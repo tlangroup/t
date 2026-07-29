@@ -3220,6 +3220,9 @@ builtin_ret :: func(name: string) -> i64 {
     if (name == "flag_get") {
         return ti_scalar("u32");
     }
+    if (name == "sys_run") {
+        return ti_scalar("i32");
+    }
     if (name == "str_len" || name == "slice_len") {
         return ti_scalar("u64");
     }
@@ -5286,6 +5289,7 @@ emit_expr :: func(e: i64) -> string {
             }
             if (cn == "args") { return "t_args()"; }
             if (cn == "exit") { return cat3("t_exit(", av[0], ")"); }
+            if (cn == "sys_run") { return cat3("sys_run(", av[0], ")"); }
             if (cn == "print") { return cat3("t_print(", av[0], ")"); }
             if (cn == "eprint") { return cat3("t_eprint(", av[0], ")"); }
             if (cn == "str_slice") {
@@ -6529,6 +6533,2565 @@ s_join :: func() -> string {
     return sb_to_str(sb);
 }
 
+// ═══════════════════════════════════════════════════════════════
+// M13: LLVM IR Emitter — .tc 直出 .ll，配合 clang 一步到可执行程序
+//
+// 值模型：
+//   * 标量表达式 → SSA 值（bool 统一 i8，仅分支处转 i1）
+//   * 聚合表达式（string/slice/struct/variant/union）→ 指向存储的 ptr
+//   * 全部 alloca 集中在函数 entry 块（循环内不增长栈）
+//   * 与 C runtime 的交互统一经 t_shim_ll.c 的 tll_* 指针化桥接；
+//     模块内 t 函数间聚合按值传递（同模块 lowering 一致，无 ABI 风险）
+// ═══════════════════════════════════════════════════════════════
+
+var ll_head: []string;    // 模块头：类型定义 + declare
+var ll_glob: []string;    // 字符串常量 + 全局变量定义
+var ll_body: []string;    // 函数定义
+var ll_fal: []string;     // 当前函数 entry 块 alloca 行
+var ll_fb: []string;      // 当前函数体指令行
+var ll_tmpc: i64;         // SSA 临时值计数（每函数重置）
+var ll_lblc: i64;         // 标签计数（每函数重置）
+var ll_scc: i64;          // scratch alloca 计数（每函数重置）
+var ll_strc: i64;         // 字符串常量计数（模块级）
+var ll_term: bool;        // 当前块是否已被终结指令封口
+var ll_cur_blk: string;   // 当前基本块标签（phi 前驱用）
+var ll_cur_ret: i64;      // 当前函数返回类型 td
+var ll_has_main: bool;
+var ll_main_fn: string;
+var ll_last_sref: string; // 最近一次字符串常量的 @.sN 引用
+var ll_last_slen: i64;
+
+llph :: func(s: string) -> void { append(ll_head, s); }
+llpg :: func(s: string) -> void { append(ll_glob, s); }
+llpb :: func(s: string) -> void { append(ll_body, s); }
+llfa :: func(s: string) -> void { append(ll_fal, s); }
+llfb :: func(s: string) -> void { append(ll_fb, s); }
+
+// ── 具名类型注册表 ─────────────────────────────────────────────
+
+var llt_names: []string;
+var llt_kinds: []string;   // struct | enum | flag | variant | union | alias
+var llt_unders: []string;  // enum/flag 底层标量名
+var llt_atd: []i64;        // alias 目标 td（其余 -1）
+
+var llsf_st: []string;     // struct 字段：名/字段/序号/td
+var llsf_fld: []string;
+var llsf_idx: []i64;
+var llsf_td: []i64;
+
+var llec_e: []string;      // enum 常量：类型名/成员名/值
+var llec_m: []string;
+var llec_v: []i64;
+
+var llfl_f: []string;      // flag 槽位：类型名/槽名/start/len
+var llfl_s: []string;
+var llfl_start: []i64;
+var llfl_len: []i64;
+
+var llv_v: []string;       // variant case：类型名/case 名/tag/载荷 td(-1 无)
+var llv_c: []string;
+var llv_tag: []i64;
+var llv_ptd: []i64;
+
+var llu_u: []string;       // union 成员：类型名/成员名/td
+var llu_m: []string;
+var llu_td: []i64;
+
+var llfn_n: []string;      // 函数签名：名/返回 td/参数池起点/参数数/extern
+var llfn_r: []i64;
+var llfn_ps: []i64;
+var llfn_pc: []i64;
+var llfn_x: []bool;
+var llfp_td: []i64;        // 参数 td 扁平池
+
+var llgv_n: []string;      // 全局 var：名/td/init 节点(-1 无)
+var llgv_td: []i64;
+var llgv_init: []i64;
+
+var llcn_n: []string;      // 全局 const：名/表达式节点（使用处内联展开）
+var llcn_e: []i64;
+
+var lla_n: []string;       // 当前函数已 alloca 的名字（去重）
+var llbrk: []string;       // break/continue 目标栈（top = ll_loopd-1）
+var llcnt: []string;
+var ll_loopd: i64;
+
+llt_find :: func(name: string) -> i64 {
+    var n: i64 = slice_len(llt_names) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        if (llt_names[i] == name) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+llsf_find :: func(st: string, f: string) -> i64 {
+    var n: i64 = slice_len(llsf_st) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        if (llsf_st[i] == st && llsf_fld[i] == f) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+llec_find :: func(e: string, m: string) -> i64 {
+    var n: i64 = slice_len(llec_e) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        if (llec_e[i] == e && llec_m[i] == m) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+llfl_find :: func(f: string, s: string) -> i64 {
+    var n: i64 = slice_len(llfl_f) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        if (llfl_f[i] == f && llfl_s[i] == s) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+llfn_find :: func(name: string) -> i64 {
+    var n: i64 = slice_len(llfn_n) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        if (llfn_n[i] == name) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+llgv_find :: func(name: string) -> i64 {
+    var n: i64 = slice_len(llgv_n) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        if (llgv_n[i] == name) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+llcn_find :: func(name: string) -> i64 {
+    var n: i64 = slice_len(llcn_n) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        if (llcn_n[i] == name) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+lla_has :: func(name: string) -> bool {
+    var n: i64 = slice_len(lla_n) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        if (lla_n[i] == name) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// variant 辅助函数名匹配：Name_from_Case / Name_is_Case / Name_as_Case
+// 命中后设置 ll_vm_kind ("from"/"is"/"as") 与池下标 ll_vm_i
+var ll_vm_kind: string;
+var ll_vm_i: i64;
+
+llv_match :: func(cn: string) -> bool {
+    ll_vm_kind = "";
+    ll_vm_i = -1;
+    var n: i64 = slice_len(llv_v) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        var f1: string = cat4(llv_v[i], "_from_", llv_c[i], "");
+        if (cn == f1) {
+            ll_vm_kind = "from";
+            ll_vm_i = i;
+            return true;
+        }
+        var f2: string = cat4(llv_v[i], "_is_", llv_c[i], "");
+        if (cn == f2) {
+            ll_vm_kind = "is";
+            ll_vm_i = i;
+            return true;
+        }
+        var f3: string = cat4(llv_v[i], "_as_", llv_c[i], "");
+        if (cn == f3) {
+            ll_vm_kind = "as";
+            ll_vm_i = i;
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// ── 标量 → LLVM 类型 ───────────────────────────────────────────
+
+scalar_to_ll :: func(name: string) -> string {
+    if (name == "u8" || name == "i8" || name == "bool") { return "i8"; }
+    if (name == "u16" || name == "i16") { return "i16"; }
+    if (name == "u32" || name == "i32") { return "i32"; }
+    if (name == "f32") { return "float"; }
+    if (name == "f64") { return "double"; }
+    return "i64";
+}
+
+ll_bits :: func(name: string) -> i64 {
+    if (name == "u8" || name == "i8" || name == "bool") { return 8; }
+    if (name == "u16" || name == "i16") { return 16; }
+    if (name == "u32" || name == "i32" || name == "f32") { return 32; }
+    return 64;
+}
+
+ll_signed :: func(name: string) -> bool {
+    if (str_len(name) == 0) {
+        return false;
+    }
+    return name[0] == 105 || name[0] == 102;
+}
+
+ll_isf :: func(name: string) -> bool {
+    return name == "f32" || name == "f64";
+}
+
+// ── td → LLVM 类型 ─────────────────────────────────────────────
+
+ll_named :: func(name: string) -> string {
+    if (name == "TSb*") { return "ptr"; }
+    var i: i64 = llt_find(name);
+    if (i < 0) {
+        return "i64";
+    }
+    var k: string = llt_kinds[i];
+    if (k == "struct") { return cat2("%st.", name); }
+    if (k == "variant") { return cat2("%vt.", name); }
+    if (k == "union") { return cat2("%un.", name); }
+    if (k == "enum" || k == "flag") { return scalar_to_ll(llt_unders[i]); }
+    if (k == "alias") { return ll_td(llt_atd[i]); }
+    return "i64";
+}
+
+ll_td :: func(td: i64) -> string {
+    if (td < 0) {
+        return "i64";
+    }
+    var t: TD = tds[td];
+    if (t.cat == "string") { return "%TStr"; }
+    if (t.cat == "slice") { return "%TSlice"; }
+    if (t.cat == "map") { return "ptr"; }
+    if (t.cat == "void") { return "void"; }
+    if (t.cat == "scalar") {
+        if (t.name == "") {
+            return "i64";
+        }
+        return scalar_to_ll(t.name);
+    }
+    if (t.cat == "named") {
+        if (t.name == "") {
+            return "ptr";
+        }
+        return ll_named(t.name);
+    }
+    return "i64";
+}
+
+// td 是否聚合（值模型走 ptr）
+ll_isagg :: func(td: i64) -> bool {
+    if (td < 0) {
+        return false;
+    }
+    var t: TD = tds[td];
+    if (t.cat == "string" || t.cat == "slice") {
+        return true;
+    }
+    if (t.cat == "named") {
+        if (t.name == "TSb*") {
+            return false;
+        }
+        var i: i64 = llt_find(t.name);
+        if (i < 0) {
+            return false;
+        }
+        var k: string = llt_kinds[i];
+        if (k == "struct" || k == "variant" || k == "union") {
+            return true;
+        }
+        if (k == "alias") {
+            return ll_isagg(llt_atd[i]);
+        }
+        return false;
+    }
+    return false;
+}
+
+// td 的标量名（"" = 非标量）；enum/flag/alias 归一到底层标量
+td_sname :: func(td: i64) -> string {
+    if (td < 0) {
+        return "i64";
+    }
+    var t: TD = tds[td];
+    if (t.cat == "scalar") {
+        if (t.name == "") {
+            return "i64";
+        }
+        return t.name;
+    }
+    if (t.cat == "unknown") {
+        return "i64";
+    }
+    if (t.cat == "named") {
+        var i: i64 = llt_find(t.name);
+        if (i < 0) {
+            return "";
+        }
+        var k: string = llt_kinds[i];
+        if (k == "enum" || k == "flag") {
+            return llt_unders[i];
+        }
+        if (k == "alias") {
+            return td_sname(llt_atd[i]);
+        }
+        return "";
+    }
+    return "";
+}
+
+ll_sizeof :: func(ty: string) -> string {
+    return cat3("ptrtoint (ptr getelementptr (", ty, ", ptr null, i32 1) to i64)");
+}
+
+ll_zero :: func(ty: string) -> string {
+    if (str_len(ty) > 0) {
+        if (ty[0] == 37) {
+            return "zeroinitializer";
+        }
+    }
+    if (ty == "float" || ty == "double") {
+        return "0.0";
+    }
+    if (ty == "ptr") {
+        return "null";
+    }
+    return "0";
+}
+
+// ── 字符串常量 ─────────────────────────────────────────────────
+
+esc_ll :: func(s: string) -> string {
+    var sb: StringBuilder = sb_new();
+    var i: u64 = 0;
+    var n: u64 = str_len(s);
+    while (i < n) {
+        var c: u8 = s[i];
+        if (c >= 32 && c <= 126 && c != 34 && c != 92) {
+            sb_append_char(sb, c);
+        } else {
+            sb_append_char(sb, 92);
+            sb_append_char(sb, hex_digit(c / 16));
+            sb_append_char(sb, hex_digit(c % 16));
+        }
+        i = i + 1;
+    }
+    return sb_to_str(sb);
+}
+
+// 生成字符串常量对（[N x i8] + %TStr），返回 "@.tsN"（聚合 ptr 值）
+ll_strlit :: func(s: string) -> string {
+    var idx: i64 = ll_strc;
+    ll_strc = ll_strc + 1;
+    var sn: string = cat2("@.s", i2s(idx));
+    var tn: string = cat2("@.ts", i2s(idx));
+    var L: i64 = str_len(s) as i64;
+    if (L == 0) {
+        llpg(cat2(sn, " = private unnamed_addr constant [1 x i8] zeroinitializer"));
+    } else {
+        var line: StringBuilder = sb_new();
+        sb_append_str(line, sn);
+        sb_append_str(line, " = private unnamed_addr constant [");
+        sb_append_i64(line, L);
+        sb_append_str(line, " x i8] c\"");
+        sb_append_str(line, esc_ll(s));
+        sb_append_str(line, "\"");
+        llpg(sb_to_str(line));
+    }
+    var l2: StringBuilder = sb_new();
+    sb_append_str(l2, tn);
+    sb_append_str(l2, " = private unnamed_addr constant %TStr { ptr ");
+    sb_append_str(l2, sn);
+    sb_append_str(l2, ", i64 ");
+    sb_append_i64(l2, L);
+    sb_append_str(l2, " }");
+    llpg(sb_to_str(l2));
+    ll_last_sref = sn;
+    ll_last_slen = L;
+    return tn;
+}
+
+// ── 临时值 / 标签 / scratch ────────────────────────────────────
+
+ll_tmp :: func() -> string {
+    var v: i64 = ll_tmpc;
+    ll_tmpc = v + 1;
+    return cat2("%t", i2s(v));
+}
+
+ll_lbl :: func(p: string) -> string {
+    var v: i64 = ll_lblc;
+    ll_lblc = v + 1;
+    return cat2(p, i2s(v));
+}
+
+ll_label :: func(name: string) -> void {
+    llfb(cat2(name, ":"));
+    ll_cur_blk = name;
+    ll_term = false;
+}
+
+ll_open :: func() -> void {
+    if (ll_term) {
+        var L: string = ll_lbl("dead");
+        ll_label(L);
+    }
+}
+
+// 每个调用点一个 scratch alloca（置于 entry，循环安全）
+ll_scratch :: func(ty: string) -> string {
+    var v: i64 = ll_scc;
+    ll_scc = v + 1;
+    var name: string = cat2("%s", i2s(v));
+    llfa(cat4("  ", name, " = alloca ", ty));
+    return name;
+}
+
+// ── 注册表构建 ─────────────────────────────────────────────────
+
+ll_build_reg :: func() -> void {
+    var n: i64 = slice_len(decl_list) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        var d: i64 = decl_list[i];
+        var dn: Node = nodes[d];
+        if (dn.kind == "StructDecl") {
+            append(llt_names, dn.sa);
+            append(llt_kinds, "struct");
+            append(llt_unders, "");
+            var neg1: i64 = -1;
+            append(llt_atd, neg1);
+            var fi: i64 = 0;
+            var c: i64 = dn.lb;
+            while (c >= 0) {
+                var k: Child = kids[c];
+                var f: Node = nodes[k.val];
+                if (f.ia < 0) {
+                    append(llsf_st, dn.sa);
+                    append(llsf_fld, f.sa);
+                    append(llsf_idx, fi);
+                    var ftd: i64 = resolve_type_desc(f.na);
+                    append(llsf_td, ftd);
+                    fi = fi + 1;
+                }
+                c = k.next;
+            }
+        }
+        if (dn.kind == "EnumDecl") {
+            append(llt_names, dn.sa);
+            append(llt_kinds, "enum");
+            append(llt_unders, dn.sb);
+            var neg2: i64 = -1;
+            append(llt_atd, neg2);
+            var auto_val: i64 = 0;
+            var c2: i64 = dn.lb;
+            while (c2 >= 0) {
+                var k2: Child = kids[c2];
+                var v: Node = nodes[k2.val];
+                if (v.na >= 0) {
+                    var vn: Node = nodes[v.na];
+                    if (vn.kind == "int") {
+                        var r: i64 = vn.ia;
+                        if (r < 2) {
+                            r = 10;
+                        }
+                        var pv: i64 = js_parse_int(vn.sa, r);
+                        append(llec_e, dn.sa);
+                        append(llec_m, v.sa);
+                        append(llec_v, pv);
+                        auto_val = pv + 1;
+                    }
+                } else {
+                    append(llec_e, dn.sa);
+                    append(llec_m, v.sa);
+                    append(llec_v, auto_val);
+                    auto_val = auto_val + 1;
+                }
+                c2 = k2.next;
+            }
+        }
+        if (dn.kind == "FlagDecl") {
+            append(llt_names, dn.sa);
+            append(llt_kinds, "flag");
+            append(llt_unders, dn.sb);
+            var neg3: i64 = -1;
+            append(llt_atd, neg3);
+            var auto_off: i64 = 0;
+            var c3: i64 = dn.lb;
+            while (c3 >= 0) {
+                var k3: Child = kids[c3];
+                var sl: Node = nodes[k3.val];
+                var start: i64 = auto_off;
+                if (sl.bb) {
+                    start = sl.ib;
+                }
+                append(llfl_f, dn.sa);
+                append(llfl_s, sl.sa);
+                append(llfl_start, start);
+                append(llfl_len, sl.ia);
+                auto_off = start + sl.ia;
+                c3 = k3.next;
+            }
+        }
+        if (dn.kind == "VariantDecl") {
+            append(llt_names, dn.sa);
+            append(llt_kinds, "variant");
+            append(llt_unders, "");
+            var neg4: i64 = -1;
+            append(llt_atd, neg4);
+            var c4: i64 = dn.lb;
+            while (c4 >= 0) {
+                var k4: Child = kids[c4];
+                var vc: Node = nodes[k4.val];
+                append(llv_v, dn.sa);
+                append(llv_c, vc.sa);
+                append(llv_tag, vc.ia);
+                var ptd: i64 = -1;
+                if (vc.na >= 0) {
+                    ptd = resolve_type_desc(vc.na);
+                }
+                append(llv_ptd, ptd);
+                c4 = k4.next;
+            }
+        }
+        if (dn.kind == "UnionDecl") {
+            append(llt_names, dn.sa);
+            append(llt_kinds, "union");
+            append(llt_unders, "");
+            var neg5: i64 = -1;
+            append(llt_atd, neg5);
+            var c5: i64 = dn.lb;
+            while (c5 >= 0) {
+                var k5: Child = kids[c5];
+                var m: Node = nodes[k5.val];
+                append(llu_u, dn.sa);
+                append(llu_m, m.sa);
+                var mtd: i64 = resolve_type_desc(m.na);
+                append(llu_td, mtd);
+                c5 = k5.next;
+            }
+        }
+        if (dn.kind == "TypeAliasDecl") {
+            append(llt_names, dn.sa);
+            append(llt_kinds, "alias");
+            append(llt_unders, "");
+            var atd: i64 = resolve_type_desc(dn.na);
+            append(llt_atd, atd);
+        }
+        if (dn.kind == "FuncDecl") {
+            append(llfn_n, dn.sa);
+            var rtd: i64 = resolve_type_desc(dn.na);
+            append(llfn_r, rtd);
+            var ps: i64 = slice_len(llfp_td) as i64;
+            append(llfn_ps, ps);
+            var pc: i64 = 0;
+            var c6: i64 = dn.lb;
+            while (c6 >= 0) {
+                var k6: Child = kids[c6];
+                var p: Node = nodes[k6.val];
+                var ptd2: i64 = resolve_type_desc(p.na);
+                append(llfp_td, ptd2);
+                pc = pc + 1;
+                c6 = k6.next;
+            }
+            append(llfn_pc, pc);
+            append(llfn_x, dn.ba);
+        }
+        if (dn.kind == "GlobalVarDecl") {
+            append(llgv_n, dn.sa);
+            var gtd: i64 = resolve_type_desc(dn.na);
+            append(llgv_td, gtd);
+            append(llgv_init, dn.nb);
+        }
+        if (dn.kind == "GlobalConstDecl") {
+            append(llcn_n, dn.sa);
+            append(llcn_e, dn.nb);
+        }
+        i = i + 1;
+    }
+}
+
+// ── 表达式类型（expr_type_desc 的 LLVM 补丁包装）───────────────
+
+ll_etd :: func(e: i64) -> i64 {
+    if (e < 0) {
+        return td_mk("unknown");
+    }
+    var n: Node = nodes[e];
+    if (n.kind == "unary") {
+        if (n.sa == "!") {
+            return td_named_mk("scalar", "bool");
+        }
+        return ll_etd(n.na);
+    }
+    if (n.kind == "struct_lit") {
+        return td_named_mk("named", n.sa);
+    }
+    if (n.kind == "member") {
+        var ob: Node = nodes[n.na];
+        if (ob.kind == "ident") {
+            var ti: i64 = llt_find(ob.sa);
+            if (ti >= 0) {
+                if (llt_kinds[ti] == "enum") {
+                    return td_named_mk("scalar", llt_unders[ti]);
+                }
+            }
+        }
+        var od: i64 = expr_type_desc(e);
+        var ot: TD = tds[od];
+        if (ot.cat != "unknown") {
+            return od;
+        }
+        // union 成员
+        var obd: i64 = ll_etd(n.na);
+        var obt: TD = tds[obd];
+        if (obt.cat == "named") {
+            var ui: i64 = llt_find(obt.name);
+            if (ui >= 0) {
+                if (llt_kinds[ui] == "union") {
+                    var un: i64 = slice_len(llu_u) as i64;
+                    var uj: i64 = 0;
+                    while (uj < un) {
+                        if (llu_u[uj] == obt.name && llu_m[uj] == n.sa) {
+                            return llu_td[uj];
+                        }
+                        uj = uj + 1;
+                    }
+                }
+            }
+        }
+        return od;
+    }
+    if (n.kind == "call") {
+        var cal: Node = nodes[n.na];
+        if (cal.kind == "ident") {
+            var cn: string = cal.sa;
+            if (cn == "flag_get") {
+                return td_named_mk("scalar", "u32");
+            }
+            if (cn == "sys_run") {
+                return td_named_mk("scalar", "i32");
+            }
+            if (llv_match(cn)) {
+                if (ll_vm_kind == "from") {
+                    return td_named_mk("named", llv_v[ll_vm_i]);
+                }
+                if (ll_vm_kind == "is") {
+                    return td_named_mk("scalar", "bool");
+                }
+                return llv_ptd[ll_vm_i];
+            }
+        }
+        return expr_type_desc(e);
+    }
+    return expr_type_desc(e);
+}
+
+// 二元运算的统一操作数类型：字面量让位于有类型的一侧
+ll_bin_td :: func(e: i64) -> i64 {
+    var n: Node = nodes[e];
+    var ln: Node = nodes[n.na];
+    var rn: Node = nodes[n.nb];
+    var llit: bool = ln.kind == "int" || ln.kind == "float";
+    var rlit: bool = rn.kind == "int" || rn.kind == "float";
+    if (llit && rlit == false) {
+        return ll_etd(n.nb);
+    }
+    return ll_etd(n.na);
+}
+
+// ── 数值转换 ───────────────────────────────────────────────────
+
+ll_cast_v :: func(v: string, ftd: i64, ttd: i64) -> string {
+    var fs: string = td_sname(ftd);
+    var ts: string = td_sname(ttd);
+    if (fs == "" || ts == "") {
+        return v;
+    }
+    if (str_len(v) == 0) {
+        return v;
+    }
+    if (v[0] != 37) {
+        return v;    // 常量文本随目标类型自适应
+    }
+    var fb2: i64 = ll_bits(fs);
+    var tb: i64 = ll_bits(ts);
+    var ff: bool = ll_isf(fs);
+    var tf: bool = ll_isf(ts);
+    var fty: string = scalar_to_ll(fs);
+    var tty: string = scalar_to_ll(ts);
+    if (ff && tf) {
+        if (fb2 == tb) {
+            return v;
+        }
+        var t1: string = ll_tmp();
+        if (fb2 < tb) {
+            llfb(cat6("  ", t1, " = fpext ", fty, " ", cat4(v, " to ", tty, "")));
+        } else {
+            llfb(cat6("  ", t1, " = fptrunc ", fty, " ", cat4(v, " to ", tty, "")));
+        }
+        return t1;
+    }
+    if (ff && tf == false) {
+        var t2: string = ll_tmp();
+        if (ll_signed(ts)) {
+            llfb(cat6("  ", t2, " = fptosi ", fty, " ", cat4(v, " to ", tty, "")));
+        } else {
+            llfb(cat6("  ", t2, " = fptoui ", fty, " ", cat4(v, " to ", tty, "")));
+        }
+        return t2;
+    }
+    if (ff == false && tf) {
+        var t3: string = ll_tmp();
+        if (ll_signed(fs)) {
+            llfb(cat6("  ", t3, " = sitofp ", fty, " ", cat4(v, " to ", tty, "")));
+        } else {
+            llfb(cat6("  ", t3, " = uitofp ", fty, " ", cat4(v, " to ", tty, "")));
+        }
+        return t3;
+    }
+    if (ts == "bool") {
+        if (fs == "bool") {
+            return v;
+        }
+        var t4: string = ll_tmp();
+        llfb(cat6("  ", t4, " = icmp ne ", fty, " ", cat3(v, ", ", "0")));
+        var t5: string = ll_tmp();
+        llfb(cat6("  ", t5, " = zext i1 ", t4, " to i8", ""));
+        return t5;
+    }
+    if (fb2 == tb) {
+        return v;
+    }
+    var t6: string = ll_tmp();
+    if (fb2 < tb) {
+        if (ll_signed(fs)) {
+            llfb(cat6("  ", t6, " = sext ", fty, " ", cat4(v, " to ", tty, "")));
+        } else {
+            llfb(cat6("  ", t6, " = zext ", fty, " ", cat4(v, " to ", tty, "")));
+        }
+    } else {
+        llfb(cat6("  ", t6, " = trunc ", fty, " ", cat4(v, " to ", tty, "")));
+    }
+    return t6;
+}
+
+// i8 bool 值 → i1（分支条件）
+ll_to_i1 :: func(v: string) -> string {
+    if (v == "1") {
+        return "true";
+    }
+    if (v == "0") {
+        return "false";
+    }
+    var t: string = ll_tmp();
+    llfb(cat4("  ", t, " = icmp ne i8 ", cat2(v, ", 0")));
+    return t;
+}
+
+// i1 → i8
+ll_b8 :: func(v1: string) -> string {
+    var t: string = ll_tmp();
+    llfb(cat4("  ", t, " = zext i1 ", cat2(v1, " to i8")));
+    return t;
+}
+
+// 从 ptr 装载
+ll_load :: func(ty: string, p: string) -> string {
+    var t: string = ll_tmp();
+    llfb(cat6("  ", t, " = load ", ty, ", ptr ", p));
+    return t;
+}
+
+// 聚合复制：src ptr → dst ptr（load/store 按值搬运）
+ll_copy :: func(ty: string, src: string, dst: string) -> void {
+    var t: string = ll_load(ty, src);
+    llfb(cat6("  store ", ty, " ", t, ", ptr ", dst));
+}
+
+// ── 左值地址 ───────────────────────────────────────────────────
+
+ll_addr :: func(e: i64) -> string {
+    var n: Node = nodes[e];
+    if (n.kind == "paren") {
+        return ll_addr(n.na);
+    }
+    if (n.kind == "ident") {
+        if (em_in_fn) {
+            var f: i64 = fs_get(em_cur_fn, n.sa);
+            if (f >= 0) {
+                return cat2("%v.", n.sa);
+            }
+        }
+        var g: i64 = llgv_find(n.sa);
+        if (g >= 0) {
+            return cat2("@", n.sa);
+        }
+        return "null";
+    }
+    if (n.kind == "member") {
+        var obd: i64 = ll_etd(n.na);
+        var obt: TD = tds[obd];
+        var op: string = emit_lle(n.na);
+        if (obt.cat == "named") {
+            var ti: i64 = llt_find(obt.name);
+            if (ti >= 0) {
+                if (llt_kinds[ti] == "struct") {
+                    var fi: i64 = llsf_find(obt.name, n.sa);
+                    if (fi >= 0) {
+                        var t: string = ll_tmp();
+                        var line: StringBuilder = sb_new();
+                        sb_append_str(line, "  ");
+                        sb_append_str(line, t);
+                        sb_append_str(line, " = getelementptr inbounds %st.");
+                        sb_append_str(line, obt.name);
+                        sb_append_str(line, ", ptr ");
+                        sb_append_str(line, op);
+                        sb_append_str(line, ", i32 0, i32 ");
+                        sb_append_i64(line, llsf_idx[fi]);
+                        llfb(sb_to_str(line));
+                        return t;
+                    }
+                }
+                if (llt_kinds[ti] == "union") {
+                    return op;    // 所有成员共址 offset 0
+                }
+            }
+        }
+        return "null";
+    }
+    if (n.kind == "index") {
+        var od: i64 = ll_etd(n.na);
+        var ot: TD = tds[od];
+        if (ot.cat == "slice") {
+            var sp: string = emit_lle(n.na);
+            var iv: string = emit_lle(n.nb);
+            var t2: string = ll_tmp();
+            llfb(cat6("  ", t2, " = call ptr @tll_slice_at(ptr ", sp, ", i64 ", cat2(iv, ")")));
+            return t2;
+        }
+        return "null";
+    }
+    return "null";
+}
+
+// ── 表达式发射 ─────────────────────────────────────────────────
+
+emit_lle :: func(e: i64) -> string {
+    if (e < 0) {
+        return "0";
+    }
+    var n: Node = nodes[e];
+
+    if (n.kind == "int") {
+        var r: i64 = n.ia;
+        if (r < 2) {
+            r = 10;
+        }
+        return i2s(js_parse_int(n.sa, r));
+    }
+    if (n.kind == "float") {
+        // 确保带小数点（LLVM 浮点常量语法）
+        var has_dot: bool = false;
+        var i: u64 = 0;
+        var L: u64 = str_len(n.sa);
+        while (i < L) {
+            if (n.sa[i] == 46 || n.sa[i] == 101 || n.sa[i] == 69) {
+                has_dot = true;
+            }
+            i = i + 1;
+        }
+        if (has_dot) {
+            return n.sa;
+        }
+        return cat2(n.sa, ".0");
+    }
+    if (n.kind == "string") {
+        return ll_strlit(n.sa);
+    }
+    if (n.kind == "bool") {
+        if (n.ba) {
+            return "1";
+        }
+        return "0";
+    }
+    if (n.kind == "null") {
+        return "null";
+    }
+    if (n.kind == "ident") {
+        if (em_in_fn) {
+            var f: i64 = fs_get(em_cur_fn, n.sa);
+            if (f >= 0) {
+                if (ll_isagg(f)) {
+                    return cat2("%v.", n.sa);
+                }
+                return ll_load(ll_td(f), cat2("%v.", n.sa));
+            }
+        }
+        var g: i64 = llgv_find(n.sa);
+        if (g >= 0) {
+            var gtd: i64 = llgv_td[g];
+            if (ll_isagg(gtd)) {
+                return cat2("@", n.sa);
+            }
+            return ll_load(ll_td(gtd), cat2("@", n.sa));
+        }
+        var ci: i64 = llcn_find(n.sa);
+        if (ci >= 0) {
+            return emit_lle(llcn_e[ci]);
+        }
+        return "0";
+    }
+    if (n.kind == "paren") {
+        return emit_lle(n.na);
+    }
+    if (n.kind == "binary") {
+        return ll_binary(e);
+    }
+    if (n.kind == "unary") {
+        return ll_unary(e);
+    }
+    if (n.kind == "assign") {
+        var v: string = emit_lle(n.nb);
+        var ltd: i64 = ll_etd(n.na);
+        var ad: string = ll_addr(n.na);
+        if (ll_isagg(ltd)) {
+            ll_copy(ll_td(ltd), v, ad);
+        } else {
+            var cv: string = ll_cast_v(v, ll_etd(n.nb), ltd);
+            llfb(cat6("  store ", ll_td(ltd), " ", cv, ", ptr ", ad));
+        }
+        return v;
+    }
+    if (n.kind == "call") {
+        return ll_call(e);
+    }
+    if (n.kind == "member") {
+        var ob: Node = nodes[n.na];
+        if (ob.kind == "ident") {
+            var ti: i64 = llt_find(ob.sa);
+            if (ti >= 0) {
+                if (llt_kinds[ti] == "enum") {
+                    var ei: i64 = llec_find(ob.sa, n.sa);
+                    if (ei >= 0) {
+                        return i2s(llec_v[ei]);
+                    }
+                    return "0";
+                }
+            }
+        }
+        var mtd: i64 = ll_etd(e);
+        var p: string = ll_addr(e);
+        if (ll_isagg(mtd)) {
+            return p;
+        }
+        return ll_load(ll_td(mtd), p);
+    }
+    if (n.kind == "index") {
+        var od: i64 = ll_etd(n.na);
+        var ot: TD = tds[od];
+        if (ot.cat == "string") {
+            var sp: string = emit_lle(n.na);
+            var iv: string = emit_lle(n.nb);
+            var iv2: string = ll_widen_idx(iv, n.nb);
+            var t: string = ll_tmp();
+            llfb(cat6("  ", t, " = call i64 @tll_str_at(ptr ", sp, ", i64 ", cat2(iv2, ")")));
+            var t2: string = ll_tmp();
+            llfb(cat4("  ", t2, " = trunc i64 ", cat2(t, " to i8")));
+            return t2;
+        }
+        if (ot.cat == "slice") {
+            var sp2: string = emit_lle(n.na);
+            var iv3: string = emit_lle(n.nb);
+            var iv4: string = ll_widen_idx(iv3, n.nb);
+            var t3: string = ll_tmp();
+            llfb(cat6("  ", t3, " = call ptr @tll_slice_at(ptr ", sp2, ", i64 ", cat2(iv4, ")")));
+            if (ot.elem >= 0) {
+                if (ll_isagg(ot.elem)) {
+                    return t3;
+                }
+                return ll_load(ll_td(ot.elem), t3);
+            }
+            return ll_load("i64", t3);
+        }
+        return "0";
+    }
+    if (n.kind == "struct_lit") {
+        var sty: string = cat2("%st.", n.sa);
+        var s: string = ll_scratch(sty);
+        llfb(cat4("  store ", sty, " zeroinitializer, ptr ", s));
+        var c: i64 = n.la;
+        while (c >= 0) {
+            var k: Child = kids[c];
+            var fv: Node = nodes[k.val];
+            var fi2: i64 = llsf_find(n.sa, fv.sa);
+            if (fi2 >= 0) {
+                var fp: string = ll_tmp();
+                var line: StringBuilder = sb_new();
+                sb_append_str(line, "  ");
+                sb_append_str(line, fp);
+                sb_append_str(line, " = getelementptr inbounds ");
+                sb_append_str(line, sty);
+                sb_append_str(line, ", ptr ");
+                sb_append_str(line, s);
+                sb_append_str(line, ", i32 0, i32 ");
+                sb_append_i64(line, llsf_idx[fi2]);
+                llfb(sb_to_str(line));
+                var ftd: i64 = llsf_td[fi2];
+                var fvv: string = emit_lle(fv.na);
+                if (ll_isagg(ftd)) {
+                    ll_copy(ll_td(ftd), fvv, fp);
+                } else {
+                    var cv2: string = ll_cast_v(fvv, ll_etd(fv.na), ftd);
+                    llfb(cat6("  store ", ll_td(ftd), " ", cv2, ", ptr ", fp));
+                }
+            }
+            c = k.next;
+        }
+        return s;
+    }
+    if (n.kind == "cast") {
+        var v2: string = emit_lle(n.na);
+        var ttd: i64 = resolve_type_desc(n.nb);
+        return ll_cast_v(v2, ll_etd(n.na), ttd);
+    }
+    llfb("  ; UNSUPPORTED expr");
+    return "0";
+}
+
+// 索引值统一拓宽为 i64（str_at/slice_at 的下标参数）
+ll_widen_idx :: func(v: string, e: i64) -> string {
+    var td: i64 = ll_etd(e);
+    var i64td: i64 = td_named_mk("scalar", "i64");
+    return ll_cast_v(v, td, i64td);
+}
+
+// ── 二元 / 一元 ────────────────────────────────────────────────
+
+ll_binary :: func(e: i64) -> string {
+    var n: Node = nodes[e];
+    var op: string = n.sa;
+
+    if (op == "&&" || op == "||") {
+        var lv: string = emit_lle(n.na);
+        var l1: string = ll_to_i1(lv);
+        var lend: string = ll_cur_blk;
+        var rhsL: string = ll_lbl("sc.r");
+        var mrgL: string = ll_lbl("sc.m");
+        if (op == "&&") {
+            llfb(cat6("  br i1 ", l1, ", label %", rhsL, ", label %", mrgL));
+        } else {
+            llfb(cat6("  br i1 ", l1, ", label %", mrgL, ", label %", rhsL));
+        }
+        ll_label(rhsL);
+        var rv: string = emit_lle(n.nb);
+        var r1: string = ll_to_i1(rv);
+        var rend: string = ll_cur_blk;
+        llfb(cat3("  br label %", mrgL, ""));
+        ll_label(mrgL);
+        var sc_const: string = "false";
+        if (op == "||") {
+            sc_const = "true";
+        }
+        var t: string = ll_tmp();
+        llfb(cat6("  ", t, " = phi i1 [ ", sc_const, ", %", cat6(lend, " ], [ ", r1, ", %", rend, " ]")));
+        return ll_b8(t);
+    }
+
+    // 字符串相等
+    if (op == "==" || op == "!=") {
+        var lt: i64 = ll_etd(n.na);
+        var rt: i64 = ll_etd(n.nb);
+        var ltc: TD = tds[lt];
+        var rtc: TD = tds[rt];
+        if (ltc.cat == "string" || rtc.cat == "string") {
+            var lp: string = emit_lle(n.na);
+            var rp: string = emit_lle(n.nb);
+            var t0: string = ll_tmp();
+            llfb(cat6("  ", t0, " = call i32 @tll_str_eq(ptr ", lp, ", ptr ", cat2(rp, ")")));
+            var t1: string = ll_tmp();
+            if (op == "==") {
+                llfb(cat4("  ", t1, " = icmp ne i32 ", cat2(t0, ", 0")));
+            } else {
+                llfb(cat4("  ", t1, " = icmp eq i32 ", cat2(t0, ", 0")));
+            }
+            return ll_b8(t1);
+        }
+    }
+
+    var utd: i64 = ll_bin_td(e);
+    var sn: string = td_sname(utd);
+    if (sn == "") {
+        sn = "i64";
+    }
+    var ty: string = scalar_to_ll(sn);
+    var isf: bool = ll_isf(sn);
+    var sg: bool = ll_signed(sn);
+    var a: string = emit_lle(n.na);
+    a = ll_cast_v(a, ll_etd(n.na), utd);
+    var b: string = emit_lle(n.nb);
+    b = ll_cast_v(b, ll_etd(n.nb), utd);
+
+    if (op == "==" || op == "!=" || op == "<" || op == ">" || op == "<=" || op == ">=") {
+        var cc: string = "";
+        if (isf) {
+            if (op == "==") { cc = "oeq"; }
+            if (op == "!=") { cc = "one"; }
+            if (op == "<") { cc = "olt"; }
+            if (op == ">") { cc = "ogt"; }
+            if (op == "<=") { cc = "ole"; }
+            if (op == ">=") { cc = "oge"; }
+            var tf: string = ll_tmp();
+            llfb(cat6("  ", tf, " = fcmp ", cc, " ", cat6(ty, " ", a, ", ", b, "")));
+            return ll_b8(tf);
+        }
+        if (op == "==") { cc = "eq"; }
+        if (op == "!=") { cc = "ne"; }
+        if (sg) {
+            if (op == "<") { cc = "slt"; }
+            if (op == ">") { cc = "sgt"; }
+            if (op == "<=") { cc = "sle"; }
+            if (op == ">=") { cc = "sge"; }
+        } else {
+            if (op == "<") { cc = "ult"; }
+            if (op == ">") { cc = "ugt"; }
+            if (op == "<=") { cc = "ule"; }
+            if (op == ">=") { cc = "uge"; }
+        }
+        var ti2: string = ll_tmp();
+        llfb(cat6("  ", ti2, " = icmp ", cc, " ", cat6(ty, " ", a, ", ", b, "")));
+        return ll_b8(ti2);
+    }
+
+    var ins: string = "";
+    if (isf) {
+        if (op == "+") { ins = "fadd"; }
+        if (op == "-") { ins = "fsub"; }
+        if (op == "*") { ins = "fmul"; }
+        if (op == "/") { ins = "fdiv"; }
+        if (op == "%") { ins = "frem"; }
+    } else {
+        if (op == "+") { ins = "add"; }
+        if (op == "-") { ins = "sub"; }
+        if (op == "*") { ins = "mul"; }
+        if (op == "/") {
+            ins = "udiv";
+            if (sg) {
+                ins = "sdiv";
+            }
+        }
+        if (op == "%") {
+            ins = "urem";
+            if (sg) {
+                ins = "srem";
+            }
+        }
+        if (op == "<<") { ins = "shl"; }
+        if (op == ">>") {
+            ins = "lshr";
+            if (sg) {
+                ins = "ashr";
+            }
+        }
+        if (op == "&") { ins = "and"; }
+        if (op == "|") { ins = "or"; }
+        if (op == "^") { ins = "xor"; }
+    }
+    if (ins == "") {
+        llfb("  ; UNSUPPORTED binop");
+        return "0";
+    }
+    var t3: string = ll_tmp();
+    llfb(cat6("  ", t3, " = ", ins, " ", cat6(ty, " ", a, ", ", b, "")));
+    return t3;
+}
+
+ll_unary :: func(e: i64) -> string {
+    var n: Node = nodes[e];
+    var op: string = n.sa;
+    if (op == "!") {
+        var v: string = emit_lle(n.na);
+        var t: string = ll_tmp();
+        llfb(cat4("  ", t, " = icmp eq i8 ", cat2(v, ", 0")));
+        return ll_b8(t);
+    }
+    var otd: i64 = ll_etd(n.na);
+    var sn: string = td_sname(otd);
+    if (sn == "") {
+        sn = "i64";
+    }
+    var ty: string = scalar_to_ll(sn);
+    var v2: string = emit_lle(n.na);
+    if (op == "-") {
+        if (str_len(v2) > 0) {
+            if (v2[0] != 37) {
+                return cat2("-", v2);    // 常量折叠
+            }
+        }
+        if (ll_isf(sn)) {
+            var tf: string = ll_tmp();
+            llfb(cat6("  ", tf, " = fneg ", ty, " ", v2));
+            return tf;
+        }
+        var t2: string = ll_tmp();
+        llfb(cat6("  ", t2, " = sub ", ty, " 0, ", v2));
+        return t2;
+    }
+    if (op == "~") {
+        var t3: string = ll_tmp();
+        llfb(cat6("  ", t3, " = xor ", ty, " ", cat2(v2, ", -1")));
+        return t3;
+    }
+    return v2;
+}
+
+// ── 尺寸计算（union/variant 载荷字节数，保守 8 字节对齐上估）──
+
+ll_round8 :: func(v: i64) -> i64 {
+    return ((v + 7) / 8) * 8;
+}
+
+ll_size_bytes :: func(td: i64) -> i64 {
+    if (td < 0) {
+        return 8;
+    }
+    var t: TD = tds[td];
+    if (t.cat == "scalar") {
+        if (t.name == "") {
+            return 8;
+        }
+        return ll_bits(t.name) / 8;
+    }
+    if (t.cat == "string") {
+        return 16;
+    }
+    if (t.cat == "slice") {
+        return 32;
+    }
+    if (t.cat == "map") {
+        return 8;
+    }
+    if (t.cat == "named") {
+        if (t.name == "TSb*") {
+            return 8;
+        }
+        var i: i64 = llt_find(t.name);
+        if (i < 0) {
+            return 8;
+        }
+        var k: string = llt_kinds[i];
+        if (k == "enum" || k == "flag") {
+            return ll_bits(llt_unders[i]) / 8;
+        }
+        if (k == "alias") {
+            return ll_size_bytes(llt_atd[i]);
+        }
+        if (k == "struct") {
+            var sum: i64 = 0;
+            var n: i64 = slice_len(llsf_st) as i64;
+            var j: i64 = 0;
+            while (j < n) {
+                if (llsf_st[j] == t.name) {
+                    sum = sum + ll_round8(ll_size_bytes(llsf_td[j]));
+                }
+                j = j + 1;
+            }
+            if (sum == 0) {
+                sum = 8;
+            }
+            return sum;
+        }
+        if (k == "variant") {
+            return 8 + ll_variant_paymax(t.name);
+        }
+        if (k == "union") {
+            return ll_union_max(t.name);
+        }
+    }
+    return 8;
+}
+
+ll_variant_paymax :: func(name: string) -> i64 {
+    var mx: i64 = 8;
+    var n: i64 = slice_len(llv_v) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        if (llv_v[i] == name && llv_ptd[i] >= 0) {
+            var s: i64 = ll_round8(ll_size_bytes(llv_ptd[i]));
+            if (s > mx) {
+                mx = s;
+            }
+        }
+        i = i + 1;
+    }
+    return mx;
+}
+
+ll_union_max :: func(name: string) -> i64 {
+    var mx: i64 = 8;
+    var n: i64 = slice_len(llu_u) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        if (llu_u[i] == name) {
+            var s: i64 = ll_round8(ll_size_bytes(llu_td[i]));
+            if (s > mx) {
+                mx = s;
+            }
+        }
+        i = i + 1;
+    }
+    return mx;
+}
+
+// iN 类型的常量文本：超出有符号范围时按补码回绕成负十进制
+ll_iconst :: func(v: i64, bits: i64) -> string {
+    if (bits == 8) {
+        if (v > 127) {
+            return i2s(v - 256);
+        }
+    }
+    if (bits == 16) {
+        if (v > 32767) {
+            return i2s(v - 65536);
+        }
+    }
+    if (bits == 32) {
+        if (v > 2147483647) {
+            return i2s(v - 4294967296);
+        }
+    }
+    return i2s(v);
+}
+
+// 复合赋值/二元共用的算术指令名
+ll_arith_ins :: func(op: string, sn: string) -> string {
+    var isf: bool = ll_isf(sn);
+    var sg: bool = ll_signed(sn);
+    if (isf) {
+        if (op == "+") { return "fadd"; }
+        if (op == "-") { return "fsub"; }
+        if (op == "*") { return "fmul"; }
+        if (op == "/") { return "fdiv"; }
+        if (op == "%") { return "frem"; }
+        return "";
+    }
+    if (op == "+") { return "add"; }
+    if (op == "-") { return "sub"; }
+    if (op == "*") { return "mul"; }
+    if (op == "/") {
+        if (sg) {
+            return "sdiv";
+        }
+        return "udiv";
+    }
+    if (op == "%") {
+        if (sg) {
+            return "srem";
+        }
+        return "urem";
+    }
+    if (op == "<<") { return "shl"; }
+    if (op == ">>") {
+        if (sg) {
+            return "ashr";
+        }
+        return "lshr";
+    }
+    if (op == "&") { return "and"; }
+    if (op == "|") { return "or"; }
+    if (op == "^") { return "xor"; }
+    return "";
+}
+
+// ── 调用发射 ───────────────────────────────────────────────────
+
+ll_call :: func(e: i64) -> string {
+    var n: Node = nodes[e];
+    var cal: Node = nodes[n.na];
+    if (cal.kind != "ident") {
+        llfb("  ; UNSUPPORTED call target");
+        return "0";
+    }
+    var cn: string = cal.sa;
+    var ae: []i64;
+    var c: i64 = n.la;
+    while (c >= 0) {
+        var k: Child = kids[c];
+        append(ae, k.val);
+        c = k.next;
+    }
+    var argc: i64 = slice_len(ae) as i64;
+    var td_i64: i64 = td_named_mk("scalar", "i64");
+    var td_i32: i64 = td_named_mk("scalar", "i32");
+
+    if (cn == "print" || cn == "eprint" || cn == "println") {
+        var p: string = emit_lle(ae[0]);
+        var fnm: string = "@tll_print";
+        if (cn == "eprint") {
+            fnm = "@tll_eprint";
+        }
+        llfb(cat4("  call void ", fnm, "(ptr ", cat2(p, ")")));
+        if (cn == "println") {
+            var nl: string = ll_strlit("\n");
+            llfb(cat3("  call void @tll_print(ptr ", nl, ")"));
+        }
+        return "0";
+    }
+    if (cn == "str_len" || cn == "slice_len") {
+        var p2: string = emit_lle(ae[0]);
+        var fn2: string = "@tll_str_len";
+        if (cn == "slice_len") {
+            fn2 = "@tll_slice_len";
+        }
+        var t0: string = ll_tmp();
+        llfb(cat6("  ", t0, " = call i64 ", fn2, "(ptr ", cat2(p2, ")")));
+        return t0;
+    }
+    if (cn == "str_at") {
+        var sp: string = emit_lle(ae[0]);
+        var iv: string = emit_lle(ae[1]);
+        iv = ll_cast_v(iv, ll_etd(ae[1]), td_i64);
+        var t1: string = ll_tmp();
+        llfb(cat6("  ", t1, " = call i64 @tll_str_at(ptr ", sp, ", i64 ", cat2(iv, ")")));
+        var t2: string = ll_tmp();
+        llfb(cat4("  ", t2, " = trunc i64 ", cat2(t1, " to i8")));
+        return t2;
+    }
+    if (cn == "str_slice") {
+        var sp2: string = emit_lle(ae[0]);
+        var a1: string = emit_lle(ae[1]);
+        a1 = ll_cast_v(a1, ll_etd(ae[1]), td_i64);
+        var b1: string = emit_lle(ae[2]);
+        b1 = ll_cast_v(b1, ll_etd(ae[2]), td_i64);
+        var out0: string = ll_scratch("%TStr");
+        var lsb: StringBuilder = sb_new();
+        sb_append_str(lsb, "  call void @tll_str_slice(ptr ");
+        sb_append_str(lsb, sp2);
+        sb_append_str(lsb, ", i64 ");
+        sb_append_str(lsb, a1);
+        sb_append_str(lsb, ", i64 ");
+        sb_append_str(lsb, b1);
+        sb_append_str(lsb, ", ptr ");
+        sb_append_str(lsb, out0);
+        sb_append_str(lsb, ")");
+        llfb(sb_to_str(lsb));
+        return out0;
+    }
+    if (cn == "append") {
+        var std: i64 = ll_etd(ae[0]);
+        var st: TD = tds[std];
+        var ety: string = "i64";
+        var etd: i64 = -1;
+        if (st.cat == "slice") {
+            etd = st.elem;
+        }
+        if (etd >= 0) {
+            ety = ll_td(etd);
+        }
+        var sp3: string = emit_lle(ae[0]);
+        var ep: string = "";
+        var isagg: bool = false;
+        if (etd >= 0) {
+            isagg = ll_isagg(etd);
+        }
+        if (isagg) {
+            ep = emit_lle(ae[1]);
+        } else {
+            var v0: string = emit_lle(ae[1]);
+            if (etd >= 0) {
+                v0 = ll_cast_v(v0, ll_etd(ae[1]), etd);
+            }
+            var sc0: string = ll_scratch(ety);
+            llfb(cat6("  store ", ety, " ", v0, ", ptr ", sc0));
+            ep = sc0;
+        }
+        var asb: StringBuilder = sb_new();
+        sb_append_str(asb, "  call void @tll_slice_append(ptr ");
+        sb_append_str(asb, sp3);
+        sb_append_str(asb, ", ptr ");
+        sb_append_str(asb, ep);
+        sb_append_str(asb, ", i64 ");
+        sb_append_str(asb, ll_sizeof(ety));
+        sb_append_str(asb, ")");
+        llfb(sb_to_str(asb));
+        return "0";
+    }
+    if (cn == "slice_set") {
+        var std2: i64 = ll_etd(ae[0]);
+        var st2: TD = tds[std2];
+        var etd2: i64 = -1;
+        if (st2.cat == "slice") {
+            etd2 = st2.elem;
+        }
+        var ety2: string = "i64";
+        if (etd2 >= 0) {
+            ety2 = ll_td(etd2);
+        }
+        var sp4: string = emit_lle(ae[0]);
+        var iv2: string = emit_lle(ae[1]);
+        iv2 = ll_cast_v(iv2, ll_etd(ae[1]), td_i64);
+        var ep2: string = "";
+        var isagg2: bool = false;
+        if (etd2 >= 0) {
+            isagg2 = ll_isagg(etd2);
+        }
+        if (isagg2) {
+            ep2 = emit_lle(ae[2]);
+        } else {
+            var v1: string = emit_lle(ae[2]);
+            if (etd2 >= 0) {
+                v1 = ll_cast_v(v1, ll_etd(ae[2]), etd2);
+            }
+            var sc1: string = ll_scratch(ety2);
+            llfb(cat6("  store ", ety2, " ", v1, ", ptr ", sc1));
+            ep2 = sc1;
+        }
+        var ssb: StringBuilder = sb_new();
+        sb_append_str(ssb, "  call void @tll_slice_set(ptr ");
+        sb_append_str(ssb, sp4);
+        sb_append_str(ssb, ", i64 ");
+        sb_append_str(ssb, iv2);
+        sb_append_str(ssb, ", ptr ");
+        sb_append_str(ssb, ep2);
+        sb_append_str(ssb, ")");
+        llfb(sb_to_str(ssb));
+        return "0";
+    }
+    if (cn == "file_read_all" || cn == "path_resolve") {
+        var pp0: string = emit_lle(ae[0]);
+        var fn3: string = "@tll_file_read_all";
+        if (cn == "path_resolve") {
+            fn3 = "@tll_path_resolve";
+        }
+        var out1: string = ll_scratch("%TStr");
+        llfb(cat6("  call void ", fn3, "(ptr ", pp0, ", ptr ", cat2(out1, ")")));
+        return out1;
+    }
+    if (cn == "file_write_all") {
+        var pa: string = emit_lle(ae[0]);
+        var pb: string = emit_lle(ae[1]);
+        var t3: string = ll_tmp();
+        llfb(cat6("  ", t3, " = call i32 @tll_file_write_all(ptr ", pa, ", ptr ", cat2(pb, ")")));
+        var t4: string = ll_tmp();
+        llfb(cat4("  ", t4, " = trunc i32 ", cat2(t3, " to i8")));
+        return t4;
+    }
+    if (cn == "args") {
+        var out2: string = ll_scratch("%TSlice");
+        llfb(cat3("  call void @tll_args(ptr ", out2, ")"));
+        return out2;
+    }
+    if (cn == "exit") {
+        var cv: string = emit_lle(ae[0]);
+        cv = ll_cast_v(cv, ll_etd(ae[0]), td_i32);
+        llfb(cat3("  call void @tll_exit(i32 ", cv, ")"));
+        return "0";
+    }
+    if (cn == "sys_run") {
+        var cp: string = emit_lle(ae[0]);
+        var t5: string = ll_tmp();
+        llfb(cat4("  ", t5, " = call i32 @tll_system(ptr ", cat2(cp, ")")));
+        return t5;
+    }
+    if (cn == "sb_new") {
+        var t6: string = ll_tmp();
+        llfb(cat3("  ", t6, " = call ptr @tll_sb_new()"));
+        return t6;
+    }
+    if (cn == "sb_append_str") {
+        var bp: string = emit_lle(ae[0]);
+        var sv: string = emit_lle(ae[1]);
+        llfb(cat6("  call void @tll_sb_append_str(ptr ", bp, ", ptr ", sv, ")", ""));
+        return "0";
+    }
+    if (cn == "sb_append_char" || cn == "sb_append_u64" || cn == "sb_append_i64") {
+        var bp2: string = emit_lle(ae[0]);
+        var cv2: string = emit_lle(ae[1]);
+        cv2 = ll_cast_v(cv2, ll_etd(ae[1]), td_i64);
+        var fn4: string = "@tll_sb_append_char";
+        if (cn == "sb_append_u64") {
+            fn4 = "@tll_sb_append_u64";
+        }
+        if (cn == "sb_append_i64") {
+            fn4 = "@tll_sb_append_i64";
+        }
+        llfb(cat6("  call void ", fn4, "(ptr ", bp2, ", i64 ", cat2(cv2, ")")));
+        return "0";
+    }
+    if (cn == "sb_to_str") {
+        var bp3: string = emit_lle(ae[0]);
+        var out3: string = ll_scratch("%TStr");
+        llfb(cat6("  call void @tll_sb_to_str(ptr ", bp3, ", ptr ", out3, ")", ""));
+        return out3;
+    }
+    if (cn == "sb_clear") {
+        var bp4: string = emit_lle(ae[0]);
+        llfb(cat3("  call void @tll_sb_clear(ptr ", bp4, ")"));
+        return "0";
+    }
+    if (cn == "flag_get" || cn == "flag_set") {
+        var mn: Node = nodes[ae[1]];
+        var slot: i64 = -1;
+        if (mn.kind == "member") {
+            var ob: Node = nodes[mn.na];
+            if (ob.kind == "ident") {
+                slot = llfl_find(ob.sa, mn.sa);
+            }
+        }
+        if (slot < 0) {
+            llfb("  ; UNSUPPORTED flag slot");
+            return "0";
+        }
+        var ftd: i64 = ll_etd(ae[0]);
+        var un: string = td_sname(ftd);
+        if (un == "") {
+            un = "u32";
+        }
+        var fty: string = scalar_to_ll(un);
+        var bits: i64 = ll_bits(un);
+        var start: i64 = llfl_start[slot];
+        var mval: i64 = js_max_val(llfl_len[slot]);
+        var m: i64 = mval * pow2_i64(start);
+        if (cn == "flag_get") {
+            var fv: string = emit_lle(ae[0]);
+            var g1: string = ll_tmp();
+            llfb(cat6("  ", g1, " = lshr ", fty, " ", cat4(fv, ", ", i2s(start), "")));
+            var g2: string = ll_tmp();
+            llfb(cat6("  ", g2, " = and ", fty, " ", cat4(g1, ", ", ll_iconst(mval, bits), "")));
+            var utd: i64 = td_named_mk("scalar", un);
+            var u32td: i64 = td_named_mk("scalar", "u32");
+            return ll_cast_v(g2, utd, u32td);
+        }
+        var ad0: string = ll_addr(ae[0]);
+        var old: string = ll_load(fty, ad0);
+        var notm: i64 = 0 - m - 1;
+        var s1: string = ll_tmp();
+        llfb(cat6("  ", s1, " = and ", fty, " ", cat4(old, ", ", i2s(notm), "")));
+        var xv: string = emit_lle(ae[2]);
+        var utd2: i64 = td_named_mk("scalar", un);
+        xv = ll_cast_v(xv, ll_etd(ae[2]), utd2);
+        var s2: string = ll_tmp();
+        llfb(cat6("  ", s2, " = shl ", fty, " ", cat4(xv, ", ", i2s(start), "")));
+        var s3: string = ll_tmp();
+        llfb(cat6("  ", s3, " = and ", fty, " ", cat4(s2, ", ", ll_iconst(m, bits), "")));
+        var s4: string = ll_tmp();
+        llfb(cat6("  ", s4, " = or ", fty, " ", cat4(s1, ", ", s3, "")));
+        llfb(cat6("  store ", fty, " ", s4, ", ptr ", ad0));
+        return "0";
+    }
+    if (cn == "assert_eq" || cn == "assert_true" || cn == "assert_false" || cn == "assert_panic") {
+        llfb("  ; assert (test-only, no-op in llvm backend)");
+        return "0";
+    }
+    if (llv_match(cn)) {
+        var vi: i64 = ll_vm_i;
+        var vty: string = cat2("%vt.", llv_v[vi]);
+        if (ll_vm_kind == "from") {
+            var scv: string = ll_scratch(vty);
+            llfb(cat4("  store ", vty, " zeroinitializer, ptr ", scv));
+            var tp: string = ll_tmp();
+            llfb(cat6("  ", tp, " = getelementptr inbounds ", vty, ", ptr ", cat2(scv, ", i32 0, i32 0")));
+            llfb(cat6("  store i64 ", i2s(llv_tag[vi]), ", ptr ", tp, "", ""));
+            if (llv_ptd[vi] >= 0 && argc > 0) {
+                var ppp: string = ll_tmp();
+                llfb(cat6("  ", ppp, " = getelementptr inbounds ", vty, ", ptr ", cat2(scv, ", i32 0, i32 1")));
+                var ptd: i64 = llv_ptd[vi];
+                var pty: string = ll_td(ptd);
+                if (ll_isagg(ptd)) {
+                    var pv: string = emit_lle(ae[0]);
+                    ll_copy(pty, pv, ppp);
+                } else {
+                    var pv2: string = emit_lle(ae[0]);
+                    pv2 = ll_cast_v(pv2, ll_etd(ae[0]), ptd);
+                    llfb(cat6("  store ", pty, " ", pv2, ", ptr ", ppp));
+                }
+            }
+            return scv;
+        }
+        var vp: string = emit_lle(ae[0]);
+        if (ll_vm_kind == "is") {
+            var tp2: string = ll_tmp();
+            llfb(cat6("  ", tp2, " = getelementptr inbounds ", vty, ", ptr ", cat2(vp, ", i32 0, i32 0")));
+            var tv: string = ll_load("i64", tp2);
+            var ic: string = ll_tmp();
+            llfb(cat6("  ", ic, " = icmp eq i64 ", tv, ", ", i2s(llv_tag[vi])));
+            return ll_b8(ic);
+        }
+        var pp2: string = ll_tmp();
+        llfb(cat6("  ", pp2, " = getelementptr inbounds ", vty, ", ptr ", cat2(vp, ", i32 0, i32 1")));
+        var ptd2: i64 = llv_ptd[vi];
+        if (ptd2 >= 0) {
+            if (ll_isagg(ptd2)) {
+                return pp2;
+            }
+            return ll_load(ll_td(ptd2), pp2);
+        }
+        return "0";
+    }
+    // 用户函数：模块内按值传递聚合
+    var fi: i64 = llfn_find(cn);
+    if (fi >= 0) {
+        var rtd: i64 = llfn_r[fi];
+        var ps: i64 = llfn_ps[fi];
+        var pc: i64 = llfn_pc[fi];
+        var csb: StringBuilder = sb_new();
+        var i: i64 = 0;
+        while (i < argc) {
+            if (i > 0) {
+                sb_append_str(csb, ", ");
+            }
+            var ptd3: i64 = -1;
+            if (i < pc) {
+                ptd3 = llfp_td[ps + i];
+            }
+            var aty: string = ll_td(ptd3);
+            var avv: string = emit_lle(ae[i]);
+            if (ptd3 >= 0 && ll_isagg(ptd3)) {
+                avv = ll_load(aty, avv);
+            } else {
+                avv = ll_cast_v(avv, ll_etd(ae[i]), ptd3);
+            }
+            sb_append_str(csb, aty);
+            sb_append_str(csb, " ");
+            sb_append_str(csb, avv);
+            i = i + 1;
+        }
+        var rty: string = ll_td(rtd);
+        var argstr: string = sb_to_str(csb);
+        if (rty == "void") {
+            llfb(cat6("  call void @t.", cn, "(", argstr, ")", ""));
+            return "0";
+        }
+        var t7: string = ll_tmp();
+        var line: StringBuilder = sb_new();
+        sb_append_str(line, "  ");
+        sb_append_str(line, t7);
+        sb_append_str(line, " = call ");
+        sb_append_str(line, rty);
+        sb_append_str(line, " @t.");
+        sb_append_str(line, cn);
+        sb_append_str(line, "(");
+        sb_append_str(line, argstr);
+        sb_append_str(line, ")");
+        llfb(sb_to_str(line));
+        if (ll_isagg(rtd)) {
+            var sc2: string = ll_scratch(rty);
+            llfb(cat6("  store ", rty, " ", t7, ", ptr ", sc2));
+            return sc2;
+        }
+        return t7;
+    }
+    llfb(cat2("  ; UNSUPPORTED call ", cn));
+    return "0";
+}
+
+// 2^n（flag 掩码用；n < 63）
+pow2_i64 :: func(n: i64) -> i64 {
+    var r: i64 = 1;
+    var i: i64 = 0;
+    while (i < n) {
+        r = r * 2;
+        i = i + 1;
+    }
+    return r;
+}
+
+// ── 循环目标栈（brk/cnt 成对维护）──────────────────────────────
+
+ll_loop_push2 :: func(brk: string, cnt: string) -> void {
+    if (ll_loopd < slice_len(llbrk) as i64) {
+        slice_set(llbrk, ll_loopd, brk);
+        slice_set(llcnt, ll_loopd, cnt);
+    } else {
+        append(llbrk, brk);
+        append(llcnt, cnt);
+    }
+    ll_loopd = ll_loopd + 1;
+}
+
+ll_loop_pop :: func() -> void {
+    ll_loopd = ll_loopd - 1;
+}
+
+// switch case 常量（按位宽回绕）
+ll_case_const :: func(e: i64, bits: i64) -> string {
+    var n: Node = nodes[e];
+    if (n.kind == "int") {
+        var r: i64 = n.ia;
+        if (r < 2) {
+            r = 10;
+        }
+        return ll_iconst(js_parse_int(n.sa, r), bits);
+    }
+    if (n.kind == "member") {
+        var ob: Node = nodes[n.na];
+        if (ob.kind == "ident") {
+            var ei: i64 = llec_find(ob.sa, n.sa);
+            if (ei >= 0) {
+                return ll_iconst(llec_v[ei], bits);
+            }
+        }
+    }
+    if (n.kind == "unary") {
+        if (n.sa == "-") {
+            var inn: Node = nodes[n.na];
+            if (inn.kind == "int") {
+                var r2: i64 = inn.ia;
+                if (r2 < 2) {
+                    r2 = 10;
+                }
+                return i2s(0 - js_parse_int(inn.sa, r2));
+            }
+        }
+    }
+    return emit_lle(e);
+}
+
+// ── 局部变量声明（alloca 进 entry，初始化留当前块）─────────────
+
+ll_local_decl :: func(name: string, td: i64, init_e: i64) -> void {
+    var ty: string = ll_td(td);
+    var vn: string = cat2("%v.", name);
+    if (lla_has(name) == false) {
+        append(lla_n, name);
+        llfa(cat4("  ", vn, " = alloca ", ty));
+    }
+    if (init_e >= 0) {
+        var v: string = emit_lle(init_e);
+        if (ll_isagg(td)) {
+            ll_copy(ty, v, vn);
+        } else {
+            v = ll_cast_v(v, ll_etd(init_e), td);
+            llfb(cat6("  store ", ty, " ", v, ", ptr ", vn));
+        }
+        return;
+    }
+    var t: TD = tds[td];
+    if (t.cat == "slice") {
+        var ety: string = "i64";
+        if (t.elem >= 0) {
+            ety = ll_td(t.elem);
+        }
+        llfb(cat6("  call void @tll_slice_new(i64 ", ll_sizeof(ety), ", ptr ", vn, ")", ""));
+        return;
+    }
+    llfb(cat6("  store ", ty, " ", ll_zero(ty), ", ptr ", vn));
+}
+
+// ── 语句发射 ───────────────────────────────────────────────────
+
+emit_llstmt :: func(sid: i64) -> void {
+    if (ll_term) {
+        ll_open();
+    }
+    var n: Node = nodes[sid];
+
+    if (n.kind == "expr") {
+        var xx: string = emit_lle(n.na);
+        xx = "";
+        return;
+    }
+    if (n.kind == "var_decl") {
+        if (n.na >= 0) {
+            ll_local_decl(n.sa, resolve_type_desc(n.na), n.nb);
+        }
+        return;
+    }
+    if (n.kind == "assignment") {
+        var op: string = n.sa;
+        var ltd: i64 = ll_etd(n.na);
+        var lty: string = ll_td(ltd);
+        if (op == "=") {
+            var v: string = emit_lle(n.nb);
+            var ad: string = ll_addr(n.na);
+            if (ll_isagg(ltd)) {
+                ll_copy(lty, v, ad);
+            } else {
+                v = ll_cast_v(v, ll_etd(n.nb), ltd);
+                llfb(cat6("  store ", lty, " ", v, ", ptr ", ad));
+            }
+            return;
+        }
+        // 复合赋值：load-op-store
+        var bop: string = str_slice(op, 0, str_len(op) - 1);
+        var ad2: string = ll_addr(n.na);
+        var old: string = ll_load(lty, ad2);
+        var rv: string = emit_lle(n.nb);
+        rv = ll_cast_v(rv, ll_etd(n.nb), ltd);
+        var sn: string = td_sname(ltd);
+        if (sn == "") {
+            sn = "i64";
+        }
+        var ins: string = ll_arith_ins(bop, sn);
+        if (ins == "") {
+            llfb("  ; UNSUPPORTED compound assign");
+            return;
+        }
+        var t: string = ll_tmp();
+        llfb(cat6("  ", t, " = ", ins, " ", cat6(lty, " ", old, ", ", rv, "")));
+        llfb(cat6("  store ", lty, " ", t, ", ptr ", ad2));
+        return;
+    }
+    if (n.kind == "if") {
+        var cv: string = emit_lle(n.na);
+        var c1: string = ll_to_i1(cv);
+        var thenL: string = ll_lbl("if.t");
+        var endL: string = ll_lbl("if.e");
+        var elseL: string = endL;
+        var has_else: bool = n.lb > -2;
+        if (has_else) {
+            elseL = ll_lbl("if.f");
+        }
+        llfb(cat6("  br i1 ", c1, ", label %", thenL, ", label %", elseL));
+        ll_term = true;
+        ll_label(thenL);
+        var tb: i64 = n.la;
+        while (tb >= 0) {
+            var tk: Child = kids[tb];
+            emit_llstmt(tk.val);
+            tb = tk.next;
+        }
+        if (ll_term == false) {
+            llfb(cat2("  br label %", endL));
+            ll_term = true;
+        }
+        if (has_else) {
+            ll_label(elseL);
+            var eb: i64 = n.lb;
+            while (eb >= 0) {
+                var ek: Child = kids[eb];
+                emit_llstmt(ek.val);
+                eb = ek.next;
+            }
+            if (ll_term == false) {
+                llfb(cat2("  br label %", endL));
+                ll_term = true;
+            }
+        }
+        ll_label(endL);
+        return;
+    }
+    if (n.kind == "while") {
+        var condL: string = ll_lbl("wh.c");
+        var bodyL: string = ll_lbl("wh.b");
+        var endL2: string = ll_lbl("wh.e");
+        llfb(cat2("  br label %", condL));
+        ll_label(condL);
+        var cv2: string = emit_lle(n.na);
+        var c2: string = ll_to_i1(cv2);
+        llfb(cat6("  br i1 ", c2, ", label %", bodyL, ", label %", endL2));
+        ll_term = true;
+        ll_label(bodyL);
+        ll_loop_push2(endL2, condL);
+        var wb: i64 = n.la;
+        while (wb >= 0) {
+            var wk: Child = kids[wb];
+            emit_llstmt(wk.val);
+            wb = wk.next;
+        }
+        ll_loop_pop();
+        if (ll_term == false) {
+            llfb(cat2("  br label %", condL));
+            ll_term = true;
+        }
+        ll_label(endL2);
+        return;
+    }
+    if (n.kind == "for") {
+        if (n.na >= 0) {
+            var ini: Node = nodes[n.na];
+            if (ini.kind == "var_decl") {
+                if (ini.na >= 0) {
+                    ll_local_decl(ini.sa, resolve_type_desc(ini.na), ini.nb);
+                }
+            }
+            if (ini.kind == "expr") {
+                var xi: string = emit_lle(ini.na);
+                xi = "";
+            }
+        }
+        var condL2: string = ll_lbl("fo.c");
+        var bodyL2: string = ll_lbl("fo.b");
+        var stepL: string = ll_lbl("fo.s");
+        var endL3: string = ll_lbl("fo.e");
+        llfb(cat2("  br label %", condL2));
+        ll_label(condL2);
+        if (n.nb >= 0) {
+            var cv3: string = emit_lle(n.nb);
+            var c3: string = ll_to_i1(cv3);
+            llfb(cat6("  br i1 ", c3, ", label %", bodyL2, ", label %", endL3));
+        } else {
+            llfb(cat2("  br label %", bodyL2));
+        }
+        ll_term = true;
+        ll_label(bodyL2);
+        ll_loop_push2(endL3, stepL);
+        var fb2: i64 = n.la;
+        while (fb2 >= 0) {
+            var fk: Child = kids[fb2];
+            emit_llstmt(fk.val);
+            fb2 = fk.next;
+        }
+        ll_loop_pop();
+        if (ll_term == false) {
+            llfb(cat2("  br label %", stepL));
+            ll_term = true;
+        }
+        ll_label(stepL);
+        if (n.nc >= 0) {
+            var xu: string = emit_lle(n.nc);
+            xu = "";
+        }
+        llfb(cat2("  br label %", condL2));
+        ll_term = true;
+        ll_label(endL3);
+        return;
+    }
+    if (n.kind == "for_each") {
+        var itd0: i64 = ll_etd(n.na);
+        var it0: TD = tds[itd0];
+        var etd: i64 = -1;
+        if (it0.cat == "slice") {
+            etd = it0.elem;
+        }
+        var ety: string = "i64";
+        if (etd >= 0) {
+            ety = ll_td(etd);
+        }
+        var iter: string = emit_lle(n.na);
+        var lenv: string = ll_tmp();
+        llfb(cat4("  ", lenv, " = call i64 @tll_slice_len(ptr ", cat2(iter, ")")));
+        var idx: string = ll_scratch("i64");
+        llfb(cat3("  store i64 0, ptr ", idx, ""));
+        if (lla_has(n.sa) == false) {
+            append(lla_n, n.sa);
+            llfa(cat4("  %v.", n.sa, " = alloca ", ety));
+        }
+        var condL3: string = ll_lbl("fe.c");
+        var bodyL3: string = ll_lbl("fe.b");
+        var stepL2: string = ll_lbl("fe.s");
+        var endL4: string = ll_lbl("fe.e");
+        llfb(cat2("  br label %", condL3));
+        ll_label(condL3);
+        var iv: string = ll_load("i64", idx);
+        var cc: string = ll_tmp();
+        llfb(cat6("  ", cc, " = icmp slt i64 ", iv, ", ", lenv));
+        llfb(cat6("  br i1 ", cc, ", label %", bodyL3, ", label %", endL4));
+        ll_term = true;
+        ll_label(bodyL3);
+        var iv2: string = ll_load("i64", idx);
+        var ep: string = ll_tmp();
+        llfb(cat6("  ", ep, " = call ptr @tll_slice_at(ptr ", iter, ", i64 ", cat2(iv2, ")")));
+        ll_copy(ety, ep, cat2("%v.", n.sa));
+        ll_loop_push2(endL4, stepL2);
+        var bb: i64 = n.la;
+        while (bb >= 0) {
+            var bk: Child = kids[bb];
+            emit_llstmt(bk.val);
+            bb = bk.next;
+        }
+        ll_loop_pop();
+        if (ll_term == false) {
+            llfb(cat2("  br label %", stepL2));
+            ll_term = true;
+        }
+        ll_label(stepL2);
+        var iv3: string = ll_load("i64", idx);
+        var iv4: string = ll_tmp();
+        llfb(cat4("  ", iv4, " = add i64 ", cat2(iv3, ", 1")));
+        llfb(cat6("  store i64 ", iv4, ", ptr ", idx, "", ""));
+        llfb(cat2("  br label %", condL3));
+        ll_term = true;
+        ll_label(endL4);
+        return;
+    }
+    if (n.kind == "return") {
+        var rty: string = ll_td(ll_cur_ret);
+        if (n.na < 0 || rty == "void") {
+            llfb("  ret void");
+            ll_term = true;
+            return;
+        }
+        var rv2: string = emit_lle(n.na);
+        if (ll_isagg(ll_cur_ret)) {
+            var rl: string = ll_load(rty, rv2);
+            llfb(cat4("  ret ", rty, " ", rl));
+        } else {
+            rv2 = ll_cast_v(rv2, ll_etd(n.na), ll_cur_ret);
+            llfb(cat4("  ret ", rty, " ", rv2));
+        }
+        ll_term = true;
+        return;
+    }
+    if (n.kind == "break") {
+        llfb(cat2("  br label %", llbrk[ll_loopd - 1]));
+        ll_term = true;
+        return;
+    }
+    if (n.kind == "continue") {
+        llfb(cat2("  br label %", llcnt[ll_loopd - 1]));
+        ll_term = true;
+        return;
+    }
+    if (n.kind == "block") {
+        var bb2: i64 = n.la;
+        while (bb2 >= 0) {
+            var bk2: Child = kids[bb2];
+            emit_llstmt(bk2.val);
+            bb2 = bk2.next;
+        }
+        return;
+    }
+    if (n.kind == "switch") {
+        var std: i64 = ll_etd(n.na);
+        var sn2: string = td_sname(std);
+        if (sn2 == "") {
+            sn2 = "i64";
+        }
+        var sty: string = scalar_to_ll(sn2);
+        var sbits: i64 = ll_bits(sn2);
+        var sv: string = emit_lle(n.na);
+        var endL5: string = ll_lbl("sw.e");
+        var defL: string = endL5;
+        if (n.lb > -2) {
+            defL = ll_lbl("sw.d");
+        }
+        // 先分配 case 标签并生成 switch 头
+        var case_ls: []string;
+        var case_vs: []string;
+        var cc2: i64 = n.la;
+        while (cc2 >= 0) {
+            var ck: Child = kids[cc2];
+            var cs: Node = nodes[ck.val];
+            var one_lbl: string = ll_lbl("sw.c");
+            append(case_ls, one_lbl);
+            var cvv: string = ll_case_const(cs.na, sbits);
+            append(case_vs, cvv);
+            cc2 = ck.next;
+        }
+        var hsb: StringBuilder = sb_new();
+        sb_append_str(hsb, "  switch ");
+        sb_append_str(hsb, sty);
+        sb_append_str(hsb, " ");
+        sb_append_str(hsb, sv);
+        sb_append_str(hsb, ", label %");
+        sb_append_str(hsb, defL);
+        sb_append_str(hsb, " [");
+        var nc: i64 = slice_len(case_ls) as i64;
+        var ci: i64 = 0;
+        while (ci < nc) {
+            sb_append_str(hsb, " ");
+            sb_append_str(hsb, sty);
+            sb_append_str(hsb, " ");
+            sb_append_str(hsb, case_vs[ci]);
+            sb_append_str(hsb, ", label %");
+            sb_append_str(hsb, case_ls[ci]);
+            ci = ci + 1;
+        }
+        sb_append_str(hsb, " ]");
+        llfb(sb_to_str(hsb));
+        ll_term = true;
+        // 逐 case 发射
+        var cc3: i64 = n.la;
+        var ci2: i64 = 0;
+        while (cc3 >= 0) {
+            var ck2: Child = kids[cc3];
+            var cs2: Node = nodes[ck2.val];
+            ll_label(case_ls[ci2]);
+            var cb: i64 = cs2.la;
+            while (cb >= 0) {
+                var cbk: Child = kids[cb];
+                emit_llstmt(cbk.val);
+                cb = cbk.next;
+            }
+            if (ll_term == false) {
+                llfb(cat2("  br label %", endL5));
+                ll_term = true;
+            }
+            ci2 = ci2 + 1;
+            cc3 = ck2.next;
+        }
+        if (n.lb > -2) {
+            ll_label(defL);
+            var db: i64 = n.lb;
+            while (db >= 0) {
+                var dk: Child = kids[db];
+                emit_llstmt(dk.val);
+                db = dk.next;
+            }
+            if (ll_term == false) {
+                llfb(cat2("  br label %", endL5));
+                ll_term = true;
+            }
+        }
+        ll_label(endL5);
+        return;
+    }
+    // defer / comptime_block：LLVM 后端暂不支持
+}
+
+// ── 函数发射 ───────────────────────────────────────────────────
+
+ll_reset_fn :: func() -> void {
+    var e1: []string;
+    ll_fal = e1;
+    var e2: []string;
+    ll_fb = e2;
+    var e3: []string;
+    lla_n = e3;
+    var e4: []string;
+    llbrk = e4;
+    var e5: []string;
+    llcnt = e5;
+    ll_loopd = 0;
+    ll_tmpc = 0;
+    ll_lblc = 0;
+    ll_scc = 0;
+    ll_cur_blk = "entry";
+    ll_term = false;
+}
+
+emit_llfunc :: func(d: i64) -> void {
+    var n: Node = nodes[d];
+    var fi: i64 = llfn_find(n.sa);
+    var rtd: i64 = -1;
+    if (fi >= 0) {
+        rtd = llfn_r[fi];
+    }
+    var rty: string = ll_td(rtd);
+
+    // 签名
+    var psb: StringBuilder = sb_new();
+    var cnt: i64 = 0;
+    var c: i64 = n.lb;
+    while (c >= 0) {
+        var k: Child = kids[c];
+        var p: Node = nodes[k.val];
+        if (cnt > 0) {
+            sb_append_str(psb, ", ");
+        }
+        var ptd: i64 = resolve_type_desc(p.na);
+        sb_append_str(psb, ll_td(ptd));
+        sb_append_str(psb, " %p.");
+        sb_append_str(psb, p.sa);
+        cnt = cnt + 1;
+        c = k.next;
+    }
+    var params: string = sb_to_str(psb);
+
+    if (n.ba) {
+        // extern：绑定 C 符号（无 t. 前缀），参数类型按同规则
+        llph(cat6("declare ", rty, " @", n.sa, "(", cat2(params, ")")));
+        return;
+    }
+
+    if (ann_find(n.la, "main") >= 0) {
+        ll_has_main = true;
+        ll_main_fn = n.sa;
+    }
+
+    ll_reset_fn();
+    em_cur_fn = n.sa;
+    em_in_fn = true;
+    ll_cur_ret = rtd;
+
+    // 参数落地：alloca %v.x + store
+    var c2: i64 = n.lb;
+    while (c2 >= 0) {
+        var k2: Child = kids[c2];
+        var p2: Node = nodes[k2.val];
+        var ptd2: i64 = resolve_type_desc(p2.na);
+        var pty: string = ll_td(ptd2);
+        append(lla_n, p2.sa);
+        llfa(cat6("  %v.", p2.sa, " = alloca ", pty, "", ""));
+        llfb(cat6("  store ", pty, " %p.", p2.sa, ", ptr %v.", p2.sa));
+        c2 = k2.next;
+    }
+
+    if (n.lc > -2) {
+        var b: i64 = n.lc;
+        while (b >= 0) {
+            var bk: Child = kids[b];
+            emit_llstmt(bk.val);
+            b = bk.next;
+        }
+    }
+    if (ll_term == false) {
+        if (rty == "void") {
+            llfb("  ret void");
+        } else {
+            llfb(cat4("  ret ", rty, " ", ll_zero(rty)));
+        }
+    }
+
+    // 组装
+    llpb(cat6("define ", rty, " @t.", n.sa, "(", cat2(params, ") {")));
+    llpb("entry:");
+    var na: i64 = slice_len(ll_fal) as i64;
+    var i: i64 = 0;
+    while (i < na) {
+        llpb(ll_fal[i]);
+        i = i + 1;
+    }
+    var nb: i64 = slice_len(ll_fb) as i64;
+    var j: i64 = 0;
+    while (j < nb) {
+        llpb(ll_fb[j]);
+        j = j + 1;
+    }
+    llpb("}");
+    llpb("");
+    em_in_fn = false;
+    em_cur_fn = "";
+}
+
+// ── 类型定义 / 全局 / 模块编排 ─────────────────────────────────
+
+emit_lltypes :: func() -> void {
+    var n: i64 = slice_len(llt_names) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        var name: string = llt_names[i];
+        var k: string = llt_kinds[i];
+        if (k == "struct") {
+            var sb: StringBuilder = sb_new();
+            sb_append_str(sb, "%st.");
+            sb_append_str(sb, name);
+            sb_append_str(sb, " = type { ");
+            var m: i64 = slice_len(llsf_st) as i64;
+            var j: i64 = 0;
+            var first: bool = true;
+            while (j < m) {
+                if (llsf_st[j] == name) {
+                    if (first == false) {
+                        sb_append_str(sb, ", ");
+                    }
+                    sb_append_str(sb, ll_td(llsf_td[j]));
+                    first = false;
+                }
+                j = j + 1;
+            }
+            if (first) {
+                sb_append_str(sb, "i8");
+            }
+            sb_append_str(sb, " }");
+            llph(sb_to_str(sb));
+        }
+        if (k == "variant") {
+            var sb2: StringBuilder = sb_new();
+            sb_append_str(sb2, "%vt.");
+            sb_append_str(sb2, name);
+            sb_append_str(sb2, " = type { i64, [");
+            sb_append_i64(sb2, ll_variant_paymax(name));
+            sb_append_str(sb2, " x i8] }");
+            llph(sb_to_str(sb2));
+        }
+        if (k == "union") {
+            var sb3: StringBuilder = sb_new();
+            sb_append_str(sb3, "%un.");
+            sb_append_str(sb3, name);
+            sb_append_str(sb3, " = type { [");
+            sb_append_i64(sb3, ll_union_max(name));
+            sb_append_str(sb3, " x i8] }");
+            llph(sb_to_str(sb3));
+        }
+        i = i + 1;
+    }
+}
+
+emit_lldeclares :: func() -> void {
+    llph("declare void @tll_print(ptr)");
+    llph("declare void @tll_eprint(ptr)");
+    llph("declare i64 @tll_str_len(ptr)");
+    llph("declare i64 @tll_str_at(ptr, i64)");
+    llph("declare i32 @tll_str_eq(ptr, ptr)");
+    llph("declare void @tll_str_slice(ptr, i64, i64, ptr)");
+    llph("declare ptr @tll_sb_new()");
+    llph("declare void @tll_sb_append_str(ptr, ptr)");
+    llph("declare void @tll_sb_append_char(ptr, i64)");
+    llph("declare void @tll_sb_append_u64(ptr, i64)");
+    llph("declare void @tll_sb_append_i64(ptr, i64)");
+    llph("declare void @tll_sb_to_str(ptr, ptr)");
+    llph("declare void @tll_sb_clear(ptr)");
+    llph("declare void @tll_slice_new(i64, ptr)");
+    llph("declare void @tll_slice_append(ptr, ptr, i64)");
+    llph("declare ptr @tll_slice_at(ptr, i64)");
+    llph("declare void @tll_slice_set(ptr, i64, ptr)");
+    llph("declare i64 @tll_slice_len(ptr)");
+    llph("declare void @tll_file_read_all(ptr, ptr)");
+    llph("declare i32 @tll_file_write_all(ptr, ptr)");
+    llph("declare void @tll_path_resolve(ptr, ptr)");
+    llph("declare void @tll_args(ptr)");
+    llph("declare void @tll_exit(i32)");
+    llph("declare i32 @tll_system(ptr)");
+    llph("declare void @t_runtime_init(i32, ptr)");
+    llph("declare ptr @t_arena_new()");
+    llph("declare void @t_runtime_set_arena(ptr)");
+    llph("declare void @t_runtime_done()");
+    llph("");
+}
+
+emit_llglobals :: func() -> void {
+    var n: i64 = slice_len(llgv_n) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        var ty: string = ll_td(llgv_td[i]);
+        llpg(cat6("@", llgv_n[i], " = global ", ty, " ", ll_zero(ty)));
+        i = i + 1;
+    }
+}
+
+// 全局初始化函数：非常量初始值 + 未初始化 slice 的 elem_size 建立
+emit_llginit :: func() -> void {
+    ll_reset_fn();
+    em_in_fn = false;
+    em_cur_fn = "";
+    ll_cur_ret = -1;
+    var n: i64 = slice_len(llgv_n) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        var td: i64 = llgv_td[i];
+        var ty: string = ll_td(td);
+        var gp: string = cat2("@", llgv_n[i]);
+        if (llgv_init[i] >= 0) {
+            var v: string = emit_lle(llgv_init[i]);
+            if (ll_isagg(td)) {
+                ll_copy(ty, v, gp);
+            } else {
+                v = ll_cast_v(v, ll_etd(llgv_init[i]), td);
+                llfb(cat6("  store ", ty, " ", v, ", ptr ", gp));
+            }
+        } else {
+            var t: TD = tds[td];
+            if (t.cat == "slice") {
+                var ety: string = "i64";
+                if (t.elem >= 0) {
+                    ety = ll_td(t.elem);
+                }
+                llfb(cat6("  call void @tll_slice_new(i64 ", ll_sizeof(ety), ", ptr ", gp, ")", ""));
+            }
+        }
+        i = i + 1;
+    }
+    llfb("  ret void");
+    llpb("define void @t.__ginit() {");
+    llpb("entry:");
+    var na: i64 = slice_len(ll_fal) as i64;
+    var j: i64 = 0;
+    while (j < na) {
+        llpb(ll_fal[j]);
+        j = j + 1;
+    }
+    var nb: i64 = slice_len(ll_fb) as i64;
+    var j2: i64 = 0;
+    while (j2 < nb) {
+        llpb(ll_fb[j2]);
+        j2 = j2 + 1;
+    }
+    llpb("}");
+    llpb("");
+}
+
+emit_llunit :: func(mod: string) -> void {
+    build_type_map();
+    ll_build_reg();
+    llph(cat2("; ModuleID = ", mod));
+    llph("%TStr = type { ptr, i64 }");
+    llph("%TSlice = type { ptr, i64, i64, i64 }");
+    emit_lltypes();
+    llph("");
+    emit_lldeclares();
+    emit_llglobals();
+    emit_llginit();
+
+    var n: i64 = slice_len(decl_list) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        var dn: Node = nodes[decl_list[i]];
+        if (dn.kind == "FuncDecl") {
+            emit_llfunc(decl_list[i]);
+        }
+        i = i + 1;
+    }
+
+    if (ll_has_main) {
+        llpb("define i32 @main(i32 %argc, ptr %argv) {");
+        llpb("entry:");
+        llpb("  call void @t_runtime_init(i32 %argc, ptr %argv)");
+        llpb("  %a = call ptr @t_arena_new()");
+        llpb("  call void @t_runtime_set_arena(ptr %a)");
+        llpb("  call void @t.__ginit()");
+        llpb(cat3("  %r = call i32 @t.", ll_main_fn, "()"));
+        llpb("  call void @t_runtime_done()");
+        llpb("  ret i32 %r");
+        llpb("}");
+    }
+}
+
+ll_join :: func() -> string {
+    var sb: StringBuilder = sb_new();
+    var n1: i64 = slice_len(ll_head) as i64;
+    var i: i64 = 0;
+    while (i < n1) {
+        sb_append_str(sb, ll_head[i]);
+        sb_append_str(sb, "\n");
+        i = i + 1;
+    }
+    var n2: i64 = slice_len(ll_glob) as i64;
+    var j: i64 = 0;
+    while (j < n2) {
+        sb_append_str(sb, ll_glob[j]);
+        sb_append_str(sb, "\n");
+        j = j + 1;
+    }
+    sb_append_str(sb, "\n");
+    var n3: i64 = slice_len(ll_body) as i64;
+    var k: i64 = 0;
+    while (k < n3) {
+        sb_append_str(sb, ll_body[k]);
+        sb_append_str(sb, "\n");
+        k = k + 1;
+    }
+    return sb_to_str(sb);
+}
+
 // ── 路径工具 ───────────────────────────────────────────────────
 
 base_no_tc :: func(path: string) -> string {
@@ -6684,6 +9247,108 @@ main :: func() -> i32 @main {
         file_write_all(hp, h_join());
         file_write_all(cp, s_join());
         print(cat6("Generated: ", to_bs(hp), ", ", to_bs(cp), "\n", ""));
+        return 0;
+    }
+
+    if (cmd == "emit-ll" || cmd == "build") {
+        var out_p: string = "";
+        var has_outp: bool = false;
+        var rt_dir: string = "runtime";
+        var clang_p: string = "clang";
+        var ai2: i64 = 3;
+        var an2: i64 = slice_len(argv) as i64;
+        while (ai2 < an2) {
+            if (argv[ai2] == "--output") {
+                if (ai2 + 1 < an2) {
+                    out_p = argv[ai2 + 1];
+                    has_outp = true;
+                    ai2 = ai2 + 2;
+                    continue;
+                }
+            }
+            if (argv[ai2] == "--runtime") {
+                if (ai2 + 1 < an2) {
+                    rt_dir = argv[ai2 + 1];
+                    ai2 = ai2 + 2;
+                    continue;
+                }
+            }
+            if (argv[ai2] == "--clang") {
+                if (ai2 + 1 < an2) {
+                    clang_p = argv[ai2 + 1];
+                    ai2 = ai2 + 2;
+                    continue;
+                }
+            }
+            ai2 = ai2 + 1;
+        }
+
+        g_file = path_resolve(file);
+        var src3: string = file_read_all(file);
+        tokenize(src3);
+        pos = 0;
+        init_anndefs();
+        parse_unit();
+        run_check();
+        flag_pass();
+        ann_pass();
+        if (has_errors()) {
+            return 1;
+        }
+
+        var mod2: string = base_no_tc(file);
+        emit_llunit(mod2);
+
+        // 输出目录：--output 指定 exe/目录前缀；缺省用源文件所在目录
+        var out_dir2: string = "";
+        if (has_outp == false) {
+            var nn2: u64 = str_len(file);
+            var cut2: u64 = 0;
+            var pi2: u64 = 0;
+            while (pi2 < nn2) {
+                if (file[pi2] == 47 || file[pi2] == 92) {
+                    cut2 = pi2;
+                }
+                pi2 = pi2 + 1;
+            }
+            if (cut2 > 0) {
+                out_dir2 = str_slice(file, 0, cut2);
+            } else {
+                out_dir2 = ".";
+            }
+            out_p = cat4(out_dir2, "/", mod2, "");
+        }
+
+        var llp: string = cat2(out_p, ".ll");
+        file_write_all(llp, ll_join());
+        print(cat3("Generated: ", to_bs(llp), "\n"));
+
+        if (cmd == "emit-ll") {
+            return 0;
+        }
+
+        // build：调 clang 一步链接 runtime 出 exe
+        var exep: string = cat2(out_p, ".exe");
+        var csb2: StringBuilder = sb_new();
+        sb_append_str(csb2, "\"");
+        sb_append_str(csb2, clang_p);
+        sb_append_str(csb2, "\" -O1 -o \"");
+        sb_append_str(csb2, exep);
+        sb_append_str(csb2, "\" \"");
+        sb_append_str(csb2, llp);
+        sb_append_str(csb2, "\" \"");
+        sb_append_str(csb2, rt_dir);
+        sb_append_str(csb2, "/t_runtime.c\" \"");
+        sb_append_str(csb2, rt_dir);
+        sb_append_str(csb2, "/t_shim_ll.c\" -I \"");
+        sb_append_str(csb2, rt_dir);
+        sb_append_str(csb2, "\"");
+        var rc: i32 = sys_run(sb_to_str(csb2));
+        if (rc != 0) {
+            eprint("clang link failed\n");
+            return 1;
+        }
+        print(cat3("Built: ", to_bs(exep), "\n"));
         return 0;
     }
 

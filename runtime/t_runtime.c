@@ -445,3 +445,22 @@ void t_exit(int32_t code) { exit(code); }
 
 void t_print(TStr s)  { if (s.len > 0) fwrite(s.ptr, 1, (size_t)s.len, stdout);  fflush(stdout); }
 void t_eprint(TStr s) { if (s.len > 0) fwrite(s.ptr, 1, (size_t)s.len, stderr);  fflush(stderr); }
+
+// sys_run(cmd)：执行外部命令，返回退出码。
+// Windows cmd.exe 引号剥离怪癖：整串命令以引号开头时需再包一层。
+int32_t t_system(TStr cmd) {
+    const char* c = t_cstr(cmd);
+#ifdef _WIN32
+    if (cmd.len > 0 && c[0] == '"') {
+        size_t n = strlen(c);
+        char* wrapped = (char*)t_arena_alloc(t_arena_current(), n + 3);
+        wrapped[0] = '"';
+        memcpy(wrapped + 1, c, n);
+        wrapped[n + 1] = '"';
+        wrapped[n + 2] = 0;
+        c = wrapped;
+    }
+#endif
+    int r = system(c);
+    return (int32_t)r;
+}
