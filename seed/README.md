@@ -18,7 +18,7 @@
 ```bash
 cd seed/tc0
 npm install            # 或使用锁定的 node_modules
-npx tsx src/index.ts compile ../../selfhost/tc1.tc --emit-c --output out
+npx tsx src/index.ts compile ../../src/tc1.tc --emit-c --output out
 # 用任意 C11 编译器（MSVC: cl /std:c11 /utf-8）编译 out/tc1.c + runtime/t_runtime.c → tc1.exe
 # 再用 tc1.exe 自编译两轮，验证 C 产物逐字节不动点
 ```
@@ -27,6 +27,6 @@ npx tsx src/index.ts compile ../../selfhost/tc1.tc --emit-c --output out
 
 ## 冻结状态
 
-- tc0 与 selfhost/tc1.tc 在 42 项差分（lex/check/compile × tests/samples + tests/err_samples + selfhost/）上逐字节一致。
+- tc0 与 src/tc1.tc 在 42 项差分（lex/check/compile × tests/samples + tests/err_samples + src/）上逐字节一致。
 - 三轮自编译 C_a ≡ C_b ≡ C_c（tools/bootstrap.mjs 判定 OK）。
-- 本目录内容**只读**：任何语言演进只发生在 `selfhost/`，规范演进只发生在 `docs/spec.md`。
+- 本目录内容**只读**：任何语言演进只发生在 `src/`，规范演进只发生在 `docs/spec.md`。

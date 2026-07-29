@@ -62,7 +62,7 @@ function normalize(s, file) {
 const files = collect(CONF_DIR);
 if (files.length === 0) { console.error("no conformance cases found"); process.exit(2); }
 
-const refCmd = ["npx", "tsx", `"${join(ROOT, "src", "index.ts")}"`];
+const refCmd = ["npx", "tsx", `"${join(ROOT, "tc0", "index.ts")}"`];
 let passed = 0, failed = 0;
 const failures = [];
 

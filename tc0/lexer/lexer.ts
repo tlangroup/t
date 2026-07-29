@@ -109,7 +109,7 @@ export class Lexer {
             this.line++;
             this.col = 1;
         } else {
-            // 列号按 UTF-8 字节计数（自举确定性要求：selfhost lexer 按字节扫描，
+            // 列号按 UTF-8 字节计数（自举确定性要求：src lexer 按字节扫描，
             // 两个实现的 line/col 必须逐字节一致才能过 difftest）。
             this.col += utf8ByteLen(ch);
         }

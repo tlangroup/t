@@ -9,10 +9,10 @@
 
 | 实现 | 位置 | 状态 |
 |------|------|------|
-| **tc1（主实现）** | `selfhost/tc1.tc`（t 语言编写，自宿主） | **活跃开发** — 一切语言演进发生在这里 |
-| tc0（种子） | `seed/tc0/`（TypeScript，冻结副本）；`src/`（工作副本，frozen） | **冻结** — 仅作参照实现与灾难恢复信任根，不再演进 |
+| **tc1（主实现）** | `src/tc1.tc`（t 语言编写，自宿主） | **活跃开发** — 一切语言演进发生在这里 |
+| tc0（种子） | `seed/tc0/`（TypeScript，冻结副本）；`tc0/`（工作副本，frozen） | **冻结** — 仅作参照实现与灾难恢复信任根，不再演进 |
 
-稳定版编译器：`build/tc1/tc1/tc1.exe`（由 `selfhost/tc1.tc` 编译而来）。
+稳定版编译器：`build/tc1/tc1/tc1.exe`（由 `src/tc1.tc` 编译而来）。
 
 ## 快速开始
 
@@ -29,13 +29,13 @@ build/tc1/tc1/tc1.exe lex app.tc --json
 # C → 原生 exe：MSVC（需 /std:c11 /utf-8）链接 runtime/t_runtime.c
 ```
 
-种子编译器（tc0，参照用）：`npx tsx src/index.ts <check|compile|lex|build|test|ast|type-info> ...`
+种子编译器（tc0，参照用）：`npx tsx tc0/index.ts <check|compile|lex|build|test|ast|type-info> ...`
 
 ## 目录
 
-- `selfhost/` — **主实现**：`tc1.tc`（完整编译器）、`lexer.tc`、`parser.tc`、`checker.tc`（历史分阶段模块）
+- `src/` — **主实现**：`tc1.tc`（完整编译器）、`lexer.tc`、`parser.tc`、`checker.tc`（历史分阶段模块）
 - `seed/` — 种子编译器 tc0 冻结封存（永不删除，见 `seed/README.md`）
-- `src/` — tc0 TypeScript 工作副本（frozen）
+- `tc0/` — tc0 TypeScript 工作副本（frozen）
 - `runtime/` — C 运行时（arena / TStr / TSb / TSlice / TMap）
 - `docs/spec.md` — 语言规范（唯一事实来源）；`docs/bootstrap.md` — 自举路线图（M1–M11，已全部完成）
 - `tests/samples/`、`tests/err_samples/` — 差分测试样例
@@ -52,6 +52,6 @@ node tools/conformance.mjs --ref                          # 符合性套件 + tc
 
 ## Stage 3 自迭代开发规则（版本晋升）
 
-1. 任何语言新特性：先改 `docs/spec.md` → 补符合性测试 → 再改 `selfhost/tc1.tc`，三步缺一不可。
-2. 修改 `selfhost/tc1.tc` 后：用当前稳定版编译出新版 → 跑符合性套件 + difftest → 不动点复验 → 通过后晋升为稳定版。
-3. `seed/` 目录与 `src/` 冻结不动；`tests/conformance/` 只增不删。
+1. 任何语言新特性：先改 `docs/spec.md` → 补符合性测试 → 再改 `src/tc1.tc`，三步缺一不可。
+2. 修改 `src/tc1.tc` 后：用当前稳定版编译出新版 → 跑符合性套件 + difftest → 不动点复验 → 通过后晋升为稳定版。
+3. `seed/` 目录与 `tc0/` 冻结不动；`tests/conformance/` 只增不删。

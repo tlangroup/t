@@ -2,9 +2,9 @@
 // bootstrap.mjs — M10 三轮自编译不动点验证 (bootstrap.md)
 //
 // 轮次:
-//   gen0: tc0 (TypeScript)      compile selfhost/tc1.tc → C_a; cl → tc1.exe
-//   gen1: tc1.exe               compile selfhost/tc1.tc → C_b; cl → tc2.exe
-//   gen2: tc2.exe               compile selfhost/tc1.tc → C_c; cl → tc3.exe
+//   gen0: tc0 (TypeScript)      compile src/tc1.tc → C_a; cl → tc1.exe
+//   gen1: tc1.exe               compile src/tc1.tc → C_b; cl → tc2.exe
+//   gen2: tc2.exe               compile src/tc1.tc → C_c; cl → tc3.exe
 // 判定: C_a ≡ C_b ≡ C_c (逐字节)。成立 ⇒ 自举不动点 (Stage 2)。
 //
 // 用法: node tools/bootstrap.mjs
@@ -14,10 +14,10 @@ import { readFileSync, mkdirSync, existsSync, readdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 
 const ROOT = resolve(new URL("..", import.meta.url).pathname.replace(/^\/([A-Za-z]):/, "$1:"));
-const SRC = join(ROOT, "selfhost", "tc1.tc");
+const SRC = join(ROOT, "src", "tc1.tc");
 const RUNTIME = join(ROOT, "runtime");
 
-// ── 定位 MSVC (同 src/index.ts findMsvc 逻辑简化版) ──────────────
+// ── 定位 MSVC (同 tc0/index.ts findMsvc 逻辑简化版) ──────────────
 function findMsvc() {
     const vsRoots = [
         "C:\\Program Files\\Microsoft Visual Studio\\2022",
@@ -94,7 +94,7 @@ function eq(a, b) { return a.h.equals(b.h) && a.c.equals(b.c); }
 // ── gen0: tc0 ────────────────────────────────────────────────────
 console.log("gen0: tc0 (TypeScript) → C_a → tc1.exe");
 const dir0 = join(ROOT, "build", "bootstrap", "gen0");
-const Ca = emitWith(["npx", "tsx", "src/index.ts"], dir0);
+const Ca = emitWith(["npx", "tsx", "tc0/index.ts"], dir0);
 const tc1exe = compileC(dir0, "tc1.exe");
 
 // ── gen1: tc1.exe ────────────────────────────────────────────────

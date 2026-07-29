@@ -10,8 +10,8 @@
 
 | 名称 | 定义 |
 |------|------|
-| **tc0** | 当前 TypeScript 实现的种子编译器（`src/`，~7000 行），产物 `dist/tc.exe` |
-| **compiler.tc** | 用 t 语言书写的编译器源码（`selfhost/` 目录） |
+| **tc0** | 当前 TypeScript 实现的种子编译器（`tc0/`，~7000 行），产物 `dist/tc.exe` |
+| **compiler.tc** | 用 t 语言书写的编译器源码（`src/` 目录） |
 | **tc1** | 由 tc0 编译 compiler.tc 得到的可执行编译器 |
 | **tc2** | 由 tc1 编译 compiler.tc 得到的可执行编译器 |
 | **tc3** | 由 tc2 编译 compiler.tc 得到的可执行编译器 |
@@ -160,8 +160,8 @@ int64_t t_map_len(TMap* m);
 ### 3.1 目录结构
 
 ```
-selfhost/
-  main.tc          # CLI 入口：参数解析、命令分发
+src/
+  tc1.tc           # CLI 入口 + 完整编译器（参数解析、命令分发、emit）
   lexer.tc         # Token 定义 + 词法器
   ast.tc           # AST 节点（struct + enum tag + 子节点索引）
   parser.tc        # 递归下降解析
@@ -203,7 +203,7 @@ selfhost/
 
 ### 3.4 Stage 1 验收标准
 
-- `tc0 build selfhost/main.tc -o dist/tc1.exe` 成功；
+- `tc0 build src/tc1.tc -o dist/tc1.exe` 成功；
 - difftest：tc1 与 tc0 在全部样例 × 全部命令上输出逐字节一致；
 - tc1 通过 `tests/samples/*.tc` 中全部 @test 用例。
 
@@ -225,7 +225,7 @@ tc2 + compiler.tc  →  tc3.exe
 ### 4.2 通过后动作
 
 1. tag `v1.0-selfhost`；tc0（TS 源码 + dist/tc.exe）封存至 `seed/` 目录，**永不删除**——这是从零重建的信任根（参照 Reflections on Trusting Trust 的经典结论，保留独立实现的种子编译器）。
-2. `README` 更新：主实现 = `selfhost/`，TS 版标记 frozen。
+2. `README` 更新：主实现 = `src/`，TS 版标记 frozen。
 3. `tests/` 升级为规范符合性套件：每条规范条款至少一个正例 + 一个负例（含预期 JSON 错误码）。
 
 ---
@@ -235,7 +235,7 @@ tc2 + compiler.tc  →  tc3.exe
 自举完成后的开发循环（人类或 AI Agent 均适用）：
 
 ```
-修改 selfhost/*.tc → 当前稳定版 tcN 编译 → 跑符合性套件 + difftest(tcN vs tcN+1)
+修改 src/*.tc → 当前稳定版 tcN 编译 → 跑符合性套件 + difftest(tcN vs tcN+1)
 → 不动点复验 → 通过则 tcN+1 晋升为稳定版
 ```
 
@@ -264,13 +264,13 @@ tc2 + compiler.tc  →  tc3.exe
 - [x] **M2** tc0：checker + emitter 支持 string/切片/map/内置函数/switch；新增 `build`、`lex --json` 命令
 - [x] **M3** mini-lexer 样例（selfhost_probe.tc）编译运行通过 —— *Stage 0.5 完成*
 - [x] **M4** tools/difftest.mjs 差分测试框架
-- [x] **M5** selfhost/lexer.tc + json.tc + diagnostics.tc，Token 流差分通过
-- [x] **M6** selfhost/ast.tc + parser.tc，AST 差分通过
-- [x] **M7** selfhost/checker.tc（单文件含 types/annotations/flag resolver），`check --json` 诊断差分通过（tests/samples 5 + tests/err_samples 5，全部逐字节一致；含 flag 双 resolve 重复诊断复刻）
-      已知差距：parse 错误时 tc0 输出恢复式诊断 JSON，selfhost 为 fail-fast stderr（不影响合法源自举不动点）
-- [x] **M8** emitter 移植（实际并入单文件 `selfhost/tc1.tc`：emit_decl/derive/flag 布局/emit 编排；
+- [x] **M5** src/lexer.tc + json.tc + diagnostics.tc，Token 流差分通过
+- [x] **M6** src/ast.tc + parser.tc，AST 差分通过
+- [x] **M7** src/checker.tc（单文件含 types/annotations/flag resolver），`check --json` 诊断差分通过（tests/samples 5 + tests/err_samples 5，全部逐字节一致；含 flag 双 resolve 重复诊断复刻）
+      已知差距：parse 错误时 tc0 输出恢复式诊断 JSON，src 为 fail-fast stderr（不影响合法源自举不动点）
+- [x] **M8** emitter 移植（实际并入单文件 `src/tc1.tc`：emit_decl/derive/flag 布局/emit 编排；
       flag 布局用 fr_layout，derive 复刻 tc0 全部字符串模板含 `[object Object]` 怪癖）
 - [x] **M9** tc1 驱动（lex/check/compile 派发）+ 全量差分：`difftest --cand tc1.exe` 42/42 逐字节一致 —— *Stage 1 完成*
 - [x] **M10** tools/bootstrap.mjs 三轮自编译：C_a ≡ C_b ≡ C_c（BOOTSTRAP FIXPOINT REACHED）—— *Stage 2 完成，自举达成*
-- [x] **M11** 封存种子（`seed/tc0/` + tag `v1.0-selfhost`）、切换主实现（README：主实现 = selfhost，TS 版 frozen）、
+- [x] **M11** 封存种子（`seed/tc0/` + tag `v1.0-selfhost`）、切换主实现（README：主实现 = src，TS 版 frozen）、
       建立符合性套件（`tests/conformance/` 16 用例 + `tools/conformance.mjs`，含 tc0 交叉验证）—— *进入 Stage 3 自迭代*

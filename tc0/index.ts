@@ -401,7 +401,7 @@ function cmdBuild(filePath: string, flags: CliFlags): void {
 
 /**
  * tc parse <file.tc> — 输出纯语法层 AST JSON（紧凑格式）。
- * 这是 selfhost parser (M6) 的字节级对拍基准：只依赖 token 流，
+ * 这是 src parser (M6) 的字节级对拍基准：只依赖 token 流，
  * 不含任何类型检查 / derive / flag 布局等语义信息。
  */
 function cmdParse(filePath: string, flags: CliFlags): void {

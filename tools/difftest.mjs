@@ -36,7 +36,7 @@ function splitCmd(cmd) {
 }
 
 const opts = parseArgs(process.argv.slice(2));
-const REF = splitCmd(opts.ref ?? "npx tsx src/index.ts");
+const REF = splitCmd(opts.ref ?? "npx tsx tc0/index.ts");
 const CAND = opts.cand ? splitCmd(opts.cand) : REF;
 const SELF_CHECK = !opts.cand;
 
@@ -131,7 +131,7 @@ for (const sample of samples) {
     if (err) { fail++; failures.push({ label, err }); console.log(`  FAIL  ${label}`); }
     else { pass++; if (opts.verbose) console.log(`  ok    ${label}`); }
 
-    // 3) selfhost lexer 对拍 (--tlex <exe>): tc0 `lex --json` vs 原生 tlex
+    // 3) src lexer 对拍 (--tlex <exe>): tc0 `lex --json` vs 原生 tlex
     if (opts.tlex) {
         const label3 = `${sample} :: tlex vs tc0 lex --json`;
         const r1 = runCompiler(REF, ["lex", filePath, "--json"]);
@@ -143,7 +143,7 @@ for (const sample of samples) {
         else { pass++; if (opts.verbose) console.log(`  ok    ${label3}`); }
     }
 
-    // 4) selfhost parser 对拍 (--tparse <exe>): tc0 `parse` vs 原生 tparse
+    // 4) src parser 对拍 (--tparse <exe>): tc0 `parse` vs 原生 tparse
     if (opts.tparse) {
         const label4 = `${sample} :: tparse vs tc0 parse`;
         const r1 = runCompiler(REF, ["parse", filePath]);
@@ -155,7 +155,7 @@ for (const sample of samples) {
         else { pass++; if (opts.verbose) console.log(`  ok    ${label4}`); }
     }
 
-    // 5) selfhost checker 对拍 (--tcheck <exe>): tc0 `check --json` vs 原生 tcheck
+    // 5) src checker 对拍 (--tcheck <exe>): tc0 `check --json` vs 原生 tcheck
     if (opts.tcheck) {
         const label5 = `${sample} :: tcheck vs tc0 check --json`;
         const r1 = runCompiler(REF, ["check", filePath, "--json"]);

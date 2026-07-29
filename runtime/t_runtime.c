@@ -145,7 +145,7 @@ void t_sb_append_i64(TSb* b, int64_t v) {
 
 TStr t_sb_to_str(TSb* b) {
     // 复制到 arena：string 在 t 中不可变，调用方持有的结果不能被后续
-    // sb_clear + append 破坏（selfhost lexer 复用 tmp builder 的关键前提）。
+    // sb_clear + append 破坏（src lexer 复用 tmp builder 的关键前提）。
     uint8_t* copy = (uint8_t*)t_arena_alloc(b->arena, (size_t)b->len + 1);
     if (b->len > 0) memcpy(copy, b->buf, (size_t)b->len);
     copy[b->len] = '\0';
@@ -426,7 +426,7 @@ void t_runtime_init(int argc, char** argv) {
     g_argc = argc; g_argv = argv;
 #ifdef _WIN32
     // stdout/stderr 切二进制模式：禁止 \n → \r\n 翻译。
-    // 自举确定性要求：selfhost 工具输出必须与 tc0 (Node) 逐字节一致。
+    // 自举确定性要求：src 工具输出必须与 tc0 (Node) 逐字节一致。
     _setmode(_fileno(stdout), _O_BINARY);
     _setmode(_fileno(stderr), _O_BINARY);
 #endif

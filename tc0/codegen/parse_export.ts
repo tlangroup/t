@@ -3,7 +3,7 @@
  *
  * Emits the *syntactic* AST as compact JSON — no type info, no derive
  * results, no flag layout resolution. This is the byte-exact comparison
- * target for the selfhost parser (M6). Everything here must be
+ * target for the src parser (M6). Everything here must be
  * reproducible from tokens alone.
  *
  * Output shape (compact JSON, no whitespace):
