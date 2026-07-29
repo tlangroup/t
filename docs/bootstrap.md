@@ -241,7 +241,7 @@ tc2 + compiler.tc  →  tc3.exe
 
 - **AI Agent 闭环**：编译失败时 JSON 诊断包（错误码、行列、修复建议）直接作为 Agent 输入 → 修改 → 重编译，即规范 §8 的设计目标。
 - **版本晋升规则**：任何语言新特性必须①先改 `docs/spec.md` ②补符合性测试 ③再改 compiler.tc，三步缺一不可（防双实现漂移在自迭代期演化为规范漂移）。
-- **待偿技术债**（按优先级）：Variant（G10）、CSV/JSON 数据表 CTFE 导入（§7.2）、@soa 布局变换、通用内存管理（脱离 arena）、优化后端。
+- **待偿技术债**（按优先级）：~~Variant（G10）~~ ✅已实现、`CSV/JSON 数据表 CTFE 导入（§7.2）`、`@soa 布局变换`、通用内存管理（脱离 arena）、优化后端。
 
 ---
 
@@ -274,3 +274,7 @@ tc2 + compiler.tc  →  tc3.exe
 - [x] **M10** tools/bootstrap.mjs 三轮自编译：C_a ≡ C_b ≡ C_c（BOOTSTRAP FIXPOINT REACHED）—— *Stage 2 完成，自举达成*
 - [x] **M11** 封存种子（`seed/tc0/` + tag `v1.0-selfhost`）、切换主实现（README：主实现 = src，TS 版 frozen）、
       建立符合性套件（`tests/conformance/` 16 用例 + `tools/conformance.mjs`，含 tc0 交叉验证）—— *进入 Stage 3 自迭代*
+- [x] **M12** Variant 一等类型（spec §2.3 / G10）：lexer `variant` 关键字 → `parse_variant_decl`（VariantDecl+VC 节点）
+      → 类型检查器注册类型与 `Name_from_Case/Name_is_Case/Name_as_Case` 助手符号 → emitter 发射 tagged-union
+      struct + 三个 `static inline` 自由函数。`tests/conformance/p08_variant.tc` + `tests/variant_smoke` 运行时验证通过；
+      bootstrap 不动点仍 C_a≡C_b≡C_c，difftest 30/30 无回归。

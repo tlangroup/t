@@ -43,7 +43,25 @@ u8/u16/u32/u64、i8/i16/i32/i64、f16/f32/f64、bool
 - 哈希映射：map[K]V
 容器遍历、接口统一，降低 AI 记忆成本。
 2.3 变体类型 Variant
-内置一等Variant，承载任意基础类型、结构体引用，用于配置解析、LLM 动态参数、跨模块数据传递。
+内置一等 Variant（带标签联合体 / tagged union），承载任意基础类型、结构体引用，用于配置解析、LLM 动态参数、跨模块数据传递。
+
+语法：
+```
+Name :: variant {
+    Circle(f64);     // 携带载荷，载荷类型可为任意已声明类型
+    Rect(f64);       // 每个 case 独立
+    Empty;           // 单元 case（无载荷）
+}
+```
+
+语义：
+- 编译产物：`typedef struct Name { uint32_t _tag; union { T_i _u_i; ... } _u; } Name;`（`_tag` 为 case 声明下标，0 起；单元 case 无 union 成员）。
+- 编译器为每个 case 生成自由函数（数据优先、免改表达式推导）：
+  - `Name_from_CaseX(payload) -> Name`          构造器（单元 case 无参数）
+  - `Name_is_CaseX(self: Name) -> bool`         判别当前 tag 是否为该 case
+  - `Name_as_CaseX(self: Name) -> payload`      取载荷（仅携带载荷的 case 提供）
+- 当前约束：Variant 上暂不支持 `@derive`（Clone/ToString/FromString/Eq/Hash 等），后续补充；跨模块需在同一编译单元内。
+
 
 ---
 3 核心数据结构体系

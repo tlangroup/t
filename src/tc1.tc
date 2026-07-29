@@ -402,6 +402,7 @@ kw_lookup :: func(text: string) -> string {
     if (text == "enum") { return "KwEnum"; }
     if (text == "flag") { return "KwFlag"; }
     if (text == "union") { return "KwUnion"; }
+    if (text == "variant") { return "KwVariant"; }
     if (text == "var") { return "KwVar"; }
     if (text == "const") { return "KwConst"; }
     if (text == "comptime") { return "KwComptime"; }
@@ -2214,6 +2215,62 @@ parse_union_decl :: func(name: string, anns: i64) -> i64 {
     return id;
 }
 
+// Variant：带标签的聚合类型（tagged union）。
+//   Name :: variant {
+//       CaseA(T);     // 携带载荷
+//       CaseB;        // 单元 case（无载荷）
+//   }
+// 编译为 struct { uint32_t _tag; union { T _u0; ... } _u; }，并为每个 case 生成
+// 自由函数：`Name_from_Case(...)` 构造、`Name_is_Case(self)` 判别、`Name_as_Case(self)` 取载荷。
+parse_variant_decl :: func(name: string, anns: i64) -> i64 {
+    advance_i();
+    var post: i64 = parse_annotations();
+    var all: i64 = list_concat(anns, post);
+
+    expect_tok("LBrace");
+    var ch: i64 = -1;
+    var ct: i64 = -1;
+    var ci: i64 = 0;
+    while (cur_t() != "RBrace" && cur_t() != "Eof") {
+        if (cur_t() != "Identifier") {
+            advance_i();
+            continue;
+        }
+        var cname: string = expect_tok("Identifier");
+        var tn: i64 = -1;
+        if (cur_t() == "LParen") {
+            advance_i();
+            tn = parse_type();
+            expect_tok("RParen");
+        }
+        var canns: i64 = parse_annotations();
+        if (cur_t() == "Comma" || cur_t() == "Semicolon") {
+            advance_i();
+        }
+        var cid: i64 = node_new("VC");
+        var cn: Node = nodes[cid];
+        cn.sa = cname;
+        cn.na = tn;
+        cn.la = canns;
+        cn.ia = ci;
+        slice_set(nodes, cid, cn);
+        ct = list_push(ch, ct, cid);
+        if (ch < 0) {
+            ch = ct;
+        }
+        ci = ci + 1;
+    }
+    expect_tok("RBrace");
+
+    var id: i64 = node_new("VariantDecl");
+    var n: Node = nodes[id];
+    n.sa = name;
+    n.la = all;
+    n.lb = ch;
+    slice_set(nodes, id, n);
+    return id;
+}
+
 parse_func_decl :: func(name: string, anns: i64, is_comptime: bool) -> i64 {
     advance_i();
     expect_tok("LParen");
@@ -2391,6 +2448,9 @@ parse_decl_body :: func(name: string, anns: i64, is_comptime: bool) -> i64 {
     }
     if (t == "KwUnion") {
         return parse_union_decl(name, anns);
+    }
+    if (t == "KwVariant") {
+        return parse_variant_decl(name, anns);
     }
     if (t == "KwFunc") {
         return parse_func_decl(name, anns, is_comptime);
@@ -2994,6 +3054,11 @@ register_decl :: func(d: i64) -> void {
         sym_define(global_scope, n.sa, "type", ti_named("Union", n.sa), d);
         return;
     }
+    if (n.kind == "VariantDecl") {
+        sym_define(global_scope, n.sa, "type", ti_named("Variant", n.sa), d);
+        register_variant_helpers(d);
+        return;
+    }
     if (n.kind == "FuncDecl") {
         sym_define(global_scope, n.sa, "func", ti_named("Func", n.sa), d);
         return;
@@ -3015,6 +3080,95 @@ register_decl :: func(d: i64) -> void {
     if (n.kind == "TypeAliasDecl") {
         sym_define(global_scope, n.sa, "type", resolve_ti(n.na), d);
         return;
+    }
+}
+
+// 为 Variant 的每个 case 注册合成函数符号（构造器/判别器/取载荷），
+// 指向合成 FuncDecl 节点但不在 decl_list 中，故仅作类型检查可见、不被 emitter 重复发射。
+register_variant_helpers :: func(d: i64) -> void {
+    var n: Node = nodes[d];
+    var c: i64 = n.lb;
+    while (c >= 0) {
+        var k: Child = kids[c];
+        var vc: Node = nodes[k.val];
+        var cname: string = vc.sa;
+        // 构造器 Name_from_Case(载荷?) -> Name
+        var ffrom: string = cat3(n.sa, "_from_", cname);
+        var retNode: i64 = node_new("named");
+        var rnn: Node = nodes[retNode];
+        rnn.sa = n.sa;
+        slice_set(nodes, retNode, rnn);
+        var plist: i64 = -1;
+        var ptail: i64 = -1;
+        if (vc.na >= 0) {
+            var pid: i64 = node_new("P");
+            var pnn: Node = nodes[pid];
+            pnn.sa = "v";
+            pnn.na = vc.na;
+            slice_set(nodes, pid, pnn);
+            ptail = list_push(plist, ptail, pid);
+            if (plist < 0) {
+                plist = ptail;
+            }
+        }
+        var fdecl1: i64 = node_new("FuncDecl");
+        var fd1: Node = nodes[fdecl1];
+        fd1.sa = ffrom;
+        fd1.la = -1;
+        fd1.lb = plist;
+        fd1.na = retNode;
+        fd1.ba = true;
+        fd1.bb = false;
+        fd1.lc = -2;
+        slice_set(nodes, fdecl1, fd1);
+        sym_define(global_scope, ffrom, "func", ti_named("Func", ffrom), fdecl1);
+
+        // 判别器 Name_is_Case(self: Name) -> bool
+        var fis: string = cat3(n.sa, "_is_", cname);
+        var retBool: i64 = mk_scalar("bool");
+        var pid2: i64 = node_new("P");
+        var pn2: Node = nodes[pid2];
+        pn2.sa = "self";
+        var selfTn: i64 = node_new("named");
+        var stn: Node = nodes[selfTn];
+        stn.sa = n.sa;
+        slice_set(nodes, selfTn, stn);
+        pn2.na = selfTn;
+        slice_set(nodes, pid2, pn2);
+        var plist2: i64 = -1;
+        var ptail2: i64 = -1;
+        ptail2 = list_push(plist2, ptail2, pid2);
+        if (plist2 < 0) {
+            plist2 = ptail2;
+        }
+        var fdecl2: i64 = node_new("FuncDecl");
+        var fd2: Node = nodes[fdecl2];
+        fd2.sa = fis;
+        fd2.la = -1;
+        fd2.lb = plist2;
+        fd2.na = retBool;
+        fd2.ba = true;
+        fd2.bb = false;
+        fd2.lc = -2;
+        slice_set(nodes, fdecl2, fd2);
+        sym_define(global_scope, fis, "func", ti_named("Func", fis), fdecl2);
+
+        // 取载荷 Name_as_Case(self: Name) -> 载荷（仅当携带载荷）
+        if (vc.na >= 0) {
+            var fas: string = cat3(n.sa, "_as_", cname);
+            var fdecl3: i64 = node_new("FuncDecl");
+            var fd3: Node = nodes[fdecl3];
+            fd3.sa = fas;
+            fd3.la = -1;
+            fd3.lb = plist2;
+            fd3.na = vc.na;
+            fd3.ba = true;
+            fd3.bb = false;
+            fd3.lc = -2;
+            slice_set(nodes, fdecl3, fd3);
+            sym_define(global_scope, fas, "func", ti_named("Func", fas), fdecl3);
+        }
+        c = k.next;
     }
 }
 
@@ -4238,6 +4392,9 @@ decl_target :: func(kind: string) -> string {
     }
     if (kind == "UnionDecl") {
         return "union";
+    }
+    if (kind == "VariantDecl") {
+        return "variant";
     }
     if (kind == "FuncDecl") {
         return "func";
@@ -5568,6 +5725,9 @@ var df_anns: []i64;
 collect_fields :: func(d: i64) -> i64 {
     var base: i64 = slice_len(df_names) as i64;
     var n: Node = nodes[d];
+    if (n.kind == "VariantDecl") {
+        return base;
+    }
     if (n.kind == "StructDecl") {
         var c: i64 = n.lb;
         while (c >= 0) {
@@ -6048,6 +6208,113 @@ emit_union_decl :: func(d: i64) -> void {
     hpush(cat3("} ", n.sa, ";"));
 }
 
+// Variant：tagged union。发射 struct { uint32_t _tag; union { 载荷 _uN; } _u; } 及各 case 的
+// static inline 构造器/判别器/取载荷（直接落头文件，函数体用 StringBuilder 拼 tag 整数）。
+emit_variant_decl :: func(d: i64) -> void {
+    var n: Node = nodes[d];
+    var hsb: StringBuilder = sb_new();
+    sb_append_str(hsb, "// variant ");
+    sb_append_str(hsb, n.sa);
+    hpush(sb_to_str(hsb));
+    hpush(cat3("typedef struct ", n.sa, " {"));
+    hpush("    uint32_t _tag;");
+    hpush("    union {");
+    var c: i64 = n.lb;
+    while (c >= 0) {
+        var k: Child = kids[c];
+        var vc: Node = nodes[k.val];
+        if (vc.na >= 0) {
+            var us: StringBuilder = sb_new();
+            sb_append_str(us, "        ");
+            sb_append_str(us, emit_ctype(vc.na));
+            sb_append_str(us, " _u");
+            sb_append_i64(us, vc.ia);
+            sb_append_str(us, ";");
+            hpush(sb_to_str(us));
+        }
+        c = k.next;
+    }
+    hpush("    } _u;");
+    hpush(cat3("} ", n.sa, ";"));
+    hpush("");
+
+    c = n.lb;
+    while (c >= 0) {
+        var k2: Child = kids[c];
+        var vc2: Node = nodes[k2.val];
+        var cname: string = vc2.sa;
+        // 构造器
+        var fsb: StringBuilder = sb_new();
+        sb_append_str(fsb, "static inline ");
+        sb_append_str(fsb, n.sa);
+        sb_append_str(fsb, " ");
+        sb_append_str(fsb, n.sa);
+        sb_append_str(fsb, "_from_");
+        sb_append_str(fsb, cname);
+        if (vc2.na >= 0) {
+            sb_append_str(fsb, "(");
+            sb_append_str(fsb, emit_ctype(vc2.na));
+            sb_append_str(fsb, " v) {");
+        } else {
+            sb_append_str(fsb, "(void) {");
+        }
+        hpush(sb_to_str(fsb));
+        hpush(cat3("    ", n.sa, " _s;"));
+        var tsb: StringBuilder = sb_new();
+        sb_append_str(tsb, "    _s._tag = ");
+        sb_append_i64(tsb, vc2.ia);
+        sb_append_str(tsb, ";");
+        hpush(sb_to_str(tsb));
+        if (vc2.na >= 0) {
+            var asb: StringBuilder = sb_new();
+            sb_append_str(asb, "    _s._u._u");
+            sb_append_i64(asb, vc2.ia);
+            sb_append_str(asb, " = v;");
+            hpush(sb_to_str(asb));
+        }
+        hpush("    return _s;");
+        hpush("}");
+        // 判别器
+        var isb: StringBuilder = sb_new();
+        sb_append_str(isb, "static inline bool ");
+        sb_append_str(isb, n.sa);
+        sb_append_str(isb, "_is_");
+        sb_append_str(isb, cname);
+        sb_append_str(isb, "(");
+        sb_append_str(isb, n.sa);
+        sb_append_str(isb, " self) {");
+        hpush(sb_to_str(isb));
+        var isb2: StringBuilder = sb_new();
+        sb_append_str(isb2, "    return self._tag == ");
+        sb_append_i64(isb2, vc2.ia);
+        sb_append_str(isb2, ";");
+        hpush(sb_to_str(isb2));
+        hpush("}");
+        // 取载荷
+        if (vc2.na >= 0) {
+            var asb2: StringBuilder = sb_new();
+            sb_append_str(asb2, "static inline ");
+            sb_append_str(asb2, emit_ctype(vc2.na));
+            sb_append_str(asb2, " ");
+            sb_append_str(asb2, n.sa);
+            sb_append_str(asb2, "_as_");
+            sb_append_str(asb2, cname);
+            sb_append_str(asb2, "(");
+            sb_append_str(asb2, n.sa);
+            sb_append_str(asb2, " self) {");
+            hpush(sb_to_str(asb2));
+            var asb3: StringBuilder = sb_new();
+            sb_append_str(asb3, "    return self._u._u");
+            sb_append_i64(asb3, vc2.ia);
+            sb_append_str(asb3, ";");
+            hpush(sb_to_str(asb3));
+            hpush("}");
+        }
+        c = k2.next;
+    }
+    hpush("");
+}
+
 emit_func_decl :: func(d: i64) -> void {
     var n: Node = nodes[d];
     var emit_name: string = n.sa;
@@ -6144,6 +6411,10 @@ emit_decl :: func(d: i64) -> void {
     }
     if (n.kind == "UnionDecl") {
         emit_union_decl(d);
+        return;
+    }
+    if (n.kind == "VariantDecl") {
+        emit_variant_decl(d);
         return;
     }
     if (n.kind == "FuncDecl") {

@@ -45,4 +45,11 @@
 - Determinism: line/col = UTF-8 字节计数; stdout 二进制模式; sb_to_str 复制语义
 - t 语法: `Name :: struct { f: T; }`；无 else-if 链；`append(s, call())` 会取临时量地址(C2102)，须先存局部变量
 - 诊断怪癖：T_TYPE_UNKNOWN 从未发出（实报 T_TYPE_MISMATCH）；命名违规是 warning (exit 0)
-- 技术债：Variant(G10)、CSV/JSON CTFE 导入、@soa、通用内存管理、优化后端
+- 技术债（Stage 3）：~~Variant(G10)~~ ✅M12 已实现；剩余 CSV/JSON CTFE 导入(§7.2)、@soa 布局变换、通用内存管理(脱离 arena)、优化后端
+
+## Variant (G10) 实现要点 — src/tc1.tc
+- 关键字 `variant`（lexer kw_lookup）；声明解析 `parse_variant_decl`（节点 VariantDecl + VC，VC.ia=case 下标, VC.na=载荷类型或 -1 单元 case）
+- 类型检查器 `register_decl` 注册类型为 Variant TI，并 `register_variant_helpers` 注册合成 FuncDecl 符号（不入 decl_list，避免重复发射）：`Name_from_Case(载荷?)`、`Name_is_Case(self)`、`Name_as_Case(self)`（仅载荷 case）
+- emitter `emit_variant_decl`：发射 `typedef struct Name { uint32_t _tag; union { T_i _u_i; } _u; } Name;` + 每 case 三个 `static inline` 自由函数（用 StringBuilder 拼 tag 整数，因无 int_to_str/cat7）
+- 设计取舍：自由函数而非方法/模式匹配，免改表达式推导；Variant 上暂不支持 @derive
+- 验证：conformance/p08_variant.tc 通过；tests/variant_smoke 运行时输出 CIRCLE/EMPTY/RECT/ROUNDTRIP_OK/UNIT_OK；bootstrap 不动点保持；difftest 30/30
