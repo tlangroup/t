@@ -1,0 +1,4530 @@
+// ═══════════════════════════════════════════════════════════════
+// selfhost/parser.tc — M6: t 语言 parser 的 t 语言实现 (Stage 1)
+//
+// 行为：tparse <file.tc>
+//   读源文件 → 内嵌 lexer 产出 token 池 → 递归下降 parser 构建
+//   扁平 Node 池 → 输出与 `tc parse` 逐字节一致的紧凑 JSON。
+// ═══════════════════════════════════════════════════════════════
+
+// ── token 池 ───────────────────────────────────────────────────
+
+Tok :: struct {
+    t: string;      // token 类型名（同 lex --json 的 type）
+    v: string;      // 文本值
+    line: u64;
+    col: u64;
+}
+
+var toks: []Tok;
+
+// ── AST 节点池（扁平化，索引引用）──────────────────────────────
+// 约定：
+//   na/nb/nc/nd : 子节点索引，-1 = null
+//   la/lb/lc    : 子节点列表头（Child 池索引），-1 = 空列表，-2 = null 列表
+//   sa/sb/sc    : 字符串载荷；has_sa=false 表示 sa 语义为 null
+//   ia/ib       : 整型载荷（radix / bitWidth / offset），-1 = null
+//   ba/bb       : 布尔载荷（isConst/isExtern/isComptime/isBitpack...）
+
+Node :: struct {
+    kind: string;
+    sa: string;
+    sb: string;
+    sc: string;
+    has_sa: bool;
+    has_sb: bool;
+    has_sc: bool;
+    ia: i64;
+    ib: i64;
+    ba: bool;
+    bb: bool;
+    na: i64;
+    nb: i64;
+    nc: i64;
+    nd: i64;
+    la: i64;
+    lb: i64;
+    lc: i64;
+    ln: u64;    // anchor token 行（诊断用；0 = 无）
+    cl: u64;    // anchor token 列
+    tv: string; // anchor token 文本（endCol = col + len(tv)）
+}
+
+var nodes: []Node;
+
+Child :: struct {
+    val: i64;
+    next: i64;
+}
+
+var kids: []Child;
+
+// 新建节点：全部字段置于"空"语义，返回索引
+node_new :: func(kind: string) -> i64 {
+    var n: Node;
+    n.kind = kind;
+    n.sa = "";
+    n.sb = "";
+    n.sc = "";
+    n.has_sa = true;
+    n.has_sb = true;
+    n.has_sc = true;
+    n.ia = -1;
+    n.ib = -1;
+    n.ba = false;
+    n.bb = false;
+    n.na = -1;
+    n.nb = -1;
+    n.nc = -1;
+    n.nd = -1;
+    n.la = -1;
+    n.lb = -1;
+    n.lc = -1;
+    n.ln = 0;
+    n.cl = 0;
+    n.tv = "";
+    append(nodes, n);
+    return (slice_len(nodes) as i64) - 1;
+}
+
+// 给节点打 anchor token（诊断定位用），tok 索引 → line/col/text
+node_at :: func(ni: i64, ti: i64) -> void {
+    var tk: Tok = toks[ti];
+    var n: Node = nodes[ni];
+    n.ln = tk.line;
+    n.cl = tk.col;
+    n.tv = tk.v;
+    slice_set(nodes, ni, n);
+}
+
+// 列表构建：head/tail 由调用方持有；返回新 tail
+list_push :: func(head: i64, tail: i64, val: i64) -> i64 {
+    var c: Child;
+    c.val = val;
+    c.next = -1;
+    append(kids, c);
+    var idx: i64 = (slice_len(kids) as i64) - 1;
+    if (tail >= 0) {
+        var prev: Child = kids[tail];
+        prev.next = idx;
+        slice_set(kids, tail, prev);
+    }
+    return idx;
+}
+
+// ── 诊断池（复刻 DiagnosticBag）────────────────────────────────
+// vv/fs/nt: -1 = null；vv/nt 指向 sitems 链表头，fs 指向 fixes 链表头
+
+Diag :: struct {
+    code: string;
+    sev: string;
+    msg: string;
+    file: string;
+    sl: i64;
+    sc: i64;
+    el: i64;
+    ec: i64;
+    vv: i64;
+    fs: i64;
+    nt: i64;
+}
+
+var diags: []Diag;
+
+SI :: struct {
+    s: string;
+    next: i64;
+}
+
+var sitems: []SI;
+
+FixS :: struct {
+    desc: string;
+    file: string;
+    sl: i64;
+    sc: i64;
+    el: i64;
+    ec: i64;
+    repl: string;
+    next: i64;
+}
+
+var fixes: []FixS;
+
+var g_file: string;
+
+diag_new :: func(code: string, sev: string, msg: string, file: string, sl: i64, sc: i64, el: i64, ec: i64) -> i64 {
+    var d: Diag;
+    d.code = code;
+    d.sev = sev;
+    d.msg = msg;
+    d.file = file;
+    d.sl = sl;
+    d.sc = sc;
+    d.el = el;
+    d.ec = ec;
+    d.vv = -1;
+    d.fs = -1;
+    d.nt = -1;
+    append(diags, d);
+    return (slice_len(diags) as i64) - 1;
+}
+
+diag_set_vv :: func(di: i64, head: i64) -> void {
+    var d: Diag = diags[di];
+    d.vv = head;
+    slice_set(diags, di, d);
+}
+
+diag_set_fs :: func(di: i64, head: i64) -> void {
+    var d: Diag = diags[di];
+    d.fs = head;
+    slice_set(diags, di, d);
+}
+
+diag_set_nt :: func(di: i64, head: i64) -> void {
+    var d: Diag = diags[di];
+    d.nt = head;
+    slice_set(diags, di, d);
+}
+
+// 字符串链表构建器（validValues / notes）
+var slb_head: i64;
+var slb_tail: i64;
+
+slb_begin :: func() -> void {
+    slb_head = -1;
+    slb_tail = -1;
+}
+
+slb_add :: func(s: string) -> void {
+    var it: SI;
+    it.s = s;
+    it.next = -1;
+    append(sitems, it);
+    var idx: i64 = (slice_len(sitems) as i64) - 1;
+    if (slb_tail >= 0) {
+        var p: SI = sitems[slb_tail];
+        p.next = idx;
+        slice_set(sitems, slb_tail, p);
+    } else {
+        slb_head = idx;
+    }
+    slb_tail = idx;
+}
+
+fix_one :: func(desc: string, file: string, sl: i64, sc: i64, el: i64, ec: i64, repl: string) -> i64 {
+    var f: FixS;
+    f.desc = desc;
+    f.file = file;
+    f.sl = sl;
+    f.sc = sc;
+    f.el = el;
+    f.ec = ec;
+    f.repl = repl;
+    f.next = -1;
+    append(fixes, f);
+    return (slice_len(fixes) as i64) - 1;
+}
+
+// ── 字符串小工具 ───────────────────────────────────────────────
+
+cat2 :: func(a: string, b: string) -> string {
+    var sb: StringBuilder = sb_new();
+    sb_append_str(sb, a);
+    sb_append_str(sb, b);
+    return sb_to_str(sb);
+}
+
+cat3 :: func(a: string, b: string, c: string) -> string {
+    var sb: StringBuilder = sb_new();
+    sb_append_str(sb, a);
+    sb_append_str(sb, b);
+    sb_append_str(sb, c);
+    return sb_to_str(sb);
+}
+
+cat4 :: func(a: string, b: string, c: string, d: string) -> string {
+    var sb: StringBuilder = sb_new();
+    sb_append_str(sb, a);
+    sb_append_str(sb, b);
+    sb_append_str(sb, c);
+    sb_append_str(sb, d);
+    return sb_to_str(sb);
+}
+
+cat5 :: func(a: string, b: string, c: string, d: string, e: string) -> string {
+    var sb: StringBuilder = sb_new();
+    sb_append_str(sb, a);
+    sb_append_str(sb, b);
+    sb_append_str(sb, c);
+    sb_append_str(sb, d);
+    sb_append_str(sb, e);
+    return sb_to_str(sb);
+}
+
+cat6 :: func(a: string, b: string, c: string, d: string, e: string, f: string) -> string {
+    var sb: StringBuilder = sb_new();
+    sb_append_str(sb, a);
+    sb_append_str(sb, b);
+    sb_append_str(sb, c);
+    sb_append_str(sb, d);
+    sb_append_str(sb, e);
+    sb_append_str(sb, f);
+    return sb_to_str(sb);
+}
+
+i2s :: func(v: i64) -> string {
+    var sb: StringBuilder = sb_new();
+    sb_append_i64(sb, v);
+    return sb_to_str(sb);
+}
+
+// ── 命名规范校验（复刻 parser.ts validate*Name）───────────────
+
+is_lower_snake :: func(name: string) -> bool {
+    var n: u64 = str_len(name);
+    if (n == 0) {
+        return false;
+    }
+    var c0: u8 = name[0];
+    if (c0 < 97 || c0 > 122) {
+        return false;
+    }
+    var i: u64 = 1;
+    while (i < n) {
+        var c: u8 = name[i];
+        var ok: bool = (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 95;
+        if (ok == false) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+is_upper_snake_name :: func(name: string) -> bool {
+    var n: u64 = str_len(name);
+    if (n == 0) {
+        return false;
+    }
+    var c0: u8 = name[0];
+    if (c0 < 65 || c0 > 90) {
+        return false;
+    }
+    var i: u64 = 1;
+    while (i < n) {
+        var c: u8 = name[i];
+        var ok: bool = (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 95;
+        if (ok == false) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+is_pascal_rest_ok :: func(name: string) -> bool {
+    var n: u64 = str_len(name);
+    var i: u64 = 1;
+    while (i < n) {
+        var c: u8 = name[i];
+        var ok: bool = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 95;
+        if (ok == false) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// 以 token 下标 ti 处的 line/col 报命名告警
+warn_name :: func(code: string, msg: string, ti: i64, name_len: i64) -> void {
+    var tk: Tok = toks[ti];
+    var l: i64 = tk.line as i64;
+    var c: i64 = tk.col as i64;
+    diag_new(code, "warning", msg, g_file, l, c, l, c + name_len);
+}
+
+validate_decl_name :: func(name: string, ti: i64) -> void {
+    var n: u64 = str_len(name);
+    if (n == 0) {
+        return;
+    }
+    var c0: u8 = name[0];
+    if (c0 >= 65 && c0 <= 90) {
+        if (is_pascal_rest_ok(name) == false) {
+            warn_name("T_NAME_TYPE_CAMEL", cat3("type name '", name, "' should be PascalCase (e.g. EntityState)"), ti, n as i64);
+        }
+    }
+}
+
+validate_var_name :: func(name: string, ti: i64) -> void {
+    if (is_lower_snake(name) == false) {
+        warn_name("T_NAME_VAR_SNAKE", cat3("variable name '", name, "' should be snake_case (e.g. entity_id)"), ti, str_len(name) as i64);
+    }
+}
+
+validate_const_name :: func(name: string, ti: i64) -> void {
+    if (is_upper_snake_name(name) == false) {
+        warn_name("T_NAME_CONST_UPPER", cat3("constant name '", name, "' should be UPPER_SNAKE_CASE (e.g. MAX_RENDER_LAYER)"), ti, str_len(name) as i64);
+    }
+}
+
+// ── 字符分类（照抄 lexer.tc）───────────────────────────────────
+
+is_digit :: func(c: u8) -> bool {
+    return c >= 48 && c <= 57;
+}
+
+is_ident_start :: func(c: u8) -> bool {
+    if (c >= 97 && c <= 122) { return true; }
+    if (c >= 65 && c <= 90) { return true; }
+    return c == 95;
+}
+
+is_ident_cont :: func(c: u8) -> bool {
+    return is_ident_start(c) || is_digit(c);
+}
+
+is_hex_digit :: func(c: u8) -> bool {
+    if (c >= 48 && c <= 57) { return true; }
+    if (c >= 97 && c <= 102) { return true; }
+    return c >= 65 && c <= 70;
+}
+
+is_bin_digit :: func(c: u8) -> bool {
+    return c == 48 || c == 49;
+}
+
+kw_lookup :: func(text: string) -> string {
+    if (text == "func") { return "KwFunc"; }
+    if (text == "struct") { return "KwStruct"; }
+    if (text == "enum") { return "KwEnum"; }
+    if (text == "flag") { return "KwFlag"; }
+    if (text == "union") { return "KwUnion"; }
+    if (text == "var") { return "KwVar"; }
+    if (text == "const") { return "KwConst"; }
+    if (text == "comptime") { return "KwComptime"; }
+    if (text == "if") { return "KwIf"; }
+    if (text == "else") { return "KwElse"; }
+    if (text == "for") { return "KwFor"; }
+    if (text == "while") { return "KwWhile"; }
+    if (text == "switch") { return "KwSwitch"; }
+    if (text == "case") { return "KwCase"; }
+    if (text == "default") { return "KwDefault"; }
+    if (text == "break") { return "KwBreak"; }
+    if (text == "continue") { return "KwContinue"; }
+    if (text == "return") { return "KwReturn"; }
+    if (text == "true") { return "KwTrue"; }
+    if (text == "false") { return "KwFalse"; }
+    if (text == "null") { return "KwNull"; }
+    if (text == "map") { return "KwMap"; }
+    if (text == "import") { return "KwImport"; }
+    if (text == "export") { return "KwExport"; }
+    if (text == "as") { return "KwAs"; }
+    if (text == "in") { return "KwIn"; }
+    if (text == "defer") { return "KwDefer"; }
+    if (text == "void") { return "KwVoid"; }
+    if (text == "string") { return "KwString"; }
+    if (text == "StringBuilder") { return "KwStringBuilder"; }
+    return "";
+}
+
+op2_name :: func(a: u8, b: u8) -> string {
+    if (a == 45 && b == 62) { return "Arrow"; }
+    if (a == 58 && b == 58) { return "DoubleColon"; }
+    if (a == 61 && b == 61) { return "Eq"; }
+    if (a == 33 && b == 61) { return "NotEq"; }
+    if (a == 60 && b == 61) { return "LtEq"; }
+    if (a == 62 && b == 61) { return "GtEq"; }
+    if (a == 38 && b == 38) { return "And"; }
+    if (a == 124 && b == 124) { return "Or"; }
+    if (a == 60 && b == 60) { return "ShiftLeft"; }
+    if (a == 62 && b == 62) { return "ShiftRight"; }
+    if (a == 46 && b == 46) { return "DoubleDot"; }
+    if (a == 43 && b == 61) { return "PlusAssign"; }
+    if (a == 45 && b == 61) { return "MinusAssign"; }
+    if (a == 42 && b == 61) { return "StarAssign"; }
+    if (a == 47 && b == 61) { return "SlashAssign"; }
+    if (a == 37 && b == 61) { return "PercentAssign"; }
+    if (a == 38 && b == 61) { return "BitAndAssign"; }
+    if (a == 124 && b == 61) { return "BitOrAssign"; }
+    if (a == 94 && b == 61) { return "BitXorAssign"; }
+    return "";
+}
+
+op1_name :: func(c: u8) -> string {
+    if (c == 43) { return "Plus"; }
+    if (c == 45) { return "Minus"; }
+    if (c == 42) { return "Star"; }
+    if (c == 47) { return "Slash"; }
+    if (c == 37) { return "Percent"; }
+    if (c == 61) { return "Assign"; }
+    if (c == 60) { return "Lt"; }
+    if (c == 62) { return "Gt"; }
+    if (c == 33) { return "Not"; }
+    if (c == 38) { return "BitAnd"; }
+    if (c == 124) { return "BitOr"; }
+    if (c == 94) { return "BitXor"; }
+    if (c == 126) { return "BitNot"; }
+    if (c == 58) { return "Colon"; }
+    if (c == 46) { return "Dot"; }
+    if (c == 63) { return "Question"; }
+    if (c == 40) { return "LParen"; }
+    if (c == 41) { return "RParen"; }
+    if (c == 123) { return "LBrace"; }
+    if (c == 125) { return "RBrace"; }
+    if (c == 91) { return "LBracket"; }
+    if (c == 93) { return "RBracket"; }
+    if (c == 44) { return "Comma"; }
+    if (c == 59) { return "Semicolon"; }
+    return "";
+}
+
+// ── token 入池 ─────────────────────────────────────────────────
+
+push_tok :: func(tname: string, value: string, line: u64, col: u64) -> void {
+    var tk: Tok;
+    tk.t = tname;
+    tk.v = value;
+    tk.line = line;
+    tk.col = col;
+    append(toks, tk);
+}
+
+// ── lexer：源码 → token 池（逻辑照抄 lexer.tc）─────────────────
+
+tokenize :: func(src: string) -> void {
+    var tmp: StringBuilder = sb_new();
+    var i: u64 = 0;
+    var n: u64 = str_len(src);
+    var line: u64 = 1;
+    var col: u64 = 1;
+
+    while (i < n) {
+        var c: u8 = src[i];
+
+        if (c == 32 || c == 9 || c == 13) {
+            i = i + 1;
+            col = col + 1;
+            continue;
+        }
+        if (c == 10) {
+            i = i + 1;
+            line = line + 1;
+            col = 1;
+            continue;
+        }
+
+        if (c == 47 && i + 1 < n && src[i + 1] == 47) {
+            while (i < n && src[i] != 10) {
+                i = i + 1;
+                col = col + 1;
+            }
+            continue;
+        }
+
+        if (c == 47 && i + 1 < n && src[i + 1] == 42) {
+            i = i + 2;
+            col = col + 2;
+            var closed: bool = false;
+            while (i < n) {
+                if (src[i] == 42 && i + 1 < n && src[i + 1] == 47) {
+                    i = i + 2;
+                    col = col + 2;
+                    closed = true;
+                    break;
+                }
+                if (src[i] == 10) {
+                    line = line + 1;
+                    col = 1;
+                } else {
+                    col = col + 1;
+                }
+                i = i + 1;
+            }
+            if (closed == false) {
+                eprint("error: unterminated block comment\n");
+                exit(1);
+            }
+            continue;
+        }
+
+        if (is_digit(c)) {
+            var tl: u64 = line;
+            var tcol: u64 = col;
+
+            if (c == 48 && i + 1 < n && (src[i + 1] == 120 || src[i + 1] == 88)) {
+                sb_clear(tmp);
+                sb_append_str(tmp, "0x");
+                i = i + 2;
+                col = col + 2;
+                var hexcnt: u64 = 0;
+                while (i < n && is_hex_digit(src[i])) {
+                    sb_append_char(tmp, src[i]);
+                    i = i + 1;
+                    col = col + 1;
+                    hexcnt = hexcnt + 1;
+                }
+                if (hexcnt == 0) {
+                    eprint("error: hex literal has no digits after 0x\n");
+                    exit(1);
+                }
+                push_tok("Integer", sb_to_str(tmp), tl, tcol);
+                continue;
+            }
+
+            if (c == 48 && i + 1 < n && (src[i + 1] == 98 || src[i + 1] == 66)) {
+                sb_clear(tmp);
+                sb_append_str(tmp, "0b");
+                i = i + 2;
+                col = col + 2;
+                var bincnt: u64 = 0;
+                while (i < n && is_bin_digit(src[i])) {
+                    sb_append_char(tmp, src[i]);
+                    i = i + 1;
+                    col = col + 1;
+                    bincnt = bincnt + 1;
+                }
+                if (bincnt == 0) {
+                    eprint("error: binary literal has no digits after 0b\n");
+                    exit(1);
+                }
+                push_tok("Integer", sb_to_str(tmp), tl, tcol);
+                continue;
+            }
+
+            var ns: u64 = i;
+            while (i < n && is_digit(src[i])) {
+                i = i + 1;
+                col = col + 1;
+            }
+
+            if (i < n && src[i] == 46 && i + 1 < n && is_digit(src[i + 1])) {
+                i = i + 1;
+                col = col + 1;
+                while (i < n && is_digit(src[i])) {
+                    i = i + 1;
+                    col = col + 1;
+                }
+                if (i < n && (src[i] == 101 || src[i] == 69)) {
+                    i = i + 1;
+                    col = col + 1;
+                    if (i < n && (src[i] == 43 || src[i] == 45)) {
+                        i = i + 1;
+                        col = col + 1;
+                    }
+                    while (i < n && is_digit(src[i])) {
+                        i = i + 1;
+                        col = col + 1;
+                    }
+                }
+                push_tok("Float", str_slice(src, ns, i), tl, tcol);
+                continue;
+            }
+
+            push_tok("Integer", str_slice(src, ns, i), tl, tcol);
+            continue;
+        }
+
+        if (c == 34) {
+            var sl: u64 = line;
+            var scol: u64 = col;
+            i = i + 1;
+            col = col + 1;
+            sb_clear(tmp);
+            while (i < n && src[i] != 34) {
+                if (src[i] == 92) {
+                    i = i + 1;
+                    col = col + 1;
+                    if (i >= n) {
+                        break;
+                    }
+                    var e: u8 = src[i];
+                    if (src[i] == 10) {
+                        line = line + 1;
+                        col = 1;
+                    } else {
+                        col = col + 1;
+                    }
+                    i = i + 1;
+                    if (e == 110) {
+                        sb_append_char(tmp, 10);
+                    } else {
+                    if (e == 116) {
+                        sb_append_char(tmp, 9);
+                    } else {
+                    if (e == 114) {
+                        sb_append_char(tmp, 13);
+                    } else {
+                    if (e == 34) {
+                        sb_append_char(tmp, 34);
+                    } else {
+                    if (e == 92) {
+                        sb_append_char(tmp, 92);
+                    } else {
+                    if (e == 48) {
+                        sb_append_char(tmp, 0);
+                    } else {
+                        sb_append_char(tmp, e);
+                    }}}}}}
+                } else {
+                    if (src[i] == 10) {
+                        line = line + 1;
+                        col = 1;
+                    } else {
+                        col = col + 1;
+                    }
+                    sb_append_char(tmp, src[i]);
+                    i = i + 1;
+                }
+            }
+            if (i >= n) {
+                eprint("error: unterminated string literal\n");
+                exit(1);
+            }
+            i = i + 1;
+            col = col + 1;
+            push_tok("String", sb_to_str(tmp), sl, scol);
+            continue;
+        }
+
+        if (is_ident_start(c)) {
+            var il: u64 = line;
+            var icol: u64 = col;
+            var is0: u64 = i;
+            while (i < n && is_ident_cont(src[i])) {
+                i = i + 1;
+                col = col + 1;
+            }
+            var text: string = str_slice(src, is0, i);
+            var tname: string = kw_lookup(text);
+            if (str_len(tname) == 0) {
+                tname = "Identifier";
+            }
+            push_tok(tname, text, il, icol);
+            continue;
+        }
+
+        if (c == 64) {
+            push_tok("At", "@", line, col);
+            i = i + 1;
+            col = col + 1;
+            continue;
+        }
+        if (c == 35) {
+            push_tok("Hash", "#", line, col);
+            i = i + 1;
+            col = col + 1;
+            continue;
+        }
+
+        if (i + 2 < n && c == 60 && src[i + 1] == 60 && src[i + 2] == 61) {
+            push_tok("ShlAssign", "<<=", line, col);
+            i = i + 3;
+            col = col + 3;
+            continue;
+        }
+        if (i + 2 < n && c == 62 && src[i + 1] == 62 && src[i + 2] == 61) {
+            push_tok("ShrAssign", ">>=", line, col);
+            i = i + 3;
+            col = col + 3;
+            continue;
+        }
+
+        if (i + 1 < n) {
+            var two: string = op2_name(c, src[i + 1]);
+            if (str_len(two) > 0) {
+                push_tok(two, str_slice(src, i, i + 2), line, col);
+                i = i + 2;
+                col = col + 2;
+                continue;
+            }
+        }
+
+        var one: string = op1_name(c);
+        if (str_len(one) > 0) {
+            push_tok(one, str_slice(src, i, i + 1), line, col);
+            i = i + 1;
+            col = col + 1;
+            continue;
+        }
+
+        eprint("error: unexpected character\n");
+        exit(1);
+    }
+
+    push_tok("Eof", "", line, col);
+}
+
+// ── parser 状态与 token 辅助 ──────────────────────────────────
+
+var pos: i64;
+var decl_list: []i64;
+
+tk_t :: func(idx: i64) -> string {
+    var tk: Tok = toks[idx];
+    return tk.t;
+}
+
+tk_v :: func(idx: i64) -> string {
+    var tk: Tok = toks[idx];
+    return tk.v;
+}
+
+cur_t :: func() -> string {
+    return tk_t(pos);
+}
+
+cur_v :: func() -> string {
+    return tk_v(pos);
+}
+
+peek_t :: func(off: i64) -> string {
+    var idx: i64 = pos + off;
+    var n: i64 = slice_len(toks) as i64;
+    if (idx >= n) {
+        idx = n - 1;
+    }
+    return tk_t(idx);
+}
+
+// 前进一个 token，返回被消费 token 的下标（Eof 处不动，返回前一个）
+advance_i :: func() -> i64 {
+    if (cur_t() != "Eof") {
+        pos = pos + 1;
+    }
+    return pos - 1;
+}
+
+expect_tok :: func(t: string) -> string {
+    if (cur_t() == t) {
+        var idx: i64 = advance_i();
+        return tk_v(idx);
+    }
+    eprint("parse error: expected ");
+    eprint(t);
+    eprint(" but found ");
+    eprint(cur_v());
+    eprint("\n");
+    exit(1);
+    return "";
+}
+
+// parseInt(s, 10) 语义：取前导十进制数字
+parse_int_str :: func(s: string) -> i64 {
+    var r: i64 = 0;
+    var i: u64 = 0;
+    var n: u64 = str_len(s);
+    while (i < n) {
+        var c: u8 = s[i];
+        if (is_digit(c) == false) {
+            break;
+        }
+        r = r * 10 + ((c as i64) - 48);
+        i = i + 1;
+    }
+    return r;
+}
+
+// 拼接两条 Child 链，返回新头
+list_concat :: func(a: i64, b: i64) -> i64 {
+    if (a < 0) {
+        return b;
+    }
+    if (b < 0) {
+        return a;
+    }
+    var it: i64 = a;
+    while (true) {
+        var c: Child = kids[it];
+        if (c.next < 0) {
+            c.next = b;
+            slice_set(kids, it, c);
+            break;
+        }
+        it = c.next;
+    }
+    return a;
+}
+
+// ── 注解解析 ───────────────────────────────────────────────────
+
+parse_annotation_args :: func() -> i64 {
+    var head: i64 = -1;
+    var tail: i64 = -1;
+    while (cur_t() != "RParen" && cur_t() != "Eof") {
+        var t: string = cur_t();
+        var made: i64 = -1;
+        if (t == "String") {
+            var idx: i64 = advance_i();
+            made = node_new("string");
+            var an: Node = nodes[made];
+            an.sa = tk_v(idx);
+            slice_set(nodes, made, an);
+        } else {
+        if (t == "Integer") {
+            var idx2: i64 = advance_i();
+            made = node_new("number");
+            var an2: Node = nodes[made];
+            an2.sa = tk_v(idx2);
+            slice_set(nodes, made, an2);
+        } else {
+        if (t == "Identifier") {
+            var ih: i64 = -1;
+            var it: i64 = -1;
+            var cnt: i64 = 1;
+            var idx3: i64 = advance_i();
+            var id1: i64 = node_new("ident");
+            var an3: Node = nodes[id1];
+            an3.sa = tk_v(idx3);
+            slice_set(nodes, id1, an3);
+            it = list_push(ih, it, id1);
+            ih = it;
+            while (cur_t() == "Comma") {
+                advance_i();
+                var v2: string = expect_tok("Identifier");
+                var id2: i64 = node_new("ident");
+                var an4: Node = nodes[id2];
+                an4.sa = v2;
+                slice_set(nodes, id2, an4);
+                it = list_push(ih, it, id2);
+                cnt = cnt + 1;
+            }
+            if (cnt == 1) {
+                made = id1;
+            } else {
+                made = node_new("list");
+                var an5: Node = nodes[made];
+                an5.la = ih;
+                slice_set(nodes, made, an5);
+            }
+        } else {
+            eprint("parse error: invalid annotation argument\n");
+            exit(1);
+        }}}
+        tail = list_push(head, tail, made);
+        if (head < 0) {
+            head = tail;
+        }
+        if (cur_t() != "RParen") {
+            if (cur_t() == "Comma") {
+                advance_i();
+            }
+        }
+    }
+    return head;
+}
+
+parse_annotations :: func() -> i64 {
+    var head: i64 = -1;
+    var tail: i64 = -1;
+    while (cur_t() == "At") {
+        advance_i();
+        var name: string = "";
+        var nti: i64 = pos;
+        if (cur_t() == "Identifier" || cur_t() == "KwExport") {
+            var idx: i64 = advance_i();
+            name = tk_v(idx);
+            nti = idx;
+        } else {
+            name = expect_tok("Identifier");
+            nti = pos - 1;
+        }
+        if (is_lower_snake(name) == false) {
+            warn_name("T_NAME_ANNOTATION_LOWER", cat3("annotation name '", name, "' should be lowercase snake_case"), nti, str_len(name) as i64);
+        }
+        var args_head: i64 = -1;
+        if (cur_t() == "LParen") {
+            advance_i();
+            args_head = parse_annotation_args();
+            expect_tok("RParen");
+        }
+        var id: i64 = node_new("A");
+        var an: Node = nodes[id];
+        an.sa = name;
+        an.la = args_head;
+        slice_set(nodes, id, an);
+        node_at(id, nti);
+        tail = list_push(head, tail, id);
+        if (head < 0) {
+            head = tail;
+        }
+    }
+    return head;
+}
+
+// ── 类型解析 ───────────────────────────────────────────────────
+
+mk_scalar :: func(name: string) -> i64 {
+    var id: i64 = node_new("scalar");
+    var sn: Node = nodes[id];
+    sn.sa = name;
+    slice_set(nodes, id, sn);
+    return id;
+}
+
+is_scalar_name :: func(name: string) -> bool {
+    if (name == "u8" || name == "u16" || name == "u32" || name == "u64") {
+        return true;
+    }
+    if (name == "i8" || name == "i16" || name == "i32" || name == "i64") {
+        return true;
+    }
+    if (name == "f16" || name == "f32" || name == "f64") {
+        return true;
+    }
+    return name == "bool";
+}
+
+parse_type :: func() -> i64 {
+    var t: string = cur_t();
+    if (t == "KwMap") {
+        advance_i();
+        expect_tok("LBracket");
+        var kt: i64 = parse_type();
+        expect_tok("RBracket");
+        var vt: i64 = parse_type();
+        var id: i64 = node_new("map");
+        var mn: Node = nodes[id];
+        mn.na = kt;
+        mn.nb = vt;
+        slice_set(nodes, id, mn);
+        return id;
+    }
+    if (t == "LBracket") {
+        advance_i();
+        if (cur_t() == "RBracket") {
+            advance_i();
+            var el: i64 = parse_type();
+            var id2: i64 = node_new("slice");
+            var sn2: Node = nodes[id2];
+            sn2.na = el;
+            slice_set(nodes, id2, sn2);
+            return id2;
+        }
+        var ln: i64 = parse_expr();
+        expect_tok("RBracket");
+        var el2: i64 = parse_type();
+        var id3: i64 = node_new("array");
+        var an3: Node = nodes[id3];
+        an3.na = el2;
+        an3.nb = ln;
+        slice_set(nodes, id3, an3);
+        return id3;
+    }
+    if (t == "Star") {
+        advance_i();
+        var el3: i64 = parse_type();
+        var id4: i64 = node_new("pointer");
+        var pn: Node = nodes[id4];
+        pn.na = el3;
+        slice_set(nodes, id4, pn);
+        return id4;
+    }
+    if (t == "Question") {
+        advance_i();
+        var el4: i64 = parse_type();
+        var id5: i64 = node_new("optional");
+        var on: Node = nodes[id5];
+        on.na = el4;
+        slice_set(nodes, id5, on);
+        return id5;
+    }
+    if (t == "KwVoid") {
+        advance_i();
+        return mk_scalar("void");
+    }
+    if (t == "KwString") {
+        advance_i();
+        return mk_scalar("string");
+    }
+    if (t == "KwStringBuilder") {
+        advance_i();
+        return mk_scalar("StringBuilder");
+    }
+    if (t == "Identifier") {
+        var idx: i64 = advance_i();
+        var name: string = tk_v(idx);
+        if (name == "flag") {
+            if (cur_t() == "LBracket") {
+                advance_i();
+                var ui: i64 = advance_i();
+                expect_tok("RBracket");
+                var idf: i64 = node_new("flag");
+                var fn: Node = nodes[idf];
+                fn.sa = tk_v(ui);
+                slice_set(nodes, idf, fn);
+                return idf;
+            }
+        }
+        if (name == "flag_set") {
+            return node_new("flag_set");
+        }
+        if (name == "Variant") {
+            return node_new("variant");
+        }
+        if (is_scalar_name(name)) {
+            return mk_scalar(name);
+        }
+        var idn: i64 = node_new("named");
+        var nn: Node = nodes[idn];
+        nn.sa = name;
+        slice_set(nodes, idn, nn);
+        return idn;
+    }
+    eprint("parse error: expected type\n");
+    exit(1);
+    return -1;
+}
+
+// ── 表达式解析（优先级爬升，逐层照抄 tc0）─────────────────────
+
+mk_bin :: func(op: string, left: i64, right: i64, ti: i64) -> i64 {
+    var id: i64 = node_new("binary");
+    var n: Node = nodes[id];
+    n.sa = op;
+    n.na = left;
+    n.nb = right;
+    slice_set(nodes, id, n);
+    node_at(id, ti);
+    return id;
+}
+
+parse_expr :: func() -> i64 {
+    return parse_assign_expr();
+}
+
+parse_assign_expr :: func() -> i64 {
+    var left: i64 = parse_or();
+    if (cur_t() == "Assign") {
+        var ti: i64 = advance_i();
+        var right: i64 = parse_assign_expr();
+        var id: i64 = node_new("assign");
+        var n: Node = nodes[id];
+        n.sa = "=";
+        n.na = left;
+        n.nb = right;
+        slice_set(nodes, id, n);
+        node_at(id, ti);
+        return id;
+    }
+    return left;
+}
+
+parse_or :: func() -> i64 {
+    var left: i64 = parse_and();
+    while (cur_t() == "Or") {
+        var ti: i64 = advance_i();
+        var right: i64 = parse_and();
+        left = mk_bin("||", left, right, ti);
+    }
+    return left;
+}
+
+parse_and :: func() -> i64 {
+    var left: i64 = parse_bitor();
+    while (cur_t() == "And") {
+        var ti: i64 = advance_i();
+        var right: i64 = parse_bitor();
+        left = mk_bin("&&", left, right, ti);
+    }
+    return left;
+}
+
+parse_bitor :: func() -> i64 {
+    var left: i64 = parse_bitxor();
+    while (cur_t() == "BitOr") {
+        var ti: i64 = advance_i();
+        var right: i64 = parse_bitxor();
+        left = mk_bin("|", left, right, ti);
+    }
+    return left;
+}
+
+parse_bitxor :: func() -> i64 {
+    var left: i64 = parse_bitand();
+    while (cur_t() == "BitXor") {
+        var ti: i64 = advance_i();
+        var right: i64 = parse_bitand();
+        left = mk_bin("^", left, right, ti);
+    }
+    return left;
+}
+
+parse_bitand :: func() -> i64 {
+    var left: i64 = parse_eq();
+    while (cur_t() == "BitAnd") {
+        var ti: i64 = advance_i();
+        var right: i64 = parse_eq();
+        left = mk_bin("&", left, right, ti);
+    }
+    return left;
+}
+
+parse_eq :: func() -> i64 {
+    var left: i64 = parse_cmp();
+    while (cur_t() == "Eq" || cur_t() == "NotEq") {
+        var op: string = "==";
+        if (cur_t() == "NotEq") {
+            op = "!=";
+        }
+        var ti: i64 = advance_i();
+        var right: i64 = parse_cmp();
+        left = mk_bin(op, left, right, ti);
+    }
+    return left;
+}
+
+parse_cmp :: func() -> i64 {
+    var left: i64 = parse_shift();
+    while (cur_t() == "Lt" || cur_t() == "Gt" || cur_t() == "LtEq" || cur_t() == "GtEq") {
+        var t: string = cur_t();
+        var op: string = "<";
+        if (t == "Gt") {
+            op = ">";
+        }
+        if (t == "LtEq") {
+            op = "<=";
+        }
+        if (t == "GtEq") {
+            op = ">=";
+        }
+        var ti: i64 = advance_i();
+        var right: i64 = parse_shift();
+        left = mk_bin(op, left, right, ti);
+    }
+    return left;
+}
+
+parse_shift :: func() -> i64 {
+    var left: i64 = parse_add();
+    while (cur_t() == "ShiftLeft" || cur_t() == "ShiftRight") {
+        var op: string = "<<";
+        if (cur_t() == "ShiftRight") {
+            op = ">>";
+        }
+        var ti: i64 = advance_i();
+        var right: i64 = parse_add();
+        left = mk_bin(op, left, right, ti);
+    }
+    return left;
+}
+
+parse_add :: func() -> i64 {
+    var left: i64 = parse_mul();
+    while (cur_t() == "Plus" || cur_t() == "Minus") {
+        var op: string = "+";
+        if (cur_t() == "Minus") {
+            op = "-";
+        }
+        var ti: i64 = advance_i();
+        var right: i64 = parse_mul();
+        left = mk_bin(op, left, right, ti);
+    }
+    return left;
+}
+
+parse_mul :: func() -> i64 {
+    var left: i64 = parse_unary();
+    while (cur_t() == "Star" || cur_t() == "Slash" || cur_t() == "Percent") {
+        var t: string = cur_t();
+        var op: string = "*";
+        if (t == "Slash") {
+            op = "/";
+        }
+        if (t == "Percent") {
+            op = "%";
+        }
+        var ti: i64 = advance_i();
+        var right: i64 = parse_unary();
+        left = mk_bin(op, left, right, ti);
+    }
+    return left;
+}
+
+parse_unary :: func() -> i64 {
+    var t: string = cur_t();
+    if (t == "Not" || t == "Minus" || t == "BitNot") {
+        var op: string = "!";
+        if (t == "Minus") {
+            op = "-";
+        }
+        if (t == "BitNot") {
+            op = "~";
+        }
+        var ti: i64 = advance_i();
+        var operand: i64 = parse_unary();
+        var id: i64 = node_new("unary");
+        var n: Node = nodes[id];
+        n.sa = op;
+        n.na = operand;
+        slice_set(nodes, id, n);
+        node_at(id, ti);
+        return id;
+    }
+    return parse_postfix();
+}
+
+parse_postfix :: func() -> i64 {
+    var e: i64 = parse_primary();
+    while (true) {
+        var t: string = cur_t();
+        if (t == "Dot") {
+            var ti: i64 = advance_i();
+            var member: string = expect_tok("Identifier");
+            var id: i64 = node_new("member");
+            var n: Node = nodes[id];
+            n.na = e;
+            n.sa = member;
+            slice_set(nodes, id, n);
+            node_at(id, ti);
+            e = id;
+        } else {
+        if (t == "LBracket") {
+            var ti2: i64 = advance_i();
+            var index: i64 = parse_expr();
+            expect_tok("RBracket");
+            var id2: i64 = node_new("index");
+            var n2: Node = nodes[id2];
+            n2.na = e;
+            n2.nb = index;
+            slice_set(nodes, id2, n2);
+            node_at(id2, ti2);
+            e = id2;
+        } else {
+        if (t == "LParen") {
+            var ti3: i64 = advance_i();
+            var head: i64 = -1;
+            var tail: i64 = -1;
+            while (cur_t() != "RParen" && cur_t() != "Eof") {
+                var arg: i64 = parse_expr();
+                tail = list_push(head, tail, arg);
+                if (head < 0) {
+                    head = tail;
+                }
+                if (cur_t() == "Comma") {
+                    advance_i();
+                } else {
+                    break;
+                }
+            }
+            expect_tok("RParen");
+            var id3: i64 = node_new("call");
+            var n3: Node = nodes[id3];
+            n3.na = e;
+            n3.la = head;
+            slice_set(nodes, id3, n3);
+            node_at(id3, ti3);
+            e = id3;
+        } else {
+            break;
+        }}}
+    }
+    if (cur_t() == "KwAs") {
+        var ti4: i64 = advance_i();
+        var tt: i64 = parse_type();
+        var id4: i64 = node_new("cast");
+        var n4: Node = nodes[id4];
+        n4.na = e;
+        n4.nb = tt;
+        slice_set(nodes, id4, n4);
+        node_at(id4, ti4);
+        e = id4;
+    }
+    return e;
+}
+
+starts_with_0x :: func(s: string) -> bool {
+    if (str_len(s) < 2) {
+        return false;
+    }
+    if (s[0] != 48) {
+        return false;
+    }
+    return s[1] == 120 || s[1] == 88;
+}
+
+starts_with_0b :: func(s: string) -> bool {
+    if (str_len(s) < 2) {
+        return false;
+    }
+    if (s[0] != 48) {
+        return false;
+    }
+    return s[1] == 98 || s[1] == 66;
+}
+
+looks_like_struct_lit :: func() -> bool {
+    if (peek_t(1) == "RBrace") {
+        return true;
+    }
+    if (peek_t(1) == "Identifier" && peek_t(2) == "Colon") {
+        return true;
+    }
+    return false;
+}
+
+parse_struct_lit :: func(type_name: string, ti: i64) -> i64 {
+    advance_i();
+    var head: i64 = -1;
+    var tail: i64 = -1;
+    while (cur_t() != "RBrace" && cur_t() != "Eof") {
+        var fname: string = expect_tok("Identifier");
+        expect_tok("Colon");
+        var val: i64 = parse_expr();
+        var fid: i64 = node_new("FV");
+        var fn: Node = nodes[fid];
+        fn.sa = fname;
+        fn.na = val;
+        slice_set(nodes, fid, fn);
+        tail = list_push(head, tail, fid);
+        if (head < 0) {
+            head = tail;
+        }
+        if (cur_t() == "Comma") {
+            advance_i();
+        } else {
+            break;
+        }
+    }
+    expect_tok("RBrace");
+    var id: i64 = node_new("struct_lit");
+    var n: Node = nodes[id];
+    n.sa = type_name;
+    n.la = head;
+    slice_set(nodes, id, n);
+    node_at(id, ti);
+    return id;
+}
+
+parse_map_lit :: func(ti: i64) -> i64 {
+    var head: i64 = -1;
+    var tail: i64 = -1;
+    while (cur_t() != "RBracket" && cur_t() != "Eof") {
+        var k: i64 = parse_expr();
+        expect_tok("Colon");
+        var v: i64 = parse_expr();
+        var eid: i64 = node_new("EN");
+        var en: Node = nodes[eid];
+        en.na = k;
+        en.nb = v;
+        slice_set(nodes, eid, en);
+        tail = list_push(head, tail, eid);
+        if (head < 0) {
+            head = tail;
+        }
+        if (cur_t() == "Comma") {
+            advance_i();
+        } else {
+            break;
+        }
+    }
+    expect_tok("RBracket");
+    var id: i64 = node_new("map_lit");
+    var n: Node = nodes[id];
+    n.la = head;
+    slice_set(nodes, id, n);
+    node_at(id, ti);
+    return id;
+}
+
+parse_array_lit :: func() -> i64 {
+    var ti: i64 = advance_i();
+    var is_maplit: bool = cur_t() == "Identifier" || cur_t() == "String" || cur_t() == "Integer";
+    if (is_maplit && peek_t(1) == "Colon") {
+        return parse_map_lit(ti);
+    }
+    var head: i64 = -1;
+    var tail: i64 = -1;
+    while (cur_t() != "RBracket" && cur_t() != "Eof") {
+        var e: i64 = parse_expr();
+        tail = list_push(head, tail, e);
+        if (head < 0) {
+            head = tail;
+        }
+        if (cur_t() == "Comma") {
+            advance_i();
+        } else {
+            break;
+        }
+    }
+    expect_tok("RBracket");
+    var id: i64 = node_new("array_lit");
+    var n: Node = nodes[id];
+    n.la = head;
+    slice_set(nodes, id, n);
+    node_at(id, ti);
+    return id;
+}
+
+parse_primary :: func() -> i64 {
+    var t: string = cur_t();
+    if (t == "Integer") {
+        var idx: i64 = advance_i();
+        var val: string = tk_v(idx);
+        var radix: i64 = 10;
+        if (starts_with_0x(val)) {
+            radix = 16;
+        } else {
+            if (starts_with_0b(val)) {
+                radix = 2;
+            }
+        }
+        var id: i64 = node_new("int");
+        var n: Node = nodes[id];
+        n.sa = val;
+        n.ia = radix;
+        slice_set(nodes, id, n);
+        node_at(id, idx);
+        return id;
+    }
+    if (t == "Float") {
+        var idx2: i64 = advance_i();
+        var id2: i64 = node_new("float");
+        var n2: Node = nodes[id2];
+        n2.sa = tk_v(idx2);
+        slice_set(nodes, id2, n2);
+        node_at(id2, idx2);
+        return id2;
+    }
+    if (t == "String") {
+        var idx3: i64 = advance_i();
+        var id3: i64 = node_new("string");
+        var n3: Node = nodes[id3];
+        n3.sa = tk_v(idx3);
+        slice_set(nodes, id3, n3);
+        node_at(id3, idx3);
+        return id3;
+    }
+    if (t == "KwTrue") {
+        var idx4: i64 = advance_i();
+        var id4: i64 = node_new("bool");
+        var n4: Node = nodes[id4];
+        n4.ba = true;
+        slice_set(nodes, id4, n4);
+        node_at(id4, idx4);
+        return id4;
+    }
+    if (t == "KwFalse") {
+        var idx5: i64 = advance_i();
+        var id5: i64 = node_new("bool");
+        var n5: Node = nodes[id5];
+        n5.ba = false;
+        slice_set(nodes, id5, n5);
+        node_at(id5, idx5);
+        return id5;
+    }
+    if (t == "KwNull") {
+        var idxn: i64 = advance_i();
+        var idn: i64 = node_new("null");
+        node_at(idn, idxn);
+        return idn;
+    }
+    if (t == "Identifier") {
+        var idx6: i64 = advance_i();
+        var name: string = tk_v(idx6);
+        if (cur_t() == "LBrace" && looks_like_struct_lit()) {
+            return parse_struct_lit(name, idx6);
+        }
+        var id6: i64 = node_new("ident");
+        var n6: Node = nodes[id6];
+        n6.sa = name;
+        slice_set(nodes, id6, n6);
+        node_at(id6, idx6);
+        return id6;
+    }
+    if (t == "LParen") {
+        var idx7: i64 = advance_i();
+        var inner: i64 = parse_expr();
+        expect_tok("RParen");
+        var id7: i64 = node_new("paren");
+        var n7: Node = nodes[id7];
+        n7.na = inner;
+        slice_set(nodes, id7, n7);
+        node_at(id7, idx7);
+        return id7;
+    }
+    if (t == "LBracket") {
+        return parse_array_lit();
+    }
+    eprint("parse error: unexpected token in expression: ");
+    eprint(cur_v());
+    eprint("\n");
+    exit(1);
+    return -1;
+}
+
+// ── 语句解析 ───────────────────────────────────────────────────
+
+parse_block :: func() -> i64 {
+    expect_tok("LBrace");
+    var head: i64 = -1;
+    var tail: i64 = -1;
+    while (cur_t() != "RBrace" && cur_t() != "Eof") {
+        var s: i64 = parse_statement();
+        if (s >= 0) {
+            tail = list_push(head, tail, s);
+            if (head < 0) {
+                head = tail;
+            }
+        }
+    }
+    expect_tok("RBrace");
+    return head;
+}
+
+parse_if_stmt :: func() -> i64 {
+    var ti: i64 = advance_i();
+    expect_tok("LParen");
+    var cond: i64 = parse_expr();
+    expect_tok("RParen");
+    var then_head: i64 = parse_block();
+    var else_head: i64 = -2;
+    if (cur_t() == "KwElse") {
+        advance_i();
+        if (cur_t() == "KwIf") {
+            var nested: i64 = parse_if_stmt();
+            var h: i64 = -1;
+            h = list_push(h, -1, nested);
+            else_head = h;
+        } else {
+            else_head = parse_block();
+        }
+    }
+    var id: i64 = node_new("if");
+    var n: Node = nodes[id];
+    n.na = cond;
+    n.la = then_head;
+    n.lb = else_head;
+    slice_set(nodes, id, n);
+    node_at(id, ti);
+    return id;
+}
+
+parse_local_var :: func(is_const: bool) -> i64 {
+    var ti: i64 = advance_i();
+    var name: string = expect_tok("Identifier");
+    var nti: i64 = pos - 1;
+    var tn: i64 = -1;
+    if (cur_t() == "Colon") {
+        advance_i();
+        tn = parse_type();
+    }
+    var init: i64 = -1;
+    if (cur_t() == "Assign") {
+        advance_i();
+        init = parse_expr();
+    }
+    expect_tok("Semicolon");
+    if (is_const) {
+        validate_const_name(name, nti);
+    } else {
+        validate_var_name(name, nti);
+    }
+    var id: i64 = node_new("var_decl");
+    var n: Node = nodes[id];
+    n.sa = name;
+    n.ba = is_const;
+    n.na = tn;
+    n.nb = init;
+    slice_set(nodes, id, n);
+    node_at(id, ti);
+    return id;
+}
+
+parse_for_stmt :: func() -> i64 {
+    var ti: i64 = advance_i();
+    expect_tok("LParen");
+    if (cur_t() == "Identifier" && peek_t(1) == "KwIn") {
+        var vi: i64 = advance_i();
+        var vname: string = tk_v(vi);
+        advance_i();
+        var iterable: i64 = parse_expr();
+        expect_tok("RParen");
+        var body: i64 = parse_block();
+        var id: i64 = node_new("for_each");
+        var n: Node = nodes[id];
+        n.sa = vname;
+        n.na = iterable;
+        n.la = body;
+        slice_set(nodes, id, n);
+        node_at(id, ti);
+        return id;
+    }
+    var init: i64 = -1;
+    if (cur_t() != "Semicolon") {
+        if (cur_t() == "KwVar") {
+            init = parse_local_var(false);
+        } else {
+        if (cur_t() == "KwConst") {
+            init = parse_local_var(true);
+        } else {
+            var e: i64 = parse_expr();
+            expect_tok("Semicolon");
+            init = node_new("expr");
+            var en: Node = nodes[init];
+            en.na = e;
+            slice_set(nodes, init, en);
+        }}
+    } else {
+        advance_i();
+    }
+    var cond: i64 = -1;
+    if (cur_t() != "Semicolon") {
+        cond = parse_expr();
+    }
+    expect_tok("Semicolon");
+    var upd: i64 = -1;
+    if (cur_t() != "RParen") {
+        upd = parse_expr();
+    }
+    expect_tok("RParen");
+    var body2: i64 = parse_block();
+    var id2: i64 = node_new("for");
+    var n2: Node = nodes[id2];
+    n2.na = init;
+    n2.nb = cond;
+    n2.nc = upd;
+    n2.la = body2;
+    slice_set(nodes, id2, n2);
+    node_at(id2, ti);
+    return id2;
+}
+
+parse_while_stmt :: func() -> i64 {
+    var ti: i64 = advance_i();
+    expect_tok("LParen");
+    var cond: i64 = parse_expr();
+    expect_tok("RParen");
+    var body: i64 = parse_block();
+    var id: i64 = node_new("while");
+    var n: Node = nodes[id];
+    n.na = cond;
+    n.la = body;
+    slice_set(nodes, id, n);
+    node_at(id, ti);
+    return id;
+}
+
+parse_switch_stmt :: func() -> i64 {
+    var ti: i64 = advance_i();
+    expect_tok("LParen");
+    var e: i64 = parse_expr();
+    expect_tok("RParen");
+    expect_tok("LBrace");
+    var cases_head: i64 = -1;
+    var cases_tail: i64 = -1;
+    var default_head: i64 = -2;
+    while (cur_t() != "RBrace" && cur_t() != "Eof") {
+        if (cur_t() == "KwCase") {
+            advance_i();
+            var pat: i64 = parse_expr();
+            expect_tok("Colon");
+            var bh: i64 = -1;
+            var bt: i64 = -1;
+            while (cur_t() != "KwCase" && cur_t() != "KwDefault" && cur_t() != "RBrace" && cur_t() != "Eof") {
+                var s: i64 = parse_statement();
+                if (s >= 0) {
+                    bt = list_push(bh, bt, s);
+                    if (bh < 0) {
+                        bh = bt;
+                    }
+                }
+            }
+            var cid: i64 = node_new("CS");
+            var cn: Node = nodes[cid];
+            cn.na = pat;
+            cn.la = bh;
+            slice_set(nodes, cid, cn);
+            cases_tail = list_push(cases_head, cases_tail, cid);
+            if (cases_head < 0) {
+                cases_head = cases_tail;
+            }
+        } else {
+        if (cur_t() == "KwDefault") {
+            advance_i();
+            expect_tok("Colon");
+            var dh: i64 = -1;
+            var dt: i64 = -1;
+            while (cur_t() != "KwCase" && cur_t() != "RBrace" && cur_t() != "Eof") {
+                var s2: i64 = parse_statement();
+                if (s2 >= 0) {
+                    dt = list_push(dh, dt, s2);
+                    if (dh < 0) {
+                        dh = dt;
+                    }
+                }
+            }
+            default_head = dh;
+        } else {
+            eprint("parse error: expected case or default in switch\n");
+            exit(1);
+        }}
+    }
+    expect_tok("RBrace");
+    var id: i64 = node_new("switch");
+    var n: Node = nodes[id];
+    n.na = e;
+    n.la = cases_head;
+    n.lb = default_head;
+    slice_set(nodes, id, n);
+    node_at(id, ti);
+    return id;
+}
+
+parse_return_stmt :: func() -> i64 {
+    var ti: i64 = advance_i();
+    var val: i64 = -1;
+    if (cur_t() != "Semicolon") {
+        val = parse_expr();
+    }
+    expect_tok("Semicolon");
+    var id: i64 = node_new("return");
+    var n: Node = nodes[id];
+    n.na = val;
+    slice_set(nodes, id, n);
+    node_at(id, ti);
+    return id;
+}
+
+parse_expr_or_assign_stmt :: func() -> i64 {
+    var ti: i64 = pos;
+    var e: i64 = parse_expr();
+    var t: string = cur_t();
+    var is_assign: bool = false;
+    if (t == "Assign" || t == "PlusAssign" || t == "MinusAssign" || t == "StarAssign") {
+        is_assign = true;
+    }
+    if (t == "SlashAssign" || t == "PercentAssign" || t == "BitAndAssign" || t == "BitOrAssign") {
+        is_assign = true;
+    }
+    if (t == "BitXorAssign" || t == "ShlAssign" || t == "ShrAssign") {
+        is_assign = true;
+    }
+    if (is_assign) {
+        var oi: i64 = advance_i();
+        var op: string = tk_v(oi);
+        var val: i64 = parse_expr();
+        expect_tok("Semicolon");
+        var id: i64 = node_new("assignment");
+        var n: Node = nodes[id];
+        n.na = e;
+        n.sa = op;
+        n.nb = val;
+        slice_set(nodes, id, n);
+        node_at(id, ti);
+        return id;
+    }
+    expect_tok("Semicolon");
+    var id2: i64 = node_new("expr");
+    var n2: Node = nodes[id2];
+    n2.na = e;
+    slice_set(nodes, id2, n2);
+    node_at(id2, ti);
+    return id2;
+}
+
+parse_statement :: func() -> i64 {
+    var t: string = cur_t();
+    if (t == "KwIf") {
+        return parse_if_stmt();
+    }
+    if (t == "KwFor") {
+        return parse_for_stmt();
+    }
+    if (t == "KwWhile") {
+        return parse_while_stmt();
+    }
+    if (t == "KwSwitch") {
+        return parse_switch_stmt();
+    }
+    if (t == "KwReturn") {
+        return parse_return_stmt();
+    }
+    if (t == "KwBreak") {
+        var tb: i64 = advance_i();
+        expect_tok("Semicolon");
+        var idb: i64 = node_new("break");
+        node_at(idb, tb);
+        return idb;
+    }
+    if (t == "KwContinue") {
+        var tc: i64 = advance_i();
+        expect_tok("Semicolon");
+        var idc: i64 = node_new("continue");
+        node_at(idc, tc);
+        return idc;
+    }
+    if (t == "KwDefer") {
+        var td: i64 = advance_i();
+        var body: i64 = parse_block();
+        var id: i64 = node_new("defer");
+        var n: Node = nodes[id];
+        n.la = body;
+        slice_set(nodes, id, n);
+        node_at(id, td);
+        return id;
+    }
+    if (t == "KwComptime") {
+        var tm: i64 = advance_i();
+        if (cur_t() == "LBrace") {
+            var body2: i64 = parse_block();
+            var id2: i64 = node_new("comptime_block");
+            var n2: Node = nodes[id2];
+            n2.la = body2;
+            slice_set(nodes, id2, n2);
+            node_at(id2, tm);
+            return id2;
+        }
+        var e: i64 = parse_expr();
+        expect_tok("Semicolon");
+        var ce: i64 = node_new("comptime");
+        var cn: Node = nodes[ce];
+        cn.na = e;
+        slice_set(nodes, ce, cn);
+        node_at(ce, tm);
+        var id3: i64 = node_new("expr");
+        var n3: Node = nodes[id3];
+        n3.na = ce;
+        slice_set(nodes, id3, n3);
+        node_at(id3, tm);
+        return id3;
+    }
+    if (t == "LBrace") {
+        var tl: i64 = pos;
+        var body3: i64 = parse_block();
+        var id4: i64 = node_new("block");
+        var n4: Node = nodes[id4];
+        n4.la = body3;
+        slice_set(nodes, id4, n4);
+        node_at(id4, tl);
+        return id4;
+    }
+    if (t == "KwVar") {
+        return parse_local_var(false);
+    }
+    if (t == "KwConst") {
+        return parse_local_var(true);
+    }
+    return parse_expr_or_assign_stmt();
+}
+
+// ── 注解查找辅助 ───────────────────────────────────────────────
+
+// 在注解链中查找名为 name 的第一个注解，返回节点下标或 -1
+ann_find :: func(head: i64, name: string) -> i64 {
+    var it: i64 = head;
+    while (it >= 0) {
+        var c: Child = kids[it];
+        var an: Node = nodes[c.val];
+        if (an.sa == name) {
+            return c.val;
+        }
+        it = c.next;
+    }
+    return -1;
+}
+
+// 注解的第一个参数节点下标，无参数返回 -1
+ann_first_arg :: func(ann_idx: i64) -> i64 {
+    var an: Node = nodes[ann_idx];
+    if (an.la < 0) {
+        return -1;
+    }
+    var c: Child = kids[an.la];
+    return c.val;
+}
+
+// ── 声明解析 ───────────────────────────────────────────────────
+
+parse_struct_decl :: func(name: string, anns: i64, layout: string) -> i64 {
+    advance_i();
+    var post: i64 = parse_annotations();
+    var all: i64 = list_concat(anns, post);
+
+    var is_bitpack: bool = false;
+    var bp_type: string = "";
+    var has_bp_type: bool = false;
+    var bp: i64 = ann_find(all, "bitpack");
+    if (bp >= 0) {
+        is_bitpack = true;
+        var arg: i64 = ann_first_arg(bp);
+        if (arg >= 0) {
+            var argn: Node = nodes[arg];
+            if (argn.kind == "ident") {
+                bp_type = argn.sa;
+                has_bp_type = true;
+            }
+        }
+    }
+
+    expect_tok("LBrace");
+    var fh: i64 = -1;
+    var ft: i64 = -1;
+    while (cur_t() != "RBrace" && cur_t() != "Eof") {
+        var fname: string = expect_tok("Identifier");
+        expect_tok("Colon");
+        var fid: i64 = -1;
+        if (is_bitpack) {
+            var wv: string = expect_tok("Integer");
+            var fanns: i64 = parse_annotations();
+            expect_tok("Semicolon");
+            fid = node_new("F");
+            var fn: Node = nodes[fid];
+            fn.sa = fname;
+            fn.na = mk_scalar("void");
+            fn.ia = parse_int_str(wv);
+            fn.la = fanns;
+            slice_set(nodes, fid, fn);
+        } else {
+            var tn: i64 = parse_type();
+            var fanns2: i64 = parse_annotations();
+            expect_tok("Semicolon");
+            fid = node_new("F");
+            var fn2: Node = nodes[fid];
+            fn2.sa = fname;
+            fn2.na = tn;
+            fn2.ia = -1;
+            fn2.la = fanns2;
+            slice_set(nodes, fid, fn2);
+        }
+        ft = list_push(fh, ft, fid);
+        if (fh < 0) {
+            fh = ft;
+        }
+    }
+    expect_tok("RBrace");
+
+    var id: i64 = node_new("StructDecl");
+    var n: Node = nodes[id];
+    n.sa = name;
+    n.la = all;
+    n.sb = layout;
+    n.ba = is_bitpack;
+    n.sc = bp_type;
+    n.has_sc = has_bp_type;
+    n.lb = fh;
+    slice_set(nodes, id, n);
+    return id;
+}
+
+parse_enum_decl :: func(name: string, anns: i64) -> i64 {
+    advance_i();
+    var underlying: string = "u32";
+    if (cur_t() == "Colon") {
+        advance_i();
+        var ti: i64 = advance_i();
+        underlying = tk_v(ti);
+    }
+    var post: i64 = parse_annotations();
+    var all: i64 = list_concat(anns, post);
+
+    expect_tok("LBrace");
+    var vh: i64 = -1;
+    var vt: i64 = -1;
+    while (cur_t() != "RBrace" && cur_t() != "Eof") {
+        if (cur_t() == "At" || cur_t() != "Identifier") {
+            advance_i();
+            continue;
+        }
+        var vname: string = expect_tok("Identifier");
+        var val: i64 = -1;
+        if (cur_t() == "Assign") {
+            advance_i();
+            val = parse_expr();
+        }
+        var vanns: i64 = parse_annotations();
+        if (cur_t() == "Comma") {
+            advance_i();
+        }
+        var vid: i64 = node_new("V");
+        var vn: Node = nodes[vid];
+        vn.sa = vname;
+        vn.na = val;
+        vn.la = vanns;
+        slice_set(nodes, vid, vn);
+        vt = list_push(vh, vt, vid);
+        if (vh < 0) {
+            vh = vt;
+        }
+    }
+    expect_tok("RBrace");
+
+    var id: i64 = node_new("EnumDecl");
+    var n: Node = nodes[id];
+    n.sa = name;
+    n.la = all;
+    n.sb = underlying;
+    n.lb = vh;
+    slice_set(nodes, id, n);
+    return id;
+}
+
+parse_flag_decl :: func(name: string, anns: i64) -> i64 {
+    advance_i();
+    var underlying: string = "u32";
+    if (cur_t() == "LBracket") {
+        advance_i();
+        var ti: i64 = advance_i();
+        underlying = tk_v(ti);
+        expect_tok("RBracket");
+    }
+    var post: i64 = parse_annotations();
+    var all: i64 = list_concat(anns, post);
+
+    expect_tok("LBrace");
+    var sh: i64 = -1;
+    var st: i64 = -1;
+    while (cur_t() != "RBrace" && cur_t() != "Eof") {
+        if (cur_t() != "Identifier") {
+            advance_i();
+            continue;
+        }
+        var sname: string = expect_tok("Identifier");
+        expect_tok("Colon");
+        var wv: string = expect_tok("Integer");
+        var sanns: i64 = parse_annotations();
+
+        var offset: i64 = -1;
+        var has_offset: bool = false;
+        var oa: i64 = ann_find(sanns, "offset");
+        if (oa >= 0) {
+            var arg: i64 = ann_first_arg(oa);
+            if (arg >= 0) {
+                var argn: Node = nodes[arg];
+                if (argn.kind == "number") {
+                    offset = parse_int_str(argn.sa);
+                    has_offset = true;
+                }
+            }
+        }
+
+        if (cur_t() == "Comma" || cur_t() == "Semicolon") {
+            advance_i();
+        }
+        var sid: i64 = node_new("SL");
+        var sn: Node = nodes[sid];
+        sn.sa = sname;
+        sn.ia = parse_int_str(wv);
+        sn.ib = offset;
+        sn.bb = has_offset;
+        sn.la = sanns;
+        slice_set(nodes, sid, sn);
+        st = list_push(sh, st, sid);
+        if (sh < 0) {
+            sh = st;
+        }
+    }
+    expect_tok("RBrace");
+
+    var id: i64 = node_new("FlagDecl");
+    var n: Node = nodes[id];
+    n.sa = name;
+    n.la = all;
+    n.sb = underlying;
+    n.lb = sh;
+    slice_set(nodes, id, n);
+    return id;
+}
+
+parse_flag_set_decl :: func(name: string, anns: i64) -> i64 {
+    advance_i();
+    var post: i64 = parse_annotations();
+    var all: i64 = list_concat(anns, post);
+
+    expect_tok("LBrace");
+    var sh: i64 = -1;
+    var st: i64 = -1;
+    while (cur_t() != "RBrace" && cur_t() != "Eof") {
+        if (cur_t() != "Identifier") {
+            advance_i();
+            continue;
+        }
+        var sname: string = expect_tok("Identifier");
+        expect_tok("Colon");
+        var wv: string = expect_tok("Integer");
+        var sanns: i64 = parse_annotations();
+        if (cur_t() == "Comma" || cur_t() == "Semicolon") {
+            advance_i();
+        }
+        var sid: i64 = node_new("SL");
+        var sn: Node = nodes[sid];
+        sn.sa = sname;
+        sn.ia = parse_int_str(wv);
+        sn.ib = -1;
+        sn.bb = false;
+        sn.la = sanns;
+        slice_set(nodes, sid, sn);
+        st = list_push(sh, st, sid);
+        if (sh < 0) {
+            sh = st;
+        }
+    }
+    expect_tok("RBrace");
+
+    var id: i64 = node_new("FlagSetDecl");
+    var n: Node = nodes[id];
+    n.sa = name;
+    n.la = all;
+    n.lb = sh;
+    slice_set(nodes, id, n);
+    return id;
+}
+
+parse_union_decl :: func(name: string, anns: i64) -> i64 {
+    advance_i();
+    var post: i64 = parse_annotations();
+    var all: i64 = list_concat(anns, post);
+
+    expect_tok("LBrace");
+    var mh: i64 = -1;
+    var mt: i64 = -1;
+    while (cur_t() != "RBrace" && cur_t() != "Eof") {
+        if (cur_t() != "Identifier") {
+            advance_i();
+            continue;
+        }
+        var mname: string = expect_tok("Identifier");
+        expect_tok("Colon");
+        var tn: i64 = parse_type();
+        var manns: i64 = parse_annotations();
+        if (cur_t() == "Comma" || cur_t() == "Semicolon") {
+            advance_i();
+        }
+        var mid: i64 = node_new("M");
+        var mn: Node = nodes[mid];
+        mn.sa = mname;
+        mn.na = tn;
+        mn.la = manns;
+        slice_set(nodes, mid, mn);
+        mt = list_push(mh, mt, mid);
+        if (mh < 0) {
+            mh = mt;
+        }
+    }
+    expect_tok("RBrace");
+
+    var id: i64 = node_new("UnionDecl");
+    var n: Node = nodes[id];
+    n.sa = name;
+    n.la = all;
+    n.lb = mh;
+    slice_set(nodes, id, n);
+    return id;
+}
+
+parse_func_decl :: func(name: string, anns: i64, is_comptime: bool) -> i64 {
+    advance_i();
+    expect_tok("LParen");
+    var ph: i64 = -1;
+    var pt: i64 = -1;
+    while (cur_t() != "RParen" && cur_t() != "Eof") {
+        var pname: string = expect_tok("Identifier");
+        expect_tok("Colon");
+        var ptn: i64 = parse_type();
+        var panns: i64 = parse_annotations();
+        var pid: i64 = node_new("P");
+        var pn: Node = nodes[pid];
+        pn.sa = pname;
+        pn.na = ptn;
+        pn.la = panns;
+        slice_set(nodes, pid, pn);
+        pt = list_push(ph, pt, pid);
+        if (ph < 0) {
+            ph = pt;
+        }
+        if (cur_t() == "Comma") {
+            advance_i();
+        } else {
+            break;
+        }
+    }
+    expect_tok("RParen");
+    expect_tok("Arrow");
+    var rt: i64 = parse_type();
+    var post: i64 = parse_annotations();
+    var all: i64 = list_concat(anns, post);
+
+    var body: i64 = -2;
+    var is_extern: bool = false;
+    if (cur_t() == "Semicolon") {
+        advance_i();
+        is_extern = true;
+    } else {
+        if (cur_t() == "LBrace") {
+            body = parse_block();
+        } else {
+            eprint("parse error: expected '{' or ';' after function signature\n");
+            exit(1);
+        }
+    }
+
+    var id: i64 = node_new("FuncDecl");
+    var n: Node = nodes[id];
+    n.sa = name;
+    n.la = all;
+    n.lb = ph;
+    n.na = rt;
+    n.ba = is_extern;
+    n.bb = is_comptime;
+    n.lc = body;
+    slice_set(nodes, id, n);
+    return id;
+}
+
+parse_global_var :: func(is_const: bool) -> i64 {
+    advance_i();
+    var name: string = expect_tok("Identifier");
+    var nti: i64 = pos - 1;
+    var tn: i64 = -1;
+    if (cur_t() == "Colon") {
+        advance_i();
+        tn = parse_type();
+    }
+    var init: i64 = -1;
+    if (cur_t() == "Assign") {
+        advance_i();
+        init = parse_expr();
+    }
+    expect_tok("Semicolon");
+    if (is_const) {
+        validate_const_name(name, nti);
+    } else {
+        validate_var_name(name, nti);
+    }
+
+    if (is_const) {
+        if (init < 0) {
+            init = node_new("null");
+        }
+        var id: i64 = node_new("GlobalConstDecl");
+        var n: Node = nodes[id];
+        n.sa = name;
+        n.la = -1;
+        n.na = tn;
+        n.nb = init;
+        n.bb = false;
+        slice_set(nodes, id, n);
+        node_at(id, nti);
+        return id;
+    }
+
+    if (tn < 0) {
+        tn = mk_scalar("void");
+    }
+    var id2: i64 = node_new("GlobalVarDecl");
+    var n2: Node = nodes[id2];
+    n2.sa = name;
+    n2.la = -1;
+    n2.na = tn;
+    n2.nb = init;
+    n2.bb = false;
+    slice_set(nodes, id2, n2);
+    node_at(id2, nti);
+    return id2;
+}
+
+parse_import_decl :: func(anns: i64) -> i64 {
+    advance_i();
+    var path: string = expect_tok("String");
+    var pti: i64 = pos - 1;
+    var alias: string = "";
+    var has_alias: bool = false;
+    if (cur_t() == "KwAs") {
+        advance_i();
+        alias = expect_tok("Identifier");
+        has_alias = true;
+    }
+    expect_tok("Semicolon");
+
+    var id: i64 = node_new("ImportDecl");
+    var n: Node = nodes[id];
+    n.has_sa = false;
+    n.la = anns;
+    n.sb = path;
+    n.sc = alias;
+    n.has_sc = has_alias;
+    slice_set(nodes, id, n);
+    node_at(id, pti);
+    return id;
+}
+
+parse_type_alias :: func(name: string, anns: i64) -> i64 {
+    var tn: i64 = parse_type();
+    expect_tok("Semicolon");
+    var id: i64 = node_new("TypeAliasDecl");
+    var n: Node = nodes[id];
+    n.sa = name;
+    n.la = anns;
+    n.na = tn;
+    slice_set(nodes, id, n);
+    return id;
+}
+
+parse_decl_body :: func(name: string, anns: i64, is_comptime: bool) -> i64 {
+    var layout: string = "default";
+    if (cur_t() == "Hash") {
+        advance_i();
+        var li: i64 = advance_i();
+        if (tk_t(li) == "Identifier") {
+            var lv: string = tk_v(li);
+            if (lv == "soa") {
+                layout = "soa";
+            } else {
+                if (lv == "aos") {
+                    layout = "aos";
+                }
+            }
+        }
+    }
+
+    var t: string = cur_t();
+    if (t == "KwStruct") {
+        return parse_struct_decl(name, anns, layout);
+    }
+    if (t == "KwEnum") {
+        return parse_enum_decl(name, anns);
+    }
+    if (t == "KwFlag") {
+        return parse_flag_decl(name, anns);
+    }
+    if (t == "KwUnion") {
+        return parse_union_decl(name, anns);
+    }
+    if (t == "KwFunc") {
+        return parse_func_decl(name, anns, is_comptime);
+    }
+    if (t == "Identifier" && cur_v() == "flag_set") {
+        return parse_flag_set_decl(name, anns);
+    }
+    return parse_type_alias(name, anns);
+}
+
+parse_declaration :: func() -> i64 {
+    var anns: i64 = parse_annotations();
+
+    if (cur_t() == "KwVar") {
+        return parse_global_var(false);
+    }
+    if (cur_t() == "KwConst") {
+        return parse_global_var(true);
+    }
+    if (cur_t() == "KwImport") {
+        return parse_import_decl(anns);
+    }
+
+    var is_comptime: bool = false;
+    if (cur_t() == "KwComptime") {
+        advance_i();
+        is_comptime = true;
+    }
+
+    if (cur_t() != "Identifier") {
+        eprint("parse error: expected declaration name but found ");
+        eprint(cur_v());
+        eprint("\n");
+        exit(1);
+    }
+    var ni: i64 = advance_i();
+    var name: string = tk_v(ni);
+    validate_decl_name(name, ni);
+
+    if (cur_t() != "DoubleColon") {
+        eprint("parse error: expected '::' after declaration name\n");
+        exit(1);
+    }
+    advance_i();
+
+    var d: i64 = parse_decl_body(name, anns, is_comptime);
+    if (d >= 0) {
+        node_at(d, ni);
+    }
+    return d;
+}
+
+parse_unit :: func() -> void {
+    while (cur_t() != "Eof") {
+        if (cur_t() == "Semicolon") {
+            advance_i();
+            continue;
+        }
+        var d: i64 = parse_declaration();
+        if (d >= 0) {
+            append(decl_list, d);
+        }
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════
+// M7-2: 类型检查器（移植 src/types/checker.ts + types.ts）
+// ═══════════════════════════════════════════════════════════════
+
+// ── TypeInfo 扁平池（复刻 types.ts TypeInfo）──────────────────
+// kind: Scalar/Void/String/StringBuilder/Array/Slice/Map/Pointer/
+//       Optional/Struct/Enum/Flag/FlagSet/Union/Variant/Func/Named/Unknown
+
+TI :: struct {
+    kind: string;
+    name: string;   // Scalar/Struct/Enum/Flag/FlagSet/Union/Func/Named
+    und: string;    // Enum/Flag underlying
+    bw: i64;        // Scalar bitWidth
+    elem: i64;      // Array/Slice/Pointer/Optional 子类型（TI 索引）
+    key: i64;       // Map key
+    val: i64;       // Map value
+    alen: i64;      // Array length
+}
+
+var tis: []TI;
+
+ti_mk :: func(kind: string) -> i64 {
+    var t: TI;
+    t.kind = kind;
+    t.name = "";
+    t.und = "";
+    t.bw = 0;
+    t.elem = -1;
+    t.key = -1;
+    t.val = -1;
+    t.alen = 0;
+    append(tis, t);
+    return (slice_len(tis) as i64) - 1;
+}
+
+ti_named :: func(kind: string, name: string) -> i64 {
+    var i: i64 = ti_mk(kind);
+    var t: TI = tis[i];
+    t.name = name;
+    slice_set(tis, i, t);
+    return i;
+}
+
+ti_with_und :: func(kind: string, name: string, und: string) -> i64 {
+    var i: i64 = ti_named(kind, name);
+    var t: TI = tis[i];
+    t.und = und;
+    slice_set(tis, i, t);
+    return i;
+}
+
+ti_elem_of :: func(kind: string, elem: i64) -> i64 {
+    var i: i64 = ti_mk(kind);
+    var t: TI = tis[i];
+    t.elem = elem;
+    slice_set(tis, i, t);
+    return i;
+}
+
+// ── 标量类型工具（复刻 types.ts）───────────────────────────────
+
+is_int_name :: func(name: string) -> bool {
+    if (name == "u8" || name == "u16" || name == "u32" || name == "u64") {
+        return true;
+    }
+    return name == "i8" || name == "i16" || name == "i32" || name == "i64";
+}
+
+is_float_name :: func(name: string) -> bool {
+    return name == "f16" || name == "f32" || name == "f64";
+}
+
+get_bw :: func(name: string) -> i64 {
+    if (name == "u8" || name == "i8") {
+        return 8;
+    }
+    if (name == "u16" || name == "i16" || name == "f16") {
+        return 16;
+    }
+    if (name == "u32" || name == "i32" || name == "f32") {
+        return 32;
+    }
+    if (name == "u64" || name == "i64" || name == "f64") {
+        return 64;
+    }
+    if (name == "bool") {
+        return 1;
+    }
+    return -1;
+}
+
+ti_scalar :: func(name: string) -> i64 {
+    var i: i64 = ti_named("Scalar", name);
+    var t: TI = tis[i];
+    t.bw = get_bw(name);
+    slice_set(tis, i, t);
+    return i;
+}
+
+ti_kind :: func(i: i64) -> string {
+    if (i < 0) {
+        return "Unknown";
+    }
+    var t: TI = tis[i];
+    return t.kind;
+}
+
+ti_name :: func(i: i64) -> string {
+    var t: TI = tis[i];
+    return t.name;
+}
+
+is_int_ti :: func(i: i64) -> bool {
+    var t: TI = tis[i];
+    if (t.kind != "Scalar") {
+        return false;
+    }
+    return is_int_name(t.name);
+}
+
+is_float_ti :: func(i: i64) -> bool {
+    var t: TI = tis[i];
+    if (t.kind != "Scalar") {
+        return false;
+    }
+    return is_float_name(t.name);
+}
+
+// typesEqual（递归）
+ti_equal :: func(ai: i64, bi: i64) -> bool {
+    var a: TI = tis[ai];
+    var b: TI = tis[bi];
+    if (a.kind != b.kind) {
+        return false;
+    }
+    if (a.kind == "Scalar") {
+        return a.name == b.name;
+    }
+    if (a.kind == "Void" || a.kind == "String" || a.kind == "StringBuilder") {
+        return true;
+    }
+    if (a.kind == "Variant" || a.kind == "Unknown") {
+        return true;
+    }
+    if (a.kind == "Array") {
+        if (a.alen != b.alen) {
+            return false;
+        }
+        return ti_equal(a.elem, b.elem);
+    }
+    if (a.kind == "Slice" || a.kind == "Pointer" || a.kind == "Optional") {
+        return ti_equal(a.elem, b.elem);
+    }
+    if (a.kind == "Map") {
+        if (ti_equal(a.key, b.key) == false) {
+            return false;
+        }
+        return ti_equal(a.val, b.val);
+    }
+    return a.name == b.name;
+}
+
+// canExplicitCast
+can_cast :: func(fi: i64, ti2: i64) -> bool {
+    if (ti_equal(fi, ti2)) {
+        return true;
+    }
+    if (is_int_ti(fi) && is_int_ti(ti2)) {
+        return true;
+    }
+    if (is_float_ti(fi) && is_float_ti(ti2)) {
+        return true;
+    }
+    if (is_int_ti(fi) && is_float_ti(ti2)) {
+        return true;
+    }
+    if (is_float_ti(fi) && is_int_ti(ti2)) {
+        return true;
+    }
+    var f: TI = tis[fi];
+    var t: TI = tis[ti2];
+    if (f.kind == "Scalar" && f.name == "bool" && is_int_ti(ti2)) {
+        return true;
+    }
+    if (is_int_ti(fi) && t.kind == "Scalar" && t.name == "bool") {
+        return true;
+    }
+    return false;
+}
+
+// typeToString（递归）
+ti_str :: func(i: i64) -> string {
+    var t: TI = tis[i];
+    if (t.kind == "Scalar") {
+        return t.name;
+    }
+    if (t.kind == "Void") {
+        return "void";
+    }
+    if (t.kind == "String") {
+        return "string";
+    }
+    if (t.kind == "StringBuilder") {
+        return "StringBuilder";
+    }
+    if (t.kind == "Array") {
+        return cat4("[", i2s(t.alen), "]", ti_str(t.elem));
+    }
+    if (t.kind == "Slice") {
+        return cat2("[]", ti_str(t.elem));
+    }
+    if (t.kind == "Map") {
+        return cat4("map[", ti_str(t.key), "]", ti_str(t.val));
+    }
+    if (t.kind == "Pointer") {
+        return cat2("*", ti_str(t.elem));
+    }
+    if (t.kind == "Optional") {
+        return cat2("?", ti_str(t.elem));
+    }
+    if (t.kind == "Variant") {
+        return "Variant";
+    }
+    if (t.kind == "Unknown") {
+        return "<unknown>";
+    }
+    return t.name;
+}
+
+// ── 符号表（扁平池 + scope 链）─────────────────────────────────
+
+Sym :: struct {
+    name: string;
+    kind: string;   // type/var/func/const
+    ti: i64;        // TI 索引
+    decl: i64;      // Node 索引（decl），-1 = 无
+    scope: i64;
+}
+
+var syms: []Sym;
+var scope_parents: []i64;
+
+scope_new :: func(parent: i64) -> i64 {
+    append(scope_parents, parent);
+    return (slice_len(scope_parents) as i64) - 1;
+}
+
+// 仅在指定 scope 内查找（不上溯）
+sym_find_in :: func(scope: i64, name: string) -> i64 {
+    var n: i64 = slice_len(syms) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        var s: Sym = syms[i];
+        if (s.scope == scope && s.name == name) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// Map.set 语义：已存在则忽略（首定义保留）
+sym_define :: func(scope: i64, name: string, kind: string, ti2: i64, decl: i64) -> void {
+    if (sym_find_in(scope, name) >= 0) {
+        return;
+    }
+    var s: Sym;
+    s.name = name;
+    s.kind = kind;
+    s.ti = ti2;
+    s.decl = decl;
+    s.scope = scope;
+    append(syms, s);
+}
+
+// 沿 scope 链上溯查找
+sym_lookup :: func(scope: i64, name: string) -> i64 {
+    var sc: i64 = scope;
+    while (sc >= 0) {
+        var f: i64 = sym_find_in(sc, name);
+        if (f >= 0) {
+            return f;
+        }
+        sc = scope_parents[sc];
+    }
+    return -1;
+}
+
+var global_scope: i64;
+var cur_scope: i64;
+var cur_ret: i64;   // 当前函数返回类型（TI 索引）
+
+// ── 诊断定位助手（复刻 tok?.file ?? "" 等）────────────────────
+
+n_file :: func(ni: i64) -> string {
+    if (ni < 0) {
+        return "";
+    }
+    var n: Node = nodes[ni];
+    if (n.ln == 0) {
+        return "";
+    }
+    return g_file;
+}
+
+n_line :: func(ni: i64) -> i64 {
+    if (ni < 0) {
+        return 1;
+    }
+    var n: Node = nodes[ni];
+    if (n.ln == 0) {
+        return 1;
+    }
+    return n.ln as i64;
+}
+
+n_col :: func(ni: i64) -> i64 {
+    if (ni < 0) {
+        return 1;
+    }
+    var n: Node = nodes[ni];
+    if (n.ln == 0) {
+        return 1;
+    }
+    return n.cl as i64;
+}
+
+// errorTypeMismatch（复刻 checker.ts:678）
+err_type_mismatch :: func(eni: i64, exp: i64, act: i64) -> void {
+    var es: string = ti_str(exp);
+    var fs2: string = ti_str(act);
+    var l: i64 = n_line(eni);
+    var c: i64 = n_col(eni);
+    var di: i64 = diag_new("T_TYPE_MISMATCH", "error",
+        cat4("type mismatch: expected ", es, " but got ", fs2),
+        n_file(eni), l, c, l, c + 5);
+    slb_begin();
+    slb_add(cat2("expected: ", es));
+    slb_add(cat2("found:    ", fs2));
+    diag_set_nt(di, slb_head);
+}
+
+// ── 整数字面量解析（复刻 BigInt(value) 与 parseInt(value,radix)）──
+
+// BigInt 语义：识别 0x/0X/0b/0B 前缀
+lit_u64 :: func(v: string) -> u64 {
+    var n: u64 = str_len(v);
+    var r: u64 = 0;
+    if (n >= 2 && v[0] == 48 && (v[1] == 120 || v[1] == 88)) {
+        var i: u64 = 2;
+        while (i < n) {
+            var c: u8 = v[i];
+            var d: u64 = 0;
+            if (c >= 48 && c <= 57) {
+                d = (c - 48) as u64;
+            } else {
+                if (c >= 97 && c <= 102) {
+                    d = (c - 87) as u64;
+                } else {
+                    d = (c - 55) as u64;
+                }
+            }
+            r = r * 16 + d;
+            i = i + 1;
+        }
+        return r;
+    }
+    if (n >= 2 && v[0] == 48 && (v[1] == 98 || v[1] == 66)) {
+        var j: u64 = 2;
+        while (j < n) {
+            r = r * 2 + ((v[j] - 48) as u64);
+            j = j + 1;
+        }
+        return r;
+    }
+    var k: u64 = 0;
+    while (k < n) {
+        r = r * 10 + ((v[k] - 48) as u64);
+        k = k + 1;
+    }
+    return r;
+}
+
+// parseInt(value, radix) 语义：radix=16 接受 0x 前缀；其余按位解析，
+// 遇非法字符停止
+parse_int_len :: func(v: string, radix: i64) -> i64 {
+    var n: u64 = str_len(v);
+    var r: i64 = 0;
+    if (radix == 16) {
+        var i: u64 = 0;
+        if (n >= 2 && v[0] == 48 && (v[1] == 120 || v[1] == 88)) {
+            i = 2;
+        }
+        while (i < n) {
+            var c: u8 = v[i];
+            var d: i64 = -1;
+            if (c >= 48 && c <= 57) {
+                d = (c - 48) as i64;
+            }
+            if (c >= 97 && c <= 102) {
+                d = (c - 87) as i64;
+            }
+            if (c >= 65 && c <= 70) {
+                d = (c - 55) as i64;
+            }
+            if (d < 0) {
+                return r;
+            }
+            r = r * 16 + d;
+            i = i + 1;
+        }
+        return r;
+    }
+    if (radix == 2) {
+        var j: u64 = 0;
+        while (j < n) {
+            var c2: u8 = v[j];
+            if (c2 != 48 && c2 != 49) {
+                return r;
+            }
+            r = r * 2 + ((c2 - 48) as i64);
+            j = j + 1;
+        }
+        return r;
+    }
+    var k: u64 = 0;
+    while (k < n) {
+        var c3: u8 = v[k];
+        if (c3 < 48 || c3 > 57) {
+            return r;
+        }
+        r = r * 10 + ((c3 - 48) as i64);
+        k = k + 1;
+    }
+    return r;
+}
+
+// ── 类型解析 resolveType（复刻 checker.ts:134）────────────────
+
+resolve_ti :: func(tn: i64) -> i64 {
+    if (tn < 0) {
+        return ti_mk("Unknown");
+    }
+    var n: Node = nodes[tn];
+    if (n.kind == "scalar") {
+        if (is_scalar_name(n.sa)) {
+            return ti_scalar(n.sa);
+        }
+        if (n.sa == "void") {
+            return ti_mk("Void");
+        }
+        if (n.sa == "string") {
+            return ti_mk("String");
+        }
+        if (n.sa == "StringBuilder") {
+            return ti_mk("StringBuilder");
+        }
+        return ti_named("Named", n.sa);
+    }
+    if (n.kind == "array") {
+        var elem: i64 = resolve_ti(n.na);
+        var length: i64 = 0;
+        if (n.nb >= 0) {
+            var le: Node = nodes[n.nb];
+            if (le.kind == "int") {
+                length = parse_int_len(le.sa, le.ia);
+            }
+        }
+        var ai: i64 = ti_elem_of("Array", elem);
+        var at: TI = tis[ai];
+        at.alen = length;
+        slice_set(tis, ai, at);
+        return ai;
+    }
+    if (n.kind == "slice") {
+        return ti_elem_of("Slice", resolve_ti(n.na));
+    }
+    if (n.kind == "map") {
+        var kt: i64 = resolve_ti(n.na);
+        var vt: i64 = resolve_ti(n.nb);
+        var mi: i64 = ti_mk("Map");
+        var mt: TI = tis[mi];
+        mt.key = kt;
+        mt.val = vt;
+        slice_set(tis, mi, mt);
+        return mi;
+    }
+    if (n.kind == "named") {
+        var si: i64 = sym_lookup(global_scope, n.sa);
+        if (si >= 0) {
+            var s: Sym = syms[si];
+            return s.ti;
+        }
+        return ti_named("Named", n.sa);
+    }
+    if (n.kind == "variant") {
+        return ti_mk("Variant");
+    }
+    if (n.kind == "flag") {
+        return ti_with_und("Flag", "<anonymous>", n.sa);
+    }
+    if (n.kind == "flag_set") {
+        return ti_named("FlagSet", "<anonymous>");
+    }
+    if (n.kind == "pointer") {
+        return ti_elem_of("Pointer", resolve_ti(n.na));
+    }
+    if (n.kind == "optional") {
+        return ti_elem_of("Optional", resolve_ti(n.na));
+    }
+    return ti_mk("Unknown");
+}
+
+// ── 声明注册 registerDecl（复刻 checker.ts:97）────────────────
+
+register_decl :: func(d: i64) -> void {
+    var n: Node = nodes[d];
+    if (n.kind == "StructDecl") {
+        sym_define(global_scope, n.sa, "type", ti_named("Struct", n.sa), d);
+        return;
+    }
+    if (n.kind == "EnumDecl") {
+        sym_define(global_scope, n.sa, "type", ti_with_und("Enum", n.sa, n.sb), d);
+        return;
+    }
+    if (n.kind == "FlagDecl") {
+        sym_define(global_scope, n.sa, "type", ti_with_und("Flag", n.sa, n.sb), d);
+        return;
+    }
+    if (n.kind == "FlagSetDecl") {
+        sym_define(global_scope, n.sa, "type", ti_named("FlagSet", n.sa), d);
+        return;
+    }
+    if (n.kind == "UnionDecl") {
+        sym_define(global_scope, n.sa, "type", ti_named("Union", n.sa), d);
+        return;
+    }
+    if (n.kind == "FuncDecl") {
+        sym_define(global_scope, n.sa, "func", ti_named("Func", n.sa), d);
+        return;
+    }
+    if (n.kind == "GlobalVarDecl") {
+        sym_define(global_scope, n.sa, "var", resolve_ti(n.na), d);
+        return;
+    }
+    if (n.kind == "GlobalConstDecl") {
+        var cti: i64 = -1;
+        if (n.na >= 0) {
+            cti = resolve_ti(n.na);
+        } else {
+            cti = ti_mk("Unknown");
+        }
+        sym_define(global_scope, n.sa, "const", cti, d);
+        return;
+    }
+    if (n.kind == "TypeAliasDecl") {
+        sym_define(global_scope, n.sa, "type", resolve_ti(n.na), d);
+        return;
+    }
+}
+
+// ── 列表助手 ───────────────────────────────────────────────────
+
+list_last_val :: func(head: i64) -> i64 {
+    var c: i64 = head;
+    var last: i64 = -1;
+    while (c >= 0) {
+        var k: Child = kids[c];
+        last = k.val;
+        c = k.next;
+    }
+    return last;
+}
+
+list_count :: func(head: i64) -> i64 {
+    var c: i64 = head;
+    var n: i64 = 0;
+    while (c >= 0) {
+        var k: Child = kids[c];
+        n = n + 1;
+        c = k.next;
+    }
+    return n;
+}
+
+// ── 内置函数返回类型（复刻 checker.ts:616）────────────────────
+
+builtin_ret :: func(name: string) -> i64 {
+    if (name == "assert_eq" || name == "assert_true" || name == "assert_false") {
+        return ti_mk("Void");
+    }
+    if (name == "assert_panic" || name == "flag_set" || name == "print") {
+        return ti_mk("Void");
+    }
+    if (name == "println" || name == "append" || name == "slice_set") {
+        return ti_mk("Void");
+    }
+    if (name == "exit" || name == "eprint" || name == "sb_append_str") {
+        return ti_mk("Void");
+    }
+    if (name == "sb_append_char" || name == "sb_append_u64" || name == "sb_append_i64") {
+        return ti_mk("Void");
+    }
+    if (name == "sb_clear") {
+        return ti_mk("Void");
+    }
+    if (name == "flag_get") {
+        return ti_scalar("u32");
+    }
+    if (name == "str_len" || name == "slice_len") {
+        return ti_scalar("u64");
+    }
+    if (name == "str_at") {
+        return ti_scalar("u8");
+    }
+    if (name == "file_read_all" || name == "path_resolve" || name == "str_slice") {
+        return ti_mk("String");
+    }
+    if (name == "sb_to_str" || name == "to_string") {
+        return ti_mk("String");
+    }
+    if (name == "file_write_all") {
+        return ti_scalar("bool");
+    }
+    if (name == "args") {
+        return ti_elem_of("Slice", ti_mk("String"));
+    }
+    if (name == "sb_new") {
+        return ti_mk("StringBuilder");
+    }
+    return ti_mk("Unknown");
+}
+
+// ── 表达式类型推断 inferExprType（复刻 checker.ts:479）────────
+
+infer_expr :: func(e: i64) -> i64 {
+    var n: Node = nodes[e];
+    if (n.kind == "int") {
+        var v: u64 = lit_u64(n.sa);
+        if (v <= 255) {
+            return ti_scalar("u8");
+        }
+        if (v <= 65535) {
+            return ti_scalar("u16");
+        }
+        if (v <= 4294967295) {
+            return ti_scalar("u32");
+        }
+        return ti_scalar("u64");
+    }
+    if (n.kind == "float") {
+        return ti_scalar("f64");
+    }
+    if (n.kind == "string") {
+        return ti_mk("String");
+    }
+    if (n.kind == "bool") {
+        return ti_scalar("bool");
+    }
+    if (n.kind == "null") {
+        return ti_mk("Unknown");
+    }
+    if (n.kind == "ident") {
+        var si: i64 = sym_lookup(cur_scope, n.sa);
+        if (si >= 0) {
+            var s: Sym = syms[si];
+            return s.ti;
+        }
+        if (n.sa == "true" || n.sa == "false") {
+            return ti_scalar("bool");
+        }
+        return ti_mk("Unknown");
+    }
+    if (n.kind == "binary") {
+        var lt: i64 = infer_expr(n.na);
+        var rt: i64 = infer_expr(n.nb);
+        var op: string = n.sa;
+        if (op == "==" || op == "!=" || op == "<" || op == ">" || op == "<=" || op == ">=") {
+            return ti_scalar("bool");
+        }
+        if (op == "&&" || op == "||") {
+            return ti_scalar("bool");
+        }
+        if (ti_kind(lt) == "Scalar" && ti_kind(rt) == "Scalar") {
+            if (ti_equal(lt, rt)) {
+                return lt;
+            }
+            var ln2: Node = nodes[n.na];
+            var rn2: Node = nodes[n.nb];
+            var llit: bool = ln2.kind == "int";
+            var rlit: bool = rn2.kind == "int";
+            if (llit && rlit == false) {
+                return rt;
+            }
+            if (rlit && llit == false) {
+                return lt;
+            }
+            if (llit && rlit) {
+                return lt;
+            }
+            var di: i64 = diag_new("T_TYPE_IMPLICIT_CAST", "error",
+                cat6("binary operator '", op, "' requires same types, got ", ti_str(lt), " and ", ti_str(rt)),
+                "", 1, 1, 1, 5);
+            slb_begin();
+            slb_add("use explicit cast: `expr as Type`");
+            diag_set_nt(di, slb_head);
+        }
+        if (ti_kind(lt) != "Unknown") {
+            return lt;
+        }
+        return rt;
+    }
+    if (n.kind == "unary") {
+        var ot: i64 = infer_expr(n.na);
+        if (n.sa == "!") {
+            return ti_scalar("bool");
+        }
+        return ot;
+    }
+    if (n.kind == "assign") {
+        infer_expr(n.nb);
+        return infer_expr(n.na);
+    }
+    if (n.kind == "call") {
+        var cn: Node = nodes[n.na];
+        if (cn.kind == "ident") {
+            var fname: string = cn.sa;
+            var si2: i64 = sym_lookup(global_scope, fname);
+            if (si2 >= 0) {
+                var s2: Sym = syms[si2];
+                if (ti_kind(s2.ti) == "Func" && s2.decl >= 0) {
+                    var fd: Node = nodes[s2.decl];
+                    if (fd.kind == "FuncDecl") {
+                        return resolve_ti(fd.na);
+                    }
+                }
+            }
+            return builtin_ret(fname);
+        }
+        return ti_mk("Unknown");
+    }
+    if (n.kind == "member") {
+        var obt: i64 = infer_expr(n.na);
+        var obk: string = ti_kind(obt);
+        if (obk == "Struct" || obk == "Named") {
+            var si3: i64 = sym_lookup(global_scope, ti_name(obt));
+            if (si3 >= 0) {
+                var s3: Sym = syms[si3];
+                if (s3.decl >= 0) {
+                    var sd: Node = nodes[s3.decl];
+                    if (sd.kind == "StructDecl") {
+                        var c: i64 = sd.lb;
+                        while (c >= 0) {
+                            var k: Child = kids[c];
+                            var f: Node = nodes[k.val];
+                            if (f.sa == n.sa) {
+                                return resolve_ti(f.na);
+                            }
+                            c = k.next;
+                        }
+                    }
+                }
+            }
+        }
+        if (obk == "Enum") {
+            return obt;
+        }
+        return ti_mk("Unknown");
+    }
+    if (n.kind == "index") {
+        var obt2: i64 = infer_expr(n.na);
+        var obk2: string = ti_kind(obt2);
+        if (obk2 == "Array" || obk2 == "Slice") {
+            var t2: TI = tis[obt2];
+            return t2.elem;
+        }
+        if (obk2 == "String") {
+            return ti_scalar("u8");
+        }
+        if (obk2 == "Map") {
+            var t3: TI = tis[obt2];
+            return t3.val;
+        }
+        return ti_mk("Unknown");
+    }
+    if (n.kind == "array_lit") {
+        var cnt: i64 = list_count(n.la);
+        if (cnt > 0) {
+            var k2: Child = kids[n.la];
+            var et: i64 = infer_expr(k2.val);
+            var ai: i64 = ti_elem_of("Array", et);
+            var at: TI = tis[ai];
+            at.alen = cnt;
+            slice_set(tis, ai, at);
+            return ai;
+        }
+        return ti_elem_of("Array", ti_mk("Unknown"));
+    }
+    if (n.kind == "map_lit") {
+        if (n.la >= 0) {
+            var k3: Child = kids[n.la];
+            var en: Node = nodes[k3.val];
+            var kt: i64 = infer_expr(en.na);
+            var vt: i64 = infer_expr(en.nb);
+            var mi: i64 = ti_mk("Map");
+            var mt: TI = tis[mi];
+            mt.key = kt;
+            mt.val = vt;
+            slice_set(tis, mi, mt);
+            return mi;
+        }
+        var mi2: i64 = ti_mk("Map");
+        var ku: i64 = ti_mk("Unknown");
+        var vu: i64 = ti_mk("Unknown");
+        var mt2: TI = tis[mi2];
+        mt2.key = ku;
+        mt2.val = vu;
+        slice_set(tis, mi2, mt2);
+        return mi2;
+    }
+    if (n.kind == "struct_lit") {
+        return ti_named("Struct", n.sa);
+    }
+    if (n.kind == "cast") {
+        return resolve_ti(n.nb);
+    }
+    if (n.kind == "paren") {
+        return infer_expr(n.na);
+    }
+    if (n.kind == "comptime") {
+        return infer_expr(n.na);
+    }
+    return ti_mk("Unknown");
+}
+
+// ── 返回路径分析（复刻 checker.ts:653）────────────────────────
+
+all_paths_return :: func(head: i64) -> bool {
+    if (head < 0) {
+        return false;
+    }
+    var last: i64 = list_last_val(head);
+    if (last < 0) {
+        return false;
+    }
+    return stmt_returns(last);
+}
+
+stmt_returns :: func(s: i64) -> bool {
+    var n: Node = nodes[s];
+    if (n.kind == "return") {
+        return true;
+    }
+    if (n.kind == "if") {
+        if (n.lb != -2) {
+            if (all_paths_return(n.la)) {
+                return all_paths_return(n.lb);
+            }
+            return false;
+        }
+        return false;
+    }
+    if (n.kind == "block") {
+        return all_paths_return(n.la);
+    }
+    return false;
+}
+
+// ── 语句检查 checkStmt（复刻 checker.ts:345）──────────────────
+
+check_stmt :: func(s: i64) -> void {
+    var n: Node = nodes[s];
+    if (n.kind == "var_decl") {
+        var vt: i64 = -1;
+        if (n.na >= 0) {
+            vt = resolve_ti(n.na);
+        }
+        if (n.nb >= 0) {
+            var it: i64 = infer_expr(n.nb);
+            if (vt >= 0 && ti_kind(it) != "Unknown" && ti_equal(it, vt) == false) {
+                var vk: string = ti_kind(vt);
+                var int_to_fe: bool = (vk == "Flag" || vk == "Enum") && is_int_ti(it);
+                if (int_to_fe == false && can_cast(it, vt) == false) {
+                    err_type_mismatch(n.nb, vt, it);
+                }
+            }
+            if (vt < 0) {
+                sym_define(cur_scope, n.sa, "var", it, -1);
+                return;
+            }
+        }
+        if (vt >= 0) {
+            sym_define(cur_scope, n.sa, "var", vt, -1);
+        }
+        return;
+    }
+    if (n.kind == "if") {
+        var ct: i64 = infer_expr(n.na);
+        if (ti_kind(ct) == "Scalar" && ti_name(ct) != "bool") {
+            var di: i64 = diag_new("T_STMT_IMPLICIT_BOOL", "error",
+                cat2("if condition must be bool or explicit comparison, got ", ti_str(ct)),
+                "", 1, 1, 1, 5);
+            var fx: i64 = fix_one("add explicit comparison", "", 1, 1, 1, 1, "(expr != 0)");
+            diag_set_fs(di, fx);
+        }
+        var prev: i64 = cur_scope;
+        cur_scope = scope_new(prev);
+        var c: i64 = n.la;
+        while (c >= 0) {
+            var k: Child = kids[c];
+            check_stmt(k.val);
+            c = k.next;
+        }
+        if (n.lb != -2) {
+            cur_scope = scope_new(prev);
+            var c2: i64 = n.lb;
+            while (c2 >= 0) {
+                var k2: Child = kids[c2];
+                check_stmt(k2.val);
+                c2 = k2.next;
+            }
+        }
+        cur_scope = prev;
+        return;
+    }
+    if (n.kind == "for" || n.kind == "while") {
+        var cond: i64 = n.na;
+        if (n.kind == "for") {
+            cond = n.nb;
+        }
+        if (cond >= 0) {
+            var ct2: i64 = infer_expr(cond);
+            if (ti_kind(ct2) == "Scalar" && ti_name(ct2) != "bool") {
+                diag_new("T_STMT_IMPLICIT_BOOL", "error",
+                    cat2("loop condition must be bool, got ", ti_str(ct2)),
+                    "", 1, 1, 1, 5);
+            }
+        }
+        var prev2: i64 = cur_scope;
+        cur_scope = scope_new(prev2);
+        if (n.kind == "for" && n.na >= 0) {
+            check_stmt(n.na);
+        }
+        var c3: i64 = n.la;
+        while (c3 >= 0) {
+            var k3: Child = kids[c3];
+            check_stmt(k3.val);
+            c3 = k3.next;
+        }
+        cur_scope = prev2;
+        return;
+    }
+    if (n.kind == "for_each") {
+        var itt: i64 = infer_expr(n.na);
+        var prev3: i64 = cur_scope;
+        cur_scope = scope_new(prev3);
+        var et: i64 = -1;
+        var itk: string = ti_kind(itt);
+        if (itk == "Slice" || itk == "Array") {
+            var t4: TI = tis[itt];
+            et = t4.elem;
+        } else {
+            et = ti_mk("Unknown");
+        }
+        sym_define(cur_scope, n.sa, "var", et, -1);
+        var c4: i64 = n.la;
+        while (c4 >= 0) {
+            var k4: Child = kids[c4];
+            check_stmt(k4.val);
+            c4 = k4.next;
+        }
+        cur_scope = prev3;
+        return;
+    }
+    if (n.kind == "return") {
+        if (n.na >= 0) {
+            var rt: i64 = infer_expr(n.na);
+            if (ti_kind(rt) != "Unknown" && ti_equal(rt, cur_ret) == false) {
+                if (can_cast(rt, cur_ret) == false) {
+                    err_type_mismatch(n.na, cur_ret, rt);
+                }
+            }
+        }
+        return;
+    }
+    if (n.kind == "assignment") {
+        var tt: i64 = infer_expr(n.na);
+        var vt2: i64 = infer_expr(n.nb);
+        if (ti_kind(tt) != "Unknown" && ti_kind(vt2) != "Unknown" && ti_equal(tt, vt2) == false) {
+            if (can_cast(vt2, tt) == false) {
+                err_type_mismatch(n.nb, tt, vt2);
+            }
+        }
+        return;
+    }
+    if (n.kind == "expr") {
+        infer_expr(n.na);
+        return;
+    }
+    if (n.kind == "block" || n.kind == "defer" || n.kind == "comptime_block") {
+        var prev4: i64 = cur_scope;
+        cur_scope = scope_new(prev4);
+        var c5: i64 = n.la;
+        while (c5 >= 0) {
+            var k5: Child = kids[c5];
+            check_stmt(k5.val);
+            c5 = k5.next;
+        }
+        cur_scope = prev4;
+        return;
+    }
+    if (n.kind == "switch") {
+        infer_expr(n.na);
+        var c6: i64 = n.la;
+        while (c6 >= 0) {
+            var k6: Child = kids[c6];
+            var cs: Node = nodes[k6.val];
+            infer_expr(cs.na);
+            var b: i64 = cs.la;
+            while (b >= 0) {
+                var kb: Child = kids[b];
+                check_stmt(kb.val);
+                b = kb.next;
+            }
+            c6 = k6.next;
+        }
+        if (n.lb != -2) {
+            var c7: i64 = n.lb;
+            while (c7 >= 0) {
+                var k7: Child = kids[c7];
+                check_stmt(k7.val);
+                c7 = k7.next;
+            }
+        }
+        return;
+    }
+}
+
+// ── 声明检查（复刻 checker.ts:178-341）────────────────────────
+
+check_func_decl :: func(d: i64) -> void {
+    var n: Node = nodes[d];
+    if (n.lc == -2) {
+        return;
+    }
+
+    var prev: i64 = cur_scope;
+    cur_scope = scope_new(global_scope);
+
+    var c: i64 = n.lb;
+    while (c >= 0) {
+        var k: Child = kids[c];
+        var p: Node = nodes[k.val];
+        sym_define(cur_scope, p.sa, "var", resolve_ti(p.na), -1);
+        c = k.next;
+    }
+
+    var prev_ret: i64 = cur_ret;
+    cur_ret = resolve_ti(n.na);
+
+    var c2: i64 = n.lc;
+    while (c2 >= 0) {
+        var k2: Child = kids[c2];
+        check_stmt(k2.val);
+        c2 = k2.next;
+    }
+
+    if (ti_kind(cur_ret) != "Void") {
+        if (all_paths_return(n.lc) == false) {
+            var anchor: i64 = list_last_val(n.lc);
+            var l: i64 = n_line(anchor);
+            var cc: i64 = n_col(anchor);
+            diag_new("T_PARSE_INVALID_EXPR", "error",
+                cat3("function '", n.sa, "' is missing return on some code paths (all branches must explicitly return)"),
+                n_file(anchor), l, cc, l, cc + 10);
+        }
+    }
+
+    cur_ret = prev_ret;
+    cur_scope = prev;
+}
+
+check_struct_decl :: func(d: i64) -> void {
+    var n: Node = nodes[d];
+    var c: i64 = n.lb;
+    while (c >= 0) {
+        var k: Child = kids[c];
+        var f: Node = nodes[k.val];
+        if (f.ia == -1) {
+            resolve_ti(f.na);
+        }
+        c = k.next;
+    }
+}
+
+check_enum_decl :: func(d: i64) -> void {
+    var n: Node = nodes[d];
+    if (is_int_name(n.sb) == false) {
+        var di: i64 = diag_new("T_TYPE_MISMATCH", "error",
+            cat5("enum '", n.sa, "' underlying type must be an integer type, got '", n.sb, "'"),
+            "", 1, 1, 1, 10);
+        slb_begin();
+        slb_add("u8");
+        slb_add("u16");
+        slb_add("u32");
+        slb_add("u64");
+        slb_add("i8");
+        slb_add("i16");
+        slb_add("i32");
+        slb_add("i64");
+        diag_set_vv(di, slb_head);
+    }
+
+    var c: i64 = n.lb;
+    while (c >= 0) {
+        var k: Child = kids[c];
+        var v: Node = nodes[k.val];
+        if (v.na >= 0) {
+            var vt: i64 = infer_expr(v.na);
+            if (ti_kind(vt) == "Scalar" && is_int_name(ti_name(vt)) == false) {
+                diag_new("T_TYPE_MISMATCH", "error",
+                    cat2("enum variant value must be integer, got ", ti_str(vt)),
+                    "", 1, 1, 1, 5);
+            }
+        }
+        c = k.next;
+    }
+}
+
+// flag decl 检查用的 usedBits 暂存池（append-only，按 base 划分）
+var fd_names: []string;
+var fd_starts: []i64;
+var fd_ends: []i64;
+
+check_flag_decl :: func(d: i64) -> void {
+    var n: Node = nodes[d];
+    var is_flag: bool = n.kind == "FlagDecl";
+    if (is_flag && is_int_name(n.sb) == false) {
+        var di: i64 = diag_new("T_TYPE_MISMATCH", "error",
+            cat5("flag '", n.sa, "' underlying type must be an integer type, got '", n.sb, "'"),
+            "", 1, 1, 1, 10);
+        slb_begin();
+        slb_add("u8");
+        slb_add("u16");
+        slb_add("u32");
+        slb_add("u64");
+        diag_set_vv(di, slb_head);
+    }
+
+    var auto_off: i64 = 0;
+    var base: i64 = slice_len(fd_names) as i64;
+
+    var c: i64 = n.lb;
+    while (c >= 0) {
+        var k: Child = kids[c];
+        var sl: Node = nodes[k.val];
+        var start: i64 = auto_off;
+        if (sl.bb) {
+            start = sl.ib;
+        }
+        var end: i64 = start + sl.ia;
+
+        var i: i64 = base;
+        var total: i64 = slice_len(fd_names) as i64;
+        while (i < total) {
+            var us: i64 = fd_starts[i];
+            var ue: i64 = fd_ends[i];
+            if (start < ue && end > us) {
+                var msb: StringBuilder = sb_new();
+                sb_append_str(msb, "flag slot '");
+                sb_append_str(msb, sl.sa);
+                sb_append_str(msb, "' (bits ");
+                sb_append_i64(msb, start);
+                sb_append_str(msb, "-");
+                sb_append_i64(msb, end - 1);
+                sb_append_str(msb, ") overlaps with '");
+                sb_append_str(msb, fd_names[i]);
+                sb_append_str(msb, "' (bits ");
+                sb_append_i64(msb, us);
+                sb_append_str(msb, "-");
+                sb_append_i64(msb, ue - 1);
+                sb_append_str(msb, ")");
+                diag_new("T_FLAG_OFFSET_CONFLICT", "error", sb_to_str(msb), "", 1, 1, 1, 10);
+            }
+            i = i + 1;
+        }
+
+        append(fd_names, sl.sa);
+        append(fd_starts, start);
+        append(fd_ends, end);
+
+        if (is_flag) {
+            var tw: i64 = get_bw(n.sb);
+            if (tw > 0 && end > tw) {
+                var osb: StringBuilder = sb_new();
+                sb_append_str(osb, "flag '");
+                sb_append_str(osb, n.sa);
+                sb_append_str(osb, "' slot '");
+                sb_append_str(osb, sl.sa);
+                sb_append_str(osb, "' exceeds ");
+                sb_append_str(osb, n.sb);
+                sb_append_str(osb, " (");
+                sb_append_i64(osb, tw);
+                sb_append_str(osb, " bits): uses bits ");
+                sb_append_i64(osb, start);
+                sb_append_str(osb, "-");
+                sb_append_i64(osb, end - 1);
+                var di2: i64 = diag_new("T_FLAG_OVERFLOW", "error", sb_to_str(osb), "", 1, 1, 1, 10);
+                slb_begin();
+                slb_add(cat3("0-", i2s(tw - 1), " bits"));
+                diag_set_vv(di2, slb_head);
+            }
+        }
+
+        auto_off = end;
+        c = k.next;
+    }
+}
+
+check_decl :: func(d: i64) -> void {
+    var n: Node = nodes[d];
+    if (n.kind == "FuncDecl") {
+        check_func_decl(d);
+        return;
+    }
+    if (n.kind == "StructDecl") {
+        check_struct_decl(d);
+        return;
+    }
+    if (n.kind == "EnumDecl") {
+        check_enum_decl(d);
+        return;
+    }
+    if (n.kind == "FlagDecl" || n.kind == "FlagSetDecl") {
+        check_flag_decl(d);
+        return;
+    }
+    if (n.kind == "GlobalVarDecl") {
+        if (n.nb >= 0) {
+            var it: i64 = infer_expr(n.nb);
+            var vt: i64 = resolve_ti(n.na);
+            if (ti_kind(it) != "Unknown" && ti_equal(it, vt) == false) {
+                if (can_cast(it, vt) == false) {
+                    err_type_mismatch(n.nb, vt, it);
+                }
+            }
+        }
+        return;
+    }
+    if (n.kind == "GlobalConstDecl") {
+        if (n.nb >= 0) {
+            var it2: i64 = infer_expr(n.nb);
+            if (n.na >= 0) {
+                var ct: i64 = resolve_ti(n.na);
+                if (ti_kind(it2) != "Unknown" && ti_equal(it2, ct) == false) {
+                    if (can_cast(it2, ct) == false) {
+                        err_type_mismatch(n.nb, ct, it2);
+                    }
+                }
+            }
+        }
+        return;
+    }
+}
+
+// ── check 主流程（复刻 checker.ts:83）─────────────────────────
+
+run_check :: func() -> void {
+    global_scope = scope_new(-1);
+    cur_scope = global_scope;
+    cur_ret = ti_mk("Void");
+
+    var n: i64 = slice_len(decl_list) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        register_decl(decl_list[i]);
+        i = i + 1;
+    }
+    var j: i64 = 0;
+    while (j < n) {
+        check_decl(decl_list[j]);
+        j = j + 1;
+    }
+}
+
+// ── Flag Resolver（复刻 src/flag/bitfield.ts resolve）─────────
+// 注意：与 checker.checkFlagDecl 不同——overflow 先检、overlap 后检；
+// FlagSetDecl 不产生诊断。
+
+var fr_names: []string;
+var fr_starts: []i64;
+var fr_ends: []i64;
+
+fr_resolve_flag :: func(d: i64) -> void {
+    var n: Node = nodes[d];
+    var tw: i64 = get_bw(n.sb);
+    if (tw < 0) {
+        tw = 32;
+    }
+    var auto_off: i64 = 0;
+    var base: i64 = slice_len(fr_names) as i64;
+
+    var c: i64 = n.lb;
+    while (c >= 0) {
+        var k: Child = kids[c];
+        var sl: Node = nodes[k.val];
+        var start: i64 = auto_off;
+        if (sl.bb) {
+            start = sl.ib;
+        }
+        var end: i64 = start + sl.ia;
+
+        if (end > tw) {
+            var osb: StringBuilder = sb_new();
+            sb_append_str(osb, "flag '");
+            sb_append_str(osb, n.sa);
+            sb_append_str(osb, "' slot '");
+            sb_append_str(osb, sl.sa);
+            sb_append_str(osb, "' exceeds ");
+            sb_append_str(osb, n.sb);
+            sb_append_str(osb, " capacity: uses bits ");
+            sb_append_i64(osb, start);
+            sb_append_str(osb, "-");
+            sb_append_i64(osb, end - 1);
+            sb_append_str(osb, ", but ");
+            sb_append_str(osb, n.sb);
+            sb_append_str(osb, " only has ");
+            sb_append_i64(osb, tw);
+            sb_append_str(osb, " bits");
+            var di: i64 = diag_new("T_FLAG_OVERFLOW", "error", sb_to_str(osb), "", 0, 0, 0, 0);
+            slb_begin();
+            slb_add(cat2("0-", i2s(tw - 1)));
+            diag_set_vv(di, slb_head);
+            var fx: i64 = fix_one("reduce bit width or use larger underlying type (u64)", "", 0, 0, 0, 0, "flag[u64]");
+            diag_set_fs(di, fx);
+        }
+
+        var i: i64 = base;
+        var total: i64 = slice_len(fr_names) as i64;
+        while (i < total) {
+            var us: i64 = fr_starts[i];
+            var ue: i64 = fr_ends[i];
+            if (start < ue && end > us) {
+                var msb: StringBuilder = sb_new();
+                sb_append_str(msb, "flag slot '");
+                sb_append_str(msb, sl.sa);
+                sb_append_str(msb, "' (bits ");
+                sb_append_i64(msb, start);
+                sb_append_str(msb, "-");
+                sb_append_i64(msb, end - 1);
+                sb_append_str(msb, ") overlaps with '");
+                sb_append_str(msb, fr_names[i]);
+                sb_append_str(msb, "' (bits ");
+                sb_append_i64(msb, us);
+                sb_append_str(msb, "-");
+                sb_append_i64(msb, ue - 1);
+                sb_append_str(msb, ")");
+                diag_new("T_FLAG_OFFSET_CONFLICT", "error", sb_to_str(msb), "", 0, 0, 0, 0);
+            }
+            i = i + 1;
+        }
+
+        append(fr_names, sl.sa);
+        append(fr_starts, start);
+        append(fr_ends, end);
+        auto_off = end;
+        c = k.next;
+    }
+}
+
+flag_pass :: func() -> void {
+    // 复刻 index.ts compilePipeline：每个 FlagDecl 被 resolve 两次——
+    // 一次经 typeInfoProvider.registerDecl（内部调 flagResolver.resolve），
+    // 一次为管线中的直接 flagResolver.resolve(decl)。诊断因此重复两遍。
+    var n: i64 = slice_len(decl_list) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        var d: i64 = decl_list[i];
+        var nd: Node = nodes[d];
+        if (nd.kind == "FlagDecl") {
+            fr_resolve_flag(d);
+            fr_resolve_flag(d);
+        }
+        i = i + 1;
+    }
+}
+
+// ── 注解注册表（复刻 src/annotations/registry.ts）─────────────
+
+AnnDef :: struct {
+    name: string;
+    spec: string;       // none/string/ident/ident_list/number/mixed
+    targets: string;    // ", " 分隔（照 validTargets.join(", ") 顺序）
+    depr: bool;
+    repl: string;
+}
+
+var anndefs: []AnnDef;
+
+ad :: func(name: string, spec: string, targets: string) -> void {
+    var a: AnnDef;
+    a.name = name;
+    a.spec = spec;
+    a.targets = targets;
+    a.depr = false;
+    a.repl = "";
+    append(anndefs, a);
+}
+
+init_anndefs :: func() -> void {
+    ad("test", "none", "func");
+    ad("test_skip", "none", "func");
+    ad("test_only", "none", "func");
+    ad("expect_fail", "none", "func");
+    ad("test_group", "string", "func");
+    ad("derive", "ident_list", "struct, enum, flag, flag_set, union");
+    ad("cfg", "ident", "global, func, struct, enum, var, const");
+    ad("cfg_attr", "mixed", "global, func, struct, enum");
+    ad("allow", "ident_list", "global, func, struct, var, const");
+    ad("warn", "ident_list", "global, func, struct, var, const");
+    ad("deny", "ident_list", "global, func, struct, var, const");
+    ad("deprecated", "string", "global, func, struct, enum, var, const");
+    ad("repr", "ident", "struct, enum, union");
+    ad("no_padding", "none", "struct, flag");
+    ad("align", "number", "struct, union");
+    ad("bitpack", "ident", "struct");
+    ad("offset", "number", "flag_slot");
+    ad("binary_offset", "number", "field");
+    ad("binary_skip", "none", "field");
+    ad("soa", "none", "struct");
+    ad("aos", "none", "struct");
+    ad("inline", "none", "func");
+    ad("no_inline", "none", "func");
+    ad("must_use", "none", "func");
+    ad("const_fn", "none", "func");
+    ad("unsafe", "none", "func");
+    ad("main", "none", "func");
+    ad("export_symbol", "string", "func");
+    ad("link_name", "string", "func");
+    ad("panic_handler", "none", "func");
+    ad("doc", "string", "global");
+    ad("doc_file", "string", "func, struct, enum");
+    ad("export", "mixed", "field, func, var, const");
+    ad("auto_convert", "none", "struct, enum");
+    // auto_convert 标记 deprecated
+    var last: i64 = (slice_len(anndefs) as i64) - 1;
+    var a2: AnnDef = anndefs[last];
+    a2.depr = true;
+    a2.repl = "@derive(FromString)";
+    slice_set(anndefs, last, a2);
+}
+
+anndef_find :: func(name: string) -> i64 {
+    var n: i64 = slice_len(anndefs) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        var a: AnnDef = anndefs[i];
+        if (a.name == name) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// ", " 分隔的 targets 中精确匹配
+targets_has :: func(ts: string, t: string) -> bool {
+    var n: i64 = str_len(ts) as i64;
+    var start: i64 = 0;
+    var i: i64 = 0;
+    while (i <= n) {
+        var hit: bool = i == n;
+        if (hit == false) {
+            hit = ts[i] == 44;
+        }
+        if (hit) {
+            var seg: string = str_slice(ts, start, i);
+            if (seg == t) {
+                return true;
+            }
+            start = i + 2;
+            i = i + 1;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// 把 targets 逐段加入 slb（validValues）
+targets_push_vv :: func(ts: string) -> void {
+    var n: i64 = str_len(ts) as i64;
+    var start: i64 = 0;
+    var i: i64 = 0;
+    while (i <= n) {
+        var hit: bool = i == n;
+        if (hit == false) {
+            hit = ts[i] == 44;
+        }
+        if (hit) {
+            slb_add(str_slice(ts, start, i));
+            start = i + 2;
+            i = i + 1;
+        }
+        i = i + 1;
+    }
+}
+
+starts_with :: func(s: string, p: string) -> bool {
+    var np: u64 = str_len(p);
+    if (str_len(s) < np) {
+        return false;
+    }
+    var i: u64 = 0;
+    while (i < np) {
+        if (s[i] != p[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+is_cfg_cond :: func(v: string) -> bool {
+    if (v == "debug" || v == "release" || v == "windows" || v == "linux") {
+        return true;
+    }
+    return v == "mac" || v == "android" || v == "web";
+}
+
+is_derive_trait :: func(v: string) -> bool {
+    if (v == "ToString" || v == "FromString" || v == "Clone" || v == "Copy") {
+        return true;
+    }
+    if (v == "DebugPrint" || v == "BinarySerde" || v == "Eq") {
+        return true;
+    }
+    return v == "PartialEq" || v == "Hash";
+}
+
+is_valid_warning :: func(v: string) -> bool {
+    if (v == "unused" || v == "unused_field" || v == "dead_code") {
+        return true;
+    }
+    if (v == "overflow_literal" || v == "implicit_cast") {
+        return true;
+    }
+    return v == "bitfield_overlap" || v == "deprecated";
+}
+
+vv_derive_traits :: func() -> void {
+    slb_add("ToString");
+    slb_add("FromString");
+    slb_add("Clone");
+    slb_add("Copy");
+    slb_add("DebugPrint");
+    slb_add("BinarySerde");
+    slb_add("Eq");
+    slb_add("PartialEq");
+    slb_add("Hash");
+}
+
+vv_warnings :: func() -> void {
+    slb_add("unused");
+    slb_add("unused_field");
+    slb_add("dead_code");
+    slb_add("overflow_literal");
+    slb_add("implicit_cast");
+    slb_add("bitfield_overlap");
+    slb_add("deprecated");
+}
+
+vv_cfg :: func() -> void {
+    slb_add("debug");
+    slb_add("release");
+    slb_add("windows");
+    slb_add("linux");
+    slb_add("mac");
+    slb_add("android");
+    slb_add("web");
+}
+
+// derive/allow/warn/deny 的 trait/warning 项遍历校验
+ann_check_items :: func(ai: i64, is_derive: bool, l: i64, c: i64) -> void {
+    var an: Node = nodes[ai];
+    var c1: i64 = an.la;
+    while (c1 >= 0) {
+        var k: Child = kids[c1];
+        var arg: Node = nodes[k.val];
+        if (arg.kind == "list") {
+            var c2: i64 = arg.la;
+            while (c2 >= 0) {
+                var k2: Child = kids[c2];
+                var m: Node = nodes[k2.val];
+                var v: string = "";
+                if (m.kind == "ident") {
+                    v = m.sa;
+                }
+                ann_check_item(v, is_derive, l, c);
+                c2 = k2.next;
+            }
+        } else {
+            var v2: string = "";
+            if (arg.kind == "ident") {
+                v2 = arg.sa;
+            }
+            ann_check_item(v2, is_derive, l, c);
+        }
+        c1 = k.next;
+    }
+}
+
+ann_check_item :: func(v: string, is_derive: bool, l: i64, c: i64) -> void {
+    if (is_derive) {
+        if (is_derive_trait(v) == false) {
+            var di: i64 = diag_new("T_DERIVE_UNSUPPORTED", "error",
+                cat3("unsupported derive trait '", v, "'"),
+                g_file, l, c, l, c + 20);
+            slb_begin();
+            vv_derive_traits();
+            diag_set_vv(di, slb_head);
+        }
+        return;
+    }
+    if (is_valid_warning(v) == false) {
+        var di2: i64 = diag_new("T_ANNOTATION_INVALID_ARG", "error",
+            cat3("unknown warning item '", v, "'"),
+            g_file, l, c, l, c + 20);
+        slb_begin();
+        vv_warnings();
+        diag_set_vv(di2, slb_head);
+    }
+}
+
+// validate（复刻 registry.ts:168）；ai = A 节点索引
+ann_validate :: func(ai: i64, target: string) -> void {
+    var an: Node = nodes[ai];
+    var name: string = an.sa;
+    var l: i64 = an.ln as i64;
+    var c: i64 = an.cl as i64;
+    var name_len: i64 = str_len(name) as i64;
+    var di_: i64 = anndef_find(name);
+
+    if (di_ < 0) {
+        var d1: i64 = diag_new("T_ANNOTATION_UNKNOWN", "error",
+            cat3("unknown annotation '@", name, "'"),
+            g_file, l, c, l, c + name_len + 1);
+        slb_begin();
+        var n: i64 = slice_len(anndefs) as i64;
+        var i: i64 = 0;
+        while (i < n) {
+            var a: AnnDef = anndefs[i];
+            slb_add(cat2("@", a.name));
+            i = i + 1;
+        }
+        diag_set_vv(d1, slb_head);
+        return;
+    }
+
+    var def: AnnDef = anndefs[di_];
+
+    if (def.depr) {
+        var msg: string = cat3("annotation '@", name, "' is deprecated");
+        if (str_len(def.repl) > 0) {
+            msg = cat4(msg, ", use ", def.repl, " instead");
+        }
+        diag_new("T_ANNOTATION_UNKNOWN", "warning", msg, g_file, l, c, l, c + name_len + 1);
+    }
+
+    if (targets_has(def.targets, target) == false) {
+        var d2: i64 = diag_new("T_ANNOTATION_WRONG_TARGET", "error",
+            cat6("annotation '@", name, "' cannot be applied to ", target, ", valid targets: ", def.targets),
+            g_file, l, c, l, c + name_len + 1);
+        slb_begin();
+        targets_push_vv(def.targets);
+        diag_set_vv(d2, slb_head);
+    }
+
+    // ── validateArgs ──
+    var argc: i64 = list_count(an.la);
+
+    if (def.spec == "none") {
+        if (argc > 0) {
+            diag_new("T_ANNOTATION_INVALID_ARG", "error",
+                cat3("annotation '@", name, "' takes no arguments"),
+                g_file, l, c, l, c + name_len + 1);
+        }
+        return;
+    }
+    if (def.spec == "string") {
+        var bad: bool = argc != 1;
+        if (bad == false) {
+            var k0: Child = kids[an.la];
+            var a0: Node = nodes[k0.val];
+            bad = a0.kind != "string";
+        }
+        if (bad) {
+            var d3: i64 = diag_new("T_ANNOTATION_INVALID_ARG", "error",
+                cat3("annotation '@", name, "' requires exactly one string argument"),
+                g_file, l, c, l, c + name_len + 1);
+            slb_begin();
+            slb_add("@${annotation.name}(\"text\")");
+            diag_set_vv(d3, slb_head);
+        }
+        return;
+    }
+    if (def.spec == "ident") {
+        var bad2: bool = argc != 1;
+        var a0k: string = "";
+        var a0v: string = "";
+        if (argc >= 1) {
+            var k1: Child = kids[an.la];
+            var a1: Node = nodes[k1.val];
+            a0k = a1.kind;
+            a0v = a1.sa;
+        }
+        if (bad2 == false) {
+            bad2 = a0k != "ident" && a0k != "list";
+        }
+        if (bad2) {
+            diag_new("T_ANNOTATION_INVALID_ARG", "error",
+                cat3("annotation '@", name, "' requires one identifier argument"),
+                g_file, l, c, l, c + name_len + 1);
+        }
+        if (name == "cfg" && a0k == "ident") {
+            if (is_cfg_cond(a0v) == false && starts_with(a0v, "feature=") == false) {
+                var d4: i64 = diag_new("T_ANNOTATION_INVALID_ARG", "error",
+                    cat3("invalid @cfg condition '", a0v, "'"),
+                    g_file, l, c, l, c + name_len + 1);
+                slb_begin();
+                vv_cfg();
+                diag_set_vv(d4, slb_head);
+            }
+        }
+        return;
+    }
+    if (def.spec == "ident_list") {
+        if (argc < 1) {
+            diag_new("T_ANNOTATION_INVALID_ARG", "error",
+                cat3("annotation '@", name, "' requires at least one argument"),
+                g_file, l, c, l, c + name_len + 1);
+        }
+        if (name == "derive") {
+            ann_check_items(ai, true, l, c);
+        }
+        if (name == "allow" || name == "warn" || name == "deny") {
+            ann_check_items(ai, false, l, c);
+        }
+        return;
+    }
+    if (def.spec == "number") {
+        var bad3: bool = argc != 1;
+        if (bad3 == false) {
+            var k2: Child = kids[an.la];
+            var a2: Node = nodes[k2.val];
+            bad3 = a2.kind != "number";
+        }
+        if (bad3) {
+            diag_new("T_ANNOTATION_INVALID_ARG", "error",
+                cat3("annotation '@", name, "' requires one numeric argument"),
+                g_file, l, c, l, c + name_len + 1);
+        }
+        return;
+    }
+}
+
+// getDeclTarget（复刻 index.ts:181）
+decl_target :: func(kind: string) -> string {
+    if (kind == "StructDecl") {
+        return "struct";
+    }
+    if (kind == "EnumDecl") {
+        return "enum";
+    }
+    if (kind == "FlagDecl") {
+        return "flag";
+    }
+    if (kind == "FlagSetDecl") {
+        return "flag_set";
+    }
+    if (kind == "UnionDecl") {
+        return "union";
+    }
+    if (kind == "FuncDecl") {
+        return "func";
+    }
+    if (kind == "GlobalVarDecl") {
+        return "var";
+    }
+    if (kind == "GlobalConstDecl") {
+        return "const";
+    }
+    return "global";
+}
+
+ann_pass :: func() -> void {
+    var n: i64 = slice_len(decl_list) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        var d: i64 = decl_list[i];
+        var nd: Node = nodes[d];
+        var target: string = decl_target(nd.kind);
+        var c: i64 = nd.la;
+        while (c >= 0) {
+            var k: Child = kids[c];
+            ann_validate(k.val, target);
+            c = k.next;
+        }
+        i = i + 1;
+    }
+}
+
+// ── pretty JSON 输出（复刻 JSON.stringify(x, null, 2)）────────
+
+hex_digit :: func(v: u8) -> u8 {
+    if (v < 10) {
+        return 48 + v;
+    }
+    return 97 + (v - 10);
+}
+
+json_escape_into :: func(out: StringBuilder, s: string) -> void {
+    var i: u64 = 0;
+    var n: u64 = str_len(s);
+    while (i < n) {
+        var b: u8 = s[i];
+        if (b == 34) {
+            sb_append_char(out, 92);
+            sb_append_char(out, 34);
+        } else {
+        if (b == 92) {
+            sb_append_char(out, 92);
+            sb_append_char(out, 92);
+        } else {
+        if (b == 10) {
+            sb_append_char(out, 92);
+            sb_append_char(out, 110);
+        } else {
+        if (b == 9) {
+            sb_append_char(out, 92);
+            sb_append_char(out, 116);
+        } else {
+        if (b == 13) {
+            sb_append_char(out, 92);
+            sb_append_char(out, 114);
+        } else {
+        if (b == 8) {
+            sb_append_char(out, 92);
+            sb_append_char(out, 98);
+        } else {
+        if (b == 12) {
+            sb_append_char(out, 92);
+            sb_append_char(out, 102);
+        } else {
+        if (b < 32) {
+            sb_append_char(out, 92);
+            sb_append_char(out, 117);
+            sb_append_char(out, 48);
+            sb_append_char(out, 48);
+            sb_append_char(out, hex_digit(b / 16));
+            sb_append_char(out, hex_digit(b % 16));
+        } else {
+            sb_append_char(out, b);
+        }}}}}}}}
+        i = i + 1;
+    }
+}
+
+j_qstr :: func(out: StringBuilder, s: string) -> void {
+    sb_append_char(out, 34);
+    json_escape_into(out, s);
+    sb_append_char(out, 34);
+}
+
+// "      \"key\": \"value\",\n" 之类的辅助
+jkv_str :: func(out: StringBuilder, ind: string, key: string, val: string, comma: bool) -> void {
+    sb_append_str(out, ind);
+    sb_append_char(out, 34);
+    sb_append_str(out, key);
+    sb_append_str(out, "\": ");
+    j_qstr(out, val);
+    if (comma) {
+        sb_append_char(out, 44);
+    }
+    sb_append_char(out, 10);
+}
+
+jkv_num :: func(out: StringBuilder, ind: string, key: string, val: i64, comma: bool) -> void {
+    sb_append_str(out, ind);
+    sb_append_char(out, 34);
+    sb_append_str(out, key);
+    sb_append_str(out, "\": ");
+    sb_append_i64(out, val);
+    if (comma) {
+        sb_append_char(out, 44);
+    }
+    sb_append_char(out, 10);
+}
+
+// location/range 对象输出
+j_loc :: func(out: StringBuilder, ind: string, ind2: string, key: string, file: string, sl: i64, sc: i64, el: i64, ec: i64, comma: bool) -> void {
+    sb_append_str(out, ind);
+    sb_append_char(out, 34);
+    sb_append_str(out, key);
+    sb_append_str(out, "\": {");
+    sb_append_char(out, 10);
+    jkv_str(out, ind2, "file", file, true);
+    jkv_num(out, ind2, "startLine", sl, true);
+    jkv_num(out, ind2, "startCol", sc, true);
+    jkv_num(out, ind2, "endLine", el, true);
+    jkv_num(out, ind2, "endCol", ec, false);
+    sb_append_str(out, ind);
+    sb_append_char(out, 125);
+    if (comma) {
+        sb_append_char(out, 44);
+    }
+    sb_append_char(out, 10);
+}
+
+// 字符串链表数组输出（validValues/notes）；head=-1 输出 null
+j_str_list :: func(out: StringBuilder, ind: string, ind2: string, key: string, head: i64, comma: bool) -> void {
+    sb_append_str(out, ind);
+    sb_append_char(out, 34);
+    sb_append_str(out, key);
+    sb_append_str(out, "\": ");
+    if (head < 0) {
+        sb_append_str(out, "null");
+    } else {
+        sb_append_char(out, 91);
+        sb_append_char(out, 10);
+        var c: i64 = head;
+        while (c >= 0) {
+            var it: SI = sitems[c];
+            sb_append_str(out, ind2);
+            j_qstr(out, it.s);
+            if (it.next >= 0) {
+                sb_append_char(out, 44);
+            }
+            sb_append_char(out, 10);
+            c = it.next;
+        }
+        sb_append_str(out, ind);
+        sb_append_char(out, 93);
+    }
+    if (comma) {
+        sb_append_char(out, 44);
+    }
+    sb_append_char(out, 10);
+}
+
+print_json :: func() -> void {
+    var out: StringBuilder = sb_new();
+    var nd: i64 = slice_len(diags) as i64;
+
+    sb_append_str(out, "{\n");
+    if (nd == 0) {
+        sb_append_str(out, "  \"diagnostics\": [],\n");
+    } else {
+        sb_append_str(out, "  \"diagnostics\": [\n");
+        var i: i64 = 0;
+        while (i < nd) {
+            var d: Diag = diags[i];
+            sb_append_str(out, "    {\n");
+            jkv_str(out, "      ", "code", d.code, true);
+            jkv_str(out, "      ", "severity", d.sev, true);
+            jkv_str(out, "      ", "message", d.msg, true);
+            j_loc(out, "      ", "        ", "location", d.file, d.sl, d.sc, d.el, d.ec, true);
+            j_str_list(out, "      ", "        ", "validValues", d.vv, true);
+
+            // fixSuggestions
+            sb_append_str(out, "      \"fixSuggestions\": ");
+            if (d.fs < 0) {
+                sb_append_str(out, "null");
+            } else {
+                sb_append_str(out, "[\n");
+                var f: i64 = d.fs;
+                while (f >= 0) {
+                    var fx: FixS = fixes[f];
+                    sb_append_str(out, "        {\n");
+                    jkv_str(out, "          ", "description", fx.desc, true);
+                    j_loc(out, "          ", "            ", "range", fx.file, fx.sl, fx.sc, fx.el, fx.ec, true);
+                    jkv_str(out, "          ", "replacement", fx.repl, false);
+                    sb_append_str(out, "        }");
+                    if (fx.next >= 0) {
+                        sb_append_char(out, 44);
+                    }
+                    sb_append_char(out, 10);
+                    f = fx.next;
+                }
+                sb_append_str(out, "      ]");
+            }
+            sb_append_str(out, ",\n");
+
+            j_str_list(out, "      ", "        ", "notes", d.nt, false);
+
+            sb_append_str(out, "    }");
+            if (i + 1 < nd) {
+                sb_append_char(out, 44);
+            }
+            sb_append_char(out, 10);
+            i = i + 1;
+        }
+        sb_append_str(out, "  ],\n");
+    }
+
+    var errs: i64 = 0;
+    var warns: i64 = 0;
+    var infos: i64 = 0;
+    var j: i64 = 0;
+    while (j < nd) {
+        var d2: Diag = diags[j];
+        if (d2.sev == "error") {
+            errs = errs + 1;
+        }
+        if (d2.sev == "warning") {
+            warns = warns + 1;
+        }
+        if (d2.sev == "info") {
+            infos = infos + 1;
+        }
+        j = j + 1;
+    }
+    sb_append_str(out, "  \"summary\": {\n");
+    jkv_num(out, "    ", "total", nd, true);
+    jkv_num(out, "    ", "errors", errs, true);
+    jkv_num(out, "    ", "warnings", warns, true);
+    jkv_num(out, "    ", "infos", infos, false);
+    sb_append_str(out, "  }\n");
+    sb_append_str(out, "}");
+
+    print(sb_to_str(out));
+    print("\n");
+}
+
+has_errors :: func() -> bool {
+    var n: i64 = slice_len(diags) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        var d: Diag = diags[i];
+        if (d.sev == "error") {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// ── main ───────────────────────────────────────────────────────
+
+main :: func() -> i32 @main {
+    var argv: []string = args();
+    if (slice_len(argv) != 2) {
+        eprint("usage: tcheck <file.tc>\n");
+        return 2;
+    }
+    g_file = path_resolve(argv[1]);
+    var src: string = file_read_all(argv[1]);
+    tokenize(src);
+    pos = 0;
+    init_anndefs();
+    parse_unit();
+
+    run_check();
+    flag_pass();
+    ann_pass();
+
+    print_json();
+    if (has_errors()) {
+        return 1;
+    }
+    return 0;
+}

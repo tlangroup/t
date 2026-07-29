@@ -1,0 +1,495 @@
+// ═══════════════════════════════════════════════════════════════
+// selfhost/lexer.tc — M5: t 语言 lexer 的 t 语言实现 (Stage 1)
+//
+// 语义与 src/lexer/lexer.ts 逐字节对齐：
+//   * 输出与 `tc lex <file> --json` 完全一致的 JSON token 流
+//   * line/col 均按 UTF-8 字节计数（tc0 已同步改为字节列号）
+//   * 词法错误 → stderr 诊断 + 退出码 1（stdout 无输出）
+// 用法：tlex <file.tc>
+// ═══════════════════════════════════════════════════════════════
+
+// ── 字符分类（字节级）──────────────────────────────────────────
+
+is_digit :: func(c: u8) -> bool {
+    return c >= 48 && c <= 57;
+}
+
+is_ident_start :: func(c: u8) -> bool {
+    if (c >= 97 && c <= 122) { return true; }
+    if (c >= 65 && c <= 90) { return true; }
+    return c == 95;
+}
+
+is_ident_cont :: func(c: u8) -> bool {
+    return is_ident_start(c) || is_digit(c);
+}
+
+is_hex_digit :: func(c: u8) -> bool {
+    if (c >= 48 && c <= 57) { return true; }
+    if (c >= 97 && c <= 102) { return true; }
+    return c >= 65 && c <= 70;
+}
+
+is_bin_digit :: func(c: u8) -> bool {
+    return c == 48 || c == 49;
+}
+
+// ── 关键字表（与 token.ts KEYWORDS 一致）───────────────────────
+
+kw_lookup :: func(text: string) -> string {
+    if (text == "func") { return "KwFunc"; }
+    if (text == "struct") { return "KwStruct"; }
+    if (text == "enum") { return "KwEnum"; }
+    if (text == "flag") { return "KwFlag"; }
+    if (text == "union") { return "KwUnion"; }
+    if (text == "var") { return "KwVar"; }
+    if (text == "const") { return "KwConst"; }
+    if (text == "comptime") { return "KwComptime"; }
+    if (text == "if") { return "KwIf"; }
+    if (text == "else") { return "KwElse"; }
+    if (text == "for") { return "KwFor"; }
+    if (text == "while") { return "KwWhile"; }
+    if (text == "switch") { return "KwSwitch"; }
+    if (text == "case") { return "KwCase"; }
+    if (text == "default") { return "KwDefault"; }
+    if (text == "break") { return "KwBreak"; }
+    if (text == "continue") { return "KwContinue"; }
+    if (text == "return") { return "KwReturn"; }
+    if (text == "true") { return "KwTrue"; }
+    if (text == "false") { return "KwFalse"; }
+    if (text == "null") { return "KwNull"; }
+    if (text == "map") { return "KwMap"; }
+    if (text == "import") { return "KwImport"; }
+    if (text == "export") { return "KwExport"; }
+    if (text == "as") { return "KwAs"; }
+    if (text == "in") { return "KwIn"; }
+    if (text == "defer") { return "KwDefer"; }
+    if (text == "void") { return "KwVoid"; }
+    if (text == "string") { return "KwString"; }
+    if (text == "StringBuilder") { return "KwStringBuilder"; }
+    return "";
+}
+
+// ── 双字符运算符（与 lexer.ts twoChar 表一致）──────────────────
+
+op2_name :: func(a: u8, b: u8) -> string {
+    if (a == 45 && b == 62) { return "Arrow"; }        // ->
+    if (a == 58 && b == 58) { return "DoubleColon"; }  // ::
+    if (a == 61 && b == 61) { return "Eq"; }           // ==
+    if (a == 33 && b == 61) { return "NotEq"; }        // !=
+    if (a == 60 && b == 61) { return "LtEq"; }         // <=
+    if (a == 62 && b == 61) { return "GtEq"; }         // >=
+    if (a == 38 && b == 38) { return "And"; }          // &&
+    if (a == 124 && b == 124) { return "Or"; }         // ||
+    if (a == 60 && b == 60) { return "ShiftLeft"; }    // <<
+    if (a == 62 && b == 62) { return "ShiftRight"; }   // >>
+    if (a == 46 && b == 46) { return "DoubleDot"; }    // ..
+    if (a == 43 && b == 61) { return "PlusAssign"; }   // +=
+    if (a == 45 && b == 61) { return "MinusAssign"; }  // -=
+    if (a == 42 && b == 61) { return "StarAssign"; }   // *=
+    if (a == 47 && b == 61) { return "SlashAssign"; }  // /=
+    if (a == 37 && b == 61) { return "PercentAssign"; }// %=
+    if (a == 38 && b == 61) { return "BitAndAssign"; } // &=
+    if (a == 124 && b == 61) { return "BitOrAssign"; } // |=
+    if (a == 94 && b == 61) { return "BitXorAssign"; } // ^=
+    return "";
+}
+
+// ── 单字符运算符/分隔符 ────────────────────────────────────────
+
+op1_name :: func(c: u8) -> string {
+    if (c == 43) { return "Plus"; }
+    if (c == 45) { return "Minus"; }
+    if (c == 42) { return "Star"; }
+    if (c == 47) { return "Slash"; }
+    if (c == 37) { return "Percent"; }
+    if (c == 61) { return "Assign"; }
+    if (c == 60) { return "Lt"; }
+    if (c == 62) { return "Gt"; }
+    if (c == 33) { return "Not"; }
+    if (c == 38) { return "BitAnd"; }
+    if (c == 124) { return "BitOr"; }
+    if (c == 94) { return "BitXor"; }
+    if (c == 126) { return "BitNot"; }
+    if (c == 58) { return "Colon"; }
+    if (c == 46) { return "Dot"; }
+    if (c == 63) { return "Question"; }
+    if (c == 40) { return "LParen"; }
+    if (c == 41) { return "RParen"; }
+    if (c == 123) { return "LBrace"; }
+    if (c == 125) { return "RBrace"; }
+    if (c == 91) { return "LBracket"; }
+    if (c == 93) { return "RBracket"; }
+    if (c == 44) { return "Comma"; }
+    if (c == 59) { return "Semicolon"; }
+    return "";
+}
+
+// ── JSON 字符串转义（对齐 JSON.stringify 语义）─────────────────
+
+hex_digit :: func(d: u8) -> u8 {
+    if (d < 10) { return 48 + d; }
+    return 87 + d;   // 'a' + d - 10
+}
+
+json_escape_into :: func(out: StringBuilder, s: string) -> void {
+    var i: u64 = 0;
+    var n: u64 = str_len(s);
+    while (i < n) {
+        var b: u8 = s[i];
+        if (b == 34) {                 // "
+            sb_append_char(out, 92);
+            sb_append_char(out, 34);
+        } else {
+        if (b == 92) {                 // backslash
+            sb_append_char(out, 92);
+            sb_append_char(out, 92);
+        } else {
+        if (b == 10) {                 // \n
+            sb_append_char(out, 92);
+            sb_append_char(out, 110);
+        } else {
+        if (b == 9) {                  // \t
+            sb_append_char(out, 92);
+            sb_append_char(out, 116);
+        } else {
+        if (b == 13) {                 // \r
+            sb_append_char(out, 92);
+            sb_append_char(out, 114);
+        } else {
+        if (b == 8) {                  // \b
+            sb_append_char(out, 92);
+            sb_append_char(out, 98);
+        } else {
+        if (b == 12) {                 // \f
+            sb_append_char(out, 92);
+            sb_append_char(out, 102);
+        } else {
+        if (b < 32) {                  // \u00xy
+            sb_append_char(out, 92);
+            sb_append_char(out, 117);
+            sb_append_char(out, 48);
+            sb_append_char(out, 48);
+            sb_append_char(out, hex_digit(b / 16));
+            sb_append_char(out, hex_digit(b % 16));
+        } else {
+            sb_append_char(out, b);
+        }}}}}}}}
+        i = i + 1;
+    }
+}
+
+// ── token 输出：返回新的 token 计数 ────────────────────────────
+
+emit_tok :: func(out: StringBuilder, count: u64, tname: string, value: string, line: u64, col: u64) -> u64 {
+    if (count > 0) {
+        sb_append_char(out, 44);       // ,
+    }
+    sb_append_str(out, "{\"type\":\"");
+    sb_append_str(out, tname);
+    sb_append_str(out, "\",\"value\":\"");
+    json_escape_into(out, value);
+    sb_append_str(out, "\",\"line\":");
+    sb_append_u64(out, line);
+    sb_append_str(out, ",\"col\":");
+    sb_append_u64(out, col);
+    sb_append_char(out, 125);          // }
+    return count + 1;
+}
+
+// ── 入口 ───────────────────────────────────────────────────────
+
+main :: func() -> i32 @main {
+    var argv: []string = args();
+    if (slice_len(argv) != 2) {
+        eprint("usage: tlex <file.tc>\n");
+        return 2;
+    }
+    var src: string = file_read_all(argv[1]);
+
+    var out: StringBuilder = sb_new();
+    var tmp: StringBuilder = sb_new();
+    sb_append_char(out, 91);           // [
+
+    var i: u64 = 0;
+    var n: u64 = str_len(src);
+    var line: u64 = 1;
+    var col: u64 = 1;
+    var count: u64 = 0;
+
+    while (i < n) {
+        var c: u8 = src[i];
+
+        // ── 空白 ──
+        if (c == 32 || c == 9 || c == 13) {
+            i = i + 1;
+            col = col + 1;
+            continue;
+        }
+        if (c == 10) {
+            i = i + 1;
+            line = line + 1;
+            col = 1;
+            continue;
+        }
+
+        // ── 行注释 ──
+        if (c == 47 && i + 1 < n && src[i + 1] == 47) {
+            while (i < n && src[i] != 10) {
+                i = i + 1;
+                col = col + 1;
+            }
+            continue;
+        }
+
+        // ── 块注释 ──
+        if (c == 47 && i + 1 < n && src[i + 1] == 42) {
+            i = i + 2;
+            col = col + 2;
+            var closed: bool = false;
+            while (i < n) {
+                if (src[i] == 42 && i + 1 < n && src[i + 1] == 47) {
+                    i = i + 2;
+                    col = col + 2;
+                    closed = true;
+                    break;
+                }
+                if (src[i] == 10) {
+                    line = line + 1;
+                    col = 1;
+                } else {
+                    col = col + 1;
+                }
+                i = i + 1;
+            }
+            if (closed == false) {
+                eprint("error: unterminated block comment\n");
+                exit(1);
+            }
+            continue;
+        }
+
+        // ── 数字 ──
+        if (is_digit(c)) {
+            var tl: u64 = line;
+            var tcol: u64 = col;
+
+            // 0x / 0X 十六进制
+            if (c == 48 && i + 1 < n && (src[i + 1] == 120 || src[i + 1] == 88)) {
+                sb_clear(tmp);
+                sb_append_str(tmp, "0x");
+                i = i + 2;
+                col = col + 2;
+                var hexcnt: u64 = 0;
+                while (i < n && is_hex_digit(src[i])) {
+                    sb_append_char(tmp, src[i]);
+                    i = i + 1;
+                    col = col + 1;
+                    hexcnt = hexcnt + 1;
+                }
+                if (hexcnt == 0) {
+                    eprint("error: hex literal has no digits after 0x\n");
+                    exit(1);
+                }
+                count = emit_tok(out, count, "Integer", sb_to_str(tmp), tl, tcol);
+                continue;
+            }
+
+            // 0b / 0B 二进制
+            if (c == 48 && i + 1 < n && (src[i + 1] == 98 || src[i + 1] == 66)) {
+                sb_clear(tmp);
+                sb_append_str(tmp, "0b");
+                i = i + 2;
+                col = col + 2;
+                var bincnt: u64 = 0;
+                while (i < n && is_bin_digit(src[i])) {
+                    sb_append_char(tmp, src[i]);
+                    i = i + 1;
+                    col = col + 1;
+                    bincnt = bincnt + 1;
+                }
+                if (bincnt == 0) {
+                    eprint("error: binary literal has no digits after 0b\n");
+                    exit(1);
+                }
+                count = emit_tok(out, count, "Integer", sb_to_str(tmp), tl, tcol);
+                continue;
+            }
+
+            // 十进制 / 浮点
+            var ns: u64 = i;
+            while (i < n && is_digit(src[i])) {
+                i = i + 1;
+                col = col + 1;
+            }
+
+            // 浮点：digits '.' digit
+            if (i < n && src[i] == 46 && i + 1 < n && is_digit(src[i + 1])) {
+                i = i + 1;             // '.'
+                col = col + 1;
+                while (i < n && is_digit(src[i])) {
+                    i = i + 1;
+                    col = col + 1;
+                }
+                // 可选指数
+                if (i < n && (src[i] == 101 || src[i] == 69)) {
+                    i = i + 1;
+                    col = col + 1;
+                    if (i < n && (src[i] == 43 || src[i] == 45)) {
+                        i = i + 1;
+                        col = col + 1;
+                    }
+                    while (i < n && is_digit(src[i])) {
+                        i = i + 1;
+                        col = col + 1;
+                    }
+                }
+                count = emit_tok(out, count, "Float", str_slice(src, ns, i), tl, tcol);
+                continue;
+            }
+
+            count = emit_tok(out, count, "Integer", str_slice(src, ns, i), tl, tcol);
+            continue;
+        }
+
+        // ── 字符串字面量 ──
+        if (c == 34) {
+            var sl: u64 = line;
+            var scol: u64 = col;
+            i = i + 1;                 // 开引号
+            col = col + 1;
+            sb_clear(tmp);
+            while (i < n && src[i] != 34) {
+                if (src[i] == 92) {
+                    // 反斜杠 + 转义字符（advance 两次）
+                    i = i + 1;
+                    col = col + 1;
+                    if (i >= n) {
+                        break;
+                    }
+                    var e: u8 = src[i];
+                    if (src[i] == 10) {
+                        line = line + 1;
+                        col = 1;
+                    } else {
+                        col = col + 1;
+                    }
+                    i = i + 1;
+                    if (e == 110) {                    // n
+                        sb_append_char(tmp, 10);
+                    } else {
+                    if (e == 116) {                    // t
+                        sb_append_char(tmp, 9);
+                    } else {
+                    if (e == 114) {                    // r
+                        sb_append_char(tmp, 13);
+                    } else {
+                    if (e == 34) {                     // "
+                        sb_append_char(tmp, 34);
+                    } else {
+                    if (e == 92) {                     // backslash
+                        sb_append_char(tmp, 92);
+                    } else {
+                    if (e == 48) {                     // 0
+                        sb_append_char(tmp, 0);
+                    } else {
+                        // 未知转义：按字面收录（tc0 仅告警，不中断）
+                        sb_append_char(tmp, e);
+                    }}}}}}
+                } else {
+                    if (src[i] == 10) {
+                        line = line + 1;
+                        col = 1;
+                    } else {
+                        col = col + 1;
+                    }
+                    sb_append_char(tmp, src[i]);
+                    i = i + 1;
+                }
+            }
+            if (i >= n) {
+                eprint("error: unterminated string literal\n");
+                exit(1);
+            }
+            i = i + 1;                 // 闭引号
+            col = col + 1;
+            count = emit_tok(out, count, "String", sb_to_str(tmp), sl, scol);
+            continue;
+        }
+
+        // ── 标识符 / 关键字 ──
+        if (is_ident_start(c)) {
+            var il: u64 = line;
+            var icol: u64 = col;
+            var is0: u64 = i;
+            while (i < n && is_ident_cont(src[i])) {
+                i = i + 1;
+                col = col + 1;
+            }
+            var text: string = str_slice(src, is0, i);
+            var tname: string = kw_lookup(text);
+            if (str_len(tname) == 0) {
+                tname = "Identifier";
+            }
+            count = emit_tok(out, count, tname, text, il, icol);
+            continue;
+        }
+
+        // ── @ 与 # ──
+        if (c == 64) {
+            count = emit_tok(out, count, "At", "@", line, col);
+            i = i + 1;
+            col = col + 1;
+            continue;
+        }
+        if (c == 35) {
+            count = emit_tok(out, count, "Hash", "#", line, col);
+            i = i + 1;
+            col = col + 1;
+            continue;
+        }
+
+        // ── 三字符运算符：<<= >>= ──
+        if (i + 2 < n && c == 60 && src[i + 1] == 60 && src[i + 2] == 61) {
+            count = emit_tok(out, count, "ShlAssign", "<<=", line, col);
+            i = i + 3;
+            col = col + 3;
+            continue;
+        }
+        if (i + 2 < n && c == 62 && src[i + 1] == 62 && src[i + 2] == 61) {
+            count = emit_tok(out, count, "ShrAssign", ">>=", line, col);
+            i = i + 3;
+            col = col + 3;
+            continue;
+        }
+
+        // ── 双字符运算符 ──
+        if (i + 1 < n) {
+            var two: string = op2_name(c, src[i + 1]);
+            if (str_len(two) > 0) {
+                count = emit_tok(out, count, two, str_slice(src, i, i + 2), line, col);
+                i = i + 2;
+                col = col + 2;
+                continue;
+            }
+        }
+
+        // ── 单字符运算符 ──
+        var one: string = op1_name(c);
+        if (str_len(one) > 0) {
+            count = emit_tok(out, count, one, str_slice(src, i, i + 1), line, col);
+            i = i + 1;
+            col = col + 1;
+            continue;
+        }
+
+        eprint("error: unexpected character\n");
+        exit(1);
+    }
+
+    count = emit_tok(out, count, "Eof", "", line, col);
+    sb_append_char(out, 93);           // ]
+    print(sb_to_str(out));
+    print("\n");
+    return 0;
+}

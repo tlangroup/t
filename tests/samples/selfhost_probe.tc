@@ -1,0 +1,124 @@
+// ═══════════════════════════════════════════════════════════════
+// selfhost_probe.tc — Stage 0.5 自举探针（M3）
+//
+// 一个 mini-lexer：对内嵌源码字符串做词法切分，统计各类 token 数量。
+// 覆盖自举硬前提能力：
+//   G1 string：字面量、len(s)、s[i] 字节访问、== 比较
+//   G2 切片：[]u8 声明、append、slice_len、下标读取
+//   G3 输出：print / eprint
+//   G4 控制流：while / if / switch
+// 通过判据：token 统计与手工计数一致 → 退出码 0
+// ═══════════════════════════════════════════════════════════════
+
+// token 种类编码
+const TK_IDENT: u8 = 1;
+const TK_NUMBER: u8 = 2;
+const TK_OP: u8 = 3;
+
+// ── 字符分类 ────────────────────────────────────────────────
+is_digit :: func(c: u8) -> bool {
+    return c >= 48 && c <= 57;          // '0'..'9'
+}
+
+is_alpha :: func(c: u8) -> bool {
+    if (c >= 97 && c <= 122) { return true; }   // 'a'..'z'
+    if (c >= 65 && c <= 90) { return true; }    // 'A'..'Z'
+    return c == 95;                              // '_'
+}
+
+is_space :: func(c: u8) -> bool {
+    return c == 32 || c == 9 || c == 10 || c == 13;
+}
+
+// ── mini-lexer：返回 token 种类序列 ─────────────────────────
+lex :: func(src: string) -> []u8 {
+    var kinds: []u8;
+    var i: u64 = 0;
+    var n: u64 = str_len(src);
+
+    while (i < n) {
+        var c: u8 = src[i];
+
+        if (is_space(c)) {
+            i = i + 1;
+            continue;
+        }
+
+        if (is_digit(c)) {
+            while (i < n && is_digit(src[i])) {
+                i = i + 1;
+            }
+            var k1: u8 = TK_NUMBER;
+            append(kinds, k1);
+            continue;
+        }
+
+        if (is_alpha(c)) {
+            while (i < n && (is_alpha(src[i]) || is_digit(src[i]))) {
+                i = i + 1;
+            }
+            var k2: u8 = TK_IDENT;
+            append(kinds, k2);
+            continue;
+        }
+
+        // 其余一律视为单字符运算符
+        var k3: u8 = TK_OP;
+        append(kinds, k3);
+        i = i + 1;
+    }
+
+    return kinds;
+}
+
+// ── 统计某类 token 出现次数 ─────────────────────────────────
+count_kind :: func(kinds: []u8, target: u8) -> u64 {
+    var total: u64 = 0;
+    var i: u64 = 0;
+    var n: u64 = slice_len(kinds);
+    while (i < n) {
+        if (kinds[i] == target) {
+            total = total + 1;
+        }
+        i = i + 1;
+    }
+    return total;
+}
+
+// ── 入口 ────────────────────────────────────────────────────
+main :: func() -> i32 @main {
+    // 手工计数：ident=4 (var, x1, foo_bar, y)  number=2 (42, 7)  op=5 (= + * ; ;)
+    var src: string = "var x1 = 42 + foo_bar * 7 ; y ;";
+
+    var kinds: []u8 = lex(src);
+
+    var idents: u64 = count_kind(kinds, TK_IDENT);
+    var numbers: u64 = count_kind(kinds, TK_NUMBER);
+    var ops: u64 = count_kind(kinds, TK_OP);
+
+    if (slice_len(kinds) != 11) {
+        eprint("PROBE FAIL: total token count\n");
+        return 1;
+    }
+    if (idents != 4) {
+        eprint("PROBE FAIL: ident count\n");
+        return 2;
+    }
+    if (numbers != 2) {
+        eprint("PROBE FAIL: number count\n");
+        return 3;
+    }
+    if (ops != 5) {
+        eprint("PROBE FAIL: op count\n");
+        return 4;
+    }
+
+    // string == 比较（G1）
+    var greeting: string = "hello";
+    if (greeting == "hello") {
+        print("PROBE OK\n");
+        return 0;
+    }
+    eprint("PROBE FAIL: string eq\n");
+    return 5;
+}

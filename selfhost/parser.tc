@@ -1,0 +1,2909 @@
+// ═══════════════════════════════════════════════════════════════
+// selfhost/parser.tc — M6: t 语言 parser 的 t 语言实现 (Stage 1)
+//
+// 行为：tparse <file.tc>
+//   读源文件 → 内嵌 lexer 产出 token 池 → 递归下降 parser 构建
+//   扁平 Node 池 → 输出与 `tc parse` 逐字节一致的紧凑 JSON。
+// ═══════════════════════════════════════════════════════════════
+
+// ── token 池 ───────────────────────────────────────────────────
+
+Tok :: struct {
+    t: string;      // token 类型名（同 lex --json 的 type）
+    v: string;      // 文本值
+    line: u64;
+    col: u64;
+}
+
+var toks: []Tok;
+
+// ── AST 节点池（扁平化，索引引用）──────────────────────────────
+// 约定：
+//   na/nb/nc/nd : 子节点索引，-1 = null
+//   la/lb/lc    : 子节点列表头（Child 池索引），-1 = 空列表，-2 = null 列表
+//   sa/sb/sc    : 字符串载荷；has_sa=false 表示 sa 语义为 null
+//   ia/ib       : 整型载荷（radix / bitWidth / offset），-1 = null
+//   ba/bb       : 布尔载荷（isConst/isExtern/isComptime/isBitpack...）
+
+Node :: struct {
+    kind: string;
+    sa: string;
+    sb: string;
+    sc: string;
+    has_sa: bool;
+    has_sb: bool;
+    has_sc: bool;
+    ia: i64;
+    ib: i64;
+    ba: bool;
+    bb: bool;
+    na: i64;
+    nb: i64;
+    nc: i64;
+    nd: i64;
+    la: i64;
+    lb: i64;
+    lc: i64;
+}
+
+var nodes: []Node;
+
+Child :: struct {
+    val: i64;
+    next: i64;
+}
+
+var kids: []Child;
+
+// 新建节点：全部字段置于"空"语义，返回索引
+node_new :: func(kind: string) -> i64 {
+    var n: Node;
+    n.kind = kind;
+    n.sa = "";
+    n.sb = "";
+    n.sc = "";
+    n.has_sa = true;
+    n.has_sb = true;
+    n.has_sc = true;
+    n.ia = -1;
+    n.ib = -1;
+    n.ba = false;
+    n.bb = false;
+    n.na = -1;
+    n.nb = -1;
+    n.nc = -1;
+    n.nd = -1;
+    n.la = -1;
+    n.lb = -1;
+    n.lc = -1;
+    append(nodes, n);
+    return (slice_len(nodes) as i64) - 1;
+}
+
+// 列表构建：head/tail 由调用方持有；返回新 tail
+list_push :: func(head: i64, tail: i64, val: i64) -> i64 {
+    var c: Child;
+    c.val = val;
+    c.next = -1;
+    append(kids, c);
+    var idx: i64 = (slice_len(kids) as i64) - 1;
+    if (tail >= 0) {
+        var prev: Child = kids[tail];
+        prev.next = idx;
+        slice_set(kids, tail, prev);
+    }
+    return idx;
+}
+
+// ── 字符分类（照抄 lexer.tc）───────────────────────────────────
+
+is_digit :: func(c: u8) -> bool {
+    return c >= 48 && c <= 57;
+}
+
+is_ident_start :: func(c: u8) -> bool {
+    if (c >= 97 && c <= 122) { return true; }
+    if (c >= 65 && c <= 90) { return true; }
+    return c == 95;
+}
+
+is_ident_cont :: func(c: u8) -> bool {
+    return is_ident_start(c) || is_digit(c);
+}
+
+is_hex_digit :: func(c: u8) -> bool {
+    if (c >= 48 && c <= 57) { return true; }
+    if (c >= 97 && c <= 102) { return true; }
+    return c >= 65 && c <= 70;
+}
+
+is_bin_digit :: func(c: u8) -> bool {
+    return c == 48 || c == 49;
+}
+
+kw_lookup :: func(text: string) -> string {
+    if (text == "func") { return "KwFunc"; }
+    if (text == "struct") { return "KwStruct"; }
+    if (text == "enum") { return "KwEnum"; }
+    if (text == "flag") { return "KwFlag"; }
+    if (text == "union") { return "KwUnion"; }
+    if (text == "var") { return "KwVar"; }
+    if (text == "const") { return "KwConst"; }
+    if (text == "comptime") { return "KwComptime"; }
+    if (text == "if") { return "KwIf"; }
+    if (text == "else") { return "KwElse"; }
+    if (text == "for") { return "KwFor"; }
+    if (text == "while") { return "KwWhile"; }
+    if (text == "switch") { return "KwSwitch"; }
+    if (text == "case") { return "KwCase"; }
+    if (text == "default") { return "KwDefault"; }
+    if (text == "break") { return "KwBreak"; }
+    if (text == "continue") { return "KwContinue"; }
+    if (text == "return") { return "KwReturn"; }
+    if (text == "true") { return "KwTrue"; }
+    if (text == "false") { return "KwFalse"; }
+    if (text == "null") { return "KwNull"; }
+    if (text == "map") { return "KwMap"; }
+    if (text == "import") { return "KwImport"; }
+    if (text == "export") { return "KwExport"; }
+    if (text == "as") { return "KwAs"; }
+    if (text == "in") { return "KwIn"; }
+    if (text == "defer") { return "KwDefer"; }
+    if (text == "void") { return "KwVoid"; }
+    if (text == "string") { return "KwString"; }
+    if (text == "StringBuilder") { return "KwStringBuilder"; }
+    return "";
+}
+
+op2_name :: func(a: u8, b: u8) -> string {
+    if (a == 45 && b == 62) { return "Arrow"; }
+    if (a == 58 && b == 58) { return "DoubleColon"; }
+    if (a == 61 && b == 61) { return "Eq"; }
+    if (a == 33 && b == 61) { return "NotEq"; }
+    if (a == 60 && b == 61) { return "LtEq"; }
+    if (a == 62 && b == 61) { return "GtEq"; }
+    if (a == 38 && b == 38) { return "And"; }
+    if (a == 124 && b == 124) { return "Or"; }
+    if (a == 60 && b == 60) { return "ShiftLeft"; }
+    if (a == 62 && b == 62) { return "ShiftRight"; }
+    if (a == 46 && b == 46) { return "DoubleDot"; }
+    if (a == 43 && b == 61) { return "PlusAssign"; }
+    if (a == 45 && b == 61) { return "MinusAssign"; }
+    if (a == 42 && b == 61) { return "StarAssign"; }
+    if (a == 47 && b == 61) { return "SlashAssign"; }
+    if (a == 37 && b == 61) { return "PercentAssign"; }
+    if (a == 38 && b == 61) { return "BitAndAssign"; }
+    if (a == 124 && b == 61) { return "BitOrAssign"; }
+    if (a == 94 && b == 61) { return "BitXorAssign"; }
+    return "";
+}
+
+op1_name :: func(c: u8) -> string {
+    if (c == 43) { return "Plus"; }
+    if (c == 45) { return "Minus"; }
+    if (c == 42) { return "Star"; }
+    if (c == 47) { return "Slash"; }
+    if (c == 37) { return "Percent"; }
+    if (c == 61) { return "Assign"; }
+    if (c == 60) { return "Lt"; }
+    if (c == 62) { return "Gt"; }
+    if (c == 33) { return "Not"; }
+    if (c == 38) { return "BitAnd"; }
+    if (c == 124) { return "BitOr"; }
+    if (c == 94) { return "BitXor"; }
+    if (c == 126) { return "BitNot"; }
+    if (c == 58) { return "Colon"; }
+    if (c == 46) { return "Dot"; }
+    if (c == 63) { return "Question"; }
+    if (c == 40) { return "LParen"; }
+    if (c == 41) { return "RParen"; }
+    if (c == 123) { return "LBrace"; }
+    if (c == 125) { return "RBrace"; }
+    if (c == 91) { return "LBracket"; }
+    if (c == 93) { return "RBracket"; }
+    if (c == 44) { return "Comma"; }
+    if (c == 59) { return "Semicolon"; }
+    return "";
+}
+
+// ── token 入池 ─────────────────────────────────────────────────
+
+push_tok :: func(tname: string, value: string, line: u64, col: u64) -> void {
+    var tk: Tok;
+    tk.t = tname;
+    tk.v = value;
+    tk.line = line;
+    tk.col = col;
+    append(toks, tk);
+}
+
+// ── lexer：源码 → token 池（逻辑照抄 lexer.tc）─────────────────
+
+tokenize :: func(src: string) -> void {
+    var tmp: StringBuilder = sb_new();
+    var i: u64 = 0;
+    var n: u64 = str_len(src);
+    var line: u64 = 1;
+    var col: u64 = 1;
+
+    while (i < n) {
+        var c: u8 = src[i];
+
+        if (c == 32 || c == 9 || c == 13) {
+            i = i + 1;
+            col = col + 1;
+            continue;
+        }
+        if (c == 10) {
+            i = i + 1;
+            line = line + 1;
+            col = 1;
+            continue;
+        }
+
+        if (c == 47 && i + 1 < n && src[i + 1] == 47) {
+            while (i < n && src[i] != 10) {
+                i = i + 1;
+                col = col + 1;
+            }
+            continue;
+        }
+
+        if (c == 47 && i + 1 < n && src[i + 1] == 42) {
+            i = i + 2;
+            col = col + 2;
+            var closed: bool = false;
+            while (i < n) {
+                if (src[i] == 42 && i + 1 < n && src[i + 1] == 47) {
+                    i = i + 2;
+                    col = col + 2;
+                    closed = true;
+                    break;
+                }
+                if (src[i] == 10) {
+                    line = line + 1;
+                    col = 1;
+                } else {
+                    col = col + 1;
+                }
+                i = i + 1;
+            }
+            if (closed == false) {
+                eprint("error: unterminated block comment\n");
+                exit(1);
+            }
+            continue;
+        }
+
+        if (is_digit(c)) {
+            var tl: u64 = line;
+            var tcol: u64 = col;
+
+            if (c == 48 && i + 1 < n && (src[i + 1] == 120 || src[i + 1] == 88)) {
+                sb_clear(tmp);
+                sb_append_str(tmp, "0x");
+                i = i + 2;
+                col = col + 2;
+                var hexcnt: u64 = 0;
+                while (i < n && is_hex_digit(src[i])) {
+                    sb_append_char(tmp, src[i]);
+                    i = i + 1;
+                    col = col + 1;
+                    hexcnt = hexcnt + 1;
+                }
+                if (hexcnt == 0) {
+                    eprint("error: hex literal has no digits after 0x\n");
+                    exit(1);
+                }
+                push_tok("Integer", sb_to_str(tmp), tl, tcol);
+                continue;
+            }
+
+            if (c == 48 && i + 1 < n && (src[i + 1] == 98 || src[i + 1] == 66)) {
+                sb_clear(tmp);
+                sb_append_str(tmp, "0b");
+                i = i + 2;
+                col = col + 2;
+                var bincnt: u64 = 0;
+                while (i < n && is_bin_digit(src[i])) {
+                    sb_append_char(tmp, src[i]);
+                    i = i + 1;
+                    col = col + 1;
+                    bincnt = bincnt + 1;
+                }
+                if (bincnt == 0) {
+                    eprint("error: binary literal has no digits after 0b\n");
+                    exit(1);
+                }
+                push_tok("Integer", sb_to_str(tmp), tl, tcol);
+                continue;
+            }
+
+            var ns: u64 = i;
+            while (i < n && is_digit(src[i])) {
+                i = i + 1;
+                col = col + 1;
+            }
+
+            if (i < n && src[i] == 46 && i + 1 < n && is_digit(src[i + 1])) {
+                i = i + 1;
+                col = col + 1;
+                while (i < n && is_digit(src[i])) {
+                    i = i + 1;
+                    col = col + 1;
+                }
+                if (i < n && (src[i] == 101 || src[i] == 69)) {
+                    i = i + 1;
+                    col = col + 1;
+                    if (i < n && (src[i] == 43 || src[i] == 45)) {
+                        i = i + 1;
+                        col = col + 1;
+                    }
+                    while (i < n && is_digit(src[i])) {
+                        i = i + 1;
+                        col = col + 1;
+                    }
+                }
+                push_tok("Float", str_slice(src, ns, i), tl, tcol);
+                continue;
+            }
+
+            push_tok("Integer", str_slice(src, ns, i), tl, tcol);
+            continue;
+        }
+
+        if (c == 34) {
+            var sl: u64 = line;
+            var scol: u64 = col;
+            i = i + 1;
+            col = col + 1;
+            sb_clear(tmp);
+            while (i < n && src[i] != 34) {
+                if (src[i] == 92) {
+                    i = i + 1;
+                    col = col + 1;
+                    if (i >= n) {
+                        break;
+                    }
+                    var e: u8 = src[i];
+                    if (src[i] == 10) {
+                        line = line + 1;
+                        col = 1;
+                    } else {
+                        col = col + 1;
+                    }
+                    i = i + 1;
+                    if (e == 110) {
+                        sb_append_char(tmp, 10);
+                    } else {
+                    if (e == 116) {
+                        sb_append_char(tmp, 9);
+                    } else {
+                    if (e == 114) {
+                        sb_append_char(tmp, 13);
+                    } else {
+                    if (e == 34) {
+                        sb_append_char(tmp, 34);
+                    } else {
+                    if (e == 92) {
+                        sb_append_char(tmp, 92);
+                    } else {
+                    if (e == 48) {
+                        sb_append_char(tmp, 0);
+                    } else {
+                        sb_append_char(tmp, e);
+                    }}}}}}
+                } else {
+                    if (src[i] == 10) {
+                        line = line + 1;
+                        col = 1;
+                    } else {
+                        col = col + 1;
+                    }
+                    sb_append_char(tmp, src[i]);
+                    i = i + 1;
+                }
+            }
+            if (i >= n) {
+                eprint("error: unterminated string literal\n");
+                exit(1);
+            }
+            i = i + 1;
+            col = col + 1;
+            push_tok("String", sb_to_str(tmp), sl, scol);
+            continue;
+        }
+
+        if (is_ident_start(c)) {
+            var il: u64 = line;
+            var icol: u64 = col;
+            var is0: u64 = i;
+            while (i < n && is_ident_cont(src[i])) {
+                i = i + 1;
+                col = col + 1;
+            }
+            var text: string = str_slice(src, is0, i);
+            var tname: string = kw_lookup(text);
+            if (str_len(tname) == 0) {
+                tname = "Identifier";
+            }
+            push_tok(tname, text, il, icol);
+            continue;
+        }
+
+        if (c == 64) {
+            push_tok("At", "@", line, col);
+            i = i + 1;
+            col = col + 1;
+            continue;
+        }
+        if (c == 35) {
+            push_tok("Hash", "#", line, col);
+            i = i + 1;
+            col = col + 1;
+            continue;
+        }
+
+        if (i + 2 < n && c == 60 && src[i + 1] == 60 && src[i + 2] == 61) {
+            push_tok("ShlAssign", "<<=", line, col);
+            i = i + 3;
+            col = col + 3;
+            continue;
+        }
+        if (i + 2 < n && c == 62 && src[i + 1] == 62 && src[i + 2] == 61) {
+            push_tok("ShrAssign", ">>=", line, col);
+            i = i + 3;
+            col = col + 3;
+            continue;
+        }
+
+        if (i + 1 < n) {
+            var two: string = op2_name(c, src[i + 1]);
+            if (str_len(two) > 0) {
+                push_tok(two, str_slice(src, i, i + 2), line, col);
+                i = i + 2;
+                col = col + 2;
+                continue;
+            }
+        }
+
+        var one: string = op1_name(c);
+        if (str_len(one) > 0) {
+            push_tok(one, str_slice(src, i, i + 1), line, col);
+            i = i + 1;
+            col = col + 1;
+            continue;
+        }
+
+        eprint("error: unexpected character\n");
+        exit(1);
+    }
+
+    push_tok("Eof", "", line, col);
+}
+
+// ── parser 状态与 token 辅助 ──────────────────────────────────
+
+var pos: i64;
+var decl_list: []i64;
+
+tk_t :: func(idx: i64) -> string {
+    var tk: Tok = toks[idx];
+    return tk.t;
+}
+
+tk_v :: func(idx: i64) -> string {
+    var tk: Tok = toks[idx];
+    return tk.v;
+}
+
+cur_t :: func() -> string {
+    return tk_t(pos);
+}
+
+cur_v :: func() -> string {
+    return tk_v(pos);
+}
+
+peek_t :: func(off: i64) -> string {
+    var idx: i64 = pos + off;
+    var n: i64 = slice_len(toks) as i64;
+    if (idx >= n) {
+        idx = n - 1;
+    }
+    return tk_t(idx);
+}
+
+// 前进一个 token，返回被消费 token 的下标（Eof 处不动，返回前一个）
+advance_i :: func() -> i64 {
+    if (cur_t() != "Eof") {
+        pos = pos + 1;
+    }
+    return pos - 1;
+}
+
+expect_tok :: func(t: string) -> string {
+    if (cur_t() == t) {
+        var idx: i64 = advance_i();
+        return tk_v(idx);
+    }
+    eprint("parse error: expected ");
+    eprint(t);
+    eprint(" but found ");
+    eprint(cur_v());
+    eprint("\n");
+    exit(1);
+    return "";
+}
+
+// parseInt(s, 10) 语义：取前导十进制数字
+parse_int_str :: func(s: string) -> i64 {
+    var r: i64 = 0;
+    var i: u64 = 0;
+    var n: u64 = str_len(s);
+    while (i < n) {
+        var c: u8 = s[i];
+        if (is_digit(c) == false) {
+            break;
+        }
+        r = r * 10 + ((c as i64) - 48);
+        i = i + 1;
+    }
+    return r;
+}
+
+// 拼接两条 Child 链，返回新头
+list_concat :: func(a: i64, b: i64) -> i64 {
+    if (a < 0) {
+        return b;
+    }
+    if (b < 0) {
+        return a;
+    }
+    var it: i64 = a;
+    while (true) {
+        var c: Child = kids[it];
+        if (c.next < 0) {
+            c.next = b;
+            slice_set(kids, it, c);
+            break;
+        }
+        it = c.next;
+    }
+    return a;
+}
+
+// ── 注解解析 ───────────────────────────────────────────────────
+
+parse_annotation_args :: func() -> i64 {
+    var head: i64 = -1;
+    var tail: i64 = -1;
+    while (cur_t() != "RParen" && cur_t() != "Eof") {
+        var t: string = cur_t();
+        var made: i64 = -1;
+        if (t == "String") {
+            var idx: i64 = advance_i();
+            made = node_new("string");
+            var an: Node = nodes[made];
+            an.sa = tk_v(idx);
+            slice_set(nodes, made, an);
+        } else {
+        if (t == "Integer") {
+            var idx2: i64 = advance_i();
+            made = node_new("number");
+            var an2: Node = nodes[made];
+            an2.sa = tk_v(idx2);
+            slice_set(nodes, made, an2);
+        } else {
+        if (t == "Identifier") {
+            var ih: i64 = -1;
+            var it: i64 = -1;
+            var cnt: i64 = 1;
+            var idx3: i64 = advance_i();
+            var id1: i64 = node_new("ident");
+            var an3: Node = nodes[id1];
+            an3.sa = tk_v(idx3);
+            slice_set(nodes, id1, an3);
+            it = list_push(ih, it, id1);
+            ih = it;
+            while (cur_t() == "Comma") {
+                advance_i();
+                var v2: string = expect_tok("Identifier");
+                var id2: i64 = node_new("ident");
+                var an4: Node = nodes[id2];
+                an4.sa = v2;
+                slice_set(nodes, id2, an4);
+                it = list_push(ih, it, id2);
+                cnt = cnt + 1;
+            }
+            if (cnt == 1) {
+                made = id1;
+            } else {
+                made = node_new("list");
+                var an5: Node = nodes[made];
+                an5.la = ih;
+                slice_set(nodes, made, an5);
+            }
+        } else {
+            eprint("parse error: invalid annotation argument\n");
+            exit(1);
+        }}}
+        tail = list_push(head, tail, made);
+        if (head < 0) {
+            head = tail;
+        }
+        if (cur_t() != "RParen") {
+            if (cur_t() == "Comma") {
+                advance_i();
+            }
+        }
+    }
+    return head;
+}
+
+parse_annotations :: func() -> i64 {
+    var head: i64 = -1;
+    var tail: i64 = -1;
+    while (cur_t() == "At") {
+        advance_i();
+        var name: string = "";
+        if (cur_t() == "Identifier" || cur_t() == "KwExport") {
+            var idx: i64 = advance_i();
+            name = tk_v(idx);
+        } else {
+            name = expect_tok("Identifier");
+        }
+        var args_head: i64 = -1;
+        if (cur_t() == "LParen") {
+            advance_i();
+            args_head = parse_annotation_args();
+            expect_tok("RParen");
+        }
+        var id: i64 = node_new("A");
+        var an: Node = nodes[id];
+        an.sa = name;
+        an.la = args_head;
+        slice_set(nodes, id, an);
+        tail = list_push(head, tail, id);
+        if (head < 0) {
+            head = tail;
+        }
+    }
+    return head;
+}
+
+// ── 类型解析 ───────────────────────────────────────────────────
+
+mk_scalar :: func(name: string) -> i64 {
+    var id: i64 = node_new("scalar");
+    var sn: Node = nodes[id];
+    sn.sa = name;
+    slice_set(nodes, id, sn);
+    return id;
+}
+
+is_scalar_name :: func(name: string) -> bool {
+    if (name == "u8" || name == "u16" || name == "u32" || name == "u64") {
+        return true;
+    }
+    if (name == "i8" || name == "i16" || name == "i32" || name == "i64") {
+        return true;
+    }
+    if (name == "f16" || name == "f32" || name == "f64") {
+        return true;
+    }
+    return name == "bool";
+}
+
+parse_type :: func() -> i64 {
+    var t: string = cur_t();
+    if (t == "KwMap") {
+        advance_i();
+        expect_tok("LBracket");
+        var kt: i64 = parse_type();
+        expect_tok("RBracket");
+        var vt: i64 = parse_type();
+        var id: i64 = node_new("map");
+        var mn: Node = nodes[id];
+        mn.na = kt;
+        mn.nb = vt;
+        slice_set(nodes, id, mn);
+        return id;
+    }
+    if (t == "LBracket") {
+        advance_i();
+        if (cur_t() == "RBracket") {
+            advance_i();
+            var el: i64 = parse_type();
+            var id2: i64 = node_new("slice");
+            var sn2: Node = nodes[id2];
+            sn2.na = el;
+            slice_set(nodes, id2, sn2);
+            return id2;
+        }
+        var ln: i64 = parse_expr();
+        expect_tok("RBracket");
+        var el2: i64 = parse_type();
+        var id3: i64 = node_new("array");
+        var an3: Node = nodes[id3];
+        an3.na = el2;
+        an3.nb = ln;
+        slice_set(nodes, id3, an3);
+        return id3;
+    }
+    if (t == "Star") {
+        advance_i();
+        var el3: i64 = parse_type();
+        var id4: i64 = node_new("pointer");
+        var pn: Node = nodes[id4];
+        pn.na = el3;
+        slice_set(nodes, id4, pn);
+        return id4;
+    }
+    if (t == "Question") {
+        advance_i();
+        var el4: i64 = parse_type();
+        var id5: i64 = node_new("optional");
+        var on: Node = nodes[id5];
+        on.na = el4;
+        slice_set(nodes, id5, on);
+        return id5;
+    }
+    if (t == "KwVoid") {
+        advance_i();
+        return mk_scalar("void");
+    }
+    if (t == "KwString") {
+        advance_i();
+        return mk_scalar("string");
+    }
+    if (t == "KwStringBuilder") {
+        advance_i();
+        return mk_scalar("StringBuilder");
+    }
+    if (t == "Identifier") {
+        var idx: i64 = advance_i();
+        var name: string = tk_v(idx);
+        if (name == "flag") {
+            if (cur_t() == "LBracket") {
+                advance_i();
+                var ui: i64 = advance_i();
+                expect_tok("RBracket");
+                var idf: i64 = node_new("flag");
+                var fn: Node = nodes[idf];
+                fn.sa = tk_v(ui);
+                slice_set(nodes, idf, fn);
+                return idf;
+            }
+        }
+        if (name == "flag_set") {
+            return node_new("flag_set");
+        }
+        if (name == "Variant") {
+            return node_new("variant");
+        }
+        if (is_scalar_name(name)) {
+            return mk_scalar(name);
+        }
+        var idn: i64 = node_new("named");
+        var nn: Node = nodes[idn];
+        nn.sa = name;
+        slice_set(nodes, idn, nn);
+        return idn;
+    }
+    eprint("parse error: expected type\n");
+    exit(1);
+    return -1;
+}
+
+// ── 表达式解析（优先级爬升，逐层照抄 tc0）─────────────────────
+
+mk_bin :: func(op: string, left: i64, right: i64) -> i64 {
+    var id: i64 = node_new("binary");
+    var n: Node = nodes[id];
+    n.sa = op;
+    n.na = left;
+    n.nb = right;
+    slice_set(nodes, id, n);
+    return id;
+}
+
+parse_expr :: func() -> i64 {
+    return parse_assign_expr();
+}
+
+parse_assign_expr :: func() -> i64 {
+    var left: i64 = parse_or();
+    if (cur_t() == "Assign") {
+        advance_i();
+        var right: i64 = parse_assign_expr();
+        var id: i64 = node_new("assign");
+        var n: Node = nodes[id];
+        n.sa = "=";
+        n.na = left;
+        n.nb = right;
+        slice_set(nodes, id, n);
+        return id;
+    }
+    return left;
+}
+
+parse_or :: func() -> i64 {
+    var left: i64 = parse_and();
+    while (cur_t() == "Or") {
+        advance_i();
+        var right: i64 = parse_and();
+        left = mk_bin("||", left, right);
+    }
+    return left;
+}
+
+parse_and :: func() -> i64 {
+    var left: i64 = parse_bitor();
+    while (cur_t() == "And") {
+        advance_i();
+        var right: i64 = parse_bitor();
+        left = mk_bin("&&", left, right);
+    }
+    return left;
+}
+
+parse_bitor :: func() -> i64 {
+    var left: i64 = parse_bitxor();
+    while (cur_t() == "BitOr") {
+        advance_i();
+        var right: i64 = parse_bitxor();
+        left = mk_bin("|", left, right);
+    }
+    return left;
+}
+
+parse_bitxor :: func() -> i64 {
+    var left: i64 = parse_bitand();
+    while (cur_t() == "BitXor") {
+        advance_i();
+        var right: i64 = parse_bitand();
+        left = mk_bin("^", left, right);
+    }
+    return left;
+}
+
+parse_bitand :: func() -> i64 {
+    var left: i64 = parse_eq();
+    while (cur_t() == "BitAnd") {
+        advance_i();
+        var right: i64 = parse_eq();
+        left = mk_bin("&", left, right);
+    }
+    return left;
+}
+
+parse_eq :: func() -> i64 {
+    var left: i64 = parse_cmp();
+    while (cur_t() == "Eq" || cur_t() == "NotEq") {
+        var op: string = "==";
+        if (cur_t() == "NotEq") {
+            op = "!=";
+        }
+        advance_i();
+        var right: i64 = parse_cmp();
+        left = mk_bin(op, left, right);
+    }
+    return left;
+}
+
+parse_cmp :: func() -> i64 {
+    var left: i64 = parse_shift();
+    while (cur_t() == "Lt" || cur_t() == "Gt" || cur_t() == "LtEq" || cur_t() == "GtEq") {
+        var t: string = cur_t();
+        var op: string = "<";
+        if (t == "Gt") {
+            op = ">";
+        }
+        if (t == "LtEq") {
+            op = "<=";
+        }
+        if (t == "GtEq") {
+            op = ">=";
+        }
+        advance_i();
+        var right: i64 = parse_shift();
+        left = mk_bin(op, left, right);
+    }
+    return left;
+}
+
+parse_shift :: func() -> i64 {
+    var left: i64 = parse_add();
+    while (cur_t() == "ShiftLeft" || cur_t() == "ShiftRight") {
+        var op: string = "<<";
+        if (cur_t() == "ShiftRight") {
+            op = ">>";
+        }
+        advance_i();
+        var right: i64 = parse_add();
+        left = mk_bin(op, left, right);
+    }
+    return left;
+}
+
+parse_add :: func() -> i64 {
+    var left: i64 = parse_mul();
+    while (cur_t() == "Plus" || cur_t() == "Minus") {
+        var op: string = "+";
+        if (cur_t() == "Minus") {
+            op = "-";
+        }
+        advance_i();
+        var right: i64 = parse_mul();
+        left = mk_bin(op, left, right);
+    }
+    return left;
+}
+
+parse_mul :: func() -> i64 {
+    var left: i64 = parse_unary();
+    while (cur_t() == "Star" || cur_t() == "Slash" || cur_t() == "Percent") {
+        var t: string = cur_t();
+        var op: string = "*";
+        if (t == "Slash") {
+            op = "/";
+        }
+        if (t == "Percent") {
+            op = "%";
+        }
+        advance_i();
+        var right: i64 = parse_unary();
+        left = mk_bin(op, left, right);
+    }
+    return left;
+}
+
+parse_unary :: func() -> i64 {
+    var t: string = cur_t();
+    if (t == "Not" || t == "Minus" || t == "BitNot") {
+        var op: string = "!";
+        if (t == "Minus") {
+            op = "-";
+        }
+        if (t == "BitNot") {
+            op = "~";
+        }
+        advance_i();
+        var operand: i64 = parse_unary();
+        var id: i64 = node_new("unary");
+        var n: Node = nodes[id];
+        n.sa = op;
+        n.na = operand;
+        slice_set(nodes, id, n);
+        return id;
+    }
+    return parse_postfix();
+}
+
+parse_postfix :: func() -> i64 {
+    var e: i64 = parse_primary();
+    while (true) {
+        var t: string = cur_t();
+        if (t == "Dot") {
+            advance_i();
+            var member: string = expect_tok("Identifier");
+            var id: i64 = node_new("member");
+            var n: Node = nodes[id];
+            n.na = e;
+            n.sa = member;
+            slice_set(nodes, id, n);
+            e = id;
+        } else {
+        if (t == "LBracket") {
+            advance_i();
+            var index: i64 = parse_expr();
+            expect_tok("RBracket");
+            var id2: i64 = node_new("index");
+            var n2: Node = nodes[id2];
+            n2.na = e;
+            n2.nb = index;
+            slice_set(nodes, id2, n2);
+            e = id2;
+        } else {
+        if (t == "LParen") {
+            advance_i();
+            var head: i64 = -1;
+            var tail: i64 = -1;
+            while (cur_t() != "RParen" && cur_t() != "Eof") {
+                var arg: i64 = parse_expr();
+                tail = list_push(head, tail, arg);
+                if (head < 0) {
+                    head = tail;
+                }
+                if (cur_t() == "Comma") {
+                    advance_i();
+                } else {
+                    break;
+                }
+            }
+            expect_tok("RParen");
+            var id3: i64 = node_new("call");
+            var n3: Node = nodes[id3];
+            n3.na = e;
+            n3.la = head;
+            slice_set(nodes, id3, n3);
+            e = id3;
+        } else {
+            break;
+        }}}
+    }
+    if (cur_t() == "KwAs") {
+        advance_i();
+        var tt: i64 = parse_type();
+        var id4: i64 = node_new("cast");
+        var n4: Node = nodes[id4];
+        n4.na = e;
+        n4.nb = tt;
+        slice_set(nodes, id4, n4);
+        e = id4;
+    }
+    return e;
+}
+
+starts_with_0x :: func(s: string) -> bool {
+    if (str_len(s) < 2) {
+        return false;
+    }
+    if (s[0] != 48) {
+        return false;
+    }
+    return s[1] == 120 || s[1] == 88;
+}
+
+starts_with_0b :: func(s: string) -> bool {
+    if (str_len(s) < 2) {
+        return false;
+    }
+    if (s[0] != 48) {
+        return false;
+    }
+    return s[1] == 98 || s[1] == 66;
+}
+
+looks_like_struct_lit :: func() -> bool {
+    if (peek_t(1) == "RBrace") {
+        return true;
+    }
+    if (peek_t(1) == "Identifier" && peek_t(2) == "Colon") {
+        return true;
+    }
+    return false;
+}
+
+parse_struct_lit :: func(type_name: string) -> i64 {
+    advance_i();
+    var head: i64 = -1;
+    var tail: i64 = -1;
+    while (cur_t() != "RBrace" && cur_t() != "Eof") {
+        var fname: string = expect_tok("Identifier");
+        expect_tok("Colon");
+        var val: i64 = parse_expr();
+        var fid: i64 = node_new("FV");
+        var fn: Node = nodes[fid];
+        fn.sa = fname;
+        fn.na = val;
+        slice_set(nodes, fid, fn);
+        tail = list_push(head, tail, fid);
+        if (head < 0) {
+            head = tail;
+        }
+        if (cur_t() == "Comma") {
+            advance_i();
+        } else {
+            break;
+        }
+    }
+    expect_tok("RBrace");
+    var id: i64 = node_new("struct_lit");
+    var n: Node = nodes[id];
+    n.sa = type_name;
+    n.la = head;
+    slice_set(nodes, id, n);
+    return id;
+}
+
+parse_map_lit :: func() -> i64 {
+    var head: i64 = -1;
+    var tail: i64 = -1;
+    while (cur_t() != "RBracket" && cur_t() != "Eof") {
+        var k: i64 = parse_expr();
+        expect_tok("Colon");
+        var v: i64 = parse_expr();
+        var eid: i64 = node_new("EN");
+        var en: Node = nodes[eid];
+        en.na = k;
+        en.nb = v;
+        slice_set(nodes, eid, en);
+        tail = list_push(head, tail, eid);
+        if (head < 0) {
+            head = tail;
+        }
+        if (cur_t() == "Comma") {
+            advance_i();
+        } else {
+            break;
+        }
+    }
+    expect_tok("RBracket");
+    var id: i64 = node_new("map_lit");
+    var n: Node = nodes[id];
+    n.la = head;
+    slice_set(nodes, id, n);
+    return id;
+}
+
+parse_array_lit :: func() -> i64 {
+    advance_i();
+    var is_maplit: bool = cur_t() == "Identifier" || cur_t() == "String" || cur_t() == "Integer";
+    if (is_maplit && peek_t(1) == "Colon") {
+        return parse_map_lit();
+    }
+    var head: i64 = -1;
+    var tail: i64 = -1;
+    while (cur_t() != "RBracket" && cur_t() != "Eof") {
+        var e: i64 = parse_expr();
+        tail = list_push(head, tail, e);
+        if (head < 0) {
+            head = tail;
+        }
+        if (cur_t() == "Comma") {
+            advance_i();
+        } else {
+            break;
+        }
+    }
+    expect_tok("RBracket");
+    var id: i64 = node_new("array_lit");
+    var n: Node = nodes[id];
+    n.la = head;
+    slice_set(nodes, id, n);
+    return id;
+}
+
+parse_primary :: func() -> i64 {
+    var t: string = cur_t();
+    if (t == "Integer") {
+        var idx: i64 = advance_i();
+        var val: string = tk_v(idx);
+        var radix: i64 = 10;
+        if (starts_with_0x(val)) {
+            radix = 16;
+        } else {
+            if (starts_with_0b(val)) {
+                radix = 2;
+            }
+        }
+        var id: i64 = node_new("int");
+        var n: Node = nodes[id];
+        n.sa = val;
+        n.ia = radix;
+        slice_set(nodes, id, n);
+        return id;
+    }
+    if (t == "Float") {
+        var idx2: i64 = advance_i();
+        var id2: i64 = node_new("float");
+        var n2: Node = nodes[id2];
+        n2.sa = tk_v(idx2);
+        slice_set(nodes, id2, n2);
+        return id2;
+    }
+    if (t == "String") {
+        var idx3: i64 = advance_i();
+        var id3: i64 = node_new("string");
+        var n3: Node = nodes[id3];
+        n3.sa = tk_v(idx3);
+        slice_set(nodes, id3, n3);
+        return id3;
+    }
+    if (t == "KwTrue") {
+        advance_i();
+        var id4: i64 = node_new("bool");
+        var n4: Node = nodes[id4];
+        n4.ba = true;
+        slice_set(nodes, id4, n4);
+        return id4;
+    }
+    if (t == "KwFalse") {
+        advance_i();
+        var id5: i64 = node_new("bool");
+        var n5: Node = nodes[id5];
+        n5.ba = false;
+        slice_set(nodes, id5, n5);
+        return id5;
+    }
+    if (t == "KwNull") {
+        advance_i();
+        return node_new("null");
+    }
+    if (t == "Identifier") {
+        var idx6: i64 = advance_i();
+        var name: string = tk_v(idx6);
+        if (cur_t() == "LBrace" && looks_like_struct_lit()) {
+            return parse_struct_lit(name);
+        }
+        var id6: i64 = node_new("ident");
+        var n6: Node = nodes[id6];
+        n6.sa = name;
+        slice_set(nodes, id6, n6);
+        return id6;
+    }
+    if (t == "LParen") {
+        advance_i();
+        var inner: i64 = parse_expr();
+        expect_tok("RParen");
+        var id7: i64 = node_new("paren");
+        var n7: Node = nodes[id7];
+        n7.na = inner;
+        slice_set(nodes, id7, n7);
+        return id7;
+    }
+    if (t == "LBracket") {
+        return parse_array_lit();
+    }
+    eprint("parse error: unexpected token in expression: ");
+    eprint(cur_v());
+    eprint("\n");
+    exit(1);
+    return -1;
+}
+
+// ── 语句解析 ───────────────────────────────────────────────────
+
+parse_block :: func() -> i64 {
+    expect_tok("LBrace");
+    var head: i64 = -1;
+    var tail: i64 = -1;
+    while (cur_t() != "RBrace" && cur_t() != "Eof") {
+        var s: i64 = parse_statement();
+        if (s >= 0) {
+            tail = list_push(head, tail, s);
+            if (head < 0) {
+                head = tail;
+            }
+        }
+    }
+    expect_tok("RBrace");
+    return head;
+}
+
+parse_if_stmt :: func() -> i64 {
+    advance_i();
+    expect_tok("LParen");
+    var cond: i64 = parse_expr();
+    expect_tok("RParen");
+    var then_head: i64 = parse_block();
+    var else_head: i64 = -2;
+    if (cur_t() == "KwElse") {
+        advance_i();
+        if (cur_t() == "KwIf") {
+            var nested: i64 = parse_if_stmt();
+            var h: i64 = -1;
+            h = list_push(h, -1, nested);
+            else_head = h;
+        } else {
+            else_head = parse_block();
+        }
+    }
+    var id: i64 = node_new("if");
+    var n: Node = nodes[id];
+    n.na = cond;
+    n.la = then_head;
+    n.lb = else_head;
+    slice_set(nodes, id, n);
+    return id;
+}
+
+parse_local_var :: func(is_const: bool) -> i64 {
+    advance_i();
+    var name: string = expect_tok("Identifier");
+    var tn: i64 = -1;
+    if (cur_t() == "Colon") {
+        advance_i();
+        tn = parse_type();
+    }
+    var init: i64 = -1;
+    if (cur_t() == "Assign") {
+        advance_i();
+        init = parse_expr();
+    }
+    expect_tok("Semicolon");
+    var id: i64 = node_new("var_decl");
+    var n: Node = nodes[id];
+    n.sa = name;
+    n.ba = is_const;
+    n.na = tn;
+    n.nb = init;
+    slice_set(nodes, id, n);
+    return id;
+}
+
+parse_for_stmt :: func() -> i64 {
+    advance_i();
+    expect_tok("LParen");
+    if (cur_t() == "Identifier" && peek_t(1) == "KwIn") {
+        var vi: i64 = advance_i();
+        var vname: string = tk_v(vi);
+        advance_i();
+        var iterable: i64 = parse_expr();
+        expect_tok("RParen");
+        var body: i64 = parse_block();
+        var id: i64 = node_new("for_each");
+        var n: Node = nodes[id];
+        n.sa = vname;
+        n.na = iterable;
+        n.la = body;
+        slice_set(nodes, id, n);
+        return id;
+    }
+    var init: i64 = -1;
+    if (cur_t() != "Semicolon") {
+        if (cur_t() == "KwVar") {
+            init = parse_local_var(false);
+        } else {
+        if (cur_t() == "KwConst") {
+            init = parse_local_var(true);
+        } else {
+            var e: i64 = parse_expr();
+            expect_tok("Semicolon");
+            init = node_new("expr");
+            var en: Node = nodes[init];
+            en.na = e;
+            slice_set(nodes, init, en);
+        }}
+    } else {
+        advance_i();
+    }
+    var cond: i64 = -1;
+    if (cur_t() != "Semicolon") {
+        cond = parse_expr();
+    }
+    expect_tok("Semicolon");
+    var upd: i64 = -1;
+    if (cur_t() != "RParen") {
+        upd = parse_expr();
+    }
+    expect_tok("RParen");
+    var body2: i64 = parse_block();
+    var id2: i64 = node_new("for");
+    var n2: Node = nodes[id2];
+    n2.na = init;
+    n2.nb = cond;
+    n2.nc = upd;
+    n2.la = body2;
+    slice_set(nodes, id2, n2);
+    return id2;
+}
+
+parse_while_stmt :: func() -> i64 {
+    advance_i();
+    expect_tok("LParen");
+    var cond: i64 = parse_expr();
+    expect_tok("RParen");
+    var body: i64 = parse_block();
+    var id: i64 = node_new("while");
+    var n: Node = nodes[id];
+    n.na = cond;
+    n.la = body;
+    slice_set(nodes, id, n);
+    return id;
+}
+
+parse_switch_stmt :: func() -> i64 {
+    advance_i();
+    expect_tok("LParen");
+    var e: i64 = parse_expr();
+    expect_tok("RParen");
+    expect_tok("LBrace");
+    var cases_head: i64 = -1;
+    var cases_tail: i64 = -1;
+    var default_head: i64 = -2;
+    while (cur_t() != "RBrace" && cur_t() != "Eof") {
+        if (cur_t() == "KwCase") {
+            advance_i();
+            var pat: i64 = parse_expr();
+            expect_tok("Colon");
+            var bh: i64 = -1;
+            var bt: i64 = -1;
+            while (cur_t() != "KwCase" && cur_t() != "KwDefault" && cur_t() != "RBrace" && cur_t() != "Eof") {
+                var s: i64 = parse_statement();
+                if (s >= 0) {
+                    bt = list_push(bh, bt, s);
+                    if (bh < 0) {
+                        bh = bt;
+                    }
+                }
+            }
+            var cid: i64 = node_new("CS");
+            var cn: Node = nodes[cid];
+            cn.na = pat;
+            cn.la = bh;
+            slice_set(nodes, cid, cn);
+            cases_tail = list_push(cases_head, cases_tail, cid);
+            if (cases_head < 0) {
+                cases_head = cases_tail;
+            }
+        } else {
+        if (cur_t() == "KwDefault") {
+            advance_i();
+            expect_tok("Colon");
+            var dh: i64 = -1;
+            var dt: i64 = -1;
+            while (cur_t() != "KwCase" && cur_t() != "RBrace" && cur_t() != "Eof") {
+                var s2: i64 = parse_statement();
+                if (s2 >= 0) {
+                    dt = list_push(dh, dt, s2);
+                    if (dh < 0) {
+                        dh = dt;
+                    }
+                }
+            }
+            default_head = dh;
+        } else {
+            eprint("parse error: expected case or default in switch\n");
+            exit(1);
+        }}
+    }
+    expect_tok("RBrace");
+    var id: i64 = node_new("switch");
+    var n: Node = nodes[id];
+    n.na = e;
+    n.la = cases_head;
+    n.lb = default_head;
+    slice_set(nodes, id, n);
+    return id;
+}
+
+parse_return_stmt :: func() -> i64 {
+    advance_i();
+    var val: i64 = -1;
+    if (cur_t() != "Semicolon") {
+        val = parse_expr();
+    }
+    expect_tok("Semicolon");
+    var id: i64 = node_new("return");
+    var n: Node = nodes[id];
+    n.na = val;
+    slice_set(nodes, id, n);
+    return id;
+}
+
+parse_expr_or_assign_stmt :: func() -> i64 {
+    var e: i64 = parse_expr();
+    var t: string = cur_t();
+    var is_assign: bool = false;
+    if (t == "Assign" || t == "PlusAssign" || t == "MinusAssign" || t == "StarAssign") {
+        is_assign = true;
+    }
+    if (t == "SlashAssign" || t == "PercentAssign" || t == "BitAndAssign" || t == "BitOrAssign") {
+        is_assign = true;
+    }
+    if (t == "BitXorAssign" || t == "ShlAssign" || t == "ShrAssign") {
+        is_assign = true;
+    }
+    if (is_assign) {
+        var oi: i64 = advance_i();
+        var op: string = tk_v(oi);
+        var val: i64 = parse_expr();
+        expect_tok("Semicolon");
+        var id: i64 = node_new("assignment");
+        var n: Node = nodes[id];
+        n.na = e;
+        n.sa = op;
+        n.nb = val;
+        slice_set(nodes, id, n);
+        return id;
+    }
+    expect_tok("Semicolon");
+    var id2: i64 = node_new("expr");
+    var n2: Node = nodes[id2];
+    n2.na = e;
+    slice_set(nodes, id2, n2);
+    return id2;
+}
+
+parse_statement :: func() -> i64 {
+    var t: string = cur_t();
+    if (t == "KwIf") {
+        return parse_if_stmt();
+    }
+    if (t == "KwFor") {
+        return parse_for_stmt();
+    }
+    if (t == "KwWhile") {
+        return parse_while_stmt();
+    }
+    if (t == "KwSwitch") {
+        return parse_switch_stmt();
+    }
+    if (t == "KwReturn") {
+        return parse_return_stmt();
+    }
+    if (t == "KwBreak") {
+        advance_i();
+        expect_tok("Semicolon");
+        return node_new("break");
+    }
+    if (t == "KwContinue") {
+        advance_i();
+        expect_tok("Semicolon");
+        return node_new("continue");
+    }
+    if (t == "KwDefer") {
+        advance_i();
+        var body: i64 = parse_block();
+        var id: i64 = node_new("defer");
+        var n: Node = nodes[id];
+        n.la = body;
+        slice_set(nodes, id, n);
+        return id;
+    }
+    if (t == "KwComptime") {
+        advance_i();
+        if (cur_t() == "LBrace") {
+            var body2: i64 = parse_block();
+            var id2: i64 = node_new("comptime_block");
+            var n2: Node = nodes[id2];
+            n2.la = body2;
+            slice_set(nodes, id2, n2);
+            return id2;
+        }
+        var e: i64 = parse_expr();
+        expect_tok("Semicolon");
+        var ce: i64 = node_new("comptime");
+        var cn: Node = nodes[ce];
+        cn.na = e;
+        slice_set(nodes, ce, cn);
+        var id3: i64 = node_new("expr");
+        var n3: Node = nodes[id3];
+        n3.na = ce;
+        slice_set(nodes, id3, n3);
+        return id3;
+    }
+    if (t == "LBrace") {
+        var body3: i64 = parse_block();
+        var id4: i64 = node_new("block");
+        var n4: Node = nodes[id4];
+        n4.la = body3;
+        slice_set(nodes, id4, n4);
+        return id4;
+    }
+    if (t == "KwVar") {
+        return parse_local_var(false);
+    }
+    if (t == "KwConst") {
+        return parse_local_var(true);
+    }
+    return parse_expr_or_assign_stmt();
+}
+
+// ── 注解查找辅助 ───────────────────────────────────────────────
+
+// 在注解链中查找名为 name 的第一个注解，返回节点下标或 -1
+ann_find :: func(head: i64, name: string) -> i64 {
+    var it: i64 = head;
+    while (it >= 0) {
+        var c: Child = kids[it];
+        var an: Node = nodes[c.val];
+        if (an.sa == name) {
+            return c.val;
+        }
+        it = c.next;
+    }
+    return -1;
+}
+
+// 注解的第一个参数节点下标，无参数返回 -1
+ann_first_arg :: func(ann_idx: i64) -> i64 {
+    var an: Node = nodes[ann_idx];
+    if (an.la < 0) {
+        return -1;
+    }
+    var c: Child = kids[an.la];
+    return c.val;
+}
+
+// ── 声明解析 ───────────────────────────────────────────────────
+
+parse_struct_decl :: func(name: string, anns: i64, layout: string) -> i64 {
+    advance_i();
+    var post: i64 = parse_annotations();
+    var all: i64 = list_concat(anns, post);
+
+    var is_bitpack: bool = false;
+    var bp_type: string = "";
+    var has_bp_type: bool = false;
+    var bp: i64 = ann_find(all, "bitpack");
+    if (bp >= 0) {
+        is_bitpack = true;
+        var arg: i64 = ann_first_arg(bp);
+        if (arg >= 0) {
+            var argn: Node = nodes[arg];
+            if (argn.kind == "ident") {
+                bp_type = argn.sa;
+                has_bp_type = true;
+            }
+        }
+    }
+
+    expect_tok("LBrace");
+    var fh: i64 = -1;
+    var ft: i64 = -1;
+    while (cur_t() != "RBrace" && cur_t() != "Eof") {
+        var fname: string = expect_tok("Identifier");
+        expect_tok("Colon");
+        var fid: i64 = -1;
+        if (is_bitpack) {
+            var wv: string = expect_tok("Integer");
+            var fanns: i64 = parse_annotations();
+            expect_tok("Semicolon");
+            fid = node_new("F");
+            var fn: Node = nodes[fid];
+            fn.sa = fname;
+            fn.na = mk_scalar("void");
+            fn.ia = parse_int_str(wv);
+            fn.la = fanns;
+            slice_set(nodes, fid, fn);
+        } else {
+            var tn: i64 = parse_type();
+            var fanns2: i64 = parse_annotations();
+            expect_tok("Semicolon");
+            fid = node_new("F");
+            var fn2: Node = nodes[fid];
+            fn2.sa = fname;
+            fn2.na = tn;
+            fn2.ia = -1;
+            fn2.la = fanns2;
+            slice_set(nodes, fid, fn2);
+        }
+        ft = list_push(fh, ft, fid);
+        if (fh < 0) {
+            fh = ft;
+        }
+    }
+    expect_tok("RBrace");
+
+    var id: i64 = node_new("StructDecl");
+    var n: Node = nodes[id];
+    n.sa = name;
+    n.la = all;
+    n.sb = layout;
+    n.ba = is_bitpack;
+    n.sc = bp_type;
+    n.has_sc = has_bp_type;
+    n.lb = fh;
+    slice_set(nodes, id, n);
+    return id;
+}
+
+parse_enum_decl :: func(name: string, anns: i64) -> i64 {
+    advance_i();
+    var underlying: string = "u32";
+    if (cur_t() == "Colon") {
+        advance_i();
+        var ti: i64 = advance_i();
+        underlying = tk_v(ti);
+    }
+    var post: i64 = parse_annotations();
+    var all: i64 = list_concat(anns, post);
+
+    expect_tok("LBrace");
+    var vh: i64 = -1;
+    var vt: i64 = -1;
+    while (cur_t() != "RBrace" && cur_t() != "Eof") {
+        if (cur_t() == "At" || cur_t() != "Identifier") {
+            advance_i();
+            continue;
+        }
+        var vname: string = expect_tok("Identifier");
+        var val: i64 = -1;
+        if (cur_t() == "Assign") {
+            advance_i();
+            val = parse_expr();
+        }
+        var vanns: i64 = parse_annotations();
+        if (cur_t() == "Comma") {
+            advance_i();
+        }
+        var vid: i64 = node_new("V");
+        var vn: Node = nodes[vid];
+        vn.sa = vname;
+        vn.na = val;
+        vn.la = vanns;
+        slice_set(nodes, vid, vn);
+        vt = list_push(vh, vt, vid);
+        if (vh < 0) {
+            vh = vt;
+        }
+    }
+    expect_tok("RBrace");
+
+    var id: i64 = node_new("EnumDecl");
+    var n: Node = nodes[id];
+    n.sa = name;
+    n.la = all;
+    n.sb = underlying;
+    n.lb = vh;
+    slice_set(nodes, id, n);
+    return id;
+}
+
+parse_flag_decl :: func(name: string, anns: i64) -> i64 {
+    advance_i();
+    var underlying: string = "u32";
+    if (cur_t() == "LBracket") {
+        advance_i();
+        var ti: i64 = advance_i();
+        underlying = tk_v(ti);
+        expect_tok("RBracket");
+    }
+    var post: i64 = parse_annotations();
+    var all: i64 = list_concat(anns, post);
+
+    expect_tok("LBrace");
+    var sh: i64 = -1;
+    var st: i64 = -1;
+    while (cur_t() != "RBrace" && cur_t() != "Eof") {
+        if (cur_t() != "Identifier") {
+            advance_i();
+            continue;
+        }
+        var sname: string = expect_tok("Identifier");
+        expect_tok("Colon");
+        var wv: string = expect_tok("Integer");
+        var sanns: i64 = parse_annotations();
+
+        var offset: i64 = -1;
+        var has_offset: bool = false;
+        var oa: i64 = ann_find(sanns, "offset");
+        if (oa >= 0) {
+            var arg: i64 = ann_first_arg(oa);
+            if (arg >= 0) {
+                var argn: Node = nodes[arg];
+                if (argn.kind == "number") {
+                    offset = parse_int_str(argn.sa);
+                    has_offset = true;
+                }
+            }
+        }
+
+        if (cur_t() == "Comma" || cur_t() == "Semicolon") {
+            advance_i();
+        }
+        var sid: i64 = node_new("SL");
+        var sn: Node = nodes[sid];
+        sn.sa = sname;
+        sn.ia = parse_int_str(wv);
+        sn.ib = offset;
+        sn.bb = has_offset;
+        sn.la = sanns;
+        slice_set(nodes, sid, sn);
+        st = list_push(sh, st, sid);
+        if (sh < 0) {
+            sh = st;
+        }
+    }
+    expect_tok("RBrace");
+
+    var id: i64 = node_new("FlagDecl");
+    var n: Node = nodes[id];
+    n.sa = name;
+    n.la = all;
+    n.sb = underlying;
+    n.lb = sh;
+    slice_set(nodes, id, n);
+    return id;
+}
+
+parse_flag_set_decl :: func(name: string, anns: i64) -> i64 {
+    advance_i();
+    var post: i64 = parse_annotations();
+    var all: i64 = list_concat(anns, post);
+
+    expect_tok("LBrace");
+    var sh: i64 = -1;
+    var st: i64 = -1;
+    while (cur_t() != "RBrace" && cur_t() != "Eof") {
+        if (cur_t() != "Identifier") {
+            advance_i();
+            continue;
+        }
+        var sname: string = expect_tok("Identifier");
+        expect_tok("Colon");
+        var wv: string = expect_tok("Integer");
+        var sanns: i64 = parse_annotations();
+        if (cur_t() == "Comma" || cur_t() == "Semicolon") {
+            advance_i();
+        }
+        var sid: i64 = node_new("SL");
+        var sn: Node = nodes[sid];
+        sn.sa = sname;
+        sn.ia = parse_int_str(wv);
+        sn.ib = -1;
+        sn.bb = false;
+        sn.la = sanns;
+        slice_set(nodes, sid, sn);
+        st = list_push(sh, st, sid);
+        if (sh < 0) {
+            sh = st;
+        }
+    }
+    expect_tok("RBrace");
+
+    var id: i64 = node_new("FlagSetDecl");
+    var n: Node = nodes[id];
+    n.sa = name;
+    n.la = all;
+    n.lb = sh;
+    slice_set(nodes, id, n);
+    return id;
+}
+
+parse_union_decl :: func(name: string, anns: i64) -> i64 {
+    advance_i();
+    var post: i64 = parse_annotations();
+    var all: i64 = list_concat(anns, post);
+
+    expect_tok("LBrace");
+    var mh: i64 = -1;
+    var mt: i64 = -1;
+    while (cur_t() != "RBrace" && cur_t() != "Eof") {
+        if (cur_t() != "Identifier") {
+            advance_i();
+            continue;
+        }
+        var mname: string = expect_tok("Identifier");
+        expect_tok("Colon");
+        var tn: i64 = parse_type();
+        var manns: i64 = parse_annotations();
+        if (cur_t() == "Comma" || cur_t() == "Semicolon") {
+            advance_i();
+        }
+        var mid: i64 = node_new("M");
+        var mn: Node = nodes[mid];
+        mn.sa = mname;
+        mn.na = tn;
+        mn.la = manns;
+        slice_set(nodes, mid, mn);
+        mt = list_push(mh, mt, mid);
+        if (mh < 0) {
+            mh = mt;
+        }
+    }
+    expect_tok("RBrace");
+
+    var id: i64 = node_new("UnionDecl");
+    var n: Node = nodes[id];
+    n.sa = name;
+    n.la = all;
+    n.lb = mh;
+    slice_set(nodes, id, n);
+    return id;
+}
+
+parse_func_decl :: func(name: string, anns: i64, is_comptime: bool) -> i64 {
+    advance_i();
+    expect_tok("LParen");
+    var ph: i64 = -1;
+    var pt: i64 = -1;
+    while (cur_t() != "RParen" && cur_t() != "Eof") {
+        var pname: string = expect_tok("Identifier");
+        expect_tok("Colon");
+        var ptn: i64 = parse_type();
+        var panns: i64 = parse_annotations();
+        var pid: i64 = node_new("P");
+        var pn: Node = nodes[pid];
+        pn.sa = pname;
+        pn.na = ptn;
+        pn.la = panns;
+        slice_set(nodes, pid, pn);
+        pt = list_push(ph, pt, pid);
+        if (ph < 0) {
+            ph = pt;
+        }
+        if (cur_t() == "Comma") {
+            advance_i();
+        } else {
+            break;
+        }
+    }
+    expect_tok("RParen");
+    expect_tok("Arrow");
+    var rt: i64 = parse_type();
+    var post: i64 = parse_annotations();
+    var all: i64 = list_concat(anns, post);
+
+    var body: i64 = -2;
+    var is_extern: bool = false;
+    if (cur_t() == "Semicolon") {
+        advance_i();
+        is_extern = true;
+    } else {
+        if (cur_t() == "LBrace") {
+            body = parse_block();
+        } else {
+            eprint("parse error: expected '{' or ';' after function signature\n");
+            exit(1);
+        }
+    }
+
+    var id: i64 = node_new("FuncDecl");
+    var n: Node = nodes[id];
+    n.sa = name;
+    n.la = all;
+    n.lb = ph;
+    n.na = rt;
+    n.ba = is_extern;
+    n.bb = is_comptime;
+    n.lc = body;
+    slice_set(nodes, id, n);
+    return id;
+}
+
+parse_global_var :: func(is_const: bool) -> i64 {
+    advance_i();
+    var name: string = expect_tok("Identifier");
+    var tn: i64 = -1;
+    if (cur_t() == "Colon") {
+        advance_i();
+        tn = parse_type();
+    }
+    var init: i64 = -1;
+    if (cur_t() == "Assign") {
+        advance_i();
+        init = parse_expr();
+    }
+    expect_tok("Semicolon");
+
+    if (is_const) {
+        if (init < 0) {
+            init = node_new("null");
+        }
+        var id: i64 = node_new("GlobalConstDecl");
+        var n: Node = nodes[id];
+        n.sa = name;
+        n.la = -1;
+        n.na = tn;
+        n.nb = init;
+        n.bb = false;
+        slice_set(nodes, id, n);
+        return id;
+    }
+
+    if (tn < 0) {
+        tn = mk_scalar("void");
+    }
+    var id2: i64 = node_new("GlobalVarDecl");
+    var n2: Node = nodes[id2];
+    n2.sa = name;
+    n2.la = -1;
+    n2.na = tn;
+    n2.nb = init;
+    n2.bb = false;
+    slice_set(nodes, id2, n2);
+    return id2;
+}
+
+parse_import_decl :: func(anns: i64) -> i64 {
+    advance_i();
+    var path: string = expect_tok("String");
+    var alias: string = "";
+    var has_alias: bool = false;
+    if (cur_t() == "KwAs") {
+        advance_i();
+        alias = expect_tok("Identifier");
+        has_alias = true;
+    }
+    expect_tok("Semicolon");
+
+    var id: i64 = node_new("ImportDecl");
+    var n: Node = nodes[id];
+    n.has_sa = false;
+    n.la = anns;
+    n.sb = path;
+    n.sc = alias;
+    n.has_sc = has_alias;
+    slice_set(nodes, id, n);
+    return id;
+}
+
+parse_type_alias :: func(name: string, anns: i64) -> i64 {
+    var tn: i64 = parse_type();
+    expect_tok("Semicolon");
+    var id: i64 = node_new("TypeAliasDecl");
+    var n: Node = nodes[id];
+    n.sa = name;
+    n.la = anns;
+    n.na = tn;
+    slice_set(nodes, id, n);
+    return id;
+}
+
+parse_decl_body :: func(name: string, anns: i64, is_comptime: bool) -> i64 {
+    var layout: string = "default";
+    if (cur_t() == "Hash") {
+        advance_i();
+        var li: i64 = advance_i();
+        if (tk_t(li) == "Identifier") {
+            var lv: string = tk_v(li);
+            if (lv == "soa") {
+                layout = "soa";
+            } else {
+                if (lv == "aos") {
+                    layout = "aos";
+                }
+            }
+        }
+    }
+
+    var t: string = cur_t();
+    if (t == "KwStruct") {
+        return parse_struct_decl(name, anns, layout);
+    }
+    if (t == "KwEnum") {
+        return parse_enum_decl(name, anns);
+    }
+    if (t == "KwFlag") {
+        return parse_flag_decl(name, anns);
+    }
+    if (t == "KwUnion") {
+        return parse_union_decl(name, anns);
+    }
+    if (t == "KwFunc") {
+        return parse_func_decl(name, anns, is_comptime);
+    }
+    if (t == "Identifier" && cur_v() == "flag_set") {
+        return parse_flag_set_decl(name, anns);
+    }
+    return parse_type_alias(name, anns);
+}
+
+parse_declaration :: func() -> i64 {
+    var anns: i64 = parse_annotations();
+
+    if (cur_t() == "KwVar") {
+        return parse_global_var(false);
+    }
+    if (cur_t() == "KwConst") {
+        return parse_global_var(true);
+    }
+    if (cur_t() == "KwImport") {
+        return parse_import_decl(anns);
+    }
+
+    var is_comptime: bool = false;
+    if (cur_t() == "KwComptime") {
+        advance_i();
+        is_comptime = true;
+    }
+
+    if (cur_t() != "Identifier") {
+        eprint("parse error: expected declaration name but found ");
+        eprint(cur_v());
+        eprint("\n");
+        exit(1);
+    }
+    var ni: i64 = advance_i();
+    var name: string = tk_v(ni);
+
+    if (cur_t() != "DoubleColon") {
+        eprint("parse error: expected '::' after declaration name\n");
+        exit(1);
+    }
+    advance_i();
+
+    return parse_decl_body(name, anns, is_comptime);
+}
+
+parse_unit :: func() -> void {
+    while (cur_t() != "Eof") {
+        if (cur_t() == "Semicolon") {
+            advance_i();
+            continue;
+        }
+        var d: i64 = parse_declaration();
+        if (d >= 0) {
+            append(decl_list, d);
+        }
+    }
+}
+
+// ── JSON 序列化（逐字节复刻 JSON.stringify + parse_export.ts）──
+
+hex_digit :: func(v: u8) -> u8 {
+    if (v < 10) {
+        return 48 + v;
+    }
+    return 97 + (v - 10);
+}
+
+json_escape_into :: func(out: StringBuilder, s: string) -> void {
+    var i: u64 = 0;
+    var n: u64 = str_len(s);
+    while (i < n) {
+        var b: u8 = s[i];
+        if (b == 34) {
+            sb_append_char(out, 92);
+            sb_append_char(out, 34);
+        } else {
+        if (b == 92) {
+            sb_append_char(out, 92);
+            sb_append_char(out, 92);
+        } else {
+        if (b == 10) {
+            sb_append_char(out, 92);
+            sb_append_char(out, 110);
+        } else {
+        if (b == 9) {
+            sb_append_char(out, 92);
+            sb_append_char(out, 116);
+        } else {
+        if (b == 13) {
+            sb_append_char(out, 92);
+            sb_append_char(out, 114);
+        } else {
+        if (b == 8) {
+            sb_append_char(out, 92);
+            sb_append_char(out, 98);
+        } else {
+        if (b == 12) {
+            sb_append_char(out, 92);
+            sb_append_char(out, 102);
+        } else {
+        if (b < 32) {
+            sb_append_char(out, 92);
+            sb_append_char(out, 117);
+            sb_append_char(out, 48);
+            sb_append_char(out, 48);
+            sb_append_char(out, hex_digit(b / 16));
+            sb_append_char(out, hex_digit(b % 16));
+        } else {
+            sb_append_char(out, b);
+        }}}}}}}}
+        i = i + 1;
+    }
+}
+
+j_qstr :: func(out: StringBuilder, s: string) -> void {
+    sb_append_char(out, 34);
+    json_escape_into(out, s);
+    sb_append_char(out, 34);
+}
+
+j_bool :: func(out: StringBuilder, b: bool) -> void {
+    if (b) {
+        sb_append_str(out, "true");
+    } else {
+        sb_append_str(out, "false");
+    }
+}
+
+json_ann_arg :: func(out: StringBuilder, idx: i64) -> void {
+    var n: Node = nodes[idx];
+    if (n.kind == "list") {
+        sb_append_str(out, "{\"kind\":\"list\",\"values\":[");
+        var it: i64 = n.la;
+        while (it >= 0) {
+            var c: Child = kids[it];
+            json_ann_arg(out, c.val);
+            if (c.next >= 0) {
+                sb_append_char(out, 44);
+            }
+            it = c.next;
+        }
+        sb_append_str(out, "]}");
+        return;
+    }
+    sb_append_str(out, "{\"kind\":\"");
+    sb_append_str(out, n.kind);
+    sb_append_str(out, "\",\"value\":");
+    j_qstr(out, n.sa);
+    sb_append_char(out, 125);
+}
+
+json_ann :: func(out: StringBuilder, idx: i64) -> void {
+    var n: Node = nodes[idx];
+    sb_append_str(out, "{\"name\":");
+    j_qstr(out, n.sa);
+    sb_append_str(out, ",\"args\":[");
+    var it: i64 = n.la;
+    while (it >= 0) {
+        var c: Child = kids[it];
+        json_ann_arg(out, c.val);
+        if (c.next >= 0) {
+            sb_append_char(out, 44);
+        }
+        it = c.next;
+    }
+    sb_append_str(out, "]}");
+}
+
+json_ann_list :: func(out: StringBuilder, head: i64) -> void {
+    sb_append_char(out, 91);
+    var it: i64 = head;
+    while (it >= 0) {
+        var c: Child = kids[it];
+        json_ann(out, c.val);
+        if (c.next >= 0) {
+            sb_append_char(out, 44);
+        }
+        it = c.next;
+    }
+    sb_append_char(out, 93);
+}
+
+json_type :: func(out: StringBuilder, idx: i64) -> void {
+    var n: Node = nodes[idx];
+    var k: string = n.kind;
+    if (k == "scalar") {
+        sb_append_str(out, "{\"kind\":\"scalar\",\"name\":");
+        j_qstr(out, n.sa);
+        sb_append_char(out, 125);
+        return;
+    }
+    if (k == "named") {
+        sb_append_str(out, "{\"kind\":\"named\",\"name\":");
+        j_qstr(out, n.sa);
+        sb_append_char(out, 125);
+        return;
+    }
+    if (k == "slice") {
+        sb_append_str(out, "{\"kind\":\"slice\",\"elem\":");
+        json_type(out, n.na);
+        sb_append_char(out, 125);
+        return;
+    }
+    if (k == "array") {
+        sb_append_str(out, "{\"kind\":\"array\",\"elem\":");
+        json_type(out, n.na);
+        sb_append_str(out, ",\"length\":");
+        json_expr(out, n.nb);
+        sb_append_char(out, 125);
+        return;
+    }
+    if (k == "map") {
+        sb_append_str(out, "{\"kind\":\"map\",\"key\":");
+        json_type(out, n.na);
+        sb_append_str(out, ",\"value\":");
+        json_type(out, n.nb);
+        sb_append_char(out, 125);
+        return;
+    }
+    if (k == "variant") {
+        sb_append_str(out, "{\"kind\":\"variant\"}");
+        return;
+    }
+    if (k == "flag") {
+        sb_append_str(out, "{\"kind\":\"flag\",\"underlying\":");
+        j_qstr(out, n.sa);
+        sb_append_char(out, 125);
+        return;
+    }
+    if (k == "flag_set") {
+        sb_append_str(out, "{\"kind\":\"flag_set\"}");
+        return;
+    }
+    if (k == "pointer") {
+        sb_append_str(out, "{\"kind\":\"pointer\",\"elem\":");
+        json_type(out, n.na);
+        sb_append_char(out, 125);
+        return;
+    }
+    if (k == "optional") {
+        sb_append_str(out, "{\"kind\":\"optional\",\"elem\":");
+        json_type(out, n.na);
+        sb_append_char(out, 125);
+        return;
+    }
+    eprint("internal error: unknown type node kind\n");
+    exit(1);
+}
+
+json_expr_list :: func(out: StringBuilder, head: i64) -> void {
+    sb_append_char(out, 91);
+    var it: i64 = head;
+    while (it >= 0) {
+        var c: Child = kids[it];
+        json_expr(out, c.val);
+        if (c.next >= 0) {
+            sb_append_char(out, 44);
+        }
+        it = c.next;
+    }
+    sb_append_char(out, 93);
+}
+
+json_expr :: func(out: StringBuilder, idx: i64) -> void {
+    var n: Node = nodes[idx];
+    var k: string = n.kind;
+    if (k == "int") {
+        sb_append_str(out, "{\"kind\":\"int\",\"value\":");
+        j_qstr(out, n.sa);
+        sb_append_str(out, ",\"radix\":");
+        sb_append_i64(out, n.ia);
+        sb_append_char(out, 125);
+        return;
+    }
+    if (k == "float") {
+        sb_append_str(out, "{\"kind\":\"float\",\"value\":");
+        j_qstr(out, n.sa);
+        sb_append_char(out, 125);
+        return;
+    }
+    if (k == "string") {
+        sb_append_str(out, "{\"kind\":\"string\",\"value\":");
+        j_qstr(out, n.sa);
+        sb_append_char(out, 125);
+        return;
+    }
+    if (k == "bool") {
+        sb_append_str(out, "{\"kind\":\"bool\",\"value\":");
+        j_bool(out, n.ba);
+        sb_append_char(out, 125);
+        return;
+    }
+    if (k == "null") {
+        sb_append_str(out, "{\"kind\":\"null\"}");
+        return;
+    }
+    if (k == "ident") {
+        sb_append_str(out, "{\"kind\":\"ident\",\"name\":");
+        j_qstr(out, n.sa);
+        sb_append_char(out, 125);
+        return;
+    }
+    if (k == "binary") {
+        sb_append_str(out, "{\"kind\":\"binary\",\"op\":");
+        j_qstr(out, n.sa);
+        sb_append_str(out, ",\"left\":");
+        json_expr(out, n.na);
+        sb_append_str(out, ",\"right\":");
+        json_expr(out, n.nb);
+        sb_append_char(out, 125);
+        return;
+    }
+    if (k == "unary") {
+        sb_append_str(out, "{\"kind\":\"unary\",\"op\":");
+        j_qstr(out, n.sa);
+        sb_append_str(out, ",\"operand\":");
+        json_expr(out, n.na);
+        sb_append_char(out, 125);
+        return;
+    }
+    if (k == "assign") {
+        sb_append_str(out, "{\"kind\":\"assign\",\"op\":");
+        j_qstr(out, n.sa);
+        sb_append_str(out, ",\"target\":");
+        json_expr(out, n.na);
+        sb_append_str(out, ",\"value\":");
+        json_expr(out, n.nb);
+        sb_append_char(out, 125);
+        return;
+    }
+    if (k == "call") {
+        sb_append_str(out, "{\"kind\":\"call\",\"callee\":");
+        json_expr(out, n.na);
+        sb_append_str(out, ",\"args\":");
+        json_expr_list(out, n.la);
+        sb_append_char(out, 125);
+        return;
+    }
+    if (k == "member") {
+        sb_append_str(out, "{\"kind\":\"member\",\"object\":");
+        json_expr(out, n.na);
+        sb_append_str(out, ",\"member\":");
+        j_qstr(out, n.sa);
+        sb_append_char(out, 125);
+        return;
+    }
+    if (k == "index") {
+        sb_append_str(out, "{\"kind\":\"index\",\"object\":");
+        json_expr(out, n.na);
+        sb_append_str(out, ",\"index\":");
+        json_expr(out, n.nb);
+        sb_append_char(out, 125);
+        return;
+    }
+    if (k == "array_lit") {
+        sb_append_str(out, "{\"kind\":\"array_lit\",\"elements\":");
+        json_expr_list(out, n.la);
+        sb_append_char(out, 125);
+        return;
+    }
+    if (k == "map_lit") {
+        sb_append_str(out, "{\"kind\":\"map_lit\",\"entries\":[");
+        var it: i64 = n.la;
+        while (it >= 0) {
+            var c: Child = kids[it];
+            var en: Node = nodes[c.val];
+            sb_append_str(out, "{\"key\":");
+            json_expr(out, en.na);
+            sb_append_str(out, ",\"value\":");
+            json_expr(out, en.nb);
+            sb_append_char(out, 125);
+            if (c.next >= 0) {
+                sb_append_char(out, 44);
+            }
+            it = c.next;
+        }
+        sb_append_str(out, "]}");
+        return;
+    }
+    if (k == "struct_lit") {
+        sb_append_str(out, "{\"kind\":\"struct_lit\",\"typeName\":");
+        j_qstr(out, n.sa);
+        sb_append_str(out, ",\"fields\":[");
+        var it2: i64 = n.la;
+        while (it2 >= 0) {
+            var c2: Child = kids[it2];
+            var fv: Node = nodes[c2.val];
+            sb_append_str(out, "{\"name\":");
+            j_qstr(out, fv.sa);
+            sb_append_str(out, ",\"value\":");
+            json_expr(out, fv.na);
+            sb_append_char(out, 125);
+            if (c2.next >= 0) {
+                sb_append_char(out, 44);
+            }
+            it2 = c2.next;
+        }
+        sb_append_str(out, "]}");
+        return;
+    }
+    if (k == "cast") {
+        sb_append_str(out, "{\"kind\":\"cast\",\"expr\":");
+        json_expr(out, n.na);
+        sb_append_str(out, ",\"targetType\":");
+        json_type(out, n.nb);
+        sb_append_char(out, 125);
+        return;
+    }
+    if (k == "paren") {
+        sb_append_str(out, "{\"kind\":\"paren\",\"inner\":");
+        json_expr(out, n.na);
+        sb_append_char(out, 125);
+        return;
+    }
+    if (k == "comptime") {
+        sb_append_str(out, "{\"kind\":\"comptime\",\"expr\":");
+        json_expr(out, n.na);
+        sb_append_char(out, 125);
+        return;
+    }
+    eprint("internal error: unknown expr node kind\n");
+    exit(1);
+}
+
+json_stmt_list :: func(out: StringBuilder, head: i64) -> void {
+    sb_append_char(out, 91);
+    var it: i64 = head;
+    while (it >= 0) {
+        var c: Child = kids[it];
+        json_stmt(out, c.val);
+        if (c.next >= 0) {
+            sb_append_char(out, 44);
+        }
+        it = c.next;
+    }
+    sb_append_char(out, 93);
+}
+
+json_stmt :: func(out: StringBuilder, idx: i64) -> void {
+    var n: Node = nodes[idx];
+    var k: string = n.kind;
+    if (k == "expr") {
+        sb_append_str(out, "{\"kind\":\"expr\",\"expr\":");
+        json_expr(out, n.na);
+        sb_append_char(out, 125);
+        return;
+    }
+    if (k == "var_decl") {
+        sb_append_str(out, "{\"kind\":\"var_decl\",\"name\":");
+        j_qstr(out, n.sa);
+        sb_append_str(out, ",\"isConst\":");
+        j_bool(out, n.ba);
+        sb_append_str(out, ",\"type\":");
+        if (n.na >= 0) {
+            json_type(out, n.na);
+        } else {
+            sb_append_str(out, "null");
+        }
+        sb_append_str(out, ",\"init\":");
+        if (n.nb >= 0) {
+            json_expr(out, n.nb);
+        } else {
+            sb_append_str(out, "null");
+        }
+        sb_append_char(out, 125);
+        return;
+    }
+    if (k == "if") {
+        sb_append_str(out, "{\"kind\":\"if\",\"condition\":");
+        json_expr(out, n.na);
+        sb_append_str(out, ",\"then\":");
+        json_stmt_list(out, n.la);
+        sb_append_str(out, ",\"else\":");
+        if (n.lb == -2) {
+            sb_append_str(out, "null");
+        } else {
+            json_stmt_list(out, n.lb);
+        }
+        sb_append_char(out, 125);
+        return;
+    }
+    if (k == "for") {
+        sb_append_str(out, "{\"kind\":\"for\",\"init\":");
+        if (n.na >= 0) {
+            json_stmt(out, n.na);
+        } else {
+            sb_append_str(out, "null");
+        }
+        sb_append_str(out, ",\"condition\":");
+        if (n.nb >= 0) {
+            json_expr(out, n.nb);
+        } else {
+            sb_append_str(out, "null");
+        }
+        sb_append_str(out, ",\"update\":");
+        if (n.nc >= 0) {
+            json_expr(out, n.nc);
+        } else {
+            sb_append_str(out, "null");
+        }
+        sb_append_str(out, ",\"body\":");
+        json_stmt_list(out, n.la);
+        sb_append_char(out, 125);
+        return;
+    }
+    if (k == "for_each") {
+        sb_append_str(out, "{\"kind\":\"for_each\",\"varName\":");
+        j_qstr(out, n.sa);
+        sb_append_str(out, ",\"iterable\":");
+        json_expr(out, n.na);
+        sb_append_str(out, ",\"body\":");
+        json_stmt_list(out, n.la);
+        sb_append_char(out, 125);
+        return;
+    }
+    if (k == "while") {
+        sb_append_str(out, "{\"kind\":\"while\",\"condition\":");
+        json_expr(out, n.na);
+        sb_append_str(out, ",\"body\":");
+        json_stmt_list(out, n.la);
+        sb_append_char(out, 125);
+        return;
+    }
+    if (k == "switch") {
+        sb_append_str(out, "{\"kind\":\"switch\",\"expr\":");
+        json_expr(out, n.na);
+        sb_append_str(out, ",\"cases\":[");
+        var it: i64 = n.la;
+        while (it >= 0) {
+            var c: Child = kids[it];
+            var cs: Node = nodes[c.val];
+            sb_append_str(out, "{\"pattern\":");
+            json_expr(out, cs.na);
+            sb_append_str(out, ",\"body\":");
+            json_stmt_list(out, cs.la);
+            sb_append_char(out, 125);
+            if (c.next >= 0) {
+                sb_append_char(out, 44);
+            }
+            it = c.next;
+        }
+        sb_append_str(out, "],\"default\":");
+        if (n.lb == -2) {
+            sb_append_str(out, "null");
+        } else {
+            json_stmt_list(out, n.lb);
+        }
+        sb_append_char(out, 125);
+        return;
+    }
+    if (k == "return") {
+        sb_append_str(out, "{\"kind\":\"return\",\"value\":");
+        if (n.na >= 0) {
+            json_expr(out, n.na);
+        } else {
+            sb_append_str(out, "null");
+        }
+        sb_append_char(out, 125);
+        return;
+    }
+    if (k == "break") {
+        sb_append_str(out, "{\"kind\":\"break\"}");
+        return;
+    }
+    if (k == "continue") {
+        sb_append_str(out, "{\"kind\":\"continue\"}");
+        return;
+    }
+    if (k == "defer") {
+        sb_append_str(out, "{\"kind\":\"defer\",\"body\":");
+        json_stmt_list(out, n.la);
+        sb_append_char(out, 125);
+        return;
+    }
+    if (k == "block") {
+        sb_append_str(out, "{\"kind\":\"block\",\"body\":");
+        json_stmt_list(out, n.la);
+        sb_append_char(out, 125);
+        return;
+    }
+    if (k == "comptime_block") {
+        sb_append_str(out, "{\"kind\":\"comptime_block\",\"body\":");
+        json_stmt_list(out, n.la);
+        sb_append_char(out, 125);
+        return;
+    }
+    if (k == "assignment") {
+        sb_append_str(out, "{\"kind\":\"assignment\",\"target\":");
+        json_expr(out, n.na);
+        sb_append_str(out, ",\"op\":");
+        j_qstr(out, n.sa);
+        sb_append_str(out, ",\"value\":");
+        json_expr(out, n.nb);
+        sb_append_char(out, 125);
+        return;
+    }
+    eprint("internal error: unknown stmt node kind\n");
+    exit(1);
+}
+
+// decl 公共前缀：{"kind":"..","name":..,"annotations":[..]
+json_decl_base :: func(out: StringBuilder, n_kind: string, name: string, has_name: bool, anns: i64) -> void {
+    sb_append_str(out, "{\"kind\":");
+    j_qstr(out, n_kind);
+    sb_append_str(out, ",\"name\":");
+    if (has_name) {
+        j_qstr(out, name);
+    } else {
+        sb_append_str(out, "null");
+    }
+    sb_append_str(out, ",\"annotations\":");
+    json_ann_list(out, anns);
+}
+
+json_decl :: func(out: StringBuilder, idx: i64) -> void {
+    var n: Node = nodes[idx];
+    var k: string = n.kind;
+    json_decl_base(out, k, n.sa, n.has_sa, n.la);
+
+    if (k == "StructDecl") {
+        sb_append_str(out, ",\"memoryLayout\":");
+        j_qstr(out, n.sb);
+        sb_append_str(out, ",\"isBitpack\":");
+        j_bool(out, n.ba);
+        sb_append_str(out, ",\"bitpackType\":");
+        if (n.has_sc) {
+            j_qstr(out, n.sc);
+        } else {
+            sb_append_str(out, "null");
+        }
+        sb_append_str(out, ",\"fields\":[");
+        var it: i64 = n.lb;
+        while (it >= 0) {
+            var c: Child = kids[it];
+            var f: Node = nodes[c.val];
+            sb_append_str(out, "{\"name\":");
+            j_qstr(out, f.sa);
+            sb_append_str(out, ",\"type\":");
+            if (f.na >= 0) {
+                json_type(out, f.na);
+            } else {
+                sb_append_str(out, "null");
+            }
+            sb_append_str(out, ",\"bitWidth\":");
+            if (f.ia >= 0) {
+                sb_append_i64(out, f.ia);
+            } else {
+                sb_append_str(out, "null");
+            }
+            sb_append_str(out, ",\"annotations\":");
+            json_ann_list(out, f.la);
+            sb_append_char(out, 125);
+            if (c.next >= 0) {
+                sb_append_char(out, 44);
+            }
+            it = c.next;
+        }
+        sb_append_str(out, "]}");
+        return;
+    }
+    if (k == "EnumDecl") {
+        sb_append_str(out, ",\"underlyingType\":");
+        j_qstr(out, n.sb);
+        sb_append_str(out, ",\"variants\":[");
+        var it2: i64 = n.lb;
+        while (it2 >= 0) {
+            var c2: Child = kids[it2];
+            var v: Node = nodes[c2.val];
+            sb_append_str(out, "{\"name\":");
+            j_qstr(out, v.sa);
+            sb_append_str(out, ",\"value\":");
+            if (v.na >= 0) {
+                json_expr(out, v.na);
+            } else {
+                sb_append_str(out, "null");
+            }
+            sb_append_str(out, ",\"annotations\":");
+            json_ann_list(out, v.la);
+            sb_append_char(out, 125);
+            if (c2.next >= 0) {
+                sb_append_char(out, 44);
+            }
+            it2 = c2.next;
+        }
+        sb_append_str(out, "]}");
+        return;
+    }
+    if (k == "FlagDecl" || k == "FlagSetDecl") {
+        if (k == "FlagDecl") {
+            sb_append_str(out, ",\"underlyingType\":");
+            j_qstr(out, n.sb);
+        }
+        sb_append_str(out, ",\"slots\":[");
+        var it3: i64 = n.lb;
+        while (it3 >= 0) {
+            var c3: Child = kids[it3];
+            var s: Node = nodes[c3.val];
+            sb_append_str(out, "{\"name\":");
+            j_qstr(out, s.sa);
+            sb_append_str(out, ",\"bitWidth\":");
+            sb_append_i64(out, s.ia);
+            sb_append_str(out, ",\"offset\":");
+            if (s.bb) {
+                sb_append_i64(out, s.ib);
+            } else {
+                sb_append_str(out, "null");
+            }
+            sb_append_str(out, ",\"annotations\":");
+            json_ann_list(out, s.la);
+            sb_append_char(out, 125);
+            if (c3.next >= 0) {
+                sb_append_char(out, 44);
+            }
+            it3 = c3.next;
+        }
+        sb_append_str(out, "]}");
+        return;
+    }
+    if (k == "UnionDecl") {
+        sb_append_str(out, ",\"members\":[");
+        var it4: i64 = n.lb;
+        while (it4 >= 0) {
+            var c4: Child = kids[it4];
+            var m: Node = nodes[c4.val];
+            sb_append_str(out, "{\"name\":");
+            j_qstr(out, m.sa);
+            sb_append_str(out, ",\"type\":");
+            json_type(out, m.na);
+            sb_append_str(out, ",\"annotations\":");
+            json_ann_list(out, m.la);
+            sb_append_char(out, 125);
+            if (c4.next >= 0) {
+                sb_append_char(out, 44);
+            }
+            it4 = c4.next;
+        }
+        sb_append_str(out, "]}");
+        return;
+    }
+    if (k == "FuncDecl") {
+        sb_append_str(out, ",\"params\":[");
+        var it5: i64 = n.lb;
+        while (it5 >= 0) {
+            var c5: Child = kids[it5];
+            var p: Node = nodes[c5.val];
+            sb_append_str(out, "{\"name\":");
+            j_qstr(out, p.sa);
+            sb_append_str(out, ",\"type\":");
+            json_type(out, p.na);
+            sb_append_str(out, ",\"annotations\":");
+            json_ann_list(out, p.la);
+            sb_append_char(out, 125);
+            if (c5.next >= 0) {
+                sb_append_char(out, 44);
+            }
+            it5 = c5.next;
+        }
+        sb_append_str(out, "],\"returnType\":");
+        json_type(out, n.na);
+        sb_append_str(out, ",\"isExtern\":");
+        j_bool(out, n.ba);
+        sb_append_str(out, ",\"isComptime\":");
+        j_bool(out, n.bb);
+        sb_append_str(out, ",\"body\":");
+        if (n.lc == -2) {
+            sb_append_str(out, "null");
+        } else {
+            json_stmt_list(out, n.lc);
+        }
+        sb_append_char(out, 125);
+        return;
+    }
+    if (k == "GlobalVarDecl") {
+        sb_append_str(out, ",\"type\":");
+        json_type(out, n.na);
+        sb_append_str(out, ",\"init\":");
+        if (n.nb >= 0) {
+            json_expr(out, n.nb);
+        } else {
+            sb_append_str(out, "null");
+        }
+        sb_append_str(out, ",\"isComptime\":");
+        j_bool(out, n.bb);
+        sb_append_char(out, 125);
+        return;
+    }
+    if (k == "GlobalConstDecl") {
+        sb_append_str(out, ",\"type\":");
+        if (n.na >= 0) {
+            json_type(out, n.na);
+        } else {
+            sb_append_str(out, "null");
+        }
+        sb_append_str(out, ",\"init\":");
+        json_expr(out, n.nb);
+        sb_append_str(out, ",\"isComptime\":");
+        j_bool(out, n.bb);
+        sb_append_char(out, 125);
+        return;
+    }
+    if (k == "ImportDecl") {
+        sb_append_str(out, ",\"path\":");
+        j_qstr(out, n.sb);
+        sb_append_str(out, ",\"alias\":");
+        if (n.has_sc) {
+            j_qstr(out, n.sc);
+        } else {
+            sb_append_str(out, "null");
+        }
+        sb_append_char(out, 125);
+        return;
+    }
+    if (k == "TypeAliasDecl") {
+        sb_append_str(out, ",\"aliasedType\":");
+        json_type(out, n.na);
+        sb_append_char(out, 125);
+        return;
+    }
+    eprint("internal error: unknown decl node kind\n");
+    exit(1);
+}
+
+// ── 入口 ───────────────────────────────────────────────────────
+
+main :: func() -> i32 @main {
+    var argv: []string = args();
+    if (slice_len(argv) != 2) {
+        eprint("usage: tparse <file.tc>\n");
+        return 2;
+    }
+    var src: string = file_read_all(argv[1]);
+    tokenize(src);
+    pos = 0;
+    parse_unit();
+
+    var out: StringBuilder = sb_new();
+    sb_append_str(out, "{\"format\":\"t-parse-json\",\"decls\":[");
+    var nd: u64 = slice_len(decl_list);
+    var i: u64 = 0;
+    while (i < nd) {
+        json_decl(out, decl_list[i]);
+        if (i + 1 < nd) {
+            sb_append_char(out, 44);
+        }
+        i = i + 1;
+    }
+    sb_append_str(out, "]}");
+    print(sb_to_str(out));
+    print("\n");
+    return 0;
+}
