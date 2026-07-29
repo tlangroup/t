@@ -9164,7 +9164,7 @@ run_lex :: func(file: string) -> i32 {
 main :: func() -> i32 @main {
     var argv: []string = args();
     if (slice_len(argv) < 3) {
-        eprint("usage: tc1 <lex|check|compile> <file.tc> [--json] [--emit-c --output <dir>]\n");
+        eprint("usage: tc1 <lex|check|compile|emit-ll|build|run> <file.tc> [--example <name>] [--output <path>] [--clang <path>] [--runtime <dir>]\n");
         return 2;
     }
     var cmd: string = argv[1];
@@ -9250,12 +9250,16 @@ main :: func() -> i32 @main {
         return 0;
     }
 
-    if (cmd == "emit-ll" || cmd == "build") {
+    if (cmd == "emit-ll" || cmd == "build" || cmd == "run") {
         var out_p: string = "";
         var has_outp: bool = false;
         var rt_dir: string = "runtime";
         var clang_p: string = "clang";
-        var ai2: i64 = 3;
+        var src_file: string = "";
+        var has_src: bool = false;
+        var ex_name: string = "";
+        var is_example: bool = false;
+        var ai2: i64 = 2;
         var an2: i64 = slice_len(argv) as i64;
         while (ai2 < an2) {
             if (argv[ai2] == "--output") {
@@ -9280,11 +9284,54 @@ main :: func() -> i32 @main {
                     continue;
                 }
             }
+            if (argv[ai2] == "--example") {
+                if (ai2 + 1 < an2) {
+                    ex_name = argv[ai2 + 1];
+                    is_example = true;
+                    ai2 = ai2 + 2;
+                    continue;
+                }
+            }
+            // 位置参数：第一个非 flag 即源文件
+            if (has_src == false) {
+                src_file = argv[ai2];
+                has_src = true;
+            }
             ai2 = ai2 + 1;
         }
 
-        g_file = path_resolve(file);
-        var src3: string = file_read_all(file);
+        // cargo 风格 example：源 = examples/<name>.tc，产物 = build/examples/<name>.exe
+        if (is_example) {
+            var probe: string = cat4("cmd /c if exist \"examples\\", ex_name, ".tc\" (exit 0) else (exit 1)", "");
+            var prc: i32 = sys_run(probe);
+            if (prc != 0) {
+                eprint(cat3("error: no example named `", ex_name, "`\navailable examples:\n"));
+                sys_run("cmd /c dir /b examples\\*.tc 2>nul");
+                return 2;
+            }
+            src_file = cat3("examples/", ex_name, ".tc");
+            has_src = true;
+            if (has_outp == false) {
+                sys_run("cmd /c if not exist \"build\\examples\" mkdir \"build\\examples\"");
+                out_p = cat2("build/examples/", ex_name);
+                has_outp = true;
+            }
+        }
+        if (has_src == false) {
+            eprint("usage: tc1 build|run <file.tc> | --example <name>\n");
+            return 2;
+        }
+
+        // 缺省 clang：PATH 上没有时探测标准安装路径
+        if (clang_p == "clang") {
+            var crc: i32 = sys_run("cmd /c if exist \"C:\\Program Files\\LLVM\\bin\\clang.exe\" (exit 0) else (exit 1)");
+            if (crc == 0) {
+                clang_p = "C:/Program Files/LLVM/bin/clang.exe";
+            }
+        }
+
+        g_file = path_resolve(src_file);
+        var src3: string = file_read_all(src_file);
         tokenize(src3);
         pos = 0;
         init_anndefs();
@@ -9296,23 +9343,23 @@ main :: func() -> i32 @main {
             return 1;
         }
 
-        var mod2: string = base_no_tc(file);
+        var mod2: string = base_no_tc(src_file);
         emit_llunit(mod2);
 
         // 输出目录：--output 指定 exe/目录前缀；缺省用源文件所在目录
         var out_dir2: string = "";
         if (has_outp == false) {
-            var nn2: u64 = str_len(file);
+            var nn2: u64 = str_len(src_file);
             var cut2: u64 = 0;
             var pi2: u64 = 0;
             while (pi2 < nn2) {
-                if (file[pi2] == 47 || file[pi2] == 92) {
+                if (src_file[pi2] == 47 || src_file[pi2] == 92) {
                     cut2 = pi2;
                 }
                 pi2 = pi2 + 1;
             }
             if (cut2 > 0) {
-                out_dir2 = str_slice(file, 0, cut2);
+                out_dir2 = str_slice(src_file, 0, cut2);
             } else {
                 out_dir2 = ".";
             }
@@ -9349,6 +9396,13 @@ main :: func() -> i32 @main {
             return 1;
         }
         print(cat3("Built: ", to_bs(exep), "\n"));
+
+        // run：构建成功后立即执行，透传子进程退出码（cargo run 语义）
+        if (cmd == "run") {
+            var run_cmd: string = cat3("\"", to_bs(exep), "\"");
+            var rrc: i32 = sys_run(run_cmd);
+            return rrc;
+        }
         return 0;
     }
 

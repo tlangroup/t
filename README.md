@@ -17,7 +17,17 @@
 ## 快速开始
 
 ```bash
-# 用稳定版 tc1 编译 .tc → C
+# 一步到可执行程序（LLVM 后端：.tc → .ll → exe，需 clang）
+build/tc1/tc1/tc1.exe build app.tc            # 生成 app.ll + app.exe
+build/tc1/tc1/tc1.exe run app.tc              # 构建并立即运行（透传退出码）
+build/tc1/tc1/tc1.exe emit-ll app.tc          # 只生成 LLVM IR
+
+# cargo 风格 examples（源: examples/<name>.tc，产物: build/examples/<name>.exe）
+build/tc1/tc1/tc1.exe run --example hello     # 构建并运行示例
+build/tc1/tc1/tc1.exe build --example fib     # 只构建示例
+build/tc1/tc1/tc1.exe run --example nope      # 名字不存在 → 列出可用示例
+
+# 用稳定版 tc1 编译 .tc → C（传统 C 后端）
 build/tc1/tc1/tc1.exe compile app.tc --emit-c --output build/app
 
 # 类型检查（JSON 诊断，AI-Agent 友好）
@@ -29,11 +39,15 @@ build/tc1/tc1/tc1.exe lex app.tc --json
 # C → 原生 exe：MSVC（需 /std:c11 /utf-8）链接 runtime/t_runtime.c
 ```
 
+`build`/`run` 可选 flags：`--clang <path>`（缺省探测 PATH 与 `C:\Program Files\LLVM\bin\clang.exe`）、
+`--runtime <dir>`（缺省 `runtime`）、`--output <前缀>`（缺省源文件旁）。
+
 种子编译器（tc0，参照用）：`npx tsx tc0/index.ts <check|compile|lex|build|test|ast|type-info> ...`
 
 ## 目录
 
 - `src/` — **主实现**：`tc1.tc`（完整编译器）、`lexer.tc`、`parser.tc`、`checker.tc`（历史分阶段模块）
+- `examples/` — 示例代码（cargo 风格，`tc1 run --example <name>` 直接运行）
 - `seed/` — 种子编译器 tc0 冻结封存（永不删除，见 `seed/README.md`）
 - `tc0/` — tc0 TypeScript 工作副本（frozen）
 - `runtime/` — C 运行时（arena / TStr / TSb / TSlice / TMap）
