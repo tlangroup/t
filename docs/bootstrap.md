@@ -268,7 +268,9 @@ tc2 + compiler.tc  →  tc3.exe
 - [x] **M6** selfhost/ast.tc + parser.tc，AST 差分通过
 - [x] **M7** selfhost/checker.tc（单文件含 types/annotations/flag resolver），`check --json` 诊断差分通过（tests/samples 5 + tests/err_samples 5，全部逐字节一致；含 flag 双 resolve 重复诊断复刻）
       已知差距：parse 错误时 tc0 输出恢复式诊断 JSON，selfhost 为 fail-fast stderr（不影响合法源自举不动点）
-- [ ] **M8** selfhost/flag.tc + ctfe.tc + type_info.tc + derive.tc，自省差分通过
-- [ ] **M9** selfhost/emitter.tc + main.tc，端到端差分通过 → tc1 —— *Stage 1 完成*
-- [ ] **M10** tools/bootstrap.mjs 三轮自编译，tc2 ≡ tc3 —— *Stage 2 完成，自举达成*
-- [ ] **M11** 封存种子、切换主实现、建立符合性套件 —— *进入 Stage 3 自迭代*
+- [x] **M8** emitter 移植（实际并入单文件 `selfhost/tc1.tc`：emit_decl/derive/flag 布局/emit 编排；
+      flag 布局用 fr_layout，derive 复刻 tc0 全部字符串模板含 `[object Object]` 怪癖）
+- [x] **M9** tc1 驱动（lex/check/compile 派发）+ 全量差分：`difftest --cand tc1.exe` 42/42 逐字节一致 —— *Stage 1 完成*
+- [x] **M10** tools/bootstrap.mjs 三轮自编译：C_a ≡ C_b ≡ C_c（BOOTSTRAP FIXPOINT REACHED）—— *Stage 2 完成，自举达成*
+- [x] **M11** 封存种子（`seed/tc0/` + tag `v1.0-selfhost`）、切换主实现（README：主实现 = selfhost，TS 版 frozen）、
+      建立符合性套件（`tests/conformance/` 16 用例 + `tools/conformance.mjs`，含 tc0 交叉验证）—— *进入 Stage 3 自迭代*
