@@ -36,6 +36,11 @@ var an_repl: []string;       // 弃用替代（非空表示 deprecated）
 
 var nd_name: []string;       // AST 节点种类名（reference.md §2.9 NodeTable）
 var nd_slots: []string;      // 该种类使用的槽，空格分隔（按 Node 结构字段序）
+var slt_name: []string;      // 槽定义表（reference.md §2.9 SlotTable，行序 = Node 结构字段序）
+var slt_note: []string;      // 记法（str/has/int/bool/node/list/anchor）
+var slt_ty: []string;        // t 类型（string/bool/i64/u64）
+var slt_def: []string;       // node_new 初值（t 字面量文本）
+var slt_cmt: []string;       // 结构体字段注释（仅锚点槽有）
 
 // ── 解析器分发表（由 build/ebnf.json 的 dispatches 段驱动，见 reference.md §2.7）──
 // 为避免嵌套 slice，分发表以扁平 1D 数组存储：dp_name[i] + dp_start[i] + dp_len[i]
@@ -366,6 +371,19 @@ load_tables :: func() -> void {
         m = jnodes[m].sib;
     }
 
+    // ── 槽定义表（reference.md §2.9 SlotTable）──
+    var n_sl: i64 = json_obj_get(root, "slots");
+    var arr_sl: i64 = jnodes[n_sl].child;
+    m = jnodes[arr_sl].child;
+    while (m >= 0) {
+        append(slt_name, jnodes[json_obj_get(m, "name")].s);
+        append(slt_note, jnodes[json_obj_get(m, "note")].s);
+        append(slt_ty, jnodes[json_obj_get(m, "ty")].s);
+        append(slt_def, jnodes[json_obj_get(m, "def")].s);
+        append(slt_cmt, jnodes[json_obj_get(m, "cmt")].s);
+        m = jnodes[m].sib;
+    }
+
     load_dispatches(root);
     load_xid(root);
     g_json_root = root;
@@ -571,10 +589,12 @@ nl_find :: func(s: string, item: string) -> i64 {
 
 // 槽在 node_new 里的初值——未显式赋值的参数一律填它。
 slot_default :: func(s: string) -> string {
-    if (s == "sa" || s == "sb" || s == "sc") { return "\"\""; }
-    if (s == "has_sa" || s == "has_sb" || s == "has_sc") { return "true"; }
-    if (s == "ba" || s == "bb") { return "false"; }
-    return "-1";
+    var i: i64 = 0;
+    while (i < slice_len(slt_name) as i64) {
+        if (slt_name[i] == s) { return slt_def[i]; }
+        i = i + 1;
+    }
+    return "?SLOT_DEF?";  // 表外槽：发射非法 token 让生成物编译失败（暴露 SlotTable 遗漏）
 }
 
 nd_slots_of :: func(kind: string) -> string {
@@ -1727,10 +1747,12 @@ slot_at :: func(s: string, k: i64) -> string {
 }
 
 slot_ty :: func(s: string) -> string {
-    if (s == "sa" || s == "sb" || s == "sc") { return "string"; }
-    if (s == "ba" || s == "bb") { return "bool"; }
-    if (s == "has_sa" || s == "has_sb" || s == "has_sc") { return "bool"; }
-    return "i64";
+    var i: i64 = 0;
+    while (i < slice_len(slt_name) as i64) {
+        if (slt_name[i] == s) { return slt_ty[i]; }
+        i = i + 1;
+    }
+    return "?SLOT_TY?";  // 表外槽：发射非法 token 让生成物编译失败
 }
 
 // + 节点种类注册表（node_kind_names / init_node_kinds / is_node_kind，由 nodes 表生成）。
@@ -1748,26 +1770,24 @@ emit_ast :: func() -> string {
     sb_append_str(sb, "\n");
     sb_append_str(sb, "Node :: struct {\n");
     sb_append_str(sb, "    kind: string;\n");
-    sb_append_str(sb, "    sa: string;\n");
-    sb_append_str(sb, "    sb: string;\n");
-    sb_append_str(sb, "    sc: string;\n");
-    sb_append_str(sb, "    has_sa: bool;\n");
-    sb_append_str(sb, "    has_sb: bool;\n");
-    sb_append_str(sb, "    has_sc: bool;\n");
-    sb_append_str(sb, "    ia: i64;\n");
-    sb_append_str(sb, "    ib: i64;\n");
-    sb_append_str(sb, "    ba: bool;\n");
-    sb_append_str(sb, "    bb: bool;\n");
-    sb_append_str(sb, "    na: i64;\n");
-    sb_append_str(sb, "    nb: i64;\n");
-    sb_append_str(sb, "    nc: i64;\n");
-    sb_append_str(sb, "    nd: i64;\n");
-    sb_append_str(sb, "    la: i64;\n");
-    sb_append_str(sb, "    lb: i64;\n");
-    sb_append_str(sb, "    lc: i64;\n");
-    sb_append_str(sb, "    ln: u64;    // anchor token 行（诊断用；0 = 无）\n");
-    sb_append_str(sb, "    cl: u64;    // anchor token 列\n");
-    sb_append_str(sb, "    tv: string; // anchor token 文本（endCol = col + len(tv)）\n");
+    var si: i64 = 0;
+    while (si < slice_len(slt_name) as i64) {
+        sb_append_str(sb, "    ");
+        sb_append_str(sb, slt_name[si]);
+        sb_append_str(sb, ": ");
+        sb_append_str(sb, slt_ty[si]);
+        sb_append_str(sb, ";");
+        if (slt_cmt[si] != "") {
+            // 注释对齐到列 16（不足补空格，至少 1 个）
+            var w: i64 = 4 + (str_len(slt_name[si]) as i64) + 2 + (str_len(slt_ty[si]) as i64) + 1;
+            if (w >= 16) { w = 15; }
+            while (w < 16) { sb_append_str(sb, " "); w = w + 1; }
+            sb_append_str(sb, "// ");
+            sb_append_str(sb, slt_cmt[si]);
+        }
+        sb_append_str(sb, "\n");
+        si = si + 1;
+    }
     sb_append_str(sb, "}\n");
     sb_append_str(sb, "\n");
     sb_append_str(sb, "var nodes: []Node;\n");
@@ -1783,26 +1803,15 @@ emit_ast :: func() -> string {
     sb_append_str(sb, "node_new :: func(kind: string) -> i64 {\n");
     sb_append_str(sb, "    var n: Node;\n");
     sb_append_str(sb, "    n.kind = kind;\n");
-    sb_append_str(sb, "    n.sa = \"\";\n");
-    sb_append_str(sb, "    n.sb = \"\";\n");
-    sb_append_str(sb, "    n.sc = \"\";\n");
-    sb_append_str(sb, "    n.has_sa = true;\n");
-    sb_append_str(sb, "    n.has_sb = true;\n");
-    sb_append_str(sb, "    n.has_sc = true;\n");
-    sb_append_str(sb, "    n.ia = -1;\n");
-    sb_append_str(sb, "    n.ib = -1;\n");
-    sb_append_str(sb, "    n.ba = false;\n");
-    sb_append_str(sb, "    n.bb = false;\n");
-    sb_append_str(sb, "    n.na = -1;\n");
-    sb_append_str(sb, "    n.nb = -1;\n");
-    sb_append_str(sb, "    n.nc = -1;\n");
-    sb_append_str(sb, "    n.nd = -1;\n");
-    sb_append_str(sb, "    n.la = -1;\n");
-    sb_append_str(sb, "    n.lb = -1;\n");
-    sb_append_str(sb, "    n.lc = -1;\n");
-    sb_append_str(sb, "    n.ln = 0;\n");
-    sb_append_str(sb, "    n.cl = 0;\n");
-    sb_append_str(sb, "    n.tv = \"\";\n");
+    si = 0;
+    while (si < slice_len(slt_name) as i64) {
+        sb_append_str(sb, "    n.");
+        sb_append_str(sb, slt_name[si]);
+        sb_append_str(sb, " = ");
+        sb_append_str(sb, slt_def[si]);
+        sb_append_str(sb, ";\n");
+        si = si + 1;
+    }
     sb_append_str(sb, "    append(nodes, n);\n");
     sb_append_str(sb, "    return (slice_len(nodes) as i64) - 1;\n");
     sb_append_str(sb, "}\n");

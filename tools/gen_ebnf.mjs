@@ -222,9 +222,9 @@ function parseRecord(s) {
   return out;
 }
 
-const TABLE_RULES = ['Keyword', 'BuiltinTable', 'DeriveTraitTable', 'DiagnosticTable', 'AnnotationTable', 'NodeTable'];
+const TABLE_RULES = ['Keyword', 'BuiltinTable', 'DeriveTraitTable', 'DiagnosticTable', 'AnnotationTable', 'NodeTable', 'SlotTable'];
 
-const tables = { keywords: [], builtins: [], derives: [], diagnostics: [], annotations: [], nodes: [] };
+const tables = { keywords: [], builtins: [], derives: [], diagnostics: [], annotations: [], nodes: [], slots: [] };
 const dispatches = {};
 
 for (const r of rules) {
@@ -280,6 +280,14 @@ for (const r of rules) {
       let sm;
       while ((sm = slotRe.exec(m[2])) !== null) slots.push({ slot: sm[1], type: sm[2] });
       tables.nodes.push({ name, slots });
+    }
+  } else if (r.name === 'SlotTable') {
+    // 解析 `// @slot <名> <记法> <t类型> <初值> [字段注释…]`（行序 = Node 结构字段序）。
+    for (const line of r.rawFull.split('\n')) {
+      const { comment } = splitCodeComment(line);
+      const m = comment.match(/^@slot\s+([A-Za-z_]\w*)\s+(\w+)\s+(\w+)\s+(\S+)\s*(.*)$/);
+      if (!m) continue;
+      tables.slots.push({ name: m[1], note: m[2], ty: m[3], def: m[4], cmt: m[5] || '' });
     }
   } else if (r.name.endsWith('Dispatch')) {
     const key = r.name.slice(0, -'Dispatch'.length);

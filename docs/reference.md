@@ -495,6 +495,32 @@ switch_stmt :: "(" expr ")" "{" ( "case" expr ":" statement* | "default" ":" sta
 
 构造器约定：参数按上表字段序排列，末位固定为 anchor token 下标 `ti`；`ti < 0` 表示不打 anchor（跳过 `node_at`）。无槽种类只生成 `mk_<kind>(ti)`。
 
+槽本身的机器可读定义（`Node` 结构字段序 = 本表行序；totter 由此生成 `Node` 结构体字段、`node_new` 初值，并驱动 `slot_ty`/`slot_default` 查表）。每行 `// @slot <槽名> <记法> <t类型> <初值> [字段注释…]`；锚点槽（记法 `anchor`）不参与 `@node` 标注与构造器参数，仅由 `node_at` 写入：
+
+```ebnf
+SlotTable ::
+  // @slot sa str string ""
+  // @slot sb str string ""
+  // @slot sc str string ""
+  // @slot has_sa has bool true
+  // @slot has_sb has bool true
+  // @slot has_sc has bool true
+  // @slot ia int i64 -1
+  // @slot ib int i64 -1
+  // @slot ba bool bool false
+  // @slot bb bool bool false
+  // @slot na node i64 -1
+  // @slot nb node i64 -1
+  // @slot nc node i64 -1
+  // @slot nd node i64 -1
+  // @slot la list i64 -1
+  // @slot lb list i64 -1
+  // @slot lc list i64 -1
+  // @slot ln anchor u64 0 anchor token 行（诊断用；0 = 无）
+  // @slot cl anchor u64 0 anchor token 列
+  // @slot tv anchor string "" anchor token 文本（endCol = col + len(tv)）
+```
+
 ```ebnf
 NodeTable ::
   // @node A sa=str la=list

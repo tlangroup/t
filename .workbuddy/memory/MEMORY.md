@@ -50,8 +50,9 @@
 - **成果**：结构型声明 + 表达式金字塔（or→…→primary）+ statement 顶层分发 + 全部语句体内部结构，全部由文法生成。
 - 保留胶水（GEN 区外、设计使然）：`parse_local_var`（名校验副作用 + `nti=pos-1` 定位，被 forx 调用）、`parse_expr_or_assign_stmt`、`mk_un`、postfix/primary 的 helper 群、`str_or`/`flag_offset_of` 等注解提取。
 
-### AST 层（M20 Phase B 地基 + M21 Phase A 构造器 ✅）
+### AST 层（M20 地基 + M21 构造器 + M22 Phase C + M23 SlotTable ✅ 全链数据驱动）
 - `reference.md` §2.9 `NodeTable ::` 块内 65 条 `// @node <name> [slot=type ...]`，槽标注已全量补齐（60 有槽 / 5 无槽：break、continue、flag_set、null、variant）。槽类型映射：sa/sb/sc→str、has_*→has、ia/ib→int、ba/bb→bool、na..nd→node、la..lc→list。
+- **M23 SlotTable**：§2.9 另有 `SlotTable ::` 20 行 `// @slot <名> <记法> <t类型> <初值> [注释]`（17 数据槽 + ln/cl/tv anchor 槽），行序 = Node 字段序，是槽定义唯一真相源 → gen_ebnf `slots` 段 → totter `slt_*` 表驱动：Node 结构字段、node_new 初值循环发射（锚点注释对齐列 16），`slot_ty`/`slot_default` 查表（表外槽发射 `?SLOT_TY?` 非法 token 失败可见）。验证 = gen/tote.tc md5 逐字节不变（tote 零变化）。
 - `Node` 是**固定通用槽结构**：`sa/sb/sc` 字符串槽（`has_s*` 表 null）、`na/nb/nc/nd` 子节点索引（-1=null）、`ia/ib` 整型载荷、`la/lb/lc` 列表头（-1 空、-2 null）、`ba/bb` 布尔、`ln/cl/tv` 位置锚点。
 - `GEN:ast` 区间含：`Node` 结构 + `nodes`/`Child`/`kids` 池 + `node_new` + `node_at` + 节点注册表（`node_kind_names`/`init_node_kinds`/`is_node_kind`）+ **65 个 `mk_<kind>` 构造器**；`main` 在 `init_keywords()` 后调 `init_node_kinds()`（区外胶水）。
 - 构造器约定：`mk_<kind>(槽参数按 Node 字段序…, ti: i64) -> i64`；`ti < 0` 跳过 `node_at`；槽取该 kind 所有调用点的**并集**，未设槽填 `node_new` 默认值 → 零行为差异。totter 侧靠 `nd_slots` 表 + `slot_count/slot_at/slot_ty` 发射。
@@ -68,9 +69,11 @@
 - OPKIND 表须与 lexer 实际 token 对齐（`~`→`BitNot` 而非 `Tilde`）。
 - 新增 DSL 能力后，等价性用 **AST/LLVM IR 逐字节 diff** 兜底，比 difftest 更早暴露节点位置漂移。tote 无 `ast` 子命令，最灵敏的兜底是「对 `gen/tote.tc` 自身 emit-ll 逐字节 diff」（2.4MB IR，任何索引漂移必现）。
 - exe 的 md5 差异属 clang 链接器时间戳/路径，**不代表功能差异**；不动点判定一律以 IR 逐字节为准。
+- **负向测试禁用 `git checkout` 恢复**含未提交编辑的文件（M23 曾把 SlotTable 编辑一并回滚）；用副本或 sed 反向恢复。
+- totter 内 `cat5` 等宽 cat 内建可用性不确定（reference 只见 cat3）；拼接优先 StringBuilder。
 
 ## 技术债 / 后续候选
-1. 用 §2.9 槽定义反向驱动 `Node` 结构体字段生成（目前 Node 字段仍是 `emit_ast` 里的固定文本）；typechecker 规则表；@derive 派生生成器表
+1. typechecker 规则表；@derive 派生生成器表
 2. §7.2 CSV/JSON CTFE 编译期导入
 3. `@soa` 布局变换、脱离 arena 的通用内存管理
 4. 修既有限制：lld-link subsystem、LLVM `int_to_str`、数组字面量类型推导
