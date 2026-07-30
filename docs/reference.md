@@ -590,6 +590,61 @@ NodeTable ::
   // @node while na=node la=list
 ```
 
+### 2.10 Scalar types（标量类型表与派生函数）✅ tote
+
+标量类型的全部属性收敛为一张表 `ScalarTable`，编译器中所有按标量名分派的查询函数（谓词、位宽、C 类型名、LLVM 类型名）都是这张表的投影，由 `ScalarFnTable` 声明投影方式后自动生成。
+
+`// @scalar <name> <class> <bw> <c> <ll> <llbits>`：
+
+| 列 | 含义 |
+|---|---|
+| `name` | t 源码中的类型名 |
+| `class` | `int` / `float` / `bool` / `none`（`none` = 非标量，仅供 C 类型映射复用） |
+| `bw` | t 语义位宽（`bool` 为 1；`none` 为 -1） |
+| `c` | 生成 C 代码时的类型名 |
+| `ll` | 生成 LLVM IR 时的类型名 |
+| `llbits` | LLVM 表示位宽（`bool` 按 i8 存储，故为 8） |
+
+```ebnf
+ScalarTable ::
+  // @scalar u8   int   8  uint8_t  i8     8
+  // @scalar u16  int   16 uint16_t i16    16
+  // @scalar u32  int   32 uint32_t i32    32
+  // @scalar u64  int   64 uint64_t i64    64
+  // @scalar i8   int   8  int8_t   i8     8
+  // @scalar i16  int   16 int16_t  i16    16
+  // @scalar i32  int   32 int32_t  i32    32
+  // @scalar i64  int   64 int64_t  i64    64
+  // @scalar f16  float 16 _Float16 i64    64
+  // @scalar f32  float 32 float    float  32
+  // @scalar f64  float 64 double   double 64
+  // @scalar bool bool  1  bool     i8     8
+  // @scalar void none  -1 void     i64    64
+```
+
+`// @sfn <fn> <ret> <mode> <filter> <col> <fallback> <region>` 声明由上表派生的查询函数。所有派生函数签名固定为 `<fn> :: func(name: string) -> <ret>`。
+
+- `filter`：`all` = 全表；`scalar` = `class != none`；`int` / `float` / `bool` = 按 class 取。
+- `col`：取值列（`pred` 模式不取值，写 `-`）。
+- `fallback`：兜底返回值，**取值等于 fallback 的条目不发射分支**（由兜底覆盖）。`name` 表示返回入参本身；`-` 表示无（`pred` 模式固定 `return <末组条件>;`）。
+- `mode`：
+  - `pred` — 谓词。按名字**首字母**分组，前 n−1 组发 `if (<或链>) {\n    return true;\n}`，末组发 `return <或链>;`。
+  - `group1` — 按 `col` 取值分组，组序 = 取值在表中的首现序，单行体 `if (<或链>) { return V; }`。
+  - `group2` — 同 `group1` 但多行体，末尾附 `return <fallback>;`。
+  - `each` — 不分组，逐条发 `if (name == "X") { return V; }`，末尾附 `return <fallback>;`。
+- `region`：所属 `GEN:` 生成区间名。同一区间内的函数按表序发射、函数间空一行。区间拆成四段只为贴合各函数在 `tote.tc` 中的既有位置，不影响语义。
+
+```ebnf
+ScalarFnTable ::
+  // @sfn is_scalar_name bool   pred   scalar -      -    scalar_pred
+  // @sfn is_int_name    bool   pred   int    -      -    scalar_bits
+  // @sfn is_float_name  bool   pred   float  -      -    scalar_bits
+  // @sfn get_bw         i64    group2 all    bw     -1   scalar_bits
+  // @sfn scalar_to_c    string each   all    c      name scalar_ctype
+  // @sfn scalar_to_ll   string group1 all    ll     i64  scalar_llmap
+  // @sfn ll_bits        i64    group1 all    llbits 64   scalar_llmap
+```
+
 ## 3. Syntax（语法）
 
 ### 3.1 Items（顶层条目）

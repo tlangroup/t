@@ -42,6 +42,23 @@ var slt_ty: []string;        // t 类型（string/bool/i64/u64）
 var slt_def: []string;       // node_new 初值（t 字面量文本）
 var slt_cmt: []string;       // 结构体字段注释（仅锚点槽有）
 
+// ── 标量类型表（reference.md §2.10 ScalarTable / ScalarFnTable）──
+// 行序即语义：group 模式的组序 = 取值在表中的首现序，故不可重排。
+var sc_name: []string;       // t 类型名（u8/i32/f64/bool/void…）
+var sc_cls: []string;        // 类别：int / float / bool / none（none = 非标量）
+var sc_bw: []string;         // t 语义位宽（bool=1，none=-1）
+var sc_c: []string;          // C 类型名
+var sc_ll: []string;         // LLVM 类型名
+var sc_llbits: []string;     // LLVM 表示位宽（bool 按 i8 存储 → 8）
+
+var sf_fn: []string;         // 派生查询函数名
+var sf_ret: []string;        // 返回类型（bool/i64/string）
+var sf_mode: []string;       // 发射模式：pred / group1 / group2 / each
+var sf_filter: []string;     // 取行过滤：all / scalar / int / float / bool
+var sf_col: []string;        // 取值列（pred 模式为 "-"）
+var sf_fb: []string;         // 兜底返回值；取值等于它的条目不发射分支
+var sf_region: []string;     // 所属 GEN 区间名
+
 // ── 解析器分发表（由 build/ebnf.json 的 dispatches 段驱动，见 reference.md §2.7）──
 // 为避免嵌套 slice，分发表以扁平 1D 数组存储：dp_name[i] + dp_start[i] + dp_len[i]
 // 描述第 i 张表的名称与在扁平数组中的区间 [start, start+len)。
@@ -381,6 +398,35 @@ load_tables :: func() -> void {
         append(slt_ty, jnodes[json_obj_get(m, "ty")].s);
         append(slt_def, jnodes[json_obj_get(m, "def")].s);
         append(slt_cmt, jnodes[json_obj_get(m, "cmt")].s);
+        m = jnodes[m].sib;
+    }
+
+    // ── 标量类型表（reference.md §2.10 ScalarTable）──
+    var n_sc: i64 = json_obj_get(root, "scalars");
+    var arr_sc: i64 = jnodes[n_sc].child;
+    m = jnodes[arr_sc].child;
+    while (m >= 0) {
+        append(sc_name, jnodes[json_obj_get(m, "name")].s);
+        append(sc_cls, jnodes[json_obj_get(m, "cls")].s);
+        append(sc_bw, jnodes[json_obj_get(m, "bw")].s);
+        append(sc_c, jnodes[json_obj_get(m, "c")].s);
+        append(sc_ll, jnodes[json_obj_get(m, "ll")].s);
+        append(sc_llbits, jnodes[json_obj_get(m, "llbits")].s);
+        m = jnodes[m].sib;
+    }
+
+    // ── 标量派生函数表（reference.md §2.10 ScalarFnTable）──
+    var n_sf: i64 = json_obj_get(root, "sfns");
+    var arr_sf: i64 = jnodes[n_sf].child;
+    m = jnodes[arr_sf].child;
+    while (m >= 0) {
+        append(sf_fn, jnodes[json_obj_get(m, "fn")].s);
+        append(sf_ret, jnodes[json_obj_get(m, "ret")].s);
+        append(sf_mode, jnodes[json_obj_get(m, "mode")].s);
+        append(sf_filter, jnodes[json_obj_get(m, "filter")].s);
+        append(sf_col, jnodes[json_obj_get(m, "col")].s);
+        append(sf_fb, jnodes[json_obj_get(m, "fallback")].s);
+        append(sf_region, jnodes[json_obj_get(m, "region")].s);
         m = jnodes[m].sib;
     }
 
@@ -1893,6 +1939,195 @@ emit_ast :: func() -> string {
     return sb_to_str(sb);
 }
 
+// ───────────── 标量类型派生函数（§2.10）─────────────
+
+// 取第 i 个标量在 col 列的值。表外列名返回非法 token，让生成物编译立即失败。
+sc_col :: func(i: i64, col: string) -> string {
+    if (col == "bw") { return sc_bw[i]; }
+    if (col == "c") { return sc_c[i]; }
+    if (col == "ll") { return sc_ll[i]; }
+    if (col == "llbits") { return sc_llbits[i]; }
+    return "?SCALAR_COL?";
+}
+
+// filter 取行：all = 全表，scalar = 非 none，其余按 class 精确匹配。
+sc_keep :: func(i: i64, filter: string) -> bool {
+    if (filter == "all") { return true; }
+    if (filter == "scalar") { return sc_cls[i] != "none"; }
+    return sc_cls[i] == filter;
+}
+
+// 分组键：pred 按名字首字母分组，其余按取值列分组。
+sc_gkey :: func(i: i64, mode: string, col: string) -> string {
+    if (mode == "pred") { return str_slice(sc_name[i], 0, 1); }
+    return sc_col(i, col);
+}
+
+// 分组键的首现序（换行分隔）。非 pred 模式跳过取值 == fallback 的条目（由兜底覆盖）。
+sc_keys :: func(filter: string, mode: string, col: string, fb: string) -> string {
+    var sb: StringBuilder = sb_new();
+    var acc: string = "";
+    var n: i64 = slice_len(sc_name) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        if (sc_keep(i, filter)) {
+            var k: string = sc_gkey(i, mode, col);
+            var skip: bool = false;
+            if (mode != "pred") {
+                if (k == fb) { skip = true; }
+            }
+            if (skip == false) {
+                if (nl_find(acc, k) < 0) {
+                    if (acc != "") { sb_append_str(sb, "\n"); }
+                    sb_append_str(sb, k);
+                    acc = sb_to_str(sb);
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return acc;
+}
+
+// 收集分组键 == key 的成员名（空格分隔，保持表序）。
+sc_members :: func(filter: string, mode: string, col: string, key: string) -> string {
+    var sb: StringBuilder = sb_new();
+    var n: i64 = slice_len(sc_name) as i64;
+    var i: i64 = 0;
+    var first: bool = true;
+    while (i < n) {
+        if (sc_keep(i, filter)) {
+            if (sc_gkey(i, mode, col) == key) {
+                if (first == false) { sb_append_str(sb, " "); }
+                sb_append_str(sb, sc_name[i]);
+                first = false;
+            }
+        }
+        i = i + 1;
+    }
+    return sb_to_str(sb);
+}
+
+// 发射 `name == "a" || name == "b"` 或链。
+sc_orchain :: func(sb: StringBuilder, members: string) -> void {
+    var c: i64 = slot_count(members);
+    var i: i64 = 0;
+    while (i < c) {
+        if (i > 0) { sb_append_str(sb, " || "); }
+        sb_append_str(sb, "name == \"");
+        sb_append_str(sb, slot_at(members, i));
+        sb_append_str(sb, "\"");
+        i = i + 1;
+    }
+}
+
+// 按返回类型发射字面量：string 加引号，数值裸写。
+sc_val :: func(sb: StringBuilder, ret: string, v: string) -> void {
+    if (ret == "string") {
+        sb_append_str(sb, "\"");
+        sb_append_str(sb, v);
+        sb_append_str(sb, "\"");
+        return;
+    }
+    sb_append_str(sb, v);
+}
+
+// 发射第 k 个派生函数（末尾不含换行）。
+emit_sfn :: func(sb: StringBuilder, k: i64) -> void {
+    var ret: string = sf_ret[k];
+    var mode: string = sf_mode[k];
+    var filter: string = sf_filter[k];
+    var col: string = sf_col[k];
+    var fb: string = sf_fb[k];
+
+    sb_append_str(sb, sf_fn[k]);
+    sb_append_str(sb, " :: func(name: string) -> ");
+    sb_append_str(sb, ret);
+    sb_append_str(sb, " {\n");
+
+    if (mode == "each") {
+        var n: i64 = slice_len(sc_name) as i64;
+        var i: i64 = 0;
+        while (i < n) {
+            if (sc_keep(i, filter)) {
+                sb_append_str(sb, "    if (name == \"");
+                sb_append_str(sb, sc_name[i]);
+                sb_append_str(sb, "\") { return ");
+                sc_val(sb, ret, sc_col(i, col));
+                sb_append_str(sb, "; }\n");
+            }
+            i = i + 1;
+        }
+    } else {
+        var keys: string = sc_keys(filter, mode, col, fb);
+        var kc: i64 = nl_count(keys);
+        var j: i64 = 0;
+        while (j < kc) {
+            var key: string = nl_at(keys, j);
+            var mem: string = sc_members(filter, mode, col, key);
+            var islast: bool = j == kc - 1;
+            if (mode == "pred" && islast) {
+                // 谓词末组直接 return 或链，不再包 if
+                sb_append_str(sb, "    return ");
+                sc_orchain(sb, mem);
+                sb_append_str(sb, ";\n");
+            } else {
+                sb_append_str(sb, "    if (");
+                sc_orchain(sb, mem);
+                if (mode == "group1") {
+                    sb_append_str(sb, ") { return ");
+                    sc_val(sb, ret, key);
+                    sb_append_str(sb, "; }\n");
+                } else {
+                    sb_append_str(sb, ") {\n        return ");
+                    if (mode == "pred") {
+                        sb_append_str(sb, "true");
+                    } else {
+                        sc_val(sb, ret, key);
+                    }
+                    sb_append_str(sb, ";\n    }\n");
+                }
+            }
+            j = j + 1;
+        }
+    }
+
+    if (mode != "pred") {
+        sb_append_str(sb, "    return ");
+        if (fb == "name") {
+            sb_append_str(sb, "name");
+        } else {
+            sc_val(sb, ret, fb);
+        }
+        sb_append_str(sb, ";\n");
+    }
+    sb_append_str(sb, "}");
+}
+
+// 生成一个标量 GEN 区间：区间内函数按表序发射、函数间空一行。
+emit_scalar_region :: func(region: string) -> string {
+    var sb: StringBuilder = sb_new();
+    sb_append_str(sb, "// >>> GEN:");
+    sb_append_str(sb, region);
+    sb_append_str(sb, " (generated by tools/totter.tc from build/ebnf.json -- DO NOT EDIT) >>>\n");
+    var n: i64 = slice_len(sf_fn) as i64;
+    var i: i64 = 0;
+    var first: bool = true;
+    while (i < n) {
+        if (sf_region[i] == region) {
+            if (first == false) { sb_append_str(sb, "\n"); }
+            emit_sfn(sb, i);
+            sb_append_str(sb, "\n");
+            first = false;
+        }
+        i = i + 1;
+    }
+    sb_append_str(sb, "// <<< GEN:");
+    sb_append_str(sb, region);
+    sb_append_str(sb, " <<<");
+    return sb_to_str(sb);
+}
+
 // ───────────── 主流程 ─────────────
 
 main_fn :: func() -> i32 @main {
@@ -1938,6 +2173,22 @@ main_fn :: func() -> i32 @main {
         "// >>> GEN:ast",
         "// <<< GEN:ast <<<",
         emit_ast());
+    out = replace_interval(out,
+        "// >>> GEN:scalar_pred",
+        "// <<< GEN:scalar_pred <<<",
+        emit_scalar_region("scalar_pred"));
+    out = replace_interval(out,
+        "// >>> GEN:scalar_bits",
+        "// <<< GEN:scalar_bits <<<",
+        emit_scalar_region("scalar_bits"));
+    out = replace_interval(out,
+        "// >>> GEN:scalar_ctype",
+        "// <<< GEN:scalar_ctype <<<",
+        emit_scalar_region("scalar_ctype"));
+    out = replace_interval(out,
+        "// >>> GEN:scalar_llmap",
+        "// <<< GEN:scalar_llmap <<<",
+        emit_scalar_region("scalar_llmap"));
 
     file_write_all("gen/tote.tc", out);
     return 0;

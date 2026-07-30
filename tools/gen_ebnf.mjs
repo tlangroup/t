@@ -222,9 +222,9 @@ function parseRecord(s) {
   return out;
 }
 
-const TABLE_RULES = ['Keyword', 'BuiltinTable', 'DeriveTraitTable', 'DiagnosticTable', 'AnnotationTable', 'NodeTable', 'SlotTable'];
+const TABLE_RULES = ['Keyword', 'BuiltinTable', 'DeriveTraitTable', 'DiagnosticTable', 'AnnotationTable', 'NodeTable', 'SlotTable', 'ScalarTable', 'ScalarFnTable'];
 
-const tables = { keywords: [], builtins: [], derives: [], diagnostics: [], annotations: [], nodes: [], slots: [] };
+const tables = { keywords: [], builtins: [], derives: [], diagnostics: [], annotations: [], nodes: [], slots: [], scalars: [], sfns: [] };
 const dispatches = {};
 
 for (const r of rules) {
@@ -288,6 +288,22 @@ for (const r of rules) {
       const m = comment.match(/^@slot\s+([A-Za-z_]\w*)\s+(\w+)\s+(\w+)\s+(\S+)\s*(.*)$/);
       if (!m) continue;
       tables.slots.push({ name: m[1], note: m[2], ty: m[3], def: m[4], cmt: m[5] || '' });
+    }
+  } else if (r.name === 'ScalarTable') {
+    // 解析 `// @scalar <name> <class> <bw> <c> <ll> <llbits>`（行序即分组首现序，语义相关）。
+    for (const line of r.rawFull.split('\n')) {
+      const { comment } = splitCodeComment(line);
+      const m = comment.match(/^@scalar\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s*$/);
+      if (!m) continue;
+      tables.scalars.push({ name: m[1], cls: m[2], bw: m[3], c: m[4], ll: m[5], llbits: m[6] });
+    }
+  } else if (r.name === 'ScalarFnTable') {
+    // 解析 `// @sfn <fn> <ret> <mode> <filter> <col> <fallback> <region>`。
+    for (const line of r.rawFull.split('\n')) {
+      const { comment } = splitCodeComment(line);
+      const m = comment.match(/^@sfn\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s*$/);
+      if (!m) continue;
+      tables.sfns.push({ fn: m[1], ret: m[2], mode: m[3], filter: m[4], col: m[5], fallback: m[6], region: m[7] });
     }
   } else if (r.name.endsWith('Dispatch')) {
     const key = r.name.slice(0, -'Dispatch'.length);
@@ -550,6 +566,9 @@ const counts = {
   diagnostics: tables.diagnostics.length,
   annotations: tables.annotations.length,
   nodes: tables.nodes.length,
+  slots: tables.slots.length,
+  scalars: tables.scalars.length,
+  sfns: tables.sfns.length,
   rules: structural.length,
   grammar: grammar.length,
   dispatchTables: Object.keys(dispatches).length,

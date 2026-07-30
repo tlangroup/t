@@ -1,79 +1,74 @@
 # t Language Compiler — Project Notes
 
 ## 概览
-- **t**：数据驱动、ECS 取向、AI-Agent 友好的静态类型语言，扩展名 `.tc`；规范 `docs/spec.md`，参考手册 `docs/reference.md`（数据表/文法唯一真相源）。
-- **主实现 = `src/tote.tc`**（单文件 ~12.5k 行，自举编译器：lex/check/compile/emit-c/emit-ll/build/run/test/ast/type-info）。
+- **t**：数据驱动、ECS 取向、AI-Agent 友好的静态类型语言，扩展名 `.tc`；规范 `docs/spec.md`，参考手册 `docs/reference.md`（数据表/文法**唯一真相源**）。
+- **主实现 = `src/tote.tc`**（单文件 ~12.5k 行自举编译器：lex/check/compile/emit-c/emit-ll/build/run/test/ast/type-info）。
 - **生成器 = `src/totter.tc`**（t 编写）：读 `build/ebnf.json` 数据表，重写 `src/tote.tc` 的 `// >>> GEN:xxx >>>` … `// <<< GEN:xxx <<<` 区间，输出 `gen/tote.tc`。
 - `tc0/`（TypeScript 参考实现）已冻结；种子封存 `seed/tc0/`（信任根，永不删除）。
 
 ## 构建 & 验证
-- 编译：`build/tote/tote.exe build <f.tc> --clang "C:/Program Files/LLVM/bin/clang.exe" --output build/<dir>/<name>`
-  （注：`_build_one.mjs` 的 /Fe 硬编码 tote.exe，故产物常在 `build/<dir>/tote.exe`）
-- `emit-ll <f.tc>` 输出 `<name>.ll` **写在源文件旁**（stdout 只有短提示）。
+- 编译：`build/tote/tote.exe build <f.tc> --clang "C:/Program Files/LLVM/bin/clang.exe" --output build/<dir>/<name>`（输出目录须先 mkdir）。
+  - 注：`_build_one.mjs` 的 /Fe 硬编码 tote.exe，故 C 路径产物常在 `build/<dir>/tote.exe`；canonical totter 落在 `build/totter/tote.exe`（同时保留一份 `totter.exe`）。
+- `emit-ll <f.tc> --output p` 实际写 `p.ll`（会再补一次后缀）；stdout 只有短提示。
 - **标准流水线**：canonical tote 编译 `src/totter.tc` → totter；totter 重生成 `gen/tote.tc`；`cp gen/tote.tc src/tote.tc` 提升定点；canonical tote 编译 `gen/tote.tc` → 新 tote。
 - **验证四件套**：
-  1. 定点 `md5sum src/tote.tc gen/tote.tc` 相等且重跑幂等
-  2. `node tools/difftest.mjs --ref build/tote/tote.exe --cand <new>`（当前 **27/27**）
-  3. `node tools/conformance.mjs --compiler <new>`（**17/17**；加 `--ref` 走 tc0 交叉极慢，慎用）
-  4. LLVM IR 逐字节：`p06_control_flow.ll` 两版 diff 为空 + `run --example hello/fib` smoke
-- 两阶段自举：tote-b→tote-c difftest 27/27（二进制 md5 不同系内嵌路径/时间戳，非功能差异）。
+  1. 定点：`md5sum src/tote.tc gen/tote.tc` 相等且重跑幂等
+  2. `node tools/difftest.mjs [--ref A --cand B]` → **27/27**
+  3. `node tools/conformance.mjs` → **17/17**（`--ref` 走 tc0 交叉极慢，慎用）
+  4. LLVM IR 逐字节 diff（最灵敏）+ `run --example hello/fib` smoke
+- 两阶段自举：tote-b→tote-c，IR 逐字节相同 + difftest 27/27（exe md5 不同系链接时间戳，非功能差异）。
 - `tools/bootstrap.mjs` 目前在 gen1 失败 = tc0 发射器基线 bug，与近期改动无关；等价性以 difftest 为准。
 - 提升 canonical 前先归档：`build/archive/<name>_pre-<里程碑>.exe`。
 
 ## 环境 / 实现约束
-- MSVC 路径需 `/utf-8` + 生成 C 带 BOM（`.tc` 源不能带 BOM）；LLVM 路径避开 Win64 聚合 ABI（`runtime/t_shim_ll.c` 的 `tll_*` 指针桥）。
-- runtime arena 已扩至 **512MB**（`runtime/t_runtime.c`）。
+- MSVC 路径需 `/utf-8` + 生成 C 带 BOM（`.tc` 源不能带 BOM）；LLVM 路径避开 Win64 聚合 ABI（`runtime/t_shim_ll.c` 的 `tll_*` 指针桥）。runtime arena 512MB。
 - 确定性：line/col = UTF-8 字节计数；stdout 二进制模式；`sb_to_str` 复制语义。
-- t 语法坑：`Name :: struct { f: T; }`；**无 else-if 链**；`append(s, call())` 会取临时量地址(C2102)，须先存局部变量；无 slice 重赋值（不能 `= []` 重置）；无 `str_find`（自实现）。
-- tc1/tote C 后端 `sys_run` 必须直通输出 `sys_run(...)`，否则不动点破坏。
+- t 语法坑：`Name :: struct { f: T; }`；**无 else-if 链**；`append(s, call())` 取临时量地址(C2102)须先存局部；无 slice 重赋值；无 `str_find`（自实现）；拼接优先 StringBuilder（宽 cat 可用性不定）。
+- tote C 后端 `sys_run` 必须直通输出 `sys_run(...)`，否则不动点破坏。
 - 诊断怪癖：`T_TYPE_UNKNOWN` 从未发出（实报 `T_TYPE_MISMATCH`）；命名违规是 warning（exit 0）。
-- **既有限制（非回归）**：`run <任意路径.tc>` lld-link `subsystem must be defined`；LLVM 后端 `int_to_str` UNSUPPORTED；数组字面量 `[N]u8` / 空数组 `[]` 推 `[0]<unknown>` 不能赋 `[]i64`。
+- **既有限制（非回归）**：`run <任意路径.tc>` lld-link `subsystem must be defined`；LLVM 后端 `int_to_str` UNSUPPORTED；数组字面量 `[N]u8` / `[]` 推 `[0]<unknown>`。
 
 ## Variant (G10, M12)
-- 关键字 `variant`；`parse_variant_decl` → VariantDecl + VC（`VC.ia`=case 下标，`VC.na`=载荷类型或 -1 单元 case）。
-- 检查器 `register_variant_helpers` 注册合成符号（不入 decl_list）：`Name_from_Case` / `Name_is_Case` / `Name_as_Case`。
-- 发射 `typedef struct { uint32_t _tag; union {...} _u; }` + 每 case 三个 `static inline` 自由函数。
-- 取舍：自由函数而非方法/模式匹配；Variant 上暂不支持 `@derive`。
+关键字 `variant` → `parse_variant_decl`（VariantDecl + VC：`ia`=case 下标，`na`=载荷类型或 -1）；检查器 `register_variant_helpers` 注册合成符号 `Name_from_/is_/as_Case`（不入 decl_list）；发射 tag+union struct + 每 case 三个 `static inline` 自由函数。取舍：自由函数而非模式匹配；不支持 `@derive`。
 
-## 数据驱动自生成主线（M17 → M20）✅
-**目标**：用数据表生成 tote 自身的代码，而非给 t 语言加数据驱动特性。
+## 数据驱动自生成主线（M17 → M24）✅
+**目标**：用数据表生成 tote 自身的代码（不是给 t 语言加数据驱动特性）。
+**链路**：`docs/reference.md`（数据表 + `// @rule` EBNF + `// @node`/`@slot`/`@scalar`/`@sfn` 表）→ `tools/gen_ebnf.mjs` → `build/ebnf.json` → `src/totter.tc` 各 emitter → `src/tote.tc` 的 GEN 区间。
 
-### 链路
-`docs/reference.md`（数据表 + `// @rule` EBNF + `// @node` 表）→ `tools/gen_ebnf.mjs` → `build/ebnf.json` → `src/totter.tc` 各 emitter → `src/tote.tc` 的 GEN 区间。
-
-### 当前 9 个 GEN 区间
-`kw_lookup`(33 关键字) / `builtins`(15 组) / `derives`(9 trait) / `diagnostics`(10 码) / `annotations`(34 注解) / `xid` / `parser_dispatch` / `parser_rules`(30 文法规则) / `ast`(65 节点种类)
+### 当前 13 个 GEN 区间
+`kw_lookup`(33 关键字) / `builtins`(15 组) / `derives`(9 trait) / `diagnostics`(10 码) / `annotations`(34 注解) / `xid` / `parser_dispatch` / `parser_rules`(30 文法规则) / `ast`(65 节点种类) / `scalar_pred` / `scalar_bits` / `scalar_ctype` / `scalar_llmap`
 
 ### parser 数据驱动（M19，10 种 fold 模式）
-- 通用：`bin`(左折叠二元塔) / `pre`(右结合前缀一元) / `post`(左折叠后缀+胶水下沉) / `prim`(终端 dispatch) / `disp`(守卫式分发，骨架不消费引导 token)
-- 语句体专用（逐字节复刻手写 C，保 `node_at` 与列表兜底零差异）：`whilex` / `returnx` / `ifx`(else 嵌套 if 需包单元素 list) / `forx`(peek `KwIn` 分流) / `swx`(case/default 循环聚合，default_head 缺省 -2)
-- **成果**：结构型声明 + 表达式金字塔（or→…→primary）+ statement 顶层分发 + 全部语句体内部结构，全部由文法生成。
-- 保留胶水（GEN 区外、设计使然）：`parse_local_var`（名校验副作用 + `nti=pos-1` 定位，被 forx 调用）、`parse_expr_or_assign_stmt`、`mk_un`、postfix/primary 的 helper 群、`str_or`/`flag_offset_of` 等注解提取。
+- 通用：`bin` / `pre` / `post` / `prim` / `disp`（守卫式分发，骨架不消费引导 token）
+- 语句体专用（逐字节复刻手写 C）：`whilex` / `returnx` / `ifx`（else 嵌 if 需包单元素 list）/ `forx`（peek `KwIn` 分流）/ `swx`（default_head 缺省 -2）
+- 保留胶水（GEN 区外、设计使然）：`parse_local_var`（名校验副作用 + `nti=pos-1`）、`parse_expr_or_assign_stmt`、`mk_un`、postfix/primary helper 群、`str_or`/`flag_offset_of`。
 
-### AST 层（M20 地基 + M21 构造器 + M22 Phase C + M23 SlotTable ✅ 全链数据驱动）
-- `reference.md` §2.9 `NodeTable ::` 块内 65 条 `// @node <name> [slot=type ...]`，槽标注已全量补齐（60 有槽 / 5 无槽：break、continue、flag_set、null、variant）。槽类型映射：sa/sb/sc→str、has_*→has、ia/ib→int、ba/bb→bool、na..nd→node、la..lc→list。
-- **M23 SlotTable**：§2.9 另有 `SlotTable ::` 20 行 `// @slot <名> <记法> <t类型> <初值> [注释]`（17 数据槽 + ln/cl/tv anchor 槽），行序 = Node 字段序，是槽定义唯一真相源 → gen_ebnf `slots` 段 → totter `slt_*` 表驱动：Node 结构字段、node_new 初值循环发射（锚点注释对齐列 16），`slot_ty`/`slot_default` 查表（表外槽发射 `?SLOT_TY?` 非法 token 失败可见）。验证 = gen/tote.tc md5 逐字节不变（tote 零变化）。
-- `Node` 是**固定通用槽结构**：`sa/sb/sc` 字符串槽（`has_s*` 表 null）、`na/nb/nc/nd` 子节点索引（-1=null）、`ia/ib` 整型载荷、`la/lb/lc` 列表头（-1 空、-2 null）、`ba/bb` 布尔、`ln/cl/tv` 位置锚点。
-- `GEN:ast` 区间含：`Node` 结构 + `nodes`/`Child`/`kids` 池 + `node_new` + `node_at` + 节点注册表（`node_kind_names`/`init_node_kinds`/`is_node_kind`）+ **65 个 `mk_<kind>` 构造器**；`main` 在 `init_keywords()` 后调 `init_node_kinds()`（区外胶水）。
-- 构造器约定：`mk_<kind>(槽参数按 Node 字段序…, ti: i64) -> i64`；`ti < 0` 跳过 `node_at`；槽取该 kind 所有调用点的**并集**，未设槽填 `node_new` 默认值 → 零行为差异。totter 侧靠 `nd_slots` 表 + `slot_count/slot_at/slot_ty` 发射。
-- 迁移成果（Phase A 手写调用点 + Phase C 生成器发射）：`node_new` 全项目仅剩 **2 处非构造器调用** —— 手写 `P`、`mk=inline` 的 `F`；`mk_` 调用点 96 处。手写 `mk_scalar` 已删（并入生成器），`mk_bin`/`mk_un` 降级为转调 `mk_binary`/`mk_unary` 的薄包装。
-- **Phase C**：totter 的 `emit_mk_call(indent, lhs, kind, fields, exprs, ti)` 统一发射 `mk_` 调用（fields/exprs 为**换行分隔**并行列表，因 t 无 map 且表达式含空格）；配套 `nl_count`/`nl_at`/`nl_find`/`slot_default`/`nd_slots_of`。覆盖 5 个语句体发射器 + `emit_rule` 通用 construct 路径。
-- **⚠️ 节点索引漂移铁律**：槽赋值表达式内若含子节点分配调用，改写 `mk_X(...)` 会让实参先于 `node_new` 求值 → 子节点索引挪到父节点之前 → AST 变化。两处命中：手写 `node_new("P")`（与 `named` 交错分配后回填 `pn2.na`）；文法规则 `sfield`（`sfield_na` 会 `mk_scalar("void")`）—— 后者用 `@rule ... mk=inline` 标注关闭 mk_ 发射。
-- **⚠️ construct 块求值顺序会被重排为 Node 字段序**（非书写顺序），块内含副作用表达式时须自查。当前唯一副作用调用 `list_concat`（就地改 kids 链）在 `flag_decl`/`struct_decl` 重排后仍位于所有读注解链的 `bp_*` 之后，安全。
+### AST 层（M20–M23）
+- §2.9 `NodeTable ::` 65 条 `// @node <name> [slot=type…]`（60 有槽/5 无槽）；`SlotTable ::` 20 行 `// @slot <名> <记法> <t类型> <初值>`（17 数据槽 + ln/cl/tv），行序 = Node 字段序，驱动 Node 结构、`node_new` 初值、`slot_ty`/`slot_default`。
+- `Node` 固定通用槽：`sa/sb/sc`(+`has_s*`)、`na..nd`(-1=null)、`ia/ib`、`la/lb/lc`(-1 空 / -2 null)、`ba/bb`、`ln/cl/tv`。
+- `GEN:ast` 含 Node 结构 + 池 + `node_new`/`node_at` + 节点注册表 + **65 个 `mk_<kind>` 构造器**（签名：槽参数按字段序 + `ti`，`ti<0` 跳过 `node_at`；槽取所有调用点并集）。
+- 迁移成果：`node_new` 全项目仅剩 2 处非构造器调用（手写 `P`、`mk=inline` 的 `F`）；`mk_` 调用点 96 处。
+- **⚠️ 节点索引漂移铁律**：槽表达式内含子节点分配时改写成 `mk_X(...)` 会让实参先求值 → 子节点索引挪到父节点之前 → AST 变化。命中处用 `@rule … mk=inline` 关闭发射。
+- **⚠️ construct 块求值顺序被重排为 Node 字段序**（非书写顺序），块内副作用表达式须自查。
+
+### 标量类型表（M24 ScalarTable）
+- §2.10 两张表：`ScalarTable` 13 行 `// @scalar <name> <class> <bw> <c> <ll> <llbits>`；`ScalarFnTable` 7 行 `// @sfn <fn> <ret> <mode> <filter> <col> <fallback> <region>`。
+- 7 个手写 if 链函数全部由表生成：`is_scalar_name`/`is_int_name`/`is_float_name`（mode=pred，按首字母分组）、`get_bw`（group2）、`scalar_to_c`（each）、`scalar_to_ll`/`ll_bits`（group1，按取值分组）。
+- **兜底规则**：取值 == fallback 的条目不发射分支（`scalar_to_ll` 的 i64、`get_bw` 的 -1），这是逐字节复现手写代码的关键。
+- 方法论：先写 Python 原型逐区间比对手写原文（IDENTICAL）再移植 totter，一次成功。
 
 ### 踩坑铁律
 - **GEN 标记名不得是其他标记的前缀**（`GEN:parser` 曾误命中 `GEN:parser_dispatch`）。
 - 表驱 `kw_lookup` 必须在任何 `tokenize()` **之前** init；统一在 `main()` 入口调一次。
-- `gen_ebnf.mjs` 收集规则时 `cur.raw` 只存 code（注释被 `splitCodeComment` 剥掉）；纯注释表（如 `@node`）须读 `cur.rawFull`。
+- `gen_ebnf.mjs` 中 `cur.raw` 只存 code（注释被剥离）；纯注释表（`@node`/`@slot`/`@scalar`/`@sfn`）须读 `cur.rawFull`。
 - totter JSON 导航：成员节点 `.child` 指向**值节点**；数组元素 = `jnodes[值节点].child` 起 `.sib` 链。
-- OPKIND 表须与 lexer 实际 token 对齐（`~`→`BitNot` 而非 `Tilde`）。
-- 新增 DSL 能力后，等价性用 **AST/LLVM IR 逐字节 diff** 兜底，比 difftest 更早暴露节点位置漂移。tote 无 `ast` 子命令，最灵敏的兜底是「对 `gen/tote.tc` 自身 emit-ll 逐字节 diff」（2.4MB IR，任何索引漂移必现）。
-- exe 的 md5 差异属 clang 链接器时间戳/路径，**不代表功能差异**；不动点判定一律以 IR 逐字节为准。
-- **负向测试禁用 `git checkout` 恢复**含未提交编辑的文件（M23 曾把 SlotTable 编辑一并回滚）；用副本或 sed 反向恢复。
-- totter 内 `cat5` 等宽 cat 内建可用性不确定（reference 只见 cat3）；拼接优先 StringBuilder。
+- 表外键查询要发射失败可见的非法 token（`?SLOT_TY?` / `?SCALAR_COL?`），不要静默兜底。
+- 新增 DSL 后等价性用 **IR 逐字节 diff** 兜底（对 `gen/tote.tc` 自身 emit-ll，2.4MB IR，索引漂移必现）；exe md5 差异不代表功能差异。
+- **负向测试禁用 `git checkout` 恢复**含未提交编辑的文件（M23 踩过）；用副本备份恢复。
+- 若改动只新增 GEN 标记行，`gen/tote.tc` md5 变化属预期，此时以 difftest + IR 逐字节为金标准。
 
 ## 技术债 / 后续候选
-1. typechecker 规则表；@derive 派生生成器表
+1. typechecker 规则表（M24 探查过：`infer_expr` L6891–7090 按 kind 分派、分支差异极大，整体表驱会打乱 IR 顺序，需先拆子模式）；@derive 派生生成器表（9 trait 生成体仍手写）
 2. §7.2 CSV/JSON CTFE 编译期导入
 3. `@soa` 布局变换、脱离 arena 的通用内存管理
 4. 修既有限制：lld-link subsystem、LLVM `int_to_str`、数组字面量类型推导
