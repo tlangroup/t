@@ -222,9 +222,9 @@ function parseRecord(s) {
   return out;
 }
 
-const TABLE_RULES = ['Keyword', 'BuiltinTable', 'DeriveTraitTable', 'DiagnosticTable', 'AnnotationTable', 'NodeTable', 'SlotTable', 'ScalarTable', 'ScalarFnTable'];
+const TABLE_RULES = ['Keyword', 'BuiltinTable', 'DeriveTraitTable', 'DiagnosticTable', 'AnnotationTable', 'NodeTable', 'SlotTable', 'ScalarTable', 'ScalarFnTable', 'TypeRuleTable', 'DeclRegTable'];
 
-const tables = { keywords: [], builtins: [], derives: [], diagnostics: [], annotations: [], nodes: [], slots: [], scalars: [], sfns: [] };
+const tables = { keywords: [], builtins: [], derives: [], diagnostics: [], annotations: [], nodes: [], slots: [], scalars: [], sfns: [], trules: [], dregs: [] };
 const dispatches = {};
 
 for (const r of rules) {
@@ -304,6 +304,22 @@ for (const r of rules) {
       const m = comment.match(/^@sfn\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s*$/);
       if (!m) continue;
       tables.sfns.push({ fn: m[1], ret: m[2], mode: m[3], filter: m[4], col: m[5], fallback: m[6], region: m[7] });
+    }
+  } else if (r.name === 'TypeRuleTable') {
+    // 解析 `// @trule <region> <fn> <kind> <mode> <a1> <a2> <a3>`（行序即发射序）。
+    for (const line of r.rawFull.split('\n')) {
+      const { comment } = splitCodeComment(line);
+      const m = comment.match(/^@trule\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s*$/);
+      if (!m) continue;
+      tables.trules.push({ region: m[1], fn: m[2], kind: m[3], mode: m[4], a1: m[5], a2: m[6], a3: m[7] });
+    }
+  } else if (r.name === 'DeclRegTable') {
+    // 解析 `// @dreg <kind> <symkind> <mode> <a1> <a2> <post>`（行序即发射序）。
+    for (const line of r.rawFull.split('\n')) {
+      const { comment } = splitCodeComment(line);
+      const m = comment.match(/^@dreg\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s*$/);
+      if (!m) continue;
+      tables.dregs.push({ kind: m[1], symkind: m[2], mode: m[3], a1: m[4], a2: m[5], post: m[6] });
     }
   } else if (r.name.endsWith('Dispatch')) {
     const key = r.name.slice(0, -'Dispatch'.length);
@@ -569,6 +585,8 @@ const counts = {
   slots: tables.slots.length,
   scalars: tables.scalars.length,
   sfns: tables.sfns.length,
+  trules: tables.trules.length,
+  dregs: tables.dregs.length,
   rules: structural.length,
   grammar: grammar.length,
   dispatchTables: Object.keys(dispatches).length,

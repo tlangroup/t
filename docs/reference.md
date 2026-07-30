@@ -645,6 +645,73 @@ ScalarFnTable ::
   // @sfn ll_bits        i64    group1 all    llbits 64   scalar_llmap
 ```
 
+### 2.11 Type rules（类型检查器规则表）✅ tote
+
+类型检查器中「AST 节点种类 → 类型」的**规律分支**收敛为两张表：`TypeRuleTable` 描述 `infer_expr`（表达式类型推断）与 `resolve_ti`（类型标注求解）的定型规则，`DeclRegTable` 描述 `register_decl`（顶层声明注册符号表）的注册规则。
+
+两个函数中依赖上下文的分支（整数字面量按值选宽、标识符查作用域、二元运算符的同型约束与隐式转换诊断、成员/下标/字面量的结构遍历等）**不在表内**，仍是手写代码：它们不是「查表得类型」，而是带控制流与诊断副作用的算法。表只吃掉真正规律的那部分。
+
+`// @trule <region> <fn> <kind> <mode> <a1> <a2> <a3>`：
+
+| 列 | 含义 |
+|---|---|
+| `region` | 所属 `GEN:` 区间名（区间拆分只为贴合各分支在 `tote.tc` 中的既有位置） |
+| `fn` | `infer` = `infer_expr`（表达式）/ `resolve` = `resolve_ti`（类型标注） |
+| `kind` | 匹配的 AST 节点种类，对应 §2.9 `NodeTable` |
+| `mode` | 结果类型的构造方式，见下 |
+| `a1..a3` | 模式参数，缺省填 `-` |
+
+参数取值约定：以 `n.` 开头视为**代码**（读节点槽），否则视为**字符串字面量**。
+
+- `mk <K>` — `ti_mk("<K>")`
+- `scalar <N>` — `ti_scalar("<N>")`
+- `named <K> <name>` — `ti_named("<K>", <name>)`
+- `und <K> <name> <und>` — `ti_with_und("<K>", <name>, <und>)`
+- `elem <K> <slot>` — `ti_elem_of("<K>", <递归函数>(<slot>))`，递归函数由 `fn` 列决定
+- `rec <fn2> <slot>` — `<fn2>(<slot>)`，透传或改派到另一个求解函数
+
+发射体固定为 `if (n.kind == "<kind>") {` + `return <表达式>;` + `}`。
+
+```ebnf
+TypeRuleTable ::
+  // @trule type_infer1  infer   float      scalar f64        -           -
+  // @trule type_infer1  infer   string     mk     String     -           -
+  // @trule type_infer1  infer   bool       scalar bool       -           -
+  // @trule type_infer1  infer   null       mk     Unknown    -           -
+  // @trule type_infer2  infer   struct_lit named  Struct     n.sa        -
+  // @trule type_infer2  infer   cast       rec    resolve_ti n.nb        -
+  // @trule type_infer2  infer   paren      rec    infer_expr n.na        -
+  // @trule type_infer2  infer   comptime   rec    infer_expr n.na        -
+  // @trule type_slice   resolve slice      elem   Slice      n.na        -
+  // @trule type_resolve resolve variant    mk     Variant    -           -
+  // @trule type_resolve resolve flag       und    Flag       <anonymous> n.sa
+  // @trule type_resolve resolve flag_set   named  FlagSet    <anonymous> -
+  // @trule type_resolve resolve pointer    elem   Pointer    n.na        -
+  // @trule type_resolve resolve optional   elem   Optional   n.na        -
+```
+
+`// @dreg <kind> <symkind> <mode> <a1> <a2> <post>` 生成 `register_decl` **整个函数**。每条发射
+`if (n.kind == "<kind>")` 块，块内调用 `sym_define(global_scope, n.sa, "<symkind>", <类型>, d);` 后 `return;`。
+
+- `symkind`：符号类别 `type` / `func` / `var` / `const`。
+- `mode`：`named <K>` → `ti_named("<K>", n.sa)`；`und <K> <und>` → `ti_with_und("<K>", n.sa, <und>)`；
+  `res <slot>` → `resolve_ti(<slot>)`；`optres <slot> <K>` → 槽为空时退化到 `ti_mk("<K>")`（经临时变量 `cti`）。
+- `post`：注册后追加调用的钩子（`-` 表示无）。`VariantDecl` 借此登记 case 的合成构造器/判别器符号。
+
+```ebnf
+DeclRegTable ::
+  // @dreg StructDecl      type  named  Struct  -       -
+  // @dreg EnumDecl        type  und    Enum    n.sb    -
+  // @dreg FlagDecl        type  und    Flag    n.sb    -
+  // @dreg FlagSetDecl     type  named  FlagSet -       -
+  // @dreg UnionDecl       type  named  Union   -       -
+  // @dreg VariantDecl     type  named  Variant -       register_variant_helpers
+  // @dreg FuncDecl        func  named  Func    -       -
+  // @dreg GlobalVarDecl   var   res    n.na    -       -
+  // @dreg GlobalConstDecl const optres n.na    Unknown -
+  // @dreg TypeAliasDecl   type  res    n.na    -       -
+```
+
 ## 3. Syntax（语法）
 
 ### 3.1 Items（顶层条目）

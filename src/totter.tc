@@ -59,6 +59,23 @@ var sf_col: []string;        // 取值列（pred 模式为 "-"）
 var sf_fb: []string;         // 兜底返回值；取值等于它的条目不发射分支
 var sf_region: []string;     // 所属 GEN 区间名
 
+// ── 类型检查器规则表（reference.md §2.11 TypeRuleTable / DeclRegTable）──
+// 行序即发射序（if 链自上而下匹配），不可重排。
+var tr_region: []string;     // 所属 GEN 区间名
+var tr_fn: []string;         // infer = infer_expr / resolve = resolve_ti
+var tr_kind: []string;       // 匹配的 AST 节点种类
+var tr_mode: []string;       // 构造方式：mk / scalar / named / und / elem / rec
+var tr_a1: []string;         // 模式参数 1
+var tr_a2: []string;         // 模式参数 2（"-" = 缺省）
+var tr_a3: []string;         // 模式参数 3（"-" = 缺省）
+
+var dr_kind: []string;       // 声明节点种类（StructDecl/FuncDecl…）
+var dr_symkind: []string;    // 符号类别：type / func / var / const
+var dr_mode: []string;       // 类型构造：named / und / res / optres
+var dr_a1: []string;         // 模式参数 1
+var dr_a2: []string;         // 模式参数 2（"-" = 缺省）
+var dr_post: []string;       // 注册后追加的钩子调用（"-" = 无）
+
 // ── 解析器分发表（由 build/ebnf.json 的 dispatches 段驱动，见 reference.md §2.7）──
 // 为避免嵌套 slice，分发表以扁平 1D 数组存储：dp_name[i] + dp_start[i] + dp_len[i]
 // 描述第 i 张表的名称与在扁平数组中的区间 [start, start+len)。
@@ -427,6 +444,35 @@ load_tables :: func() -> void {
         append(sf_col, jnodes[json_obj_get(m, "col")].s);
         append(sf_fb, jnodes[json_obj_get(m, "fallback")].s);
         append(sf_region, jnodes[json_obj_get(m, "region")].s);
+        m = jnodes[m].sib;
+    }
+
+    // ── 类型规则表（reference.md §2.11 TypeRuleTable）──
+    var n_tr: i64 = json_obj_get(root, "trules");
+    var arr_tr: i64 = jnodes[n_tr].child;
+    m = jnodes[arr_tr].child;
+    while (m >= 0) {
+        append(tr_region, jnodes[json_obj_get(m, "region")].s);
+        append(tr_fn, jnodes[json_obj_get(m, "fn")].s);
+        append(tr_kind, jnodes[json_obj_get(m, "kind")].s);
+        append(tr_mode, jnodes[json_obj_get(m, "mode")].s);
+        append(tr_a1, jnodes[json_obj_get(m, "a1")].s);
+        append(tr_a2, jnodes[json_obj_get(m, "a2")].s);
+        append(tr_a3, jnodes[json_obj_get(m, "a3")].s);
+        m = jnodes[m].sib;
+    }
+
+    // ── 声明注册表（reference.md §2.11 DeclRegTable）──
+    var n_dr: i64 = json_obj_get(root, "dregs");
+    var arr_dr: i64 = jnodes[n_dr].child;
+    m = jnodes[arr_dr].child;
+    while (m >= 0) {
+        append(dr_kind, jnodes[json_obj_get(m, "kind")].s);
+        append(dr_symkind, jnodes[json_obj_get(m, "symkind")].s);
+        append(dr_mode, jnodes[json_obj_get(m, "mode")].s);
+        append(dr_a1, jnodes[json_obj_get(m, "a1")].s);
+        append(dr_a2, jnodes[json_obj_get(m, "a2")].s);
+        append(dr_post, jnodes[json_obj_get(m, "post")].s);
         m = jnodes[m].sib;
     }
 
@@ -2128,6 +2174,180 @@ emit_scalar_region :: func(region: string) -> string {
     return sb_to_str(sb);
 }
 
+// ── 类型检查器规则表发射（reference.md §2.11）────────────────
+
+// 参数取值：以 "n." 开头视为代码（读节点槽），否则视为字符串字面量。
+tr_arg :: func(sb: StringBuilder, x: string) -> void {
+    if (str_len(x) >= 2 && str_slice(x, 0, 2) == "n.") {
+        sb_append_str(sb, x);
+        return;
+    }
+    sb_append_str(sb, "\"");
+    sb_append_str(sb, x);
+    sb_append_str(sb, "\"");
+}
+
+// elem/rec 模式的递归求解函数由 fn 列决定。
+tr_recfn :: func(fn: string) -> string {
+    if (fn == "resolve") {
+        return "resolve_ti";
+    }
+    return "infer_expr";
+}
+
+// 发射第 k 条类型规则的结果类型表达式。
+tr_expr :: func(sb: StringBuilder, k: i64) -> void {
+    var mode: string = tr_mode[k];
+    if (mode == "mk") {
+        sb_append_str(sb, "ti_mk(\"");
+        sb_append_str(sb, tr_a1[k]);
+        sb_append_str(sb, "\")");
+        return;
+    }
+    if (mode == "scalar") {
+        sb_append_str(sb, "ti_scalar(\"");
+        sb_append_str(sb, tr_a1[k]);
+        sb_append_str(sb, "\")");
+        return;
+    }
+    if (mode == "named") {
+        sb_append_str(sb, "ti_named(\"");
+        sb_append_str(sb, tr_a1[k]);
+        sb_append_str(sb, "\", ");
+        tr_arg(sb, tr_a2[k]);
+        sb_append_str(sb, ")");
+        return;
+    }
+    if (mode == "und") {
+        sb_append_str(sb, "ti_with_und(\"");
+        sb_append_str(sb, tr_a1[k]);
+        sb_append_str(sb, "\", ");
+        tr_arg(sb, tr_a2[k]);
+        sb_append_str(sb, ", ");
+        tr_arg(sb, tr_a3[k]);
+        sb_append_str(sb, ")");
+        return;
+    }
+    if (mode == "elem") {
+        sb_append_str(sb, "ti_elem_of(\"");
+        sb_append_str(sb, tr_a1[k]);
+        sb_append_str(sb, "\", ");
+        sb_append_str(sb, tr_recfn(tr_fn[k]));
+        sb_append_str(sb, "(");
+        tr_arg(sb, tr_a2[k]);
+        sb_append_str(sb, "))");
+        return;
+    }
+    if (mode == "rec") {
+        sb_append_str(sb, tr_a1[k]);
+        sb_append_str(sb, "(");
+        tr_arg(sb, tr_a2[k]);
+        sb_append_str(sb, ")");
+        return;
+    }
+    // 表外模式：发射非法 token 让编译立刻失败，避免静默兜底。
+    sb_append_str(sb, "?TRULE_MODE?");
+}
+
+// 生成一个类型规则 GEN 区间：区间内规则按表序发射为 if 链片段。
+emit_trule_region :: func(region: string) -> string {
+    var sb: StringBuilder = sb_new();
+    sb_append_str(sb, "// >>> GEN:");
+    sb_append_str(sb, region);
+    sb_append_str(sb, " (generated by tools/totter.tc from build/ebnf.json -- DO NOT EDIT) >>>\n");
+    var n: i64 = slice_len(tr_kind) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        if (tr_region[i] == region) {
+            sb_append_str(sb, "    if (n.kind == \"");
+            sb_append_str(sb, tr_kind[i]);
+            sb_append_str(sb, "\") {\n        return ");
+            tr_expr(sb, i);
+            sb_append_str(sb, ";\n    }\n");
+        }
+        i = i + 1;
+    }
+    sb_append_str(sb, "// <<< GEN:");
+    sb_append_str(sb, region);
+    sb_append_str(sb, " <<<");
+    return sb_to_str(sb);
+}
+
+// optres 模式需要先算临时变量 cti（槽为空时退化到 ti_mk）。
+dr_prelude :: func(sb: StringBuilder, k: i64) -> void {
+    if (dr_mode[k] != "optres") {
+        return;
+    }
+    sb_append_str(sb, "        var cti: i64 = -1;\n        if (");
+    sb_append_str(sb, dr_a1[k]);
+    sb_append_str(sb, " >= 0) {\n            cti = resolve_ti(");
+    sb_append_str(sb, dr_a1[k]);
+    sb_append_str(sb, ");\n        } else {\n            cti = ti_mk(\"");
+    sb_append_str(sb, dr_a2[k]);
+    sb_append_str(sb, "\");\n        }\n");
+}
+
+// 发射第 k 条声明注册规则登记进符号表的类型。
+dr_ti :: func(sb: StringBuilder, k: i64) -> void {
+    var mode: string = dr_mode[k];
+    if (mode == "named") {
+        sb_append_str(sb, "ti_named(\"");
+        sb_append_str(sb, dr_a1[k]);
+        sb_append_str(sb, "\", n.sa)");
+        return;
+    }
+    if (mode == "und") {
+        sb_append_str(sb, "ti_with_und(\"");
+        sb_append_str(sb, dr_a1[k]);
+        sb_append_str(sb, "\", n.sa, ");
+        tr_arg(sb, dr_a2[k]);
+        sb_append_str(sb, ")");
+        return;
+    }
+    if (mode == "res") {
+        sb_append_str(sb, "resolve_ti(");
+        sb_append_str(sb, dr_a1[k]);
+        sb_append_str(sb, ")");
+        return;
+    }
+    if (mode == "optres") {
+        sb_append_str(sb, "cti");
+        return;
+    }
+    sb_append_str(sb, "?DREG_MODE?");
+}
+
+// 生成 register_decl 整个函数（GEN:type_declreg 区间）。
+emit_declreg :: func() -> string {
+    var sb: StringBuilder = sb_new();
+    sb_append_str(sb, "// >>> GEN:type_declreg (generated by tools/totter.tc from build/ebnf.json -- DO NOT EDIT) >>>\n");
+    sb_append_str(sb, "register_decl :: func(d: i64) -> void {\n");
+    sb_append_str(sb, "    var n: Node = nodes[d];\n");
+    var n: i64 = slice_len(dr_kind) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        sb_append_str(sb, "    if (n.kind == \"");
+        sb_append_str(sb, dr_kind[i]);
+        sb_append_str(sb, "\") {\n");
+        dr_prelude(sb, i);
+        sb_append_str(sb, "        sym_define(global_scope, n.sa, \"");
+        sb_append_str(sb, dr_symkind[i]);
+        sb_append_str(sb, "\", ");
+        dr_ti(sb, i);
+        sb_append_str(sb, ", d);\n");
+        if (dr_post[i] != "-") {
+            sb_append_str(sb, "        ");
+            sb_append_str(sb, dr_post[i]);
+            sb_append_str(sb, "(d);\n");
+        }
+        sb_append_str(sb, "        return;\n    }\n");
+        i = i + 1;
+    }
+    sb_append_str(sb, "}\n");
+    sb_append_str(sb, "// <<< GEN:type_declreg <<<");
+    return sb_to_str(sb);
+}
+
 // ───────────── 主流程 ─────────────
 
 main_fn :: func() -> i32 @main {
@@ -2189,6 +2409,26 @@ main_fn :: func() -> i32 @main {
         "// >>> GEN:scalar_llmap",
         "// <<< GEN:scalar_llmap <<<",
         emit_scalar_region("scalar_llmap"));
+    out = replace_interval(out,
+        "// >>> GEN:type_infer1",
+        "// <<< GEN:type_infer1 <<<",
+        emit_trule_region("type_infer1"));
+    out = replace_interval(out,
+        "// >>> GEN:type_infer2",
+        "// <<< GEN:type_infer2 <<<",
+        emit_trule_region("type_infer2"));
+    out = replace_interval(out,
+        "// >>> GEN:type_slice",
+        "// <<< GEN:type_slice <<<",
+        emit_trule_region("type_slice"));
+    out = replace_interval(out,
+        "// >>> GEN:type_resolve",
+        "// <<< GEN:type_resolve <<<",
+        emit_trule_region("type_resolve"));
+    out = replace_interval(out,
+        "// >>> GEN:type_declreg",
+        "// <<< GEN:type_declreg <<<",
+        emit_declreg());
 
     file_write_all("gen/tote.tc", out);
     return 0;

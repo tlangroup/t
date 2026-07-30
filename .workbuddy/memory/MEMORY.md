@@ -35,8 +35,8 @@
 **目标**：用数据表生成 tote 自身的代码（不是给 t 语言加数据驱动特性）。
 **链路**：`docs/reference.md`（数据表 + `// @rule` EBNF + `// @node`/`@slot`/`@scalar`/`@sfn` 表）→ `tools/gen_ebnf.mjs` → `build/ebnf.json` → `src/totter.tc` 各 emitter → `src/tote.tc` 的 GEN 区间。
 
-### 当前 13 个 GEN 区间
-`kw_lookup`(33 关键字) / `builtins`(15 组) / `derives`(9 trait) / `diagnostics`(10 码) / `annotations`(34 注解) / `xid` / `parser_dispatch` / `parser_rules`(30 文法规则) / `ast`(65 节点种类) / `scalar_pred` / `scalar_bits` / `scalar_ctype` / `scalar_llmap`
+### 当前 18 个 GEN 区间
+`kw_lookup`(关键字) / `builtins`(15 组) / `derives`(9 trait) / `diagnostics`(10 码) / `annotations`(34 注解) / `xid` / `parser_dispatch` / `parser_rules`(30 文法规则) / `ast`(65 节点种类) / `scalar_pred` / `scalar_bits` / `scalar_ctype` / `scalar_llmap` / `type_infer1` / `type_infer2` / `type_slice` / `type_resolve` / `type_declreg`
 
 ### parser 数据驱动（M19，10 种 fold 模式）
 - 通用：`bin` / `pre` / `post` / `prim` / `disp`（守卫式分发，骨架不消费引导 token）
@@ -57,6 +57,14 @@
 - **兜底规则**：取值 == fallback 的条目不发射分支（`scalar_to_ll` 的 i64、`get_bw` 的 -1），这是逐字节复现手写代码的关键。
 - 方法论：先写 Python 原型逐区间比对手写原文（IDENTICAL）再移植 totter，一次成功。
 
+### 类型检查器规则表（M25 TypeRuleTable / DeclRegTable）
+- §2.11 两张表：`TypeRuleTable` 14 行 `// @trule <region> <fn> <kind> <mode> <a1> <a2> <a3>`；`DeclRegTable` 10 行 `// @dreg <kind> <symkind> <mode> <a1> <a2> <post>`。
+- trule 模式：`mk` / `scalar` / `named` / `und` / `elem`(递归函数由 fn 列定) / `rec`(透传或改派)。参数以 `n.` 开头视为代码，否则为字符串字面量。
+- dreg 模式：`named` / `und` / `res` / `optres`(经临时变量 cti 退化)；`post` 列挂钩子（VariantDecl → register_variant_helpers）。生成 `register_decl` **整个函数**。
+- 区间：`type_infer1`(float/string/bool/null)、`type_infer2`(struct_lit/cast/paren/comptime)、`type_slice`、`type_resolve`(variant/flag/flag_set/pointer/optional)、`type_declreg`。
+- **划界原则**：只吃「查表得类型」的规律分支；带控制流与诊断副作用的算法分支（int 字面量选宽、ident 查作用域、binary 同型约束+隐式转换诊断、member/index/array_lit/map_lit 结构遍历）留手写。`infer_expr` 整体表驱会打乱 IR 顺序，不可做。
+- 未表驱的同类候选：emitter 侧 `resolve_type_desc` / `expr_type_desc` 的 `td_*` 单行分派（另一套构造器族，需加 oneline 样式列）。
+
 ### 踩坑铁律
 - **GEN 标记名不得是其他标记的前缀**（`GEN:parser` 曾误命中 `GEN:parser_dispatch`）。
 - 表驱 `kw_lookup` 必须在任何 `tokenize()` **之前** init；统一在 `main()` 入口调一次。
@@ -68,7 +76,7 @@
 - 若改动只新增 GEN 标记行，`gen/tote.tc` md5 变化属预期，此时以 difftest + IR 逐字节为金标准。
 
 ## 技术债 / 后续候选
-1. typechecker 规则表（M24 探查过：`infer_expr` L6891–7090 按 kind 分派、分支差异极大，整体表驱会打乱 IR 顺序，需先拆子模式）；@derive 派生生成器表（9 trait 生成体仍手写）
+1. @derive 派生生成器表（9 trait 生成体仍手写，**用户 2026-07-30 明示暂缓**）；emitter 侧 `td_*` 类型描述符分派表
 2. §7.2 CSV/JSON CTFE 编译期导入
 3. `@soa` 布局变换、脱离 arena 的通用内存管理
 4. 修既有限制：lld-link subsystem、LLVM `int_to_str`、数组字面量类型推导
