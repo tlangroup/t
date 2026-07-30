@@ -1,0 +1,743 @@
+// totter.tc — 数据驱动的程序生成器（用 t 语言编写）
+//
+// 它读取当前的 `src/tote.tc`（编译器前端 + 引擎），把其中用
+// `// >>> GEN:xxx >>>` ... `// <<< GEN:xxx <<<` 标记的数据表区间，
+// 替换为「由 build/ebnf.json（由 reference.md 的 ebnf 块经 tools/gen_ebnf.mjs 生成）数据驱动生成」的代码，输出 `gen/tote.tc`。
+//
+// 数据模型（真相源链）来自 reference.md 的 ebnf 块 → tools/gen_ebnf.mjs → build/ebnf.json，
+// 由下方的 JSON 解析器加载到全局表：
+//   - 关键字表   kw_t / kw_k               → 生成 kw_lookup（词法）
+//   - 内建函数表 bi_cond / bi_ret          → 生成 builtin_ret（类型检查）
+//   - 派生策略表 dv_names                   → 生成 vv_derive_traits（@derive）
+//   - 诊断码表   dg_code / dg_sev          → 生成 diag_sev（诊断严重度查询）
+//   - 注解注册表 an_name / an_spec / an_targets / an_repl → 生成 init_anndefs（§4.8）
+//   - 解析器分发表 dp_*（来自 ebnf.json dispatches 段，见 reference.md §2.7）→ 生成 parse_decl_body 的 GEN:parser_dispatch 区间
+//
+// 生成的 gen/tote.tc 行为须与 src/tote.tc 逐字节等价（difftest 验证），
+// 从而证明「用数据驱动方式生成 tote」不破坏编译器语义。
+
+// ───────────── 全局数据表（由 build/ebnf.json 填充）─────────────
+
+var kw_t: []string;          // 关键字文本
+var kw_k: []string;          // 对应 token 种类
+
+var bi_cond: []string;       // 内建名判定条件（完整 if 条件文本）
+var bi_ret: []string;        // 返回类型构造表达式
+
+var dv_names: []string;      // @derive 支持的 trait 名
+
+var dg_code: []string;       // 诊断码名（T_XXX）
+var dg_sev: []string;        // 规范严重度（"error" / "warning"；调用点可覆盖）
+
+var an_name: []string;       // 注解名
+var an_spec: []string;       // 参数规约（none/string/ident/ident_list/number/mixed）
+var an_targets: []string;    // 合法作用目标（", " 分隔）
+var an_repl: []string;       // 弃用替代（非空表示 deprecated）
+
+// ── 解析器分发表（由 build/ebnf.json 的 dispatches 段驱动，见 reference.md §2.7）──
+// 为避免嵌套 slice，分发表以扁平 1D 数组存储：dp_name[i] + dp_start[i] + dp_len[i]
+// 描述第 i 张表的名称与在扁平数组中的区间 [start, start+len)。
+var dp_name: []string;      // 各分发表名（如 "DeclBody"）
+var dp_start: []i64;       // 在扁平数组中的起始下标
+var dp_len: []i64;         // 条目数
+var dp_mkind: []string;     // 匹配种类：token / idval / default
+var dp_mval: []string;      // 匹配值（token 种类名 / id 字面量；default 为空）
+var dp_call: []string;      // 调用的 parse_* 表达式
+
+// ── XID_Start / XID_Continue 范围表（来自 build/ebnf.json 的 xid_start/xid_continue，
+//    由 tools/gen_xid.mjs 从 unicode-xid 的 UCD 范围表生成，十进制 [lo,hi] 闭区间）──
+// 注意：ebnf.json 中范围为数字，totter 以字符串形式保存其十进制文本，发射时直接拼入源码。
+var xid_start_lo: []string;
+var xid_start_hi: []string;
+var xid_cont_lo: []string;
+var xid_cont_hi: []string;
+
+// ───────────── 最小 JSON 解析器（索引式树，规避递归结构体类型）─────────────
+// 节点不持有递归 slice 字段，改用 child/sib 索引链接，根节点统一存于 jnodes。
+JsonNode :: struct {
+    kind: i64;    // 0=obj, 1=arr, 2=str, 3=num, 4=bool, 5=null
+    s: string;    // str/bool/num 文本
+    key: string;  // object member key
+    child: i64;   // 首个子节点（obj 成员 / arr 元素）
+    sib: i64;     // 下一个兄弟节点
+}
+
+var jnodes: []JsonNode;
+var jtext: string;
+var jpos: i64;
+var jl: i64;
+
+jch :: func() -> i64 {
+    if (jpos < 0 || jpos >= jl) { return -1; }
+    return str_at(jtext, jpos);
+}
+
+json_newnode :: func(kind: i64, s: string) -> i64 {
+    var n: JsonNode;
+    n.kind = kind;
+    n.s = s;
+    n.key = "";
+    n.child = -1;
+    n.sib = -1;
+    append(jnodes, n);
+    return (slice_len(jnodes) as i64) - 1;
+}
+
+json_skip_ws :: func() -> void {
+    var l: i64 = str_len(jtext) as i64;
+    while (jpos < l) {
+        var c: i64 = jch();
+        if (c == 32 || c == 9 || c == 10 || c == 13) {
+            jpos = jpos + 1;
+        } else {
+            break;
+        }
+    }
+}
+
+json_parse_value :: func() -> i64 {
+    json_skip_ws();
+    var c: i64 = jch();
+    if (c == 34) { return json_parse_string(); }
+    if (c == 123) { return json_parse_object(); }
+    if (c == 91) { return json_parse_array(); }
+    if (c == 116 || c == 102 || c == 110) { return json_parse_lit(); }
+    return json_parse_number();
+}
+
+json_parse_string :: func() -> i64 {
+    jpos = jpos + 1;   // 跳过开引号
+    var buf: StringBuilder = sb_new();
+    var l: i64 = str_len(jtext) as i64;
+    while (jpos < l) {
+        var c: i64 = jch();
+        if (c == 34) { jpos = jpos + 1; break; }   // 闭引号
+        if (c == 92) {   // 反斜杠转义
+            jpos = jpos + 1;
+            var e: i64 = jch();
+            if (e == 34) { sb_append_char(buf, 34); }
+            else if (e == 92) { sb_append_char(buf, 92); }
+            else if (e == 47) { sb_append_char(buf, 47); }
+            else if (e == 110) { sb_append_char(buf, 10); }
+            else if (e == 116) { sb_append_char(buf, 9); }
+            else if (e == 114) { sb_append_char(buf, 13); }
+            else if (e == 98) { sb_append_char(buf, 8); }
+            else if (e == 102) { sb_append_char(buf, 12); }
+            else if (e == 117) {   // \uXXXX
+                jpos = jpos + 1;
+                var cp: i64 = 0;
+                var k: i64 = 0;
+                while (k < 4) {
+                    var hc: i64 = jch();
+                    var d: i64 = 0;
+                    if (hc >= 48 && hc <= 57) { d = hc - 48; }
+                    else if (hc >= 97 && hc <= 102) { d = hc - 87; }
+                    else if (hc >= 65 && hc <= 70) { d = hc - 55; }
+                    cp = cp * 16 + d;
+                    jpos = jpos + 1;
+                    k = k + 1;
+                }
+                if (cp < 128) { sb_append_char(buf, cp); } else { sb_append_char(buf, 63); }
+            }
+            else { sb_append_char(buf, e); }
+            jpos = jpos + 1;
+        } else {
+            sb_append_char(buf, c);
+            jpos = jpos + 1;
+        }
+    }
+    return json_newnode(2, sb_to_str(buf));
+}
+
+json_parse_lit :: func() -> i64 {
+    if (jch() == 116) {   // true
+        jpos = jpos + 4;
+        return json_newnode(4, "true");
+    }
+    if (jch() == 102) {   // false
+        jpos = jpos + 5;
+        return json_newnode(4, "false");
+    }
+    jpos = jpos + 4;   // null
+    return json_newnode(5, "null");
+}
+
+json_parse_number :: func() -> i64 {
+    var start: i64 = jpos;
+    var l: i64 = str_len(jtext) as i64;
+    while (jpos < l) {
+        var c: i64 = jch();
+        if ((c >= 48 && c <= 57) || c == 45 || c == 46 || c == 101 || c == 69 || c == 43) {
+            jpos = jpos + 1;
+        } else { break; }
+    }
+    return json_newnode(3, str_slice(jtext, start, jpos));
+}
+
+json_parse_array :: func() -> i64 {
+    jpos = jpos + 1;   // 跳过 [
+    var first: i64 = -1;
+    var prev: i64 = -1;
+    json_skip_ws();
+    if (jch() == 93) { jpos = jpos + 1; }   // 空数组
+    else {
+        while (true) {
+            // 元素值节点直接入链表（不再包一层 wrapper），与对象成员一致
+            var v: i64 = json_parse_value();
+            if (first < 0) { first = v; }
+            else {
+                var pv: JsonNode = jnodes[prev];
+                pv.sib = v;
+                slice_set(jnodes, prev, pv);
+            }
+            prev = v;
+            json_skip_ws();
+            var c: i64 = jch();
+            if (c == 44) { jpos = jpos + 1; }
+            else if (c == 93) { jpos = jpos + 1; break; }
+            else { break; }
+        }
+    }
+    var arrNode: i64 = json_newnode(1, "");
+    var arrN: JsonNode = jnodes[arrNode];
+    arrN.child = first;
+    slice_set(jnodes, arrNode, arrN);
+    return arrNode;
+}
+
+json_parse_object :: func() -> i64 {
+    jpos = jpos + 1;   // 跳过 {
+    var first: i64 = -1;
+    var prev: i64 = -1;
+    json_skip_ws();
+    if (jch() == 125) { jpos = jpos + 1; }   // 空对象
+    else {
+        while (true) {
+            json_skip_ws();
+            var keyNode: i64 = json_parse_string();
+            var key: string = jnodes[keyNode].s;
+            json_skip_ws();
+            jpos = jpos + 1;   // 跳过 :
+            var v: i64 = json_parse_value();
+            var m: JsonNode;
+            m.kind = jnodes[v].kind;
+            m.s = jnodes[v].s;
+            m.key = key;
+            m.child = v;
+            m.sib = -1;
+            append(jnodes, m);
+            var midx: i64 = (slice_len(jnodes) as i64) - 1;
+            if (first < 0) { first = midx; }
+            else {
+                var pm: JsonNode = jnodes[prev];
+                pm.sib = midx;
+                slice_set(jnodes, prev, pm);
+            }
+            prev = midx;
+            json_skip_ws();
+            var c: i64 = jch();
+            if (c == 44) { jpos = jpos + 1; }
+            else if (c == 125) { jpos = jpos + 1; break; }
+            else { break; }
+        }
+    }
+    var objNode: i64 = json_newnode(0, "");
+    var objN: JsonNode = jnodes[objNode];
+    objN.child = first;
+    slice_set(jnodes, objNode, objN);
+    return objNode;
+}
+
+// 在对象节点中按 key 查找成员，返回成员节点 idx（未找到返回 -1）
+json_obj_get :: func(nidx: i64, key: string) -> i64 {
+    if (nidx < 0) { return -1; }
+    var m: i64 = jnodes[nidx].child;
+    while (m >= 0) {
+        if (jnodes[m].key == key) { return m; }
+        m = jnodes[m].sib;
+    }
+    return -1;
+}
+
+load_tables :: func() -> void {
+    // 数据来自 build/ebnf.json（由 reference.md 的 ebnf 块经 tools/gen_ebnf.mjs 抽取生成）。
+    // totter 直接用下方最小 JSON 解析器读取它，填充各全局数据表；
+    // 修改文法应改 reference.md 的 ebnf 产生式并重新生成 ebnf.json，而非本函数体。
+    jtext = file_read_all("build/ebnf.json");
+    jpos = 0;
+    jl = str_len(jtext) as i64;
+    var root: i64 = json_parse_value();
+
+    // ── 关键字 → token 种类 ──
+    // 约定：对象成员 child 直接指向值节点；数组节点 child 指向首个元素值节点，
+    // 因此数组访问需先 descent 一层（n_X.child = 数组节点，再 .child = 首个元素）。
+    var n_kw: i64 = json_obj_get(root, "keywords");
+    var arr_kw: i64 = jnodes[n_kw].child;     // 数组节点
+    var m: i64 = jnodes[arr_kw].child;        // 首个元素（对象节点）
+    while (m >= 0) {
+        var obj: i64 = m;                      // 元素即对象节点
+        append(kw_t, jnodes[json_obj_get(obj, "text")].s);
+        append(kw_k, jnodes[json_obj_get(obj, "kind")].s);
+        m = jnodes[m].sib;
+    }
+
+    // ── 内建函数返回类型 ──
+    var n_bi: i64 = json_obj_get(root, "builtins");
+    var arr_bi: i64 = jnodes[n_bi].child;
+    m = jnodes[arr_bi].child;
+    while (m >= 0) {
+        var obj: i64 = m;
+        append(bi_cond, jnodes[json_obj_get(obj, "cond")].s);
+        append(bi_ret, jnodes[json_obj_get(obj, "ret")].s);
+        m = jnodes[m].sib;
+    }
+
+    // ── @derive 支持的 trait（数组元素为字符串，直接用 .s）──
+    var n_dv: i64 = json_obj_get(root, "derives");
+    var arr_dv: i64 = jnodes[n_dv].child;
+    m = jnodes[arr_dv].child;
+    while (m >= 0) {
+        append(dv_names, jnodes[m].s);
+        m = jnodes[m].sib;
+    }
+
+    // ── 诊断码 → 规范严重度 ──
+    var n_dg: i64 = json_obj_get(root, "diagnostics");
+    var arr_dg: i64 = jnodes[n_dg].child;
+    m = jnodes[arr_dg].child;
+    while (m >= 0) {
+        var obj: i64 = m;
+        append(dg_code, jnodes[json_obj_get(obj, "code")].s);
+        append(dg_sev, jnodes[json_obj_get(obj, "sev")].s);
+        m = jnodes[m].sib;
+    }
+
+    // ── 注解注册表（spec §4.8）──
+    var n_an: i64 = json_obj_get(root, "annotations");
+    var arr_an: i64 = jnodes[n_an].child;
+    m = jnodes[arr_an].child;
+    while (m >= 0) {
+        var obj: i64 = m;
+        append(an_name, jnodes[json_obj_get(obj, "name")].s);
+        append(an_spec, jnodes[json_obj_get(obj, "spec")].s);
+        append(an_targets, jnodes[json_obj_get(obj, "targets")].s);
+        append(an_repl, jnodes[json_obj_get(obj, "repl")].s);
+        m = jnodes[m].sib;
+    }
+
+    load_dispatches(root);
+    load_xid(root);
+}
+
+// 加载 build/ebnf.json 的 xid_start / xid_continue 段（均为 [[lo,hi], ...] 数字数组）。
+load_xid :: func(root: i64) -> void {
+    load_xid_arr(root, "xid_start", 0);
+    load_xid_arr(root, "xid_continue", 1);
+}
+
+// which: 0 -> xid_start_lo/hi, 1 -> xid_cont_lo/hi（直接 append 到全局，规避 slice 参数别名）
+load_xid_arr :: func(root: i64, key: string, which: i64) -> void {
+    var n: i64 = json_obj_get(root, key);
+    if (n < 0) { return; }
+    var arr: i64 = jnodes[n].child;        // 数组节点（顶层 [[lo,hi],...]）
+    var el: i64 = jnodes[arr].child;       // 首个元素 = [lo,hi] 数组节点
+    while (el >= 0) {
+        var e0: i64 = jnodes[el].child;    // lo 数字节点
+        var e1: i64 = jnodes[e0].sib;      // hi 数字节点
+        if (which == 0) {
+            append(xid_start_lo, jnodes[e0].s);
+            append(xid_start_hi, jnodes[e1].s);
+        } else {
+            append(xid_cont_lo, jnodes[e0].s);
+            append(xid_cont_hi, jnodes[e1].s);
+        }
+        el = jnodes[el].sib;
+    }
+}
+
+// 加载 build/ebnf.json 的 dispatches 段（解析器分发表）到扁平 1D 数组。
+// dispatches 是对象：键为分发表名（如 "DeclBody"），值为 [{matchKind, matchVal?, call}] 数组。
+load_dispatches :: func(root: i64) -> void {
+    var n_dp: i64 = json_obj_get(root, "dispatches");
+    if (n_dp < 0) { return; }
+    var dpObj: i64 = jnodes[n_dp].child;    // dispatches 对象节点（值）
+    var mem: i64 = jnodes[dpObj].child;     // 首个成员节点（"DeclBody"）
+    while (mem >= 0) {
+        var kname: string = jnodes[mem].key;     // 分发表名
+        var arr: i64 = jnodes[mem].child;        // 数组节点（DeclBody 的值）
+        var el: i64 = jnodes[arr].child;         // 首个元素对象节点
+        var start: i64 = slice_len(dp_mkind) as i64;
+        var cnt: i64 = 0;
+        while (el >= 0) {
+            var obj: i64 = el;                   // 元素对象本身 {matchKind, matchVal?, call}
+            var knd: i64 = json_obj_get(obj, "matchKind");
+            var kind: string = jnodes[jnodes[knd].child].s;
+            var cln: i64 = json_obj_get(obj, "call");
+            var call: string = jnodes[jnodes[cln].child].s;
+            var val: string = "";
+            var vn: i64 = json_obj_get(obj, "matchVal");
+            if (vn >= 0) { val = jnodes[jnodes[vn].child].s; }
+            append(dp_mkind, kind);
+            append(dp_mval, val);
+            append(dp_call, call);
+            cnt = cnt + 1;
+            el = jnodes[el].sib;
+        }
+        append(dp_name, kname);
+        append(dp_start, start);
+        append(dp_len, cnt);
+        mem = jnodes[mem].sib;
+    }
+}
+
+// ───────────── 字符串工具（t 无 str_find，自实现）─────────────
+
+str_find :: func(hay: string, needle: string) -> i64 {
+    var hl: i64 = str_len(hay) as i64;
+    var nl: i64 = str_len(needle) as i64;
+    if (nl == 0) { return 0; }
+    var i: i64 = 0;
+    while (i + nl <= hl) {
+        var j: i64 = 0;
+        var ok: bool = true;
+        while (j < nl) {
+            if (str_at(hay, i + j) != str_at(needle, j)) { ok = false; break; }
+            j = j + 1;
+        }
+        if (ok) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// 用 newBlock 替换 src 中 [startMarker, endMarker] 闭区间（含标记行）
+replace_interval :: func(src: string, startMarker: string, endMarker: string, newBlock: string) -> string {
+    var s: i64 = str_find(src, startMarker);
+    var e: i64 = str_find(src, endMarker);
+    if (s < 0 || e < 0) {
+        return src;   // 未找到则原样返回（不应发生）
+    }
+    var head: string = str_slice(src, 0, s);
+    var tail: string = str_slice(src, e + str_len(endMarker), str_len(src));
+    var sb: StringBuilder = sb_new();
+    sb_append_str(sb, head);
+    sb_append_str(sb, newBlock);
+    sb_append_str(sb, tail);
+    return sb_to_str(sb);
+}
+
+// ───────────── 各区间的代码生成 ─────────────
+
+emit_kw :: func() -> string {
+    var sb: StringBuilder = sb_new();
+    sb_append_str(sb, "// >>> GEN:kw_lookup (generated by tools/totter.tc from build/ebnf.json -- DO NOT EDIT) >>>\n");
+    sb_append_str(sb, "KwEntry :: struct {\n");
+    sb_append_str(sb, "    text: string;\n");
+    sb_append_str(sb, "    kind: string;\n");
+    sb_append_str(sb, "}\n\n");
+    sb_append_str(sb, "var keywords_tbl: []KwEntry;\n\n");
+    sb_append_str(sb, "kw_reg :: func(t: string, k: string) -> void {\n");
+    sb_append_str(sb, "    var e: KwEntry;\n");
+    sb_append_str(sb, "    e.text = t;\n");
+    sb_append_str(sb, "    e.kind = k;\n");
+    sb_append_str(sb, "    append(keywords_tbl, e);\n");
+    sb_append_str(sb, "}\n\n");
+    sb_append_str(sb, "init_keywords :: func() -> void {\n");
+    var i: i64 = 0;
+    while (i < slice_len(kw_t) as i64) {
+        sb_append_str(sb, "    kw_reg(\"");
+        sb_append_str(sb, kw_t[i]);
+        sb_append_str(sb, "\", \"");
+        sb_append_str(sb, kw_k[i]);
+        sb_append_str(sb, "\");\n");
+        i = i + 1;
+    }
+    sb_append_str(sb, "}\n\n");
+    sb_append_str(sb, "kw_lookup :: func(text: string) -> string {\n");
+    sb_append_str(sb, "    var i: i64 = 0;\n");
+    sb_append_str(sb, "    while (i < (slice_len(keywords_tbl) as i64)) {\n");
+    sb_append_str(sb, "        if (keywords_tbl[i].text == text) { return keywords_tbl[i].kind; }\n");
+    sb_append_str(sb, "        i = i + 1;\n");
+    sb_append_str(sb, "    }\n");
+    sb_append_str(sb, "    return \"\";\n");
+    sb_append_str(sb, "}\n");
+    sb_append_str(sb, "// <<< GEN:kw_lookup <<<");
+    return sb_to_str(sb);
+}
+
+emit_bi :: func() -> string {
+    var sb: StringBuilder = sb_new();
+    sb_append_str(sb, "// >>> GEN:builtins (generated by tools/totter.tc from build/ebnf.json -- DO NOT EDIT) >>>\n");
+    sb_append_str(sb, "builtin_ret :: func(name: string) -> i64 {\n");
+    var i: i64 = 0;
+    while (i < slice_len(bi_cond) as i64) {
+        sb_append_str(sb, "    if (");
+        sb_append_str(sb, bi_cond[i]);
+        sb_append_str(sb, ") {\n");
+        sb_append_str(sb, "        return ");
+        sb_append_str(sb, bi_ret[i]);
+        sb_append_str(sb, ";\n");
+        sb_append_str(sb, "    }\n");
+        i = i + 1;
+    }
+    sb_append_str(sb, "    return ti_mk(\"Unknown\");\n");
+    sb_append_str(sb, "}\n");
+    sb_append_str(sb, "// <<< GEN:builtins <<<");
+    return sb_to_str(sb);
+}
+
+emit_dv :: func() -> string {
+    var sb: StringBuilder = sb_new();
+    sb_append_str(sb, "// >>> GEN:derives (generated by tools/totter.tc from build/ebnf.json -- DO NOT EDIT) >>>\n");
+    sb_append_str(sb, "vv_derive_traits :: func() -> void {\n");
+    var i: i64 = 0;
+    while (i < slice_len(dv_names) as i64) {
+        sb_append_str(sb, "    slb_add(\"");
+        sb_append_str(sb, dv_names[i]);
+        sb_append_str(sb, "\");\n");
+        i = i + 1;
+    }
+    sb_append_str(sb, "}\n");
+    sb_append_str(sb, "// <<< GEN:derives <<<");
+    return sb_to_str(sb);
+}
+
+emit_dg :: func() -> string {
+    var sb: StringBuilder = sb_new();
+    sb_append_str(sb, "// >>> GEN:diagnostics (generated by tools/totter.tc from build/ebnf.json -- DO NOT EDIT) >>>\n");
+    sb_append_str(sb, "// 诊断码 → 规范严重度查询。diag_new 在 sev==\"\" 时以此作为兜底默认值；\n");
+    sb_append_str(sb, "// 调用点显式传 sev 时优先（如 T_ANNOTATION_UNKNOWN 的 warning 用例）。\n");
+    sb_append_str(sb, "diag_sev :: func(code: string) -> string {\n");
+    var i: i64 = 0;
+    while (i < slice_len(dg_code) as i64) {
+        sb_append_str(sb, "    if (code == \"");
+        sb_append_str(sb, dg_code[i]);
+        sb_append_str(sb, "\") { return \"");
+        sb_append_str(sb, dg_sev[i]);
+        sb_append_str(sb, "\"; }\n");
+        i = i + 1;
+    }
+    sb_append_str(sb, "    return \"\";\n");
+    sb_append_str(sb, "}\n");
+    sb_append_str(sb, "// <<< GEN:diagnostics <<<");
+    return sb_to_str(sb);
+}
+
+emit_ann :: func() -> string {
+    var sb: StringBuilder = sb_new();
+    sb_append_str(sb, "// >>> GEN:annotations (generated by tools/totter.tc from build/ebnf.json -- DO NOT EDIT) >>>\n");
+    sb_append_str(sb, "init_anndefs :: func() -> void {\n");
+    var i: i64 = 0;
+    while (i < slice_len(an_name) as i64) {
+        sb_append_str(sb, "    ad(\"");
+        sb_append_str(sb, an_name[i]);
+        sb_append_str(sb, "\", \"");
+        sb_append_str(sb, an_spec[i]);
+        sb_append_str(sb, "\", \"");
+        sb_append_str(sb, an_targets[i]);
+        sb_append_str(sb, "\");\n");
+        i = i + 1;
+    }
+    // 弃用标记（数据驱动：repl 非空者标记 deprecated）
+    sb_append_str(sb, "    // 弃用标记（数据驱动生成）\n");
+    i = 0;
+    while (i < slice_len(an_name) as i64) {
+        var r: string = an_repl[i];
+        if (str_len(r) as i64 > 0) {
+            sb_append_str(sb, "    var di");
+            sb_append_str(sb, an_name[i]);
+            sb_append_str(sb, ": i64 = anndef_find(\"");
+            sb_append_str(sb, an_name[i]);
+            sb_append_str(sb, "\");\n");
+            sb_append_str(sb, "    if (di");
+            sb_append_str(sb, an_name[i]);
+            sb_append_str(sb, " >= 0) {\n");
+            sb_append_str(sb, "        var a");
+            sb_append_str(sb, an_name[i]);
+            sb_append_str(sb, ": AnnDef = anndefs[di");
+            sb_append_str(sb, an_name[i]);
+            sb_append_str(sb, "];\n");
+            sb_append_str(sb, "        a");
+            sb_append_str(sb, an_name[i]);
+            sb_append_str(sb, ".depr = true;\n");
+            sb_append_str(sb, "        a");
+            sb_append_str(sb, an_name[i]);
+            sb_append_str(sb, ".repl = \"");
+            sb_append_str(sb, r);
+            sb_append_str(sb, "\";\n");
+            sb_append_str(sb, "        slice_set(anndefs, di");
+            sb_append_str(sb, an_name[i]);
+            sb_append_str(sb, ", a");
+            sb_append_str(sb, an_name[i]);
+            sb_append_str(sb, ");\n");
+            sb_append_str(sb, "    }\n");
+        }
+        i = i + 1;
+    }
+    sb_append_str(sb, "}\n");
+    sb_append_str(sb, "// <<< GEN:annotations <<<");
+    return sb_to_str(sb);
+}
+
+emit_parser_dispatch :: func() -> string {
+    var sb: StringBuilder = sb_new();
+    sb_append_str(sb, "// >>> GEN:parser_dispatch (generated by tools/totter.tc from build/ebnf.json dispatches -- DO NOT EDIT) >>>\n");
+    sb_append_str(sb, "    var t: string = cur_t();\n");
+    // 找到名为 "DeclBody" 的分发表（扁平数组中的区间）
+    var bi: i64 = -1;
+    var k: i64 = 0;
+    while (k < slice_len(dp_name) as i64) {
+        if (dp_name[k] == "DeclBody") { bi = k; }
+        k = k + 1;
+    }
+    if (bi >= 0) {
+        var start: i64 = dp_start[bi];
+        var len: i64 = dp_len[bi];
+        var i: i64 = start;
+        while (i < start + len) {
+            var kind: string = dp_mkind[i];
+            var val: string = dp_mval[i];
+            var call: string = dp_call[i];
+            if (kind == "default") {
+                sb_append_str(sb, "    return ");
+                sb_append_str(sb, call);
+                sb_append_str(sb, ";\n");
+            } else if (kind == "idval") {
+                sb_append_str(sb, "    if (t == \"Identifier\" && cur_v() == \"");
+                sb_append_str(sb, val);
+                sb_append_str(sb, "\") {\n        return ");
+                sb_append_str(sb, call);
+                sb_append_str(sb, ";\n    }\n");
+            } else {
+                sb_append_str(sb, "    if (t == \"");
+                sb_append_str(sb, val);
+                sb_append_str(sb, "\") {\n        return ");
+                sb_append_str(sb, call);
+                sb_append_str(sb, ";\n    }\n");
+            }
+            i = i + 1;
+        }
+    }
+    sb_append_str(sb, "// <<< GEN:parser_dispatch <<<");
+    return sb_to_str(sb);
+}
+
+// 生成 GEN:xid 区间：XID 范围全局表 + UTF-8 解码助手 + 二分查表 + init_xid()。
+// 数据来自 build/ebnf.json 的 xid_start / xid_continue（[[lo,hi],...] 十进制）。
+emit_xid :: func() -> string {
+    var sb: StringBuilder = sb_new();
+    sb_append_str(sb, "// >>> GEN:xid (generated by tools/totter.tc from build/ebnf.json -- DO NOT EDIT) >>>\n");
+    sb_append_str(sb, "\n");
+    sb_append_str(sb, "// XID_Start / XID_Continue 范围表（十进制 [lo,hi] 闭区间，来自 Unicode UCD）\n");
+    sb_append_str(sb, "var xid_start_lo: []i64;\n");
+    sb_append_str(sb, "var xid_start_hi: []i64;\n");
+    sb_append_str(sb, "var xid_cont_lo: []i64;\n");
+    sb_append_str(sb, "var xid_cont_hi: []i64;\n\n");
+    // UTF-8 解码助手（src 为字符串，按字节索引；返回码点 + 首字节宽度）
+    sb_append_str(sb, "utf8_w0 :: func(c0: u8) -> i64 {\n");
+    sb_append_str(sb, "    if (c0 < 128) { return 1; }\n");
+    sb_append_str(sb, "    if (c0 < 224) { return 2; }\n");
+    sb_append_str(sb, "    if (c0 < 240) { return 3; }\n");
+    sb_append_str(sb, "    return 4;\n");
+    sb_append_str(sb, "}\n\n");
+    sb_append_str(sb, "utf8_cp_at :: func(src: string, i: i64, n: i64) -> i64 {\n");
+    sb_append_str(sb, "    var c0: u8 = src[i];\n");
+    sb_append_str(sb, "    if (c0 < 128) { return c0 as i64; }\n");
+    sb_append_str(sb, "    if (c0 < 224) {\n");
+    sb_append_str(sb, "        var cp: i64 = (c0 & 31) as i64;\n");
+    sb_append_str(sb, "        cp = (cp << 6) | (src[i + 1] & 63) as i64;\n");
+    sb_append_str(sb, "        return cp;\n");
+    sb_append_str(sb, "    }\n");
+    sb_append_str(sb, "    if (c0 < 240) {\n");
+    sb_append_str(sb, "        var cp: i64 = (c0 & 15) as i64;\n");
+    sb_append_str(sb, "        cp = (cp << 6) | (src[i + 1] & 63) as i64;\n");
+    sb_append_str(sb, "        cp = (cp << 6) | (src[i + 2] & 63) as i64;\n");
+    sb_append_str(sb, "        return cp;\n");
+    sb_append_str(sb, "    }\n");
+    sb_append_str(sb, "    var cp: i64 = (c0 & 7) as i64;\n");
+    sb_append_str(sb, "    cp = (cp << 6) | (src[i + 1] & 63) as i64;\n");
+    sb_append_str(sb, "    cp = (cp << 6) | (src[i + 2] & 63) as i64;\n");
+    sb_append_str(sb, "    cp = (cp << 6) | (src[i + 3] & 63) as i64;\n");
+    sb_append_str(sb, "    return cp;\n");
+    sb_append_str(sb, "}\n\n");
+    // 二分查表
+    sb_append_str(sb, "cp_in_ranges :: func(cp: i64, lo: []i64, hi: []i64) -> bool {\n");
+    sb_append_str(sb, "    var lo_i: i64 = 0;\n");
+    sb_append_str(sb, "    var hi_i: i64 = (slice_len(lo) as i64) - 1;\n");
+    sb_append_str(sb, "    while (lo_i <= hi_i) {\n");
+    sb_append_str(sb, "        var mid: i64 = (lo_i + hi_i) / 2;\n");
+    sb_append_str(sb, "        if (cp < lo[mid]) { hi_i = mid - 1; }\n");
+    sb_append_str(sb, "        else if (cp > hi[mid]) { lo_i = mid + 1; }\n");
+    sb_append_str(sb, "        else { return true; }\n");
+    sb_append_str(sb, "    }\n");
+    sb_append_str(sb, "    return false;\n");
+    sb_append_str(sb, "}\n\n");
+    // init_xid —— 注意：append(slice, 字面量) 会被发射器生成 &字面量（非法 C），
+    // 故先把每个范围端点存入临时量 _xidv，再 append(_xidv)（&_xidv 合法）。
+    sb_append_str(sb, "init_xid :: func() -> void {\n");
+    sb_append_str(sb, "    var _xidv: i64 = 0;\n");
+    var i: i64 = 0;
+    while (i < slice_len(xid_start_lo) as i64) {
+        sb_append_str(sb, "    _xidv = ");
+        sb_append_str(sb, xid_start_lo[i]);
+        sb_append_str(sb, "; append(xid_start_lo, _xidv);\n");
+        sb_append_str(sb, "    _xidv = ");
+        sb_append_str(sb, xid_start_hi[i]);
+        sb_append_str(sb, "; append(xid_start_hi, _xidv);\n");
+        i = i + 1;
+    }
+    i = 0;
+    while (i < slice_len(xid_cont_lo) as i64) {
+        sb_append_str(sb, "    _xidv = ");
+        sb_append_str(sb, xid_cont_lo[i]);
+        sb_append_str(sb, "; append(xid_cont_lo, _xidv);\n");
+        sb_append_str(sb, "    _xidv = ");
+        sb_append_str(sb, xid_cont_hi[i]);
+        sb_append_str(sb, "; append(xid_cont_hi, _xidv);\n");
+        i = i + 1;
+    }
+    sb_append_str(sb, "}\n");
+    sb_append_str(sb, "// <<< GEN:xid <<<");
+    return sb_to_str(sb);
+}
+
+// ───────────── 主流程 ─────────────
+
+main_fn :: func() -> i32 @main {
+    load_tables();
+
+    var src: string = file_read_all("src/tote.tc");
+    var out: string = src;
+
+    out = replace_interval(out,
+        "// >>> GEN:kw_lookup",
+        "// <<< GEN:kw_lookup <<<",
+        emit_kw());
+    out = replace_interval(out,
+        "// >>> GEN:builtins",
+        "// <<< GEN:builtins <<<",
+        emit_bi());
+    out = replace_interval(out,
+        "// >>> GEN:derives",
+        "// <<< GEN:derives <<<",
+        emit_dv());
+    out = replace_interval(out,
+        "// >>> GEN:diagnostics",
+        "// <<< GEN:diagnostics <<<",
+        emit_dg());
+    out = replace_interval(out,
+        "// >>> GEN:annotations",
+        "// <<< GEN:annotations <<<",
+        emit_ann());
+    out = replace_interval(out,
+        "// >>> GEN:parser_dispatch",
+        "// <<< GEN:parser_dispatch <<<",
+        emit_parser_dispatch());
+    out = replace_interval(out,
+        "// >>> GEN:xid",
+        "// <<< GEN:xid <<<",
+        emit_xid());
+
+    file_write_all("gen/tote.tc", out);
+    return 0;
+}
