@@ -31,12 +31,12 @@
 ## Variant (G10, M12)
 关键字 `variant` → `parse_variant_decl`（VariantDecl + VC：`ia`=case 下标，`na`=载荷类型或 -1）；检查器 `register_variant_helpers` 注册合成符号 `Name_from_/is_/as_Case`（不入 decl_list）；发射 tag+union struct + 每 case 三个 `static inline` 自由函数。取舍：自由函数而非模式匹配；不支持 `@derive`。
 
-## 数据驱动自生成主线（M17 → M24）✅
+## 数据驱动自生成主线（M17 → M26）✅
 **目标**：用数据表生成 tote 自身的代码（不是给 t 语言加数据驱动特性）。
 **链路**：`docs/reference.md`（数据表 + `// @rule` EBNF + `// @node`/`@slot`/`@scalar`/`@sfn` 表）→ `tools/gen_ebnf.mjs` → `build/ebnf.json` → `src/totter.tc` 各 emitter → `src/tote.tc` 的 GEN 区间。
 
-### 当前 18 个 GEN 区间
-`kw_lookup`(关键字) / `builtins`(15 组) / `derives`(9 trait) / `diagnostics`(10 码) / `annotations`(34 注解) / `xid` / `parser_dispatch` / `parser_rules`(30 文法规则) / `ast`(65 节点种类) / `scalar_pred` / `scalar_bits` / `scalar_ctype` / `scalar_llmap` / `type_infer1` / `type_infer2` / `type_slice` / `type_resolve` / `type_declreg`
+### 当前 24 个 GEN 区间
+`kw_lookup`(关键字) / `builtins`(15 组) / `derives`(9 trait) / `diagnostics`(10 码) / `annotations`(34 注解) / `xid` / `parser_dispatch` / `parser_rules`(30 文法规则) / `ast`(65 节点种类) / `scalar_pred` / `scalar_bits` / `scalar_ctype` / `scalar_llmap` / `type_infer1` / `type_infer2` / `type_slice` / `type_resolve` / `type_declreg` / `td_scalar` / `td_rslice` / `td_rnamed` / `td_expr1` / `td_expr2` / `td_calls`
 
 ### parser 数据驱动（M19，10 种 fold 模式）
 - 通用：`bin` / `pre` / `post` / `prim` / `disp`（守卫式分发，骨架不消费引导 token）
@@ -63,7 +63,12 @@
 - dreg 模式：`named` / `und` / `res` / `optres`(经临时变量 cti 退化)；`post` 列挂钩子（VariantDecl → register_variant_helpers）。生成 `register_decl` **整个函数**。
 - 区间：`type_infer1`(float/string/bool/null)、`type_infer2`(struct_lit/cast/paren/comptime)、`type_slice`、`type_resolve`(variant/flag/flag_set/pointer/optional)、`type_declreg`。
 - **划界原则**：只吃「查表得类型」的规律分支；带控制流与诊断副作用的算法分支（int 字面量选宽、ident 查作用域、binary 同型约束+隐式转换诊断、member/index/array_lit/map_lit 结构遍历）留手写。`infer_expr` 整体表驱会打乱 IR 顺序，不可做。
-- 未表驱的同类候选：emitter 侧 `resolve_type_desc` / `expr_type_desc` 的 `td_*` 单行分派（另一套构造器族，需加 oneline 样式列）。
+### emitter 类型描述符表（M26 TdRuleTable）
+- §2.12 一张表：`TdRuleTable` 22 行 `// @tdrule <region> <indent> <key> <match> <style> <mode> <a1> <a2>`。
+- 覆盖 6 区间：`td_scalar`(resolve scalar 内层 n.sa 链+def 兜底)、`td_rslice`/`td_rnamed`(kind 块)、`td_expr1`(string/int/float/bool 单行)、`td_expr2`(paren/cast rec 块)、`td_calls`(10 条内建函数名分派，缩进 12)。
+- 列设计：`indent`(4/8/12 → 空格串，表外发 `?TDR_IND?`)、`key`(守卫左值代码 n.kind/n.sa/cn)、`style`(**one 单行 if / blk 三行块 / def 裸 return**)、mode `mk`/`named`/`elem`/`rec`。
+- 参数判码规则升级：以 `n.` 开头**或含 `(`** 视为代码（elem 的 a2 可以是 `td_mk("string")` 这类无空格调用）。
+- 划界：`resolve_type_desc` 的 map 分支（多语句算法）与 `expr_type_desc` 的 ident/index/call 尾部/binary/member 留手写。
 
 ### 踩坑铁律
 - **GEN 标记名不得是其他标记的前缀**（`GEN:parser` 曾误命中 `GEN:parser_dispatch`）。
@@ -76,7 +81,7 @@
 - 若改动只新增 GEN 标记行，`gen/tote.tc` md5 变化属预期，此时以 difftest + IR 逐字节为金标准。
 
 ## 技术债 / 后续候选
-1. @derive 派生生成器表（9 trait 生成体仍手写，**用户 2026-07-30 明示暂缓**）；emitter 侧 `td_*` 类型描述符分派表
+1. @derive 派生生成器表（9 trait 生成体仍手写，**用户 2026-07-30 明示暂缓**）
 2. §7.2 CSV/JSON CTFE 编译期导入
 3. `@soa` 布局变换、脱离 arena 的通用内存管理
 4. 修既有限制：lld-link subsystem、LLVM `int_to_str`、数组字面量类型推导

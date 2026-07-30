@@ -712,6 +712,50 @@ DeclRegTable ::
   // @dreg TypeAliasDecl   type  res    n.na    -       -
 ```
 
+### 2.12 Type descriptors（emitter 类型描述符分派表）✅ tote
+
+emitter 侧 `resolve_type_desc` / `expr_type_desc` 的 `td_*` 单行分派规则。
+每行 `// @tdrule <region> <indent> <key> <match> <style> <mode> <a1> <a2>`：
+
+| 列 | 含义 |
+| --- | --- |
+| `region` | 所属 GEN 区间名（`td_scalar` / `td_rslice` / `td_rnamed` / `td_expr1` / `td_expr2` / `td_calls`） |
+| `indent` | 发射缩进空格数（4 / 8 / 12） |
+| `key` | 守卫左值代码（`n.kind` / `n.sa` / `cn`），`-` = 无守卫 |
+| `match` | 守卫比较的字符串字面量，`-` = 无守卫 |
+| `style` | `one` 单行 if / `blk` 三行 if 块 / `def` 裸 return（区间兜底） |
+| `mode` | `mk` → `td_mk("a1")`；`named` → `td_named_mk("a1", a2)`；`elem` → `td_elem_mk("a1", a2)`；`rec` → 直接 `return a1;` |
+| `a1` `a2` | 参数：含 `(` 或以 `n.` 开头视为代码，否则为字符串字面量；`-` = 无 |
+
+划界：`resolve_type_desc` 的 map 分支（多语句算法块）与 `expr_type_desc` 的
+ident/index/call 尾部/binary/member 分支（作用域查找、结构遍历、诊断逻辑）留手写。
+
+```ebnf
+TdRuleTable ::
+  // @tdrule td_scalar 8  n.sa   string        one mk    string -
+  // @tdrule td_scalar 8  n.sa   void          one mk    void   -
+  // @tdrule td_scalar 8  n.sa   StringBuilder one named named  TSb*
+  // @tdrule td_scalar 8  -      -             def named scalar n.sa
+  // @tdrule td_rslice 4  n.kind slice         blk elem  slice  resolve_type_desc(n.na)
+  // @tdrule td_rnamed 4  n.kind named         blk named named  n.sa
+  // @tdrule td_expr1  4  n.kind string        one mk    string -
+  // @tdrule td_expr1  4  n.kind int           one named scalar i64
+  // @tdrule td_expr1  4  n.kind float         one named scalar f64
+  // @tdrule td_expr1  4  n.kind bool          one named scalar bool
+  // @tdrule td_expr2  4  n.kind paren         blk rec   expr_type_desc(n.na) -
+  // @tdrule td_expr2  4  n.kind cast          blk rec   resolve_type_desc(n.nb) -
+  // @tdrule td_calls  12 cn     file_read_all one mk    string -
+  // @tdrule td_calls  12 cn     path_resolve  one mk    string -
+  // @tdrule td_calls  12 cn     str_len       one named scalar u64
+  // @tdrule td_calls  12 cn     slice_len     one named scalar u64
+  // @tdrule td_calls  12 cn     str_at        one named scalar u8
+  // @tdrule td_calls  12 cn     args          blk elem  slice  td_mk("string")
+  // @tdrule td_calls  12 cn     file_write_all one named scalar bool
+  // @tdrule td_calls  12 cn     str_slice     one mk    string -
+  // @tdrule td_calls  12 cn     sb_to_str     one mk    string -
+  // @tdrule td_calls  12 cn     sb_new        one named named  TSb*
+```
+
 ## 3. Syntax（语法）
 
 ### 3.1 Items（顶层条目）

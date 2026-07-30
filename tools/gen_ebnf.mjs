@@ -222,9 +222,9 @@ function parseRecord(s) {
   return out;
 }
 
-const TABLE_RULES = ['Keyword', 'BuiltinTable', 'DeriveTraitTable', 'DiagnosticTable', 'AnnotationTable', 'NodeTable', 'SlotTable', 'ScalarTable', 'ScalarFnTable', 'TypeRuleTable', 'DeclRegTable'];
+const TABLE_RULES = ['Keyword', 'BuiltinTable', 'DeriveTraitTable', 'DiagnosticTable', 'AnnotationTable', 'NodeTable', 'SlotTable', 'ScalarTable', 'ScalarFnTable', 'TypeRuleTable', 'DeclRegTable', 'TdRuleTable'];
 
-const tables = { keywords: [], builtins: [], derives: [], diagnostics: [], annotations: [], nodes: [], slots: [], scalars: [], sfns: [], trules: [], dregs: [] };
+const tables = { keywords: [], builtins: [], derives: [], diagnostics: [], annotations: [], nodes: [], slots: [], scalars: [], sfns: [], trules: [], dregs: [], tdrules: [] };
 const dispatches = {};
 
 for (const r of rules) {
@@ -320,6 +320,14 @@ for (const r of rules) {
       const m = comment.match(/^@dreg\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s*$/);
       if (!m) continue;
       tables.dregs.push({ kind: m[1], symkind: m[2], mode: m[3], a1: m[4], a2: m[5], post: m[6] });
+    }
+  } else if (r.name === 'TdRuleTable') {
+    // 解析 `// @tdrule <region> <indent> <key> <match> <style> <mode> <a1> <a2>`（行序即发射序）。
+    for (const line of r.rawFull.split('\n')) {
+      const { comment } = splitCodeComment(line);
+      const m = comment.match(/^@tdrule\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s*$/);
+      if (!m) continue;
+      tables.tdrules.push({ region: m[1], indent: m[2], key: m[3], match: m[4], style: m[5], mode: m[6], a1: m[7], a2: m[8] });
     }
   } else if (r.name.endsWith('Dispatch')) {
     const key = r.name.slice(0, -'Dispatch'.length);
@@ -587,6 +595,7 @@ const counts = {
   sfns: tables.sfns.length,
   trules: tables.trules.length,
   dregs: tables.dregs.length,
+  tdrules: tables.tdrules.length,
   rules: structural.length,
   grammar: grammar.length,
   dispatchTables: Object.keys(dispatches).length,
