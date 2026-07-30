@@ -44,6 +44,7 @@ int64_t tll_map_len(TMap* m)                            { return t_map_len(m); }
 
 // ── I/O 与进程 ─────────────────────────────────────────────────
 void    tll_file_read_all(TStr* path, TStr* out)     { *out = t_file_read_all(t_cstr(*path)); }
+int32_t tll_file_exists(TStr* path)                  { return t_file_exists(t_cstr(*path)) ? 1 : 0; }
 int32_t tll_file_write_all(TStr* path, TStr* c)      { return t_file_write_all(t_cstr(*path), *c) ? 1 : 0; }
 void    tll_path_resolve(TStr* path, TStr* out)      { *out = t_path_resolve(t_cstr(*path)); }
 void    tll_args(TSlice* out)                        { *out = t_args(); }

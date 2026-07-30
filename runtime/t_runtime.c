@@ -410,6 +410,13 @@ TStr t_path_resolve(const char* path) {
     TStr r; r.ptr = p; r.len = (int64_t)n; return r;
 }
 
+bool t_file_exists(const char* path) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return false;
+    fclose(f);
+    return true;
+}
+
 bool t_file_write_all(const char* path, TStr content) {
     FILE* f = fopen(path, "wb");
     if (!f) { fprintf(stderr, "{\"error\":\"io\",\"op\":\"write\",\"path\":\"%s\"}\n", path); exit(1); }

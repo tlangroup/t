@@ -94,11 +94,13 @@ int64_t t_map_key_int_at(TMap* m, int64_t i);
 // ── 文件 I/O 与进程 ───────────────────────────────────────────
 // 对应 t 语言内置：
 //   file_read_all(path: string) -> string
+//   file_exists(path: string) -> bool
 //   file_write_all(path: string, content: string) -> bool
 //   args() -> []string
 //   exit(code: i32)
 //   print(s: string) / eprint(s: string)
 TStr    t_file_read_all(const char* path);          // 失败 → panic + exit(1)
+bool    t_file_exists(const char* path);            // file_exists(s) -> 可读性探测（fopen 试探）
 bool    t_file_write_all(const char* path, TStr content); // 失败 → panic + exit(1)
 TStr    t_path_resolve(const char* path);           // path_resolve(s) -> 绝对路径（_fullpath/realpath）
 TSlice  t_args(void);                               // 返回 []TStr（复制进 arena）

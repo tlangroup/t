@@ -926,6 +926,10 @@ diag_sev :: func(code: string) -> string {
     if (code == "T_ANNOTATION_INVALID_ARG") { return "error"; }
     if (code == "T_ANNOTATION_UNKNOWN") { return "error"; }
     if (code == "T_ANNOTATION_WRONG_TARGET") { return "error"; }
+    if (code == "T_IMPORT_IO") { return "error"; }
+    if (code == "T_IMPORT_HEADER") { return "error"; }
+    if (code == "T_IMPORT_VALUE") { return "error"; }
+    if (code == "T_IMPORT_CONTEXT") { return "error"; }
     return "";
 }
 // <<< GEN:diagnostics <<<
@@ -6883,7 +6887,7 @@ builtin_ret :: func(name: string) -> i64 {
     if (name == "sb_to_str" || name == "to_string") {
         return ti_mk("String");
     }
-    if (name == "file_write_all") {
+    if (name == "file_write_all" || name == "file_exists") {
         return ti_scalar("bool");
     }
     if (name == "args") {
@@ -7532,6 +7536,645 @@ check_decl :: func(d: i64) -> void {
     }
 }
 
+// ── §7.2 CTFE 导入脱糖（M27）──────────────────────────────────
+// 在 register_decl 全部完成后、check_decl 之前执行。
+// 检测 var x: []Struct = import_csv("path") / import_json("path") →
+// 编译期读文件 → 解析 → 值域校验 → 合成 __import_N 加载函数 → 替换 init。
+// 残存调用报 T_IMPORT_CONTEXT。
+
+var g_imp_counter: i64;
+
+// 从切片类型节点提取元素 struct 名。na 指向 slice 节点（na=named），返回 struct 名或 ""。
+import_elem_struct_name :: func(type_node: i64) -> string {
+    if (type_node < 0) { return ""; }
+    var tn: Node = nodes[type_node];
+    if (tn.kind != "slice") { return ""; }
+    if (tn.na < 0) { return ""; }
+    var elem: Node = nodes[tn.na];
+    if (elem.kind == "named") { return elem.sa; }
+    return "";
+}
+
+// 从 struct 名查找 StructDecl，返回其字段链表头（n.lb）或 -1。
+find_struct_fields :: func(sname: string) -> i64 {
+    var si: i64 = sym_lookup(global_scope, sname);
+    if (si < 0) { return -1; }
+    var s: Sym = syms[si];
+    if (s.decl < 0) { return -1; }
+    var dn: Node = nodes[s.decl];
+    if (dn.kind != "StructDecl") { return -1; }
+    return dn.lb;
+}
+
+// 从字段链表收集 (字段名, 标量类型名) 对。结果写入全局 imp_fnames/imp_ftypes。
+// 注意：t 的 slice 是值传递，无法用 out 参数，故用全局。
+var imp_fnames: []string;
+var imp_ftypes: []string;
+// 当前正在处理的 import 的字段表起始下标（调用 collect_struct_fields 前记录）
+var imp_fbase: i64;
+// JSON 解析临时键值表（同样因 slice 值传递限制而用全局）
+var jp_keys: []string;
+var jp_vals: []string;
+
+// 返回值：字段数。字段写入 imp_fnames/imp_ftypes 的尾部，
+// 起始下标由调用方在调用前用 slice_len 记录（同 fr_resolve_flag 的 base 手法）。
+collect_struct_fields :: func(field_head: i64) -> i64 {
+    var count: i64 = 0;
+    var c: i64 = field_head;
+    while (c >= 0) {
+        var k: Child = kids[c];
+        var f: Node = nodes[k.val];
+        var fname: string = f.sa;
+        var tname: string = "";
+        if (f.na >= 0) {
+            var ft: Node = nodes[f.na];
+            if (ft.kind == "scalar") {
+                tname = ft.sa;
+            }
+        }
+        append(imp_fnames, fname);
+        append(imp_ftypes, tname);
+        count = count + 1;
+        c = k.next;
+    }
+    return count;
+}
+
+// 校验单个值是否可赋给标量类型。返回 true=ok。
+validate_scalar_value :: func(val: string, tname: string, row_idx: i64, col_idx: i64) -> bool {
+    if (tname == "string") { return true; }
+    if (tname == "bool") {
+        if (val == "true" || val == "false") { return true; }
+        return false;
+    }
+    if (is_int_name(tname)) {
+        // 简单检查：首字符可选负号，其余全数字
+        var L: u64 = str_len(val);
+        if (L == 0) { return false; }
+        var start: u64 = 0;
+        var c0: u8 = val[0];
+        if (c0 == 45) { start = 1; }
+        if (start >= L) { return false; }
+        var i: u64 = start;
+        while (i < L) {
+            var ch: u8 = val[i];
+            if (ch < 48 || ch > 57) { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+    if (is_float_name(tname)) {
+        // 简单检查：包含 . 或 e/E，或纯数字
+        var L2: u64 = str_len(val);
+        if (L2 == 0) { return false; }
+        var has_dot: bool = false;
+        var has_digit: bool = false;
+        var i2: u64 = 0;
+        if (val[0] == 45) { i2 = 1; }
+        while (i2 < L2) {
+            var ch2: u8 = val[i2];
+            if (ch2 >= 48 && ch2 <= 57) { has_digit = true; }
+            if (ch2 == 46) { has_dot = true; }
+            i2 = i2 + 1;
+        }
+        if (has_digit == false) { return false; }
+        return true;
+    }
+    return false;
+}
+
+// 为单个值合成标量字面量 AST 节点（int/float/bool/string + cast）
+make_value_node :: func(val: string, tname: string) -> i64 {
+    if (tname == "string") {
+        return mk_string(val, -1);
+    }
+    if (tname == "bool") {
+        if (val == "true") { return mk_bool(true, -1); }
+        return mk_bool(false, -1);
+    }
+    if (is_int_name(tname)) {
+        var inode: i64 = mk_int(val, 10, -1);
+        var target: i64 = mk_scalar(tname, -1);
+        return mk_cast(inode, target, -1);
+    }
+    if (is_float_name(tname)) {
+        var fnode: i64 = mk_float(val, -1);
+        var target2: i64 = mk_scalar(tname, -1);
+        return mk_cast(fnode, target2, -1);
+    }
+    return mk_string(val, -1);
+}
+
+// CSV 解析：返回行数组，每行是列数组。简单实现：逗号分隔，双引号转义。
+// 输出写入 out_rows（每行用 \x1f 分隔列）。
+csv_parse :: func(content: string) -> []string {
+    var rows: []string;
+    var sb: StringBuilder = sb_new();
+    var in_quotes: bool = false;
+    var row_buf: StringBuilder = sb_new();
+    var col_buf: StringBuilder = sb_new();
+    var L: u64 = str_len(content);
+    var i: u64 = 0;
+    while (i < L) {
+        var ch: u8 = content[i];
+        if (in_quotes) {
+            if (ch == 34) {
+                if (i + 1 < L && content[i + 1] == 34) {
+                    sb_append_char(col_buf, 34);
+                    i = i + 2;
+                    continue;
+                }
+                in_quotes = false;
+                i = i + 1;
+                continue;
+            }
+            sb_append_char(col_buf, ch);
+            i = i + 1;
+            continue;
+        }
+        if (ch == 34) {
+            in_quotes = true;
+            i = i + 1;
+            continue;
+        }
+        if (ch == 44) {
+            // 逗号 → 列分隔
+            sb_append_str(row_buf, sb_to_str(col_buf));
+            sb_append_char(row_buf, 31);
+            col_buf = sb_new();
+            i = i + 1;
+            continue;
+        }
+        if (ch == 10) {
+            // 换行 → 行结束
+            sb_append_str(row_buf, sb_to_str(col_buf));
+            append(rows, sb_to_str(row_buf));
+            row_buf = sb_new();
+            col_buf = sb_new();
+            i = i + 1;
+            continue;
+        }
+        if (ch == 13) {
+            // CR → 跳过
+            i = i + 1;
+            continue;
+        }
+        sb_append_char(col_buf, ch);
+        i = i + 1;
+    }
+    // 尾行
+    if (str_len(sb_to_str(col_buf)) > 0 || str_len(sb_to_str(row_buf)) > 0) {
+        sb_append_str(row_buf, sb_to_str(col_buf));
+        append(rows, sb_to_str(row_buf));
+    }
+    return rows;
+}
+
+// 从 CSV 行中提取第 col 列的值（\x1f 分隔）
+csv_col :: func(row: string, col: i64) -> string {
+    var idx: i64 = 0;
+    var sb2: StringBuilder = sb_new();
+    var L: u64 = str_len(row);
+    var i: u64 = 0;
+    while (i < L) {
+        var ch: u8 = row[i];
+        if (ch == 31) {
+            if (idx == col) {
+                return sb_to_str(sb2);
+            }
+            idx = idx + 1;
+            sb2 = sb_new();
+            i = i + 1;
+            continue;
+        }
+        sb_append_char(sb2, ch);
+        i = i + 1;
+    }
+    if (idx == col) {
+        return sb_to_str(sb2);
+    }
+    return "";
+}
+
+// JSON 解析：期望顶层是对象数组 [ {..}, {..} ]。
+// 按 imp_fnames[imp_fbase .. imp_fbase+num_fields) 的字段序，把每个对象
+// 归一化成与 CSV 相同的 \x1f 分隔行，从而复用后续的值域校验与合成逻辑。
+// 缺失的键归一化为空串（后续值域校验会报 T_IMPORT_VALUE）。
+// 返回行数组；解析失败返回空数组。
+json_parse :: func(content: string, num_fields: i64) -> []string {
+    var rows: []string;
+    var L: u64 = str_len(content);
+    var i: u64 = 0;
+
+    // 跳到第一个 '['
+    while (i < L && content[i] != 91) { i = i + 1; }
+    if (i >= L) { return rows; }
+    i = i + 1;
+
+    while (i < L) {
+        // 跳空白与逗号
+        while (i < L) {
+            var c0: u8 = content[i];
+            if (c0 == 32 || c0 == 9 || c0 == 10 || c0 == 13 || c0 == 44) {
+                i = i + 1;
+                continue;
+            }
+            break;
+        }
+        if (i >= L) { break; }
+        if (content[i] == 93) { break; }
+        if (content[i] != 123) { return rows; }
+        i = i + 1;
+
+        // 收集本对象的键值对到临时并列表
+        var kbase: i64 = slice_len(jp_keys) as i64;
+        while (i < L) {
+            // 跳空白与逗号
+            while (i < L) {
+                var c1: u8 = content[i];
+                if (c1 == 32 || c1 == 9 || c1 == 10 || c1 == 13 || c1 == 44) {
+                    i = i + 1;
+                    continue;
+                }
+                break;
+            }
+            if (i >= L) { break; }
+            if (content[i] == 125) { i = i + 1; break; }
+            if (content[i] != 34) { return rows; }
+
+            // 读键
+            i = i + 1;
+            var kb: StringBuilder = sb_new();
+            while (i < L && content[i] != 34) {
+                sb_append_char(kb, content[i]);
+                i = i + 1;
+            }
+            i = i + 1;
+
+            // 跳到冒号
+            while (i < L && content[i] != 58) { i = i + 1; }
+            i = i + 1;
+            while (i < L) {
+                var c2: u8 = content[i];
+                if (c2 == 32 || c2 == 9 || c2 == 10 || c2 == 13) {
+                    i = i + 1;
+                    continue;
+                }
+                break;
+            }
+            if (i >= L) { break; }
+
+            // 读值：字符串带引号，其余读到分隔符
+            var vb: StringBuilder = sb_new();
+            if (content[i] == 34) {
+                i = i + 1;
+                while (i < L && content[i] != 34) {
+                    if (content[i] == 92 && i + 1 < L) {
+                        i = i + 1;
+                        var esc: u8 = content[i];
+                        if (esc == 110) { sb_append_char(vb, 10); }
+                        if (esc == 116) { sb_append_char(vb, 9); }
+                        if (esc == 114) { sb_append_char(vb, 13); }
+                        if (esc == 34) { sb_append_char(vb, 34); }
+                        if (esc == 92) { sb_append_char(vb, 92); }
+                        i = i + 1;
+                        continue;
+                    }
+                    sb_append_char(vb, content[i]);
+                    i = i + 1;
+                }
+                i = i + 1;
+            } else {
+                while (i < L) {
+                    var c3: u8 = content[i];
+                    if (c3 == 44 || c3 == 125 || c3 == 32 || c3 == 9 || c3 == 10 || c3 == 13) {
+                        break;
+                    }
+                    sb_append_char(vb, c3);
+                    i = i + 1;
+                }
+            }
+            append(jp_keys, sb_to_str(kb));
+            append(jp_vals, sb_to_str(vb));
+        }
+
+        // 按字段序拼成 \x1f 行
+        var kn: i64 = slice_len(jp_keys) as i64;
+        var rb: StringBuilder = sb_new();
+        var fi: i64 = 0;
+        while (fi < num_fields) {
+            if (fi > 0) { sb_append_char(rb, 31); }
+            var want: string = imp_fnames[(imp_fbase + fi) as u64];
+            var ki: i64 = kbase;
+            while (ki < kn) {
+                if (jp_keys[ki as u64] == want) {
+                    sb_append_str(rb, jp_vals[ki as u64]);
+                    ki = kn;
+                    continue;
+                }
+                ki = ki + 1;
+            }
+            fi = fi + 1;
+        }
+        append(rows, sb_to_str(rb));
+    }
+    return rows;
+}
+
+// 合成 __import_N 加载函数并返回其节点索引。
+// 形态: __import_N :: func() -> []StructName {
+//   var __r: []StructName;
+//   var __imp_r0: StructName = StructName{ f1: val1, f2: val2, ... };
+//   append(__r, __imp_r0);
+//   ...
+//   return __r;
+// }
+synthesize_loader :: func(sname: string, rows: []string, header_row: string, num_fields: i64, is_csv: bool) -> i64 {
+    var fn_name: string = cat2("__import_", i2s(g_imp_counter));
+    g_imp_counter = g_imp_counter + 1;
+
+    // 返回类型: []StructName
+    var elem_named: i64 = mk_named(sname, -1);
+    var ret_slice: i64 = mk_slice(elem_named, -1);
+
+    // 函数体语句链表
+    var body_head: i64 = -1;
+    var body_tail: i64 = -1;
+
+    // var __r: []StructName;
+    var r_type: i64 = mk_slice(mk_named(sname, -1), -1);
+    var r_decl: i64 = mk_var_decl("__r", false, r_type, -1, -1);
+    body_tail = list_push(body_head, body_tail, r_decl);
+    if (body_head < 0) { body_head = body_tail; }
+
+    // CSV: header_row 是第一行，用于字段名映射
+    // JSON: rows 直接是对象数组，field_names 已固定
+    var nrows: i64 = slice_len(rows) as i64;
+    var ri: i64 = 0;
+    if (is_csv) {
+        ri = 1; // 跳过表头
+    }
+    while (ri < nrows) {
+        var row: string = rows[ri];
+        // 构建 struct_lit 的字段链表
+        var fv_head: i64 = -1;
+        var fv_tail: i64 = -1;
+        var ci: i64 = 0;
+        while (ci < num_fields) {
+            var fname: string = imp_fnames[(imp_fbase + ci) as u64];
+            var ftype: string = imp_ftypes[(imp_fbase + ci) as u64];
+            var col_val: string;
+            if (is_csv) {
+                // 根据 header_row 中的列名映射
+                col_val = csv_col(row, ci);
+            } else {
+                col_val = csv_col(row, ci);
+            }
+            var vnode: i64 = make_value_node(col_val, ftype);
+            var fv: i64 = mk_FV(fname, vnode, -1);
+            fv_tail = list_push(fv_head, fv_tail, fv);
+            if (fv_head < 0) { fv_head = fv_tail; }
+            ci = ci + 1;
+        }
+        var lit: i64 = mk_struct_lit(sname, fv_head, -1);
+        var tmp_name: string = cat2("__imp_r", i2s(ri));
+        var tmp_decl: i64 = mk_var_decl(tmp_name, false, mk_named(sname, -1), lit, -1);
+        body_tail = list_push(body_head, body_tail, tmp_decl);
+        if (body_head < 0) { body_head = body_tail; }
+
+        // append(__r, __imp_r0);
+        var call_args_head: i64 = -1;
+        var call_args_tail: i64 = -1;
+        call_args_tail = list_push(call_args_head, call_args_tail, mk_ident("__r", -1));
+        if (call_args_head < 0) { call_args_head = call_args_tail; }
+        call_args_tail = list_push(call_args_head, call_args_tail, mk_ident(tmp_name, -1));
+        if (call_args_head < 0) { call_args_head = call_args_tail; }
+        var append_call: i64 = mk_call(mk_ident("append", -1), call_args_head, -1);
+        var append_stmt: i64 = mk_expr(append_call, -1);
+        body_tail = list_push(body_head, body_tail, append_stmt);
+        if (body_head < 0) { body_head = body_tail; }
+
+        ri = ri + 1;
+    }
+
+    // return __r;
+    var ret_stmt: i64 = mk_return(mk_ident("__r", -1), -1);
+    body_tail = list_push(body_head, body_tail, ret_stmt);
+    if (body_head < 0) { body_head = body_tail; }
+
+    // ba=is_extern 必须为 false，否则 emitter 只发 declare 不发函数体；
+    // lb=参数列表用 -2 表示空（-1 会被当作 null 链表头处理）
+    var fn: i64 = mk_FuncDecl(fn_name, false, false, ret_slice, -1, -1, body_head, -1);
+    // 注册符号
+    sym_define(global_scope, fn_name, "func", ti_named("Func", fn_name), fn);
+    // 加入 decl_list，使 emitter 能发射该合成函数。
+    // 注意：desugar_imports 在 register 循环之后、check 循环之前运行，
+    // check 循环用 slice_len(decl_list) 重新取长度，故新增项也会被检查。
+    append(decl_list, fn);
+    return fn;
+}
+
+// 检测一个表达式是否是 import_csv/import_json 调用
+is_import_call :: func(expr_idx: i64) -> string {
+    if (expr_idx < 0) { return ""; }
+    var n: Node = nodes[expr_idx];
+    if (n.kind != "call") { return ""; }
+    if (n.na < 0) { return ""; }
+    var callee: Node = nodes[n.na];
+    if (callee.kind != "ident") { return ""; }
+    if (callee.sa == "import_csv") { return "csv"; }
+    if (callee.sa == "import_json") { return "json"; }
+    return "";
+}
+
+// 从 import call 节点提取路径参数字符串
+import_path_arg :: func(call_idx: i64) -> string {
+    var n: Node = nodes[call_idx];
+    var c: i64 = n.la;
+    if (c < 0) { return ""; }
+    var k: Child = kids[c];
+    var arg: Node = nodes[k.val];
+    if (arg.kind == "string") { return arg.sa; }
+    return "";
+}
+
+// 对单个 var_decl 执行脱糖。成功返回 true。
+desugar_one :: func(var_idx: i64, file_for_diag: string, ln: i64, cl: i64) -> bool {
+    var vn: Node = nodes[var_idx];
+    var imp_kind: string = is_import_call(vn.nb);
+    if (imp_kind == "") { return false; }
+
+    // 提取目标类型: []StructName
+    var sname: string = import_elem_struct_name(vn.na);
+    if (sname == "") {
+        diag_new("T_IMPORT_CONTEXT", "error",
+            "import_csv/import_json requires target type []StructName",
+            file_for_diag, ln, cl, ln, cl + 20);
+        return false;
+    }
+
+    // 查找 struct 字段
+    var field_head: i64 = find_struct_fields(sname);
+    if (field_head < 0) {
+        diag_new("T_IMPORT_CONTEXT", "error",
+            cat3("struct '", sname, "' not found for import"),
+            file_for_diag, ln, cl, ln, cl + 20);
+        return false;
+    }
+
+    imp_fbase = slice_len(imp_fnames) as i64;
+    var num_fields: i64 = collect_struct_fields(field_head);
+
+    // 提取路径参数
+    var path: string = import_path_arg(vn.nb);
+    if (path == "") {
+        diag_new("T_IMPORT_CONTEXT", "error",
+            "import_csv/import_json requires a string literal path argument",
+            file_for_diag, ln, cl, ln, cl + 20);
+        return false;
+    }
+
+    // 解析路径（相对源文件目录）
+    var dir: string = "";
+    var slash: i64 = -1;
+    var pl: u64 = str_len(g_file);
+    var pi: u64 = 0;
+    while (pi < pl) {
+        var ch: u8 = g_file[pi];
+        if (ch == 47 || ch == 92) { slash = pi as i64; }
+        pi = pi + 1;
+    }
+    if (slash >= 0) {
+        dir = str_slice(g_file, 0, slash + 1);
+    }
+    var full_path: string = cat2(dir, path);
+
+    // 存在性检查
+    if (file_exists(full_path) == false) {
+        diag_new("T_IMPORT_IO", "error",
+            cat3("import: file not found: ", full_path, ""),
+            file_for_diag, ln, cl, ln, cl + 20);
+        return false;
+    }
+
+    // 读文件
+    var content: string = file_read_all(full_path);
+
+    // 解析
+    var rows: []string;
+    var is_csv: bool;
+    if (imp_kind == "csv") {
+        // CSV 首行是表头，后续按 is_csv 跳过
+        is_csv = true;
+        rows = csv_parse(content);
+    } else {
+        // JSON 已按字段序归一化，无表头行
+        is_csv = false;
+        rows = json_parse(content, num_fields);
+    }
+
+    if (slice_len(rows) as i64 == 0) {
+        diag_new("T_IMPORT_IO", "error",
+            cat3("import: file is empty: ", full_path, ""),
+            file_for_diag, ln, cl, ln, cl + 20);
+        return false;
+    }
+
+    // CSV: 验证表头
+    if (imp_kind == "csv") {
+        var header: string = rows[0];
+        var hi: i64 = 0;
+        while (hi < num_fields) {
+            var hval: string = csv_col(header, hi);
+            if (hval != imp_fnames[(imp_fbase + hi) as u64]) {
+                diag_new("T_IMPORT_HEADER", "error",
+                    cat5("CSV header column ", i2s(hi), ": expected '", imp_fnames[(imp_fbase + hi) as u64], "'"),
+                    file_for_diag, ln, cl, ln, cl + 20);
+                return false;
+            }
+            hi = hi + 1;
+        }
+    }
+
+    // 值域校验
+    var nrows: i64 = slice_len(rows) as i64;
+    var ri2: i64 = 0;
+    if (is_csv) { ri2 = 1; }
+    while (ri2 < nrows) {
+        var row2: string = rows[ri2];
+        var ci2: i64 = 0;
+        while (ci2 < num_fields) {
+            var val2: string = csv_col(row2, ci2);
+            var ftype2: string = imp_ftypes[(imp_fbase + ci2) as u64];
+            if (validate_scalar_value(val2, ftype2, ri2, ci2) == false) {
+                diag_new("T_IMPORT_VALUE", "error",
+                    cat5("import: row ", i2s(ri2), " col ", i2s(ci2), ": invalid value for type"),
+                    file_for_diag, ln, cl, ln, cl + 20);
+                return false;
+            }
+            ci2 = ci2 + 1;
+        }
+        ri2 = ri2 + 1;
+    }
+
+    // 合成加载函数
+    var loader_fn: i64 = synthesize_loader(sname, rows, rows[0], num_fields, is_csv);
+
+    // 替换原 init 为对加载函数的调用
+    var new_call: i64 = mk_call(mk_ident(cat2("__import_", i2s(g_imp_counter - 1)), -1), -1, -1);
+    var nn: Node = nodes[var_idx];
+    nn.nb = new_call;
+    slice_set(nodes, var_idx, nn);
+
+    return true;
+}
+
+// 遍历函数体语句链表，检测 import 脱糖点
+desugar_stmts :: func(stmt_head: i64, file_for_diag: string) -> void {
+    var c: i64 = stmt_head;
+    while (c >= 0) {
+        var k: Child = kids[c];
+        var s: Node = nodes[k.val];
+        if (s.kind == "var_decl") {
+            desugar_one(k.val, file_for_diag, s.ln, s.cl);
+        }
+        // 残存的 import 调用（不在 var 初始化位置）→ T_IMPORT_CONTEXT
+        if (s.kind == "expr") {
+            if (is_import_call(s.na) != "") {
+                diag_new("T_IMPORT_CONTEXT", "error",
+                    "import_csv/import_json is only allowed as a var initializer",
+                    file_for_diag, s.ln, s.cl, s.ln, s.cl + 20);
+            }
+        }
+        // 递归 if/while/for/block 体
+        if (s.kind == "if") {
+            desugar_stmts(s.la, file_for_diag);
+            if (s.lb > -2) { desugar_stmts(s.lb, file_for_diag); }
+        }
+        if (s.kind == "while" || s.kind == "block") {
+            desugar_stmts(s.la, file_for_diag);
+        }
+        if (s.kind == "for") {
+            desugar_stmts(s.la, file_for_diag);
+        }
+        c = k.next;
+    }
+}
+
+desugar_imports :: func() -> void {
+    g_imp_counter = 0;
+    var n: i64 = slice_len(decl_list) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        var d: i64 = decl_list[i];
+        var dn: Node = nodes[d];
+        if (dn.kind == "FuncDecl" && dn.lc != -2) {
+            desugar_stmts(dn.lc, n_file(d));
+        }
+        i = i + 1;
+    }
+}
+
 // ── check 主流程（复刻 checker.ts:83）─────────────────────────
 
 run_check :: func() -> void {
@@ -7545,8 +8188,11 @@ run_check :: func() -> void {
         register_decl(decl_list[i]);
         i = i + 1;
     }
+    desugar_imports();
+    // desugar 可能追加合成的 __import_N 函数，重新取长度以便一并检查
+    var n2: i64 = slice_len(decl_list) as i64;
     var j: i64 = 0;
-    while (j < n) {
+    while (j < n2) {
         check_decl(decl_list[j]);
         j = j + 1;
     }
@@ -8680,6 +9326,7 @@ expr_type_desc :: func(e: i64) -> i64 {
                 return td_elem_mk("slice", td_mk("string"));
             }
             if (cn == "file_write_all") { return td_named_mk("scalar", "bool"); }
+            if (cn == "file_exists") { return td_named_mk("scalar", "bool"); }
             if (cn == "str_slice") { return td_mk("string"); }
             if (cn == "sb_to_str") { return td_mk("string"); }
             if (cn == "sb_new") { return td_named_mk("named", "TSb*"); }
@@ -8956,6 +9603,7 @@ emit_expr :: func(e: i64) -> string {
                 return cat6("t_slice_set(", av[0], ", ", av[1], ", &", cat2(av[2], ")"));
             }
             if (cn == "file_read_all") { return cat3("t_file_read_all(t_cstr(", av[0], "))"); }
+            if (cn == "file_exists") { return cat3("t_file_exists(t_cstr(", av[0], "))"); }
             if (cn == "path_resolve") { return cat3("t_path_resolve(t_cstr(", av[0], "))"); }
             if (cn == "file_write_all") {
                 return cat6("t_file_write_all(t_cstr(", av[0], "), ", av[1], ")", "");
@@ -11801,6 +12449,14 @@ ll_call :: func(e: i64) -> string {
         llfb(cat4("  ", t4, " = trunc i32 ", cat2(t3, " to i8")));
         return t4;
     }
+    if (cn == "file_exists") {
+        var pfe: string = emit_lle(ae[0]);
+        var t5: string = ll_tmp();
+        llfb(cat4("  ", t5, " = call i32 @tll_file_exists(ptr ", cat2(pfe, ")")));
+        var t6: string = ll_tmp();
+        llfb(cat4("  ", t6, " = trunc i32 ", cat2(t5, " to i8")));
+        return t6;
+    }
     if (cn == "args") {
         var out2: string = ll_scratch("%TSlice");
         llfb(cat3("  call void @tll_args(ptr ", out2, ")"));
@@ -12645,6 +13301,7 @@ emit_lldeclares :: func() -> void {
     llph("declare i64 @tll_slice_len(ptr)");
     llph("declare void @tll_file_read_all(ptr, ptr)");
     llph("declare i32 @tll_file_write_all(ptr, ptr)");
+    llph("declare i32 @tll_file_exists(ptr)");
     llph("declare void @tll_path_resolve(ptr, ptr)");
     llph("declare void @tll_args(ptr)");
     llph("declare void @tll_exit(i32)");

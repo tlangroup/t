@@ -174,7 +174,7 @@ BuiltinTable:
   | "str_at" => ti_scalar("u8")
   | "file_read_all" / "path_resolve" / "str_slice" => ti_mk("String")
   | "sb_to_str" / "to_string" => ti_mk("String")
-  | "file_write_all" => ti_scalar("bool")
+  | "file_write_all" / "file_exists" => ti_scalar("bool")
   | "args" => ti_elem_of("Slice", ti_mk("String"))
   | "sb_new" => ti_mk("StringBuilder")
 
@@ -193,6 +193,10 @@ DiagnosticTable:
   | "T_ANNOTATION_INVALID_ARG" -> error
   | "T_ANNOTATION_UNKNOWN" -> error
   | "T_ANNOTATION_WRONG_TARGET" -> error
+  | "T_IMPORT_IO" -> error
+  | "T_IMPORT_HEADER" -> error
+  | "T_IMPORT_VALUE" -> error
+  | "T_IMPORT_CONTEXT" -> error
 
 AnnotationTable:
     "test" { spec: "none", targets: "func", repl: "" }
@@ -751,6 +755,7 @@ TdRuleTable ::
   // @tdrule td_calls  12 cn     str_at        one named scalar u8
   // @tdrule td_calls  12 cn     args          blk elem  slice  td_mk("string")
   // @tdrule td_calls  12 cn     file_write_all one named scalar bool
+  // @tdrule td_calls  12 cn     file_exists   one named scalar bool
   // @tdrule td_calls  12 cn     str_slice     one mk    string -
   // @tdrule td_calls  12 cn     sb_to_str     one mk    string -
   // @tdrule td_calls  12 cn     sb_new        one named named  TSb*
@@ -966,11 +971,28 @@ FloatType:"f16" | "f32" | "f64"
 ```ebnf
 ComptimeFunc: "comptime" "func" ...           // 与运行时同写法，编译期执行
 TypeInfoExpr: "type_info" "(" Type ")"        // 编译期类型自省（字段/偏移/位宽/注解）
+```
+
+- spec §5：`comptime` 函数语法与运行时一致。
+- `type_info(T)` 是 `@derive`、序列化、编辑器导出、CTFE 导入的**核心底座**，当前 tote 的 `TypeInfo` 池为简化版、内建未接入。
+
+### 3.6.1 CTFE 数据导入（import_csv / import_json） ✅ tote
+
+```ebnf
 ImportExpr:   "import_csv" "(" StringLiteral ")" | "import_json" "(" StringLiteral ")"
 ```
 
-- spec §5：`comptime` 函数语法与运行时一致；支持编译期读取外部 CSV/JSON 并固化为静态常量、完成值域校验。
-- `type_info(T)` 是 `@derive`、序列化、编辑器导出、CTFE 导入的**核心底座**，当前 tote 的 `TypeInfo` 池为简化版、内建未接入。
+编译期（检查阶段，register 之后、类型推导之前）读取外部数据文件并脱糖为静态加载函数。
+
+**语义规则**：
+1. **唯一合法上下文**：局部 `var x: []S = import_csv("path");`（或 `import_json`），其中 `S` 是已声明的 struct、显式写出 `[]S` 类型标注。出现在任何其他位置（表达式中段、全局、无标注、非 slice-of-struct 目标）报 `T_IMPORT_CONTEXT`。
+2. **路径解析**：相对路径相对**源文件所在目录**解析；文件不存在或不可读报 `T_IMPORT_IO`。
+3. **CSV 映射**：首行为表头，表头名须与 `S` 的字段名**一一对应**（顺序可异、不可缺、不可多），否则报 `T_IMPORT_HEADER`。单元格按逗号切分，不支持引号转义（值内不得含逗号）。
+4. **JSON 映射**：顶层须为对象数组，每个对象的键集合须与 `S` 字段名一致，否则报 `T_IMPORT_HEADER`。
+5. **值校验（编译期）**：整型字段做位宽值域校验（如 `u8` 越界 256 报错）；`bool` 只接受 `true`/`false`；float 接受十进制小数；string 原样取值。违规报 `T_IMPORT_VALUE`，消息含行列与字段名。字段类型仅支持标量与 string（enum/嵌套 struct 暂不支持，报 `T_IMPORT_VALUE`）。
+6. **脱糖产物**：每个导入点合成一个 `__import_N :: func() -> []S` 加载函数（append 逐行 struct 字面量）挂入 decl_list 尾部，原初始化器替换为对该函数的调用。运行时零文件 IO。
+
+**诊断码**：`T_IMPORT_IO`（文件读取失败）、`T_IMPORT_HEADER`（表头/键映射不匹配）、`T_IMPORT_VALUE`（值域/类型违规）、`T_IMPORT_CONTEXT`（非法使用上下文）。
 
 ### 3.7 Flag builtins（位域内建函数） ✅ tote
 
