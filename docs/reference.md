@@ -251,6 +251,315 @@ DeclBodyDispatch:
 
 ---
 
+### 2.8 Parser grammar（数据驱动生成的权威文法）✅ tote（部分，规则驱动生成试点）
+
+以下 `// @rule` 文法是**递归下降 parser 的权威生成源**：`tools/gen_ebnf.mjs` 把每条规则的 body 解析成结构化 EBNF 树（含 FIRST 集），再由 `src/totter.tc` 发射进 `gen/tote.tc` 的 `GEN:parser` 标记区间，生成 `parse_<rule>` 函数，取代对应手写实现。
+
+记号：
+- `// @rule <name> params=(...) ret=<T> node=<NodeKind> eatFirst=<bool>`：规则元数据。`eatFirst=true` 表示被分发表按关键字匹配后，函数先 `advance_i()` 吃掉该关键字（如 `variant`）。
+- body 为 EBNF：`A B` 序列、`A | B` 选择、`A?`/`A*`/`A+` 可选/重复、`(...)` 分组、`"X"` 字面量（映射到 token 种类）、`Ident` 标识符终端、`type`/`anns`/`case` 等非终结符（映射到 `parse_*` 调用）。
+- `{ field = expr }` 节点构造块：`field` 为 AST 节点字段；`expr` 中 `@sym` 引用 body 中符号的解析结果，`name`/`anns` 等参数名与 `list_concat(...)` 等辅助调用原样保留。
+- `// @rule <name> ... fold=bin`：额外元数据，标记该规则是**左结合二元运算塔**（`base (op base)*` 形状）。生成器发射 `while (op 集合) { left = mk_bin(op, left, parse_base(), ti); }`；运算符字面量即 `mk_bin` 的 op 串（如 `"<<"`→`"<<"`、`"&&"`→`"&&"`），其 token kind 由 `tools/gen_ebnf.mjs` 的 `OPKIND` 表映射（覆盖结构标点表）。
+- `// @rule <name> ... fold=pre`：额外元数据，标记该规则是**前缀一元折叠**（`(op)* base` 形状，右结合递归）。生成器发射 `if (cur_t() in ops) { op; operand = parse_<self>(); return mk_un(op, operand, ti); } return parse_<base>();`；运算符字面量即 `mk_un` 的 op 串（如 `"!"`→`"!"`、`"-"`→`"-"`、`"~"`→`"~"`），其 token kind 由 `OPKIND` 映射（`!`→Not、`-`→Minus、`~`→BitNot）。递归目标为规则自身（允许 `!!x` 堆叠），无 op 时落到 `base`。
+- `// @rule <name> ... fold=post`：额外元数据，标记该规则是**左结合后缀折叠**（`base ( lead nt | lead nt | ... )* ( lead nt )?` 形状）。每个后缀分支 = `引导 token 字面量 + 胶水非终结符`；生成器发射 `var e = parse_base(); while (引导 token 集合) { var ti = advance_i(); e = parse_<胶水>(e, ti); }`，尾部 `( lead nt )?` 可选分支发射单次 `if`。胶水 helper（如 `post_member`/`post_index`/`post_call`/`post_cast`）为手写函数，签名 `(e: i64, ti: i64) -> i64`，负责消费引导 token 之后的剩余形态并返回折叠后的节点。`fold` 当前支持 `bin`/`pre`/`post`/`prim`/`disp` 五类通用模式，以及语句体专用的 `whilex`/`returnx`（纯序列 + node_at）/ `ifx`（if/else-if 链）/ `forx`（peek 前瞻分流两段式）/ `swx`（case/default 循环聚合）五种专用模式。
+- `// @rule <name> ... fold=prim`：额外元数据，标记该规则是**终端驱动 dispatch**（`term nt | term nt | ...` 形状）。每个分支 = `分发终端 + 胶水非终结符`；终端可为命名终端（`Integer`/`Float`/`String`/`Ident`）或字面量（关键字/标点）。生成器发射 `if (cur_t() == "K") { var ti = advance_i(); return parse_<胶水>(ti); }` 链，末尾发射错误兜底（`eprint` + `exit(1)`）。胶水 helper 为手写函数，签名 `(ti: i64) -> i64`，负责分发 token 之后的剩余形态并构造节点。
+- `// @rule <name> ... fold=disp`：额外元数据，标记该规则是**守卫式分发**（`term nt | term nt | ... | nt` 形状）。与 `fold=prim` 的区别：骨架**不消费**引导 token（各目标函数自行消费），故发射 `if (cur_t() == "K") { return parse_<目标>(); }` 链；末尾**裸非终结符分支**为兜底（`return parse_<兜底>();`），无错误兜底。目标函数签名一律 `() -> i64`。用于 `statement` 这类「引导 token 只做路由、解析体各自独立」的规则。
+
+```ebnf
+// @rule type_alias params=(name: string, anns: i64) ret=i64 node=TypeAliasDecl eatFirst=false
+type_alias :: type ";"
+{
+    sa = name
+    la = anns
+    na = @type
+}
+
+// @rule variant_decl params=(name: string, anns: i64) ret=i64 node=VariantDecl eatFirst=true
+variant_decl :: anns "{" case* "}"
+{
+    sa = name
+    la = list_concat(anns, @anns)
+    lb = @case
+}
+
+// @rule case params=(ci: i64) ret=i64 node=VC eatFirst=false
+case :: Ident ( "(" type ")" )? anns ("," | ";")?
+{
+    sa = @Ident
+    na = @type
+    la = @anns
+    ia = ci
+}
+
+// @rule flag_decl params=(name: string, anns: i64) ret=i64 node=FlagDecl eatFirst=true
+flag_decl :: ( "[" Ident "]" )? anns "{" slot* "}"
+{
+    sa = name
+    la = list_concat(anns, @anns)
+    sb = str_or(@Ident, "u32")
+    lb = @slot
+}
+
+// @rule slot params=() ret=i64 node=SL eatFirst=false
+slot :: Ident ":" Integer anns ("," | ";")?
+{
+    sa = @Ident
+    ia = parse_int_str(@Integer)
+    ib = flag_offset_of(@anns)
+    bb = flag_has_offset(@anns)
+    la = @anns
+}
+
+// @rule flag_set_decl params=(name: string, anns: i64) ret=i64 node=FlagSetDecl eatFirst=true
+flag_set_decl :: anns "{" setmember* "}"
+{
+    sa = name
+    la = list_concat(anns, @anns)
+    lb = @setmember
+}
+
+// @rule setmember params=() ret=i64 node=SL eatFirst=false
+setmember :: Ident ":" Integer anns ("," | ";")?
+{
+    sa = @Ident
+    ia = parse_int_str(@Integer)
+    ib = -1
+    bb = false
+    la = @anns
+}
+
+// @rule union_decl params=(name: string, anns: i64) ret=i64 node=UnionDecl eatFirst=true
+union_decl :: anns "{" umember* "}"
+{
+    sa = name
+    la = list_concat(anns, @anns)
+    lb = @umember
+}
+
+// @rule umember params=() ret=i64 node=M eatFirst=false
+umember :: Ident ":" type anns ("," | ";")?
+{
+    sa = @Ident
+    na = @type
+    la = @anns
+}
+
+// @rule struct_decl params=(name: string, anns: i64, layout: string) ret=i64 node=StructDecl eatFirst=true
+// @bitpack 检测下沉为手写 helper（bp_is2/bp_type2/bp_has_type2 在两个注解列表上查找，
+// 避免为检测而重复 list_concat）；成员形态由 sfield 的 FIRST 守卫 alt 区分，无需结构体级状态。
+struct_decl :: anns "{" sfield* "}"
+{
+    sa = name
+    ba = bp_is2(anns, @anns)
+    sc = bp_type2(anns, @anns)
+    has_sc = bp_has_type2(anns, @anns)
+    la = list_concat(anns, @anns)
+    sb = layout
+    lb = @sfield
+}
+
+// @rule sfield params=() ret=i64 node=F eatFirst=false
+// 成员二分形态：位宽成员（@bitpack 结构体，`name: 3;`）以 Integer 开头，
+// 类型成员以其余 token 开头——FIRST 可区分，故用 alt 而非结构体级 is_bitpack 状态。
+sfield :: Ident ":" ( Integer | type ) anns ";"
+{
+    sa = @Ident
+    na = sfield_na(@Integer, @type)
+    ia = sfield_ia(@Integer)
+    la = @anns
+}
+
+// ── 表达式二进制优先级塔（fold=bin：左结合二元运算折叠）──
+// 形状：base ( (op | op | ...) base )*  →  while (op) { left = mk_bin(op, left, parse_base(), ti); }
+// 运算符字面量即 mk_bin 的 op 串（"&&"→"&&"、"<<"→"<<"），token kind 由 gen_ebnf 的 OPKIND 映射。
+
+// @rule or params=() ret=i64 node=_ eatFirst=false fold=bin
+or :: and ( "||" and )*
+
+// @rule and params=() ret=i64 node=_ eatFirst=false fold=bin
+and :: bitor ( "&&" bitor )*
+
+// @rule bitor params=() ret=i64 node=_ eatFirst=false fold=bin
+bitor :: bitxor ( "|" bitxor )*
+
+// @rule bitxor params=() ret=i64 node=_ eatFirst=false fold=bin
+bitxor :: bitand ( "^" bitand )*
+
+// @rule bitand params=() ret=i64 node=_ eatFirst=false fold=bin
+bitand :: eq ( "&" eq )*
+
+// @rule eq params=() ret=i64 node=_ eatFirst=false fold=bin
+eq :: cmp ( ("==" | "!=") cmp )*
+
+// @rule cmp params=() ret=i64 node=_ eatFirst=false fold=bin
+cmp :: shift ( ("<" | ">" | "<=" | ">=") shift )*
+
+// @rule shift params=() ret=i64 node=_ eatFirst=false fold=bin
+shift :: add ( ("<<" | ">>") add )*
+
+// @rule add params=() ret=i64 node=_ eatFirst=false fold=bin
+add :: mul ( ("+" | "-") mul )*
+
+// @rule mul params=() ret=i64 node=_ eatFirst=false fold=bin
+mul :: unary ( ("*" | "/" | "%") unary )*
+
+// ── 表达式前缀一元运算符（fold=pre：右结合前缀折叠）──
+// 形状：( (op | op | ...) )* base  →  if (cur in ops) { op; operand = parse_self(); return mk_un(op, operand, ti); } return parse_base();
+// 运算符字面量（"!"/"-"/"~"）token kind 由 OPKIND 映射（!→Not、-→Minus、~→BitNot）。
+
+// @rule unary params=() ret=i64 node=_ eatFirst=false fold=pre
+unary :: ( "!" | "-" | "~" )* postfix
+
+// ── 表达式后缀（fold=post：左结合后缀折叠，胶水 helper 下沉）──
+// 形状：base ( lead nt | ... )* ( lead nt )?  →  e = parse_base(); while (lead 集合) { ti = advance_i(); e = parse_<nt>(e, ti); } 尾部可选分支单次 if。
+// 引导 token："."→Dot、"["→LBracket、"("→LParen（PUNCT 表）、"as"→KwAs（关键字表）。
+// 胶水 helper（手写，GEN 区外）：post_member（.成员）、post_index（[下标]）、post_call（(参数表)）、post_cast（as 类型转换）。
+
+// @rule postfix params=() ret=i64 node=_ eatFirst=false fold=post
+postfix :: primary ( "." post_member | "[" post_index | "(" post_call )* ( "as" post_cast )?
+
+// ── 表达式基底（fold=prim：终端驱动 dispatch，分支体下沉）──
+// 形状：term nt | term nt | ...  →  if (cur_t()==K) { ti = advance_i(); return parse_<nt>(ti); } 链 + 错误兜底（eprint + exit(1)）。
+// 分发 token：Integer/Float/String（命名终端）、"true"→KwTrue、"false"→KwFalse、"null"→KwNull（关键字表）、Ident→Identifier、"("→LParen、"["→LBracket（PUNCT 表）。
+// 胶水 helper（手写，GEN 区外，签名 (ti: i64) -> i64）：prim_int/prim_float/prim_str/prim_true/prim_false/prim_null/prim_ident（含 struct_lit 前瞻）/prim_paren/prim_array（含 map_lit 前瞻）。
+
+// @rule primary params=() ret=i64 node=_ eatFirst=false fold=prim
+primary :: Integer prim_int | Float prim_float | String prim_str | "true" prim_true | "false" prim_false | "null" prim_null | Ident prim_ident | "(" prim_paren | "[" prim_array
+
+// ── 语句顶层分发（fold=disp：守卫式分发，骨架不消费引导 token）──
+// 形状：term nt | ... | nt（裸 NT 兜底）→ if (cur_t()==K) { return parse_<nt>(); } 链 + return parse_<兜底>();
+// 目标函数一律签名 () -> i64、自行消费引导 token：if/for/while/switch/return 为既有函数原样路由；
+// break/continue/defer/comptime/block/var/const 为下沉胶水（block_stmt 用 pos 做位点故不 advance）。
+
+// @rule statement params=() ret=i64 node=_ eatFirst=false fold=disp
+statement :: "if" if_stmt | "for" for_stmt | "while" while_stmt | "switch" switch_stmt | "return" return_stmt | "break" break_stmt | "continue" continue_stmt | "defer" defer_stmt | "comptime" comptime_stmt | "{" block_stmt | "var" var_stmt | "const" const_stmt | expr_or_assign_stmt
+
+// ── 语句体内部结构（fold=whilex/returnx：纯序列形态，含 node_at 守卫）──
+// 形状：while "(" expr ")" block  /  return expr? ";"  →  通用骨架 + 节点构造，eatFirst 吃掉引导关键字。
+
+// @rule while_stmt params=() ret=i64 node=While eatFirst=true fold=whilex
+while_stmt :: "(" expr ")" block
+
+// @rule return_stmt params=() ret=i64 node=Return eatFirst=true fold=returnx
+return_stmt :: expr? ";"
+
+// ── 语句体内部结构（fold=ifx：if/else-if 链，else 分支嵌套 if 须包成单元素 list 兜底）──
+// 形状：if "(" expr ")" block ("else" (block | if_stmt))?  →  守卫式骨架识别 else/else-if，递归自身。
+
+// @rule if_stmt params=() ret=i64 node=If eatFirst=true fold=ifx
+if_stmt :: "(" expr ")" block ("else" (block | if_stmt))?
+
+// ── 语句体内部结构（fold=forx：peek 前瞻分发两段式 for：Identifier KwIn=for_each，否则 C 式三子句）──
+// 形状：for "(" ( Ident "in" expr | (expr? ";" expr? ";" expr?) ) ")" block  →  守卫式骨架按 peek_t(1) 分流。
+
+// @rule for_stmt params=() ret=i64 node=For eatFirst=true fold=forx
+for_stmt :: "(" ( Ident "in" expr | expr? ";" expr? ";" expr? ) ")" block
+
+// ── 语句体内部结构（fold=swx：case/default 循环聚合，default 缺省 -2 兜底）──
+// 形状：switch "(" expr ")" "{" ( "case" expr ":" statement* | "default" ":" statement* )* "}"  →  循环收集 CS 节点。
+
+// @rule switch_stmt params=() ret=i64 node=Switch eatFirst=true fold=swx
+switch_stmt :: "(" expr ")" "{" ( "case" expr ":" statement* | "default" ":" statement* )* "}"
+```
+
+- 终端约定：`Ident` → `expect_tok("Identifier")`（string 结果）；`Integer` → `expect_tok("Integer")`（string 结果，字面量文本）。
+- 语义胶水以**手写 helper** 下沉：`str_or(s, d)`（可选捕获缺省值）、`flag_offset_of(anns)`/`flag_has_offset(anns)`（`@offset(n)` 注解参数提取）——文法保持纯结构，构造块直接调用。
+- ✅ tote（部分）：`type_alias`、`variant_decl`/`case`、`flag_decl`/`slot`、`flag_set_decl`/`setmember`、`union_decl`/`umember`、`struct_decl`/`sfield` 已由此文法数据驱动生成（`GEN:parser_rules`），经 difftest 与 conformance 验证。至此全部结构型声明均为数据驱动生成。
+- ✅ tote（续）：表达式二进制优先级塔 `or`/`and`/`bitor`/`bitxor`/`bitand`/`eq`/`cmp`/`shift`/`add`/`mul` 亦以此文法以 `fold=bin` 规则生成（左结合 `while` + `mk_bin` 折叠），替换 10 个手写函数。
+- ✅ tote（续）：表达式前缀一元运算符 `unary` 亦以此文法以 `fold=pre` 规则生成（右结合前缀折叠 + `mk_un` 构造），替换手写 `parse_unary`。
+- ✅ tote（续）：表达式后缀 `postfix` 亦以此文法以 `fold=post` 规则生成（左结合后缀折叠骨架 + 胶水 helper `post_member`/`post_index`/`post_call`/`post_cast` 下沉），替换手写 `parse_postfix`。
+- ✅ tote（续）：表达式基底 `primary` 亦以此文法以 `fold=prim` 规则生成（终端驱动 dispatch 骨架 + 9 个胶水 helper `prim_int`/`prim_float`/`prim_str`/`prim_true`/`prim_false`/`prim_null`/`prim_ident`/`prim_paren`/`prim_array` 下沉）。**表达式金字塔 or→…→primary 全部数据驱动生成。**
+- ✅ tote（续）：语句顶层分发 `statement` 亦以此文法以 `fold=disp` 规则生成（守卫式分发骨架：if/for/while/switch/return 路由既有函数，break/continue/defer/comptime/block/var/const 下沉为胶水，兜底 `expr_or_assign_stmt`），替换手写 `parse_statement`。
+- ✅ tote（续）：语句体内部结构亦以文法表达——`while_stmt`/`return_stmt` 以 `fold=whilex`/`fold=returnx`（纯序列 + node_at 守卫）生成；`if_stmt` 以 `fold=ifx`（if/else-if 链，else 分支嵌套 if 包成单元素 list 兜底）生成；`for_stmt` 以 `fold=forx`（peek_t(1) 前瞻分流 for_each / C 式三子句）生成；`switch_stmt` 以 `fold=swx`（case/default 循环聚合，default 缺省 -2）生成。五者各自替换对应手写 `parse_*` 函数，`local_var`（名校验副作用 + nti 定位）仍保留为胶水。`statement` 顶层分发路由目标现为全数据驱动生成。
+
+---
+
+### 2.9 AST node kinds（数据驱动生成的节点种类表）✅ tote
+
+节点种类（AST 的 `kind` 标签）的单一真相源。totter 读取本表（经 `tools/gen_ebnf.mjs` → `build/ebnf.json` 的 `nodes` 段）生成 `Node` 结构、`node_new` / `node_at`、节点种类注册表（`node_kind_names` / `init_node_kinds` / `is_node_kind`），以及**每个种类的构造器 `mk_<kind>(槽参数…, ti)`**。
+
+`Node` 是固定通用槽结构，每行 `// @node <名字> [槽=类型 …]` 声明该种类实际使用的槽（按结构字段序）：
+
+| 槽 | 记法 | t 类型 | 语义 |
+|---|---|---|---|
+| `sa` `sb` `sc` | `str` | `string` | 字符串载荷 |
+| `has_sa` `has_sb` `has_sc` | `has` | `bool` | 对应字符串槽是否为 null 语义 |
+| `ia` `ib` | `int` | `i64` | 整型载荷（radix / bitWidth / offset），-1 = null |
+| `ba` `bb` | `bool` | `bool` | 布尔载荷（isConst / isExtern / isBitpack…） |
+| `na` `nb` `nc` `nd` | `node` | `i64` | 子节点索引，-1 = null |
+| `la` `lb` `lc` | `list` | `i64` | 子节点列表头，-1 = 空列表，-2 = null 列表 |
+
+构造器约定：参数按上表字段序排列，末位固定为 anchor token 下标 `ti`；`ti < 0` 表示不打 anchor（跳过 `node_at`）。无槽种类只生成 `mk_<kind>(ti)`。
+
+```ebnf
+NodeTable ::
+  // @node A sa=str la=list
+  // @node CS na=node la=list
+  // @node EN na=node nb=node
+  // @node EnumDecl sa=str sb=str la=list lb=list
+  // @node F sa=str ia=int na=node la=list
+  // @node FV sa=str na=node
+  // @node FlagDecl sa=str sb=str la=list lb=list
+  // @node FlagSetDecl sa=str la=list lb=list
+  // @node FuncDecl sa=str ba=bool bb=bool na=node la=list lb=list lc=list
+  // @node GlobalConstDecl sa=str bb=bool na=node nb=node la=list
+  // @node GlobalVarDecl sa=str bb=bool na=node nb=node la=list
+  // @node ImportDecl sb=str sc=str has_sa=has has_sc=has la=list
+  // @node M sa=str na=node la=list
+  // @node P sa=str na=node la=list
+  // @node SL sa=str ia=int ib=int bb=bool la=list
+  // @node StructDecl sa=str sb=str sc=str has_sc=has ba=bool la=list lb=list
+  // @node TypeAliasDecl sa=str na=node la=list
+  // @node UnionDecl sa=str la=list lb=list
+  // @node V sa=str na=node la=list
+  // @node VC sa=str ia=int na=node la=list
+  // @node VariantDecl sa=str la=list lb=list
+  // @node array na=node nb=node
+  // @node array_lit la=list
+  // @node assign sa=str na=node nb=node
+  // @node assignment sa=str na=node nb=node
+  // @node binary sa=str na=node nb=node
+  // @node block la=list
+  // @node bool ba=bool
+  // @node break
+  // @node call na=node la=list
+  // @node cast na=node nb=node
+  // @node comptime na=node
+  // @node comptime_block la=list
+  // @node continue
+  // @node defer la=list
+  // @node expr na=node
+  // @node flag sa=str
+  // @node flag_set
+  // @node float sa=str
+  // @node for na=node nb=node nc=node la=list
+  // @node for_each sa=str na=node la=list
+  // @node ident sa=str
+  // @node if na=node la=list lb=list
+  // @node index na=node nb=node
+  // @node int sa=str ia=int
+  // @node list la=list
+  // @node map na=node nb=node
+  // @node map_lit la=list
+  // @node member sa=str na=node
+  // @node named sa=str
+  // @node null
+  // @node number sa=str
+  // @node optional na=node
+  // @node paren na=node
+  // @node pointer na=node
+  // @node return na=node
+  // @node scalar sa=str
+  // @node slice na=node
+  // @node string sa=str
+  // @node struct_lit sa=str la=list
+  // @node switch na=node la=list lb=list
+  // @node unary sa=str na=node
+  // @node var_decl sa=str ba=bool na=node nb=node
+  // @node variant
+  // @node while na=node la=list
+```
+
 ## 3. Syntax（语法）
 
 ### 3.1 Items（顶层条目）

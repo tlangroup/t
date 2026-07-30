@@ -1,83 +1,75 @@
-# t Language Compiler - Project Notes
+# t Language Compiler — Project Notes
 
-## Project Overview
-- t is a data-driven, ECS-oriented, AI-Agent-friendly static type system language
-- File extension: .tc
-- Compiler implemented in TypeScript, transpiles to C
-- Spec document: docs/spec.md
+## 概览
+- **t**：数据驱动、ECS 取向、AI-Agent 友好的静态类型语言，扩展名 `.tc`；规范 `docs/spec.md`，参考手册 `docs/reference.md`（数据表/文法唯一真相源）。
+- **主实现 = `src/tote.tc`**（单文件 ~12.5k 行，自举编译器：lex/check/compile/emit-c/emit-ll/build/run/test/ast/type-info）。
+- **生成器 = `src/totter.tc`**（t 编写）：读 `build/ebnf.json` 数据表，重写 `src/tote.tc` 的 `// >>> GEN:xxx >>>` … `// <<< GEN:xxx <<<` 区间，输出 `gen/tote.tc`。
+- `tc0/`（TypeScript 参考实现）已冻结；种子封存 `seed/tc0/`（信任根，永不删除）。
 
-## Architecture
-- `tc0/diagnostics/` — Dual-output diagnostic system (human + JSON)
-- `tc0/lexer/` — Tokenizer
-- `tc0/ast/` — AST node definitions + walker
-- `tc0/parser/` — Recursive descent parser
-- `tc0/types/` — Type system + type checker
-- `tc0/annotations/` — Annotation registry + derive processor + test runner
-- `tc0/flag/` — Flag/bitfield system with SlotInfo
-- `tc0/comptime/` — CTFE engine + type_info introspection
-- `tc0/codegen/` — AST JSON export + C code emitter
-- `tc0/index.ts` — CLI entry point (tc command)
+## 构建 & 验证
+- 编译：`build/tote/tote.exe build <f.tc> --clang "C:/Program Files/LLVM/bin/clang.exe" --output build/<dir>/<name>`
+  （注：`_build_one.mjs` 的 /Fe 硬编码 tote.exe，故产物常在 `build/<dir>/tote.exe`）
+- `emit-ll <f.tc>` 输出 `<name>.ll` **写在源文件旁**（stdout 只有短提示）。
+- **标准流水线**：canonical tote 编译 `src/totter.tc` → totter；totter 重生成 `gen/tote.tc`；`cp gen/tote.tc src/tote.tc` 提升定点；canonical tote 编译 `gen/tote.tc` → 新 tote。
+- **验证四件套**：
+  1. 定点 `md5sum src/tote.tc gen/tote.tc` 相等且重跑幂等
+  2. `node tools/difftest.mjs --ref build/tote/tote.exe --cand <new>`（当前 **27/27**）
+  3. `node tools/conformance.mjs --compiler <new>`（**17/17**；加 `--ref` 走 tc0 交叉极慢，慎用）
+  4. LLVM IR 逐字节：`p06_control_flow.ll` 两版 diff 为空 + `run --example hello/fib` smoke
+- 两阶段自举：tote-b→tote-c difftest 27/27（二进制 md5 不同系内嵌路径/时间戳，非功能差异）。
+- `tools/bootstrap.mjs` 目前在 gen1 失败 = tc0 发射器基线 bug，与近期改动无关；等价性以 difftest 为准。
+- 提升 canonical 前先归档：`build/archive/<name>_pre-<里程碑>.exe`。
 
-## Key Design Decisions
-- Implementation language: TypeScript (static typing, good for compilers)
-- Code generation strategy: Transpile to C, leverage existing C toolchains
-- Parser: Recursive descent with precedence climbing for expressions
-- Annotation system: Registry pattern for extensibility
-- Flag system: Auto bit allocation with @offset override
+## 环境 / 实现约束
+- MSVC 路径需 `/utf-8` + 生成 C 带 BOM（`.tc` 源不能带 BOM）；LLVM 路径避开 Win64 聚合 ABI（`runtime/t_shim_ll.c` 的 `tll_*` 指针桥）。
+- runtime arena 已扩至 **512MB**（`runtime/t_runtime.c`）。
+- 确定性：line/col = UTF-8 字节计数；stdout 二进制模式；`sb_to_str` 复制语义。
+- t 语法坑：`Name :: struct { f: T; }`；**无 else-if 链**；`append(s, call())` 会取临时量地址(C2102)，须先存局部变量；无 slice 重赋值（不能 `= []` 重置）；无 `str_find`（自实现）。
+- tc1/tote C 后端 `sys_run` 必须直通输出 `sys_run(...)`，否则不动点破坏。
+- 诊断怪癖：`T_TYPE_UNKNOWN` 从未发出（实报 `T_TYPE_MISMATCH`）；命名违规是 warning（exit 0）。
+- **既有限制（非回归）**：`run <任意路径.tc>` lld-link `subsystem must be defined`；LLVM 后端 `int_to_str` UNSUPPORTED；数组字面量 `[N]u8` / 空数组 `[]` 推 `[0]<unknown>` 不能赋 `[]i64`。
 
-## Build & Run
-- **LLVM 直达（M13, commit b3421ff）**: `build/tc1/tc1/tc1.exe build <f.tc> --clang "C:/Program Files/LLVM/bin/clang.exe"` — .tc → .ll → exe；`emit-ll` 只出 IR。链接 runtime/t_runtime.c + runtime/t_shim_ll.c（指针化 tll_* 桥，规避 Win64 聚合 ABI）。值模型：标量=SSA(bool=i8)、聚合=entry 块 alloca ptr；用户函数 mangle @t.<name>；全局走 @t.__ginit
-- 注意：tc1 C 后端 sys_run 必须直通输出 `sys_run(...)`（与 tc0 一致，靠 t_runtime.h 宏），否则自举不动点破坏
-- `npx tsx tc0/index.ts check <file.tc>` — type check
-- `npx tsx tc0/index.ts compile <file.tc> --emit-c --output build/` — generate C code
-- `npx tsx tc0/index.ts build <file.tc> --output build/x` — .tc → C → native exe (MSVC cl)
-- `npx tsx tc0/index.ts lex <file.tc> --json` — export token stream JSON
-- `npx tsx tc0/index.ts test <file.tc>` — run @test cases
-- `npx tsx tc0/index.ts ast <file.tc>` — export AST JSON
-- `npx tsx tc0/index.ts type-info <file.tc> <TypeName>` — print type_info(T)
-- `node tools/difftest.mjs [--tlex build/tlex/lexer.exe]` — byte-level diff testing
+## Variant (G10, M12)
+- 关键字 `variant`；`parse_variant_decl` → VariantDecl + VC（`VC.ia`=case 下标，`VC.na`=载荷类型或 -1 单元 case）。
+- 检查器 `register_variant_helpers` 注册合成符号（不入 decl_list）：`Name_from_Case` / `Name_is_Case` / `Name_as_Case`。
+- 发射 `typedef struct { uint32_t _tag; union {...} _u; }` + 每 case 三个 `static inline` 自由函数。
+- 取舍：自由函数而非方法/模式匹配；Variant 上暂不支持 `@derive`。
 
-## LLVM 后端 (M13–M15) — ✅ 双后端自举完成
-- `tc1 build <f.tc>` = .tc→.ll→exe（clang 自动探测）；`emit-ll` 只出 IR；`run [--example <n>]` = cargo 风格构建+运行（M14，示例在 examples/，产物 build/examples/）
-- **M15 自举**：`tc1 build src/tc1.tc` 成功 → build/selfll/tc1.exe；LLVM 不动点达成（C 出身/LLVM 出身 emit-ll 逐字节一致）
-- 值模型：标量=SSA(bool=i8)，聚合=ptr+入口块 alloca；runtime 桥 runtime/t_shim_ll.c (tll_*)
-- 易错点：ll_etd（类型查询）必须与发射逻辑一致——binary 用 ll_bin_td（字面量让位），比较→bool，paren 透传（M15 修的就是这个错配）
-- 验证四件套：bootstrap 不动点 + difftest + conformance + LLVM 不动点（selfll emit-ll cmp）
+## 数据驱动自生成主线（M17 → M20）✅
+**目标**：用数据表生成 tote 自身的代码，而非给 t 语言加数据驱动特性。
 
-## Bootstrap status — ✅ COMPLETE (M1–M11, tag v1.0-selfhost, git repo initialized)
-- **主实现 = src/tote.tc**（M16 起编译器更名 tote，原 tc1.tc；~9500 行单文件，lex/check/compile/emit-ll/build/run 全命令）；稳定版: **build/tote/tote.exe**（旧 build/tc1/tc1/tc1.exe 为备份）
-- tc0 (TypeScript, tc0/) 已冻结；种子封存 seed/tc0/（信任根，永不删除）
-- 验证三件套：`node tools/difftest.mjs --cand build/tc1/tc1/tc1.exe`（42 项逐字节）、`node tools/bootstrap.mjs`（三轮自编译不动点）、`node tools/conformance.mjs --ref`（tests/conformance 16 用例 + tc0 交叉）
-- Stage 3 晋升规则：改 spec → 补 conformance 测试 → 改 tc1.tc → 套件+difftest → 不动点复验 → 晋升
-- `runtime/t_runtime.{h,c}` — C runtime; MSVC 需 /utf-8 + 生成 C 带 BOM（.tc 源不能带 BOM）
-- C compiler: VS2022 cl.exe (14.37.32822, SDK 10.0.22621.0)，PowerShell 里手动设 INCLUDE/LIB/Path
-- Determinism: line/col = UTF-8 字节计数; stdout 二进制模式; sb_to_str 复制语义
-- t 语法: `Name :: struct { f: T; }`；无 else-if 链；`append(s, call())` 会取临时量地址(C2102)，须先存局部变量
-- 诊断怪癖：T_TYPE_UNKNOWN 从未发出（实报 T_TYPE_MISMATCH）；命名违规是 warning (exit 0)
-- 技术债（Stage 3）：~~Variant(G10)~~ ✅M12 已实现；剩余 CSV/JSON CTFE 导入(§7.2)、@soa 布局变换、通用内存管理(脱离 arena)、优化后端
+### 链路
+`docs/reference.md`（数据表 + `// @rule` EBNF + `// @node` 表）→ `tools/gen_ebnf.mjs` → `build/ebnf.json` → `src/totter.tc` 各 emitter → `src/tote.tc` 的 GEN 区间。
 
-## Variant (G10) 实现要点 — src/tc1.tc
-- 关键字 `variant`（lexer kw_lookup）；声明解析 `parse_variant_decl`（节点 VariantDecl + VC，VC.ia=case 下标, VC.na=载荷类型或 -1 单元 case）
-- 类型检查器 `register_decl` 注册类型为 Variant TI，并 `register_variant_helpers` 注册合成 FuncDecl 符号（不入 decl_list，避免重复发射）：`Name_from_Case(载荷?)`、`Name_is_Case(self)`、`Name_as_Case(self)`（仅载荷 case）
-- emitter `emit_variant_decl`：发射 `typedef struct Name { uint32_t _tag; union { T_i _u_i; } _u; } Name;` + 每 case 三个 `static inline` 自由函数（用 StringBuilder 拼 tag 整数，因无 int_to_str/cat7）
-- 设计取舍：自由函数而非方法/模式匹配，免改表达式推导；Variant 上暂不支持 @derive
-- 验证：conformance/p08_variant.tc 通过；tests/variant_smoke 运行时输出 CIRCLE/EMPTY/RECT/ROUNDTRIP_OK/UNIT_OK；bootstrap 不动点保持；difftest 30/30
+### 当前 9 个 GEN 区间
+`kw_lookup`(33 关键字) / `builtins`(15 组) / `derives`(9 trait) / `diagnostics`(10 码) / `annotations`(34 注解) / `xid` / `parser_dispatch` / `parser_rules`(30 文法规则) / `ast`(65 节点种类)
 
-## 数据驱动编译器生成 (M17) — 用数据生成 tote 代码
-- 切入点：把 `kw_lookup`（原 tote.tc 手写 33 个 `if(text=="func")...` 链）改为**表驱**。这是「用数据驱动 t 编译器自身构造」的第一刀（用户原话：用数据生成 tote 代码，而非给 t 加数据驱动特性）。
-- 唯一真相源：`src/compiler_data.json`（{keywords:[{text,kind}]}，从原 kw_lookup 精确抽取 33 关键字→token 种类，保证行为一致）；schema 预留扩展其他表（注解/内建/AST 节点）。
-- 生成器：`tools/gen_compiler.mjs` — 重写 `src/tote.tc` 中 `// >>> GEN:kw_lookup >>>` 标记区间（KwEntry 结构 + 全局 `keywords_tbl` + `init_keywords()` 线性扫描 `kw_lookup`）；标记区间幂等（重跑无 diff）。
-- 关键修复：`tk_lookup` 表驱后**必须在 tokenize 之前 init**。原 main 各分支 `tokenize()` 在 `init_keywords()` 之前，导致表空、关键字全识别成 Identifier。改法：在 `main()` 入口 `args()` 之后**统一调用一次** `init_keywords()`，并移除 3 处 per-command 调用（避免重复 append，因 t 不支持 slice 重赋值 `= []` 重置）。
-- 验证（等价性）：新 tote 由稳定 tote 编译 → `node tools/difftest.mjs --ref build/tote/tote.exe --cand build/tote-new/tote.exe` = **15/15 逐字节一致**（5 样例 × lex/check/emit-c）；新编译器自举自身成功、`run --example hello` 输出 "Hello, t language!" 正确。已提升 build/tote/tote.exe 为数据驱动版本。
-- **注意**：`tools/bootstrap.mjs`（tc0→tote1→tote2→tote3 不动点）当前在 gen1 失败——这是 tc0（冻结的 TS 参考编译器）发射器的**基线 bug**（tote1.exe 连最小 `func main` 都解析失败），与本次改动无关（tc0 直接编译修改后的 tote.tc 0 错误、且与稳定 tote 发射 C 逐字节一致）。等价性证明以 difftest 为准，bootstrap 待单独修 tc0。
-- 下一步候选（数据驱动生成扩展）：AST 节点表、内建函数表、@derive 派生生成器表、诊断码表；或把 compiler_data.json 扩成多表 schema。
+### parser 数据驱动（M19，10 种 fold 模式）
+- 通用：`bin`(左折叠二元塔) / `pre`(右结合前缀一元) / `post`(左折叠后缀+胶水下沉) / `prim`(终端 dispatch) / `disp`(守卫式分发，骨架不消费引导 token)
+- 语句体专用（逐字节复刻手写 C，保 `node_at` 与列表兜底零差异）：`whilex` / `returnx` / `ifx`(else 嵌套 if 需包单元素 list) / `forx`(peek `KwIn` 分流) / `swx`(case/default 循环聚合，default_head 缺省 -2)
+- **成果**：结构型声明 + 表达式金字塔（or→…→primary）+ statement 顶层分发 + 全部语句体内部结构，全部由文法生成。
+- 保留胶水（GEN 区外、设计使然）：`parse_local_var`（名校验副作用 + `nti=pos-1` 定位，被 forx 调用）、`parse_expr_or_assign_stmt`、`mk_un`、postfix/primary 的 helper 群、`str_or`/`flag_offset_of` 等注解提取。
 
-## totter (M18) — 用 t 语言写的数据驱动生成器，生成 tote 自身
-- 用户意图澄清：是「用数据驱动方式生成 tote 编译器代码」（不是给 t 加数据驱动特性）。参考 Rust 参考文档 notation 写 `docs/reference.md`（记号/词法/语法/表达式/类型/comptime 自省/位域内建/文法总览/实现面对应表）。
-- **totter = 数据驱动程序（t 编写）**：`src/totter.tc` 内嵌三张数据表（关键字 33、内建函数 15 组、@derive 9 trait），读取 `src/tote.tc`、把其中 `// >>> GEN:xxx >>>`…`// <<< GEN:xxx <<<` 标记区间替换为「由表生成」的代码，写出 `gen/tote.tc`。
-- `src/tote.tc` 现含 4 个标记区间：`GEN:kw_lookup`（原 gen_compiler.mjs 生成）、`GEN:builtins`（包裹 `builtin_ret`）、`GEN:derives`（包裹 `vv_derive_traits`）、`GEN:diagnostics`（包裹 `diag_sev(code)`）。
-- 实现约束（t 语言）：无 `str_find`→自实现子串查找（`str_at` 返回 i64 字符码）；无 JSON 解析器→表内嵌为 t 数据（用 `add_kw/add_bi/add_dv` builder，无结构体字面量）；无 slice 重赋值；`str_slice(s,i64,i64)`、`file_read_all`/`file_write_all` 可用；`cat3` 等内建仅在被多处使用时才发射（totter 改用 StringBuilder 拼接避免依赖）。
-- 验证（等价性）：`gen/tote.tc` 与 `src/tote.tc` 仅差标记注释文字 → `gen/tote.exe` 经 `difftest` 对稳定 tote **15/15 逐字节一致**（5 样例 × lex/check/emit-c）；`gen/tote.exe run --example hello` 输出 "Hello, t language!"；`gen/tote.exe` 能自举重编译 `src/totter.tc`。
-- 构建链：`build/totter/tote.exe` = 稳定 tote 编译 totter.tc 产物（注 `_build_one.mjs` 的 /Fe 硬编码为 tote.exe，故产物在 build/<dir>/tote.exe，不是 totter.exe）；`gen/tote.tc` / `build/gentote/tote.exe` = totter 生成并构建的 tote。
-- 设计取舍：totter 仅「数据驱动生成」数据表区间，引擎（parser/checker/codegen）沿用 tote 现有代码（标记区间外），保证行为等价。后续可扩 `GEN:ast` 等区间，或让 totter 也生成引擎模板。
-- **截止 M18 续2**：已加第 5 张表 `GEN:annotations`（`init_anndefs` 由 4 列数据表生成 34 个 `ad()` 注册 + auto_convert 弃用块，用 `anndef_find` 通用写法）。totter 现内嵌 5 表（关键字 33 / 内建 15 组 / @derive 9 trait / 诊断码 10 / 注解 34），`gen/tote.exe` 经 difftest 对稳定 tote **15/15 逐字节一致**（含注解诊断 validValues 列表逐字节一致），已提升为 canonical `build/tote/tote.exe`。机制充分证明可横向铺开。下一步候选：`GEN:ast`（AST 节点表）、或让 totter 生成引擎模板。
+### AST 层（M20 Phase B 地基 + M21 Phase A 构造器 ✅）
+- `reference.md` §2.9 `NodeTable ::` 块内 65 条 `// @node <name> [slot=type ...]`，槽标注已全量补齐（60 有槽 / 5 无槽：break、continue、flag_set、null、variant）。槽类型映射：sa/sb/sc→str、has_*→has、ia/ib→int、ba/bb→bool、na..nd→node、la..lc→list。
+- `Node` 是**固定通用槽结构**：`sa/sb/sc` 字符串槽（`has_s*` 表 null）、`na/nb/nc/nd` 子节点索引（-1=null）、`ia/ib` 整型载荷、`la/lb/lc` 列表头（-1 空、-2 null）、`ba/bb` 布尔、`ln/cl/tv` 位置锚点。
+- `GEN:ast` 区间含：`Node` 结构 + `nodes`/`Child`/`kids` 池 + `node_new` + `node_at` + 节点注册表（`node_kind_names`/`init_node_kinds`/`is_node_kind`）+ **65 个 `mk_<kind>` 构造器**；`main` 在 `init_keywords()` 后调 `init_node_kinds()`（区外胶水）。
+- 构造器约定：`mk_<kind>(槽参数按 Node 字段序…, ti: i64) -> i64`；`ti < 0` 跳过 `node_at`；槽取该 kind 所有调用点的**并集**，未设槽填 `node_new` 默认值 → 零行为差异。totter 侧靠 `nd_slots` 表 + `slot_count/slot_at/slot_ty` 发射。
+- 迁移成果：手写 `node_new` **61 处 → 1 处**（分布：GEN:ast 65、GEN:parser_rules 19、手写仅 `P` 一处）。手写 `mk_scalar` 已删（并入生成器），`mk_bin`/`mk_un` 降级为转调 `mk_binary`/`mk_unary` 的薄包装。
+- **⚠️ 节点索引漂移铁律**：槽赋值表达式内若含子节点分配调用、且该调用在父 `node_new` 之后，改写 `mk_X(...)` 会提前分配子节点 → 索引漂移 → AST 变化。仅 `node_new("P")`（与 `named` 交错分配后回填 `pn2.na`）命中，永久保留手写。
+
+### 踩坑铁律
+- **GEN 标记名不得是其他标记的前缀**（`GEN:parser` 曾误命中 `GEN:parser_dispatch`）。
+- 表驱 `kw_lookup` 必须在任何 `tokenize()` **之前** init；统一在 `main()` 入口调一次。
+- `gen_ebnf.mjs` 收集规则时 `cur.raw` 只存 code（注释被 `splitCodeComment` 剥掉）；纯注释表（如 `@node`）须读 `cur.rawFull`。
+- totter JSON 导航：成员节点 `.child` 指向**值节点**；数组元素 = `jnodes[值节点].child` 起 `.sib` 链。
+- OPKIND 表须与 lexer 实际 token 对齐（`~`→`BitNot` 而非 `Tilde`）。
+- 新增 DSL 能力后，等价性用 **AST/LLVM IR 逐字节 diff** 兜底，比 difftest 更早暴露节点位置漂移。tote 无 `ast` 子命令，最灵敏的兜底是「对 `gen/tote.tc` 自身 emit-ll 逐字节 diff」（2.4MB IR，任何索引漂移必现）。
+- exe 的 md5 差异属 clang 链接器时间戳/路径，**不代表功能差异**；不动点判定一律以 IR 逐字节为准。
+
+## 技术债 / 后续候选
+1. **GEN:ast Phase C**：把 `mk_*` 调用点纳入 `parser_rules` 文法生成；或用 §2.9 槽定义反向驱动 `Node` 结构体字段生成
+2. §7.2 CSV/JSON CTFE 编译期导入
+3. `@soa` 布局变换、脱离 arena 的通用内存管理
+4. 修既有限制：lld-link subsystem、LLVM `int_to_str`、数组字面量类型推导
+5. 优化后端

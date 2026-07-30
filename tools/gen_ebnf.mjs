@@ -134,13 +134,15 @@ while ((bm = blockRe.exec(md)) !== null) {
     const h = sline.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*:/);
     // 头行：行首（可缩进）是 标识符 + 冒号，且该冒号前不是引号内容
     if (h && !sline.trim().startsWith('"')) {
-      cur = { name: h[1], raw: '', sectionSt: secSt, headSt: lineSt, lineSts: [] };
+      cur = { name: h[1], raw: '', rawFull: '', sectionSt: secSt, headSt: lineSt, lineSts: [] };
       cur.lineSts.push({ start: 0, end: sline.length + 1, st: lineSt });
       cur.raw = sline + '\n';
+      cur.rawFull = line + '\n';
       rules.push(cur);
     } else if (cur) {
       cur.lineSts.push({ start: cur.raw.length, end: cur.raw.length + sline.length + 1, st: lineSt });
       cur.raw += sline + '\n';
+      cur.rawFull += line + '\n';
     }
   }
 }
@@ -220,9 +222,9 @@ function parseRecord(s) {
   return out;
 }
 
-const TABLE_RULES = ['Keyword', 'BuiltinTable', 'DeriveTraitTable', 'DiagnosticTable', 'AnnotationTable'];
+const TABLE_RULES = ['Keyword', 'BuiltinTable', 'DeriveTraitTable', 'DiagnosticTable', 'AnnotationTable', 'NodeTable'];
 
-const tables = { keywords: [], builtins: [], derives: [], diagnostics: [], annotations: [] };
+const tables = { keywords: [], builtins: [], derives: [], diagnostics: [], annotations: [], nodes: [] };
 const dispatches = {};
 
 for (const r of rules) {
@@ -266,6 +268,19 @@ for (const r of rules) {
         });
       }
     }
+  } else if (r.name === 'NodeTable') {
+    // 解析 `// @node <name> [slot=type ...]` 注释行（行内代码为空，全部在注释中，故读 rawFull）。
+    for (const line of r.rawFull.split('\n')) {
+      const { comment } = splitCodeComment(line);
+      const m = comment.match(/^@node\s+([A-Za-z_]\w*)\s*(.*)$/);
+      if (!m) continue;
+      const name = m[1];
+      const slots = [];
+      const slotRe = /([A-Za-z_]\w*)=([A-Za-z_]\w*)/g;
+      let sm;
+      while ((sm = slotRe.exec(m[2])) !== null) slots.push({ slot: sm[1], type: sm[2] });
+      tables.nodes.push({ name, slots });
+    }
   } else if (r.name.endsWith('Dispatch')) {
     const key = r.name.slice(0, -'Dispatch'.length);
     dispatches[key] = [];
@@ -304,7 +319,219 @@ try {
   console.warn('gen_ebnf: 未找到 src/xid_ranges.json，请先运行 tools/gen_xid.mjs');
 }
 
-const out = { ...tables, rules: structural, dispatches, xid_start: xid.xid_start, xid_continue: xid.xid_cont };
+// ───────────── Parser grammar（数据驱动生成，M19）─────────────
+// 解析 reference.md 的 `// @rule` 文法块，把每条规则的 body 解析成结构化 EBNF 树，
+// 并计算每个节点的 FIRST(token-kind) 集合，存入 ebnf.json 的 `grammar` 段。
+// totter 读取该段，发射 `parse_<rule>` 递归下降函数（模仿手写 parser 风格）。
+
+const PUNCT = {
+  '{': 'LBrace', '}': 'RBrace', '(': 'LParen', ')': 'RParen', ';': 'Semicolon',
+  ',': 'Comma', ':': 'Colon', '::': 'DoubleColon', '[': 'LBracket', ']': 'RBracket',
+  '@': 'At', '#': 'Hash', '?': 'Question', '<': 'LAngle', '>': 'RAngle', '.': 'Dot',
+  '*': 'Star', '&': 'Amp', '|': 'Pipe', '+': 'Plus', '-': 'Minus', '/': 'Slash',
+  '%': 'Percent', '=': 'Assign', '->': 'Arrow', '<=': 'Le', '>=': 'Ge', '==': 'Eq',
+  '!=': 'Ne', '!': 'Bang', '~': 'Tilde',
+};
+const _kwMap = {};
+for (const k of tables.keywords) _kwMap[k.text] = k.kind;
+// 表达式运算符字面量 → 真实 token kind（覆盖 PUNCT 的结构映射；结构文法不使用这些字符）
+// 含二元塔运算符与一元前缀运算符（!/-/~）。
+const OPKIND = {
+  '||': 'Or', '&&': 'And', '|': 'BitOr', '^': 'BitXor', '&': 'BitAnd',
+  '==': 'Eq', '!=': 'NotEq', '<': 'Lt', '>': 'Gt', '<=': 'LtEq', '>=': 'GtEq',
+  '<<': 'ShiftLeft', '>>': 'ShiftRight', '+': 'Plus', '-': 'Minus', '*': 'Star',
+  '/': 'Slash', '%': 'Percent', '!': 'Not', '~': 'BitNot',
+};
+function kindOfLit(v) {
+  if (OPKIND[v]) return OPKIND[v];
+  if (_kwMap[v]) return _kwMap[v];
+  if (PUNCT[v]) return PUNCT[v];
+  return '???';
+}
+// body 非终结符 → parse_* 调用名（未列出的默认 parse_<name>）
+const NT_CALL = { type: 'parse_type', anns: 'parse_annotations', case: 'parse_case' };
+// 外部非终结符的 FIRST（未生成的既有函数）
+const EXT_FIRST = { anns: ['At'], type: [] };
+
+function tokenizeBody(s) {
+  const toks = [];
+  let i = 0;
+  while (i < s.length) {
+    const c = s[i];
+    if (c === ' ' || c === '\t') { i++; continue; }
+    if (c === '"') {
+      let j = i + 1, str = '';
+      while (j < s.length && s[j] !== '"') { str += s[j]; j++; }
+      toks.push({ t: 'lit', v: str }); i = j + 1; continue;
+    }
+    if (c === '(' || c === ')' || c === '|' || c === '?' || c === '*' || c === '+') {
+      toks.push({ t: c }); i++; continue;
+    }
+    let j = i, str = '';
+    while (j < s.length && /[A-Za-z0-9_]/.test(s[j])) { str += s[j]; j++; }
+    if (str) { toks.push({ t: 'id', v: str }); i = j; continue; }
+    i++;
+  }
+  return toks;
+}
+
+function parseEbnf(toks) {
+  let p = 0;
+  const peek = () => toks[p];
+  function parseAlt() {
+    const kids = [parseSeq()];
+    while (peek() && peek().t === '|') { p++; kids.push(parseSeq()); }
+    return kids.length === 1 ? kids[0] : { k: 'alt', kids };
+  }
+  function parseSeq() {
+    const kids = [];
+    while (peek() && peek().t !== '|' && peek().t !== ')') kids.push(parsePost());
+    return kids.length === 1 ? kids[0] : { k: 'seq', kids };
+  }
+  function parsePost() {
+    let node = parsePrimary();
+    while (peek() && (peek().t === '?' || peek().t === '*' || peek().t === '+')) {
+      const op = peek().t; p++;
+      node = { k: op === '?' ? 'opt' : op === '*' ? 'star' : 'plus', kid: node };
+    }
+    return node;
+  }
+  function parsePrimary() {
+    const tk = peek();
+    if (!tk) return { k: 'empty' };
+    if (tk.t === '(') { p++; const node = parseAlt(); if (peek() && peek().t === ')') p++; return { k: 'group', kid: node }; }
+    if (tk.t === 'lit') { p++; return { k: 'lit', v: tk.v }; }
+    if (tk.t === 'id') {
+      p++;
+      if (tk.v === 'Ident') return { k: 'id' };
+      if (tk.v === 'Integer') return { k: 'int' };
+      if (tk.v === 'Float' || tk.v === 'String') return { k: 'tok', v: tk.v }; // 命名终端：token kind 直接引用
+      return { k: 'nt', v: tk.v };
+    }
+    p++; return { k: 'empty' };
+  }
+  return parseAlt();
+}
+
+function computeGrammar(rules) {
+  const ruleFirst = {};
+  for (const r of rules) ruleFirst[r.name] = [];
+  const ruleTree = {};
+  for (const r of rules) ruleTree[r.name] = parseEbnf(tokenizeBody(r.body));
+
+  function firstOf(node) {
+    if (node._first) return node._first;
+    const f = [];
+    const set = (arr) => { for (const x of arr) if (!f.includes(x)) f.push(x); };
+    switch (node.k) {
+      case 'lit': node.kind = kindOfLit(node.v); set([node.kind]); break;
+      case 'id': set(['Identifier']); break;
+      case 'int': set(['Integer']); break;
+      case 'tok': node.kind = node.v; set([node.v]); break;
+      case 'nt': {
+        const nm = node.v;
+        node.call = NT_CALL[nm] || ('parse_' + nm);
+        if (ruleFirst[nm] && ruleFirst[nm].length) set(ruleFirst[nm]);
+        else if (EXT_FIRST[nm]) set(EXT_FIRST[nm]);
+        break;
+      }
+      case 'group': case 'opt': case 'star': case 'plus': set(firstOf(node.kid)); break;
+      case 'seq': {
+        // 完整递归标注所有子节点（确保 call/kind/first 都被计算），返回值再按 nullable 截断
+        for (const kid of node.kids) firstOf(kid);
+        const f2 = [];
+        const add = (a) => { for (const x of a) if (!f2.includes(x)) f2.push(x); };
+        for (const kid of node.kids) {
+          add(firstOf(kid));
+          if (!nullable(kid)) break;
+        }
+        for (const x of f2) if (!f.includes(x)) f.push(x);
+        break;
+      }
+      case 'alt': for (const kid of node.kids) set(firstOf(kid)); break;
+      case 'empty': break;
+    }
+    node._first = f;
+    return f;
+  }
+  function nullable(node) {
+    if (node._null !== undefined) return node._null;
+    let n = false;
+    switch (node.k) {
+      case 'lit': case 'id': case 'int': case 'tok': n = false; break;
+      case 'nt': n = !!(ruleFirst[node.v] && ruleFirst[node.v].length === 0 && EXT_FIRST[node.v] && EXT_FIRST[node.v].length === 0); break;
+      case 'opt': case 'star': n = true; break;
+      case 'plus': n = false; break;
+      case 'group': n = nullable(node.kid); break;
+      case 'seq': n = node.kids.every(nullable); break;
+      case 'alt': n = node.kids.some(nullable); break;
+      case 'empty': n = true; break;
+    }
+    node._null = n;
+    return n;
+  }
+
+  let changed = true, it = 0;
+  while (changed && it < 30) {
+    changed = false; it++;
+    for (const r of rules) {
+      const f = firstOf(ruleTree[r.name]);
+      if (JSON.stringify(f) !== JSON.stringify(ruleFirst[r.name])) { ruleFirst[r.name] = f; changed = true; }
+    }
+  }
+  // 定点收敛后，用最终 ruleFirst 重算所有节点的 first（清除早期缓存的陈旧值）
+  function clearCache(node) {
+    if (!node) return;
+    node._first = undefined;
+    if (node.kids) node.kids.forEach(clearCache);
+    if (node.kid) clearCache(node.kid);
+  }
+  for (const r of rules) clearCache(ruleTree[r.name]);
+  for (const r of rules) firstOf(ruleTree[r.name]);
+  for (const r of rules) r.tree = serialize(ruleTree[r.name]);
+  return rules;
+}
+
+function serialize(node) {
+  if (!node) return node;
+  const o = { k: node.k };
+  if (node.v !== undefined) o.v = node.v;
+  if (node.kind !== undefined) o.kind = node.kind;
+  if (node.call !== undefined) o.call = node.call;
+  if (node._first) o.first = node._first;
+  if (node.kids) o.kids = node.kids.map(serialize);
+  if (node.kid) o.kid = serialize(node.kid);
+  return o;
+}
+
+function parseParserGrammar(md) {
+  const out = [];
+  const re = /\/\/\s*@rule\s+(\w+)\s+params=\(([^)]*)\)\s+ret=(\w+)\s+node=(\w+)\s+eatFirst=(\w+)(?:\s+fold=(\w+))?/g;
+  let m;
+  while ((m = re.exec(md)) !== null) {
+    const name = m[1], params = m[2].trim(), ret = m[3], node = m[4], eatFirst = m[5] === 'true';
+    const after = md.slice(m.index);
+    const brm = after.match(new RegExp('^[\\t ]*' + name + '[\\t ]*::[\\t ]*(.*)$', 'm'));
+    const body = brm ? brm[1].trim() : '';
+    let construct = [];
+    if (brm) {
+      const rest = md.slice(m.index + brm.index + brm[0].length);
+      const cb = rest.match(/\{([\s\S]*?)\}/);
+      if (cb) for (const line of cb[1].split('\n')) {
+        const t = line.trim(); if (!t) continue;
+        const eq = t.indexOf('='); if (eq < 0) continue;
+        construct.push({ field: t.slice(0, eq).trim(), expr: t.slice(eq + 1).trim() });
+      }
+    }
+    out.push({ name, params, ret, node, eatFirst, fold: m[6] || '', body, construct });
+  }
+  return out;
+}
+
+let grammar = parseParserGrammar(md);
+if (grammar.length) grammar = computeGrammar(grammar);
+
+const out = { ...tables, rules: structural, dispatches, grammar, xid_start: xid.xid_start, xid_continue: xid.xid_cont };
 fs.writeFileSync(OUT, JSON.stringify(out, null, 2) + '\n');
 
 // 诊断输出
@@ -314,7 +541,9 @@ const counts = {
   derives: tables.derives.length,
   diagnostics: tables.diagnostics.length,
   annotations: tables.annotations.length,
+  nodes: tables.nodes.length,
   rules: structural.length,
+  grammar: grammar.length,
   dispatchTables: Object.keys(dispatches).length,
   xid_start: (xid.xid_start || []).length,
   xid_continue: (xid.xid_cont || []).length,
@@ -326,5 +555,10 @@ for (const r of structural) for (const a of r.alts) if (a.status) altAnnotated++
 
 console.log('gen_ebnf: wrote', OUT);
 console.log('gen_ebnf: table counts =', JSON.stringify(counts));
+if (grammar.length) {
+  for (const r of grammar) {
+    console.log('  grammar', r.name, '| params=(' + r.params + ') node=' + r.node + ' eatFirst=' + r.eatFirst + ' | tree=', JSON.stringify(r.tree));
+  }
+}
 console.log('gen_ebnf: rule status =', JSON.stringify(statusCounts), '| alt-level annotations =', altAnnotated);
 console.log('gen_ebnf: dispatches =', JSON.stringify(dispatches, null, 2));

@@ -40,7 +40,7 @@ struct TArena {
 TArena* t_arena_new(void) {
     TArena* a = (TArena*)malloc(sizeof(TArena));
     if (!a) t_fatal("arena: malloc failed");
-    a->size = 64 * 1024 * 1024; // 64 MB 一次性批处理足够
+    a->size = 512 * 1024 * 1024; // 512 MB：自举编译 12k+ 行（含 XID 表）需要更大 arena
     a->base = (uint8_t*)malloc(a->size);
     if (!a->base) t_fatal("arena: base malloc failed");
     a->used = 0;
