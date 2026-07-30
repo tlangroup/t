@@ -506,7 +506,7 @@ function serialize(node) {
 
 function parseParserGrammar(md) {
   const out = [];
-  const re = /\/\/\s*@rule\s+(\w+)\s+params=\(([^)]*)\)\s+ret=(\w+)\s+node=(\w+)\s+eatFirst=(\w+)(?:\s+fold=(\w+))?/g;
+  const re = /\/\/\s*@rule\s+(\w+)\s+params=\(([^)]*)\)\s+ret=(\w+)\s+node=(\w+)\s+eatFirst=(\w+)(?:\s+fold=(\w+))?(?:\s+mk=(\w+))?/g;
   let m;
   while ((m = re.exec(md)) !== null) {
     const name = m[1], params = m[2].trim(), ret = m[3], node = m[4], eatFirst = m[5] === 'true';
@@ -523,7 +523,7 @@ function parseParserGrammar(md) {
         construct.push({ field: t.slice(0, eq).trim(), expr: t.slice(eq + 1).trim() });
       }
     }
-    out.push({ name, params, ret, node, eatFirst, fold: m[6] || '', body, construct });
+    out.push({ name, params, ret, node, eatFirst, fold: m[6] || '', mk: m[7] || '', body, construct });
   }
   return out;
 }

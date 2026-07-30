@@ -55,6 +55,7 @@ var gp_ret: []string;       // 返回类型
 var gp_node: []string;      // 构造的 AST 节点种类（空表示无）
 var gp_eat: []string;       // "true" 表示先 advance_i() 吃掉分发表匹配的关键字
 var gp_fold: []string;      // 规则生成模式："bin" = 左折叠二元运算塔，"" = 普通节点构造
+var gp_mk: []string;        // "inline" = 构造块退回内联 node_new（槽表达式会分配节点时必需）
 var gp_tree: []i64;         // grammar 结构化 EBNF 树（JSON 节点）
 var gp_construct: []i64;    // 节点构造块数组（JSON 节点）
 var gp_sb: StringBuilder;   // 生成时的全局 StringBuilder
@@ -384,6 +385,7 @@ load_grammar :: func(root: i64) -> void {
         var nd: string = jstr(el, "node");
         var et: string = jstr(el, "eatFirst");
         var fo: string = jstr(el, "fold");
+        var mkm: string = jstr(el, "mk");
         var tr: i64 = jchild(el, "tree");
         var cn: i64 = jchild(el, "construct");
         append(gp_name, nm);
@@ -392,6 +394,7 @@ load_grammar :: func(root: i64) -> void {
         append(gp_node, nd);
         append(gp_eat, et);
         append(gp_fold, fo);
+        append(gp_mk, mkm);
         append(gp_tree, tr);
         append(gp_construct, cn);
         el = jnodes[el].sib;
@@ -516,6 +519,118 @@ split_params :: func(plist: string) -> []string {
     return out;
 }
 
+// ── mk_<kind>(...) 构造器调用发射 ─────────────────────────────────────
+// fields / exprs 是换行分隔的并行列表（槽名 → 赋值表达式）；§2.9 声明了但未列出的
+// 槽自动填 node_new 的初值，因此与「node_new + 逐槽赋值 + slice_set」逐字节等价。
+// ⚠ 铁律：仅当所有 expr 都不分配新节点时才可用。函数实参先于 node_new 求值，
+//   若某 expr 内部分配子节点，子节点索引会挪到父节点之前 → AST 漂移。
+
+nl_count :: func(s: string) -> i64 {
+    var n: i64 = str_len(s) as i64;
+    if (n == 0) { return 0; }
+    var c: i64 = 1;
+    var i: i64 = 0;
+    while (i < n) {
+        if (str_at(s, i) == 10) { c = c + 1; }
+        i = i + 1;
+    }
+    return c;
+}
+
+nl_at :: func(s: string, k: i64) -> string {
+    var n: i64 = str_len(s) as i64;
+    var start: i64 = 0;
+    var idx: i64 = 0;
+    var i: i64 = 0;
+    while (i <= n) {
+        var isend: bool = false;
+        if (i == n) {
+            isend = true;
+        } else {
+            if (str_at(s, i) == 10) { isend = true; }
+        }
+        if (isend) {
+            if (idx == k) { return str_slice(s, start, i); }
+            idx = idx + 1;
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+nl_find :: func(s: string, item: string) -> i64 {
+    var c: i64 = nl_count(s);
+    var i: i64 = 0;
+    while (i < c) {
+        if (nl_at(s, i) == item) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// 槽在 node_new 里的初值——未显式赋值的参数一律填它。
+slot_default :: func(s: string) -> string {
+    if (s == "sa" || s == "sb" || s == "sc") { return "\"\""; }
+    if (s == "has_sa" || s == "has_sb" || s == "has_sc") { return "true"; }
+    if (s == "ba" || s == "bb") { return "false"; }
+    return "-1";
+}
+
+nd_slots_of :: func(kind: string) -> string {
+    var i: i64 = 0;
+    while (i < slice_len(nd_name) as i64) {
+        if (nd_name[i] == kind) { return nd_slots[i]; }
+        i = i + 1;
+    }
+    return "";
+}
+
+// 发射 `<indent><lhs>mk_<kind>(槽…, ti);`；ti 传 "-1" 表示不打 anchor。
+emit_mk_call :: func(indent: string, lhs: string, kind: string, fields: string, exprs: string, ti: string) -> void {
+    var sl: string = nd_slots_of(kind);
+    var cnt: i64 = slot_count(sl);
+    // 校验：construct 用到表外槽说明 §2.9 标注漏了，发射非法 token 让编译立刻失败
+    var fc: i64 = nl_count(fields);
+    var f: i64 = 0;
+    while (f < fc) {
+        var fname: string = nl_at(fields, f);
+        var hit: i64 = -1;
+        var q: i64 = 0;
+        while (q < cnt) {
+            if (slot_at(sl, q) == fname) { hit = q; }
+            q = q + 1;
+        }
+        if (hit < 0) {
+            sb_append_str(gp_sb, "!!! undeclared slot ");
+            sb_append_str(gp_sb, fname);
+            sb_append_str(gp_sb, " on node ");
+            sb_append_str(gp_sb, kind);
+            sb_append_str(gp_sb, " -- fix reference.md 2.9\n");
+        }
+        f = f + 1;
+    }
+    sb_append_str(gp_sb, indent);
+    sb_append_str(gp_sb, lhs);
+    sb_append_str(gp_sb, "mk_");
+    sb_append_str(gp_sb, kind);
+    sb_append_str(gp_sb, "(");
+    var k: i64 = 0;
+    while (k < cnt) {
+        var pn: string = slot_at(sl, k);
+        var fi: i64 = nl_find(fields, pn);
+        if (fi < 0) {
+            sb_append_str(gp_sb, slot_default(pn));
+        } else {
+            sb_append_str(gp_sb, nl_at(exprs, fi));
+        }
+        sb_append_str(gp_sb, ", ");
+        k = k + 1;
+    }
+    sb_append_str(gp_sb, ti);
+    sb_append_str(gp_sb, ");\n");
+}
+
 // ── 语句体专用 fold 发射器（骨架与手写 parse_* 逐字节等价，含 node_at 守卫）──
 
 // fold=whilex：纯序列 while "(" expr ")" block
@@ -529,12 +644,7 @@ emit_whilex :: func(idx: i64) -> void {
     sb_append_str(gp_sb, "    var cond: i64 = parse_expr();\n");
     sb_append_str(gp_sb, "    expect_tok(\"RParen\");\n");
     sb_append_str(gp_sb, "    var body: i64 = parse_block();\n");
-    sb_append_str(gp_sb, "    var id: i64 = node_new(\"while\");\n");
-    sb_append_str(gp_sb, "    var n: Node = nodes[id];\n");
-    sb_append_str(gp_sb, "    n.na = cond;\n");
-    sb_append_str(gp_sb, "    n.la = body;\n");
-    sb_append_str(gp_sb, "    slice_set(nodes, id, n);\n");
-    sb_append_str(gp_sb, "    node_at(id, ti);\n");
+    emit_mk_call("    ", "var id: i64 = ", "while", "na\nla", "cond\nbody", "ti");
     sb_append_str(gp_sb, "    return id;\n");
     sb_append_str(gp_sb, "}\n\n");
 }
@@ -551,11 +661,7 @@ emit_returnx :: func(idx: i64) -> void {
     sb_append_str(gp_sb, "        val = parse_expr();\n");
     sb_append_str(gp_sb, "    }\n");
     sb_append_str(gp_sb, "    expect_tok(\"Semicolon\");\n");
-    sb_append_str(gp_sb, "    var id: i64 = node_new(\"return\");\n");
-    sb_append_str(gp_sb, "    var n: Node = nodes[id];\n");
-    sb_append_str(gp_sb, "    n.na = val;\n");
-    sb_append_str(gp_sb, "    slice_set(nodes, id, n);\n");
-    sb_append_str(gp_sb, "    node_at(id, ti);\n");
+    emit_mk_call("    ", "var id: i64 = ", "return", "na", "val", "ti");
     sb_append_str(gp_sb, "    return id;\n");
     sb_append_str(gp_sb, "}\n\n");
 }
@@ -583,13 +689,7 @@ emit_ifx :: func(idx: i64) -> void {
     sb_append_str(gp_sb, "            else_head = parse_block();\n");
     sb_append_str(gp_sb, "        }\n");
     sb_append_str(gp_sb, "    }\n");
-    sb_append_str(gp_sb, "    var id: i64 = node_new(\"if\");\n");
-    sb_append_str(gp_sb, "    var n: Node = nodes[id];\n");
-    sb_append_str(gp_sb, "    n.na = cond;\n");
-    sb_append_str(gp_sb, "    n.la = then_head;\n");
-    sb_append_str(gp_sb, "    n.lb = else_head;\n");
-    sb_append_str(gp_sb, "    slice_set(nodes, id, n);\n");
-    sb_append_str(gp_sb, "    node_at(id, ti);\n");
+    emit_mk_call("    ", "var id: i64 = ", "if", "na\nla\nlb", "cond\nthen_head\nelse_head", "ti");
     sb_append_str(gp_sb, "    return id;\n");
     sb_append_str(gp_sb, "}\n\n");
 }
@@ -610,13 +710,7 @@ emit_forx :: func(idx: i64) -> void {
     sb_append_str(gp_sb, "        var iterable: i64 = parse_expr();\n");
     sb_append_str(gp_sb, "        expect_tok(\"RParen\");\n");
     sb_append_str(gp_sb, "        var body: i64 = parse_block();\n");
-    sb_append_str(gp_sb, "        var id: i64 = node_new(\"for_each\");\n");
-    sb_append_str(gp_sb, "        var n: Node = nodes[id];\n");
-    sb_append_str(gp_sb, "        n.sa = vname;\n");
-    sb_append_str(gp_sb, "        n.na = iterable;\n");
-    sb_append_str(gp_sb, "        n.la = body;\n");
-    sb_append_str(gp_sb, "        slice_set(nodes, id, n);\n");
-    sb_append_str(gp_sb, "        node_at(id, ti);\n");
+    emit_mk_call("        ", "var id: i64 = ", "for_each", "sa\nna\nla", "vname\niterable\nbody", "ti");
     sb_append_str(gp_sb, "        return id;\n");
     sb_append_str(gp_sb, "    }\n");
     sb_append_str(gp_sb, "    var init: i64 = -1;\n");
@@ -629,10 +723,7 @@ emit_forx :: func(idx: i64) -> void {
     sb_append_str(gp_sb, "        } else {\n");
     sb_append_str(gp_sb, "            var e: i64 = parse_expr();\n");
     sb_append_str(gp_sb, "            expect_tok(\"Semicolon\");\n");
-    sb_append_str(gp_sb, "            init = node_new(\"expr\");\n");
-    sb_append_str(gp_sb, "            var en: Node = nodes[init];\n");
-    sb_append_str(gp_sb, "            en.na = e;\n");
-    sb_append_str(gp_sb, "            slice_set(nodes, init, en);\n");
+    emit_mk_call("            ", "init = ", "expr", "na", "e", "-1");
     sb_append_str(gp_sb, "        }}\n");
     sb_append_str(gp_sb, "    } else {\n");
     sb_append_str(gp_sb, "        advance_i();\n");
@@ -648,14 +739,7 @@ emit_forx :: func(idx: i64) -> void {
     sb_append_str(gp_sb, "    }\n");
     sb_append_str(gp_sb, "    expect_tok(\"RParen\");\n");
     sb_append_str(gp_sb, "    var body2: i64 = parse_block();\n");
-    sb_append_str(gp_sb, "    var id2: i64 = node_new(\"for\");\n");
-    sb_append_str(gp_sb, "    var n2: Node = nodes[id2];\n");
-    sb_append_str(gp_sb, "    n2.na = init;\n");
-    sb_append_str(gp_sb, "    n2.nb = cond;\n");
-    sb_append_str(gp_sb, "    n2.nc = upd;\n");
-    sb_append_str(gp_sb, "    n2.la = body2;\n");
-    sb_append_str(gp_sb, "    slice_set(nodes, id2, n2);\n");
-    sb_append_str(gp_sb, "    node_at(id2, ti);\n");
+    emit_mk_call("    ", "var id2: i64 = ", "for", "na\nnb\nnc\nla", "init\ncond\nupd\nbody2", "ti");
     sb_append_str(gp_sb, "    return id2;\n");
     sb_append_str(gp_sb, "}\n\n");
 }
@@ -691,11 +775,7 @@ emit_swx :: func(idx: i64) -> void {
     sb_append_str(gp_sb, "                    }\n");
     sb_append_str(gp_sb, "                }\n");
     sb_append_str(gp_sb, "            }\n");
-    sb_append_str(gp_sb, "            var cid: i64 = node_new(\"CS\");\n");
-    sb_append_str(gp_sb, "            var cn: Node = nodes[cid];\n");
-    sb_append_str(gp_sb, "            cn.na = pat;\n");
-    sb_append_str(gp_sb, "            cn.la = bh;\n");
-    sb_append_str(gp_sb, "            slice_set(nodes, cid, cn);\n");
+    emit_mk_call("            ", "var cid: i64 = ", "CS", "na\nla", "pat\nbh", "-1");
     sb_append_str(gp_sb, "            cases_tail = list_push(cases_head, cases_tail, cid);\n");
     sb_append_str(gp_sb, "            if (cases_head < 0) {\n");
     sb_append_str(gp_sb, "                cases_head = cases_tail;\n");
@@ -722,13 +802,7 @@ emit_swx :: func(idx: i64) -> void {
     sb_append_str(gp_sb, "        }}\n");
     sb_append_str(gp_sb, "    }\n");
     sb_append_str(gp_sb, "    expect_tok(\"RBrace\");\n");
-    sb_append_str(gp_sb, "    var id: i64 = node_new(\"switch\");\n");
-    sb_append_str(gp_sb, "    var n: Node = nodes[id];\n");
-    sb_append_str(gp_sb, "    n.na = e;\n");
-    sb_append_str(gp_sb, "    n.la = cases_head;\n");
-    sb_append_str(gp_sb, "    n.lb = default_head;\n");
-    sb_append_str(gp_sb, "    slice_set(nodes, id, n);\n");
-    sb_append_str(gp_sb, "    node_at(id, ti);\n");
+    emit_mk_call("    ", "var id: i64 = ", "switch", "na\nla\nlb", "e\ncases_head\ndefault_head", "ti");
     sb_append_str(gp_sb, "    return id;\n");
     sb_append_str(gp_sb, "}\n\n");
 }
@@ -762,20 +836,42 @@ emit_rule :: func(idx: i64) -> void {
     emit_node(tree, "decl");
 
     if (node != "") {
-        sb_append_str(gp_sb, "    var __id: i64 = node_new(\""); sb_append_str(gp_sb, node);
-        sb_append_str(gp_sb, "\");\n");
-        sb_append_str(gp_sb, "    var __n: Node = nodes[__id];\n");
         var ce: i64 = -1;  // cons = construct 数组节点，child = 首元素对象
         if (cons >= 0) { ce = jnodes[cons].child; }
-        while (ce >= 0) {
-            var field: string = jstr(ce, "field");
-            var expr: string = jstr(ce, "expr");
-            sb_append_str(gp_sb, "    __n."); sb_append_str(gp_sb, field);
-            sb_append_str(gp_sb, " = "); sb_append_str(gp_sb, resolve_expr(expr));
-            sb_append_str(gp_sb, ";\n");
-            ce = jnodes[ce].sib;
+        if (gp_mk[idx] == "inline") {
+            // 槽表达式内部会分配节点，必须先 node_new 占位再逐槽赋值（详见 §2.8 mk=inline）
+            sb_append_str(gp_sb, "    var __id: i64 = node_new(\""); sb_append_str(gp_sb, node);
+            sb_append_str(gp_sb, "\");\n");
+            sb_append_str(gp_sb, "    var __n: Node = nodes[__id];\n");
+            while (ce >= 0) {
+                var field: string = jstr(ce, "field");
+                var expr: string = jstr(ce, "expr");
+                sb_append_str(gp_sb, "    __n."); sb_append_str(gp_sb, field);
+                sb_append_str(gp_sb, " = "); sb_append_str(gp_sb, resolve_expr(expr));
+                sb_append_str(gp_sb, ";\n");
+                ce = jnodes[ce].sib;
+            }
+            sb_append_str(gp_sb, "    slice_set(nodes, __id, __n);\n");
+        } else {
+            var fsb: StringBuilder = sb_new();
+            var esb: StringBuilder = sb_new();
+            var first: bool = true;
+            while (ce >= 0) {
+                var field2: string = jstr(ce, "field");
+                var expr2: string = jstr(ce, "expr");
+                if (first == false) {
+                    sb_append_str(fsb, "\n");
+                    sb_append_str(esb, "\n");
+                }
+                first = false;
+                sb_append_str(fsb, field2);
+                sb_append_str(esb, resolve_expr(expr2));
+                ce = jnodes[ce].sib;
+            }
+            var fstr: string = sb_to_str(fsb);
+            var estr: string = sb_to_str(esb);
+            emit_mk_call("    ", "var __id: i64 = ", node, fstr, estr, "-1");
         }
-        sb_append_str(gp_sb, "    slice_set(nodes, __id, __n);\n");
         sb_append_str(gp_sb, "    return __id;\n");
     }
     sb_append_str(gp_sb, "}\n\n");

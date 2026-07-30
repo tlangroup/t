@@ -258,7 +258,9 @@ DeclBodyDispatch:
 记号：
 - `// @rule <name> params=(...) ret=<T> node=<NodeKind> eatFirst=<bool>`：规则元数据。`eatFirst=true` 表示被分发表按关键字匹配后，函数先 `advance_i()` 吃掉该关键字（如 `variant`）。
 - body 为 EBNF：`A B` 序列、`A | B` 选择、`A?`/`A*`/`A+` 可选/重复、`(...)` 分组、`"X"` 字面量（映射到 token 种类）、`Ident` 标识符终端、`type`/`anns`/`case` 等非终结符（映射到 `parse_*` 调用）。
-- `{ field = expr }` 节点构造块：`field` 为 AST 节点字段；`expr` 中 `@sym` 引用 body 中符号的解析结果，`name`/`anns` 等参数名与 `list_concat(...)` 等辅助调用原样保留。
+- `{ field = expr }` 节点构造块：`field` 为 AST 节点字段；`expr` 中 `@sym` 引用 body 中符号的解析结果，`name`/`anns` 等参数名与 `list_concat(...)` 等辅助调用原样保留。构造块默认发射为 §2.9 生成的 `mk_<NodeKind>(...)` 一行调用，未在块中列出的槽自动填 `node_new` 初值。
+- `// @rule <name> ... mk=inline`：额外元数据，**关闭** `mk_<kind>(...)` 发射、退回「`node_new` + 逐槽赋值 + `slice_set`」内联形态。仅当某个 `expr` 内部会**分配新 AST 节点**时才需要：函数实参先于 `node_new` 求值，子节点索引会挪到父节点之前，导致 AST 结构漂移。目前仅 `sfield` 命中（`sfield_na` 会 `mk_scalar("void")`）。
+- ⚠ 走 `mk_` 路径时，构造块内各 `expr` 的**求值顺序会被重排为 Node 字段序**（`sa sb sc has_* ia ib ba bb na..nd la..lc`），而非书写顺序。因此块内含**有副作用**的表达式时须自查重排后语义不变。当前唯一的副作用调用是 `list_concat`（就地改写 `kids` 链），它在 `flag_decl`/`struct_decl` 重排后仍排在所有读注解链的 `bp_*`/`str_or` 之后，故安全。
 - `// @rule <name> ... fold=bin`：额外元数据，标记该规则是**左结合二元运算塔**（`base (op base)*` 形状）。生成器发射 `while (op 集合) { left = mk_bin(op, left, parse_base(), ti); }`；运算符字面量即 `mk_bin` 的 op 串（如 `"<<"`→`"<<"`、`"&&"`→`"&&"`），其 token kind 由 `tools/gen_ebnf.mjs` 的 `OPKIND` 表映射（覆盖结构标点表）。
 - `// @rule <name> ... fold=pre`：额外元数据，标记该规则是**前缀一元折叠**（`(op)* base` 形状，右结合递归）。生成器发射 `if (cur_t() in ops) { op; operand = parse_<self>(); return mk_un(op, operand, ti); } return parse_<base>();`；运算符字面量即 `mk_un` 的 op 串（如 `"!"`→`"!"`、`"-"`→`"-"`、`"~"`→`"~"`），其 token kind 由 `OPKIND` 映射（`!`→Not、`-`→Minus、`~`→BitNot）。递归目标为规则自身（允许 `!!x` 堆叠），无 op 时落到 `base`。
 - `// @rule <name> ... fold=post`：额外元数据，标记该规则是**左结合后缀折叠**（`base ( lead nt | lead nt | ... )* ( lead nt )?` 形状）。每个后缀分支 = `引导 token 字面量 + 胶水非终结符`；生成器发射 `var e = parse_base(); while (引导 token 集合) { var ti = advance_i(); e = parse_<胶水>(e, ti); }`，尾部 `( lead nt )?` 可选分支发射单次 `if`。胶水 helper（如 `post_member`/`post_index`/`post_call`/`post_cast`）为手写函数，签名 `(e: i64, ti: i64) -> i64`，负责消费引导 token 之后的剩余形态并返回折叠后的节点。`fold` 当前支持 `bin`/`pre`/`post`/`prim`/`disp` 五类通用模式，以及语句体专用的 `whilex`/`returnx`（纯序列 + node_at）/ `ifx`（if/else-if 链）/ `forx`（peek 前瞻分流两段式）/ `swx`（case/default 循环聚合）五种专用模式。
@@ -358,9 +360,11 @@ struct_decl :: anns "{" sfield* "}"
     lb = @sfield
 }
 
-// @rule sfield params=() ret=i64 node=F eatFirst=false
+// @rule sfield params=() ret=i64 node=F eatFirst=false mk=inline
 // 成员二分形态：位宽成员（@bitpack 结构体，`name: 3;`）以 Integer 开头，
 // 类型成员以其余 token 开头——FIRST 可区分，故用 alt 而非结构体级 is_bitpack 状态。
+// mk=inline：sfield_na 在位宽分支里会 mk_scalar("void") 分配节点，若走 mk_F(...) 则
+// 该实参先于 F 自身求值，void 节点索引会挪到 F 之前 → AST 漂移。故保留内联构造。
 sfield :: Ident ":" ( Integer | type ) anns ";"
 {
     sa = @Ident

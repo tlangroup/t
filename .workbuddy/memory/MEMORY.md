@@ -55,8 +55,10 @@
 - `Node` 是**固定通用槽结构**：`sa/sb/sc` 字符串槽（`has_s*` 表 null）、`na/nb/nc/nd` 子节点索引（-1=null）、`ia/ib` 整型载荷、`la/lb/lc` 列表头（-1 空、-2 null）、`ba/bb` 布尔、`ln/cl/tv` 位置锚点。
 - `GEN:ast` 区间含：`Node` 结构 + `nodes`/`Child`/`kids` 池 + `node_new` + `node_at` + 节点注册表（`node_kind_names`/`init_node_kinds`/`is_node_kind`）+ **65 个 `mk_<kind>` 构造器**；`main` 在 `init_keywords()` 后调 `init_node_kinds()`（区外胶水）。
 - 构造器约定：`mk_<kind>(槽参数按 Node 字段序…, ti: i64) -> i64`；`ti < 0` 跳过 `node_at`；槽取该 kind 所有调用点的**并集**，未设槽填 `node_new` 默认值 → 零行为差异。totter 侧靠 `nd_slots` 表 + `slot_count/slot_at/slot_ty` 发射。
-- 迁移成果：手写 `node_new` **61 处 → 1 处**（分布：GEN:ast 65、GEN:parser_rules 19、手写仅 `P` 一处）。手写 `mk_scalar` 已删（并入生成器），`mk_bin`/`mk_un` 降级为转调 `mk_binary`/`mk_unary` 的薄包装。
-- **⚠️ 节点索引漂移铁律**：槽赋值表达式内若含子节点分配调用、且该调用在父 `node_new` 之后，改写 `mk_X(...)` 会提前分配子节点 → 索引漂移 → AST 变化。仅 `node_new("P")`（与 `named` 交错分配后回填 `pn2.na`）命中，永久保留手写。
+- 迁移成果（Phase A 手写调用点 + Phase C 生成器发射）：`node_new` 全项目仅剩 **2 处非构造器调用** —— 手写 `P`、`mk=inline` 的 `F`；`mk_` 调用点 96 处。手写 `mk_scalar` 已删（并入生成器），`mk_bin`/`mk_un` 降级为转调 `mk_binary`/`mk_unary` 的薄包装。
+- **Phase C**：totter 的 `emit_mk_call(indent, lhs, kind, fields, exprs, ti)` 统一发射 `mk_` 调用（fields/exprs 为**换行分隔**并行列表，因 t 无 map 且表达式含空格）；配套 `nl_count`/`nl_at`/`nl_find`/`slot_default`/`nd_slots_of`。覆盖 5 个语句体发射器 + `emit_rule` 通用 construct 路径。
+- **⚠️ 节点索引漂移铁律**：槽赋值表达式内若含子节点分配调用，改写 `mk_X(...)` 会让实参先于 `node_new` 求值 → 子节点索引挪到父节点之前 → AST 变化。两处命中：手写 `node_new("P")`（与 `named` 交错分配后回填 `pn2.na`）；文法规则 `sfield`（`sfield_na` 会 `mk_scalar("void")`）—— 后者用 `@rule ... mk=inline` 标注关闭 mk_ 发射。
+- **⚠️ construct 块求值顺序会被重排为 Node 字段序**（非书写顺序），块内含副作用表达式时须自查。当前唯一副作用调用 `list_concat`（就地改 kids 链）在 `flag_decl`/`struct_decl` 重排后仍位于所有读注解链的 `bp_*` 之后，安全。
 
 ### 踩坑铁律
 - **GEN 标记名不得是其他标记的前缀**（`GEN:parser` 曾误命中 `GEN:parser_dispatch`）。
@@ -68,7 +70,7 @@
 - exe 的 md5 差异属 clang 链接器时间戳/路径，**不代表功能差异**；不动点判定一律以 IR 逐字节为准。
 
 ## 技术债 / 后续候选
-1. **GEN:ast Phase C**：把 `mk_*` 调用点纳入 `parser_rules` 文法生成；或用 §2.9 槽定义反向驱动 `Node` 结构体字段生成
+1. 用 §2.9 槽定义反向驱动 `Node` 结构体字段生成（目前 Node 字段仍是 `emit_ast` 里的固定文本）；typechecker 规则表；@derive 派生生成器表
 2. §7.2 CSV/JSON CTFE 编译期导入
 3. `@soa` 布局变换、脱离 arena 的通用内存管理
 4. 修既有限制：lld-link subsystem、LLVM `int_to_str`、数组字面量类型推导
