@@ -24,7 +24,7 @@
 - 字面量用等宽 `"..."` 表示关键字或标点。
 - `Ident`、`IntegerLiteral` 等非终结符首字母大写。
 - 终止符（token 类别）用小写 `ident`、`int`、`lbrace` 等表示。
-- ebnf 块内注释统一为两种形式：`//` 行注释与 `/* ... */` 块注释。状态注记（`⚠ spec-only`、`✅ tote` 等）一律写在上述注释内部，不单独成句。所有注释由 `tools/gen_ebnf.mjs` 在抽取时**统一剥离**（尊重引号，不会误删 `"//"`、`"/*"` 这类字面量），不进入机器文法 `build/ebnf.json`。注释仅供人类阅读，机器表示只需产生式本身。
+- ebnf 块内注释统一为两种形式：`//` 行注释与 `/* ... */` 块注释。状态注记（`⚠ spec-only`、`✅ tote` 等）一律写在上述注释内部，不单独成句。注释文本由 `tools/gen_ebnf.mjs` 在抽取时从产生式中**剥离**（尊重引号，不会误删 `"//"`、`"/*"` 这类字面量），但其中的状态注记会被**结构化抽取**进 `build/ebnf.json` 的 `rules` 段：每条 rule 带 `status` 字段（`"tote"` 已实现 / `"partial"` 部分实现 / `"spec-only"` 仅设计 / `"unspecified"` 未注记），规则级状态取头行注记、缺省继承最近章节标题（`##`/`###`/`####`）的注记；每个 alt 为 `{text, status?, note?}` 对象，行内注释的注记附着到对应 alt 并覆盖规则级。该字段是 rules 驱动 parser 生成的过滤依据（生成器只应消费 `tote`/`partial` 条目）。
 
 **设计铁律（来自 spec §0，所有产生式不得违反）：**
 
@@ -347,11 +347,11 @@ Statement:
     | ExpressionStatement
     | IfStatement
     | WhileStatement
-    | ForStatement                           // ⚠ spec-only 细节
-    | SwitchStatement                        // ⚠ spec-only 细节
+    | ForStatement                           // ✅ tote
+    | SwitchStatement                        // ✅ tote
     | ReturnStatement
-    | BreakStatement                         // ⚠ spec-only
-    | ContinueStatement                      // ⚠ spec-only
+    | BreakStatement                         // ✅ tote
+    | ContinueStatement                      // ✅ tote
     | Block
 
 VarDeclStatement:   "var" Ident ":" Type ("=" Expression)? ";"
@@ -375,10 +375,30 @@ IfStatement:
 
 WhileStatement:
     "while" "(" Expression ")" Block
+
+ForStatement:                                        // ✅ tote
+      "for" "(" Ident "in" Expression ")" Block      // for-each（迭代切片，元素只读拷贝）
+    | "for" "(" ForInit? ";" Expression? ";" Expression? ")" Block   // C 风格三段式
+
+ForInit:
+      VarDeclStatement                               // var/const 声明（自带分号）
+    | ConstDeclStatement
+    | Expression ";"
+
+SwitchStatement:                                     // ✅ tote
+    "switch" "(" Expression ")" "{" SwitchCase* SwitchDefault? "}"
+
+SwitchCase:
+    "case" Expression ":" Statement*
+
+SwitchDefault:
+    "default" ":" Statement*
+
+BreakStatement:    "break" ";"                       // ✅ tote
+ContinueStatement: "continue" ";"                    // ✅ tote
 ```
 
-- ✅ tote：支持 `if/else`、`while`；`for` 语法 spec 未给全，tote 当前以 `while` + 手动索引为主。
-- ⚠ `switch/case/default`、`break`、`continue` 为 spec §1.2 提及但 tote 未实装。
+- ✅ tote：`if/else`、`while`、`for`（C 风格三段式，init 支持 `var` 声明）、`switch/case/default`、`break`、`continue` 均已实装（含 LLVM 后端；见 build/lltest/stmt_probe.tc 实测）。
 
 ### 3.4 Expressions（表达式） ✅ tote（核心）
 

@@ -11,6 +11,11 @@
 //   AnnotationTable   -> "@name" { spec, targets, repl }
 //
 // 其余 ebnf 块作为结构文法（rules）一并输出，供后续生成递归下降解析器使用。
+// rules 段结构（M19 起）：
+//   { name, status, alts: [{ text, status?, note? }] }
+//   status ∈ "tote"（已实现）| "partial"（部分）| "spec-only"（仅设计）| "unspecified"
+//   规则级 status = 头行注记 > 最近章节标题注记 > "unspecified"；
+//   alt 级 status 来自行内注释注记（⚠/✅），覆盖规则级。parser 生成器只应消费 tote/partial。
 
 import fs from 'fs';
 import path from 'path';
@@ -44,47 +49,97 @@ function splitTop(s, sep) {
   return out;
 }
 
-// 去除 ebnf 行内注释，尊重引号，以免误删字面量中的 "//"（如 LineComment 的 "///" 记号）。
-// ebnf 块内的注释统一只有两种形式（均不进入机器文法，由本函数剥离）：
+// 拆分 ebnf 行为「代码 + 注释」，尊重引号，以免误删字面量中的 "//"（如 LineComment 的 "///" 记号）。
+// ebnf 块内的注释统一只有两种形式（不进入机器文法，但其中的状态注记会被结构化抽取）：
 //   - // 行注释
 //   - /* */ 块注释
-// 状态注记（⚠ spec-only / ✅ tote 等）一律写在上述注释内部，不单独成句。
-function stripEbnfComments(s) {
-  let out = '';
+// 状态注记（⚠ spec-only / ✅ tote 等）一律写在上述注释内部，不单独成句；
+// 由 parseStatusText 归一化为 rules 段的结构化 status 字段。
+function splitCodeComment(s) {
+  let code = '';
+  let comment = '';
   let q = false;
   let i = 0;
   while (i < s.length) {
     const c = s[i];
-    if (c === '"') { q = !q; out += c; i++; continue; }
-    if (!q && c === '/' && s[i + 1] === '/') break;                // // 行注释：丢弃本行剩余
+    if (c === '"') { q = !q; code += c; i++; continue; }
+    if (!q && c === '/' && s[i + 1] === '/') {                     // // 行注释：本行剩余归注释
+      comment += ' ' + s.slice(i + 2);
+      break;
+    }
     if (!q && c === '/' && s[i + 1] === '*') {                     // /* */ 块注释：跳到 */
       i += 2;
+      const st = i;
       while (i < s.length && !(s[i] === '*' && s[i + 1] === '/')) i++;
+      comment += ' ' + s.slice(st, i);
       i += 2;
       continue;
     }
-    out += c;
+    code += c;
     i++;
   }
-  return out;
+  return { code, comment: comment.trim() };
 }
 
-// 抽取所有 ebnf 块，解析为 { name, raw }
+function stripEbnfComments(s) {
+  return splitCodeComment(s).code;
+}
+
+// 状态注记归一化：
+//   ✅ tote            -> "tote"       （已实现）
+//   ✅ tote（部分）     -> "partial"    （部分实现）
+//   ⚠ spec-only ...    -> "spec-only"  （仅 spec 设计目标）
+// 返回 { status, note } 或 null（无注记）。note 保留原始注记文本供人类阅读。
+function parseStatusText(s) {
+  if (!s) return null;
+  const hasWarn = s.includes('\u26a0');   // ⚠
+  const hasOk = s.includes('\u2705');     // ✅
+  if (!hasWarn && !hasOk) return null;
+  let status;
+  if (hasWarn) status = 'spec-only';
+  else status = /部分|partial/.test(s) ? 'partial' : 'tote';
+  const note = s.trim();
+  return { status, note };
+}
+
+// 章节标题（##/###/####）中的状态注记：块内规则默认继承最近的上级章节状态。
+const headings = [];
+{
+  const hre = /^#{2,4}\s+(.*)$/gm;
+  let hm;
+  while ((hm = hre.exec(md)) !== null) headings.push({ index: hm.index, st: parseStatusText(hm[1]) });
+}
+function sectionStatusAt(idx) {
+  let best = null;
+  for (const h of headings) {
+    if (h.index < idx) best = h;
+    else break;
+  }
+  return best ? best.st : null;
+}
+
+// 抽取所有 ebnf 块，解析为 { name, raw, sectionSt, lineSts }
+// lineSts: [{ start, end, st }] — 每行代码在 raw 中的偏移区间与该行注释中的状态注记
 const rules = [];
 const blockRe = /```ebnf\s*\n([\s\S]*?)```/g;
 let bm;
 while ((bm = blockRe.exec(md)) !== null) {
   const block = bm[1];
+  const secSt = sectionStatusAt(bm.index);
   const lines = block.split('\n');
   let cur = null;
   for (const line of lines) {
-    const sline = stripEbnfComments(line);
+    const { code: sline, comment } = splitCodeComment(line);
+    const lineSt = parseStatusText(comment);
     const h = sline.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*:/);
     // 头行：行首（可缩进）是 标识符 + 冒号，且该冒号前不是引号内容
     if (h && !sline.trim().startsWith('"')) {
-      cur = { name: h[1], raw: sline + '\n' };
+      cur = { name: h[1], raw: '', sectionSt: secSt, headSt: lineSt, lineSts: [] };
+      cur.lineSts.push({ start: 0, end: sline.length + 1, st: lineSt });
+      cur.raw = sline + '\n';
       rules.push(cur);
     } else if (cur) {
+      cur.lineSts.push({ start: cur.raw.length, end: cur.raw.length + sline.length + 1, st: lineSt });
       cur.raw += sline + '\n';
     }
   }
@@ -95,6 +150,59 @@ function stripHeader(r) {
 }
 function altsOf(r) {
   return splitTop(stripHeader(r), '|').map((x) => x.trim()).filter(Boolean);
+}
+
+// 与 splitTop 同逻辑，但额外返回每段在输入中的 [start,end) 偏移，用于把 alt 映射回源行状态。
+function splitTopWithPos(s, sep) {
+  const out = [];
+  let depth = 0, q = false, cur = '', curStart = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === '"') { q = !q; cur += c; continue; }
+    if (q) { cur += c; continue; }
+    if (c === '{') depth++;
+    else if (c === '}') depth--;
+    if (depth === 0 && s.startsWith(sep, i)) {
+      out.push({ text: cur, start: curStart, end: i });
+      cur = '';
+      i += sep.length - 1;
+      curStart = i + 1;
+      continue;
+    }
+    cur += c;
+  }
+  out.push({ text: cur, start: curStart, end: s.length });
+  return out;
+}
+
+// 结构化 alt：{ text, status?, note? }。status 取该 alt 覆盖行中第一个带注记的行。
+function structuredAlts(r) {
+  const body = stripHeader(r);
+  const headerOfs = r.raw.length - body.length; // body 在 raw 中的起始偏移
+  const alts = [];
+  for (const seg of splitTopWithPos(body, '|')) {
+    const text = seg.text.trim();
+    if (!text) continue;
+    // 用非空白实际内容的区间做行匹配，避免段尾/段首空白蹭到相邻行的注记（off-by-one）
+    const lead = seg.text.length - seg.text.trimStart().length;
+    const trail = seg.text.length - seg.text.trimEnd().length;
+    const rs = seg.start + headerOfs + lead;
+    const re = seg.end + headerOfs - trail;
+    let st = null;
+    for (const ls of r.lineSts) {
+      if (ls.st && ls.start < re && ls.end > rs) { st = ls.st; break; }
+    }
+    const alt = { text };
+    if (st) { alt.status = st.status; alt.note = st.note; }
+    alts.push(alt);
+  }
+  return alts;
+}
+
+// 规则级 status：头行注记 > 章节标题注记 > 缺省 "unspecified"
+function ruleStatus(r) {
+  const st = r.headSt || r.sectionSt;
+  return st ? st.status : 'unspecified';
 }
 
 function parseRecord(s) {
@@ -179,9 +287,13 @@ for (const r of rules) {
   }
 }
 
+// 结构文法：每条 rule 带结构化 status（"tote" | "partial" | "spec-only" | "unspecified"），
+// 每个 alt 可带自己的 status/note（来自行内注释注记，覆盖规则级）。
+// alts 保持字符串数组向后兼容？——否：正式升级为对象数组 {text, status?, note?}，
+// 当前 rules 段尚无消费方（totter 只读 5 张表 + dispatches + xid），是安全窗口。
 const structural = rules
   .filter((r) => !TABLE_RULES.includes(r.name) && !r.name.endsWith('Dispatch'))
-  .map((r) => ({ name: r.name, alts: altsOf(r) }));
+  .map((r) => ({ name: r.name, status: ruleStatus(r), alts: structuredAlts(r) }));
 
 // 并入 XID_Start / XID_Continue 范围表（来自 src/xid_ranges.json，由 tools/gen_xid.mjs 生成）
 const XID = path.join(__dirname, '..', 'src', 'xid_ranges.json');
@@ -207,6 +319,12 @@ const counts = {
   xid_start: (xid.xid_start || []).length,
   xid_continue: (xid.xid_cont || []).length,
 };
+const statusCounts = {};
+for (const r of structural) statusCounts[r.status] = (statusCounts[r.status] || 0) + 1;
+let altAnnotated = 0;
+for (const r of structural) for (const a of r.alts) if (a.status) altAnnotated++;
+
 console.log('gen_ebnf: wrote', OUT);
 console.log('gen_ebnf: table counts =', JSON.stringify(counts));
+console.log('gen_ebnf: rule status =', JSON.stringify(statusCounts), '| alt-level annotations =', altAnnotated);
 console.log('gen_ebnf: dispatches =', JSON.stringify(dispatches, null, 2));
