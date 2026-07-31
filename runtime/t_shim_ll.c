@@ -28,6 +28,11 @@ void    tll_sb_append_i64(TSb* b, int64_t v)  { t_sb_append_i64(b, v); }
 void    tll_sb_to_str(TSb* b, TStr* out)    { *out = t_sb_to_str(b); }
 void    tll_sb_clear(TSb* b)                { t_sb_clear(b); }
 void    tll_int_to_str(int64_t v, TStr* out) { *out = t_int_to_str(v); }
+void    tll_cat2(TStr* a, TStr* b, TStr* out)          { *out = t_cat2(*a, *b); }
+void    tll_cat3(TStr* a, TStr* b, TStr* c, TStr* out) { *out = t_cat3(*a, *b, *c); }
+void    tll_cat4(TStr* a, TStr* b, TStr* c, TStr* d, TStr* out) { *out = t_cat4(*a, *b, *c, *d); }
+void    tll_cat5(TStr* a, TStr* b, TStr* c, TStr* d, TStr* e, TStr* out) { *out = t_cat5(*a, *b, *c, *d, *e); }
+void    tll_cat6(TStr* a, TStr* b, TStr* c, TStr* d, TStr* e, TStr* f, TStr* out) { *out = t_cat6(*a, *b, *c, *d, *e, *f); }
 
 // ── slice ──────────────────────────────────────────────────────
 void    tll_slice_new(int64_t esz, TSlice* out)              { *out = t_slice_new(esz); }

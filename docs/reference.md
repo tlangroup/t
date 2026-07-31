@@ -175,6 +175,7 @@ BuiltinTable:
   | "file_read_all" / "path_resolve" / "str_slice" => ti_mk("String")
   | "sb_to_str" / "to_string" => ti_mk("String")
   | "int_to_str" => ti_mk("String")
+  | "cat2" / "cat3" / "cat4" / "cat5" / "cat6" => ti_mk("String")
   | "file_write_all" / "file_exists" => ti_scalar("bool")
   | "args" => ti_elem_of("Slice", ti_mk("String"))
   | "sb_new" => ti_mk("StringBuilder")
@@ -766,6 +767,11 @@ TdRuleTable ::
   // @tdrule td_calls  12 cn     str_slice     one mk    string -
   // @tdrule td_calls  12 cn     sb_to_str     one mk    string -
   // @tdrule td_calls  12 cn     int_to_str    one mk    string -
+  // @tdrule td_calls  12 cn     cat2         one mk    string -
+  // @tdrule td_calls  12 cn     cat3         one mk    string -
+  // @tdrule td_calls  12 cn     cat4         one mk    string -
+  // @tdrule td_calls  12 cn     cat5         one mk    string -
+  // @tdrule td_calls  12 cn     cat6         one mk    string -
   // @tdrule td_calls  12 cn     sb_new        one named named  TSb*
   // @tdrule td_calls  12 cn     map_has       one named scalar bool
   // @tdrule td_calls  12 cn     map_del       one named scalar bool

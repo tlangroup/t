@@ -64,6 +64,13 @@ void t_sb_clear(TSb* b);
 // int_to_str(v: i64) -> string —— 整数转十进制字符串（arena 分配）
 TStr t_int_to_str(int64_t v);
 
+// cat2..cat6(a, b, ...) -> string —— 字符串拼接（各实参须为 string）
+TStr t_cat2(TStr a, TStr b);
+TStr t_cat3(TStr a, TStr b, TStr c);
+TStr t_cat4(TStr a, TStr b, TStr c, TStr d);
+TStr t_cat5(TStr a, TStr b, TStr c, TStr d, TStr e);
+TStr t_cat6(TStr a, TStr b, TStr c, TStr d, TStr e, TStr f);
+
 // ── 切片 []T：泛型经元素宽度单态化 ─────────────────────────────
 // t 语言层不暴露 void*；类型安全由 tc 类型检查器在编译期保证。
 // emitter 规则：tokens[i] → *(Token*)t_slice_at(tokens, i)

@@ -162,6 +162,50 @@ TStr t_int_to_str(int64_t v) {
     return t_sb_to_str(b);
 }
 
+// ── 字符串拼接 cat2..cat6(a, b, ...) -> string ──────────────────
+// 各实参均为 string（TStr）。需要拼接非字符串类型时，先 int_to_str/...
+// 注意：返回值是 arena 中副本，调用方持有的 TStr 不会因后续 arena 写入而失效。
+TStr t_cat2(TStr a, TStr b) {
+    TSb* b_ = t_sb_new(t_arena_current());
+    t_sb_append_str(b_, a);
+    t_sb_append_str(b_, b);
+    return t_sb_to_str(b_);
+}
+TStr t_cat3(TStr a, TStr b, TStr c) {
+    TSb* b_ = t_sb_new(t_arena_current());
+    t_sb_append_str(b_, a);
+    t_sb_append_str(b_, b);
+    t_sb_append_str(b_, c);
+    return t_sb_to_str(b_);
+}
+TStr t_cat4(TStr a, TStr b, TStr c, TStr d) {
+    TSb* b_ = t_sb_new(t_arena_current());
+    t_sb_append_str(b_, a);
+    t_sb_append_str(b_, b);
+    t_sb_append_str(b_, c);
+    t_sb_append_str(b_, d);
+    return t_sb_to_str(b_);
+}
+TStr t_cat5(TStr a, TStr b, TStr c, TStr d, TStr e) {
+    TSb* b_ = t_sb_new(t_arena_current());
+    t_sb_append_str(b_, a);
+    t_sb_append_str(b_, b);
+    t_sb_append_str(b_, c);
+    t_sb_append_str(b_, d);
+    t_sb_append_str(b_, e);
+    return t_sb_to_str(b_);
+}
+TStr t_cat6(TStr a, TStr b, TStr c, TStr d, TStr e, TStr f) {
+    TSb* b_ = t_sb_new(t_arena_current());
+    t_sb_append_str(b_, a);
+    t_sb_append_str(b_, b);
+    t_sb_append_str(b_, c);
+    t_sb_append_str(b_, d);
+    t_sb_append_str(b_, e);
+    t_sb_append_str(b_, f);
+    return t_sb_to_str(b_);
+}
+
 // ── 切片 []T ──────────────────────────────────────────────────
 TSlice t_slice_new(int64_t elem_size) {
     TSlice s;

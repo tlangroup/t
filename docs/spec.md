@@ -37,6 +37,8 @@ func_name(param: Type) -> ReturnType { ... }
 彻底废弃模糊int，全部显式位宽：
 u8/u16/u32/u64、i8/i16/i32/i64、f16/f32/f64、bool
 字符串：string（只读 UTF-8）、StringBuilder（可变拼接）
+- 字符串拼接内建：`cat2(a,b)` … `cat6(a,b,c,d,e,f)`，各实参均为 string，返回拼接后的 string。
+  需拼接非字符串时先 `int_to_str(x)`（如 `cat2("v=", int_to_str(n))`）。等价于 `StringBuilder` 逐项 `sb_append_str` 后 `sb_to_str`。
 2.2 容器统一范式
 - 定长数组：[N]T
 - 动态切片：[]T
