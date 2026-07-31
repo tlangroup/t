@@ -15,6 +15,21 @@
 void    tll_print(TStr* s)                  { t_print(*s); }
 void    tll_eprint(TStr* s)                 { t_eprint(*s); }
 void    tll_println(TStr* s)                { t_println(*s); }
+
+// ── type_info(T) accessor shim（M36）──
+// 约定：返回聚合（string）用 out-pointer，且 out 排在末位——与
+//       tll_file_read_all / tll_str_slice / tll_sb_to_str 一致，顺序不可颠倒；
+//       返回标量/指针直接返回（与 str_len / slice_at 一致）。
+void       tll_ti_name(TTypeInfo* ti, TStr* out)      { *out = t_ti_name(ti); }
+int64_t    tll_ti_size(TTypeInfo* ti)                 { return t_ti_size(ti); }
+int64_t    tll_ti_kind(TTypeInfo* ti)                 { return t_ti_kind(ti); }
+int64_t    tll_ti_field_count(TTypeInfo* ti)          { return t_ti_field_count(ti); }
+TFieldInfo* tll_ti_field(TTypeInfo* ti, int64_t i)    { return t_ti_field(ti, i); }
+void       tll_fi_name(TFieldInfo* fi, TStr* out)     { *out = t_fi_name(fi); }
+int64_t    tll_fi_offset(TFieldInfo* fi)              { return t_fi_offset(fi); }
+void       tll_fi_type_name(TFieldInfo* fi, TStr* out){ *out = t_fi_type_name(fi); }
+int64_t    tll_fi_type_size(TFieldInfo* fi)           { return t_fi_type_size(fi); }
+int8_t     tll_fi_is_ptr(TFieldInfo* fi)              { return t_fi_is_ptr(fi); }
 int64_t tll_str_len(TStr* s)                { return t_str_len(*s); }
 int64_t tll_str_at(TStr* s, int64_t i)      { return (int64_t)t_str_byte_at(*s, i); }
 int32_t tll_str_eq(TStr* a, TStr* b)        { return t_str_eq(*a, *b) ? 1 : 0; }

@@ -5088,6 +5088,16 @@ parse_prim_null :: func(ti: i64) -> i64 {
 
 parse_prim_ident :: func(ti: i64) -> i64 {
     var name: string = tk_v(ti);
+    if (name == "type_info" && cur_t() == "LParen") {
+        advance_i();
+        var tn_tok: string = expect_tok("Identifier");
+        expect_tok("RParen");
+        var id: i64 = node_new("typeinfo");
+        var nn: Node = nodes[id];
+        nn.sa = tn_tok;
+        slice_set(nodes, id, nn);
+        return id;
+    }
     if (cur_t() == "LBrace" && looks_like_struct_lit()) {
         return parse_struct_lit(name, ti);
     }
@@ -6306,7 +6316,7 @@ ti_scalar :: func(name: string) -> i64 {
     return i;
 }
 
-ti_kind :: func(i: i64) -> string {
+tip_kind :: func(i: i64) -> string {
     if (i < 0) {
         return "Unknown";
     }
@@ -6314,7 +6324,7 @@ ti_kind :: func(i: i64) -> string {
     return t.kind;
 }
 
-ti_name :: func(i: i64) -> string {
+tip_name :: func(i: i64) -> string {
     var t: TI = tis[i];
     return t.name;
 }
@@ -6375,15 +6385,15 @@ can_cast :: func(fi: i64, ti2: i64) -> bool {
         return true;
     }
     // 数组 ↔ 切片：元素可转型即可（目标为定长数组时要求长度一致）
-    var fk: string = ti_kind(fi);
-    var tk: string = ti_kind(ti2);
+    var fk: string = tip_kind(fi);
+    var tk: string = tip_kind(ti2);
     if ((fk == "Array" || fk == "Slice") && (tk == "Array" || tk == "Slice")) {
         var f: TI = tis[fi];
         var t: TI = tis[ti2];
         if (fk == "Array" && tk == "Array" && f.alen != t.alen) {
             return false;
         }
-        if (ti_kind(f.elem) == "Unknown" || ti_kind(t.elem) == "Unknown") {
+        if (tip_kind(f.elem) == "Unknown" || tip_kind(t.elem) == "Unknown") {
             return true;
         }
         return can_cast(f.elem, t.elem);
@@ -6711,6 +6721,8 @@ resolve_ti :: func(tn: i64) -> i64 {
         return mi;
     }
     if (n.kind == "named") {
+        if (n.sa == "TypeInfo") { return ti_mk("TypeInfo"); }
+        if (n.sa == "FieldInfo") { return ti_mk("FieldInfo"); }
         var si: i64 = sym_lookup(global_scope, n.sa);
         if (si >= 0) {
             var s: Sym = syms[si];
@@ -6939,6 +6951,18 @@ builtin_ret :: func(name: string) -> i64 {
     if (name == "map_get") {
         return ti_mk("Unknown");
     }
+    if (name == "ti_name" || name == "fi_name" || name == "fi_type_name") {
+        return ti_mk("String");
+    }
+    if (name == "ti_size" || name == "ti_kind" || name == "ti_field_count" || name == "fi_offset" || name == "fi_type_size") {
+        return ti_scalar("i64");
+    }
+    if (name == "ti_field") {
+        return ti_mk("FieldInfo");
+    }
+    if (name == "fi_is_ptr") {
+        return ti_scalar("bool");
+    }
     return ti_mk("Unknown");
 }
 // <<< GEN:builtins <<<
@@ -6974,6 +6998,9 @@ infer_expr :: func(e: i64) -> i64 {
         return ti_mk("Unknown");
     }
 // <<< GEN:type_infer1 <<<
+    if (n.kind == "typeinfo") {
+        return ti_mk("TypeInfo");
+    }
     if (n.kind == "ident") {
         var si: i64 = sym_lookup(cur_scope, n.sa);
         if (si >= 0) {
@@ -6995,7 +7022,7 @@ infer_expr :: func(e: i64) -> i64 {
         if (op == "&&" || op == "||") {
             return ti_scalar("bool");
         }
-        if (ti_kind(lt) == "Scalar" && ti_kind(rt) == "Scalar") {
+        if (tip_kind(lt) == "Scalar" && tip_kind(rt) == "Scalar") {
             if (ti_equal(lt, rt)) {
                 return lt;
             }
@@ -7019,7 +7046,7 @@ infer_expr :: func(e: i64) -> i64 {
             slb_add("use explicit cast: `expr as Type`");
             diag_set_nt(di, slb_head);
         }
-        if (ti_kind(lt) != "Unknown") {
+        if (tip_kind(lt) != "Unknown") {
             return lt;
         }
         return rt;
@@ -7042,7 +7069,7 @@ infer_expr :: func(e: i64) -> i64 {
             var si2: i64 = sym_lookup(global_scope, fname);
             if (si2 >= 0) {
                 var s2: Sym = syms[si2];
-                if (ti_kind(s2.ti) == "Func" && s2.decl >= 0) {
+                if (tip_kind(s2.ti) == "Func" && s2.decl >= 0) {
                     var fd: Node = nodes[s2.decl];
                     if (fd.kind == "FuncDecl") {
                         return resolve_ti(fd.na);
@@ -7053,7 +7080,7 @@ infer_expr :: func(e: i64) -> i64 {
             if (fname == "map_get" && n.la >= 0) {
                 var mgn: i64 = kids[n.la].val;
                 var mgt: i64 = infer_expr(mgn);
-                if (ti_kind(mgt) == "Map") {
+                if (tip_kind(mgt) == "Map") {
                     var mgti: TI = tis[mgt];
                     if (mgti.val >= 0) {
                         return mgti.val;
@@ -7068,7 +7095,7 @@ infer_expr :: func(e: i64) -> i64 {
                 if (n.la >= 0) {
                     var pan: i64 = kids[n.la].val;
                     var pat: i64 = infer_expr(pan);
-                    if (ti_kind(pat) != "String" && ti_kind(pat) != "Unknown") {
+                    if (tip_kind(pat) != "String" && tip_kind(pat) != "Unknown") {
                         diag_new("T_TYPE_MISMATCH", "error",
                             cat3(fname, " 的实参必须是字符串（String）；标量请先用 int_to_str / to_string / cat* 转换。当前收到: ", ti_str(pat)),
                             n_file(e), n_line(e), n_col(e), n_line(e), n_col(e) + 5);
@@ -7081,9 +7108,9 @@ infer_expr :: func(e: i64) -> i64 {
     }
     if (n.kind == "member") {
         var obt: i64 = infer_expr(n.na);
-        var obk: string = ti_kind(obt);
+        var obk: string = tip_kind(obt);
         if (obk == "Struct" || obk == "Named") {
-            var si3: i64 = sym_lookup(global_scope, ti_name(obt));
+            var si3: i64 = sym_lookup(global_scope, tip_name(obt));
             if (si3 >= 0) {
                 var s3: Sym = syms[si3];
                 if (s3.decl >= 0) {
@@ -7109,7 +7136,7 @@ infer_expr :: func(e: i64) -> i64 {
     }
     if (n.kind == "index") {
         var obt2: i64 = infer_expr(n.na);
-        var obk2: string = ti_kind(obt2);
+        var obk2: string = tip_kind(obt2);
         if (obk2 == "Array" || obk2 == "Slice") {
             var t2: TI = tis[obt2];
             return t2.elem;
@@ -7130,7 +7157,7 @@ infer_expr :: func(e: i64) -> i64 {
             var et: i64 = infer_expr(k2.val);
             // 数组字面量的整型元素按「默认 int」提升为 i64（与多数语言一致，
             // 避免 [1,2,3] 被推成 []u8）；其余类型（bool/f64/struct…）保持不变。
-            if (ti_kind(et) == "Scalar" && is_int_name(ti_name(et)) && ti_name(et) != "i64" && ti_name(et) != "i32") {
+            if (tip_kind(et) == "Scalar" && is_int_name(tip_name(et)) && tip_name(et) != "i64" && tip_name(et) != "i32") {
                 et = ti_scalar("i64");
             }
             var ai: i64 = ti_elem_of("Array", et);
@@ -7150,10 +7177,10 @@ infer_expr :: func(e: i64) -> i64 {
             var vt: i64 = infer_expr(en.nb);
             // 与数组字面量同规则：整型键/值按「默认 int」提升为 i64，
             // 避免 [1: 2] 被推成 map[u8]u8。
-            if (ti_kind(kt) == "Scalar" && is_int_name(ti_name(kt)) && ti_name(kt) != "i64" && ti_name(kt) != "i32") {
+            if (tip_kind(kt) == "Scalar" && is_int_name(tip_name(kt)) && tip_name(kt) != "i64" && tip_name(kt) != "i32") {
                 kt = ti_scalar("i64");
             }
-            if (ti_kind(vt) == "Scalar" && is_int_name(ti_name(vt)) && ti_name(vt) != "i64" && ti_name(vt) != "i32") {
+            if (tip_kind(vt) == "Scalar" && is_int_name(tip_name(vt)) && tip_name(vt) != "i64" && tip_name(vt) != "i32") {
                 vt = ti_scalar("i64");
             }
             var mi: i64 = ti_mk("Map");
@@ -7233,8 +7260,8 @@ check_stmt :: func(s: i64) -> void {
         }
         if (n.nb >= 0) {
             var it: i64 = infer_expr(n.nb);
-            if (vt >= 0 && ti_kind(it) != "Unknown" && ti_equal(it, vt) == false) {
-                var vk: string = ti_kind(vt);
+            if (vt >= 0 && tip_kind(it) != "Unknown" && ti_equal(it, vt) == false) {
+                var vk: string = tip_kind(vt);
                 var int_to_fe: bool = (vk == "Flag" || vk == "Enum") && is_int_ti(it);
                 if (int_to_fe == false && can_cast(it, vt) == false) {
                     err_type_mismatch(n.nb, vt, it);
@@ -7252,7 +7279,7 @@ check_stmt :: func(s: i64) -> void {
     }
     if (n.kind == "if") {
         var ct: i64 = infer_expr(n.na);
-        if (ti_kind(ct) == "Scalar" && ti_name(ct) != "bool") {
+        if (tip_kind(ct) == "Scalar" && tip_name(ct) != "bool") {
             var di: i64 = diag_new("T_STMT_IMPLICIT_BOOL", "error",
                 cat2("if condition must be bool or explicit comparison, got ", ti_str(ct)),
                 "", 1, 1, 1, 5);
@@ -7286,7 +7313,7 @@ check_stmt :: func(s: i64) -> void {
         }
         if (cond >= 0) {
             var ct2: i64 = infer_expr(cond);
-            if (ti_kind(ct2) == "Scalar" && ti_name(ct2) != "bool") {
+            if (tip_kind(ct2) == "Scalar" && tip_name(ct2) != "bool") {
                 diag_new("T_STMT_IMPLICIT_BOOL", "error",
                     cat2("loop condition must be bool, got ", ti_str(ct2)),
                     "", 1, 1, 1, 5);
@@ -7311,7 +7338,7 @@ check_stmt :: func(s: i64) -> void {
         var prev3: i64 = cur_scope;
         cur_scope = scope_new(prev3);
         var et: i64 = -1;
-        var itk: string = ti_kind(itt);
+        var itk: string = tip_kind(itt);
         if (itk == "Slice" || itk == "Array") {
             var t4: TI = tis[itt];
             et = t4.elem;
@@ -7349,7 +7376,7 @@ check_stmt :: func(s: i64) -> void {
     if (n.kind == "return") {
         if (n.na >= 0) {
             var rt: i64 = infer_expr(n.na);
-            if (ti_kind(rt) != "Unknown" && ti_equal(rt, cur_ret) == false) {
+            if (tip_kind(rt) != "Unknown" && ti_equal(rt, cur_ret) == false) {
                 if (can_cast(rt, cur_ret) == false) {
                     err_type_mismatch(n.na, cur_ret, rt);
                 }
@@ -7360,7 +7387,7 @@ check_stmt :: func(s: i64) -> void {
     if (n.kind == "assignment") {
         var tt: i64 = infer_expr(n.na);
         var vt2: i64 = infer_expr(n.nb);
-        if (ti_kind(tt) != "Unknown" && ti_kind(vt2) != "Unknown" && ti_equal(tt, vt2) == false) {
+        if (tip_kind(tt) != "Unknown" && tip_kind(vt2) != "Unknown" && ti_equal(tt, vt2) == false) {
             if (can_cast(vt2, tt) == false) {
                 err_type_mismatch(n.nb, tt, vt2);
             }
@@ -7439,7 +7466,7 @@ check_func_decl :: func(d: i64) -> void {
         c2 = k2.next;
     }
 
-    if (ti_kind(cur_ret) != "Void") {
+    if (tip_kind(cur_ret) != "Void") {
         if (all_paths_return(n.lc) == false) {
             var anchor: i64 = list_last_val(n.lc);
             var l: i64 = n_line(anchor);
@@ -7491,7 +7518,7 @@ check_enum_decl :: func(d: i64) -> void {
         var v: Node = nodes[k.val];
         if (v.na >= 0) {
             var vt: i64 = infer_expr(v.na);
-            if (ti_kind(vt) == "Scalar" && is_int_name(ti_name(vt)) == false) {
+            if (tip_kind(vt) == "Scalar" && is_int_name(tip_name(vt)) == false) {
                 diag_new("T_TYPE_MISMATCH", "error",
                     cat2("enum variant value must be integer, got ", ti_str(vt)),
                     "", 1, 1, 1, 5);
@@ -7613,7 +7640,7 @@ check_decl :: func(d: i64) -> void {
         if (n.nb >= 0) {
             var it: i64 = infer_expr(n.nb);
             var vt: i64 = resolve_ti(n.na);
-            if (ti_kind(it) != "Unknown" && ti_equal(it, vt) == false) {
+            if (tip_kind(it) != "Unknown" && ti_equal(it, vt) == false) {
                 if (can_cast(it, vt) == false) {
                     err_type_mismatch(n.nb, vt, it);
                 }
@@ -7626,7 +7653,7 @@ check_decl :: func(d: i64) -> void {
             var it2: i64 = infer_expr(n.nb);
             if (n.na >= 0) {
                 var ct: i64 = resolve_ti(n.na);
-                if (ti_kind(it2) != "Unknown" && ti_equal(it2, ct) == false) {
+                if (tip_kind(it2) != "Unknown" && ti_equal(it2, ct) == false) {
                     if (can_cast(it2, ct) == false) {
                         err_type_mismatch(n.nb, ct, it2);
                     }
@@ -9081,6 +9108,9 @@ var glines: []string;   // 全局初始化函数体（t__ginit）
 // 重定向开关：为 true 时 spush 写入 glines（全局 var 初始化器需运行期构建，
 // 如 map 字面量在 C 中不是编译期常量，必须搬进 t__ginit）。
 var g_spush_to_ginit: bool = false;
+// type_info(T) 编译期常量合成（M36）：去重表 + 模块级常量定义缓冲
+var ti_lines: []string;
+var ti_done: []string;
 
 hpush :: func(s: string) -> void {
     append(hlines, s);
@@ -9141,6 +9171,34 @@ TD :: struct {
 }
 
 var tds: []TD;
+
+// 字段类型可读名（用于 TypeInfo 的 type_name 字段，双后端一致）
+td_readable :: func(td: i64) -> string {
+    if (td < 0) { return "?"; }
+    var t: TD = tds[td];
+    if (t.cat == "scalar") {
+        if (t.name == "") { return "i64"; }
+        return t.name;
+    }
+    if (t.cat == "string") { return "string"; }
+    if (t.cat == "void") { return "void"; }
+    if (t.cat == "unknown") { return "unknown"; }
+    if (t.cat == "named") { return t.name; }
+    if (t.cat == "typeinfo") { return t.name; }
+    if (t.cat == "fieldinfo") { return "FieldInfo"; }
+    if (t.cat == "slice") { return cat2("[]", td_readable(t.elem)); }
+    if (t.cat == "array") { return cat4("[", i2s(t.alen), "]", td_readable(t.elem)); }
+    if (t.cat == "map") { return cat4("map[", td_readable(t.key), "]", td_readable(t.val)); }
+    return "?";
+}
+
+// 字段是否引用类型（指针/聚合，is_ptr=1）；标量/void 为 false
+is_ref_type :: func(td: i64) -> bool {
+    if (td < 0) { return false; }
+    var t: TD = tds[td];
+    if (t.cat == "scalar" || t.cat == "void" || t.cat == "unknown") { return false; }
+    return true;
+}
 
 td_mk :: func(cat: string) -> i64 {
     var t: TD;
@@ -9276,6 +9334,10 @@ emit_ctype :: func(tn: i64) -> string {
         return scalar_to_c(n.sa);
     }
     if (n.kind == "named") {
+        // type_info 自省类型：C 后端一律按指针（与 LLVM 后端的 ptr 一致），
+        // 因为运行时 t_ti_*/t_fi_* 接收 TTypeInfo*/TFieldInfo*。
+        if (n.sa == "TypeInfo") { return "TTypeInfo*"; }
+        if (n.sa == "FieldInfo") { return "TFieldInfo*"; }
         return n.sa;
     }
     if (n.kind == "array") {
@@ -9350,6 +9412,10 @@ resolve_type_desc :: func(tn: i64) -> i64 {
         slice_set(tds, mi, t);
         return mi;
     }
+    // 反射内建类型（M36）：TypeInfo/FieldInfo 为不透明句柄，双后端均落为指针。
+    // 必须放在 GEN:td_rnamed 之前——生成区间由 build/ebnf.json 驱动，手改会被覆盖。
+    if (n.kind == "named" && n.sa == "TypeInfo") { return td_named_mk("typeinfo", n.sa); }
+    if (n.kind == "named" && n.sa == "FieldInfo") { return td_named_mk("fieldinfo", n.sa); }
 // >>> GEN:td_rnamed (generated by tools/totter.tc from build/ebnf.json -- DO NOT EDIT) >>>
     if (n.kind == "named") {
         return td_named_mk("named", n.sa);
@@ -9397,6 +9463,8 @@ desc_to_c :: func(td: i64) -> string {
     }
     var t: TD = tds[td];
     if (t.cat == "string") { return "TStr"; }
+    if (t.cat == "typeinfo") { return "TTypeInfo*"; }
+    if (t.cat == "fieldinfo") { return "TFieldInfo*"; }
     if (t.cat == "slice") { return "TSlice"; }
     if (t.cat == "array") { return cat2(desc_to_c(t.elem), "*"); }
     if (t.cat == "map") { return "TMap*"; }
@@ -9429,6 +9497,9 @@ expr_type_desc :: func(e: i64) -> i64 {
     if (n.kind == "float") { return td_named_mk("scalar", "f64"); }
     if (n.kind == "bool") { return td_named_mk("scalar", "bool"); }
 // <<< GEN:td_expr1 <<<
+    if (n.kind == "typeinfo") {
+        return td_named_mk("typeinfo", n.sa);
+    }
     if (n.kind == "ident") {
         if (em_in_fn) {
             var f: i64 = fs_get(em_cur_fn, n.sa);
@@ -9499,6 +9570,16 @@ expr_type_desc :: func(e: i64) -> i64 {
             if (cn == "map_len") { return td_named_mk("scalar", "i64"); }
             if (cn == "map_set") { return td_mk("void"); }
             if (cn == "map_new") { return td_mk("map"); }
+            if (cn == "ti_name") { return td_mk("string"); }
+            if (cn == "fi_name") { return td_mk("string"); }
+            if (cn == "fi_type_name") { return td_mk("string"); }
+            if (cn == "ti_size") { return td_named_mk("scalar", "i64"); }
+            if (cn == "ti_kind") { return td_named_mk("scalar", "i64"); }
+            if (cn == "ti_field_count") { return td_named_mk("scalar", "i64"); }
+            if (cn == "fi_offset") { return td_named_mk("scalar", "i64"); }
+            if (cn == "fi_type_size") { return td_named_mk("scalar", "i64"); }
+            if (cn == "ti_field") { return td_named_mk("fieldinfo", "FieldInfo"); }
+            if (cn == "fi_is_ptr") { return td_named_mk("scalar", "bool"); }
 // <<< GEN:td_calls <<<
             // map_get(m, k) 的返回类型 = 映射的 V（从首个实参的 map 类型反查）
             if (cn == "map_get" && n.la >= 0) {
@@ -9862,6 +9943,9 @@ emit_expr :: func(e: i64) -> string {
     if (n.kind == "string") {
         return cat3("TSTR_LIT(\"", esc_c(n.sa), "\")");
     }
+    if (n.kind == "typeinfo") {
+        return emit_type_info_c(n.sa);
+    }
     if (n.kind == "bool") {
         if (n.ba) {
             return "true";
@@ -9948,6 +10032,9 @@ emit_expr :: func(e: i64) -> string {
                 return cat6("t_file_write_all(t_cstr(", av[0], "), ", av[1], ")", "");
             }
             if (cn == "args") { return "t_args()"; }
+            if (cn == "ti_name" || cn == "ti_size" || cn == "ti_kind" || cn == "ti_field_count" || cn == "ti_field" || cn == "fi_name" || cn == "fi_offset" || cn == "fi_type_name" || cn == "fi_type_size" || cn == "fi_is_ptr") {
+                return c_emit_accessor_call(cn, av);
+            }
             if (cn == "exit") { return cat3("t_exit(", av[0], ")"); }
             if (cn == "sys_run") { return cat3("sys_run(", av[0], ")"); }
             if (cn == "print") { return cat3("t_print(", av[0], ")"); }
@@ -11252,6 +11339,8 @@ emit_unit :: func(mod: string) -> void {
     hpush("#include <stddef.h>");
     hpush("#include \"t_runtime.h\"");
     hpush("");
+    // type_info(T) 常量结构（M36）：TTypeInfo/TFieldInfo 由 t_runtime.h 提供，
+    // 此处不再重复 typedef（否则与 t_runtime.h 重定义冲突）。
 
     spush(cat3("#include \"", mod, ".h\""));
     spush("#include <stdio.h>");
@@ -11267,6 +11356,17 @@ emit_unit :: func(mod: string) -> void {
     while (i < n) {
         emit_decl(decl_list[i]);
         i = i + 1;
+    }
+
+    // type_info(T) 编译期常量（引用 StructDecl，须在类型定义后输出）
+    var tln: i64 = slice_len(ti_lines) as i64;
+    if (tln > 0) {
+        spush("");
+        var ti: i64 = 0;
+        while (ti < tln) {
+            spush(ti_lines[ti]);
+            ti = ti + 1;
+        }
     }
 
     // 全局 var 的运行期初始化器（非编译期常量）汇总为 t__ginit，在 main 开头调用
@@ -11609,6 +11709,7 @@ ll_td :: func(td: i64) -> string {
         return cat5("[", i2s(an), " x ", ll_td(t.elem), "]");
     }
     if (t.cat == "map") { return "ptr"; }
+    if (t.cat == "typeinfo" || t.cat == "fieldinfo") { return "ptr"; }
     if (t.cat == "void") { return "void"; }
     if (t.cat == "scalar") {
         if (t.name == "") {
@@ -12284,6 +12385,9 @@ emit_lle :: func(e: i64) -> string {
     }
     if (n.kind == "string") {
         return ll_strlit(n.sa);
+    }
+    if (n.kind == "typeinfo") {
+        return emit_type_info_ll(n.sa);
     }
     if (n.kind == "bool") {
         if (n.ba) {
@@ -13023,6 +13127,34 @@ ll_call :: func(e: i64) -> string {
         var out1: string = ll_scratch("%TStr");
         llfb(cat6("  call void ", fn3, "(ptr ", pp0, ", ptr ", cat2(out1, ")")));
         return out1;
+    }
+    // type_info accessor 内建（M36）
+    if (cn == "ti_name" || cn == "fi_name" || cn == "fi_type_name") {
+        var p: string = emit_lle(ae[0]);
+        var out: string = ll_scratch("%TStr");
+        llfb(cat6("  call void @tll_", cn, "(ptr ", p, ", ptr ", cat2(out, ")")));
+        return out;
+    }
+    if (cn == "ti_size" || cn == "ti_kind" || cn == "ti_field_count" || cn == "fi_offset" || cn == "fi_type_size") {
+        var p: string = emit_lle(ae[0]);
+        var out: string = ll_tmp();
+        llfb(cat6("  ", out, " = call i64 @tll_", cn, "(ptr ", cat2(p, ")")));
+        return out;
+    }
+    if (cn == "ti_field") {
+        var p: string = emit_lle(ae[0]);
+        var iv: string = emit_lle(ae[1]);
+        iv = ll_cast_v(iv, ll_etd(ae[1]), td_i64);
+        var out: string = ll_tmp();
+        llfb(cat6("  ", out, " = call ptr @tll_ti_field(ptr ", p, ", i64 ", cat2(iv, ")")));
+        return out;
+    }
+    if (cn == "fi_is_ptr") {
+        var p: string = emit_lle(ae[0]);
+        var out: string = ll_tmp();
+        // bool 在 LLVM 后端一律 i8（与 file_write_all 等一致），不能用 i1
+        llfb(cat4("  ", out, " = call i8 @tll_fi_is_ptr(ptr ", cat2(p, ")")));
+        return out;
     }
     if (cn == "file_write_all") {
         var pa: string = emit_lle(ae[0]);
@@ -14170,6 +14302,17 @@ emit_lldeclares :: func() -> void {
     llph("declare void @tll_file_read_all(ptr, ptr)");
     llph("declare i32 @tll_file_write_all(ptr, ptr)");
     llph("declare i32 @tll_file_exists(ptr)");
+    // type_info accessor 内建（M36）
+    llph("declare void @tll_ti_name(ptr, ptr)");
+    llph("declare i64 @tll_ti_size(ptr)");
+    llph("declare i64 @tll_ti_kind(ptr)");
+    llph("declare i64 @tll_ti_field_count(ptr)");
+    llph("declare ptr @tll_ti_field(ptr, i64)");
+    llph("declare void @tll_fi_name(ptr, ptr)");
+    llph("declare i64 @tll_fi_offset(ptr)");
+    llph("declare void @tll_fi_type_name(ptr, ptr)");
+    llph("declare i64 @tll_fi_type_size(ptr)");
+    llph("declare i8 @tll_fi_is_ptr(ptr)");
     llph("declare void @tll_path_resolve(ptr, ptr)");
     llph("declare void @tll_args(ptr)");
     llph("declare void @tll_exit(i32)");
@@ -14248,6 +14391,9 @@ emit_llunit :: func(mod: string) -> void {
     llph(cat2("; ModuleID = ", mod));
     llph("%TStr = type { ptr, i64 }");
     llph("%TSlice = type { ptr, i64, i64, i64 }");
+    // type_info(T) 常量结构（M36）
+    llph("%TFieldInfo = type { %TStr, i64, %TStr, i64, i8 }");
+    llph("%TTypeInfo = type { %TStr, i64, i64, i64, %TSlice }");
     emit_lltypes();
     llph("");
     emit_lldeclares();
@@ -14631,4 +14777,188 @@ main :: func() -> i32 @main {
 
     eprint("unknown command\n");
     return 2;
+}
+
+// ── type_info(T) 编译期常量合成（M36）─────────────────────────
+// type_info(Point) 在编译期遍历 StructDecl 字段，合成全局常量
+// __ti_Point（含字段数组），返回其地址（LLVM: ptr @__ti_Point；C: &__ti_Point）。
+// accessor 内建（ti_name/ti_field/fi_*）在运行时读取该常量。
+
+c_emit_accessor_call :: func(cn: string, av: []string) -> string {
+    var r: string = cat2("t_", cn);
+    r = cat2(r, "(");
+    var i: i64 = 0;
+    var n: i64 = slice_len(av) as i64;
+    while (i < n) {
+        if (i > 0) { r = cat2(r, ", "); }
+        r = cat2(r, av[i]);
+        i = i + 1;
+    }
+    return cat2(r, ")");
+}
+
+// 按名查 StructDecl 节点下标。emit 期只能依赖 decl_list —— checker 的
+// global_scope/syms 在发射阶段已不保证有效，用 sym_lookup 会取到野下标。
+ti_struct_decl :: func(tname: string) -> i64 {
+    var n: i64 = slice_len(decl_list) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        var d: i64 = decl_list[i];
+        var dn: Node = nodes[d];
+        if (dn.kind == "StructDecl" && dn.sa == tname) { return d; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+emit_type_info_c :: func(tname: string) -> string {
+    var gref: string = cat2("&__ti_", tname);
+    var di: i64 = 0;
+    var dn2: i64 = slice_len(ti_done) as i64;
+    while (di < dn2) {
+        if (ti_done[di] == tname) { return gref; }
+        di = di + 1;
+    }
+    var d: i64 = ti_struct_decl(tname);
+    if (d < 0) {
+        diag_new("T_TYPE_MISMATCH", "error", cat2("type_info: '", cat2(tname, "' 不是 struct 类型（当前仅支持 struct）")), "", 1, 1, 1, 10);
+        return "0";
+    }
+    append(ti_done, tname);
+    // C 后端：type_info 常量定义在 t_entry_main 之后（emit 期才合成），
+    // 但 C 的 static 先用后定义在同 TU 非法；故在 .h 内放前向声明。
+    // （Point 等 struct 已落在 .h，故 .c 顶部 include 后即可见。）
+    hpush(cat3("static TTypeInfo __ti_", tname, ";"));
+    hpush(cat3("static TFieldInfo __ti_", tname, "_f[];"));
+    var decl: Node = nodes[d];
+
+    var fsb: StringBuilder = sb_new();
+    sb_append_str(fsb, "static TFieldInfo __ti_");
+    sb_append_str(fsb, tname);
+    sb_append_str(fsb, "_f[] = { ");
+    var n: i64 = 0;
+    var c: i64 = decl.lb;
+    while (c >= 0) {
+        var k: Child = kids[c];
+        var f: Node = nodes[k.val];
+        if (f.ia < 0) {
+            if (n > 0) { sb_append_str(fsb, ", "); }
+            var ftd: i64 = resolve_type_desc(f.na);
+            var cty: string = emit_ctype(f.na);
+            var isp: i64 = 0;
+            if (is_ref_type(ftd)) { isp = 1; }
+            sb_append_str(fsb, cat3("{ TSTR_LIT(\"", esc_c(f.sa), "\"), "));
+            sb_append_str(fsb, cat5("offsetof(", tname, ", ", f.sa, "), "));
+            sb_append_str(fsb, cat3("TSTR_LIT(\"", esc_c(td_readable(ftd)), "\"), "));
+            sb_append_str(fsb, cat3("sizeof(", cty, "), "));
+            sb_append_i64(fsb, isp);
+            sb_append_str(fsb, " }");
+            n = n + 1;
+        }
+        c = k.next;
+    }
+    sb_append_str(fsb, " };");
+
+    var tsb: StringBuilder = sb_new();
+    sb_append_str(tsb, "static TTypeInfo __ti_");
+    sb_append_str(tsb, tname);
+    sb_append_str(tsb, cat3(" = { TSTR_LIT(\"", esc_c(tname), "\"), "));
+    sb_append_str(tsb, cat3("sizeof(", tname, "), 0, "));
+    sb_append_i64(tsb, n);
+    sb_append_str(tsb, cat3(", { __ti_", tname, "_f, "));
+    sb_append_i64(tsb, n);
+    sb_append_str(tsb, ", ");
+    sb_append_i64(tsb, n);
+    sb_append_str(tsb, ", (int64_t)sizeof(TFieldInfo) } };");
+    // 字段数组必须先于 TTypeInfo 输出（后者引用前者）
+    append(ti_lines, sb_to_str(fsb));
+    append(ti_lines, sb_to_str(tsb));
+    return gref;
+}
+
+emit_type_info_ll :: func(tname: string) -> string {
+    var gref: string = cat2("@__ti_", tname);
+    var di: i64 = 0;
+    var dn2: i64 = slice_len(ti_done) as i64;
+    while (di < dn2) {
+        if (ti_done[di] == tname) { return gref; }
+        di = di + 1;
+    }
+    // 字段元数据取自 ll_build_reg 建好的注册表（emit 期唯一可靠来源）
+    var lti: i64 = llt_find(tname);
+    if (lti < 0) {
+        diag_new("T_TYPE_MISMATCH", "error", cat2("type_info: '", cat2(tname, "' 不是 struct 类型（当前仅支持 struct）")), "", 1, 1, 1, 10);
+        return "null";
+    }
+    if (llt_kinds[lti] != "struct") {
+        diag_new("T_TYPE_MISMATCH", "error", cat2("type_info: '", cat2(tname, "' 不是 struct 类型（当前仅支持 struct）")), "", 1, 1, 1, 10);
+        return "null";
+    }
+    append(ti_done, tname);
+    var sty: string = ll_named(tname);
+
+    var m: i64 = slice_len(llsf_st) as i64;
+    var n: i64 = 0;
+    var j: i64 = 0;
+    while (j < m) {
+        if (llsf_st[j] == tname) { n = n + 1; }
+        j = j + 1;
+    }
+
+    var fsb: StringBuilder = sb_new();
+    sb_append_str(fsb, gref);
+    sb_append_str(fsb, "_f = internal constant [");
+    sb_append_i64(fsb, n);
+    sb_append_str(fsb, " x %TFieldInfo] [");
+    var i: i64 = 0;
+    j = 0;
+    while (j < m) {
+        if (llsf_st[j] == tname) {
+            if (i > 0) { sb_append_str(fsb, ", "); }
+            var ftd: i64 = llsf_td[j];
+            // ll_strlit 发射 @.sN 字面量并回填 ll_last_sref/ll_last_slen；
+            // 常量初始化器要的是内联 %TStr 值，不能用它返回的 @.tsN 指针。
+            ll_strlit(llsf_fld[j]);
+            var fns: string = cat5("%TStr { ptr ", ll_last_sref, ", i64 ", i2s(ll_last_slen), " }");
+            ll_strlit(td_readable(ftd));
+            var tns: string = cat5("%TStr { ptr ", ll_last_sref, ", i64 ", i2s(ll_last_slen), " }");
+            var isp: i64 = 0;
+            if (is_ref_type(ftd)) { isp = 1; }
+            sb_append_str(fsb, cat3("%TFieldInfo { ", fns, ", i64 ptrtoint (ptr getelementptr ("));
+            sb_append_str(fsb, sty);
+            sb_append_str(fsb, ", ptr null, i32 0, i32 ");
+            sb_append_i64(fsb, llsf_idx[j]);
+            sb_append_str(fsb, ") to i64), ");
+            sb_append_str(fsb, tns);
+            sb_append_str(fsb, ", i64 ");
+            sb_append_str(fsb, ll_sizeof(ll_td(ftd)));
+            sb_append_str(fsb, ", i8 ");
+            sb_append_i64(fsb, isp);
+            sb_append_str(fsb, " }");
+            i = i + 1;
+        }
+        j = j + 1;
+    }
+    sb_append_str(fsb, "]");
+    llpg(sb_to_str(fsb));
+
+    ll_strlit(tname);
+    var tnm: string = cat5("%TStr { ptr ", ll_last_sref, ", i64 ", i2s(ll_last_slen), " }");
+    var tsb: StringBuilder = sb_new();
+    sb_append_str(tsb, gref);
+    sb_append_str(tsb, " = internal constant %TTypeInfo { ");
+    sb_append_str(tsb, tnm);
+    sb_append_str(tsb, ", i64 ");
+    sb_append_str(tsb, ll_sizeof(sty));
+    sb_append_str(tsb, ", i64 0, i64 ");
+    sb_append_i64(tsb, n);
+    sb_append_str(tsb, cat3(", %TSlice { ptr ", gref, "_f, i64 "));
+    sb_append_i64(tsb, n);
+    sb_append_str(tsb, ", i64 ");
+    sb_append_i64(tsb, n);
+    sb_append_str(tsb, ", i64 ");
+    sb_append_str(tsb, ll_sizeof("%TFieldInfo"));
+    sb_append_str(tsb, " } }");
+    llpg(sb_to_str(tsb));
+    return gref;
 }

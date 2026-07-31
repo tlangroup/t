@@ -184,6 +184,10 @@ BuiltinTable:
   | "map_has" / "map_del" => ti_scalar("bool")
   | "map_len" => ti_scalar("i64")
   | "map_get" => ti_mk("Unknown")   // 返回类型 = 映射的 V，由 infer_expr/expr_type_desc 特判
+  | "ti_name" / "fi_name" / "fi_type_name" => ti_mk("String")
+  | "ti_size" / "ti_kind" / "ti_field_count" / "fi_offset" / "fi_type_size" => ti_scalar("i64")
+  | "ti_field" => ti_mk("FieldInfo")
+  | "fi_is_ptr" => ti_scalar("bool")
 
 DeriveTraitTable:
     "ToString" | "FromString" | "Clone" | "Copy" | "DebugPrint"
@@ -778,6 +782,16 @@ TdRuleTable ::
   // @tdrule td_calls  12 cn     map_len       one named scalar i64
   // @tdrule td_calls  12 cn     map_set       one mk    void -
   // @tdrule td_calls  12 cn     map_new       one mk    map -
+  // @tdrule td_calls  12 cn     ti_name       one mk    string -
+  // @tdrule td_calls  12 cn     fi_name       one mk    string -
+  // @tdrule td_calls  12 cn     fi_type_name  one mk    string -
+  // @tdrule td_calls  12 cn     ti_size       one named scalar i64
+  // @tdrule td_calls  12 cn     ti_kind       one named scalar i64
+  // @tdrule td_calls  12 cn     ti_field_count one named scalar i64
+  // @tdrule td_calls  12 cn     fi_offset     one named scalar i64
+  // @tdrule td_calls  12 cn     fi_type_size  one named scalar i64
+  // @tdrule td_calls  12 cn     ti_field      one named fieldinfo FieldInfo
+  // @tdrule td_calls  12 cn     fi_is_ptr     one named scalar bool
 ```
 
 ## 3. Syntax（语法）

@@ -536,6 +536,20 @@ void t_print(TStr s)  { if (s.len > 0) fwrite(s.ptr, 1, (size_t)s.len, stdout); 
 void t_eprint(TStr s) { if (s.len > 0) fwrite(s.ptr, 1, (size_t)s.len, stderr);  fflush(stderr); }
 void t_println(TStr s){ if (s.len > 0) fwrite(s.ptr, 1, (size_t)s.len, stdout); fputc('\n', stdout); fflush(stdout); }
 
+// ── type_info(T) accessor 内建（M36）──
+TStr        t_ti_name(TTypeInfo* ti)        { return ti->name; }
+int64_t     t_ti_size(TTypeInfo* ti)        { return ti->size; }
+int64_t     t_ti_kind(TTypeInfo* ti)        { return ti->kind; }
+int64_t     t_ti_field_count(TTypeInfo* ti) { return ti->field_count; }
+TFieldInfo* t_ti_field(TTypeInfo* ti, int64_t i) {
+    return (TFieldInfo*)ti->fields.ptr + i;
+}
+TStr        t_fi_name(TFieldInfo* fi)        { return fi->name; }
+int64_t     t_fi_offset(TFieldInfo* fi)      { return fi->offset; }
+TStr        t_fi_type_name(TFieldInfo* fi)   { return fi->type_name; }
+int64_t     t_fi_type_size(TFieldInfo* fi)   { return fi->type_size; }
+int8_t      t_fi_is_ptr(TFieldInfo* fi)      { return fi->is_ptr; }
+
 // sys_run(cmd)：执行外部命令，返回退出码。
 // Windows cmd.exe 引号剥离怪癖：整串命令以引号开头时需再包一层。
 int32_t t_system(TStr cmd) {

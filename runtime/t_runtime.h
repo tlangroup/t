@@ -121,6 +121,23 @@ void    t_exit(int32_t code);
 void    t_print(TStr s);
 void    t_eprint(TStr s);
 void    t_println(TStr s);
+
+// ── type_info(T) 编译期自省（M36）──
+// TypeInfo / FieldInfo 是编译器在编译期合成的常量结构；用户通过 accessor
+// 内建（ti_name / ti_field / fi_*）读取，type_info(T) 返回指向常量的指针。
+typedef struct { TStr name; int64_t size; int64_t kind; int64_t field_count; TSlice fields; } TTypeInfo;
+typedef struct { TStr name; int64_t offset; TStr type_name; int64_t type_size; int8_t is_ptr; } TFieldInfo;
+
+TStr        t_ti_name(TTypeInfo* ti);
+int64_t     t_ti_size(TTypeInfo* ti);
+int64_t     t_ti_kind(TTypeInfo* ti);
+int64_t     t_ti_field_count(TTypeInfo* ti);
+TFieldInfo* t_ti_field(TTypeInfo* ti, int64_t i);
+TStr        t_fi_name(TFieldInfo* fi);
+int64_t     t_fi_offset(TFieldInfo* fi);
+TStr        t_fi_type_name(TFieldInfo* fi);
+int64_t     t_fi_type_size(TFieldInfo* fi);
+int8_t      t_fi_is_ptr(TFieldInfo* fi);
 int32_t t_system(TStr cmd);                         // sys_run(cmd) -> 子进程退出码
 #define sys_run(cmd) t_system(cmd)                  // 兼容旧版 C 后端把 sys_run 按普通调用发射
 
