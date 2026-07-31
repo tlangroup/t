@@ -174,6 +174,7 @@ BuiltinTable:
   | "str_at" => ti_scalar("u8")
   | "file_read_all" / "path_resolve" / "str_slice" => ti_mk("String")
   | "sb_to_str" / "to_string" => ti_mk("String")
+  | "int_to_str" => ti_mk("String")
   | "file_write_all" / "file_exists" => ti_scalar("bool")
   | "args" => ti_elem_of("Slice", ti_mk("String"))
   | "sb_new" => ti_mk("StringBuilder")
@@ -758,6 +759,7 @@ TdRuleTable ::
   // @tdrule td_calls  12 cn     file_exists   one named scalar bool
   // @tdrule td_calls  12 cn     str_slice     one mk    string -
   // @tdrule td_calls  12 cn     sb_to_str     one mk    string -
+  // @tdrule td_calls  12 cn     int_to_str    one mk    string -
   // @tdrule td_calls  12 cn     sb_new        one named named  TSb*
 ```
 
@@ -954,7 +956,7 @@ Block: "{" Statement* "}"
 Type:
       IntType | FloatType | "bool" | "string" | "StringBuilder"
     | "[" Type "]"                       // 动态切片 []T
-    | "[" IntegerLiteral "]" Type        // 定长数组 [N]T  ⚠ spec-only 部分
+    | "[" IntegerLiteral "]" Type        // 定长数组 [N]T
     | "map" "[" Type "]" Type            // 哈希映射 map[K]V  ⚠ spec-only
     | TypeName                           // 命名类型（struct/enum/flag/variant）
     | "func" "(" (Type ("," Type)*)? ")" "->" Type   // ⚠ spec-only 函数类型
@@ -963,8 +965,9 @@ IntType:  "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64"
 FloatType:"f16" | "f32" | "f64"
 ```
 
-- ✅ tote：标量固定位宽 + `string`/`StringBuilder` + `[]T` 切片均实装；`[N]T`/`map[K]V`/函数类型为 spec-only。
+- ✅ tote：标量固定位宽 + `string`/`StringBuilder` + `[]T` 切片 + `[N]T` 定长数组均实装；`map[K]V`/函数类型为 spec-only。
 - 类型名解析：先查内建，再查当前单元已声明命名类型。
+- **数组字面量 `[e1, e2, …]`**：元素类型取首元素推断，整型元素统一提升为 `i64`（`[1,2,3]` 是 `[3]i64` 而非 `[3]u8`）；空字面量 `[]` 元素类型未知，可赋给任意 `[]T` / `[N]T`。定长数组与切片之间只要元素可转型即可互赋（目标为定长数组时长度须一致）。赋给 `[]T` 时脱糖为运行期 `slice_new` + 逐元素 `append`；赋给 `[N]T` 时 C 后端用花括号初始化器、LLVM 后端零初始化后按 `getelementptr` 逐元素 `store`。
 
 ### 3.6 Comptime & introspection（编译期与自省） ⚠ spec-only（设计目标）
 
@@ -1049,6 +1052,6 @@ Annotation      : "@" Ident ("(" ArgList? ")")?
 | §4 | 注解系统（注册表） | ✅ 注册表数据化；⚠ 多数语义未接入 |
 | §5 | CTFE / type_info(T) 内建 | ⚠ 未接入 |
 | §6 | flag[T] 位域 + flag_set/get | ✅ 已实现（含 SlotInfo 自省） |
-| §7 | 外部数据导入 CSV/JSON | ⚠ 完全缺失 |
+| §7.2 | 外部数据导入 CSV/JSON（CTFE 脱糖） | ✅ 已实现 |
 
 > 设计哲学落地：**语法根本源为 `docs/reference.md`**（内含 `ebnf` 产生式块），经 `tools/gen_ebnf.mjs` 生成 `build/ebnf.json`，再由 `src/totter.tc` 数据驱动生成 `gen/tote.tc`（见 `src/tote.tc` `kw_lookup` 等标记区间）。这是「数据优先」原则在编译器构造上的直接应用。

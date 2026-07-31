@@ -154,6 +154,14 @@ TStr t_sb_to_str(TSb* b) {
 
 void t_sb_clear(TSb* b) { b->len = 0; }
 
+// int_to_str(v: i64) -> string —— 十进制文本（负数带前导 '-'）。
+// 走 arena，语义与 sb_new + sb_append_i64 + sb_to_str 完全一致。
+TStr t_int_to_str(int64_t v) {
+    TSb* b = t_sb_new(t_arena_current());
+    t_sb_append_i64(b, v);
+    return t_sb_to_str(b);
+}
+
 // ── 切片 []T ──────────────────────────────────────────────────
 TSlice t_slice_new(int64_t elem_size) {
     TSlice s;

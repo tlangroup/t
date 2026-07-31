@@ -61,6 +61,9 @@ void t_sb_append_char(TSb* b, uint8_t c);
 TStr t_sb_to_str(TSb* b);          // 返回以 \0 结尾的 TStr（arena 分配）
 void t_sb_clear(TSb* b);
 
+// int_to_str(v: i64) -> string —— 整数转十进制字符串（arena 分配）
+TStr t_int_to_str(int64_t v);
+
 // ── 切片 []T：泛型经元素宽度单态化 ─────────────────────────────
 // t 语言层不暴露 void*；类型安全由 tc 类型检查器在编译期保证。
 // emitter 规则：tokens[i] → *(Token*)t_slice_at(tokens, i)
