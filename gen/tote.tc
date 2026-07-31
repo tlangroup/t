@@ -9742,6 +9742,23 @@ c_map_get :: func(mn: i64, kn: i64) -> string {
     return cat6("(*(", valc, "*)t_map_val_ptr(", mstr, ", ", cat2(kstr, "))"));
 }
 
+// map 索引写时求 LHS 的 TMap* 基指针：
+// 单层 m[k] → m（变量本身即 TMap*）；嵌套 deep[a][x] → deep[a] 求内层 TMap* 值。
+// 用于 t_map_put 的第一个实参。
+c_map_lhs_ptr :: func(nd: i64) -> string {
+    var n1: Node = nodes[nd];
+    if (n1.kind == "index") {
+        var btd: i64 = expr_type_desc(nd);
+        if (btd >= 0 && tds[btd].cat == "map") {
+            // 嵌套：base 是 m[k] 本身也是 map，求内层 TMap* 值（t_map_val_ptr 返回槽指针，解引用得 TMap*）
+            var base: string = emit_expr(n1.na);
+            var key: string = c_map_keyp(nd, n1.nb);
+            return cat6("(*(TMap**)", "t_map_val_ptr(", base, ", ", key, "))");
+        }
+    }
+    return emit_expr(nd);
+}
+
 // map 字面量作为表达式（调用实参 / 返回值 / 嵌套值 / 赋值右值）时，
 // 建临时 TMap* 变量并逐项 put，返回该变量名。pad 为缩进（表达式场景通常为 ""）。
 var g_map_lit_cnt: i64 = 0;
@@ -9850,6 +9867,17 @@ emit_expr :: func(e: i64) -> string {
         return cat4("(", n.sa, emit_expr(n.na), ")");
     }
     if (n.kind == "assign") {
+        // m[k] = v : map 索引写须走 t_map_put（find-or-insert），不能对读值再存回
+        if (n.sa == "=") {
+            var lnode: Node = nodes[n.na];
+            if (lnode.kind == "index") {
+                var lotd: i64 = expr_type_desc(lnode.na);
+                if (lotd >= 0 && tds[lotd].cat == "map") {
+                    var mptr: string = c_map_lhs_ptr(lnode.na);
+                    return cat6("t_map_put(", mptr, ", ", c_map_keyp(lnode.na, lnode.nb), ", ", cat2(c_map_valp(lnode.na, n.nb), ")"));
+                }
+            }
+        }
         return cat6("(", emit_expr(n.na), " ", n.sa, " ", cat2(emit_expr(n.nb), ")"));
     }
     if (n.kind == "call") {
@@ -10247,6 +10275,8 @@ emit_stmt :: func(sid: i64, indent: i64) -> void {
         return;
     }
     if (n.kind == "assignment") {
+        // 注：普通 a = b 语句实际是 "assign" 表达式节点（见 emit_expr），"assignment"
+        // 节点在此保留为兜底；map 索引写已在 emit_expr 的 "assign" 分支处理。
         spush(cat6(pad, emit_expr(n.na), " ", n.sa, " ", cat2(emit_expr(n.nb), ";")));
         return;
     }
@@ -12264,6 +12294,21 @@ emit_lle :: func(e: i64) -> string {
         return ll_unary(e);
     }
     if (n.kind == "assign") {
+        // m[k] = v : map 索引写须走 tll_map_put（find-or-insert）
+        if (n.sa == "=") {
+            var ln: Node = nodes[n.na];
+            if (ln.kind == "index") {
+                var lotd: i64 = ll_etd(ln.na);
+                var lott: TD = tds[lotd];
+                if (lott.cat == "map") {
+                    var mp: string = emit_lle(ln.na);
+                    var kp: string = ll_map_keyptr(ln.nb, lott.key);
+                    var vp: string = ll_map_argptr(n.nb, lott.val);
+                    llfb(cat6("  call void @tll_map_put(ptr ", mp, ", ptr ", kp, ", ptr ", cat2(vp, ")")));
+                    return "0";
+                }
+            }
+        }
         var v: string = emit_lle(n.nb);
         var ltd: i64 = ll_etd(n.na);
         var ad: string = ll_addr(n.na);
@@ -13438,6 +13483,21 @@ emit_llstmt :: func(sid: i64) -> void {
         var ltd: i64 = ll_etd(n.na);
         var lty: string = ll_td(ltd);
         if (op == "=") {
+            // m[k] = v : map 索引写须走 tll_map_put（find-or-insert），不能对读值再存回
+            if (n.na >= 0) {
+                var ln: Node = nodes[n.na];
+                if (ln.kind == "index") {
+                    var lotd: i64 = ll_etd(ln.na);
+                    var lott: TD = tds[lotd];
+                    if (lott.cat == "map") {
+                        var mp: string = emit_lle(ln.na);
+                        var kp: string = ll_map_keyptr(ln.nb, lott.key);
+                        var vp: string = ll_map_argptr(n.nb, lott.val);
+                        llfb(cat6("  call void @tll_map_put(ptr ", mp, ", ptr ", kp, ", ptr ", cat2(vp, ")")));
+                        return;
+                    }
+                }
+            }
             var v: string = emit_lle(n.nb);
             var ad: string = ll_addr(n.na);
             if (ll_isagg(ltd)) {

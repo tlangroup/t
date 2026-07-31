@@ -103,6 +103,18 @@ for (k, v in m) {
 - `map_del(m, k) -> bool`    删除，返回删除前是否存在
 迭代顺序 = 插入顺序（确定性；删除后其余键的相对次序保持不变）。
 
+索引写（赋值）等价于 `map_set`，且支持 find-or-insert 语义——键不存在时自动创建，存在时覆盖（覆盖不增长长度）：
+```t
+var m: map[string]i64;
+m["alice"] = 10;                 // 等价 map_set(m, "alice", 10)
+m["alice"] = 15;                 // 覆盖
+m["sum"] = m["alice"] + m["bob"];// 读 + 写可混用
+var deep: map[string]map[string]i64;
+deep["a"] = ["x": 1, "y": 2];
+deep["a"]["x"] = 100;            // 嵌套索引写：自动对 inner map 求 TMap* 后插入
+```
+注意：索引写 `m[k] = v` 走的是 `t_map_put`（find-or-insert），**不是**对 `m[k]` 读值再回写——后者在键未命中时会写入 `t_map_val_ptr` 返回的零缓冲而丢失。整型键统一按 i64 落盘；计算右值、嵌套多层索引写两个后端行为一致。
+
 2.3 变体类型 Variant
 内置一等 Variant（带标签联合体 / tagged union），承载任意基础类型、结构体引用，用于配置解析、LLM 动态参数、跨模块数据传递。
 
