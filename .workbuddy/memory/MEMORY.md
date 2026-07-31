@@ -59,6 +59,15 @@ lld-link 加 `-Wl,-subsystem:console`（链接前查 `ll_has_main`）/ `int_to_s
 - **M31d 字面量非局部位置（全局 var / 结构体字段）**：C 不允许运行时调用作文件作用域初始化器 → 引入 `glines` 缓冲 + `g_spush_to_ginit` 开关，`emit_global_var` 把非常量初始化器搬进 `t__ginit()`（main 开头调用）；`g_stmt_pad` 供 `emit_expr` 的 map 字面量分支对齐缩进。LLVM 无此限制但双后端产物逐字节一致。
 - 验证：定点 src==gen（md5 `abd2e465…`）/ difftest 27/27 / conformance **29/29**（新增 `pass/p15_map_advanced.tc` + `fail/f14_for_kv_non_map.tc`）/ 三阶段自举 c→d IR 逐字节相同 / `examples/map_advanced.tc`（30 行）C==LLVM==`.expected.txt` 逐字节 / UNSUPPORTED 基线 0 条。canonical 已提升 `build/m31d/tote.exe`→`build/tote/tote.exe`。
 
+## M32：map 索引写 m[k] = v（2026-07-31）✅
+补齐 map 对称能力：读 `m[k]`（M29 经 `map_get`/`c_map_get`/`ll_map_get`，返回 V 值字节指针）已有，写 `m[k]=v` 此前只能走 `map_set` 内建。现 `m[k]=v` 编译为 `t_map_put`/`tll_map_put`（find-or-insert，**绝不**对读值回写——键未命中时 `t_map_val_ptr` 返回零缓冲，回写会丢失）。
+- **关键节点类型陷阱**：`a = b` 解析为 **`"assign"`** 节点（`parse_assign_expr`→`mk_assign`，L4896），**不是** `"assignment"`（`mk_assignment` L459 由 `parse_expr_or_assign_stmt` 创建，因 `parse_expr` 已吃掉 `=`，实际几乎不可达 → 死代码）。所以 **`m[k]=v` 的发射点必须在 `emit_expr`/`emit_lle` 的 `"assign"` 分支（L9869 / L12299），而非 `emit_stmt`/`emit_llstmt` 的 `"assignment"` 分支**——当初误改 `"assignment"` 分支导致所有改动不生效、长时间以为是 stale 二进制。
+- **C 后端**（`emit_expr` "assign" 分支）：`mptr = c_map_lhs_ptr(lnode.na)`，`t_map_put(mptr, c_map_keyp(lnode.na, lnode.nb), c_map_valp(lnode.na, n.nb))`。`c_map_lhs_ptr`（新增，L9750 后）单层 `m[k]` → `emit_expr(m)`（变量即 `TMap*`）；嵌套 `deep[a][x]` → `(*(TMap**)t_map_val_ptr(deep, &"a"))`（注意 `(*(TMap**)` 解引用需 **两个** 收尾 `))`）。`c_map_keyp`/`c_map_valp` 从 map 类型反查 K/V（标量键 `&(int64_t){…}`、标量值 `&(V){(V)(…)}`）。
+- **LLVM 后端**（`emit_lle` "assign" 分支）：`mp = emit_lle(ln.na)`（map 非 aggregate，`ll_map_get` 对 map 值直接 `load ptr` 返回 `TMap*`，单层/嵌套同此路径）；`ll_map_keyptr(ln.nb, lott.key)` + `ll_map_argptr(n.nb, lott.val)` → `call void @tll_map_put(ptr mp, ptr kp, ptr vp)`。
+- 复合赋值 `m[k] += v` 仍走 `binary` 分支（读值 `*ptr` 是左值，`+=` 直接生效），无需特判。
+- 用例 `examples/map_assign.tc`（string/整型键、覆盖、计算右值、嵌套写）+ `.expected.txt`（17 字节 `1520onetwo3510070`），C==LLVM 逐字节一致；`examples/map_advanced.tc` 回归 C==LLVM 一致。
+- 验证：定点 src==gen（md5 `9c68f878…`）/ difftest 27/27 / conformance 29/29 / 两阶段自举 IR 逐字节相同 / canonical 已提升（`build/tote/tote.exe`）。
+
 ## 数据驱动自生成主线（M17→M26）✅
 链路：`docs/reference.md` 表 → `tools/gen_ebnf.mjs` → `build/ebnf.json` → `src/totter.tc` → `src/tote.tc` 的 24 个 GEN 区间（`kw_lookup`/`builtins`/`derives`(9)/`diagnostics`(10)/`annotations`(34)/`xid`/`parser_dispatch`/`parser_rules`(30)/`ast`(65)/`scalar_*`(4)/`type_infer1/2`/`type_slice`/`type_resolve`/`type_declreg`/`td_*`(6)）。
 - **节点索引漂移铁律**：槽表达式内子节点分配改 `mk_X(...)` 会让实参先求值→索引前移→AST 变。命中处 `@rule … mk=inline`。
@@ -74,3 +83,20 @@ lld-link 加 `-Wl,-subsystem:console`（链接前查 `ll_has_main`）/ `int_to_s
 2. 函数类型（spec-only）；`type_info(T)` CTFE 内建
 3. import_json 嵌套对象/数组字段
 4. C 后端 `append(s, 字面量/调用)` 取址问题；缺 `println`；优化后端
+
+## M33：cat2..cat6 字符串拼接内建接入运行时（2026-07-31）✅ 修复技术债 #5
+`t` 文档称「字符串拼接一律 cat2..cat6」，但此前 cat2..cat6 仅在编译器自身源码定义（L997-1031），无 builtin 发射分支、runtime 无 `t_catN`/`tll_catN` —— 用户程序调用即 `undeclared`/链接失败，必须绕道 `StringBuilder`。
+- **数据驱动注册**（真相源 `docs/reference.md`）：`BuiltinTable` 加 `cat2..cat6 => ti_mk("String")`；`@tdrule td_calls` 加 5 行 `cn catN one mk string`。`node tools/gen_ebnf.mjs` → `build/ebnf.json`；`build/totter/totter.exe` → `gen/tote.tc`（同步 `src/tote.tc` 的 `builtin_ret` 与 `td_calls` GEN 块）。`catN` 返回 string，实参须为 string（拼接非字符串先 `int_to_str`）。
+- **runtime**：`t_runtime.c` 加 `t_cat2..t_cat6(TStr…) -> TStr`（StringBuilder 拼接）；`t_runtime.h` 加声明；`t_shim_ll.c` 加 `tll_cat2..tll_cat6`（TStr* 指针 + out 参数）。
+- **C 后端**（`emit_expr` builtin 分支）：`c_emit_cat_call(cn, av)`（新增助手 L9770 后）按 `t_<cn>(...)` 发射（实参 TStr 值传递）；注意前缀 `t_`（LLVM 用 `@tll_`）——初版漏 `t_` 导致发 `cat2(...)` 仍 `undeclared`，已修。
+- **LLVM 后端**（`emit_lle` builtin 分支）：`ll_scratch("%TStr")` 取 out，`emit_lle(ae[i])` 得各实参 `ptr`，`call void @tll_catN(ptr, ptr, …, ptr out)`；`llph` 加 5 条 `declare void @tll_catN(ptr…, ptr)`。
+- **自举注意**：`cat2..cat6` 在编译器自身源码定义为用户函数；`builtin_ret` 仅在 `sym_lookup` 失败时被查询（L7061），故注册为 builtin 不与其冲突、不触发重定义；自举后编译器内部 `catN` 调用改为走 `@tll_catN`（IR 中 `@t.cat3`→`@tll_cat3` 即本次改动落地之证）。
+- 用例 `examples/cat_demo.tc` + `.expected.txt`（46 字节 `Hello, World!abcx12yn=10 20 okv1234!ABCDsum=15`，含嵌套 cat/返回值/右值/实参），C==LLVM 逐字节一致。
+- 验证：定点 src==gen（md5 `ad1fe3e6…`）/ difftest 27/27 / conformance **29/29** / 两阶段自举 IR 逐字节相同（tote-b==tote-c；tote-a→tote-b 因 emit 变更而 `@t.cat3`→`@tll_cat3` 属一次性过渡，非不动点破坏）/ UNSUPPORTED 基线 0 条 / 提升 canonical `build/tote/tote.exe`。
+
+## M34：修复 `print(scalar)` LLVM 后端崩溃（2026-07-31）✅
+`print(x)`（x 为标量）此前漏过类型检查，LLVM 后端生成 `call void @tll_print(ptr <i64>)` 触发 IR 校验失败 `'i64' but expected 'ptr'` → `clang link failed`。根因：内建调用实参类型完全不校验（`builtin_ret` 只管返回类型）。
+- **修复**：`infer_expr` 的 `call` 分支对 `print`/`println`/`eprint` 实参加 `String` 约束（非 `String` 且非 `Unknown` → `T_TYPE_MISMATCH`，提示用 `int_to_str`/`to_string`/`cat*`）。在 `run_check()` 阶段触发、`has_errors()` 中止，故不进 `emit_llunit`，后端崩溃消除。
+- **坑**：`infer_expr` 形参 `e` 才是 i64 节点索引，`n` 是 `Node` 结构；误用 `n_file(n)` 会让编译器自身重编译时 `@t.n_file(i64 %v.n)` �� ptr 错。位置信息一律用 `e`。
+- 回归用例 `tests/conformance/fail/f12_print_scalar.tc`（`// EXPECT: error T_TYPE_MISMATCH`）。所有现有示例 `print(` 均传字符串/`int_to_str`/`cat*`，无误伤。
+- 验证：两阶段自举 IR 逐字节相同（`a75de97a…`）/ difftest 27/27 / conformance **30/30** / shadow_check+catn_check OK / UNSUPPORTED 0 / canonical 提升 `build/tote/tote.exe`。
