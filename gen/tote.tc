@@ -6352,11 +6352,11 @@ ti_equal :: func(ai: i64, bi: i64) -> bool {
     if (a.kind == "Slice" || a.kind == "Pointer" || a.kind == "Optional") {
         return ti_equal(a.elem, b.elem);
     }
-    if (a.kind == "Map") {
-        if (ti_equal(a.key, b.key) == false) {
-            return false;
-        }
-        return ti_equal(a.val, b.val);
+    if (a.kind == "Map" && b.kind == "Map") {
+        // 任一侧 key/val 为 Unknown（如 map_new 返回值）即放行，支持 map_new() -> map[K]V 赋值
+        var okk: bool = (a.key < 0 || b.key < 0 || ti_equal(a.key, b.key));
+        var okv: bool = (a.val < 0 || b.val < 0 || ti_equal(a.val, b.val));
+        return okk && okv;
     }
     return a.name == b.name;
 }
@@ -6913,6 +6913,21 @@ builtin_ret :: func(name: string) -> i64 {
     if (name == "sb_new") {
         return ti_mk("StringBuilder");
     }
+    if (name == "map_new") {
+        return ti_mk("Map");
+    }
+    if (name == "map_set") {
+        return ti_mk("Void");
+    }
+    if (name == "map_has" || name == "map_del") {
+        return ti_scalar("bool");
+    }
+    if (name == "map_len") {
+        return ti_scalar("i64");
+    }
+    if (name == "map_get") {
+        return ti_mk("Unknown");
+    }
     return ti_mk("Unknown");
 }
 // <<< GEN:builtins <<<
@@ -7022,6 +7037,18 @@ infer_expr :: func(e: i64) -> i64 {
                         return resolve_ti(fd.na);
                     }
                 }
+            }
+            // map_get(m, k) 的返回类型 = 映射的 V（需从首个实参的 map 类型反查）
+            if (fname == "map_get" && n.la >= 0) {
+                var mgn: i64 = kids[n.la].val;
+                var mgt: i64 = infer_expr(mgn);
+                if (ti_kind(mgt) == "Map") {
+                    var mgti: TI = tis[mgt];
+                    if (mgti.val >= 0) {
+                        return mgti.val;
+                    }
+                }
+                return ti_mk("Unknown");
             }
             return builtin_ret(fname);
         }
@@ -9372,7 +9399,24 @@ expr_type_desc :: func(e: i64) -> i64 {
             if (cn == "sb_to_str") { return td_mk("string"); }
             if (cn == "int_to_str") { return td_mk("string"); }
             if (cn == "sb_new") { return td_named_mk("named", "TSb*"); }
+            if (cn == "map_has") { return td_named_mk("scalar", "bool"); }
+            if (cn == "map_del") { return td_named_mk("scalar", "bool"); }
+            if (cn == "map_len") { return td_named_mk("scalar", "i64"); }
+            if (cn == "map_set") { return td_mk("void"); }
+            if (cn == "map_new") { return td_mk("map"); }
 // <<< GEN:td_calls <<<
+            // map_get(m, k) 的返回类型 = 映射的 V（从首个实参的 map 类型反查）
+            if (cn == "map_get" && n.la >= 0) {
+                var mn: i64 = kids[n.la].val;
+                var mtd: i64 = expr_type_desc(mn);
+                if (mtd >= 0) {
+                    var mt: TD = tds[mtd];
+                    if (mt.cat == "map" && mt.val >= 0) {
+                        return mt.val;
+                    }
+                }
+                return td_mk("unknown");
+            }
             var rt: i64 = tm_get(cat2(cn, "()"));
             if (rt >= 0) {
                 return rt;
@@ -9557,6 +9601,17 @@ mk_pad :: func(indent: i64) -> string {
 
 // ── emitExpr（复刻 emitter.ts emitExpr）────────────────────────
 
+// map 读索引助手：t_map_val_ptr 返回存储值字节指针，按 V 类型解引用。
+// 注意：key 需是左值（&k），与 append 字面量取址限制一致。
+c_map_get :: func(mn: i64, kn: i64) -> string {
+    var mtd: i64 = expr_type_desc(mn);
+    var mt: TD = tds[mtd];
+    var valc: string = desc_to_c(mt.val);
+    var mstr: string = emit_expr(mn);
+    var kstr: string = emit_expr(kn);
+    return cat6("(*(", valc, "*)t_map_val_ptr(", mstr, ", &", cat2(kstr, "))"));
+}
+
 emit_expr :: func(e: i64) -> string {
     if (e < 0) {
         return "";
@@ -9666,6 +9721,25 @@ emit_expr :: func(e: i64) -> string {
             if (cn == "sb_to_str") { return cat3("t_sb_to_str(", av[0], ")"); }
             if (cn == "int_to_str") { return cat3("t_int_to_str(", av[0], ")"); }
             if (cn == "sb_clear") { return cat3("t_sb_clear(", av[0], ")"); }
+            if (cn == "map_new") {
+                var mnw0: i64 = -1;
+                if (n.la >= 0) { mnw0 = kids[n.la].val; }
+                var mnwtd: i64 = expr_type_desc(mnw0);
+                var mnwt: TD = tds[mnwtd];
+                var mnwkk: i64 = 0;
+                if (tds[mnwt.key].cat != "string") { mnwkk = 1; }
+                var mnwvs: string = cat3("sizeof(", desc_to_c(mnwt.val), ")");
+                return cat5("t_map_new(t_arena_current(), ", i2s(mnwkk), ", (int64_t)", mnwvs, ")");
+            }
+            if (cn == "map_set") { return cat6("t_map_put(", av[0], ", &", av[1], ", &", cat2(av[2], ")")); }
+            if (cn == "map_has") { return cat5("t_map_has(", av[0], ", &", av[1], ")"); }
+            if (cn == "map_len") { return cat3("t_map_len(", av[0], ")"); }
+            if (cn == "map_del") { return cat5("t_map_del(", av[0], ", &", av[1], ")"); }
+            if (cn == "map_get") {
+                var mg0: i64 = -1; if (n.la >= 0) { mg0 = kids[n.la].val; }
+                var mg1: i64 = -1; if (n.la >= 0 && kids[n.la].next >= 0) { mg1 = kids[kids[n.la].next].val; }
+                return c_map_get(mg0, mg1);
+            }
             // 普通调用
             var sb: StringBuilder = sb_new();
             sb_append_str(sb, cn);
@@ -9713,6 +9787,9 @@ emit_expr :: func(e: i64) -> string {
         if (ot.cat == "slice") {
             var ec: string = desc_to_c(ot.elem);
             return cat6("(*(", ec, "*)t_slice_at(", obj, ", ", cat2(idx, "))"));
+        }
+        if (ot.cat == "map") {
+            return c_map_get(n.na, n.nb);
         }
         return cat6("(", obj, "[", idx, "]", ")");
     }
@@ -11991,6 +12068,9 @@ emit_lle :: func(e: i64) -> string {
             }
             return ll_load("i64", gp2);
         }
+        if (ot.cat == "map") {
+            return ll_map_get(n.na, n.nb);
+        }
         return "0";
     }
     if (n.kind == "struct_lit") {
@@ -12382,6 +12462,43 @@ ll_arith_ins :: func(op: string, sn: string) -> string {
 
 // ── 调用发射 ───────────────────────────────────────────────────
 
+// map 读索引助手（LLVM）：tll_map_val_ptr 返回存储值字节指针，按 V 类型 load。
+// map 操作数取指针助手（LLVM）：按 map 声明的 K/V 类型落盘，
+// 标量 alloca+store（必要时先转宽），聚合直接取地址。want<0 表示沿用实参自身类型。
+ll_map_argptr :: func(an: i64, want: i64) -> string {
+    var atd: i64 = ll_etd(an);
+    var used: i64 = atd;
+    if (want >= 0) {
+        used = want;
+    }
+    if (ll_isagg(used)) {
+        return emit_lle(an);
+    }
+    var aty: string = ll_td(used);
+    var av: string = emit_lle(an);
+    av = ll_cast_v(av, atd, used);
+    var asc: string = ll_scratch(aty);
+    llfb(cat6("  store ", aty, " ", av, ", ptr ", asc));
+    return asc;
+}
+
+ll_map_get :: func(mn: i64, kn: i64) -> string {
+    var mtd: i64 = ll_etd(mn);
+    var mt: TD = tds[mtd];
+    var valtd: i64 = mt.val;
+    var valty: string = ll_td(valtd);
+    var mp: string = emit_lle(mn);
+    var kp: string = ll_map_argptr(kn, mt.key);
+    var addr: string = ll_tmp();
+    llfb(cat6("  ", addr, " = call ptr @tll_map_val_ptr(ptr ", mp, ", ptr ", cat2(kp, ")")));
+    if (ll_isagg(valtd)) {
+        return addr;
+    }
+    var out: string = ll_tmp();
+    llfb(cat6("  ", out, " = load ", valty, ", ptr ", addr));
+    return out;
+}
+
 ll_call :: func(e: i64) -> string {
     var n: Node = nodes[e];
     var cal: Node = nodes[n.na];
@@ -12620,6 +12737,56 @@ ll_call :: func(e: i64) -> string {
         var out5: string = ll_scratch("%TStr");
         llfb(cat6("  call void @tll_int_to_str(i64 ", iv5, ", ptr ", out5, ")", ""));
         return out5;
+    }
+    if (cn == "map_new") {
+        var mtd2: i64 = ll_etd(ae[0]);
+        var mt2: TD = tds[mtd2];
+        var kk2: i64 = 0;
+        if (tds[mt2.key].cat != "string") { kk2 = 1; }
+        var vs2: string = ll_sizeof(ll_td(mt2.val));
+        var tnew: string = ll_tmp();
+        llfb(cat6("  ", tnew, " = call ptr @tll_map_new(i64 ", i2s(kk2), ", i64 ", cat2(vs2, ")")));
+        return tnew;
+    }
+    if (cn == "map_get") {
+        return ll_map_get(ae[0], ae[1]);
+    }
+    if (cn == "map_set") {
+        var mtd3: i64 = ll_etd(ae[0]);
+        var mt3: TD = tds[mtd3];
+        var mp3: string = emit_lle(ae[0]);
+        var kp3: string = ll_map_argptr(ae[1], mt3.key);
+        var vp3: string = ll_map_argptr(ae[2], mt3.val);
+        llfb(cat6("  call void @tll_map_put(ptr ", mp3, ", ptr ", kp3, ", ptr ", cat2(vp3, ")")));
+        return "0";
+    }
+    if (cn == "map_has") {
+        var mtd4: i64 = ll_etd(ae[0]);
+        var mt4: TD = tds[mtd4];
+        var mp4: string = emit_lle(ae[0]);
+        var kp4: string = ll_map_argptr(ae[1], mt4.key);
+        var t4: string = ll_tmp();
+        llfb(cat6("  ", t4, " = call i32 @tll_map_has(ptr ", mp4, ", ptr ", cat2(kp4, ")")));
+        var t4b: string = ll_tmp();
+        llfb(cat4("  ", t4b, " = trunc i32 ", cat2(t4, " to i8")));
+        return t4b;
+    }
+    if (cn == "map_len") {
+        var mp5: string = emit_lle(ae[0]);
+        var t5: string = ll_tmp();
+        llfb(cat6("  ", t5, " = call i64 @tll_map_len(ptr ", mp5, ")", ""));
+        return t5;
+    }
+    if (cn == "map_del") {
+        var mtd6: i64 = ll_etd(ae[0]);
+        var mt6: TD = tds[mtd6];
+        var mp6: string = emit_lle(ae[0]);
+        var kp6: string = ll_map_argptr(ae[1], mt6.key);
+        var t6: string = ll_tmp();
+        llfb(cat6("  ", t6, " = call i32 @tll_map_del(ptr ", mp6, ", ptr ", cat2(kp6, ")")));
+        var t6b: string = ll_tmp();
+        llfb(cat4("  ", t6b, " = trunc i32 ", cat2(t6, " to i8")));
+        return t6b;
     }
     if (cn == "flag_get" || cn == "flag_set") {
         var mn: Node = nodes[ae[1]];
@@ -13478,6 +13645,12 @@ emit_lldeclares :: func() -> void {
     llph("declare ptr @tll_slice_at(ptr, i64)");
     llph("declare void @tll_slice_set(ptr, i64, ptr)");
     llph("declare i64 @tll_slice_len(ptr)");
+    llph("declare ptr @tll_map_new(i64, i64)");
+    llph("declare void @tll_map_put(ptr, ptr, ptr)");
+    llph("declare ptr @tll_map_val_ptr(ptr, ptr)");
+    llph("declare i32 @tll_map_has(ptr, ptr)");
+    llph("declare i64 @tll_map_len(ptr)");
+    llph("declare i32 @tll_map_del(ptr, ptr)");
     llph("declare void @tll_file_read_all(ptr, ptr)");
     llph("declare i32 @tll_file_write_all(ptr, ptr)");
     llph("declare i32 @tll_file_exists(ptr)");

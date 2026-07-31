@@ -88,6 +88,8 @@ bool  t_map_get(TMap* m, const void* key, void* out_val);   // key: TStr* 或 in
 void  t_map_put(TMap* m, const void* key, const void* val);
 bool  t_map_has(TMap* m, const void* key);
 int64_t t_map_len(TMap* m);
+void* t_map_val_ptr(TMap* m, const void* key);   // 返回存储值字节指针；未命中返回零缓冲（val_size 字节）
+bool  t_map_del(TMap* m, const void* key);        // 删除键，返回是否曾存在
 
 // 按插入序迭代（保证确定性，对应 bootstrap.md 风险项）
 int64_t t_map_count(TMap* m);

@@ -178,6 +178,11 @@ BuiltinTable:
   | "file_write_all" / "file_exists" => ti_scalar("bool")
   | "args" => ti_elem_of("Slice", ti_mk("String"))
   | "sb_new" => ti_mk("StringBuilder")
+  | "map_new" => ti_mk("Map")
+  | "map_set" => ti_mk("Void")
+  | "map_has" / "map_del" => ti_scalar("bool")
+  | "map_len" => ti_scalar("i64")
+  | "map_get" => ti_mk("Unknown")   // 返回类型 = 映射的 V，由 infer_expr/expr_type_desc 特判
 
 DeriveTraitTable:
     "ToString" | "FromString" | "Clone" | "Copy" | "DebugPrint"
@@ -761,6 +766,11 @@ TdRuleTable ::
   // @tdrule td_calls  12 cn     sb_to_str     one mk    string -
   // @tdrule td_calls  12 cn     int_to_str    one mk    string -
   // @tdrule td_calls  12 cn     sb_new        one named named  TSb*
+  // @tdrule td_calls  12 cn     map_has       one named scalar bool
+  // @tdrule td_calls  12 cn     map_del       one named scalar bool
+  // @tdrule td_calls  12 cn     map_len       one named scalar i64
+  // @tdrule td_calls  12 cn     map_set       one mk    void -
+  // @tdrule td_calls  12 cn     map_new       one mk    map -
 ```
 
 ## 3. Syntax（语法）
@@ -957,7 +967,7 @@ Type:
       IntType | FloatType | "bool" | "string" | "StringBuilder"
     | "[" Type "]"                       // 动态切片 []T
     | "[" IntegerLiteral "]" Type        // 定长数组 [N]T
-    | "map" "[" Type "]" Type            // 哈希映射 map[K]V  ⚠ spec-only
+    | "map" "[" Type "]" Type            // 哈希映射 map[K]V  ✅ tote
     | TypeName                           // 命名类型（struct/enum/flag/variant）
     | "func" "(" (Type ("," Type)*)? ")" "->" Type   // ⚠ spec-only 函数类型
 
@@ -965,7 +975,7 @@ IntType:  "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64"
 FloatType:"f16" | "f32" | "f64"
 ```
 
-- ✅ tote：标量固定位宽 + `string`/`StringBuilder` + `[]T` 切片 + `[N]T` 定长数组均实装；`map[K]V`/函数类型为 spec-only。
+- ✅ tote：标量固定位宽 + `string`/`StringBuilder` + `[]T` 切片 + `[N]T` 定长数组 + `map[K]V` 哈希映射均实装（new/set/get/has/len/del 内建 + `m[k]` 读索引）；函数类型为 spec-only。
 - 类型名解析：先查内建，再查当前单元已声明命名类型。
 - **数组字面量 `[e1, e2, …]`**：元素类型取首元素推断，整型元素统一提升为 `i64`（`[1,2,3]` 是 `[3]i64` 而非 `[3]u8`）；空字面量 `[]` 元素类型未知，可赋给任意 `[]T` / `[N]T`。定长数组与切片之间只要元素可转型即可互赋（目标为定长数组时长度须一致）。赋给 `[]T` 时脱糖为运行期 `slice_new` + 逐元素 `append`；赋给 `[N]T` 时 C 后端用花括号初始化器、LLVM 后端零初始化后按 `getelementptr` 逐元素 `store`。
 

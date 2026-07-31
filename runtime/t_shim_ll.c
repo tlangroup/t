@@ -42,6 +42,8 @@ int32_t tll_map_get(TMap* m, void* key, void* out)      { return t_map_get(m, ke
 void    tll_map_put(TMap* m, void* key, void* val)      { t_map_put(m, key, val); }
 int32_t tll_map_has(TMap* m, void* key)                 { return t_map_has(m, key) ? 1 : 0; }
 int64_t tll_map_len(TMap* m)                            { return t_map_len(m); }
+void*   tll_map_val_ptr(TMap* m, void* key)            { return t_map_val_ptr(m, key); }
+int32_t tll_map_del(TMap* m, void* key)                { return t_map_del(m, key) ? 1 : 0; }
 
 // ── I/O 与进程 ─────────────────────────────────────────────────
 void    tll_file_read_all(TStr* path, TStr* out)     { *out = t_file_read_all(t_cstr(*path)); }

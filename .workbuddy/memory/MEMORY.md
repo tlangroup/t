@@ -12,12 +12,16 @@
 3. `./build/totter/totter.exe` → `gen/tote.tc`；`cp gen/tote.tc src/tote.tc` 提升定点
 4. canonical tote 编译 `src/tote.tc` → 新 tote
 - 编译：`build/tote/tote.exe build <f.tc> --clang "C:/Program Files/LLVM/bin/clang.exe" --output build/<dir>/<name>`（输出目录先 mkdir）。`emit-ll --output p` 写 `p.ll`；`compile --output <dir>` 出 C。
-- 验证四件套：① 定点 `md5sum src/tote.tc gen/tote.tc` 相等 ② `node tools/difftest.mjs --ref A --cand B` → 27/27 ③ `node tools/conformance.mjs --compiler <exe>` → 25/25 ④ LLVM IR 逐字节 diff + `run --example hello/fib` smoke。
+- 验证四件套：① 定点 `md5sum src/tote.tc gen/tote.tc` 相等 ② `node tools/difftest.mjs --ref A --cand B` → 27/27 ③ `node tools/conformance.mjs --compiler <exe>` → 26/26 ④ LLVM IR 逐字节 diff + `run --example hello/fib` smoke。
+- 提交前自检：`node tools/shadow_check.mjs src/tote.tc`（同名不同型局部变量）+ `node tools/catn_check.mjs src/tote.tc`（catN 实参数）。
+- **测试体系不验证运行时行为**：conformance 只跑 `check`（用例必须有 `// EXPECT: pass|error|warning` 首行），difftest 只比 lex/parse/check 的 stdout，`assert_*` 在 LLVM 后端是 no-op（IR 仅留注释）。运行时语义必须写 `examples/*.tc` 实跑 + 存 `.expected.txt` 比对，并交叉验证 C 后端（`compile --output <目录>` 出 .h/.c → clang 编译 → 输出应与 LLVM 产物逐字节一致）。
+- 新增能力会让 b→c 阶段 IR 多出新 declare（canonical 旧版不认识），**不算不动点破坏**；判据是再跑一阶段 c→d IR 逐字节相同。
 - 两阶段自举 tote-b→tote-c，IR 逐字节相同即等价（exe md5 差异=链接时间戳）。提升 canonical 前归档 `build/archive/<name>_pre-<里程碑>.exe`。
 
 ## 环境 / 实现铁律（最高频踩坑）
 - MSVC 需 `/utf-8` + 生成 C 带 BOM；LLVM 避开 Win64 聚合 ABI（`runtime/t_shim_ll.c` 的 `tll_*` 指针桥）。arena 512MB。line/col = UTF-8 字节计数；stdout 二进制模式；`sb_to_str` 复制语义。
-- **catN 实参个数必须严格等于 N**——多传不报错，只在 IR 炸（曾多传 `""` 拼成 `i64 @.tsN`）。
+- **catN 实参个数必须严格等于 N**——多传/少传不一定报错，可能只发射出残缺字符串或在 IR 炸。守卫 `tools/catn_check.mjs`。
+- **同一函数内同名局部变量不得有不同类型**：LLVM 后端 `fs` 表按 (fn,var) 扁平记录、`fs_get` 从后往前取，后声明的同名变量污染前面的聚合性判定 → 漏 `load`，症状 `'%v.x' defined with type 'ptr' but expected 'i64'`。守卫 `tools/shadow_check.mjs`。
 - **checker 跨函数引用很宽松**：在 `ll_addr` 用 `ll_call` 的局部（如 `td_i64`）不会报错、被当 0 → 错 IR。索引用 `ll_widen_idx(emit_lle(n.nb), n.nb)`，勿硬编码 `td_i64`。
 - **slice 是值传递**：函数内 `append` 不影响调用方，无 out 参数；返回表用全局 slice + base 偏移。误用表现 `t_slice_at index 0 length 0`。
 - **string `+` 在 LLVM 后端未实现**（静默发 `add i64`），一律 `cat2..cat6`。
@@ -34,6 +38,16 @@
 4. **切片字面量 codegen**（新）：`var xs: []T = [a,b,c]` C 后端发 `t_slice_new`+逐元素局部+`t_slice_append`；LLVM `ll_local_decl` 发 `tll_slice_new`+`tll_slice_append`。辅助 `is_array_lit(e)`。
 5. **定长数组 `[N]T` LLVM 支持**（新，原静默读 0）：`TD` 加 `alen`；`resolve_type_desc` 补 `array` 分支；`desc_to_c` array→`T*`；`ll_td`→`[N x T]`；`ll_isagg` array=true；`ll_zero` 把 `[` 开头也当 zeroinitializer；`ll_addr`/`emit_lle` index 走 `getelementptr [N x T], ptr, i64 0, i64 idx`；`ll_local_decl` 先 zeroinit 再逐元素 store。
 - 新增 conformance：`pass/p11_array_literal.tc`、`pass/p12_int_to_str.tc`（25 例）。归档 `build/archive/tote_pre-M28-limits.exe`、`totter_pre-M28-limits.exe`。
+
+## M29：map[K]V 端到端（2026-07-30）✅
+- 解析/TI/TD 骨架早已实装（reference.md 的 `spec-only` 标注过时）；本轮补的是内建 + 双后端 codegen + runtime。
+- runtime：`map_find_slot()` 抽公共探测；新增 `t_map_val_ptr`（未命中返回 arena 零缓冲）+ `t_map_del`（tombstone + 从 order 数组 memmove 保持插入序）+ 两个 `tll_*` shim。
+- 6 内建 `map_new/set/get/has/len/del`：前 5 个入 `BuiltinTable`/`@tdrule td_calls`；**`map_get` 返回 V 无法表驱**，在 `infer_expr`/`expr_type_desc` 手写特判（取首实参 map 类型的 `.val`）。
+- C 后端 `c_map_get` 发 `(*(V*)t_map_val_ptr(m,&k))`；LLVM `ll_map_argptr(an, want)` 按声明的 K/V 类型 alloca+store（先 `ll_cast_v` 转宽，否则只写低位）+ `ll_map_get`；两后端 index 分支 `ot.cat=="map"` 复用同路径 → `m[k]` ≡ `map_get`。
+- `can_cast` Map 分支：任一侧 key/val 为 Unknown 即放行（否则 `map_new()` 的返回值无法赋给 `map[K]V`）。
+- `map_new(m)` 需传同类型变量提供 K/V（t 无类型参数语法）；语义已写入 `docs/spec.md` §2.2。
+- 未做：map 字面量 `{k:v}` 的 emit 路径（解析/infer 已有）、map 的 for-in 迭代。
+- 用例：`tests/conformance/pass/p13_map_ops.tc`（静态）+ `examples/maps.tc`/`maps.expected.txt`（运行时 19 行，C/LLVM 逐字节一致）。归档 `build/archive/{tote,totter}_pre-M29-map.exe`。
 
 ## 数据驱动自生成主线（M17→M26）✅
 链路：`docs/reference.md` 表 → `tools/gen_ebnf.mjs` → `build/ebnf.json` → `src/totter.tc` → `src/tote.tc` 的 24 个 GEN 区间（`kw_lookup`/`builtins`/`derives`(9)/`diagnostics`(10)/`annotations`(34)/`xid`/`parser_dispatch`/`parser_rules`(30)/`ast`(65)/`scalar_*`(4)/`type_infer1/2`/`type_slice`/`type_resolve`/`type_declreg`/`td_*`(6)）。

@@ -338,48 +338,67 @@ void t_map_put(TMap* m, const void* key, const void* val) {
     if (m->used * 10 >= m->cap * 7 && m->cap < (1LL << 40)) map_rehash(m);
 }
 
-bool t_map_get(TMap* m, const void* key, void* out_val) {
+static int64_t map_find_slot(TMap* m, const void* key) {
     if (m->key_kind == 0) {
         uint64_t h = map_hash_str(*(const TStr*)key);
         int64_t i = map_probe(m, h);
         while (m->slots[i].state != 0) {
-            if (m->slots[i].state == 1 && t_str_eq(m->slots[i].key_str, *(const TStr*)key)) {
-                memcpy(out_val, m->slots[i].value, (size_t)m->val_size);
-                return true;
-            }
+            if (m->slots[i].state == 1 && t_str_eq(m->slots[i].key_str, *(const TStr*)key)) return i;
             i = (i + 1) & (m->cap - 1);
         }
     } else {
         uint64_t h = map_hash_int(*(const int64_t*)key);
         int64_t i = map_probe(m, h);
         while (m->slots[i].state != 0) {
-            if (m->slots[i].state == 1 && m->slots[i].key_int == *(const int64_t*)key) {
-                memcpy(out_val, m->slots[i].value, (size_t)m->val_size);
-                return true;
-            }
+            if (m->slots[i].state == 1 && m->slots[i].key_int == *(const int64_t*)key) return i;
             i = (i + 1) & (m->cap - 1);
         }
     }
-    return false;
+    return -1;
+}
+
+bool t_map_get(TMap* m, const void* key, void* out_val) {
+    int64_t i = map_find_slot(m, key);
+    if (i < 0) return false;
+    memcpy(out_val, m->slots[i].value, (size_t)m->val_size);
+    return true;
 }
 
 bool t_map_has(TMap* m, const void* key) {
+    return map_find_slot(m, key) >= 0;
+}
+
+void* t_map_val_ptr(TMap* m, const void* key) {
+    int64_t i = map_find_slot(m, key);
+    if (i >= 0) return m->slots[i].value;
+    void* z = t_arena_alloc(m->a, (size_t)m->val_size);
+    memset(z, 0, (size_t)m->val_size);
+    return z;
+}
+
+bool t_map_del(TMap* m, const void* key) {
+    int64_t i = map_find_slot(m, key);
+    if (i < 0) return false;
+    m->slots[i].state = 2;  // tombstone
+    m->count--;
     if (m->key_kind == 0) {
-        uint64_t h = map_hash_str(*(const TStr*)key);
-        int64_t i = map_probe(m, h);
-        while (m->slots[i].state != 0) {
-            if (m->slots[i].state == 1 && t_str_eq(m->slots[i].key_str, *(const TStr*)key)) return true;
-            i = (i + 1) & (m->cap - 1);
+        for (int64_t o = 0; o < m->order_str_len; o++) {
+            if (t_str_eq(m->order_str[o], *(const TStr*)key)) {
+                memmove(&m->order_str[o], &m->order_str[o + 1], sizeof(TStr) * (size_t)(m->order_str_len - o - 1));
+                m->order_str_len--;
+                break;
+            }
         }
     } else {
-        uint64_t h = map_hash_int(*(const int64_t*)key);
-        int64_t i = map_probe(m, h);
-        while (m->slots[i].state != 0) {
-            if (m->slots[i].state == 1 && m->slots[i].key_int == *(const int64_t*)key) return true;
-            i = (i + 1) & (m->cap - 1);
+        for (int64_t o = 0; o < m->order_int_len; o++) {
+            if (m->order_int[o] == *(const int64_t*)key) {
+                memmove(&m->order_int[o], &m->order_int[o + 1], sizeof(int64_t) * (size_t)(m->order_int_len - o - 1));
+                m->order_int_len--;
+                break;
+            }
         }
     }
-    return false;
+    return true;
 }
 
 int64_t t_map_len(TMap* m)  { return m->count; }
