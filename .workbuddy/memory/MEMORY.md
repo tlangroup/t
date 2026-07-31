@@ -31,23 +31,18 @@
 - 诊断：`T_TYPE_UNKNOWN` 从未发出（实报 `T_TYPE_MISMATCH`）；命名违规是 warning（exit 0）。
 - 自举鸡蛋问题：新增内建要在 tote 自身运行期生效须两阶段自举；只用于被编译程序则一阶段即可。
 
-## M28：既有限制修复（2026-07-30）✅
-1. **lld-link subsystem**：clang 命令加 `-Wl,-subsystem:console`；链接前查 `ll_has_main`，无 `@main` 报 `error: no entry point`（emit-ll 不受限）。
-2. **LLVM int_to_str UNSUPPORTED**：全链路内建 `int_to_str(i64)->string`：runtime `t_int_to_str`(sb+append_i64+to_str) + `t_runtime.h` 声明 + shim `tll_int_to_str(i64,TStr*)` + reference.md `BuiltinTable`/`@tdrule td_calls` 各加一行 + C 后端 `t_int_to_str(...)` + LLVM `ll_call` 用 `ll_scratch("%TStr")` + `emit_lldeclares` 加 declare。
-3. **数组字面量推导**：`infer_expr(array_lit)` 整型元素统一提 `i64`（`[1,2,3]`=`[3]i64`）；`can_cast` 新增 Array↔Slice 转型（定长→定长要求 alen 相等，元素 Unknown 放行，否则递归）。
-4. **切片字面量 codegen**（新）：`var xs: []T = [a,b,c]` C 后端发 `t_slice_new`+逐元素局部+`t_slice_append`；LLVM `ll_local_decl` 发 `tll_slice_new`+`tll_slice_append`。辅助 `is_array_lit(e)`。
-5. **定长数组 `[N]T` LLVM 支持**（新，原静默读 0）：`TD` 加 `alen`；`resolve_type_desc` 补 `array` 分支；`desc_to_c` array→`T*`；`ll_td`→`[N x T]`；`ll_isagg` array=true；`ll_zero` 把 `[` 开头也当 zeroinitializer；`ll_addr`/`emit_lle` index 走 `getelementptr [N x T], ptr, i64 0, i64 idx`；`ll_local_decl` 先 zeroinit 再逐元素 store。
-- 新增 conformance：`pass/p11_array_literal.tc`、`pass/p12_int_to_str.tc`（25 例）。归档 `build/archive/tote_pre-M28-limits.exe`、`totter_pre-M28-limits.exe`。
+## M28：既有限制修复（2026-07-30）✅ 详见日志
+lld-link 加 `-Wl,-subsystem:console`（链接前查 `ll_has_main`）/ `int_to_str` 全链路内建 / 数组字面量整型统一提 `i64` + `can_cast` Array↔Slice / 切片字面量 codegen / 定长数组 `[N]T` LLVM 支持（`TD.alen`、`ll_td`→`[N x T]`、index 走 `getelementptr [N x T], ptr, i64 0, i64 idx`）。用例 p11/p12。
 
 ## M29：map[K]V 端到端（2026-07-30）✅
-- 解析/TI/TD 骨架早已实装（reference.md 的 `spec-only` 标注过时）；本轮补的是内建 + 双后端 codegen + runtime。
-- runtime：`map_find_slot()` 抽公共探测；新增 `t_map_val_ptr`（未命中返回 arena 零缓冲）+ `t_map_del`（tombstone + 从 order 数组 memmove 保持插入序）+ 两个 `tll_*` shim。
+- 解析/TI/TD 骨架早已实装（`spec-only` 标注过时）；本轮补内建 + 双后端 codegen + runtime。
+- runtime：`map_find_slot()` 抽公共探测；`t_map_val_ptr`（未命中返回 arena 零缓冲）+ `t_map_del`（tombstone + 从 order 数组 memmove 保持插入序）+ 两个 `tll_*` shim。
 - 6 内建 `map_new/set/get/has/len/del`：前 5 个入 `BuiltinTable`/`@tdrule td_calls`；**`map_get` 返回 V 无法表驱**，在 `infer_expr`/`expr_type_desc` 手写特判（取首实参 map 类型的 `.val`）。
 - C 后端 `c_map_get` 发 `(*(V*)t_map_val_ptr(m,&k))`；LLVM `ll_map_argptr(an, want)` 按声明的 K/V 类型 alloca+store（先 `ll_cast_v` 转宽，否则只写低位）+ `ll_map_get`；两后端 index 分支 `ot.cat=="map"` 复用同路径 → `m[k]` ≡ `map_get`。
-- `can_cast` Map 分支：任一侧 key/val 为 Unknown 即放行（否则 `map_new()` 的返回值无法赋给 `map[K]V`）。
-- `map_new(m)` 需传同类型变量提供 K/V（t 无类型参数语法）；语义已写入 `docs/spec.md` §2.2。
+- `can_cast` Map 分支：任一侧 key/val 为 Unknown 即放行（否则 `map_new()` 返回值无法赋给 `map[K]V`）。
+- `map_new(m)` 需传同类型变量提供 K/V（t 无类型参数语法）；语义见 `docs/spec.md` §2.2。
 - 未做：map 字面量 `{k:v}` 的 emit 路径（解析/infer 已有）、map 的 for-in 迭代。
-- 用例：`tests/conformance/pass/p13_map_ops.tc`（静态）+ `examples/maps.tc`/`maps.expected.txt`（运行时 19 行，C/LLVM 逐字节一致）。归档 `build/archive/{tote,totter}_pre-M29-map.exe`。
+- 用例 `pass/p13_map_ops.tc` + `examples/maps.tc`/`maps.expected.txt`（19 行，C/LLVM 逐字节一致）。
 
 ## 数据驱动自生成主线（M17→M26）✅
 链路：`docs/reference.md` 表 → `tools/gen_ebnf.mjs` → `build/ebnf.json` → `src/totter.tc` → `src/tote.tc` 的 24 个 GEN 区间（`kw_lookup`/`builtins`/`derives`(9)/`diagnostics`(10)/`annotations`(34)/`xid`/`parser_dispatch`/`parser_rules`(30)/`ast`(65)/`scalar_*`(4)/`type_infer1/2`/`type_slice`/`type_resolve`/`type_declreg`/`td_*`(6)）。
@@ -61,6 +56,6 @@
 
 ## 技术债 / 后续
 1. @derive 表驱生成（9 trait 仍手写，用户 2026-07-30 明示暂缓）
-2. `map[K]V`、函数类型（spec-only）；`type_info(T)` CTFE 内建未接
+2. map 字面量 `{k:v}` emit 路径、map for-in 迭代；函数类型（spec-only）；`type_info(T)` CTFE 内建
 3. import_json 嵌套对象/数组字段
 4. C 后端 `append(s, 字面量/调用)` 取址问题；缺 `println`；优化后端
