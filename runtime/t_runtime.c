@@ -407,6 +407,17 @@ int64_t t_map_count(TMap* m) { return m->count; }
 TStr    t_map_key_str_at(TMap* m, int64_t i) { return m->order_str[i]; }
 int64_t t_map_key_int_at(TMap* m, int64_t i) { return m->order_int[i]; }
 
+// 第 i 个插入序键对应的值字节指针（越界或键已删返回零缓冲，语义与 t_map_val_ptr 一致）
+void* t_map_val_at(TMap* m, int64_t i) {
+    if (i < 0 || i >= m->count) {
+        void* z = t_arena_alloc(m->a, (size_t)m->val_size);
+        memset(z, 0, (size_t)m->val_size);
+        return z;
+    }
+    if (m->key_kind == 0) return t_map_val_ptr(m, &m->order_str[i]);
+    return t_map_val_ptr(m, &m->order_int[i]);
+}
+
 // ── 文件 I/O 与进程 ───────────────────────────────────────────
 TStr t_file_read_all(const char* path) {
     FILE* f = fopen(path, "rb");

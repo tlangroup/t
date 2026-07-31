@@ -1,0 +1,143 @@
+// map_advanced.tc — map 的进阶用法（M31）
+// 覆盖：map 作函数参数与返回值、map 字面量作为表达式（实参 / 返回值 / 赋值右值）、
+// 嵌套 map[K]map[K2]V、for (k, v in m) 键值同迭代、
+// map 字面量出现在非局部位置（全局 var 初始化器 / 结构体字面量字段）。
+// 期望输出见 examples/map_advanced.expected.txt。
+
+Config :: struct {
+    name: string;
+    opts: map[string]i64;
+}
+
+emit :: func(sb: StringBuilder, k: string, v: i64) -> void {
+    sb_append_str(sb, k);
+    sb_append_str(sb, "=");
+    sb_append_str(sb, int_to_str(v));
+    sb_append_char(sb, 10);
+}
+
+emits :: func(sb: StringBuilder, k: string, v: string) -> void {
+    sb_append_str(sb, k);
+    sb_append_str(sb, "=");
+    sb_append_str(sb, v);
+    sb_append_char(sb, 10);
+}
+
+// ── map 作参数：读 ──
+count_keys :: func(m: map[string]i64) -> i64 {
+    return map_len(m);
+}
+
+sum_vals :: func(m: map[string]i64) -> i64 {
+    var total: i64 = 0;
+    for (k, v in m) {
+        total = total + v;
+    }
+    return total;
+}
+
+// ── map 作参数：写（引用语义，调用方可见）──
+bump :: func(m: map[string]i64, k: string) -> void {
+    map_set(m, k, m[k] + 1);
+}
+
+// ── map 作返回值 ──
+make_defaults :: func() -> map[string]i64 {
+    return ["w": 1, "h": 2, "d": 3];
+}
+
+// ── map 既作参数又作返回值 ──
+with_extra :: func(m: map[string]i64) -> map[string]i64 {
+    map_set(m, "extra", 99);
+    return m;
+}
+
+// ── 全局 var 用 map 字面量初始化（C 后端搬进 t__ginit）──
+var g_limits: map[string]i64 = ["max": 100, "min": 1];
+
+@main
+main :: func() -> i64 {
+    var sb: StringBuilder = sb_new();
+
+    // ── 全局 map ──
+    emit(sb, "g_max", g_limits["max"]);
+    emit(sb, "g_min", g_limits["min"]);
+
+    // ── 字面量直接作实参 ──
+    emit(sb, "cnt", count_keys(["a": 1, "b": 2, "c": 3]));
+    emit(sb, "sum", sum_vals(["a": 10, "b": 20]));
+
+    // ── 字面量作返回值 ──
+    var d: map[string]i64 = make_defaults();
+    emit(sb, "d_w", d["w"]);
+    emit(sb, "d_len", map_len(d));
+
+    // ── map 作参数：写入对调用方可见 ──
+    bump(d, "w");
+    bump(d, "w");
+    emit(sb, "d_w_bumped", d["w"]);
+
+    var d2: map[string]i64 = with_extra(d);
+    emit(sb, "d2_extra", d2["extra"]);
+    emit(sb, "d_extra_shared", d["extra"]);
+
+    // ── 字面量作赋值右值 ──
+    var m: map[string]i64;
+    m = ["p": 7, "q": 8];
+    emit(sb, "m_p", m["p"]);
+    emit(sb, "m_q", m["q"]);
+
+    // ── for (k, v in m)：键值同时迭代，按插入序 ──
+    for (k, v in m) {
+        emit(sb, k, v);
+    }
+
+    // 整型键的键值迭代
+    var im: map[i64]i64 = [10: 100, 20: 200];
+    var ks: i64 = 0;
+    var vs: i64 = 0;
+    for (ik, iv in im) {
+        ks = ks + ik;
+        vs = vs + iv;
+    }
+    emit(sb, "int_key_sum", ks);
+    emit(sb, "int_val_sum", vs);
+
+    // 字符串值的键值迭代
+    var nm: map[string]string = ["x": "hello", "y": "world"];
+    for (nk, nv in nm) {
+        emits(sb, nk, nv);
+    }
+
+    // ── 嵌套 map ──
+    var deep: map[string]map[string]i64 = ["a": ["x": 10, "y": 20], "b": ["z": 30]];
+    emit(sb, "deep_a_x", deep["a"]["x"]);
+    emit(sb, "deep_a_y", deep["a"]["y"]);
+    emit(sb, "deep_b_z", deep["b"]["z"]);
+    emit(sb, "deep_len", map_len(deep));
+
+    // 改内层
+    map_set(deep["a"], "w", 40);
+    emit(sb, "deep_a_w", deep["a"]["w"]);
+
+    // 单独构建内层再挂到外层
+    var inner: map[string]i64 = ["p": 100];
+    map_set(deep, "c", inner);
+    emit(sb, "deep_c_p", deep["c"]["p"]);
+
+    // 嵌套 map 的键值迭代：值本身是 map
+    for (dk, dv in deep) {
+        emit(sb, dk, map_len(dv));
+    }
+
+    // ── 结构体字面量字段用 map 字面量 ──
+    var c: Config = Config{ name: "app", opts: ["retries": 3, "timeout": 30] };
+    emits(sb, "c_name", c.name);
+    emit(sb, "c_retries", c.opts["retries"]);
+    for (ck, cv in c.opts) {
+        emit(sb, ck, cv);
+    }
+
+    print(sb_to_str(sb));
+    return 0;
+}

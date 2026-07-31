@@ -95,6 +95,7 @@ bool  t_map_del(TMap* m, const void* key);        // 删除键，返回是否曾
 int64_t t_map_count(TMap* m);
 TStr    t_map_key_str_at(TMap* m, int64_t i);
 int64_t t_map_key_int_at(TMap* m, int64_t i);
+void*   t_map_val_at(TMap* m, int64_t i);        // 第 i 个插入序键对应的值字节指针
 
 // ── 文件 I/O 与进程 ───────────────────────────────────────────
 // 对应 t 语言内置：

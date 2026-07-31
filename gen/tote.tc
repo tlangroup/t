@@ -600,10 +600,11 @@ mk_for :: func(na: i64, nb: i64, nc: i64, la: i64, ti: i64) -> i64 {
     return id;
 }
 
-mk_for_each :: func(sa: string, na: i64, la: i64, ti: i64) -> i64 {
+mk_for_each :: func(sa: string, sb: string, na: i64, la: i64, ti: i64) -> i64 {
     var id: i64 = node_new("for_each");
     var n: Node = nodes[id];
     n.sa = sa;
+    n.sb = sb;
     n.na = na;
     n.la = la;
     slice_set(nodes, id, n);
@@ -5674,14 +5675,21 @@ parse_switch_stmt :: func() -> i64 {
 parse_for_stmt :: func() -> i64 {
     var ti: i64 = advance_i();
     expect_tok("LParen");
-    if (cur_t() == "Identifier" && peek_t(1) == "KwIn") {
+    var is_kv: bool = cur_t() == "Identifier" && peek_t(1) == "Comma" && peek_t(2) == "Identifier" && peek_t(3) == "KwIn";
+    if ((cur_t() == "Identifier" && peek_t(1) == "KwIn") || is_kv) {
         var vi: i64 = advance_i();
         var vname: string = tk_v(vi);
+        var vname2: string = "";
+        if (is_kv) {
+            advance_i();
+            var vi2: i64 = advance_i();
+            vname2 = tk_v(vi2);
+        }
         advance_i();
         var iterable: i64 = parse_expr();
         expect_tok("RParen");
         var body: i64 = parse_block();
-        var id: i64 = mk_for_each(vname, iterable, body, ti);
+        var id: i64 = mk_for_each(vname, vname2, iterable, body, ti);
         return id;
     }
     var init: i64 = -1;
@@ -7299,6 +7307,19 @@ check_stmt :: func(s: i64) -> void {
             et = ti_mk("Unknown");
         }}
         sym_define(cur_scope, n.sa, "var", et, -1);
+        // 双变量形式 `for (k, v in m)`：第二个变量绑定值类型
+        if (str_len(n.sb) > 0) {
+            var vt5: i64 = ti_mk("Unknown");
+            if (itk == "Map") {
+                var t6: TI = tis[itt];
+                vt5 = t6.val;
+            } else {
+                diag_new("T_TYPE_MISMATCH", "error",
+                    "for (k, v in x): 双变量迭代仅支持 map",
+                    n_file(n.na), n_line(n.na), n_col(n.na), n_line(n.na), n_col(n.na) + 5);
+            }
+            sym_define(cur_scope, n.sb, "var", vt5, -1);
+        }
         var c4: i64 = n.la;
         while (c4 >= 0) {
             var k4: Child = kids[c4];
@@ -9039,12 +9060,20 @@ has_errors :: func() -> bool {
 
 var hlines: []string;   // headerLines
 var slines: []string;   // sourceLines
+var glines: []string;   // 全局初始化函数体（t__ginit）
+// 重定向开关：为 true 时 spush 写入 glines（全局 var 初始化器需运行期构建，
+// 如 map 字面量在 C 中不是编译期常量，必须搬进 t__ginit）。
+var g_spush_to_ginit: bool = false;
 
 hpush :: func(s: string) -> void {
     append(hlines, s);
 }
 
 spush :: func(s: string) -> void {
+    if (g_spush_to_ginit) {
+        append(glines, s);
+        return;
+    }
     append(slines, s);
 }
 
@@ -9312,6 +9341,37 @@ resolve_type_desc :: func(tn: i64) -> i64 {
     return td_mk("unknown");
 }
 
+// ── tiToTd：TI → TD 转换（map 字面量作为表达式时需从推断类型取元素 TD）──
+ti_to_td :: func(ti: i64) -> i64 {
+    if (ti < 0) {
+        return td_mk("unknown");
+    }
+    var t: TI = tis[ti];
+    if (t.kind == "Scalar") { return td_named_mk("scalar", t.name); }
+    if (t.kind == "String") { return td_mk("string"); }
+    if (t.kind == "StringBuilder") { return td_named_mk("named", "TSb*"); }
+    if (t.kind == "Void") { return td_mk("void"); }
+    if (t.kind == "Slice") { return td_elem_mk("slice", ti_to_td(t.elem)); }
+    if (t.kind == "Array") {
+        var r: i64 = td_elem_mk("array", ti_to_td(t.elem));
+        var at: TD = tds[r];
+        at.alen = t.alen;
+        slice_set(tds, r, at);
+        return r;
+    }
+    if (t.kind == "Map") {
+        var r: i64 = td_mk("map");
+        var mt: TD = tds[r];
+        mt.key = ti_to_td(t.key);
+        mt.val = ti_to_td(t.val);
+        slice_set(tds, r, mt);
+        return r;
+    }
+    if (t.kind == "Named") { return td_named_mk("named", t.name); }
+    return td_mk("unknown");
+}
+
+
 // ── descToC（复刻 emitter.ts descToC）──────────────────────────
 
 desc_to_c :: func(td: i64) -> string {
@@ -9502,6 +9562,9 @@ collect_local_types :: func(head: i64) -> void {
             }
             if (itd.cat == "map" && itd.key >= 0) {
                 fs_set(em_cur_fn, n.sa, itd.key);
+                if (str_len(n.sb) > 0 && itd.val >= 0) {
+                    fs_set(em_cur_fn, n.sb, itd.val);
+                }
             }
             collect_local_types(n.la);
         }
@@ -9679,6 +9742,42 @@ c_map_get :: func(mn: i64, kn: i64) -> string {
     return cat6("(*(", valc, "*)t_map_val_ptr(", mstr, ", ", cat2(kstr, "))"));
 }
 
+// map 字面量作为表达式（调用实参 / 返回值 / 嵌套值 / 赋值右值）时，
+// 建临时 TMap* 变量并逐项 put，返回该变量名。pad 为缩进（表达式场景通常为 ""）。
+var g_map_lit_cnt: i64 = 0;
+var g_stmt_pad: string = "";   // 当前语句缩进（map 字面量作表达式时对齐用）
+
+c_emit_map_lit :: func(en: i64, mname: string, pad: string, keytd: i64, valtd: i64) -> void {
+    var mlkk: i64 = 0;
+    if (tds[keytd].cat != "string") { mlkk = 1; }
+    var mlkc: string = desc_to_c(keytd);
+    var mlvc: string = desc_to_c(valtd);
+    spush(cat5(pad, "TMap* ", mname, " = t_map_new(t_arena_current(), ", cat3(i2s(mlkk), ", (int64_t)sizeof(", cat2(mlvc, "));"))));
+    var mlkx: string = "";
+    if (tds[keytd].cat == "scalar") {
+        mlkc = "int64_t";
+        mlkx = "(int64_t)";
+    }
+    var mlvx: string = "";
+    if (tds[valtd].cat == "scalar") {
+        mlvx = cat3("(", mlvc, ")");
+    }
+    var mlnode: Node = nodes[en];
+    var mlc: i64 = mlnode.la;
+    var mlix: i64 = 0;
+    while (mlc >= 0) {
+        var mlck: Child = kids[mlc];
+        var mlen: Node = nodes[mlck.val];
+        var mlkn: string = cat4("_ml_", mname, "k", i2s(mlix));
+        var mlvn: string = cat4("_ml_", mname, "v", i2s(mlix));
+        spush(cat6(pad, mlkc, " ", mlkn, cat3(" = ", mlkx, emit_expr(mlen.na)), ";"));
+        spush(cat6(pad, mlvc, " ", mlvn, cat3(" = ", mlvx, emit_expr(mlen.nb)), ";"));
+        spush(cat6(pad, "t_map_put(", mname, ", &", mlkn, cat3(", &", mlvn, ");")));
+        mlix = mlix + 1;
+        mlc = mlck.next;
+    }
+}
+
 emit_expr :: func(e: i64) -> string {
     if (e < 0) {
         return "";
@@ -9719,6 +9818,16 @@ emit_expr :: func(e: i64) -> string {
     }
     if (n.kind == "ident") {
         return n.sa;
+    }
+    if (n.kind == "map_lit") {
+        g_map_lit_cnt = g_map_lit_cnt + 1;
+        var mname: string = cat2("_tmlit", i2s(g_map_lit_cnt));
+        var mti: i64 = infer_expr(e);
+        var mt: TI = tis[mti];
+        var keytd: i64 = ti_to_td(mt.key);
+        var valtd: i64 = ti_to_td(mt.val);
+        c_emit_map_lit(e, mname, g_stmt_pad, keytd, valtd);
+        return mname;
     }
     if (n.kind == "binary") {
         var op: string = n.sa;
@@ -9939,6 +10048,7 @@ is_map_lit :: func(e: i64) -> bool {
 
 emit_stmt :: func(sid: i64, indent: i64) -> void {
     var pad: string = mk_pad(indent);
+    g_stmt_pad = pad;    // 供 emit_expr 的 map 字面量分支对齐缩进
     var n: Node = nodes[sid];
 
     if (n.kind == "expr") {
@@ -9971,40 +10081,20 @@ emit_stmt :: func(sid: i64, indent: i64) -> void {
                 }
                 return;
             }
-            // map：`var m: map[K]V;` 建空表；`= [k: v, ...]` 建表后逐项插入
-            if (t.cat == "map" && (n.nb < 0 || is_map_lit(n.nb))) {
-                var mlkk: i64 = 0;
-                if (tds[t.key].cat != "string") { mlkk = 1; }
-                var mlkc: string = desc_to_c(t.key);
-                var mlvc: string = desc_to_c(t.val);
-                var mlhd: string = cat5("TMap* ", n.sa, " = t_map_new(t_arena_current(), ", i2s(mlkk), ", (int64_t)sizeof(");
-                spush(cat4(pad, mlhd, mlvc, "));"));
-                if (n.nb >= 0) {
-                    // 标量才加显式强转：C 不允许 cast 到 struct 类型（TStr / 具名结构）。
-                    // 整型键一律落成 int64_t（runtime 按 int64_t 读键）。
-                    var mlkx: string = "";
-                    if (tds[t.key].cat == "scalar") {
-                        mlkc = "int64_t";
-                        mlkx = "(int64_t)";
+            // map：`var m: map[K]V;` 建空表；`= [k: v, ...]` 建表后逐项插入；
+            // 从变量/表达式赋值（含 map 字面量表达式）则交给下面的通用分支。
+            if (t.cat == "map") {
+                if (n.nb < 0 || is_map_lit(n.nb)) {
+                    if (n.nb < 0) {
+                        var mlkk: i64 = 0;
+                        if (tds[t.key].cat != "string") { mlkk = 1; }
+                        var mlvc: string = desc_to_c(t.val);
+                        spush(cat5(pad, "TMap* ", n.sa, " = t_map_new(t_arena_current(), ", cat3(i2s(mlkk), ", (int64_t)sizeof(", cat2(mlvc, "));"))));
+                    } else {
+                        c_emit_map_lit(n.nb, n.sa, pad, t.key, t.val);
                     }
-                    var mlvx: string = "";
-                    if (tds[t.val].cat == "scalar") { mlvx = cat3("(", mlvc, ")"); }
-                    var mlnode: Node = nodes[n.nb];
-                    var mlc: i64 = mlnode.la;
-                    var mlix: i64 = 0;
-                    while (mlc >= 0) {
-                        var mlck: Child = kids[mlc];
-                        var mlen: Node = nodes[mlck.val];
-                        var mlkn: string = cat4("_ml_", n.sa, "k", i2s(mlix));
-                        var mlvn: string = cat4("_ml_", n.sa, "v", i2s(mlix));
-                        spush(cat6(pad, mlkc, " ", mlkn, cat3(" = ", mlkx, emit_expr(mlen.na)), ";"));
-                        spush(cat6(pad, mlvc, " ", mlvn, cat3(" = ", mlvx, emit_expr(mlen.nb)), ";"));
-                        spush(cat6(pad, "t_map_put(", n.sa, ", &", mlkn, cat3(", &", mlvn, ");")));
-                        mlix = mlix + 1;
-                        mlc = mlck.next;
-                    }
+                    return;
                 }
-                return;
             }
             if (t.cat == "string" && n.nb < 0) {
                 spush(cat4(pad, "TStr ", n.sa, " = {0};"));
@@ -10042,6 +10132,11 @@ emit_stmt :: func(sid: i64, indent: i64) -> void {
             var mfit: string = emit_expr(n.na);
             spush(cat4(pad, "for (int64_t _fe_i = 0; _fe_i < t_map_count(", mfit, "); _fe_i = _fe_i + 1) {"));
             spush(cat6(cat2(pad, "    "), mfkc, " ", n.sa, cat6(" = ", mfat, "(", mfit, ", _fe_i);", ""), ""));
+            // 双变量形式 `for (k, v in m)`：v 由插入序下标直接取值
+            if (str_len(n.sb) > 0) {
+                var mfvc: string = desc_to_c(it.val);
+                spush(cat6(cat2(pad, "    "), mfvc, " ", n.sb, cat5(" = *((", mfvc, "*)t_map_val_at(", mfit, ", _fe_i));"), ""));
+            }
             var mfb: i64 = n.la;
             while (mfb >= 0) {
                 var mfbk: Child = kids[mfb];
@@ -10987,11 +11082,24 @@ emit_func_decl :: func(d: i64) -> void {
 emit_global_var :: func(d: i64) -> void {
     var n: Node = nodes[d];
     hpush(cat6("extern ", emit_ctype(n.na), " ", n.sa, ";", ""));
-    var init: string = "";
-    if (n.nb >= 0) {
-        init = cat2(" = ", emit_expr(n.nb));
+    if (n.nb < 0) {
+        spush(cat6(emit_ctype(n.na), " ", n.sa, "", ";", ""));
+        return;
     }
-    spush(cat6(emit_ctype(n.na), " ", n.sa, init, ";", ""));
+    // 先在重定向模式下发射初始化器：若它产生了辅助语句（如 map 字面量的
+    // t_map_new/t_map_put），说明不是 C 的编译期常量，须搬进 t__ginit。
+    var gbase: i64 = slice_len(glines) as i64;
+    g_spush_to_ginit = true;
+    g_stmt_pad = "    ";
+    var gv: string = emit_expr(n.nb);
+    g_spush_to_ginit = false;
+    g_stmt_pad = "";
+    if ((slice_len(glines) as i64) > gbase) {
+        spush(cat6(emit_ctype(n.na), " ", n.sa, "", ";", ""));
+        append(glines, cat4("    ", n.sa, " = ", cat2(gv, ";")));
+        return;
+    }
+    spush(cat6(emit_ctype(n.na), " ", n.sa, cat2(" = ", gv), ";", ""));
 }
 
 emit_global_const :: func(d: i64) -> void {
@@ -11089,11 +11197,27 @@ emit_unit :: func(mod: string) -> void {
         i = i + 1;
     }
 
+    // 全局 var 的运行期初始化器（非编译期常量）汇总为 t__ginit，在 main 开头调用
+    var gn: i64 = slice_len(glines) as i64;
+    if (gn > 0) {
+        spush("");
+        spush("static void t__ginit(void) {");
+        var gi: i64 = 0;
+        while (gi < gn) {
+            spush(glines[gi]);
+            gi = gi + 1;
+        }
+        spush("}");
+    }
+
     if (em_has_main) {
         spush("");
         spush("int main(int argc, char** argv) {");
         spush("    t_runtime_init(argc, argv);");
         spush("    t_runtime_set_arena(t_arena_new());");
+        if (gn > 0) {
+            spush("    t__ginit();");
+        }
         spush(cat3("    int32_t _exit_code = ", em_main_fn, "();"));
         spush("    t_runtime_done();");
         spush("    return (int)_exit_code;");
@@ -12121,6 +12245,14 @@ emit_lle :: func(e: i64) -> string {
             return emit_lle(llcn_e[ci]);
         }
         return "0";
+    }
+    // map 字面量作为表达式：就地建表并返回 TMap* 临时量
+    if (n.kind == "map_lit") {
+        var mlqp: string = ll_tmp();
+        var mlqi: i64 = infer_expr(e);
+        var mlqt: TI = tis[mlqi];
+        ll_build_map_lit(e, mlqp, ti_to_td(mlqt.key), ti_to_td(mlqt.val));
+        return mlqp;
     }
     if (n.kind == "paren") {
         return emit_lle(n.na);
@@ -13153,6 +13285,24 @@ ll_case_const :: func(e: i64, bits: i64) -> string {
 
 // ── 局部变量声明（alloca 进 entry，初始化留当前块）─────────────
 
+// map 字面量构建：在 mdp 中建 TMap* 并逐项 tll_map_put。keytd/valtd 为 TD 索引。
+ll_build_map_lit :: func(en: i64, mdp: string, keytd: i64, valtd: i64) -> void {
+    var mdkk: i64 = 0;
+    if (tds[keytd].cat != "string") { mdkk = 1; }
+    var mdvty: string = ll_td(valtd);
+    llfb(cat5(cat4("  ", mdp, " = call ptr @tll_map_new(i64 ", i2s(mdkk)), ", i64 ", ll_sizeof(mdvty), ")", ""));
+    var mdn: Node = nodes[en];
+    var mdc: i64 = mdn.la;
+    while (mdc >= 0) {
+        var mdck: Child = kids[mdc];
+        var mden: Node = nodes[mdck.val];
+        var mdkp: string = ll_map_keyptr(mden.na, keytd);
+        var mdvp: string = ll_map_argptr(mden.nb, valtd);
+        llfb(cat5(cat4("  call void @tll_map_put(ptr ", mdp, ", ptr ", mdkp), ", ptr ", mdvp, ")", ""));
+        mdc = mdck.next;
+    }
+}
+
 ll_local_decl :: func(name: string, td: i64, init_e: i64) -> void {
     var ty: string = ll_td(td);
     var vn: string = cat2("%v.", name);
@@ -13192,26 +13342,19 @@ ll_local_decl :: func(name: string, td: i64, init_e: i64) -> void {
         return;
     }
     // map：`var m: map[K]V;` 建空表；`= [k: v, ...]` 建表后逐项插入
-    if (t0.cat == "map" && (init_e < 0 || is_map_lit(init_e))) {
-        var mdkk: i64 = 0;
-        if (tds[t0.key].cat != "string") { mdkk = 1; }
-        var mdvty: string = ll_td(t0.val);
-        var mdp: string = ll_tmp();
-        llfb(cat5(cat4("  ", mdp, " = call ptr @tll_map_new(i64 ", i2s(mdkk)), ", i64 ", ll_sizeof(mdvty), ")", ""));
-        llfb(cat4("  store ptr ", mdp, ", ptr ", vn));
-        if (init_e >= 0) {
-            var mdn: Node = nodes[init_e];
-            var mdc: i64 = mdn.la;
-            while (mdc >= 0) {
-                var mdck: Child = kids[mdc];
-                var mden: Node = nodes[mdck.val];
-                var mdkp: string = ll_map_keyptr(mden.na, t0.key);
-                var mdvp: string = ll_map_argptr(mden.nb, t0.val);
-                llfb(cat5(cat4("  call void @tll_map_put(ptr ", mdp, ", ptr ", mdkp), ", ptr ", mdvp, ")", ""));
-                mdc = mdck.next;
+    if (t0.cat == "map") {
+        if (init_e < 0 || is_map_lit(init_e)) {
+            var mdp: string = ll_tmp();
+            if (init_e < 0) {
+                var mdkk2: i64 = 0;
+                if (tds[t0.key].cat != "string") { mdkk2 = 1; }
+                llfb(cat5(cat4("  ", mdp, " = call ptr @tll_map_new(i64 ", i2s(mdkk2)), ", i64 ", ll_sizeof(ll_td(t0.val)), ")", ""));
+            } else {
+                ll_build_map_lit(init_e, mdp, t0.key, t0.val);
             }
+            llfb(cat4("  store ptr ", mdp, ", ptr ", vn));
+            return;
         }
-        return;
     }
     // 切片字面量：`var xs: []T = [a, b, c];` → slice_new + 逐元素 append
     if (t0.cat == "slice" && is_array_lit(init_e)) {
@@ -13486,6 +13629,24 @@ emit_llstmt :: func(sid: i64) -> void {
                     mfsv = mftr;
                 }
                 llfb(cat6("  store ", mfkty, " ", mfsv, ", ptr ", mfvn));
+            }
+            // 双变量形式 `for (k, v in m)`：v 由插入序下标直接取值
+            if (str_len(n.sb) > 0) {
+                var mfvd: i64 = it0.val;
+                var mfvty: string = ll_td(mfvd);
+                var mfvvn: string = cat2("%v.", n.sb);
+                if (lla_has(n.sb) == false) {
+                    append(lla_n, n.sb);
+                    llfa(cat4("  ", mfvvn, " = alloca ", mfvty));
+                }
+                var mfvp: string = ll_tmp();
+                llfb(cat5(cat4("  ", mfvp, " = call ptr @tll_map_val_at(ptr ", mfiter), ", i64 ", mfi2, ")", ""));
+                if (ll_isagg(mfvd)) {
+                    ll_copy(mfvty, mfvp, mfvvn);
+                } else {
+                    var mfvv: string = ll_load(mfvty, mfvp);
+                    llfb(cat6("  store ", mfvty, " ", mfvv, ", ptr ", mfvvn));
+                }
             }
             ll_loop_push2(mfeL, mfsL);
             var mfbb: i64 = n.la;
@@ -13883,6 +14044,7 @@ emit_lldeclares :: func() -> void {
     llph("declare i64 @tll_map_count(ptr)");
     llph("declare void @tll_map_key_str_at(ptr, i64, ptr)");
     llph("declare i64 @tll_map_key_int_at(ptr, i64)");
+    llph("declare ptr @tll_map_val_at(ptr, i64)");
     llph("declare void @tll_file_read_all(ptr, ptr)");
     llph("declare i32 @tll_file_write_all(ptr, ptr)");
     llph("declare i32 @tll_file_exists(ptr)");

@@ -12,7 +12,7 @@
 3. `./build/totter/totter.exe` → `gen/tote.tc`；`cp gen/tote.tc src/tote.tc` 提升定点
 4. canonical tote 编译 `src/tote.tc` → 新 tote
 - 编译：`build/tote/tote.exe build <f.tc> --clang "C:/Program Files/LLVM/bin/clang.exe" --output build/<dir>/<name>`（输出目录先 mkdir）。`emit-ll --output p` 写 `p.ll`；`compile --output <dir>` 出 C。
-- 验证四件套：① 定点 `md5sum src/tote.tc gen/tote.tc` 相等 ② `node tools/difftest.mjs --ref A --cand B` → 27/27 ③ `node tools/conformance.mjs --compiler <exe>` → 27/27 ④ LLVM IR 逐字节 diff + `run --example hello/fib` smoke。
+- 验证四件套：① 定点 `md5sum src/tote.tc gen/tote.tc` 相等 ② `node tools/difftest.mjs --ref A --cand B` → 27/27 ③ `node tools/conformance.mjs --compiler <exe>` → 29/29 ④ LLVM IR 逐字节 diff + `run --example hello/fib` smoke。
 - 提交前自检：`node tools/shadow_check.mjs src/tote.tc`（同名不同型局部变量）+ `node tools/catn_check.mjs src/tote.tc`（catN 实参数）。
 - **测试体系不验证运行时行为**：conformance 只跑 `check`（用例必须有 `// EXPECT: pass|error|warning` 首行），difftest 只比 lex/parse/check 的 stdout，`assert_*` 在 LLVM 后端是 no-op（IR 仅留注释）。运行时语义必须写 `examples/*.tc` 实跑 + 存 `.expected.txt` 比对，并交叉验证 C 后端（`compile --output <目录>` 出 .h/.c → clang 编译 → 输出应与 LLVM 产物逐字节一致）。
 - 新增能力会让 b→c 阶段 IR 多出新 declare（canonical 旧版不认识），**不算不动点破坏**；判据是再跑一阶段 c→d IR 逐字节相同。
@@ -50,6 +50,14 @@ lld-link 加 `-Wl,-subsystem:console`（链接前查 `ll_has_main`）/ `int_to_s
 - **整型键/值统一提 i64**：复刻 array_lit 规则，否则 `["a":1]` 推成 `map[string]u8` 失配。
 - **修掉静默 bug：窄整型键**。`map[i32]i64` 此前 `map_get` 恒返回 0（runtime 按 `int64_t*` 读键，后端对 i32 直接取址 → 高位栈垃圾）。修法：整型键一律按 i64 落盘（C 复合字面量 `&(int64_t){(int64_t)(expr)}`；LLVM `ll_map_keyptr`→`ll_map_argptr(kn, i64)` 扩宽）。附带收益：键/值可写字面量（`map_set(m,"k",11)`/`map_get(m,8)`）。新增 `call_arg_node(cid,ix)` 助手供 C 后端反查实参类型。
 - 验证：定点 src==gen / difftest 27/27 / conformance 27/27（新增 `pass/p14_map_iter.tc`）/ 三阶段自举 c→d IR 逐字节相同 / `examples/map_iter.tc` C==LLVM==`.expected.txt` 逐字节。归档 `build/archive/{tote,totter}_pre-M30-mapiter.exe`，canonical 已提升。
+
+## M31：map 收尾四块（2026-07-31）✅
+延续 M30，补齐 map 使用体验剩余四块（用户全选）：M31a 参数/返回值、M31b for(k,v in m)、M31c 嵌套 map + 字面量作表达式、M31d 字面量非局部位置。
+- **M31a 参数/返回值**：类型系统（resolve_type_desc/ti_equal/desc_to_c/ll_td）与双后端发射层天然支持，无需改动；`examples/map_advanced.tc` 实证 `fn(m: map[K]V) -> map[K]V` 正确。
+- **M31c 嵌套 map + 字面量作表达式**：`emit_lle`（LLVM）补 `map_lit` 分支调 `ll_build_map_lit` 到 `ll_tmp()` 返回（此前漏分支对 map_lit 返 `"0"` → `store ptr 0` / `call i64 @t.count_keys(ptr 0)`）；C `emit_expr` 同补 `map_lit` 分支复用 `c_emit_map_lit`。`map[K]map[K2]V` 逐层 `m[k1][k2]` 读写 OK。
+- **M31b for(k,v in m) 双变量迭代**：`for_each` 节点加 `sb`（值变量名）槽；parser `parse_for_stmt`/`src/totter.tc` 的 `emit_forx` 支持 `(k, v in m)`；checker 绑定 `vt5=t6.val` 并 `sym_define`，非 map 双变量报 `T_TYPE_MISMATCH`；`collect_local_types` 对 `sb` 设 `itd.val`；C/LLVM `emit_stmt`/`emit_llstmt` 经 `t_map_val_at(m,i)`（插入序下标）绑定值变量；LLVM declare 加 `tll_map_val_at`。runtime `t_runtime.c` 加 `t_map_val_at`（str/int 键分支，`t_shim_ll.c` 加 `tll_map_map_val_at`→`tll_map_val_at` 同名 shim）。
+- **M31d 字面量非局部位置（全局 var / 结构体字段）**：C 不允许运行时调用作文件作用域初始化器 → 引入 `glines` 缓冲 + `g_spush_to_ginit` 开关，`emit_global_var` 把非常量初始化器搬进 `t__ginit()`（main 开头调用）；`g_stmt_pad` 供 `emit_expr` 的 map 字面量分支对齐缩进。LLVM 无此限制但双后端产物逐字节一致。
+- 验证：定点 src==gen（md5 `abd2e465…`）/ difftest 27/27 / conformance **29/29**（新增 `pass/p15_map_advanced.tc` + `fail/f14_for_kv_non_map.tc`）/ 三阶段自举 c→d IR 逐字节相同 / `examples/map_advanced.tc`（30 行）C==LLVM==`.expected.txt` 逐字节 / UNSUPPORTED 基线 0 条。canonical 已提升 `build/m31d/tote.exe`→`build/tote/tote.exe`。
 
 ## 数据驱动自生成主线（M17→M26）✅
 链路：`docs/reference.md` 表 → `tools/gen_ebnf.mjs` → `build/ebnf.json` → `src/totter.tc` → `src/tote.tc` 的 24 个 GEN 区间（`kw_lookup`/`builtins`/`derives`(9)/`diagnostics`(10)/`annotations`(34)/`xid`/`parser_dispatch`/`parser_rules`(30)/`ast`(65)/`scalar_*`(4)/`type_infer1/2`/`type_slice`/`type_resolve`/`type_declreg`/`td_*`(6)）。

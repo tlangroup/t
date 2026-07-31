@@ -463,11 +463,12 @@ return_stmt :: expr? ";"
 // @rule if_stmt params=() ret=i64 node=If eatFirst=true fold=ifx
 if_stmt :: "(" expr ")" block ("else" (block | if_stmt))?
 
-// ── 语句体内部结构（fold=forx：peek 前瞻分发两段式 for：Identifier KwIn=for_each，否则 C 式三子句）──
-// 形状：for "(" ( Ident "in" expr | (expr? ";" expr? ";" expr?) ) ")" block  →  守卫式骨架按 peek_t(1) 分流。
+// ── 语句体内部结构（fold=forx：peek 前瞻分发两段式 for：Identifier [","Ident] KwIn=for_each，否则 C 式三子句）──
+// 形状：for "(" ( Ident ("," Ident)? "in" expr | (expr? ";" expr? ";" expr?) ) ")" block  →  守卫式骨架按 peek_t(1)/peek_t(3) 分流。
+// 双变量形式仅对 map 有意义：第一个绑定键、第二个绑定值（按插入序）。
 
 // @rule for_stmt params=() ret=i64 node=For eatFirst=true fold=forx
-for_stmt :: "(" ( Ident "in" expr | expr? ";" expr? ";" expr? ) ")" block
+for_stmt :: "(" ( Ident ("," Ident)? "in" expr | expr? ";" expr? ";" expr? ) ")" block
 
 // ── 语句体内部结构（fold=swx：case/default 循环聚合，default 缺省 -2 兜底）──
 // 形状：switch "(" expr ")" "{" ( "case" expr ":" statement* | "default" ":" statement* )* "}"  →  循环收集 CS 节点。
@@ -573,7 +574,7 @@ NodeTable ::
   // @node flag_set
   // @node float sa=str
   // @node for na=node nb=node nc=node la=list
-  // @node for_each sa=str na=node la=list
+  // @node for_each sa=str sb=str na=node la=list
   // @node ident sa=str
   // @node if na=node la=list lb=list
   // @node index na=node nb=node
