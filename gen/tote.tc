@@ -7061,6 +7061,20 @@ infer_expr :: func(e: i64) -> i64 {
                 }
                 return ti_mk("Unknown");
             }
+            // print / println / eprint 的实参必须是字符串。若不校验，LLVM 后端会把标量
+            // 当做 ptr 传给 @tll_print，导致 IR 校验失败（'i64' but expected 'ptr'）并使
+            // `clang link failed`。这里在检查阶段给出清晰的类型错误。
+            if (fname == "print" || fname == "println" || fname == "eprint") {
+                if (n.la >= 0) {
+                    var pan: i64 = kids[n.la].val;
+                    var pat: i64 = infer_expr(pan);
+                    if (ti_kind(pat) != "String" && ti_kind(pat) != "Unknown") {
+                        diag_new("T_TYPE_MISMATCH", "error",
+                            cat3(fname, " 的实参必须是字符串（String）；标量请先用 int_to_str / to_string / cat* 转换。当前收到: ", ti_str(pat)),
+                            n_file(e), n_line(e), n_col(e), n_line(e), n_col(e) + 5);
+                    }
+                }
+            }
             return builtin_ret(fname);
         }
         return ti_mk("Unknown");
@@ -9938,6 +9952,7 @@ emit_expr :: func(e: i64) -> string {
             if (cn == "sys_run") { return cat3("sys_run(", av[0], ")"); }
             if (cn == "print") { return cat3("t_print(", av[0], ")"); }
             if (cn == "eprint") { return cat3("t_eprint(", av[0], ")"); }
+            if (cn == "println") { return cat3("t_println(", av[0], ")"); }
             if (cn == "str_slice") {
                 return cat6("t_str_slice(", av[0], ", ", av[1], ", ", cat2(av[2], ")"));
             }
@@ -12873,11 +12888,10 @@ ll_call :: func(e: i64) -> string {
         if (cn == "eprint") {
             fnm = "@tll_eprint";
         }
-        llfb(cat4("  call void ", fnm, "(ptr ", cat2(p, ")")));
         if (cn == "println") {
-            var nl: string = ll_strlit("\n");
-            llfb(cat3("  call void @tll_print(ptr ", nl, ")"));
+            fnm = "@tll_println";
         }
+        llfb(cat4("  call void ", fnm, "(ptr ", cat2(p, ")")));
         return "0";
     }
     if (cn == "str_len" || cn == "slice_len") {
@@ -14120,6 +14134,7 @@ emit_lltypes :: func() -> void {
 emit_lldeclares :: func() -> void {
     llph("declare void @tll_print(ptr)");
     llph("declare void @tll_eprint(ptr)");
+    llph("declare void @tll_println(ptr)");
     llph("declare i64 @tll_str_len(ptr)");
     llph("declare i64 @tll_str_at(ptr, i64)");
     llph("declare i32 @tll_str_eq(ptr, ptr)");

@@ -82,7 +82,7 @@ lld-link 加 `-Wl,-subsystem:console`（链接前查 `ll_has_main`）/ `int_to_s
 1. @derive 表驱生成（9 trait 仍手写，用户 2026-07-30 明示暂缓）
 2. 函数类型（spec-only）；`type_info(T)` CTFE 内建
 3. import_json 嵌套对象/数组字段
-4. C 后端 `append(s, 字面量/调用)` 取址问题；缺 `println`；优化后端
+4. C 后端 `append(s, 字面量/调用)` 取址问题；缺 `println`（已于 M35 修复）；优化后端
 
 ## M33：cat2..cat6 字符串拼接内建接入运行时（2026-07-31）✅ 修复技术债 #5
 `t` 文档称「字符串拼接一律 cat2..cat6」，但此前 cat2..cat6 仅在编译器自身源码定义（L997-1031），无 builtin 发射分支、runtime 无 `t_catN`/`tll_catN` —— 用户程序调用即 `undeclared`/链接失败，必须绕道 `StringBuilder`。
@@ -100,3 +100,12 @@ lld-link 加 `-Wl,-subsystem:console`（链接前查 `ll_has_main`）/ `int_to_s
 - **坑**：`infer_expr` 形参 `e` 才是 i64 节点索引，`n` 是 `Node` 结构；误用 `n_file(n)` 会让编译器自身重编译时 `@t.n_file(i64 %v.n)` �� ptr 错。位置信息一律用 `e`。
 - 回归用例 `tests/conformance/fail/f12_print_scalar.tc`（`// EXPECT: error T_TYPE_MISMATCH`）。所有现有示例 `print(` 均传字符串/`int_to_str`/`cat*`，无误伤。
 - 验证：两阶段自举 IR 逐字节相同（`a75de97a…`）/ difftest 27/27 / conformance **30/30** / shadow_check+catn_check OK / UNSUPPORTED 0 / canonical 提升 `build/tote/tote.exe`。
+
+## M35：修复 `println` C 后端缺口（2026-07-31）✅
+`println` 在 C 后端 `emit_expr` 的 call 分发**缺分支**（L9953 仅处理 `print`/`eprint`），落到通用路径生成 `println(arg)` 调用不存在的函数 → C 编译 `undefined reference`。LLVM 端本就正确（原复用 `@tll_print` + `"\n"`）。
+- **修复**（仿 `print`/`eprint` 的 `t_`+`tll_` 双运行时模式）：
+  - runtime：`t_runtime.c` 加 `t_println`（print + `fputc('\n')`）；`t_runtime.h` 加声明；`t_shim_ll.c` 加 `tll_println` shim。
+  - C 发射（L9955）：`if (cn=="println") return t_println(...)`。
+  - LLVM 发射（L12884）：`println` 改调 `@tll_println`（单次调用取代原两次 `@tll_print`），declare 区加 `declare void @tll_println(ptr)`。
+- **验证**：定点 src==gen（md5 相同）/ 两阶段自举 IR 逐字节相同 / difftest **27/27** / conformance **30/30** / shadow+catn OK / UNSUPPORTED 0 / `examples/println_demo.{tc,expected.txt}`（`hello\ncount=3\nno-newlinedone\n`）C==LLVM 逐字节一致。canonical 提升 `build/tote/tote.exe`。
+- **认知修正**：difftest 实际会比较 `compile --emit-c` 的 .h/.c 产物（不止 lex/parse/check stdout）。任何 codegen 变更都会让旧 ref 报差异，须先提升 canonical 再跑。

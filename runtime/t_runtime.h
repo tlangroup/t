@@ -120,6 +120,7 @@ TSlice  t_args(void);                               // 返回 []TStr（复制进
 void    t_exit(int32_t code);
 void    t_print(TStr s);
 void    t_eprint(TStr s);
+void    t_println(TStr s);
 int32_t t_system(TStr cmd);                         // sys_run(cmd) -> 子进程退出码
 #define sys_run(cmd) t_system(cmd)                  // 兼容旧版 C 后端把 sys_run 按普通调用发射
 

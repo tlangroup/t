@@ -14,6 +14,7 @@
 // ── string ─────────────────────────────────────────────────────
 void    tll_print(TStr* s)                  { t_print(*s); }
 void    tll_eprint(TStr* s)                 { t_eprint(*s); }
+void    tll_println(TStr* s)                { t_println(*s); }
 int64_t tll_str_len(TStr* s)                { return t_str_len(*s); }
 int64_t tll_str_at(TStr* s, int64_t i)      { return (int64_t)t_str_byte_at(*s, i); }
 int32_t tll_str_eq(TStr* a, TStr* b)        { return t_str_eq(*a, *b) ? 1 : 0; }
