@@ -975,7 +975,8 @@ IntType:  "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64"
 FloatType:"f16" | "f32" | "f64"
 ```
 
-- ✅ tote：标量固定位宽 + `string`/`StringBuilder` + `[]T` 切片 + `[N]T` 定长数组 + `map[K]V` 哈希映射均实装（new/set/get/has/len/del 内建 + `m[k]` 读索引）；函数类型为 spec-only。
+- ✅ tote：标量固定位宽 + `string`/`StringBuilder` + `[]T` 切片 + `[N]T` 定长数组 + `map[K]V` 哈希映射均实装（new/set/get/has/len/del 内建 + `m[k]` 读索引 + `[k: v, …]` 字面量 + `for (k in m)` 按插入序迭代键）；函数类型为 spec-only。
+- **map 字面量 `[k1: v1, k2: v2]`**：键/值类型取首项推断，整型统一提升为 `i64`（同数组字面量）。仅作为局部 `var` 的初始化器发射：C 后端脱糖为 `t_map_new` + 逐项局部量 + `t_map_put`，LLVM 后端为 `tll_map_new` + 逐项 `tll_map_put`。`var m: map[K]V;` 无初始化时同样建空表。整型键一律按 `int64` 落盘（C 用 C99 复合字面量 `&(int64_t){…}`，LLVM 用 `alloca i64` + 扩宽），故窄整型键不会因高位垃圾而失配，键/值也可以直接写字面量。
 - 类型名解析：先查内建，再查当前单元已声明命名类型。
 - **数组字面量 `[e1, e2, …]`**：元素类型取首元素推断，整型元素统一提升为 `i64`（`[1,2,3]` 是 `[3]i64` 而非 `[3]u8`）；空字面量 `[]` 元素类型未知，可赋给任意 `[]T` / `[N]T`。定长数组与切片之间只要元素可转型即可互赋（目标为定长数组时长度须一致）。赋给 `[]T` 时脱糖为运行期 `slice_new` + 逐元素 `append`；赋给 `[N]T` 时 C 后端用花括号初始化器、LLVM 后端零初始化后按 `getelementptr` 逐元素 `store`。
 

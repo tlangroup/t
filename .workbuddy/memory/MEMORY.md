@@ -12,7 +12,7 @@
 3. `./build/totter/totter.exe` → `gen/tote.tc`；`cp gen/tote.tc src/tote.tc` 提升定点
 4. canonical tote 编译 `src/tote.tc` → 新 tote
 - 编译：`build/tote/tote.exe build <f.tc> --clang "C:/Program Files/LLVM/bin/clang.exe" --output build/<dir>/<name>`（输出目录先 mkdir）。`emit-ll --output p` 写 `p.ll`；`compile --output <dir>` 出 C。
-- 验证四件套：① 定点 `md5sum src/tote.tc gen/tote.tc` 相等 ② `node tools/difftest.mjs --ref A --cand B` → 27/27 ③ `node tools/conformance.mjs --compiler <exe>` → 26/26 ④ LLVM IR 逐字节 diff + `run --example hello/fib` smoke。
+- 验证四件套：① 定点 `md5sum src/tote.tc gen/tote.tc` 相等 ② `node tools/difftest.mjs --ref A --cand B` → 27/27 ③ `node tools/conformance.mjs --compiler <exe>` → 27/27 ④ LLVM IR 逐字节 diff + `run --example hello/fib` smoke。
 - 提交前自检：`node tools/shadow_check.mjs src/tote.tc`（同名不同型局部变量）+ `node tools/catn_check.mjs src/tote.tc`（catN 实参数）。
 - **测试体系不验证运行时行为**：conformance 只跑 `check`（用例必须有 `// EXPECT: pass|error|warning` 首行），difftest 只比 lex/parse/check 的 stdout，`assert_*` 在 LLVM 后端是 no-op（IR 仅留注释）。运行时语义必须写 `examples/*.tc` 实跑 + 存 `.expected.txt` 比对，并交叉验证 C 后端（`compile --output <目录>` 出 .h/.c → clang 编译 → 输出应与 LLVM 产物逐字节一致）。
 - 新增能力会让 b→c 阶段 IR 多出新 declare（canonical 旧版不认识），**不算不动点破坏**；判据是再跑一阶段 c→d IR 逐字节相同。
@@ -41,8 +41,15 @@ lld-link 加 `-Wl,-subsystem:console`（链接前查 `ll_has_main`）/ `int_to_s
 - C 后端 `c_map_get` 发 `(*(V*)t_map_val_ptr(m,&k))`；LLVM `ll_map_argptr(an, want)` 按声明的 K/V 类型 alloca+store（先 `ll_cast_v` 转宽，否则只写低位）+ `ll_map_get`；两后端 index 分支 `ot.cat=="map"` 复用同路径 → `m[k]` ≡ `map_get`。
 - `can_cast` Map 分支：任一侧 key/val 为 Unknown 即放行（否则 `map_new()` 返回值无法赋给 `map[K]V`）。
 - `map_new(m)` 需传同类型变量提供 K/V（t 无类型参数语法）；语义见 `docs/spec.md` §2.2。
-- 未做：map 字面量 `{k:v}` 的 emit 路径（解析/infer 已有）、map 的 for-in 迭代。
 - 用例 `pass/p13_map_ops.tc` + `examples/maps.tc`/`maps.expected.txt`（19 行，C/LLVM 逐字节一致）。
+- map 字面量 `{k:v}` emit + `for (k in m)` 按插入序迭代键，已在 **M30** 交付（见下）。
+
+## M30：map 字面量 + for-in 迭代（2026-07-31）✅
+- **map 字面量**：`var m: map[K]V = [k1: v1, …];`，无初始化声明也建空表（声明即可用，不必 `m = map_new(m)`）。emit 路径 C/LLVM 双后端（`t_map_new`/`tll_map_new` + 逐项 `put`）。
+- **for-in 迭代键**：`for (k in m){…}` 按插入序，绑定变量类型 = K。runtime 已有 `t_map_count`/`t_map_key_str_at`/`t_map_key_int_at`，仅补 3 个 `tll_*` shim；`check_stmt`/`collect_local_types`/双后端 `emit_stmt`/`emit_llstmt` + `emit_lldeclares` 各加一段。
+- **整型键/值统一提 i64**：复刻 array_lit 规则，否则 `["a":1]` 推成 `map[string]u8` 失配。
+- **修掉静默 bug：窄整型键**。`map[i32]i64` 此前 `map_get` 恒返回 0（runtime 按 `int64_t*` 读键，后端对 i32 直接取址 → 高位栈垃圾）。修法：整型键一律按 i64 落盘（C 复合字面量 `&(int64_t){(int64_t)(expr)}`；LLVM `ll_map_keyptr`→`ll_map_argptr(kn, i64)` 扩宽）。附带收益：键/值可写字面量（`map_set(m,"k",11)`/`map_get(m,8)`）。新增 `call_arg_node(cid,ix)` 助手供 C 后端反查实参类型。
+- 验证：定点 src==gen / difftest 27/27 / conformance 27/27（新增 `pass/p14_map_iter.tc`）/ 三阶段自举 c→d IR 逐字节相同 / `examples/map_iter.tc` C==LLVM==`.expected.txt` 逐字节。归档 `build/archive/{tote,totter}_pre-M30-mapiter.exe`，canonical 已提升。
 
 ## 数据驱动自生成主线（M17→M26）✅
 链路：`docs/reference.md` 表 → `tools/gen_ebnf.mjs` → `build/ebnf.json` → `src/totter.tc` → `src/tote.tc` 的 24 个 GEN 区间（`kw_lookup`/`builtins`/`derives`(9)/`diagnostics`(10)/`annotations`(34)/`xid`/`parser_dispatch`/`parser_rules`(30)/`ast`(65)/`scalar_*`(4)/`type_infer1/2`/`type_slice`/`type_resolve`/`type_declreg`/`td_*`(6)）。
@@ -56,6 +63,6 @@ lld-link 加 `-Wl,-subsystem:console`（链接前查 `ll_has_main`）/ `int_to_s
 
 ## 技术债 / 后续
 1. @derive 表驱生成（9 trait 仍手写，用户 2026-07-30 明示暂缓）
-2. map 字面量 `{k:v}` emit 路径、map for-in 迭代；函数类型（spec-only）；`type_info(T)` CTFE 内建
+2. 函数类型（spec-only）；`type_info(T)` CTFE 内建
 3. import_json 嵌套对象/数组字段
 4. C 后端 `append(s, 字面量/调用)` 取址问题；缺 `println`；优化后端

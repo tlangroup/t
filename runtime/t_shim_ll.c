@@ -44,6 +44,10 @@ int32_t tll_map_has(TMap* m, void* key)                 { return t_map_has(m, ke
 int64_t tll_map_len(TMap* m)                            { return t_map_len(m); }
 void*   tll_map_val_ptr(TMap* m, void* key)            { return t_map_val_ptr(m, key); }
 int32_t tll_map_del(TMap* m, void* key)                { return t_map_del(m, key) ? 1 : 0; }
+// 迭代（按插入序）：count + 按下标取键
+int64_t tll_map_count(TMap* m)                          { return t_map_count(m); }
+void    tll_map_key_str_at(TMap* m, int64_t i, TStr* out) { *out = t_map_key_str_at(m, i); }
+int64_t tll_map_key_int_at(TMap* m, int64_t i)          { return t_map_key_int_at(m, i); }
 
 // ── I/O 与进程 ─────────────────────────────────────────────────
 void    tll_file_read_all(TStr* path, TStr* out)     { *out = t_file_read_all(t_cstr(*path)); }

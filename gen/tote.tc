@@ -7123,6 +7123,14 @@ infer_expr :: func(e: i64) -> i64 {
             var en: Node = nodes[k3.val];
             var kt: i64 = infer_expr(en.na);
             var vt: i64 = infer_expr(en.nb);
+            // 与数组字面量同规则：整型键/值按「默认 int」提升为 i64，
+            // 避免 [1: 2] 被推成 map[u8]u8。
+            if (ti_kind(kt) == "Scalar" && is_int_name(ti_name(kt)) && ti_name(kt) != "i64" && ti_name(kt) != "i32") {
+                kt = ti_scalar("i64");
+            }
+            if (ti_kind(vt) == "Scalar" && is_int_name(ti_name(vt)) && ti_name(vt) != "i64" && ti_name(vt) != "i32") {
+                vt = ti_scalar("i64");
+            }
             var mi: i64 = ti_mk("Map");
             var mt: TI = tis[mi];
             mt.key = kt;
@@ -7283,8 +7291,13 @@ check_stmt :: func(s: i64) -> void {
             var t4: TI = tis[itt];
             et = t4.elem;
         } else {
+        if (itk == "Map") {
+            // map 的 for-in 迭代键（按插入序）
+            var t5: TI = tis[itt];
+            et = t5.key;
+        } else {
             et = ti_mk("Unknown");
-        }
+        }}
         sym_define(cur_scope, n.sa, "var", et, -1);
         var c4: i64 = n.la;
         while (c4 >= 0) {
@@ -9487,6 +9500,9 @@ collect_local_types :: func(head: i64) -> void {
             if (itd.cat == "slice" && itd.elem >= 0) {
                 fs_set(em_cur_fn, n.sa, itd.elem);
             }
+            if (itd.cat == "map" && itd.key >= 0) {
+                fs_set(em_cur_fn, n.sa, itd.key);
+            }
             collect_local_types(n.la);
         }
         if (n.kind == "switch") {
@@ -9603,13 +9619,64 @@ mk_pad :: func(indent: i64) -> string {
 
 // map 读索引助手：t_map_val_ptr 返回存储值字节指针，按 V 类型解引用。
 // 注意：key 需是左值（&k），与 append 字面量取址限制一致。
+// 取调用节点的第 ix 个实参节点 id（-1 表示不存在）。
+call_arg_node :: func(cid: i64, ix: i64) -> i64 {
+    if (cid < 0) {
+        return -1;
+    }
+    var cn9: Node = nodes[cid];
+    var c9: i64 = cn9.la;
+    var j9: i64 = 0;
+    while (c9 >= 0) {
+        var ck9: Child = kids[c9];
+        if (j9 == ix) {
+            return ck9.val;
+        }
+        j9 = j9 + 1;
+        c9 = ck9.next;
+    }
+    return -1;
+}
+
+// map 键取地址（C 后端）：整型键统一提升为 int64_t 存储——runtime 按 int64_t 读键，
+// 直接对 i32/u8 变量取址会让高位字节变成垃圾（M30 前的静默失配）。用 C99 复合字面量，
+// 顺带允许键写成字面量或表达式。string 键是 TStr 聚合，仍取原表达式地址。
+c_map_keyp :: func(mn: i64, kn: i64) -> string {
+    var ktd9: i64 = -1;
+    var mtd9: i64 = expr_type_desc(mn);
+    if (mtd9 >= 0) {
+        var mt9: TD = tds[mtd9];
+        ktd9 = mt9.key;
+    }
+    if (ktd9 >= 0 && tds[ktd9].cat != "scalar") {
+        return cat2("&", emit_expr(kn));
+    }
+    return cat3("&(int64_t){(int64_t)(", emit_expr(kn), ")}");
+}
+
+// map 值取地址（C 后端）：标量值按声明的 V 落进复合字面量（宽度对齐 val_size，
+// 且允许值写成字面量）；聚合值取原表达式地址。
+c_map_valp :: func(mn: i64, vn: i64) -> string {
+    var vtd8: i64 = -1;
+    var mtd8: i64 = expr_type_desc(mn);
+    if (mtd8 >= 0) {
+        var mt8: TD = tds[mtd8];
+        vtd8 = mt8.val;
+    }
+    if (vtd8 < 0 || tds[vtd8].cat != "scalar") {
+        return cat2("&", emit_expr(vn));
+    }
+    var vc8: string = desc_to_c(vtd8);
+    return cat6("&(", vc8, "){(", vc8, ")(", cat2(emit_expr(vn), ")}"));
+}
+
 c_map_get :: func(mn: i64, kn: i64) -> string {
     var mtd: i64 = expr_type_desc(mn);
     var mt: TD = tds[mtd];
     var valc: string = desc_to_c(mt.val);
     var mstr: string = emit_expr(mn);
-    var kstr: string = emit_expr(kn);
-    return cat6("(*(", valc, "*)t_map_val_ptr(", mstr, ", &", cat2(kstr, "))"));
+    var kstr: string = c_map_keyp(mn, kn);
+    return cat6("(*(", valc, "*)t_map_val_ptr(", mstr, ", ", cat2(kstr, "))"));
 }
 
 emit_expr :: func(e: i64) -> string {
@@ -9731,14 +9798,23 @@ emit_expr :: func(e: i64) -> string {
                 var mnwvs: string = cat3("sizeof(", desc_to_c(mnwt.val), ")");
                 return cat5("t_map_new(t_arena_current(), ", i2s(mnwkk), ", (int64_t)", mnwvs, ")");
             }
-            if (cn == "map_set") { return cat6("t_map_put(", av[0], ", &", av[1], ", &", cat2(av[2], ")")); }
-            if (cn == "map_has") { return cat5("t_map_has(", av[0], ", &", av[1], ")"); }
+            if (cn == "map_set") {
+                var ms0: i64 = call_arg_node(e, 0);
+                var ms1: i64 = call_arg_node(e, 1);
+                var ms2: i64 = call_arg_node(e, 2);
+                return cat6("t_map_put(", av[0], ", ", c_map_keyp(ms0, ms1), ", ", cat2(c_map_valp(ms0, ms2), ")"));
+            }
+            if (cn == "map_has") {
+                var mh0: i64 = call_arg_node(e, 0);
+                return cat4("t_map_has(", av[0], cat2(", ", c_map_keyp(mh0, call_arg_node(e, 1))), ")");
+            }
             if (cn == "map_len") { return cat3("t_map_len(", av[0], ")"); }
-            if (cn == "map_del") { return cat5("t_map_del(", av[0], ", &", av[1], ")"); }
+            if (cn == "map_del") {
+                var md0: i64 = call_arg_node(e, 0);
+                return cat4("t_map_del(", av[0], cat2(", ", c_map_keyp(md0, call_arg_node(e, 1))), ")");
+            }
             if (cn == "map_get") {
-                var mg0: i64 = -1; if (n.la >= 0) { mg0 = kids[n.la].val; }
-                var mg1: i64 = -1; if (n.la >= 0 && kids[n.la].next >= 0) { mg1 = kids[kids[n.la].next].val; }
-                return c_map_get(mg0, mg1);
+                return c_map_get(call_arg_node(e, 0), call_arg_node(e, 1));
             }
             // 普通调用
             var sb: StringBuilder = sb_new();
@@ -9851,6 +9927,14 @@ is_array_lit :: func(e: i64) -> bool {
     return an.kind == "array_lit";
 }
 
+is_map_lit :: func(e: i64) -> bool {
+    if (e < 0) {
+        return false;
+    }
+    var mln: Node = nodes[e];
+    return mln.kind == "map_lit";
+}
+
 // ── emitStmt（复刻 emitter.ts emitStmt；输出到 slines）─────────
 
 emit_stmt :: func(sid: i64, indent: i64) -> void {
@@ -9887,6 +9971,41 @@ emit_stmt :: func(sid: i64, indent: i64) -> void {
                 }
                 return;
             }
+            // map：`var m: map[K]V;` 建空表；`= [k: v, ...]` 建表后逐项插入
+            if (t.cat == "map" && (n.nb < 0 || is_map_lit(n.nb))) {
+                var mlkk: i64 = 0;
+                if (tds[t.key].cat != "string") { mlkk = 1; }
+                var mlkc: string = desc_to_c(t.key);
+                var mlvc: string = desc_to_c(t.val);
+                var mlhd: string = cat5("TMap* ", n.sa, " = t_map_new(t_arena_current(), ", i2s(mlkk), ", (int64_t)sizeof(");
+                spush(cat4(pad, mlhd, mlvc, "));"));
+                if (n.nb >= 0) {
+                    // 标量才加显式强转：C 不允许 cast 到 struct 类型（TStr / 具名结构）。
+                    // 整型键一律落成 int64_t（runtime 按 int64_t 读键）。
+                    var mlkx: string = "";
+                    if (tds[t.key].cat == "scalar") {
+                        mlkc = "int64_t";
+                        mlkx = "(int64_t)";
+                    }
+                    var mlvx: string = "";
+                    if (tds[t.val].cat == "scalar") { mlvx = cat3("(", mlvc, ")"); }
+                    var mlnode: Node = nodes[n.nb];
+                    var mlc: i64 = mlnode.la;
+                    var mlix: i64 = 0;
+                    while (mlc >= 0) {
+                        var mlck: Child = kids[mlc];
+                        var mlen: Node = nodes[mlck.val];
+                        var mlkn: string = cat4("_ml_", n.sa, "k", i2s(mlix));
+                        var mlvn: string = cat4("_ml_", n.sa, "v", i2s(mlix));
+                        spush(cat6(pad, mlkc, " ", mlkn, cat3(" = ", mlkx, emit_expr(mlen.na)), ";"));
+                        spush(cat6(pad, mlvc, " ", mlvn, cat3(" = ", mlvx, emit_expr(mlen.nb)), ";"));
+                        spush(cat6(pad, "t_map_put(", n.sa, ", &", mlkn, cat3(", &", mlvn, ");")));
+                        mlix = mlix + 1;
+                        mlc = mlck.next;
+                    }
+                }
+                return;
+            }
             if (t.cat == "string" && n.nb < 0) {
                 spush(cat4(pad, "TStr ", n.sa, " = {0};"));
                 return;
@@ -9915,6 +10034,23 @@ emit_stmt :: func(sid: i64, indent: i64) -> void {
     if (n.kind == "for_each") {
         var itd: i64 = expr_type_desc(n.na);
         var it: TD = tds[itd];
+        // map 的 for-in：按插入序迭代键
+        if (it.cat == "map") {
+            var mfkc: string = desc_to_c(it.key);
+            var mfat: string = "t_map_key_int_at";
+            if (tds[it.key].cat == "string") { mfat = "t_map_key_str_at"; }
+            var mfit: string = emit_expr(n.na);
+            spush(cat4(pad, "for (int64_t _fe_i = 0; _fe_i < t_map_count(", mfit, "); _fe_i = _fe_i + 1) {"));
+            spush(cat6(cat2(pad, "    "), mfkc, " ", n.sa, cat6(" = ", mfat, "(", mfit, ", _fe_i);", ""), ""));
+            var mfb: i64 = n.la;
+            while (mfb >= 0) {
+                var mfbk: Child = kids[mfb];
+                emit_stmt(mfbk.val, indent + 2);
+                mfb = mfbk.next;
+            }
+            spush(cat2(pad, "}"));
+            return;
+        }
         var elem_c: string = "void*";
         if (it.cat == "slice" && it.elem >= 0) {
             elem_c = desc_to_c(it.elem);
@@ -12465,6 +12601,15 @@ ll_arith_ins :: func(op: string, sn: string) -> string {
 // map 读索引助手（LLVM）：tll_map_val_ptr 返回存储值字节指针，按 V 类型 load。
 // map 操作数取指针助手（LLVM）：按 map 声明的 K/V 类型落盘，
 // 标量 alloca+store（必要时先转宽），聚合直接取地址。want<0 表示沿用实参自身类型。
+// map 键取指针（LLVM 后端）：整型键统一按 i64 存储——runtime 按 int64_t 读键，
+// 直接存 i32/u8 会让高位字节是垃圾。string 键是 TStr 聚合，走原路径。
+ll_map_keyptr :: func(kn: i64, keytd: i64) -> string {
+    if (keytd >= 0 && ll_isagg(keytd)) {
+        return ll_map_argptr(kn, keytd);
+    }
+    return ll_map_argptr(kn, td_named_mk("scalar", "i64"));
+}
+
 ll_map_argptr :: func(an: i64, want: i64) -> string {
     var atd: i64 = ll_etd(an);
     var used: i64 = atd;
@@ -12488,7 +12633,7 @@ ll_map_get :: func(mn: i64, kn: i64) -> string {
     var valtd: i64 = mt.val;
     var valty: string = ll_td(valtd);
     var mp: string = emit_lle(mn);
-    var kp: string = ll_map_argptr(kn, mt.key);
+    var kp: string = ll_map_keyptr(kn, mt.key);
     var addr: string = ll_tmp();
     llfb(cat6("  ", addr, " = call ptr @tll_map_val_ptr(ptr ", mp, ", ptr ", cat2(kp, ")")));
     if (ll_isagg(valtd)) {
@@ -12755,7 +12900,7 @@ ll_call :: func(e: i64) -> string {
         var mtd3: i64 = ll_etd(ae[0]);
         var mt3: TD = tds[mtd3];
         var mp3: string = emit_lle(ae[0]);
-        var kp3: string = ll_map_argptr(ae[1], mt3.key);
+        var kp3: string = ll_map_keyptr(ae[1], mt3.key);
         var vp3: string = ll_map_argptr(ae[2], mt3.val);
         llfb(cat6("  call void @tll_map_put(ptr ", mp3, ", ptr ", kp3, ", ptr ", cat2(vp3, ")")));
         return "0";
@@ -12764,7 +12909,7 @@ ll_call :: func(e: i64) -> string {
         var mtd4: i64 = ll_etd(ae[0]);
         var mt4: TD = tds[mtd4];
         var mp4: string = emit_lle(ae[0]);
-        var kp4: string = ll_map_argptr(ae[1], mt4.key);
+        var kp4: string = ll_map_keyptr(ae[1], mt4.key);
         var t4: string = ll_tmp();
         llfb(cat6("  ", t4, " = call i32 @tll_map_has(ptr ", mp4, ", ptr ", cat2(kp4, ")")));
         var t4b: string = ll_tmp();
@@ -12781,7 +12926,7 @@ ll_call :: func(e: i64) -> string {
         var mtd6: i64 = ll_etd(ae[0]);
         var mt6: TD = tds[mtd6];
         var mp6: string = emit_lle(ae[0]);
-        var kp6: string = ll_map_argptr(ae[1], mt6.key);
+        var kp6: string = ll_map_keyptr(ae[1], mt6.key);
         var t6: string = ll_tmp();
         llfb(cat6("  ", t6, " = call i32 @tll_map_del(ptr ", mp6, ", ptr ", cat2(kp6, ")")));
         var t6b: string = ll_tmp();
@@ -13046,6 +13191,28 @@ ll_local_decl :: func(name: string, td: i64, init_e: i64) -> void {
         }
         return;
     }
+    // map：`var m: map[K]V;` 建空表；`= [k: v, ...]` 建表后逐项插入
+    if (t0.cat == "map" && (init_e < 0 || is_map_lit(init_e))) {
+        var mdkk: i64 = 0;
+        if (tds[t0.key].cat != "string") { mdkk = 1; }
+        var mdvty: string = ll_td(t0.val);
+        var mdp: string = ll_tmp();
+        llfb(cat5(cat4("  ", mdp, " = call ptr @tll_map_new(i64 ", i2s(mdkk)), ", i64 ", ll_sizeof(mdvty), ")", ""));
+        llfb(cat4("  store ptr ", mdp, ", ptr ", vn));
+        if (init_e >= 0) {
+            var mdn: Node = nodes[init_e];
+            var mdc: i64 = mdn.la;
+            while (mdc >= 0) {
+                var mdck: Child = kids[mdc];
+                var mden: Node = nodes[mdck.val];
+                var mdkp: string = ll_map_keyptr(mden.na, t0.key);
+                var mdvp: string = ll_map_argptr(mden.nb, t0.val);
+                llfb(cat5(cat4("  call void @tll_map_put(ptr ", mdp, ", ptr ", mdkp), ", ptr ", mdvp, ")", ""));
+                mdc = mdck.next;
+            }
+        }
+        return;
+    }
     // 切片字面量：`var xs: []T = [a, b, c];` → slice_new + 逐元素 append
     if (t0.cat == "slice" && is_array_lit(init_e)) {
         var ety0: string = "i64";
@@ -13279,6 +13446,68 @@ emit_llstmt :: func(sid: i64) -> void {
         var etd: i64 = -1;
         if (it0.cat == "slice") {
             etd = it0.elem;
+        }
+        // map 的 for-in：按插入序迭代键（tll_map_count + tll_map_key_*_at）
+        if (it0.cat == "map") {
+            var mfkd: i64 = it0.key;
+            var mfkty: string = ll_td(mfkd);
+            var mfiter: string = emit_lle(n.na);
+            var mfcnt: string = ll_tmp();
+            llfb(cat4("  ", mfcnt, " = call i64 @tll_map_count(ptr ", cat2(mfiter, ")")));
+            var mfidx: string = ll_scratch("i64");
+            llfb(cat2("  store i64 0, ptr ", mfidx));
+            if (lla_has(n.sa) == false) {
+                append(lla_n, n.sa);
+                llfa(cat4("  %v.", n.sa, " = alloca ", mfkty));
+            }
+            var mfvn: string = cat2("%v.", n.sa);
+            var mfcL: string = ll_lbl("fm.c");
+            var mfbL: string = ll_lbl("fm.b");
+            var mfsL: string = ll_lbl("fm.s");
+            var mfeL: string = ll_lbl("fm.e");
+            llfb(cat2("  br label %", mfcL));
+            ll_label(mfcL);
+            var mfi: string = ll_load("i64", mfidx);
+            var mfcc: string = ll_tmp();
+            llfb(cat6("  ", mfcc, " = icmp slt i64 ", mfi, ", ", mfcnt));
+            llfb(cat6("  br i1 ", mfcc, ", label %", mfbL, ", label %", mfeL));
+            ll_term = true;
+            ll_label(mfbL);
+            var mfi2: string = ll_load("i64", mfidx);
+            if (tds[mfkd].cat == "string") {
+                llfb(cat5(cat4("  call void @tll_map_key_str_at(ptr ", mfiter, ", i64 ", mfi2), ", ptr ", mfvn, ")", ""));
+            } else {
+                var mfkv: string = ll_tmp();
+                llfb(cat5(cat4("  ", mfkv, " = call i64 @tll_map_key_int_at(ptr ", mfiter), ", i64 ", mfi2, ")", ""));
+                var mfsv: string = mfkv;
+                if (mfkty != "i64") {
+                    var mftr: string = ll_tmp();
+                    llfb(cat6("  ", mftr, " = trunc i64 ", mfkv, " to ", mfkty));
+                    mfsv = mftr;
+                }
+                llfb(cat6("  store ", mfkty, " ", mfsv, ", ptr ", mfvn));
+            }
+            ll_loop_push2(mfeL, mfsL);
+            var mfbb: i64 = n.la;
+            while (mfbb >= 0) {
+                var mfbk2: Child = kids[mfbb];
+                emit_llstmt(mfbk2.val);
+                mfbb = mfbk2.next;
+            }
+            ll_loop_pop();
+            if (ll_term == false) {
+                llfb(cat2("  br label %", mfsL));
+                ll_term = true;
+            }
+            ll_label(mfsL);
+            var mfi3: string = ll_load("i64", mfidx);
+            var mfi4: string = ll_tmp();
+            llfb(cat4("  ", mfi4, " = add i64 ", cat2(mfi3, ", 1")));
+            llfb(cat5("  store i64 ", mfi4, ", ptr ", mfidx, ""));
+            llfb(cat2("  br label %", mfcL));
+            ll_term = true;
+            ll_label(mfeL);
+            return;
         }
         var ety: string = "i64";
         if (etd >= 0) {
@@ -13651,6 +13880,9 @@ emit_lldeclares :: func() -> void {
     llph("declare i32 @tll_map_has(ptr, ptr)");
     llph("declare i64 @tll_map_len(ptr)");
     llph("declare i32 @tll_map_del(ptr, ptr)");
+    llph("declare i64 @tll_map_count(ptr)");
+    llph("declare void @tll_map_key_str_at(ptr, i64, ptr)");
+    llph("declare i64 @tll_map_key_int_at(ptr, i64)");
     llph("declare void @tll_file_read_all(ptr, ptr)");
     llph("declare i32 @tll_file_write_all(ptr, ptr)");
     llph("declare i32 @tll_file_exists(ptr)");
