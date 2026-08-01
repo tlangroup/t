@@ -179,7 +179,7 @@ src/
 
 ### 3.2 关键设计决策
 
-1. **AST 表示**：t 语言无继承/接口，AST 节点统一为 `Node :: struct` + `NodeKind :: enum : u16` + 按需字段；子节点用 `[]u32`（节点池索引）而非指针，所有节点存于 `nodes: []Node` 池中。索引式 AST 同时天然利于 JSON 导出与 arena 布局。
+1. **AST 表示**：t 语言无继承/接口，AST 节点统一为 `Node struct` + `NodeKind enum : u16` + 按需字段；子节点用 `[]u32`（节点池索引）而非指针，所有节点存于 `nodes: []Node` 池中。索引式 AST 同时天然利于 JSON 导出与 arena 布局。
 2. **诊断 JSON**：无反射依赖，`json.tc` 手写发射器（StringBuilder 拼接，字段顺序固定），保证与 tc0 输出**字段序一致**，便于差分。
 3. **CTFE 自宿主**：Stage 1 的 CTFE 先支持规范要求的子集（整数算术、控制流、type_info 遍历）；外部 CSV/JSON 数据表导入（§7.2）推迟到 Stage 3。
 4. **不移植 TS 独有便利**（正则、闭包、异常）：一律改写为显式循环 + 错误码返回，与规范的显式原则一致。

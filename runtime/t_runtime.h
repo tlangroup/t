@@ -64,13 +64,6 @@ void t_sb_clear(TSb* b);
 // int_to_str(v: i64) -> string —— 整数转十进制字符串（arena 分配）
 TStr t_int_to_str(int64_t v);
 
-// cat2..cat6(a, b, ...) -> string —— 字符串拼接（各实参须为 string）
-TStr t_cat2(TStr a, TStr b);
-TStr t_cat3(TStr a, TStr b, TStr c);
-TStr t_cat4(TStr a, TStr b, TStr c, TStr d);
-TStr t_cat5(TStr a, TStr b, TStr c, TStr d, TStr e);
-TStr t_cat6(TStr a, TStr b, TStr c, TStr d, TStr e, TStr f);
-
 // ── 切片 []T：泛型经元素宽度单态化 ─────────────────────────────
 // t 语言层不暴露 void*；类型安全由 tc 类型检查器在编译期保证。
 // emitter 规则：tokens[i] → *(Token*)t_slice_at(tokens, i)
@@ -103,6 +96,19 @@ int64_t t_map_count(TMap* m);
 TStr    t_map_key_str_at(TMap* m, int64_t i);
 int64_t t_map_key_int_at(TMap* m, int64_t i);
 void*   t_map_val_at(TMap* m, int64_t i);        // 第 i 个插入序键对应的值字节指针
+
+// ── Sym：字符串驻留符号池（ECS Component 专用，M40）─────────────
+// Sym32("tag") / Sym16("tag")：Component 字段仅存 u32 / u16 id；真实字符串
+// 按 tag 分池存储（不定长）。同一 tag 内相同字符串去重返回同一 id。
+// 生命周期为「区域释放」，无引用计数：
+//   sym_release(tag)   —— 释放该 tag 整个池（真正 free 内存，其后 id 全部失效）
+//   sym_release_all()  —— 释放所有池
+// 池内存独立 malloc/free，不走 arena，以支持运行期真正回收；
+// 一个轻量全局注册表（Symbols）按 tag 索引所有池，仅用于查找/释放，不在热路径分配。
+uint32_t t_sym_intern(TStr tag, TStr str, int64_t bits);  // 驻留字符串→id（去重；bits=16/32 校验上限）
+TStr     t_sym_str(TStr tag, uint32_t id);                // id→字符串（无效 id 返回空串）
+void     t_sym_release(TStr tag);                         // 释放该 tag 整池
+void     t_sym_release_all(void);                         // 释放所有池
 
 // ── 文件 I/O 与进程 ───────────────────────────────────────────
 // 对应 t 语言内置：

@@ -1,3 +1,16 @@
+<!-- ============ 废弃状态 / DEPRECATED ============ -->
+# ⚠️ 本文件已废弃 (DEPRECATED)
+
+本文件(`docs/spec.md`)已被 **t 语言设计宪法**(`docs/constitution.md`)取代,自 2026-08-01 起进入**废弃状态**:
+
+- 不再作为语言规范参考,所有设计决策以 `docs/constitution.md` 为准;
+- 内容已冻结,不再更新、不再被引用;
+- 仅作历史封存保留,供追溯。
+
+---
+
+<!-- ============ 以下为废弃前的原始内容,保留备查 ============ -->
+
 语言名称为t，代码文件为tc。
 
 本文为数据驱动 + AI Agent 友好 编程语言完整设计规范
@@ -36,9 +49,7 @@ func_name(param: Type) -> ReturnType { ... }
 2.1 标量固定位宽类型
 彻底废弃模糊int，全部显式位宽：
 u8/u16/u32/u64、i8/i16/i32/i64、f16/f32/f64、bool
-字符串：string（只读 UTF-8）、StringBuilder（可变拼接）
-- 字符串拼接内建：`cat2(a,b)` … `cat6(a,b,c,d,e,f)`，各实参均为 string，返回拼接后的 string。
-  需拼接非字符串时先 `int_to_str(x)`（如 `cat2("v=", int_to_str(n))`）。等价于 `StringBuilder` 逐项 `sb_append_str` 后 `sb_to_str`。
+字符串：string（只读 UTF-8），StringBuilder（可变拼接）
 2.2 容器统一范式
 - 定长数组：[N]T
 - 动态切片：[]T
@@ -117,7 +128,20 @@ deep["a"]["x"] = 100;            // 嵌套索引写：自动对 inner map 求 TM
 ```
 注意：索引写 `m[k] = v` 走的是 `t_map_put`（find-or-insert），**不是**对 `m[k]` 读值再回写——后者在键未命中时会写入 `t_map_val_ptr` 返回的零缓冲而丢失。整型键统一按 i64 落盘；计算右值、嵌套多层索引写两个后端行为一致。
 
-2.3 变体类型 Variant
+2.3 字符串驻留符号 Sym32/Sym16
+
+面向 ECS Component 的字符串需求：Component 字段不能使用不定长 string，但业务又需要「字符串身份」。Sym 把「真实字符串」与「字段存储」解耦——声明 `Sym32("tag")` / `Sym16("tag")` 的字段，编译期只存 32 位 / 16 位无符号整数 id；真实字符串按 tag 分池、运行期不定长存储，由编译器自动维护。
+
+- 语法（唯一写法，无变体）：`var <name>: Sym32("<tag>") = "<string>";` 位宽仅允许 32 / 16；`<tag>` 为每个内存池的命名空间（不同 tag = 不同池，互不干扰）。
+- 自动驻留（intern）：赋字符串时编译器自动调用 `t_sym_intern(tag, str, bits)` 取得 id 存入变量；同池相同字符串去重，返回同一 id。
+- 按 id 比较（O(1)）：`==` / `!=` 比较底层 id，不比较字符串内容；同池同字符串恒等。
+- 跨池类型安全：`Sym32("A")` 与 `Sym32("B")` 视为不同类型，互相赋值报 `T_TYPE_MISMATCH`（f15）；`Sym32` 与 `Sym16` 亦不兼容。
+- 区域释放（无引用计数）：`sym_release("<tag>")` 释放整池，`sym_release_all()` 释放全部池；编码者须自行在合适时机（区域结束）调用。
+- 取回字符串：`sym_str(v)` 由变量类型推出所属 tag，返回池中原始字符串（String）。
+- 全局变量字符串初始化器含 intern 调用时，自动搬进 `t__ginit` / `t.__ginit` 运行期执行（双后端一致）。
+- 设计契合：显式（无隐式转换）、数据驱动（tag 即命名空间）、AI 友好（唯一写法）。
+
+2.4 变体类型 Variant
 内置一等 Variant（带标签联合体 / tagged union），承载任意基础类型、结构体引用，用于配置解析、LLM 动态参数、跨模块数据传递。
 
 语法：

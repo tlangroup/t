@@ -3,7 +3,7 @@
 //
 // 用法:
 //   node tools/difftest.mjs                          # 自校验: tc0 vs tc0 (验证确定性)
-//   node tools/difftest.mjs --cand "build/tc1.exe"   # tc0 vs tc1
+//   node tools/difftest.mjs --cand "out/dbg/tc.exe"    # tc0 vs tc
 //   node tools/difftest.mjs --ref "<cmd>" --cand "<cmd>" [--samples <dir>]
 //
 // 判定: 对每个样例 × 每条命令, stdout / exit code 逐字节比对;
@@ -109,12 +109,12 @@ for (const sample of samples) {
 
     // 2) emit-c 命令: 各自输出到独立目录, 比对文件集
     const base = basename(sample, ".tc");
-    const dirRef = join(ROOT, "build", "difftest", "ref", base);
-    const dirCand = join(ROOT, "build", "difftest", "cand", base);
+    const dirRef = join(ROOT, "out", "difftest", "ref", base);
+    const dirCand = join(ROOT, "out", "difftest", "cand", base);
     for (const d of [dirRef, dirCand]) mkdirSync(d, { recursive: true });
     const label = `${sample} :: tc compile --emit-c`;
-    const e1 = runCompiler(REF, emitCmd(filePath, join("build", "difftest", "ref", base)));
-    const e2 = runCompiler(CAND, emitCmd(filePath, join("build", "difftest", "cand", base)));
+    const e1 = runCompiler(REF, emitCmd(filePath, join("out", "difftest", "ref", base)));
+    const e2 = runCompiler(CAND, emitCmd(filePath, join("out", "difftest", "cand", base)));
     let err = null;
     if (e1.code !== e2.code) {
         err = `exit code differs: ref=${e1.code} cand=${e2.code}`;

@@ -3,11 +3,12 @@
 // 同名不同型会让先声明处误判聚合性，导致漏 load / 错误取址（M29 踩坑）。
 import fs from 'node:fs';
 
-const file = process.argv[2] || 'src/tote.tc';
+const file = process.argv[2] || 'src/tc.tc';
 const only = process.argv.slice(3);
 const lines = fs.readFileSync(file, 'utf8').split(/\r?\n/);
 
-const fnStart = /^([a-zA-Z_][a-zA-Z0-9_]*)\s*::\s*func/;
+// 顶层函数头：并置式 `Name fn(` （`::`/`func` 已于 2026-08-01 移除）
+const fnStart = /^(?:comptime\s+)?([\p{XID_Start}_][\p{XID_Continue}_]*)\s+fn\s*\(/u;
 const varDecl = /^\s*var\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*:\s*([^=;]+?)\s*(?:=|;)/;
 
 let cur = null;

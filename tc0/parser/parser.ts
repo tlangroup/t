@@ -3,7 +3,7 @@
  *
  * Recursive descent parser for the t programming language.
  * Implements spec sections 1-6 syntax rules:
- * - Declaration syntax: Name :: <decl_body>
+ * - Declaration syntax: Name [::] <decl_body>   (:: optional since 2026-08-01; Name fn(...) / Name struct {...} / Name Type;)
  * - Struct/Enum/Flag/Union/Func declarations
  * - Statement parsing with enforced braces (spec 1.2)
  * - Expression parsing with full precedence
@@ -213,17 +213,11 @@ export class Parser {
         // Validate naming convention (spec 1.1)
         this.validateDeclName(name, nameTok);
 
-        // Expect '::'
-        if (!this.match(TokenType.DoubleColon)) {
-            const tok = this.current();
-            this.bag.error(
-                ErrorCode.T_PARSE_EXPECTED_TOKEN,
-                `expected '::' after declaration name '${name}' but found '${tok.value}'`,
-                makeSpan(this.file, tok.line, tok.col, tok.line, tok.col + tok.value.length),
-            );
-            this.synchronize();
-            return null;
-        }
+        // The '::' binder is OPTIONAL since the 2026-08-01 migration:
+        //   old: Name :: func(...) / Name :: struct { ... } / Name :: Type;
+        //   new: Name fn(...)      / Name struct { ... }      / Name Type;
+        // Both forms are accepted so tc0 remains a usable reference for migrated sources.
+        this.match(TokenType.DoubleColon);
 
         // Parse declaration body based on next token
         const decl = this.parseDeclBody(name, nameTok, annotations, isComptime);

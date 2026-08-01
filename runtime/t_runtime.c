@@ -162,50 +162,6 @@ TStr t_int_to_str(int64_t v) {
     return t_sb_to_str(b);
 }
 
-// ── 字符串拼接 cat2..cat6(a, b, ...) -> string ──────────────────
-// 各实参均为 string（TStr）。需要拼接非字符串类型时，先 int_to_str/...
-// 注意：返回值是 arena 中副本，调用方持有的 TStr 不会因后续 arena 写入而失效。
-TStr t_cat2(TStr a, TStr b) {
-    TSb* b_ = t_sb_new(t_arena_current());
-    t_sb_append_str(b_, a);
-    t_sb_append_str(b_, b);
-    return t_sb_to_str(b_);
-}
-TStr t_cat3(TStr a, TStr b, TStr c) {
-    TSb* b_ = t_sb_new(t_arena_current());
-    t_sb_append_str(b_, a);
-    t_sb_append_str(b_, b);
-    t_sb_append_str(b_, c);
-    return t_sb_to_str(b_);
-}
-TStr t_cat4(TStr a, TStr b, TStr c, TStr d) {
-    TSb* b_ = t_sb_new(t_arena_current());
-    t_sb_append_str(b_, a);
-    t_sb_append_str(b_, b);
-    t_sb_append_str(b_, c);
-    t_sb_append_str(b_, d);
-    return t_sb_to_str(b_);
-}
-TStr t_cat5(TStr a, TStr b, TStr c, TStr d, TStr e) {
-    TSb* b_ = t_sb_new(t_arena_current());
-    t_sb_append_str(b_, a);
-    t_sb_append_str(b_, b);
-    t_sb_append_str(b_, c);
-    t_sb_append_str(b_, d);
-    t_sb_append_str(b_, e);
-    return t_sb_to_str(b_);
-}
-TStr t_cat6(TStr a, TStr b, TStr c, TStr d, TStr e, TStr f) {
-    TSb* b_ = t_sb_new(t_arena_current());
-    t_sb_append_str(b_, a);
-    t_sb_append_str(b_, b);
-    t_sb_append_str(b_, c);
-    t_sb_append_str(b_, d);
-    t_sb_append_str(b_, e);
-    t_sb_append_str(b_, f);
-    return t_sb_to_str(b_);
-}
-
 // ── 切片 []T ──────────────────────────────────────────────────
 TSlice t_slice_new(int64_t elem_size) {
     TSlice s;
@@ -460,6 +416,163 @@ void* t_map_val_at(TMap* m, int64_t i) {
     }
     if (m->key_kind == 0) return t_map_val_ptr(m, &m->order_str[i]);
     return t_map_val_ptr(m, &m->order_int[i]);
+}
+
+// ── Sym：字符串驻留符号池（M40）────────────────────────────────
+// 每个 tag 一个池：去重哈希表 + id→(off,len) 表 + 字节 bump 缓冲。
+// entries 存 bytes 内的偏移而非指针，故 bytes realloc 移动后仍有效。
+// 池内存独立 malloc/free，sym_release 时可真正回收（arena 无法按池回收）。
+struct TSymPool {
+    int32_t* htab;          // 去重哈希表：hash(str)&(cap-1) → id+1（0=空槽），线性探测
+    int64_t  htab_cap;      // 2 的幂
+    int64_t  htab_used;
+    int64_t* ent_off;       // id → 字符串在 bytes 中的偏移
+    int64_t* ent_len;       // id → 字符串长度
+    int64_t  ent_count, ent_cap;
+    uint8_t* bytes;         // 所有字符串字节（bump，realloc 增长）
+    int64_t  bytes_len, bytes_cap;
+    int64_t  bits;          // 16 / 32（id 上限校验）
+};
+
+typedef struct { TStr tag; struct TSymPool* pool; } TSymRegItem;
+// 轻量全局注册表（Symbols）：按 tag 索引所有池；仅查找/释放用，不在 intern 热路径分配。
+static struct { TSymRegItem* items; int64_t len, cap; } g_sym_reg = { NULL, 0, 0 };
+
+static uint64_t sym_hash(const uint8_t* p, int64_t n) {
+    uint64_t h = 1469598103934665603ULL;
+    for (int64_t i = 0; i < n; i++) { h ^= p[i]; h *= 1099511628211ULL; }
+    return h;
+}
+
+static struct TSymPool* sym_pool_new(int64_t bits) {
+    struct TSymPool* p = (struct TSymPool*)calloc(1, sizeof(struct TSymPool));
+    if (!p) t_fatal("sym: pool malloc failed");
+    p->htab_cap = 16;
+    p->htab = (int32_t*)calloc((size_t)p->htab_cap, sizeof(int32_t));
+    p->ent_cap = 8;
+    p->ent_off = (int64_t*)malloc(sizeof(int64_t) * (size_t)p->ent_cap);
+    p->ent_len = (int64_t*)malloc(sizeof(int64_t) * (size_t)p->ent_cap);
+    p->bytes_cap = 256;
+    p->bytes = (uint8_t*)malloc((size_t)p->bytes_cap);
+    p->bits = bits;
+    if (!p->htab || !p->ent_off || !p->ent_len || !p->bytes) t_fatal("sym: pool buffers malloc failed");
+    return p;
+}
+
+static void sym_pool_free(struct TSymPool* p) {
+    if (!p) return;
+    free(p->htab); free(p->ent_off); free(p->ent_len); free(p->bytes);
+    free(p);
+}
+
+// 按 tag 查池；create!=0 时不存在则新建并登记进注册表
+static struct TSymPool* sym_pool_for(TStr tag, int64_t bits, int create) {
+    for (int64_t i = 0; i < g_sym_reg.len; i++)
+        if (t_str_eq(g_sym_reg.items[i].tag, tag)) return g_sym_reg.items[i].pool;
+    if (!create) return NULL;
+    if (g_sym_reg.len >= g_sym_reg.cap) {
+        int64_t nc = g_sym_reg.cap < 4 ? 4 : g_sym_reg.cap * 2;
+        TSymRegItem* ni = (TSymRegItem*)realloc(g_sym_reg.items, sizeof(TSymRegItem) * (size_t)nc);
+        if (!ni) t_fatal("sym: registry realloc failed");
+        g_sym_reg.items = ni; g_sym_reg.cap = nc;
+    }
+    // 注册表持有 tag 的稳定副本（便于 release 时释放）
+    uint8_t* tb = (uint8_t*)malloc((size_t)(tag.len > 0 ? tag.len : 1));
+    if (!tb) t_fatal("sym: tag malloc failed");
+    if (tag.len > 0) memcpy(tb, tag.ptr, (size_t)tag.len);
+    TStr tcopy; tcopy.ptr = tb; tcopy.len = tag.len;
+    struct TSymPool* p = sym_pool_new(bits);
+    g_sym_reg.items[g_sym_reg.len].tag = tcopy;
+    g_sym_reg.items[g_sym_reg.len].pool = p;
+    g_sym_reg.len++;
+    return p;
+}
+
+static void sym_htab_rehash(struct TSymPool* p) {
+    int64_t oldcap = p->htab_cap;
+    int32_t* old = p->htab;
+    p->htab_cap *= 2;
+    p->htab = (int32_t*)calloc((size_t)p->htab_cap, sizeof(int32_t));
+    if (!p->htab) t_fatal("sym: htab rehash failed");
+    for (int64_t i = 0; i < oldcap; i++) {
+        int32_t slot = old[i];
+        if (slot != 0) {
+            int64_t id = slot - 1;
+            uint64_t h = sym_hash(p->bytes + p->ent_off[id], p->ent_len[id]);
+            int64_t j = (int64_t)(h & (uint64_t)(p->htab_cap - 1));
+            while (p->htab[j] != 0) j = (j + 1) & (p->htab_cap - 1);
+            p->htab[j] = slot;
+        }
+    }
+    free(old);
+}
+
+uint32_t t_sym_intern(TStr tag, TStr str, int64_t bits) {
+    struct TSymPool* p = sym_pool_for(tag, bits, 1);
+    uint64_t h = sym_hash(str.ptr, str.len);
+    int64_t idx = (int64_t)(h & (uint64_t)(p->htab_cap - 1));
+    while (p->htab[idx] != 0) {   // 去重命中检查
+        int64_t id = p->htab[idx] - 1;
+        if (p->ent_len[id] == str.len &&
+            (str.len == 0 || memcmp(p->bytes + p->ent_off[id], str.ptr, (size_t)str.len) == 0))
+            return (uint32_t)id;
+        idx = (idx + 1) & (p->htab_cap - 1);
+    }
+    // 新字符串：写入 bytes（必要时 realloc；entries 存偏移，移动安全）
+    if (p->bytes_len + str.len > p->bytes_cap) {
+        int64_t nc = p->bytes_cap;
+        while (p->bytes_len + str.len > nc) nc *= 2;
+        uint8_t* nb = (uint8_t*)realloc(p->bytes, (size_t)nc);
+        if (!nb) t_fatal("sym: bytes realloc failed");
+        p->bytes = nb; p->bytes_cap = nc;
+    }
+    int64_t off = p->bytes_len;
+    if (str.len > 0) memcpy(p->bytes + off, str.ptr, (size_t)str.len);
+    p->bytes_len += str.len;
+    // 新 entry
+    if (p->ent_count >= p->ent_cap) {
+        int64_t nc = p->ent_cap * 2;
+        int64_t* no = (int64_t*)realloc(p->ent_off, sizeof(int64_t) * (size_t)nc);
+        int64_t* nl = (int64_t*)realloc(p->ent_len, sizeof(int64_t) * (size_t)nc);
+        if (!no || !nl) t_fatal("sym: entries realloc failed");
+        p->ent_off = no; p->ent_len = nl; p->ent_cap = nc;
+    }
+    int64_t id = p->ent_count;
+    if (bits == 16 && id >= 65535) t_fatal("sym: Sym16 pool overflow (>65535 strings)");
+    p->ent_off[id] = off;
+    p->ent_len[id] = str.len;
+    p->ent_count++;
+    p->htab[idx] = (int32_t)(id + 1);
+    p->htab_used++;
+    if (p->htab_used * 10 >= p->htab_cap * 7) sym_htab_rehash(p);
+    return (uint32_t)id;
+}
+
+TStr t_sym_str(TStr tag, uint32_t id) {
+    struct TSymPool* p = sym_pool_for(tag, 32, 0);
+    if (!p || (int64_t)id >= p->ent_count) { TStr e; e.ptr = (const uint8_t*)""; e.len = 0; return e; }
+    TStr r; r.ptr = p->bytes + p->ent_off[id]; r.len = p->ent_len[id]; return r;
+}
+
+void t_sym_release(TStr tag) {
+    for (int64_t i = 0; i < g_sym_reg.len; i++) {
+        if (t_str_eq(g_sym_reg.items[i].tag, tag)) {
+            sym_pool_free(g_sym_reg.items[i].pool);
+            free((void*)g_sym_reg.items[i].tag.ptr);
+            for (int64_t j = i; j < g_sym_reg.len - 1; j++) g_sym_reg.items[j] = g_sym_reg.items[j + 1];
+            g_sym_reg.len--;
+            return;
+        }
+    }
+}
+
+void t_sym_release_all(void) {
+    for (int64_t i = 0; i < g_sym_reg.len; i++) {
+        sym_pool_free(g_sym_reg.items[i].pool);
+        free((void*)g_sym_reg.items[i].tag.ptr);
+    }
+    free(g_sym_reg.items);
+    g_sym_reg.items = NULL; g_sym_reg.len = 0; g_sym_reg.cap = 0;
 }
 
 // ── 文件 I/O 与进程 ───────────────────────────────────────────

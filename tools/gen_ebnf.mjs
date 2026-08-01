@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // tools/gen_ebnf.mjs
 // 从 docs/reference.md 的 ```ebnf 代码块抽取文法 + 5 张机器可读数据表，
-// 生成 build/ebnf.json（中间产物，不进 docs/，已被 .gitignore 忽略）。
+// 生成 out/ebnf.json（中间产物，不进 docs/，已被 .gitignore 忽略）。
 //
 // 数据表规则名（须在 reference.md 中出现）：
 //   Keyword          -> 关键字字面量 -> token kind
@@ -23,7 +23,7 @@ import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REF = path.join(__dirname, '..', 'docs', 'reference.md');
-const OUT = path.join(__dirname, '..', 'build', 'ebnf.json');
+const OUT = path.join(__dirname, '..', 'out', 'ebnf.json');
 
 const md = fs.readFileSync(REF, 'utf8');
 
@@ -353,7 +353,7 @@ for (const r of rules) {
 // 结构文法：每条 rule 带结构化 status（"tote" | "partial" | "spec-only" | "unspecified"），
 // 每个 alt 可带自己的 status/note（来自行内注释注记，覆盖规则级）。
 // alts 保持字符串数组向后兼容？——否：正式升级为对象数组 {text, status?, note?}，
-// 当前 rules 段尚无消费方（totter 只读 5 张表 + dispatches + xid），是安全窗口。
+// 当前 rules 段尚无消费方（totter 自 M38 起已放弃，原只读 5 张表 + dispatches + xid 的历史设计），是安全窗口。
 const structural = rules
   .filter((r) => !TABLE_RULES.includes(r.name) && !r.name.endsWith('Dispatch'))
   .map((r) => ({ name: r.name, status: ruleStatus(r), alts: structuredAlts(r) }));
@@ -370,7 +370,7 @@ try {
 // ───────────── Parser grammar（数据驱动生成，M19）─────────────
 // 解析 reference.md 的 `// @rule` 文法块，把每条规则的 body 解析成结构化 EBNF 树，
 // 并计算每个节点的 FIRST(token-kind) 集合，存入 ebnf.json 的 `grammar` 段。
-// totter 读取该段，发射 `parse_<rule>` 递归下降函数（模仿手写 parser 风格）。
+// totter（自 M38 起已放弃）读取该段，发射 `parse_<rule>` 递归下降函数（模仿手写 parser 风格）；此生成路径不再使用。
 
 const PUNCT = {
   '{': 'LBrace', '}': 'RBrace', '(': 'LParen', ')': 'RParen', ';': 'Semicolon',
@@ -580,6 +580,7 @@ let grammar = parseParserGrammar(md);
 if (grammar.length) grammar = computeGrammar(grammar);
 
 const out = { ...tables, rules: structural, dispatches, grammar, xid_start: xid.xid_start, xid_continue: xid.xid_cont };
+fs.mkdirSync(path.dirname(OUT), { recursive: true });
 fs.writeFileSync(OUT, JSON.stringify(out, null, 2) + '\n');
 
 // 诊断输出

@@ -13,7 +13,7 @@ export enum TokenType {
     Identifier,
 
     // ── Keywords ──
-    KwFunc,         // func
+    KwFunc,         // func / fn
     KwStruct,       // struct
     KwEnum,         // enum
     KwFlag,         // flag
@@ -124,6 +124,7 @@ export function tokenTypeToString(t: TokenType): string {
 // Keyword map for fast lookup
 const KEYWORDS: Record<string, TokenType> = {
     "func": TokenType.KwFunc,
+    "fn": TokenType.KwFunc,   // new syntax: `Name fn(...)` (2026-08-01 migration)
     "struct": TokenType.KwStruct,
     "enum": TokenType.KwEnum,
     "flag": TokenType.KwFlag,

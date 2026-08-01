@@ -44,11 +44,6 @@ void    tll_sb_append_i64(TSb* b, int64_t v)  { t_sb_append_i64(b, v); }
 void    tll_sb_to_str(TSb* b, TStr* out)    { *out = t_sb_to_str(b); }
 void    tll_sb_clear(TSb* b)                { t_sb_clear(b); }
 void    tll_int_to_str(int64_t v, TStr* out) { *out = t_int_to_str(v); }
-void    tll_cat2(TStr* a, TStr* b, TStr* out)          { *out = t_cat2(*a, *b); }
-void    tll_cat3(TStr* a, TStr* b, TStr* c, TStr* out) { *out = t_cat3(*a, *b, *c); }
-void    tll_cat4(TStr* a, TStr* b, TStr* c, TStr* d, TStr* out) { *out = t_cat4(*a, *b, *c, *d); }
-void    tll_cat5(TStr* a, TStr* b, TStr* c, TStr* d, TStr* e, TStr* out) { *out = t_cat5(*a, *b, *c, *d, *e); }
-void    tll_cat6(TStr* a, TStr* b, TStr* c, TStr* d, TStr* e, TStr* f, TStr* out) { *out = t_cat6(*a, *b, *c, *d, *e, *f); }
 
 // ── slice ──────────────────────────────────────────────────────
 void    tll_slice_new(int64_t esz, TSlice* out)              { *out = t_slice_new(esz); }
@@ -70,6 +65,13 @@ int64_t tll_map_count(TMap* m)                          { return t_map_count(m);
 void    tll_map_key_str_at(TMap* m, int64_t i, TStr* out) { *out = t_map_key_str_at(m, i); }
 int64_t tll_map_key_int_at(TMap* m, int64_t i)          { return t_map_key_int_at(m, i); }
 void*   tll_map_val_at(TMap* m, int64_t i)              { return t_map_val_at(m, i); }
+
+// ── Sym ────────────────────────────────────────────────────────
+// 聚合参数(TStr)按指针传入；返回聚合(string)用末位 out 指针；返回标量(id)直接返回。
+uint32_t tll_sym_intern(TStr* tag, TStr* str, int64_t bits)  { return t_sym_intern(*tag, *str, bits); }
+void     tll_sym_str(TStr* tag, uint32_t id, TStr* out)      { *out = t_sym_str(*tag, id); }
+void     tll_sym_release(TStr* tag)                          { t_sym_release(*tag); }
+void     tll_sym_release_all(void)                           { t_sym_release_all(); }
 
 // ── I/O 与进程 ─────────────────────────────────────────────────
 void    tll_file_read_all(TStr* path, TStr* out)     { *out = t_file_read_all(t_cstr(*path)); }

@@ -3,10 +3,10 @@
 > 版本 v1 (基于 `docs/spec.md` 设计终稿整理)
 > 本文档描述 **t** 编程语言的词法与语法形式，采用类似 *The Rust Reference* 的记号约定。
 > 文中每个语法产生式给出 **Syntax**、可选 **Where** 约束、以及 **Examples**。
-> 凡当前 `tote` 编译器尚未实现、仅属 spec 设计目标的条目，以 `⚠ spec-only` 标注；已实现条目以 `✅ tote` 标注。
+> 凡当前 `tc` 编译器尚未实现、仅属 spec 设计目标的条目，以 `⚠ spec-only` 标注；已实现条目以 `✅ tote` 标注。
 
 > **语法根本源（single source of truth）**：本文档 **`docs/reference.md`** 是 **t** 语法的权威描述，其中各节以 `ebnf` 代码块给出的产生式即文法的机器可读表示。
-> 由 `tools/gen_ebnf.mjs` 抽取本文档的 `ebnf` 块生成 [`build/ebnf.json`](./../build/ebnf.json)；`src/totter.tc` 解析 `ebnf.json` 驱动生成 `gen/tote.tc` 的词法关键字表与（后续）递归下降解析器（数据驱动生成管线）。修改文法应改本文档的 `ebnf` 产生式并重新生成 `ebnf.json`，而非手写 `ebnf.json` 或 `tote.tc`。
+> 由 `tools/gen_ebnf.mjs` 抽取本文档的 `ebnf` 块生成 [`out/ebnf.json`](./../out/ebnf.json)；`src/totter.tc` 解析 `ebnf.json` 驱动生成 `gen/tc.tc` 的词法关键字表与（后续）递归下降解析器（数据驱动生成管线）。**⚠ totter 自 M38 起已放弃（abandoned），此「数据驱动生成」管线为历史设计：`src/tc.tc` 的 `// >>> GEN:` 区间已冻结、现由手写维护，`out/ebnf.json` 与 `gen/tc.tc` 均为冻结快照，不再重跑 totter 重新生成。**
 
 ---
 
@@ -24,7 +24,7 @@
 - 字面量用等宽 `"..."` 表示关键字或标点。
 - `Ident`、`IntegerLiteral` 等非终结符首字母大写。
 - 终止符（token 类别）用小写 `ident`、`int`、`lbrace` 等表示。
-- ebnf 块内注释统一为两种形式：`//` 行注释与 `/* ... */` 块注释。状态注记（`⚠ spec-only`、`✅ tote` 等）一律写在上述注释内部，不单独成句。注释文本由 `tools/gen_ebnf.mjs` 在抽取时从产生式中**剥离**（尊重引号，不会误删 `"//"`、`"/*"` 这类字面量），但其中的状态注记会被**结构化抽取**进 `build/ebnf.json` 的 `rules` 段：每条 rule 带 `status` 字段（`"tote"` 已实现 / `"partial"` 部分实现 / `"spec-only"` 仅设计 / `"unspecified"` 未注记），规则级状态取头行注记、缺省继承最近章节标题（`##`/`###`/`####`）的注记；每个 alt 为 `{text, status?, note?}` 对象，行内注释的注记附着到对应 alt 并覆盖规则级。该字段是 rules 驱动 parser 生成的过滤依据（生成器只应消费 `tote`/`partial` 条目）。
+- ebnf 块内注释统一为两种形式：`//` 行注释与 `/* ... */` 块注释。状态注记（`⚠ spec-only`、`✅ tote` 等）一律写在上述注释内部，不单独成句。注释文本由 `tools/gen_ebnf.mjs` 在抽取时从产生式中**剥离**（尊重引号，不会误删 `"//"`、`"/*"` 这类字面量），但其中的状态注记会被**结构化抽取**进 `out/ebnf.json` 的 `rules` 段：每条 rule 带 `status` 字段（`"tote"` 已实现 / `"partial"` 部分实现 / `"spec-only"` 仅设计 / `"unspecified"` 未注记），规则级状态取头行注记、缺省继承最近章节标题（`##`/`###`/`####`）的注记；每个 alt 为 `{text, status?, note?}` 对象，行内注释的注记附着到对应 alt 并覆盖规则级。该字段是 rules 驱动 parser 生成的过滤依据（生成器只应消费 `tote`/`partial` 条目）。
 
 **设计铁律（来自 spec §0，所有产生式不得违反）：**
 
@@ -79,7 +79,7 @@ IDENTIFIER:
 
 ```ebnf
 Keyword:
-    "func" -> KwFunc
+    "fn" -> KwFunc
   | "struct" -> KwStruct
   | "enum" -> KwEnum
   | "flag" -> KwFlag
@@ -112,8 +112,8 @@ Keyword:
   | "StringBuilder" -> KwStringBuilder
 ```
 
-> 关键字由 `lex` 阶段查表（`kw_lookup`，基于 `keywords_tbl`）判定。其权威列表即上方 `Keyword` 产生式中的字面量，由 `tools/gen_ebnf.mjs` 抽取生成 `build/ebnf.json`、`src/totter.tc` 解析后生成进 `gen/tote.tc`。`i8`/`i16`/`i32`/`i64`/`u8`/`u16`/`u32`/`u64`/`f16`/`f32`/`f64`/`bool`/`type` 为**内建类型名**（见 §3.5），不是关键字。
-> ⚠ spec-only（设计中、tote 未接入）：`union`、`enum` 完整语义、`comptime` 表达式。
+> 关键字由 `lex` 阶段查表（`kw_lookup`，基于 `keywords_tbl`）判定。其权威列表即上方 `Keyword` 产生式中的字面量，由 `tools/gen_ebnf.mjs` 抽取生成 `out/ebnf.json`、`src/totter.tc` 解析后生成进 `gen/tc.tc`（totter 已放弃，该区间现冻结于 `src/tc.tc`、手写维护）。`i8`/`i16`/`i32`/`i64`/`u8`/`u16`/`u32`/`u64`/`f16`/`f32`/`f64`/`bool`/`type` 为**内建类型名**（见 §3.5），不是关键字。
+> ⚠ spec-only（设计中、tc 未接入）：`union`、`enum` 完整语义、`comptime` 表达式。
 
 ### 2.4 Literals（字面量） ✅ tote（部分）
 
@@ -146,17 +146,17 @@ OpOrPunct:
     "+" | "-" | "*" | "/" | "%" | "==" | "!=" | "<" | ">" | "<=" | ">="
   | "&&" | "||" | "!" | "&" | "|" | "^" | "~" | "<<" | ">>"
   | "=" | "+=" | "-=" | "*=" | "/=" | "%="
-  | "->" | ":" | "::" | ";" | "," | "." | ".."
+  | "->" | ":" | ";" | "," | "." | ".."
   | "(" | ")" | "{" | "}" | "[" | "]" | "@" | "#"
 ```
 
-- `::` 为声明绑定算子（`Name :: func ...`、`Name :: struct ...`）。
+- 顶层声明为**并置式**：声明名后直接跟声明种类关键字（`Name fn ...`、`Name struct ...`），无绑定算子。⚠ `::` 绑定算子已于 2026-08-01 移除；旧写法 `Name :: func ...` 由 parser 报带迁移指引的硬错误。
 - `#` 用于内存布局指令 `#aos` / `#soa`（⚠ spec-only 实变换未接入）。
 - `@` 引入注解 `@name(args)`。
 
 ### 2.6 Compiler data tables（机器可读数据表）✅ tote
 
-以下五个产生式以 `ebnf` 块形式给出编译器内部**可枚举目录**（关键字表、内建返回类型、@derive trait、诊断码、注解注册表）。它们由 `tools/gen_ebnf.mjs` 从本文档抽取、生成 [`build/ebnf.json`](./../build/ebnf.json) 的对应字段，再由 `src/totter.tc` 驱动生成 `gen/tote.tc` 的 5 个 `GEN:` 标记区间。**修改这些目录应改本节的 `ebnf` 产生式并重新生成 `ebnf.json`**，而非手写 `ebnf.json` 或 `tote.tc`。
+以下五个产生式以 `ebnf` 块形式给出编译器内部**可枚举目录**（关键字表、内建返回类型、@derive trait、诊断码、注解注册表）。它们由 `tools/gen_ebnf.mjs` 从本文档抽取、生成 [`out/ebnf.json`](./../out/ebnf.json) 的对应字段，再由 `src/totter.tc`（已放弃）驱动生成 `gen/tc.tc`（冻结快照）的 5 个 `GEN:` 标记区间，现冻结于 `src/tc.tc`、手写维护。（⚠ totter 已放弃，不再依赖重新生成；修改这些目录直接在 `src/tc.tc` 手写，`ebnf` 产生式仅作文档记录。）
 
 > 记号约定：枚举项以 `|` 分隔；`"x" -> Kind` 表示关键字字面量映射到 token 种类；`"x" / "y" => Ret` 表示多个内建名共享同一返回类型（生成 `name == "x" || name == "y"` 的判别式）；`"@n" { spec, targets, repl }` 表示注解注册项。
 
@@ -175,7 +175,6 @@ BuiltinTable:
   | "file_read_all" / "path_resolve" / "str_slice" => ti_mk("String")
   | "sb_to_str" / "to_string" => ti_mk("String")
   | "int_to_str" => ti_mk("String")
-  | "cat2" / "cat3" / "cat4" / "cat5" / "cat6" => ti_mk("String")
   | "file_write_all" / "file_exists" => ti_scalar("bool")
   | "args" => ti_elem_of("Slice", ti_mk("String"))
   | "sb_new" => ti_mk("StringBuilder")
@@ -248,7 +247,7 @@ AnnotationTable:
 
 ### 2.7 Parser dispatch tables（解析器分发表，EBNF → 代码）✅ tote
 
-以下 `ebnf` 块给出递归下降解析器中**关键字驱动的分发表**：每条 `NameDispatch:` 规则列出「当前 token → 调用的 `parse_*` 函数」。它们由 `tools/gen_ebnf.mjs` 抽取进 `build/ebnf.json` 的 `dispatches` 段，再由 `src/totter.tc` 生成进 `gen/tote.tc` 的 `GEN:parser_dispatch` 标记区间，从而令 `parse_decl_body` 等分发表由文法数据驱动（取代手写 if 链）。
+以下 `ebnf` 块给出递归下降解析器中**关键字驱动的分发表**：每条 `NameDispatch:` 规则列出「当前 token → 调用的 `parse_*` 函数」。它们由 `tools/gen_ebnf.mjs` 抽取进 `out/ebnf.json` 的 `dispatches` 段，再由 `src/totter.tc`（已放弃）生成进 `gen/tc.tc`（冻结快照）的 `GEN:parser_dispatch` 标记区间，该区间现冻结于 `src/tc.tc`、手写维护（取代手写 if 链的设计仍保留，但不再由 totter 生成）。
 
 记号约定：`KwXxx` 表示匹配 token 种类 `KwXxx`；`Id("v")` 表示匹配 `Identifier` 且字面量为 `v`；`_`（唯一一条，置于末尾）表示默认分支。
 
@@ -268,7 +267,7 @@ DeclBodyDispatch:
 
 ### 2.8 Parser grammar（数据驱动生成的权威文法）✅ tote（部分，规则驱动生成试点）
 
-以下 `// @rule` 文法是**递归下降 parser 的权威生成源**：`tools/gen_ebnf.mjs` 把每条规则的 body 解析成结构化 EBNF 树（含 FIRST 集），再由 `src/totter.tc` 发射进 `gen/tote.tc` 的 `GEN:parser` 标记区间，生成 `parse_<rule>` 函数，取代对应手写实现。
+以下 `// @rule` 文法是**递归下降 parser 的权威生成源**：`tools/gen_ebnf.mjs` 把每条规则的 body 解析成结构化 EBNF 树（含 FIRST 集），再由 `src/totter.tc`（已放弃）发射进 `gen/tc.tc`（冻结快照）的 `GEN:parser` 标记区间，生成 `parse_<rule>` 函数。⚠ totter 已放弃，此生成路径不再使用；`src/tc.tc` 的解析器为手写实现，`GEN:parser` 区间现为冻结快照。
 
 记号：
 - `// @rule <name> params=(...) ret=<T> node=<NodeKind> eatFirst=<bool>`：规则元数据。`eatFirst=true` 表示被分发表按关键字匹配后，函数先 `advance_i()` 吃掉该关键字（如 `variant`）。
@@ -496,7 +495,7 @@ switch_stmt :: "(" expr ")" "{" ( "case" expr ":" statement* | "default" ":" sta
 
 ### 2.9 AST node kinds（数据驱动生成的节点种类表）✅ tote
 
-节点种类（AST 的 `kind` 标签）的单一真相源。totter 读取本表（经 `tools/gen_ebnf.mjs` → `build/ebnf.json` 的 `nodes` 段）生成 `Node` 结构、`node_new` / `node_at`、节点种类注册表（`node_kind_names` / `init_node_kinds` / `is_node_kind`），以及**每个种类的构造器 `mk_<kind>(槽参数…, ti)`**。
+节点种类（AST 的 `kind` 标签）的单一真相源。totter 读取本表（经 `tools/gen_ebnf.mjs` → `out/ebnf.json` 的 `nodes` 段；totter 已放弃，该生成现冻结于 `src/tc.tc`）生成 `Node` 结构、`node_new` / `node_at`、节点种类注册表（`node_kind_names` / `init_node_kinds` / `is_node_kind`），以及**每个种类的构造器 `mk_<kind>(槽参数…, ti)`**。
 
 `Node` 是固定通用槽结构，每行 `// @node <名字> [槽=类型 …]` 声明该种类实际使用的槽（按结构字段序）：
 
@@ -511,7 +510,7 @@ switch_stmt :: "(" expr ")" "{" ( "case" expr ":" statement* | "default" ":" sta
 
 构造器约定：参数按上表字段序排列，末位固定为 anchor token 下标 `ti`；`ti < 0` 表示不打 anchor（跳过 `node_at`）。无槽种类只生成 `mk_<kind>(ti)`。
 
-槽本身的机器可读定义（`Node` 结构字段序 = 本表行序；totter 由此生成 `Node` 结构体字段、`node_new` 初值，并驱动 `slot_ty`/`slot_default` 查表）。每行 `// @slot <槽名> <记法> <t类型> <初值> [字段注释…]`；锚点槽（记法 `anchor`）不参与 `@node` 标注与构造器参数，仅由 `node_at` 写入：
+槽本身的机器可读定义（`Node` 结构字段序 = 本表行序；totter 由此生成（totter 已放弃，现冻结于 `src/tc.tc`）`Node` 结构体字段、`node_new` 初值，并驱动 `slot_ty`/`slot_default` 查表）。每行 `// @slot <槽名> <记法> <t类型> <初值> [字段注释…]`；锚点槽（记法 `anchor`）不参与 `@node` 标注与构造器参数，仅由 `node_at` 写入：
 
 ```ebnf
 SlotTable ::
@@ -638,7 +637,7 @@ ScalarTable ::
   // @scalar void none  -1 void     i64    64
 ```
 
-`// @sfn <fn> <ret> <mode> <filter> <col> <fallback> <region>` 声明由上表派生的查询函数。所有派生函数签名固定为 `<fn> :: func(name: string) -> <ret>`。
+`// @sfn <fn> <ret> <mode> <filter> <col> <fallback> <region>` 声明由上表派生的查询函数。所有派生函数签名固定为 `<fn> fn(name: string) -> <ret>`。
 
 - `filter`：`all` = 全表；`scalar` = `class != none`；`int` / `float` / `bool` = 按 class 取。
 - `col`：取值列（`pred` 模式不取值，写 `-`）。
@@ -648,7 +647,7 @@ ScalarTable ::
   - `group1` — 按 `col` 取值分组，组序 = 取值在表中的首现序，单行体 `if (<或链>) { return V; }`。
   - `group2` — 同 `group1` 但多行体，末尾附 `return <fallback>;`。
   - `each` — 不分组，逐条发 `if (name == "X") { return V; }`，末尾附 `return <fallback>;`。
-- `region`：所属 `GEN:` 生成区间名。同一区间内的函数按表序发射、函数间空一行。区间拆成四段只为贴合各函数在 `tote.tc` 中的既有位置，不影响语义。
+- `region`：所属 `GEN:` 生成区间名。同一区间内的函数按表序发射、函数间空一行。区间拆成四段只为贴合各函数在 `tc.tc` 中的既有位置，不影响语义。
 
 ```ebnf
 ScalarFnTable ::
@@ -671,7 +670,7 @@ ScalarFnTable ::
 
 | 列 | 含义 |
 |---|---|
-| `region` | 所属 `GEN:` 区间名（区间拆分只为贴合各分支在 `tote.tc` 中的既有位置） |
+| `region` | 所属 `GEN:` 区间名（区间拆分只为贴合各分支在 `tc.tc` 中的既有位置） |
 | `fn` | `infer` = `infer_expr`（表达式）/ `resolve` = `resolve_ti`（类型标注） |
 | `kind` | 匹配的 AST 节点种类，对应 §2.9 `NodeTable` |
 | `mode` | 结果类型的构造方式，见下 |
@@ -771,11 +770,6 @@ TdRuleTable ::
   // @tdrule td_calls  12 cn     str_slice     one mk    string -
   // @tdrule td_calls  12 cn     sb_to_str     one mk    string -
   // @tdrule td_calls  12 cn     int_to_str    one mk    string -
-  // @tdrule td_calls  12 cn     cat2         one mk    string -
-  // @tdrule td_calls  12 cn     cat3         one mk    string -
-  // @tdrule td_calls  12 cn     cat4         one mk    string -
-  // @tdrule td_calls  12 cn     cat5         one mk    string -
-  // @tdrule td_calls  12 cn     cat6         one mk    string -
   // @tdrule td_calls  12 cn     sb_new        one named named  TSb*
   // @tdrule td_calls  12 cn     map_has       one named scalar bool
   // @tdrule td_calls  12 cn     map_del       one named scalar bool
@@ -798,6 +792,8 @@ TdRuleTable ::
 
 ### 3.1 Items（顶层条目）
 
+> 本节气法由 `decl.md` / `decl_var.md` / `decl_struct.md` / `decl_enum.md` / `decl_flag.md` / `decl_variant.md` / `decl_typealias.md` / `decl_import.md` / `decl_func.md` 经 L-15 采用并并入（原草稿已标记失效）。`match.md` 的函数子句声明形式已于 2026-08-01 用户指令对齐为本节气法（L-04 声明层张力已消解）；但 match 表达式与函数子句的完整语义在 `src/tc.tc` 尚未实现（L-14 门禁未覆盖），故 `match.md` 仍维持 DRAFT / 按指令忽略，不并入本手册。函数声明形式固定为 `Name fn(...) -> Ret`（并置式、禁止重载），与 `src/tc.tc` 一致。
+
 ```ebnf
 ModuleItem:
       FuncDecl
@@ -811,18 +807,18 @@ ModuleItem:
     | InnerAttribute
 
 FuncDecl:
-    FuncName "::" "func" "(" (Param ("," Param)*)? ")" "->" Type FuncAnns? Block
+    FuncName "fn" "(" (Param ("," Param)*)? ")" "->" Type FuncAnns? Block
 
 FuncName: IDENTIFIER
 Param:    ParamName ":" Type
 ```
 
-- 函数**必须**用 `Name :: func(...) -> Ret { ... }` 绑定形式声明（spec §1.3：参数类型后置、禁止重载、禁止隐式返回、所有分支显式 `return`）。
-- ✅ tote：已支持 `func` 声明、`@main` 入口、`@test` 等注解；`enum` 完整语义、`union` 标记但未实装。
+- 函数**必须**用 `Name fn(...) -> Ret { ... }` 并置形式声明（spec §1.3：参数类型后置、禁止重载、禁止隐式返回、所有分支显式 `return`）。
+- ✅ tote：已支持 `fn` 声明、`@main` 入口、`@test` 等注解；`enum` 完整语义、`union` 标记但未实装。
 
 ```ebnf
 StructDecl:
-    StructName "::" "struct" StructAnns? "{" (StructField ";")* "}"
+    StructName "struct" StructAnns? "{" (StructField ";")* "}"
 
 StructField:
     FieldName ":" Type (Annotation)*
@@ -832,11 +828,11 @@ StructAnns:
 ```
 
 - 字段以 `;` 结尾；字段可挂 `@doc` / `@export` / `@binary_offset(N)` / `@binary_skip` 等注解。
-- ⚠ spec-only：`@derive` 全能力（当前 tote 的 `@derive` 处理函数体为空壳/带已知 bug，见 `src/tote.tc` `process_derive`）。
+- ⚠ spec-only：`@derive` 全能力（当前 tc 的 `@derive` 处理函数体为空壳/带已知 bug，见 `src/tc.tc` `process_derive`）。
 
 ```ebnf
 FlagDecl:
-    FlagName "::" "flag" "[" IntType "]" "{" (FlagSlot ";")* "}"
+    FlagName "flag" "[" IntType "]" "{" (FlagSlot ";")* "}"
 
 FlagSlot:
     SlotName ":" Digits FlagSlotAnns?
@@ -850,7 +846,7 @@ FlagSlotAnns:
 
 ```ebnf
 VariantDecl:
-    VariantName "::" "variant" "{" (VariantCase ";")* "}"
+    VariantName "variant" "{" (VariantCase ";")* "}"
 
 VariantCase:
       CaseName "(" Type ("," Type)* ")"      // 携带载荷
@@ -862,6 +858,8 @@ VariantCase:
 
 ### 3.2 Annotations（注解） ✅ tote（注册表已数据化）
 
+> 本节气法由 `annotation.md` 经 L-15 采用并并入（原草稿已标记失效）；部分注解语义仍为 spec-only。
+
 ```ebnf
 Annotation:
     "@" AnnName ("(" AnnArg ("," AnnArg)* ")")?
@@ -870,7 +868,7 @@ AnnName: IDENTIFIER
 AnnArg:  Expression | StringLiteral
 ```
 
-注解可挂于类型、字段、函数、全局节点；全部经 `type_info(T)` 编译期自省读取（⚠ `type_info` 内建尚未接入）。当前 tote `init_anndefs` 已表驱注册全量注解（spec §4.8）：
+注解可挂于类型、字段、函数、全局节点；全部经 `type_info(T)` 编译期自省读取（⚠ `type_info` 内建尚未接入）。当前 tc `init_anndefs` 已表驱注册全量注解（spec §4.8）：
 
 - 测试类：`@test` `@test_skip` `@test_only` `@expect_fail` `@test_group("分组")`
 - 派生类：`@derive(ToString,FromString,Clone,Copy,DebugPrint,BinarySerde,Eq,Hash)`
@@ -880,6 +878,8 @@ AnnArg:  Expression | StringLiteral
 - 函数约束：`@inline` `@no_inline` `@must_use` `@const_fn` `@unsafe` `@main` `@export_symbol` `@link_name` `@panic_handler` `@doc` `@doc_file`
 
 ### 3.3 Statements（语句） ✅ tote（核心）
+
+> 本节气法由 `stmt.md` / `stmt_var.md` / `stmt_control.md` / `stmt_defer.md` / `stmt_comptime.md` 经 L-15 采用并并入（原草稿已标记失效）；`DeferStatement` 已实装、`ComptimeStatement` 为 partial。
 
 ```ebnf
 Statement:
@@ -891,17 +891,22 @@ Statement:
     | IfStatement
     | WhileStatement
     | ForStatement                           // ✅ tote
-    | SwitchStatement                        // ✅ tote
+    | SwitchStatement                        // 🚫 已废弃(deprecated)：由 match 表达式取代（见草稿 match.md）
     | ReturnStatement
     | BreakStatement                         // ✅ tote
     | ContinueStatement                      // ✅ tote
+    | DeferStatement                         // ✅ tote（已实装，L-15 采用）
+    | ComptimeStatement                      // ⚠ partial（块节点已定义，表达式级语义 spec-only）
     | Block
 
+Block: "{" Statement* "}"                   // 语句块
 VarDeclStatement:   "var" Ident ":" Type ("=" Expression)? ";"
 ConstDeclStatement: "const" Ident ":" Type "=" Expression ";"
 AssignStatement:    Expression "=" Expression ";"
 ReturnStatement:    "return" Expression? ";"
 ExpressionStatement: Expression ";"
+DeferStatement:     "defer" Block            // 延迟块，作用域退出时按 LIFO 执行
+ComptimeStatement:  "comptime" Block         // 编译期块（块内语句编译期求值）
 ```
 
 **语句强制规则（spec §1.2）：**
@@ -928,7 +933,7 @@ ForInit:
     | ConstDeclStatement
     | Expression ";"
 
-SwitchStatement:                                     // ✅ tote
+SwitchStatement:                                     // 🚫 已废弃(deprecated)：由 match 表达式取代；文法保留仅作历史
     "switch" "(" Expression ")" "{" SwitchCase* SwitchDefault? "}"
 
 SwitchCase:
@@ -941,59 +946,102 @@ BreakStatement:    "break" ";"                       // ✅ tote
 ContinueStatement: "continue" ";"                    // ✅ tote
 ```
 
-- ✅ tote：`if/else`、`while`、`for`（C 风格三段式，init 支持 `var` 声明）、`switch/case/default`、`break`、`continue` 均已实装（含 LLVM 后端；见 build/lltest/stmt_probe.tc 实测）。
+- ✅ tote：`if/else`、`while`、`for`（C 风格三段式，init 支持 `var` 声明）、`break`、`continue` 均已实装（含 LLVM 后端）。⚠ `switch`/`case`/`default` 已于 2026-08-01 废弃(deprecated)并从编译器删除，由 `match` 表达式取代（见草稿 `docs/syntax/drafts/match.md`）；实测示例见 `build/lltest/stmt_probe.tc`（已改写为 `if/else`）。
 
 ### 3.4 Expressions（表达式） ✅ tote（核心）
 
+> 本节气法由 `expr.md` 及其细分草稿 `expr_binary.md` / `expr_unary.md` / `expr_postfix.md` / `expr_literal.md` 经 L-15 采用并并入（原草稿已标记失效）。
+
 ```ebnf
-Expression:
-      Literal
-    | Ident
-    | Expression "." Ident                  // 字段/方法访问
-    | Expression "[" Expression "]"         // 索引 ⚠ spec-only
-    | Expression "(" (Expression ("," Expression)*)? ")"   // 调用
-    | UnaryOp Expression
-    | Expression BinaryOp Expression
-    | "(" Expression ")"
-    | Block
+Expr: AssignExpr                                    // 顶层为赋值表达式，右结合
 
-UnaryOp:  "-" | "!" | "~"
-BinaryOp:
-      "*" | "/" | "%" | "+" | "-"           // 算术
-    | "<<" | ">>" | "&" | "|" | "^"         // 位
-    | "<" | ">" | "<=" | ">=" | "==" | "!=" // 比较
-    | "&&" | "||"                           // 逻辑
+// 赋值（右结合，允许 a = b = c）
+AssignExpr: OrExpr ("=" AssignExpr)?
 
-Block: "{" Statement* "}"
+// —— 二元运算符优先级塔（从低到高，全部左结合）——
+OrExpr:    AndExpr ("||" AndExpr)*
+AndExpr:   BitOrExpr ("&&" BitOrExpr)*
+BitOrExpr: BitXorExpr ("|" BitXorExpr)*
+BitXorExpr: BitAndExpr ("^" BitAndExpr)*
+BitAndExpr: EqExpr ("&" EqExpr)*
+EqExpr:    CmpExpr ("==" | "!=" CmpExpr)*
+CmpExpr:   ShiftExpr ("<" | ">" | "<=" | ">=" ShiftExpr)*
+ShiftExpr: AddExpr ("<<" | ">>" AddExpr)*
+AddExpr:   MulExpr ("+" | "-" MulExpr)*
+MulExpr:   UnaryExpr ("*" | "/" | "%" UnaryExpr)*
+
+// 前缀一元（右结合，可堆叠：!!x、--x、~~x）
+UnaryExpr: ("!" | "-" | "~") UnaryExpr | PostfixExpr
+
+// 后缀（左结合，可堆叠）；`as` 仅在后缀循环结束后出现一次
+PostfixExpr:
+    PrimaryExpr (("." ident) | ("[" Expr "]") | ("(" Args? ")"))*
+    ("as" Type)?
+
+Args: Expr ("," Expr)*
+
+// —— 字面量与基本表达式（primary）——
+PrimaryExpr:
+    | IntLit
+    | FloatLit
+    | StrLit
+    | BoolLit
+    | NullLit
+    | IdentExpr
+    | TypeInfoExpr
+    | StructLit
+    | ArrayLit
+    | MapLit
+    | "(" Expr ")"            // 仅分组，非元组
+
+IntLit:   integer            // 十进制；0x 前缀十六进制；0b 前缀二进制
+FloatLit: float
+StrLit:   string
+BoolLit:  "true" | "false"
+NullLit:  "null"
+IdentExpr: ident
+TypeInfoExpr: "type_info" "(" ident ")"      // 编译期类型信息内建
+StructLit: ident "{" (ident ":" Expr ("," ident ":" Expr)*)? "}"
+ArrayLit:  "[" (Expr ("," Expr)*)? "]"
+MapLit:    "[" (Expr ":" Expr ("," Expr ":" Expr)*)? "]"   // 当首元素后跟 ":"
 ```
 
-- 二元运算符优先级（从高到低，spec §1.2 要求手动加括号消除歧义，下表为推荐优先级）：
-  1. 一元 `- ! ~`
-  2. `*` `/` `%`
-  3. `+` `-`
-  4. `<<` `>>`
-  5. `&`
-  6. `^`
-  7. `|`
-  8. `<` `>` `<=` `>=` `==` `!=`
-  9. `&&`
-  10. `||`
+- **优先级塔固定（L-03 可预判）**：`||` 最低、`*`/`/`/`%` 最高，10 级全部左结合；赋值 `=` 右结合；无右结合二元运算符。塔层级与 `src/tc.tc` 的 `parse_or → … → parse_mul → parse_unary → parse_postfix → parse_primary` 一一对应，不可调换。
+- **全行为显式（L-02）**：`as` 为唯一显式类型转换（仅一次、不可 `e as T1 as T2`）；无隐式类型转换 / 隐式布尔 / 隐式内存分配；复合字面量（数组 `[...]` / map `[k:v]` / 结构体 `T{...}`）显式构造。
+- **静态类型安全（L-03）**：每个 `Expr` 的静态类型由 checker 推算；元素 / 字段 / 下标 / `type_info` 静态校验；`MapLit` 与 `ArrayLit` 共用 `[ ]`，由首元素后是否跟 `:`` 向前看消歧（无二义）。
+- **唯一写法（L-04 ✅）**：调用 `f(x)`、转换 `e as T`、下标 `e[i]`、成员 `e.f`、结构体 `T{...}`、数组 `[...]`、map `[k:v]` 均仅一种标准写法，无等价多写变体。
 - `>>>` 注意：比较/移位序列中 `>>` 不得被词法拆成两个 `>`。
-- 调用与字段访问左结合。
 
 ### 3.5 Types（类型） ✅ tote（核心）
 
+> 本节气法由 `types.md` 经 L-15 采用并并入（原草稿已标记失效）；`FuncType` 仍为 spec-only。
+
 ```ebnf
 Type:
-      IntType | FloatType | "bool" | "string" | "StringBuilder"
-    | "[" Type "]"                       // 动态切片 []T
-    | "[" IntegerLiteral "]" Type        // 定长数组 [N]T
-    | "map" "[" Type "]" Type            // 哈希映射 map[K]V  ✅ tote
-    | TypeName                           // 命名类型（struct/enum/flag/variant）
-    | "func" "(" (Type ("," Type)*)? ")" "->" Type   // ⚠ spec-only 函数类型
+      Scalar
+    | ArrayType
+    | SliceType
+    | MapType
+    | PointerType
+    | OptionalType
+    | FlagArrayType
+    | NamedType
+    | SymType                           // ✅ tote 字符串驻留符号 Sym32("tag")/Sym16("tag")
+    | FuncType                          // ⚠ spec-only 函数类型
 
-IntType:  "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64"
-FloatType:"f16" | "f32" | "f64"
+Scalar: "u8" | "u16" | "u32" | "u64"
+      | "i8" | "i16" | "i32" | "i64"
+      | "f16" | "f32" | "f64" | "bool" | "void" | "string" | "StringBuilder"
+ArrayType: "[" Expr "]" Type          // 定长数组 [N]T
+SliceType: "[" "]" Type               // 动态切片 []T
+MapType: "map" "[" Type "]" Type      // 哈希映射 map[K]V  ✅ tote
+PointerType: "*" Type                 // 指针 *T
+OptionalType: Type "?"                // 可选 T?
+FlagArrayType: "flag" "[" Integer "]" // 位域数组 flag[N]
+NamedType: Ident                      // 结构体/枚举/flag/variant/别名名
+SymType: "Sym" ("32"|"16") "(" StringLiteral ")"
+FuncType: "fn" "(" TypeList? ")" "->" Type   // ⚠ spec-only 函数类型（值语义）
+TypeList: Type ("," Type)*
 ```
 
 - ✅ tote：标量固定位宽 + `string`/`StringBuilder` + `[]T` 切片 + `[N]T` 定长数组 + `map[K]V` 哈希映射均实装（new/set/get/has/len/del 内建 + `m[k]` 读索引 + `[k: v, …]` 字面量 + `for (k in m)` 按插入序迭代键）；函数类型为 spec-only。
@@ -1001,15 +1049,19 @@ FloatType:"f16" | "f32" | "f64"
 - 类型名解析：先查内建，再查当前单元已声明命名类型。
 - **数组字面量 `[e1, e2, …]`**：元素类型取首元素推断，整型元素统一提升为 `i64`（`[1,2,3]` 是 `[3]i64` 而非 `[3]u8`）；空字面量 `[]` 元素类型未知，可赋给任意 `[]T` / `[N]T`。定长数组与切片之间只要元素可转型即可互赋（目标为定长数组时长度须一致）。赋给 `[]T` 时脱糖为运行期 `slice_new` + 逐元素 `append`；赋给 `[N]T` 时 C 后端用花括号初始化器、LLVM 后端零初始化后按 `getelementptr` 逐元素 `store`。
 
+- **字符串驻留符号 `Sym32("tag")` / `Sym16("tag")`** ✅ tote（M40）：字段仅存 32/16 位无符号 id；真实字符串按 tag 分池、运行期不定长存储，由编译器自动维护。`= "str"` 自动 intern 取 id；同池相同字符串去重返回同一 id；`==`/`!=` 按 id 比较（O(1)）；跨池（`Sym32("A")` vs `Sym32("B")`）类型不同，互相赋值报 `T_TYPE_MISMATCH`（f15）；全局变量字符串初始化器自动搬进 `t__ginit`/`t.__ginit`（C / LLVM 双后端一致）。内建 API 与类型规则见 §3.8。
+
 ### 3.6 Comptime & introspection（编译期与自省） ⚠ spec-only（设计目标）
 
+> 本节气法由 `stmt_comptime.md` / `decl_import.md` / `decl.md`（comptime 项）经 L-15 采用并并入（原草稿已标记失效）；表达式级 `comptime` 语义仍为 spec-only。
+
 ```ebnf
-ComptimeFunc: "comptime" "func" ...           // 与运行时同写法，编译期执行
+ComptimeFunc: "comptime" Ident "fn" ...       // 与运行时同写法，编译期执行
 TypeInfoExpr: "type_info" "(" Type ")"        // 编译期类型自省（字段/偏移/位宽/注解）
 ```
 
 - spec §5：`comptime` 函数语法与运行时一致。
-- `type_info(T)` 是 `@derive`、序列化、编辑器导出、CTFE 导入的**核心底座**，当前 tote 的 `TypeInfo` 池为简化版、内建未接入。
+- `type_info(T)` 是 `@derive`、序列化、编辑器导出、CTFE 导入的**核心底座**，当前 tc 的 `TypeInfo` 池为简化版、内建未接入。
 
 ### 3.6.1 CTFE 数据导入（import_csv / import_json） ✅ tote
 
@@ -1025,11 +1077,13 @@ ImportExpr:   "import_csv" "(" StringLiteral ")" | "import_json" "(" StringLiter
 3. **CSV 映射**：首行为表头，表头名须与 `S` 的字段名**一一对应**（顺序可异、不可缺、不可多），否则报 `T_IMPORT_HEADER`。单元格按逗号切分，不支持引号转义（值内不得含逗号）。
 4. **JSON 映射**：顶层须为对象数组，每个对象的键集合须与 `S` 字段名一致，否则报 `T_IMPORT_HEADER`。
 5. **值校验（编译期）**：整型字段做位宽值域校验（如 `u8` 越界 256 报错）；`bool` 只接受 `true`/`false`；float 接受十进制小数；string 原样取值。违规报 `T_IMPORT_VALUE`，消息含行列与字段名。字段类型仅支持标量与 string（enum/嵌套 struct 暂不支持，报 `T_IMPORT_VALUE`）。
-6. **脱糖产物**：每个导入点合成一个 `__import_N :: func() -> []S` 加载函数（append 逐行 struct 字面量）挂入 decl_list 尾部，原初始化器替换为对该函数的调用。运行时零文件 IO。
+6. **脱糖产物**：每个导入点合成一个 `__import_N fn() -> []S` 加载函数（append 逐行 struct 字面量）挂入 decl_list 尾部，原初始化器替换为对该函数的调用。运行时零文件 IO。
 
 **诊断码**：`T_IMPORT_IO`（文件读取失败）、`T_IMPORT_HEADER`（表头/键映射不匹配）、`T_IMPORT_VALUE`（值域/类型违规）、`T_IMPORT_CONTEXT`（非法使用上下文）。
 
 ### 3.7 Flag builtins（位域内建函数） ✅ tote
+
+> 本节气法由 `builtins.md`（Flag 段）经 L-15 采用并并入（原草稿已标记失效）。
 
 ```ebnf
 FlagSetCall: "flag_set" "(" FlagInstance "," SlotName "," IntegerLiteral "|" Expression ")"
@@ -1041,14 +1095,33 @@ FlagGetCall: "flag_get" "(" FlagInstance "," SlotName ")"
 
 ---
 
+### 3.8 Sym builtins（字符串驻留符号）✅ tote
+
+> 本节气法由 `builtins.md`（Sym 段）经 L-15 采用并并入（原草稿已标记失效）。
+
+```ebnf
+SymStrCall:  "sym_str"  "(" SymExpr ")"
+SymReleaseCall: "sym_release" "(" StringLiteral ")"        // 释放指定 tag 整池
+SymReleaseAllCall: "sym_release_all" "(" ")"               // 释放全部池
+// 内部（编译器在 `= "str"` 时自动插入，用户不直接调用）：t_sym_intern(tag, str, bits) -> id
+```
+
+- `sym_str(v)`：由变量 `v` 的 Sym 类型推出所属 tag，返回该池中 id 对应的原始字符串（`String`）。`Sym16` 的 id 在内部归一到 i32。
+- `sym_release("<tag>")`：释放 `<tag>` 对应的整池（区域结束语义）；之后同 tag 的 intern 可重新使用。
+- `sym_release_all()`：经全局 `Symbols` 注册表遍历释放所有剩余池。
+- 内建 `sym_intern` 由编译器在「`Sym = 字符串`」赋值时自动插入，用户无需手写（手动调用亦可）。
+- 类型规则：`Sym32("A")` 与 `Sym32("B")` 视为不同类型（跨池禁止，f15）；`Sym` 与 `string` 之间仅允许 `Sym = "str"` 方向（自动 intern），反向取字符串须用 `sym_str`。
+
+---
+
 ## 4. Program entry（程序入口） ✅ tote
 
 ```ebnf
 EntryPoint: FuncDecl with "@main" annotation
 ```
 
-- 可用 `@main` 显式标记入口（替代固定名 `main`）：`app_entry :: func() -> i32 @main { ... }`。
-- tote 代码生成：被 `@main` 标记的函数发射为 `int32_t t_entry_<name>(void)`，并在生成的 `int main()` 中按序调用 `t_runtime_init` → `t_runtime_set_arena` → `t_entry_<name>()` → `t_runtime_done()`，返回退出码。
+- 可用 `@main` 显式标记入口（替代固定名 `main`）：`app_entry fn() -> i32 @main { ... }`。
+- tc 代码生成：被 `@main` 标记的函数发射为 `int32_t t_entry_<name>(void)`，并在生成的 `int main()` 中按序调用 `t_runtime_init` → `t_runtime_set_arena` → `t_entry_<name>()` → `t_runtime_done()`，返回退出码。
 
 ---
 
@@ -1058,10 +1131,10 @@ EntryPoint: FuncDecl with "@main" annotation
 TranslationUnit : ModuleItem*
 ModuleItem      : FuncDecl | StructDecl | FlagDecl | VariantDecl
                 | GlobalVarDecl | ConstDecl | InnerAttribute
-FuncDecl        : Ident "::" "func" "(" Params? ")" "->" Type Anns? Block
-StructDecl      : Ident "::" "struct" Anns? "{" Field* "}"
-FlagDecl        : Ident "::" "flag" "[" IntType "]" "{" Slot* "}"
-VariantDecl     : Ident "::" "variant" "{" Case* "}"
+FuncDecl        : Ident "fn" "(" Params? ")" "->" Type Anns? Block
+StructDecl      : Ident "struct" Anns? "{" Field* "}"
+FlagDecl        : Ident "flag" "[" IntType "]" "{" Slot* "}"
+VariantDecl     : Ident "variant" "{" Case* "}"
 Block           : "{" Statement* "}"
 Statement       : VarDecl | ConstDecl | Assign | If | While | Return | ExprStmt | Block
 Expression      : Literal | Ident | Call | FieldAccess | Unary | Binary | "(" Expression ")"
@@ -1071,9 +1144,9 @@ Annotation      : "@" Ident ("(" ArgList? ")")?
 
 ---
 
-## 6. Implementation status vs spec（与 tote 实现面对应）
+## 6. Implementation status vs spec（与 tc 实现面对应）
 
-| spec 章节 | 能力 | tote 状态 |
+| spec 章节 | 能力 | tc 状态 |
 |---|---|---|
 | §1 | 基础语法/命名/函数签名 | ✅ 已实现 |
 | §2 | 固定位宽标量 + string/StringBuilder | ✅ 已实现 |
@@ -1085,5 +1158,58 @@ Annotation      : "@" Ident ("(" ArgList? ")")?
 | §5 | CTFE / type_info(T) 内建 | ⚠ 未接入 |
 | §6 | flag[T] 位域 + flag_set/get | ✅ 已实现（含 SlotInfo 自省） |
 | §7.2 | 外部数据导入 CSV/JSON（CTFE 脱糖） | ✅ 已实现 |
+| §2.3 | 字符串驻留符号 Sym32/Sym16（intern / sym_str / sym_release） | ✅ 已实现（M40） |
 
-> 设计哲学落地：**语法根本源为 `docs/reference.md`**（内含 `ebnf` 产生式块），经 `tools/gen_ebnf.mjs` 生成 `build/ebnf.json`，再由 `src/totter.tc` 数据驱动生成 `gen/tote.tc`（见 `src/tote.tc` `kw_lookup` 等标记区间）。这是「数据优先」原则在编译器构造上的直接应用。
+> 设计哲学落地：**语法根本源为 `docs/reference.md`**（内含 `ebnf` 产生式块），经 `tools/gen_ebnf.mjs` 生成 `out/ebnf.json`，再由 `src/totter.tc`（已放弃）数据驱动生成 `gen/tc.tc`（冻结快照，见 `src/tc.tc` `kw_lookup` 等标记区间）。⚠ totter 已放弃，此「数据优先」生成管线为历史设计；`src/tc.tc` 现手写维护，`GEN:` 区间为冻结快照。
+
+---
+
+## 7. Toolchain conventions（工具链约定） ✅ tote
+
+本章描述 t 工具链对**任意 t 项目**生效的默认约定，不属于语言语义，但属于实现面的规范性要求。
+
+### 7.1 Default output layout（默认输出目录结构）
+
+所有编译产物统一落在项目根目录下的 `out/`，按构建配置分为两棵平行子树：
+
+```
+<project-root>/
+├── src/                    # t 源码
+├── docs/                   # 文档（语言/项目）
+├── tests/                  # 测试
+├── examples/               # cargo 风格示例（examples/<name>.tc）
+└── out/                    # 编译输出根目录
+    ├── dbg/                # 调试构建产物
+    │   ├── deps/           # 依赖静态库（t_runtime.lib）
+    │   ├── <name>.exe      # 可执行文件
+    │   ├── <name>.obj      # 中间目标文件
+    │   ├── <name>.ll/.c/.h # 中间产物（LLVM IR / C 后端）
+    │   ├── <name>.pdb      # debug 符号信息
+    │   └── examples/       # --example 产物
+    └── rls/                # 发布优化构建产物
+        ├── deps/           # 依赖静态库（优化版）
+        ├── <name>.exe      # 可执行程序
+        ├── <name>.obj
+        └── archive/        # 打包归档文件
+```
+
+### 7.2 Build mode（构建模式 `--mode`）
+
+| 模式 | 落盘目录 | 优化档 | 符号 |
+|---|---|---|---|
+| `dbg`（缺省） | `out/dbg/` | `-O0` | `-gcodeview` → 产出 `.pdb` |
+| `rls` | `out/rls/` | `-O2` | 无 |
+
+规范性要求：
+
+1. `--mode` 只接受 `dbg` 与 `rls`；其它取值必须报错并以非 0 退出码终止。
+2. 缺省模式为 `dbg`。
+3. 缺省输出路径为 `out/<mode>/<模块名>`；`--output <前缀>` 可显式覆盖，覆盖时 `--mode` 只影响优化档，不再影响目录。
+4. 该约定对所有产出文件的子命令一致生效：`compile --emit-c`、`emit-ll`、`build`、`run`、`--example`。
+5. 输出目录**按需自动创建**，实现不得要求调用方预先 `mkdir`。
+
+### 7.3 Dependency libraries（依赖静态库 `deps/`）
+
+- `build` / `run` 缺省链接 `out/<mode>/deps/t_runtime.lib`（由 runtime C 源码预编译，`dbg` 用 `-O0`、`rls` 用 `-O2`）。
+- `--runtime <dir>` 将依赖库来源改为 `<dir>/t_runtime.lib`。
+- **回退规则（开箱即用）**：目标 `.lib` 不存在时，实现必须自动回退为直接编译 `runtime/*.c` 源码，使新项目无需预构建步骤即可完成链接。

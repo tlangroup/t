@@ -22,7 +22,7 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const CONF_DIR = join(ROOT, "tests", "conformance");
 
 const args = process.argv.slice(2);
-let compiler = join(ROOT, "build", "tote", "tote.exe");
+let compiler = join(ROOT, "out", "dbg", "tc.exe");
 let useRef = false;
 for (let i = 0; i < args.length; i++) {
   if (args[i] === "--compiler") compiler = resolve(args[++i]);
