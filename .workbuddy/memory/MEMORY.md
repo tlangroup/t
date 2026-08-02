@@ -21,6 +21,20 @@
 - **UNSUPPORTED 口径**：`grep -cE '^[[:space:]]*; UNSUPPORTED'`；裸 grep 会命中 6 处编译器自身诊断字符串（假阳性）。
 - **管道 SIGPIPE 假象**：`node tools/x.mjs | tail` 可能 exit 1 吞掉总结行 → 长输出重定向到文件再 grep。
 - **改语法后必须核对正则型门禁工具的匹配数**（shadow_check 等）：正则失配会零样本打印 OK → 假绿。
+- **rls 通道按需跑（2026-08-02 实测裁定）**：`--mode` 只影响 ①输出目录 ②clang 优化档（`-O0 -gcodeview`/`-O2`），**前端零介入**；实测 dbg 与 rls 两档编译器对 21 个示例 + `tc.tc` 自身发射的 IR **逐字节相同**（tc.tc 均为不动点 md5）。故 rls 独有覆盖仅剩「-O2 碰巧暴露的 UB」。判据按改动层：**只动 parser/checker → 跳过 rls**（IR 同则 -O2 产物必同）；**动 emitter / runtime / 升 clang → 必跑**。替代 rls 全量（30s）的秒级等价物：`out/rls/tc.exe emit-ll src/tc.tc` 与 dbg 版 IR 比对 —— 完全覆盖「-O2 是否破坏编译器自身」。
+- **ASan 在本项目可用**（clang 22.1.8 实测通过）：`-fsanitize=address` 链接+运行均 OK，需 `PATH=/c/Program\ Files/LLVM/lib/clang/22/lib/windows:$PATH`（否则缺 `clang_rt.asan_dynamic-x86_64.dll` → exit 127）。对越界/UAF 是确定性检测，强于 -O2 碰运气；M48 闭包有意泄漏不会误报（Windows 默认不启 LeakSanitizer）。
+
+## 分层门禁工具链（gate.mjs，独立提交）
+- **入口**：`node tools/gate.mjs L0|L1|L2 [--full]`。`--full` 无视快照结论强制跑运行类门禁；L2 默认 `--full`。
+- **三层（按影响面付费）**：
+  - **L0**（~10s，每次保存）：静态检查(catn+shadow) → 自举一代 g1 → **IR 双后端快照比对** → conformance → `; UNSUPPORTED` 计数 0。
+  - **L1**（IR 洁 ~13s / IR 脏 ~32s，提交前）：+ 自举不动点 **g2==g3** + （IR 洁则 SKIP run_examples/difftest，否则全跑）。
+  - **L2**（~57s，里程碑）：+ 四代不动点 **g2==g3==g4** + difftest tc0 对拍(XFAIL emit-c) + **rls 快速通道**(g4 vs rls 编译器发射 `tc.tc` IR 互比 + 3 示例冒烟) + tote 冒烟。
+- **自举不动点判据从第二代起算**：g1 由**改动前**编译器编出，改 emitter 后 g1≠g2 必然且正确。故比 `g2==g3`(boot23)、`g2==g3==g4`(boot4)、代际对拍比 `g2↔g3`、run_examples 用 g3、rls 用 g4 且两档编译器 IR 互比（不依赖 baseline）。
+- **IR 快照（`tools/ir_snapshot.mjs` + `tests/ir_baseline.json`）**：对 `examples/*.tc` + `src/tc.tc` + `src/tote.tc`（23 目标 × ll/c/h = 69 条目）md5 基线。**必须双后端**（ll + c/h）——只比 `.ll` 无法覆盖 C 发射器改动（run_examples 是双后端验证）。⚠ 不覆盖：conformance 的 fail 用例诊断、runtime 改动、clang 版本变化。
+- **防假绿 + 退出码**：catn_check / shadow_check 加最小匹配数断言（`sb_catN` ≥470 / 函数 ≥330 / 变量 ≥1880），低于阈值 `exit 2`；两工具均补 `process.exit(0/1/2)`，否则编排时被当通过。
+- **difftest XFAIL**：tc0 emitter 冻结，`compile --emit-c` 通道恒失败属已知基线，以 tc0 为 ref 时自动 XFAIL（不计失败）；`--strict` 可关，`--xfail ch,...` 手指定。去 `npx tsx` 冷启动（用 `node node_modules/tsx/dist/cli.mjs`）+ 并行 `--jobs` → 52s→~6s。
+- **并行安全区分**：不同工具之间串行（争抢 `out/`）；同一工具内**用例级**可并行（产物名按用例唯一、runtime lib 只读）。run_examples `--jobs N` 默认 `min(8, cpus)` → 57s→~10s。
 
 ## 实现铁律（致命坑）
 - `sb_catN` 实参必==N（catn_check 守）；`cat2..6` 内建已移除；拼接只用 StringBuilder。**LLVM 后端不支持 `sb_cat2..6` 调用**，示例/测试一律 `sb_new`/`sb_append_str`/`sb_to_str`。

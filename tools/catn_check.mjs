@@ -63,6 +63,7 @@ const checks = [
   { re: /\bcat([2-9])\(/g,    kind: 'removed' },  // 已移除内建，出现即错
 ];
 
+let nScanned = 0;
 for (const c of checks) {
   const re = new RegExp(c.re.source, 'g');
   let m;
@@ -74,6 +75,7 @@ for (const c of checks) {
       console.log(`L${ln}: cat${want} 已被移除（应改用 StringBuilder）；${snippet(m.index)}`);
       continue;
     }
+    nScanned++;
     const { args, closed } = countArgs(clean, m.index + m[0].length - 1);
     if (!closed) {
       bad++;
@@ -86,4 +88,20 @@ for (const c of checks) {
     }
   }
 }
-console.log(bad === 0 ? 'OK: sb_catN 实参个数全部匹配，且无残留 catN' : `发现 ${bad} 处问题`);
+
+// ── 防假绿：最小匹配数断言 ───────────────────────────────────────
+// 若 sb_cat 改名/改写法而正则未同步，匹配数会归零 —— 零样本同样打印 OK。
+// 阈值 ≈ 记录时实际值的 70%（2026-08-02: src/tc.tc 有 673 处 sb_catN）。
+const MIN_CALLS = 470;
+if (file.endsWith('tc.tc') && nScanned < MIN_CALLS) {
+  console.error(`catn_check: 正则失配嫌疑 —— 只扫到 ${nScanned} 处 sb_catN，预期 >= ${MIN_CALLS}`);
+  console.error('  多半是拼接 helper 改名或写法变更；请更新 checks 正则与阈值常量。');
+  process.exit(2);
+}
+
+if (bad === 0) {
+  console.log(`OK: sb_catN 实参个数全部匹配，且无残留 catN（扫描 ${nScanned} 处调用）`);
+  process.exit(0);
+}
+console.log(`发现 ${bad} 处问题（扫描 ${nScanned} 处调用）`);
+process.exit(1);
