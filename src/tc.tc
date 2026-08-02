@@ -116,6 +116,7 @@ init_node_kinds fn() -> void {
     append(node_kind_names, "FlagDecl");
     append(node_kind_names, "FlagSetDecl");
     append(node_kind_names, "FuncDecl");
+    append(node_kind_names, "func_type");
     append(node_kind_names, "GlobalConstDecl");
     append(node_kind_names, "GlobalVarDecl");
     append(node_kind_names, "ImportDecl");
@@ -273,6 +274,16 @@ mk_FuncDecl fn(sa: string, ba: bool, bb: bool, na: i64, la: i64, lb: i64, lc: i6
     n.la = la;
     n.lb = lb;
     n.lc = lc;
+    slice_set(nodes, id, n);
+    if (ti >= 0) { node_at(id, ti); }
+    return id;
+}
+
+mk_func_type fn(na: i64, la: i64, ti: i64) -> i64 {
+    var id: i64 = node_new("func_type");
+    var n: Node = nodes[id];
+    n.na = na;
+    n.la = la;
     slice_set(nodes, id, n);
     if (ti >= 0) { node_at(id, ti); }
     return id;
@@ -4824,6 +4835,24 @@ is_scalar_name fn(name: string) -> bool {
 
 parse_type fn() -> i64 {
     var t: string = cur_t();
+    if (t == "KwFunc") {
+        advance_i();
+        expect_tok("LParen");
+        var fphead: i64 = -1;
+        var fptail: i64 = -1;
+        if (cur_t() != "RParen") {
+            while (true) {
+                var fpt: i64 = parse_type();
+                fptail = list_push(fphead, fptail, fpt);
+                if (fphead < 0) { fphead = fptail; }
+                if (cur_t() == "Comma") { advance_i(); } else { break; }
+            }
+        }
+        expect_tok("RParen");
+        expect_tok("Arrow");
+        var frt: i64 = parse_type();
+        return mk_func_type(frt, fphead, -1);
+    }
     if (t == "KwMap") {
         advance_i();
         expect_tok("LBracket");
@@ -6658,6 +6687,12 @@ TI struct {
 
 var tis: []TI;
 
+// 函数类型（Func）签名侧池：索引与 tis 对齐（ti_mk 每次同步追加）
+var tif_ret: []i64;     // 返回类型 TI 索引
+var tif_pstart: []i64;  // 参数 TI 扁平池起点
+var tif_pcount: []i64;  // 参数个数
+var tif_params: []i64;  // 参数 TI 扁平池
+
 ti_mk fn(kind: string) -> i64 {
     var t: TI;
     t.kind = kind;
@@ -6669,7 +6704,11 @@ ti_mk fn(kind: string) -> i64 {
     t.val = -1;
     t.alen = 0;
     append(tis, t);
-    return (slice_len(tis) as i64) - 1;
+    var i: i64 = (slice_len(tis) as i64) - 1;
+    append(tif_ret, -1);
+    append(tif_pstart, -1);
+    append(tif_pcount, 0);
+    return i;
 }
 
 ti_named fn(kind: string, name: string) -> i64 {
@@ -6693,6 +6732,15 @@ ti_elem_of fn(kind: string, elem: i64) -> i64 {
     var t: TI = tis[i];
     t.elem = elem;
     slice_set(tis, i, t);
+    return i;
+}
+
+// 函数类型：ret = 返回类型 TI，参数 TI 存于扁平池 tif_params[pstart .. pstart+pcount)
+ti_func fn(ret: i64, pstart: i64, pcount: i64) -> i64 {
+    var i: i64 = ti_mk("Func");
+    tif_ret[i] = ret;
+    tif_pstart[i] = pstart;
+    tif_pcount[i] = pcount;
     return i;
 }
 
@@ -6802,6 +6850,18 @@ ti_equal fn(ai: i64, bi: i64) -> bool {
         // 同类型 Sym：同 tag 且同位宽；跨池即不同类型（禁止互赋）
         return a.name == b.name && a.bw == b.bw;
     }
+    if (a.kind == "Func") {
+        if (tif_pcount[ai] != tif_pcount[bi]) { return false; }
+        if (ti_equal(tif_ret[ai], tif_ret[bi]) == false) { return false; }
+        var fj: i64 = 0;
+        while (fj < tif_pcount[ai]) {
+            if (ti_equal(tif_params[tif_pstart[ai] + fj], tif_params[tif_pstart[bi] + fj]) == false) {
+                return false;
+            }
+            fj = fj + 1;
+        }
+        return true;
+    }
     return a.name == b.name;
 }
 
@@ -6882,6 +6942,19 @@ ti_str fn(i: i64) -> string {
     }
     if (t.kind == "Variant") {
         return "Variant";
+    }
+    if (t.kind == "Func") {
+        var s: StringBuilder = sb_new();
+        sb_append_str(s, "fn(");
+        var fj2: i64 = 0;
+        while (fj2 < tif_pcount[i]) {
+            if (fj2 > 0) { sb_append_str(s, ", "); }
+            sb_append_str(s, ti_str(tif_params[tif_pstart[i] + fj2]));
+            fj2 = fj2 + 1;
+        }
+        sb_append_str(s, ") -> ");
+        sb_append_str(s, ti_str(tif_ret[i]));
+        return sb_to_str(s);
     }
     if (t.kind == "Unknown") {
         return "<unknown>";
@@ -6988,6 +7061,31 @@ n_col fn(ni: i64) -> i64 {
 }
 
 // errorTypeMismatch（复刻 checker.ts:678）
+// 间接调用（通过函数类型变量）的实参校验：元数 + 逐位类型
+check_indirect_call fn(e: i64, fti: i64) -> void {
+    var n: Node = nodes[e];
+    var want: i64 = tif_pcount[fti];
+    var got: i64 = 0;
+    var c: i64 = n.la;
+    while (c >= 0) {
+        var k: Child = kids[c];
+        if (got < want) {
+            var at: i64 = infer_expr(k.val);
+            var pt: i64 = tif_params[tif_pstart[fti] + got];
+            if (tip_kind(at) != "Unknown" && ti_equal(pt, at) == false && can_cast(at, pt) == false) {
+                err_type_mismatch(k.val, pt, at);
+            }
+        }
+        got = got + 1;
+        c = k.next;
+    }
+    if (got != want) {
+        fc_err("T_CALL_ARITY",
+            sb_cat6("间接调用实参个数不符：", ti_str(fti), " 需要 ", i2s(want),
+                sb_cat3(" 个实参，实际给了 ", i2s(got), " 个"), ""), e);
+    }
+}
+
 err_type_mismatch fn(eni: i64, exp: i64, act: i64) -> void {
     var es: string = ti_str(exp);
     var fs2: string = ti_str(act);
@@ -7183,6 +7281,26 @@ resolve_ti fn(tn: i64) -> i64 {
         return ti_elem_of("Optional", resolve_ti(n.na));
     }
 // <<< GEN:type_resolve <<<
+    if (n.kind == "func_type") {
+        // 先把参数类型解析到局部表，再整段搬进 tif_params——
+        // 嵌套函数类型会在递归里自行 append，直接边解析边 append 会打断本层参数区的连续性。
+        var fret: i64 = resolve_ti(n.na);
+        var fbuf: []i64;
+        var fk: i64 = n.la;
+        while (fk >= 0) {
+            var fc: Child = kids[fk];
+            append(fbuf, resolve_ti(fc.val));
+            fk = fc.next;
+        }
+        var fpstart: i64 = slice_len(tif_params) as i64;
+        var fpc: i64 = slice_len(fbuf) as i64;
+        var fj0: i64 = 0;
+        while (fj0 < fpc) {
+            append(tif_params, fbuf[fj0]);
+            fj0 = fj0 + 1;
+        }
+        return ti_func(fret, fpstart, fpc);
+    }
     return ti_mk("Unknown");
 }
 
@@ -7217,7 +7335,28 @@ register_decl fn(d: i64) -> void {
         return;
     }
     if (n.kind == "FuncDecl") {
-        sym_define(global_scope, n.sa, "func", ti_named("Func", n.sa), d);
+        var fti: i64 = ti_named("Func", n.sa);
+        // 记录具名函数的真实签名，供「函数作为值」可赋值性 / 间接调用使用
+        var fret2: i64 = resolve_ti(n.na);
+        var fbuf2: []i64;
+        var fp: i64 = n.lb;
+        while (fp >= 0) {
+            var fpid: i64 = kids[fp].val;
+            var fpn: Node = nodes[fpid];
+            append(fbuf2, resolve_ti(fpn.na));
+            fp = kids[fp].next;
+        }
+        var fpstart2: i64 = slice_len(tif_params) as i64;
+        var fpc2: i64 = slice_len(fbuf2) as i64;
+        var fj1: i64 = 0;
+        while (fj1 < fpc2) {
+            append(tif_params, fbuf2[fj1]);
+            fj1 = fj1 + 1;
+        }
+        tif_ret[fti] = fret2;
+        tif_pstart[fti] = fpstart2;
+        tif_pcount[fti] = fpc2;
+        sym_define(global_scope, n.sa, "func", fti, d);
         return;
     }
     if (n.kind == "GlobalVarDecl") {
@@ -7586,13 +7725,27 @@ infer_expr fn(e: i64) -> i64 {
         if (cn.kind == "ident") {
             var fname: string = cn.sa;
             var si2: i64 = sym_lookup(global_scope, fname);
+            if (si2 < 0) { si2 = sym_lookup(cur_scope, fname); }
             if (si2 >= 0) {
                 var s2: Sym = syms[si2];
-                if (tip_kind(s2.ti) == "Func" && s2.decl >= 0) {
-                    var fd: Node = nodes[s2.decl];
-                    if (fd.kind == "FuncDecl") {
-                        return resolve_ti(fd.na);
+                if (tip_kind(s2.ti) == "Func") {
+                    if (s2.decl >= 0) {
+                        var fd: Node = nodes[s2.decl];
+                        if (fd.kind == "FuncDecl") {
+                            return resolve_ti(fd.na);
+                        }
                     }
+                    // 函数类型变量 / 参数：校验实参后返回签名的返回类型。
+                    // 这里必须校验——间接调用没有 C 原型兜底，元数不符会一路漏到
+                    // clang 报错或生成语义错误的 IR。
+                    check_indirect_call(e, s2.ti);
+                    return tif_ret[s2.ti];
+                }
+                // 对非函数的值做调用：给出明确诊断，别让它退化成「未知内建」
+                if (s2.kind == "var" && tip_kind(s2.ti) != "Unknown") {
+                    fc_err("T_NOT_CALLABLE",
+                        sb_cat4("`", fname, "` 不是函数，不能调用；它的类型是 ", ti_str(s2.ti)), e);
+                    return ti_mk("Unknown");
                 }
             }
             // map_get(m, k) 的返回类型 = 映射的 V（需从首个实参的 map 类型反查）
@@ -9672,6 +9825,12 @@ TD struct {
 
 var tds: []TD;
 
+// 函数类型（cat == "func"）签名侧池：索引与 tds 对齐
+var tdf_ret: []i64;      // 返回类型 TD 索引
+var tdf_pstart: []i64;   // 参数区起点（tdf_params 下标）
+var tdf_pcount: []i64;   // 参数个数
+var tdf_params: []i64;   // 参数类型 TD 索引扁平区
+
 // 字段类型可读名（用于 TypeInfo 的 type_name 字段，双后端一致）
 td_readable fn(td: i64) -> string {
     if (td < 0) { return "?"; }
@@ -9690,6 +9849,19 @@ td_readable fn(td: i64) -> string {
     if (t.cat == "array") { return sb_cat4("[", i2s(t.alen), "]", td_readable(t.elem)); }
     if (t.cat == "map") { return sb_cat4("map[", td_readable(t.key), "]", td_readable(t.val)); }
     if (t.cat == "sym") { return sb_cat5("Sym", i2s(t.alen), "(\"", t.name, "\")"); }
+    if (t.cat == "func") {
+        var fb: StringBuilder = sb_new();
+        sb_append_str(fb, "fn(");
+        var fi: i64 = 0;
+        while (fi < tdf_pcount[td]) {
+            if (fi > 0) { sb_append_str(fb, ", "); }
+            sb_append_str(fb, td_readable(tdf_params[tdf_pstart[td] + fi]));
+            fi = fi + 1;
+        }
+        sb_append_str(fb, ") -> ");
+        sb_append_str(fb, td_readable(tdf_ret[td]));
+        return sb_to_str(fb);
+    }
     return "?";
 }
 
@@ -9710,7 +9882,73 @@ td_mk fn(cat: string) -> i64 {
     t.val = -1;
     t.alen = -1;
     append(tds, t);
-    return (slice_len(tds) as i64) - 1;
+    var idx: i64 = (slice_len(tds) as i64) - 1;
+    append(tdf_ret, -1);
+    append(tdf_pstart, -1);
+    append(tdf_pcount, 0);
+    return idx;
+}
+
+// 构造函数类型 TD：参数类型须已 append 到 tdf_params[pstart .. pstart+pcount)
+td_func fn(ret: i64, pstart: i64, pcount: i64) -> i64 {
+    var i: i64 = td_mk("func");
+    tdf_ret[i] = ret;
+    tdf_pstart[i] = pstart;
+    tdf_pcount[i] = pcount;
+    return i;
+}
+
+// 函数指针的 C 声明：Ret (*<inner>)(P0, P1, ...)
+// inner 为变量名/字段名/参数名，可为空（用于纯类型位置）
+td_func_c_decl fn(td: i64, inner: string) -> string {
+    var b: StringBuilder = sb_new();
+    sb_append_str(b, desc_to_c(tdf_ret[td]));
+    sb_append_str(b, " (*");
+    sb_append_str(b, inner);
+    sb_append_str(b, ")(");
+    var i: i64 = 0;
+    while (i < tdf_pcount[td]) {
+        if (i > 0) { sb_append_str(b, ", "); }
+        sb_append_str(b, desc_to_c(tdf_params[tdf_pstart[td] + i]));
+        i = i + 1;
+    }
+    if (tdf_pcount[td] == 0) { sb_append_str(b, "void"); }
+    sb_append_str(b, ")");
+    return sb_to_str(b);
+}
+
+// 该 TD 是否为函数类型（C 后端需要内联声明特例）
+td_is_func fn(td: i64) -> bool {
+    if (td < 0) { return false; }
+    return tds[td].cat == "func";
+}
+
+// 「类型 + 名字」的 C 声明。函数指针不能写成 `<type> <name>`，必须把名字
+// 嵌进声明子（`Ret (*name)(Args)`），因此统一走这里而非裸拼接。
+c_decl_of fn(td: i64, name: string) -> string {
+    if (td_is_func(td)) {
+        return td_func_c_decl(td, name);
+    }
+    return sb_cat3(desc_to_c(td), " ", name);
+}
+
+// 指向该类型的 C 指针类型名。函数指针的指针是 `Ret (**)(Args)`，不是 `... *`。
+c_ptr_to fn(td: i64) -> string {
+    if (td_is_func(td)) {
+        return td_func_c_decl(td, "*");
+    }
+    return sb_cat2(desc_to_c(td), "*");
+}
+
+// 同上，但输入是类型节点（发射期大多数位置持有的是节点索引）
+c_decl_of_node fn(tn: i64, name: string) -> string {
+    if (tn >= 0) {
+        var dn: Node = nodes[tn];
+        if (dn.kind == "func_type") {
+            return td_func_c_decl(resolve_type_desc(tn), name);
+        }
+    }
+    return sb_cat3(emit_ctype(tn), " ", name);
 }
 
 td_named_mk fn(cat: string, name: string) -> i64 {
@@ -9869,6 +10107,9 @@ emit_ctype fn(tn: i64) -> string {
     if (n.kind == "variant") {
         return "void*";
     }
+    if (n.kind == "func_type") {
+        return td_func_c_decl(resolve_type_desc(tn), "");
+    }
     return "void";
 }
 
@@ -9933,6 +10174,25 @@ resolve_type_desc fn(tn: i64) -> i64 {
         return td_named_mk("named", n.sa);
     }
 // <<< GEN:td_rnamed <<<
+    if (n.kind == "func_type") {
+        // 与 resolve_ti 同理：先收进局部表再整段搬入，保证参数区连续。
+        var fret: i64 = resolve_type_desc(n.na);
+        var fbuf: []i64;
+        var fk: i64 = n.la;
+        while (fk >= 0) {
+            var fc: Child = kids[fk];
+            append(fbuf, resolve_type_desc(fc.val));
+            fk = fc.next;
+        }
+        var fpstart: i64 = slice_len(tdf_params) as i64;
+        var fpc: i64 = slice_len(fbuf) as i64;
+        var fj: i64 = 0;
+        while (fj < fpc) {
+            append(tdf_params, fbuf[fj]);
+            fj = fj + 1;
+        }
+        return td_func(fret, fpstart, fpc);
+    }
     return td_mk("unknown");
 }
 
@@ -9970,6 +10230,23 @@ ti_to_td fn(ti: i64) -> i64 {
         return rs;
     }
     if (t.kind == "Named") { return td_named_mk("named", t.name); }
+    if (t.kind == "Func") {
+        var fret: i64 = ti_to_td(tif_ret[ti]);
+        var fbuf: []i64;
+        var fj: i64 = 0;
+        while (fj < tif_pcount[ti]) {
+            append(fbuf, ti_to_td(tif_params[tif_pstart[ti] + fj]));
+            fj = fj + 1;
+        }
+        var fpstart: i64 = slice_len(tdf_params) as i64;
+        var fpc: i64 = slice_len(fbuf) as i64;
+        var fj2: i64 = 0;
+        while (fj2 < fpc) {
+            append(tdf_params, fbuf[fj2]);
+            fj2 = fj2 + 1;
+        }
+        return td_func(fret, fpstart, fpc);
+    }
     return td_mk("unknown");
 }
 
@@ -9985,7 +10262,7 @@ desc_to_c fn(td: i64) -> string {
     if (t.cat == "typeinfo") { return "TTypeInfo*"; }
     if (t.cat == "fieldinfo") { return "TFieldInfo*"; }
     if (t.cat == "slice") { return "TSlice"; }
-    if (t.cat == "array") { return sb_cat2(desc_to_c(t.elem), "*"); }
+    if (t.cat == "array") { return c_ptr_to(t.elem); }
     if (t.cat == "map") { return "TMap*"; }
     if (t.cat == "sym") {
         if (t.alen == 16) { return "uint16_t"; }
@@ -10004,6 +10281,7 @@ desc_to_c fn(td: i64) -> string {
         return t.name;
     }
     if (t.cat == "void") { return "void"; }
+    if (t.cat == "func") { return td_func_c_decl(td, ""); }
     return "void*";
 }
 
@@ -10156,9 +10434,21 @@ expr_type_desc fn(e: i64) -> i64 {
                 }
                 return td_mk("unknown");
             }
+            // 间接调用：被调者是函数类型的局部变量时，取其签名返回类型（局部遮蔽同名全局函数）
+            var lftd: i64 = -1;
+            if (em_in_fn) {
+                lftd = fs_get(em_cur_fn, mb_sub(cn));
+            }
+            if (td_is_func(lftd)) {
+                return tdf_ret[lftd];
+            }
             var rt: i64 = tm_get(sb_cat2(cn, "()"));
             if (rt >= 0) {
                 return rt;
+            }
+            var gftd: i64 = tm_get(mb_sub(cn));
+            if (td_is_func(gftd)) {
+                return tdf_ret[gftd];
             }
             return td_mk("unknown");
         }
@@ -10769,8 +11059,8 @@ emit_expr fn(e: i64) -> string {
             return sb_cat5("t_str_byte_at(", obj, ", ", idx, ")");
         }
         if (ot.cat == "slice") {
-            var ec: string = desc_to_c(ot.elem);
-            return sb_cat6("(*(", ec, "*)t_slice_at(", obj, ", ", sb_cat2(idx, "))"));
+            var ec: string = c_ptr_to(ot.elem);
+            return sb_cat6("(*(", ec, ")t_slice_at(", obj, ", ", sb_cat2(idx, "))"));
         }
         if (ot.cat == "map") {
             return c_map_get(n.na, n.nb);
@@ -10929,6 +11219,16 @@ emit_stmt fn(sid: i64, indent: i64) -> void {
                 }
                 return;
             }
+            // 函数类型：C 侧是函数指针，名字必须嵌进声明子
+            if (t.cat == "func") {
+                var fdecl: string = td_func_c_decl(td, n.sa);
+                if (n.nb < 0) {
+                    spush(sb_cat3(pad, fdecl, " = NULL;"));
+                } else {
+                    spush(sb_cat5(pad, fdecl, " = ", emit_expr(n.nb), ";"));
+                }
+                return;
+            }
             if (t.cat == "string" && n.nb < 0) {
                 spush(sb_cat4(pad, "TStr ", n.sa, " = {0};"));
                 return;
@@ -10979,13 +11279,13 @@ emit_stmt fn(sid: i64, indent: i64) -> void {
             spush(sb_cat2(pad, "}"));
             return;
         }
-        var elem_c: string = "void*";
+        var fe_elem_td: i64 = -1;
         if (it.cat == "slice" && it.elem >= 0) {
-            elem_c = desc_to_c(it.elem);
+            fe_elem_td = it.elem;
         }
         var iter: string = emit_expr(n.na);
         spush(sb_cat6(pad, "for (int64_t _fe_i = 0; _fe_i < t_slice_len(", iter, "); _fe_i = _fe_i + 1) {", "", ""));
-        spush(sb_cat6(sb_cat2(pad, "    "), elem_c, " ", n.sa, sb_cat6(" = *((", elem_c, "*)t_slice_at(", iter, ", _fe_i));", ""), ""));
+        spush(sb_cat6(sb_cat2(pad, "    "), c_decl_of(fe_elem_td, n.sa), " = *((", c_ptr_to(fe_elem_td), sb_cat4(")t_slice_at(", iter, ", _fe_i));", ""), ""));
         var b: i64 = n.la;
         while (b >= 0) {
             var bk: Child = kids[b];
@@ -11581,7 +11881,7 @@ emit_struct_decl fn(d: i64) -> void {
                 if (fattrs != "") {
                     hpush(sb_cat2("    ", fattrs));
                 }
-                hpush(sb_cat6("    ", emit_ctype(f2.na), " ", f2.sa, ";", ""));
+                hpush(sb_cat3("    ", c_decl_of_node(f2.na, f2.sa), ";"));
             }
             c2 = k2.next;
         }
@@ -11859,9 +12159,7 @@ emit_func_decl fn(d: i64) -> void {
         if (cnt > 0) {
             sb_append_str(psb, ", ");
         }
-        sb_append_str(psb, emit_ctype(p.na));
-        sb_append_str(psb, " ");
-        sb_append_str(psb, p.sa);
+        sb_append_str(psb, c_decl_of_node(p.na, p.sa));
         cnt = cnt + 1;
         c = k.next;
     }
@@ -11869,25 +12167,27 @@ emit_func_decl fn(d: i64) -> void {
     if (cnt > 0) {
         param_str = sb_to_str(psb);
     }
-    var ret: string = emit_ctype(n.na);
+    // 返回函数指针的函数必须写成 `Ret (*name(params))(Args)`——把 `name(params)`
+    // 整体当作声明子塞进函数指针声明里，不能拼成 `Ret (*)(Args) name(params)`。
+    var sig: string = c_decl_of_node(n.na, sb_cat4(emit_name, "(", param_str, ")"));
 
     if (n.ba) {
         if (attrs != "") {
             hpush(attrs);
         }
-        hpush(sb_cat6(ret, " ", emit_name, "(", param_str, ");"));
+        hpush(sb_cat2(sig, ";"));
         return;
     }
 
     if (attrs != "") {
         hpush(attrs);
     }
-    hpush(sb_cat6(ret, " ", emit_name, "(", param_str, ");"));
+    hpush(sb_cat2(sig, ";"));
 
     em_cur_fn = n.sa;
     em_in_fn = true;
     g_defer_n = 0;   // 每个函数独立延迟栈
-    spush(sb_cat6(ret, " ", emit_name, "(", param_str, ") {"));
+    spush(sb_cat2(sig, " {"));
     if (n.lc > -2) {
         var b: i64 = n.lc;
         while (b >= 0) {
@@ -11921,7 +12221,7 @@ emit_func_decl fn(d: i64) -> void {
 
 emit_global_var fn(d: i64) -> void {
     var n: Node = nodes[d];
-    hpush(sb_cat6("extern ", emit_ctype(n.na), " ", n.sa, ";", ""));
+    hpush(sb_cat3("extern ", c_decl_of_node(n.na, n.sa), ";"));
     // Sym 全局变量：字段仅存 u32/u16 id。无初始化 → 零值；`= "str"` →
     // 运行期 intern（函数调用），须搬进 t__ginit（C 文件作用域不允许调用）。
     var gtd0: i64 = resolve_type_desc(n.na);
@@ -11939,7 +12239,7 @@ emit_global_var fn(d: i64) -> void {
         return;
     }
     if (n.nb < 0) {
-        spush(sb_cat6(emit_ctype(n.na), " ", n.sa, "", ";", ""));
+        spush(sb_cat2(c_decl_of_node(n.na, n.sa), ";"));
         return;
     }
     // 先在重定向模式下发射初始化器：若它产生了辅助语句（如 map 字面量的
@@ -11951,11 +12251,11 @@ emit_global_var fn(d: i64) -> void {
     g_spush_to_ginit = false;
     g_stmt_pad = "";
     if ((slice_len(glines) as i64) > gbase) {
-        spush(sb_cat6(emit_ctype(n.na), " ", n.sa, "", ";", ""));
+        spush(sb_cat2(c_decl_of_node(n.na, n.sa), ";"));
         append(glines, sb_cat4("    ", n.sa, " = ", sb_cat2(gv, ";")));
         return;
     }
-    spush(sb_cat6(emit_ctype(n.na), " ", n.sa, sb_cat2(" = ", gv), ";", ""));
+    spush(sb_cat4(c_decl_of_node(n.na, n.sa), " = ", gv, ";"));
 }
 
 emit_global_const fn(d: i64) -> void {
@@ -12413,6 +12713,8 @@ ll_td fn(td: i64) -> string {
         return "i32";
     }
     if (t.cat == "typeinfo" || t.cat == "fieldinfo") { return "ptr"; }
+    // 函数类型在 LLVM 里就是不透明指针（opaque pointer），签名信息在调用点重建
+    if (t.cat == "func") { return "ptr"; }
     if (t.cat == "void") { return "void"; }
     if (t.cat == "scalar") {
         if (t.name == "") {
@@ -13129,6 +13431,10 @@ emit_lle fn(e: i64) -> string {
         var ci: i64 = llcn_find(le_idn);
         if (ci >= 0) {
             return emit_lle(llcn_e[ci]);
+        }
+        // 顶层具名函数作为值：直接取函数符号地址（LLVM 里就是 @t.<name>）
+        if (llfn_find(le_idn) >= 0) {
+            return sb_cat2("@t.", le_idn);
         }
         return "0";
     }
@@ -14164,6 +14470,57 @@ ll_call fn(e: i64) -> string {
             return ll_load(ll_td(ptd2), pp2);
         }
         return "0";
+    }
+    // 间接调用：被调者是函数类型的变量（函数指针）。局部优先，其次全局。
+    var iftd: i64 = -1;
+    if (em_in_fn) {
+        iftd = fs_get(em_cur_fn, mb_sub(cn));
+    }
+    if (td_is_func(iftd) == false) {
+        var igv: i64 = llgv_find(mb_sub(cn));
+        if (igv >= 0) {
+            iftd = llgv_td[igv];
+        }
+    }
+    if (td_is_func(iftd)) {
+        var fpv: string = emit_lle(n.na);
+        var icsb: StringBuilder = sb_new();
+        var ii: i64 = 0;
+        while (ii < argc) {
+            if (ii > 0) {
+                sb_append_str(icsb, ", ");
+            }
+            var iptd: i64 = -1;
+            if (ii < tdf_pcount[iftd]) {
+                iptd = tdf_params[tdf_pstart[iftd] + ii];
+            }
+            var iaty: string = ll_td(iptd);
+            var iav: string = emit_lle(ae[ii]);
+            if (iptd >= 0 && ll_isagg(iptd)) {
+                iav = ll_load(iaty, iav);
+            } else {
+                iav = ll_cast_v(iav, ll_etd(ae[ii]), iptd);
+            }
+            sb_append_str(icsb, iaty);
+            sb_append_str(icsb, " ");
+            sb_append_str(icsb, iav);
+            ii = ii + 1;
+        }
+        var irtd: i64 = tdf_ret[iftd];
+        var irty: string = ll_td(irtd);
+        var iargs: string = sb_to_str(icsb);
+        if (irty == "void") {
+            llfb(sb_cat5("  call void ", fpv, "(", iargs, ")"));
+            return "0";
+        }
+        var itmp: string = ll_tmp();
+        llfb(sb_cat6(sb_cat3("  ", itmp, " = call "), irty, " ", fpv, sb_cat3("(", iargs, ")"), ""));
+        if (ll_isagg(irtd)) {
+            var isc: string = ll_scratch(irty);
+            llfb(sb_cat6("  store ", irty, " ", itmp, ", ptr ", isc));
+            return isc;
+        }
+        return itmp;
     }
     // 用户函数：模块内按值传递聚合
     var fi: i64 = llfn_find(cn);

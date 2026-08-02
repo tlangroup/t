@@ -7,7 +7,7 @@
 - **totter `src/totter.tc`**：已放弃 abandoned，保留不删；`gen/tc.tc` 冻结快照。`src/tc.tc` 的 `// >>> GEN:` 区间现手写维护。
 - **tote `src/tote.tc`**：包管理器/构建系统，委托 `tc`；二进制 `out/<mode>/tote.exe`。
 - **命名红线**：`✅ tote` / `status='tote'`（"已实现"）绝不可改名为二进制 `tote`；改的是裸 `tote` 编译器引用→`tc`。
-- `tc0/` TS 参考实现已冻结，**且自 M44 起只认旧语法 → difftest 的 tc0 对拍通道已失效**，改用自举代际对拍。
+- `tc0/` TS 参考实现已冻结，但其 **parser 已升级（M44 后）**：`fn`→`KwFunc`（`func` 仍作别名保留）、`::` 改**可选**，故能解析新语法 → difftest 的 `tc0 vs tc` 通道（`--cand out/dbg/tc.exe`）**`lex --json` / `check --json` 已逐字节恢复（9/9）**；仅 `compile --emit-c` 仍失败（tc0 冻结的 emitter 在生成 C 里仍写旧命名 `println` 与旧语法 `clone :: func`，且两后端 C 结构本就不可逐字节对齐）。
 
 ## 法律体系
 - 宪法→法律→代码。宪法 `docs/constitution.md` 审查法律（四层 ✅/⚠️/❌/🚫）。
@@ -19,7 +19,7 @@
 - 流水线：gen_ebnf→build_runtime→tc/tote 自举。`out/dbg/tc.exe` 运行锁 exe，重建须 `--output <临时名>` 再 `cp`。
 
 ## 验证七步（门禁）
-1. md5sum src==gen（已废，totter 放弃）2. difftest **自举代际对拍** `--ref <genB.exe> --cand <genD.exe>` → 27/27（tc0 通道已失效，见上）3. conformance **40/40** 4. 三阶段自举 IR 逐字节(b==c==d) 5. shadow_check+catn_check OK 6. 发射侧 `; UNSUPPORTED` 计数 0 7. run_examples 双后端 **12/12**（dbg+rls）。tote PM 冒烟单独验。
+1. md5sum src==gen（已废，totter 放弃）2. difftest **自举代际对拍** `--ref <genB.exe> --cand <genD.exe>` → 27/27；另 **tc0 vs tc 外部对拍** `--cand out/dbg/tc.exe`：lex/check 9/9 逐字节绿、emit-c 0/9（tc0 emitter 旧命名/旧语法，见上）3. conformance **44/44** 4. 三阶段自举 IR 逐字节(b==c==d) 5. shadow_check+catn_check OK 6. 发射侧 `; UNSUPPORTED` 计数 0 7. run_examples 双后端 **13/13**（dbg+rls）。tote PM 冒烟单独验。
 - **门禁必须串行跑**：并行会争抢 `out/` 产物造成假失败。
 - **UNSUPPORTED 计数口径**：必须 `grep -cE '^[[:space:]]*; UNSUPPORTED'`；裸 `grep -c '; UNSUPPORTED'` 会命中 6 处编译器自身诊断字符串常量（假阳性）。
 - **管道 SIGPIPE 假象**：`node tools/xxx.mjs | tail -N` 可能 exit 1 并吞掉总结行，误判失败；长输出改重定向到文件再 grep。
@@ -50,8 +50,17 @@
   - **迁移错误须带具体名字与建议写法**（L-01 第19条），非泛化 parse error。
   - 文档改写边界：**EBNF 产生式分隔符（`rule :: ...`、`SlotTable ::`）与注解 `targets:"func"`/symkind `"func"` 一律不动**，只改带引号的语言绑定符与散文示例。`spec.md` 冻结不动；`gen/tc.tc` 虽为冻结快照但**必须迁移**（维持"仓库内所有 `.tc` 均合法"不变量）。
   - 自举不动点 md5 `2874d4f29ccc88714140b0e1e23d45d5`，全门禁绿。
+- **M45 FuncType 实装（函数指针语义，v1）**：`fn(ArgTypes) -> Ret` 成为一等值类型（变量/参数/返回值/结构体字段/全局变量可存储与传递），顶层具名函数可绑定并间接调用；**无闭包、不捕获局部变量**。
+  - **双类型池**：checker 侧 `TI` 增 `tif_ret/tif_pstart/tif_pcount/tif_params`（L6691-6694）；emitter 侧 `TD` 增 `tdf_ret/tdf_pstart/tdf_pcount/tdf_params`（L9780 后）。`ti_equal` 加 Func 结构比较分支 → 可赋值性自动成立。
+  - **C 后端**：内联函数指针声明 `Ret (*name)(Args)`（`td_func_c_decl`/`c_decl_of`/`c_decl_of_node`/`c_ptr_to`）；`emit_ctype`/`resolve_type_desc`/`ti_to_td`/`desc_to_c` 均加 `func` 分支。
+  - **LLVM 后端**：`ll_td` 中 `func`→`ptr`；顶层具名函数作值经 `emit_lle` ident 分支返回 `@t.<name>`；`ll_call` 增间接调用分支。
+  - **嵌套连续性**：`resolve_ti`/`resolve_type_desc` 的 func_type 分支及 `register_decl` FuncDecl 分支改为「先收局部 `[]i64` 表、再整段搬入扁平池」，防递归 append 打断参数区。
+  - **间接调用诊断**：`check_indirect_call`（T_CALL_ARITY + 逐位 T_TYPE_MISMATCH，带 `can_cast` 兜底）；`T_NOT_CALLABLE`（对非函数值调用）。
+  - **自举不动点 md5 `544bdeb3cd1ff525f4b6611ba37ce99f`**，全门禁绿（conformance 44/44、run_examples 13/13、UNSUPPORTED 0）。
+  - 资产：`examples/func_type_demo.tc`+`.expected.txt`（双后端 6 行全对，含 `@main` 注解防 segfault）、`tests/conformance/pass/p18_func_type_ok.tc`、`tests/conformance/fail/f23_func_type_sig_mismatch.tc`/`f24_func_type_call_arity.tc`/`f25_not_callable.tc`。
+  - 文档：`docs/reference.md` §3.5 FuncType `spec-only`→✅ tote；`docs/syntax/drafts/types.md` 同步。
 
 ## 技术债
 - @derive 表驱生成（9 trait 手写，暂缓）
-- 函数类型(spec-only)；type_info 仅 struct
+- type_info 仅 struct（函数类型已实装，见 M45）
 - import_json 嵌套；C 后端 append 取址；优化后端

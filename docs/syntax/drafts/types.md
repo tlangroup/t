@@ -18,7 +18,7 @@ PointerType: "*" Type                 // 指针 *T
 OptionalType: Type "?"                // 可选 T?
 FlagArrayType: "flag" "[" Integer "]" // 位域数组 flag[N]
 NamedType: Ident                      // 结构体/枚举/flag/variant/别名名
-FuncType: "fn" "(" TypeList? ")" "->" Type   // 函数类型（spec-only）
+FuncType: "fn" "(" TypeList? ")" "->" Type   // 函数类型（✅ tote 函数指针语义）
 TypeList: Type ("," Type)*
 ```
 
@@ -30,7 +30,7 @@ TypeList: Type ("," Type)*
 - **固定位宽标量**：全部整数/浮点为定宽（`u8`–`u64`/`i8`–`i64`/`f16`/`f32`/`f64`），无隐式宽度（对应宪法静态类型/引擎底层）。
 - **无隐式转换**：类型间转换须显式（见 `expr_postfix.md` 的 `as`），`parse_type` 不接受隐式推导。
 - `FlagArrayType` 的 `Integer` 为位宽（1bit 布尔位或 ≥2bit 数值位域，reference L842）。
-- `FuncType` 当前 spec-only（reference L988）。
+- `FuncType` 已实装（✅ tote）：函数指针语义，顶层具名函数可绑定（reference §3.5）。
 
 ## 3. 示例
 
@@ -42,7 +42,7 @@ dict: map[string]i64;
 p: *Vec3;
 maybe: i32?;
 flags: flag[bool];
-fnt: fn(i64) -> void;   // spec-only
+fnt: fn(i64) -> void;   // ✅ tote 函数类型
 ```
 
 ## 4. 与既有构造关系
