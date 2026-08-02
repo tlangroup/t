@@ -10061,56 +10061,102 @@ td_func fn(ret: i64, pstart: i64, pcount: i64) -> i64 {
     return i;
 }
 
-// 函数指针的 C 声明：Ret (*<inner>)(P0, P1, ...)
-// inner 为变量名/字段名/参数名，可为空（用于纯类型位置）
-td_func_c_decl fn(td: i64, inner: string) -> string {
+// ── 闭包表示（FuncType v2 / M47）───────────────────────────────
+// 函数类型的**值**在两个后端都是「指向 TClosure { void* fn; void* env; } 的指针」：
+//   C 后端    → TClosure*
+//   LLVM 后端 → ptr（沿用 v1 的不透明指针，避开 Win64 聚合 ABI）
+// 底层被调函数统一按 `Ret (*)(void* env, Args...)` 调用，env 为首参。
+// 顶层具名函数（含提升后的 lambda）自身没有 env 首参，故「函数作为值」时经
+// 一层 static trampoline 吃掉 env 再转发；捕获型闭包（Stage B2）则直接把提升
+// 函数的 env 首参接上堆分配的环境记录。
+//
+// 调用点强转类型：`Ret (*)(void*, A0, A1)`（无名声明子）
+td_func_c_fnptr fn(td: i64) -> string {
     var b: StringBuilder = sb_new();
     sb_append_str(b, desc_to_c(tdf_ret[td]));
-    sb_append_str(b, " (*");
-    sb_append_str(b, inner);
-    sb_append_str(b, ")(");
+    sb_append_str(b, " (*)(void*");
     var i: i64 = 0;
     while (i < tdf_pcount[td]) {
-        if (i > 0) { sb_append_str(b, ", "); }
+        sb_append_str(b, ", ");
         sb_append_str(b, desc_to_c(tdf_params[tdf_pstart[td] + i]));
         i = i + 1;
     }
-    if (tdf_pcount[td] == 0) { sb_append_str(b, "void"); }
     sb_append_str(b, ")");
     return sb_to_str(b);
 }
 
-// 该 TD 是否为函数类型（C 后端需要内联声明特例）
+// 该 TD 是否为函数类型
 td_is_func fn(td: i64) -> bool {
     if (td < 0) { return false; }
     return tds[td].cat == "func";
 }
 
-// 「类型 + 名字」的 C 声明。函数指针不能写成 `<type> <name>`，必须把名字
-// 嵌进声明子（`Ret (*name)(Args)`），因此统一走这里而非裸拼接。
-c_decl_of fn(td: i64, name: string) -> string {
-    if (td_is_func(td)) {
-        return td_func_c_decl(td, name);
+// 「被当作值使用」的顶层函数名，发射期惰性去重收集；全部函数体发射完毕后
+// 统一生成 trampoline 与闭包全局（C 追加到头文件尾，LLVM 追加到模块尾）。
+// 只有真正取值的函数才生成，避免为全库上千个函数产出无用代码。
+var clos_names: []string;
+
+clos_mark fn(name: string) -> void {
+    var n: i64 = slice_len(clos_names) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        if (clos_names[i] == name) { return; }
+        i = i + 1;
     }
+    append(clos_names, name);
+}
+
+// 按名字回查顶层 FuncDecl 节点。只在生成 trampoline 时调用，规模 = 被取值的
+// 函数个数（通常个位数），线性扫描无性能问题。
+clos_decl_of fn(name: string) -> i64 {
+    var n: i64 = slice_len(decl_list) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        var d: i64 = decl_list[i];
+        var dn: Node = nodes[d];
+        if (dn.kind == "FuncDecl") {
+            if (dn.sa == name) {
+                return d;
+            }
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// 间接调用点所需的函数类型 TD：局部变量优先，其次全局变量；顶层具名函数
+// （tm 里有 "name()" 条目）不算间接调用。
+clos_callee_td fn(cn: string) -> i64 {
+    var td: i64 = -1;
+    if (em_in_fn) {
+        td = fs_get(em_cur_fn, mb_sub(cn));
+    }
+    if (td_is_func(td)) {
+        return td;
+    }
+    if (tm_get(sb_cat2(cn, "()")) >= 0) {
+        return -1;
+    }
+    var g: i64 = tm_get(mb_sub(cn));
+    if (td_is_func(g)) {
+        return g;
+    }
+    return -1;
+}
+
+// 「类型 + 名字」的 C 声明。函数类型已统一为 TClosure*（普通指针），
+// 不再需要把名字嵌进函数指针声明子。
+c_decl_of fn(td: i64, name: string) -> string {
     return sb_cat3(desc_to_c(td), " ", name);
 }
 
-// 指向该类型的 C 指针类型名。函数指针的指针是 `Ret (**)(Args)`，不是 `... *`。
+// 指向该类型的 C 指针类型名
 c_ptr_to fn(td: i64) -> string {
-    if (td_is_func(td)) {
-        return td_func_c_decl(td, "*");
-    }
     return sb_cat2(desc_to_c(td), "*");
 }
 
 // 同上，但输入是类型节点（发射期大多数位置持有的是节点索引）
 c_decl_of_node fn(tn: i64, name: string) -> string {
-    if (tn >= 0) {
-        var dn: Node = nodes[tn];
-        if (dn.kind == "func_type") {
-            return td_func_c_decl(resolve_type_desc(tn), name);
-        }
-    }
     return sb_cat3(emit_ctype(tn), " ", name);
 }
 
@@ -10271,7 +10317,7 @@ emit_ctype fn(tn: i64) -> string {
         return "void*";
     }
     if (n.kind == "func_type") {
-        return td_func_c_decl(resolve_type_desc(tn), "");
+        return "TClosure*";
     }
     return "void";
 }
@@ -10444,7 +10490,7 @@ desc_to_c fn(td: i64) -> string {
         return t.name;
     }
     if (t.cat == "void") { return "void"; }
-    if (t.cat == "func") { return td_func_c_decl(td, ""); }
+    if (t.cat == "func") { return "TClosure*"; }
     return "void*";
 }
 
@@ -11002,11 +11048,6 @@ c_elem_ctype fn(slice_expr: i64) -> string {
         if (ce_d >= 0) {
             var ce_t: TD = tds[ce_d];
             if (ce_t.elem >= 0) {
-                // 函数指针的声明符不能直接跟 `[1]`（`Ret (*)(Args)[1]` 无意义），
-                // 退化成 void*：宽度一致，取址语义不变。
-                if (td_is_func(ce_t.elem)) {
-                    return "void*";
-                }
                 return desc_to_c(ce_t.elem);
             }
         }
@@ -11056,7 +11097,17 @@ emit_expr fn(e: i64) -> string {
         return "NULL";
     }
     if (n.kind == "ident") {
-        return mb_sub(n.sa);
+        var idn: string = mb_sub(n.sa);
+        // 顶层具名函数出现在**值位置** → 取其闭包全局的地址（FuncType v2 / M47）。
+        // 直接调用的 callee 不经此分支（call 分支直接读 cal.sa），故凡是走到这里
+        // 且解析到 FuncDecl 的标识符，必然是「函数作为值」。局部/参数同名时局部优先。
+        if (em_in_fn == false || fs_get(em_cur_fn, idn) < 0) {
+            if (clos_decl_of(idn) >= 0) {
+                clos_mark(idn);
+                return sb_cat3("(&__tclos_", idn, ")");
+            }
+        }
+        return idn;
     }
     if (n.kind == "map_lit") {
         g_map_lit_cnt = g_map_lit_cnt + 1;
@@ -11236,6 +11287,29 @@ emit_expr fn(e: i64) -> string {
             }
             if (cn == "sym_release") { return sb_cat3("t_sym_release(", av[0], ")"); }
             if (cn == "sym_release_all") { return "t_sym_release_all()"; }
+            // 间接调用：被调者是函数类型的变量/参数/全局，其值是 TClosure*，须解包成
+            // `((Ret(*)(void*,A...))(f->fn))(f->env, args)`。顶层具名函数的直接调用
+            // 不会命中（clos_callee_td 见到 "name()" 条目即返回 -1）。
+            var ictd: i64 = clos_callee_td(cn);
+            if (td_is_func(ictd)) {
+                var icv: string = mb_sub(cn);
+                var icb: StringBuilder = sb_new();
+                sb_append_str(icb, "((");
+                sb_append_str(icb, td_func_c_fnptr(ictd));
+                sb_append_str(icb, ")((");
+                sb_append_str(icb, icv);
+                sb_append_str(icb, ")->fn))((");
+                sb_append_str(icb, icv);
+                sb_append_str(icb, ")->env");
+                var ici: i64 = 0;
+                while (ici < argc) {
+                    sb_append_str(icb, ", ");
+                    sb_append_str(icb, av[ici]);
+                    ici = ici + 1;
+                }
+                sb_append_str(icb, ")");
+                return sb_to_str(icb);
+            }
             // 普通调用
             var sb: StringBuilder = sb_new();
             sb_append_str(sb, cn);
@@ -11441,9 +11515,9 @@ emit_stmt fn(sid: i64, indent: i64) -> void {
                 }
                 return;
             }
-            // 函数类型：C 侧是函数指针，名字必须嵌进声明子
+            // 函数类型：C 侧是闭包指针 TClosure*
             if (t.cat == "func") {
-                var fdecl: string = td_func_c_decl(td, n.sa);
+                var fdecl: string = c_decl_of(td, n.sa);
                 if (n.nb < 0) {
                     spush(sb_cat3(pad, fdecl, " = NULL;"));
                 } else {
@@ -12548,6 +12622,68 @@ emit_flag_macros fn() -> void {
 
 // ── emit 编排（复刻 CEmitter.emit）─────────────────────────────
 
+// ── 函数值闭包的 C 侧落地（FuncType v2 / M47）───────────────────
+// 顶层具名函数的 C 定义是 `Ret g(Args)`，没有 env 首参；而函数**值**的统一
+// 调用约定是 `Ret (*)(void* env, Args)`。直接强转会让 env 挤掉首个真实参数，
+// 故为每个被取值的函数生成一层 static trampoline 吃掉 env 再转发：
+//
+//   static Ret __tramp_g(void* __env, A0 __a0, A1 __a1) {
+//       (void)__env; return g(__a0, __a1);
+//   }
+//   static TClosure __tclos_g = { (void*)__tramp_g, NULL };
+//
+// 输出进头文件尾部：此时全部函数原型已在其上方，且生成的 .c 首行即 #include
+// 该头文件，故所有函数体引用 `(&__tclos_g)` 时它已定义。
+emit_c_closures fn() -> void {
+    var cn: i64 = slice_len(clos_names) as i64;
+    if (cn == 0) {
+        return;
+    }
+    hpush("");
+    hpush("// ── 函数值闭包（FuncType v2）：trampoline + 静态闭包记录 ──");
+    var i: i64 = 0;
+    while (i < cn) {
+        var nm: string = clos_names[i];
+        var d: i64 = clos_decl_of(nm);
+        if (d >= 0) {
+            var dn: Node = nodes[d];
+            var callee: string = nm;
+            if (ann_find(dn.la, "main") >= 0) {
+                callee = sb_cat2("t_entry_", nm);
+            }
+            var rty: string = emit_ctype(dn.na);
+            var psb: StringBuilder = sb_new();
+            var asb: StringBuilder = sb_new();
+            sb_append_str(psb, "void* __env");
+            var c: i64 = dn.lb;
+            var pi: i64 = 0;
+            while (c >= 0) {
+                var k: Child = kids[c];
+                var p: Node = nodes[k.val];
+                var pn: string = sb_cat2("__a", i2s(pi));
+                sb_append_str(psb, ", ");
+                sb_append_str(psb, c_decl_of_node(p.na, pn));
+                if (pi > 0) {
+                    sb_append_str(asb, ", ");
+                }
+                sb_append_str(asb, pn);
+                pi = pi + 1;
+                c = k.next;
+            }
+            hpush(sb_cat6("static ", rty, " __tramp_", nm, "(", sb_cat2(sb_to_str(psb), ") {")));
+            hpush("    (void)__env;");
+            if (rty == "void") {
+                hpush(sb_cat5("    ", callee, "(", sb_to_str(asb), ");"));
+            } else {
+                hpush(sb_cat5("    return ", callee, "(", sb_to_str(asb), ");"));
+            }
+            hpush("}");
+            hpush(sb_cat6("static TClosure __tclos_", nm, " = { (void*)__tramp_", nm, ", NULL };", ""));
+        }
+        i = i + 1;
+    }
+}
+
 emit_unit fn(mod: string) -> void {
     var guard: string = sb_cat3("TC_", to_upper(mod), "_H");
     hpush(sb_cat2("#ifndef ", guard));
@@ -12617,6 +12753,9 @@ emit_unit fn(mod: string) -> void {
     }
 
     emit_flag_macros();
+
+    // 函数值闭包须在全部函数原型之后落地（trampoline 要调用它们）
+    emit_c_closures();
 
     hpush("");
     hpush(sb_cat2("#endif // ", guard));
@@ -13654,9 +13793,12 @@ emit_lle fn(e: i64) -> string {
         if (ci >= 0) {
             return emit_lle(llcn_e[ci]);
         }
-        // 顶层具名函数作为值：直接取函数符号地址（LLVM 里就是 @t.<name>）
+        // 顶层具名函数作为**值**：取其闭包全局（FuncType v2 / M47）。函数值统一是
+        // 指向 %TClosure { ptr fn; ptr env } 的 ptr，直接取函数地址会让间接调用点
+        // 把代码当记录来 GEP。直接调用的 callee 不经此分支（ll_call 按名解析）。
         if (llfn_find(le_idn) >= 0) {
-            return sb_cat2("@t.", le_idn);
+            clos_mark(le_idn);
+            return sb_cat2("@t.clos.", le_idn);
         }
         return "0";
     }
@@ -14705,13 +14847,21 @@ ll_call fn(e: i64) -> string {
         }
     }
     if (td_is_func(iftd)) {
-        var fpv: string = emit_lle(n.na);
+        // 闭包解包（FuncType v2 / M47）：函数值是指向 %TClosure { ptr fn; ptr env }
+        // 的指针；被调函数统一为 `Ret (ptr env, Args...)`，env 作首参。
+        var iclp: string = emit_lle(n.na);
+        var ifnp: string = ll_tmp();
+        llfb(sb_cat6("  ", ifnp, " = getelementptr inbounds %TClosure, ptr ", iclp, ", i32 0, i32 0", ""));
+        var fpv: string = ll_load("ptr", ifnp);
+        var ienp: string = ll_tmp();
+        llfb(sb_cat6("  ", ienp, " = getelementptr inbounds %TClosure, ptr ", iclp, ", i32 0, i32 1", ""));
+        var ienv: string = ll_load("ptr", ienp);
         var icsb: StringBuilder = sb_new();
+        sb_append_str(icsb, "ptr ");
+        sb_append_str(icsb, ienv);
         var ii: i64 = 0;
         while (ii < argc) {
-            if (ii > 0) {
-                sb_append_str(icsb, ", ");
-            }
+            sb_append_str(icsb, ", ");
             var iptd: i64 = -1;
             if (ii < tdf_pcount[iftd]) {
                 iptd = tdf_params[tdf_pstart[iftd] + ii];
@@ -15698,12 +15848,69 @@ emit_llginit fn() -> void {
     llpb("");
 }
 
+// ── 函数值闭包的 LLVM 侧落地（FuncType v2 / M47）────────────────
+// 与 C 后端同构：为每个被取值的顶层函数生成 trampoline（吃掉 env 首参后转发）
+// 与一个内部闭包全局。函数值在 LLVM 里就是指向该全局的 ptr。
+emit_ll_closures fn() -> void {
+    var cn: i64 = slice_len(clos_names) as i64;
+    if (cn == 0) {
+        return;
+    }
+    var i: i64 = 0;
+    while (i < cn) {
+        var nm: string = clos_names[i];
+        var fi: i64 = llfn_find(nm);
+        if (fi >= 0) {
+            var rty: string = ll_td(llfn_r[fi]);
+            var sym: string = sb_cat2("@t.", nm);
+            if (llfn_x[fi]) {
+                sym = sb_cat2("@", nm);
+            }
+            var psb: StringBuilder = sb_new();
+            var asb: StringBuilder = sb_new();
+            sb_append_str(psb, "ptr %__env");
+            var ps: i64 = llfn_ps[fi];
+            var pc: i64 = llfn_pc[fi];
+            var pi: i64 = 0;
+            while (pi < pc) {
+                var pty: string = ll_td(llfp_td[ps + pi]);
+                sb_append_str(psb, ", ");
+                sb_append_str(psb, pty);
+                sb_append_str(psb, " %__a");
+                sb_append_str(psb, i2s(pi));
+                if (pi > 0) {
+                    sb_append_str(asb, ", ");
+                }
+                sb_append_str(asb, pty);
+                sb_append_str(asb, " %__a");
+                sb_append_str(asb, i2s(pi));
+                pi = pi + 1;
+            }
+            llpb(sb_cat6("define internal ", rty, " @t.tramp.", nm, "(", sb_cat2(sb_to_str(psb), ") {")));
+            llpb("entry:");
+            if (rty == "void") {
+                llpb(sb_cat5("  call void ", sym, "(", sb_to_str(asb), ")"));
+                llpb("  ret void");
+            } else {
+                llpb(sb_cat6("  %r = call ", rty, " ", sym, "(", sb_cat2(sb_to_str(asb), ")")));
+                llpb(sb_cat3("  ret ", rty, " %r"));
+            }
+            llpb("}");
+            llpb("");
+            llpg(sb_cat6("@t.clos.", nm, " = internal global %TClosure { ptr @t.tramp.", nm, ", ptr null }", ""));
+        }
+        i = i + 1;
+    }
+}
+
 emit_llunit fn(mod: string) -> void {
     build_type_map();
     ll_build_reg();
     llph(sb_cat2("; ModuleID = ", mod));
     llph("%TStr = type { ptr, i64 }");
     llph("%TSlice = type { ptr, i64, i64, i64 }");
+    // 函数值的统一表示（FuncType v2 / M47）：{ 函数指针, 环境指针 }
+    llph("%TClosure = type { ptr, ptr }");
     // type_info(T) 常量结构（M36）
     llph("%TFieldInfo = type { %TStr, i64, %TStr, i64, i8 }");
     llph("%TTypeInfo = type { %TStr, i64, i64, i64, %TSlice }");
@@ -15722,6 +15929,9 @@ emit_llunit fn(mod: string) -> void {
         }
         i = i + 1;
     }
+
+    // 函数值闭包：全部函数体发射完毕后统一落地（LLVM 无前向声明顺序约束）
+    emit_ll_closures();
 
     if (ll_has_main) {
         llpb("define i32 @main(i32 %argc, ptr %argv) {");

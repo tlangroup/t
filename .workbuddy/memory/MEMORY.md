@@ -19,7 +19,7 @@
 - 流水线：gen_ebnf→build_runtime→tc/tote 自举。`out/dbg/tc.exe` 运行锁 exe，重建须 `--output <临时名>` 再 `cp`。
 
 ## 验证七步（门禁）
-1. md5sum src==gen（已废，totter 放弃）2. difftest **自举代际对拍** `--ref <genB.exe> --cand <genD.exe>` → 27/27；另 **tc0 vs tc 外部对拍** `--cand out/dbg/tc.exe`：lex/check 9/9 逐字节绿、emit-c 0/9（tc0 emitter 旧命名/旧语法，见上）3. conformance **44/44** 4. 三阶段自举 IR 逐字节(b==c==d) 5. shadow_check+catn_check OK 6. 发射侧 `; UNSUPPORTED` 计数 0 7. run_examples 双后端 **13/13**（dbg+rls）。tote PM 冒烟单独验。
+1. md5sum src==gen（已废，totter 放弃）2. difftest **自举代际对拍** `--ref <genB.exe> --cand <genD.exe>` → 27/27；另 **tc0 vs tc 外部对拍** `--cand out/dbg/tc.exe`：lex/check 9/9 逐字节绿、emit-c 0/9（tc0 emitter 旧命名/旧语法，见上）3. conformance **48/48** 4. 三阶段自举 IR 逐字节(b==c==d) 5. shadow_check+catn_check OK 6. 发射侧 `; UNSUPPORTED` 计数 0 7. run_examples 双后端 **14/14**（dbg+rls）。tote PM 冒烟单独验。
 - **门禁必须串行跑**：并行会争抢 `out/` 产物造成假失败。
 - **UNSUPPORTED 计数口径**：必须 `grep -cE '^[[:space:]]*; UNSUPPORTED'`；裸 `grep -c '; UNSUPPORTED'` 会命中 6 处编译器自身诊断字符串常量（假阳性）。
 - **管道 SIGPIPE 假象**：`node tools/xxx.mjs | tail -N` 可能 exit 1 并吞掉总结行，误判失败；长输出改重定向到文件再 grep。
@@ -59,8 +59,20 @@
   - **自举不动点 md5 `544bdeb3cd1ff525f4b6611ba37ce99f`**，全门禁绿（conformance 44/44、run_examples 13/13、UNSUPPORTED 0）。
   - 资产：`examples/func_type_demo.tc`+`.expected.txt`（双后端 6 行全对，含 `@main` 注解防 segfault）、`tests/conformance/pass/p18_func_type_ok.tc`、`tests/conformance/fail/f23_func_type_sig_mismatch.tc`/`f24_func_type_call_arity.tc`/`f25_not_callable.tc`。
   - 文档：`docs/reference.md` §3.5 FuncType `spec-only`→✅ tote；`docs/syntax/drafts/types.md` 同步。
+- **M46 FuncType v2 Stage A 匿名函数字面量（无捕获）**：`fn(Params) -> Ret { ... }` 作为表达式产生 FuncType 值，编译期提升为顶层函数 `__lam_N`（`desugar_lambdas`），可作一等值传递/返回/存结构体字段；**不捕获**外层局部（引用报 `T_CLOSURE_CAPTURE`）。双后端零改动（复用 FuncType v1 ABI）。**Stage B（pending）= 按值捕获 + 堆分配闭包**（用户裁定：v2 先泄漏不 free）。
+  - 连带修复（晋级暴露）：① `parse_lambda_expr` 误写 `cur_i`→`advance_i()` 游标笔误；② 新增 `T_UNDEFINED_IDENT` 堵未定义标识符静默错编缺口；③ `for` 循环 checker 初始化变量作用域外推断 + 步进 `nc` 从未检查；④ C 后端 `append`/`slice_set` 对字面量实参 `&(-1)` 非法 + `sizeof` 仅 4 字节 → 数组复合字面量 `(ElemT[1]){ val }`（`c_elem_ctype` 取切片 elem 宽度）。
+  - 自举不动点 LLVM IR 三代 md5 `171b6c0e8b7638469f883374690f2e43`；conformance 48/48；run_examples 双后端 14/14。commit `f431ca0`。
+  - 资产：`examples/lambda_demo.tc`+`.expected.txt`、`conformance pass/p19` + `fail/f26`(T_CLOSURE_CAPTURE)/`f27`(T_VAR_NO_TYPE)/`f28`(T_UNDEFINED_IDENT)。
+  - 文档：reference.md DiagnosticTable 补三码 + FuncLit 文法；types.md 注匿名函数字面量 M46。
+- **M47 FuncType v2 Stage B1：统一 TClosure ABI（非捕获路径）**：函数值统一表示为 **`TClosure*` 指针**（C 后端 `TClosure*`，LLVM 后端 `ptr`），底层被调函数统一 `Ret (*)(void* env, Args...)`，**env 为首参**。
+  - **必须用指针不是按值结构体**：`ll_isagg` 对 func 返回 false，按值 `%TClosure` 会踩红线「LLVM 避 Win64 聚合 ABI」；用指针则 LLVM 类型层零改动，只改取值点与调用点。
+  - **trampoline 不可省**：顶层函数定义无 env 首参，直接强转会让 env 挤掉首个真实参数。为每个**被取值**的函数惰性生成（`clos_names`/`clos_mark`）：C 侧 `__tramp_g` + `static TClosure __tclos_g`（输出到**头文件尾部**）；LLVM 侧 `@t.tramp.g` + `@t.clos.g`。
+  - **判定「函数作为值」不要靠 AST 标记**：`infer_expr` 的 call 分支对直接调用顶层函数**直接 return，不遍历实参**（t 的 checker 对直接调用不做实参类型校验，靠 C 原型兜底），故实参位置的 ident 拿不到标记。正解：发射期就地判定 —— **直接调用的 callee 不经 ident 分支**（call 分支直接读 `cal.sa`），所以凡走到 ident 分支且解析到 FuncDecl 的必是函数值。C 用 `clos_decl_of`（先查 `fs_get` 让局部优先），LLVM 用 `llfn_find`。
+  - 自举不动点 md5 **`3b8ec05600782538db5b0a060b224d0c`**，全门禁绿。b1→b2 的 IR 差异仅 1 行（新增 `%TClosure` 类型声明）→ 佐证 tc.tc 自身不用函数值。
 
 ## 技术债
 - @derive 表驱生成（9 trait 手写，暂缓）
 - type_info 仅 struct（函数类型已实装，见 M45）
-- import_json 嵌套；C 后端 append 取址；优化后端
+- import_json 嵌套；优化后端
+- **C 后端自举产物运行崩溃（深层技术债）**：修取址 bug 后 `tc.c` 能完整 clang 自编译（exit 0，仅 benign 警告），但 `tc_from_c.exe` 运行即崩溃（access violation `3221225477`，conformance 0/48）—— C 后端编示例 OK、编 `tc.tc` 自身崩溃；超出 Stage A 范围，待排。
+- **FuncType v2 Stage B 按值捕获闭包 pending**：runtime 已备 `t_alloc`/`t_free`/`TClosure`（M46 已随编译器链接），待落地 `closure_make`/`closure_capture` 节点与调用 ABI 改动（C/LLVM 双后端），用户裁定「按值捕获 + 堆分配，v2 先泄漏不 free」。
