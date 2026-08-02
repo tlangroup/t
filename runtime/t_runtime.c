@@ -60,6 +60,17 @@ void t_arena_free_all(TArena* a) {
     if (a) { a->used = 0; } // 进程退出时 OS 回收 base
 }
 
+// ── 通用堆分配（闭包 env / TClosure record）──
+void* t_alloc(size_t size) {
+    void* p = malloc(size);
+    if (!p) t_fatal("t_alloc: malloc failed");
+    return p;
+}
+
+void t_free(void* p) {
+    if (p) free(p);
+}
+
 void t_runtime_done(void) {
     if (g_arena) { t_arena_free_all(g_arena); }
 }

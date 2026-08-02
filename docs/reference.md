@@ -207,6 +207,9 @@ DiagnosticTable:
   | "T_IMPORT_HEADER" -> error
   | "T_IMPORT_VALUE" -> error
   | "T_IMPORT_CONTEXT" -> error
+  | "T_CLOSURE_CAPTURE" -> error
+  | "T_VAR_NO_TYPE" -> error
+  | "T_UNDEFINED_IDENT" -> error
 
 AnnotationTable:
     "test" { spec: "none", targets: "func", repl: "" }
@@ -992,6 +995,7 @@ PrimaryExpr:
     | StructLit
     | ArrayLit
     | MapLit
+    | FuncLit                 // ✅ tote 匿名函数字面量（M46）
     | "(" Expr ")"            // 仅分组，非元组
 
 IntLit:   integer            // 十进制；0x 前缀十六进制；0b 前缀二进制
@@ -1004,17 +1008,19 @@ TypeInfoExpr: "type_info" "(" ident ")"      // 编译期类型信息内建
 StructLit: ident "{" (ident ":" Expr ("," ident ":" Expr)*)? "}"
 ArrayLit:  "[" (Expr ("," Expr)*)? "]"
 MapLit:    "[" (Expr ":" Expr ("," Expr ":" Expr)*)? "]"   // 当首元素后跟 ":"
+FuncLit:   "fn" "(" ParamList? ")" "->" Type Block         // 匿名函数；静态类型即同签名 FuncType
 ```
 
 - **优先级塔固定（L-03 可预判）**：`||` 最低、`*`/`/`/`%` 最高，10 级全部左结合；赋值 `=` 右结合；无右结合二元运算符。塔层级与 `src/tc.tc` 的 `parse_or → … → parse_mul → parse_unary → parse_postfix → parse_primary` 一一对应，不可调换。
 - **全行为显式（L-02）**：`as` 为唯一显式类型转换（仅一次、不可 `e as T1 as T2`）；无隐式类型转换 / 隐式布尔 / 隐式内存分配；复合字面量（数组 `[...]` / map `[k:v]` / 结构体 `T{...}`）显式构造。
 - **静态类型安全（L-03）**：每个 `Expr` 的静态类型由 checker 推算；元素 / 字段 / 下标 / `type_info` 静态校验；`MapLit` 与 `ArrayLit` 共用 `[ ]`，由首元素后是否跟 `:`` 向前看消歧（无二义）。
-- **唯一写法（L-04 ✅）**：调用 `f(x)`、转换 `e as T`、下标 `e[i]`、成员 `e.f`、结构体 `T{...}`、数组 `[...]`、map `[k:v]` 均仅一种标准写法，无等价多写变体。
+- **唯一写法（L-04 ✅）**：调用 `f(x)`、转换 `e as T`、下标 `e[i]`、成员 `e.f`、结构体 `T{...}`、数组 `[...]`、map `[k:v]`、匿名函数 `fn(...) -> T {...}` 均仅一种标准写法，无等价多写变体。
+- **匿名函数字面量 `FuncLit`** ✅ tote（M46）：与函数**声明**靠「`fn` 前有无名字」区分——声明位先吃名字（`Name fn(...)`），表达式位裸 `fn` 即字面量，无二义。返回类型不可省（`-> Ret` 必写，与声明一致，L-02 全行为显式）。语义与限制见 §3.5。
 - `>>>` 注意：比较/移位序列中 `>>` 不得被词法拆成两个 `>`。
 
 ### 3.5 Types（类型） ✅ tote（核心）
 
-> 本节气法由 `types.md` 经 L-15 采用并并入（原草稿已标记失效）；`FuncType` 已于 FuncType 实装里程碑落地（✅ tote，函数指针语义）。
+> 本节气法由 `types.md` 经 L-15 采用并并入（原草稿已标记失效）；`FuncType` 已于 FuncType 实装里程碑落地（✅ tote，函数指针语义），M46 补齐匿名函数字面量。
 
 ```ebnf
 Type:
@@ -1044,7 +1050,12 @@ FuncType: "fn" "(" TypeList? ")" "->" Type   // ✅ tote 函数类型（函数�
 TypeList: Type ("," Type)*
 ```
 
-- ✅ tote：标量固定位宽 + `string`/`StringBuilder` + `[]T` 切片 + `[N]T` 定长数组 + `map[K]V` 哈希映射 + `fn(...) -> Ret` 函数类型均实装（函数类型 v1 为函数指针语义：仅顶层具名函数可被绑定到函数类型变量 / 参数 / 返回值 / 结构体字段 / 全局变量；支持间接调用，诊断 T_CALL_ARITY / T_NOT_CALLABLE / T_TYPE_MISMATCH；无闭包、不捕获局部变量）。
+- ✅ tote：标量固定位宽 + `string`/`StringBuilder` + `[]T` 切片 + `[N]T` 定长数组 + `map[K]V` 哈希映射 + `fn(...) -> Ret` 函数类型均实装（函数类型 v1 为函数指针语义：仅顶层具名函数可被绑定到函数类型变量 / 参数 / 返回值 / 结构体字段 / 全局变量；支持间接调用，诊断 T_CALL_ARITY / T_NOT_CALLABLE / T_TYPE_MISMATCH）。
+- **匿名函数字面量 `fn(...) -> Ret { ... }`** ✅ tote（M46）：表达式位的函数字面量，静态类型即同签名 `FuncType`，可赋给函数类型变量 / 作实参 / 作返回值 / 存结构体字段。
+  - **不捕获**：字面量在解析末尾被**提升**为顶层合成函数 `__lam_N`（原节点就地降级为对该函数的引用），故完全复用函数指针路径，双后端无额外开销、无堆分配。
+  - 函数体内引用外层局部变量报 `T_CLOSURE_CAPTURE`（附修复建议：改为形参传入，或提升为全局）。需要携带状态时请显式传参或用全局。
+  - 由此，**闭包**（按值捕获 + 环境堆分配）尚未实装，属后续里程碑。
+- **未定义标识符报 `T_UNDEFINED_IDENT`**（M46）：此前 checker 对解析不到的标识符静默退化为 `Unknown`，错误要到 C 后端生成的 `.c` 才暴露，LLVM 后端更直接产出读 0 的垃圾值（静默错编）。现于检查期即报错。同批补上 `T_VAR_NO_TYPE`：局部 `var` 必须写类型标注（发射侧以有标注为前提，无标注声明会被整条丢弃）。
 - **map 字面量 `[k1: v1, k2: v2]`**：键/值类型取首项推断，整型统一提升为 `i64`（同数组字面量）。仅作为局部 `var` 的初始化器发射：C 后端脱糖为 `t_map_new` + 逐项局部量 + `t_map_put`，LLVM 后端为 `tll_map_new` + 逐项 `tll_map_put`。`var m: map[K]V;` 无初始化时同样建空表。整型键一律按 `int64` 落盘（C 用 C99 复合字面量 `&(int64_t){…}`，LLVM 用 `alloca i64` + 扩宽），故窄整型键不会因高位垃圾而失配，键/值也可以直接写字面量。
 - 类型名解析：先查内建，再查当前单元已声明命名类型。
 - **数组字面量 `[e1, e2, …]`**：元素类型取首元素推断，整型元素统一提升为 `i64`（`[1,2,3]` 是 `[3]i64` 而非 `[3]u8`）；空字面量 `[]` 元素类型未知，可赋给任意 `[]T` / `[N]T`。定长数组与切片之间只要元素可转型即可互赋（目标为定长数组时长度须一致）。赋给 `[]T` 时脱糖为运行期 `slice_new` + 逐元素 `append`；赋给 `[N]T` 时 C 后端用花括号初始化器、LLVM 后端零初始化后按 `getelementptr` 逐元素 `store`。

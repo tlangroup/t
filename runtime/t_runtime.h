@@ -28,6 +28,16 @@ TArena* t_arena_new(void);
 void*   t_arena_alloc(TArena* a, size_t size);
 void    t_arena_free_all(TArena* a);   // 编译结束一次性释放
 
+// ── 通用堆分配（闭包 env / TClosure record；不走 arena，可直接 free）──
+// v2 闭包按值捕获：创建闭包时 malloc 一份「记录 + 环境」块；v2 暂不 free（泄漏），
+// 留作后续引用计数增强。
+void*   t_alloc(size_t size);
+void    t_free(void* p);
+
+// 闭包值：指向 {fnptr, env} 记录的指针（见 FuncType v2 / M46）。
+// fn 字段统一为 (void* env, Args...) -> Ret 的函数指针（首参为环境）。
+typedef struct { void* fn; void* env; } TClosure;
+
 // ── 运行时生命周期（由生成的 C main() 调用）─────────────────────
 void    t_runtime_init(int argc, char** argv);  // 保存 argc/argv 供 t_args()
 void    t_runtime_set_arena(TArena* a);         // 注入全局 arena

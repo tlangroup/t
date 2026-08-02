@@ -117,6 +117,9 @@ init_node_kinds fn() -> void {
     append(node_kind_names, "FlagSetDecl");
     append(node_kind_names, "FuncDecl");
     append(node_kind_names, "func_type");
+    append(node_kind_names, "lambda");        // 闭包字面量（M46）：na=返回类型, lb=参数 P 链, lc=body 语句链, sa=合成函数名(脱糖回填), la=捕获 ident 链
+    append(node_kind_names, "closure_make");  // 闭包构造点（M46）：sa=合成函数名, la=捕获 ident 链；emit 时堆分配记录+环境并返回指针
+    append(node_kind_names, "closure_capture"); // 闭包 thunk 顶部重建捕获变量的语句（M46）：sa=捕获变量名, na=类型节点, ia=环境结构字段下标
     append(node_kind_names, "GlobalConstDecl");
     append(node_kind_names, "GlobalVarDecl");
     append(node_kind_names, "ImportDecl");
@@ -284,6 +287,44 @@ mk_func_type fn(na: i64, la: i64, ti: i64) -> i64 {
     var n: Node = nodes[id];
     n.na = na;
     n.la = la;
+    slice_set(nodes, id, n);
+    if (ti >= 0) { node_at(id, ti); }
+    return id;
+}
+
+// 闭包字面量（M46）：na=返回类型节点, lb=参数 P 链, lc=body 语句链；
+// sa=合成函数名(脱糖回填), la=捕获 ident 链(检查期填充)。
+mk_lambda fn(sa: string, na: i64, la: i64, lb: i64, lc: i64, ti: i64) -> i64 {
+    var id: i64 = node_new("lambda");
+    var n: Node = nodes[id];
+    n.sa = sa;
+    n.na = na;
+    n.la = la;
+    n.lb = lb;
+    n.lc = lc;
+    slice_set(nodes, id, n);
+    if (ti >= 0) { node_at(id, ti); }
+    return id;
+}
+
+// 闭包构造点（M46）：sa=合成函数名, la=捕获 ident 链。emit 时堆分配记录+环境并返回指针。
+mk_closure_make fn(sa: string, la: i64, ti: i64) -> i64 {
+    var id: i64 = node_new("closure_make");
+    var n: Node = nodes[id];
+    n.sa = sa;
+    n.la = la;
+    slice_set(nodes, id, n);
+    if (ti >= 0) { node_at(id, ti); }
+    return id;
+}
+
+// 闭包 thunk 顶部重建捕获变量的语句（M46）：sa=捕获变量名, na=类型节点, ia=环境结构字段下标。
+mk_closure_capture fn(sa: string, na: i64, ia: i64, ti: i64) -> i64 {
+    var id: i64 = node_new("closure_capture");
+    var n: Node = nodes[id];
+    n.sa = sa;
+    n.na = na;
+    n.ia = ia;
     slice_set(nodes, id, n);
     if (ti >= 0) { node_at(id, ti); }
     return id;
@@ -4644,6 +4685,14 @@ tokenize fn(src: string) -> void {
 var pos: i64;
 var decl_list: []i64;
 
+// 匿名函数字面量（M46 / FuncType v2a）：解析期收集全部 lambda 节点，
+// parse_unit 末尾统一提升为顶层合成函数 `__lam_N`，原节点就地降级为 ident。
+var g_lambdas: []i64;
+var g_lam_counter: i64;
+// 检查期标记：当前正在检查的 FuncDecl 是由 lambda 提升而来（sc == "__lambda__"），
+// 此时未解析的标识符即「试图捕获外层局部」，给出专门诊断而非静默 Unknown。
+var g_in_lambda: bool;
+
 tk_t fn(idx: i64) -> string {
     var tk: Tok = toks[idx];
     return tk.t;
@@ -5493,6 +5542,75 @@ sfield_ia fn(bits: string) -> i64 {
 //   "_" Guard?              通配占位，不绑定变量
 //   Literal Guard?          字面量相等模式
 // 模式信息落在 P 节点的空闲字段：ba=通配、nb=字面量模式、nc=when 守卫。
+
+// 闭包字面量（M46）：表达式位置的 `fn (params) -> Ret { body }`。
+// 与声明靠「前面有无名字」区分（声明在 parse_declaration 先吃名字）；此处裸 `fn` 即 lambda。
+parse_lambda_expr fn() -> i64 {
+    var ti0: i64 = advance_i();    // 吃掉 'fn'，返回其 token 下标（诊断锚点）
+    expect_tok("LParen");
+    var ph: i64 = -1;
+    var pt: i64 = -1;
+    while (cur_t() != "RParen" && cur_t() != "Eof") {
+        var pname: string = expect_tok("Identifier");
+        expect_tok("Colon");
+        var ptn: i64 = parse_type();
+        var pid: i64 = mk_P(pname, ptn, -1, -1);
+        pt = list_push(ph, pt, pid);
+        if (ph < 0) { ph = pt; }
+        if (cur_t() == "Comma") { advance_i(); } else { break; }
+    }
+    expect_tok("RParen");
+    expect_tok("Arrow");
+    var rt: i64 = parse_type();
+    var body: i64 = -2;
+    if (cur_t() == "LBrace") {
+        body = parse_block();
+    } else {
+        eprint("parse error: expected '{' after lambda signature\n");
+        exit(1);
+    }
+    // 合成名在解析期就定下来，提升阶段直接复用；同时登记到 g_lambdas，
+    // 免去后续在任意表达式里递归搜寻 lambda 节点。
+    var lname: string = sb_cat2("__lam_", i2s(g_lam_counter));
+    g_lam_counter = g_lam_counter + 1;
+    var id: i64 = mk_lambda(lname, rt, -1, ph, body, ti0);
+    append(g_lambdas, id);
+    return id;
+}
+
+// 匿名函数字面量提升（M46 / FuncType v2a）。
+// 把每个 lambda 节点提升为顶层合成 FuncDecl，并把原节点**就地**改写为 ident
+// （节点 id 不变 → 父节点无需回填指针，沿用 ClauseDead 的下线手法）。
+// 提升后「函数字面量作为值」完全复用 FuncType v1 的具名函数取址路径，
+// 双后端零改动；合成函数进入 decl_list 后也自动获得 desugar_stmts /
+// register_decl / check_decl / 发射的全套常规处理。
+desugar_lambdas fn() -> void {
+    var n: i64 = slice_len(g_lambdas) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        var lid: i64 = g_lambdas[i];
+        var ln: Node = nodes[lid];
+        if (ln.kind == "lambda") {
+            var fd: i64 = mk_FuncDecl(ln.sa, false, false, ln.na, -1, ln.lb, ln.lc, -1);
+            var fdn: Node = nodes[fd];
+            fdn.sc = "__lambda__";   // 检查期据此启用「不得捕获外层局部」诊断
+            fdn.ln = ln.ln;
+            fdn.cl = ln.cl;
+            fdn.tv = ln.tv;
+            slice_set(nodes, fd, fdn);
+            append(decl_list, fd);
+            var ln2: Node = nodes[lid];
+            ln2.kind = "ident";      // sa 已是合成函数名
+            ln2.na = -1;
+            ln2.la = -1;
+            ln2.lb = -1;
+            ln2.lc = -1;
+            slice_set(nodes, lid, ln2);
+        }
+        i = i + 1;
+    }
+}
+
 parse_func_decl fn(name: string, anns: i64, is_comptime: bool) -> i64 {
     advance_i();
     expect_tok("LParen");
@@ -5737,6 +5855,8 @@ parse_unit fn() -> void {
         }
     }
     desugar_func_clauses();
+    // 子句合并会重建 FuncDecl 节点，但 lambda 节点 id 不变，故提升放在其后即可。
+    desugar_lambdas();
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -6266,6 +6386,9 @@ parse_match_expr fn() -> i64 {
 
 parse_primary fn() -> i64 {
     var t: string = cur_t();
+    if (t == "KwFunc") {
+        return parse_lambda_expr();
+    }
     if (t == "KwMatch") {
         return parse_match_expr();
     }
@@ -7588,6 +7711,26 @@ infer_expr fn(e: i64) -> i64 {
         if (n.sa == "true" || n.sa == "false") {
             return ti_scalar("bool");
         }
+        // 未解析的标识符。静默退化成 Unknown 属**静默错编**：C 后端会一路漏到
+        // 生成的 .c 里才报「未声明标识符」，LLVM 后端更糟——直接产出读 0 的垃圾值。
+        // （本诊断即由此坑倒逼补上：parse_lambda_expr 误写 `cur_i`，检查期 0 errors、
+        //  LLVM 自举照常通过，直到 C 后端自举才在 tc.c:8610 炸出来。）
+        // bb 标志保证 infer_expr 重入时只报一次。
+        if (n.bb == false) {
+            var lcap: Node = nodes[e];
+            lcap.bb = true;
+            slice_set(nodes, e, lcap);
+            if (g_in_lambda) {
+                // 匿名函数体已脱离原词法环境，未解析标识符即试图捕获外层局部。
+                fc_err("T_CLOSURE_CAPTURE",
+                    sb_cat3("匿名函数不能捕获外层局部变量 `", n.sa,
+                        "`：函数字面量会被提升为顶层函数，外层局部不在其作用域内。请改为形参传入，或提升为全局变量/常量"), e);
+            } else {
+                fc_err("T_UNDEFINED_IDENT",
+                    sb_cat3("未定义的标识符 `", n.sa,
+                        "`：请检查拼写，或先声明对应的变量/常量/函数"), e);
+            }
+        }
         return ti_mk("Unknown");
     }
     // match 表达式（L-15）：分支结果类型统一 + when 守卫布尔显式 + 穷尽性
@@ -7929,6 +8072,13 @@ check_stmt fn(s: i64) -> void {
         var vt: i64 = -1;
         if (n.na >= 0) {
             vt = resolve_ti(n.na);
+        } else {
+            // 发射侧（collect_local_types / emit_stmt / ll_stmt）都以 `n.na >= 0`
+            // 为前提，无类型标注的局部声明会被整条丢弃 → 变量读出 0 的静默错编。
+            // 在检查期挡住，比让它一路漏到运行期强得多。
+            fc_err("T_VAR_NO_TYPE",
+                sb_cat3("局部变量 `", n.sa,
+                    "` 缺少类型标注：当前不支持局部类型推断，请写成 `var 名字: 类型 = 初值;`"), s);
         }
         if (n.nb >= 0) {
             var it: i64 = infer_expr(n.nb);
@@ -7981,6 +8131,14 @@ check_stmt fn(s: i64) -> void {
         return;
     }
     if (n.kind == "for" || n.kind == "while") {
+        // 循环头与循环体共用一层作用域。C 式 for 的初始化变量必须**先**入作用域，
+        // 条件与步进才解析得到它 —— 原实现在建作用域前就推断条件，`for (var i...; i <= n; ...)`
+        // 里的 `i` 解析不到，靠 infer_expr 的 Unknown 兜底才没炸（T_UNDEFINED_IDENT 上线后暴露）。
+        var prev2: i64 = cur_scope;
+        cur_scope = scope_new(prev2);
+        if (n.kind == "for" && n.na >= 0) {
+            check_stmt(n.na);
+        }
         var cond: i64 = n.na;
         if (n.kind == "for") {
             cond = n.nb;
@@ -7993,16 +8151,15 @@ check_stmt fn(s: i64) -> void {
                     "", 1, 1, 1, 5);
             }
         }
-        var prev2: i64 = cur_scope;
-        cur_scope = scope_new(prev2);
-        if (n.kind == "for" && n.na >= 0) {
-            check_stmt(n.na);
-        }
         var c3: i64 = n.la;
         while (c3 >= 0) {
             var k3: Child = kids[c3];
             check_stmt(k3.val);
             c3 = k3.next;
+        }
+        // 步进语句此前**完全未被检查**（发射侧照常发射），一并补上。
+        if (n.kind == "for" && n.nc >= 0) {
+            check_stmt(n.nc);
         }
         cur_scope = prev2;
         return;
@@ -8099,6 +8256,11 @@ check_func_decl fn(d: i64) -> void {
     var prev: i64 = cur_scope;
     cur_scope = scope_new(global_scope);
 
+    // 由 lambda 提升而来的合成函数：函数体已脱离原词法环境，未解析的标识符
+    // 即「试图捕获外层局部」，需给出可执行的诊断（见 infer_expr ident 分支）。
+    var prev_lam: bool = g_in_lambda;
+    g_in_lambda = n.sc == "__lambda__";
+
     var c: i64 = n.lb;
     while (c >= 0) {
         var k: Child = kids[c];
@@ -8130,6 +8292,7 @@ check_func_decl fn(d: i64) -> void {
 
     cur_ret = prev_ret;
     cur_scope = prev;
+    g_in_lambda = prev_lam;
 }
 
 check_struct_decl fn(d: i64) -> void {
@@ -10530,6 +10693,32 @@ collect_local_types fn(head: i64) -> void {
 
 // ── buildTypeMap（复刻 emitter.ts buildTypeMap）────────────────
 
+// 具名函数的「函数类型」TD。用于「函数作为值」的类型推断：
+//   var f = add;                  // 无类型标注
+//   var g = fn(a: i64) -> i64 {}  // 提升后同样是裸函数名
+// 没有它，expr_type_desc 会对函数名返回 unknown，导致 var_decl 发射出错误的 C 类型。
+funcdecl_td fn(rt_node: i64, params_head: i64) -> i64 {
+    var rtd: i64 = resolve_type_desc(rt_node);
+    var buf: []i64;
+    var c: i64 = params_head;
+    while (c >= 0) {
+        var k: Child = kids[c];
+        var p: Node = nodes[k.val];
+        append(buf, resolve_type_desc(p.na));
+        c = k.next;
+    }
+    // 先收局部表再整段搬入扁平池：嵌套函数类型解析会递归 append，
+    // 直接边解析边 append 会打断本层参数区的连续性。
+    var ps: i64 = slice_len(tdf_params) as i64;
+    var pc: i64 = slice_len(buf) as i64;
+    var i: i64 = 0;
+    while (i < pc) {
+        append(tdf_params, buf[i]);
+        i = i + 1;
+    }
+    return td_func(rtd, ps, pc);
+}
+
 build_type_map fn() -> void {
     var n: i64 = slice_len(decl_list) as i64;
     var i: i64 = 0;
@@ -10556,6 +10745,8 @@ build_type_map fn() -> void {
             if (dn.na >= 0) {
                 tm_set(sb_cat2(dn.sa, "()"), resolve_type_desc(dn.na));
             }
+            // 裸函数名 → 函数类型（函数作为值）。局部变量优先级更高，不会被遮蔽。
+            tm_set(dn.sa, funcdecl_td(dn.na, dn.lb));
             em_cur_fn = dn.sa;
             em_in_fn = true;
             var pc: i64 = dn.lb;
@@ -10802,6 +10993,27 @@ match_first_body fn(e: i64) -> i64 {
     return nodes[mf_k.val].nc;
 }
 
+// 切片元素的 C 类型名。append / slice_set 的元素宽度必须取自**切片**，
+// 不能用 `sizeof(<实参表达式>)`：`append(xs, -1)` 的 sizeof 是 sizeof(int)==4，
+// 对 []i64 只会写入半个元素（静默错编）。
+c_elem_ctype fn(slice_expr: i64) -> string {
+    if (slice_expr >= 0) {
+        var ce_d: i64 = expr_type_desc(slice_expr);
+        if (ce_d >= 0) {
+            var ce_t: TD = tds[ce_d];
+            if (ce_t.elem >= 0) {
+                // 函数指针的声明符不能直接跟 `[1]`（`Ret (*)(Args)[1]` 无意义），
+                // 退化成 void*：宽度一致，取址语义不变。
+                if (td_is_func(ce_t.elem)) {
+                    return "void*";
+                }
+                return desc_to_c(ce_t.elem);
+            }
+        }
+    }
+    return "int64_t";
+}
+
 emit_expr fn(e: i64) -> string {
     if (e < 0) {
         return "";
@@ -10945,10 +11157,20 @@ emit_expr fn(e: i64) -> string {
             if (cn == "str_at") { return sb_cat5("t_str_byte_at(", av[0], ", ", av[1], ")"); }
             if (cn == "slice_len") { return sb_cat3("t_slice_len(", av[0], ")"); }
             if (cn == "append") {
-                return sb_cat6("t_slice_append_sized(&", av[0], ", &", av[1], ", (int64_t)sizeof(", sb_cat2(av[1], "))"));
+                // 实参可能是非左值（字面量 / 运算结果），`&(-1)` 不是合法 C。
+                // 用**数组**复合字面量 `(ElemT[1]){ 值 }` materialize 出可取址的临时量：
+                // 数组初始化列表填的是元素 0，故标量 / 结构体 / TStr 一律正确
+                // （标量复合字面量 `(Node){ n }` 会误初始化第一个成员，不能用）；
+                // 数组自动退化为指针，无需再取址。顺带把 sizeof 锚到元素类型。
+                var ap_ct: string = c_elem_ctype(call_arg_node(e, 0));
+                return sb_cat6("t_slice_append_sized(&", av[0],
+                    sb_cat3(", (", ap_ct, "[1]){ "), av[1],
+                    sb_cat3(" }, (int64_t)sizeof(", ap_ct, "))"), "");
             }
             if (cn == "slice_set") {
-                return sb_cat6("t_slice_set(", av[0], ", ", av[1], ", &", sb_cat2(av[2], ")"));
+                var ss_ct: string = c_elem_ctype(call_arg_node(e, 0));
+                return sb_cat6("t_slice_set(", av[0], ", ", av[1],
+                    sb_cat3(", (", ss_ct, "[1]){ "), sb_cat2(av[2], " })"));
             }
             if (cn == "file_read_all") { return sb_cat3("t_file_read_all(t_cstr(", av[0], "))"); }
             if (cn == "file_exists") { return sb_cat3("t_file_exists(t_cstr(", av[0], "))"); }

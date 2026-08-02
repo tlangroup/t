@@ -18,7 +18,7 @@ PointerType: "*" Type                 // 指针 *T
 OptionalType: Type "?"                // 可选 T?
 FlagArrayType: "flag" "[" Integer "]" // 位域数组 flag[N]
 NamedType: Ident                      // 结构体/枚举/flag/variant/别名名
-FuncType: "fn" "(" TypeList? ")" "->" Type   // 函数类型（✅ tote 函数指针语义）
+FuncType: "fn" "(" TypeList? ")" "->" Type   // 函数类型（✅ tote 函数指针语义 + 匿名函数字面量 M46）
 TypeList: Type ("," Type)*
 ```
 
@@ -31,6 +31,7 @@ TypeList: Type ("," Type)*
 - **无隐式转换**：类型间转换须显式（见 `expr_postfix.md` 的 `as`），`parse_type` 不接受隐式推导。
 - `FlagArrayType` 的 `Integer` 为位宽（1bit 布尔位或 ≥2bit 数值位域，reference L842）。
 - `FuncType` 已实装（✅ tote）：函数指针语义，顶层具名函数可绑定（reference §3.5）。
+- 匿名函数字面量 `fn(Params) -> Ret { ... }` 亦产生 `FuncType` 值（M46 ✅ tote）：无捕获，编译期提升为顶层函数 `__lam_N`，不可引用外层局部（否则 `T_CLOSURE_CAPTURE`）；闭包（捕获）未实装。
 
 ## 3. 示例
 
