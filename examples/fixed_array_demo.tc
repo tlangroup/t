@@ -1,0 +1,52 @@
+// 定长数组存储回归守卫。
+//
+// C 后端把 [N]T 表示为 T*（指针），指针本身不带存储。若发射器不为其分配定长缓冲，
+// 全局 `var g: [8]i64;` 就会是一个 NULL 指针 —— `g[0] = x` 直接写 0 地址而崩溃。
+// 这正是 C 后端自举产物 tc_from_c.exe 一开始干活就 access violation 的根因
+// （tc.tc 自身用了 6 个定长数组全局：g_fc_d / g_fc_i / g_mb_arm / g_mb_no /
+//  g_defer / g_defer_ll，解析首个函数子句时写 g_fc_d[0] 即炸）。
+//
+// conformance 只跑 check（诊断），不碰代码生成，覆盖不到此类缺陷；
+// 本例经 run_examples 的「LLVM + C」双后端实跑比对，才能真正守住。
+
+var g_buf: [8]i64;
+var g_hits: [4]i64;
+
+@main
+main fn() -> i64 {
+    // ① 全局定长数组：逐元素写入后回读（旧 C 后端在此处崩溃）
+    var i: i64 = 0;
+    while (i < 8) {
+        g_buf[i] = i * i;
+        i = i + 1;
+    }
+    var sum: i64 = 0;
+    i = 0;
+    while (i < 8) {
+        sum = sum + g_buf[i];
+        i = i + 1;
+    }
+    println(int_to_str(sum));                                // 140
+
+    // ② 全局定长数组做计数桶：读-改-写
+    g_hits[2] = 7;
+    g_hits[3] = 1;
+    g_hits[2] = g_hits[2] + 1;
+    println(int_to_str(g_hits[2] + g_hits[3]));              // 9
+
+    // ③ 局部定长数组（无初始化器）：同样必须有独立存储
+    var loc: [4]i64;
+    loc[0] = 10;
+    loc[3] = 32;
+    println(int_to_str(loc[0] + loc[3]));                    // 42
+
+    // ④ 局部定长数组（带字面量初始化器）：缓冲需承接花括号初始化
+    var lit: [3]u8 = [1, 2, 3];
+    println(int_to_str((lit[0] as i64) + (lit[2] as i64)));  // 4
+
+    // ⑤ 两个全局数组互不串台（缓冲各自独立，非同一块内存）
+    g_buf[0] = 100;
+    println(int_to_str(g_buf[0] + g_hits[3]));               // 101
+
+    return 0;
+}

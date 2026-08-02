@@ -29,9 +29,9 @@
 - **三层（按影响面付费）**：
   - **L0**（~10s，每次保存）：静态检查(catn+shadow) → 自举一代 g1 → **IR 双后端快照比对** → conformance → `; UNSUPPORTED` 计数 0。
   - **L1**（IR 洁 ~13s / IR 脏 ~32s，提交前）：+ 自举不动点 **g2==g3** + （IR 洁则 SKIP run_examples/difftest，否则全跑）。
-  - **L2**（~57s，里程碑）：+ 四代不动点 **g2==g3==g4** + difftest tc0 对拍(XFAIL emit-c) + **rls 快速通道**(g4 vs rls 编译器发射 `tc.tc` IR 互比 + 3 示例冒烟) + tote 冒烟。
+  - **L2**（~139s，里程碑）：+ 四代不动点 **g2==g3==g4** + **`cself` C 后端自举**(emit-c→clang→C 产物发射 IR 与 g4.ll 比 md5 + conformance，~14s) + difftest tc0 对拍(XFAIL emit-c) + **rls 快速通道**(g4 vs rls 编译器发射 `tc.tc` IR 互比 + 3 示例冒烟) + tote 冒烟。
 - **自举不动点判据从第二代起算**：g1 由**改动前**编译器编出，改 emitter 后 g1≠g2 必然且正确。故比 `g2==g3`(boot23)、`g2==g3==g4`(boot4)、代际对拍比 `g2↔g3`、run_examples 用 g3、rls 用 g4 且两档编译器 IR 互比（不依赖 baseline）。
-- **IR 快照（`tools/ir_snapshot.mjs` + `tests/ir_baseline.json`）**：对 `examples/*.tc` + `src/tc.tc` + `src/tote.tc`（23 目标 × ll/c/h = 69 条目）md5 基线。**必须双后端**（ll + c/h）——只比 `.ll` 无法覆盖 C 发射器改动（run_examples 是双后端验证）。⚠ 不覆盖：conformance 的 fail 用例诊断、runtime 改动、clang 版本变化。
+- **IR 快照（`tools/ir_snapshot.mjs` + `tests/ir_baseline.json`）**：对 `examples/*.tc` + `src/tc.tc` + `src/tote.tc`（24 目标 × ll/c/h = 72 条目）md5 基线。**必须双后端**（ll + c/h）——只比 `.ll` 无法覆盖 C 发射器改动（run_examples 是双后端验证）。⚠ 不覆盖：conformance 的 fail 用例诊断、runtime 改动、clang 版本变化。
 - **防假绿 + 退出码**：catn_check / shadow_check 加最小匹配数断言（`sb_catN` ≥470 / 函数 ≥330 / 变量 ≥1880），低于阈值 `exit 2`；两工具均补 `process.exit(0/1/2)`，否则编排时被当通过。
 - **difftest XFAIL**：tc0 emitter 冻结，`compile --emit-c` 通道恒失败属已知基线，以 tc0 为 ref 时自动 XFAIL（不计失败）；`--strict` 可关，`--xfail ch,...` 手指定。去 `npx tsx` 冷启动（用 `node node_modules/tsx/dist/cli.mjs`）+ 并行 `--jobs` → 52s→~6s。
 - **并行安全区分**：不同工具之间串行（争抢 `out/`）；同一工具内**用例级**可并行（产物名按用例唯一、runtime lib 只读）。run_examples `--jobs N` 默认 `min(8, cpus)` → 57s→~10s。
@@ -45,6 +45,8 @@
 - 合成节点须承接原节点锚点（`ln`/`cl`/`tv`），否则诊断报不出行列（`n_file` 靠 `n.ln != 0`）。
 - 全局 Sym var 初始化器搬进 `t__ginit`/`t.__ginit`。
 - **LLVM 全局 slice 变量生成非法 IR**（`load %TSlice, ptr 0`）→全局栈用定长数组+计数，勿用 `[]i64` 全局。
+- **C 后端 `[N]T` 表示为 `T*`，指针不自带存储**：任何新增的定长数组声明路径都必须同时发射 `T name_abuf[N];` 并让指针指向它，否则就是 NULL/野指针写入（M49 根因）。
+- **conformance 只跑 `check`，完全不覆盖代码生成**；真正跑代码的是 run_examples（双后端实跑比对）与 gate 的 `cself`。新增运行期语义务必配示例，只加 conformance 用例等于没测。
 - **新增关键字前必须全库扫同名标识符**（`fn` 曾撞 `var fn: i64` 等 3 处）。
 - **跨语法不兼容期的桥接自举通法**：①编译器兼容新旧两法→用旧 canonical 编旧源得桥接器 ②脚本批量迁移全部 `.tc` ③编译器收紧（旧写法改硬错误）→重新自举至不动点。迁移错误须带具体名字与建议写法。
 
@@ -67,8 +69,14 @@
   - **被捕获绑定须有显式类型标注**否则 `T_CLOSURE_CAPTURE`（for-each 迭代变量无标注→不可捕获）；名字根本不存在则 `T_UNDEFINED_IDENT`。
   - **非 ident callee 间接调用**（同批修复）：`h.op(4)`/`make2(1)(2)(3)`/`fs[i](x)` 现均可调。`iftd` 顺序：局部 `fs_get`→全局 `llgv_find`→**仅非 ident 时** `ll_etd(n.na)`（裸 ident 是顶层函数名时须走直接调用路径，否则误当闭包解包）。⚠ `ll_call` **入口**就对非 ident bail，补丁必须抽成独立函数从入口分流，写在函数中段不可达。
   - md5 `d134ad6a…`，全门禁绿（conformance 49/49、examples 双模式 16/16、代际对拍 27/27）。
+- **M49 C 后端自举打通**（修掉长期技术债，`tc_from_c.exe` 从「一启动干活就崩」到完全可自举）。
+  - **根因**：C 后端把定长数组 `[N]T` 表示为 `T*`（与 slice 同形），但**指针本身不分配存储**。于是全局 `var g_fc_d: [64]i64;` 发射成 `int64_t* g_fc_d;` = NULL → `desugar_func_clauses` 首行 `g_fc_d[0] = d` 直接写 0 地址。tc.tc 自身用了 6 个定长数组全局（`g_fc_d`/`g_fc_i`/`g_mb_arm`/`g_mb_no`/`g_defer`/`g_defer_ll`），故解析第一个函数子句就炸；示例都不用定长数组，所以 C 后端编示例一直正常。
+  - **修法**（`emit_global_var` + `emit_stmt` 的 var_decl 分支，各加一段）：先发射定长缓冲再让指针指向它 —— `int64_t g_fc_d_abuf[64]; int64_t* g_fc_d = g_fc_d_abuf;`。保持 `T*` 表示法与 `(obj[idx])` 索引发射不变，改动面最小。局部同理（含带字面量初始化器的 `var lit: [3]u8 = [1,2,3];`，旧发射是非法的 `uint8_t* lit = {1,2,3};`）。
+  - **ASan 是本次的定位主力**：直接给出 `WRITE of size 8 at 0x000000000000` + `desugar_func_clauses ← parse_unit` 调用栈，几分钟定位；printf 二分会慢得多。
+  - **门禁盲区（本次一并堵上）**：conformance 只跑 `check`（**不碰代码生成**），run_examples 虽是双后端但示例不用定长数组，两道门禁都照不到 → 新增 ①`examples/fixed_array_demo.tc`（全局/局部、有无初始化器全覆盖，经双后端实跑）②gate L2 新步骤 **`cself`「C 后端自举」**：`g4 → emit-c → clang → 用 C 产物发射 tc.tc 的 IR 与 g4.ll 比 md5 + 跑 conformance`，仅 ~14s。**已验证反向有效**：用 `git show HEAD:src/tc.tc` 重建的旧编译器跑新示例，LLVM 通过而 C 后端硬失败。
+  - **结论**：C 产物与 LLVM 产物对 `src/tc.tc` 发射**逐字节相同的 IR**，且 C 产物能重新生成逐字节相同的 `tc.c`/`tc.h`（C 后端自身也到不动点）；conformance 49/49、ASan 编译 tc.tc 全程无报告。不动点 IR md5 `e5852ea1…`，gate L2 13/13 绿（139s）。
 
 ## 技术债
 - @derive 表驱生成（9 trait 手写）；type_info 仅 struct；import_json 嵌套；优化后端。
-- **C 后端自举产物运行崩溃**：`tc.c` 能 clang 自编译（exit 0）但 `tc_from_c.exe` 运行即崩（access violation 3221225477，conformance 0/48）；C 后端编示例 OK、编 tc.tc 自身崩溃，待排。
+- ~~C 后端自举产物运行崩溃~~ **已解决（M49）**，见里程碑。
 - 闭包环境不回收（M48 v1 有意泄漏），需所有权或 GC 才能解。

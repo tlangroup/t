@@ -5,7 +5,8 @@
 //
 //   L0  改语法后每次保存        ~10s   静态检查 + 一代自举 + 产物快照 + conformance
 //   L1  提交前                  ~15s   L0 + 二代不动点 + 代际对拍 (+ 运行类门禁, 见下)
-//   L2  里程碑 / 合并前         ~45s   L1 全量 + 四代不动点 + tc0 对拍 + rls + tote
+//   L2  里程碑 / 合并前        ~150s   L1 全量 + 四代不动点 + C 后端自举 + tc0 对拍
+//                                     + rls + tote
 //
 // 核心判据（见 tools/ir_snapshot.mjs）：
 //   若两个后端的发射产物与基线逐字节相同，则 clang 输入不变 ⇒ 运行结果必然相同，
@@ -70,6 +71,14 @@ const tc = (exe, ...args) => run(exe, args);
 function md5(p) {
     return createHash("md5").update(readFileSync(p)).digest("hex");
 }
+function findClang() {
+    for (const p of [
+        "C:\\Program Files\\LLVM\\bin\\clang.exe",
+        "C:\\Program Files (x86)\\LLVM\\bin\\clang.exe",
+    ]) if (existsSync(p)) return p;
+    return "clang";
+}
+const CLANG = findClang();
 function lastLine(s, n = 1) {
     const ls = s.trimEnd().split("\n").filter((l) => l.trim());
     return ls.slice(-n).join(" / ").trim();
@@ -190,6 +199,36 @@ const steps = [
             const ms = ["g2", "g3", "g4"].map((g) => md5(join(ROOT, `out/dbg/${g}.ll`)));
             const same = ms.every((m) => m === ms[0]);
             return { ok: same, note: same ? `g2==g3==g4 = ${ms[0].slice(0, 8)}` : `不一致: ${ms.map((m) => m.slice(0, 6)).join(" ")}` };
+        },
+    },
+    {
+        id: "cself", lv: 2, name: "C 后端自举 (tc.c → clang → conformance)",
+        run: async () => {
+            // 盲区补丁：C 后端长期只在示例上验证过，从未拿它编译过编译器自身。
+            // 「定长数组全局无存储」的缺陷因此潜伏了很久 —— tc.tc 用了 6 个 [N]i64
+            // 全局，C 后端把 [N]T 表示为 T* 却不分配缓冲，解析首个函数子句时写
+            // g_fc_d[0] 就是写 NULL。conformance 只跑 check（不碰代码生成）、
+            // 示例又都不用定长数组，两道门禁都照不到。这一步专门堵住它。
+            const dir = join("out", "dbg", "cself");
+            const e = await tc(`${G4}.exe`, "compile", "src/tc.tc", "--emit-c", "--output", dir);
+            if (e.code !== 0) return { ok: false, note: `emit-c 失败: ${lastLine(e.out, 3)}` };
+            const exe = join(ROOT, dir, "tc.exe");
+            const cc = await run(CLANG, [
+                "-O0", "-o", exe,
+                join(ROOT, dir, "tc.c"), join(ROOT, "runtime", "t_runtime.c"),
+                "-I", join(ROOT, "runtime"), "-I", join(ROOT, dir), "-Wl,-subsystem:console",
+            ]);
+            if (cc.code !== 0) return { ok: false, note: `clang 构建失败: ${lastLine(cc.out, 3)}` };
+            // ① 跨后端等价：C 产物与 LLVM 产物对同一份源必须发射逐字节相同的 IR。
+            //    这同时证明 C 产物「能跑」且「跑对」——它做的是全项目最重的一份工作。
+            const a = await tc(exe, "emit-ll", "src/tc.tc", "--output", join("out", "dbg", "cself_ir"));
+            if (a.code !== 0) return { ok: false, note: `C 自举产物运行失败 (exit ${a.code}) ${lastLine(a.out, 2)}` };
+            const m1 = md5(join(ROOT, "out/dbg/cself_ir.ll"));
+            const m2 = md5(join(ROOT, "out/dbg/g4.ll"));
+            if (m1 !== m2) return { ok: false, note: `跨后端行为不一致: C=${m1.slice(0, 8)} vs LLVM=${m2.slice(0, 8)}` };
+            // ② 再用 C 产物跑一遍 conformance，确认诊断层面也完全一致
+            const cf = await node("conformance.mjs", "--compiler", exe);
+            return { ok: cf.code === 0, note: `IR 与 LLVM 产物全同 (${m1.slice(0, 8)}); ${lastLine(cf.out)}` };
         },
     },
     {
