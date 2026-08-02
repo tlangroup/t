@@ -118,8 +118,8 @@ init_node_kinds fn() -> void {
     append(node_kind_names, "FuncDecl");
     append(node_kind_names, "func_type");
     append(node_kind_names, "lambda");        // 闭包字面量（M46）：na=返回类型, lb=参数 P 链, lc=body 语句链, sa=合成函数名(脱糖回填), la=捕获 ident 链
-    append(node_kind_names, "closure_make");  // 闭包构造点（M46）：sa=合成函数名, la=捕获 ident 链；emit 时堆分配记录+环境并返回指针
-    append(node_kind_names, "closure_capture"); // 闭包 thunk 顶部重建捕获变量的语句（M46）：sa=捕获变量名, na=类型节点, ia=环境结构字段下标
+    append(node_kind_names, "closure_make");  // 闭包构造点（M48）：sa=合成函数名, sb=环境结构名, la=捕获 ident 链；emit 时堆分配环境+TClosure 并返回指针
+    append(node_kind_names, "closure_capture"); // 闭包体首重建捕获变量的语句（M48）：sa=捕获变量名, sb=环境结构名, na=类型节点, ia=环境结构字段下标
     append(node_kind_names, "GlobalConstDecl");
     append(node_kind_names, "GlobalVarDecl");
     append(node_kind_names, "ImportDecl");
@@ -4685,9 +4685,8 @@ tokenize fn(src: string) -> void {
 var pos: i64;
 var decl_list: []i64;
 
-// 匿名函数字面量（M46 / FuncType v2a）：解析期收集全部 lambda 节点，
-// parse_unit 末尾统一提升为顶层合成函数 `__lam_N`，原节点就地降级为 ident。
-var g_lambdas: []i64;
+// 匿名函数字面量（M46 / FuncType v2）：合成函数名 `__lam_N` 在解析期定名，
+// parse_unit 末尾由 desugar_lambdas 统一提升为顶层函数。
 var g_lam_counter: i64;
 // 检查期标记：当前正在检查的 FuncDecl 是由 lambda 提升而来（sc == "__lambda__"），
 // 此时未解析的标识符即「试图捕获外层局部」，给出专门诊断而非静默 Unknown。
@@ -5569,43 +5568,408 @@ parse_lambda_expr fn() -> i64 {
         eprint("parse error: expected '{' after lambda signature\n");
         exit(1);
     }
-    // 合成名在解析期就定下来，提升阶段直接复用；同时登记到 g_lambdas，
-    // 免去后续在任意表达式里递归搜寻 lambda 节点。
+    // 合成名在解析期就定下来，提升阶段直接复用。
     var lname: string = sb_cat2("__lam_", i2s(g_lam_counter));
     g_lam_counter = g_lam_counter + 1;
     var id: i64 = mk_lambda(lname, rt, -1, ph, body, ti0);
-    append(g_lambdas, id);
     return id;
 }
 
-// 匿名函数字面量提升（M46 / FuncType v2a）。
-// 把每个 lambda 节点提升为顶层合成 FuncDecl，并把原节点**就地**改写为 ident
-// （节点 id 不变 → 父节点无需回填指针，沿用 ClauseDead 的下线手法）。
-// 提升后「函数字面量作为值」完全复用 FuncType v1 的具名函数取址路径，
-// 双后端零改动；合成函数进入 decl_list 后也自动获得 desugar_stmts /
-// register_decl / check_decl / 发射的全套常规处理。
-desugar_lambdas fn() -> void {
-    var n: i64 = slice_len(g_lambdas) as i64;
+// ── 闭包捕获分析（M48 / FuncType v2 Stage B2）──────────────────
+// 提升 lambda 之前先算「自由变量 ∩ 外层函数可见变量」= 捕获集：
+//   * 绑定名栈 cap_bnd 按词法作用域压/弹（回退长度即出栈）
+//   * 自由名 cap_free 去重收集，保持首次出现顺序（决定 env 字段顺序）
+// 绑定集宁可**多收**不可少收：多收 → 少捕获 → 后续 T_UNDEFINED_IDENT 响亮报错；
+// 少收 → 多捕获 → 环境字段遮蔽同名局部，属静默错编。
+var cap_bnd: []string;
+var cap_bnd_n: i64;
+var cap_free: []string;
+var cap_free_n: i64;
+
+cap_push fn(nm: string) -> void {
+    if (cap_bnd_n < (slice_len(cap_bnd) as i64)) {
+        slice_set(cap_bnd, cap_bnd_n, nm);
+    } else {
+        append(cap_bnd, nm);
+    }
+    cap_bnd_n = cap_bnd_n + 1;
+}
+
+cap_bound fn(nm: string) -> bool {
     var i: i64 = 0;
-    while (i < n) {
-        var lid: i64 = g_lambdas[i];
-        var ln: Node = nodes[lid];
-        if (ln.kind == "lambda") {
-            var fd: i64 = mk_FuncDecl(ln.sa, false, false, ln.na, -1, ln.lb, ln.lc, -1);
-            var fdn: Node = nodes[fd];
-            fdn.sc = "__lambda__";   // 检查期据此启用「不得捕获外层局部」诊断
-            fdn.ln = ln.ln;
-            fdn.cl = ln.cl;
-            fdn.tv = ln.tv;
-            slice_set(nodes, fd, fdn);
-            append(decl_list, fd);
-            var ln2: Node = nodes[lid];
-            ln2.kind = "ident";      // sa 已是合成函数名
-            ln2.na = -1;
-            ln2.la = -1;
-            ln2.lb = -1;
-            ln2.lc = -1;
-            slice_set(nodes, lid, ln2);
+    while (i < cap_bnd_n) {
+        if (cap_bnd[i] == nm) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+cap_free_add fn(nm: string) -> void {
+    var i: i64 = 0;
+    while (i < cap_free_n) {
+        if (cap_free[i] == nm) { return; }
+        i = i + 1;
+    }
+    if (cap_free_n < (slice_len(cap_free) as i64)) {
+        slice_set(cap_free, cap_free_n, nm);
+    } else {
+        append(cap_free, nm);
+    }
+    cap_free_n = cap_free_n + 1;
+}
+
+// 语句链里直接引入的绑定名（**不**下钻嵌套 lambda 体：那是独立作用域）
+cap_bind_stmts fn(head: i64) -> void {
+    var c: i64 = head;
+    while (c >= 0) {
+        var k: Child = kids[c];
+        var s: Node = nodes[k.val];
+        if (s.kind == "var_decl") { cap_push(s.sa); }
+        if (s.kind == "closure_capture") { cap_push(s.sa); }
+        if (s.kind == "for") {
+            if (s.na >= 0) {
+                var fi: Node = nodes[s.na];
+                if (fi.kind == "var_decl") { cap_push(fi.sa); }
+            }
+            cap_bind_stmts(s.la);
+        }
+        if (s.kind == "for_each") {
+            cap_push(s.sa);
+            if (str_len(s.sb) > 0) { cap_push(s.sb); }
+            cap_bind_stmts(s.la);
+        }
+        if (s.kind == "if") {
+            cap_bind_stmts(s.la);
+            if (s.lb > -2) { cap_bind_stmts(s.lb); }
+        }
+        if (s.kind == "while" || s.kind == "block" || s.kind == "defer") {
+            cap_bind_stmts(s.la);
+        }
+        if (s.kind == "comptime_block") { cap_bind_stmts(s.la); }
+        c = k.next;
+    }
+}
+
+cap_scan_list fn(head: i64) -> void {
+    var c: i64 = head;
+    while (c >= 0) {
+        var k: Child = kids[c];
+        cap_scan(k.val);
+        c = k.next;
+    }
+}
+
+// 通用槽位遍历：Node 的子节点固定落在 na/nb/nc/nd + la/lb/lc，
+// 故无需逐 kind 枚举。类型节点里不会出现 ident 节点，顺带遍历无副作用；
+// 直接调用的被调名存在 call.na 的 ident 上，会被当自由名收集——这正是
+// 「局部变量持有函数值再调用」需要捕获的情形，全局函数名则自然落空。
+cap_scan fn(e: i64) -> void {
+    if (e < 0) { return; }
+    var n: Node = nodes[e];
+    if (n.kind == "ident") {
+        if (cap_bound(n.sa) == false) { cap_free_add(n.sa); }
+        return;
+    }
+    if (n.kind == "lambda") {
+        // 嵌套 lambda 自成作用域，但其未绑定的自由名对本层依然自由
+        var sv: i64 = cap_bnd_n;
+        var p: i64 = n.lb;
+        while (p >= 0) {
+            var pk: Child = kids[p];
+            var pn: Node = nodes[pk.val];
+            cap_push(pn.sa);
+            p = pk.next;
+        }
+        cap_bind_stmts(n.lc);
+        cap_scan_list(n.lc);
+        cap_bnd_n = sv;
+        return;
+    }
+    if (n.kind == "arm") {
+        // match 分支绑定名只在该分支的守卫 / 体内可见
+        var sv2: i64 = cap_bnd_n;
+        if (str_len(n.sa) > 0) { cap_push(n.sa); }
+        cap_scan(n.na);
+        cap_scan(n.nb);
+        cap_scan(n.nc);
+        cap_bnd_n = sv2;
+        return;
+    }
+    cap_scan(n.na);
+    cap_scan(n.nb);
+    cap_scan(n.nc);
+    cap_scan(n.nd);
+    cap_scan_list(n.la);
+    cap_scan_list(n.lb);
+    cap_scan_list(n.lc);
+}
+
+// 外层函数可见变量表：名字 → 类型节点（-1 = 无显式类型，不可捕获）
+var envm_n: []string;
+var envm_t: []i64;
+var envm_c: i64;
+
+envm_add fn(nm: string, tn: i64) -> void {
+    var i: i64 = 0;
+    while (i < envm_c) {
+        if (envm_n[i] == nm) { return; }
+        i = i + 1;
+    }
+    if (envm_c < (slice_len(envm_n) as i64)) {
+        slice_set(envm_n, envm_c, nm);
+        slice_set(envm_t, envm_c, tn);
+    } else {
+        append(envm_n, nm);
+        append(envm_t, tn);
+    }
+    envm_c = envm_c + 1;
+}
+
+envm_find fn(nm: string) -> i64 {
+    var i: i64 = 0;
+    while (i < envm_c) {
+        if (envm_n[i] == nm) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+envm_stmts fn(head: i64) -> void {
+    var c: i64 = head;
+    while (c >= 0) {
+        var k: Child = kids[c];
+        var s: Node = nodes[k.val];
+        if (s.kind == "var_decl") { envm_add(s.sa, s.na); }
+        if (s.kind == "closure_capture") { envm_add(s.sa, s.na); }
+        if (s.kind == "for") {
+            if (s.na >= 0) {
+                var fi: Node = nodes[s.na];
+                if (fi.kind == "var_decl") { envm_add(fi.sa, fi.na); }
+            }
+            envm_stmts(s.la);
+        }
+        if (s.kind == "for_each") {
+            envm_add(s.sa, -1);
+            if (str_len(s.sb) > 0) { envm_add(s.sb, -1); }
+            envm_stmts(s.la);
+        }
+        if (s.kind == "if") {
+            envm_stmts(s.la);
+            if (s.lb > -2) { envm_stmts(s.lb); }
+        }
+        if (s.kind == "while" || s.kind == "block" || s.kind == "defer") {
+            envm_stmts(s.la);
+        }
+        if (s.kind == "comptime_block") { envm_stmts(s.la); }
+        c = k.next;
+    }
+}
+
+// 本层直属 lambda 收集（命中即停，嵌套的留给提升后的合成函数那一轮处理）
+var lam_hit: []i64;
+var lam_hit_n: i64;
+
+lam_hit_add fn(id: i64) -> void {
+    if (lam_hit_n < (slice_len(lam_hit) as i64)) {
+        slice_set(lam_hit, lam_hit_n, id);
+    } else {
+        append(lam_hit, id);
+    }
+    lam_hit_n = lam_hit_n + 1;
+}
+
+lam_find_list fn(head: i64) -> void {
+    var c: i64 = head;
+    while (c >= 0) {
+        var k: Child = kids[c];
+        lam_find(k.val);
+        c = k.next;
+    }
+}
+
+lam_find fn(e: i64) -> void {
+    if (e < 0) { return; }
+    var n: Node = nodes[e];
+    if (n.kind == "lambda") {
+        lam_hit_add(e);
+        return;
+    }
+    lam_find(n.na);
+    lam_find(n.nb);
+    lam_find(n.nc);
+    lam_find(n.nd);
+    lam_find_list(n.la);
+    lam_find_list(n.lb);
+    lam_find_list(n.lc);
+}
+
+var g_env_counter: i64;
+
+// 单个 lambda 提升。envm_* 须由调用方按外层作用域填好。
+//   无捕获 → 节点就地降级为 ident（完全复用 FuncType v1 的具名函数取值路径）
+//   有捕获 → 合成 `__env_N` 结构 + 体首插 closure_capture 语句 + 节点改写为 closure_make
+lift_one_lambda fn(lid: i64) -> void {
+    var ln: Node = nodes[lid];
+    if (ln.kind != "lambda") { return; }
+
+    cap_bnd_n = 0;
+    cap_free_n = 0;
+    var p0: i64 = ln.lb;
+    while (p0 >= 0) {
+        var pk0: Child = kids[p0];
+        var pn0: Node = nodes[pk0.val];
+        cap_push(pn0.sa);
+        p0 = pk0.next;
+    }
+    cap_bind_stmts(ln.lc);
+    cap_scan_list(ln.lc);
+
+    var cn: []string;
+    var ct: []i64;
+    var fi2: i64 = 0;
+    while (fi2 < cap_free_n) {
+        var nm: string = cap_free[fi2];
+        var ei: i64 = envm_find(nm);
+        if (ei >= 0) {
+            if (envm_t[ei] < 0) {
+                fc_err("T_CLOSURE_CAPTURE",
+                    sb_cat3("无法捕获外层绑定 `", nm,
+                        "`：它没有显式类型标注（如 for-each 迭代变量），环境结构无法为其定型。请先赋给带类型标注的局部变量再捕获"), lid);
+            } else {
+                append(cn, nm);
+                append(ct, envm_t[ei]);
+            }
+        }
+        fi2 = fi2 + 1;
+    }
+    var ncap: i64 = slice_len(cn) as i64;
+
+    var fd: i64 = mk_FuncDecl(ln.sa, false, false, ln.na, -1, ln.lb, ln.lc, -1);
+    var fdn: Node = nodes[fd];
+    fdn.sc = "__lambda__";   // 检查期据此把未解析标识符判为「捕获失败」
+    fdn.ln = ln.ln;
+    fdn.cl = ln.cl;
+    fdn.tv = ln.tv;
+
+    if (ncap == 0) {
+        slice_set(nodes, fd, fdn);
+        append(decl_list, fd);
+        var ln3: Node = nodes[lid];
+        ln3.kind = "ident";      // sa 已是合成函数名
+        ln3.na = -1;
+        ln3.la = -1;
+        ln3.lb = -1;
+        ln3.lc = -1;
+        slice_set(nodes, lid, ln3);
+        return;
+    }
+
+    var ename: string = sb_cat2("__env_", i2s(g_env_counter));
+    g_env_counter = g_env_counter + 1;
+
+    var fh: i64 = -1;
+    var ft: i64 = -1;
+    var ch: i64 = -1;
+    var cht: i64 = -1;
+    var ah: i64 = -1;
+    var at: i64 = -1;
+    var ci: i64 = 0;
+    while (ci < ncap) {
+        var fnode: i64 = mk_F(cn[ci], -1, ct[ci], -1, -1);
+        var fnn: Node = nodes[fnode];
+        fnn.ln = ln.ln;
+        fnn.cl = ln.cl;
+        fnn.tv = ln.tv;
+        slice_set(nodes, fnode, fnn);
+        ft = list_push(fh, ft, fnode);
+        if (fh < 0) { fh = ft; }
+
+        var ccn: i64 = mk_closure_capture(cn[ci], ct[ci], ci, -1);
+        var ccnn: Node = nodes[ccn];
+        ccnn.sb = ename;
+        ccnn.ln = ln.ln;
+        ccnn.cl = ln.cl;
+        ccnn.tv = ln.tv;
+        slice_set(nodes, ccn, ccnn);
+        cht = list_push(ch, cht, ccn);
+        if (ch < 0) { ch = cht; }
+
+        var idn: i64 = mk_ident(cn[ci], -1);
+        var idnn: Node = nodes[idn];
+        idnn.ln = ln.ln;
+        idnn.cl = ln.cl;
+        idnn.tv = ln.tv;
+        slice_set(nodes, idn, idnn);
+        at = list_push(ah, at, idn);
+        if (ah < 0) { ah = at; }
+
+        ci = ci + 1;
+    }
+
+    var sd: i64 = mk_StructDecl(ename, "default", "", false, false, -1, fh, -1);
+    var sdn: Node = nodes[sd];
+    sdn.ln = ln.ln;
+    sdn.cl = ln.cl;
+    sdn.tv = ln.tv;
+    slice_set(nodes, sd, sdn);
+    append(decl_list, sd);
+
+    fdn.sb = ename;                          // 发射期据此前置 env 首参
+    fdn.lc = list_concat(ch, ln.lc);         // 体首重建捕获变量
+    slice_set(nodes, fd, fdn);
+    append(decl_list, fd);
+
+    var ln2: Node = nodes[lid];
+    ln2.kind = "closure_make";               // sa 仍是合成函数名
+    ln2.sb = ename;
+    ln2.na = -1;
+    ln2.la = ah;                             // 捕获实参（外层作用域求值）
+    ln2.lb = -1;
+    ln2.lc = -1;
+    slice_set(nodes, lid, ln2);
+}
+
+// 匿名函数字面量提升（M46 起；M48 起支持按值捕获）。
+// 遍历 decl_list（长度每轮重取：提升会追加合成 decl），对每个函数体先建外层
+// 变量表再提升其直属 lambda。嵌套 lambda 由「提升后的合成函数」那一轮自然处理，
+// 此时外层的 closure_capture 已在体首，作用域信息完整。
+desugar_lambdas fn() -> void {
+    var i: i64 = 0;
+    while (i < (slice_len(decl_list) as i64)) {
+        var d: i64 = decl_list[i];
+        var dn: Node = nodes[d];
+        if (dn.kind == "FuncDecl") {
+            if (dn.lc > -2) {
+                envm_c = 0;
+                var p: i64 = dn.lb;
+                while (p >= 0) {
+                    var pk: Child = kids[p];
+                    var pn: Node = nodes[pk.val];
+                    envm_add(pn.sa, pn.na);
+                    p = pk.next;
+                }
+                envm_stmts(dn.lc);
+                lam_hit_n = 0;
+                lam_find_list(dn.lc);
+                var li: i64 = 0;
+                while (li < lam_hit_n) {
+                    lift_one_lambda(lam_hit[li]);
+                    li = li + 1;
+                }
+            }
+        }
+        // 全局初始化器里的字面量：无外层局部，捕获集必空
+        if (dn.kind == "GlobalVarDecl" || dn.kind == "GlobalConstDecl") {
+            if (dn.nb >= 0) {
+                envm_c = 0;
+                lam_hit_n = 0;
+                lam_find(dn.nb);
+                var lj: i64 = 0;
+                while (lj < lam_hit_n) {
+                    lift_one_lambda(lam_hit[lj]);
+                    lj = lj + 1;
+                }
+            }
         }
         i = i + 1;
     }
@@ -7702,6 +8066,15 @@ infer_expr fn(e: i64) -> i64 {
     if (n.kind == "typeinfo") {
         return ti_mk("TypeInfo");
     }
+    // 闭包构造点（M48）：值类型 = 合成函数的函数类型（env 首参对用户不可见）
+    if (n.kind == "closure_make") {
+        var cmi: i64 = sym_lookup(global_scope, n.sa);
+        if (cmi >= 0) {
+            var cms: Sym = syms[cmi];
+            return cms.ti;
+        }
+        return ti_mk("Unknown");
+    }
     if (n.kind == "ident") {
         var si: i64 = sym_lookup(cur_scope, n.sa);
         if (si >= 0) {
@@ -7721,10 +8094,11 @@ infer_expr fn(e: i64) -> i64 {
             lcap.bb = true;
             slice_set(nodes, e, lcap);
             if (g_in_lambda) {
-                // 匿名函数体已脱离原词法环境，未解析标识符即试图捕获外层局部。
-                fc_err("T_CLOSURE_CAPTURE",
-                    sb_cat3("匿名函数不能捕获外层局部变量 `", n.sa,
-                        "`：函数字面量会被提升为顶层函数，外层局部不在其作用域内。请改为形参传入，或提升为全局变量/常量"), e);
+                // 合成函数体里的未解析名：捕获分析已在提升期扫过外层作用域，
+                // 走到这里说明外层同样没有该名字（拼写错 / 声明晚于字面量）。
+                fc_err("T_UNDEFINED_IDENT",
+                    sb_cat3("匿名函数体内未定义的标识符 `", n.sa,
+                        "`：外层作用域也没有该名字（按值捕获只认字面量之前已声明的局部/参数），请检查拼写或调整声明位置"), e);
             } else {
                 fc_err("T_UNDEFINED_IDENT",
                     sb_cat3("未定义的标识符 `", n.sa,
@@ -7919,6 +8293,13 @@ infer_expr fn(e: i64) -> i64 {
             }
             return builtin_ret(fname);
         }
+        // callee 是任意表达式（结构体字段 / 数组元素 / 调用结果…）：若其类型是函数类型，
+        // 与 ident 路径同样校验实参并返回签名的返回类型。
+        var xcti: i64 = infer_expr(n.na);
+        if (tip_kind(xcti) == "Func") {
+            check_indirect_call(e, xcti);
+            return tif_ret[xcti];
+        }
         return ti_mk("Unknown");
     }
     if (n.kind == "member") {
@@ -8068,6 +8449,13 @@ stmt_returns fn(s: i64) -> bool {
 
 check_stmt fn(s: i64) -> void {
     var n: Node = nodes[s];
+    // 闭包体首的捕获变量重建（M48）：类型来自捕获点的原始声明，直接定义同名局部
+    if (n.kind == "closure_capture") {
+        if (n.na >= 0) {
+            sym_define(cur_scope, n.sa, "var", resolve_ti(n.na), -1);
+        }
+        return;
+    }
     if (n.kind == "var_decl") {
         var vt: i64 = -1;
         if (n.na >= 0) {
@@ -10551,6 +10939,14 @@ expr_type_desc fn(e: i64) -> i64 {
     if (n.kind == "typeinfo") {
         return td_named_mk("typeinfo", n.sa);
     }
+    // 闭包构造点（M48）：值类型 = 合成函数的函数类型（build_type_map 已按裸名登记）
+    if (n.kind == "closure_make") {
+        var cmtd: i64 = tm_get(n.sa);
+        if (cmtd >= 0) {
+            return cmtd;
+        }
+        return td_mk("unknown");
+    }
     if (n.kind == "ident") {
         var etd_idn: string = mb_sub(n.sa);
         if (em_in_fn) {
@@ -10661,6 +11057,11 @@ expr_type_desc fn(e: i64) -> i64 {
             }
             return td_mk("unknown");
         }
+        // callee 是任意表达式（结构体字段 / 数组元素 / 调用结果…）：按其静态类型取返回类型
+        var xftd: i64 = expr_type_desc(n.na);
+        if (td_is_func(xftd)) {
+            return tdf_ret[xftd];
+        }
         return td_mk("unknown");
     }
     if (n.kind == "binary") {
@@ -10695,6 +11096,12 @@ collect_local_types fn(head: i64) -> void {
         var k: Child = kids[c];
         var n: Node = nodes[k.val];
         if (n.kind == "var_decl") {
+            if (n.na >= 0) {
+                fs_set(em_cur_fn, n.sa, resolve_type_desc(n.na));
+            }
+        }
+        // 闭包体首重建的捕获变量（M48）：与普通局部同权，须登记类型
+        if (n.kind == "closure_capture") {
             if (n.na >= 0) {
                 fs_set(em_cur_fn, n.sa, resolve_type_desc(n.na));
             }
@@ -10944,6 +11351,7 @@ c_map_lhs_ptr fn(nd: i64) -> string {
 // 建临时 TMap* 变量并逐项 put，返回该变量名。pad 为缩进（表达式场景通常为 ""）。
 var g_map_lit_cnt: i64 = 0;
 var g_match_cnt: i64 = 0;      // match 表达式序号（结果/被匹配值临时量命名）
+var g_clos_cnt: i64 = 0;       // 闭包构造序号（环境/闭包临时量命名，M48）
 var g_stmt_pad: string = "";   // 当前语句缩进（map 字面量作表达式时对齐用）
 var g_defer: [1024]i64;         // defer 延迟栈（节点索引），函数级、LIFO 于 return/函数尾运行
 var g_defer_n: i64 = 0;         // g_defer 栈顶计数
@@ -11108,6 +11516,30 @@ emit_expr fn(e: i64) -> string {
             }
         }
         return idn;
+    }
+    // 闭包构造（M48）：堆分配环境 → 按值拷入捕获量 → 堆分配 TClosure → 返回其指针。
+    // 借 map 字面量同款「前置语句 + 临时量」机制，故可出现在任意表达式位置。
+    if (n.kind == "closure_make") {
+        g_clos_cnt = g_clos_cnt + 1;
+        var cm_pad: string = g_stmt_pad;
+        var cm_e: string = sb_cat2("_tcloe", i2s(g_clos_cnt));
+        var cm_c: string = sb_cat2("_tclo", i2s(g_clos_cnt));
+        var cm_ep: string = sb_cat2(n.sb, "*");
+        spush(sb_cat6(cm_pad, cm_ep, " ", cm_e, sb_cat4(" = (", cm_ep, ")t_alloc(sizeof(", n.sb), "));"));
+        var cm_ch: i64 = n.la;
+        while (cm_ch >= 0) {
+            var cm_k: Child = kids[cm_ch];
+            var cm_f: Node = nodes[cm_k.val];
+            var cm_v: string = emit_expr(cm_k.val);
+            spush(sb_cat6(cm_pad, cm_e, "->", cm_f.sa, " = ", sb_cat2(cm_v, ";")));
+            cm_ch = cm_k.next;
+        }
+        spush(sb_cat6(cm_pad, "TClosure* ", cm_c, " = (TClosure*)t_alloc(sizeof(TClosure));", "", ""));
+        spush(sb_cat6(cm_pad, cm_c, "->fn = (void*)", n.sa, ";", ""));
+        spush(sb_cat6(cm_pad, cm_c, "->env = (void*)", cm_e, ";", ""));
+        fs_set(em_cur_fn, cm_c, expr_type_desc(e));
+        g_stmt_pad = cm_pad;
+        return cm_c;
     }
     if (n.kind == "map_lit") {
         g_map_lit_cnt = g_map_lit_cnt + 1;
@@ -11325,7 +11757,27 @@ emit_expr fn(e: i64) -> string {
             sb_append_char(sb, 41);
             return sb_to_str(sb);
         }
-        // callee 非 ident
+        // callee 非 ident（结构体字段 / 数组元素 / 调用结果…）。若其静态类型是函数类型，
+        // 说明拿到的是 TClosure*，须与 ident 路径同样解包。callee 表达式**只能求值一次**
+        // （可能是带副作用的调用），故借 clang 语句表达式落到临时量再解包。
+        var xctd: i64 = expr_type_desc(n.na);
+        if (td_is_func(xctd)) {
+            var xcb: StringBuilder = sb_new();
+            sb_append_str(xcb, "({ TClosure* __ic = ");
+            sb_append_str(xcb, emit_expr(n.na));
+            sb_append_str(xcb, "; ((");
+            sb_append_str(xcb, td_func_c_fnptr(xctd));
+            sb_append_str(xcb, ")(__ic->fn))(__ic->env");
+            var xc: i64 = n.la;
+            while (xc >= 0) {
+                var xk: Child = kids[xc];
+                sb_append_str(xcb, ", ");
+                sb_append_str(xcb, emit_expr(xk.val));
+                xc = xk.next;
+            }
+            sb_append_str(xcb, "); })");
+            return sb_to_str(xcb);
+        }
         var sb2: StringBuilder = sb_new();
         sb_append_str(sb2, emit_expr(n.na));
         sb_append_char(sb2, 40);
@@ -11459,6 +11911,15 @@ emit_stmt fn(sid: i64, indent: i64) -> void {
 
     if (n.kind == "expr") {
         spush(sb_cat3(pad, emit_expr(n.na), ";"));
+        return;
+    }
+    // 闭包体首重建捕获变量（M48）：从 env 结构按值拷回同名局部
+    if (n.kind == "closure_capture") {
+        if (n.na >= 0) {
+            var cctd: i64 = resolve_type_desc(n.na);
+            spush(sb_cat6(pad, desc_to_c(cctd), " ", n.sa,
+                sb_cat4(" = ((", n.sb, "*)__env)->", n.sa), ";"));
+        }
         return;
     }
     if (n.kind == "var_decl") {
@@ -12448,6 +12909,11 @@ emit_func_decl fn(d: i64) -> void {
 
     var psb: StringBuilder = sb_new();
     var cnt: i64 = 0;
+    // 带捕获的合成闭包函数（M48）：env 指针为首参，与 TClosure ABI 一致
+    if (str_len(n.sb) > 0) {
+        sb_append_str(psb, "void* __env");
+        cnt = 1;
+    }
     var c: i64 = n.lb;
     while (c >= 0) {
         var k: Child = kids[c];
@@ -13960,6 +14426,43 @@ emit_lle fn(e: i64) -> string {
         }
         return "0";
     }
+    // 闭包构造（M48）：堆分配环境 → 按值拷入捕获量 → 堆分配 TClosure → 返回其指针。
+    // 函数值在 LLVM 里就是 ptr，故此处直接把 %TClosure* 当值返回。
+    if (n.kind == "closure_make") {
+        var cmety: string = sb_cat2("%st.", n.sb);
+        var cmep: string = ll_tmp();
+        llfb(sb_cat5("  ", cmep, " = call ptr @t_alloc(i64 ", ll_sizeof(cmety), ")"));
+        var cmc: i64 = n.la;
+        while (cmc >= 0) {
+            var cmk: Child = kids[cmc];
+            var cmf: Node = nodes[cmk.val];
+            var cmfi: i64 = llsf_find(n.sb, cmf.sa);
+            if (cmfi >= 0) {
+                var cmfp: string = ll_tmp();
+                llfb(sb_cat6(sb_cat4("  ", cmfp, " = getelementptr inbounds ", cmety),
+                    ", ptr ", cmep, ", i32 0, i32 ", i2s(llsf_idx[cmfi]), ""));
+                var cmftd: i64 = llsf_td[cmfi];
+                var cmfty: string = ll_td(cmftd);
+                var cmfv: string = emit_lle(cmk.val);
+                if (ll_isagg(cmftd)) {
+                    ll_copy(cmfty, cmfv, cmfp);
+                } else {
+                    var cmcv: string = ll_cast_v(cmfv, ll_etd(cmk.val), cmftd);
+                    llfb(sb_cat6("  store ", cmfty, " ", cmcv, ", ptr ", cmfp));
+                }
+            }
+            cmc = cmk.next;
+        }
+        var cmcp: string = ll_tmp();
+        llfb(sb_cat5("  ", cmcp, " = call ptr @t_alloc(i64 ", ll_sizeof("%TClosure"), ")"));
+        var cmg0: string = ll_tmp();
+        llfb(sb_cat6("  ", cmg0, " = getelementptr inbounds %TClosure, ptr ", cmcp, ", i32 0, i32 0", ""));
+        llfb(sb_cat6("  store ptr @t.", n.sa, ", ptr ", cmg0, "", ""));
+        var cmg1: string = ll_tmp();
+        llfb(sb_cat6("  ", cmg1, " = getelementptr inbounds %TClosure, ptr ", cmcp, ", i32 0, i32 1", ""));
+        llfb(sb_cat4("  store ptr ", cmep, ", ptr ", cmg1));
+        return cmcp;
+    }
     if (n.kind == "struct_lit") {
         var sty: string = sb_cat2("%st.", n.sa);
         var s: string = ll_scratch(sty);
@@ -14395,10 +14898,76 @@ ll_map_get fn(mn: i64, kn: i64) -> string {
     return out;
 }
 
+// 闭包解包间接调用（FuncType v2 / M47）：函数值是指向 %TClosure { ptr fn; ptr env }
+// 的指针；被调函数统一为 `Ret (ptr env, Args...)`，env 作首参。
+// callee 可以是任意表达式（ident / 结构体字段 / 数组元素 / 调用结果…），
+// 这里只求值一次再解包，避免重复副作用。
+ll_call_indirect fn(e: i64, iftd: i64) -> string {
+    var n: Node = nodes[e];
+    var ae: []i64;
+    var c: i64 = n.la;
+    while (c >= 0) {
+        var k: Child = kids[c];
+        append(ae, k.val);
+        c = k.next;
+    }
+    var argc: i64 = slice_len(ae) as i64;
+    var iclp: string = emit_lle(n.na);
+    var ifnp: string = ll_tmp();
+    llfb(sb_cat6("  ", ifnp, " = getelementptr inbounds %TClosure, ptr ", iclp, ", i32 0, i32 0", ""));
+    var fpv: string = ll_load("ptr", ifnp);
+    var ienp: string = ll_tmp();
+    llfb(sb_cat6("  ", ienp, " = getelementptr inbounds %TClosure, ptr ", iclp, ", i32 0, i32 1", ""));
+    var ienv: string = ll_load("ptr", ienp);
+    var icsb: StringBuilder = sb_new();
+    sb_append_str(icsb, "ptr ");
+    sb_append_str(icsb, ienv);
+    var ii: i64 = 0;
+    while (ii < argc) {
+        sb_append_str(icsb, ", ");
+        var iptd: i64 = -1;
+        if (ii < tdf_pcount[iftd]) {
+            iptd = tdf_params[tdf_pstart[iftd] + ii];
+        }
+        var iaty: string = ll_td(iptd);
+        var iav: string = emit_lle(ae[ii]);
+        if (iptd >= 0 && ll_isagg(iptd)) {
+            iav = ll_load(iaty, iav);
+        } else {
+            iav = ll_cast_v(iav, ll_etd(ae[ii]), iptd);
+        }
+        sb_append_str(icsb, iaty);
+        sb_append_str(icsb, " ");
+        sb_append_str(icsb, iav);
+        ii = ii + 1;
+    }
+    var irtd: i64 = tdf_ret[iftd];
+    var irty: string = ll_td(irtd);
+    var iargs: string = sb_to_str(icsb);
+    if (irty == "void") {
+        llfb(sb_cat5("  call void ", fpv, "(", iargs, ")"));
+        return "0";
+    }
+    var itmp: string = ll_tmp();
+    llfb(sb_cat6(sb_cat3("  ", itmp, " = call "), irty, " ", fpv, sb_cat3("(", iargs, ")"), ""));
+    if (ll_isagg(irtd)) {
+        var isc: string = ll_scratch(irty);
+        llfb(sb_cat6("  store ", irty, " ", itmp, ", ptr ", isc));
+        return isc;
+    }
+    return itmp;
+}
+
 ll_call fn(e: i64) -> string {
     var n: Node = nodes[e];
     var cal: Node = nodes[n.na];
     if (cal.kind != "ident") {
+        // callee 是任意表达式（结构体字段 / 数组元素 / 调用结果…）：只要它的静态类型
+        // 是函数类型，就按闭包解包间接调用；否则才是真的不支持。
+        var xftd: i64 = ll_etd(n.na);
+        if (td_is_func(xftd)) {
+            return ll_call_indirect(e, xftd);
+        }
         llfb("  ; UNSUPPORTED call target");
         return "0";
     }
@@ -14847,52 +15416,7 @@ ll_call fn(e: i64) -> string {
         }
     }
     if (td_is_func(iftd)) {
-        // 闭包解包（FuncType v2 / M47）：函数值是指向 %TClosure { ptr fn; ptr env }
-        // 的指针；被调函数统一为 `Ret (ptr env, Args...)`，env 作首参。
-        var iclp: string = emit_lle(n.na);
-        var ifnp: string = ll_tmp();
-        llfb(sb_cat6("  ", ifnp, " = getelementptr inbounds %TClosure, ptr ", iclp, ", i32 0, i32 0", ""));
-        var fpv: string = ll_load("ptr", ifnp);
-        var ienp: string = ll_tmp();
-        llfb(sb_cat6("  ", ienp, " = getelementptr inbounds %TClosure, ptr ", iclp, ", i32 0, i32 1", ""));
-        var ienv: string = ll_load("ptr", ienp);
-        var icsb: StringBuilder = sb_new();
-        sb_append_str(icsb, "ptr ");
-        sb_append_str(icsb, ienv);
-        var ii: i64 = 0;
-        while (ii < argc) {
-            sb_append_str(icsb, ", ");
-            var iptd: i64 = -1;
-            if (ii < tdf_pcount[iftd]) {
-                iptd = tdf_params[tdf_pstart[iftd] + ii];
-            }
-            var iaty: string = ll_td(iptd);
-            var iav: string = emit_lle(ae[ii]);
-            if (iptd >= 0 && ll_isagg(iptd)) {
-                iav = ll_load(iaty, iav);
-            } else {
-                iav = ll_cast_v(iav, ll_etd(ae[ii]), iptd);
-            }
-            sb_append_str(icsb, iaty);
-            sb_append_str(icsb, " ");
-            sb_append_str(icsb, iav);
-            ii = ii + 1;
-        }
-        var irtd: i64 = tdf_ret[iftd];
-        var irty: string = ll_td(irtd);
-        var iargs: string = sb_to_str(icsb);
-        if (irty == "void") {
-            llfb(sb_cat5("  call void ", fpv, "(", iargs, ")"));
-            return "0";
-        }
-        var itmp: string = ll_tmp();
-        llfb(sb_cat6(sb_cat3("  ", itmp, " = call "), irty, " ", fpv, sb_cat3("(", iargs, ")"), ""));
-        if (ll_isagg(irtd)) {
-            var isc: string = ll_scratch(irty);
-            llfb(sb_cat6("  store ", irty, " ", itmp, ", ptr ", isc));
-            return isc;
-        }
-        return itmp;
+        return ll_call_indirect(e, iftd);
     }
     // 用户函数：模块内按值传递聚合
     var fi: i64 = llfn_find(cn);
@@ -15159,6 +15683,23 @@ emit_llstmt fn(sid: i64) -> void {
     if (n.kind == "expr") {
         var xx: string = emit_lle(n.na);
         xx = "";
+        return;
+    }
+    // 闭包体首（M48）：从环境结构按值拷回捕获变量，成为普通局部
+    if (n.kind == "closure_capture") {
+        if (n.na >= 0) {
+            var cctd: i64 = resolve_type_desc(n.na);
+            var ccty: string = ll_td(cctd);
+            var ccvn: string = sb_cat2("%v.", n.sa);
+            if (lla_has(n.sa) == false) {
+                append(lla_n, n.sa);
+                llfa(sb_cat4("  ", ccvn, " = alloca ", ccty));
+            }
+            var ccgp: string = ll_tmp();
+            llfb(sb_cat3(sb_cat4("  ", ccgp, " = getelementptr inbounds %st.", n.sb),
+                ", ptr %__env, i32 0, i32 ", i2s(n.ia)));
+            ll_copy(ccty, ccgp, ccvn);
+        }
         return;
     }
     if (n.kind == "var_decl") {
@@ -15556,6 +16097,12 @@ emit_llfunc fn(d: i64) -> void {
     // 签名
     var psb: StringBuilder = sb_new();
     var cnt: i64 = 0;
+    // 闭包合成函数（M48）：sb 记环境结构名 → 前置 env 首参（与 TClosure ABI 一致）。
+    // %__env 直接当 ptr 用，无需 alloca；closure_capture 语句会从中拷回捕获量。
+    if (str_len(n.sb) > 0) {
+        sb_append_str(psb, "ptr %__env");
+        cnt = 1;
+    }
     var c: i64 = n.lb;
     while (c >= 0) {
         var k: Child = kids[c];
@@ -15762,6 +16309,8 @@ emit_lldeclares fn() -> void {
     llph("declare void @tll_args(ptr)");
     llph("declare void @tll_exit(i32)");
     llph("declare i32 @tll_system(ptr)");
+    // 闭包环境 / TClosure 记录的堆分配（M48）
+    llph("declare ptr @t_alloc(i64)");
     llph("declare void @t_runtime_init(i32, ptr)");
     llph("declare ptr @t_arena_new()");
     llph("declare void @t_runtime_set_arena(ptr)");
