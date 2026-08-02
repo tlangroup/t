@@ -16,8 +16,10 @@
 - 流水线：gen_ebnf→build_runtime→tc/tote 自举。`out/dbg/tc.exe` 运行时锁 exe，重建须 `--output <临时名>` 再 `cp`。
 
 ## 验证七步（门禁）
-1. ~~md5 src==gen~~（废）2. difftest 自举代际对拍 `--ref genB --cand genD` 27/27；tc0 外部对拍 lex/check 9/9 3. conformance 48/48 4. 三阶段自举 IR 逐字节 b==c==d 5. shadow_check+catn_check 6. `; UNSUPPORTED` 计数 0 7. run_examples 双后端 14/14（dbg+rls）。tote 冒烟单独验。
+1. ~~md5 src==gen~~（废）2. difftest 自举代际对拍 `--ref genB --cand genD` 27/27；tc0 外部对拍 lex/check 9/9 3. conformance 55/55 4. 四代自举 IR 逐字节 g2==g3==g4 5. shadow_check+catn_check 6. `; UNSUPPORTED` 计数 0 7. run_examples 双后端（dbg+rls）。tote 冒烟单独验。**日常直接跑 `node tools/gate.mjs L2`（13 步，约 170s）。**
 - **必须串行跑**（并行争抢 `out/` 产物→假失败）。
+- **gate L2 超过 Bash 默认 120s 超时** → 必须 `> build/gate_l2.log 2>&1` 再读，并把 timeout 提到 580000。**别放后台**（历史上后台 + spawn 管道组合出过静默挂起）。
+- **工具参数拼错会静默退回默认值（假绿/假红源）**：`conformance.mjs` 的参数是 `--compiler` 不是 `--tc`；写错曾导致「以为新编译器失败、实为测了旧 tc.exe」。现 conformance/difftest/run_examples/ir_snapshot/gate 均已加未知参数 `exit 2`。
 - **UNSUPPORTED 口径**：`grep -cE '^[[:space:]]*; UNSUPPORTED'`；裸 grep 会命中 6 处编译器自身诊断字符串（假阳性）。
 - **管道 SIGPIPE 假象**：`node tools/x.mjs | tail` 可能 exit 1 吞掉总结行 → 长输出重定向到文件再 grep。
 - **改语法后必须核对正则型门禁工具的匹配数**（shadow_check 等）：正则失配会零样本打印 OK → 假绿。

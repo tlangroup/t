@@ -55,14 +55,39 @@ if (!existsSync(BASE_TC)) {
 }
 
 // ── 执行辅助 ─────────────────────────────────────────────────────
+// 单步硬超时（毫秒）。最慢的一步是 run_examples 双后端（约 45s），留足余量。
+const STEP_TIMEOUT_MS = Number(process.env.GATE_STEP_TIMEOUT_MS || 8 * 60 * 1000);
+// 'exit' 之后再等 stdio 关闭的宽限期。子进程可能 spawn 了继承管道的孙进程
+// （clang / lld），孙进程若不退出，'close' 永远不来 —— 只等 'close' 会让整个
+// 门禁静默挂起（实测卡死 9 分钟无输出）。故以 'exit' 为准、'close' 仅用于收尾。
+const DRAIN_MS = 3000;
+
 function run(cmd, args) {
     return new Promise((res) => {
         const p = spawn(cmd, args, { cwd: ROOT, windowsHide: true });
         let out = "";
+        let done = false;
+        let drainTimer = null;
+        const finish = (code, extra) => {
+            if (done) return;
+            done = true;
+            if (drainTimer) clearTimeout(drainTimer);
+            clearTimeout(hardTimer);
+            res({ code, out: extra ? out + extra : out });
+        };
+        const hardTimer = setTimeout(() => {
+            try { p.kill("SIGKILL"); } catch { /* 已退出 */ }
+            finish(-1, `\n[gate] 步骤超时 ${STEP_TIMEOUT_MS / 1000}s，已强制终止\n`);
+        }, STEP_TIMEOUT_MS);
+
         p.stdout.on("data", (d) => { out += d; });
         p.stderr.on("data", (d) => { out += d; });
-        p.on("close", (code) => res({ code: code ?? -1, out }));
-        p.on("error", (e) => res({ code: -1, out: String(e) }));
+        // 进程本身已退出即可判定结果；再给 stdio 一点时间排空，超时就直接收工。
+        p.on("exit", (code) => {
+            drainTimer = setTimeout(() => finish(code ?? -1), DRAIN_MS);
+        });
+        p.on("close", (code) => finish(code ?? -1));
+        p.on("error", (e) => finish(-1, String(e)));
     });
 }
 const node = (script, ...args) => run(NODE, [join("tools", script), ...args]);

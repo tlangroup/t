@@ -7286,6 +7286,24 @@ tip_name fn(i: i64) -> string {
     return t.name;
 }
 
+// 条件位置（if / while / for 的条件，match 的 `when` 守卫）只接受 bool。
+// Unknown 一律放行：该表达式多半已有诊断，再报一次只会级联噪声。
+//
+// ⚠ 判据不可写成 `tip_kind(i) == "Scalar" && tip_name(i) != "bool"`。
+// 那样只拦住标量，String / Slice / Struct / Enum / Func 全部静默漏过 ——
+// `if ("hello")`、`while (some_slice)` 曾零诊断通过（2026-08-02 实测）。
+// 正确的形状是白名单：唯有 Scalar/bool 合法，其余皆拒。
+is_cond_bool fn(i: i64) -> bool {
+    var ck: string = tip_kind(i);
+    if (ck == "Unknown") {
+        return true;
+    }
+    if (ck == "Scalar" && tip_name(i) == "bool") {
+        return true;
+    }
+    return false;
+}
+
 is_int_ti fn(i: i64) -> bool {
     var t: TI = tis[i];
     if (t.kind != "Scalar") {
@@ -8032,6 +8050,145 @@ builtin_ret fn(name: string) -> i64 {
 }
 // <<< GEN:builtins <<<
 
+// ── match 穷尽性：enum case 覆盖分析 ────────────────────────────
+// 裁定（2026-08-02）：scrutinee 为 enum 且**每个**成员都被一条无守卫的
+// `X.Case` 臂覆盖时，该 match 视为穷尽，`_` 通配变为可选。
+// 这样给 enum 新增成员会让所有旧 match 立刻报错、强制回访 —— 正是穷尽性检查的价值所在；
+// 若一律要求 `_`，新成员会静默落进兜底分支，漏处理无从察觉。
+
+// C2 模式消歧（PascalCase 约定）：模式位置的裸标识符，首字母大写即 CaseName，
+// 小写才是绑定名。没有这条约定，`Red => ...` 会被当成不可反驳绑定 ——
+// 它匹配一切、让后续所有臂不可达，且完全静默，是最难察觉的一类错。
+starts_upper fn(name: string) -> bool {
+    if (str_len(name) == 0) {
+        return false;
+    }
+    var c0: u8 = name[0];
+    return c0 >= 65 && c0 <= 90;
+}
+
+// scrutinee 所属 enum 是否含有名为 cname 的成员。
+enum_has_case fn(scr: i64, cname: string) -> bool {
+    if (tip_kind(scr) != "Enum") {
+        return false;
+    }
+    var hsi: i64 = sym_lookup(global_scope, tip_name(scr));
+    if (hsi < 0) {
+        return false;
+    }
+    var hsym: Sym = syms[hsi];
+    if (hsym.decl < 0) {
+        return false;
+    }
+    var hd: Node = nodes[hsym.decl];
+    if (hd.kind != "EnumDecl") {
+        return false;
+    }
+    var hc: i64 = hd.lb;
+    while (hc >= 0) {
+        var hk: Child = kids[hc];
+        var hv: Node = nodes[hk.val];
+        if (hv.sa == cname) {
+            return true;
+        }
+        hc = hk.next;
+    }
+    return false;
+}
+
+// 某个 case 名是否被 match 的某条「无守卫」臂以 `X.Case` 形式覆盖。
+// 带守卫的臂不算覆盖：守卫可能为假，控制流仍会漏出。
+// 只比对 member 模式的字段名而不校验限定符 —— scrutinee 已限定为该 enum，
+// 若写成别的 enum 的成员，会先被上面的 arm 模式类型检查拦下。
+match_covers_case fn(e: i64, cname: string) -> bool {
+    var mn: Node = nodes[e];
+    var mc: i64 = mn.la;
+    while (mc >= 0) {
+        var mk: Child = kids[mc];
+        var arm: Node = nodes[mk.val];
+        if (arm.nb < 0 && arm.na >= 0) {
+            var pat: Node = nodes[arm.na];
+            if (pat.kind == "member" && pat.sa == cname) {
+                return true;
+            }
+        }
+        mc = mk.next;
+    }
+    return false;
+}
+
+// scrutinee 类型 scr 若是 enum，判断 match 是否覆盖了它的全部成员。
+// 非 enum、查不到声明、或成员表为空 → 一律返回 false（退回「需要 `_`」的旧判据）。
+enum_all_cases_covered fn(e: i64, scr: i64) -> bool {
+    if (tip_kind(scr) != "Enum") {
+        return false;
+    }
+    var esi: i64 = sym_lookup(global_scope, tip_name(scr));
+    if (esi < 0) {
+        return false;
+    }
+    var esym: Sym = syms[esi];
+    if (esym.decl < 0) {
+        return false;
+    }
+    var ednode: Node = nodes[esym.decl];
+    if (ednode.kind != "EnumDecl") {
+        return false;
+    }
+    if (ednode.lb < 0) {
+        return false;
+    }
+    var covered: bool = true;
+    var vc: i64 = ednode.lb;
+    while (vc >= 0) {
+        var vk: Child = kids[vc];
+        var vnode: Node = nodes[vk.val];
+        if (match_covers_case(e, vnode.sa) == false) {
+            covered = false;
+        }
+        vc = vk.next;
+    }
+    return covered;
+}
+
+// 未被覆盖的 enum 成员，形如 `Color.Green, Color.Blue`；非 enum 或已全覆盖时返回空串。
+// 供 T_MATCH_NONEXHAUSTIVE 指名道姓地报缺口，而不是只说「加个 `_`」。
+enum_missing_cases fn(e: i64, scr: i64) -> string {
+    if (tip_kind(scr) != "Enum") {
+        return "";
+    }
+    var esi: i64 = sym_lookup(global_scope, tip_name(scr));
+    if (esi < 0) {
+        return "";
+    }
+    var esym: Sym = syms[esi];
+    if (esym.decl < 0) {
+        return "";
+    }
+    var ednode: Node = nodes[esym.decl];
+    if (ednode.kind != "EnumDecl") {
+        return "";
+    }
+    var sb: StringBuilder = sb_new();
+    var cnt: i64 = 0;
+    var vc: i64 = ednode.lb;
+    while (vc >= 0) {
+        var vk: Child = kids[vc];
+        var vnode: Node = nodes[vk.val];
+        if (match_covers_case(e, vnode.sa) == false) {
+            if (cnt > 0) {
+                sb_append_str(sb, ", ");
+            }
+            sb_append_str(sb, tip_name(scr));
+            sb_append_str(sb, ".");
+            sb_append_str(sb, vnode.sa);
+            cnt = cnt + 1;
+        }
+        vc = vk.next;
+    }
+    return sb_to_str(sb);
+}
+
 // ── 表达式类型推断 inferExprType（复刻 checker.ts:479）────────
 
 infer_expr fn(e: i64) -> i64 {
@@ -8122,6 +8279,46 @@ infer_expr fn(e: i64) -> i64 {
         while (m_c >= 0) {
             var m_k: Child = kids[m_c];
             var m_an: Node = nodes[m_k.val];
+            // C2 模式消歧：裸标识符首字母大写 → CaseName，改写为等价的 member 模式
+            // （`Case` ⇒ `Enum.Case`），让 checker 与 C/LLVM 双后端复用既有 member 路径。
+            // 改写后 sa 清空，故对 infer_expr 的重入天然幂等。
+            if (str_len(m_an.sa) > 0 && m_an.na < 0 && m_an.ba == false && starts_upper(m_an.sa)) {
+                if (enum_has_case(m_scr, m_an.sa)) {
+                    var cs_base: i64 = mk_ident(tip_name(m_scr), -1);
+                    var cs_bn: Node = nodes[cs_base];
+                    cs_bn.ln = m_an.ln;
+                    cs_bn.cl = m_an.cl;
+                    cs_bn.tv = m_an.tv;
+                    slice_set(nodes, cs_base, cs_bn);
+                    var cs_mem: i64 = mk_member(m_an.sa, cs_base, -1);
+                    var cs_mn: Node = nodes[cs_mem];
+                    cs_mn.ln = m_an.ln;
+                    cs_mn.cl = m_an.cl;
+                    cs_mn.tv = m_an.tv;
+                    slice_set(nodes, cs_mem, cs_mn);
+                    m_an.na = cs_mem;
+                    m_an.sa = "";
+                    slice_set(nodes, m_k.val, m_an);
+                } else {
+                    if (m_rep) {
+                        var cs_l: i64 = n_line(m_k.val);
+                        var cs_c: i64 = n_col(m_k.val);
+                        var cs_msg: string = sb_cat3(
+                            "pattern `", m_an.sa,
+                            "` starts with an uppercase letter, so it is read as a case name, not a binding");
+                        if (tip_kind(m_scr) == "Enum") {
+                            cs_msg = sb_cat5("unknown case `", m_an.sa, "` for enum ", tip_name(m_scr),
+                                " — check the spelling, or use a lowercase name to bind instead");
+                        }
+                        var cs_di: i64 = diag_new("T_MATCH_UNKNOWN_CASE", "error", cs_msg,
+                            n_file(m_k.val), cs_l, cs_c, cs_l, cs_c + (str_len(m_an.sa) as i64));
+                        var cs_fx: i64 = fix_one("use a lowercase binding name",
+                            n_file(m_k.val), cs_l, cs_c, cs_l, cs_c + (str_len(m_an.sa) as i64),
+                            "<lowercase_name>");
+                        diag_set_fs(cs_di, cs_fx);
+                    }
+                }
+            }
             var m_prev: i64 = cur_scope;
             cur_scope = scope_new(m_prev);
             if (str_len(m_an.sa) > 0) {
@@ -8137,7 +8334,7 @@ infer_expr fn(e: i64) -> i64 {
             }
             if (m_an.nb >= 0) {
                 var m_gt: i64 = infer_expr(m_an.nb);
-                if (m_rep && tip_kind(m_gt) == "Scalar" && tip_name(m_gt) != "bool") {
+                if (m_rep && is_cond_bool(m_gt) == false) {
                     var m_gl: i64 = n_line(m_an.nb);
                     var m_gc: i64 = n_col(m_an.nb);
                     diag_new("T_STMT_IMPLICIT_BOOL", "error",
@@ -8165,11 +8362,20 @@ infer_expr fn(e: i64) -> i64 {
             }
             m_c = m_k.next;
         }
+        // enum scrutinee 的全 case 覆盖同样构成穷尽，此时 `_` 不再必需。
+        if (m_irref == false && enum_all_cases_covered(e, m_scr)) {
+            m_irref = true;
+        }
         if (m_rep && m_irref == false) {
             var m_l: i64 = n_line(e);
             var m_col: i64 = n_col(e);
-            var m_di: i64 = diag_new("T_MATCH_NONEXHAUSTIVE", "error",
-                "match is not exhaustive: add a `_` wildcard arm or a binding arm without guard",
+            var m_miss: string = enum_missing_cases(e, m_scr);
+            var m_msg: string = "match is not exhaustive: add a `_` wildcard arm or a binding arm without guard";
+            if (str_len(m_miss) > 0) {
+                m_msg = sb_cat3("match is not exhaustive: unhandled case(s) ", m_miss,
+                    " — cover them all, or add a `_` wildcard arm");
+            }
+            var m_di: i64 = diag_new("T_MATCH_NONEXHAUSTIVE", "error", m_msg,
                 n_file(e), m_l, m_col, m_l, m_col + 5);
             var m_fx: i64 = fix_one("add wildcard arm", n_file(e), m_l, m_col, m_l, m_col, "_ => <default>");
             diag_set_fs(m_di, m_fx);
@@ -8491,7 +8697,7 @@ check_stmt fn(s: i64) -> void {
     }
     if (n.kind == "if") {
         var ct: i64 = infer_expr(n.na);
-        if (tip_kind(ct) == "Scalar" && tip_name(ct) != "bool") {
+        if (is_cond_bool(ct) == false) {
             var di: i64 = diag_new("T_STMT_IMPLICIT_BOOL", "error",
                 sb_cat2("if condition must be bool or explicit comparison, got ", ti_str(ct)),
                 "", 1, 1, 1, 5);
@@ -8533,7 +8739,7 @@ check_stmt fn(s: i64) -> void {
         }
         if (cond >= 0) {
             var ct2: i64 = infer_expr(cond);
-            if (tip_kind(ct2) == "Scalar" && tip_name(ct2) != "bool") {
+            if (is_cond_bool(ct2) == false) {
                 diag_new("T_STMT_IMPLICIT_BOOL", "error",
                     sb_cat2("loop condition must be bool, got ", ti_str(ct2)),
                     "", 1, 1, 1, 5);

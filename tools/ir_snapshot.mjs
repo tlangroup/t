@@ -54,6 +54,11 @@ for (let i = 0; i < argv.length; i++) {
     else if (argv[i] === "--keep") keep = true;
     else if (argv[i] === "--backends") backends = argv[++i].split(",").map((s) => s.trim()).filter(Boolean);
     else if (argv[i] === "--jobs") jobs = Math.max(1, parseInt(argv[++i], 10) || 1);
+    else {
+        // 未知参数硬失败：静默忽略会让笔误退回默认编译器，快照对比失去意义。
+        console.error(`ir_snapshot: 未知参数 ${argv[i]}；可用：--compiler --update --keep --backends --jobs`);
+        process.exit(2);
+    }
 }
 if (!existsSync(compiler)) {
     console.error(`ir_snapshot: compiler not found: ${compiler}`);

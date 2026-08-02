@@ -56,6 +56,11 @@ function parseArgs(argv) {
         else if (argv[i] === "--strict") opts.strict = true;
         else if (argv[i] === "--jobs") opts.jobs = Math.max(1, parseInt(argv[++i], 10) || 1);
         else if (argv[i] === "--verbose" || argv[i] === "-v") opts.verbose = true;
+        else {
+            // 未知参数硬失败：静默忽略会让笔误退回默认配置，测出「不是你以为的那个对比」。
+            console.error(`difftest: 未知参数 ${argv[i]}；可用：--ref --cand --samples --tlex --tparse --tcheck --xfail --strict --jobs --verbose`);
+            process.exit(2);
+        }
     }
     return opts;
 }

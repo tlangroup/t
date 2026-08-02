@@ -27,6 +27,12 @@ let useRef = false;
 for (let i = 0; i < args.length; i++) {
   if (args[i] === "--compiler") compiler = resolve(args[++i]);
   else if (args[i] === "--ref") useRef = true;
+  else {
+    // 未知参数必须硬失败：静默忽略会让 `--tc xxx` 这类笔误退回默认编译器，
+    // 制造「测的不是你以为的那个二进制」式假绿/假红。
+    console.error(`conformance: 未知参数 ${args[i]}；可用参数：--compiler <路径> | --ref`);
+    process.exit(2);
+  }
 }
 
 function collect(dir) {

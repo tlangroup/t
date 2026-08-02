@@ -41,6 +41,11 @@ for (let i = 0; i < argv.length; i++) {
     else if (argv[i] === "--compiler") compiler = argv[++i];
     else if (argv[i] === "--only") only = argv[++i].split(",").map((s) => s.trim()).filter(Boolean);
     else if (argv[i] === "--jobs") jobs = Math.max(1, parseInt(argv[++i], 10) || 1);
+    else {
+        // 未知参数硬失败：静默忽略会让笔误退回默认编译器/模式，制造假绿。
+        console.error(`run_examples: 未知参数 ${argv[i]}；可用：--mode --compiler --only --jobs`);
+        process.exit(2);
+    }
 }
 if (mode !== "dbg" && mode !== "rls") {
     console.error(`run_examples: invalid --mode '${mode}' (expected dbg|rls)`);

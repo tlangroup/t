@@ -92,9 +92,6 @@ Keyword:
   | "else" -> KwElse
   | "for" -> KwFor
   | "while" -> KwWhile
-  | "switch" -> KwSwitch
-  | "case" -> KwCase
-  | "default" -> KwDefault
   | "break" -> KwBreak
   | "continue" -> KwContinue
   | "return" -> KwReturn
@@ -449,11 +446,11 @@ primary :: Integer prim_int | Float prim_float | String prim_str | "true" prim_t
 
 // ── 语句顶层分发（fold=disp：守卫式分发，骨架不消费引导 token）──
 // 形状：term nt | ... | nt（裸 NT 兜底）→ if (cur_t()==K) { return parse_<nt>(); } 链 + return parse_<兜底>();
-// 目标函数一律签名 () -> i64、自行消费引导 token：if/for/while/switch/return 为既有函数原样路由；
+// 目标函数一律签名 () -> i64、自行消费引导 token：if/for/while/return 为既有函数原样路由；
 // break/continue/defer/comptime/block/var/const 为下沉胶水（block_stmt 用 pos 做位点故不 advance）。
 
 // @rule statement params=() ret=i64 node=_ eatFirst=false fold=disp
-statement :: "if" if_stmt | "for" for_stmt | "while" while_stmt | "switch" switch_stmt | "return" return_stmt | "break" break_stmt | "continue" continue_stmt | "defer" defer_stmt | "comptime" comptime_stmt | "{" block_stmt | "var" var_stmt | "const" const_stmt | expr_or_assign_stmt
+statement :: "if" if_stmt | "for" for_stmt | "while" while_stmt | "return" return_stmt | "break" break_stmt | "continue" continue_stmt | "defer" defer_stmt | "comptime" comptime_stmt | "{" block_stmt | "var" var_stmt | "const" const_stmt | expr_or_assign_stmt
 
 // ── 语句体内部结构（fold=whilex/returnx：纯序列形态，含 node_at 守卫）──
 // 形状：while "(" expr ")" block  /  return expr? ";"  →  通用骨架 + 节点构造，eatFirst 吃掉引导关键字。
@@ -477,11 +474,13 @@ if_stmt :: "(" expr ")" block ("else" (block | if_stmt))?
 // @rule for_stmt params=() ret=i64 node=For eatFirst=true fold=forx
 for_stmt :: "(" ( Ident ("," Ident)? "in" expr | expr? ";" expr? ";" expr? ) ")" block
 
-// ── 语句体内部结构（fold=swx：case/default 循环聚合，default 缺省 -2 兜底）──
-// 形状：switch "(" expr ")" "{" ( "case" expr ":" statement* | "default" ":" statement* )* "}"  →  循环收集 CS 节点。
-
-// @rule switch_stmt params=() ret=i64 node=Switch eatFirst=true fold=swx
-switch_stmt :: "(" expr ")" "{" ( "case" expr ":" statement* | "default" ":" statement* )* "}"
+// 🚫 switch_stmt（fold=swx）已于 2026-08-01 废弃并从编译器删除，由 match 表达式取代。
+//    其 @rule / @node 条目连同 KwSwitch/KwCase/KwDefault 三个关键字已从本文法移除，
+//    编译器侧 KwSwitch/KwCase/KwDefault 均为零命中。
+//    ⚠ 冻结快照 out/ebnf.json 与 gen/tc.tc 生成于删除之前，仍含 switch 条目；
+//      二者不参与门禁（totter 自 M38 放弃、GEN 区间改手写维护），故不同步是预期的。
+//    ⚠ node_kind_names 中的 "CS"（switch case 节点）为死条目：无任何代码产生它，
+//      但删除会移动后续 node kind 索引，故有意保留。
 ```
 
 - 终端约定：`Ident` → `expect_tok("Identifier")`（string 结果）；`Integer` → `expect_tok("Integer")`（string 结果，字面量文本）。
@@ -491,8 +490,8 @@ switch_stmt :: "(" expr ")" "{" ( "case" expr ":" statement* | "default" ":" sta
 - ✅ tote（续）：表达式前缀一元运算符 `unary` 亦以此文法以 `fold=pre` 规则生成（右结合前缀折叠 + `mk_un` 构造），替换手写 `parse_unary`。
 - ✅ tote（续）：表达式后缀 `postfix` 亦以此文法以 `fold=post` 规则生成（左结合后缀折叠骨架 + 胶水 helper `post_member`/`post_index`/`post_call`/`post_cast` 下沉），替换手写 `parse_postfix`。
 - ✅ tote（续）：表达式基底 `primary` 亦以此文法以 `fold=prim` 规则生成（终端驱动 dispatch 骨架 + 9 个胶水 helper `prim_int`/`prim_float`/`prim_str`/`prim_true`/`prim_false`/`prim_null`/`prim_ident`/`prim_paren`/`prim_array` 下沉）。**表达式金字塔 or→…→primary 全部数据驱动生成。**
-- ✅ tote（续）：语句顶层分发 `statement` 亦以此文法以 `fold=disp` 规则生成（守卫式分发骨架：if/for/while/switch/return 路由既有函数，break/continue/defer/comptime/block/var/const 下沉为胶水，兜底 `expr_or_assign_stmt`），替换手写 `parse_statement`。
-- ✅ tote（续）：语句体内部结构亦以文法表达——`while_stmt`/`return_stmt` 以 `fold=whilex`/`fold=returnx`（纯序列 + node_at 守卫）生成；`if_stmt` 以 `fold=ifx`（if/else-if 链，else 分支嵌套 if 包成单元素 list 兜底）生成；`for_stmt` 以 `fold=forx`（peek_t(1) 前瞻分流 for_each / C 式三子句）生成；`switch_stmt` 以 `fold=swx`（case/default 循环聚合，default 缺省 -2）生成。五者各自替换对应手写 `parse_*` 函数，`local_var`（名校验副作用 + nti 定位）仍保留为胶水。`statement` 顶层分发路由目标现为全数据驱动生成。
+- ✅ tote（续）：语句顶层分发 `statement` 亦以此文法以 `fold=disp` 规则生成（守卫式分发骨架：if/for/while/return 路由既有函数，break/continue/defer/comptime/block/var/const 下沉为胶水，兜底 `expr_or_assign_stmt`），替换手写 `parse_statement`。（生成时该分发还含 `switch`，2026-08-01 随 switch 废弃一并移除。）
+- ✅ tote（续）：语句体内部结构亦以文法表达——`while_stmt`/`return_stmt` 以 `fold=whilex`/`fold=returnx`（纯序列 + node_at 守卫）生成；`if_stmt` 以 `fold=ifx`（if/else-if 链，else 分支嵌套 if 包成单元素 list 兜底）生成；`for_stmt` 以 `fold=forx`（peek_t(1) 前瞻分流 for_each / C 式三子句）生成；`switch_stmt` 曾以 `fold=swx`（case/default 循环聚合，default 缺省 -2）生成，已随 switch 废弃删除。四者（原五者）各自替换对应手写 `parse_*` 函数，`local_var`（名校验副作用 + nti 定位）仍保留为胶水。`statement` 顶层分发路由目标现为全数据驱动生成。
 
 ---
 
@@ -601,7 +600,6 @@ NodeTable ::
   // @node slice na=node
   // @node string sa=str
   // @node struct_lit sa=str la=list
-  // @node switch na=node la=list lb=list
   // @node unary sa=str na=node
   // @node var_decl sa=str ba=bool na=node nb=node
   // @node variant
@@ -795,7 +793,7 @@ TdRuleTable ::
 
 ### 3.1 Items（顶层条目）
 
-> 本节气法由 `decl.md` / `decl_var.md` / `decl_struct.md` / `decl_enum.md` / `decl_flag.md` / `decl_variant.md` / `decl_typealias.md` / `decl_import.md` / `decl_func.md` 经 L-15 采用并并入（原草稿已标记失效）。`match.md` 的函数子句声明形式已于 2026-08-01 用户指令对齐为本节气法（L-04 声明层张力已消解）；但 match 表达式与函数子句的完整语义在 `src/tc.tc` 尚未实现（L-14 门禁未覆盖），故 `match.md` 仍维持 DRAFT / 按指令忽略，不并入本手册。函数声明形式固定为 `Name fn(...) -> Ret`（并置式、禁止重载），与 `src/tc.tc` 一致。
+> 本节气法由 `decl.md` / `decl_var.md` / `decl_struct.md` / `decl_enum.md` / `decl_flag.md` / `decl_variant.md` / `decl_typealias.md` / `decl_import.md` / `decl_func.md` 经 L-15 采用并并入（原草稿已标记失效）。`match.md` 的函数子句声明形式已于 2026-08-01 用户指令对齐为本节气法（L-04 声明层张力已消解）；match 表达式与函数子句的完整语义**已在 `src/tc.tc` 实装且门禁覆盖**（L-14 已满足），但据 L-15 第5条仍需用户显式「规则采纳」方可并入本手册，故 `match.md` 现维持 DRAFT **待采纳**（而非「未实现」）。函数声明形式固定为 `Name fn(...) -> Ret`（并置式、禁止重载），与 `src/tc.tc` 一致。
 
 ```ebnf
 ModuleItem:
@@ -894,7 +892,6 @@ Statement:
     | IfStatement
     | WhileStatement
     | ForStatement                           // ✅ tote
-    | SwitchStatement                        // 🚫 已废弃(deprecated)：由 match 表达式取代（见草稿 match.md）
     | ReturnStatement
     | BreakStatement                         // ✅ tote
     | ContinueStatement                      // ✅ tote
@@ -914,11 +911,14 @@ ComptimeStatement:  "comptime" Block         // 编译期块（块内语句编�
 
 **语句强制规则（spec §1.2）：**
 
-- `if/for/while/switch` **强制大括号**包裹，禁止单行省略。
+- `if/for/while` **强制大括号**包裹，禁止单行省略。
 - 语句必须以 `;` 结尾。
 - 禁用三元运算符、`do-while`、`goto`。
 - 多优先级运算必须手动加括号。
 - 禁止隐式布尔判定：条件必须显式比较（如 `if ((mask & F.x) != 0) { }`）。
+  适用范围为**全部条件位置**：`if` / `while` / `for` 的条件，以及 `match` 的 `when` 守卫。
+  判据是白名单——唯 `bool` 合法，`Unknown` 放行以免级联；`string`/`slice`/`struct`/`enum`/`func`
+  一律报 `T_STMT_IMPLICIT_BOOL`。（2026-08-02 前的实现只拦标量，非标量静默漏过，已修复。）
 
 ```ebnf
 IfStatement:
@@ -936,14 +936,8 @@ ForInit:
     | ConstDeclStatement
     | Expression ";"
 
-SwitchStatement:                                     // 🚫 已废弃(deprecated)：由 match 表达式取代；文法保留仅作历史
-    "switch" "(" Expression ")" "{" SwitchCase* SwitchDefault? "}"
-
-SwitchCase:
-    "case" Expression ":" Statement*
-
-SwitchDefault:
-    "default" ":" Statement*
+// 🚫 SwitchStatement / SwitchCase / SwitchDefault 已于 2026-08-01 废弃并从本文法删除。
+//    多路分支改用 match 表达式（已实装，规则见草稿 docs/syntax/drafts/match.md，待采纳后并入本节）。
 
 BreakStatement:    "break" ";"                       // ✅ tote
 ContinueStatement: "continue" ";"                    // ✅ tote
