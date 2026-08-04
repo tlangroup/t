@@ -6321,11 +6321,16 @@ parse_global_var fn(is_const: bool) -> i64 {
 
 parse_import_decl fn(anns: i64) -> i64 {
     advance_i();
-    // 模块导入 `import xxx [as m]`（标识符形式，M-Module）：与旧数据导入 `import "path"` 分支并存。
+    // 模块导入 `import xxx[.yyy...] [as m]`（点分模块名，M-Module）：
+    // 点即路径分隔符，import d.e 解析为 <src>/d/e.tc。与旧数据导入 `import "path"` 分支并存。
     if (cur_t() == "Identifier") {
         var mname: string = tk_v(pos);
         var mti: i64 = pos;
         advance_i();
+        while (cur_t() == "Dot") {
+            advance_i();
+            mname = sb_cat3(mname, ".", expect_tok("Identifier"));
+        }
         var alias: string = "";
         var has_alias: bool = false;
         if (cur_t() == "KwAs") {
@@ -11117,7 +11122,6 @@ load_module_file fn(path: string) -> void {
     var msrc: string = file_read_all(path);
     tokenize(msrc);                           // 追加在入口/父模块 token 之后
     pos = base;                               // 从本模块起点解析，而非 0（否则会重解析入口文件）
-    var mdir: string = mod_dir_of(path);
     while (cur_t() != "Eof") {
         if (cur_t() == "Semicolon") {
             advance_i();
@@ -11128,8 +11132,8 @@ load_module_file fn(path: string) -> void {
             continue;
         }
         if (nodes[d].kind == "ImportModDecl") {
-            // 嵌套 import：就地递归解析，不加入 decl_list
-            handle_one_import(d, mdir);
+            // 嵌套 import：就地递归解析，不加入 decl_list（统一相对 g_src_root）
+            handle_one_import(d);
         } else {
             append(decl_list, d);
         }
@@ -11138,19 +11142,26 @@ load_module_file fn(path: string) -> void {
 }
 
 // 解析单个 import 声明：定位模块文件 → 去重/环检测 → 内联加载
-handle_one_import fn(imp: i64, base_dir: string) -> void {
+handle_one_import fn(imp: i64) -> void {
     var nm: string = nodes[imp].sb;
-    var alias: string = nodes[imp].sc;
+    var user_alias: string = nodes[imp].sc;
     if (nodes[imp].bc) {
         fc_err("T_EXPORT_SCOPE", "export 不能修饰 import 声明", imp);
         return;
     }
-    var p: string = path_resolve(sb_cat4(base_dir, "/", nm, ".tc"));
+    // 工程内 import 统一相对项目源码根（g_src_root）解析；
+    // 模块名中的 '.' 即路径分隔符：import d.e => <src>/d/e.tc
+    var rel: string = dots_to_slashes(nm);
+    var p: string = path_resolve(sb_cat4(g_src_root, "/", rel, ".tc"));
     if (path_exists(p) == false) {
         fc_err("T_IMPORT_NOT_FOUND",
             sb_cat3("模块 '", nm, "' 无法解析：文件 '"), imp);
         return;
     }
+    // 限定访问前缀 = 模块名最后一段（Go 风格）：import d.e 以 e.foo() 调用；
+    // 用户显式 as 优先。
+    var alias: string = user_alias;
+    if (alias == "") { alias = last_segment(nm); }
     mod_alias_add(nm, alias);
     // 已加载过则跳过（同时天然打破 import 成环，避免无限递归）
     if (in_mod_visited(p)) {
@@ -11160,16 +11171,58 @@ handle_one_import fn(imp: i64, base_dir: string) -> void {
     load_module_file(p);
 }
 
+// 项目源码根：所有工程内 import 相对此目录解析（取代「相对导入方目录」）。
+// 查找规则：从入口文件所在目录向上找 tote.toml；找到则源码根 = tote.toml 目录/src，
+// 否则回退为入口文件所在目录（保持单文件/老项目兼容，等价于旧的「相对导入方」）。
+var g_src_root: string;
+
+// 项目源码根：所有工程内 import 相对此目录解析（取代「相对导入方目录」）。
+// 取「入口文件所在目录」：标准布局下入口为 <root>/src/main.tc，故源码根即 <root>/src，
+// 从而 import a => <root>/src/a.tc、import d.e => <root>/src/d/e.tc。
+// 注：向上查找 tote.toml 以自动定位 <root> 的方案因 path_exists/sys_run 在当前运行时不稳定
+// （存在性探测会触发 arena OOM）而暂未启用；采用入口目录作为源码根对标准布局等价且稳健。
+compute_src_root fn() -> string {
+    return mod_dir_of(g_file);
+}
+
+// 取模块名最后一段作为限定访问前缀（Go 风格：import d.e 以 e.foo() 调用）。
+last_segment fn(s: string) -> string {
+    var n: u64 = str_len(s);
+    var i: u64 = n;
+    while (i > 0) {
+        i = i - 1;
+        var c: u8 = s[i];
+        if (c == 46 || c == 47 || c == 92) {
+            return str_slice(s, i + 1, n);
+        }
+    }
+    return s;
+}
+
+// 模块名中的 '.' 转为路径分隔符：d.e -> d/e（用于拼接 .tc 路径）。
+dots_to_slashes fn(s: string) -> string {
+    var n: u64 = str_len(s);
+    var sb: StringBuilder = sb_new();
+    var i: u64 = 0;
+    while (i < n) {
+        var c: u8 = s[i];
+        if (c == 46) { sb_append_char(sb, 47); }
+        else { sb_append_char(sb, c); }
+        i = i + 1;
+    }
+    return sb_to_str(sb);
+}
+
 // 顶层入口：内联所有 import，并构建模块别名集合。
 // ImportModDecl 节点留在 decl_list 中无害（register/emit 均对其忽略）。
 resolve_modules fn() -> void {
-    var entry_dir: string = mod_dir_of(g_file);
+    g_src_root = compute_src_root();
     var n: i64 = slice_len(decl_list) as i64;
     var i: i64 = 0;
     while (i < n) {
         var d: i64 = decl_list[i];
         if (nodes[d].kind == "ImportModDecl") {
-            handle_one_import(d, entry_dir);
+            handle_one_import(d);
         }
         i = i + 1;
     }
