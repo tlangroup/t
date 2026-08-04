@@ -11077,6 +11077,30 @@ mod_dir_of fn(p: string) -> string {
     return ".";
 }
 
+// 取父目录（纯字符串，不依赖 _fullpath；盘符根/无分隔符返回 "" 表示已到顶）。
+// 兼容 / 与 \；先剥除末尾分隔符，避免 "C:/" 被误判；用于 import 源码根向上遍历，
+// 杜绝 _fullpath 把 "C:" 展开为「C 盘当前目录」导致的 C:/ <-> C:/Users/... 震荡 OOM。
+parent_dir_of fn(p: string) -> string {
+    var n: u64 = str_len(p);
+    if (n == 0) { return ""; }
+    var end: u64 = n;
+    while (end > 0) {
+        var c: u8 = p[end - 1];
+        if (c == 47 || c == 92) { end = end - 1; } else { break; }
+    }
+    if (end == 0) { return ""; }
+    var i: u64 = end;
+    while (i > 0) {
+        i = i - 1;
+        var c: u8 = p[i];
+        if (c == 47 || c == 92) {
+            if (i == 0) { return ""; }   // 形如 /foo 的 unix 绝对路径，无更上层
+            return str_slice(p, 0, i);
+        }
+    }
+    return "";   // 无分隔符（如 C: 或裸名）
+}
+
 in_mod_aliases fn(sa: string) -> bool {
     var n: i64 = slice_len(g_mod_aliases) as i64;
     var i: i64 = 0;
@@ -11132,7 +11156,7 @@ load_module_file fn(path: string) -> void {
             continue;
         }
         if (nodes[d].kind == "ImportModDecl") {
-            // 嵌套 import：就地递归解析，不加入 decl_list（统一相对 g_src_root）
+            // 嵌套 import：就地递归解析，不加入 decl_list（统一相对候选源码根）
             handle_one_import(d);
         } else {
             append(decl_list, d);
@@ -11149,13 +11173,19 @@ handle_one_import fn(imp: i64) -> void {
         fc_err("T_EXPORT_SCOPE", "export 不能修饰 import 声明", imp);
         return;
     }
-    // 工程内 import 统一相对项目源码根（g_src_root）解析；
-    // 模块名中的 '.' 即路径分隔符：import d.e => <src>/d/e.tc
+    // 工程内 import 统一相对候选源码根解析；模块名中的 '.' 即路径分隔符：import d.e => <root>/d/e.tc
     var rel: string = dots_to_slashes(nm);
-    var p: string = path_resolve(sb_cat4(g_src_root, "/", rel, ".tc"));
-    if (path_exists(p) == false) {
+    var chosen: string = "";
+    var i: i64 = 0;
+    var nr: i64 = slice_len(g_src_roots) as i64;
+    while (i < nr) {
+        var cand: string = path_resolve(sb_cat4(g_src_roots[i], "/", rel, ".tc"));
+        if (path_exists(cand)) { chosen = cand; break; }
+        i = i + 1;
+    }
+    if (chosen == "") {
         fc_err("T_IMPORT_NOT_FOUND",
-            sb_cat3("模块 '", nm, "' 无法解析：文件 '"), imp);
+            sb_cat3("模块 '", nm, "' 无法解析：未在任何源码根下找到对应 .tc 文件"), imp);
         return;
     }
     // 限定访问前缀 = 模块名最后一段（Go 风格）：import d.e 以 e.foo() 调用；
@@ -11164,25 +11194,51 @@ handle_one_import fn(imp: i64) -> void {
     if (alias == "") { alias = last_segment(nm); }
     mod_alias_add(nm, alias);
     // 已加载过则跳过（同时天然打破 import 成环，避免无限递归）
-    if (in_mod_visited(p)) {
+    if (in_mod_visited(chosen)) {
         return;
     }
-    append(g_mod_visited, p);
-    load_module_file(p);
+    append(g_mod_visited, chosen);
+    load_module_file(chosen);
 }
 
-// 项目源码根：所有工程内 import 相对此目录解析（取代「相对导入方目录」）。
-// 查找规则：从入口文件所在目录向上找 tote.toml；找到则源码根 = tote.toml 目录/src，
-// 否则回退为入口文件所在目录（保持单文件/老项目兼容，等价于旧的「相对导入方」）。
-var g_src_root: string;
+// 候选源码根列表（按优先级）：入口目录兜底 + 各祖先工程根/src（最近优先）。
+// import 解析时依序尝试每个候选根下的 <rel>.tc，首个命中即采用。
+// 这样既满足「工程根/src」约定（用户规范），又不破坏扁平/示例项目（入口目录兜底）。
+var g_src_roots: []string;
 
-// 项目源码根：所有工程内 import 相对此目录解析（取代「相对导入方目录」）。
-// 取「入口文件所在目录」：标准布局下入口为 <root>/src/main.tc，故源码根即 <root>/src，
-// 从而 import a => <root>/src/a.tc、import d.e => <root>/src/d/e.tc。
-// 注：向上查找 tote.toml 以自动定位 <root> 的方案因 path_exists/sys_run 在当前运行时不稳定
-// （存在性探测会触发 arena OOM）而暂未启用；采用入口目录作为源码根对标准布局等价且稳健。
-compute_src_root fn() -> string {
-    return mod_dir_of(g_file);
+// 计算候选源码根：
+//  1) 入口文件所在目录（兜底，等同旧的「相对导入方」，保证扁平/示例/老项目可用）；
+//  2) 从入口目录向上遍历祖先目录，凡是含 tote.toml 者，其 src 子目录即候选源码根
+//     （<工程根>/src 约定，最近祖先优先），版本钉由 tote.toml 负责。
+// path_exists 现已改用稳健的 file_exists 内建（不再走 sys_run 外 shell，消除 arena OOM），
+// 故向上遍历在绝对路径下也安全。
+compute_src_roots fn() -> void {
+    var roots: []string;
+    // 入口目录兜底（仅此处用一次 path_resolve 规范化，已知安全）。
+    var entry_dir: string = path_resolve(mod_dir_of(g_file));
+    append(roots, entry_dir);
+    // 从入口目录向上遍历祖先，凡是含 tote.toml 者，其 src 子目录即候选源码根。
+    // 循环内只用纯字符串 parent_dir_of（不碰 _fullpath），并设硬上限，杜绝震荡 OOM。
+    // 拼接走 StringBuilder（LLVM 后端不支持 sb_cat2..6，故不用 sb_cat2）。
+    var cur: string = entry_dir;
+    var guard: i64 = 0;
+    while (guard < 32) {
+        guard = guard + 1;
+        var parent: string = parent_dir_of(cur);
+        if (parent == "" || parent == cur) { break; }
+        cur = parent;
+        var sb: StringBuilder = sb_new();
+        sb_append_str(sb, cur);
+        sb_append_str(sb, "/tote.toml");
+        var toml: string = sb_to_str(sb);
+        if (path_exists(toml)) {
+            var sb2: StringBuilder = sb_new();
+            sb_append_str(sb2, cur);
+            sb_append_str(sb2, "/src");
+            append(roots, sb_to_str(sb2));
+        }
+    }
+    g_src_roots = roots;
 }
 
 // 取模块名最后一段作为限定访问前缀（Go 风格：import d.e 以 e.foo() 调用）。
@@ -11216,7 +11272,7 @@ dots_to_slashes fn(s: string) -> string {
 // 顶层入口：内联所有 import，并构建模块别名集合。
 // ImportModDecl 节点留在 decl_list 中无害（register/emit 均对其忽略）。
 resolve_modules fn() -> void {
-    g_src_root = compute_src_root();
+    compute_src_roots();
     var n: i64 = slice_len(decl_list) as i64;
     var i: i64 = 0;
     while (i < n) {
@@ -19144,14 +19200,10 @@ valid_mode fn(m: string) -> bool {
     return false;
 }
 
-// 探测路径是否存在（Windows: cmd /c if exist）
+// 探测路径是否存在。直接调用稳健的 file_exists 内建（C fopen 直查 / LLVM @tll_file_exists），
+// 取代原先的 sys_run("cmd /c if exist ...") 外 shell 方案——后者在绝对路径下会触发 arena OOM。
 path_exists fn(p: string) -> bool {
-    var q: string = to_bs(p);
-    var rc: i32 = sys_run(sb_cat3("cmd /c if exist \"", q, "\" (exit 0) else (exit 1)"));
-    if (rc == 0) {
-        return true;
-    }
-    return false;
+    return file_exists(p);
 }
 
 // 写出文件前确保父目录存在（Windows: cmd /c mkdir，幂等）
