@@ -98,19 +98,19 @@ Agent 由四个静态可描述部分构成:
 - **Mind Agent（心智体 / 认知 Agent）** —— Core + Edge(LLM)。例：LLM 驱动 NPC（自由对话、即兴剧情）。✅ 已示例（`examples/agent_npc.tc` 的 `Receptionist`）。
 - **Player Agent（玩家体 / 化身体）** —— 任意 Core + Edge=人类输入（纯 Reflex，人类直驱）。玩家角色也是 agent，与 NPC 在模型上统一。✅ 已示例：`Hero`（`examples/agent_edge.tc`，人类 input 事件直接作消息喂 `step`）。
 
-**Planning 行（全部属「待 goal」——需 `goal`/`plan` 子句，当前语法未实现；命名先定，实现后置，暂不可写示例）**:
+**Planning 行（表达法见 §11.5：不靠 `goal`/`plan` 语法，改用纯 `planner(State) -> Msg` 自由 fn 喂同一 `step`；✅ 已示例 `examples/planner_demo.tc`）**:
 - **Plan Agent（规划体）** —— Core=规划/目标栈（GOAP / utility AI），Edge=none。填补 reflex 与 LLM 之间的 deliberative 空白；将来作 `goal`/`plan` 子句预留。
 - **Scout Agent（侦察体）** —— Core=规划 + Edge=Env·感知；先侦察/探索再决策（规划式感知），区别于 Sensor 的反应式感知。
 - **Operator Agent（操作体）** —— Core=规划 + Edge=Tool/IO；按计划调用外部工具执行。
 - **Strategist Agent（策略体）** —— Core=规划 + Edge=LLM；LLM 做策略/规划推理。
 - **Adjutant Agent（副官体）** —— Core=规划 + Edge=Human；人类为指挥官、agent 为副官负责规划协调（区别于 Player 玩家体 = 纯 Reflex 人类直驱）。
 
-> ⚠ **Planning 体当前不可写**：`agent` 原语只支持 `state` / `step` 子句，尚无 `goal` / `plan` 子句语法，故 Planning 行五格仍只是命名 + 设计草图（见上方「待 goal」批注），无法给出可运行示例。
+> ⚠ **Planning 体「待 goal」为决策 A 前的旧表述**：2026-08-04 决策 A 第 2/5 条已拍板**永不新增 `goal`/`plan` 语法**，故 Planning 不靠新子句表达，而是用纯 `planner(State) -> Msg` 自由 fn 算出「下一步消息」喂同一纯 `step`（见 §11.5）。**现已可写可运行示例**：`examples/planner_demo.tc`（Operator / Scout / Strategist / Adjutant 四 planner 自由 fn，共用同一 `robot_step` 原语，差异只在边界驱动）。
 
 **元类**:
 - **Spawner / Colony Agent（调度体，元类）** —— 管理/生成子 agent（导演 AI、小队队长、刷怪波次），吃 ECS 海量能力；需运行时 spawn / 寻址支持（后续里程碑，当前不可写）。
 
-**优先级（语言侧成本）**: Tool / Player / Sensor Agent = 0（纯模式，现有语法可写，**已示例**）；Scout / Operator / Strategist / Adjutant / Plan Agent = 加 `goal`/`plan` 子句预留（**暂不可写**）；Spawner = 运行时最重，后续里程碑。
+**优先级（语言侧成本）**: Tool / Player / Sensor Agent = 0（纯模式，现有语法可写，**已示例**）；Scout / Operator / Strategist / Adjutant / Plan Agent = 用纯 `planner(State)->Msg` 自由 fn 表达（**已可写，见 `examples/planner_demo.tc`**，不引 `goal`/`plan` 语法，决策 A 第5条）；Spawner = 运行时最重，后续里程碑。
 
 ## 7. 开放问题(待法律化时裁决)
 
@@ -221,7 +221,7 @@ t 为 Agent First 能做的，与刻意不做的，同样重要。语言层只�
 > **最关键**：以上 5 层是 t 该做的；虚线之下（Sensor / Tool / LLM / Human / Network 适配器）是**运行时 / 模型库**的事，不进编译器 intrinsics。一句话：**语言负责确定性，库负责可能性。**
 
 ### 11.5 规划体（Planning）的无语法表达
-§6 说 Planning 行「待 goal」——但 §8 决策 A 第 5 条已定：**不引入 `goal`/`plan` 语法**，改用纯 `planner(State) -> Msg` 自由 fn。即：规划 Core = 一个算出「下一步消息」的自由 fn，把结果喂同一纯 `step`。不变量不变（step 纯、效应在边界）。这把「最聪明的决策」也压回库层模式，而非新语法。
+§6 说 Planning 行「待 goal」——那是决策 A 前的旧表述。§8 决策 A 第 2/5 条已拍板**永不引入 `goal`/`plan` 语法**，改用纯 `planner(State) -> Msg` 自由 fn。即：规划 Core = 一个算出「下一步消息」的自由 fn，把结果喂同一纯 `step`。不变量不变（step 纯、效应在边界）。这把「最聪明的决策」也压回库层模式，而非新语法。**已落地可运行示例**：`examples/planner_demo.tc` —— `Robot agent` 只有一个纯反射 `step`；Operator/Scout/Strategist/Adjutant 是四个 `fn(RobotState)->atom` 自由 fn（各自不同「边界驱动」：纯执行 / 先侦察 / 能量告急先充电 / 开工前请示人类）；`run_with_planner(p, init, steps)` 是通用循环 `s = robot_step(s, p(s))`，`p` 是唯一变量。
 
 ---
 

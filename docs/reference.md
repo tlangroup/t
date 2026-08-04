@@ -1671,7 +1671,7 @@ AgentClause:
 | **Planning（规划）** | Plan Agent 规划体 | Scout Agent 侦察体 | Operator Agent 操作体 | Strategist Agent 策略体 | Adjutant Agent 副官体 |
 
 - **已示例（Reflex 行）**：State（`Monster`）、Mind（`Receptionist`）——见 `examples/agent_npc.tc`；**Sensor（`Radar`）、Tool（`DbAgent`）、Player（`Hero`）——见 `examples/agent_edge.tc`**（三体演示 Edge 边界差异：`step` 在边界记意图、`drive_*()` 去读感知/调工具/读人类输入，与 Mind 同构，核心 step 纯函数可回放）。
-- **待 goal（🟢，需 `goal`/`plan` 子句，当前语法未实现）**：Plan / Scout / Operator / Strategist / Adjutant —— 当前 `agent` 原语只支持 `state`/`step` 子句，**写不出真正的规划体**：它们的「规划/目标栈（GOAP / utility AI）」Core 需预留 `goal`/`plan` 语法（见 `agent_first.md` §6 设计草图），故现阶段仅命名与占位，不可写示例。
+- **已示例（Planning 行，无 `goal`/`plan` 语法，决策 A 第5条）**：Plan / Scout / Operator / Strategist / Adjutant —— 用纯 `planner(State) -> Msg` 自由 fn 算出「下一步消息」喂同一纯 `step`，**已可写可运行示例**：`examples/planner_demo.tc`（四 planner 自由 fn 共用同一 `robot_step` 原语，差异只在边界驱动）。
 - **元类 待运行时（🟠，需运行时 spawn/寻址，后续里程碑）**：Spawner / Colony Agent 调度体（管理/生成子 agent）。
 - 命名对称：Scout = 规划式感知（先侦察再决策），区别于 Sensor 反应式感知；Adjutant = 人类为指挥官、agent 为副官负责规划协调，区别于 Player 玩家体（纯 Reflex 人类直驱）。完整定义见 `docs/agent_first.md` §6。
 
