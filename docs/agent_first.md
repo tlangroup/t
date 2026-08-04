@@ -153,3 +153,109 @@ Agent 由四个静态可描述部分构成:
 **什么会破坏该目标（须拒绝）**：`step` 直连 LLM / IO / 时钟（复现断链）；`step` 读写隐藏全局 / 共享世界状态（成因不可重放）；`step` 内 spawn 副作用改外部实体（效应不可追踪）；给 State 挂方法（OOP，状态快照难）。
 
 **结论**：Agent 原语的真正价值，是用语法把 `(struct + 纯 fn + spawn)` 这一形状**焊死**，让任何写出的 agent 自动满足「`init + 有序消息 ⇒ 可复现`」。这恰由当前**最小** `X agent { state; step }` 糖衣满足——它脱糖出的 struct + 自由 fn 天然契合上述 5 条。这也是 §8 选项 A 的底层依据：不扩语法、守住这个不变量即可。
+
+---
+
+## 10. 库层边界协议（agentkit 与运行时接缝）
+
+§8 决策 A 第 4 条把「数据流可复现」的工程工具（消息日志 / 回放 / diff）移入**库层**（如 `agentkit`）；§0/§4 亦明确 LLM / 工具 / 感知 / IO 这些 Edge 适配器只活在**运行时边界**。本节规定这套接缝的**协议与库职责**——全部可用现有 `t` 表达（消息即 struct、自由 fn），**不引入任何编译器特性**，与决策 A「绝不再扩语法」一致。
+
+### 10.1 统一握手：`pending` 意图 + 回填消息
+所有 Edge 体共用同一条握手（已在 `examples/agent_npc.tc`、`examples/agent_edge.tc` 实测双后端通过）：
+1. **记意图**：`step` 收到某消息（如 `:ask` / `:scan` / `:query`）后只更新状态，把 `state.pending` 置为对应 atom（`:llm` / `:sense` / `:tool`）。`step` 本身不触外部世界（§9 守恒①）。
+2. **边界分发**：运行时 `drive_*(state, input)` 先调 `step(state, :ask)` 之类记意图，再检测 `state.pending`；若非空，则对接对应 effector（调 `fake_llm` / `sense_world` / `fake_db` / 人类输入源）拿到结果。
+3. **回填**：边界把结果写回状态字段（如 `contacts` / `last_result` / `mood`），并构造 `:sense_done` / `:tool_done` / `:llm_reply` 消息再喂一次 `step` 清空 `pending`（`:none`）。
+> 这一来一回（`记意图 → 边界 → 回填`）即 Core/Edge 解耦的全部机制。`step` 始终是纯函数，非确定性只活在 `drive_*` 里「则调用 effector」那一小段（§0、§9）。
+
+### 10.2 五个 Edge 的边界适配器职责
+| Edge | 对接谁 | 边界 fn（示例名） | 非确定性来源 |
+|---|---|---|---|
+| Tool·IO | DB / 支付 / HTTP / 游戏状态 API | `drive_db` → `fake_db` | 工具副作用 |
+| LLM | 大模型 | `drive_receptionist` → `fake_llm`（真实即 LLM/IO） | 模型随机性 |
+| Human | 人类输入设备 | `drive_hero` ← 人类事件 | 人类意志 |
+| Sensor·Env | 读世界 / 邻近实体 | `drive_radar` → `sense_world` | 世界状态 |
+| Network·OtherAgents（候选） | 跨进程消息 | 见 §7 身份与发现 | 传输层 |
+> `examples/agent_edge.tc` 已演示 Tool / Sensor / Human 三体同构（内核 `step` 完全相同，差异只在 `drive_*` 接谁）；`agent_npc.tc` 演示 LLM 体。`Network` 仍候选（受 §7 开放问题约束）。
+
+### 10.3 `agentkit` 库职责（§8.4 落地，⏳ 待建 `agentkit.tc`）
+- **`record`**：廉价、默认地记录整条消息流 `(InitState, [Msg...])`——重建因果链的最小输入（§9 守恒⑤）。
+- **`replay`**：给定记录重新喂消息、断言每帧 `State`——`step` 纯函数保证同输入同行为，可逐帧定位「哪一帧开始偏离」（§9 守恒①②③）。
+- **`diff`**：两帧 `State` 逐字段比对，输出偏离字段。
+- **时钟注入**：若游戏需 `:tick`，由 `agentkit` 单调时钟产生，而非 `step` 内部读墙钟（守 §9 守恒①「零时钟」）。
+> 以上皆纯 `t` 可实现（消息即 struct、状态可快照），属「库」不属「语言」。`examples/agent_edge.tc` 已用手写 `replay radar` 演示 replay 的可复现性（见其 `.expected.txt` 第 18 行 `replay radar -> contacts=7`）。
+
+### 10.4 边界确定性纪律
+- 边界是**唯一允许非确定性**之处；测试时把 `fake_llm` / `sense_world` 换成**确定性桩**即让整条回路可复现（示例正是这么做的）。
+- 出问题时二分：**是 `step` 纯逻辑 bug（从消息日志可复现），还是边界 / IO bug（允许非确定性的那部分）**——这是 §9 守恒④防火墙的日常用法。
+
+---
+
+## 11. ECS 集成与非容器原则
+
+用户质问：「agent 成为一等公民后 System 全挂 agent 里 → 臃肿」「每个 agent 要挂移动 / 碰撞 / 旋转怎么办」。答：agent 在 ECS 里只扮演**两个独立且可选**的角色，它**既不是系统的父容器、也不是命名空间**。
+
+### 11.1 agent 的两重 ECS 角色（非容器）
+- **角色 A（数据）**：`XState` 是一个 **Component**，与 `Position` / `Velocity` 平级地挂到 Entity。
+- **角色 B（逻辑）**：`x_step` 是**众多 System 中的一个**，与 `MovementSystem` / `CollisionSystem` 平起平坐。
+> 一个 NPC 不会因「是一等公民」就吞下移动 / 对话 / 战斗 / 感知 / 渲染——那种「上帝 Agent」是反模式，t 的规则从根上禁止（见护栏）。
+
+### 11.2 多能力分解：移动 / 碰撞 / 旋转 = 配对 Component+System
+「NPC 需要移动 + 碰撞 + 旋转」**不等于** agent 体内挂三个方法，而是：
+- **数据 → Component**：`Position` / `Velocity` / `Rotation` / `BoundingBox`（并行的纯数据）；
+- **逻辑 → System**：`MovementSystem` / `CollisionSystem` / `RotationSystem`（并排的自由 fn）；
+- **agent 只贡献**：`NpcState`（一个 Component）+ `npc_step`（一个决策 System，只算**意图**如 `intent_dir`，不执行动作）。
+Scene/Spawn 把 `NpcState` 与物理 Component **组合**到同一 Entity；每帧循环 `npc_step` 先跑算意图，物理 System 读意图去算。能力越多，只是多挂几个 Component / 多跑几个 System——**agent 声明一行不增**。
+
+### 11.3 三道护栏（已在语言 / 架构铺好，堵死臃肿）
+1. **struct 无方法（铁律）**：物理逻辑没语法资格进 `NpcState`（§0、§4）。
+2. **逻辑在 System 不在 step**：`step` 只做三件事——`match(msg)` → 改两三个字段 → 设 `pending`/`intent`，永远只产出意图。
+3. **模型库外置**：移动 / 碰撞 / 旋转属 `physics.tc` 这类**模块**（`import` 进来），不进 `tc.tc`、不进 agent（见 §12）。
+
+### 11.4 语言职责边界（5 层）
+t 为 Agent First 能做的，与刻意不做的，同样重要。语言层只管这 5 层，Edge 在库：
+1. **语法层** — `agent` 是一等公民声明（脱糖为 struct + fn + spawn）。
+2. **类型与安全层** — 消息 / 工具签名静态类型检查，缝不静默崩。
+3. **语义层** — 确定性 actor（`step` 纯、状态不可变传递），可单测 / 回放。
+4. **自省层** — `type_info` 描述类型，支撑 fid 序列化与自动生成工具 / 消息 schema。
+5. **边界契约层** — `pending → reply` 握手是纯 `t` 可表达的协议，非语言特性。
+> **最关键**：以上 5 层是 t 该做的；虚线之下（Sensor / Tool / LLM / Human / Network 适配器）是**运行时 / 模型库**的事，不进编译器 intrinsics。一句话：**语言负责确定性，库负责可能性。**
+
+### 11.5 规划体（Planning）的无语法表达
+§6 说 Planning 行「待 goal」——但 §8 决策 A 第 5 条已定：**不引入 `goal`/`plan` 语法**，改用纯 `planner(State) -> Msg` 自由 fn。即：规划 Core = 一个算出「下一步消息」的自由 fn，把结果喂同一纯 `step`。不变量不变（step 纯、效应在边界）。这把「最聪明的决策」也压回库层模式，而非新语法。
+
+---
+
+## 12. 模块与模型库分层（功能外置）
+
+用户原话：「主程序仅提供词法 / 语法 / 语义；具体功能实现由接入的模型库决定。」这与决策 A、§3.13 模块系统一致——`agent` 引入**零运行时特性**，所有「能力」都可外置为 `import` 的模型库。
+
+### 12.1 分层
+- **主程序（编译器 `tc.tc`）**：仅词法 / 语法 / 语义——含 `agent` 脱糖、模块 `import/export`、既有类型系统。不内置任何领域功能。
+- **模型库（模块）**：`import` 进来的聚焦单元，每个一个领域。例：
+  - `physics.tc` — 运动 / 碰撞 / 旋转 Component+System（§11.2）。
+  - `agentkit` — §10 的 record / replay / diff 与时钟注入（⏳ 待建）。
+  - `llm_boundary` — 真实 LLM 调用的 `drive_*` 适配器（替换示例里的 `fake_llm` 桩）。
+  - `time` / `ser`（fid）— 已在 M54–M57 / M51 实现的具体功能，亦属可外置模型库。
+> 这些库**不进 `tc.tc`**；主程序因此保持精简，与用户诉求一致。
+
+### 12.2 组合方式（agent 声明只「引用」，不「包含」）
+```t
+import physics;          // 运动/碰撞是外置模型库（§3.13 内联机制已落地）
+Guard agent {
+  state pos: Position            // Position 来自 physics 模块（Component）
+  state pending: atom
+  state intent_dir: Velocity     // 决策意图，MovementSystem 读
+  step fn(s: GuardState, msg: atom) -> GuardState {
+    if (msg == :tick) { return GuardState { pos: s.pos, pending: :llm, intent_dir: steer_patrol(s.pos) }; }
+    else if (msg == :llm_reply) { return GuardState { pos: s.pos, pending: :none, intent_dir: s.intent_dir }; }
+    return s;
+  }
+}
+// 世界循环：decision Core 写意图 → physics.MovementSystem 读意图算位置 → llm_boundary.drive 填对话
+```
+- `Position` / `Velocity` / `steer_patrol` / `MovementSystem` 全部来自 `physics`（§3.13 模块内联机制已落地，`module_hello` 双后端通过）。
+- `step` 只引用库符号、写意图，**智能在库不在 agent**。
+
+### 12.3 与 §3.13 衔接
+- agent 脱糖产物 `XState` / `x_spawn` / `x_step` 标 `export` 后可跨模块复用（消息回路边界），见 §3.13 末段。
+- 模型库须 `export` 其 Component / System / 边界 fn，agent 声明 `import` 后按命名空间引用。
