@@ -1,0 +1,168 @@
+// agent_npc_mind_llm.tc —— 接「本地 LLM」的运行时边界实跑（旁路桥模式）
+//
+// 与 agent_npc_mind.tc 唯一差别：fake_llm（确定性桩）换成 llm_local（真实 LLM 接缝）。
+// 架构（对应 docs/agent_first.md §7 / §10 / §10.4）：
+//   - step 仍是纯函数，只在状态里记意图（:llm / :tool）；非确定性只活在 drive_npc 边界。
+//   - 真正的 LLM 调用发生在「运行时边界」——这里经 stdin/stdout 管道交给外部 Python 桥
+//     （tools/llm_bridge.py），桥去打本地 LLM（默认 Ollama，失败回退确定性应答）。
+//   - 语言零改动：t 只有 stdin/stdout 两个 fid，没有 FFI/HTTP，所以 LLM 必然活在进程外。
+//
+// 协议（stdin/stdout 固定为 :text，读字符串按空白分词，含空格无法 round-trip）：
+//   请求 t→桥：println("LLMREQ|" + prompt) + fflush(stdout)   —— 一行一个请求
+//   回复 桥→t：把应答按词发，末尾加哨兵 __EOM__               —— t 逐 token 读、空格重拼
+//   其它 t 的 stdout 行（show_entity 日志）桥原样镜像到 stderr，不作协议。
+//
+// 注意：prompt 须单行（\n 不允许出现在 t 字符串字面量内）；多行 prompt 需上层约定。
+
+import physics;
+
+// ───────────────────────── agent（瘦决策核，与 agent_npc_mind.tc 完全相同） ─────────────────────────
+Npc agent {
+    state memory: string;
+    state pending: atom;          // :none / :llm / :tool
+    state intent_dir: Velocity;
+    state last_line: string;
+    step fn(s: NpcState, msg: atom) -> NpcState {
+        if (msg == :tick) {
+            s.pending = :none;
+            s.intent_dir = Velocity{ dx: 1, dy: 0, dz: 0 };
+            return s;
+        }
+        if (msg == :talk)    { s.pending = :llm;  return s; }
+        if (msg == :use_door) { s.pending = :tool; return s; }
+        if (msg == :llm_reply) { s.pending = :none; return s; }
+        if (msg == :tool_done)  { s.pending = :none; return s; }
+        return s;
+    }
+}
+
+Entity struct {
+    pos: Position;
+    vel: Velocity;
+    rot: Rotation;
+    box: BoundingBox;
+    wall_hit: bool;
+    mind: NpcState;
+}
+
+make_entity fn() -> Entity {
+    return Entity{
+        pos:  Position{ x: 0, y: 0, z: 0 },
+        vel:  Velocity{ dx: 0, dy: 0, dz: 0 },
+        rot:  Rotation{ yaw: 0, pitch: 0 },
+        box:  BoundingBox{ w: 1, h: 2, d: 1 },
+        wall_hit: false,
+        mind: npc_spawn("", :none, Velocity{ dx: 0, dy: 0, dz: 0 }, "")
+    };
+}
+
+intent_label fn(p: atom) -> string {
+    return match (p) {
+        :none => "idle"
+        :llm  => "await-llm"
+        :tool => "await-tool"
+        _     => "?"
+    };
+}
+
+// ───────────────────────── 运行时边界：本地 LLM（stdin/stdout 旁路桥） ─────────────────────────
+// 这就是「把 fake_llm 换成真实 LLM 接缝」的全部改动点（§10.4）。
+// 函数签名不变（fn(q: string) -> string），只把函数体从 match 桩换成一次管道往返。
+llm_local fn(q: string) -> string {
+    // 发包：stdout 写协议请求行（前缀 LLMREQ|），刷盘让桥立刻收到，否则会死锁
+    var rb: StringBuilder = sb_new();
+    sb_append_str(rb, "LLMREQ|");
+    sb_append_str(rb, q);
+    println(sb_to_str(rb));
+    fflush(stdout);
+
+    // 收包：从 stdin 逐 token 读，遇 __EOM__ 停止，用空格重拼
+    //（绕开 :text 读字符串按空白分词、含空格无法 round-trip 的已知限制）
+    var wb: StringBuilder = sb_new();
+    var first: bool = true;
+    while (true) {
+        var tok: string = stdin > string;
+        if (tok == "__EOM__") { break; }
+        if (first) { first = false; } else { sb_append_str(wb, " "); }
+        sb_append_str(wb, tok);
+    }
+    return sb_to_str(wb);
+}
+
+// 工具效应仍是确定性桩（用户本次只要求接 LLM；Tool 也可同样旁路，留作练习）
+fake_tool fn(arg: string) -> string {
+    return match (arg) {
+        "door" => "door opened"
+        _      => "no-op"
+    };
+}
+
+// 边界驱动：pending==:llm → 打本地 LLM；pending==:tool → 调工具桩；结果回填 last_line 并清空意图
+drive_npc fn(s: NpcState, prompt: string, tool_arg: string) -> NpcState {
+    if (s.pending == :llm) {
+        var reply: string = llm_local(prompt);            // ← 边界：本地 LLM（非确定性接缝）
+        s.last_line = reply;
+        s = npc_step(s, :llm_reply);
+    } else if (s.pending == :tool) {
+        var res: string = fake_tool(tool_arg);
+        s.last_line = res;
+        s = npc_step(s, :tool_done);
+    }
+    return s;
+}
+
+// ───────────────────────── 世界循环（一帧推进，与 agent_npc_mind.tc 完全相同） ─────────────────────────
+world_tick fn(e: Entity, msg: atom, prompt: string, tool_arg: string) -> Entity {
+    e.mind = npc_step(e.mind, msg);
+    e.vel = e.mind.intent_dir;
+    e.pos = physics.movement_system(e.pos, e.vel, 1);
+    e.rot = physics.rotation_system(e.rot, 90);
+    e.wall_hit = physics.collision_system(e.pos, e.box, 3);
+    e.mind = drive_npc(e.mind, prompt, tool_arg);
+    return e;
+}
+
+// 展示实体快照（日志走 stdout，由桥镜像到 stderr；不参与协议）
+show_entity fn(tag: string, e: Entity) -> void {
+    var b: StringBuilder = sb_new();
+    sb_append_str(b, tag);
+    sb_append_str(b, " pos=(");
+    sb_append_i64(b, e.pos.x);
+    sb_append_str(b, ",");
+    sb_append_i64(b, e.pos.y);
+    sb_append_str(b, ",");
+    sb_append_i64(b, e.pos.z);
+    sb_append_str(b, ") yaw=");
+    sb_append_i64(b, e.rot.yaw);
+    sb_append_str(b, " pending=");
+    sb_append_str(b, intent_label(e.mind.pending));
+    sb_append_str(b, " hit=");
+    if (e.wall_hit) { sb_append_str(b, "yes"); } else { sb_append_str(b, "no"); }
+    sb_append_str(b, " last=");
+    sb_append_str(b, e.mind.last_line);
+    println(sb_to_str(b));
+}
+
+@main
+main fn() -> i64 {
+    println("=== agent_npc_mind_llm: 本地 LLM 旁路桥 ===");
+    var e: Entity = make_entity();
+    show_entity("spawn   ->", e);
+
+    e = world_tick(e, :tick, "", "");
+    show_entity("frame1  ->", e);
+    e = world_tick(e, :tick, "", "");
+    show_entity("frame2  ->", e);
+    e = world_tick(e, :tick, "", "");
+    show_entity("frame3  ->", e);
+
+    // 玩家让 NPC 说话（LLM 边界：经管道打本地 LLM）
+    e = world_tick(e, :talk, "hours", "");
+    show_entity("after talk->", e);
+
+    // 玩家让 NPC 开门（Tool 边界：仍是确定性桩）
+    e = world_tick(e, :use_door, "", "door");
+    show_entity("after tool->", e);
+
+    return 0;
+}

@@ -44,3 +44,7 @@
 - ~~reference.md L907 "defer 作用域退出 LIFO" 描述不精确(实测函数级),待订正。~~ **已订正**（2026-08-04）：L928 EBNF 注释改为「函数级：登记到当前函数延迟栈，于 return/函数尾按 LIFO 执行（写在 if/while 块内也到函数退出才触发，非块级作用域退出）」；L1244 本就准确。
 - **已修复(2026-08-03)**：`compile`/`emit-ll`/`build`/`run` 子命令原在 `has_errors()` 时静默 `return 1` 不打印诊断，任何编译错误都伪装成「沉默 exit 1」，易被误判为段错误。已在 `src/tc.tc` 主入口两处补 `print_json()`（与 `check` 一致）。排查「编译器崩溃」时先跑 `tc check <file>` 看 JSON 诊断，别被 build/emit-ll 的静默 exit 骗了。
 - **C 后端「大结构体按值返回」崩溃(已知限制, 待修)**:函数返回**体量大的 struct**(如含 `[256]T` 定长数组、约数 KB)按值 → C 后端实跑段错误(exit 139),LLVM 正常。小 struct(`Position` 24B、`Entity` 等)按值返回正常,故阈值是"超过寄存器承载 → 走 sret → C 发射 sret 路径有 bug"。**规避手法**:用 `[]T` 切片承载大序列,使承载结构体本身很小(切片头 ptr+len ≈16B + 计数 i64),返回/传参按值安全,记录实际存于堆。`agentkit.tc` 的 `MsgLog`(底层 `[]MsgRec` 切片)即此手法。长远应修 C 发射器的大 struct sret 返回(类似此前拓扑排序修复),但属编译器改动,需 gate L2 全绿验证,不在 agentkit 交付范围内。
+
+## 架构约定(Agent / Edge 落地)
+- **t 无 `extern`/FFI、无内建 socket/HTTP**:所有 LLM / 工具 / 感知 / 人类输入等 Edge 效应**必然活在进程外**(决策 A §10.4)。`step` 纯函数只在状态记意图,运行时边界 `drive_*` 对接外部 effector 后以消息回填。
+- **本地 LLM 落地 = stdin/stdout 旁路桥(sidecar, 零编译器改动)**:t 有 `stdin`/`stdout` 作 `fid`(§3.10)。`stdin`/`stdout` 固定 `:text`,`runtime/t_deser_str`(1860)证**读字符串按空白分词、含空格无法 round-trip** ⇒ 协议:请求 `t→桥` = `println("LLMREQ|"+prompt)+fflush(stdout)`(写不分词);回复 `桥→t` = 应答按词发 + 哨兵 `__EOM__`,t 侧 `while` 逐 `stdin > string` token 读、遇 `__EOM__` break、空格重拼。参照实现 `examples/agent_npc_mind_llm.tc`(改 `fake_llm`→`llm_local`)+ `tools/llm_bridge.py`(默认打 Ollama `:11434/api/generate`,`LOCAL_LLM_MODEL`/`LOCAL_LLM_URL` 可配,不可达回退确定性应答)。`\n` 不允许在字符串字面量内(reference 137)→ 换行靠 `println`+`fflush`。
