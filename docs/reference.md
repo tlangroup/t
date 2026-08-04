@@ -1681,7 +1681,7 @@ AgentClause:
 
 ---
 
-### 3.13 Modules / Import / Export（代码模块与插件系统）⚠ 部分实现（2026-08-04：parser + 两个诊断 + whole-program inlining 已落地，`module_hello` 双后端真实通过；**工程源码根 + 点分模块名 `import a` / `import d.e` 已落地（commit 71659a3，`proj_demo` 双后端真实通过）**；`.tlib`/`.tlibd` 产物 / `T_IMPORT_CYCLE` / `export` 私有隔离强校验 / `@` 外部库 / tote 依赖图 / C 互操作导出待实现）
+### 3.13 Modules / Import / Export（代码模块与插件系统）⚠ 部分实现（2026-08-04：parser + 两个诊断 + whole-program inlining 已落地，`module_hello` 双后端真实通过；**工程源码根 + 点分模块名 `import a` / `import d.e` 已落地（commit 71659a3，`proj_demo` 双后端真实通过）**；**`@` 外部库搜索路径 + 命名空间隔离 `lib__name` 重整 + `export` 私有隔离强校验（`T_MODULE_PRIVATE`/`T_MODULE_NO_SYMBOL`）已落地（第四刀，2026-08-05）**；`.tlib`/`.tlibd` 产物 / `T_IMPORT_CYCLE` / tote 依赖图 / C 互操作导出待实现）
 
 > 本节气法由 `docs/syntax/drafts/module.md` 经 L-15 采用并并入（原草稿已标记失效）。与 §3.6.1 数据导入（`import_csv`/`import_json` 函数调用）正交：代码模块走 `import xxx` 标识符形式（支持点分 `xxx.yyy`）。
 
@@ -1694,6 +1694,7 @@ ModuleFile:     <src_root> "/" ModuleName-with-"/" ".tc"
 ModuleArtifact: ModuleStem "." ("tlib" | "tlibd")   // ⚠ spec-only 编译产物（插件形态），如 math.tlib / math.tlibd（待独立编译编排）
 
 ImportDecl:     "import" ModuleName ("as" IDENTIFIER)? ";"   // import math; / import net.http; / import net.http as h;
+ExtLibImport:   "import" "@" IDENTIFIER ("as" IDENTIFIER)? ";"  // import @json; / import @csv as j;
 ExportPrefix:   "export"                            // 前缀修饰顶层声明
 ```
 
@@ -1702,16 +1703,18 @@ ExportPrefix:   "export"                            // 前缀修饰顶层声明
 1. **导入形式**：`import xxx;` 或 `import xxx as m;`。`import` 后是**点分模块名**（标识符，允许 `.` 分段），非字符串路径；与数据导入函数不重名（L-04 唯一语义）。
 2. **默认私有**：顶层符号默认模块内可见；跨模块可见须显式 `export <name> fn/struct/enum/flag/variant/const/typealias`。`export` 修饰非顶层 → `T_EXPORT_SCOPE`（L-02 显式）。
    - ⚠ 语法注意：t 声明为并置式 `Name fn(...)`，`export` 前缀置于**名字之前**：`export add fn(...) { ... }`（非 `export fn add`）。
-   - ⚠ 隔离现状：当前 inlining 模型下 `export` 仅作文档约定，**私有符号尚未被强制隐藏**（跨模块仍可调用，见实现状态第三刀），真隔离属未来 `.tlib` 接口块里程碑。
+   - ✅ **私有隔离已强制（2026-08-05 第四刀）**：经 `mangle_modules` 重整，导入模块（别名 `A`）的顶层符号被改写为 `A__name`；未 `export` 的符号**跨模块不可见**——`A.priv()` 触发 `T_MODULE_PRIVATE`，`A.NoSuchType` 触发 `T_MODULE_NO_SYMBOL`。模块**内部**自调用同样脱糖为 `A__name`（库内自洽）。入口模块别名 `""` → **永不重整**，故单文件程序 IR 逐字节不变（已重录基线、L2 gate 全绿验证）。
 3. **名称解析与限定前缀（Go 风格末段）**：`import net.http;` 的命名空间取**模块名最后一段** `http`，以 `http.get(...)` 访问；`import math;` 即 `math.add(...)`；`import net.http as h;` 则 `h.get(...)`；裸名 `get(...)` 亦可直接调用（inlining 进同一单元）。限定前缀**只取末段**，`import net.http` 不能用 `net.http.get`（点分仅用于描述文件路径，不构造多级命名空间）。零碰撞、显式。
+3b. **限定类型与字面量（跨模块类型引用）**：引用外部/其他模块**导出类型**须带限定前缀——`var v: json.Value;`、字面量 `var p: physics.Position = physics.Position{ x: 1, y: 2 };`。解析期 `named{A.T}` 重整为 `A__T`（找不到 → `T_MODULE_NO_SYMBOL`）；`A.T{}` 结构化字面量同理。`mangle_modules` Pass 1 先处理：识别 object 为模块别名的 `member`、带 `sb != ""` 的 `named`/`struct_lit`，按 `def_lookup` 解析后清 `sb`。未限定的 `Value`/`Position` 只在本模块查找。
 4. **工程源码根（2026-08-04 第三刀，已落地）**：所有工程内 `import` 相对**项目源码根 `<src_root>`** 解析，模块名中的 `.` 即路径分隔符：
    - `import a;` → `<src_root>/a.tc`
    - `import d.e;` → `<src_root>/d/e.tc`
    - 文件不存在 → `T_IMPORT_NOT_FOUND`。
    - `<src_root>` 取值 = **入口文件所在目录**（取代旧的「相对导入方目录」）。标准布局下你跑 `tc run src/main.tc`，入口目录即 `<root>/src`，于是 `import a` ⇒ `<root>/src/a.tc`、`import d.e` ⇒ `<root>/src/d/e.tc`，完全吻合「工程目录\src 为统一源码根」的设计。
    - ⚠ **已知限制**：向上查找 `tote.toml` 自动定位 `<root>` 的方案**暂未启用**——编译器内置 `path_exists`（`sys_run`→`cmd /c if exist`）在当前运行时对绝对路径探测不稳定（会触发 `arena: out of memory`），向上遍历会越界。故采用「入口目录 = 源码根」这一对标准布局等价且稳健的折中。**约定用法**始终是 `tc run src/main.tc`（入口置于 `src/` 下）；若从工程根目录直接 `tc run main.tc`（main 不在 `src/` 下），则不会自动下钻 `src/`。
-5. **版本钉与依赖**：外部依赖的**版本钉统一由 `tote.toml` 负责**（见 `src/tote.tc` 与 §4）；编译器层面仅保留 `@外部库` 的语法位（预留），**`@` 外部库导入尚未实现**——当前 `import` 一律按工程内源码解析。
-6. **解析序（实际实现）**：`handle_one_import` 将 `ModuleName` 的 `.` 转 `/`，相对 `<src_root>` 取**源码**整体内联（C 的 `#include` 风格、单命名空间），无 `.tlib(d)` 产物查找；嵌套 import 递归、重复自动去重。⚠ 草稿设计的「先找 `.tlibd`/`.tlib` 产物、否则编译同仓 `.tc`」两步优化路径**尚未实现**（属未来独立编译编排）。
+5. **`@` 外部库（搜索路径 + 命名空间隔离，2026-08-05 第四刀已落地）**：`import @json;` 导入**外部库**（区别于工程内 `import a;` 点分源码）。解析顺序沿**库搜索路径**依次探测 `<libdir>/json.tc` → `<libdir>/json/index.tc` → `<libdir>/json/lib.tc`，命中即载入为别名 `json`；全无命中 → `T_IMPORT_NOT_FOUND`。载入后该库顶层符号经命名空间重整（`json__version` 等），只能经 `json.xxx` 限定访问，未 `export` 符号跨模块不可见（见 rule 2）。版本钉仍归口 `tote.toml`（见 §4），编译器只负责解析与隔离。
+5b. **库搜索路径（`compute_lib_dirs`）**：候选目录顺序 = ① 入口文件目录下的 `lib/`、`libs/`；② 每个工程源码根 `<src_root>` 的**父目录**（工程根）下的 `lib/`、`libs/`。故 `examples/extlib_demo.tc` 入口目录 `examples/` 自然命中 `examples/lib/json.tc`、`examples/lib/csv.tc`；标准工程 `src/main.tc` 命中 `<root>/lib`、`<root>/libs`。`~/.tote/libs` 与 `T_LIB_PATH` 环境变量搜索属 **Phase 2**（待 `getenv` 内建）。
+6. **解析序（实际实现）**：`handle_one_import` 将 `ModuleName` 的 `.` 转 `/`，相对 `<src_root>` 取**源码**整体内联（C 的 `#include` 风格、单命名空间），无 `.tlib(d)` 产物查找；嵌套 import 递归、重复自动去重。⚠ 草稿设计的「先找 `.tlibd`/`.tlib` 产物、否则编译同仓 `.tc`」两步优化路径**尚未实现**（属未来独立编译编排）。`import @x`（外部库）走 `resolve_external_lib` 搜索路径 + `mangle_modules` 命名空间重整（非单命名空间内联，见第四刀）；工程内 `import a` 仍走 `handle_one_import` 整体内联。
 7. **依赖图无环**：当前靠 `in_mod_visited` 访问集对重复 import **去重、天然打断递归**（避免无限递归），但 `T_IMPORT_CYCLE` 错误**尚未发射**（真成环不报错、仅去重）。⚠ 严格无环校验 + 错误诊断属未来 `tote` 协同实现。
 8. **接口自描述**：`.tlib`/`.tlibd` 内嵌接口块（后端无关、确定性可读的 `export` 签名区），importer `check` 只读接口块即可类型检查；未 `export` 符号不进接口块，私有天然不可见。
 9. **C 互操作**：`.tlib` 可经 `tote` 导出为 C 兼容 `.lib`/`.dll`（符号来自接口块），导出表仅含 `export` 符号（见草稿 §11）。
@@ -1752,7 +1755,12 @@ main fn() -> i32 @main {
   - ✅ **版本钉原则落地**：外部依赖版本钉统一归口 `tote.toml`（语法层 `@外部库` 位预留，导入仍走工程内源码）；用户拍板「工程内 `import a` ⇒ `<root>/src/a.tc`，`import d.e` ⇒ `<root>/src/d/e.tc`」。
   - ✅ **验证**：新增 `examples/proj_demo/`（tote.toml + src/main.tc + src/hello.tc + src/d/e.tc），**双后端（LLVM + C）跑通** `hi from hello` / `5` / `110`（`e.deep(10)=110` 证明 `import d.e` + 末段限定 + `as` 别名 + 裸名全对）；`examples/module_hello` 回归无碍；L2 gate 全绿，IR 基线重录后逐字节一致。
   - ⚠ **已知限制（已记入记忆）**：向上查找 `tote.toml` 自动定位 `<root>` 的方案**未启用**——内置 `path_exists`（`sys_run`→`cmd /c if exist`）对绝对路径探测不稳定（触发 `arena: out of memory`）。故以「入口目录 = 源码根」折中，对标准布局等价；约定用法 `tc run src/main.tc`（入口置于 `src/` 下），不要从工程根目录直接 `tc run main.tc`（main 不在 `src/` 下时不会下钻）。
-  - ⏳ **待实现**：`@` 外部库真正落地（搜索路径 + 预编译 + 命名空间隔离）、`tote.toml` 自动定位 `<root>`（待 `path_exists`/运行时修复后）、`export` 私有隔离强校验、`T_IMPORT_CYCLE` 诊断。
+  - ⏳ **待实现（余下）**：`@` 外部库的**预编译 `.tlib` 产物**（搜索路径 + 命名空间隔离已实现，见第四刀）、`tote.toml` 自动定位 `<root>`（待 `path_exists`/运行时修复后）、`T_IMPORT_CYCLE` 诊断。
+- **实现状态（2026-08-05 第四刀 —— `@` 外部库搜索路径 + 命名空间隔离，端到端可跑）**：
+  - ✅ **已落地**：`import @x;` 外部库经**搜索路径 + 命名空间重整**真实隔离（区别于工程内 `import a` 点分源码）。`compute_lib_dirs` 计算候选 `lib/`、`libs/` 目录（入口目录优先，其次各工程根的 `lib/`/`libs/`）；`resolve_external_lib` 按 `<libdir>/x.tc` → `/x/index.tc` → `/x/lib.tc` 探测，全失 → `T_IMPORT_NOT_FOUND`。命中后 `mangle_modules` 对该库（别名 `A`）顶层符号整写为 `A__name`，限定访问 `A.sym` 脱糖为 `A__sym`；未 `export` 符号跨模块访问被强拒：`A.priv()` → `T_MODULE_PRIVATE`，`A.NoType` → `T_MODULE_NO_SYMBOL`；库内自调用同样脱糖 `A__name`（自洽）。入口模块别名 `""` → 永不重整，**单文件程序 IR 逐字节不变**（已重录基线、L2 gate 全绿验证）。
+  - ✅ **限定类型 / 字面量**：`parse_type` 支持 `A.T` 限定类型、`parse_prim_ident` 支持 `A.T{...}` 限定结构化字面量，均经 `mangle_modules` 重整为 `A__T`；找不到报 `T_MODULE_NO_SYMBOL`。`clone_type_node` 深拷贝补齐 `sb`（模块限定）字段，修复 agent state 字段类型克隆丢失 `physics.` 前缀退化成 `i64` 的 LLVM link 错误。
+  - ✅ **验证**：新增 `examples/lib/json.tc`、`examples/lib/csv.tc`（二者故意同名 `version`/`encode`/`quote`，证明命名空间隔离互不污染）、`examples/extlib_demo.tc`（双后端 `run` 输出 `json/0.1` / `csv/0.1` / `{"count":42}` / `count,42`）；conformance 新增 `f54_ext_import_not_found`（期望 `T_IMPORT_NOT_FOUND`）、`f55_module_private`（期望 `T_MODULE_PRIVATE`）、`f56_module_no_symbol`（期望 `T_MODULE_NO_SYMBOL`），随 gate 全绿。既有 `agentkit_demo`/`agent_npc_mind` 因隔离收紧改为显式 `agentkit.`/`physics.` 限定，已同步修订。Bootstrap 不动点（g2==g3==g4）保持，L2 gate 13 passed/0 failed/0 warn，IR 基线重录（46 targets/138 entries）。
+  - ⏳ **待实现（Phase 2）**：`.tlib`/`.tlibd` 预编译产物 + 内嵌接口块、`build --lib` 模式（发 `exports.json` + `.a`/`.bc`）、下游 `import @x` 链接归档 + 发射 externs、`T_IMPORT_CYCLE` 依赖图无环校验、`~/.tote/libs` 与 `T_LIB_PATH` 环境变量搜索（需 `getenv` 内建）、`tote` 依赖图协同、C 互操作导出（`.lib`/`.dll`）。
 
 ---
 

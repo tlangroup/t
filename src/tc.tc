@@ -45,6 +45,7 @@ Node struct {
     ba: bool;
     bb: bool;
     bc: bool;   // 模块系统：该声明是否被 `export` 修饰（顶层可见性）
+    bd: bool;   // 模块系统：该 import 声明是否指向外部库（import @x）
     na: i64;
     nb: i64;
     nc: i64;
@@ -81,6 +82,7 @@ node_new fn(kind: string) -> i64 {
     n.ba = false;
     n.bb = false;
     n.bc = false;
+    n.bd = false;
     n.na = -1;
     n.nb = -1;
     n.nc = -1;
@@ -92,6 +94,7 @@ node_new fn(kind: string) -> i64 {
     n.cl = 0;
     n.tv = "";
     append(nodes, n);
+    append(g_node_mod, g_cur_mod);   // provenance：记录本节点所属模块别名（"" = 入口）
     return (slice_len(nodes) as i64) - 1;
 }
 
@@ -377,12 +380,13 @@ mk_ImportDecl fn(sb: string, sc: string, has_sa: bool, has_sc: bool, la: i64, ti
 
 // 模块导入 `import xxx [as m]`（M-Module）：sb=模块名, sc=别名(可空), has_sc=有别名；
 // bc=被 export 修饰（非法，check 期报 T_EXPORT_SCOPE）。
-mk_ImportModDecl fn(sb: string, sc: string, has_sc: bool, la: i64, ti: i64) -> i64 {
+mk_ImportModDecl fn(sb: string, sc: string, has_sc: bool, is_ext: bool, la: i64, ti: i64) -> i64 {
     var id: i64 = node_new("ImportModDecl");
     var n: Node = nodes[id];
     n.sb = sb;
     n.sc = sc;
     n.has_sc = has_sc;
+    n.bd = is_ext;   // true = 外部库 import @x
     n.la = la;
     slice_set(nodes, id, n);
     if (ti >= 0) { node_at(id, ti); }
@@ -4717,6 +4721,25 @@ var g_agent_anchor: i64 = -1;       // agent 声明脱糖时，合成节点锚�
 var g_mod_aliases: []string;        // 已导入模块的「模块名 / 别名」集合（用于识别限定访问前缀）
 var g_mod_visited: []string;        // 已完整加载的模块绝对路径（去重 + 环检测）
 
+// ── 命名空间隔离（外部库真正落地）──────────────────────────────
+// provenance：每个 AST 节点记录它是在哪个模块（别名）里被解析出来的。
+// 入口（main）模块别名 = ""，不参与名字重整（mangling）。
+var g_cur_mod: string;              // 解析期当前模块别名（load_module_file 内设置）
+var g_node_mod: []string;           // 与 nodes 平行的数组：nodes[i] 所属模块别名（"" = 入口）
+
+// 外部库搜索目录候选（compute_lib_dirs 填充）：工程根/lib、T_LIB_PATH、~/.tote/libs、编译器/libs
+var g_lib_dirs: []string;
+
+// 名字重整表（mangle_modules 构建）：并行数组，记录每个顶层声明原名/所属模块/是否导出。
+var g_def_orig: []string;           // 声明原名（重整前）
+var g_def_alias: []string;          // 所属模块别名（"" = 入口，不重整）
+var g_def_export: []bool;           // 该声明是否被 export 修饰
+var g_mod_has_export: []string;     // 至少含一个 export 声明的模块别名集合
+// 预编译外部库（.tlib）链接信息（Phase2）：下游 import @x 命中 .tlib 时填充，
+// 发射期据此外链归档并补 extern 声明，跳过库源码内联。
+var g_ext_link: []string;           // 待链接的归档/对象文件路径
+var g_ext_externs: []string;        // 待发射的 extern 声明（C 原型 / LLVM declare）文本
+
 
 // 匿名函数字面量（M46 / FuncType v2）：合成函数名 `__lam_N` 在解析期定名，
 // parse_unit 末尾由 desugar_lambdas 统一提升为顶层函数。
@@ -4997,6 +5020,17 @@ parse_type fn() -> i64 {
     if (t == "Identifier") {
         var idx: i64 = advance_i();
         var name: string = tk_v(idx);
+        // 模块限定类型 `A.T`（A = import 别名）：类型位置上 `X.Y` 只可能是模块限定，
+        // 故直接记为 named{ sa = T, sb = A }，由 mangle_modules 解析成 A__T。
+        if (cur_t() == "Dot" && peek_t(1) == "Identifier") {
+            advance_i();
+            var qtn: string = expect_tok("Identifier");
+            var idq: i64 = mk_named(qtn, idx);
+            var nq: Node = nodes[idq];
+            nq.sb = name;
+            slice_set(nodes, idq, nq);
+            return idq;
+        }
         if (name == "flag") {
             if (cur_t() == "LBracket") {
                 advance_i();
@@ -5263,6 +5297,22 @@ parse_prim_ident fn(ti: i64) -> i64 {
     }
     if (cur_t() == "LBrace" && looks_like_struct_lit()) {
         return parse_struct_lit(name, ti);
+    }
+    // 模块限定结构体字面量 `A.T{ ... }`：记为 struct_lit{ sa = T, sb = A }，
+    // 由 mangle_modules 解析成 A__T。判定条件与 looks_like_struct_lit 对齐（`{}` 或 `{ ident:`）。
+    if (cur_t() == "Dot" && peek_t(1) == "Identifier" && peek_t(2) == "LBrace") {
+        var ok_lit: bool = false;
+        if (peek_t(3) == "RBrace") { ok_lit = true; }
+        if (peek_t(3) == "Identifier" && peek_t(4) == "Colon") { ok_lit = true; }
+        if (ok_lit) {
+            advance_i();
+            var qtn: string = expect_tok("Identifier");
+            var slid: i64 = parse_struct_lit(qtn, ti);
+            var sln: Node = nodes[slid];
+            sln.sb = name;
+            slice_set(nodes, slid, sln);
+            return slid;
+        }
     }
     var id: i64 = mk_ident(name, ti);
     return id;
@@ -6153,7 +6203,17 @@ clone_type_node fn(n: i64) -> i64 {
     if (n < 0) { return -1; }
     var nd: Node = nodes[n];
     var k: string = nd.kind;
-    if (k == "named") { return mk_named(nd.sa, -1); }
+    if (k == "named") {
+        // 深拷贝须带上模块限定前缀 sb（`A.T` 的 A），否则克隆体丢失命名空间，
+        // mangle_modules 认不出来 → 退化成未知类型（agent state 字段曾因此变 i64）。
+        var cid: i64 = mk_named(nd.sa, -1);
+        if (nd.sb != "") {
+            var cn: Node = nodes[cid];
+            cn.sb = nd.sb;
+            slice_set(nodes, cid, cn);
+        }
+        return cid;
+    }
     if (k == "scalar") { return mk_scalar(nd.sa, -1); }
     if (k == "array") { return mk_array(clone_type_node(nd.na), nd.nb, -1); }
     if (k == "slice") { return mk_slice(clone_type_node(nd.na), -1); }
@@ -6321,7 +6381,29 @@ parse_global_var fn(is_const: bool) -> i64 {
 
 parse_import_decl fn(anns: i64) -> i64 {
     advance_i();
-    // 模块导入 `import xxx[.yyy...] [as m]`（点分模块名，M-Module）：
+    // 外部库导入 `import @name[.sub...] [as m]`（M-Module 外部库，@ 区分）：
+    // 走搜索路径（工程根/lib、T_LIB_PATH、~/.tote/libs、编译器/libs）定位 .tc/.tlib，
+    // 点号即子目录分隔符，@json.extra => <libdir>/json/extra.tc。
+    if (cur_t() == "At") {
+        advance_i();
+        var mname: string = expect_tok("Identifier");
+        var mti: i64 = pos - 1;
+        while (cur_t() == "Dot") {
+            advance_i();
+            mname = sb_cat3(mname, ".", expect_tok("Identifier"));
+        }
+        var alias: string = "";
+        var has_alias: bool = false;
+        if (cur_t() == "KwAs") {
+            advance_i();
+            alias = expect_tok("Identifier");
+            has_alias = true;
+        }
+        expect_tok("Semicolon");
+        var id: i64 = mk_ImportModDecl(mname, alias, has_alias, true, anns, mti);
+        return id;
+    }
+    // 工程内模块导入 `import xxx[.yyy...] [as m]`（点分模块名，M-Module）：
     // 点即路径分隔符，import d.e 解析为 <src>/d/e.tc。与旧数据导入 `import "path"` 分支并存。
     if (cur_t() == "Identifier") {
         var mname: string = tk_v(pos);
@@ -6339,7 +6421,7 @@ parse_import_decl fn(anns: i64) -> i64 {
             has_alias = true;
         }
         expect_tok("Semicolon");
-        var id: i64 = mk_ImportModDecl(mname, alias, has_alias, anns, mti);
+        var id: i64 = mk_ImportModDecl(mname, alias, has_alias, false, anns, mti);
         return id;
     }
     // 旧数据导入 `import "path" [as x]`（已由 import_csv/json 函数调用取代，仅保留兼容）
@@ -11139,13 +11221,15 @@ mod_alias_add fn(nm: string, alias: string) -> void {
 
 // 把模块文件解析为顶层声明，追加进 decl_list。
 // 其内嵌的 import 在此就地递归解析（内联），不会以 ImportModDecl 形式残留。
-// 注：解析后不再恢复 toks/pos —— check/emit 只依赖 AST，不再需要词法状态。
-load_module_file fn(path: string) -> void {
+// provenance：解析本模块期间把 g_cur_mod 置为模块别名，使模块内所有节点（含函数体/类型）
+// 都记录所属模块，供后续名字重整（mangling）做模块内引用改写；入口模块别名 = ""。
+load_module_file fn(path: string, alias: string) -> void {
     var saved_pos: i64 = pos;                 // 保存调用方的 token 流位置（支持嵌套 import 透明返回）
     var base: i64 = slice_len(toks) as i64;   // 模块 token 将从此下标开始（tokenize 是 append 语义）
     var msrc: string = file_read_all(path);
     tokenize(msrc);                           // 追加在入口/父模块 token 之后
     pos = base;                               // 从本模块起点解析，而非 0（否则会重解析入口文件）
+    g_cur_mod = alias;                        // 进入模块：标记 provenance
     while (cur_t() != "Eof") {
         if (cur_t() == "Semicolon") {
             advance_i();
@@ -11156,12 +11240,13 @@ load_module_file fn(path: string) -> void {
             continue;
         }
         if (nodes[d].kind == "ImportModDecl") {
-            // 嵌套 import：就地递归解析，不加入 decl_list（统一相对候选源码根）
+            // 嵌套 import：就地递归解析，不加入 decl_list（统一相对候选源码根/搜索路径）
             handle_one_import(d);
         } else {
             append(decl_list, d);
         }
     }
+    g_cur_mod = "";                           // 离开模块：恢复入口上下文
     pos = saved_pos;                          // 恢复调用方（入口或父模块）的解析位置
 }
 
@@ -11173,32 +11258,96 @@ handle_one_import fn(imp: i64) -> void {
         fc_err("T_EXPORT_SCOPE", "export 不能修饰 import 声明", imp);
         return;
     }
-    // 工程内 import 统一相对候选源码根解析；模块名中的 '.' 即路径分隔符：import d.e => <root>/d/e.tc
-    var rel: string = dots_to_slashes(nm);
-    var chosen: string = "";
-    var i: i64 = 0;
-    var nr: i64 = slice_len(g_src_roots) as i64;
-    while (i < nr) {
-        var cand: string = path_resolve(sb_cat4(g_src_roots[i], "/", rel, ".tc"));
-        if (path_exists(cand)) { chosen = cand; break; }
-        i = i + 1;
-    }
-    if (chosen == "") {
-        fc_err("T_IMPORT_NOT_FOUND",
-            sb_cat3("模块 '", nm, "' 无法解析：未在任何源码根下找到对应 .tc 文件"), imp);
-        return;
-    }
     // 限定访问前缀 = 模块名最后一段（Go 风格）：import d.e 以 e.foo() 调用；
-    // 用户显式 as 优先。
+    // 用户显式 as 优先。该别名同时是名字重整（mangling）的命名空间。
     var alias: string = user_alias;
     if (alias == "") { alias = last_segment(nm); }
     mod_alias_add(nm, alias);
+
+    // 外部库 import @x：走搜索路径（工程根/lib、入口/lib、~/.tote/libs、编译器/libs），
+    // 命中 .tc 源码则内联（名字重整后即为命名空间隔离）；.tlib 预编译外链为 Phase2。
+    var chosen: string = "";
+    if (nodes[imp].bd) {
+        chosen = resolve_external_lib(nm);
+        if (chosen == "") {
+            fc_err("T_IMPORT_NOT_FOUND",
+                sb_cat3("外部库 '@", nm, "' 无法解析：未在搜索路径下找到对应 .tc 文件"), imp);
+            return;
+        }
+    } else {
+        // 工程内 import 统一相对候选源码根解析；模块名中的 '.' 即路径分隔符：import d.e => <root>/d/e.tc
+        var rel: string = dots_to_slashes(nm);
+        var i: i64 = 0;
+        var nr: i64 = slice_len(g_src_roots) as i64;
+        while (i < nr) {
+            var cand: string = path_resolve(sb_cat4(g_src_roots[i], "/", rel, ".tc"));
+            if (path_exists(cand)) { chosen = cand; break; }
+            i = i + 1;
+        }
+        if (chosen == "") {
+            fc_err("T_IMPORT_NOT_FOUND",
+                sb_cat3("模块 '", nm, "' 无法解析：未在任何源码根下找到对应 .tc 文件"), imp);
+            return;
+        }
+    }
     // 已加载过则跳过（同时天然打破 import 成环，避免无限递归）
     if (in_mod_visited(chosen)) {
         return;
     }
     append(g_mod_visited, chosen);
-    load_module_file(chosen);
+    load_module_file(chosen, alias);
+}
+
+// 外部库搜索路径解析：返回命中路径（"" = 未找到）。
+// 搜索顺序：工程根/lib（逐个祖先含 tote.toml 者）、入口目录自身 lib、~/.tote/libs、编译器/libs。
+// 每个搜索目录下的候选：<name>.tc > <name>/index.tc > <name>/lib.tc。
+// （.tlib 预编译外链在 Phase2 接入；T_LIB_PATH 环境变量亦在 Phase2 纳入。）
+resolve_external_lib fn(nm: string) -> string {
+    var rel: string = dots_to_slashes(nm);
+    var dirs: []string = g_lib_dirs;          // compute_lib_dirs 已填充
+    var i: i64 = 0;
+    var nd: i64 = slice_len(dirs) as i64;
+    while (i < nd) {
+        var base: string = dirs[i];
+        var c_tc: string = path_resolve(sb_cat4(base, "/", rel, ".tc"));
+        if (path_exists(c_tc)) { return c_tc; }
+        var c_idx: string = path_resolve(sb_cat4(base, "/", rel, "/index.tc"));
+        if (path_exists(c_idx)) { return c_idx; }
+        var c_lib: string = path_resolve(sb_cat4(base, "/", rel, "/lib.tc"));
+        if (path_exists(c_lib)) { return c_lib; }
+        i = i + 1;
+    }
+    return "";
+}
+
+// 追加一个「<base>/<sub>」搜索目录（LLVM 后端不支持 sb_cat2..6，故走 StringBuilder）。
+lib_dir_push fn(base: string, sub: string) -> void {
+    var sb: StringBuilder = sb_new();
+    sb_append_str(sb, base);
+    sb_append_str(sb, "/");
+    sb_append_str(sb, sub);
+    append(g_lib_dirs, sb_to_str(sb));
+}
+
+// 计算外部库搜索目录（在 compute_src_roots 之后调用，复用祖先工程根信息）。
+// 顺序 = 就近优先（与 node_modules 式解析一致）：
+//  1) 入口目录/lib、入口目录/libs（单文件与示例就近放库）；
+//  2) 各祖先含 tote.toml 的工程根 <root>/lib、<root>/libs（最近祖先优先）。
+// 注：g_src_roots[0] 是「入口目录兜底」而非 <root>/src，不能对它取 parent 推工程根，
+//     否则会把入口的父目录误当工程根（examples/ → 仓库根）。故从下标 1 起遍历。
+// 注：环境变量 T_LIB_PATH 与 ~/.tote/libs 需要 getenv 内建支持，留待 Phase2。
+compute_lib_dirs fn() -> void {
+    var entry_dir: string = path_resolve(mod_dir_of(g_file));
+    lib_dir_push(entry_dir, "lib");
+    lib_dir_push(entry_dir, "libs");
+    var i: i64 = 1;                             // 跳过 [0]（入口目录兜底根）
+    var n: i64 = slice_len(g_src_roots) as i64;
+    while (i < n) {
+        var root: string = parent_dir_of(g_src_roots[i]);   // g_src_roots[i] = <root>/src
+        lib_dir_push(root, "lib");
+        lib_dir_push(root, "libs");
+        i = i + 1;
+    }
 }
 
 // 候选源码根列表（按优先级）：入口目录兜底 + 各祖先工程根/src（最近优先）。
@@ -11273,6 +11422,7 @@ dots_to_slashes fn(s: string) -> string {
 // ImportModDecl 节点留在 decl_list 中无害（register/emit 均对其忽略）。
 resolve_modules fn() -> void {
     compute_src_roots();
+    compute_lib_dirs();
     var n: i64 = slice_len(decl_list) as i64;
     var i: i64 = 0;
     while (i < n) {
@@ -11284,22 +11434,194 @@ resolve_modules fn() -> void {
     }
 }
 
-// 模块限定访问脱糖：`hello.add` / `hello.add(...)` → 裸 `add` 标识符。
-// 仅当对象为标识符且其 sa 命中模块别名时才改写，结构体字段访问不受影响。
-desugar_module_qualifiers fn() -> void {
-    var tot: i64 = slice_len(nodes) as i64;
+// ── 模块命名空间隔离（名字重整 / mangling）─────────────────────
+//
+// 目标：两个库各自定义 `foo` 不再相撞。做法是把**被导入模块**（别名 A）的顶层符号
+// 统一重整为 `A__foo`；入口模块（别名 ""）永不重整，因此单文件程序的 IR 逐字节不变。
+//
+//  · 定义处：模块内顶层声明 sa → A__sa；
+//  · 模块内引用：provenance 属于 A 的 ident/named/struct_lit/var_decl/P，
+//    若名字命中 A 的顶层符号集，一并改写（局部同名变量也一起改，保持自洽）；
+//  · 限定访问：`A.sym` → ident `A__sym`；类型位置 `A.T` / 字面量 `A.T{}` 同理，
+//    并做 export 可见性校验（模块若含任一 export，则未 export 的符号跨模块不可见）。
+//
+// 顶层可重整的声明 kind。
+is_top_decl_kind fn(k: string) -> bool {
+    if (k == "FuncDecl" || k == "StructDecl" || k == "EnumDecl") { return true; }
+    if (k == "FlagDecl" || k == "FlagSetDecl" || k == "UnionDecl") { return true; }
+    if (k == "VariantDecl" || k == "GlobalVarDecl") { return true; }
+    if (k == "GlobalConstDecl" || k == "TypeAliasDecl") { return true; }
+    return false;
+}
+
+// 重整名：A + "__" + name（LLVM 后端不支持 sb_cat2..6，故走 StringBuilder）。
+mangled_name fn(alias: string, name: string) -> string {
+    var sb: StringBuilder = sb_new();
+    sb_append_str(sb, alias);
+    sb_append_str(sb, "__");
+    sb_append_str(sb, name);
+    return sb_to_str(sb);
+}
+
+// 在符号表 g_def_* 中查 (alias, name)，返回下标，未命中 -1。
+def_lookup fn(alias: string, name: string) -> i64 {
+    var n: i64 = slice_len(g_def_orig) as i64;
     var i: i64 = 0;
-    while (i < tot) {
-        var nd: Node = nodes[i];
-        if (nd.kind == "member") {
-            var ob: Node = nodes[nd.na];
-            if (ob.kind == "ident" && in_mod_aliases(ob.sa)) {
-                nd.kind = "ident";
-                nd.na = -1;   // 丢弃对象（模块名）子节点
-                slice_set(nodes, i, nd);
+    while (i < n) {
+        if (g_def_alias[i] == alias) {
+            if (g_def_orig[i] == name) { return i; }
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// 该模块是否至少含一个 export 声明（含 → 未 export 者为私有）。
+mod_has_export fn(alias: string) -> bool {
+    var n: i64 = slice_len(g_mod_has_export) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        if (g_mod_has_export[i] == alias) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+def_add fn(alias: string, name: string, exported: bool) -> void {
+    if (def_lookup(alias, name) >= 0) { return; }
+    append(g_def_orig, name);
+    append(g_def_alias, alias);
+    append(g_def_export, exported);
+}
+
+// Variant 的合成辅助函数（Name_from_C / Name_is_C / Name_as_C）也要进符号集，
+// 否则模块内 `V_from_C(...)` 这类裸调用不会被重整，而定义侧却由已重整的 sa 派生。
+collect_variant_helper_defs fn(d: i64, alias: string, exported: bool) -> void {
+    var n: Node = nodes[d];
+    var c: i64 = n.lb;
+    while (c >= 0) {
+        var k: Child = kids[c];
+        var vc: Node = nodes[k.val];
+        def_add(alias, sb_cat3(n.sa, "_from_", vc.sa), exported);
+        def_add(alias, sb_cat3(n.sa, "_is_", vc.sa), exported);
+        if (vc.na >= 0) { def_add(alias, sb_cat3(n.sa, "_as_", vc.sa), exported); }
+        c = k.next;
+    }
+}
+
+// 扫描 decl_list，收集所有「来自被导入模块」的顶层符号。
+collect_module_defs fn() -> void {
+    var n: i64 = slice_len(decl_list) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        var d: i64 = decl_list[i];
+        var a: string = g_node_mod[d];
+        if (a != "") {
+            var nd: Node = nodes[d];
+            if (is_top_decl_kind(nd.kind)) {
+                def_add(a, nd.sa, nd.bc);
+                if (nd.bc) {
+                    if (mod_has_export(a) == false) { append(g_mod_has_export, a); }
+                }
+                if (nd.kind == "VariantDecl") { collect_variant_helper_defs(d, a, nd.bc); }
             }
         }
         i = i + 1;
+    }
+}
+
+// 可见性校验：模块 A 含 export 时，未 export 的符号不得跨模块访问。
+check_mod_visible fn(alias: string, name: string, di: i64, at: i64) -> void {
+    if (mod_has_export(alias) == false) { return; }
+    if (g_def_export[di]) { return; }
+    var sb: StringBuilder = sb_new();
+    sb_append_str(sb, "符号 '");
+    sb_append_str(sb, name);
+    sb_append_str(sb, "' 是模块 '");
+    sb_append_str(sb, alias);
+    sb_append_str(sb, "' 的私有符号（未用 export 标记），不可跨模块访问");
+    fc_err("T_MODULE_PRIVATE", sb_to_str(sb), at);
+}
+
+// 未知限定符号诊断。
+err_no_symbol fn(alias: string, name: string, at: i64) -> void {
+    var sb: StringBuilder = sb_new();
+    sb_append_str(sb, "模块 '");
+    sb_append_str(sb, alias);
+    sb_append_str(sb, "' 中不存在顶层符号 '");
+    sb_append_str(sb, name);
+    sb_append_str(sb, "'");
+    fc_err("T_MODULE_NO_SYMBOL", sb_to_str(sb), at);
+}
+
+mangle_modules fn() -> void {
+    collect_module_defs();
+    var ndef: i64 = slice_len(g_def_orig) as i64;
+    var tot: i64 = slice_len(nodes) as i64;
+
+    // Pass 1：限定访问 `A.sym` / 类型 `A.T` / 字面量 `A.T{}` → 重整名（必须先于 Pass 2，
+    // 否则模块内写 `B.T` 会被 Pass 2 当成本模块的 T 误重整）。
+    var i: i64 = 0;
+    while (i < tot) {
+        var nd: Node = nodes[i];
+        if (nd.kind == "member" && nd.na >= 0) {
+            var ob: Node = nodes[nd.na];
+            if (ob.kind == "ident" && in_mod_aliases(ob.sa)) {
+                var di: i64 = def_lookup(ob.sa, nd.sa);
+                if (di >= 0) {
+                    check_mod_visible(ob.sa, nd.sa, di, i);
+                    nd.sa = mangled_name(ob.sa, nd.sa);
+                    nd.kind = "ident";
+                    nd.na = -1;                     // 丢弃对象（模块名）子节点
+                    slice_set(nodes, i, nd);
+                }
+                // 未命中则保持 member 不变：同名局部/字段访问不受影响（由后续检查兜底）
+            }
+        } else if (nd.kind == "named" && nd.sb != "") {
+            var di2: i64 = def_lookup(nd.sb, nd.sa);
+            if (di2 >= 0) {
+                check_mod_visible(nd.sb, nd.sa, di2, i);
+                nd.sa = mangled_name(nd.sb, nd.sa);
+            } else {
+                err_no_symbol(nd.sb, nd.sa, i);
+            }
+            nd.sb = "";
+            slice_set(nodes, i, nd);
+        } else if (nd.kind == "struct_lit" && nd.sb != "") {
+            var di3: i64 = def_lookup(nd.sb, nd.sa);
+            if (di3 >= 0) {
+                check_mod_visible(nd.sb, nd.sa, di3, i);
+                nd.sa = mangled_name(nd.sb, nd.sa);
+            } else {
+                err_no_symbol(nd.sb, nd.sa, i);
+            }
+            nd.sb = "";
+            slice_set(nodes, i, nd);
+        }
+        i = i + 1;
+    }
+
+    if (ndef == 0) { return; }   // 无被导入模块符号：Pass 2 无事可做（单文件程序零影响）
+
+    // Pass 2：按 provenance 重整模块自身的定义与内部裸引用。
+    var j: i64 = 0;
+    while (j < tot) {
+        var m: string = g_node_mod[j];
+        if (m != "") {
+            var n2: Node = nodes[j];
+            var k: string = n2.kind;
+            var hit: bool = false;
+            if (k == "ident" || k == "named" || k == "struct_lit") { hit = true; }
+            if (k == "var_decl" || k == "P") { hit = true; }
+            if (is_top_decl_kind(k)) { hit = true; }
+            if (hit) {
+                if (def_lookup(m, n2.sa) >= 0) {
+                    n2.sa = mangled_name(m, n2.sa);
+                    slice_set(nodes, j, n2);
+                }
+            }
+        }
+        j = j + 1;
     }
 }
 
@@ -11311,9 +11633,10 @@ run_check fn() -> void {
     cur_ret = ti_mk("Void");
 
     // 模块内联：在注册声明之前把 import 的模块整体并入 decl_list，
-    // 并把 `hello.add` 限定访问改写成裸 `add`。单文件程序（无 import）零影响。
+    // 再做命名空间重整（`hello.add` → `hello__add`，模块顶层符号加 `别名__` 前缀）。
+    // 单文件程序（无 import）零影响：无模块符号 ⇒ 无任何改写。
     resolve_modules();
-    desugar_module_qualifiers();
+    mangle_modules();
 
     // 子句合并 + lambda 提升：必须在 register 之前跑（子句组先并成单一 FuncDecl，
     // 否则同名多条 FuncDecl 会被 register 当成重复定义）。覆盖模块内联后的整张 decl_list。
