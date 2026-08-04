@@ -1,0 +1,77 @@
+// agentkit_demo.tc —— 演示 agentkit 库（决策 A §8.4 / §9 / §10.3）
+//
+// 被测 agent：一个计数器，真实状态是单个 i64。
+// 用模块级变量承载真实状态（指纹 round-trip 无需 string->int，见 §9②）；
+// step 回调返回 int_to_str(状态) 作为日志指纹。replay 前把状态重置为相同初态即可复现。
+//
+// 运行：tc run --example agentkit_demo（双后端逐字节一致）
+
+import agentkit;
+
+// 真实状态（模块级变量）：agentkit 的指纹只认 string，这里用整数做真值。
+var g_count: i64 = 0;
+
+// step 契约：fn(string, Msg) -> string。s 是输入指纹（此处未解析，仅作契约标记），
+// 真实计算走 g_count，返回新指纹。
+counter_step fn(s: string, m: Msg) -> string {
+    if (m.kind == :inc) {
+        g_count = g_count + m.arg_i;
+    } else if (m.kind == :dec) {
+        g_count = g_count - m.arg_i;
+    } else if (m.kind == :reset) {
+        g_count = 0;
+    }
+    // :tick / :noop 不改变状态
+    return int_to_str(g_count);
+}
+
+main_fn fn() -> i32 @main {
+    var log: MsgLog;
+    var msgs: []Msg;
+    append(msgs, mk_msg(:inc, 3, ""));
+    append(msgs, mk_msg(:inc, 4, ""));
+    append(msgs, mk_msg(:dec, 1, ""));
+    append(msgs, mk_msg(:inc, 10, ""));
+
+    // 1) 记录一趟：初态 g_count=0，指纹 "0"（值语义：返回填好的日志）
+    g_count = 0;
+    log = agentkit.record_log(counter_step, "0", msgs, 1000);
+    var n: i64 = log.n;
+    var sb: StringBuilder = sb_new();
+    sb_append_str(sb, "recorded frames = ");
+    sb_append_i64(sb, n);
+    println(sb_to_str(sb));
+
+    // 2) 重放：从相同初态起步，断言每帧输出一致（§9① 确定性 / ④ 输出可断言）
+    g_count = 0;
+    var ok: bool = agentkit.replay_log(log, counter_step);
+    var sb2: StringBuilder = sb_new();
+    sb_append_str(sb2, "replay deterministic = ");
+    if (ok) { sb_append_str(sb2, "true"); } else { sb_append_str(sb2, "false"); }
+    println(sb_to_str(sb2));
+
+    // 3) 篡改一条记录的状态指纹，重放应能侦测（§9⑤ 消息日志是一等凭证）
+    var tampered: MsgLog = agentkit.clone_log(log);   // 深拷贝，独立底
+    tampered.recs[2].state_out = "BAD";
+    g_count = 0;
+    var ok2: bool = agentkit.replay_log(tampered, counter_step);
+    var sb3: StringBuilder = sb_new();
+    sb_append_str(sb3, "tamper detected = ");
+    if (ok2) { sb_append_str(sb3, "false"); } else { sb_append_str(sb3, "true"); }
+    println(sb_to_str(sb3));
+
+    // 4) diff：同日志自比 = true；与篡改版 = false
+    var same: bool = agentkit.diff_log(log, log);
+    var diff: bool = agentkit.diff_log(log, tampered);
+    var sb4: StringBuilder = sb_new();
+    sb_append_str(sb4, "self diff = ");
+    if (same) { sb_append_str(sb4, "true"); } else { sb_append_str(sb4, "false"); }
+    println(sb_to_str(sb4));
+    var sb5: StringBuilder = sb_new();
+    sb_append_str(sb5, "tampered diff = ");
+    if (diff) { sb_append_str(sb5, "false"); } else { sb_append_str(sb5, "true"); }
+    println(sb_to_str(sb5));
+
+    if (ok && !ok2 && same && !diff) { return 0; }
+    return 1;
+}

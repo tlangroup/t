@@ -1,0 +1,104 @@
+// agentkit.tc —— 库层可复现工具（决策 A §8.4 / §10.3）
+//
+// 对应 docs/agent_first.md：可复现工具（消息日志 / 回放 / diff）属库层，不进语言语法。
+// 以「序列化指纹」为通用状态载体，规避 t 无泛型限制（§9③ 状态可快照/序列化）：
+//   replay 接收 fn(string, Msg) -> string 回调；demo 在回调里用模块级变量承载真实状态，
+//   仅以 int_to_str(状态) 形式返回指纹。这样 agentkit 自身只认 string，无需泛型。
+//
+// 采用值语义（t 无局部取地址 &）：record_log 返回填好的 MsgLog；replay_log / diff_log 以值入参。
+// MsgLog 的底层用 []MsgRec 切片（而非定长大数组），使 MsgLog 本身很小（切片头 + 计数），
+// 返回/传参按值安全——记录实际存于堆上。规避 C 后端「大结构体按值返回」的已知限制。
+//
+// 时钟注入（§9 step 内零时钟）：record 在每帧记录一个单调 clock 值，
+//   但 step 的契约只看 (state_in, msg)，绝不接收 clock —— 时钟是观测元数据，不是计算的输入。
+//
+// 用法见 examples/agentkit_demo.tc。
+
+// ── 通用消息：atom 语义 + 可选整数 / 字符串参数 ──
+export Msg struct {
+    kind: atom;
+    arg_i: i64;
+    arg_s: string;
+}
+
+// ── 单帧记录：输入指纹 + 消息 + 输出指纹 + 注入时钟 ──
+export MsgRec struct {
+    state_in: string;
+    msg: Msg;
+    state_out: string;
+    clock: i64;
+}
+
+// ── 消息日志：切片承载记录（MsgLog 本身很小，按值传返安全）──
+export MsgLog struct {
+    recs: []MsgRec;
+    n: i64;
+}
+
+// 构造消息的便捷函数
+export mk_msg fn(kind: atom, arg_i: i64, arg_s: string) -> Msg {
+    return Msg{ kind: kind, arg_i: arg_i, arg_s: arg_s };
+}
+
+// 深拷贝一条日志（独立切片底，互不干扰）—— 用于「篡改副本」等场景
+export clone_log fn(a: MsgLog) -> MsgLog {
+    var r: MsgLog;
+    r.n = a.n;
+    var i: i64 = 0;
+    for (i = 0; i < a.n; i = i + 1) {
+        append(r.recs, a.recs[i]);
+    }
+    return r;
+}
+
+// 记录一趟：从 init 指纹起步，依次喂 msgs，逐帧落日志。
+// step: fn(string, Msg) -> string —— 输入指纹 + 消息，返回新指纹。
+// 内部新建 MsgLog（切片底在堆）并填好返回。
+export record_log fn(step: fn(string, Msg) -> string, init: string, msgs: []Msg, clock0: i64) -> MsgLog {
+    var recs: []MsgRec;
+    var out_log: MsgLog;
+    out_log.n = 0;
+    var s: string = init;
+    for (m in msgs) {
+        var out: string = step(s, m);
+        var clk: i64 = clock0 + out_log.n;     // 单调时钟：仅记录，step 不读
+        append(recs, MsgRec{ state_in: s, msg: m, state_out: out, clock: clk });
+        out_log.n = out_log.n + 1;
+        s = out;
+    }
+    out_log.recs = recs;
+    return out_log;
+}
+
+// 重放：用日志里记录的 messages 重喂 step，逐帧断言 state_out 一致。
+// 若任意一帧输出 != 记录值（或前缀初态不一致），返回 false（§9① 确定性 / ④ 输出可断言）。
+// 注：demo 必须在调用前把真实状态重置为 recs[0].state_in 对应的初态。
+export replay_log fn(log: MsgLog, step: fn(string, Msg) -> string) -> bool {
+    var s: string = log.recs[0].state_in;
+    var i: i64 = 0;
+    for (i = 0; i < log.n; i = i + 1) {
+        var r: MsgRec = log.recs[i];
+        if (s != r.state_in) { return false; }      // 前缀 / 初态一致性
+        var out: string = step(s, r.msg);
+        if (out != r.state_out) { return false; }   // 输出可断言
+        s = out;
+    }
+    return true;
+}
+
+// 逐字段比对两条日志（§9⑤ 消息日志是一等凭证）。
+export diff_log fn(a: MsgLog, b: MsgLog) -> bool {
+    if (a.n != b.n) { return false; }
+    var i: i64 = 0;
+    for (i = 0; i < a.n; i = i + 1) {
+        var ra: MsgRec = a.recs[i];
+        var rb: MsgRec = b.recs[i];
+        if (ra.state_in != rb.state_in) { return false; }
+        if (ra.state_out != rb.state_out) { return false; }
+        if (ra.clock != rb.clock) { return false; }
+        if (ra.msg.kind != rb.msg.kind) { return false; }
+        if (ra.msg.arg_i != rb.msg.arg_i) { return false; }
+        if (ra.msg.arg_s != rb.msg.arg_s) { return false; }
+    }
+    return true;
+}
