@@ -172,6 +172,10 @@ BuiltinTable:
   | "file_read_all" / "path_resolve" / "str_slice" => ti_mk("String")
   | "sb_to_str" / "to_string" => ti_mk("String")
   | "int_to_str" => ti_mk("String")
+  | "format_int" / "format_uint" / "format_float" => ti_mk("String")
+  | "format_str" / "format_bool" / "format_char" => ti_mk("String")
+  | "sb_append_fmt_int" / "sb_append_fmt_uint" / "sb_append_fmt_float" => ti_mk("Void")
+  | "sb_append_fmt_str" / "sb_append_fmt_bool" / "sb_append_fmt_char" => ti_mk("Void")
   | "file_write_all" / "file_exists" => ti_scalar("bool")
   | "args" => ti_elem_of("Slice", ti_mk("String"))
   | "sb_new" => ti_mk("StringBuilder")
@@ -181,9 +185,13 @@ BuiltinTable:
   | "map_len" => ti_scalar("i64")
   | "map_get" => ti_mk("Unknown")   // 返回类型 = 映射的 V，由 infer_expr/expr_type_desc 特判
   | "ti_name" / "fi_name" / "fi_type_name" => ti_mk("String")
-  | "ti_size" / "ti_kind" / "ti_field_count" / "fi_offset" / "fi_type_size" => ti_scalar("i64")
+  | "ti_size" / "ti_kind" / "ti_field_count" / "fi_offset" / "fi_type_size" / "fi_tag" => ti_scalar("i64")
   | "ti_field" => ti_mk("FieldInfo")
   | "fi_is_ptr" => ti_scalar("bool")
+  | "now" => ti_scalar("i64")
+  | "format_time" / "format_time_local" / "format_time_tz" => ti_mk("String")
+  | "parse_time" / "parse_time_local" => ti_scalar("i64")
+  | "time_invalid" => ti_scalar("i64")
 
 DeriveTraitTable:
     "ToString" | "FromString" | "Clone" | "Copy" | "DebugPrint"
@@ -207,6 +215,8 @@ DiagnosticTable:
   | "T_CLOSURE_CAPTURE" -> error
   | "T_VAR_NO_TYPE" -> error
   | "T_UNDEFINED_IDENT" -> error
+  | "T_TAGID_MIXED" -> error
+  | "T_TAGID_DUP" -> error
 
 AnnotationTable:
     "test" { spec: "none", targets: "func", repl: "" }
@@ -771,6 +781,18 @@ TdRuleTable ::
   // @tdrule td_calls  12 cn     str_slice     one mk    string -
   // @tdrule td_calls  12 cn     sb_to_str     one mk    string -
   // @tdrule td_calls  12 cn     int_to_str    one mk    string -
+  // @tdrule td_calls  12 cn     format_int    one mk    string -
+  // @tdrule td_calls  12 cn     format_uint   one mk    string -
+  // @tdrule td_calls  12 cn     format_float  one mk    string -
+  // @tdrule td_calls  12 cn     format_str    one mk    string -
+  // @tdrule td_calls  12 cn     format_bool   one mk    string -
+  // @tdrule td_calls  12 cn     format_char   one mk    string -
+  // @tdrule td_calls  12 cn     sb_append_fmt_int   one mk void -
+  // @tdrule td_calls  12 cn     sb_append_fmt_uint  one mk void -
+  // @tdrule td_calls  12 cn     sb_append_fmt_float one mk void -
+  // @tdrule td_calls  12 cn     sb_append_fmt_str   one mk void -
+  // @tdrule td_calls  12 cn     sb_append_fmt_bool  one mk void -
+  // @tdrule td_calls  12 cn     sb_append_fmt_char  one mk void -
   // @tdrule td_calls  12 cn     sb_new        one named named  TSb*
   // @tdrule td_calls  12 cn     map_has       one named scalar bool
   // @tdrule td_calls  12 cn     map_del       one named scalar bool
@@ -785,6 +807,7 @@ TdRuleTable ::
   // @tdrule td_calls  12 cn     ti_field_count one named scalar i64
   // @tdrule td_calls  12 cn     fi_offset     one named scalar i64
   // @tdrule td_calls  12 cn     fi_type_size  one named scalar i64
+  // @tdrule td_calls  12 cn     fi_tag        one named scalar i64
   // @tdrule td_calls  12 cn     ti_field      one named fieldinfo FieldInfo
   // @tdrule td_calls  12 cn     fi_is_ptr     one named scalar bool
 ```
@@ -793,7 +816,7 @@ TdRuleTable ::
 
 ### 3.1 Items（顶层条目）
 
-> 本节气法由 `decl.md` / `decl_var.md` / `decl_struct.md` / `decl_enum.md` / `decl_flag.md` / `decl_variant.md` / `decl_typealias.md` / `decl_import.md` / `decl_func.md` 经 L-15 采用并并入（原草稿已标记失效）。`match.md` 的函数子句声明形式已于 2026-08-01 用户指令对齐为本节气法（L-04 声明层张力已消解）；match 表达式与函数子句的完整语义**已在 `src/tc.tc` 实装且门禁覆盖**（L-14 已满足），但据 L-15 第5条仍需用户显式「规则采纳」方可并入本手册，故 `match.md` 现维持 DRAFT **待采纳**（而非「未实现」）。函数声明形式固定为 `Name fn(...) -> Ret`（并置式、禁止重载），与 `src/tc.tc` 一致。
+> 本节气法由 `decl.md` / `decl_var.md` / `decl_struct.md` / `decl_enum.md` / `decl_flag.md` / `decl_variant.md` / `decl_typealias.md` / `decl_import.md` / `decl_func.md` 经 L-15 采用并并入（原草稿已标记失效）。`match.md` 的函数子句声明形式已于 2026-08-01 用户指令对齐为本节气法（L-04 声明层张力已消解）；match 表达式与函数子句的完整语义**已在 `src/tc.tc` 实装且门禁覆盖**（L-14 已满足），但据 L-15 第5条仍需用户显式「规则采纳」方可并入本手册，故 `match.md` 现维持 DRAFT **待采纳**（而非「未实现」）。代码模块导入 `ImportDecl` 由 `docs/syntax/drafts/module.md` 经 L-15 采用并并入 §3.13（原草稿已标记失效）。函数声明形式固定为 `Name fn(...) -> Ret`（并置式、禁止重载），与 `src/tc.tc` 一致。
 
 ```ebnf
 ModuleItem:
@@ -806,6 +829,7 @@ ModuleItem:
     | GlobalVarDecl
     | ConstDecl
     | InnerAttribute
+    | ImportDecl        // ⚠ spec-only（代码模块导入，语法经 L-15 采纳，实现待排期）
 
 FuncDecl:
     FuncName "fn" "(" (Param ("," Param)*)? ")" "->" Type FuncAnns? Block
@@ -822,7 +846,7 @@ StructDecl:
     StructName "struct" StructAnns? "{" (StructField ";")* "}"
 
 StructField:
-    FieldName ":" Type (Annotation)*
+    FieldName ":" Type (Annotation)* ( "@" IntLiteral )? ( "=" Expression )? (Annotation)*
 
 StructAnns:
     "@derive" "(" DeriveCap ("," DeriveCap)* ")"
@@ -830,6 +854,36 @@ StructAnns:
 
 - 字段以 `;` 结尾；字段可挂 `@doc` / `@export` / `@binary_offset(N)` / `@binary_skip` 等注解。
 - ⚠ spec-only：`@derive` 全能力（当前 tc 的 `@derive` 处理函数体为空壳/带已知 bug，见 `src/tc.tc` `process_derive`）。
+
+#### 3.1.1.1 字段 tagID（`@ N`）与默认值（`= expr`） ✅ tote（M-tagID）
+
+字段声明里除类型与注解外，还可在类型之后挂两个**正交**的编译期槽：
+
+- **tagID `@ N`**：给字段一个稳定的整数身份标识（数据版本迭代兼容用）。`N` 为 `i64` 字面量，须 `≥ 1`。
+- **默认值 `= expr`**：给字段一个默认表达式；构造 struct 字面量时若省略该字段，则由编译器在检查期合成该默认值填充（双后端自动受益）。`expr` 类型须可转型为该字段类型，否则报 `T_TYPE_MISMATCH`。
+
+```t
+Point struct {
+    x: i64 @ 1;
+    y: i64 @ 2 = 42;     // 显式 tagID + 默认值
+    z: i64 @ 3;
+}
+Auto struct {             // 全自动：无 @N → tagID 按声明序 1,2,3 隐式分配
+    a: i64;
+    b: i64 = 7;           // 仅默认值，无 tagID
+    c: i64;
+}
+```
+
+**强制规则（编译期）**：
+
+1. **全有或全无（all-or-nothing）**：同一个 struct 内，要么**所有**字段都显式写 `@ N`，要么**全都不写**。部分写、部分不写 → 报 `T_TAGID_MIXED`。
+2. **去重**：显式 tagID 在同一个 struct 内必须唯一，重复 → 报 `T_TAGID_DUP`。
+3. **全自动兜底**：不写 `@ N` 时按声明顺序自动分配 `1,2,3,…`（基值 1）。
+
+**关键性质 —— tagID 是纯编译期元数据，运行时零内存成本**：它只活在 `type_info` 的 `FieldInfo.tag`（见 §3.6）与（未来的）序列化线格式里，**不进入 struct 的内存布局**。struct 的字段排布、大小、对齐完全不受 tagID 影响。
+
+**用途**：数据版本迭代兼容。字段改名、重排、增删时，tagID 提供跨变更的稳定身份，使序列化/反序列化能按 id 而非位置/名字识别字段 —— 这是 fid v2 字段级版本化的前置（序列化线格式写入 tag 仍待排期）。
 
 ```ebnf
 FlagDecl:
@@ -869,7 +923,7 @@ AnnName: IDENTIFIER
 AnnArg:  Expression | StringLiteral
 ```
 
-注解可挂于类型、字段、函数、全局节点；全部经 `type_info(T)` 编译期自省读取（⚠ `type_info` 内建尚未接入）。当前 tc `init_anndefs` 已表驱注册全量注解（spec §4.8）：
+注解可挂于类型、字段、函数、全局节点；全部经 `type_info(T)` 编译期自省读取（字段自省内建已接入，见 §3.6.0；注解元数据表驱注册见 `src/tc.tc` `init_anndefs`）。当前 tc `init_anndefs` 已表驱注册全量注解（spec §4.8）：
 
 - 测试类：`@test` `@test_skip` `@test_only` `@expect_fail` `@test_group("分组")`
 - 派生类：`@derive(ToString,FromString,Clone,Copy,DebugPrint,BinarySerde,Eq,Hash)`
@@ -905,7 +959,7 @@ ConstDeclStatement: "const" Ident ":" Type "=" Expression ";"
 AssignStatement:    Expression "=" Expression ";"
 ReturnStatement:    "return" Expression? ";"
 ExpressionStatement: Expression ";"
-DeferStatement:     "defer" Block            // 延迟块，作用域退出时按 LIFO 执行
+DeferStatement:     "defer" Block            // 延迟块，**函数级**：登记到当前函数延迟栈，于 return/函数尾按 LIFO 执行（写在 if/while 块内也到函数退出才触发，非块级作用域退出）
 ComptimeStatement:  "comptime" Block         // 编译期块（块内语句编译期求值）
 ```
 
@@ -1072,7 +1126,28 @@ TypeInfoExpr: "type_info" "(" Type ")"        // 编译期类型自省（字段/
 ```
 
 - spec §5：`comptime` 函数语法与运行时一致。
-- `type_info(T)` 是 `@derive`、序列化、编辑器导出、CTFE 导入的**核心底座**，当前 tc 的 `TypeInfo` 池为简化版、内建未接入。
+- `type_info(T)` 是 `@derive`、序列化、编辑器导出、CTFE 导入的**核心底座**。当前 tc 的 `TypeInfo` 池为简化版，但字段自省内建**已接入**（`ti_name` / `ti_size` / `ti_kind` / `ti_field_count` / `ti_field` / `fi_name` / `fi_offset` / `fi_type_name` / `fi_type_size` / `fi_is_ptr` / `fi_tag` 双后端均可用，见 `examples/type_info_demo.tc`、`examples/tagid_typeinfo.tc`）。
+
+#### 3.6.0 type_info 字段自省内建 ✅ tote
+
+`TypeInfo` / `FieldInfo` 为**不透明句柄**（双后端均落为指针），读取一律走**函数式 API**（无 `.name` / `.tag` 成员语法糖）：
+
+| 内建 | 作用 | 返回 |
+|---|---|---|
+| `type_info(T)` | 取类型自省信息（编译期可调用） | `TypeInfo` |
+| `ti_name(ti)` | 类型名 | `string` |
+| `ti_size(ti)` | 类型字节大小 | `i64` |
+| `ti_kind(ti)` | 类型种类（`Struct`/`Enum`/…） | `i64` |
+| `ti_field_count(ti)` | 字段数 | `i64` |
+| `ti_field(ti, i)` | 第 `i` 个字段信息 | `FieldInfo` |
+| `fi_name(fi)` | 字段名 | `string` |
+| `fi_offset(fi)` | 字段内存偏移 | `i64` |
+| `fi_type_name(fi)` | 字段类型名 | `string` |
+| `fi_type_size(fi)` | 字段类型大小 | `i64` |
+| `fi_is_ptr(fi)` | 字段是否指针 | `bool` |
+| `fi_tag(fi)` | **字段 tagID**（见 §3.1.1.1） | `i64` |
+
+⚠ 注意：`FieldInfo` 不支持 `.tag` 成员访问写法（`f.tag` 在 C 后端编译报错、LLVM 后端段错误）；必须用 `fi_tag(f)` 函数调用。
 
 ### 3.6.1 CTFE 数据导入（import_csv / import_json） ✅ tote
 
@@ -1125,6 +1200,536 @@ SymReleaseAllCall: "sym_release_all" "(" ")"               // 释放全部池
 
 ---
 
+### 3.9 fid：文件描述符与序列化操作符 ✅ tote（M51 写路径，M52 `fid_error`/`fseek`/`ftell`，M53 读路径 `>` / `fid_eof`）
+
+> 本节气法由 `docs/syntax/drafts/fid.md` 经 L-15 采用并并入（原草稿标记失效）。涵盖新标量 `fid`、`stdin`/`stdout`/`stderr` 保留标识符、`fopen`/`fclose`/`fflush`/`fid_is_open`/`fid_format`/`fmt_register`/`fid_error` 内建，以及序列化操作符 `<`（写）与 `>`（读，v1.5）。
+
+**EBNF**
+
+```ebnf
+// fid 加入标量类型集合，与 atom 同为 64 位不透明标量
+ScalarType: ... | "fid"
+
+// 保留标识符（非关键字），检查阶段按保留名解析为 fid 常量
+FidConst: "stdin" | "stdout" | "stderr"
+
+// 序列化操作符复用 "<" / ">" 记号，并入比较层，左结合
+// 语义由左操作数静态类型判定（见 D1）
+CmpExpr: ShiftExpr (("<" | ">" | "<=" | ">=") ShiftExpr)*
+```
+
+- 不新增任何词法记号。`fid` 是类型名（与 `atom` 同类，非关键字）；`<`/`>` 复用既有的 `Lt`/`Gt`。
+- `stdin`/`stdout`/`stderr` 为**保留标识符**：不可作为变量名/参数名/函数名/字段名重新声明，违者报 `T_FID_RESERVED_NAME`。
+
+**D1 —— `<` / `>` 语义由左操作数静态类型唯一确定（L-04 唯一语义）**
+
+- 左操作数静态类型为 `fid`：
+  - `<` ⇒ **序列化（写）**，检查阶段脱糖为内部 `serialize` 节点，结果类型 = `fid`（目标自身），可链式（D2）。
+  - `>` 且右操作数为**类型** ⇒ **反序列化（读）**，结果类型 = 裸 `Type`（EOF 返默认值，由 `fid_eof` 探针表达，见 §3.9.1 Option B）。
+  - `>` 且右操作数**非类型** ⇒ 报 `T_FID_DESERIALIZE_NEEDS_TYPE`（不再退化为大于比较）。
+- 左操作数为其他类型：
+  - `<` / `>` ⇒ 小于 / 大于**比较**，语义不变。
+  - `<=` / `>=` ⇒ 比较（若类型有序）。
+  - `>` 右操作数却写成类型 ⇒ 报 `T_FID_DESERIALIZE_NEEDS_FID`（只有左操作数是 `fid` 时 `>` 才是读）。
+- `fid` **无序**：`fid` 不参与 `<=` / `>=` 比较（恒报 `T_FID_NOT_ORDERED`）；`fid` 仅支持 `==` / `!=`（句柄相等比较）。
+  - 右操作数为 `fid` 而左操作数不是 ⇒ 报 `T_FID_NOT_ORDERED`。
+
+**D1 附则 —— 类型操作数的词法消解**
+
+`string` / `StringBuilder` / `void` / `map` 是**关键字** token，永远不能作表达式起始；
+故 parser 在 `>` 之后遇到它们即按类型解析（`f > string` 可写）。
+`i64` / `bool` / `atom` / `MyStruct` 等本就是标识符，按普通表达式解析，
+由检查期把 ident 节点**重解释**为类型（查全局符号表 `kind == "type"` 的条目）。
+两条路径都在检查期汇合到同一判定，故 `>` 的读/比较之分仍只取决于左操作数静态类型。
+
+**D2 —— 结果类型与链式（L-03）**
+
+`f < v` 的类型是 `fid`，值即 `f` 本身。因 `CmpExpr` 左结合，`stdout < a < b` 解析为 `(stdout < a) < b`，天然等价于「先写 a 再写 b」。链式不是额外规则，是结合性的自然结果。
+
+**D3 —— 打开方式与格式解析（L-02 全行为显式）**
+
+```
+fopen fn(path: string, mode: atom) -> fid
+```
+
+`mode` **必须是 atom 字面量**（编译期可判定），否则报 `T_FID_MODE_NOT_LITERAL`。合法取值：
+
+| mode | 打开方式类别 | C 语义 |
+|---|---|---|
+| `:read` | text | `"r"` |
+| `:write` | text | `"w"` |
+| `:append` | text | `"a"` |
+| `:read_binary` | binary | `"rb"` |
+| `:write_binary` | binary | `"wb"` |
+| `:append_binary` | binary | `"ab"` |
+
+非上表取值报 `T_FID_BAD_MODE`（编译期）。格式解析在 `fopen` 时一次性完成并冻结进 fid 记录：取 path 最后一个 `.` 之后的后缀（小写，无 `.` 则空串），以 `(类别, 后缀)` 查注册表；未命中用该类别默认格式。
+
+**D4 —— 后缀注册表（挂靠注册模式）**
+
+```
+fmt_register fn(kind: atom, suffix: string, fmt: atom) -> void
+```
+
+- `kind` ∈ { `:text`, `:binary` }，`fmt` ∈ { `:text`, `:json`, `:rawbin`, `:protobuf` }。非 atom 字面量 ⇒ `T_FID_FORMAT_NOT_LITERAL`；取值越界 ⇒ `T_FID_BAD_FORMAT`。与 `fopen` 的 mode 轴（`T_FID_MODE_NOT_LITERAL` / `T_FID_BAD_MODE`）**分开成码**。
+- `suffix` 不含 `.`，大小写不敏感（内部统一小写）。同 `(kind, suffix)` 重复注册 ⇒ 后覆盖先（运行时行为）。
+- 内建预置：`:text`+`json`→`:json`；`:text` 默认→`:text`；`:binary`+`pb`→`:protobuf`；`:binary` 默认→`:rawbin`。
+- `stdin`/`stdout`/`stderr` 视为 text 类别、空后缀 ⇒ 格式恒 `:text`。查询：`fid_format fn(f: fid) -> atom`。
+
+**D5 —— 各格式写出语义（L-02 显式、L-09 零 UB）**
+
+`<` 右操作数 v1 支持：整数标量、`f32`/`f64`、`bool`、`atom`、`string`；其余（结构体/slice/map）报 `T_FID_UNSERIALIZABLE`（v2 走 `@derive`，见 §3.9.6）。
+
+| fmt | 整数 | 浮点 | bool | atom | string |
+|---|---|---|---|---|---|
+| `:text` | 十进制 | 十进制 | `true`/`false` | 原子名（无引号） | 原样字节 |
+| `:json` | 十进制 | 十进制 | `true`/`false` | `"名字"` | `"..."`（转义 `" \ \n \r \t` 与控制字符） |
+| `:rawbin` | 定宽小端 | IEEE754 小端 | 1 字节 0/1 | 8 字节小端 id | `u64` 小端长度前缀 + 原始字节 |
+| `:protobuf` | v1 未实装 ⇒ 运行时 `t_panic("protobuf serialization not implemented")` | 同左 | 同左 | 同左 | 同左 |
+
+- 不隐式插入分隔符/换行（L-02）；不隐式类型转换（`f < 3` 与 `f < "3"` 不等价）。
+- `:json` 是纯值编码器：每个右操作数各编成一个 JSON 值，无「原样输出」旁路（否则同一 `<` 有两种字节语义，违反 L-04）。文档级结构留 v2 聚合序列化。
+
+**D6 —— 生命周期与错误（L-02 / L-09）**
+
+- `fopen` 失败返回无效句柄；用 `fid_is_open fn(f: fid) -> bool` 显式检测。无隐式异常/重试。
+- 对无效/已关闭句柄执行 `<`/`fclose`/`fflush` ⇒ 运行时 `t_panic`（确定性中止，非 UB）。
+- `fclose fn(f: fid) -> void` **不幂等**，重复关闭 panic。关闭 `stdin`/`stdout`/`stderr` ⇒ panic。
+- **无自动关闭**：句柄不随作用域回收，须显式 `fclose`。
+- ⚠️ `defer` 须跟块（`defer { fclose(f); }`），且为**函数级**（写在 `if`/`while` 块内仍到函数退出才 LIFO 触发）；「打开→写→读回」等需块内落盘的场景须显式 `fclose`，不能靠 defer。
+- 句柄容量硬上限 `T_FID_MAX = 256`（runtime），`0/1/2` 恒为 stdin/stdout/stderr，用户同时最多 253 个；表满 `fopen` 返回 -1（同打开失败表象，靠 `fid_is_open` 探测）。
+- 缓冲：`FILE*` 经 stdio 缓冲，写不保证立即落盘，须 `fflush`/`fclose`；读写回环须先关/刷；stdout/stderr 交织顺序由刷新时机决定。
+- `fid_error fn(f: fid) -> string`（走系统函数，仿 `fid_is_open`）：返回句柄最近一次错误原因，无错误返空串；查 runtime `g_fids[slot].err`，不 panic。
+- `fid_eof fn(f: fid) -> bool`（读路径探针，与 `fid_is_open`/`fid_error` 同族）：语义是**「还有没有下一个字节可读」**，实现为一字节前瞻（`getc` + `ungetc`），**不是** C 的 `feof` —— `feof` 要等一次读越界后才置位，恰好读完全部内容时仍为假，`while (!fid_eof(f))` 会凭空多转一圈。无效/已关闭句柄或流错误返 `true`。单纯 EOF **不写** `fid_error`（EOF 由 `fid_eof` 表达）。实参必须是 `fid`，否则报 `T_FID_EOF_ARG`。
+  - ⚠️ `:text` / `:json` 下文件尾部的空白/换行会被前瞻看见 ⇒ 返 `false`，但其后已无值可读。定长/精确边界场景请用 `:rawbin`。
+- `fseek fn(f: fid, off: i64) -> bool` / `ftell fn(f: fid) -> i64`：绝对定位与取偏移，均不 panic，失败返 `false` / `-1` 并写 `fid_error`。
+- `f > Type`（读路径，`>` 操作符）：从 `f` 反序列化一个 `Type` 值，结果类型为裸 `Type`；EOF/错误返默认值。各格式语义见 §3.9.1。
+
+**示例**
+
+```t
+main fn() -> i64 {
+    stdout < "hello " < "world" < "\n";
+    stdout < "n=" < 42 < " ok=" < true < " " < :ready < "\n";
+
+    var f: fid = fopen("out.txt", :write);
+    if (fid_is_open(f)) {
+        f < "line1\n" < "pi=" < 3.5 < "\n";
+        fclose(f);                 // 块内要落盘就显式关，defer 是函数级的（D6）
+    }
+
+    var j: fid = fopen("out.json", :write);
+    if (fid_is_open(j)) {
+        j < "he said \"hi\"\n";    // → "he said \"hi\"\n"
+        j < 12 < true < :ready;    // → 12true"ready"
+        fclose(j);
+    }
+
+    var b: fid = fopen("out.dat", :write_binary);
+    if (fid_is_open(b)) {
+        b < 1000 < 3.5 < "abc";    // 27 字节 rawbin
+        fclose(b);
+    }
+
+    fmt_register(:text, "ndjson", :json);   // 后注册覆盖先注册
+    return 0;
+}
+```
+
+**与既有构造的关系（L-04）**
+
+- `file_write_all(path, content) -> bool`：**保留**（一次性整文件覆盖写，无句柄/格式/增量，不构成等价多写法）。
+- `print`/`println`/`eprint`：**保留**，仍只接受 `string`（与 `tc.tc:8662` 现有检查一致）。`print(s) ≡ stdout < s` 等字节语义等价，已裁定为**文档化语法糖**（A 口径），运行期行为不变，不引入第二套字节语义（L-04 满足）。
+- `<` 小于比较：由 D1 静态类型判定，`fid` 无序故唯一。
+- `atom`：fid 复用 atom 作 mode/格式标记，是使用而非重叠。
+
+**法律验证（L-15 采纳依据）**
+
+| 法律 | 验证点 | 结论 |
+|---|---|---|
+| L-04 唯一语义 | `<`/`>` 双语义由静态类型唯一判定；`fid` 无序无二义；`print` 重叠已裁决（A 口径） | ✅ |
+| L-02 全行为显式 | 无隐式换行/分隔符/类型转换/自动关闭；错误须显式 `fid_is_open`/`fid_error` | ✅ |
+| L-03 静态类型 | `fid` 固定 64 位；`<` 结果类型 `fid`；mode/fmt 须字面量，编译期可判定 | ✅ |
+| L-09 零 UB | 无效句柄/重复关闭/未实装格式确定性 `t_panic`；读路径 EOF 返该类型默认值、不 panic（Option B） | ✅ |
+| L-14 铁律校验 | conformance（75/75）+ examples 双后端实跑比对（M51 / M52 / M53） | ✅ |
+
+**§3.9.1–§3.9.10 设计补全与未来规划（已裁定）**
+
+> 以下为 M51 草案未覆盖的设计面补全，全部经用户裁定。带 ✅ 表示运行时/编译器已具备落地基础，带 ⏳ 表示设计已定、待实装排期（v1.5 / v2）。
+
+**§3.9.1 读路径（反序列化）—— `>` 操作符 ✅（M53 已落地，Option B 裁定）**
+
+> **L-15 裁定（M53）**：原设计结果类型 `T?` 因可选类型当时仅为外壳（无值表示、无 `T→?T` 提升、无解包语法）无法实现。裁定改用 **Option B**：`f > Type` 返回**裸 `Type`**，EOF/错误返回该类型的默认值（数值 0 / 空串），是否到尾由新增探针 **`fid_eof(f) -> bool`** 显式表达。这契合 L-02 显式原则，且与 `fid_is_open`/`fid_error` 同族；代价是「零值 vs EOF」需调用方显式查 `fid_eof` 区分。
+
+与 `<` 对称，读由 `>` 承担。消歧锚点 = 左操作数为 `fid`（与写路径一致）：`fid > Type` 是读，结果类型为裸 `Type`（EOF 不 panic、不报错）；`fid > 非类型` 报 `T_FID_DESERIALIZE_NEEDS_TYPE`；聚合类型（struct/array/slice/map/pointer）读报 `T_FID_DESERIALIZE_AGG`（属 v2）。`Type` 取子集：标量（`i8..i64`/`u8..u64`/`f32`/`f64`/`bool`/`atom`）与 `string`；命名类型须为上述标量或 string 的别名。
+
+各格式读语义与写路径镜像（runtime `t_deser_*`）：
+- `:rawbin` —— 标量按静态位宽读小端；`string` 先读 `u64` 小端长度前缀再读字节（干净往返）。
+- `:text` —— 按空白切 token：整数/浮点读下一 token；`bool` 读 `true`/`false`/`1`/`0`；`atom` 读名称反查 id；`string` 读下一空白分隔 token（**含空格的字符串无法 text round-trip**，已知限制）。
+- `:json` —— 读下一 JSON 值：数字按 `strtod`/`strtoll`；`bool` 读 `true`/`false`；`atom` 读 JSON 字符串反查 id；`string` 读带引号 JSON 字符串（支持 `\" \\ \n \r \t \/ \uXXXX` 转义）。
+- `:protobuf` —— 留 v2（写出即 panic）。
+
+EOF 语义：单纯 EOF **不写** `fid_error`（EOF 是预期结束，由 `fid_eof` 表达）；仅真实 I/O 错误写 `fid_error`。读路径不 panic（L-09）。
+
+发射约定：运行时桥接统一以最宽标量返回（`double` / `int64_t`），窄目标由**编译器**显式收窄。
+C 后端靠隐式转换，LLVM 后端必须显式 `trunc` / `fptrunc`（复用 `ll_cast_v`），
+否则 `store i64 …, ptr %v`（`v: i8`）是非法 IR。
+
+conformance：`p27_fid_read_ok`(pass) + `f43_fid_read_needs_type`(fail, `T_FID_DESERIALIZE_NEEDS_TYPE`)
++ `f44_fid_read_agg`(fail, `T_FID_DESERIALIZE_AGG`) + `f45_fid_read_needs_fid`(fail, `T_FID_DESERIALIZE_NEEDS_FID`)
++ `f46_fid_eof_arg`(fail, `T_FID_EOF_ARG`)；run_examples：`fid_read_demo`（rawbin 往返 i64/i8/u8/f64/bool/atom/string + `fid_eof` 探测）。
+
+⚠️ 语义变更（M53 相对 M51）：`f > 1`（左 `fid`、右非类型）此前报 `T_FID_NOT_ORDERED`，现改报 `T_FID_DESERIALIZE_NEEDS_TYPE` —— `>` 已被读路径占用。`T_FID_NOT_ORDERED` 现仅覆盖 `<=` / `>=`，以及「右操作数为 `fid` 而左操作数不是」。回归用例 `f35_fid_not_ordered` 已相应改用 `>=`。
+
+**§3.9.2 `fid_error` ✅（M52 已落地）**
+
+内建 `fid_error fn(f: fid) -> string`，发射期调 runtime `t_fid_error`/`tll_fid_error`（仿 `fid_is_open`）；runtime `TFidRec` 加 `err[128]` 字段，`fclose`/`fflush`/序列化写失败（`ferror` 探测）时写入，越界/已关闭/未开槽返回空串不 panic。
+
+- **错误语义为「最近一次」**：成功路径**不清空** `err`，故可在若干次写之后统一探测；探测到后 `clearerr` 复位流标志。
+- `fopen` 失败返回的哨兵句柄 `-1` 不对应任何槽位，其原因单独存于全局 `g_fid_open_err`，`fid_error(-1)` 取之。
+- **已关闭句柄仍可查**：`fid_error` 不要求句柄处于打开状态（否则「关闭时出错」将永远取不到原因）。
+- 实参必须是 `fid`，否则报 `T_FID_ERROR_ARG`（`fid` 与 `i64` 不隐式互转，传整数不按下标解释）。
+
+conformance：`p25_fid_error_ok`(pass) + `f41_fid_error_arg`(fail, `T_FID_ERROR_ARG`)；run_examples：`fid_error_demo`（打开失败取原因非空、健康句柄空串、关闭后查询不 panic）。
+
+**§3.9.3 句柄容量与生命周期实限 ✅（runtime 已落地）**
+
+`T_FID_MAX=256`，用户最多 253 个；长生命周期批量打开须自行 `fclose` 回收，无自动 GC。run_examples：`fid_capacity_demo`（表满第 254 次 `fid_is_open==false`）。
+
+**§3.9.4 缓冲与 fflush 语义 ✅（runtime 已落地）**
+
+stdio 缓冲；读写回环须先 flush/fclose；stdout/stderr 交织顺序非确定（仅文档声明）。run_examples：`fid_buffer_demo`。
+
+**§3.9.5 定位 / 随机访问（fseek / ftell）✅（M52 已落地）**
+
+`fseek fn(f: fid, off: i64) -> bool`（非法偏移/不可定位句柄返 `false` 并写 `fid_error`）、`ftell fn(f: fid) -> i64`（不可定位返 `-1`）；**均不 panic**。
+
+- 偏移是**自文件头起算的绝对位置**，v1 不提供 `SEEK_CUR`/`SEEK_END` 相对定位；负偏移直接判失败（不做 C 式的从尾回绕）。
+- 与 `fclose`/`fflush` 走 `fid_get`（无效句柄即 panic）不同，这两个内建走**非 panic 版访问器**：无效 / 已关闭句柄写 `err` 后返回失败值，由调用方显式取因（L-02 / L-09）。
+- `fseek` 成功后 `clearerr` 复位 EOF 标志，否则读到尾再定位回去仍读不出内容。
+- runtime 用 64 位定位原语（Windows `_fseeki64`/`_ftelli64`，其余 `fseeko`/`ftello`），避免 `long` 只有 32 位导致 >2GB 文件截断。
+- 检查期：第 1 个实参非 `fid`、或 `fseek` 第 2 个实参非整型标量 ⇒ `T_FID_SEEK_ARG`（拦住 `fseek(0, f)` 这类参数写反）。
+
+conformance：`p26_fid_seek_ok`(pass) + `f42_fid_seek_arg`(fail, `T_FID_SEEK_ARG`)；run_examples：`fid_seek_demo`。
+
+**§3.9.6 聚合类型序列化与 `@derive` 衔接 ⏳（v2，部分预接线）**
+
+`@derive(BinarySerde)` 已生成 `serialize`/`deserialize`；v2 接通 `<`/`>`：写时脱糖 `f < value.serialize()`（按 `:rawbin` 长度前缀），读时 `f > S` ⇒ 先读 `[]u8` 再 `S.deserialize`。conformance（v2）：`f47_fid_serde_missing_derive`(fail, `T_FID_UNSERIALIZABLE` 回归护栏) + `p29_fid_serde_ok`(pass)；run_examples：`aggregate_serde_demo`。
+
+**§3.9.7 字符编码约定 ⏳**
+
+字节透明（UTF-8 假定）；`:json` 读路径拒绝非法 UTF-8 转义（`T_FID_JSON_BAD_ESCAPE`，v2）。run_examples：`fid_json_escape_demo`。
+
+**§3.9.8 并发与线程安全（单线程前提）✅（无需实装）**
+
+`g_fids` 表与 stdio 缓冲非线程安全；并行模型落地后另立子条款。
+
+**§3.9.9 全局 fid 变量 ⏳**
+
+`fid` 不可作全局静态初始化器（`var g: fid = fopen(...)` 非法，报 `T_FID_GLOBAL_INIT`）；`var g: fid;`（运行期赋值）合法。conformance：`f48_fid_global_init`(fail) + `p30_fid_global_decl`(pass)；run_examples：`fid_global_demo`。
+
+**§3.9.10 `print` / `println` 与 `<` 的 L-04 重叠裁决（已裁定 A 口径）✅**
+
+`print`/`println`/`eprint` 仍只接受 `string`（与 `tc.tc:8662` 一致），明确定义为 `stdout < s` / `stdout < s < "\n"` / `stderr < s` 的**文档化语法糖**，运行期行为不变；`print(非string)` 仍报类型错（对应 `f49` 的 `T_FID_PRINT_ARG`）。conformance：`f49_fid_print_nonstring`(fail) + `p31_fid_print_sugar`(pass)；run_examples：`print_sugar_demo`（stdout 字节比对验证 L-04 等价消除）。
+
+### 3.10 格式化内建（Python 格式规范迷你语言子集）✅ tc（M54）
+
+**§3.10.1 为什么是「按类型分函数」而不是 `str.format`**
+
+Python 的 `"{:>10}{:.2f}".format(a, b)` 依赖三样 `t` 目前都没有的东西：**变参**、**`Any`/动态类型**、**字符串 `+`/插值**。因此 `t` 不提供多参 `format`，而是按被格式化值的静态类型拆成**定元数内建**，与既有 `int_to_str` / `sb_append_*` 家族同构：
+
+```ebnf
+FormatBuiltins:
+    format_int   fn(spec: string, v: i64)    -> string
+  | format_uint  fn(spec: string, v: u64)    -> string
+  | format_float fn(spec: string, v: f64)    -> string
+  | format_str   fn(spec: string, v: string) -> string
+  | format_bool  fn(spec: string, v: bool)   -> string
+  | format_char  fn(spec: string, v: i64)    -> string   // v 为码点，t 无字符字面量
+
+SbFormatBuiltins:
+    sb_append_fmt_int   fn(sb: StringBuilder, spec: string, v: i64)    -> void
+  | sb_append_fmt_uint  fn(sb: StringBuilder, spec: string, v: u64)    -> void
+  | sb_append_fmt_float fn(sb: StringBuilder, spec: string, v: f64)    -> void
+  | sb_append_fmt_str   fn(sb: StringBuilder, spec: string, v: string) -> void
+  | sb_append_fmt_bool  fn(sb: StringBuilder, spec: string, v: bool)   -> void
+  | sb_append_fmt_char  fn(sb: StringBuilder, spec: string, v: i64)    -> void
+```
+
+`sb_append_fmt_*` 是直写变体：结果直接追加进 `StringBuilder`，省掉中间 `string`。多段拼接一律走 StringBuilder（`t` 无 `string+`，见 §3.4）。
+
+**§3.10.2 spec 文法**
+
+```ebnf
+FormatSpec: [ "{" ] [ ":" ] [ [fill] align ] [ sign ] [ "#" ] [ "0" ] [ width ]
+            [ grouping ] [ "." precision ] [ type ] [ "}" ]
+  align:    "<" | ">" | "=" | "^"
+  sign:     "+" | "-" | " "
+  grouping: "," | "_"
+  type:     "b" | "c" | "d" | "e" | "E" | "f" | "F" | "g" | "G" | "n" | "o" | "s" | "x" | "X" | "%"
+```
+
+**外壳自动剥除**：`">10"`、`":>10"`、`"{:>10}"` 三种写法等价——解析时先剥 `{}`，再剥前导 `:`。这样可以把 Python 文档里的 spec 直接粘过来用。
+
+语义与 CPython 一致：`fill` 默认空格、`align` 数值默认 `>`／字符串默认 `<`、`=` 把填充插在符号与数字之间、`#` 给 `b/o/x/X` 加 `0b/0o/0x` 前缀、单个 `0` 等价于 `fill='0'` + `align='='`、`,` 为十进制千分位、`_` 对 `b/o/x/X` 每 4 位分组・对 `d` 每 3 位分组。
+
+**§3.10.3 与 CPython 的两处有意偏离**
+
+| 项 | CPython | `t` | 理由 |
+|---|---|---|---|
+| 整数 `precision`（如 `.4d`） | `ValueError` | 视为**最小位数**，前导补零（`0007`） | 对齐 C 的 `%.4d`，且比抛错有用 |
+| `format_bool` 非空 spec | 走 int 通道（`format(True,">5")` → `"    1"`） | 走文本通道（→ `" true"`），仅 `d/b/o/x/X` 等数值 type 才出 `1`/`0` | `t` 的 bool 字面量是小写 `true`/`false`，文本形态更自洽 |
+
+除这两项外，`examples/format_demo.tc` 的 30 条断言与 CPython `format()` **逐字节一致**。
+
+**§3.10.4 实现约定**
+
+- 浮点走 runtime `snprintf`（`t_format_float` 内部拼 `%[+ ][#].{prec}{f|e|E|g|G}`），**不是**生成代码里 `snprintf`；`%` 类型先乘 100 再补 `%` 号；`,` 千分位由 `append_float_grouped` 对整数段后处理。
+- 引擎单点实现于 `runtime/t_runtime.c`（`FmtSpec` / `fmt_parse` / `fmt_pad` / `fmt_int_core`），C 后端直调，LLVM 后端经 `runtime/t_shim_ll.c` 的 `tll_format_*` / `tll_sb_append_fmt_*` 指针桥（聚合按 `TStr*` 传入、返回聚合用末位 out 指针，见 §2.12）。故**双后端逐字节一致**。
+- 结果串在当前 arena 上分配，随进程退出统一释放。
+- conformance：`p28_format_ok`(pass)；run_examples：`format_demo`（双后端实跑比对）。
+
+**§3.10.5 编译期 spec 校验（M54 补充）**
+
+spec 字面量在编译期按 §3.10.2 文法校验（复刻 runtime `fmt_parse` 的外壳剥除——`{}` 仅当首尾都是才剥、再到最后一个 `:`；随后解析 fill/align/sign/`#`/`0`/width/grouping/precision/type，并要求**无残留字符**）。两种失败：
+
+- 非法 type 字符（不在 `b c d e E f F g G n o s x X %` 集合，外加 `format_bool` 专属的 `!`）→ **`T_FMT_BAD_SPEC`**；
+- type 之后仍残留无法解析的字符（如 `{:>10z}`）→ 同样 **`T_FMT_BAD_SPEC`**（运行期会贪婪吞尾、静默忽略，故这类笔误只能靠编译期捕获）。
+
+spec 实参本身若非 `string` 类型（且非 `Unknown`）→ **`T_FMT_SPEC_TYPE`**。`now()` 误传参 → `T_CALL_ARITY`（见 §3.11）。**非常量 spec**（运行期才确定的字符串）不做编译期校验，维持运行期宽松：非法字符照常由 `fmt_parse` 忽略。校验实现见 `src/tc.tc` 的 `check_fmt_spec` + 内建实参检查块。
+
+conformance：`p31_fmt_spec_ok`(pass)、`f41_fmt_bad_spec` / `f42_fmt_bad_spec2`(均 `T_FMT_BAD_SPEC`)。
+
+**§3.10.6 方法式 `format`（`"tmpl".format(a, b)`）✅ tc（M57）**
+
+为贴近 Python 习惯，`t` 允许以**方法式**调用数值模板：`"hello {0}".format(name)` 与函数式 `format("hello {0}", name)` **完全同义**，由编译器在检查期归一化——把接收者（须为字符串字面量）挪为第 0 实参、callee 换成裸 `format`，再走 M55 的 `desugar_format_call` 脱糖。
+
+```t
+var name: string = "world";
+println("hello {0}".format(name));      // 方法式，等价于 format("hello {0}", name)
+println("{0} @ {1}".format(name, 42));  // 多参同样支持
+var tmpl: string = "x={0}";
+// "tmpl".format(...) 若 tmpl 非字面量：编译期报 T_FMT_TEMPLATE_NOT_LITERAL
+```
+
+- 接收者**必须是字符串字面量**（`desugar_format_call` 需要把模板提升为匿名函数 `__fmt_N`）；若为变量则编译期报 **`T_FMT_TEMPLATE_NOT_LITERAL`**。
+- 方法式与函数式可自由嵌套：`format("at {0}", "t={0}".format(format_time("%H:%M", now())))`。
+- 归一化发生在 `infer_expr` 的 `call` 分支：仅当 callee 为 member 且方法名 `format`、接收者静态类型为 `string` 时触发；其它成员调用不受影响。conformance：`p34_fmt_method_ok`(pass)、`f51_fmt_method_not_literal`（`T_FMT_TEMPLATE_NOT_LITERAL`）(fail)；run_examples：`fmt_method_demo.tc`。
+
+---
+
+### 3.11 时间格式化内建（strftime / `datetime.strftime` 的 `%` 风格子集）✅ tc（M56 / M57）
+
+`t` 共有两个格式化 spec 语法家族，按领域分化（详见 §3.10）：数值/字符串走 Python 格式规范迷你语言（`{:>10}`），日期/时间走本节的 `%` 风格。后者是业界事实标准（C `strftime`、Python `datetime.strftime`），与数值域刻意不强行统一。
+
+> **M57 增量**（相对 M56）：① 新增 `parse_time` / `parse_time_local` 时间**解析**（spec → 微秒 epoch，失败返回哨兵）；② 新增 `format_time_tz` 按**固定时区偏移**格式化（不依赖平台 tzdata）；③ `%c %x %X` 三个 locale 字段码从「未知原样保留」升级为**已实装**；④ 数值模板新增**方法式** `"tmpl".format(a,b)`（与函数式 `format` 同义，见 §3.10.6）。
+
+**§3.11.1 EBNF（无新词法/关键字/类型）**
+
+内建直接接入，与 `format_int` 完全同构；时间值复用既有 `i64` 标量，不新增类型或标量管线。
+
+```ebnf
+now                fn()                       -> i64     // 当前时刻的微秒 epoch
+format_time        fn(spec: string, t: i64)  -> string  // 按 UTC 展开（gmtime）
+format_time_local  fn(spec: string, t: i64)  -> string  // 按本机本地时区展开（localtime）
+format_time_tz     fn(spec: string, t: i64, tz: i64) -> string  // 固定时区偏移（分钟）展开，不依赖平台 tzdata
+parse_time         fn(spec: string, s: string) -> i64  // 按 UTC 解析为微秒 epoch；失败返回 T_TIME_INVALID
+parse_time_local   fn(spec: string, s: string) -> i64  // 按本机本地时区解析；失败返回 T_TIME_INVALID
+time_invalid       fn() -> i64                // 返回 T_TIME_INVALID (= INT64_MIN)，解析失败哨兵
+```
+
+`now()` 无参数；`format_time` / `format_time_local` 的 `spec` 为 `%` 风格格式串，`t` 为 i64 微秒 epoch。三者可与 M55 的 `format(tmpl, ...)` 模板自由组合：`format("到期 {0}", format_time("%Y-%m-%d", now()))`。
+
+**§3.11.2 spec 文法与字段码**
+
+```ebnf
+TimeSpec: ( literal_char | "%" conversion )*
+conversion:
+    "Y" | "y" | "m" | "d" | "H" | "M" | "S" | "f" | "I"
+  | "b" | "B" | "a" | "A" | "p"
+  | "j" | "U" | "W" | "w" | "z" | "Z" | "%"
+  | "c" | "x" | "X"          // locale 字段码（M57 实装）
+```
+
+- **D1 时间值语义 = i64 微秒 Unix epoch**：从 `1970-01-01T00:00:00Z` 起的微秒数；正数=1970 之后，负数=1970 之前（`gmtime`/`localtime` 须正确处理，`runtime` 用 `int64_t` 承载，规避 2038 年 `time_t` 32 位溢出）。`now()` 返回当前微秒 epoch。runtime 内部拆 `sec = t/1000000`、`us = t%1000000`，余数用于 `%f`。
+- **D2 字段码表**（全部已实现 ✅）：
+
+| 字段码 | 含义 | 示例 | 备注 |
+|---|---|---|---|
+| `%Y` | 4 位年 | `2026` | |
+| `%y` | 2 位年 | `26` | |
+| `%m` | 月 `01`–`12` | `08` | |
+| `%d` | 日 `01`–`31` | `03` | |
+| `%H` | 24 小时制时 `00`–`23` | `20` | |
+| `%M` | 分 `00`–`59` | `51` | |
+| `%S` | 秒 `00`–`59` | `30` | |
+| `%I` | 12 小时制时 `01`–`12` | `08` | 配合 `%p` |
+| `%f` | 微秒 `000000`–`999999` | `123000` | 取 `t%1000000` |
+| `%b` | 短月名 | `Aug` | 固定英语 ASCII，不受 locale 影响 |
+| `%B` | 全月名 | `August` | |
+| `%a` | 短星期 | `Mon` | |
+| `%A` | 全星期 | `Monday` | |
+| `%p` | AM/PM | `PM` | 依 12 小时制 |
+| `%j` | 年积日 `001`–`366` | `215` | |
+| `%U` | 周数（周日起） | `31` | `(yday+7-wday)/7` |
+| `%W` | 周数（周一起） | `30` | `(yday+7-(wday+6)%7)/7` |
+| `%w` | 星期数 `0`(周日)–`6` | `0` | |
+| `%z` | 时区偏移 | `+0000`（UTC） | UTC 下恒 `+0000`；本地下由 `localtime↔gmtime` 差经 `mktime` 计算（东为正） |
+| `%Z` | 时区名 | `UTC`（UTC） | UTC 下恒 `UTC`；本地借 `strftime("%Z")` 取平台名 |
+| `%%` | 字面 `%` | `%` | |
+| `%c` | locale 日期时间 | `Sun Aug  3 20:51:30 2025` | `strftime("%a %b %e %H:%M:%S %Y")`，`%e` 空格填充日；固定英语 ASCII |
+| `%x` | locale 短日期 | `08/03/25` | `strftime("%m/%d/%y")` |
+| `%X` | locale 时间 | `20:51:30` | `strftime("%H:%M:%S")` |
+
+- `literal_char`：任何非 `%` 字符原样输出。
+- **D3 时区**：`format_time` 始终按 UTC（`gmtime`），确定性、可测、无平台差异，为默认推荐；`format_time_local` 按运行时本地时区（`localtime`），平台相关。`format_time_tz(spec, t, tz_minutes)` 按**固定时区偏移**（分钟，东为正，如东八区 `480`、印度 `+330`、西五点半 `−330`）展开，无需平台 tzdata、跨平台结果一致；实现上把偏移推进到「墙上时间」后再按 UTC 展开，并对 `%z` 输出 `±HHMM`、对 `%Z` 输出 `UTC±HH:MM`。
+- **D4 实参类型与返回值**：`now()`→`i64`（无参）；`format_time`/`format_time_local`/`format_time_tz` 的 `spec` 须 `string`、`t` 须 `i64`，`format_time_tz` 第三参 `tz` 须整型（否则 `T_TIME_ARG_TYPE`、缺参 `T_CALL_ARITY`），三者均返回 `string`（当前 arena 分配）。`parse_time`/`parse_time_local` 的 `spec` 须 `string`、`s` 须 `string`，返回 `i64` 微秒 epoch（解析失败返回 `T_TIME_INVALID`）。不隐式类型转换（`t` 传 `u64`/`f64` 报 `T_TIME_ARG_TYPE`）。
+
+**§3.11.3 字段码校验两层策略（格式化）**
+
+格式化 spec 字面量在编译期按 §3.11.2 白名单扫描字段码：遇未知 `%X`（如 `%Q`）报 **`T_TIME_BAD_SPEC`**，把笔误前移到编译期。非常量 spec 无法编译期判定，运行期引擎对未知 `%X` **原样保留字符**（宽松兜底）。`spec` 非 `string` 报 `T_TIME_SPEC_TYPE`；`now()` 误传参报 `T_CALL_ARITY`。
+
+> M57 起 `%c %x %X` 已实装（见 D2 字段码表），不再落入「未知原样保留」分支；仅 `%c %x %X` 之外的非白名单码（如 `%Q`）才按未知处理。
+
+**§3.11.3.1 解析白名单（`parse_time` / `parse_time_local`）**
+
+解析是格式化的**严格子集**——白名单比格式化更窄，因为 `%w %U %W %Z` 无法被反推为唯一时刻（或存在歧义），故在解析侧**明确拒绝**（而非「原样保留」）：
+
+- `%w %U %W %Z` → **`T_TIME_PARSE_UNSUPPORTED`**（编译期，字面量 spec）；
+- 其余非白名单 `%X`（如 `%Q`）→ **`T_TIME_BAD_SPEC`**（同格式化）；
+- 解析还强制**输入须被完全消耗**（字符串末尾不可有残留非空白字符），否则视为解析失败、返回 `T_TIME_INVALID`。
+
+扫描由 `check_time_parse_spec` 完成（编译期），运行期解析器 `t_parse_time` 同时自实现一套白名单以兼容非常量 spec。
+
+**§3.11.4 实现约定**
+
+- runtime 单点实现于 `runtime/t_runtime.c`（`t_now()` / `t_format_time()` / `t_format_time_tz()` / `t_parse_time()`），C 后端直调，LLVM 后端经 `runtime/t_shim_ll.c` 的 `tll_now` / `tll_format_time` / `tll_format_time_tz` / `tll_parse_time` 指针桥（`TStr` 按 `TStr*` 传入、返回用末位 out 指针），故**双后端逐字节一致**。`t_parse_time` 自带 `t_days_from_civil`（Howard Hinnant 民用历→epoch 日数，跨平台一致）与递归扫描器 `pt_scan`，不依赖 `strptime`（规避平台差异与 `%z` 解析缺口）。
+- 编译器按 `fid_error`/`format_int` 同款**五处注册**：`builtin_ret` / `td_calls` / C 发射 / LLVM 发射 / `llph` declare，并加 `check_time_spec` / `check_time_parse_spec` 编译期字段码扫描。缺任一注册点 ⇒ 发射 `; UNSUPPORTED call X`（gate 的 `UNSUPPORTED 计数 0` 断言是唯一自动防线）。
+- `gmtime`/`localtime` 返回静态缓冲，须立即拷出；epoch 负/溢出走 `int64_t` 承载，零 UB。解析失败统一返回哨兵 `T_TIME_INVALID`（= `INT64_MIN`），由 `#define` 在 `t_runtime.h` 提供，编译器 `time_invalid()` 内建直接返回该常量。
+
+**§3.11.5 验收与门禁**
+
+- conformance：`p29_time_fmt_ok`、`p30_time_fmt_ext`（pass）；`f38_time_fmt_bad_spec`（`T_TIME_BAD_SPEC`）、`f39_time_fmt_bad_arg`（`T_TIME_SPEC_TYPE`+`T_TIME_ARG_TYPE`）、`f40_time_now_arity`（`T_CALL_ARITY`）（fail）。
+
+**§3.11.6 时间解析（`parse_time` / `parse_time_local`）与失败哨兵**
+
+`parse_time(spec, s)` 把按 `spec` 组织的字符串 `s` 解析回微秒 epoch（`parse_time_local` 走本机本地时区）。语义要点：
+
+- **失败哨兵**：解析失败（字段缺失/越界/格式不符/输入未完全消耗）返回 `T_TIME_INVALID`（= `INT64_MIN`）。**不抛错、不返回 0**——调用方应以 `if (t == time_invalid()) { ... }` 判错，或以 `t > time_invalid()` 判有效（因合法 epoch 恒 `>= 0`）。
+- **支持的字段码**：`%Y %y %m %d %e %H %I %M %S %f %j %p %a %A %b %B %z %c %x %X %%%`；其中 `%c/%x/%X` 按 locale 串整体匹配，`%z` 支持 `+0800` / `+08:00` / `Z`，`%I/%p` 组合转 24h，`%y` 的 `69`→`1969`、其余→`20xx`，闰秒夹紧到 `59`，`%j` 反推日序。
+- **白名单严格小于格式化**：`%w %U %W %Z` 在解析侧明确拒绝（见 §3.11.3.1），因无法反推唯一时刻。
+- **输入须完全消耗**：解析器消费完 spec 后，`s` 必须恰好结束（尾部空白可忽略），否则失败。
+
+**§3.11.7 固定时区格式化（`format_time_tz`）**
+
+`format_time_tz(spec, t, tz_minutes)` 与 `format_time` 同构，但时区由第三参**显式给定**（分钟，东为正），而非取 UTC 或本机时区：
+
+- 实现把 `tz_minutes` 推进到「墙上时间」后再按 UTC 展开，对 `%z` 输出 `±HHMM`、对 `%Z` 输出 `UTC±HH:MM`，彻底不依赖平台 tzdata，跨平台逐字节一致。
+- 典型值：东八区 `+480`、印度 `+330`、美东夏令时 `−240`、UTC `0`。`examples/time_tz_demo.tc` 演示同一次 `t` 在多个偏移下的输出。
+
+**§3.11.8 验收与门禁（M57 增量）**
+
+- run_examples：`examples/time_fmt_demo.tc`（含 `%c/%x/%X` 与 `format_time_tz` 多偏移）、`examples/time_tz_demo.tc`、`examples/time_parse_demo.tc`（成功/失败/往返）、`examples/fmt_method_demo.tc`（方法式 `format`、嵌套、与 `format_time` 组合）、`examples/time_fmt_local.tc`（now+本地）。
+- conformance（M57 新增）：`p32_time_locale_ok` / `p33_time_parse_ok` / `p34_fmt_method_ok`（pass）；`f47_time_parse_unsupported`（`T_TIME_PARSE_UNSUPPORTED`）、`f48_time_parse_bad_spec`（`T_TIME_BAD_SPEC`）、`f49_time_tz_arity`、`f50_time_tz_arg_type`、`f51_fmt_method_not_literal`（`T_FMT_TEMPLATE_NOT_LITERAL`）、`f52_time_invalid_arity`、`f53_parse_time_arg_type`（fail）。
+- 对拍：固定 epoch `1754254290123000`（= `2025-08-03T20:51:30.123000Z`）断言 `format_time` / `format_time_tz` 与 Python `datetime(...,tzinfo=timezone.utc).strftime(...)` 及 `timezone(timedelta(minutes=480)).strftime(...)` 逐字节一致；`parse_time` 与 Python `datetime.strptime(...).timestamp()*1e6` 对拍一致。
+
+---
+
+### 3.12 Agent（智能体一等公民）✅ tc（actor 底层 + 用户态编排）
+
+Agent 是语言的一等公民（宪法支柱，2026-08-03 用户裁定 B：actor 底层 + LLM 上层；LLM 调用属运行时边界，编译器只落地 actor 声明）。一个 `X agent { ... }` 在**解析期**脱糖为三个顶层符号，皆可像普通声明一样被 check / 双后端发射：
+
+```ebnf
+AgentDecl:  IDENTIFIER "agent" "{" (AgentClause ";")* "}"
+AgentClause:
+      "state" (IDENTIFIER ":" Type ("@" IDENTIFIER)? ("=" Expr)? ";")+
+  |   "step"  FuncDecl            -- 形如 `step fn(s: <Name>State, msg: <Msg>) -> <Name>State { ... }`
+```
+
+脱糖产物（以 `Counter agent { state count: i64; step fn(s: CounterState, msg: i64) -> CounterState {...} }` 为例）：
+
+| 生成符号 | 形态 | 命名约定 |
+|---|---|---|
+| `<Name>State` | struct（字段 = `state` 列表，含 `@tag` / `=default`） | PascalCase 类型名（§2.2） |
+| `<name>_spawn` | `fn(init0, ...) -> <Name>State`：一参一字段（按声明顺序），body = `return <Name>State{ f: f, ... }` | **小蛇形** `counter_spawn` |
+| `<name>_step` | `fn(s: <Name>State, msg: <Msg>) -> <Name>State`：用户所写 `step` 体 | **小蛇形** `counter_step` |
+
+**命名红线（M-A 修正）**：编译器先把 PascalCase 的 agent 名经 `pascal_to_snake` 转小写，再拼 `_spawn` / `_step`，故生成的函数名恒为合法 snake_case。若手写 `Counter_step`（大写开头）会触发 `T_NAME_TYPE_CAMEL` 警告——因为命名校验器把「首字母大写」的标识符按**类型名**规则校验（§2.2：普通函数须小蛇形）。脱糖产物从根上规避该警告。
+
+- `step` 首参必须是 `<Name>State`，返回值也必须是 `<Name>State`（状态不可变传递：每次 step 返回新状态，由调用方接回）。
+- `msg` 的类型由用户在 `step` 签名里自由书写（i64 / atom / 自定义 struct 均可），编译器不限制。
+- 生成的 `spawn` / `step` 是普通顶层函数，可直接调用、可被 `match` / 闭包 / 其他函数组合——agent 不构成独立命名空间。
+- 验收：`examples/agent_demo.tc`（i64 驱动的计数器，`counter_spawn(0)` → 两次 `counter_step` +5/+3 → 输出 `count = 8`）+ `examples/agent_demo.expected.txt`，run_examples 双后端（LLVM + C）交叉验证通过。
+- 进阶示例 `examples/agent_npc.tc`：两个 agent 演示 agent_first.md 的多概念——① `Monster` = State Agent（纯 Core 确定性状态机，atom 消息 `:hit`/`:heal`/`:patrol` 驱动 hp/aggro 转移）；② `Receptionist` = Mind Agent（Core + Edge(LLM)），关键演示 **LLM 边界缝**：`step` 永不直接调 LLM、只在状态里记 `pending=:llm` 意图，运行时边界 `drive()` 检测到意图后调用工具函数 `fake_llm`（确定性桩，真实项目即 LLM/IO 接缝）并以 `:llm_reply` 回填清空意图；核心纯函数、确定性、可回放（同消息序列 → 同终态，已演示）。`step` 用 if/else 原地更新后返回 `s`（C 后端等价写法；LLVM 后端亦可改用 `return match(msg){...}` 结构体字面量返回“新”状态，但 C 后端暂不支持 match 返回结构体）。双后端 + run_examples 通过。
+- 进阶示例 `examples/agent_edge.tc`：演示 §6 分类矩阵里三个**纯模式** Edge 体——① `Radar` = Sensor Agent（Core×Env·感知，`:scan` 时 `step` 记 `pending=:sense`，边界 `drive_radar()` 去读世界 `sense_world()` 并把探测到的邻近实体数写回 `contacts`）；② `DbAgent` = Tool Agent（Core×Tool/IO，`:query` 时记 `pending=:tool`，边界 `drive_db()` 调 `fake_db()` 并把结果写回 `last_result`）；③ `Hero` = Player Agent（Core×Human，消息直接来自人类 input 事件，无 LLM/工具边界）。三体内部 `step` 都是纯函数、确定性、与对应 Mind 体同构；边界效应（读世界/调工具/读人类输入）只活在运行时边界。双后端 + run_examples 通过。
+
+**分类矩阵（2 轴 × 最终定名 · 2026-08-04）**：全部共用同一 `agent` 原语，差别在（a）Core 类型（Reflex 状态机 / Planning 规划）、（b）Edge 边界。Edge 含 **Env·感知**（对称于 Tool·IO 的「向世界写」，Env·感知是「在边界读世界」）。
+
+| | none | Env·感知 | Tool/IO | LLM | Human |
+|---|---|---|---|---|---|
+| **Reflex（状态机）** | State Agent 状态体 | Sensor Agent 感知体 | Tool Agent 工具体 | Mind Agent 心智体 | Player Agent 玩家体 |
+| **Planning（规划）** | Plan Agent 规划体 | Scout Agent 侦察体 | Operator Agent 操作体 | Strategist Agent 策略体 | Adjutant Agent 副官体 |
+
+- **已示例（Reflex 行）**：State（`Monster`）、Mind（`Receptionist`）——见 `examples/agent_npc.tc`；**Sensor（`Radar`）、Tool（`DbAgent`）、Player（`Hero`）——见 `examples/agent_edge.tc`**（三体演示 Edge 边界差异：`step` 在边界记意图、`drive_*()` 去读感知/调工具/读人类输入，与 Mind 同构，核心 step 纯函数可回放）。
+- **待 goal（🟢，需 `goal`/`plan` 子句，当前语法未实现）**：Plan / Scout / Operator / Strategist / Adjutant —— 当前 `agent` 原语只支持 `state`/`step` 子句，**写不出真正的规划体**：它们的「规划/目标栈（GOAP / utility AI）」Core 需预留 `goal`/`plan` 语法（见 `agent_first.md` §6 设计草图），故现阶段仅命名与占位，不可写示例。
+- **元类 待运行时（🟠，需运行时 spawn/寻址，后续里程碑）**：Spawner / Colony Agent 调度体（管理/生成子 agent）。
+- 命名对称：Scout = 规划式感知（先侦察再决策），区别于 Sensor 反应式感知；Adjutant = 人类为指挥官、agent 为副官负责规划协调，区别于 Player 玩家体（纯 Reflex 人类直驱）。完整定义见 `docs/agent_first.md` §6。
+
+**收敛决策 A（2026-08-04 拍板）**：`agent` 在语言层**无能力净增**（脱糖产物 `struct` + 自由 `fn` + 构造器 `t` 均已是一等公民，连 `spawn` 也可用 `XState{...}` struct 字面量替代），故**保留为极简意图标记，绝不再扩语法**——`use` 接线式、`goal`/`plan` 子句、`Spawner`/`Colony` 原语、消息路由均**不进编译器**。上方 10 格分类矩阵是**模式目录（非语法）**：所有 flavor 只是同一 `step` 契约 + 同一边界模型下**边界驱动方式不同**（读世界 / 调工具 / 调 LLM / 读人类 / 规划后喂 `step`），First-class agent ≠ built-in-flavors。支撑「数据流可复现」的工程工具（消息日志 / 回放定位 / 确定性 diff）移至**库层**（详见 `docs/agent_first.md` §8、§9）。
+
+**数据流可复现设计约束（Agent 该怎么做）**：引入 Agent 的核心卖点是「`init + 有序消息 ⇒ 可逐帧复现并定位偏离」」，它源自 `Agent = 纯函数状态机` 这一设计不变量，而非调试功能。守恒定则 5 条：① `step` 必为纯函数（零 IO / 零全局可变 / 零时钟 / 零随机）；② 消息是唯独输入通道（`step` 不得偷偷读世界 / 外部状态）；③ 状态是 Plain Data（无方法 struct，可快照 / diff）；④ 效应隔离到 `drive()` 边界（LLM / 工具 / IO / 人类输入只在此发生、以消息回填）；⑤ 消息日志是一等调试凭证。`agent_demo` / `agent_npc` / `agent_edge` 三示例之所以「特别容易按数据流定位问题」，正是无意中满足这 5 条——这正是该固化成设计纪律的东西。
+
+---
+
+### 3.13 Modules / Import / Export（代码模块与插件系统）⚠ 部分实现（2026-08-04：parser + 两个诊断 + whole-program inlining 已落地，`module_hello` 双后端真实通过；`.tlib`/`.tlibd` 产物 / `T_IMPORT_CYCLE` / tote 依赖图 / C 互操作导出待实现）
+
+> 本节气法由 `docs/syntax/drafts/module.md` 经 L-15 采用并并入（原草稿已标记失效）。与 §3.6.1 数据导入（`import_csv`/`import_json` 函数调用）正交：代码模块走 `import xxx` 标识符形式。
+
+一个 `.tc` 文件即一个模块；发布态为 `xxx.tlib`，调试态为 `xxx.tlibd`（刻意避开 C 静态库 `.lib` 扩展名）。`import xxx` 按名导入，命名空间即 `xxx`；跨模块可见的符号须显式 `export`。四法评审：L-04/L-02/L-03 全 ✅，L-14 原则 ✅（门禁用例实现期落）。
+
+```ebnf
+ModuleStem:     IDENTIFIER                          // 模块名 = 文件 stem，如 math（现已落地：whole-program inlining 直接吃 <stem>.tc）
+ModuleFile:     ModuleStem ".tc"                    // 模块源码（含 export、无 main），如 math.tc（✅ 现已落地，module_hello 真实通过）
+ModuleArtifact: ModuleStem "." ("tlib" | "tlibd")   // ⚠ spec-only 编译产物（插件形态），如 math.tlib / math.tlibd（待独立编译编排）
+
+ImportDecl:     "import" IDENTIFIER ("as" IDENTIFIER)? ";"   // import math; / import math as m;
+ExportPrefix:   "export"                            // 前缀修饰顶层声明
+```
+
+**规则**：
+
+1. **导入形式**：`import xxx;`（命名空间 = `xxx`）或 `import xxx as m;`（别名 `m`）。`import` 后是标识符（模块名），非字符串路径；与数据导入函数不重名（L-04 唯一语义）。
+2. **默认私有**：顶层符号默认模块内可见；跨模块可见须显式 `export <name> fn/struct/enum/flag/variant/const/typealias`。`export` 修饰非顶层 → `T_EXPORT_SCOPE`（L-02 显式）。
+   - ⚠ 语法注意：t 声明为并置式 `Name fn(...)`，`export` 前缀置于**名字之前**：`export add fn(...) { ... }`（非 `export fn add`）。
+3. **名称解析**：`import math;` → `math.add`；`import math as m;` → `m.add`。零碰撞、显式。
+4. **解析序（2026-08-04 实际实现）**：当前 `handle_one_import` 直接 `path_resolve("<base_dir>/<stem>.tc")` 取**源码**整体内联（C 的 `#include` 风格、单命名空间），无 `.tlib(d)` 产物查找；文件不存在 → `T_IMPORT_NOT_FOUND`。⚠ 草稿设计的「先找 `.tlibd`/`.tlib` 产物、否则编译同仓 `.tc`」两步优化路径**尚未实现**（属未来独立编译编排）。
+5. **依赖图无环**：当前靠 `in_mod_visited` 访问集对重复 import **去重、天然打断递归**（避免无限递归），但 `T_IMPORT_CYCLE` 错误**尚未发射**（真成环不报错、仅去重）。⚠ 严格无环校验 + 错误诊断属未来 `tote` 协同实现。
+6. **接口自描述**：`.tlib`/`.tlibd` 内嵌接口块（后端无关、确定性可读的 `export` 签名区），importer `check` 只读接口块即可类型检查；未 `export` 符号不进接口块，私有天然不可见。
+7. **C 互操作**：`.tlib` 可经 `tote` 导出为 C 兼容 `.lib`/`.dll`（符号来自接口块），导出表仅含 `export` 符号（见草稿 §11）。
+
+```t
+// math.tc —— 模块源码（含 export、无 main）
+export add fn(a: i64, b: i64) -> i64 { return a + b; }
+ipart fn(x: f64) -> f64 { return x; }   // 私有，模块外不可见
+
+// main.tc —— 程序入口
+import math;
+export run fn() -> i32 {
+    return i2s(math.add(1, 2));   // 经命名空间访问
+}
+```
+
+- agent 模块契合：actor 脱糖产物 `XState`/`x_spawn`/`x_step` 标 `export` 后可跨模块复用（消息回路边界）。
+- **实现状态（2026-08-04 第一刀 —— parser + 诊断）**：
+  - ✅ **已落地**：parser 支持 `export` 前缀（顶层声明打 `is_export` 标记）、`import xxx [as m]` 标识符形式（旧的 `import "path"` 数据导入保留兼容）；checker 诊断 `T_EXPORT_SCOPE`（`export` 修饰局部/嵌套 `var`/`const` 或 `import` 声明）、`T_IMPORT_NOT_FOUND`（单文件 `tc` 不解析模块，模块解析由 `tote` 构建层完成）。conformance 用例 `p_export_ok` / `f_export_scope` / `f_import_not_found` / `f_export_on_import` 已落地并随 gate 全绿。
+- **实现状态（2026-08-04 第二刀 —— whole-program inlining，端到端可跑）**：
+  - ✅ **已落地**：`import xxx;` 采用**整体程序内联**策略——将 `xxx.tc` 顶层声明并入同一编译单元（C 的 `#include` 风格、单命名空间），`xxx.foo` 限定访问脱糖为裸 `foo`；单文件程序不受影响。`examples/module_hello/` 现已**真实通过**：双后端 `build`+`run` 输出 `hello from main` / `6` / `hello, world`（`add(2,3)`=6 含私有 `helper` 调用，`greet` 返回 `hello, world`），gate `run_examples` 已覆盖。两处根因修复：
+    - `load_module_file` token-append bug：旧实现 `tokenize(msrc); pos = 0;` 因 `tokenize` 是 append 语义（永不清空全局 `toks`），`pos = 0` 重解析入口文件 → 嵌套 import 递归 → 幻影第二个 `main` → `fc_merge` 拒 `main`（0 参数）报 `T_FUNC_CLAUSE_ARITY`。修复：`var saved_pos = pos; var base = slice_len(toks); tokenize(msrc); pos = base; ...; pos = saved_pos;`（嵌套 import 透明返回、恢复调用方解析位置）。
+    - `i2s` 代码生成缺口（预先存在，被 `module_hello` 暴露）：LLVM/C emitter 处理 `int_to_str` 但不处理 `i2s` → `; UNSUPPORTED call i2s` → 指针 0 → LLVM verifier `integer constant must have integer type`。修复：在 `builtin_ret`/`td_calls`/LLVM `ll_call`/C emit 四处将 `i2s` 别名到 `int_to_str`（`t_int_to_str` / `@tll_int_to_str`）。
+  - ⏳ **待实现（仍依赖多文件独立编译编排）**：`.tlib`/`.tlibd` 产物与内嵌接口块、`T_IMPORT_CYCLE`（依赖图无环校验，需 `tote` 协同）、C 互操作导出（`.lib`/`.dll`）、真正的「分模块独立编译 + 链接」（当前为单文件内联而非独立编译；跨模块可见性隔离靠 inlining 单命名空间近似实现，私有符号的硬性不可见在跨模块边界尚未强制校验）。
+
+---
+
 ## 4. Program entry（程序入口） ✅ tote
 
 ```ebnf
@@ -1166,10 +1771,11 @@ Annotation      : "@" Ident ("(" ArgList? ")")?
 | §3.1 | #aos / #soa 布局变换 | ⚠ 仅注释 |
 | §3.2 | enum | ⚠ 标记未实装 |
 | §4 | 注解系统（注册表） | ✅ 注册表数据化；⚠ 多数语义未接入 |
-| §5 | CTFE / type_info(T) 内建 | ⚠ 未接入 |
+| §5 | CTFE / type_info(T) 内建 | ⚠ 字段自省已接入（ti_*/fi_*，含 fi_tag）；comptime 求值/注解元数据仍为 partial |
 | §6 | flag[T] 位域 + flag_set/get | ✅ 已实现（含 SlotInfo 自省） |
 | §7.2 | 外部数据导入 CSV/JSON（CTFE 脱糖） | ✅ 已实现 |
 | §2.3 | 字符串驻留符号 Sym32/Sym16（intern / sym_str / sym_release） | ✅ 已实现（M40） |
+| §3.11 | 时间格式化（strftime `%` 风格）+ 解析/固定时区/locale/M57 增量 | ✅ 已实现（M56 / M57） |
 
 > 设计哲学落地：**语法根本源为 `docs/reference.md`**（内含 `ebnf` 产生式块），经 `tools/gen_ebnf.mjs` 生成 `out/ebnf.json`，再由 `src/totter.tc`（已放弃）数据驱动生成 `gen/tc.tc`（冻结快照，见 `src/tc.tc` `kw_lookup` 等标记区间）。⚠ totter 已放弃，此「数据优先」生成管线为历史设计；`src/tc.tc` 现手写维护，`GEN:` 区间为冻结快照。
 

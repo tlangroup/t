@@ -6,6 +6,8 @@
 //   // EXPECT: pass                            → check exit 0
 //   // EXPECT: error T_CODE1[, T_CODE2 ...]    → check exit != 0 且各码均出现
 //   // EXPECT: warning T_CODE1[, T_CODE2 ...]  → check exit 0 且各码均出现（警告不拦截）
+//   // EXPECT: build-error T_CODE1[, ...]      → build exit != 0 且各码均出现
+//   //                                             （守护「build 出错须打印诊断、不得静默 exit 1」）
 //
 // 用法:
 //   node tools/conformance.mjs                     # 用稳定版 tc1.exe 跑
@@ -57,6 +59,19 @@ function runCheck(cmdv, file, useShell) {
   }
 }
 
+// 与 runCheck 平行：跑 `build` 子命令，守护「编译出错时 build 必须打印诊断、
+// 不得静默 exit 1」的修复（见 MEMORY.md 2026-08-03 修复记录）。
+function runBuild(cmdv, file) {
+  const tmp = join(ROOT, "out", "dbg", "_conf_build_tmp");
+  try {
+    const opts = { cwd: ROOT, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] };
+    const stdout = execFileSync(cmdv[0], [...cmdv.slice(1), "build", file, "--output", tmp], opts);
+    return { code: 0, stdout };
+  } catch (e) {
+    return { code: e.status ?? -1, stdout: (e.stdout ?? "") + (e.stderr ?? "") };
+  }
+}
+
 // 归一化：JSON 内的绝对路径 → 文件名（正/反斜杠、转义反斜杠均处理）
 function normalize(s, file) {
   const base = file.replace(/\\/g, "/").split("/").pop();
@@ -75,15 +90,17 @@ const failures = [];
 for (const file of files) {
   const rel = file.slice(ROOT.length + 1).replace(/\\/g, "/");
   const src = readFileSync(file, "utf8");
-  const m = src.match(/^\/\/ EXPECT: *(pass|(error|warning) +([A-Z0-9_, ]+))/m);
+  const m = src.match(/^\/\/ EXPECT: *(pass|(error|warning|build-error) +([A-Z0-9_, ]+))/m);
   if (!m) { failed++; failures.push(`${rel}: missing "// EXPECT:" directive`); continue; }
-  const kind = m[2] ?? "pass"; // pass | error | warning
+  const kind = m[2] ?? "pass"; // pass | error | warning | build-error
   const codes = kind === "pass" ? [] : m[3].split(",").map(s => s.trim()).filter(Boolean);
 
-  const r = runCheck([compiler], file);
+  const r = (kind === "build-error")
+    ? runBuild([compiler], file)
+    : runCheck([compiler], file);
   let ok = true, why = "";
 
-  const wantExit = kind === "error" ? "nonzero" : "zero";
+  const wantExit = (kind === "error" || kind === "build-error") ? "nonzero" : "zero";
   if (wantExit === "zero" && r.code !== 0) { ok = false; why = `expected exit 0, got ${r.code}`; }
   if (wantExit === "nonzero" && r.code === 0) { ok = false; why = "expected error, exit=0"; }
   for (const c of codes) {
@@ -92,7 +109,7 @@ for (const file of files) {
     }
   }
 
-  if (ok && useRef) {
+  if (ok && useRef && kind !== "build-error") {
     const r0 = runCheck(refCmd, file, true);
     if (r0.code !== r.code) { ok = false; why = `ref exit=${r0.code} vs cand exit=${r.code}`; }
     else if (normalize(r0.stdout, file) !== normalize(r.stdout, file)) {

@@ -1,0 +1,155 @@
+# 智能体第一 — 设计纲要(草案)
+
+> **状态:核心设定已确认(Style B 语法 + 分类命名 + Core/Edge 模型);EBNF 待 L-15 法律化** ｜ 日期:2026-08-03 ｜ 关联宪法修正案:「智能体第一」增补为目标支柱(待第23条四层评审确认)  
+> 本文件为「智能体第一」的设计素描,**非法律、不具约束力**。后续须经语法规则子层(L-15 流程)起草 EBNF、验证、并入 `docs/reference.md` 方为权威。  
+> **2026-08-04 收敛决策（选项 A 拍板）**:经评审,`agent` 在语言层**无能力净增**(脱糖产物 struct/fn/构造器均已是一等公民),故**保留为极简意图标记,绝不再扩语法**(`use`/`goal`/`plan`/Spawner/消息路由均不进编译器);10 格分类矩阵降级为**模式目录(非语法)**;「数据流可复现」工具移**库层**(见 §8)。
+
+---
+
+## 0. 已裁定决策（2026-08-03）
+
+- **用户选择 B：actor 底层 + LLM 上层**。Agent = 确定性 actor（纯数据状态 + 自由 `step(State, Msg) -> State` + 消息穷尽匹配），LLM 驱动能力建在 actor 基盘**之上**。
+- **对本游戏（关键）**：LLM 驱动的 NPC / 角色是**真需求**，不是语言通用冗余。故 LLM 层必须预留，但纯运行时边界，不进编译器。
+- **边界效应模型（核心架构）**：`step` 永不直接调 LLM / 工具——只更新状态并记「意图」字段（如 `pending: atom`）；真正的 LLM / 工具调用发生在**运行时边界**，结果以消息（如 `:llm_reply` / `:tool_result`）回填给 `step`。核心决策逻辑保持纯函数、确定性、可回放；非确定性只活在边界。
+- **对编译器 scope 的结论**：实现「智能体第一」只需在编译器落地 **actor 声明**（脱糖为 纯数据 struct + 自由 `step` fn + 可选 `spawn` 构造器），**无需任何 LLM / 异步 / IO 编译器特性**。LLM 调用是上层运行时 / 库关注点。
+- **struct 无方法（用户重申铁律）**：agent 的 `state` 是纯数据 struct，`step` / `tools` 是顶层自由 fn，绝不把函数挂进 struct。此举恰与 ECS 数据导向契合（方法暗示对象；自由 fn + 纯数据才是批量处理本色）。
+- **最小实装路径（无运行时改动）**：`agent` 关键字 + `AgentDecl` 节点 + `parse_agent_decl` + 脱糖 pass（struct + fn + spawn 构造器），配 `examples/agent_monster.tc`（野怪确定性 AI）+ `examples/agent_refund.tc`（演示 LLM 边界模式）；跑 gate L0 不红。
+- 开放问题（持久化走 fid v2、多 Agent 确定性、工具语义）部分由边界模型缓解：工具 / LLM 调用即「消息回填」，`step` 仍是纯函数。
+
+
+
+## 1. 定位与边界
+
+- 与既有「AI Agent 友好」(语言**可被** Agent 消费:JSON 诊断、AST 导出、编译期自省)正交。「智能体第一」指 **Agent 作为语言一等公民被编写**——写 Agent 是原生语言构造,而非外部脚本调用 t 编译器。
+- 不新增隐式堆 / GC / 运行时类型歧义。Agent 的全部状态与行为由**既有静态类型系统**表达(呼应第1/3/8条)。
+
+## &#x20;2. 一等公民定义
+
+Agent 由四个静态可描述部分构成:
+
+| 部分         | 形态                            | 说明                                           |
+| ---------- | ----------------------------- | -------------------------------------------- |
+| 身份         | `atom`(复用 M50 原子)             | 编译期 intern,全局唯一,可作消息路由键                      |
+| 状态         | 纯数据 `struct`                  | 数据第一;显式字段、固定位宽;生命周期显式(第3/8/12条)              |
+| 能力集(tools) | 一组类型化函数 `fn(Input) -> Result` | 声明即契约,调用的类型安全由编译器保证                          |
+| 消息回路       | 类型化 inbox/outbox(消息即 struct)  | 驱动 `step(state, msg) -> (state, actions)` 推进 |
+
+## 3. 与既有模型的关系
+
+- **数据第一** — Agent 状态 = `struct`,消息 = `struct`,无隐藏状态;业务逻辑弱依附于数据定义。
+- **ECS 第一** — Agent 可作 ECS 的 **System** 编排 World;Agent 自身状态也可作为 Component 挂到 Entity,使「数据 / ECS / 智能体」三者统一于同一套静态数据模型。
+- **AI 稳定生成** — Agent 定义是确定语法(第2条唯一确定语义),无风格变体,模型可稳定产出。
+- **静态类型** — 消息字段、工具入参/返回全程类型检查,无运行时类型歧义。
+- **确定性(第7条)** — 同输入同行为;无隐式并发,并行须走第12条沙盒多核 / 极简协程。
+
+## 4. 最小语法（已确认 · Style B 统一 fn）
+
+- 声明（并置式 + `agent` 关键字）:
+  ```
+  Counter agent {
+    state count: i64
+    step fn(s: CounterState, msg: atom) -> CounterState {
+      return match (msg) {
+        :inc => CounterState { count: s.count + 1 }
+        :dec => CounterState { count: s.count - 1 }
+        _    => s
+      };
+    }
+  }
+  ```
+- **Style B 裁定**：`step` 子句显式带 `fn` 关键字（与全语言一致——全语言只有一种函数写法，parser 零特例）。`state` 不带 `fn`（它是字段声明）。
+- **struct 无函数（铁律）**：`CounterState` 脱糖为纯数据 struct，函数一律是顶层自由 `fn`，绝不挂进 struct（契合 ECS 数据导向）。
+- 脱糖产物（仅编译器前端完成，后端零改动）:
+  - `CounterState struct { count: i64 }`（纯数据）
+  - `Counter_step fn(s: CounterState, msg: atom) -> CounterState { ... }`（自由函数，函数体逐字保留）
+  - `Counter_spawn(init) -> CounterState`（合成构造器）
+- 实例构造（显式，无隐式分配）: `var c: CounterState = Counter_spawn(0);`
+- 消息驱动: 调用方手写循环 `c = Counter_step(c, :inc);`
+- **最小实装不含运行时邮箱 / 调度**（`send`/`recv`/`spawn` 的邮箱语义 deferred）；只为演示「agent 一等公民」。
+
+> 最终 EBNF 待语法规则子层（L-15）起草、验证后并入 `reference.md`。
+
+## 5. 约束清单(不得突破)
+
+- 不得引入隐式 GC(第8/12条)。Agent 状态须落在显式存储(栈 / 显式 Arena / 全局定长缓冲)。
+- 消息派发必须静态类型化(第1/2条)。
+- 唯一确定语义:Agent 只有一种标准写法(第2条)。
+- 资源显式绑定(第12条);生命周期可静态追溯(第3条)。
+- 危险操作(如跨 Agent 共享可变状态)须显式标注且可静态审查(第8条)。
+
+## 6. Agent 分类与命名（已确认）
+
+全部共用**同一个 `agent` 声明原语**；差别只在（a）Core 里放什么（reflex / plan / goal）、（b）Edge 接什么（none / Env·感知 / tool / LLM / human）。**Edge 轴含 Env·感知（2026-08-04 补列）**：对称于 Tool·IO 的「向世界写」，Env·感知是「在边界读世界」，导出 Sensor / Scout 体。
+
+> ⚠ **矩阵是「模式目录」，不是语法**。这 10 格（＋Spawner 元类）是给人看的分类清单，用于统一术语与讨论；`t` 编译器**不**内置这 10 种 agent 类型。所有 flavor 只是「同一 `step` 契约 + 同一边界模型」下**边界驱动方式不同**（读世界 / 调工具 / 调 LLM / 读人类 / 规划后喂 `step`）。First-class agent ≠ built-in-flavors。详见 §8 收敛决策。
+
+**命名对称规则**:Reflex 行称「X 体」(State/Sensor/Tool/Mind/Player)，Planning 行除保留「规划体」外，其余取对称专名（侦察体/操作体/策略体/副官体），英文后缀 -er / -ist / -ant。
+
+**2 轴分类矩阵（最终定名 · 2026-08-04）**:
+| | none | Env·感知 | Tool/IO | LLM | Human |
+|---|---|---|---|---|---|
+| **Reflex（状态机）** | State Agent（状态体） | Sensor Agent（感知体） | Tool Agent（工具体） | Mind Agent（心智体） | Player Agent（玩家体） |
+| **Planning（目标/规划）** | Plan Agent（规划体） | Scout Agent（侦察体） | Operator Agent（操作体） | Strategist Agent（策略体） | Adjutant Agent（副官体） |
+
+**已命名实例（Reflex 行）**:
+- **State Agent（状态体 / 确定性 Agent）** —— 纯 Core，确定性状态机。例：野怪 Monster（血量 / 仇恨 / 巡逻，消息驱动转移）。✅ 已示例（`examples/agent_npc.tc`）。
+- **Sensor Agent（感知体）** —— Core×Env·感知，纯读世界/环境、产出感知状态或感知消息（雷达、邻近检测、视觉传感器），喂给其他 agent。与 Mind 的内/外智能正交（一个 Sensor 也可再接 LLM 做感知推理 = Mind×Env，待补）。✅ 已示例：`Radar`（`examples/agent_edge.tc`，`:scan` 记意图、边界读世界写回 `contacts`）。
+- **Tool Agent（工具体）** —— Core 任意 + Edge=外部工具/IO（数据库、支付、匹配、HTTP）。把「Edge 效应」从「只有 LLM」泛化为一等概念。零新语法，纯模式。✅ 已示例：`DbAgent`（`examples/agent_edge.tc`，`:query` 记意图、边界调 `fake_db` 写回 `last_result`）。
+- **Mind Agent（心智体 / 认知 Agent）** —— Core + Edge(LLM)。例：LLM 驱动 NPC（自由对话、即兴剧情）。✅ 已示例（`examples/agent_npc.tc` 的 `Receptionist`）。
+- **Player Agent（玩家体 / 化身体）** —— 任意 Core + Edge=人类输入（纯 Reflex，人类直驱）。玩家角色也是 agent，与 NPC 在模型上统一。✅ 已示例：`Hero`（`examples/agent_edge.tc`，人类 input 事件直接作消息喂 `step`）。
+
+**Planning 行（全部属「待 goal」——需 `goal`/`plan` 子句，当前语法未实现；命名先定，实现后置，暂不可写示例）**:
+- **Plan Agent（规划体）** —— Core=规划/目标栈（GOAP / utility AI），Edge=none。填补 reflex 与 LLM 之间的 deliberative 空白；将来作 `goal`/`plan` 子句预留。
+- **Scout Agent（侦察体）** —— Core=规划 + Edge=Env·感知；先侦察/探索再决策（规划式感知），区别于 Sensor 的反应式感知。
+- **Operator Agent（操作体）** —— Core=规划 + Edge=Tool/IO；按计划调用外部工具执行。
+- **Strategist Agent（策略体）** —— Core=规划 + Edge=LLM；LLM 做策略/规划推理。
+- **Adjutant Agent（副官体）** —— Core=规划 + Edge=Human；人类为指挥官、agent 为副官负责规划协调（区别于 Player 玩家体 = 纯 Reflex 人类直驱）。
+
+> ⚠ **Planning 体当前不可写**：`agent` 原语只支持 `state` / `step` 子句，尚无 `goal` / `plan` 子句语法，故 Planning 行五格仍只是命名 + 设计草图（见上方「待 goal」批注），无法给出可运行示例。
+
+**元类**:
+- **Spawner / Colony Agent（调度体，元类）** —— 管理/生成子 agent（导演 AI、小队队长、刷怪波次），吃 ECS 海量能力；需运行时 spawn / 寻址支持（后续里程碑，当前不可写）。
+
+**优先级（语言侧成本）**: Tool / Player / Sensor Agent = 0（纯模式，现有语法可写，**已示例**）；Scout / Operator / Strategist / Adjutant / Plan Agent = 加 `goal`/`plan` 子句预留（**暂不可写**）；Spawner = 运行时最重，后续里程碑。
+
+## 7. 开放问题(待法律化时裁决)
+
+- **持久化 / 序列化** — 能否复用 fid v1 序列化?当前聚合类型(struct / slice / map)尚不可序列化(M51 技术债),需 v2 走 `type_info`。
+- **多 Agent 协作的确定性** — 顺序无关并行(第12条)如何映射到消息顺序与全局状态收敛。
+- **工具调用语义** — 失败 / 重试 / 超时如何与 `Result` 类型及 `defer` 生命周期交互。
+- **身份与发现** — `atom` 作路由键时,跨进程 / 分布式 Agent 的寻址边界(超出单进程运行时范畴,可能需运行时扩展)。
+
+---
+
+## 8. 收敛决策：agent 降为极简意图标记（2026-08-04 · 选项 A 拍板）
+
+多轮评审后的结论。**「引入 Agent 的初衷」极小**（2026-08-03 裁定 B：为游戏 LLM 驱动 NPC 真需求，只做确定性 actor 糖衣），而 later 被一层层加出来的 10 格 taxonomy、`use` 接线、`goal`/`plan`、Spawner 运行时都是膨胀源。把账算清后：
+
+- **语言层能力净增 = 0**：`agent` 脱糖产物 = `struct`（状态）+ 自由 `fn`（step）+ 构造器；三者 `t` 均已是一等公民。连合成的 `spawn` 构造器也可用 `XState{ ... }` **struct 字面量**完全替代。故 `agent` 在**能力**上不提供任何 struct/fn 之外的东西。
+- **保留 `agent` 的唯一理由**：作为「这是一个 Agent」的**意图标记**（intent marker），是宪法支柱「智能体第一」的可见锚点（写 Agent 是原生语言构造，而非外部脚本调用编译器）。它几乎零成本，且防止有人把 impurity 悄悄写进 `step`。
+
+**拍板：选项 A —— 保留 `agent` 为极简意图标记，绝不再扩语法。**
+
+1. ✅ **保留唯一写法** `X agent { state...; step... }`，脱糖行为不变。
+2. ❌ **永不新增**第二套语法：`use` 接线式、`goal`/`plan` 子句、`Spawner`/`Colony` 原语、消息路由 / 多 system 编排。任何「flavor 差异」靠**边界驱动模式**（§6 矩阵）+ **自由 fn**表达，不进编译器。
+3. ❌ **10 格分类矩阵降级为「模式目录」**（见 §6 蓝框）：写文档、不进编译器；不意味语言内置 10 种 agent 类型。
+4. 📦 **可复现工具移库**：支撑「数据流可复现」的工程价值——消息日志（record）、回放定位（replay）、确定性 diff——放进**库**（如 `agentkit` helper），**不进语言层**。
+5. **规划体若将来要做**：以**纯** `planner(State) -> Msg` 自由 fn 表达（算出的下一步消息喂同一纯 `step`），**不引入** `goal`/`plan` 语法；不变量不变（step 纯、消息唯独、效应在边界）。
+
+> 一句话：`agent` 在语言层的必要度已从「需要一套原语」退到「需要一个意图标记」；它不再是能力，而是符号。
+
+---
+
+## 9. 数据流可复现：设计约束（Agent 该怎么做）
+
+「数据流可复现」（哪条消息让状态偏离预期，可逐帧回放、精确定位）是引入 Agent 时的核心卖点，也是 `agent_demo` / `agent_npc` / `agent_edge` 示例「特别容易按数据流定位问题」的根因。它**不是某个调试功能给的，而是 `Agent = 纯函数状态机` 这个设计天然带出的不变量**。要守住它，须满足 5 条设计约束：
+
+1. **`step` 必须是纯函数** —— `step(State, Msg) -> State`，内部零 IO、零全局可变、零时钟、零随机。判据一句话：同一条 `(State, Msg)` 永远得同一 `State`。
+2. **消息是唯独输入通道** —— 所有「成因」走消息进来；`step` 内部不得偷偷读世界 / 读别的 agent / 读外部状态，否则成因不在消息日志里、无法重放。
+3. **状态是 Plain Data（无方法 struct）** —— 每帧状态可被快照、序列化、逐字段 diff，这是定位「哪一帧开始偏离」的物质基础。
+4. **效应隔离到 `drive()` 边界** —— LLM / 工具 / IO / 人类输入**只**在边界发生，结果以消息回填 `step`。关键防火墙：出问题时立刻二分——是 `step` 纯逻辑 bug（确定性、从消息日志可复现），还是边界 / IO bug（允许非确定性的那部分）。
+5. **消息日志是一等调试凭证** —— 「记录消息流」应廉价、默认，而非事后打补丁；它是重建整条因果链的最小输入。
+
+**什么会破坏该目标（须拒绝）**：`step` 直连 LLM / IO / 时钟（复现断链）；`step` 读写隐藏全局 / 共享世界状态（成因不可重放）；`step` 内 spawn 副作用改外部实体（效应不可追踪）；给 State 挂方法（OOP，状态快照难）。
+
+**结论**：Agent 原语的真正价值，是用语法把 `(struct + 纯 fn + spawn)` 这一形状**焊死**，让任何写出的 agent 自动满足「`init + 有序消息 ⇒ 可复现`」。这恰由当前**最小** `X agent { state; step }` 糖衣满足——它脱糖出的 struct + 自由 fn 天然契合上述 5 条。这也是 §8 选项 A 的底层依据：不扩语法、守住这个不变量即可。

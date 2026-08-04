@@ -30,6 +30,7 @@ int64_t    tll_fi_offset(TFieldInfo* fi)              { return t_fi_offset(fi); 
 void       tll_fi_type_name(TFieldInfo* fi, TStr* out){ *out = t_fi_type_name(fi); }
 int64_t    tll_fi_type_size(TFieldInfo* fi)           { return t_fi_type_size(fi); }
 int8_t     tll_fi_is_ptr(TFieldInfo* fi)              { return t_fi_is_ptr(fi); }
+int64_t    tll_fi_tag(TFieldInfo* fi)                { return t_fi_tag(fi); }
 int64_t tll_str_len(TStr* s)                { return t_str_len(*s); }
 int64_t tll_str_at(TStr* s, int64_t i)      { return (int64_t)t_str_byte_at(*s, i); }
 int32_t tll_str_eq(TStr* a, TStr* b)        { return t_str_eq(*a, *b) ? 1 : 0; }
@@ -44,6 +45,26 @@ void    tll_sb_append_i64(TSb* b, int64_t v)  { t_sb_append_i64(b, v); }
 void    tll_sb_to_str(TSb* b, TStr* out)    { *out = t_sb_to_str(b); }
 void    tll_sb_clear(TSb* b)                { t_sb_clear(b); }
 void    tll_int_to_str(int64_t v, TStr* out) { *out = t_int_to_str(v); }
+
+// ── 格式化（Python 格式规范迷你语言子集）──
+void tll_format_int(TStr* spec, int64_t v, TStr* out)        { *out = t_format_int(*spec, v); }
+void tll_format_uint(TStr* spec, uint64_t v, TStr* out)      { *out = t_format_uint(*spec, v); }
+void tll_format_float(TStr* spec, double v, TStr* out)       { *out = t_format_float(*spec, v); }
+void tll_format_str(TStr* spec, TStr* v, TStr* out)          { *out = t_format_str(*spec, *v); }
+void tll_format_bool(TStr* spec, int8_t v, TStr* out)        { *out = t_format_bool(*spec, v); }
+void tll_format_char(TStr* spec, int64_t v, TStr* out)       { *out = t_format_char(*spec, (uint8_t)v); }
+void tll_sb_append_fmt_int(TSb* b, TStr* spec, int64_t v)    { t_sb_append_fmt_int(b, *spec, v); }
+void tll_sb_append_fmt_uint(TSb* b, TStr* spec, uint64_t v)  { t_sb_append_fmt_uint(b, *spec, v); }
+void tll_sb_append_fmt_float(TSb* b, TStr* spec, double v)   { t_sb_append_fmt_float(b, *spec, v); }
+void tll_sb_append_fmt_str(TSb* b, TStr* spec, TStr* v)      { t_sb_append_fmt_str(b, *spec, *v); }
+void tll_sb_append_fmt_bool(TSb* b, TStr* spec, int8_t v)    { t_sb_append_fmt_bool(b, *spec, v); }
+void tll_sb_append_fmt_char(TSb* b, TStr* spec, int64_t v)       { t_sb_append_fmt_char(b, *spec, (uint8_t)v); }
+
+// ── 时间格式化 / 解析（M56 / M57）──
+int64_t tll_now(void) { return t_now(); }
+void    tll_format_time(TStr* spec, int64_t t_us, int64_t use_local, TStr* out) { *out = t_format_time(*spec, t_us, (int)use_local); }
+void    tll_format_time_tz(TStr* spec, int64_t t_us, int64_t tz_min, TStr* out) { *out = t_format_time_tz(*spec, t_us, tz_min); }
+int64_t tll_parse_time(TStr* spec, TStr* s, int64_t use_local) { return t_parse_time(*spec, *s, (int)use_local); }
 
 // ── slice ──────────────────────────────────────────────────────
 void    tll_slice_new(int64_t esz, TSlice* out)              { *out = t_slice_new(esz); }
@@ -72,6 +93,35 @@ uint32_t tll_sym_intern(TStr* tag, TStr* str, int64_t bits)  { return t_sym_inte
 void     tll_sym_str(TStr* tag, uint32_t id, TStr* out)      { *out = t_sym_str(*tag, id); }
 void     tll_sym_release(TStr* tag)                          { t_sym_release(*tag); }
 void     tll_sym_release_all(void)                           { t_sym_release_all(); }
+
+// ── Atom ─────────────────────────────────────────────────────────
+// 返回聚合(string)用末位 out 指针；id 为标量直接传入。
+void     tll_atom_str(int64_t id, TStr* out)                { *out = t_atom_str(id); }
+
+// ── Fid：文件描述符 + 序列化操作符（M51）────────────────────────
+// 句柄/格式码均为标量直接传；聚合参数(TStr)按指针传入。
+int64_t tll_fopen(TStr* path, int32_t mode)                 { return t_fopen(t_cstr(*path), mode); }
+void    tll_fclose(int64_t f)                               { t_fclose(f); }
+void    tll_fflush(int64_t f)                               { t_fflush(f); }
+int32_t tll_fid_is_open(int64_t f)                          { return t_fid_is_open(f); }
+void    tll_fid_error(int64_t f, TStr* out)                 { *out = t_fid_error(f); }
+int32_t tll_fseek(int64_t f, int64_t off)                   { return t_fseek(f, off); }
+int64_t tll_ftell(int64_t f)                                { return t_ftell(f); }
+int64_t tll_fid_format(int64_t f, int64_t a_text, int64_t a_json, int64_t a_raw, int64_t a_pb) {
+    return t_fid_format(f, a_text, a_json, a_raw, a_pb);
+}
+void    tll_fmt_register(int32_t kind, TStr* suffix, int32_t fmt) { t_fmt_register(kind, t_cstr(*suffix), fmt); }
+int64_t tll_ser_int(int64_t f, int64_t v, int32_t bits, int32_t sgn) { return t_ser_int(f, v, bits, sgn); }
+int64_t tll_ser_f64(int64_t f, double v, int32_t bits)      { return t_ser_f64(f, v, bits); }
+int64_t tll_ser_bool(int64_t f, int8_t v)                   { return t_ser_bool(f, v); }
+int64_t tll_ser_atom(int64_t f, int64_t id)                 { return t_ser_atom(f, id); }
+int64_t tll_ser_str(int64_t f, TStr* s)                     { return t_ser_str(f, *s); }
+int32_t tll_fid_eof(int64_t f)                              { return t_fid_eof(f); }
+int64_t tll_deser_int(int64_t f, int32_t bits, int32_t sgn) { return t_deser_int(f, bits, sgn); }
+double  tll_deser_f64(int64_t f, int32_t bits)              { return t_deser_f64(f, bits); }
+int8_t  tll_deser_bool(int64_t f)                           { return t_deser_bool(f); }
+int64_t tll_deser_atom(int64_t f)                           { return t_deser_atom(f); }
+void    tll_deser_str(int64_t f, TStr* out)                 { *out = t_deser_str(f); }
 
 // ── I/O 与进程 ─────────────────────────────────────────────────
 void    tll_file_read_all(TStr* path, TStr* out)     { *out = t_file_read_all(t_cstr(*path)); }

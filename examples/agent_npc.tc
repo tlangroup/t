@@ -1,0 +1,149 @@
+// agent_npc.tc —— Agent 概念演示（心智体 Mind Agent + 状态体 State Agent）
+//
+// 演示的 Agent 相关概念（对应 docs/agent_first.md 设计纲要 / docs/reference.md §3.12）：
+//   1) Agent 一等公民： `X agent { state ...; step ... }` 在脱糖期展开为
+//      <Name>State struct + <name>_spawn 构造器 + <name>_step 步进器（皆普通顶层符号）。
+//   2) 状态即纯数据 struct（无方法，契合 ECS 数据导向；struct 绝不含函数）。
+//   3) 身份 / 消息用 atom 作路由键（:greet / :hit / :llm_reply …），编译期 intern、零开销。
+//   4) 消息回路（message loop）：spawn → 循环 step(msg) → 状态确定性演化、可回放、可单测。
+//   5) LLM 边界模型（Style B）：step 永不直接调 LLM，只在状态里记 pending=:llm 表示“意图”；
+//      真正的 LLM / 工具调用发生在运行时边界（见 drive()），结果以 :llm_reply 消息回填。
+//      核心逻辑纯函数、确定性；非确定性只活在边界。
+//   6) 工具 / 能力集 = 一组类型化自由 fn（fake_llm），声明即契约，调用类型安全。
+//   7) 两类已命名实例（agent_first.md §6 分类矩阵）：
+//        - Monster      = State Agent（纯 Core，确定性状态机）
+//        - Receptionist = Mind Agent（Core + Edge(LLM)）
+
+// ───────────────────────── 状态体 State Agent ─────────────────────────
+// 野怪：血量 hp + 仇恨 aggro。消息驱动状态转移，纯确定性（无 LLM、无 IO）。
+// step 收到状态、按消息更新并返回（状态回传给调用方）——确定性、可回放。
+// 注：此处用 if/else 原地更新后返回 s；等价地也可用 `return match (msg) { ... }`
+// 配合结构体字面量返回“新”状态（LLVM 后端支持，C 后端暂不支持 match 返回结构体）。
+Monster agent {
+    state hp: i64;
+    state aggro: i64;
+    step fn(s: MonsterState, msg: atom) -> MonsterState {
+        if (msg == :hit)    { s.hp = s.hp - 10; s.aggro = 1;    return s; }
+        if (msg == :heal)   { s.hp = s.hp + 5;                   return s; }
+        if (msg == :patrol) { s.aggro = 0;                       return s; }
+        return s;
+    }
+}
+
+// ───────────────────────── 心智体 Mind Agent ─────────────────────────
+// 接待员 NPC：名字 name + 情绪 mood + 待回复意图 pending + 已接待轮次 turns。
+// 用户提问(:ask)时核心只记“等待 LLM”，绝不就地调模型——意图留待边界处理。
+Receptionist agent {
+    state name: string;
+    state mood: i64;          // 0=neutral 1=happy 2=annoyed
+    state pending: atom;      // :none=空闲  :llm=等待 LLM 回复
+    state turns: i64;
+    step fn(s: ReceptionistState, msg: atom) -> ReceptionistState {
+        if (msg == :greet)     { s.mood = 1;       s.turns = s.turns + 1; return s; }
+        if (msg == :ask)       { s.pending = :llm; s.turns = s.turns + 1; return s; }
+        if (msg == :llm_reply) { s.mood = 1;       s.pending = :none;     return s; }
+        if (msg == :bye)       { s.mood = 0;                            return s; }
+        return s;
+    }
+}
+
+// 运行时边界：工具 / 能力集（声明即契约）。真实项目里这里是网络/模型调用，
+// 属于非确定性接缝；此处用确定性“假”LLM 便于演示与回放。
+fake_llm fn(question: string) -> string {
+    return match (question) {
+        "hours" => "We are open 9 to 5."
+        _       => "Interesting, tell me more."
+    };
+}
+
+// 把 atom 意图显式解释成可读字符串（演示：消息/意图即 atom，可穷尽匹配解释）。
+// 注：不依赖 atom_str（其名表发射在某些上下文下不稳定），这里手写解释更可靠也更直观。
+pending_label fn(p: atom) -> string {
+    return match (p) {
+        :none => "idle"
+        :llm  => "await-llm"
+        _     => "?"
+    };
+}
+
+// 打印接待员当前状态（演示“状态即数据结构”，可直接观察演化）
+show_receptionist fn(s: ReceptionistState) -> void {
+    var b: StringBuilder = sb_new();
+    sb_append_str(b, "  [");
+    sb_append_str(b, s.name);
+    sb_append_str(b, "] mood=");
+    sb_append_i64(b, s.mood);
+    sb_append_str(b, " pending=");
+    sb_append_str(b, pending_label(s.pending));
+    sb_append_str(b, " turns=");
+    sb_append_i64(b, s.turns);
+    println(sb_to_str(b));
+}
+
+// 驱动一回合：处理一条用户消息；若触发 LLM 意图，则在边界模拟调用并回填。
+// 关键：step 内部没有任何 LLM/IO；LLM 只发生在 drive() 这一运行时边界。
+drive fn(s: ReceptionistState, user_msg: atom, prompt: string) -> ReceptionistState {
+    s = receptionist_step(s, user_msg);          // 核心 step：纯函数更新状态、记意图
+    if (s.pending == :llm) {
+        show_receptionist(s);                    // 先展示“意图已记录、等待 LLM”（LLM 尚未被调）
+        var reply: string = fake_llm(prompt);    // ← 边界：LLM / 工具在此发生（非确定性接缝）
+        var lb: StringBuilder = sb_new();
+        sb_append_str(lb, "  (LLM) ");
+        sb_append_str(lb, reply);
+        println(sb_to_str(lb));                  // 展示“LLM 回复”
+        s = receptionist_step(s, :llm_reply);    // 回填，清空意图
+    }
+    return s;
+}
+
+// 打印野怪状态行（hp / aggro）
+mon_line fn(tag: string, hp: i64, aggro: i64) -> void {
+    var b: StringBuilder = sb_new();
+    sb_append_str(b, tag);
+    sb_append_str(b, " hp=");
+    sb_append_i64(b, hp);
+    sb_append_str(b, " aggro=");
+    sb_append_i64(b, aggro);
+    println(sb_to_str(b));
+}
+
+@main
+main fn() -> i64 {
+    println("=== State Agent: Monster (确定性状态机) ===");
+    var m: MonsterState = monster_spawn(100, 0);
+    println("spawn hp=100 aggro=0");
+    m = monster_step(m, :patrol);
+    mon_line("after :patrol ->", m.hp, m.aggro);
+    m = monster_step(m, :hit);
+    mon_line("after :hit    ->", m.hp, m.aggro);
+    m = monster_step(m, :hit);
+    mon_line("after :hit    ->", m.hp, m.aggro);
+    m = monster_step(m, :heal);
+    mon_line("after :heal   ->", m.hp, m.aggro);
+    m = monster_step(m, :patrol);
+    mon_line("after :patrol ->", m.hp, m.aggro);
+
+    println("");
+    println("=== Mind Agent: Receptionist (Core + LLM 边界) ===");
+    var r: ReceptionistState = receptionist_spawn("Ada", 0, :none, 0);
+    show_receptionist(r);
+    r = drive(r, :greet, "");
+    show_receptionist(r);
+    r = drive(r, :ask, "hours");
+    show_receptionist(r);
+    r = drive(r, :ask, "weather");
+    show_receptionist(r);
+    r = drive(r, :bye, "");
+    show_receptionist(r);
+
+    println("");
+    println("=== 确定性回放：同一消息序列 => 相同终态（可单测 / 可回放）===");
+    var r2: ReceptionistState = receptionist_spawn("Ada", 0, :none, 0);
+    r2 = drive(r2, :greet, "");
+    r2 = drive(r2, :ask, "hours");
+    r2 = drive(r2, :ask, "weather");
+    r2 = drive(r2, :bye, "");
+    show_receptionist(r2);
+
+    return 0;
+}

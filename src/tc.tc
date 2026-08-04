@@ -44,6 +44,7 @@ Node struct {
     ib: i64;
     ba: bool;
     bb: bool;
+    bc: bool;   // 模块系统：该声明是否被 `export` 修饰（顶层可见性）
     na: i64;
     nb: i64;
     nc: i64;
@@ -79,6 +80,7 @@ node_new fn(kind: string) -> i64 {
     n.ib = -1;
     n.ba = false;
     n.bb = false;
+    n.bc = false;
     n.na = -1;
     n.nb = -1;
     n.nc = -1;
@@ -123,6 +125,7 @@ init_node_kinds fn() -> void {
     append(node_kind_names, "GlobalConstDecl");
     append(node_kind_names, "GlobalVarDecl");
     append(node_kind_names, "ImportDecl");
+    append(node_kind_names, "ImportModDecl");   // 模块导入 `import xxx [as m]`：sb=模块名, sc=别名(可空), has_sc=有别名, bc=被 export 修饰(非法)
     append(node_kind_names, "M");
     append(node_kind_names, "P");
     append(node_kind_names, "SL");
@@ -172,6 +175,9 @@ init_node_kinds fn() -> void {
     append(node_kind_names, "scalar");
     append(node_kind_names, "slice");
     append(node_kind_names, "string");
+    append(node_kind_names, "atom");        // Erlang 式原子字面量（M50）
+    append(node_kind_names, "fidconst");    // 内建文件描述符常量 stdin/stdout/stderr（M51）
+    append(node_kind_names, "serialize");   // 序列化操作符 `fid < value`（M51，由 binary "<" 脱糖）
     append(node_kind_names, "struct_lit");
     append(node_kind_names, "unary");
     append(node_kind_names, "var_decl");
@@ -362,6 +368,20 @@ mk_ImportDecl fn(sb: string, sc: string, has_sa: bool, has_sc: bool, la: i64, ti
     n.sb = sb;
     n.sc = sc;
     n.has_sa = has_sa;
+    n.has_sc = has_sc;
+    n.la = la;
+    slice_set(nodes, id, n);
+    if (ti >= 0) { node_at(id, ti); }
+    return id;
+}
+
+// 模块导入 `import xxx [as m]`（M-Module）：sb=模块名, sc=别名(可空), has_sc=有别名；
+// bc=被 export 修饰（非法，check 期报 T_EXPORT_SCOPE）。
+mk_ImportModDecl fn(sb: string, sc: string, has_sc: bool, la: i64, ti: i64) -> i64 {
+    var id: i64 = node_new("ImportModDecl");
+    var n: Node = nodes[id];
+    n.sb = sb;
+    n.sc = sc;
     n.has_sc = has_sc;
     n.la = la;
     slice_set(nodes, id, n);
@@ -1006,6 +1026,9 @@ diag_sev fn(code: string) -> string {
     if (code == "T_IMPORT_HEADER") { return "error"; }
     if (code == "T_IMPORT_VALUE") { return "error"; }
     if (code == "T_IMPORT_CONTEXT") { return "error"; }
+    if (code == "T_EXPORT_SCOPE") { return "error"; }
+    if (code == "T_IMPORT_NOT_FOUND") { return "error"; }
+    if (code == "T_IMPORT_CYCLE") { return "error"; }
     return "";
 }
 // <<< GEN:diagnostics <<<
@@ -4309,6 +4332,7 @@ init_keywords fn() -> void {
     kw_reg("flag", "KwFlag");
     kw_reg("union", "KwUnion");
     kw_reg("variant", "KwVariant");
+    kw_reg("agent", "KwAgent");
     kw_reg("var", "KwVar");
     kw_reg("const", "KwConst");
     kw_reg("comptime", "KwComptime");
@@ -4684,6 +4708,15 @@ tokenize fn(src: string) -> void {
 
 var pos: i64;
 var decl_list: []i64;
+var g_agent_anchor: i64 = -1;       // agent 声明脱糖时，合成节点锚点统一挂到 agent 名字 token
+
+// ── 模块系统（M-Module / whole-program 内联）──────────────────
+// 内联策略：`import hello` 把 `hello.tc` 的顶层声明整体并入同一编译单元
+// （类似 C 的 #include，单一命名空间），再把 `hello.add` 这种限定访问就地
+// 改写成裸 `add`。跨模块私有隔离、名字重整（mangling）留待后续里程碑。
+var g_mod_aliases: []string;        // 已导入模块的「模块名 / 别名」集合（用于识别限定访问前缀）
+var g_mod_visited: []string;        // 已完整加载的模块绝对路径（去重 + 环检测）
+
 
 // 匿名函数字面量（M46 / FuncType v2）：合成函数名 `__lam_N` 在解析期定名，
 // parse_unit 末尾由 desugar_lambdas 统一提升为顶层函数。
@@ -4708,6 +4741,17 @@ cur_t fn() -> string {
 
 cur_v fn() -> string {
     return tk_v(pos);
+}
+
+// ── 内建文件描述符常量（M51）────────────────────────────────
+// stdin/stdout/stderr 是**保留标识符**（非关键字）：词法上仍是 Identifier，
+// 由 parse_primary 在表达式位置降为 fidconst 常量节点，由 sym_define 在声明
+// 位置拒绝重定义。返回句柄值，非保留名返回 -1。
+fid_const_of fn(name: string) -> i64 {
+    if (name == "stdin") { return 0; }
+    if (name == "stdout") { return 1; }
+    if (name == "stderr") { return 2; }
+    return -1;
 }
 
 peek_t fn(off: i64) -> string {
@@ -4834,7 +4878,9 @@ parse_annotation_args fn() -> i64 {
 parse_annotations fn() -> i64 {
     var head: i64 = -1;
     var tail: i64 = -1;
-    while (cur_t() == "At") {
+    // 注解循环只消费 `@名`/`@Export` 形式；`@ <整数>` 是字段 tagID，
+    // 必须由 parse_sfield 单独消费，故此处遇 `@` 后接 Integer 即停（留待 tagID 解析）。
+    while (cur_t() == "At" && (peek_t(1) == "Identifier" || peek_t(1) == "KwExport")) {
         advance_i();
         var name: string = "";
         var nti: i64 = pos;
@@ -4877,7 +4923,7 @@ is_scalar_name fn(name: string) -> bool {
     if (name == "f16" || name == "f32" || name == "f64") {
         return true;
     }
-    return name == "bool";
+    return name == "bool" || name == "atom" || name == "fid";
 }
 // <<< GEN:scalar_pred <<<
 
@@ -5028,7 +5074,15 @@ parse_post_index fn(e: i64, ti: i64) -> i64 {
     return id;
 }
 
+// format 出现开关：置位后 infer 才会对调用实参子树做补扫（详见 fmt_scan_subtree 的
+// 长注释）。⚠ M55 漏了置位，导致 `sb_append_str(b, format(...))` 这类**嵌套**用法
+// 一路漏到发射期变成 `; UNSUPPORTED call format`；M57 在这里补上。
+// 置位点选在建 call 节点时，方法式 `"...".format(x)` 与函数式 `format("...", x)` 同时覆盖。
+var g_has_format: bool;
+
 parse_post_call fn(e: i64, ti: i64) -> i64 {
+    var ce: Node = nodes[e];
+    if (ce.sa == "format" && (ce.kind == "ident" || ce.kind == "member")) { g_has_format = true; }
     var head: i64 = -1;
     var tail: i64 = -1;
     while (cur_t() != "RParen" && cur_t() != "Eof") {
@@ -5244,7 +5298,7 @@ parse_block fn() -> i64 {
     return head;
 }
 
-parse_local_var fn(is_const: bool) -> i64 {
+parse_local_var fn(is_const: bool, is_export: bool) -> i64 {
     var ti: i64 = advance_i();
     var name: string = expect_tok("Identifier");
     var nti: i64 = pos - 1;
@@ -5265,6 +5319,11 @@ parse_local_var fn(is_const: bool) -> i64 {
         validate_var_name(name, nti);
     }
     var id: i64 = mk_var_decl(name, is_const, tn, init, ti);
+    // 模块系统（M-Module）：export 只能修饰顶层声明；局部/嵌套变量加 export → T_EXPORT_SCOPE
+    if (is_export) {
+        nodes[id].bc = true;
+        fc_err("T_EXPORT_SCOPE", "export 只能修饰顶层声明，不能修饰局部/嵌套变量", id);
+    }
     return id;
 }
 
@@ -5340,11 +5399,11 @@ parse_block_stmt fn() -> i64 {
 }
 
 parse_var_stmt fn() -> i64 {
-    return parse_local_var(false);
+    return parse_local_var(false, false);
 }
 
 parse_const_stmt fn() -> i64 {
-    return parse_local_var(true);
+    return parse_local_var(true, false);
 }
 
 // parse_statement 已由 GEN:parser_rules 区间生成（fold=disp 守卫式分发）。
@@ -6054,6 +6113,176 @@ parse_func_decl fn(name: string, anns: i64, is_comptime: bool) -> i64 {
     return id;
 }
 
+// ═════════════════════════════════════════════════════════════
+// 智能体一等公民（Style B / docs/agent_first.md）：
+//   Counter agent {
+//     state count: i64
+//     step fn(s: CounterState, msg: atom) -> CounterState { ... }
+//   }
+// 脱糖为（仅编译器前端，后端零改动）：
+//   CounterState struct { count: i64 }        // 纯数据
+//   Counter_step  fn(...) { ... }             // 自由函数，函数体逐字保留
+//   Counter_spawn(count: i64) -> CounterState // 合成构造器
+// 设计铁律：state 是纯数据 struct；step/tools 是顶层自由 fn，绝不挂进 struct。
+// 解析期直接合成三个真实声明节点并 append 到 decl_list（struct 在前，
+// 保证 register 阶段先见 struct），不引入新的 AST 死节点。
+// ═════════════════════════════════════════════════════════════
+// ── agent 脱糖辅助 ───────────────────────────────────────────────
+// PascalCase → snake_case：agent 生成的普通函数名须遵循「普通函数 = 小蛇形」命名规范
+// （原 <Name>_step / <Name>_spawn 以大写开头，被 validate_decl_name 误判为类型并告警 T_NAME_TYPE_CAMEL）。
+pascal_to_snake fn(s: string) -> string {
+    var sb: StringBuilder = sb_new();
+    var i: u64 = 0;
+    var n: u64 = str_len(s);
+    while (i < n) {
+        var c: u8 = s[i];
+        if (c >= 65 && c <= 90) {
+            if (i > 0) { sb_append_char(sb, 95); }   // '_'
+            sb_append_char(sb, c + 32);              // 转小写
+        } else {
+            sb_append_char(sb, c);
+        }
+        i = i + 1;
+    }
+    return sb_to_str(sb);
+}
+
+// 深拷贝一个类型节点。脱糖合成 spawn 形参时，必须与源 struct 字段的类型节点分属两份，
+// 否则 check 期对同一节点原地改写（类型解析回填）会触发越界切片（index_out_of_bounds panic）。
+clone_type_node fn(n: i64) -> i64 {
+    if (n < 0) { return -1; }
+    var nd: Node = nodes[n];
+    var k: string = nd.kind;
+    if (k == "named") { return mk_named(nd.sa, -1); }
+    if (k == "scalar") { return mk_scalar(nd.sa, -1); }
+    if (k == "array") { return mk_array(clone_type_node(nd.na), nd.nb, -1); }
+    if (k == "slice") { return mk_slice(clone_type_node(nd.na), -1); }
+    if (k == "optional") { return mk_optional(clone_type_node(nd.na), -1); }
+    if (k == "pointer") { return mk_pointer(clone_type_node(nd.na), -1); }
+    if (k == "map") { return mk_map(clone_type_node(nd.na), clone_type_node(nd.nb), -1); }
+    if (k == "func_type") { return mk_func_type(clone_type_node(nd.na), clone_type_list(nd.la), -1); }
+    if (k == "flag") { return mk_flag(nd.sa, -1); }
+    if (k == "flag_set") { return mk_flag_set(-1); }
+    if (k == "sym") { return mk_sym(nd.sa, nd.ia, -1); }
+    if (k == "variant") { return mk_variant(-1); }
+    return n;   // 兜底：未知类型节点原样复用（风险自负）
+}
+
+// 深拷贝一个类型节点链表（func_type 的参数类型列表）。
+clone_type_list fn(l: i64) -> i64 {
+    var head: i64 = -1;
+    var tail: i64 = -1;
+    var c: i64 = l;
+    while (c >= 0) {
+        var v: i64 = clone_type_node(kids[c].val);
+        tail = list_push(head, tail, v);
+        if (head < 0) { head = tail; }
+        c = kids[c].next;
+    }
+    return head;
+}
+
+parse_agent_decl fn(name: string, anns: i64) -> i64 {
+    advance_i(); // consume KwAgent
+    expect_tok("LBrace");
+    var field_head: i64 = -1;
+    var field_tail: i64 = -1;
+    var step_fn: i64 = -1;
+    while (cur_t() != "RBrace" && cur_t() != "Eof") {
+        if (cur_t() == "Semicolon") { advance_i(); continue; }
+        if (cur_t() != "Identifier") {
+            eprint("parse error: expected 'state' or 'step' clause in agent '");
+            eprint(name);
+            eprint("'\n");
+            exit(1);
+        }
+        var kwi: i64 = advance_i();
+        var kw: string = tk_v(kwi);
+        if (kw == "state") {
+            // 一个或多个 `name: Type[ @tag][ = default];` 字段行
+            while (cur_t() == "Identifier" && peek_t(1) == "Colon") {
+                var fid: i64 = parse_sfield();
+                field_tail = list_push(field_head, field_tail, fid);
+                if (field_head < 0) { field_head = field_tail; }
+            }
+        } else if (kw == "step") {
+            if (step_fn >= 0) {
+                eprint("parse error: agent '");
+                eprint(name);
+                eprint("' has multiple 'step' clauses\n");
+                exit(1);
+            }
+            // 当前 token 应为 fn（parse_func_decl 自吞）；函数名走 snake_case 命名规范
+            step_fn = parse_func_decl(sb_cat2(pascal_to_snake(name), "_step"), anns, false);
+        } else {
+            eprint("parse error: unknown agent clause '");
+            eprint(kw);
+            eprint("' in agent '");
+            eprint(name);
+            eprint("'\n");
+            exit(1);
+        }
+    }
+    expect_tok("RBrace");
+    if (step_fn < 0) {
+        eprint("parse error: agent '");
+        eprint(name);
+        eprint("' is missing a 'step' clause\n");
+        exit(1);
+    }
+    if (field_head < 0) {
+        eprint("parse error: agent '");
+        eprint(name);
+        eprint("' has no 'state' fields\n");
+        exit(1);
+    }
+
+    var state_name: string = sb_cat2(name, "State");
+
+    // 1) state struct：复用字段节点（含 @tag / =default），完全继承
+    var sdecl: i64 = mk_StructDecl(state_name, "default", "", false, false, anns, field_head, g_agent_anchor);
+
+    // 2) spawn 构造器：一参一字段（按声明顺序），body = return State{ f: f, ... }
+    var spawn_name: string = sb_cat2(pascal_to_snake(name), "_spawn");
+    var ph: i64 = -1;
+    var pt: i64 = -1;
+    var fv_head: i64 = -1;
+    var fv_tail: i64 = -1;
+    var c: i64 = field_head;
+    while (c >= 0) {
+        var f: i64 = kids[c].val;
+        var fld: Node = nodes[f];
+        var pname: string = fld.sa;
+        // 形参（类型节点深拷贝，避免与 struct 字段共享同一份被 check 期改写而越界）
+        var pid: i64 = mk_P(pname, clone_type_node(fld.na), -1, -1);
+        pt = list_push(ph, pt, pid);
+        if (ph < 0) { ph = pt; }
+        // struct 字面量字段：field = 同名形参
+        var vid: i64 = mk_FV(pname, mk_ident(pname, -1), -1);
+        fv_tail = list_push(fv_head, fv_tail, vid);
+        if (fv_head < 0) { fv_head = fv_tail; }
+        c = kids[c].next;
+    }
+    var lit: i64 = mk_struct_lit(state_name, fv_head, g_agent_anchor);
+    var ret: i64 = mk_return(lit, g_agent_anchor);
+    // 合成体必须是「语句链表头」(kids 链表节点)，而非 "block" AST 节点，
+    // 否则 desugar_lambdas 会把 block 节点索引当链表头读 kids[] 越界。
+    var sbody: i64 = list_push(-1, -1, ret);
+    var spawn_td: i64 = mk_named(state_name, -1);
+    var spawn_fn: i64 = mk_FuncDecl(spawn_name, false, false, spawn_td, anns, ph, sbody, g_agent_anchor);
+
+    // 锚点：统一挂到 agent 名字 token
+    node_at(sdecl, g_agent_anchor);
+    node_at(step_fn, g_agent_anchor);
+    node_at(spawn_fn, g_agent_anchor);
+
+    // 顺序：struct → step → spawn
+    append(decl_list, sdecl);
+    append(decl_list, step_fn);
+    append(decl_list, spawn_fn);
+    return -1; // 已自行 append
+}
+
 parse_global_var fn(is_const: bool) -> i64 {
     advance_i();
     var name: string = expect_tok("Identifier");
@@ -6092,6 +6321,23 @@ parse_global_var fn(is_const: bool) -> i64 {
 
 parse_import_decl fn(anns: i64) -> i64 {
     advance_i();
+    // 模块导入 `import xxx [as m]`（标识符形式，M-Module）：与旧数据导入 `import "path"` 分支并存。
+    if (cur_t() == "Identifier") {
+        var mname: string = tk_v(pos);
+        var mti: i64 = pos;
+        advance_i();
+        var alias: string = "";
+        var has_alias: bool = false;
+        if (cur_t() == "KwAs") {
+            advance_i();
+            alias = expect_tok("Identifier");
+            has_alias = true;
+        }
+        expect_tok("Semicolon");
+        var id: i64 = mk_ImportModDecl(mname, alias, has_alias, anns, mti);
+        return id;
+    }
+    // 旧数据导入 `import "path" [as x]`（已由 import_csv/json 函数调用取代，仅保留兼容）
     var path: string = expect_tok("String");
     var pti: i64 = pos - 1;
     var alias: string = "";
@@ -6143,6 +6389,9 @@ parse_decl_body fn(name: string, anns: i64, is_comptime: bool) -> i64 {
     if (t == "KwVariant") {
         return parse_variant_decl(name, anns);
     }
+    if (t == "KwAgent") {
+        return parse_agent_decl(name, anns);
+    }
     if (t == "KwFunc") {
         return parse_func_decl(name, anns, is_comptime);
     }
@@ -6156,13 +6405,30 @@ parse_decl_body fn(name: string, anns: i64, is_comptime: bool) -> i64 {
 parse_declaration fn() -> i64 {
     var anns: i64 = parse_annotations();
 
+    // 模块系统（M-Module）：顶层声明可用 `export` 修饰，标记跨模块可见。
+    var is_export: bool = false;
+    if (cur_t() == "KwExport") {
+        advance_i();
+        is_export = true;
+    }
+
     if (cur_t() == "KwVar") {
-        return parse_global_var(false);
+        var d: i64 = parse_global_var(false);
+        if (is_export) { nodes[d].bc = true; }
+        return d;
     }
     if (cur_t() == "KwConst") {
-        return parse_global_var(true);
+        var d: i64 = parse_global_var(true);
+        if (is_export) { nodes[d].bc = true; }
+        return d;
     }
     if (cur_t() == "KwImport") {
+        if (is_export) {
+            // export 不能修饰 import 声明
+            var id: i64 = parse_import_decl(anns);
+            nodes[id].bc = true;
+            return id;
+        }
         return parse_import_decl(anns);
     }
 
@@ -6180,6 +6446,7 @@ parse_declaration fn() -> i64 {
     }
     var ni: i64 = advance_i();
     var name: string = tk_v(ni);
+    g_agent_anchor = ni;
     validate_decl_name(name, ni);
 
     // 声明形态为 `Name fn(...)` / `Name struct {...}`，绑定符 `::` 已移除。
@@ -6203,6 +6470,7 @@ parse_declaration fn() -> i64 {
     var d: i64 = parse_decl_body(name, anns, is_comptime);
     if (d >= 0) {
         node_at(d, ni);
+        if (is_export) { nodes[d].bc = true; }
     }
     return d;
 }
@@ -6218,9 +6486,9 @@ parse_unit fn() -> void {
             append(decl_list, d);
         }
     }
-    desugar_func_clauses();
-    // 子句合并会重建 FuncDecl 节点，但 lambda 节点 id 不变，故提升放在其后即可。
-    desugar_lambdas();
+    // 注意：子句合并（desugar_func_clauses）与 lambda 提升（desugar_lambdas）
+    // 现在改在 run_check 里、模块内联（resolve_modules）完成之后统一跑一遍，
+    // 以便覆盖「入口 + 所有被 import 的模块」合并后的整张 decl_list。
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -6582,11 +6850,13 @@ parse_for_stmt fn() -> i64 {
     }
     var init: i64 = -1;
     if (cur_t() != "Semicolon") {
+        var exp: bool = false;
+        if (cur_t() == "KwExport") { advance_i(); exp = true; }
         if (cur_t() == "KwVar") {
-            init = parse_local_var(false);
+            init = parse_local_var(false, exp);
         } else {
         if (cur_t() == "KwConst") {
-            init = parse_local_var(true);
+            init = parse_local_var(true, exp);
         } else {
             var e: i64 = parse_expr();
             expect_tok("Semicolon");
@@ -6682,6 +6952,15 @@ parse_statement fn() -> i64 {
     if (t == "LBrace") {
         return parse_block_stmt();
     }
+    if (t == "KwExport") {
+        // 模块系统（M-Module）：函数体内 export 只能修饰局部 var/const → T_EXPORT_SCOPE
+        advance_i();
+        var nt: string = cur_t();
+        if (nt == "KwVar") { return parse_local_var(false, true); }
+        if (nt == "KwConst") { return parse_local_var(true, true); }
+        eprint("parse error: export 只能修饰顶层声明或局部 var/const");
+        exit(1);
+    }
     if (t == "KwVar") {
         return parse_var_stmt();
     }
@@ -6750,6 +7029,21 @@ parse_match_expr fn() -> i64 {
 
 parse_primary fn() -> i64 {
     var t: string = cur_t();
+    // Erlang 式原子字面量：`:name` → atom 节点（表达式位置的 `:` 此前未使用）
+    if (t == "Colon") {
+        var ti_Colon: i64 = advance_i();
+        if (cur_t() != "Identifier") {
+            eprint("parse error: expected atom name after ':'\n");
+            exit(1);
+        }
+        var ti_Name: i64 = advance_i();
+        var id: i64 = node_new("atom");
+        var nn: Node = nodes[id];
+        nn.sa = tk_v(ti_Name);
+        slice_set(nodes, id, nn);
+        node_at(id, ti_Name);
+        return id;
+    }
     if (t == "KwFunc") {
         return parse_lambda_expr();
     }
@@ -6781,6 +7075,20 @@ parse_primary fn() -> i64 {
         return parse_prim_null(ti_KwNull);
     }
     if (t == "Identifier") {
+        // 内建文件描述符常量（M51）：stdin/stdout/stderr 在**表达式位置**直接降为
+        // fidconst 节点（值 0/1/2），与 atom 同为编译期常量、零运行时查找。
+        // 声明位置的同名标识符由 sym_define 的保留名检查拦截（T_FID_RESERVED_NAME）。
+        var fcv: i64 = fid_const_of(cur_v());
+        if (fcv >= 0) {
+            var ti_Fid: i64 = advance_i();
+            var fid_id: i64 = node_new("fidconst");
+            var fidn: Node = nodes[fid_id];
+            fidn.sa = tk_v(ti_Fid);
+            fidn.ia = fcv;
+            slice_set(nodes, fid_id, fidn);
+            node_at(fid_id, ti_Fid);
+            return fid_id;
+        }
         var ti_Identifier: i64 = advance_i();
         return parse_prim_ident(ti_Identifier);
     }
@@ -6868,6 +7176,15 @@ parse_shift fn() -> i64 {
     return left;
 }
 
+// 只能出现在**类型位置**、永远不能作表达式起始的 token。
+// `string` / `StringBuilder` / `void` / `map` 都是关键字（不是 Identifier），
+// parse_primary 见到它们必然报 "unexpected token in expression"，
+// 因此在 `>` 之后遇到它们，只可能是反序列化 `fid > Type` 的类型操作数。
+tok_type_only fn(t: string) -> bool {
+    if (t == "KwString" || t == "KwStringBuilder") { return true; }
+    return t == "KwVoid" || t == "KwMap";
+}
+
 parse_cmp fn() -> i64 {
     var left: i64 = parse_shift();
     while (cur_t() == "Lt" || cur_t() == "Gt" || cur_t() == "LtEq" || cur_t() == "GtEq") {
@@ -6877,7 +7194,16 @@ parse_cmp fn() -> i64 {
         if (t == "LtEq") { op = "<="; }
         if (t == "GtEq") { op = ">="; }
         var ti: i64 = advance_i();
-        var right: i64 = parse_shift();
+        // 反序列化 `fid > Type`：右操作数是类型而非值（M52 读路径）。这里只做**词法层**
+        // 消解 —— 左操作数是不是 fid 由 check 阶段裁定（parse 期没有类型信息）。
+        // i64 / bool / atom / f64 / MyStruct 等本就是 Identifier，走普通表达式路径即可，
+        // 由 deser_type_of 在 check 期把 ident 节点重解释为类型。
+        var right: i64 = -1;
+        if (op == ">" && tok_type_only(cur_t())) {
+            right = parse_type();
+        } else {
+            right = parse_shift();
+        }
         left = mk_bin(op, left, right, ti);
     }
     return left;
@@ -6969,6 +7295,23 @@ parse_sfield fn() -> i64 {
         eprint("parse error: unexpected token in alternative\n"); exit(1);
     }
     var r_anns: i64 = parse_annotations();
+    // ── 字段 tagID：`@ Integer`（与 @注解 以「@ 后是否数字」区分；注解循环已跳过 @<int>）──
+    var r_tag: i64 = -1;
+    if (cur_t() == "At") {
+        advance_i();
+        r_tag = parse_int_str(expect_tok("Integer"));
+    }
+    // ── 字段默认值：`= Expr` ──
+    var r_def: i64 = -1;
+    if (cur_t() == "Assign") {
+        advance_i();
+        r_def = parse_expr();
+    }
+    // 收尾注解（如 `@ 1 @derive(...)` 中 tagID 之后的注解；注解循环已因 @<int> 提前退出）
+    var r_anns2: i64 = parse_annotations();
+    if (r_anns2 >= 0) {
+        r_anns = list_concat(r_anns, r_anns2);
+    }
     expect_tok("Semicolon");
     var __id: i64 = node_new("F");
     var __n: Node = nodes[__id];
@@ -6976,6 +7319,8 @@ parse_sfield fn() -> i64 {
     __n.na = sfield_na(r_Integer, r_type);
     __n.ia = sfield_ia(r_Integer);
     __n.la = r_anns;
+    __n.ib = r_tag;   // tagID（≥1 显式；-1 = 自动化分配）
+    __n.nb = r_def;   // 默认表达式节点（-1 = 无默认值）
     slice_set(nodes, __id, __n);
     return __id;
 }
@@ -7261,6 +7606,9 @@ get_bw fn(name: string) -> i64 {
     if (name == "bool") {
         return 1;
     }
+    if (name == "atom" || name == "fid") {
+        return 64;
+    }
     return -1;
 }
 // <<< GEN:scalar_bits <<<
@@ -7501,6 +7849,14 @@ sym_find_in fn(scope: i64, name: string) -> i64 {
 
 // Map.set 语义：已存在则忽略（首定义保留）
 sym_define fn(scope: i64, name: string, kind: string, ti2: i64, decl: i64) -> void {
+    // 保留标识符（M51）：stdin/stdout/stderr 在表达式位置恒为内建 fid 常量，
+    // 若允许同名声明，引用点仍会解析成常量 → 静默错编。故声明位置直接拒绝。
+    if (fid_const_of(name) >= 0) {
+        fc_err("T_FID_RESERVED_NAME",
+            sb_cat3("`", name, "` 是内建文件描述符常量（保留标识符），不可用作变量 / 参数 / 函数 / 类型名；请改用其他名字"),
+            decl);
+        return;
+    }
     if (sym_find_in(scope, name) >= 0) {
         return;
     }
@@ -8001,7 +8357,7 @@ builtin_ret fn(name: string) -> i64 {
     if (name == "sb_to_str" || name == "to_string") {
         return ti_mk("String");
     }
-    if (name == "int_to_str") {
+    if (name == "int_to_str" || name == "i2s") {
         return ti_mk("String");
     }
     if (name == "file_write_all" || name == "file_exists") {
@@ -8031,7 +8387,7 @@ builtin_ret fn(name: string) -> i64 {
     if (name == "ti_name" || name == "fi_name" || name == "fi_type_name") {
         return ti_mk("String");
     }
-    if (name == "ti_size" || name == "ti_kind" || name == "ti_field_count" || name == "fi_offset" || name == "fi_type_size") {
+    if (name == "ti_size" || name == "ti_kind" || name == "ti_field_count" || name == "fi_offset" || name == "fi_type_size" || name == "fi_tag") {
         return ti_scalar("i64");
     }
     if (name == "ti_field") {
@@ -8044,6 +8400,51 @@ builtin_ret fn(name: string) -> i64 {
         return ti_mk("String");
     }
     if (name == "sym_release" || name == "sym_release_all") {
+        return ti_mk("Void");
+    }
+    if (name == "atom_str") {
+        return ti_mk("String");
+    }
+    // 文件描述符内建（M51）
+    if (name == "fopen") {
+        return ti_scalar("fid");
+    }
+    if (name == "fclose" || name == "fflush" || name == "fmt_register") {
+        return ti_mk("Void");
+    }
+    if (name == "fid_is_open") {
+        return ti_scalar("bool");
+    }
+    // 读路径 EOF 探针（M52，Option B）：`f > T` 返回裸 T，EOF 时给默认值，
+    // 「是否还有数据」由此探针独立表达。
+    if (name == "fid_eof") {
+        return ti_scalar("bool");
+    }
+    if (name == "fid_format") {
+        return ti_scalar("atom");
+    }
+    if (name == "fid_error") {
+        return ti_mk("String");
+    }
+    if (name == "fseek") {
+        return ti_scalar("bool");
+    }
+    if (name == "ftell") {
+        return ti_scalar("i64");
+    }
+    // 时间格式化（M56）/ 解析与固定时区（M57）：
+    // now() / parse_time* / time_invalid() 返回微秒 epoch（i64），format_time* 返回字符串
+    if (name == "now" || name == "time_invalid" || name == "parse_time" || name == "parse_time_local") {
+        return ti_scalar("i64");
+    }
+    if (name == "format_time" || name == "format_time_local" || name == "format_time_tz") {
+        return ti_mk("String");
+    }
+    // 格式化（Python 格式规范迷你语言子集）
+    if (name == "format_int" || name == "format_uint" || name == "format_float" || name == "format_str" || name == "format_bool" || name == "format_char") {
+        return ti_mk("String");
+    }
+    if (name == "sb_append_fmt_int" || name == "sb_append_fmt_uint" || name == "sb_append_fmt_float" || name == "sb_append_fmt_str" || name == "sb_append_fmt_bool" || name == "sb_append_fmt_char") {
         return ti_mk("Void");
     }
     return ti_mk("Unknown");
@@ -8189,6 +8590,559 @@ enum_missing_cases fn(e: i64, scr: i64) -> string {
     return sb_to_str(sb);
 }
 
+// ── 文件描述符内建的编译期校验（M51）──────────────────────────
+
+fid_atom_allowed fn(sel: string) -> string {
+    if (sel == "mode") {
+        return ":read / :write / :append / :read_binary / :write_binary / :append_binary";
+    }
+    if (sel == "kind") {
+        return ":text / :binary";
+    }
+    return ":text / :json / :rawbin / :protobuf";
+}
+
+fid_atom_ok fn(sel: string, v: string) -> bool {
+    if (sel == "mode") {
+        if (v == "read" || v == "write" || v == "append") {
+            return true;
+        }
+        return v == "read_binary" || v == "write_binary" || v == "append_binary";
+    }
+    if (sel == "kind") {
+        return v == "text" || v == "binary";
+    }
+    return v == "text" || v == "json" || v == "rawbin" || v == "protobuf";
+}
+
+// 诊断码分轴：mode 轴（fopen 打开方式）与 format 轴（fmt_register 的类别 / 格式）
+// 各自成码 —— 「格式取值非法」却报 BAD_MODE 会误导定位。
+fid_code_lit fn(sel: string) -> string {
+    if (sel == "mode") { return "T_FID_MODE_NOT_LITERAL"; }
+    return "T_FID_FORMAT_NOT_LITERAL";
+}
+fid_code_bad fn(sel: string) -> string {
+    if (sel == "mode") { return "T_FID_BAD_MODE"; }
+    return "T_FID_BAD_FORMAT";
+}
+
+// atom 形参必须是字面量且取值在白名单内 —— 打开方式 / 格式决定字节形态，
+// 若允许运行期取值，`<` 的语义就不再是编译期确定的（违反 L-02 / L-03）。
+check_atom_arg fn(a: i64, what: string, sel: string, anchor: i64) -> void {
+    if (a < 0) {
+        fc_err(fid_code_lit(sel),
+            sb_cat3(what, " 缺失；必须是 atom 字面量，取值：", fid_atom_allowed(sel)), anchor);
+        return;
+    }
+    var an: Node = nodes[a];
+    if (an.kind != "atom") {
+        fc_err(fid_code_lit(sel),
+            sb_cat3(what, " 必须是 atom **字面量**（编译期可判定），取值：", fid_atom_allowed(sel)), a);
+        return;
+    }
+    if (fid_atom_ok(sel, an.sa) == false) {
+        fc_err(fid_code_bad(sel),
+            sb_cat6(what, " 取值非法：`:", an.sa, "`；合法取值：", fid_atom_allowed(sel), ""), a);
+    }
+}
+
+// 时间格式化 spec 字段码扫描（M56/M57）：编译期校验 format_time / format_time_local /
+// format_time_tz 的 spec 字面量。已知字段码：
+//   最小集 %Y %y %m %d %H %M %S %f %%
+//   扩展集 %a %A %b %B %p %I %j %w %U %W %z %Z
+//   locale 集（M57）%c %x %X
+// 其余 `%?` 一律报 T_TIME_BAD_SPEC。运行期对非常量 spec 宽容原样保留。
+check_time_spec fn(spec: string, d: i64) -> void {
+    var sl: u64 = str_len(spec);
+    var i: u64 = 0;
+    while (i < sl) {
+        var c: i64 = spec[i] as i64;
+        if (c != 37) {                 // '%'
+            i = i + 1;
+            continue;
+        }
+        if (i + 1 >= sl) {
+            fc_err("T_TIME_BAD_SPEC",
+                "时间格式串以 `%` 结尾，缺少后续字段码；合法示例：`%Y-%m-%d %H:%M:%S`", d);
+            return;
+        }
+        var x: i64 = spec[i + 1] as i64;
+        if (x == 89 || x == 121 || x == 109 || x == 100 || x == 72
+            || x == 77 || x == 83 || x == 102 || x == 37
+            || x == 97 || x == 65 || x == 98 || x == 66 || x == 112
+            || x == 73 || x == 106 || x == 119 || x == 85 || x == 87
+            || x == 122 || x == 90
+            || x == 99 || x == 120 || x == 88) {
+            i = i + 2;                 // Y y m d H M S f % a A b B p I j w U W z Z c x X
+            continue;
+        }
+        fc_err("T_TIME_BAD_SPEC",
+            "时间格式串含未知字段码（以 `%` 打头的非法保留序列）；支持 %Y %y %m %d %H %M %S %f %% %a %A %b %B %p %I %j %w %U %W %z %Z %c %x %X",
+            d);
+        i = i + 2;
+    }
+}
+
+// 时间**解析** spec 字段码扫描（M57）：parse_time / parse_time_local 的白名单
+// 严格小于格式化白名单 —— %w %U %W 是从日期推导出的派生量，反过来定不出唯一时刻；
+// %Z 是自由文本时区缩写（"CST" 同时是北京和美中部），无从消歧。四者一律拒绝，
+// 而不是运行期静默返回哨兵：让"这个串根本不该用于解析"在编译期就暴露。
+check_time_parse_spec fn(spec: string, d: i64) -> void {
+    var sl: u64 = str_len(spec);
+    var i: u64 = 0;
+    while (i < sl) {
+        var c: i64 = spec[i] as i64;
+        if (c != 37) {
+            i = i + 1;
+            continue;
+        }
+        if (i + 1 >= sl) {
+            fc_err("T_TIME_BAD_SPEC",
+                "时间解析串以 `%` 结尾，缺少后续字段码；合法示例：`%Y-%m-%d %H:%M:%S`", d);
+            return;
+        }
+        var x: i64 = spec[i + 1] as i64;
+        if (x == 89 || x == 121 || x == 109 || x == 100 || x == 72
+            || x == 77 || x == 83 || x == 102 || x == 37
+            || x == 97 || x == 65 || x == 98 || x == 66 || x == 112
+            || x == 73 || x == 106 || x == 122
+            || x == 99 || x == 120 || x == 88) {
+            i = i + 2;                 // Y y m d H M S f % a A b B p I j z c x X
+            continue;
+        }
+        if (x == 119 || x == 85 || x == 87 || x == 90) {
+            fc_err("T_TIME_PARSE_UNSUPPORTED",
+                "时间解析不支持该字段码：%w / %U / %W 是日期的派生量（无法反推唯一日期），%Z 是有歧义的时区缩写；请改用 %z 表示数值偏移",
+                d);
+            i = i + 2;
+            continue;
+        }
+        fc_err("T_TIME_BAD_SPEC",
+            "时间解析串含未知字段码（以 `%` 打头的非法保留序列）；解析支持 %Y %y %m %d %H %M %S %f %% %a %A %b %B %p %I %j %z %c %x %X",
+            d);
+        i = i + 2;
+    }
+}
+
+// 数字/字符串格式化 spec 文法校验（M54/M55 补充）：编译期校验 format_int / format_uint /
+// format_float / format_str / format_bool / format_char 的 spec 字面量。
+// 复刻 runtime/t_runtime.c fmt_parse 的外壳剥除（剥 {} 仅当首尾都是；剥到最后一个 ':'），
+// 并在文法解析后强制"无残留字符"。因此能拦住 {:z}（非法 type）、{:>10z}（残留）这类
+// 运行期会被静默吞掉的笔误。非常量 spec 维持运行期宽松（fmt_parse 贪婪吞尾）。
+check_fmt_spec fn(spec: string, d: i64) -> void {
+    var sl: u64 = str_len(spec);
+    // 是否像「模板」（含替换字段 {…}）：用户常把 format_int 当成 str.format 用，
+    // 写了 "x={0}" 这类带字面量文本的串；此时报错顺手提示改用 format()。
+    var g_tmpl_hint: bool = false;
+    var gi: u64 = 0;
+    while (gi < sl) { if ((spec[gi] as i64) == 123) { g_tmpl_hint = true; } gi = gi + 1; }
+    var start: u64 = 0;
+    var end: u64 = sl;
+    if (sl >= 2 && (spec[0] as i64) == 123 && (spec[sl - 1] as i64) == 125) { start = 1; end = sl - 1; } // 剥 {}
+    var j: u64 = start;
+    var lc: i64 = -1;
+    while (j < end) { if ((spec[j] as i64) == 58) { lc = j as i64; } j = j + 1; }  // 最后一个 ':'
+    if (lc >= 0) { start = (lc + 1) as u64; }
+    var i: u64 = start;
+    // [fill]align
+    if (end - i >= 2) {
+        var c1: i64 = spec[i] as i64;
+        var c2: i64 = spec[i + 1] as i64;
+        if (c2 == 60 || c2 == 62 || c2 == 61 || c2 == 94) { i = i + 2; }       // < > = ^
+        else if (c1 == 60 || c1 == 62 || c1 == 61 || c1 == 94) { i = i + 1; }
+    } else if (end - i >= 1) {
+        var c1: i64 = spec[i] as i64;
+        if (c1 == 60 || c1 == 62 || c1 == 61 || c1 == 94) { i = i + 1; }
+    }
+    if (end - i >= 1) { var c: i64 = spec[i] as i64; if (c == 43 || c == 45 || c == 32) { i = i + 1; } } // + - ' '
+    if (end - i >= 1) { var c: i64 = spec[i] as i64; if (c == 35) { i = i + 1; } }                     // '#'
+    if (end - i >= 1) { var c: i64 = spec[i] as i64; if (c == 48) { i = i + 1; } }                     // '0'
+    while (end - i >= 1) { var c: i64 = spec[i] as i64; if (c >= 48 && c <= 57) { i = i + 1; } else { break; } } // width
+    if (end - i >= 1) { var c: i64 = spec[i] as i64; if (c == 44 || c == 95) { i = i + 1; } }           // ',' '_'
+    if (end - i >= 1) { var c: i64 = spec[i] as i64; if (c == 46) {                                       // '.' precision
+        i = i + 1;
+        while (end - i >= 1) { var d2: i64 = spec[i] as i64; if (d2 >= 48 && d2 <= 57) { i = i + 1; } else { break; } }
+    } }
+    var has_type: bool = false;
+    var tc: i64 = 0;
+    if (end - i >= 1) { has_type = true; tc = spec[i] as i64; i = i + 1; }
+    if (has_type) {
+        // 允许的类型字符集（与 reference.md §3.10.2 一致）；'!' 是 format_bool 的专属
+        // 合法 type（runtime t_format_bool 对未识别 type 一律走 true/false 分支，故 lenient）。
+        var ok: bool = (tc == 98 || tc == 99 || tc == 100 || tc == 101 || tc == 69
+            || tc == 102 || tc == 70 || tc == 103 || tc == 71 || tc == 110
+            || tc == 111 || tc == 115 || tc == 120 || tc == 88 || tc == 37
+            || tc == 33); // b c d e E f F g G n o s x X %  + '!'(bool)
+        if (!ok) {
+            var m1: string = "格式化 spec 含非法类型字符；M54 允许的 type 为 b c d e E f F g G n o s x X %";
+            if (g_tmpl_hint) {
+                m1 = sb_cat2(m1, "；若需带字面量文本的模板（如 \"x={0}\"），请改用 str.format：format(\"x={0}\", v) 或 \"x={0}\".format(v)");
+            }
+            fc_err("T_FMT_BAD_SPEC", m1, d);
+            return;
+        }
+    }
+    if (i < end) {
+        var m2: string = "格式化 spec 文法非法（含无法解析的残留字符）；合法示例：\":>10\" \"{:>10.2f}\" \"#x\" \"{:,}\"";
+        if (g_tmpl_hint) {
+            m2 = sb_cat2(m2, "；若需带字面量文本的模板（如 \"x={0}\"），请改用 str.format：format(\"x={0}\", v) 或 \"x={0}\".format(v)");
+        }
+        fc_err("T_FMT_BAD_SPEC", m2, d);
+    }
+}
+
+// 序列化右操作数类型白名单（M51 v1）：标量（含 atom / bool / 浮点）与 string。
+// 结构体 / slice / map 需走 type_info 反射逐字段展开，留待 v2。
+check_serializable fn(e: i64, sti: i64) -> void {
+    var k: string = tip_kind(sti);
+    if (k == "Scalar" || k == "String" || k == "Unknown") {
+        return;
+    }
+    fc_err("T_FID_UNSERIALIZABLE",
+        sb_cat3("`<` 不支持序列化该类型：", ti_str(sti),
+            "；v1 仅支持标量（整数 / 浮点 / bool / atom / fid）与 string，聚合类型请逐字段写出"), e);
+}
+
+// ── format 模板替换字段（M55）──────────────────────────────
+//
+// Python `str.format` 分两层：**替换字段**（`{0}` 选第几个实参）与**格式规范**
+// （`:` 之后的 `>10.2f`，M54 已实现）。这里补上层。
+//
+// t 无变参、无 kwargs、无 Any，做不出运行期模板引擎，故三条硬约束：
+//   ① 模板必须是字符串**字面量** —— 编译期解析，运行期零模板开销（L-03 静态优先）
+//   ② 只有位置索引 `{0}` 与自动编号 `{}`；`{name}` 无 kwargs 可查，直接报错
+//   ③ 脱糖成提升函数 `__fmt_N`，体内 StringBuilder 顺序拼接，实参按值传入
+//
+// 实参在**调用点**求值一次后传参，故 `"{0} {0}"` 只求值一次 —— 这是提升函数
+// 相对宏展开的关键优势（`format("{0}{0}", next())` 不会调用两次 next）。
+var g_fmt_counter: i64;
+var g_fmt_ak: [64]i64;   // 各值实参的种类码（见 fmt_kind_of）
+var g_fmt_at: [64]i64;   // 各值实参对应的形参类型节点
+
+// 值类型 → 种类码。-1 表示不可格式化（聚合类型等）。
+// ⚠ 整数字面量按最小无符号宽度推断（`42` 是 u8），故必须按名字判有无符号，
+//    不能只比 "i64"，否则 `format("{0}", 42)` 会错走有符号通道。
+fmt_kind_of fn(t: i64) -> i64 {
+    var k: string = tip_kind(t);
+    if (k == "String") { return 3; }
+    if (k == "Scalar") {
+        var nm: string = tip_name(t);
+        if (nm == "bool") { return 4; }
+        if (is_float_name(nm)) { return 2; }
+        if (nm == "u8" || nm == "u16" || nm == "u32" || nm == "u64") { return 1; }
+        if (is_int_name(nm)) { return 0; }
+    }
+    return -1;
+}
+
+fmt_append_fn fn(k: i64) -> string {
+    if (k == 0) { return "sb_append_fmt_int"; }
+    if (k == 1) { return "sb_append_fmt_uint"; }
+    if (k == 2) { return "sb_append_fmt_float"; }
+    if (k == 3) { return "sb_append_fmt_str"; }
+    return "sb_append_fmt_bool";
+}
+
+// 形参类型节点：string 与各标量都由 mk_scalar 承载（见 parse_type:4959/4993）
+fmt_type_node fn(t: i64) -> i64 {
+    if (tip_kind(t) == "String") { return mk_scalar("string", -1); }
+    return mk_scalar(tip_name(t), -1);
+}
+
+// 把一条语句追加进函数体链表。head 为 -1 时同时把它设成表头。
+// 返回新的 tail；调用方需自行同步 head（与 synthesize_loader 的定式一致）。
+fmt_push_stmt fn(head: i64, tail: i64, stmt: i64) -> i64 {
+    return list_push(head, tail, stmt);
+}
+
+// format(tmpl, a, b, ...) 的脱糖入口。
+// 成功则**就地改写** e 为 `__fmt_N(a, b, ...)` 并返回 String；失败返回 Unknown。
+desugar_format_call fn(e: i64) -> i64 {
+    var n: Node = nodes[e];
+
+    // ── 1. 模板必须存在且是字面量 ──────────────────────────
+    var tmpl_node: i64 = call_arg_node(e, 0);
+    if (tmpl_node < 0) {
+        fc_err("T_FMT_NO_TEMPLATE",
+            "format 至少需要一个实参：模板字符串字面量，如 format(\"{0} 分\", n)", e);
+        return ti_mk("Unknown");
+    }
+    var tnode: Node = nodes[tmpl_node];
+    if (tnode.kind != "string") {
+        fc_err("T_FMT_TEMPLATE_NOT_LITERAL",
+            "format 的模板必须是字符串**字面量**（编译期解析，运行期无模板引擎）；变量模板请改用 StringBuilder 逐段拼接",
+            tmpl_node);
+        return ti_mk("Unknown");
+    }
+    var tmpl: string = tnode.sa;
+
+    // ── 2. 收集值实参并推断类型 ────────────────────────────
+    var argc: i64 = 0;
+    var c0: i64 = n.la;
+    if (c0 >= 0) {
+        var k0: Child = kids[c0];
+        c0 = k0.next;                      // 跳过模板串本身
+    }
+    while (c0 >= 0) {
+        var ck: Child = kids[c0];
+        if (argc >= 64) {
+            fc_err("T_FMT_TOO_MANY_ARGS", "format 的值实参不能超过 64 个", e);
+            return ti_mk("Unknown");
+        }
+        var at: i64 = infer_expr(ck.val);
+        var kind: i64 = fmt_kind_of(at);
+        if (kind < 0 && tip_kind(at) != "Unknown") {
+            fc_err("T_FMT_ARG_TYPE",
+                sb_cat3("format 的第 ", i2s(argc),
+                    sb_cat3(" 个值实参类型不可格式化：", ti_str(at),
+                        "；仅支持整数 / 浮点 / bool / string，聚合类型请逐字段写出")),
+                ck.val);
+            return ti_mk("Unknown");
+        }
+        if (kind < 0) { kind = 0; }        // Unknown：已有诊断，按 int 兜底避免级联
+        g_fmt_ak[argc] = kind;
+        g_fmt_at[argc] = fmt_type_node(at);
+        argc = argc + 1;
+        c0 = ck.next;
+    }
+
+    // ── 3. 解析模板，边解析边生成函数体语句 ────────────────
+    var body_head: i64 = -1;
+    var body_tail: i64 = -1;
+
+    // var __fb: StringBuilder = sb_new();
+    var sbdecl: i64 = mk_var_decl("__fb", false, mk_scalar("StringBuilder", -1),
+        mk_call(mk_ident("sb_new", -1), -1, -1), -1);
+    body_tail = fmt_push_stmt(body_head, body_tail, sbdecl);
+    if (body_head < 0) { body_head = body_tail; }
+
+    var lit: StringBuilder = sb_new();
+    var tl: u64 = str_len(tmpl);
+    var i: u64 = 0;
+    var auto_next: i64 = 0;
+    var used_auto: bool = false;
+    var used_manual: bool = false;
+    var used_idx: i64 = 0;                 // 位掩码不够用，退化为「最大引用下标 + 1」
+
+    while (i < tl) {
+        var ch: i64 = tmpl[i] as i64;
+
+        // `}}` → 字面 `}`；单独的 `}` 是笔误
+        if (ch == 125) {
+            if (i + 1 < tl && (tmpl[i + 1] as i64) == 125) {
+                sb_append_char(lit, 125);
+                i = i + 2;
+                continue;
+            }
+            fc_err("T_FMT_BAD_TEMPLATE",
+                "模板里孤立的 `}`；要输出字面右花括号请写 `}}`", tmpl_node);
+            return ti_mk("Unknown");
+        }
+
+        if (ch != 123) {                   // 普通字符
+            sb_append_char(lit, ch);
+            i = i + 1;
+            continue;
+        }
+
+        // `{{` → 字面 `{`
+        if (i + 1 < tl && (tmpl[i + 1] as i64) == 123) {
+            sb_append_char(lit, 123);
+            i = i + 2;
+            continue;
+        }
+
+        // ── 替换字段 ──
+        // 先把攒下的字面段冲刷成一条 sb_append_str
+        var seg: string = sb_to_str(lit);
+        if (str_len(seg) > 0) {
+            var sa_head: i64 = -1;
+            var sa_tail: i64 = -1;
+            sa_tail = list_push(sa_head, sa_tail, mk_ident("__fb", -1));
+            if (sa_head < 0) { sa_head = sa_tail; }
+            sa_tail = list_push(sa_head, sa_tail, mk_string(seg, -1));
+            if (sa_head < 0) { sa_head = sa_tail; }
+            var scall: i64 = mk_call(mk_ident("sb_append_str", -1), sa_head, -1);
+            body_tail = fmt_push_stmt(body_head, body_tail, mk_expr(scall, -1));
+            if (body_head < 0) { body_head = body_tail; }
+        }
+        sb_clear(lit);
+
+        i = i + 1;                         // 跳过 '{'
+
+        // 索引：数字串 或 空（自动编号）
+        var idx: i64 = -1;
+        var has_digit: bool = false;
+        while (i < tl) {
+            var dc: i64 = tmpl[i] as i64;
+            if (dc < 48 || dc > 57) { i = i; break; }
+            if (has_digit == false) { idx = 0; has_digit = true; }
+            idx = idx * 10 + (dc - 48);
+            i = i + 1;
+        }
+
+        // 既没数字，下一个也不是 ':' / '}' ⇒ 命名字段
+        if (has_digit == false && i < tl) {
+            var pc: i64 = tmpl[i] as i64;
+            if (pc != 58 && pc != 125) {
+                fc_err("T_FMT_NAMED_FIELD",
+                    "不支持命名字段 `{name}`（t 没有关键字实参）；请改用位置索引 `{0}` 或自动编号 `{}`",
+                    tmpl_node);
+                return ti_mk("Unknown");
+            }
+        }
+
+        if (has_digit) {
+            used_manual = true;
+        } else {
+            used_auto = true;
+            idx = auto_next;
+            auto_next = auto_next + 1;
+        }
+        // 与 CPython 一致：自动编号与手动索引不得混用，否则读者要心算下一个是几号
+        if (used_auto && used_manual) {
+            fc_err("T_FMT_MIXED_NUMBERING",
+                "同一模板里不能混用自动编号 `{}` 与手动索引 `{0}`；请统一其中一种",
+                tmpl_node);
+            return ti_mk("Unknown");
+        }
+
+        // 格式规范（可选）
+        var spec: string = "";
+        if (i < tl && (tmpl[i] as i64) == 58) {
+            i = i + 1;
+            var sp0: u64 = i;
+            while (i < tl && (tmpl[i] as i64) != 125) { i = i + 1; }
+            spec = str_slice(tmpl, sp0, i);
+        }
+
+        if (i >= tl || (tmpl[i] as i64) != 125) {
+            fc_err("T_FMT_BAD_TEMPLATE",
+                "替换字段没有闭合的 `}`；要输出字面左花括号请写 `{{`", tmpl_node);
+            return ti_mk("Unknown");
+        }
+        i = i + 1;                         // 跳过 '}'
+
+        if (idx < 0 || idx >= argc) {
+            fc_err("T_FMT_INDEX_RANGE",
+                sb_cat3("模板引用了第 ", i2s(idx),
+                    sb_cat3(" 个值实参，但只传入了 ", i2s(argc), " 个")),
+                tmpl_node);
+            return ti_mk("Unknown");
+        }
+        if (idx + 1 > used_idx) { used_idx = idx + 1; }
+
+        // sb_append_fmt_X(__fb, "spec", aK);
+        var fa_head: i64 = -1;
+        var fa_tail: i64 = -1;
+        fa_tail = list_push(fa_head, fa_tail, mk_ident("__fb", -1));
+        if (fa_head < 0) { fa_head = fa_tail; }
+        fa_tail = list_push(fa_head, fa_tail, mk_string(spec, -1));
+        if (fa_head < 0) { fa_head = fa_tail; }
+        fa_tail = list_push(fa_head, fa_tail, mk_ident(sb_cat2("a", i2s(idx)), -1));
+        if (fa_head < 0) { fa_head = fa_tail; }
+        var fcall: i64 = mk_call(mk_ident(fmt_append_fn(g_fmt_ak[idx]), -1), fa_head, -1);
+        body_tail = fmt_push_stmt(body_head, body_tail, mk_expr(fcall, -1));
+        if (body_head < 0) { body_head = body_tail; }
+    }
+
+    // 收尾字面段
+    var tailseg: string = sb_to_str(lit);
+    if (str_len(tailseg) > 0) {
+        var ta_head: i64 = -1;
+        var ta_tail: i64 = -1;
+        ta_tail = list_push(ta_head, ta_tail, mk_ident("__fb", -1));
+        if (ta_head < 0) { ta_head = ta_tail; }
+        ta_tail = list_push(ta_head, ta_tail, mk_string(tailseg, -1));
+        if (ta_head < 0) { ta_head = ta_tail; }
+        var tcall: i64 = mk_call(mk_ident("sb_append_str", -1), ta_head, -1);
+        body_tail = fmt_push_stmt(body_head, body_tail, mk_expr(tcall, -1));
+        if (body_head < 0) { body_head = body_tail; }
+    }
+
+    // return sb_to_str(__fb);
+    var ra_head: i64 = -1;
+    var ra_tail: i64 = -1;
+    ra_tail = list_push(ra_head, ra_tail, mk_ident("__fb", -1));
+    if (ra_head < 0) { ra_head = ra_tail; }
+    var rcall: i64 = mk_call(mk_ident("sb_to_str", -1), ra_head, -1);
+    body_tail = fmt_push_stmt(body_head, body_tail, mk_return(rcall, -1));
+    if (body_head < 0) { body_head = body_tail; }
+
+    // ── 4. 合成形参列表 a0..a(argc-1) ──────────────────────
+    var p_head: i64 = -1;
+    var p_tail: i64 = -1;
+    var pi: i64 = 0;
+    while (pi < argc) {
+        var pn: i64 = mk_P(sb_cat2("a", i2s(pi)), g_fmt_at[pi], -1, -1);
+        p_tail = list_push(p_head, p_tail, pn);
+        if (p_head < 0) { p_head = p_tail; }
+        pi = pi + 1;
+    }
+
+    // ── 5. 提升为顶层函数并注册 ────────────────────────────
+    var fn_name: string = sb_cat2("__fmt_", i2s(g_fmt_counter));
+    g_fmt_counter = g_fmt_counter + 1;
+    var fdecl: i64 = mk_FuncDecl(fn_name, false, false, mk_scalar("string", -1),
+        -1, p_head, body_head, -1);
+    // 锚点承接：合成函数若在发射期出诊断，得能指回用户写 format 的那一行
+    var fdn: Node = nodes[fdecl];
+    fdn.ln = n.ln;
+    fdn.cl = n.cl;
+    fdn.tv = n.tv;
+    slice_set(nodes, fdecl, fdn);
+    sym_define(global_scope, fn_name, "func", ti_named("Func", fn_name), fdecl);
+    append(decl_list, fdecl);
+
+    // ── 6. 就地改写调用点：format(tmpl, a, b) → __fmt_N(a, b) ──
+    var nn: Node = nodes[e];
+    nn.na = mk_ident(fn_name, -1);
+    if (nn.la >= 0) {
+        var fk: Child = kids[nn.la];
+        nn.la = fk.next;                   // 丢掉模板串实参
+    }
+    slice_set(nodes, e, nn);
+    return ti_mk("String");
+}
+
+// 调用实参**不走通用遍历**（见 run_check 尾部关于 scan_fid_format_atoms 的长注释），
+// 于是 `show(format(...))` / `sb_append_str(b, format(...))` 里的 format 永远等不到
+// infer，发射期只会吐一行 `; UNSUPPORTED call format` 然后生成 `load %TStr, ptr 0`。
+// 平坦扫描救不了它 —— 脱糖要实参的静态类型，而类型要作用域，出了 check 就没了。
+// 故在 call 分支入口就地补扫实参子树：此刻 cur_scope 正确，命中即交回 infer_expr。
+//
+// 递归保护用节点池的天然不变式：`node_new` 顺序追加 ⇒ 子节点索引恒小于父节点。
+// 只向索引更小处递归，既杜绝成环，也挡住「某 kind 把非节点整数存进 na」的误伤。
+// （开关 g_has_format 声明在 parse_post_call 附近，与置位点同处。）
+
+fmt_scan_list fn(h: i64, lim: i64) -> void {
+    var c: i64 = h;
+    while (c >= 0) {
+        var k: Child = kids[c];
+        fmt_scan_subtree(k.val, lim);
+        c = k.next;
+    }
+}
+
+fmt_scan_subtree fn(x: i64, lim: i64) -> void {
+    if (x < 0 || x >= lim) { return; }
+    var xn: Node = nodes[x];
+    if (xn.kind == "call" && xn.na >= 0) {
+        var cee: Node = nodes[xn.na];
+        if (cee.sa == "format" && (cee.kind == "ident" || cee.kind == "member")) {
+            infer_expr(x);          // 就地改写成 __fmt_N(...)，幂等
+            xn = nodes[x];          // 重读：na/la 已被改写
+        }
+    }
+    fmt_scan_subtree(xn.na, lim);
+    fmt_scan_subtree(xn.nb, lim);
+    fmt_scan_subtree(xn.nc, lim);
+    fmt_scan_subtree(xn.nd, lim);
+    fmt_scan_list(xn.la, lim);
+    fmt_scan_list(xn.lb, lim);
+    fmt_scan_list(xn.lc, lim);
+}
+
 // ── 表达式类型推断 inferExprType（复刻 checker.ts:479）────────
 
 infer_expr fn(e: i64) -> i64 {
@@ -8205,6 +9159,27 @@ infer_expr fn(e: i64) -> i64 {
             return ti_scalar("u32");
         }
         return ti_scalar("u64");
+    }
+    // Erlang 式原子字面量：类型 = 64 位标量 "atom"，值 = 编译期 intern 的稳定 i64 id
+    if (n.kind == "atom") {
+        n.ia = atom_intern(n.sa);
+        slice_set(nodes, e, n);
+        return ti_scalar("atom");
+    }
+    // 内建文件描述符常量（M51）：stdin/stdout/stderr → 64 位标量 "fid"
+    if (n.kind == "fidconst") {
+        return ti_scalar("fid");
+    }
+    // 序列化操作符（M51）：`f < v` 的值即目标 fid 本身，故左结合可链式
+    if (n.kind == "serialize") {
+        infer_expr(n.na);
+        infer_expr(n.nb);
+        return ti_scalar("fid");
+    }
+    // 反序列化操作符（M52 读路径）：`f > Type` 的值是裸 Type；右操作数是类型表达式，不调 infer_expr
+    if (n.kind == "deserialize") {
+        infer_expr(n.na);
+        return ti_from_td(deser_type_of(n.nb));
     }
 // >>> GEN:type_infer1 (generated by tools/totter.tc from out/ebnf.json -- DO NOT EDIT) >>>
     if (n.kind == "float") {
@@ -8386,9 +9361,55 @@ infer_expr fn(e: i64) -> i64 {
         return m_res;
     }
     if (n.kind == "binary") {
-        var lt: i64 = infer_expr(n.na);
-        var rt: i64 = infer_expr(n.nb);
         var op: string = n.sa;
+        // ── 序列化/反序列化操作符脱糖（M51 `<` 写；M52 读路径 `>` 读）────────
+        // 语义由**左操作数静态类型**唯一判定：fid ⇒ 序列化/反序列化，否则 ⇒ 普通比较。
+        // fid 无序，故 `<`/`>` 作比较时不存在二义（L-04）；`>` 作反序列化时右操作数是「类型」而非值。
+        var lt: i64 = infer_expr(n.na);
+        var lfid: bool = tip_kind(lt) == "Scalar" && tip_name(lt) == "fid";
+        if (lfid && op == "<") {
+            var rt: i64 = infer_expr(n.nb);
+            check_serializable(n.nb, rt);
+            n.kind = "serialize";
+            slice_set(nodes, e, n);
+            return ti_scalar("fid");
+        }
+        if (lfid && op == ">") {
+            // 右操作数是「类型」，不是值：按类型解析，不调 infer_expr(n.nb)
+            var rtd: i64 = deser_type_of(n.nb);
+            if (rtd < 0 || tds[rtd].cat == "unknown") {
+                fc_err("T_FID_DESERIALIZE_NEEDS_TYPE",
+                    "反序列化 `fid > Type` 的右操作数必须是类型（如 i64 / string / MyStruct）；当前无法解析为类型", e);
+                return ti_mk("Unknown");
+            }
+            if (deser_supported(rtd) == false) {
+                fc_err("T_FID_DESERIALIZE_AGG",
+                    "反序列化暂仅支持标量（i8..i64 / u8..u64 / f32 / f64 / bool / atom）与 string；聚合类型（struct / array / slice / map / pointer）读属 v2", e);
+                return ti_mk("Unknown");
+            }
+            n.kind = "deserialize";
+            slice_set(nodes, e, n);
+            return ti_from_td(rtd);          // Option B：结果类型为裸 T，EOF 由 fid_eof 探针表达
+        }
+        // parse 期把 `> string` / `> map[K]V` 等关键字型类型收成了类型节点；若左操作数
+        // 并非 fid，这就不是反序列化，而是把类型当值比较 —— 须给出定位准确的诊断，
+        // 否则 infer_expr 会在类型节点上得到 Unknown，报出与病因无关的错误。
+        if (op == ">" && node_type_only(n.nb)) {
+            fc_err("T_FID_DESERIALIZE_NEEDS_FID",
+                "`>` 的右操作数写成了类型 —— 只有左操作数是 fid 时 `>` 才是反序列化；普通比较的两侧都必须是值", e);
+            return ti_mk("Unknown");
+        }
+        // 其余：正常推断右操作数，再按既有规则处理比较/有序错误
+        var rt: i64 = infer_expr(n.nb);
+        var rfid: bool = tip_kind(rt) == "Scalar" && tip_name(rt) == "fid";
+        if (lfid || rfid) {
+            if (op == "<" || op == ">" || op == "<=" || op == ">=") {
+                fc_err("T_FID_NOT_ORDERED",
+                    sb_cat3("fid 是无序句柄，不支持 `", op,
+                        "` 比较；写出用 `目标fid < 值`（序列化），读入用 `源fid > 类型`（反序列化），判等用 `==` / `!=`"), e);
+                return ti_scalar("bool");
+            }
+        }
         if (op == "==" || op == "!=" || op == "<" || op == ">" || op == "<=" || op == ">=") {
             return ti_scalar("bool");
         }
@@ -8444,7 +9465,42 @@ infer_expr fn(e: i64) -> i64 {
         return atl;
     }
     if (n.kind == "call") {
+        // 实参不走通用遍历，嵌套其中的 format 只能在这里补扫（详见 fmt_scan_subtree）
+        if (g_has_format) { fmt_scan_list(n.la, e); }
         var cn: Node = nodes[n.na];
+        // 方法式 `"tmpl".format(a, b)`（M57）：与函数式 `format("tmpl", a, b)` 完全同义。
+        // 实现取「归一化」而非「另起一套」——就地把 receiver 挪成第 0 个实参、callee 换成
+        // 裸 `format`，随后交给同一个 desugar_format_call。两种写法因此共享同一份模板文法、
+        // 同一组诊断码，永远不会各自漂移。
+        if (cn.kind == "member" && cn.sa == "format") {
+            var mfa_recv: i64 = cn.na;
+            var mfa_rn: Node = nodes[mfa_recv];
+            if (mfa_rn.kind == "string") {
+                var mfa_h: i64 = -1;
+                var mfa_t: i64 = -1;
+                mfa_t = list_push(mfa_h, mfa_t, mfa_recv);
+                if (mfa_h < 0) { mfa_h = mfa_t; }
+                var mfa_c: i64 = n.la;
+                while (mfa_c >= 0) {
+                    var mfa_k: Child = kids[mfa_c];
+                    mfa_t = list_push(mfa_h, mfa_t, mfa_k.val);
+                    if (mfa_h < 0) { mfa_h = mfa_t; }
+                    mfa_c = mfa_k.next;
+                }
+                var mfa_n: Node = nodes[e];
+                mfa_n.na = mk_ident("format", -1);
+                mfa_n.la = mfa_h;
+                slice_set(nodes, e, mfa_n);
+                return desugar_format_call(e);
+            }
+            var mfa_rt: i64 = infer_expr(mfa_recv);
+            if (tip_kind(mfa_rt) == "String") {
+                fc_err("T_FMT_TEMPLATE_NOT_LITERAL",
+                    "`.format(...)` 的接收者必须是字符串**字面量**（编译期解析，运行期无模板引擎）；变量模板请改用 StringBuilder 逐段拼接",
+                    mfa_recv);
+                return ti_mk("Unknown");
+            }
+        }
         if (cn.kind == "ident") {
             var fname: string = cn.sa;
             var si2: i64 = sym_lookup(global_scope, fname);
@@ -8471,6 +9527,13 @@ infer_expr fn(e: i64) -> i64 {
                     return ti_mk("Unknown");
                 }
             }
+            // format(tmpl, ...) 的替换字段脱糖（M55）。必须挂在这里而非 parse 期：
+            // 选 sb_append_fmt_int 还是 _float 取决于实参的**静态类型**，只有
+            // infer 之后才知道。脱糖会就地把本节点改写成 __fmt_N(...) 调用，
+            // callee 名随之改变，故重复 infer 天然幂等。
+            if (fname == "format") {
+                return desugar_format_call(e);
+            }
             // map_get(m, k) 的返回类型 = 映射的 V（需从首个实参的 map 类型反查）
             if (fname == "map_get" && n.la >= 0) {
                 var mgn: i64 = kids[n.la].val;
@@ -8495,6 +9558,179 @@ infer_expr fn(e: i64) -> i64 {
                             sb_cat3(fname, " 的实参必须是字符串（String）；标量请先用 int_to_str / to_string / StringBuilder 拼接。当前收到: ", ti_str(pat)),
                             n_file(e), n_line(e), n_col(e), n_line(e), n_col(e) + 5);
                     }
+                }
+            }
+            // 文件描述符内建（M51）：atom 形参必须是**字面量** —— 打开方式与格式
+            // 决定后续每一次 `<` 的字节形态，必须编译期可判定（L-02 显式 / L-03 静态）。
+            if (fname == "fopen") {
+                check_atom_arg(call_arg_node(e, 1), "fopen 的第 2 个实参（打开方式）", "mode", e);
+            }
+            if (fname == "fmt_register") {
+                check_atom_arg(call_arg_node(e, 0), "fmt_register 的第 1 个实参（打开方式类别）", "kind", e);
+                check_atom_arg(call_arg_node(e, 2), "fmt_register 的第 3 个实参（格式）", "fmt", e);
+            }
+            // fid_error 的实参必须是 fid（与 serialize 脱糖的 fid 判定同款：kind==Scalar && name==fid）。
+            // 传非 fid（如 i64）应报 T_FID_ERROR_ARG，而非退化成「未知内建」或静默按 i64 传递。
+            if (fname == "fid_error") {
+                if (n.la >= 0) {
+                    var fean: i64 = kids[n.la].val;
+                    var feat: i64 = infer_expr(fean);
+                    var feok: bool = (tip_kind(feat) == "Scalar" && tip_name(feat) == "fid") || tip_kind(feat) == "Unknown";
+                    if (!feok) {
+                        diag_new("T_FID_ERROR_ARG", "error",
+                            sb_cat2("fid_error 的实参必须是 fid；当前收到: ", ti_str(feat)),
+                            n_file(e), n_line(e), n_col(e), n_line(e), n_col(e) + 5);
+                    }
+                }
+            }
+            // fid_eof 同理：探针只对句柄有意义，传 i64 必须拦下而不是让运行时兜底。
+            if (fname == "fid_eof") {
+                if (n.la >= 0) {
+                    var feon: i64 = kids[n.la].val;
+                    var feot: i64 = infer_expr(feon);
+                    var feook: bool = (tip_kind(feot) == "Scalar" && tip_name(feot) == "fid") || tip_kind(feot) == "Unknown";
+                    if (!feook) {
+                        diag_new("T_FID_EOF_ARG", "error",
+                            sb_cat2("fid_eof 的实参必须是 fid；当前收到: ", ti_str(feot)),
+                            n_file(e), n_line(e), n_col(e), n_line(e), n_col(e) + 5);
+                    }
+                }
+            }
+            // fseek/ftell 的首个实参必须是 fid；fseek 的偏移必须是整型标量。
+            // fid 与 i64 不隐式互转，写反参数顺序（fseek(0, f)）必须在检查期就拦下。
+            if (fname == "fseek" || fname == "ftell") {
+                if (n.la >= 0) {
+                    var skn: i64 = kids[n.la].val;
+                    var skt: i64 = infer_expr(skn);
+                    var skok: bool = (tip_kind(skt) == "Scalar" && tip_name(skt) == "fid") || tip_kind(skt) == "Unknown";
+                    if (!skok) {
+                        diag_new("T_FID_SEEK_ARG", "error",
+                            sb_cat3(fname, " 的第 1 个实参必须是 fid；当前收到: ", ti_str(skt)),
+                            n_file(e), n_line(e), n_col(e), n_line(e), n_col(e) + 5);
+                    }
+                }
+                if (fname == "fseek") {
+                    var skon: i64 = call_arg_node(e, 1);
+                    if (skon >= 0) {
+                        var skot: i64 = infer_expr(skon);
+                        var skoname: string = tip_name(skot);
+                        var skoint: bool = tip_kind(skot) == "Scalar" && skoname != "fid" && skoname != "atom"
+                            && skoname != "bool" && skoname != "f32" && skoname != "f64";
+                        if (!skoint && tip_kind(skot) != "Unknown") {
+                            diag_new("T_FID_SEEK_ARG", "error",
+                                sb_cat2("fseek 的第 2 个实参（偏移）必须是整型标量；当前收到: ", ti_str(skot)),
+                                n_file(e), n_line(e), n_col(e), n_line(e), n_col(e) + 5);
+                        }
+                    }
+                }
+            }
+            // 时间格式化（M56）：spec 字面量扫描字段码；实参类型校验
+            if (fname == "format_time" || fname == "format_time_local" || fname == "format_time_tz") {
+                var ftn: i64 = call_arg_node(e, 0);
+                if (ftn >= 0) {
+                    var ftnode: Node = nodes[ftn];
+                    if (ftnode.kind == "string") {
+                        check_time_spec(ftnode.sa, ftn);
+                    } else {
+                        var ftt: i64 = infer_expr(ftn);
+                        if (tip_kind(ftt) != "String" && tip_kind(ftt) != "Unknown") {
+                            diag_new("T_TIME_SPEC_TYPE", "error",
+                                sb_cat3(fname, " 的第 1 个实参（格式串）必须是字符串；当前收到: ", ti_str(ftt)),
+                                n_file(e), n_line(e), n_col(e), n_line(e), n_col(e) + 5);
+                        }
+                    }
+                }
+                var ftmn: i64 = call_arg_node(e, 1);
+                if (ftmn >= 0) {
+                    var ftmt: i64 = infer_expr(ftmn);
+                    var ftmname: string = tip_name(ftmt);
+                    var ftmint: bool = tip_kind(ftmt) == "Scalar" && ftmname != "fid" && ftmname != "atom"
+                        && ftmname != "bool" && ftmname != "f32" && ftmname != "f64";
+                    if (!ftmint && tip_kind(ftmt) != "Unknown") {
+                        diag_new("T_TIME_ARG_TYPE", "error",
+                            sb_cat3(fname, " 的第 2 个实参（时间微秒 epoch）必须是整型（i64）；当前收到: ", ti_str(ftmt)),
+                            n_file(e), n_line(e), n_col(e), n_line(e), n_col(e) + 5);
+                    }
+                }
+                // format_time_tz 的第 3 参：时区偏移分钟数（东为正），须整型
+                if (fname == "format_time_tz") {
+                    var tzn: i64 = call_arg_node(e, 2);
+                    if (tzn < 0) {
+                        fc_err("T_CALL_ARITY",
+                            "format_time_tz(spec, t, tz_minutes) 需要 3 个实参：格式串、微秒 epoch、时区偏移分钟数（东为正，如东八区 480）", e);
+                    } else {
+                        var tzt: i64 = infer_expr(tzn);
+                        var tzname: string = tip_name(tzt);
+                        var tzint: bool = tip_kind(tzt) == "Scalar" && tzname != "fid" && tzname != "atom"
+                            && tzname != "bool" && tzname != "f32" && tzname != "f64";
+                        if (!tzint && tip_kind(tzt) != "Unknown") {
+                            diag_new("T_TIME_ARG_TYPE", "error",
+                                sb_cat2("format_time_tz 的第 3 个实参（时区偏移分钟数）必须是整型；当前收到: ", ti_str(tzt)),
+                                n_file(e), n_line(e), n_col(e), n_line(e), n_col(e) + 5);
+                        }
+                    }
+                }
+            }
+            // 时间解析（M57）：spec 走更严的解析白名单；第 2 参必须是字符串
+            if (fname == "parse_time" || fname == "parse_time_local") {
+                var ptn: i64 = call_arg_node(e, 0);
+                if (ptn < 0) {
+                    fc_err("T_CALL_ARITY",
+                        sb_cat3(fname, "(spec, s) 需要 2 个实参：格式串与待解析字符串；失败返回 time_invalid()", ""), e);
+                }
+                if (ptn >= 0) {
+                    var ptnode: Node = nodes[ptn];
+                    if (ptnode.kind == "string") {
+                        check_time_parse_spec(ptnode.sa, ptn);
+                    } else {
+                        var ptt2: i64 = infer_expr(ptn);
+                        if (tip_kind(ptt2) != "String" && tip_kind(ptt2) != "Unknown") {
+                            diag_new("T_TIME_SPEC_TYPE", "error",
+                                sb_cat3(fname, " 的第 1 个实参（格式串）必须是字符串；当前收到: ", ti_str(ptt2)),
+                                n_file(e), n_line(e), n_col(e), n_line(e), n_col(e) + 5);
+                        }
+                    }
+                    var psn: i64 = call_arg_node(e, 1);
+                    if (psn < 0) {
+                        fc_err("T_CALL_ARITY",
+                            sb_cat3(fname, "(spec, s) 缺少第 2 个实参（待解析字符串）", ""), e);
+                    } else {
+                        var pst: i64 = infer_expr(psn);
+                        if (tip_kind(pst) != "String" && tip_kind(pst) != "Unknown") {
+                            diag_new("T_TIME_ARG_TYPE", "error",
+                                sb_cat3(fname, " 的第 2 个实参（待解析文本）必须是字符串；当前收到: ", ti_str(pst)),
+                                n_file(e), n_line(e), n_col(e), n_line(e), n_col(e) + 5);
+                        }
+                    }
+                }
+            }
+            if (fname == "time_invalid") {
+                if (call_arg_node(e, 0) >= 0) {
+                    fc_err("T_CALL_ARITY", "time_invalid() 不接受任何实参（返回解析失败哨兵：i64 最小值）", e);
+                }
+            }
+            // 数字/字符串格式化（M54）：spec 字面量文法校验；实参类型校验
+            if (fname == "format_int" || fname == "format_uint" || fname == "format_float"
+                || fname == "format_str" || fname == "format_bool" || fname == "format_char") {
+                var fspecn: i64 = call_arg_node(e, 0);
+                if (fspecn >= 0) {
+                    var fsn: Node = nodes[fspecn];
+                    if (fsn.kind == "string") {
+                        check_fmt_spec(fsn.sa, fspecn);
+                    } else {
+                        var fst: i64 = infer_expr(fspecn);
+                        if (tip_kind(fst) != "String" && tip_kind(fst) != "Unknown") {
+                            diag_new("T_FMT_SPEC_TYPE", "error",
+                                sb_cat3(fname, " 的第 1 个实参（格式串 spec）必须是字符串；当前收到: ", ti_str(fst)),
+                                n_file(e), n_line(e), n_col(e), n_line(e), n_col(e) + 5);
+                        }
+                    }
+                }
+            }
+            // now() 不接受任何实参
+            if (fname == "now") {
+                if (call_arg_node(e, 0) >= 0) {
+                    fc_err("T_CALL_ARITY", "now() 不接受任何实参（返回当前微秒 epoch）", e);
                 }
             }
             return builtin_ret(fname);
@@ -8603,6 +9839,44 @@ infer_expr fn(e: i64) -> i64 {
     }
 // >>> GEN:type_infer2 (generated by tools/totter.tc from out/ebnf.json -- DO NOT EDIT) >>>
     if (n.kind == "struct_lit") {
+        // 默认填充：struct 字段有默认值(expr)但未在字面量中给出 → 合成 FV 追加进 n.la。
+        // 后端以「指定符初始化器」按名映射，故追加在尾部与顺序无关，天然幂等。
+        var sname: string = n.sa;
+        var fh: i64 = find_struct_fields(sname);
+        if (fh >= 0) {
+            var present: []string;
+            var p: i64 = n.la;
+            while (p >= 0) {
+                var pv: Node = nodes[kids[p].val];
+                append(present, pv.sa);
+                p = kids[p].next;
+            }
+            var c: i64 = fh;
+            while (c >= 0) {
+                var f: Node = nodes[kids[c].val];
+                if (f.nb >= 0) {
+                    var found: bool = false;
+                    var i: i64 = 0;
+                    var pl: i64 = slice_len(present);
+                    while (i < pl) {
+                        if (present[i] == f.sa) { found = true; break; }
+                        i = i + 1;
+                    }
+                    if (found == false) {
+                        var fvid: i64 = mk_FV(f.sa, f.nb, -1);
+                        if (n.la < 0) {
+                            n.la = list_push(-1, -1, fvid);
+                        } else {
+                            var tail: i64 = n.la;
+                            while (kids[tail].next >= 0) { tail = kids[tail].next; }
+                            list_push(n.la, tail, fvid);
+                        }
+                    }
+                }
+                c = kids[c].next;
+            }
+            slice_set(nodes, e, n);
+        }
         return ti_named("Struct", n.sa);
     }
     if (n.kind == "cast") {
@@ -8892,11 +10166,78 @@ check_func_decl fn(d: i64) -> void {
 check_struct_decl fn(d: i64) -> void {
     var n: Node = nodes[d];
     var c: i64 = n.lb;
+    var total: i64 = 0;
+    var tag_count: i64 = 0;
+    // 第一遍：解析字段类型 + 统计显式 tagID 字段数
     while (c >= 0) {
         var k: Child = kids[c];
         var f: Node = nodes[k.val];
+        total = total + 1;
+        if (f.ib >= 1) { tag_count = tag_count + 1; }
         if (f.ia == -1) {
             resolve_ti(f.na);
+        }
+        c = k.next;
+    }
+    // ── 全有 / 全无 规则：struct 内 tagID 要么全显式(@N)，要么全自动，禁止混合 ──
+    if (tag_count > 0 && tag_count < total) {
+        diag_new("T_TAGID_MIXED", "error",
+            sb_cat3("struct '", n.sa, "' 的字段 tagID 必须「全显式 @N」或「全自动」：不能部分字段写 @N、部分不写"),
+            n_file(d), n_line(d), n_col(d), n_line(d), n_col(d) + 4);
+        return;
+    }
+    // ── 全显式：去重；全自动：顺序分配 1,2,3…（写入 f.ib 供后续 type_info / 序列化使用）──
+    if (total > 0) {
+        if (tag_count == total) {
+            // 去重：O(n^2) 两两比对（struct 字段数极少）
+            var p: i64 = n.lb;
+            while (p >= 0) {
+                var pf: Node = nodes[kids[p].val];
+                var q: i64 = kids[p].next;
+                while (q >= 0) {
+                    var qf: Node = nodes[kids[q].val];
+                    if (pf.ib >= 1 && qf.ib == pf.ib) {
+                        var osb: StringBuilder = sb_new();
+                        sb_append_str(osb, "struct '");
+                        sb_append_str(osb, n.sa);
+                        sb_append_str(osb, "': 字段 tagID 重复 @");
+                        sb_append_i64(osb, pf.ib);
+                        sb_append_str(osb, "（字段 '");
+                        sb_append_str(osb, pf.sa);
+                        sb_append_str(osb, "' 与 '");
+                        sb_append_str(osb, qf.sa);
+                        sb_append_str(osb, "'）");
+                        diag_new("T_TAGID_DUP", "error", sb_to_str(osb),
+                            n_file(d), n_line(d), n_col(d), n_line(d), n_col(d) + 4);
+                    }
+                    q = kids[q].next;
+                }
+                p = kids[p].next;
+            }
+        } else {
+            // 全自动：顺序分配（基值 1）
+            var idx: i64 = 1;
+            var cc: i64 = n.lb;
+            while (cc >= 0) {
+                var ff: Node = nodes[kids[cc].val];
+                ff.ib = idx;
+                slice_set(nodes, kids[cc].val, ff);
+                idx = idx + 1;
+                cc = kids[cc].next;
+            }
+        }
+    }
+    // ── 默认表达式类型检查：f.nb（默认）须可赋给字段类型 f.na ──
+    c = n.lb;
+    while (c >= 0) {
+        var k: Child = kids[c];
+        var f: Node = nodes[k.val];
+        if (f.nb >= 0) {
+            var ft: i64 = resolve_ti(f.na);
+            var dt: i64 = infer_expr(f.nb);
+            if (tip_kind(dt) != "Unknown" && ti_equal(dt, ft) == false && can_cast(dt, ft) == false) {
+                err_type_mismatch(f.nb, ft, dt);
+            }
         }
         c = k.next;
     }
@@ -9072,6 +10413,8 @@ check_decl fn(d: i64) -> void {
         }
         return;
     }
+    // 注：ImportModDecl 节点已在 resolve_modules（run_check 入口）内联解析时
+    // 被整体移除，故此处不会再遇到；若残留（理论上不会）将由下方通用分支兜底。
 }
 
 // ── §7.2 CTFE 导入脱糖（M27）──────────────────────────────────
@@ -9713,12 +11056,160 @@ desugar_imports fn() -> void {
     }
 }
 
+// ── 模块系统：whole-program 内联解析 ──────────────────────────
+
+// 取路径的目录部分（兼容 / 与 \）
+mod_dir_of fn(p: string) -> string {
+    var n: u64 = str_len(p);
+    var i: u64 = n;
+    while (i > 0) {
+        i = i - 1;
+        var c: u8 = p[i];
+        if (c == 47 || c == 92) {
+            return str_slice(p, 0, i);
+        }
+    }
+    return ".";
+}
+
+in_mod_aliases fn(sa: string) -> bool {
+    var n: i64 = slice_len(g_mod_aliases) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        if (g_mod_aliases[i] == sa) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+in_mod_visited fn(p: string) -> bool {
+    var n: i64 = slice_len(g_mod_visited) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        if (g_mod_visited[i] == p) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+mod_alias_add fn(nm: string, alias: string) -> void {
+    if (alias == "") {
+        if (in_mod_aliases(nm) == false) {
+            append(g_mod_aliases, nm);
+        }
+    } else {
+        if (in_mod_aliases(alias) == false) {
+            append(g_mod_aliases, alias);
+        }
+    }
+}
+
+// 把模块文件解析为顶层声明，追加进 decl_list。
+// 其内嵌的 import 在此就地递归解析（内联），不会以 ImportModDecl 形式残留。
+// 注：解析后不再恢复 toks/pos —— check/emit 只依赖 AST，不再需要词法状态。
+load_module_file fn(path: string) -> void {
+    var saved_pos: i64 = pos;                 // 保存调用方的 token 流位置（支持嵌套 import 透明返回）
+    var base: i64 = slice_len(toks) as i64;   // 模块 token 将从此下标开始（tokenize 是 append 语义）
+    var msrc: string = file_read_all(path);
+    tokenize(msrc);                           // 追加在入口/父模块 token 之后
+    pos = base;                               // 从本模块起点解析，而非 0（否则会重解析入口文件）
+    var mdir: string = mod_dir_of(path);
+    while (cur_t() != "Eof") {
+        if (cur_t() == "Semicolon") {
+            advance_i();
+            continue;
+        }
+        var d: i64 = parse_declaration();
+        if (d < 0) {
+            continue;
+        }
+        if (nodes[d].kind == "ImportModDecl") {
+            // 嵌套 import：就地递归解析，不加入 decl_list
+            handle_one_import(d, mdir);
+        } else {
+            append(decl_list, d);
+        }
+    }
+    pos = saved_pos;                          // 恢复调用方（入口或父模块）的解析位置
+}
+
+// 解析单个 import 声明：定位模块文件 → 去重/环检测 → 内联加载
+handle_one_import fn(imp: i64, base_dir: string) -> void {
+    var nm: string = nodes[imp].sb;
+    var alias: string = nodes[imp].sc;
+    if (nodes[imp].bc) {
+        fc_err("T_EXPORT_SCOPE", "export 不能修饰 import 声明", imp);
+        return;
+    }
+    var p: string = path_resolve(sb_cat4(base_dir, "/", nm, ".tc"));
+    if (path_exists(p) == false) {
+        fc_err("T_IMPORT_NOT_FOUND",
+            sb_cat3("模块 '", nm, "' 无法解析：文件 '"), imp);
+        return;
+    }
+    mod_alias_add(nm, alias);
+    // 已加载过则跳过（同时天然打破 import 成环，避免无限递归）
+    if (in_mod_visited(p)) {
+        return;
+    }
+    append(g_mod_visited, p);
+    load_module_file(p);
+}
+
+// 顶层入口：内联所有 import，并构建模块别名集合。
+// ImportModDecl 节点留在 decl_list 中无害（register/emit 均对其忽略）。
+resolve_modules fn() -> void {
+    var entry_dir: string = mod_dir_of(g_file);
+    var n: i64 = slice_len(decl_list) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        var d: i64 = decl_list[i];
+        if (nodes[d].kind == "ImportModDecl") {
+            handle_one_import(d, entry_dir);
+        }
+        i = i + 1;
+    }
+}
+
+// 模块限定访问脱糖：`hello.add` / `hello.add(...)` → 裸 `add` 标识符。
+// 仅当对象为标识符且其 sa 命中模块别名时才改写，结构体字段访问不受影响。
+desugar_module_qualifiers fn() -> void {
+    var tot: i64 = slice_len(nodes) as i64;
+    var i: i64 = 0;
+    while (i < tot) {
+        var nd: Node = nodes[i];
+        if (nd.kind == "member") {
+            var ob: Node = nodes[nd.na];
+            if (ob.kind == "ident" && in_mod_aliases(ob.sa)) {
+                nd.kind = "ident";
+                nd.na = -1;   // 丢弃对象（模块名）子节点
+                slice_set(nodes, i, nd);
+            }
+        }
+        i = i + 1;
+    }
+}
+
 // ── check 主流程（复刻 checker.ts:83）─────────────────────────
 
 run_check fn() -> void {
     global_scope = scope_new(-1);
     cur_scope = global_scope;
     cur_ret = ti_mk("Void");
+
+    // 模块内联：在注册声明之前把 import 的模块整体并入 decl_list，
+    // 并把 `hello.add` 限定访问改写成裸 `add`。单文件程序（无 import）零影响。
+    resolve_modules();
+    desugar_module_qualifiers();
+
+    // 子句合并 + lambda 提升：必须在 register 之前跑（子句组先并成单一 FuncDecl，
+    // 否则同名多条 FuncDecl 会被 register 当成重复定义）。覆盖模块内联后的整张 decl_list。
+    desugar_func_clauses();
+    desugar_lambdas();
 
     var n: i64 = slice_len(decl_list) as i64;
     var i: i64 = 0;
@@ -9733,6 +11224,31 @@ run_check fn() -> void {
     while (j < n2) {
         check_decl(decl_list[j]);
         j = j + 1;
+    }
+    scan_fid_format_atoms();
+}
+
+// fid_format(f) 返回 atom，四个格式名必须进本程序的原子表，且**必须在发射前**入表：
+// LLVM 后端的 @t_atom_table 先于函数体发射，发射期再 intern 就漏到表外
+// （id ≥ t_atom_count → atom_str 还原成空串）。
+// 不能挂在 infer_expr 的 call 分支上——内建调用的实参不会被通用遍历，
+// `atom_str(fid_format(f))` 这种嵌套里的内层调用根本不会被 infer 到。
+// 故在检查末尾对全节点做一次平坦扫描，两个后端拿到的 id 也因此一致。
+scan_fid_format_atoms fn() -> void {
+    var tot: i64 = slice_len(nodes) as i64;
+    var i: i64 = 0;
+    while (i < tot) {
+        var nd: Node = nodes[i];
+        if (nd.kind == "call") {
+            if (nd.na >= 0) {
+                var ce: Node = nodes[nd.na];
+                if (ce.kind == "ident" && ce.sa == "fid_format") {
+                    fid_intern_fmt_atoms();
+                    return;
+                }
+            }
+        }
+        i = i + 1;
     }
 }
 
@@ -10859,6 +12375,8 @@ scalar_to_c fn(name: string) -> string {
     if (name == "f64") { return "double"; }
     if (name == "bool") { return "bool"; }
     if (name == "void") { return "void"; }
+    if (name == "atom") { return "int64_t"; }
+    if (name == "fid") { return "int64_t"; }
     return name;
 }
 // <<< GEN:scalar_ctype <<<
@@ -10873,6 +12391,7 @@ emit_ctype fn(tn: i64) -> string {
     if (n.kind == "scalar") {
         if (n.sa == "string") { return "TStr"; }
         if (n.sa == "StringBuilder") { return "TSb*"; }
+        if (n.sa == "atom") { return "int64_t"; }
         return scalar_to_c(n.sa);
     }
     if (n.kind == "named") {
@@ -11142,6 +12661,10 @@ expr_type_desc fn(e: i64) -> i64 {
     if (n.kind == "float") { return td_named_mk("scalar", "f64"); }
     if (n.kind == "bool") { return td_named_mk("scalar", "bool"); }
 // <<< GEN:td_expr1 <<<
+    if (n.kind == "atom") { return td_named_mk("scalar", "atom"); }
+    if (n.kind == "fidconst") { return td_named_mk("scalar", "fid"); }
+    if (n.kind == "serialize") { return td_named_mk("scalar", "fid"); }
+    if (n.kind == "deserialize") { return deser_type_of(n.nb); }
     if (n.kind == "typeinfo") {
         return td_named_mk("typeinfo", n.sa);
     }
@@ -11212,7 +12735,7 @@ expr_type_desc fn(e: i64) -> i64 {
             if (cn == "file_exists") { return td_named_mk("scalar", "bool"); }
             if (cn == "str_slice") { return td_mk("string"); }
             if (cn == "sb_to_str") { return td_mk("string"); }
-            if (cn == "int_to_str") { return td_mk("string"); }
+            if (cn == "int_to_str" || cn == "i2s") { return td_mk("string"); }
             if (cn == "sb_new") { return td_named_mk("named", "TSb*"); }
             if (cn == "map_has") { return td_named_mk("scalar", "bool"); }
             if (cn == "map_del") { return td_named_mk("scalar", "bool"); }
@@ -11226,12 +12749,28 @@ expr_type_desc fn(e: i64) -> i64 {
             if (cn == "ti_kind") { return td_named_mk("scalar", "i64"); }
             if (cn == "ti_field_count") { return td_named_mk("scalar", "i64"); }
             if (cn == "fi_offset") { return td_named_mk("scalar", "i64"); }
+            if (cn == "fi_tag") { return td_named_mk("scalar", "i64"); }
             if (cn == "fi_type_size") { return td_named_mk("scalar", "i64"); }
             if (cn == "ti_field") { return td_named_mk("fieldinfo", "FieldInfo"); }
             if (cn == "fi_is_ptr") { return td_named_mk("scalar", "bool"); }
             if (cn == "sym_str") { return td_mk("string"); }
             if (cn == "sym_release") { return td_mk("void"); }
             if (cn == "sym_release_all") { return td_mk("void"); }
+            if (cn == "atom_str") { return td_mk("string"); }
+            if (cn == "fopen") { return td_named_mk("scalar", "fid"); }
+            if (cn == "fclose" || cn == "fflush" || cn == "fmt_register") { return td_mk("void"); }
+            if (cn == "fid_is_open") { return td_named_mk("scalar", "bool"); }
+            if (cn == "fid_eof") { return td_named_mk("scalar", "bool"); }
+            if (cn == "fid_format") { return td_named_mk("scalar", "atom"); }
+            if (cn == "fid_error") { return td_mk("string"); }
+            if (cn == "fseek") { return td_named_mk("scalar", "bool"); }
+            if (cn == "ftell") { return td_named_mk("scalar", "i64"); }
+            // 时间格式化（M56）/ 解析与固定时区（M57）
+            if (cn == "now" || cn == "time_invalid" || cn == "parse_time" || cn == "parse_time_local") { return td_named_mk("scalar", "i64"); }
+            if (cn == "format_time" || cn == "format_time_local" || cn == "format_time_tz") { return td_mk("string"); }
+            // 格式化（Python 格式规范迷你语言子集）
+            if (cn == "format_int" || cn == "format_uint" || cn == "format_float" || cn == "format_str" || cn == "format_bool" || cn == "format_char") { return td_mk("string"); }
+            if (cn == "sb_append_fmt_int" || cn == "sb_append_fmt_uint" || cn == "sb_append_fmt_float" || cn == "sb_append_fmt_str" || cn == "sb_append_fmt_bool" || cn == "sb_append_fmt_char") { return td_mk("void"); }
 // <<< GEN:td_calls <<<
             // map_get(m, k) 的返回类型 = 映射的 V（从首个实参的 map 类型反查）
             if (cn == "map_get" && n.la >= 0) {
@@ -11562,6 +13101,32 @@ var g_stmt_pad: string = "";   // 当前语句缩进（map 字面量作表达式
 var g_defer: [1024]i64;         // defer 延迟栈（节点索引），函数级、LIFO 于 return/函数尾运行
 var g_defer_n: i64 = 0;         // g_defer 栈顶计数
 
+// ── Atom 表（M50：Erlang 式原子）──────────────────────────────
+// 编译期 intern：名字 → 稳定 i64 id（等价 Erlang 原子表）。
+// 同一个名字两次 intern 返回相同 id，故 `:ok == :ok` 恒为真、`match` 按 id 分发。
+// 约定 0 为非原子（null 占位），故有效 id 从 1 起。
+var g_atom_names: []string;
+var g_atom_cnt: i64 = 0;
+atom_intern fn(name: string) -> i64 {
+    var i: i64 = 0;
+    while (i < g_atom_cnt) {
+        if (g_atom_names[i] == name) { return i + 1; }
+        i = i + 1;
+    }
+    append(g_atom_names, name);
+    g_atom_cnt = g_atom_cnt + 1;
+    return g_atom_cnt;
+}
+
+// fid_format(f) 会把这四个名字当返回值交给用户，必须保证它们进了原子表。
+// LLVM 后端的 @t_atom_table 先于函数体发射，因此只能在检查期调用本函数。
+fid_intern_fmt_atoms fn() -> void {
+    var t0: i64 = atom_intern("text");
+    var t1: i64 = atom_intern("json");
+    var t2: i64 = atom_intern("rawbin");
+    var t3: i64 = atom_intern("protobuf");
+}
+
 c_emit_map_lit fn(en: i64, mname: string, pad: string, keytd: i64, valtd: i64) -> void {
     var mlkk: i64 = 0;
     if (tds[keytd].cat != "string") { mlkk = 1; }
@@ -11669,6 +13234,141 @@ c_elem_ctype fn(slice_expr: i64) -> string {
     return "int64_t";
 }
 
+// ── fid 打开方式 / 格式的编译期编码（M51，双后端共用）─────────
+// mode / kind / fmt 形参已由 check_atom_arg 保证是白名单内的 atom 字面量，
+// 故发射期直接降为小整数码，运行时不必反查 atom 名表（也就不依赖名表内容）。
+fid_code_of fn(sel: string, v: string) -> i64 {
+    if (sel == "mode") {
+        if (v == "read") { return 0; }
+        if (v == "write") { return 1; }
+        if (v == "append") { return 2; }
+        if (v == "read_binary") { return 3; }
+        if (v == "write_binary") { return 4; }
+        return 5;
+    }
+    if (sel == "kind") {
+        if (v == "text") { return 0; }
+        return 1;
+    }
+    if (v == "text") { return 0; }
+    if (v == "json") { return 1; }
+    if (v == "rawbin") { return 2; }
+    return 3;
+}
+
+fid_arg_code fn(a: i64, sel: string) -> string {
+    if (a < 0) {
+        return "0";
+    }
+    var fan: Node = nodes[a];
+    return i2s(fid_code_of(sel, fan.sa));
+}
+
+// fid_format 返回 atom：运行时只知道格式码，atom id 作为**实参**传下去，
+// 无需全局预注册、不扰动既有 id 分配。
+// 入表动作在检查期由 fid_intern_fmt_atoms 完成（LLVM 的 @t_atom_table 先于函数体发射）；
+// 这里的 atom_intern 是幂等查表，只负责取回已分配的 id。
+fid_fmt_atom_args fn() -> string {
+    var a0: string = i2s(atom_intern("text"));
+    var a1: string = i2s(atom_intern("json"));
+    var a2: string = i2s(atom_intern("rawbin"));
+    var a3: string = i2s(atom_intern("protobuf"));
+    return sb_cat6(a0, ", ", a1, ", ", a2, sb_cat2(", ", a3));
+}
+
+// 同上，LLVM 调用点形态（每个实参都要带类型前缀）
+ll_fmt_atom_args fn() -> string {
+    var b0: string = i2s(atom_intern("text"));
+    var b1: string = i2s(atom_intern("json"));
+    var b2: string = i2s(atom_intern("rawbin"));
+    var b3: string = i2s(atom_intern("protobuf"));
+    return sb_cat6(b0, ", i64 ", b1, ", i64 ", b2, sb_cat3(", i64 ", b3, ")"));
+}
+
+// ── 序列化值分派（M51，双后端共用判定）───────────────────────
+// 返回选择子："str" | "atom" | "bool" | "f" | "i"。位宽/符号另由 ll_bits/ll_signed 取，
+// 因为 rawbin 格式要按静态位宽写定长小端字节 —— 判定必须编译期完成。
+ser_sel fn(td: i64) -> string {
+    if (td < 0) {
+        return "i";
+    }
+    var t: TD = tds[td];
+    if (t.cat == "string") {
+        return "str";
+    }
+    var sn: string = td_sname(td);
+    if (sn == "atom") {
+        return "atom";
+    }
+    if (sn == "bool") {
+        return "bool";
+    }
+    if (sn == "f16" || sn == "f32" || sn == "f64") {
+        return "f";
+    }
+    return "i";
+}
+
+// ── 反序列化（读路径，M52 读路径，Option B）：`fid > Type` 的右操作数是「类型」──
+// 把右操作数（类型表达式节点）解析为 TD，并判定读路径是否支持该类型。
+
+// 该节点是否由 parse_cmp 的 tok_type_only 分支（parse_type）产出 —— 即「一望即知是类型、
+// 不可能是值」的节点。用于左操作数非 fid 时给出准确诊断。
+node_type_only fn(nb: i64) -> bool {
+    if (nb < 0) { return false; }
+    var k: string = nodes[nb].kind;
+    return k == "scalar" || k == "map";
+}
+
+deser_type_of fn(nb: i64) -> i64 {
+    if (nb < 0) { return td_mk("unknown"); }
+    var n: Node = nodes[nb];
+    if (n.kind == "scalar") { return resolve_type_desc(nb); }   // 类型位置直接写 i64（少见）
+    if (n.kind == "paren")  { return deser_type_of(n.na); }
+    if (n.kind == "ident") {
+        var nm: string = n.sa;
+        if (nm == "string") { return td_mk("string"); }
+        if (nm == "bool")   { return td_named_mk("scalar", "bool"); }
+        if (nm == "atom")   { return td_named_mk("scalar", "atom"); }
+        if (nm == "fid")    { return td_named_mk("scalar", "fid"); }
+        if (is_int_name(nm) || is_float_name(nm)) { return td_named_mk("scalar", nm); }
+        // 命名类型（struct/enum/flag/variant/typealias）。注意**不能**用 tm_get ——
+        // 那是 emitter 的 typeMap，check 阶段尚未填充，会把已声明的类型误判成「不是类型」。
+        // check 阶段的权威来源是全局符号表里 kind == "type" 的条目。
+        var si: i64 = sym_lookup(global_scope, nm);
+        if (si >= 0) {
+            if (syms[si].kind == "type") { return td_named_mk("named", nm); }
+            return td_mk("unknown");                             // 是个值（变量/函数/常量），不是类型
+        }
+        var g: i64 = tm_get(nm);                                 // 发射期回退（此时符号表已释放）
+        if (g >= 0) { return g; }
+        return td_mk("unknown");
+    }
+    return resolve_type_desc(nb);                                // slice/array/map/func_type 等真正类型节点
+}
+
+// 读路径 v1 仅支持：标量数值 / bool / atom / string。聚合类型（struct/array/slice/map/pointer）读属 v2。
+deser_supported fn(td: i64) -> bool {
+    if (td < 0) { return false; }
+    var t: TD = tds[td];
+    if (t.cat == "string") { return true; }
+    if (t.cat == "scalar") {
+        var nm: string = td_sname(td);
+        if (nm == "fid") { return false; }     // 不能从文件读 fid 句柄
+        return nm == "atom" || nm == "bool" || is_int_name(nm) || is_float_name(nm);
+    }
+    return false;
+}
+
+// TD → TI（读路径结果类型为裸 T）。
+ti_from_td fn(td: i64) -> i64 {
+    if (td < 0) { return ti_mk("Unknown"); }
+    var t: TD = tds[td];
+    if (t.cat == "string") { return ti_mk("String"); }
+    if (t.cat == "scalar") { return ti_scalar(td_sname(td)); }
+    return ti_mk("Unknown");
+}
+
 emit_expr fn(e: i64) -> string {
     if (e < 0) {
         return "";
@@ -11691,6 +13391,48 @@ emit_expr fn(e: i64) -> string {
             return sb_cat2("0b", body);
         }
         return n.sa;
+    }
+    if (n.kind == "atom") {
+        if (n.ia <= 0) { n.ia = atom_intern(n.sa); slice_set(nodes, e, n); }
+        return i2s(n.ia);
+    }
+    // 内建 fid 常量（M51）：编译期常量 0/1/2，无运行时查找
+    if (n.kind == "fidconst") {
+        return i2s(n.ia);
+    }
+    // 序列化操作符（M51）：t_ser_* 一律**返回目标 fid**，故链式 `f < a < b`
+    // 直接落成嵌套调用 t_ser_x(t_ser_y(f, a), b)，无需临时量。
+    if (n.kind == "serialize") {
+        var sfid: string = emit_expr(n.na);
+        var sval: string = emit_expr(n.nb);
+        var std2: i64 = expr_type_desc(n.nb);
+        var ssel: string = ser_sel(std2);
+        if (ssel == "str") { return sb_cat5("t_ser_str(", sfid, ", ", sval, ")"); }
+        if (ssel == "atom") { return sb_cat5("t_ser_atom(", sfid, ", ", sval, ")"); }
+        if (ssel == "bool") { return sb_cat5("t_ser_bool(", sfid, ", ", sval, ")"); }
+        var sbits: string = i2s(ll_bits(td_sname(std2)));
+        if (ssel == "f") {
+            return sb_cat6("t_ser_f64(", sfid, ", ", sval, ", ", sb_cat2(sbits, ")"));
+        }
+        var ssgn: string = "0";
+        if (ll_signed(td_sname(std2))) { ssgn = "1"; }
+        return sb_cat6("t_ser_int(", sfid, ", ", sval, ", ", sb_cat4(sbits, ", ", ssgn, ")"));
+    }
+    // 反序列化（M52 读路径）：t_deser_* 返回裸 T 值；EOF/错误返默认值，调用方用 fid_eof 探测
+    if (n.kind == "deserialize") {
+        var dfid: string = emit_expr(n.na);
+        var dtd: i64 = deser_type_of(n.nb);
+        var dsel: string = ser_sel(dtd);
+        if (dsel == "str") { return sb_cat3("t_deser_str(", dfid, ")"); }
+        if (dsel == "atom") { return sb_cat3("t_deser_atom(", dfid, ")"); }
+        if (dsel == "bool") { return sb_cat3("t_deser_bool(", dfid, ")"); }
+        var dbits: string = i2s(get_bw(td_sname(dtd)));
+        if (dsel == "f") {
+            return sb_cat5("t_deser_f64(", dfid, ", ", dbits, ")");
+        }
+        var dsgn: string = "0";
+        if (ll_signed(td_sname(dtd))) { dsgn = "1"; }
+        return sb_cat6("t_deser_int(", dfid, ", ", dbits, ", ", sb_cat2(dsgn, ")"));
     }
     if (n.kind == "float") {
         return n.sa;
@@ -11868,7 +13610,7 @@ emit_expr fn(e: i64) -> string {
                 return sb_cat6("t_file_write_all(t_cstr(", av[0], "), ", av[1], ")", "");
             }
             if (cn == "args") { return "t_args()"; }
-            if (cn == "ti_name" || cn == "ti_size" || cn == "ti_kind" || cn == "ti_field_count" || cn == "ti_field" || cn == "fi_name" || cn == "fi_offset" || cn == "fi_type_name" || cn == "fi_type_size" || cn == "fi_is_ptr") {
+            if (cn == "ti_name" || cn == "ti_size" || cn == "ti_kind" || cn == "ti_field_count" || cn == "ti_field" || cn == "fi_name" || cn == "fi_offset" || cn == "fi_type_name" || cn == "fi_type_size" || cn == "fi_is_ptr" || cn == "fi_tag") {
                 return c_emit_accessor_call(cn, av);
             }
             if (cn == "exit") { return sb_cat3("t_exit(", av[0], ")"); }
@@ -11885,7 +13627,28 @@ emit_expr fn(e: i64) -> string {
             if (cn == "sb_append_u64") { return sb_cat5("t_sb_append_u64(", av[0], ", ", av[1], ")"); }
             if (cn == "sb_append_i64") { return sb_cat5("t_sb_append_i64(", av[0], ", ", av[1], ")"); }
             if (cn == "sb_to_str") { return sb_cat3("t_sb_to_str(", av[0], ")"); }
-            if (cn == "int_to_str") { return sb_cat3("t_int_to_str(", av[0], ")"); }
+            if (cn == "int_to_str" || cn == "i2s") { return sb_cat3("t_int_to_str(", av[0], ")"); }
+            // 格式化（Python 格式规范迷你语言子集）
+            if (cn == "format_int") { return sb_cat5("t_format_int(", av[0], ", ", av[1], ")"); }
+            if (cn == "format_uint") { return sb_cat5("t_format_uint(", av[0], ", (uint64_t)(", av[1], "))"); }
+            if (cn == "format_float") { return sb_cat5("t_format_float(", av[0], ", ", av[1], ")"); }
+            if (cn == "format_str") { return sb_cat5("t_format_str(", av[0], ", ", av[1], ")"); }
+            if (cn == "format_bool") { return sb_cat5("t_format_bool(", av[0], ", ", av[1], ")"); }
+            if (cn == "format_char") { return sb_cat5("t_format_char(", av[0], ", (uint8_t)(", av[1], "))"); }
+            // 时间格式化（M56）/ 解析与固定时区（M57）
+            if (cn == "format_time") { return sb_cat5("t_format_time(", av[0], ", ", av[1], ", 0)"); }
+            if (cn == "format_time_local") { return sb_cat5("t_format_time(", av[0], ", ", av[1], ", 1)"); }
+            if (cn == "format_time_tz") { return sb_cat6("t_format_time_tz(", av[0], ", ", av[1], ", (int64_t)(", sb_cat2(av[2], "))")); }
+            if (cn == "parse_time") { return sb_cat5("t_parse_time(", av[0], ", ", av[1], ", 0)"); }
+            if (cn == "parse_time_local") { return sb_cat5("t_parse_time(", av[0], ", ", av[1], ", 1)"); }
+            if (cn == "time_invalid") { return "INT64_MIN"; }
+            if (cn == "now") { return "t_now()"; }
+            if (cn == "sb_append_fmt_int") { return sb_cat6("t_sb_append_fmt_int(", av[0], ", ", av[1], ", ", sb_cat2(av[2], ")")); }
+            if (cn == "sb_append_fmt_uint") { return sb_cat6("t_sb_append_fmt_uint(", av[0], ", ", av[1], ", (uint64_t)(", sb_cat2(av[2], "))")); }
+            if (cn == "sb_append_fmt_float") { return sb_cat6("t_sb_append_fmt_float(", av[0], ", ", av[1], ", ", sb_cat2(av[2], ")")); }
+            if (cn == "sb_append_fmt_str") { return sb_cat6("t_sb_append_fmt_str(", av[0], ", ", av[1], ", ", sb_cat2(av[2], ")")); }
+            if (cn == "sb_append_fmt_bool") { return sb_cat6("t_sb_append_fmt_bool(", av[0], ", ", av[1], ", ", sb_cat2(av[2], ")")); }
+            if (cn == "sb_append_fmt_char") { return sb_cat6("t_sb_append_fmt_char(", av[0], ", ", av[1], ", (uint8_t)(", sb_cat2(av[2], "))")); }
             if (cn == "sb_clear") { return sb_cat3("t_sb_clear(", av[0], ")"); }
             if (cn == "map_new") {
                 var mnw0: i64 = -1;
@@ -11925,6 +13688,28 @@ emit_expr fn(e: i64) -> string {
             }
             if (cn == "sym_release") { return sb_cat3("t_sym_release(", av[0], ")"); }
             if (cn == "sym_release_all") { return "t_sym_release_all()"; }
+            if (cn == "atom_str") { return sb_cat3("t_atom_str(", av[0], ")"); }
+            // 文件描述符内建（M51）
+            if (cn == "fopen") {
+                return sb_cat5("t_fopen(t_cstr(", av[0], "), ",
+                    fid_arg_code(call_arg_node(e, 1), "mode"), ")");
+            }
+            if (cn == "fclose") { return sb_cat3("t_fclose(", av[0], ")"); }
+            if (cn == "fflush") { return sb_cat3("t_fflush(", av[0], ")"); }
+            if (cn == "fid_is_open") { return sb_cat3("t_fid_is_open(", av[0], ")"); }
+            if (cn == "fid_eof") { return sb_cat3("t_fid_eof(", av[0], ")"); }
+            if (cn == "fid_error") { return sb_cat3("t_fid_error(", av[0], ")"); }
+            if (cn == "fseek") { return sb_cat5("t_fseek(", av[0], ", ", av[1], ")"); }
+            if (cn == "ftell") { return sb_cat3("t_ftell(", av[0], ")"); }
+            if (cn == "fid_format") {
+                return sb_cat5("t_fid_format(", av[0], ", ",
+                    fid_fmt_atom_args(), ")");
+            }
+            if (cn == "fmt_register") {
+                return sb_cat6("t_fmt_register(", fid_arg_code(call_arg_node(e, 0), "kind"),
+                    ", t_cstr(", av[1], "), ",
+                    sb_cat2(fid_arg_code(call_arg_node(e, 2), "fmt"), ")"));
+            }
             // 间接调用：被调者是函数类型的变量/参数/全局，其值是 TClosure*，须解包成
             // `((Ret(*)(void*,A...))(f->fn))(f->env, args)`。顶层具名函数的直接调用
             // 不会命中（clos_callee_td 见到 "name()" 条目即返回 -1）。
@@ -13301,6 +15086,11 @@ emit_decl fn(d: i64) -> void {
         hpush(sb_cat3("#include \"", n.sb, "\""));
         return;
     }
+    if (n.kind == "ImportModDecl") {
+        // 模块导入（M-Module）：单文件 tc 不解析模块，发射期不产生任何 C 输出；
+        // 模块解析与头文件内联由 tote 构建层完成。
+        return;
+    }
     if (n.kind == "TypeAliasDecl") {
         hpush(sb_cat6("typedef ", emit_ctype(n.na), " ", n.sa, ";", ""));
         return;
@@ -13384,6 +15174,29 @@ emit_c_closures fn() -> void {
     }
 }
 
+// 全局 atom 名表（C 后端）：索引 0 为占位空串，其后按 g_atom_names 顺序；
+// 因 atom_intern 返回 1-based id，故 t_atom_table[id] 直接命中（index 0 不用）。
+// 运行时 t_atom_str(id) 经 extern 引用此表。无 atom 时也发射最小表以满足链接。
+emit_c_atom_table fn() -> void {
+    var cnt: i64 = g_atom_cnt;
+    var sb: StringBuilder = sb_new();
+    sb_append_str(sb, "TStr t_atom_table[] = { TSTR_LIT(\"\")");
+    var i: i64 = 0;
+    while (i < cnt) {
+        sb_append_str(sb, ", TSTR_LIT(\"");
+        sb_append_str(sb, esc_c(g_atom_names[i]));
+        sb_append_str(sb, "\")");
+        i = i + 1;
+    }
+    sb_append_str(sb, " };");
+    spush(sb_to_str(sb));
+    var sb2: StringBuilder = sb_new();
+    sb_append_str(sb2, "int64_t t_atom_count = ");
+    sb_append_i64(sb2, cnt + 1);
+    sb_append_str(sb2, ";");
+    spush(sb_to_str(sb2));
+}
+
 emit_unit fn(mod: string) -> void {
     var guard: string = sb_cat3("TC_", to_upper(mod), "_H");
     hpush(sb_cat2("#ifndef ", guard));
@@ -13412,6 +15225,8 @@ emit_unit fn(mod: string) -> void {
         emit_decl(decl_list[i]);
         i = i + 1;
     }
+
+    emit_c_atom_table();
 
     // type_info(T) 编译期常量（引用 StructDecl，须在类型定义后输出）
     var tln: i64 = slice_len(ti_lines) as i64;
@@ -13538,6 +15353,7 @@ var llsf_st: []string;     // struct 字段：名/字段/序号/td
 var llsf_fld: []string;
 var llsf_idx: []i64;
 var llsf_td: []i64;
+var llsf_tag: []i64;       // 字段 tagID（@N 显式 / 全显式时自动分配；解析后 ≥1）
 
 var llec_e: []string;      // enum 常量：类型名/成员名/值
 var llec_m: []string;
@@ -13991,6 +15807,7 @@ ll_build_reg fn() -> void {
                     append(llsf_idx, fi);
                     var ftd: i64 = resolve_type_desc(f.na);
                     append(llsf_td, ftd);
+                    append(llsf_tag, f.ib);   // 解析后的 tagID（全显式或全自动均已分配）
                     fi = fi + 1;
                 }
                 c = k.next;
@@ -14438,6 +16255,90 @@ emit_lle fn(e: i64) -> string {
             r = 10;
         }
         return i2s(js_parse_int(n.sa, r));
+    }
+    if (n.kind == "atom") {
+        if (n.ia <= 0) { n.ia = atom_intern(n.sa); slice_set(nodes, e, n); }
+        return i2s(n.ia);
+    }
+    // 内建 fid 常量（M51）：编译期常量 0/1/2
+    if (n.kind == "fidconst") {
+        return i2s(n.ia);
+    }
+    // 序列化操作符（M51）：@tll_ser_* 返回目标 fid（i64），链式即嵌套求值
+    if (n.kind == "serialize") {
+        var lsf: string = emit_lle(n.na);
+        var lstd: i64 = ll_etd(n.nb);
+        var lssel: string = ser_sel(lstd);
+        var lst: string = ll_tmp();
+        if (lssel == "str") {
+            var lsp: string = emit_lle(n.nb);
+            llfb(sb_cat6("  ", lst, " = call i64 @tll_ser_str(i64 ", lsf,
+                sb_cat3(", ptr ", lsp, ")"), ""));
+            return lst;
+        }
+        if (lssel == "atom") {
+            var lsa: string = emit_lle(n.nb);
+            llfb(sb_cat6("  ", lst, " = call i64 @tll_ser_atom(i64 ", lsf,
+                sb_cat3(", i64 ", lsa, ")"), ""));
+            return lst;
+        }
+        if (lssel == "bool") {
+            var lsb2: string = emit_lle(n.nb);
+            llfb(sb_cat6("  ", lst, " = call i64 @tll_ser_bool(i64 ", lsf,
+                sb_cat3(", i8 ", lsb2, ")"), ""));
+            return lst;
+        }
+        var lsbits: string = i2s(ll_bits(td_sname(lstd)));
+        if (lssel == "f") {
+            var lsfv: string = ll_cast_v(emit_lle(n.nb), lstd, td_named_mk("scalar", "f64"));
+            llfb(sb_cat6("  ", lst, " = call i64 @tll_ser_f64(i64 ", lsf,
+                sb_cat3(", double ", lsfv, ", i32 "), sb_cat2(lsbits, ")")));
+            return lst;
+        }
+        var lsiv: string = ll_cast_v(emit_lle(n.nb), lstd, td_named_mk("scalar", "i64"));
+        var lssgn: string = "0";
+        if (ll_signed(td_sname(lstd))) { lssgn = "1"; }
+        llfb(sb_cat6("  ", lst, " = call i64 @tll_ser_int(i64 ", lsf,
+            sb_cat3(", i64 ", lsiv, ", i32 "),
+            sb_cat4(lsbits, ", i32 ", lssgn, ")")));
+        return lst;
+    }
+    // 反序列化（M52 读路径，Option B）：tll_deser_* 返回裸 T 值；string 走 sret（ptr out）
+    if (n.kind == "deserialize") {
+        var ldf: string = emit_lle(n.na);
+        var ldtd: i64 = deser_type_of(n.nb);
+        var ldsel: string = ser_sel(ldtd);
+        if (ldsel == "str") {
+            var lout: string = ll_scratch("%TStr");
+            llfb(sb_cat5("  call void @tll_deser_str(i64 ", ldf, ", ptr ", lout, ")"));
+            return lout;
+        }
+        if (ldsel == "atom") {
+            var lat: string = ll_tmp();
+            llfb(sb_cat4("  ", lat, " = call i64 @tll_deser_atom(i64 ", sb_cat2(ldf, ")")));
+            return lat;
+        }
+        if (ldsel == "bool") {
+            var lbt: string = ll_tmp();
+            llfb(sb_cat4("  ", lbt, " = call i8 @tll_deser_bool(i64 ", sb_cat2(ldf, ")")));
+            return lbt;
+        }
+        // 运行时桥接统一以最宽标量返回（double / i64）—— 目标窄于它时必须显式收窄，
+        // 否则 `store i64 ... , ptr %v.b`（b: i8）是非法 IR。C 后端靠隐式转换，LLVM 不会。
+        if (ldsel == "f") {
+            var ldft: string = ll_tmp();
+            var ldbits: string = i2s(get_bw(td_sname(ldtd)));
+            llfb(sb_cat6("  ", ldft, " = call double @tll_deser_f64(i64 ", ldf,
+                ", i32 ", sb_cat2(ldbits, ")")));
+            return ll_cast_v(ldft, td_named_mk("scalar", "f64"), ldtd);
+        }
+        var lint: string = ll_tmp();
+        var lbits2: string = i2s(get_bw(td_sname(ldtd)));
+        var lsgn2: string = "0";
+        if (ll_signed(td_sname(ldtd))) { lsgn2 = "1"; }
+        llfb(sb_cat6("  ", lint, " = call i64 @tll_deser_int(i64 ", ldf,
+            sb_cat3(", i32 ", lbits2, ", i32 "), sb_cat2(lsgn2, ")")));
+        return ll_cast_v(lint, td_named_mk("scalar", "i64"), ldtd);
     }
     if (n.kind == "float") {
         // 确保带小数点（LLVM 浮点常量语法）
@@ -15366,7 +17267,7 @@ ll_call fn(e: i64) -> string {
         llfb(sb_cat6("  call void @tll_", cn, "(ptr ", p, ", ptr ", sb_cat2(out, ")")));
         return out;
     }
-    if (cn == "ti_size" || cn == "ti_kind" || cn == "ti_field_count" || cn == "fi_offset" || cn == "fi_type_size") {
+    if (cn == "ti_size" || cn == "ti_kind" || cn == "ti_field_count" || cn == "fi_offset" || cn == "fi_type_size" || cn == "fi_tag") {
         var p: string = emit_lle(ae[0]);
         var out: string = ll_tmp();
         llfb(sb_cat6("  ", out, " = call i64 @tll_", cn, "(ptr ", sb_cat2(p, ")")));
@@ -15457,12 +17358,137 @@ ll_call fn(e: i64) -> string {
         llfb(sb_cat3("  call void @tll_sb_clear(ptr ", bp4, ")"));
         return "0";
     }
-    if (cn == "int_to_str") {
+    if (cn == "int_to_str" || cn == "i2s") {
         var iv5: string = emit_lle(ae[0]);
         iv5 = ll_cast_v(iv5, ll_etd(ae[0]), td_i64);
         var out5: string = ll_scratch("%TStr");
         llfb(sb_cat6("  call void @tll_int_to_str(i64 ", iv5, ", ptr ", out5, ")", ""));
         return out5;
+    }
+    // 格式化（Python 格式规范迷你语言子集）
+    if (cn == "format_int") {
+        var spf: string = emit_lle(ae[0]);
+        var vvf: string = ll_cast_v(emit_lle(ae[1]), ll_etd(ae[1]), td_i64);
+        var outf: string = ll_scratch("%TStr");
+        llfb(sb_cat6("  call void @tll_format_int(ptr ", spf, ", i64 ", vvf, sb_cat3(", ptr ", outf, ")"), ""));
+        return outf;
+    }
+    // 时间格式化（M56）
+    if (cn == "format_time" || cn == "format_time_local") {
+        var sp: string = emit_lle(ae[0]);
+        var vt: string = ll_cast_v(emit_lle(ae[1]), ll_etd(ae[1]), td_i64);
+        var uloc: string = "0";
+        if (cn == "format_time_local") { uloc = "1"; }
+        var outt: string = ll_scratch("%TStr");
+        var call_s: string = sb_cat6("  call void @tll_format_time(ptr ", sp, ", i64 ", vt, ", i64 ", uloc);
+        call_s = sb_cat2(call_s, sb_cat3(", ptr ", outt, ")"));
+        llfb(call_s);
+        return outt;
+    }
+    if (cn == "format_time_tz") {
+        var tzsp: string = emit_lle(ae[0]);
+        var tzvt: string = ll_cast_v(emit_lle(ae[1]), ll_etd(ae[1]), td_i64);
+        var tzvz: string = ll_cast_v(emit_lle(ae[2]), ll_etd(ae[2]), td_i64);
+        var tzout: string = ll_scratch("%TStr");
+        var tzcall: string = sb_cat6("  call void @tll_format_time_tz(ptr ", tzsp, ", i64 ", tzvt, ", i64 ", tzvz);
+        tzcall = sb_cat2(tzcall, sb_cat3(", ptr ", tzout, ")"));
+        llfb(tzcall);
+        return tzout;
+    }
+    if (cn == "parse_time" || cn == "parse_time_local") {
+        var ptsp: string = emit_lle(ae[0]);
+        var ptss: string = emit_lle(ae[1]);
+        var ptloc: string = "0";
+        if (cn == "parse_time_local") { ptloc = "1"; }
+        var ptt: string = ll_tmp();
+        var ptcall: string = sb_cat6("  ", ptt, " = call i64 @tll_parse_time(ptr ", ptsp, ", ptr ", ptss);
+        ptcall = sb_cat3(ptcall, sb_cat3(", i64 ", ptloc, ")"), "");
+        llfb(ptcall);
+        return ptt;
+    }
+    // 解析失败哨兵：i64 最小值。纯常量，无需 runtime 符号，双后端同值。
+    if (cn == "time_invalid") { return "-9223372036854775808"; }
+    if (cn == "now") {
+        var now_t: string = ll_tmp();
+        llfb(sb_cat2("  ", sb_cat2(now_t, " = call i64 @tll_now()")));
+        return now_t;
+    }
+    if (cn == "format_uint") {
+        var spg: string = emit_lle(ae[0]);
+        var vvg: string = ll_cast_v(emit_lle(ae[1]), ll_etd(ae[1]), td_i64);
+        var outg: string = ll_scratch("%TStr");
+        llfb(sb_cat6("  call void @tll_format_uint(ptr ", spg, ", i64 ", vvg, sb_cat3(", ptr ", outg, ")"), ""));
+        return outg;
+    }
+    if (cn == "format_float") {
+        var sph: string = emit_lle(ae[0]);
+        var vvh: string = ll_cast_v(emit_lle(ae[1]), ll_etd(ae[1]), td_named_mk("scalar", "f64"));
+        var outh: string = ll_scratch("%TStr");
+        llfb(sb_cat6("  call void @tll_format_float(ptr ", sph, ", double ", vvh, sb_cat3(", ptr ", outh, ")"), ""));
+        return outh;
+    }
+    if (cn == "format_str") {
+        var spi: string = emit_lle(ae[0]);
+        var vvi: string = emit_lle(ae[1]);
+        var outi: string = ll_scratch("%TStr");
+        llfb(sb_cat6("  call void @tll_format_str(ptr ", spi, ", ptr ", vvi, sb_cat3(", ptr ", outi, ")"), ""));
+        return outi;
+    }
+    if (cn == "format_bool") {
+        var spj: string = emit_lle(ae[0]);
+        var vvj: string = ll_cast_v(emit_lle(ae[1]), ll_etd(ae[1]), td_named_mk("scalar", "bool"));
+        var outj: string = ll_scratch("%TStr");
+        llfb(sb_cat6("  call void @tll_format_bool(ptr ", spj, ", i8 ", vvj, sb_cat3(", ptr ", outj, ")"), ""));
+        return outj;
+    }
+    if (cn == "format_char") {
+        var spk: string = emit_lle(ae[0]);
+        var vvk: string = ll_cast_v(emit_lle(ae[1]), ll_etd(ae[1]), td_i64);
+        var outk: string = ll_scratch("%TStr");
+        llfb(sb_cat6("  call void @tll_format_char(ptr ", spk, ", i64 ", vvk, sb_cat3(", ptr ", outk, ")"), ""));
+        return outk;
+    }
+    if (cn == "sb_append_fmt_int") {
+        var bpf: string = emit_lle(ae[0]);
+        var spf2: string = emit_lle(ae[1]);
+        var vvf2: string = ll_cast_v(emit_lle(ae[2]), ll_etd(ae[2]), td_i64);
+        llfb(sb_cat6("  call void @tll_sb_append_fmt_int(ptr ", bpf, ", ptr ", spf2, ", i64 ", sb_cat2(vvf2, ")")));
+        return "0";
+    }
+    if (cn == "sb_append_fmt_uint") {
+        var bpg: string = emit_lle(ae[0]);
+        var spg2: string = emit_lle(ae[1]);
+        var vvg2: string = ll_cast_v(emit_lle(ae[2]), ll_etd(ae[2]), td_i64);
+        llfb(sb_cat6("  call void @tll_sb_append_fmt_uint(ptr ", bpg, ", ptr ", spg2, ", i64 ", sb_cat2(vvg2, ")")));
+        return "0";
+    }
+    if (cn == "sb_append_fmt_float") {
+        var bph: string = emit_lle(ae[0]);
+        var sph2: string = emit_lle(ae[1]);
+        var vvh2: string = ll_cast_v(emit_lle(ae[2]), ll_etd(ae[2]), td_named_mk("scalar", "f64"));
+        llfb(sb_cat6("  call void @tll_sb_append_fmt_float(ptr ", bph, ", ptr ", sph2, ", double ", sb_cat2(vvh2, ")")));
+        return "0";
+    }
+    if (cn == "sb_append_fmt_str") {
+        var bpi: string = emit_lle(ae[0]);
+        var spi2: string = emit_lle(ae[1]);
+        var vvi2: string = emit_lle(ae[2]);
+        llfb(sb_cat6("  call void @tll_sb_append_fmt_str(ptr ", bpi, ", ptr ", spi2, ", ptr ", sb_cat2(vvi2, ")")));
+        return "0";
+    }
+    if (cn == "sb_append_fmt_bool") {
+        var bpj: string = emit_lle(ae[0]);
+        var spj2: string = emit_lle(ae[1]);
+        var vvj2: string = ll_cast_v(emit_lle(ae[2]), ll_etd(ae[2]), td_named_mk("scalar", "bool"));
+        llfb(sb_cat6("  call void @tll_sb_append_fmt_bool(ptr ", bpj, ", ptr ", spj2, ", i8 ", sb_cat2(vvj2, ")")));
+        return "0";
+    }
+    if (cn == "sb_append_fmt_char") {
+        var bpk: string = emit_lle(ae[0]);
+        var spk2: string = emit_lle(ae[1]);
+        var vvk2: string = ll_cast_v(emit_lle(ae[2]), ll_etd(ae[2]), td_i64);
+        llfb(sb_cat6("  call void @tll_sb_append_fmt_char(ptr ", bpk, ", ptr ", spk2, ", i64 ", sb_cat2(vvk2, ")")));
+        return "0";
     }
     if (cn == "map_new") {
         var mtd2: i64 = ll_etd(ae[0]);
@@ -15537,6 +17563,78 @@ ll_call fn(e: i64) -> string {
     }
     if (cn == "sym_release_all") {
         llfb("  call void @tll_sym_release_all()");
+        return "0";
+    }
+    if (cn == "atom_str") {
+        var as_id: string = emit_lle(ae[0]);
+        var as_out: string = ll_scratch("%TStr");
+        llfb(sb_cat6("  call void @tll_atom_str(i64 ", as_id, ", ptr ", as_out, ")", ""));
+        return as_out;
+    }
+    // ── 文件描述符内建（M51）──────────────────────────────────
+    if (cn == "fopen") {
+        var fo_p: string = emit_lle(ae[0]);
+        var fo_t: string = ll_tmp();
+        llfb(sb_cat6("  ", fo_t, " = call i64 @tll_fopen(ptr ", fo_p, ", i32 ",
+            sb_cat2(fid_arg_code(ae[1], "mode"), ")")));
+        return fo_t;
+    }
+    if (cn == "fclose" || cn == "fflush") {
+        var fc_f: string = emit_lle(ae[0]);
+        var fc_n: string = "@tll_fclose";
+        if (cn == "fflush") { fc_n = "@tll_fflush"; }
+        llfb(sb_cat5("  call void ", fc_n, "(i64 ", fc_f, ")"));
+        return "0";
+    }
+    if (cn == "fid_is_open") {
+        var fio_f: string = emit_lle(ae[0]);
+        var fio_t: string = ll_tmp();
+        llfb(sb_cat4("  ", fio_t, " = call i32 @tll_fid_is_open(i64 ", sb_cat2(fio_f, ")")));
+        var fio_b: string = ll_tmp();
+        llfb(sb_cat4("  ", fio_b, " = trunc i32 ", sb_cat2(fio_t, " to i8")));
+        return fio_b;
+    }
+    if (cn == "fid_eof") {
+        var feo_f: string = emit_lle(ae[0]);
+        var feo_t: string = ll_tmp();
+        llfb(sb_cat4("  ", feo_t, " = call i32 @tll_fid_eof(i64 ", sb_cat2(feo_f, ")")));
+        var feo_b: string = ll_tmp();
+        llfb(sb_cat4("  ", feo_b, " = trunc i32 ", sb_cat2(feo_t, " to i8")));
+        return feo_b;
+    }
+    if (cn == "fid_error") {
+        var fe_f: string = emit_lle(ae[0]);
+        var fe_out: string = ll_scratch("%TStr");
+        llfb(sb_cat5("  call void @tll_fid_error(i64 ", fe_f, ", ptr ", fe_out, ")"));
+        return fe_out;
+    }
+    if (cn == "fseek") {
+        var fsk_f: string = emit_lle(ae[0]);
+        var fsk_o: string = emit_lle(ae[1]);
+        var fsk_t: string = ll_tmp();
+        llfb(sb_cat6("  ", fsk_t, " = call i32 @tll_fseek(i64 ", fsk_f, ", i64 ",
+            sb_cat2(fsk_o, ")")));
+        var fsk_b: string = ll_tmp();
+        llfb(sb_cat4("  ", fsk_b, " = trunc i32 ", sb_cat2(fsk_t, " to i8")));
+        return fsk_b;
+    }
+    if (cn == "ftell") {
+        var ftl_f: string = emit_lle(ae[0]);
+        var ftl_t: string = ll_tmp();
+        llfb(sb_cat4("  ", ftl_t, " = call i64 @tll_ftell(i64 ", sb_cat2(ftl_f, ")")));
+        return ftl_t;
+    }
+    if (cn == "fid_format") {
+        var ff_f: string = emit_lle(ae[0]);
+        var ff_t: string = ll_tmp();
+        llfb(sb_cat6("  ", ff_t, " = call i64 @tll_fid_format(i64 ", ff_f, ", i64 ",
+            ll_fmt_atom_args()));
+        return ff_t;
+    }
+    if (cn == "fmt_register") {
+        var fr_s: string = emit_lle(ae[1]);
+        llfb(sb_cat6("  call void @tll_fmt_register(i32 ", fid_arg_code(ae[0], "kind"),
+            ", ptr ", fr_s, ", i32 ", sb_cat2(fid_arg_code(ae[2], "fmt"), ")")));
         return "0";
     }
     if (cn == "flag_get" || cn == "flag_set") {
@@ -16504,6 +18602,23 @@ emit_lldeclares fn() -> void {
     llph("declare void @tll_sb_append_i64(ptr, i64)");
     llph("declare void @tll_sb_to_str(ptr, ptr)");
     llph("declare void @tll_int_to_str(i64, ptr)");
+    // 格式化（Python 格式规范迷你语言子集）
+    llph("declare void @tll_format_int(ptr, i64, ptr)");
+    llph("declare void @tll_format_time(ptr, i64, i64, ptr)");
+    llph("declare void @tll_format_time_tz(ptr, i64, i64, ptr)");
+    llph("declare i64 @tll_parse_time(ptr, ptr, i64)");
+    llph("declare i64 @tll_now()");
+    llph("declare void @tll_format_uint(ptr, i64, ptr)");
+    llph("declare void @tll_format_float(ptr, double, ptr)");
+    llph("declare void @tll_format_str(ptr, ptr, ptr)");
+    llph("declare void @tll_format_bool(ptr, i8, ptr)");
+    llph("declare void @tll_format_char(ptr, i64, ptr)");
+    llph("declare void @tll_sb_append_fmt_int(ptr, ptr, i64)");
+    llph("declare void @tll_sb_append_fmt_uint(ptr, ptr, i64)");
+    llph("declare void @tll_sb_append_fmt_float(ptr, ptr, double)");
+    llph("declare void @tll_sb_append_fmt_str(ptr, ptr, ptr)");
+    llph("declare void @tll_sb_append_fmt_bool(ptr, ptr, i8)");
+    llph("declare void @tll_sb_append_fmt_char(ptr, ptr, i64)");
     llph("declare void @tll_sb_clear(ptr)");
     llph("declare void @tll_slice_new(i64, ptr)");
     llph("declare void @tll_slice_append(ptr, ptr, i64)");
@@ -16528,6 +18643,29 @@ emit_lldeclares fn() -> void {
     llph("declare void @tll_sym_str(ptr, i32, ptr)");
     llph("declare void @tll_sym_release(ptr)");
     llph("declare void @tll_sym_release_all()");
+    // Atom：全局符号表（编译期 intern 的稳定 i64 id → 名字还原）
+    llph("declare void @tll_atom_str(i64, ptr)");
+    // Fid：文件描述符句柄 + 序列化操作符（M51）。ser_* 一律返回目标 fid 以支持链式。
+    llph("declare i64 @tll_fopen(ptr, i32)");
+    llph("declare void @tll_fclose(i64)");
+    llph("declare void @tll_fflush(i64)");
+    llph("declare i32 @tll_fid_is_open(i64)");
+    llph("declare void @tll_fid_error(i64, ptr)");
+    llph("declare i32 @tll_fid_eof(i64)");
+    llph("declare i32 @tll_fseek(i64, i64)");
+    llph("declare i64 @tll_ftell(i64)");
+    llph("declare i64 @tll_fid_format(i64, i64, i64, i64, i64)");
+    llph("declare void @tll_fmt_register(i32, ptr, i32)");
+    llph("declare i64 @tll_ser_int(i64, i64, i32, i32)");
+    llph("declare i64 @tll_ser_f64(i64, double, i32)");
+    llph("declare i64 @tll_ser_bool(i64, i8)");
+    llph("declare i64 @tll_ser_atom(i64, i64)");
+    llph("declare i64 @tll_ser_str(i64, ptr)");
+    llph("declare i64 @tll_deser_int(i64, i32, i32)");
+    llph("declare double @tll_deser_f64(i64, i32)");
+    llph("declare i8 @tll_deser_bool(i64)");
+    llph("declare i64 @tll_deser_atom(i64)");
+    llph("declare void @tll_deser_str(i64, ptr)");
     // type_info accessor 内建（M36）
     llph("declare void @tll_ti_name(ptr, ptr)");
     llph("declare i64 @tll_ti_size(ptr)");
@@ -16536,6 +18674,7 @@ emit_lldeclares fn() -> void {
     llph("declare ptr @tll_ti_field(ptr, i64)");
     llph("declare void @tll_fi_name(ptr, ptr)");
     llph("declare i64 @tll_fi_offset(ptr)");
+    llph("declare i64 @tll_fi_tag(ptr)");
     llph("declare void @tll_fi_type_name(ptr, ptr)");
     llph("declare i64 @tll_fi_type_size(ptr)");
     llph("declare i8 @tll_fi_is_ptr(ptr)");
@@ -16686,6 +18825,43 @@ emit_ll_closures fn() -> void {
     }
 }
 
+// 全局 atom 名表（LLVM 后端）：@t_atom_table = [M x %TStr]，index 0 占位空串，
+// 其后按 g_atom_names 顺序；atom_intern 返回 1-based id → t_atom_table[id] 命中。
+// `global`（外部链接）以便 C 运行时 t_atom_str 经 extern 链接此表。无 atom 时也发射最小表。
+emit_ll_atom_table fn() -> void {
+    var cnt: i64 = g_atom_cnt;
+    // 数组常量的元素必须是内联 %TStr 结构常量，不能用 @.tsN（那是指针）。
+    // ll_strlit 会把字节常量写进全局区，并把该串的 @.sN / 长度留在 ll_last_*。
+    var elems: StringBuilder = sb_new();
+    var dummy: string = ll_strlit("");
+    sb_append_str(elems, "%TStr { ptr ");
+    sb_append_str(elems, ll_last_sref);
+    sb_append_str(elems, ", i64 ");
+    sb_append_i64(elems, ll_last_slen);
+    sb_append_str(elems, " }");
+    var i: i64 = 0;
+    while (i < cnt) {
+        var ts: string = ll_strlit(g_atom_names[i]);
+        sb_append_str(elems, ", %TStr { ptr ");
+        sb_append_str(elems, ll_last_sref);
+        sb_append_str(elems, ", i64 ");
+        sb_append_i64(elems, ll_last_slen);
+        sb_append_str(elems, " }");
+        i = i + 1;
+    }
+    var sb: StringBuilder = sb_new();
+    sb_append_str(sb, "@t_atom_table = global [");
+    sb_append_i64(sb, cnt + 1);
+    sb_append_str(sb, " x %TStr] [ ");
+    sb_append_str(sb, sb_to_str(elems));
+    sb_append_str(sb, " ]");
+    llpg(sb_to_str(sb));
+    var sb2: StringBuilder = sb_new();
+    sb_append_str(sb2, "@t_atom_count = global i64 ");
+    sb_append_i64(sb2, cnt + 1);
+    llpg(sb_to_str(sb2));
+}
+
 emit_llunit fn(mod: string) -> void {
     build_type_map();
     ll_build_reg();
@@ -16695,12 +18871,13 @@ emit_llunit fn(mod: string) -> void {
     // 函数值的统一表示（FuncType v2 / M47）：{ 函数指针, 环境指针 }
     llph("%TClosure = type { ptr, ptr }");
     // type_info(T) 常量结构（M36）
-    llph("%TFieldInfo = type { %TStr, i64, %TStr, i64, i8 }");
+    llph("%TFieldInfo = type { %TStr, i64, %TStr, i64, i8, i64 }");
     llph("%TTypeInfo = type { %TStr, i64, i64, i64, %TSlice }");
     emit_lltypes();
     llph("");
     emit_lldeclares();
     emit_llglobals();
+    emit_ll_atom_table();
     emit_llginit();
 
     var n: i64 = slice_len(decl_list) as i64;
@@ -16934,6 +19111,7 @@ main fn() -> i32 @main {
         flag_pass();
         ann_pass();
         if (has_errors()) {
+            print_json();
             return 1;
         }
 
@@ -17057,6 +19235,7 @@ main fn() -> i32 @main {
         flag_pass();
         ann_pass();
         if (has_errors()) {
+            print_json();
             return 1;
         }
 
@@ -17208,6 +19387,8 @@ emit_type_info_c fn(tname: string) -> string {
             sb_append_str(fsb, sb_cat3("TSTR_LIT(\"", esc_c(td_readable(ftd)), "\"), "));
             sb_append_str(fsb, sb_cat3("sizeof(", cty, "), "));
             sb_append_i64(fsb, isp);
+            sb_append_str(fsb, ", ");
+            sb_append_i64(fsb, f.ib);   // 字段 tagID（@N 显式 / 全自动自动分配）
             sb_append_str(fsb, " }");
             n = n + 1;
         }
@@ -17290,6 +19471,8 @@ emit_type_info_ll fn(tname: string) -> string {
             sb_append_str(fsb, ll_sizeof(ll_td(ftd)));
             sb_append_str(fsb, ", i8 ");
             sb_append_i64(fsb, isp);
+            sb_append_str(fsb, ", i64 ");
+            sb_append_i64(fsb, llsf_tag[j]);   // 字段 tagID（@N 显式 / 全自动自动分配）
             sb_append_str(fsb, " }");
             i = i + 1;
         }

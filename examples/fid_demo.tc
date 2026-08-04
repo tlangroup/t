@@ -1,0 +1,105 @@
+// fid：文件描述符 + 序列化操作符 `<` 演示
+//
+// 类型： fid（64 位标量，LLVM=i64 / C=int64_t），句柄本身即整数下标。
+// 常量： stdin / stdout / stderr —— 内建保留标识符，恒为 0 / 1 / 2。
+// 操作符：`<` 在左操作数静态类型为 fid 时是**序列化**，否则仍是小于比较。
+//         序列化返回目标 fid，因此 `f < a < b` 左结合地落成嵌套调用，无临时量。
+// 格式： 在 fopen 时按 (打开方式类别, 文件后缀) 查注册表一次性解析并冻结进句柄。
+//         文本类默认 text，.json → json；二进制类默认 rawbin，.pb → protobuf。
+//         后缀挂靠可用 fmt_register(:text|:binary, "后缀", :格式) 动态注册（后注册覆盖先注册）。
+
+pr fn(label: string, v: i64) -> void {
+    var b: StringBuilder = sb_new();
+    sb_append_str(b, label);
+    sb_append_i64(b, v);
+    println(sb_to_str(b));
+}
+
+// 链式写出：每一步都返回同一个目标 fid
+row fn(f: fid, k: string, v: i64) -> fid {
+    return f < k < "=" < v < "\n";
+}
+
+@main
+main fn() -> i64 {
+    // ── 1. 标准流：直接把值写到 stdout ──────────────────────────
+    stdout < "-- 1. stdout --\n";
+    stdout < "str/" < 42 < "/" < 3.5 < "/" < true < "/" < :ok < "\n";
+
+    // 链式与函数返回值都能当左操作数
+    row(stdout, "n", 7);
+    row(row(stdout, "a", 1), "b", 2);
+
+    // stderr 同样可写（不参与 stdout 比对）
+    stderr < "(this line goes to stderr)\n";
+
+    // ── 2. 文本文件：后缀无挂靠 → text 格式 ─────────────────────
+    println("-- 2. text file --");
+    var f: fid = fopen("out/_fid_demo.txt", :write);
+    if (fid_is_open(f)) {
+        f < "hello\n" < "n=" < 7 < "\n" < "pi=" < 3.5 < "\n";
+        fclose(f);
+        print(file_read_all("out/_fid_demo.txt"));
+    } else {
+        println("open failed");
+    }
+
+    // ── 3. .json 后缀 → json 格式 ───────────────────────────────
+    // json 是**值编码器**：string / atom 编成带引号且转义的 JSON 串，
+    // 数字与 bool 裸写。注意它没有「原样输出结构字符」的口子——
+    // 手写 `{` 也会被当成一个字符串值编成 "{"。
+    // 文档级结构留给后续的聚合序列化（@derive），v1 不做。
+    println("-- 3. json file --");
+    var j: fid = fopen("out/_fid_demo.json", :write);
+    j < "he said \"hi\"\n";        // 引号与换行都被转义
+    j < 12 < true < :ready;        // 数字/bool 裸写，atom 当串
+    fclose(j);
+    println(file_read_all("out/_fid_demo.json"));
+
+    // ── 4. 二进制：rawbin 定长小端 + 8 字节长度前缀的 string ─────
+    println("-- 4. rawbin --");
+    var b: fid = fopen("out/_fid_demo.bin", :write_binary);
+    b < 1;              // i64 → 8 字节小端
+    b < true;           // bool → 1 字节
+    b < "ab";           // string → 8 字节长度 + 2 字节内容
+    fclose(b);
+    pr("bin bytes    = ", str_len(file_read_all("out/_fid_demo.bin")) as i64);
+
+    // ── 5. 后缀挂靠注册：把二进制类的 .dat 也挂到 rawbin ────────
+    println("-- 5. fmt_register --");
+    fmt_register(:binary, "dat", :rawbin);
+    var d: fid = fopen("out/_fid_demo.dat", :write_binary);
+    d < 255;
+    println(atom_str(fid_format(d)));
+    fclose(d);
+
+    // ── 6. 查询格式：fid_format 返回 atom ───────────────────────
+    println("-- 6. fid_format --");
+    println(atom_str(fid_format(stdout)));
+    var t2: fid = fopen("out/_fid_demo2.json", :write);
+    println(atom_str(fid_format(t2)));
+    fclose(t2);
+    var t3: fid = fopen("out/_fid_demo3.pb", :write_binary);
+    println(atom_str(fid_format(t3)));
+    fclose(t3);
+
+    // ── 7. 句柄语义：无序、可判等、可转 i64 ─────────────────────
+    println("-- 7. handle --");
+    if (stdout == stdout) { println("stdout == stdout => true"); }
+    if (stdout != stderr) { println("stdout != stderr => true"); }
+    pr("stdin  id    = ", stdin as i64);
+    pr("stdout id    = ", stdout as i64);
+    pr("stderr id    = ", stderr as i64);
+
+    // 关闭后 fid_is_open 为假
+    var c: fid = fopen("out/_fid_demo4.txt", :write);
+    c < "x";
+    fclose(c);
+    if (fid_is_open(c)) { println("closed? still open"); } else { println("closed? yes"); }
+
+    // 打开失败返回 -1（目录不存在），用 fid_is_open 显式检测
+    var bad: fid = fopen("out/_no_such_dir_/x.txt", :read);
+    if (fid_is_open(bad)) { println("bad open? opened"); } else { println("bad open? failed"); }
+
+    return 0;
+}

@@ -1,0 +1,188 @@
+// agent_edge.tc —— Agent「Edge 边界」三例：感知体 / 工具体 / 玩家体
+//
+// 演示 docs/agent_first.md §6 / docs/reference.md §3.12 分类矩阵里三个
+// **纯模式（🔵，现有语法可写）** 的 Edge 体。它们与 Mind Agent（心智体，见
+// agent_npc.tc）同构：差别只在 Edge 边界接什么——Sensor 接“环境/感知”，
+// Tool 接“外部工具/IO”，Player 接“人类输入”。三种内部 step 都是纯函数、确定性。
+//
+// 通用模式（边界效应模型，Style B）：
+//   step 永不直接碰外部世界，只更新状态并记“意图”字段（pending: atom）；
+//   真正的 读世界 / 调工具 / 读人类输入 都发生在运行时边界（drive_*），
+//   结果以消息回填给 step。非确定性只活在边界，核心逻辑可回放、可单测。
+//
+// ⚠ C 后端安全写法（与 agent_npc.tc 一致）：
+//   - step 用 if/else 原地更新后 return s（C 后端不支持 match 返回结构体字面量）；
+//   - 字符串不可 + 拼接，一律 StringBuilder；
+//   - 不依赖 atom_str（其名表发射某些上下文不稳定），atom 用 match 解释。
+
+// ───────────────────────── 感知体 Sensor Agent ─────────────────────────
+// 雷达：contacts(探测到的邻近实体数) + range(量程) + pending(:none/:sense)。
+// Edge=Env·感知：step 只记“要读世界”的意图，边界去读环境、把探测结果写回状态。
+Radar agent {
+    state contacts: i64;
+    state range: i64;
+    state pending: atom;          // :none=空闲  :sense=等待读世界
+    step fn(s: RadarState, msg: atom) -> RadarState {
+        if (msg == :scan)       { s.pending = :sense; return s; }   // 记意图：要读世界
+        if (msg == :sense_done) { s.pending = :none;  return s; }   // 边界已写入，清空意图
+        return s;
+    }
+}
+
+// ───────────────────────── 工具体 Tool Agent ─────────────────────────
+// 数据库查询员：last_query + last_result + pending(:none/:tool)。
+// Edge=Tool/IO：step 只记“要查库”的意图，边界去调外部工具、把结果写回状态。
+DbAgent agent {
+    state last_query: string;
+    state last_result: string;
+    state pending: atom;          // :none=空闲  :tool=等待工具返回
+    step fn(s: DbAgentState, msg: atom) -> DbAgentState {
+        if (msg == :query)     { s.pending = :tool;  return s; }    // 记意图：要查库
+        if (msg == :tool_done) { s.pending = :none;  return s; }    // 边界已回填，清空意图
+        return s;
+    }
+}
+
+// ───────────────────────── 玩家体 Player Agent ─────────────────────────
+// 玩家英雄：hp + stamina。Edge=Human：消息直接来自人类输入（无 LLM / 无工具边界）。
+// 与 State Agent 的区别不在内部逻辑，而在“消息源”=人类 input 事件。
+Hero agent {
+    state hp: i64;
+    state stamina: i64;
+    step fn(s: HeroState, cmd: atom) -> HeroState {
+        if (cmd == :move)   { s.stamina = s.stamina - 5;                 return s; }
+        if (cmd == :attack) { s.hp = s.hp - 2;      s.stamina = s.stamina - 8; return s; }
+        if (cmd == :rest)   { s.hp = s.hp + 5;      s.stamina = s.stamina + 10; return s; }
+        return s;
+    }
+}
+
+// ───────────────────────── 运行时边界：工具 / 环境（声明即契约） ─────────────────────────
+// 真实项目里这些是网络/IO/人类事件，属非确定性接缝；此处用确定性桩便于演示与回放。
+
+// 感知边界：返回“当前环境里探测到的实体数”（这里用参数模拟一次环境采样）。
+sense_world fn(nearby: i64) -> i64 { return nearby; }
+
+// 工具边界：确定性假数据库，按关键字返回结果串。
+fake_db fn(sql: string) -> string {
+    return match (sql) {
+        "balance" => "balance=42"
+        "orders"  => "orders=7"
+        _         => "unknown query"
+    };
+}
+
+// atom 意图 -> 可读标签（演示消息/意图即 atom，可穷尽匹配解释）。
+edge_label fn(p: atom) -> string {
+    return match (p) {
+        :none  => "idle"
+        :sense => "await-sense"
+        :tool  => "await-tool"
+        _      => "?"
+    };
+}
+
+// ───────────────────────── 驱动（边界编排） ─────────────────────────
+
+// Sensor 边界：记意图 -> 读世界(写入 contacts) -> 回填清空意图。
+drive_radar fn(s: RadarState, nearby: i64) -> RadarState {
+    s = radar_step(s, :scan);                 // 核心 step：记 pending=:sense
+    if (s.pending == :sense) {
+        var n: i64 = sense_world(nearby);     // ← 边界：读世界（非确定性接缝）
+        s.contacts = n;                       // 把感知结果写回状态
+        s = radar_step(s, :sense_done);       // 回填，清空意图
+    }
+    return s;
+}
+
+// Tool 边界：记意图 -> 调工具(写入 last_result) -> 回填清空意图。
+drive_db fn(s: DbAgentState, sql: string) -> DbAgentState {
+    s.last_query = sql;
+    s = db_agent_step(s, :query);             // 核心 step：记 pending=:tool
+    if (s.pending == :tool) {
+        var res: string = fake_db(sql);       // ← 边界：调外部工具（非确定性接缝）
+        s.last_result = res;                  // 把工具结果写回状态
+        s = db_agent_step(s, :tool_done);     // 回填，清空意图
+    }
+    return s;
+}
+
+// Player 边界：人类 input 事件直接作为消息喂给 step（无 LLM/工具，消息源=人类）。
+drive_hero fn(s: HeroState, human_cmd: atom) -> HeroState {
+    return hero_step(s, human_cmd);           // 人类输入即消息，直达核心 step
+}
+
+// ───────────────────────── 展示 ─────────────────────────
+radar_line fn(tag: string, contacts: i64, range: i64, pending: atom) -> void {
+    var b: StringBuilder = sb_new();
+    sb_append_str(b, tag);
+    sb_append_str(b, " contacts=");
+    sb_append_i64(b, contacts);
+    sb_append_str(b, " range=");
+    sb_append_i64(b, range);
+    sb_append_str(b, " pending=");
+    sb_append_str(b, edge_label(pending));
+    println(sb_to_str(b));
+}
+
+db_line fn(tag: string, query: string, result: string, pending: atom) -> void {
+    var b: StringBuilder = sb_new();
+    sb_append_str(b, tag);
+    sb_append_str(b, " query=");
+    sb_append_str(b, query);
+    sb_append_str(b, " result=");
+    sb_append_str(b, result);
+    sb_append_str(b, " pending=");
+    sb_append_str(b, edge_label(pending));
+    println(sb_to_str(b));
+}
+
+hero_line fn(tag: string, hp: i64, stamina: i64) -> void {
+    var b: StringBuilder = sb_new();
+    sb_append_str(b, tag);
+    sb_append_str(b, " hp=");
+    sb_append_i64(b, hp);
+    sb_append_str(b, " stamina=");
+    sb_append_i64(b, stamina);
+    println(sb_to_str(b));
+}
+
+@main
+main fn() -> i64 {
+    println("=== Sensor Agent: Radar (Core x Env·感知, 边界读世界) ===");
+    var r: RadarState = radar_spawn(0, 50, :none);
+    radar_line("spawn            ->", r.contacts, r.range, r.pending);
+    r = drive_radar(r, 3);                     // 边界读世界：探到 3 个实体
+    radar_line("after scan(near3)->", r.contacts, r.range, r.pending);
+    r = drive_radar(r, 7);                     // 再次扫描：量程内 7 个
+    radar_line("after scan(near7)->", r.contacts, r.range, r.pending);
+
+    println("");
+    println("=== Tool Agent: DbAgent (Core x Tool/IO, 边界调工具) ===");
+    var d: DbAgentState = db_agent_spawn("", "", :none);
+    db_line("spawn            ->", d.last_query, d.last_result, d.pending);
+    d = drive_db(d, "balance");                // 边界查库
+    db_line("after query(bal) ->", d.last_query, d.last_result, d.pending);
+    d = drive_db(d, "orders");                 // 边界查库
+    db_line("after query(ord) ->", d.last_query, d.last_result, d.pending);
+
+    println("");
+    println("=== Player Agent: Hero (Core x Human, 消息源=人类输入) ===");
+    var h: HeroState = hero_spawn(100, 50);
+    hero_line("spawn         ->", h.hp, h.stamina);
+    h = drive_hero(h, :move);                  // 人类按下“移动”
+    hero_line("after :move   ->", h.hp, h.stamina);
+    h = drive_hero(h, :attack);                // 人类按下“攻击”
+    hero_line("after :attack ->", h.hp, h.stamina);
+    h = drive_hero(h, :rest);                  // 人类按下“休息”
+    hero_line("after :rest   ->", h.hp, h.stamina);
+
+    println("");
+    println("=== 确定性回放：Edge 体的核心 step 与对应 Mind 体同构，可单测/可回放 ===");
+    var r2: RadarState = radar_spawn(0, 50, :none);
+    r2 = drive_radar(r2, 3);
+    r2 = drive_radar(r2, 7);
+    radar_line("replay radar    ->", r2.contacts, r2.range, r2.pending);
+
+    return 0;
+}

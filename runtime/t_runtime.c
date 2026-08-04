@@ -8,6 +8,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <ctype.h>
+#include <time.h>
 #ifdef _WIN32
 #include <io.h>
 #include <fcntl.h>
@@ -171,6 +174,652 @@ TStr t_int_to_str(int64_t v) {
     TSb* b = t_sb_new(t_arena_current());
     t_sb_append_i64(b, v);
     return t_sb_to_str(b);
+}
+
+// ── format-spec mini-language（Python 子集）──────────────────────────────
+// 语法: [[fill]align][sign][#][0][width][grouping][.precision][type]
+//   align   : '<' '>' '=' '^'
+//   sign    : '+' '-' ' '
+//   '#'     : 替代形式（0b/0o/0x 前缀、浮点强制小数点）
+//   '0'     : 零填充（等价于 fill='0' align='='）
+//   width   : 十进制整数
+//   grouping: ','（十进制千分位）或 '_'（b/o/x 每 4 位、d 每 3 位）
+//   precision: '.' 后的整数
+//   type    : 'b' 'c' 'd' 'e' 'E' 'f' 'F' 'g' 'G' 'n' 'o' 's' 'x' 'X' '%'
+// spec 可带 "{}" / ":" 外壳（如 "{:>10}"），解析时自动剥除。
+
+typedef struct {
+    int     fill;     // 填充字符，<0 表示用空格
+    char    align;    // '<' '>' '=' '^'，0 = 按类型默认
+    char    sign;     // '+' '-' ' '，0 = 无
+    int     alt;      // '#'
+    int     zero;     // '0'
+    int64_t width;
+    char    group;    // ',' '_'，0 = 无
+    int     has_prec;
+    int64_t prec;
+    char    type;     // 转换类型，0 = 无
+} FmtSpec;
+
+static FmtSpec fmt_parse(TStr spec) {
+    FmtSpec f;
+    f.fill = -1; f.align = 0; f.sign = 0; f.alt = 0; f.zero = 0;
+    f.width = 0; f.group = 0; f.has_prec = 0; f.prec = 0; f.type = 0;
+
+    char buf[256];
+    int64_t n = 0;
+    for (int64_t k = 0; k < spec.len && n < 255; k++) buf[n++] = (char)spec.ptr[k];
+    buf[n] = '\0';
+    // 剥外壳：去掉首尾 {}，再取最后一个 ':' 之后的内容（兼容 "{0:>10}" 这种字段写法）
+    if (n >= 2 && buf[0] == '{' && buf[n-1] == '}') {
+        memmove(buf, buf + 1, (size_t)(n - 2));
+        buf[n - 2] = '\0'; n -= 2;
+    }
+    char* lc = strrchr(buf, ':');
+    if (lc != NULL) {
+        int64_t off = (int64_t)(lc - buf) + 1;
+        memmove(buf, lc + 1, (size_t)(n - off + 1));
+        n -= off;
+    }
+
+    int64_t i = 0;
+    if (n - i >= 2 && (buf[i+1] == '<' || buf[i+1] == '>' || buf[i+1] == '=' || buf[i+1] == '^')) {
+        f.fill = (uint8_t)buf[i]; f.align = buf[i+1]; i += 2;
+    } else if (n - i >= 1 && (buf[i] == '<' || buf[i] == '>' || buf[i] == '=' || buf[i] == '^')) {
+        f.align = buf[i]; i += 1;
+    }
+    if (n - i >= 1 && (buf[i] == '+' || buf[i] == '-' || buf[i] == ' ')) { f.sign = buf[i]; i += 1; }
+    if (n - i >= 1 && buf[i] == '#') { f.alt = 1; i += 1; }
+    if (n - i >= 1 && buf[i] == '0') { f.zero = 1; i += 1; }
+    while (n - i >= 1 && buf[i] >= '0' && buf[i] <= '9') { f.width = f.width * 10 + (buf[i] - '0'); i += 1; }
+    if (n - i >= 1 && (buf[i] == ',' || buf[i] == '_')) { f.group = buf[i]; i += 1; }
+    if (n - i >= 1 && buf[i] == '.') {
+        f.has_prec = 1; i += 1; f.prec = 0;
+        while (n - i >= 1 && buf[i] >= '0' && buf[i] <= '9') { f.prec = f.prec * 10 + (buf[i] - '0'); i += 1; }
+    }
+    if (n - i >= 1) { f.type = buf[i]; i += 1; }
+    return f;
+}
+
+static TStr t_str_view(const uint8_t* p, int64_t n) { TStr r; r.ptr = p; r.len = n; return r; }
+
+// 把 content 按 align/width/fill 补白，返回新 TStr（arena）。
+static TStr fmt_pad(TSb* content, char align, int64_t width, char fillc, int64_t clen) {
+    if (width <= clen) return t_sb_to_str(content);
+    TSb* out = t_sb_new(t_arena_current());
+    int64_t pad = width - clen;
+    TStr cv = t_str_view(content->buf, clen);
+    if (align == '<') {
+        t_sb_append_str(out, cv);
+        for (int64_t k = 0; k < pad; k++) t_sb_append_char(out, (uint8_t)fillc);
+    } else if (align == '^') {
+        int64_t left = pad / 2, right = pad - left;
+        for (int64_t k = 0; k < left; k++) t_sb_append_char(out, (uint8_t)fillc);
+        t_sb_append_str(out, cv);
+        for (int64_t k = 0; k < right; k++) t_sb_append_char(out, (uint8_t)fillc);
+    } else {
+        for (int64_t k = 0; k < pad; k++) t_sb_append_char(out, (uint8_t)fillc);
+        t_sb_append_str(out, cv);
+    }
+    return t_sb_to_str(out);
+}
+
+// '=' 对齐：prefix 留在最左，fill 插在 prefix 与 body 之间。
+static TStr fmt_pad_eq(TStr prefix, TStr body, int64_t width, char fillc) {
+    int64_t inner = width - prefix.len;
+    if (inner < body.len) inner = body.len;
+    TSb* out = t_sb_new(t_arena_current());
+    t_sb_append_str(out, prefix);
+    int64_t pad = inner - body.len;
+    for (int64_t k = 0; k < pad; k++) t_sb_append_char(out, (uint8_t)fillc);
+    t_sb_append_str(out, body);
+    return t_sb_to_str(out);
+}
+
+// 把 mag 以 base 进制写出：min_digits 最少位数（前导零）、按 group 插入分隔符。
+static void append_int_digits(TSb* b, uint64_t mag, int base, int upper, int64_t min_digits, char group) {
+    char digits[128]; int dn = 0;
+    if (mag == 0) digits[dn++] = '0';
+    else { while (mag) { int d = (int)(mag % (uint64_t)base); digits[dn++] = (char)(d < 10 ? '0' + d : (upper ? 'A' : 'a') + (d - 10)); mag /= (uint64_t)base; } }
+    for (int i = 0; i < dn / 2; i++) { char t = digits[i]; digits[i] = digits[dn - 1 - i]; digits[dn - 1 - i] = t; }
+    int total = dn; if (total < min_digits) total = (int)min_digits;
+    int step = 0;
+    if (group == ',') step = 3;
+    else if (group == '_') step = (base == 10 ? 3 : 4);
+    char outb[384]; int on = 0;
+    for (int i = 0; i < total; i++) {
+        char c = (i < total - dn) ? '0' : digits[i - (total - dn)];
+        outb[on++] = c;
+        int remain = total - (i + 1);
+        if (step > 0 && remain > 0 && (remain % step) == 0) outb[on++] = (group == ',' ? ',' : '_');
+    }
+    for (int i = 0; i < on; i++) t_sb_append_char(b, (uint8_t)outb[i]);
+}
+
+static TStr fmt_int_core(FmtSpec f, int neg, uint64_t mag) {
+    if (f.zero && f.align == 0) { f.align = '='; f.fill = '0'; }
+    if (f.align == 0) f.align = '>';
+    if (f.type == 'c') {
+        TSb* b = t_sb_new(t_arena_current());
+        t_sb_append_char(b, (uint8_t)(mag & 0xFF));
+        int64_t L = b->len;
+        return fmt_pad(b, f.align, f.width, (f.fill >= 0 ? (char)f.fill : ' '), L);
+    }
+    int base = 10, upper = 0;
+    if (f.type == 'b') base = 2;
+    else if (f.type == 'o') base = 8;
+    else if (f.type == 'x') base = 16;
+    else if (f.type == 'X') { base = 16; upper = 1; }
+    char signc = 0;
+    if (neg) signc = '-';
+    else if (f.sign == '+') signc = '+';
+    else if (f.sign == ' ') signc = ' ';
+    const char* altp = "";
+    if (f.alt) {
+        if (base == 2) altp = "0b";
+        else if (base == 8) altp = "0o";
+        else if (base == 16) altp = (upper ? "0X" : "0x");
+    }
+    int64_t mind = f.has_prec ? f.prec : 1;
+    TSb* bdy = t_sb_new(t_arena_current());
+    append_int_digits(bdy, mag, base, upper, mind, f.group);
+    TStr body = t_sb_to_str(bdy);
+    char pbuf[8]; int pn = 0;
+    if (signc) pbuf[pn++] = signc;
+    for (const char* p = altp; *p; p++) pbuf[pn++] = *p;
+    TStr prefix = t_str_view((const uint8_t*)pbuf, pn);
+    char fillc = (f.fill >= 0 ? (char)f.fill : ' ');
+    if (f.align == '=') return fmt_pad_eq(prefix, body, f.width, fillc);
+    TSb* full = t_sb_new(t_arena_current());
+    t_sb_append_str(full, prefix);
+    t_sb_append_str(full, body);
+    int64_t L = full->len;
+    return fmt_pad(full, f.align, f.width, fillc, L);
+}
+
+TStr t_format_int(TStr spec, int64_t v) {
+    FmtSpec f = fmt_parse(spec);
+    int neg = (v < 0);
+    uint64_t mag = neg ? (uint64_t)(-(v + 1)) + 1ULL : (uint64_t)v;
+    return fmt_int_core(f, neg, mag);
+}
+
+TStr t_format_uint(TStr spec, uint64_t v) {
+    FmtSpec f = fmt_parse(spec);
+    return fmt_int_core(f, 0, v);
+}
+
+// 浮点整数部分按 group 插入分隔符（小数点/e/E 前的整数段）。
+static void append_float_grouped(TSb* b, const char* s, char group) {
+    const char* dot = s;
+    while (*dot && *dot != '.' && *dot != 'e' && *dot != 'E') dot++;
+    int intlen = (int)(dot - s);
+    for (int i = 0; i < intlen; i++) {
+        t_sb_append_char(b, (uint8_t)s[i]);
+        int remain = intlen - (i + 1);
+        if (remain > 0 && (remain % 3) == 0) t_sb_append_char(b, (uint8_t)(group == ',' ? ',' : '_'));
+    }
+    if (*dot) t_sb_append_cstr(b, dot);
+}
+
+TStr t_format_float(TStr spec, double v) {
+    FmtSpec f = fmt_parse(spec);
+    if (f.zero && f.align == 0) { f.align = '='; f.fill = '0'; }
+    if (f.align == 0) f.align = '>';
+    char tc = f.type;
+    if (tc == 'd' || tc == 'b' || tc == 'o' || tc == 'x' || tc == 'X' || tc == 'c') {
+        // 数值型：退化为整数格式化（浮点截断为整数）
+        long long iv = (long long)v;
+        return t_format_int(spec, (int64_t)iv);
+    }
+    int ispct = (tc == '%');
+    double vv = ispct ? v * 100.0 : v;
+    char fmtc;
+    if (tc == 'e' || tc == 'E') fmtc = tc;
+    else if (tc == 'f' || tc == 'F') fmtc = tc;
+    else if (tc == 'g' || tc == 'G') fmtc = tc;
+    else if (ispct) fmtc = 'f';
+    else fmtc = 'g';
+    int prec = f.has_prec ? (int)f.prec : 6;
+    char sf[40]; int si = 0;
+    sf[si++] = '%';
+    if (f.sign == '+') sf[si++] = '+'; else if (f.sign == ' ') sf[si++] = ' ';
+    if (f.alt) sf[si++] = '#';
+    sf[si++] = '.';
+    si += snprintf(sf + si, sizeof(sf) - (size_t)si, "%d", prec);
+    sf[si++] = fmtc; sf[si] = '\0';
+    char num[512];
+    snprintf(num, sizeof(num), sf, vv);
+    char signc = 0; const char* bodyc = num;
+    if (num[0] == '-' || num[0] == '+' || num[0] == ' ') { signc = num[0]; bodyc = num + 1; }
+    TSb* bdy = t_sb_new(t_arena_current());
+    if (f.group) append_float_grouped(bdy, bodyc, f.group);
+    else t_sb_append_cstr(bdy, bodyc);
+    if (ispct) t_sb_append_char(bdy, (uint8_t)'%');
+    TStr body = t_sb_to_str(bdy);
+    char pbuf[2]; int pn = 0; if (signc) pbuf[pn++] = signc;
+    TStr prefix = t_str_view((const uint8_t*)pbuf, pn);
+    char fillc = (f.fill >= 0 ? (char)f.fill : ' ');
+    if (f.align == '=') return fmt_pad_eq(prefix, body, f.width, fillc);
+    TSb* full = t_sb_new(t_arena_current());
+    t_sb_append_str(full, prefix);
+    t_sb_append_str(full, body);
+    int64_t L = full->len;
+    return fmt_pad(full, f.align, f.width, fillc, L);
+}
+
+TStr t_format_str(TStr spec, TStr v) {
+    FmtSpec f = fmt_parse(spec);
+    if (f.zero && f.align == 0) { f.align = '='; f.fill = '0'; }
+    if (f.align == 0) f.align = '<';
+    int64_t len = v.len;
+    if (f.has_prec && f.prec < len) len = f.prec;
+    TSb* b = t_sb_new(t_arena_current());
+    t_sb_append_str(b, t_str_view(v.ptr, len));
+    int64_t L = b->len;
+    return fmt_pad(b, f.align, f.width, (f.fill >= 0 ? (char)f.fill : ' '), L);
+}
+
+TStr t_format_bool(TStr spec, int v) {
+    FmtSpec f = fmt_parse(spec);
+    char tc = f.type;
+    if (tc == 'd' || tc == 'b' || tc == 'o' || tc == 'x' || tc == 'X' ||
+        tc == 'e' || tc == 'E' || tc == 'f' || tc == 'F' || tc == 'g' || tc == 'G' || tc == '%') {
+        return t_format_int(spec, v ? 1 : 0);
+    }
+    if (f.zero && f.align == 0) { f.align = '='; f.fill = '0'; }
+    if (f.align == 0) f.align = '>';
+    const char* w = v ? "true" : "false";
+    TSb* b = t_sb_new(t_arena_current());
+    t_sb_append_cstr(b, w);
+    int64_t L = b->len;
+    return fmt_pad(b, f.align, f.width, (f.fill >= 0 ? (char)f.fill : ' '), L);
+}
+
+TStr t_format_char(TStr spec, uint8_t v) {
+    FmtSpec f = fmt_parse(spec);
+    if (f.zero && f.align == 0) { f.align = '='; f.fill = '0'; }
+    if (f.align == 0) f.align = '<';
+    TSb* b = t_sb_new(t_arena_current());
+    t_sb_append_char(b, v);
+    int64_t L = b->len;
+    return fmt_pad(b, f.align, f.width, (f.fill >= 0 ? (char)f.fill : ' '), L);
+}
+
+// ── StringBuilder 直写变体 ──────────────────────────────────────────────
+void t_sb_append_fmt_int(TSb* b, TStr spec, int64_t v)  { t_sb_append_str(b, t_format_int(spec, v)); }
+void t_sb_append_fmt_uint(TSb* b, TStr spec, uint64_t v){ t_sb_append_str(b, t_format_uint(spec, v)); }
+void t_sb_append_fmt_float(TSb* b, TStr spec, double v){ t_sb_append_str(b, t_format_float(spec, v)); }
+void t_sb_append_fmt_str(TSb* b, TStr spec, TStr v)     { t_sb_append_str(b, t_format_str(spec, v)); }
+void t_sb_append_fmt_bool(TSb* b, TStr spec, int v)     { t_sb_append_str(b, t_format_bool(spec, v)); }
+void t_sb_append_fmt_char(TSb* b, TStr spec, uint8_t v) { t_sb_append_str(b, t_format_char(spec, v)); }
+
+// ── 时间格式化（M56）───────────────────────────────────────────
+// 时间值语义：i64 微秒 Unix epoch（见 docs/syntax/drafts/time_fmt.md D1）。
+int64_t t_now(void) {
+    struct timespec ts;
+    timespec_get(&ts, TIME_UTC);
+    return (int64_t)ts.tv_sec * 1000000 + (int64_t)(ts.tv_nsec / 1000);
+}
+
+static void fmt_time_append_2d(TSb* b, int v) {
+    if (v < 0) v = 0; if (v > 99) v = 99;
+    t_sb_append_char(b, (uint8_t)('0' + v / 10));
+    t_sb_append_char(b, (uint8_t)('0' + v % 10));
+}
+static void fmt_time_append_3d(TSb* b, int v) {
+    if (v < 0) v = 0; if (v > 999) v = 999;
+    t_sb_append_char(b, (uint8_t)('0' + v / 100));
+    t_sb_append_char(b, (uint8_t)('0' + (v / 10) % 10));
+    t_sb_append_char(b, (uint8_t)('0' + v % 10));
+}
+static void fmt_time_append_4d(TSb* b, int v) {
+    if (v < 0) v = 0; if (v > 9999) v = 9999;
+    t_sb_append_char(b, (uint8_t)('0' + v / 1000));
+    t_sb_append_char(b, (uint8_t)('0' + (v / 100) % 10));
+    t_sb_append_char(b, (uint8_t)('0' + (v / 10) % 10));
+    t_sb_append_char(b, (uint8_t)('0' + v % 10));
+}
+static void fmt_time_append_6d(TSb* b, int v) {   // 微秒（6 位，strftime %f 语义）
+    if (v < 0) v = 0; if (v > 999999) v = 999999;
+    t_sb_append_char(b, (uint8_t)('0' + v / 100000));
+    t_sb_append_char(b, (uint8_t)('0' + (v / 10000) % 10));
+    t_sb_append_char(b, (uint8_t)('0' + (v / 1000) % 10));
+    t_sb_append_char(b, (uint8_t)('0' + (v / 100) % 10));
+    t_sb_append_char(b, (uint8_t)('0' + (v / 10) % 10));
+    t_sb_append_char(b, (uint8_t)('0' + v % 10));
+}
+
+// 星期/月份英文名表（与 Python datetime.strftime 默认英语区一致，确定不受系统 locale 影响）
+static const char* T_WDAY_ABBR[7] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+static const char* T_WDAY_FULL[7] = {"Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"};
+static const char* T_MON_ABBR[12] = {"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};
+static const char* T_MON_FULL[12] = {"January","February","March","April","May","June","July","August","September","October","November","December"};
+
+// ── 时间格式化核心（M57 抽出：UTC / 本地 / 固定偏移三种时区模式共用）──
+// tz_kind: 0 = UTC, 1 = 本机本地时区, 2 = 固定偏移（tz_off 秒，东为正）
+static void fmt_time_hms(TSb* b, const struct tm* tp) {
+    fmt_time_append_2d(b, tp->tm_hour);
+    t_sb_append_char(b, ':');
+    fmt_time_append_2d(b, tp->tm_min);
+    t_sb_append_char(b, ':');
+    fmt_time_append_2d(b, tp->tm_sec);
+}
+
+// ±HHMM（colon != 0 时输出 ±HH:MM）
+static void fmt_time_zoff(TSb* b, long tz_off, int colon) {
+    char sign = tz_off < 0 ? '-' : '+';
+    long aa = tz_off < 0 ? -tz_off : tz_off;
+    t_sb_append_char(b, (uint8_t)sign);
+    fmt_time_append_2d(b, (int)(aa / 3600));
+    if (colon) t_sb_append_char(b, ':');
+    fmt_time_append_2d(b, (int)((aa % 3600) / 60));
+}
+
+static TStr fmt_time_run(TStr spec, const struct tm* tpp, int us, long tz_off, int tz_kind) {
+    struct tm tm_buf = *tpp;
+    TSb* b = t_sb_new(t_arena_current());
+    for (int64_t k = 0; k < spec.len; k++) {
+        uint8_t c = spec.ptr[k];
+        if (c != '%') { t_sb_append_char(b, c); continue; }
+        if (k + 1 >= spec.len) { t_sb_append_char(b, '%'); break; }
+        uint8_t x = spec.ptr[k + 1]; k++;
+        switch (x) {
+            case 'Y': fmt_time_append_4d(b, tm_buf.tm_year + 1900); break;
+            case 'y': fmt_time_append_2d(b, (tm_buf.tm_year + 1900) % 100); break;
+            case 'm': fmt_time_append_2d(b, tm_buf.tm_mon + 1); break;
+            case 'd': fmt_time_append_2d(b, tm_buf.tm_mday); break;
+            case 'H': fmt_time_append_2d(b, tm_buf.tm_hour); break;
+            case 'M': fmt_time_append_2d(b, tm_buf.tm_min); break;
+            case 'S': fmt_time_append_2d(b, tm_buf.tm_sec); break;
+            case 'f': fmt_time_append_6d(b, (int)us); break;
+            case 'I': { int hh = tm_buf.tm_hour % 12; if (hh == 0) hh = 12; fmt_time_append_2d(b, hh); break; }
+            case 'p': t_sb_append_cstr(b, tm_buf.tm_hour < 12 ? "AM" : "PM"); break;
+            case 'w': t_sb_append_char(b, (uint8_t)('0' + tm_buf.tm_wday)); break;
+            case 'j': fmt_time_append_3d(b, tm_buf.tm_yday + 1); break;
+            case 'U': fmt_time_append_2d(b, (tm_buf.tm_yday + 7 - tm_buf.tm_wday) / 7); break;
+            case 'W': fmt_time_append_2d(b, (tm_buf.tm_yday + 7 - (tm_buf.tm_wday + 6) % 7) / 7); break;
+            case 'a': t_sb_append_cstr(b, T_WDAY_ABBR[tm_buf.tm_wday]); break;
+            case 'A': t_sb_append_cstr(b, T_WDAY_FULL[tm_buf.tm_wday]); break;
+            case 'b': t_sb_append_cstr(b, T_MON_ABBR[tm_buf.tm_mon]); break;
+            case 'B': t_sb_append_cstr(b, T_MON_FULL[tm_buf.tm_mon]); break;
+            case 'z': fmt_time_zoff(b, tz_off, 0); break;
+            case 'Z': {
+                if (tz_kind == 1) {
+                    char zbuf[64];
+                    if (strftime(zbuf, sizeof(zbuf), "%Z", &tm_buf) > 0) t_sb_append_cstr(b, zbuf);
+                } else if (tz_kind == 2 && tz_off != 0) {
+                    // 与 Python datetime.timezone(...).tzname() 一致：UTC±HH:MM
+                    t_sb_append_cstr(b, "UTC");
+                    fmt_time_zoff(b, tz_off, 1);
+                } else {
+                    t_sb_append_cstr(b, "UTC");
+                }
+                break;
+            }
+            // ── locale 字段码（M57）：固定采用 C/POSIX 英语区表示，不随系统 locale 漂移 ──
+            case 'x':                                   // %m/%d/%y
+                fmt_time_append_2d(b, tm_buf.tm_mon + 1);
+                t_sb_append_char(b, '/');
+                fmt_time_append_2d(b, tm_buf.tm_mday);
+                t_sb_append_char(b, '/');
+                fmt_time_append_2d(b, (tm_buf.tm_year + 1900) % 100);
+                break;
+            case 'X': fmt_time_hms(b, &tm_buf); break;  // %H:%M:%S
+            case 'c':                                   // %a %b %e %H:%M:%S %Y
+                t_sb_append_cstr(b, T_WDAY_ABBR[tm_buf.tm_wday]);
+                t_sb_append_char(b, ' ');
+                t_sb_append_cstr(b, T_MON_ABBR[tm_buf.tm_mon]);
+                t_sb_append_char(b, ' ');
+                if (tm_buf.tm_mday < 10) t_sb_append_char(b, ' ');   // %e：空格填充日
+                else t_sb_append_char(b, (uint8_t)('0' + tm_buf.tm_mday / 10));
+                t_sb_append_char(b, (uint8_t)('0' + tm_buf.tm_mday % 10));
+                t_sb_append_char(b, ' ');
+                fmt_time_hms(b, &tm_buf);
+                t_sb_append_char(b, ' ');
+                fmt_time_append_4d(b, tm_buf.tm_year + 1900);
+                break;
+            case '%': t_sb_append_char(b, '%'); break;
+            default:
+                // 未知转换：原样保留 "%?"（reference §3.11 D2 运行期宽松兜底；
+                // 字面量场景由编译器静态校验 T_TIME_BAD_SPEC 提前拦截）
+                t_sb_append_char(b, '%');
+                t_sb_append_char(b, x);
+                break;
+        }
+    }
+    return t_sb_to_str(b);
+}
+
+// spec 是否用到 %z / %Z（只有用到才值得付出算时区偏移的代价）
+static int fmt_time_needs_tz(TStr spec) {
+    for (int64_t k = 0; k < spec.len; k++) {
+        if (spec.ptr[k] == '%' && k + 1 < spec.len) {
+            uint8_t x = spec.ptr[k + 1];
+            if (x == 'z' || x == 'Z') return 1;
+        }
+    }
+    return 0;
+}
+
+TStr t_format_time(TStr spec, int64_t t_us, int use_local) {
+    int64_t sec = t_us / 1000000;
+    int64_t us = t_us % 1000000;
+    if (us < 0) { us += 1000000; sec -= 1; }    // 防御负 epoch：向下取整到秒
+    time_t t = (time_t)sec;
+    struct tm* p = use_local ? localtime(&t) : gmtime(&t);
+    if (p == NULL) {                            // 非法时间（溢出等）：确定性返回空串，不 panic
+        TSb* eb = t_sb_new(t_arena_current());
+        return t_sb_to_str(eb);
+    }
+    struct tm tm_buf = *p;
+    long tz_off = 0;
+    if (use_local && fmt_time_needs_tz(spec)) {
+        struct tm lt = tm_buf;                  // 已是 localtime 结果
+        struct tm gt = *gmtime(&t);
+        gt.tm_isdst = lt.tm_isdst;              // 同一 DST 标志，避免夏令时差 1 小时
+        tz_off = (long)(mktime(&lt) - mktime(&gt));
+    }
+    return fmt_time_run(spec, &tm_buf, (int)us, tz_off, use_local ? 1 : 0);
+}
+
+// M57：固定时区偏移。做法是把瞬时偏移进"墙上时间"后按 UTC 展开 ——
+// 这样无需依赖平台 tzdata，任意偏移都可测、可复现。
+TStr t_format_time_tz(TStr spec, int64_t t_us, int64_t tz_min) {
+    int64_t sec = t_us / 1000000;
+    int64_t us = t_us % 1000000;
+    if (us < 0) { us += 1000000; sec -= 1; }
+    sec += tz_min * 60;
+    time_t t = (time_t)sec;
+    struct tm* p = gmtime(&t);
+    if (p == NULL) {
+        TSb* eb = t_sb_new(t_arena_current());
+        return t_sb_to_str(eb);
+    }
+    struct tm tm_buf = *p;
+    return fmt_time_run(spec, &tm_buf, (int)us, (long)(tz_min * 60), 2);
+}
+
+// ── 时间解析（M57，strptime 子集）──────────────────────────────
+// 民用历 → epoch 日数（Howard Hinnant days_from_civil）。自实现而非 timegm，
+// 因为 timegm 非 C99 标准、各平台名字不一（_mkgmtime / timegm），且这里要求
+// 跨平台逐位一致。m ∈ [1,12]，d ∈ [1,31]。
+static int64_t t_days_from_civil(int64_t y, int m, int d) {
+    y -= (m <= 2);
+    int64_t era = (y >= 0 ? y : y - 399) / 400;
+    int64_t yoe = y - era * 400;                          // [0, 399]
+    int64_t doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    int64_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;  // [0, 146096]
+    return era * 146097 + doe - 719468;
+}
+
+typedef struct {
+    int64_t y; int mon, mday, hour, min, sec, us;
+    int hour12, pm;            // %I / %p：pm = 0 未见 / 1 AM / 2 PM
+    int have_hour12;
+    int yday, have_yday, have_mday;
+    int tz_min, have_tz;
+} TParts;
+
+static int pt_lower(int c) { return (c >= 'A' && c <= 'Z') ? c + 32 : c; }
+
+static void pt_skip_ws(const uint8_t* in, int64_t n, int64_t* ip) {
+    while (*ip < n && (in[*ip] == ' ' || in[*ip] == '\t' || in[*ip] == '\r' || in[*ip] == '\n')) (*ip)++;
+}
+
+// 读 1..maxd 位十进制数；不足 1 位返回 0（失败）
+static int pt_num(const uint8_t* in, int64_t n, int64_t* ip, int maxd, int* out, int* ndig) {
+    int v = 0, k = 0;
+    while (*ip < n && k < maxd && in[*ip] >= '0' && in[*ip] <= '9') {
+        v = v * 10 + (in[*ip] - '0');
+        (*ip)++; k++;
+    }
+    if (k == 0) return 0;
+    *out = v;
+    if (ndig) *ndig = k;
+    return 1;
+}
+
+// 在名称表里做大小写不敏感匹配，命中最长者
+static int pt_name(const uint8_t* in, int64_t n, int64_t* ip, const char** tab, int cnt, int* idx) {
+    int best = -1; int64_t bestlen = 0;
+    for (int i = 0; i < cnt; i++) {
+        int64_t L = (int64_t)strlen(tab[i]);
+        if (*ip + L > n) continue;
+        int ok = 1;
+        for (int64_t k = 0; k < L; k++) {
+            if (pt_lower(in[*ip + k]) != pt_lower((unsigned char)tab[i][k])) { ok = 0; break; }
+        }
+        if (ok && L > bestlen) { best = i; bestlen = L; }
+    }
+    if (best < 0) return 0;
+    *ip += bestlen;
+    *idx = best;
+    return 1;
+}
+
+static int pt_scan(const uint8_t* sp, int64_t sl, const uint8_t* in, int64_t n, int64_t* ip, TParts* P);
+
+// 把 locale 字段码展开成等价子模式后递归解析
+static int pt_sub(const char* pat, const uint8_t* in, int64_t n, int64_t* ip, TParts* P) {
+    return pt_scan((const uint8_t*)pat, (int64_t)strlen(pat), in, n, ip, P);
+}
+
+static int pt_scan(const uint8_t* sp, int64_t sl, const uint8_t* in, int64_t n, int64_t* ip, TParts* P) {
+    for (int64_t k = 0; k < sl; k++) {
+        uint8_t c = sp[k];
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') { pt_skip_ws(in, n, ip); continue; }
+        if (c != '%') {
+            if (*ip >= n || in[*ip] != c) return 0;
+            (*ip)++;
+            continue;
+        }
+        if (k + 1 >= sl) return 0;               // 以 '%' 结尾：非法模式
+        uint8_t x = sp[k + 1]; k++;
+        int v = 0, nd = 0, idx = 0;
+        switch (x) {
+            case 'Y': if (!pt_num(in, n, ip, 4, &v, &nd)) return 0; P->y = v; break;
+            case 'y': if (!pt_num(in, n, ip, 2, &v, &nd)) return 0;
+                      P->y = (v >= 69) ? 1900 + v : 2000 + v; break;   // 与 Python 一致
+            case 'm': if (!pt_num(in, n, ip, 2, &v, &nd)) return 0;
+                      if (v < 1 || v > 12) return 0; P->mon = v; break;
+            case 'd': if (!pt_num(in, n, ip, 2, &v, &nd)) return 0;
+                      if (v < 1 || v > 31) return 0; P->mday = v; P->have_mday = 1; break;
+            case 'e': pt_skip_ws(in, n, ip);
+                      if (!pt_num(in, n, ip, 2, &v, &nd)) return 0;
+                      if (v < 1 || v > 31) return 0; P->mday = v; P->have_mday = 1; break;
+            case 'H': if (!pt_num(in, n, ip, 2, &v, &nd)) return 0;
+                      if (v > 23) return 0; P->hour = v; break;
+            case 'I': if (!pt_num(in, n, ip, 2, &v, &nd)) return 0;
+                      if (v < 1 || v > 12) return 0; P->hour12 = v; P->have_hour12 = 1; break;
+            case 'M': if (!pt_num(in, n, ip, 2, &v, &nd)) return 0;
+                      if (v > 59) return 0; P->min = v; break;
+            case 'S': if (!pt_num(in, n, ip, 2, &v, &nd)) return 0;
+                      if (v > 60) return 0; P->sec = (v == 60 ? 59 : v); break;  // 闰秒夹紧
+            case 'j': if (!pt_num(in, n, ip, 3, &v, &nd)) return 0;
+                      if (v < 1 || v > 366) return 0; P->yday = v; P->have_yday = 1; break;
+            case 'f': {
+                if (!pt_num(in, n, ip, 6, &v, &nd)) return 0;
+                for (int q = nd; q < 6; q++) v *= 10;           // 右补零到微秒
+                P->us = v; break;
+            }
+            case 'p': {
+                static const char* AP[2] = { "AM", "PM" };
+                if (!pt_name(in, n, ip, AP, 2, &idx)) return 0;
+                P->pm = idx + 1; break;
+            }
+            case 'a': case 'A': {
+                if (!pt_name(in, n, ip, T_WDAY_FULL, 7, &idx)
+                    && !pt_name(in, n, ip, T_WDAY_ABBR, 7, &idx)) return 0;
+                break;                                          // 星期只做校验消费，不参与定值
+            }
+            case 'b': case 'B': {
+                if (!pt_name(in, n, ip, T_MON_FULL, 12, &idx)
+                    && !pt_name(in, n, ip, T_MON_ABBR, 12, &idx)) return 0;
+                P->mon = idx + 1; break;
+            }
+            case 'z': {
+                if (*ip < n && (in[*ip] == 'Z' || in[*ip] == 'z')) { (*ip)++; P->tz_min = 0; P->have_tz = 1; break; }
+                if (*ip >= n || (in[*ip] != '+' && in[*ip] != '-')) return 0;
+                int sign = (in[*ip] == '-') ? -1 : 1;
+                (*ip)++;
+                int hh = 0, mm = 0;
+                if (!pt_num(in, n, ip, 2, &hh, &nd) || nd != 2) return 0;
+                if (*ip < n && in[*ip] == ':') (*ip)++;
+                if (!pt_num(in, n, ip, 2, &mm, &nd) || nd != 2) return 0;
+                P->tz_min = sign * (hh * 60 + mm); P->have_tz = 1; break;
+            }
+            case 'c': if (!pt_sub("%a %b %e %H:%M:%S %Y", in, n, ip, P)) return 0; break;
+            case 'x': if (!pt_sub("%m/%d/%y", in, n, ip, P)) return 0; break;
+            case 'X': if (!pt_sub("%H:%M:%S", in, n, ip, P)) return 0; break;
+            case '%': if (*ip >= n || in[*ip] != '%') return 0; (*ip)++; break;
+            default: return 0;                   // 解析不支持的字段码（%U %W %w %Z）
+        }
+    }
+    return 1;
+}
+
+int64_t t_parse_time(TStr spec, TStr s, int use_local) {
+    TParts P;
+    P.y = 1900; P.mon = 1; P.mday = 1; P.hour = 0; P.min = 0; P.sec = 0; P.us = 0;
+    P.hour12 = 0; P.pm = 0; P.have_hour12 = 0;
+    P.yday = 0; P.have_yday = 0; P.have_mday = 0;
+    P.tz_min = 0; P.have_tz = 0;
+
+    int64_t ip = 0;
+    if (!pt_scan(spec.ptr, spec.len, s.ptr, s.len, &ip, &P)) return T_TIME_INVALID;
+    pt_skip_ws(s.ptr, s.len, &ip);
+    if (ip != s.len) return T_TIME_INVALID;      // 输入未被完全消耗：判失败，不做静默截断
+
+    if (P.have_hour12) {
+        int h = P.hour12 % 12;
+        if (P.pm == 2) h += 12;
+        P.hour = h;
+    }
+
+    int64_t days;
+    if (P.have_yday && !P.have_mday) {
+        days = t_days_from_civil(P.y, 1, 1) + (P.yday - 1);
+    } else {
+        days = t_days_from_civil(P.y, P.mon, P.mday);
+    }
+    int64_t sec = days * 86400 + (int64_t)P.hour * 3600 + (int64_t)P.min * 60 + P.sec;
+
+    if (P.have_tz) {
+        sec -= (int64_t)P.tz_min * 60;           // 串内偏移优先于 use_local
+    } else if (use_local) {
+        struct tm lt;
+        memset(&lt, 0, sizeof(lt));
+        lt.tm_year = (int)(P.y - 1900);
+        lt.tm_mon = P.mon - 1;
+        lt.tm_mday = P.mday;
+        lt.tm_hour = P.hour; lt.tm_min = P.min; lt.tm_sec = P.sec;
+        lt.tm_isdst = -1;                        // 交给 libc 判夏令时
+        time_t lv = mktime(&lt);
+        if (lv == (time_t)-1) return T_TIME_INVALID;
+        sec = (int64_t)lv;
+    }
+    return sec * 1000000 + P.us;
 }
 
 // ── 切片 []T ──────────────────────────────────────────────────
@@ -565,6 +1214,22 @@ TStr t_sym_str(TStr tag, uint32_t id) {
     TStr r; r.ptr = p->bytes + p->ent_off[id]; r.len = p->ent_len[id]; return r;
 }
 
+// Atom：名字表由编译器发射到生成代码（t_atom_table[] / t_atom_count），此处还原名字。
+// id 为 1-based（索引 0 是占位空串）；越界返回空串。
+//
+// 自举逃生阀：本函数 extern 引用编译器发射的 t_atom_table/t_atom_count。若手头的
+// 引导编译器早于「发射原子表」这段逻辑，链接会报 undefined symbol。此时用
+//   clang -c -DT_ATOM_BOOTSTRAP_STUB ... runtime/t_runtime.c
+// 编一版桩运行时打通一代，再去掉宏用新编译器重建即可。日常构建不要定义此宏。
+TStr t_atom_str(int64_t id) {
+#ifdef T_ATOM_BOOTSTRAP_STUB
+    (void)id; { TStr e; e.ptr = (const uint8_t*)""; e.len = 0; return e; }
+#else
+    if (id <= 0 || id >= t_atom_count) { TStr e; e.ptr = (const uint8_t*)""; e.len = 0; return e; }
+    return t_atom_table[id];
+#endif
+}
+
 void t_sym_release(TStr tag) {
     for (int64_t i = 0; i < g_sym_reg.len; i++) {
         if (t_str_eq(g_sym_reg.items[i].tag, tag)) {
@@ -673,6 +1338,7 @@ int64_t     t_fi_offset(TFieldInfo* fi)      { return fi->offset; }
 TStr        t_fi_type_name(TFieldInfo* fi)   { return fi->type_name; }
 int64_t     t_fi_type_size(TFieldInfo* fi)   { return fi->type_size; }
 int8_t      t_fi_is_ptr(TFieldInfo* fi)      { return fi->is_ptr; }
+int64_t     t_fi_tag(TFieldInfo* fi)         { return fi->tag; }
 
 // sys_run(cmd)：执行外部命令，返回退出码。
 // Windows cmd.exe 引号剥离怪癖：整串命令以引号开头时需再包一层。
@@ -691,4 +1357,511 @@ int32_t t_system(TStr cmd) {
 #endif
     int r = system(c);
     return (int32_t)r;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Fid：文件描述符句柄 + 序列化操作符（M51）
+// 句柄即 i64 下标。0/1/2 恒为 stdin/stdout/stderr。
+// mode/kind/fmt 均为编译期降下来的小整数码，运行时零字符串比较。
+// 格式在 t_fopen 时按 (kind, 后缀) 查注册表一次性解析并冻结进句柄记录。
+// ═══════════════════════════════════════════════════════════════
+
+#define T_FMT_TEXT     0
+#define T_FMT_JSON     1
+#define T_FMT_RAWBIN   2
+#define T_FMT_PROTOBUF 3
+
+#define T_FID_MAX 256
+#define T_FMT_REG_MAX 64
+#define T_FID_SUF_MAX 16
+
+typedef struct TFidRec {
+    FILE*   fp;
+    int32_t fmt;     // T_FMT_*
+    int32_t binary;  // 0=text 1=binary
+    int32_t open;
+    int32_t is_std;  // 标准流不可关闭
+    char    err[128];// 最近一次错误描述（fid_error 查询用）
+} TFidRec;
+
+typedef struct TFmtReg {
+    int32_t kind;                  // 0=text 1=binary
+    char    suffix[T_FID_SUF_MAX]; // 不含点，全小写
+    int32_t fmt;
+} TFmtReg;
+
+static TFidRec g_fids[T_FID_MAX];
+static TFmtReg g_fmt_reg[T_FMT_REG_MAX];
+static int32_t g_fmt_reg_count = 0;
+static int32_t g_fid_inited = 0;
+static char    g_fid_open_err[256]; // 最近一次 fopen 失败原因（fid == -1 时查）
+
+static char fid_lower(char c) { return (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c; }
+
+// 后注册覆盖先注册：同 (kind, suffix) 就地改写，否则追加。
+static void fmt_reg_put(int32_t kind, const char* suffix, int32_t fmt) {
+    char buf[T_FID_SUF_MAX];
+    int  n = 0;
+    if (suffix) {
+        while (suffix[n] && n < T_FID_SUF_MAX - 1) { buf[n] = fid_lower(suffix[n]); n++; }
+    }
+    buf[n] = 0;
+    for (int32_t i = 0; i < g_fmt_reg_count; i++) {
+        if (g_fmt_reg[i].kind == kind && strcmp(g_fmt_reg[i].suffix, buf) == 0) {
+            g_fmt_reg[i].fmt = fmt;
+            return;
+        }
+    }
+    if (g_fmt_reg_count >= T_FMT_REG_MAX) t_fatal("fmt_register: 注册表已满");
+    g_fmt_reg[g_fmt_reg_count].kind = kind;
+    memcpy(g_fmt_reg[g_fmt_reg_count].suffix, buf, (size_t)n + 1);
+    g_fmt_reg[g_fmt_reg_count].fmt = fmt;
+    g_fmt_reg_count++;
+}
+
+static void fid_init(void) {
+    if (g_fid_inited) return;
+    g_fid_inited = 1;
+    for (int32_t i = 0; i < T_FID_MAX; i++) {
+        g_fids[i].fp = NULL; g_fids[i].fmt = T_FMT_TEXT;
+        g_fids[i].binary = 0; g_fids[i].open = 0; g_fids[i].is_std = 0; g_fids[i].err[0] = 0;
+    }
+    g_fids[0].fp = stdin;  g_fids[0].open = 1; g_fids[0].is_std = 1;
+    g_fids[1].fp = stdout; g_fids[1].open = 1; g_fids[1].is_std = 1;
+    g_fids[2].fp = stderr; g_fids[2].open = 1; g_fids[2].is_std = 1;
+    // 内建后缀挂靠：文本 .json → json；二进制 .pb → protobuf
+    fmt_reg_put(0, "json", T_FMT_JSON);
+    fmt_reg_put(1, "pb",   T_FMT_PROTOBUF);
+}
+
+// 取路径最后一段的后缀（不含点，小写）。无后缀返回空串。
+static void fid_suffix_of(const char* path, char* out) {
+    int   dot = -1;
+    int   i;
+    out[0] = 0;
+    if (!path) return;
+    for (i = 0; path[i]; i++) {
+        if (path[i] == '/' || path[i] == '\\') dot = -1;
+        else if (path[i] == '.') dot = i;
+    }
+    if (dot < 0) return;
+    int n = 0;
+    for (i = dot + 1; path[i] && n < T_FID_SUF_MAX - 1; i++) out[n++] = fid_lower(path[i]);
+    out[n] = 0;
+}
+
+static int32_t fid_resolve_fmt(int32_t kind, const char* suffix) {
+    for (int32_t i = g_fmt_reg_count - 1; i >= 0; i--) {
+        if (g_fmt_reg[i].kind == kind && strcmp(g_fmt_reg[i].suffix, suffix) == 0)
+            return g_fmt_reg[i].fmt;
+    }
+    return (kind == 1) ? T_FMT_RAWBIN : T_FMT_TEXT;
+}
+
+int64_t t_fopen(const char* path, int32_t mode) {
+    fid_init();
+    const char* ms;
+    int32_t binary = (mode >= 3) ? 1 : 0;
+    switch (mode) {
+        case 0: ms = "r";  break;
+        case 1: ms = "w";  break;
+        case 2: ms = "a";  break;
+        case 3: ms = "rb"; break;
+        case 4: ms = "wb"; break;
+        case 5: ms = "ab"; break;
+        default: t_fatal("fopen: 非法打开方式码"); return -1;
+    }
+    FILE* fp = fopen(path, ms);
+    if (!fp) { snprintf(g_fid_open_err, sizeof(g_fid_open_err), "fopen '%s': %s", path ? path : "", strerror(errno)); return -1; }
+    int32_t slot = -1;
+    for (int32_t i = 3; i < T_FID_MAX; i++) { if (!g_fids[i].open) { slot = i; break; } }
+    if (slot < 0) { snprintf(g_fid_open_err, sizeof(g_fid_open_err), "fopen '%s': 文件描述符表已满", path ? path : ""); fclose(fp); t_fatal("fopen: 文件描述符表已满"); return -1; }
+    char suf[T_FID_SUF_MAX];
+    fid_suffix_of(path, suf);
+    g_fids[slot].fp     = fp;
+    g_fids[slot].binary = binary;
+    g_fids[slot].fmt    = fid_resolve_fmt(binary, suf);
+    g_fids[slot].open   = 1;
+    g_fids[slot].is_std = 0;
+    return (int64_t)slot;
+}
+
+// 记录句柄最近一次错误原因（fid_error 查询用）。语义是「最近一次错误」：
+// 成功路径**不清空**，故调用方可在若干次写之后统一探测。越界槽位静默忽略。
+static void fid_set_err(int64_t f, const char* op, const char* why) {
+    if (f < 0 || f >= T_FID_MAX) return;
+    snprintf(g_fids[f].err, sizeof(g_fids[f].err), "%s: %s", op, why ? why : "未知错误");
+}
+
+// stdio 的写失败只置流错误标志，不逐调用返回；须显式 ferror 才能发现。
+static void fid_check_write(int64_t f, TFidRec* r, const char* op) {
+    if (!r || !r->fp) return;
+    if (ferror(r->fp)) { fid_set_err(f, op, strerror(errno)); clearerr(r->fp); }
+}
+
+static TFidRec* fid_get(int64_t f) {
+    fid_init();
+    if (f < 0 || f >= T_FID_MAX) { t_fatal("fid: 非法文件描述符"); return NULL; }
+    if (!g_fids[f].open)         { fid_set_err(f, "fid", "文件描述符已关闭或未打开");
+                                   t_fatal("fid: 文件描述符已关闭或未打开"); return NULL; }
+    return &g_fids[f];
+}
+
+void t_fclose(int64_t f) {
+    TFidRec* r = fid_get(f);
+    if (r->is_std) { fid_set_err(f, "fclose", "标准流不可关闭"); t_fatal("fclose: 标准流不可关闭"); }
+    if (fclose(r->fp) != 0) fid_set_err(f, "fclose", strerror(errno));
+    r->fp = NULL;
+    r->open = 0;
+}
+
+void t_fflush(int64_t f) {
+    TFidRec* r = fid_get(f);
+    if (fflush(r->fp) != 0) fid_set_err(f, "fflush", strerror(errno));
+    fid_check_write(f, r, "fflush");
+}
+
+int32_t t_fid_is_open(int64_t f) {
+    fid_init();
+    if (f < 0 || f >= T_FID_MAX) return 0;
+    return g_fids[f].open ? 1 : 0;
+}
+
+// 查询句柄最近一次错误描述。f == -1 取自 fopen 失败原因；非法/未开句柄返回空串（不 panic，符合 D6/L-09）。
+TStr t_fid_error(int64_t f) {
+    if (f == -1) return t_str_from_c(g_fid_open_err);
+    if (f < 0 || f >= T_FID_MAX) { TStr e; e.ptr = (const uint8_t*)""; e.len = 0; return e; }
+    return t_str_from_c(g_fids[f].err);
+}
+
+// 是否已到结尾或出错（读路径探针，与 fid_is_open / fid_error 同族）。
+// 无效/已关闭句柄或流错误一律返 1（不能再读），并写 fid_error；正常且未到尾返 0。
+// 注意：单纯 EOF 不写 fid_error（EOF 是预期结束，应由 fid_eof 表达，见 §3.9.1 Option B）。
+static TFidRec* fid_try(int64_t f);   // 前向声明（定义见下方 fseek 段）
+// 语义是「还有没有下一个字节可读」，而**不是** C 的 feof —— feof 要等到一次读越界之后
+// 才置位，恰好读完全部内容时它仍为假，`while (!fid_eof(f))` 会凭空多转一圈。
+// 故这里做一字节前瞻（getc + ungetc）。纯 EOF 不写 fid_error（EOF 不是错误）。
+int32_t t_fid_eof(int64_t f) {
+    TFidRec* r = fid_try(f);
+    if (!r) { fid_set_err(f, "fid_eof", "无效或已关闭的文件描述符"); return 1; }
+    if (ferror(r->fp)) { fid_set_err(f, "fid_eof", strerror(errno)); return 1; }
+    if (feof(r->fp)) return 1;
+    int c = getc(r->fp);
+    if (c == EOF) {
+        if (ferror(r->fp)) { fid_set_err(f, "fid_eof", strerror(errno)); clearerr(r->fp); }
+        return 1;
+    }
+    ungetc(c, r->fp);
+    return 0;
+}
+
+// ── 定位 / 随机访问（fseek / ftell）───────────────────────────
+// 与 fid_get 不同，这两个内建**不 panic**：无效/已关闭句柄写 err 后返回失败值
+// （fseek→false，ftell→-1），由调用方用 fid_error 显式取因（L-02 / L-09）。
+// 用 64 位定位原语，避免 Windows 上 long 只有 32 位导致 >2GB 文件截断。
+#if defined(_WIN32)
+  #define T_FSEEK_SET(fp, off) _fseeki64((fp), (off), SEEK_SET)
+  #define T_FTELL(fp)          _ftelli64(fp)
+#else
+  #define T_FSEEK_SET(fp, off) fseeko((fp), (off_t)(off), SEEK_SET)
+  #define T_FTELL(fp)          ((int64_t)ftello(fp))
+#endif
+
+static TFidRec* fid_try(int64_t f) {
+    fid_init();
+    if (f < 0 || f >= T_FID_MAX) return NULL;
+    if (!g_fids[f].open)         return NULL;
+    return &g_fids[f];
+}
+
+int32_t t_fseek(int64_t f, int64_t off) {
+    TFidRec* r = fid_try(f);
+    if (!r)      { fid_set_err(f, "fseek", "无效或已关闭的文件描述符"); return 0; }
+    if (off < 0) { fid_set_err(f, "fseek", "偏移不能为负"); return 0; }
+    if (T_FSEEK_SET(r->fp, off) != 0) { fid_set_err(f, "fseek", strerror(errno)); return 0; }
+    clearerr(r->fp);   // 定位成功即清 EOF 标志，否则读到尾后再 seek 回去仍读不出
+    return 1;
+}
+
+int64_t t_ftell(int64_t f) {
+    TFidRec* r = fid_try(f);
+    if (!r) { fid_set_err(f, "ftell", "无效或已关闭的文件描述符"); return -1; }
+    int64_t p = (int64_t)T_FTELL(r->fp);
+    if (p < 0) { fid_set_err(f, "ftell", strerror(errno)); return -1; }
+    return p;
+}
+
+int64_t t_fid_format(int64_t f, int64_t a_text, int64_t a_json, int64_t a_raw, int64_t a_pb) {
+    TFidRec* r = fid_get(f);
+    switch (r->fmt) {
+        case T_FMT_JSON:     return a_json;
+        case T_FMT_RAWBIN:   return a_raw;
+        case T_FMT_PROTOBUF: return a_pb;
+        default:             return a_text;
+    }
+}
+
+void t_fmt_register(int32_t kind, const char* suffix, int32_t fmt) {
+    fid_init();
+    fmt_reg_put(kind, suffix, fmt);
+}
+
+// ── 序列化：一律返回目标 fid，`f < a < b` 落成嵌套调用 ──────────
+static void ser_raw(TFidRec* r, const void* p, size_t n) { fwrite(p, 1, n, r->fp); }
+
+static void ser_pb_unsupported(void) { t_fatal("ser: protobuf 格式尚未实现（v1）"); }
+
+// 序列化统一出口：探测写失败并落 err，再返回目标 fid（`f < a < b` 靠返回值串联）。
+static int64_t ser_done(int64_t f, TFidRec* r) { fid_check_write(f, r, "serialize"); return f; }
+
+int64_t t_ser_int(int64_t f, int64_t v, int32_t bits, int32_t sgn) {
+    TFidRec* r = fid_get(f);
+    if (r->fmt == T_FMT_PROTOBUF) ser_pb_unsupported();
+    if (r->fmt == T_FMT_RAWBIN) {
+        size_t n = (size_t)(bits / 8);
+        if (n == 0 || n > 8) n = 8;
+        uint64_t u = (uint64_t)v;
+        uint8_t  b[8];
+        for (size_t i = 0; i < n; i++) b[i] = (uint8_t)((u >> (8 * i)) & 0xFF); // little-endian
+        ser_raw(r, b, n);
+        return ser_done(f, r);
+    }
+    if (sgn) fprintf(r->fp, "%lld", (long long)v);
+    else     fprintf(r->fp, "%llu", (unsigned long long)(uint64_t)v);
+    return ser_done(f, r);
+}
+
+int64_t t_ser_f64(int64_t f, double v, int32_t bits) {
+    TFidRec* r = fid_get(f);
+    if (r->fmt == T_FMT_PROTOBUF) ser_pb_unsupported();
+    if (r->fmt == T_FMT_RAWBIN) {
+        if (bits == 32) { float g = (float)v; ser_raw(r, &g, 4); }
+        else            { ser_raw(r, &v, 8); }
+        return ser_done(f, r);
+    }
+    fprintf(r->fp, "%g", v);
+    return ser_done(f, r);
+}
+
+int64_t t_ser_bool(int64_t f, int8_t v) {
+    TFidRec* r = fid_get(f);
+    if (r->fmt == T_FMT_PROTOBUF) ser_pb_unsupported();
+    if (r->fmt == T_FMT_RAWBIN) { uint8_t b = v ? 1u : 0u; ser_raw(r, &b, 1); return ser_done(f, r); }
+    fputs(v ? "true" : "false", r->fp);
+    return ser_done(f, r);
+}
+
+// JSON 字符串转义：双引号、反斜杠与控制字符。
+static void ser_json_str(TFidRec* r, const uint8_t* p, int64_t n) {
+    fputc('"', r->fp);
+    for (int64_t i = 0; i < n; i++) {
+        uint8_t c = p[i];
+        if (c == '"')       fputs("\\\"", r->fp);
+        else if (c == '\\') fputs("\\\\", r->fp);
+        else if (c == '\n') fputs("\\n", r->fp);
+        else if (c == '\r') fputs("\\r", r->fp);
+        else if (c == '\t') fputs("\\t", r->fp);
+        else if (c < 0x20)  fprintf(r->fp, "\\u%04x", (unsigned)c);
+        else                fputc((int)c, r->fp);
+    }
+    fputc('"', r->fp);
+}
+
+int64_t t_ser_atom(int64_t f, int64_t id) {
+    TFidRec* r = fid_get(f);
+    if (r->fmt == T_FMT_PROTOBUF) ser_pb_unsupported();
+    if (r->fmt == T_FMT_RAWBIN) {
+        uint64_t u = (uint64_t)id;
+        uint8_t  b[8];
+        for (size_t i = 0; i < 8; i++) b[i] = (uint8_t)((u >> (8 * i)) & 0xFF);
+        ser_raw(r, b, 8);
+        return ser_done(f, r);
+    }
+    TStr nm = t_atom_str(id);
+    if (r->fmt == T_FMT_JSON) { ser_json_str(r, nm.ptr, nm.len); return ser_done(f, r); }
+    if (nm.len > 0) fwrite(nm.ptr, 1, (size_t)nm.len, r->fp);
+    return ser_done(f, r);
+}
+
+int64_t t_ser_str(int64_t f, TStr s) {
+    TFidRec* r = fid_get(f);
+    if (r->fmt == T_FMT_PROTOBUF) ser_pb_unsupported();
+    if (r->fmt == T_FMT_RAWBIN) {
+        uint64_t u = (uint64_t)s.len;
+        uint8_t  b[8];
+        for (size_t i = 0; i < 8; i++) b[i] = (uint8_t)((u >> (8 * i)) & 0xFF);
+        ser_raw(r, b, 8);                                  // 8 字节 LE 长度前缀
+        if (s.len > 0) ser_raw(r, s.ptr, (size_t)s.len);
+        return ser_done(f, r);
+    }
+    if (r->fmt == T_FMT_JSON) { ser_json_str(r, s.ptr, s.len); return ser_done(f, r); }
+    if (s.len > 0) fwrite(s.ptr, 1, (size_t)s.len, r->fp);
+    return ser_done(f, r);
+}
+
+// ── 反序列化（读路径，M52 读路径，Option B：裸 T + fid_eof 探针）────────
+// EOF/错误返回默认值（数值 0 / 空串），调用方用 fid_eof / fid_error 显式探测（L-02 显式）。
+// 各格式与写路径镜像：:text 按空白切 token；:json 解析下一 JSON 值；:rawbin 按静态位宽读小端、
+//   string 先读 u64 长度前缀；:protobuf 留 v2。
+
+// 读 n 字节；短读/EOF 返 0（调用方用 fid_eof 探测）；I/O 错误写 err 后仍返 0。
+static int64_t deser_read_raw(TFidRec* r, uint8_t* b, size_t n) {
+    if (n == 0) return (int64_t)n;
+    size_t got = fread(b, 1, n, r->fp);
+    if (got != n) {
+        if (ferror(r->fp)) fid_set_err((int64_t)(r - g_fids), "deserialize", strerror(errno));
+        return 0;
+    }
+    return (int64_t)n;
+}
+
+// 跳过空白，读一个非空白 token 到 buf（不含结尾 \0），返回 token 长度；EOF 返 -1。
+static int64_t deser_next_token(TFidRec* r, char* buf, int64_t cap) {
+    int c = fgetc(r->fp);
+    while (c != EOF && isspace(c)) c = fgetc(r->fp);
+    if (c == EOF) return -1;
+    int64_t n = 0;
+    while (c != EOF && !isspace(c)) {
+        if (n < cap - 1) buf[n++] = (char)c;
+        c = fgetc(r->fp);
+    }
+    if (c != EOF) ungetc(c, r->fp);
+    buf[n] = 0;
+    return n;
+}
+
+// JSON 字符串：跳过前导空白与开引号，读到闭引号，处理 \" \\ \n \r \t \/ \uXXXX（简化）。
+// 成功返回新分配缓冲（t_alloc）且 *out_len >= 0；格式错 *out_len = -1；非字符串值 *out_len = 0 且返 NULL。
+static uint8_t* deser_json_str(TFidRec* r, int64_t* out_len) {
+    int c = fgetc(r->fp);
+    while (c != EOF && isspace(c)) c = fgetc(r->fp);
+    if (c != '"') { if (c != EOF) ungetc(c, r->fp); *out_len = 0; return NULL; }
+    int64_t cap = 4096, len = 0;
+    uint8_t* buf = (uint8_t*)t_alloc((size_t)cap);
+    while (1) {
+        c = fgetc(r->fp);
+        if (c == EOF) { *out_len = -1; return buf; }
+        if (c == '"') break;
+        if (c == '\\') {
+            c = fgetc(r->fp);
+            if (c == EOF) { *out_len = -1; return buf; }
+            int outc;
+            if (c == 'n') outc = '\n';
+            else if (c == 't') outc = '\t';
+            else if (c == 'r') outc = '\r';
+            else if (c == '"') outc = '"';
+            else if (c == '\\') outc = '\\';
+            else if (c == '/') outc = '/';
+            else if (c == 'u') {
+                int v = 0;
+                for (int k = 0; k < 4; k++) {
+                    int h = fgetc(r->fp);
+                    if (h == EOF) { *out_len = -1; return buf; }
+                    v = v * 16 + (isdigit(h) ? h - '0' : tolower(h) - 'a' + 10);
+                }
+                outc = v & 0xFF;
+            } else outc = c;
+            c = outc;
+        }
+        if (len >= cap) { fid_set_err((int64_t)(r - g_fids), "deserialize", "JSON 字符串过长（>4096）"); break; }
+        buf[len++] = (uint8_t)c;
+    }
+    *out_len = len;
+    return buf;
+}
+
+int64_t t_deser_int(int64_t f, int32_t bits, int32_t sgn) {
+    TFidRec* r = fid_try(f);
+    if (!r) { fid_set_err(f, "deserialize", "无效或已关闭的文件描述符"); return 0; }
+    if (r->fmt == T_FMT_PROTOBUF) { t_fatal("deser: protobuf 格式尚未实现（v1）"); return 0; }
+    if (r->fmt == T_FMT_RAWBIN) {
+        size_t n = (size_t)(bits / 8); if (n == 0 || n > 8) n = 8;
+        uint8_t b[8] = {0};
+        if (deser_read_raw(r, b, n) == 0) return 0;   // EOF/错误：默认 0，fid_eof 探测
+        uint64_t u = 0;
+        for (size_t i = 0; i < n; i++) u |= ((uint64_t)b[i]) << (8 * i);
+        if (sgn) { int sh = 64 - bits; u = (uint64_t)((int64_t)(u << sh) >> sh); }
+        return (int64_t)u;
+    }
+    char buf[64];
+    if (deser_next_token(r, buf, sizeof buf) < 0) return 0;
+    if (sgn) return (int64_t)strtoll(buf, NULL, 10);
+    return (int64_t)strtoull(buf, NULL, 10);
+}
+
+double t_deser_f64(int64_t f, int32_t bits) {
+    TFidRec* r = fid_try(f);
+    if (!r) { fid_set_err(f, "deserialize", "无效或已关闭的文件描述符"); return 0.0; }
+    if (r->fmt == T_FMT_PROTOBUF) { t_fatal("deser: protobuf 格式尚未实现（v1）"); return 0.0; }
+    if (r->fmt == T_FMT_RAWBIN) {
+        if (bits == 32) { float g; if (deser_read_raw(r, (uint8_t*)&g, 4) == 0) return 0.0; return (double)g; }
+        double v; if (deser_read_raw(r, (uint8_t*)&v, 8) == 0) return 0.0; return v;
+    }
+    char buf[64];
+    if (deser_next_token(r, buf, sizeof buf) < 0) return 0.0;
+    return strtod(buf, NULL);
+}
+
+int8_t t_deser_bool(int64_t f) {
+    TFidRec* r = fid_try(f);
+    if (!r) { fid_set_err(f, "deserialize", "无效或已关闭的文件描述符"); return 0; }
+    if (r->fmt == T_FMT_PROTOBUF) { t_fatal("deser: protobuf 格式尚未实现（v1）"); return 0; }
+    if (r->fmt == T_FMT_RAWBIN) {
+        uint8_t b; if (deser_read_raw(r, &b, 1) == 0) return 0; return b ? 1 : 0;
+    }
+    char buf[16];
+    if (deser_next_token(r, buf, sizeof buf) < 0) return 0;
+    if (strcmp(buf, "true") == 0 || strcmp(buf, "1") == 0) return 1;
+    return 0;
+}
+
+int64_t t_deser_atom(int64_t f) {
+    TFidRec* r = fid_try(f);
+    if (!r) { fid_set_err(f, "deserialize", "无效或已关闭的文件描述符"); return 0; }
+    if (r->fmt == T_FMT_PROTOBUF) { t_fatal("deser: protobuf 格式尚未实现（v1）"); return 0; }
+    if (r->fmt == T_FMT_RAWBIN) {
+        uint8_t b[8];
+        if (deser_read_raw(r, b, 8) == 0) return 0;
+        uint64_t u = 0; for (int i = 0; i < 8; i++) u |= ((uint64_t)b[i]) << (8 * i);
+        return (int64_t)u;
+    }
+    char buf[64];
+    if (deser_next_token(r, buf, sizeof buf) < 0) return 0;
+#ifndef T_ATOM_BOOTSTRAP_STUB
+    for (int64_t i = 1; i < t_atom_count; i++) {
+        TStr nm = t_atom_str(i);
+        if (nm.len == (int64_t)strlen(buf) && strncmp((const char*)nm.ptr, buf, (size_t)nm.len) == 0) return i;
+    }
+#endif
+    fid_set_err(f, "deserialize", "未识别的 atom 名");
+    return 0;
+}
+
+TStr t_deser_str(int64_t f) {
+    TStr out; out.ptr = (const uint8_t*)""; out.len = 0;
+    TFidRec* r = fid_try(f);
+    if (!r) { fid_set_err(f, "deserialize", "无效或已关闭的文件描述符"); return out; }
+    if (r->fmt == T_FMT_PROTOBUF) { t_fatal("deser: protobuf 格式尚未实现（v1）"); return out; }
+    if (r->fmt == T_FMT_RAWBIN) {
+        uint8_t b[8];
+        if (deser_read_raw(r, b, 8) == 0) return out;   // EOF/错误：空串
+        uint64_t u = 0; for (int i = 0; i < 8; i++) u |= ((uint64_t)b[i]) << (8 * i);
+        int64_t n = (int64_t)u;
+        if (n <= 0) return out;
+        uint8_t* p = (uint8_t*)t_alloc((size_t)n);
+        if (deser_read_raw(r, p, (size_t)n) == 0) { out.ptr = p; out.len = 0; return out; }  // 短读/EOF：空串
+        out.ptr = p; out.len = n; return out;
+    }
+    if (r->fmt == T_FMT_JSON) {
+        int64_t n = 0; uint8_t* p = deser_json_str(r, &n);
+        if (n < 0) { fid_set_err(f, "deserialize", "JSON 字符串格式错误"); return out; }
+        out.ptr = p; out.len = n; return out;
+    }
+    // :text：读下一 token（空白分隔；含空格的字符串无法 round-trip，属已知限制）
+    char buf[4096];
+    int64_t n = deser_next_token(r, buf, sizeof buf);
+    if (n < 0) return out;
+    uint8_t* p = (uint8_t*)t_alloc((size_t)n);
+    for (int64_t i = 0; i < n; i++) p[i] = (uint8_t)buf[i];
+    out.ptr = p; out.len = n; return out;
 }

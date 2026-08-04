@@ -74,6 +74,35 @@ void t_sb_clear(TSb* b);
 // int_to_str(v: i64) -> string —— 整数转十进制字符串（arena 分配）
 TStr t_int_to_str(int64_t v);
 
+// ── 格式化（Python 格式规范迷你语言子集）──────────────────────────────
+// 语法: [[fill]align][sign][#][0][width][grouping][.precision][type]
+// spec 可带 "{}" / ":" 外壳，解析时自动剥除。
+TStr t_format_int(TStr spec, int64_t v);
+TStr t_format_uint(TStr spec, uint64_t v);
+TStr t_format_float(TStr spec, double v);
+TStr t_format_str(TStr spec, TStr v);
+TStr t_format_bool(TStr spec, int v);
+TStr t_format_char(TStr spec, uint8_t v);
+// StringBuilder 直写变体
+void t_sb_append_fmt_int(TSb* b, TStr spec, int64_t v);
+void t_sb_append_fmt_uint(TSb* b, TStr spec, uint64_t v);
+void t_sb_append_fmt_float(TSb* b, TStr spec, double v);
+void t_sb_append_fmt_str(TSb* b, TStr spec, TStr v);
+void t_sb_append_fmt_bool(TSb* b, TStr spec, int v);
+void t_sb_append_fmt_char(TSb* b, TStr spec, uint8_t v);
+
+// ── 时间格式化（strftime / Python datetime.strftime 的 % 风格子集，M56/M57）──
+// now() -> 当前时刻微秒 epoch；format_time(spec, t_us, use_local) 按 UTC / 本地时区展开。
+// use_local != 0 时按本地时区（localtime），否则 UTC（gmtime）。
+int64_t t_now(void);
+TStr    t_format_time(TStr spec, int64_t t_us, int use_local);
+// M57：固定时区偏移（分钟，东为正）。%z 输出 ±HHMM，%Z 输出 "UTC" / "UTC±HH:MM"。
+TStr    t_format_time_tz(TStr spec, int64_t t_us, int64_t tz_min);
+// M57：strptime 子集。成功返回微秒 epoch；失败返回 T_TIME_INVALID（INT64_MIN）。
+// use_local != 0 且串内无 %z 时，按本机本地时区解释；否则按 UTC / 串内偏移。
+int64_t t_parse_time(TStr spec, TStr s, int use_local);
+#define T_TIME_INVALID INT64_MIN
+
 // ── 切片 []T：泛型经元素宽度单态化 ─────────────────────────────
 // t 语言层不暴露 void*；类型安全由 tc 类型检查器在编译期保证。
 // emitter 规则：tokens[i] → *(Token*)t_slice_at(tokens, i)
@@ -120,6 +149,14 @@ TStr     t_sym_str(TStr tag, uint32_t id);                // id→字符串（�
 void     t_sym_release(TStr tag);                         // 释放该 tag 整池
 void     t_sym_release_all(void);                         // 释放所有池
 
+// ── Atom：Erlang 式全局原子���编译期 intern 的稳定 i64 id）────────────
+// atom 值在 IR 中即为 i64（id）；名字表由编译器发射到生成代码中（见 tc 的
+// emit_c_atom_table / emit_ll_atom_table），此处仅作 extern 声明与还原函数。
+// atom_str(id) 还原原子名（无效 id 返回空串）。
+extern TStr    t_atom_table[];                            // 编译器发射：index 0 占位空串
+extern int64_t t_atom_count;                              // 编译器发射：表长（含占位）
+TStr     t_atom_str(int64_t id);                          // id→原子名（1-based，越界空串）
+
 // ── 文件 I/O 与进程 ───────────────────────────────────────────
 // 对应 t 语言内置：
 //   file_read_all(path: string) -> string
@@ -142,7 +179,10 @@ void    t_println(TStr s);
 // TypeInfo / FieldInfo 是编译器在编译期合成的常量结构；用户通过 accessor
 // 内建（ti_name / ti_field / fi_*）读取，type_info(T) 返回指向常量的指针。
 typedef struct { TStr name; int64_t size; int64_t kind; int64_t field_count; TSlice fields; } TTypeInfo;
-typedef struct { TStr name; int64_t offset; TStr type_name; int64_t type_size; int8_t is_ptr; } TFieldInfo;
+//  tag：字段 tagID（@N 显式 / 全显式时按声明序自动分配，1 基）。编译期元数据，
+//       运行时零内存成本（不进 struct 内存布局，只活于此 FieldInfo 常量）。fid v2
+//       字段级版本化将据此做前向兼容。
+typedef struct { TStr name; int64_t offset; TStr type_name; int64_t type_size; int8_t is_ptr; int64_t tag; } TFieldInfo;
 
 TStr        t_ti_name(TTypeInfo* ti);
 int64_t     t_ti_size(TTypeInfo* ti);
@@ -154,8 +194,47 @@ int64_t     t_fi_offset(TFieldInfo* fi);
 TStr        t_fi_type_name(TFieldInfo* fi);
 int64_t     t_fi_type_size(TFieldInfo* fi);
 int8_t      t_fi_is_ptr(TFieldInfo* fi);
+int64_t     t_fi_tag(TFieldInfo* fi);
 int32_t t_system(TStr cmd);                         // sys_run(cmd) -> 子进程退出码
 #define sys_run(cmd) t_system(cmd)                  // 兼容旧版 C 后端把 sys_run 按普通调用发射
+
+// ── Fid：文件描述符句柄 + 序列化操作符（M51）───────────────────
+// fid 在 IR 中即为 i64（句柄）。0/1/2 恒为 stdin/stdout/stderr，由运行时预置；
+// 其余句柄由 t_fopen 分配。打开方式与格式在**编译期**降为小整数码（见 tc 的
+// fid_code_of），运行时不做字符串比较、不依赖 atom 名表。
+//   mode: 0=read 1=write 2=append 3=read_binary 4=write_binary 5=append_binary
+//   kind: 0=text 1=binary
+//   fmt : 0=text 1=json 2=rawbin 3=protobuf
+// 格式在 t_fopen 时按 (kind, 后缀) 查注册表一次性解析并冻结进句柄记录。
+int64_t t_fopen(const char* path, int32_t mode);    // 失败返回 -1（用 fid_is_open 显式检测）
+void    t_fclose(int64_t f);                        // 重复关闭 / 关闭标准流 → panic
+void    t_fflush(int64_t f);
+int32_t t_fid_is_open(int64_t f);
+// fid_error(f) -> string：查询句柄最近一次错误描述；无错误返回空串。
+// f == -1（fopen 失败的哨兵值）时返回最近一次 fopen 的失败原因。
+TStr    t_fid_error(int64_t f);
+// fid_format(f) -> atom：运行时只持有格式码，atom id 由编译期 intern 后传入
+int64_t t_fid_format(int64_t f, int64_t a_text, int64_t a_json, int64_t a_raw, int64_t a_pb);
+void    t_fmt_register(int32_t kind, const char* suffix, int32_t fmt);  // 后缀挂靠（后注册覆盖先注册）
+// 定位：均**不 panic**，失败写 err 供 fid_error 取因。
+int32_t t_fseek(int64_t f, int64_t off);            // 成功 1 / 失败 0（负偏移、不可定位、已关闭）
+int64_t t_ftell(int64_t f);                         // 当前偏移；不可定位返 -1
+// fid_eof(f) -> bool：是否已到结尾或出错（读路径探针）。无效/已关闭句柄或流错误返 1；单纯 EOF 不写 fid_error。
+int32_t t_fid_eof(int64_t f);
+
+// 序列化：一律**返回目标 fid**，故 `f < a < b` 直接落成嵌套调用，无需临时量。
+int64_t t_ser_int(int64_t f, int64_t v, int32_t bits, int32_t sgn);
+int64_t t_ser_f64(int64_t f, double v, int32_t bits);
+int64_t t_ser_bool(int64_t f, int8_t v);
+int64_t t_ser_atom(int64_t f, int64_t id);
+int64_t t_ser_str(int64_t f, TStr s);
+
+// 反序列化（读路径，Option B：裸 T + fid_eof 探针）。EOF/错误返回默认值（0 / 空串），调用方用 fid_eof / fid_error 探测。
+int64_t t_deser_int(int64_t f, int32_t bits, int32_t sgn);   // bits: 静态位宽；sgn: 1=有符号
+double  t_deser_f64(int64_t f, int32_t bits);               // bits: 32 或 64
+int8_t  t_deser_bool(int64_t f);
+int64_t t_deser_atom(int64_t f);
+TStr    t_deser_str(int64_t f);
 
 // ── 诊断 panic ────────────────────────────────────────────────
 // 越界等运行时非法访问：打印 JSON 诊断包后退出，供 AI Agent 消费。
