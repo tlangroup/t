@@ -12305,6 +12305,117 @@ var em_in_fn: bool;
 var em_main_fn: string;   // @main 函数的 mangle 名
 var em_has_main: bool;
 
+// C 后端：按字段依赖拓扑排序后，已先发射的 struct 族类型名集合（供主循环跳过）。
+// 原因：C 要求 struct 在被值内嵌（作为字段）之前已完整定义；而导入模块的 struct
+// （如 physics 的 Position/Velocity）被追加在 entry 之后，按 decl_list 顺序发射会因
+// 类型未完成而报错。拓扑排序保证「被依赖者先定义」。指针/切片字段不强制顺序。
+var g_emitted_structs: []string;
+
+// 判断字符串是否已在切片中（用于 g_emitted_structs 查重）。
+str_in_slice fn(sl: []string, v: string) -> bool {
+    var n: i64 = slice_len(sl) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        if (sl[i] == v) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+// 按字段依赖拓扑排序，先发射所有 struct/union/variant 族类型的完整定义。
+// 工作表算法：反复发射「依赖均已满足」的类型，直到无进展；残留（环等异常）原序补发。
+emit_struct_families_ordered fn() -> void {
+    var _empty: []string;
+    g_emitted_structs = _empty;
+    var sdecls: []i64;
+    var snames: []string;
+    var n: i64 = slice_len(decl_list) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        var d: i64 = decl_list[i];
+        var k: string = nodes[d].kind;
+        if (k == "StructDecl" || k == "UnionDecl" || k == "VariantDecl") {
+            append(sdecls, d);
+            append(snames, nodes[d].sa);
+        }
+        i = i + 1;
+    }
+    var m: i64 = slice_len(sdecls) as i64;
+    if (m == 0) { return; }
+    var done: []bool;
+    var di: i64 = 0;
+    while (di < m) { append(done, false); di = di + 1; }
+
+    var progressed: bool = true;
+    var guard: i64 = 0;
+    while (progressed) {
+        progressed = false;
+        var j: i64 = 0;
+        while (j < m) {
+            if (done[j]) { j = j + 1; continue; }
+            var d: i64 = sdecls[j];
+            var ok: bool = true;
+            var depbuf: []string;
+            var c: i64 = nodes[d].lb;
+            while (c >= 0) {
+                var f: Node = nodes[kids[c].val];
+                if (f.na >= 0) {
+                    var tn: i64 = f.na;
+                    var tk: string = nodes[tn].kind;
+                    if (tk == "named") {
+                        append(depbuf, nodes[tn].sa);
+                    } else if (tk == "array") {
+                        var en: i64 = nodes[tn].na;
+                        if (en >= 0 && nodes[en].kind == "named") {
+                            append(depbuf, nodes[en].sa);
+                        }
+                    }
+                }
+                c = kids[c].next;
+            }
+            var dl: i64 = slice_len(depbuf) as i64;
+            var kk: i64 = 0;
+            while (kk < dl) {
+                var dep: string = depbuf[kk];
+                var is_sd: bool = false;
+                var sd_idx: i64 = -1;
+                var si: i64 = 0;
+                while (si < m) {
+                    if (snames[si] == dep) { is_sd = true; sd_idx = si; }
+                    si = si + 1;
+                }
+                if (is_sd && done[sd_idx] == false) { ok = false; }
+                kk = kk + 1;
+            }
+            if (ok) {
+                var kk2: string = nodes[d].kind;
+                if (kk2 == "StructDecl") { emit_struct_decl(d); }
+                else if (kk2 == "UnionDecl") { emit_union_decl(d); }
+                else if (kk2 == "VariantDecl") { emit_variant_decl(d); }
+                append(g_emitted_structs, snames[j]);
+                done[j] = true;
+                progressed = true;
+            }
+            j = j + 1;
+        }
+        guard = guard + 1;
+        if (guard > m + 2) { progressed = false; }
+    }
+    var j2: i64 = 0;
+    while (j2 < m) {
+        if (done[j2] == false) {
+            var d: i64 = sdecls[j2];
+            var kk2: string = nodes[d].kind;
+            if (kk2 == "StructDecl") { emit_struct_decl(d); }
+            else if (kk2 == "UnionDecl") { emit_union_decl(d); }
+            else if (kk2 == "VariantDecl") { emit_variant_decl(d); }
+            append(g_emitted_structs, snames[j2]);
+            done[j2] = true;
+        }
+        j2 = j2 + 1;
+    }
+}
+
 tm_set fn(name: string, td: i64) -> void {
     append(tm_names, name);
     append(tm_tds, td);
@@ -15219,9 +15330,23 @@ emit_unit fn(mod: string) -> void {
 
     build_type_map();
 
+    // 先按字段依赖拓扑排序，发射所有 struct/union/variant 族类型的完整定义。
+    // 这保证被值内嵌的类型（如 entry 的 NpcState 内嵌 physics 的 Velocity）在引用
+    // 之前已完整定义，消解跨模块 / 前向引用导致的 C 编译错误。
+    emit_struct_families_ordered();
+
     var n: i64 = slice_len(decl_list) as i64;
     var i: i64 = 0;
     while (i < n) {
+        var d: i64 = decl_list[i];
+        var k: string = nodes[d].kind;
+        // 已在上方按拓扑序发射，主循环跳过，避免重复定义。
+        if (k == "StructDecl" || k == "UnionDecl" || k == "VariantDecl") {
+            if (str_in_slice(g_emitted_structs, nodes[d].sa)) {
+                i = i + 1;
+                continue;
+            }
+        }
         emit_decl(decl_list[i]);
         i = i + 1;
     }

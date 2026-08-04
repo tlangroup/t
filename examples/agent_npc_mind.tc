@@ -1,0 +1,173 @@
+// agent_npc_mind.tc —— LLM∧Tool 组合 + 多能力 ECS 分解实跑
+//
+// 演示（对应 docs/agent_first.md §10 / §11 / §12）：
+//   ① agent 保持“瘦”：NpcState 只含决策字段（memory / pending / intent_dir / last_line），
+//      不内嵌任何物理逻辑（呼应“agent 非容器”原则，前几轮已论证）。
+//   ② 物理 Component（Position / Velocity / Rotation / BoundingBox）与 System
+//      （movement_system / rotation_system / collision_system）全部来自 import physics
+//      ——功能外置模型库，主程序不内嵌（呼应“主程序只管词法/语法/语义”）。
+//   ③ Edge 组合 Core×{LLM ∧ Tool}：step 只记 pending 意图（:llm 或 :tool）；
+//      运行时边界 drive_npc 同时处理两类效应（此处用确定性桩 fake_llm / fake_tool）。
+//   ④ Entity = 物理 Component 束 + agent 状态；世界循环按帧推进：
+//      decision Core 写意图 → physics System 读意图算位置/旋转/碰撞 → 边界填 LLM/Tool。
+//
+// 边界模型（Style B）：step 永不直接调 LLM/工具，只在状态里记意图；
+//   真正的 LLM/工具调用只发生在 drive_npc 运行时边界，结果以消息回填。核心纯函数、可回放。
+
+import physics;
+
+// ───────────────────────── agent（瘦决策核） ─────────────────────────
+// 注意：state 里只有“决策相关”字段；物理 Component 一个都不在这里。
+Npc agent {
+    state memory: string;
+    state pending: atom;          // :none=空闲  :llm=等待说话  :tool=等待开门
+    state intent_dir: Velocity;   // 决策输出的“移动意图”，交给 movement_system 去执行
+    state last_line: string;      // 最近一次 LLM/Tool 回填的文本
+    step fn(s: NpcState, msg: atom) -> NpcState {
+        if (msg == :tick) {
+            // 决策：继续向前巡逻（意图写入状态，physics 去执行）
+            s.pending = :none;
+            s.intent_dir = Velocity{ dx: 1, dy: 0, dz: 0 };
+            return s;
+        }
+        if (msg == :talk) {
+            s.pending = :llm;     // 记意图：要说话
+            return s;
+        }
+        if (msg == :use_door) {
+            s.pending = :tool;    // 记意图：要开门（工具效应）
+            return s;
+        }
+        if (msg == :llm_reply) {
+            s.pending = :none;    // 边界已回填，清空意图
+            return s;
+        }
+        if (msg == :tool_done) {
+            s.pending = :none;
+            return s;
+        }
+        return s;
+    }
+}
+
+// ───────────────────────── Entity（物理 Component + agent 状态） ─────────────────────────
+// 富的是 Entity（组合一堆 Component）；瘦的是 agent 声明（只管决策 Core）。
+Entity struct {
+    pos: Position;
+    vel: Velocity;
+    rot: Rotation;
+    box: BoundingBox;
+    wall_hit: bool;               // physics System 写回的“事实”，可供观察
+    mind: NpcState;
+}
+
+// 构造一个初始实体（演示：组合 physics 的 Component + agent 的 state）
+make_entity fn() -> Entity {
+    return Entity{
+        pos:  Position{ x: 0, y: 0, z: 0 },
+        vel:  Velocity{ dx: 0, dy: 0, dz: 0 },
+        rot:  Rotation{ yaw: 0, pitch: 0 },
+        box:  BoundingBox{ w: 1, h: 2, d: 1 },
+        wall_hit: false,
+        mind: npc_spawn("", :none, Velocity{ dx: 0, dy: 0, dz: 0 }, "")
+    };
+}
+
+// 把原子意图解释成可读标签（消息/意图即 atom，可穷尽匹配解释）
+intent_label fn(p: atom) -> string {
+    return match (p) {
+        :none => "idle"
+        :llm  => "await-llm"
+        :tool => "await-tool"
+        _     => "?"
+    };
+}
+
+// ───────────────────────── 运行时边界：LLM ∧ Tool（确定性桩，真实项目即 LLM/IO 接缝） ─────────────────────────
+fake_llm fn(q: string) -> string {
+    return match (q) {
+        "hours" => "We are open 9 to 5."
+        _       => "Tell me more."
+    };
+}
+
+fake_tool fn(arg: string) -> string {
+    return match (arg) {
+        "door" => "door opened"
+        _      => "no-op"
+    };
+}
+
+// 边界驱动：若 step 记了 :llm / :tool 意图，则在此处发生效应并以消息回填清空意图。
+drive_npc fn(s: NpcState, prompt: string, tool_arg: string) -> NpcState {
+    if (s.pending == :llm) {
+        var reply: string = fake_llm(prompt);         // ← 边界：LLM（非确定性接缝）
+        s.last_line = reply;
+        s = npc_step(s, :llm_reply);                  // 回填
+    } else if (s.pending == :tool) {
+        var res: string = fake_tool(tool_arg);         // ← 边界：工具（非确定性接缝）
+        s.last_line = res;
+        s = npc_step(s, :tool_done);                   // 回填
+    }
+    return s;
+}
+
+// ───────────────────────── 世界循环（一帧推进） ─────────────────────────
+// 关键分工：decision Core（agent step）只更新状态、记意图；
+//   physics System 读意图算位置/旋转/碰撞；边界 drive_npc 填 LLM/Tool。
+// 非确定性只活在 drive_npc 这一道边界里。
+world_tick fn(e: Entity, msg: atom, prompt: string, tool_arg: string) -> Entity {
+    e.mind = npc_step(e.mind, msg);                       // 决策 Core：纯函数更新状态（含意图）
+    e.vel = e.mind.intent_dir;                            // 物理：意图 → 速度
+    e.pos = physics.movement_system(e.pos, e.vel, 1);     // 物理：积分位置
+    e.rot = physics.rotation_system(e.rot, 90);           // 物理：旋转
+    e.wall_hit = physics.collision_system(e.pos, e.box, 3); // 物理：碰撞检测（墙在 x=3）
+    e.mind = drive_npc(e.mind, prompt, tool_arg);         // 边界：LLM/Tool 回填（若 pending）
+    return e;
+}
+
+// 展示实体快照（仅打印 i64 / 字符串 / 确定性 bool，保证双后端输出一致）
+show_entity fn(tag: string, e: Entity) -> void {
+    var b: StringBuilder = sb_new();
+    sb_append_str(b, tag);
+    sb_append_str(b, " pos=(");
+    sb_append_i64(b, e.pos.x);
+    sb_append_str(b, ",");
+    sb_append_i64(b, e.pos.y);
+    sb_append_str(b, ",");
+    sb_append_i64(b, e.pos.z);
+    sb_append_str(b, ") yaw=");
+    sb_append_i64(b, e.rot.yaw);
+    sb_append_str(b, " pending=");
+    sb_append_str(b, intent_label(e.mind.pending));
+    sb_append_str(b, " hit=");
+    if (e.wall_hit) { sb_append_str(b, "yes"); } else { sb_append_str(b, "no"); }
+    sb_append_str(b, " last=");
+    sb_append_str(b, e.mind.last_line);
+    println(sb_to_str(b));
+}
+
+@main
+main fn() -> i64 {
+    println("=== agent_npc_mind: LLM^Tools + ECS 分解 ===");
+    var e: Entity = make_entity();
+    show_entity("spawn   ->", e);
+
+    // 移动几帧（巡逻：x 从 0 递增，越过墙 x=3 后触发碰撞）
+    e = world_tick(e, :tick, "", "");
+    show_entity("frame1  ->", e);
+    e = world_tick(e, :tick, "", "");
+    show_entity("frame2  ->", e);
+    e = world_tick(e, :tick, "", "");
+    show_entity("frame3  ->", e);
+
+    // 玩家让 NPC 说话（LLM 边界）
+    e = world_tick(e, :talk, "hours", "");
+    show_entity("after talk->", e);
+
+    // 玩家让 NPC 开门（Tool 边界）
+    e = world_tick(e, :use_door, "", "door");
+    show_entity("after tool->", e);
+
+    return 0;
+}
