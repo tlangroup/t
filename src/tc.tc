@@ -4732,7 +4732,14 @@ var g_agent_anchor: i64 = -1;       // agent 声明脱糖时，合成节点锚�
 // （类似 C 的 #include，单一命名空间），再把 `hello.add` 这种限定访问就地
 // 改写成裸 `add`。跨模块私有隔离、名字重整（mangling）留待后续里程碑。
 var g_mod_aliases: []string;        // 已导入模块的「模块名 / 别名」集合（用于识别限定访问前缀）
-var g_mod_visited: []string;        // 已完整加载的模块绝对路径（去重 + 环检测）
+var g_mod_visited: []string;        // 已完整加载的模块绝对路径（钻石依赖去重）
+var g_mod_stack: []string;         // 当前正在加载的模块路径链（DFS 活跃栈，环检测）
+var g_mod_stack_alias: []string;   // 与 g_mod_stack 平行的模块别名，用于构造环路径信息
+var g_dep_from: []string;          // 依赖图边：父模块别名（--emit-deps 输出）
+var g_dep_to: []string;            // 依赖图边：子模块别名
+var g_emit_deps: bool = false;     // --emit-deps：打印模块依赖图后退出
+var g_debug_libs: bool = false;    // --debug-libs：import 优先链接 .tlibd 调试态库
+var g_lib_debug: bool = false;     // build --lib --debug：产出 .tlibd 调试态归档
 
 // ── 命名空间隔离（外部库真正落地）──────────────────────────────
 // provenance：每个 AST 节点记录它是在哪个模块（别名）里被解析出来的。
@@ -11304,6 +11311,34 @@ in_mod_visited fn(p: string) -> bool {
     return false;
 }
 
+// 环检测：chosen 是否处于「正在加载」的活跃栈中（DFS 回边即循环依赖）。
+mod_stack_index fn(p: string) -> i64 {
+    var n: i64 = slice_len(g_mod_stack) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        if (g_mod_stack[i] == p) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+mod_stack_push fn(p: string, a: string) -> void {
+    append(g_mod_stack, p);
+    append(g_mod_stack_alias, a);
+}
+
+// 弹出切片最后一个元素（t 无原生 pop；import 深度极小，O(n) 截断可接受）。
+slice_pop_str fn(s: []string) -> []string {
+    var n: i64 = slice_len(s) as i64;
+    var out: []string;
+    var i: i64 = 0;
+    while (i < n - 1) {
+        append(out, s[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
 mod_alias_add fn(nm: string, alias: string) -> void {
     if (alias == "") {
         if (in_mod_aliases(nm) == false) {
@@ -11388,18 +11423,46 @@ handle_one_import fn(imp: i64) -> void {
             return;
         }
     }
+    // 环检测：chosen 已在活跃加载栈 → 循环依赖（import 不能成环）。
+    var ci: i64 = mod_stack_index(chosen);
+    if (ci >= 0) {
+        var csb: StringBuilder = sb_new();
+        var k: i64 = 0;
+        var m: i64 = slice_len(g_mod_stack) as i64;
+        while (k < m) {
+            if (k > 0) { sb_append_str(csb, " -> "); }
+            sb_append_str(csb, g_mod_stack_alias[k]);
+            k = k + 1;
+        }
+        sb_append_str(csb, " -> ");
+        sb_append_str(csb, alias);
+        fc_err("T_IMPORT_CYCLE",
+            sb_cat3("检测到循环依赖：", sb_to_str(csb),
+                "（import 不能成环，请抽公共模块或改用运行时依赖注入）"), imp);
+        return;
+    }
     // 链接模式探测：存在 .tlib 预编译产物且未用 as 别名（归档按规范名构建，as 别名会错配）→ 外链。
     // 库源码仍载入供类型检查，但导出符号改发 declare、私有跳过，归档在链接期并入（真·独立编译+链接）。
     var ar: string = "";
     if (nodes[imp].bd && user_alias == "" && in_mod_visited(chosen) == false) {
         ar = resolve_external_lib_archive(nm);
     }
-    // 已加载过则跳过（同时天然打破 import 成环，避免无限递归）
+    // 记录依赖图边（父 -> 子），供 --emit-deps 输出（父 = 当前活跃栈顶）。
+    // 放在钻石去重 return 之前：重导入（如菱形共享根）也需记录边，否则依赖图缺失。
+    var dep_parent: string = "<entry>";
+    var dep_stn: i64 = slice_len(g_mod_stack_alias) as i64;
+    if (dep_stn > 0) { dep_parent = g_mod_stack_alias[dep_stn - 1]; }
+    append(g_dep_from, dep_parent);
+    append(g_dep_to, alias);
+    // 钻石依赖：已完整加载过则跳过（不报错，避免重复定义）。
     if (in_mod_visited(chosen)) {
         return;
     }
     append(g_mod_visited, chosen);
+    mod_stack_push(chosen, alias);            // 进入：压栈
     load_module_file(chosen, alias);
+    g_mod_stack = slice_pop_str(g_mod_stack);          // 离开：弹栈
+    g_mod_stack_alias = slice_pop_str(g_mod_stack_alias);
     if (ar != "") {
         append(g_link_libs, alias);
         append(g_ext_link, ar);
@@ -11436,6 +11499,11 @@ resolve_external_lib_archive fn(nm: string) -> string {
     var i: i64 = 0;
     var nd: i64 = slice_len(dirs) as i64;
     while (i < nd) {
+        // --debug-libs：优先链接调试态归档 .tlibd（带 -O0 -gcodeview），缺失则回退 .tlib
+        if (g_debug_libs) {
+            var ar_d: string = path_resolve(sb_cat4(dirs[i], "/", rel, ".tlibd"));
+            if (path_exists(ar_d)) { return ar_d; }
+        }
         var ar: string = path_resolve(sb_cat4(dirs[i], "/", rel, ".tlib"));
         if (path_exists(ar)) { return ar; }
         i = i + 1;
@@ -11544,11 +11612,36 @@ dots_to_slashes fn(s: string) -> string {
     return sb_to_str(sb);
 }
 
+// 输出模块依赖图（JSON）：每条 import 边（父 -> 子）一行，供 tote deps / 工具消费。
+// 环检测已先行；若存在循环依赖，边中会包含回边，可一眼看出环。
+emit_deps fn() -> void {
+    var out: StringBuilder = sb_new();
+    sb_append_str(out, "{\"entry\":\"");
+    json_escape_into(out, g_file);
+    sb_append_str(out, "\",\"edges\":[");
+    var first: bool = true;
+    var ne: i64 = slice_len(g_dep_from) as i64;
+    var e: i64 = 0;
+    while (e < ne) {
+        if (first == false) { sb_append_str(out, ","); }
+        first = false;
+        sb_append_str(out, "{\"from\":\"");
+        json_escape_into(out, g_dep_from[e]);
+        sb_append_str(out, "\",\"to\":\"");
+        json_escape_into(out, g_dep_to[e]);
+        sb_append_char(out, 34);
+        sb_append_char(out, 125);
+        e = e + 1;
+    }
+    sb_append_str(out, "]}\n");
+    print(sb_to_str(out));
+}
 // 顶层入口：内联所有 import，并构建模块别名集合。
 // ImportModDecl 节点留在 decl_list 中无害（register/emit 均对其忽略）。
 resolve_modules fn() -> void {
     compute_src_roots();
     compute_lib_dirs();
+    mod_stack_push(g_file, "<entry>");      // 入口作依赖图根：使「入口↔模块」成环也能被检出
     var n: i64 = slice_len(decl_list) as i64;
     var i: i64 = 0;
     while (i < n) {
@@ -11558,6 +11651,8 @@ resolve_modules fn() -> void {
         }
         i = i + 1;
     }
+    g_mod_stack = slice_pop_str(g_mod_stack);
+    g_mod_stack_alias = slice_pop_str(g_mod_stack_alias);
 }
 
 // ── 模块命名空间隔离（名字重整 / mangling）─────────────────────
@@ -19631,9 +19726,16 @@ emit_llunit fn(mod: string) -> void {
 // <out>.exports.json 接口块。库符号已按规范别名重整（json__version），与下游
 // import @json 的重整结果一致，故导入方只需外链该归档 + 发 declare。
 build_tlib fn(out_p: string, lib_alias: string, clang_p: string) -> i32 {
+    // 调试态：--debug 时产出 .tlibd 归档（clang -O0 -gcodeview），普通时 .tlib（-O2）。
+    var lib_ext: string = ".tlib";
+    var lib_cflags: string = "-O2";
+    if (g_lib_debug) {
+        lib_ext = ".tlibd";
+        lib_cflags = "-O0 -gcodeview";
+    }
     var llp: string = sb_cat2(out_p, ".ll");
     var op: string = sb_cat2(out_p, ".o");
-    var arp: string = sb_cat2(out_p, ".tlib");
+    var arp: string = sb_cat2(out_p, lib_ext);
     // 推导 llvm-ar 路径（与 clang 自动探测同源）
     var ar_p: string = "llvm-ar";
     if (clang_p == "C:/Program Files/LLVM/bin/clang.exe") {
@@ -19643,7 +19745,8 @@ build_tlib fn(out_p: string, lib_alias: string, clang_p: string) -> i32 {
     var csb: StringBuilder = sb_new();
     sb_append_str(csb, "\"");
     sb_append_str(csb, clang_p);
-    sb_append_str(csb, "\" -c -O2 -o \"");
+    sb_append_str(csb, sb_cat2("\" -c ", lib_cflags));
+    sb_append_str(csb, " -o \"");
     sb_append_str(csb, op);
     sb_append_str(csb, "\" \"");
     sb_append_str(csb, llp);
@@ -19687,7 +19790,7 @@ build_tlib fn(out_p: string, lib_alias: string, clang_p: string) -> i32 {
         i = i + 1;
     }
     sb_append_str(exp, "\n]\n");
-    file_write_all(sb_cat2(out_p, ".exports.json"), sb_to_str(exp));
+    file_write_all(sb_cat2(out_p, sb_cat2(lib_ext, ".exports.json")), sb_to_str(exp));
     // 4) 清理中间 .o（.ll 保留作调试产物）
     sys_run(sb_cat3("cmd /c del \"", op, "\" >nul 2>nul"));
     print(sb_cat3("Built library: ", to_bs(arp), "\n"));
@@ -19839,7 +19942,10 @@ print_help fn() -> void {
     print("  --mode <dbg|rls>   调试/发布(默认 dbg)\n");
     print("  --output <path>    指定输出路径前缀\n");
     print("  --clang <path>     指定 clang 路径\n");
-    print("  --runtime <dir>    指定运行时目录(默认 runtime/)\n\n");
+    print("  --runtime <dir>    指定运行时目录(默认 runtime/)\n");
+    print("  --debug-libs       链接调试态库 .tlibd（缺少则回退 .tlib）\n");
+    print("  --debug            build --lib 时产出调试态归档 .tlibd\n");
+    print("  --emit-deps        check 时打印模块依赖图(JSON)后退出\n\n");
     print("退出码: 0=成功, 1=编译/运行错误, 2=命令行用法错误\n");
 }
 
@@ -19875,8 +19981,25 @@ main fn() -> i32 @main {
     }
 
     if (cmd == "check") {
-        g_file = path_resolve(file);
-        var src: string = file_read_all(file);
+        // 解析中性开关：--emit-deps（输出依赖图）、--debug-libs（优先 .tlibd）、--debug、
+        // --lib-dir（调用方如 tote 注入的库搜索目录）
+        // 旗标位置无关：从 argv[2] 起扫描，首个非 -- 旗标即入口文件。
+        // 兼容 `tc check <file> --flag` 与 `tc check --flag <file>`（tote 委托时旗标在前）。
+        var ai: i64 = 2;
+        var an: i64 = slice_len(argv) as i64;
+        var found_file: string = "";
+        while (ai < an) {
+            if (argv[ai] == "--emit-deps") { g_emit_deps = true; ai = ai + 1; continue; }
+            if (argv[ai] == "--debug-libs") { g_debug_libs = true; ai = ai + 1; continue; }
+            if (argv[ai] == "--debug") { g_lib_debug = true; ai = ai + 1; continue; }
+            if (argv[ai] == "--lib-dir") {
+                if (ai + 1 < an) { append(g_lib_dirs, argv[ai + 1]); ai = ai + 2; continue; }
+            }
+            if (found_file == "") { found_file = argv[ai]; }
+            ai = ai + 1;
+        }
+        g_file = path_resolve(found_file);
+        var src: string = file_read_all(found_file);
         tokenize(src);
         pos = 0;
         init_anndefs();
@@ -19884,6 +20007,11 @@ main fn() -> i32 @main {
         run_check();
         flag_pass();
         ann_pass();
+        if (g_emit_deps) {
+            emit_deps();
+            if (has_errors()) { return 1; }
+            return 0;
+        }
         print_json();
         if (has_errors()) {
             return 1;
@@ -20006,6 +20134,16 @@ main fn() -> i32 @main {
             }
             if (argv[ai2] == "--lib") {
                 is_lib = true;
+                ai2 = ai2 + 1;
+                continue;
+            }
+            if (argv[ai2] == "--debug") {
+                g_lib_debug = true;
+                ai2 = ai2 + 1;
+                continue;
+            }
+            if (argv[ai2] == "--debug-libs") {
+                g_debug_libs = true;
                 ai2 = ai2 + 1;
                 continue;
             }

@@ -48,8 +48,9 @@
 - 命名空间隔离 `mangle_modules`：`A.sym`→`A__sym`（跨模块访问需导出，否则 `T_MODULE_PRIVATE`）、`A.T`→`A__T`；入口模块别名 `""` 永不重整（单文件 IR 逐字节不变）。`T_MODULE_NO_SYMBOL` 找不到限定符。
 - `.tlib` 真·独立编译+链接：`build --lib <file.tc>` 产 `out/lib/<stem>.tlib`+`.exports.json`；`import @x` 命中 `.tlib`→链接模式（declare 导出符、归档进 `g_ext_link`），未命中→回退内联。
 - **第六刀 getenv + `--lib-dir` + tote 环境变量搜索**：tc 中性 `getenv(name)->string` 内建 + `--lib-dir` 开关；tote 读 `T_LIB_PATH`/`~/.tote/libs`（`split_path_list` 只按 `;` 切）注入 `--lib-dir`。
-- 示例 `examples/lib/{json,csv}.tc` + `examples/extlib_demo.tc`；conformance `f54`/`f55`/`f56`。
-- **余留待办**：`.tlibd`、内嵌接口块、`T_IMPORT_CYCLE`、tote 依赖图、C 互操作导出。
+- **第七刀 收尾（2026-08-05）**：① `T_IMPORT_CYCLE`——`handle_one_import` DFS 活跃栈 `g_mod_stack`/`g_mod_stack_alias` 检测真环（如 `a→b→a`）；去重仍靠 `in_mod_visited`（菱形共享根只加载一次、不误报）。② `tc check --emit-deps` 输出依赖图 JSON `{"entry":<abs>,"edges":[{"from":<父栈顶|"<entry>">,"to":<子别名>}]}`；边记录置于钻石去重 `return` 之前 → 菱形（`a→b→d`、`a→c→d`）4 边全记（`c→d` 不丢）；flag 位置无关（可前可后）。边闭合用 `sb_append_char(out,34/125)` 逐字符追加 `}"`（避 `t` 字符串字面量「`\"}`→`"}`」陷阱）。③ `tote deps <file>` 委托 `tc check --emit-deps` 并注入 `--lib-dir`。④ `.tlibd` 调试归档：`build --lib --debug` 产 `out/lib/<stem>.tlibd`（`clang -O0 -gcodeview`）+伴随 `.tlibd.exports.json`；`--debug-libs` 令 `resolve_external_lib_archive` 优先 `.tlibd`（回退 `.tlib`→内联）。`tote build`/`run` 未显式 `--mode rls` 自动加 `--debug-libs`。
+- 示例 `examples/lib/{json,csv}.tc` + `examples/extlib_demo.tc`；conformance `f54`/`f55`/`f56`/`f59_import_cycle`(环)/`p35_import_diamond`(菱形 4 边不丢)。
+- **余留待办**：内嵌接口块（当前 `.exports.json` 等价）、链接模式 `.tlib` 下的 `T_IMPORT_CYCLE` 复检、C 互操作导出（`.lib`/`.dll`）。
 
 ## 技术债 & 已修
 - **用户函数实参校验（已修，2026-08-05）**：直接/间接调用现共用 `check_call_args`——`T_CALL_ARITY`（元数不符）+ 逐位 `ti_equal`/`can_cast`（`T_TYPE_MISMATCH`）。修复引入 `ti_equal` 让 `Named` 与已解析用户具名类型按 name 判等（跨模块同类型不再误判）；variant 助手 `tif_pstart=-1` 加 `pstart<0` 守卫放行；`diag_new` 加去重防兜底补扫重复报错。conformance `f57_call_arity_direct`/`f58_call_arg_type`。
