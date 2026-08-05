@@ -4739,6 +4739,19 @@ var g_mod_has_export: []string;     // 至少含一个 export 声明的模块别
 // 发射期据此外链归档并补 extern 声明，跳过库源码内联。
 var g_ext_link: []string;           // 待链接的归档/对象文件路径
 var g_ext_externs: []string;        // 待发射的 extern 声明（C 原型 / LLVM declare）文本
+var g_link_libs: []string;          // 链接模式导入的库别名集合（Phase2）：其导出符号发 declare、私有跳过，归档进 g_ext_link
+var g_lib_emit: bool = false;        // 当前是否处于 build --lib 预编译发射：跳过进程级全局（t.__ginit / t_atom_table / t_atom_count），它们由主程序提供
+
+// 该别名是否以「链接模式」（命中 .tlib 预编译产物）导入。
+in_link_libs fn(alias: string) -> bool {
+    var n: i64 = slice_len(g_link_libs) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        if (g_link_libs[i] == alias) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
 
 
 // 匿名函数字面量（M46 / FuncType v2）：合成函数名 `__lam_N` 在解析期定名，
@@ -11225,6 +11238,7 @@ mod_alias_add fn(nm: string, alias: string) -> void {
 // 都记录所属模块，供后续名字重整（mangling）做模块内引用改写；入口模块别名 = ""。
 load_module_file fn(path: string, alias: string) -> void {
     var saved_pos: i64 = pos;                 // 保存调用方的 token 流位置（支持嵌套 import 透明返回）
+    var saved_mod: string = g_cur_mod;        // 进入模块前的上下文（入口="" 或外层库别名），用于嵌套 import 正确回溯
     var base: i64 = slice_len(toks) as i64;   // 模块 token 将从此下标开始（tokenize 是 append 语义）
     var msrc: string = file_read_all(path);
     tokenize(msrc);                           // 追加在入口/父模块 token 之后
@@ -11246,7 +11260,7 @@ load_module_file fn(path: string, alias: string) -> void {
             append(decl_list, d);
         }
     }
-    g_cur_mod = "";                           // 离开模块：恢复入口上下文
+    g_cur_mod = saved_mod;                    // 离开模块：恢复调用方上下文（支持库内嵌套 import 正确回溯）
     pos = saved_pos;                          // 恢复调用方（入口或父模块）的解析位置
 }
 
@@ -11265,7 +11279,7 @@ handle_one_import fn(imp: i64) -> void {
     mod_alias_add(nm, alias);
 
     // 外部库 import @x：走搜索路径（工程根/lib、入口/lib、~/.tote/libs、编译器/libs），
-    // 命中 .tc 源码则内联（名字重整后即为命名空间隔离）；.tlib 预编译外链为 Phase2。
+    // 命中 .tc 源码则内联（名字重整后即为命名空间隔离）；若同时命中 .tlib 预编译产物则走外链模式。
     var chosen: string = "";
     if (nodes[imp].bd) {
         chosen = resolve_external_lib(nm);
@@ -11290,12 +11304,22 @@ handle_one_import fn(imp: i64) -> void {
             return;
         }
     }
+    // 链接模式探测：存在 .tlib 预编译产物且未用 as 别名（归档按规范名构建，as 别名会错配）→ 外链。
+    // 库源码仍载入供类型检查，但导出符号改发 declare、私有跳过，归档在链接期并入（真·独立编译+链接）。
+    var ar: string = "";
+    if (nodes[imp].bd && user_alias == "" && in_mod_visited(chosen) == false) {
+        ar = resolve_external_lib_archive(nm);
+    }
     // 已加载过则跳过（同时天然打破 import 成环，避免无限递归）
     if (in_mod_visited(chosen)) {
         return;
     }
     append(g_mod_visited, chosen);
     load_module_file(chosen, alias);
+    if (ar != "") {
+        append(g_link_libs, alias);
+        append(g_ext_link, ar);
+    }
 }
 
 // 外部库搜索路径解析：返回命中路径（"" = 未找到）。
@@ -11315,6 +11339,21 @@ resolve_external_lib fn(nm: string) -> string {
         if (path_exists(c_idx)) { return c_idx; }
         var c_lib: string = path_resolve(sb_cat4(base, "/", rel, "/lib.tc"));
         if (path_exists(c_lib)) { return c_lib; }
+        i = i + 1;
+    }
+    return "";
+}
+
+// 外部库预编译产物解析（Phase2 真·独立编译+链接）：返回 <libdir>/<rel>.tlib
+// （即重命名的 LLVM 归档 .a）路径，未找到返回 ""。命中即走外链模式（不再内联源码定义）。
+resolve_external_lib_archive fn(nm: string) -> string {
+    var rel: string = dots_to_slashes(nm);
+    var dirs: []string = g_lib_dirs;
+    var i: i64 = 0;
+    var nd: i64 = slice_len(dirs) as i64;
+    while (i < nd) {
+        var ar: string = path_resolve(sb_cat4(dirs[i], "/", rel, ".tlib"));
+        if (path_exists(ar)) { return ar; }
         i = i + 1;
     }
     return "";
@@ -11348,6 +11387,9 @@ compute_lib_dirs fn() -> void {
         lib_dir_push(root, "libs");
         i = i + 1;
     }
+    // 预编译产物缓存目录（build --lib 把 .tlib 落在 out/lib/）：就近优先于一切源码搜索，
+    // 命中即走外链模式（真·独立编译+链接）；缺失则回退源码内联（安全网，不破坏既有内联行为）。
+    lib_dir_push("out", "lib");
 }
 
 // 候选源码根列表（按优先级）：入口目录兜底 + 各祖先工程根/src（最近优先）。
@@ -15940,6 +15982,7 @@ var llfp_td: []i64;        // 参数 td 扁平池
 var llgv_n: []string;      // 全局 var：名/td/init 节点(-1 无)
 var llgv_td: []i64;
 var llgv_init: []i64;
+var llgv_link: []i64;      // 链接模式标记：0 普通 / 1 导出(发 declare) / 2 私有(跳过)，对应 g_link_libs 库
 
 var llcn_n: []string;      // 全局 const：名/表达式节点（使用处内联展开）
 var llcn_e: []i64;
@@ -16495,6 +16538,11 @@ ll_build_reg fn() -> void {
             var gtd: i64 = resolve_type_desc(dn.na);
             append(llgv_td, gtd);
             append(llgv_init, dn.nb);
+            if (in_link_libs(g_node_mod[d])) {
+                if (dn.bc) { append(llgv_link, 1); } else { append(llgv_link, 2); }
+            } else {
+                append(llgv_link, 0);
+            }
         }
         if (dn.kind == "GlobalConstDecl") {
             append(llcn_n, dn.sa);
@@ -19008,6 +19056,14 @@ emit_llfunc fn(d: i64) -> void {
     }
     var params: string = sb_to_str(psb);
 
+    // 链接模式库函数：导出符号发 declare（真实定义来自 .tlib 归档），私有符号跳过（避免与归档重定义冲突）。
+    if (in_link_libs(g_node_mod[d])) {
+        if (nodes[d].bc) {
+            llph(sb_cat6("declare ", rty, " @t.", n.sa, "(", sb_cat2(params, ")")));
+        }
+        return;
+    }
+
     if (n.ba) {
         // extern：绑定 C 符号（无 t. 前缀），参数类型按同规则
         llph(sb_cat6("declare ", rty, " @", n.sa, "(", sb_cat2(params, ")")));
@@ -19252,6 +19308,14 @@ emit_llglobals fn() -> void {
     var n: i64 = slice_len(llgv_n) as i64;
     var i: i64 = 0;
     while (i < n) {
+        // 链接模式私有全局：跳过（定义来自 .tlib 归档）；导出全局：发 declare（不分配存储）。
+        if (llgv_link[i] == 2) { i = i + 1; continue; }
+        if (llgv_link[i] == 1) {
+            var ty: string = ll_td(llgv_td[i]);
+            llpg(sb_cat4("@", llgv_n[i], " = external global ", ty));
+            i = i + 1;
+            continue;
+        }
         var ty: string = ll_td(llgv_td[i]);
         llpg(sb_cat6("@", llgv_n[i], " = global ", ty, " ", ll_zero(ty)));
         i = i + 1;
@@ -19267,6 +19331,7 @@ emit_llginit fn() -> void {
     var n: i64 = slice_len(llgv_n) as i64;
     var i: i64 = 0;
     while (i < n) {
+        if (llgv_link[i] != 0) { i = i + 1; continue; }   // 链接模式全局：定义/初始化来自 .tlib 归档，跳过
         var td: i64 = llgv_td[i];
         var ty: string = ll_td(td);
         var gp: string = sb_cat2("@", llgv_n[i]);
@@ -19434,8 +19499,12 @@ emit_llunit fn(mod: string) -> void {
     llph("");
     emit_lldeclares();
     emit_llglobals();
-    emit_ll_atom_table();
-    emit_llginit();
+    // 进程级全局（atom 名表 / 全局初始化）只应由主程序定义一份；
+    // 预编译库模式跳过，避免链接期与导入方重复定义冲突（库内若有引用将由导入方提供）。
+    if (g_lib_emit == false) {
+        emit_ll_atom_table();
+        emit_llginit();
+    }
 
     var n: i64 = slice_len(decl_list) as i64;
     var i: i64 = 0;
@@ -19462,6 +19531,74 @@ emit_llunit fn(mod: string) -> void {
         llpb("  ret i32 %r");
         llpb("}");
     }
+}
+
+// 预编译外部库为 .tlib（Phase2 真·独立编译+链接）：把当前已 emit 的 <out>.ll
+// 经 clang -c 编为 .o，再用 llvm-ar 打成归档 <out>.tlib（重命名的 .a），并写出
+// <out>.exports.json 接口块。库符号已按规范别名重整（json__version），与下游
+// import @json 的重整结果一致，故导入方只需外链该归档 + 发 declare。
+build_tlib fn(out_p: string, lib_alias: string, clang_p: string) -> i32 {
+    var llp: string = sb_cat2(out_p, ".ll");
+    var op: string = sb_cat2(out_p, ".o");
+    var arp: string = sb_cat2(out_p, ".tlib");
+    // 推导 llvm-ar 路径（与 clang 自动探测同源）
+    var ar_p: string = "llvm-ar";
+    if (clang_p == "C:/Program Files/LLVM/bin/clang.exe") {
+        ar_p = "C:/Program Files/LLVM/bin/llvm-ar.exe";
+    }
+    // 1) clang -c .ll -> .o
+    var csb: StringBuilder = sb_new();
+    sb_append_str(csb, "\"");
+    sb_append_str(csb, clang_p);
+    sb_append_str(csb, "\" -c -O2 -o \"");
+    sb_append_str(csb, op);
+    sb_append_str(csb, "\" \"");
+    sb_append_str(csb, llp);
+    sb_append_str(csb, "\"");
+    var rc: i32 = sys_run(sb_to_str(csb));
+    if (rc != 0) {
+        eprint("clang -c (lib) failed\n");
+        return 1;
+    }
+    // 2) llvm-ar rcs .tlib .o
+    var asb: StringBuilder = sb_new();
+    sb_append_str(asb, "\"");
+    sb_append_str(asb, ar_p);
+    sb_append_str(asb, "\" rcs \"");
+    sb_append_str(asb, arp);
+    sb_append_str(asb, "\" \"");
+    sb_append_str(asb, op);
+    sb_append_str(asb, "\"");
+    var arc: i32 = sys_run(sb_to_str(asb));
+    if (arc != 0) {
+        eprint("llvm-ar (lib) failed\n");
+        return 1;
+    }
+    // 3) 写接口块 exports.json（列出导出符号，供下游/工具读取；导入方类型检查仍用内联源码）
+    var exp: StringBuilder = sb_new();
+    sb_append_str(exp, "[\n");
+    var first: bool = true;
+    var n: i64 = slice_len(decl_list) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        var d: i64 = decl_list[i];
+        if (g_node_mod[d] == lib_alias && nodes[d].bc && is_top_decl_kind(nodes[d].kind)) {
+            if (first == false) { sb_append_str(exp, ",\n"); }
+            first = false;
+            sb_append_str(exp, "  {\"name\": \"");
+            sb_append_str(exp, nodes[d].sa);
+            sb_append_str(exp, "\", \"kind\": \"");
+            sb_append_str(exp, nodes[d].kind);
+            sb_append_str(exp, "\"}");
+        }
+        i = i + 1;
+    }
+    sb_append_str(exp, "\n]\n");
+    file_write_all(sb_cat2(out_p, ".exports.json"), sb_to_str(exp));
+    // 4) 清理中间 .o（.ll 保留作调试产物）
+    sys_run(sb_cat3("cmd /c del \"", op, "\" >nul 2>nul"));
+    print(sb_cat3("Built library: ", to_bs(arp), "\n"));
+    return 0;
 }
 
 ll_join fn() -> string {
@@ -19731,6 +19868,8 @@ main fn() -> i32 @main {
         var has_src: bool = false;
         var ex_name: string = "";
         var is_example: bool = false;
+        var is_lib: bool = false;        // build --lib：预编译外部库为 .tlib（归档 + 接口块）
+        var lib_alias: string = "";      // 库规范别名（= 源文件名 stem），用于名字重整前缀
         var ai2: i64 = 2;
         var an2: i64 = slice_len(argv) as i64;
         while (ai2 < an2) {
@@ -19762,6 +19901,11 @@ main fn() -> i32 @main {
                     ai2 = ai2 + 2;
                     continue;
                 }
+            }
+            if (argv[ai2] == "--lib") {
+                is_lib = true;
+                ai2 = ai2 + 1;
+                continue;
             }
             if (argv[ai2] == "--example") {
                 if (ai2 + 1 < an2) {
@@ -19819,7 +19963,15 @@ main fn() -> i32 @main {
         tokenize(src3);
         pos = 0;
         init_anndefs();
+        if (is_lib) {
+            // 预编译库：以规范别名（源文件名 stem）作为名字重整命名空间，
+            // 使产出的 .tlib 归档符号（json__version）与下游 import @json 的重整结果一致。
+            lib_alias = base_no_tc(src_file);
+            g_cur_mod = lib_alias;
+            g_lib_emit = true;       // 跳过进程级全局发射（t.__ginit / atom 表），避免链接冲突
+        }
         parse_unit();
+        if (is_lib) { g_cur_mod = ""; }
         run_check();
         flag_pass();
         ann_pass();
@@ -19833,7 +19985,13 @@ main fn() -> i32 @main {
 
         // 输出目录：--output 指定 exe/目录前缀；缺省按 --mode 落入 out/dbg|out/rls
         if (has_outp == false) {
-            out_p = sb_cat4("out/", mode, "/", mod2);
+            if (is_lib) {
+                // 预编译库产物：模式无关的归档缓存 out/lib/<stem>.tlib（+ 伴随 .ll），
+                // 与 resolve_external_lib_archive 的 out/lib 搜索路径一致。
+                out_p = sb_cat2("out/lib/", mod2);
+            } else {
+                out_p = sb_cat4("out/", mode, "/", mod2);
+            }
         }
 
         var llp: string = sb_cat2(out_p, ".ll");
@@ -19843,6 +20001,11 @@ main fn() -> i32 @main {
 
         if (cmd == "emit-ll") {
             return 0;
+        }
+
+        // 库预编译（build --lib）：emit-ll 后直接产出 .tlib（归档 + 接口块），不链 exe、不要求 main
+        if (is_lib) {
+            return build_tlib(out_p, lib_alias, clang_p);
         }
 
         // 无入口时提前报错：否则 lld-link 只会给出
@@ -19882,6 +20045,15 @@ main fn() -> i32 @main {
             sb_append_str(csb2, "/t_shim_ll.c\" -I \"");
             sb_append_str(csb2, rt_dir);
             sb_append_str(csb2, "\"");
+        }
+        // 链接模式外部库：把命中的 .tlib 归档（重命名的 .a）一并交给链接器
+        var elk: i64 = 0;
+        var nelk: i64 = slice_len(g_ext_link) as i64;
+        while (elk < nelk) {
+            sb_append_str(csb2, " \"");
+            sb_append_str(csb2, g_ext_link[elk]);
+            sb_append_str(csb2, "\"");
+            elk = elk + 1;
         }
         var rc: i32 = sys_run(sb_to_str(csb2));
         if (rc != 0) {

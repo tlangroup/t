@@ -1,5 +1,8 @@
 # t 语言编译器 — 项目笔记
 
+## 协作偏好（用户 2026-08-05 明示）
+- **不中途停下**：做任务时除非「确实需要用户选择」(选项无法自行决断、或会不可逆破坏数据)，否则一路跑到底，不要为确认/汇报而调用 AskUserQuestion 停下。Phase 2 方向已选「真·独立编译+链接」，后续按此直接推进。
+
 ## 概览
 - **t**:静态类型、数据驱动、ECS 取向,扩展名 `.tc`;宪法 `docs/constitution.md`,手册 `docs/reference.md`。⚠ `spec.md` 已废弃冻结。
 - **声明语法(M44 起)并置式**:`Name fn(...) -> Ret {}` / `Name struct {}` / `Name enum : u8 {}` / `Name flag[u16] {}` / `Name variant {}` / typealias `Name Type;`。⚠ `::` 与 `func` 已移除。
@@ -37,13 +40,15 @@
 - M57 时间格式化增量(**已完成**):① 方法式 `str.format`——`"tmpl".format(a,b)` 与 `format` 同义(`infer_expr` call 分支:接收者为 string 字面量则挪为第0实参、callee 换裸 `format` 走 `desugar_format_call`;变量接收者报 `T_FMT_TEMPLATE_NOT_LITERAL`);② `parse_time(spec,s)→i64`/`parse_time_local`(按 UTC/本地解析微秒 epoch;失败返哨兵 `T_TIME_INVALID`=INT64_MIN 不抛不返0;输入须完全消耗;自实现 `t_days_from_civil`+扫描器 `pt_scan`,`%z` 支持 `+0800`/`+08:00`/`Z`,`%I/%p` 转24h,`%y` 69→1969 余→20xx,闰秒夹紧,`%j` 反推日);③ `format_time_tz(spec,t,tz_minutes)`(固定偏移分钟东正,推墙上时间按 UTC 展开,`%z`→`±HHMM`/`%Z`→`UTC±HH:MM`,不依赖平台 tzdata);④ locale 字段码 `%c`(`%a %b %e %H:%M:%S %Y`)/`%x`(`%m/%d/%y`)/`%X`(`%H:%M:%S`)实装。解析白名单严格小于格式化(`%w%U%W%Z` 报 `T_TIME_PARSE_UNSUPPORTED`,其余未知 `T_TIME_BAD_SPEC`,`check_time_parse_spec` 编译期扫描+运行期兜底)。五处注册+示例(`time_tz_demo`/`time_parse_demo`/`fmt_method_demo`)+conformance(`p32/33/34` pass、`f47..f53` fail)全就位;gate L2 全绿(13 passed/0 failed/0 warn);IR 基线已重录(从 g4);`docs/reference.md` §3.10.6+§3.11 已更新。
 - **M-A Agent 脱糖(actor 底层,已完成)**:`X agent { state ...; step fn(s: XState, msg: T) -> XState {...} }` 解析期展开为 `XState` struct + `x_spawn(init...) -> XState` + `x_step(s,msg) -> XState` 三个顶层符号。命名红线:spawn/step 函数名经 `pascal_to_snake(X)+"_spawn"/"_step"` 走 snake_case(否则 `T_NAME_TYPE_CAMEL` 警告);`spawn` 体 `FuncDecl.lc` 必须是语句链表头(`list_push(-1,-1,ret)`)而非 `mk_block` 返回的 block 节点(否则 `desugar_lambdas` 读 `kids[lc]` 越界 panic——本 milestone 修掉的根因)。新增 helper:`pascal_to_snake`/`clone_type_node`/`clone_type_list`。配套 `examples/agent_demo.tc`+`.expected.txt`(`count = 8`,双后端 run_examples 通过);`docs/reference.md` §3.12 新增 Agent 小节(语法/EBNF/脱糖产物表/命名红线)。gate L2 全绿(13 passed/0 failed/0 warn),IR 基线已从 g4-host 的 g1 重录。
 
-## 外部库（import @x，第四刀 2026-08-05 已落地 Phase 1）
-- **Phase 1=搜索路径+命名空间隔离（已完成, L2 gate 13 passed/0 failed/0 warn）**;Phase 2=`.tlib` 预编译产物（Task #34, 待办）。
-- **用户拍板**：q-0 `import @json + 约定搜索路径`;q-1 `.tlib` 预编译产物留 Phase 2;q-2 `加前缀 + 限定访问`——库顶层符号 → `lib__name`,仅经 `lib.sym(...)` 访问,库内自调用也脱糖 `lib__sym`。
-- **搜索路径**：`compute_lib_dirs` 入口目录 `lib/`/`libs/` 优先,其次各 `<src_root>` 父目录(工程根)的 `lib/`/`libs/`;`resolve_external_lib` 探测 `<libdir>/x.tc`→`/x/index.tc`→`/x/lib.tc`,全失→`T_IMPORT_NOT_FOUND`。**绝不能调 `getenv`**(非内建);`~/.tote/libs`/`T_LIB_PATH` 搜索属 Phase 2。
+## 外部库（import @x）
+- **Phase 1=搜索路径+命名空间隔离(第四刀,已完成)**;**Phase 2=`.tlib` 真·独立编译+链接(第五刀,2026-08-05 已完成,Task #34 收尾)**。用户原始目标「搜索路径+预编译+命名空间隔离」三件全部交付。
+- **用户拍板**：q-0 `import @json + 约定搜索路径`;q-1 `.tlib` 预编译产物(Phase 2 落地);q-2 `加前缀 + 限定访问`——库顶层符号 → `lib__name`,仅经 `lib.sym(...)` 访问,库内自调用也脱糖 `lib__sym`。Phase 2 方向选「真·独立编译+链接」(非接口块缓存)。
+- **搜索路径**：`compute_lib_dirs` 入口目录 `lib/`/`libs/` 优先,其次各 `<src_root>` 父目录(工程根)的 `lib/`/`libs/`,再加 `out/lib/`(Phase 2 预编译产物目录);`resolve_external_lib` 探测 `<libdir>/x.tc`→`/x/index.tc`→`/x/lib.tc`,全失→`T_IMPORT_NOT_FOUND`。**绝不能调 `getenv`**(非内建);`~/.tote/libs`/`T_LIB_PATH` 搜索仍待办(需 `getenv` 内建)。
 - **命名空间重整 `mangle_modules`**(取代旧 `desugar_module_qualifiers`):Pass1 处理 `A.sym`→`A__sym`(可见性校验→`T_MODULE_PRIVATE`)、`A.T`/`A.T{}`→`A__T`;Pass2 库内符号整写 `A__name`。入口模块别名 `""` → **永不重整** → 单文件 IR 逐字节不变。
-- `parse_type` 支持 `A.T` 限定类型;`parse_prim_ident` 支持 `A.T{...}` 限定字面量;`clone_type_node` 深拷贝须补 `sb`(模块限定字段,否则克隆类型丢前缀退化 i64)。新诊断 `T_MODULE_PRIVATE`/`T_MODULE_NO_SYMBOL`。
-- 示例 `examples/lib/{json,csv}.tc`(故意同名证隔离)+`examples/extlib_demo.tc`;conformance `f54_ext_import_not_found`/`f55_module_private`/`f56_module_no_symbol`。docs/reference.md §3.13 标「第四刀已落地」。
+- **Phase 2 链接模式(`handle_one_import` 双模式)**：`import @x` 先查 `<libdir>/x.tlib`(伴随 `x.exports.json` 接口块),命中 → 载入 exports 注册导出符、代码生成对库导出符发 LLVM `declare`(不发 `define`)、私有符跳过(`g_link_libs` 集合门控)、归档进 `g_ext_link` 供链接;未找到 `.tlib` → **回退内联源码**(与第四刀一致,过渡安全网 → 未预编译时单文件 IR 不变、gate 不漂)。`build --lib <file.tc>` 以 stem 作规范别名作重整命名空间、`g_lib_emit=true` 跳过进程级全局(`t.__ginit`/`t_atom_table`/`t_atom_count`),产出 `out/lib/<stem>.tlib`(`clang -c`→`.o`→`llvm-ar rcs` 归档)+`out/lib/<stem>.exports.json`。验证:extlib_demo 经链接 json/csv `.tlib` 跑通、IR 中 `declare`/0 define/0 私有引用、输出与 expected 逐行一致。
+- `parse_type` 支持 `A.T` 限定类型;`parse_prim_ident` 支持 `A.T{...}` 限定字面量;`clone_type_node` 深拷贝须补 `sb`(模块限定字段)。新诊断 `T_MODULE_PRIVATE`/`T_MODULE_NO_SYMBOL`。
+- 示例 `examples/lib/{json,csv}.tc`(故意同名证隔离)+`examples/extlib_demo.tc`;conformance `f54_ext_import_not_found`/`f55_module_private`/`f56_module_no_symbol`。docs/reference.md §3.13 标「第四刀/第五刀已落地」。
+- **外部库 Phase 2 已知限制(待办)**:① 环境变量搜索(`getenv`)未实现;② `.tlib` 当前 LLVM 对象归档(Windows COFF `.o` + `llvm-ar`),默认 LLVM 后端全链路验证;未预编译时 C 后端回退内联(gate 即此路径,双后端不漂);③ `.tlibd`/内嵌接口块(现用 exports.json 等价)、`T_IMPORT_CYCLE`、C 互操作导出(`.lib`/`.dll`)待办。
 
 ## 技术债
 - fid v1.5:protobuf/聚合类型(struct/slice/map)序列化未实装(需 v2 走 type_info+`@derive(BinarySerde)`);`>` 返裸 `T`+`fid_eof` 探针,待可选类型一等化后回归 `T?`。
