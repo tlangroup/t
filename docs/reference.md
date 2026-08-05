@@ -1065,6 +1065,7 @@ FuncLit:   "fn" "(" ParamList? ")" "->" Type Block         // 匿名函数；静
 - **唯一写法（L-04 ✅）**：调用 `f(x)`、转换 `e as T`、下标 `e[i]`、成员 `e.f`、结构体 `T{...}`、数组 `[...]`、map `[k:v]`、匿名函数 `fn(...) -> T {...}` 均仅一种标准写法，无等价多写变体。
 - **匿名函数字面量 `FuncLit`** ✅ tote（M46）：与函数**声明**靠「`fn` 前有无名字」区分——声明位先吃名字（`Name fn(...)`），表达式位裸 `fn` 即字面量，无二义。返回类型不可省（`-> Ret` 必写，与声明一致，L-02 全行为显式）。语义与限制见 §3.5。
 - `>>>` 注意：比较/移位序列中 `>>` 不得被词法拆成两个 `>`。
+- **调用实参校验（L-03 静态类型安全，2026-08-05 收紧）**：函数调用（含后缀 `f(x)` 直接调用具名函数，以及经函数类型变量间接调用）**统一校验实参**——元数不符报 `T_CALL_ARITY`，逐位类型不符且不可 `can_cast` 报 `T_TYPE_MISMATCH`。此前**直接调用具名函数完全不校验实参**：少传的形参在函数体内读到未初始化的栈槽；若该形参是 `string`/`[]T` 的 `len` 字段，会拿到随机天文数字，导致循环把 512MB arena 瞬间耗尽（`arena: out of memory`），且报错离真正错误点极远（曾因 `tote` 的 `str_concat3(hd, "/.tote/libs")` 少传一参排查数小时）。校验实现见 `src/tc.tc` 的 `check_call_args`（直接/间接调用共用），variant 合成助手因无签名记录走 `tif_pstart<0` 守卫放行。conformance 用例 `tests/conformance/fail/f57_call_arity_direct` / `f58_call_arg_type`。
 
 ### 3.5 Types（类型） ✅ tote（核心）
 

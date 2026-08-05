@@ -1008,6 +1008,19 @@ diag_new fn(code: string, sev: string, msg: string, file: string, sl: i64, sc: i
     d.vv = -1;
     d.fs = -1;
     d.nt = -1;
+    // 幂等去重：同一 (code, file, 位置, 文案) 只保留一条。
+    // 检查器对同一子表达式可能推导多次（例如内建实参既被专属分支推、又被
+    // 兜底补扫推一遍），若不去重，用户会看到成对的重复报错。诊断数量在正常
+    // 编译里是 0~个位数，线性扫描的代价可以忽略。
+    var dq: i64 = 0;
+    var dqn: i64 = slice_len(diags) as i64;
+    while (dq < dqn) {
+        var od: Diag = diags[dq];
+        if (od.code == code && od.file == file && od.sl == sl && od.sc == sc && od.msg == msg) {
+            return dq;
+        }
+        dq = dq + 1;
+    }
     append(diags, d);
     return (slice_len(diags) as i64) - 1;
 }
@@ -7769,10 +7782,26 @@ is_float_ti fn(i: i64) -> bool {
 }
 
 // typesEqual（递归）
+// 用户具名类型（struct / enum / flag / union / variant）的已解析种类
+is_user_named_kind fn(k: string) -> bool {
+    if (k == "Struct" || k == "Enum" || k == "Flag") {
+        return true;
+    }
+    return k == "FlagSet" || k == "Union" || k == "Variant";
+}
+
 ti_equal fn(ai: i64, bi: i64) -> bool {
     var a: TI = tis[ai];
     var b: TI = tis[bi];
     if (a.kind != b.kind) {
+        // 「Named」是对用户具名类型的**未解析引用**（resolve_ti 在类型注册前产出）。
+        // 与已解析的具名类型（Struct/Enum/...）按名字判等，否则同一类型会因解析时机不同被误判为不等。
+        if (a.kind == "Named" && is_user_named_kind(b.kind)) {
+            return a.name == b.name;
+        }
+        if (b.kind == "Named" && is_user_named_kind(a.kind)) {
+            return a.name == b.name;
+        }
         return false;
     }
     if (a.kind == "Scalar") {
@@ -8023,8 +8052,23 @@ n_col fn(ni: i64) -> i64 {
 
 // errorTypeMismatch（复刻 checker.ts:678）
 // 间接调用（通过函数类型变量）的实参校验：元数 + 逐位类型
-check_indirect_call fn(e: i64, fti: i64) -> void {
+// 调用实参校验（直接调用具名函数 / 经函数类型变量间接调用共用同一份实现）。
+// `fname` 为空表示间接调用（无名可报）。
+//
+// ⚠ 这条校验是内存安全的第一道闸：t 的代码生成对少传的形参**不做任何兜底**，
+// 被调方会读到未初始化的栈槽——若那是 string/slice 的 len 字段，就是一个随机
+// 天文数字，随后的循环会把 512MB arena 瞬间耗尽（`arena: out of memory`），
+// 且现场离真正的错误调用点十万八千里。曾因此排查数小时（tote 的
+// `str_concat3(hd, "/.tote/libs")` 少传一参）。宁可误报，绝不放行。
+check_call_args fn(e: i64, fti: i64, fname: string) -> void {
     var n: Node = nodes[e];
+    var pstart: i64 = tif_pstart[fti];
+    if (pstart < 0) {
+        // 签名未记录（如 variant 合成的 Name_from_Case / Name_is_Case 助手：
+        // 它们直接 sym_define 了裸 Func tip，没走 register_decl 填 tif_*）。
+        // 无签名可比，只能放行——绝不能拿 -1 去索引 tif_params。
+        return;
+    }
     var want: i64 = tif_pcount[fti];
     var got: i64 = 0;
     var c: i64 = n.la;
@@ -8032,7 +8076,7 @@ check_indirect_call fn(e: i64, fti: i64) -> void {
         var k: Child = kids[c];
         if (got < want) {
             var at: i64 = infer_expr(k.val);
-            var pt: i64 = tif_params[tif_pstart[fti] + got];
+            var pt: i64 = tif_params[pstart + got];
             if (tip_kind(at) != "Unknown" && ti_equal(pt, at) == false && can_cast(at, pt) == false) {
                 err_type_mismatch(k.val, pt, at);
             }
@@ -8041,10 +8085,16 @@ check_indirect_call fn(e: i64, fti: i64) -> void {
         c = k.next;
     }
     if (got != want) {
+        var who: string = "间接调用";
+        if (str_len(fname) > 0) { who = sb_cat3("调用 `", fname, "`"); }
         fc_err("T_CALL_ARITY",
-            sb_cat6("间接调用实参个数不符：", ti_str(fti), " 需要 ", i2s(want),
-                sb_cat3(" 个实参，实际给了 ", i2s(got), " 个"), ""), e);
+            sb_cat6(who, " 实参个数不符：", ti_str(fti), " 需要 ", i2s(want),
+                sb_cat3(" 个实参，实际给了 ", i2s(got), " 个")), e);
     }
+}
+
+check_indirect_call fn(e: i64, fti: i64) -> void {
+    check_call_args(e, fti, "");
 }
 
 err_type_mismatch fn(eni: i64, exp: i64, act: i64) -> void {
@@ -9617,6 +9667,9 @@ infer_expr fn(e: i64) -> i64 {
                     if (s2.decl >= 0) {
                         var fd: Node = nodes[s2.decl];
                         if (fd.kind == "FuncDecl") {
+                            // 直接调用同样要校验实参：这里以前直接 return 返回类型，
+                            // 少传/多传/类型不符全部静默放行 → 运行期未初始化读。
+                            check_call_args(e, s2.ti, fname);
                             return resolve_ti(fd.na);
                         }
                     }
@@ -9852,6 +9905,17 @@ infer_expr fn(e: i64) -> i64 {
                             n_file(e), n_line(e), n_col(e), n_line(e), n_col(e) + 5);
                     }
                 }
+            }
+            // 兜底补扫：把上面任一分支没显式推导过的实参也推一遍。
+            // 内建的实参校验是「按需」的——只有关心实参类型的内建才会 infer，
+            // 于是**嵌套在内建实参里的用户函数调用**会整个逃过检查：
+            // `println(int_to_str(add3(1, 2)))` 里的少参调用曾静默通过。
+            // 重复推导由 diag_new 的去重兜住，不会产生成对报错。
+            var bsc: i64 = n.la;
+            while (bsc >= 0) {
+                var bsk: Child = kids[bsc];
+                infer_expr(bsk.val);
+                bsc = bsk.next;
             }
             return builtin_ret(fname);
         }
