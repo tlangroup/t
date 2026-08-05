@@ -60,3 +60,9 @@
 - **C 后端「大结构体按值返回」崩溃**：含 `[256]T` 定长数组的 struct 按值返回 → C 后端段错误（exit 139），LLVM 正常。规避：用 `[]T` 切片承载大序列。
 - **已修（2026-08-03）**：`compile`/`emit-ll`/`build`/`run` 在 `has_errors()` 时静默 `return 1` 不打印诊断 → 补 `print_json()`。
 - **已修（2026-08-05）**：`compute_src_roots` 用 `path_resolve`/`_fullpath` 向上遍历盘符根 `C:` 被展开成 `C:/Users/xxx` 震荡死循环 OOM → 改纯字符串 `parent_dir_of`+硬上限 `guard<32`；`path_exists` 改调 `file_exists` 内建。
+
+## agent 主线（本对话聚焦）
+- **定位**：用户明确「本对话负责 agent」。外部库支线已收尾（第七刀 `0cd59cf`），agent 子系统是主线。
+- **已落地**：actor 脱糖（`XState`/`x_spawn`/`x_step`）、Sensor/Edge 分类矩阵、本地 LLM 旁路桥（`fake_llm` 接缝）、agentkit 库层（record/replay/diff，commit d64eeeb）、planner 规划体（`examples/planner_demo.tc`）、**llm_boundary 真 LLM**（2026-08-05 深夜：`examples/lib/llm_boundary.tc` 库 + `tools/llm_bridge.py` 进程外真实 LLM，Ollama/OpenAI 兼容，确定性回退）。
+- **余留主线候选**：① `Spawner`/`Colony Agent` 调度体（运行时 spawn/寻址子 agent，§3.12 标「🟠 待运行时」）；② `agentkit` 时钟注入；③ `Network·OtherAgents` 跨进程消息（候选）。
+- **架构红线**：`t` 无 `extern`/FFI/网络——LLM/工具效应全在进程外；agent `step` 纯函数只记意图（`pending` atom），运行时边界 `drive_*` 回填。本地 LLM = stdin/stdout 旁路桥（sidecar，零编译器改动）。

@@ -1,0 +1,39 @@
+// llm_boundary.tc —— 真实 LLM 调用的运行时边界适配器（进程外 sidecar 旁路桥）
+//
+// 架构（docs/agent_first.md §7 / §10.4 / §12.1）：t 无 FFI / 网络，LLM 必然活在进程外。
+// 本库只做「协议」这一层：把 prompt 经 stdout 交给外部桥（tools/llm_bridge.py），
+// 桥去打真实 LLM（Ollama / OpenAI 兼容端点），把应答经 stdin 回填给本进程。
+// Agent 的 step 仍是纯函数——只在状态里记 pending=:llm 意图；drive_* 边界调本库的
+// drive_llm 把意图兑现成真实 LLM 应答并以 :llm_reply 消息回填。核心确定性、可回放不变。
+//
+// 协议（与 tools/llm_bridge.py 严格对齐）：
+//   t  → 桥： println("LLMREQ|" + prompt) + fflush(stdout)   —— 一行一个请求
+//   桥 → t  ： 应答按词发回，末尾加哨兵 __EOM__               —— t 逐 token 读、空格重拼
+//   t 的其它 stdout 行（日志）由桥原样镜像到 stderr，不进协议通道。
+//
+// 注意：prompt 须单行（\n 不允许出现在 t 字符串字面量内）；多行 prompt 需上层约定。
+//
+// 用法：
+//   import @llm_boundary;
+//   var reply: string = llm_boundary.drive_llm(prompt);
+
+export drive_llm fn(prompt: string) -> string {
+    // 发包：stdout 写协议请求行（前缀 LLMREQ|），刷盘让桥立刻收到，否则会死锁。
+    var rb: StringBuilder = sb_new();
+    sb_append_str(rb, "LLMREQ|");
+    sb_append_str(rb, prompt);
+    println(sb_to_str(rb));
+    fflush(stdout);
+
+    // 收包：从 stdin 逐 token 读，遇 __EOM__ 停止，用空格重拼。
+    // 绕开 :text 读字符串按空白分词、含空格无法 round-trip 的已知限制。
+    var wb: StringBuilder = sb_new();
+    var first: bool = true;
+    while (true) {
+        var tok: string = stdin > string;
+        if (tok == "__EOM__") { break; }
+        if (first) { first = false; } else { sb_append_str(wb, " "); }
+        sb_append_str(wb, tok);
+    }
+    return sb_to_str(wb);
+}

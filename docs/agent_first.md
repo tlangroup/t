@@ -163,7 +163,7 @@ Agent 由四个静态可描述部分构成:
 ### 10.1 统一握手：`pending` 意图 + 回填消息
 所有 Edge 体共用同一条握手（已在 `examples/agent_npc.tc`、`examples/agent_edge.tc` 实测双后端通过）：
 1. **记意图**：`step` 收到某消息（如 `:ask` / `:scan` / `:query`）后只更新状态，把 `state.pending` 置为对应 atom（`:llm` / `:sense` / `:tool`）。`step` 本身不触外部世界（§9 守恒①）。
-2. **边界分发**：运行时 `drive_*(state, input)` 先调 `step(state, :ask)` 之类记意图，再检测 `state.pending`；若非空，则对接对应 effector（调 `fake_llm` / `sense_world` / `fake_db` / 人类输入源）拿到结果。
+2. **边界分发**：运行时 `drive_*(state, input)` 先调 `step(state, :ask)` 之类记意图，再检测 `state.pending`；若非空，则对接对应 effector（LLM → `llm_boundary.drive_llm` + `tools/llm_bridge.py` 旁路桥 / `sense_world` / `fake_db` / 人类输入源）拿到结果。
 3. **回填**：边界把结果写回状态字段（如 `contacts` / `last_result` / `mood`），并构造 `:sense_done` / `:tool_done` / `:llm_reply` 消息再喂一次 `step` 清空 `pending`（`:none`）。
 > 这一来一回（`记意图 → 边界 → 回填`）即 Core/Edge 解耦的全部机制。`step` 始终是纯函数，非确定性只活在 `drive_*` 里「则调用 effector」那一小段（§0、§9）。
 
@@ -171,7 +171,7 @@ Agent 由四个静态可描述部分构成:
 | Edge | 对接谁 | 边界 fn（示例名） | 非确定性来源 |
 |---|---|---|---|
 | Tool·IO | DB / 支付 / HTTP / 游戏状态 API | `drive_db` → `fake_db` | 工具副作用 |
-| LLM | 大模型 | `drive_receptionist` → `fake_llm`（真实即 LLM/IO） | 模型随机性 |
+| LLM | 大模型 | `llm_boundary.drive_llm`（进程外 `tools/llm_bridge.py` 打真实 LLM） | 模型随机性 |
 | Human | 人类输入设备 | `drive_hero` ← 人类事件 | 人类意志 |
 | Sensor·Env | 读世界 / 邻近实体 | `drive_radar` → `sense_world` | 世界状态 |
 | Network·OtherAgents（候选） | 跨进程消息 | 见 §7 身份与发现 | 传输层 |
@@ -234,7 +234,7 @@ t 为 Agent First 能做的，与刻意不做的，同样重要。语言层只�
 - **模型库（模块）**：`import` 进来的聚焦单元，每个一个领域。例：
   - `physics.tc` — 运动 / 碰撞 / 旋转 Component+System（§11.2）。
   - `agentkit` — §10 的 record / replay / diff 与时钟注入（⏳ 待建）。
-  - `llm_boundary` — 真实 LLM 调用的 `drive_*` 适配器（替换示例里的 `fake_llm` 桩）。
+  - `llm_boundary` — 真实 LLM 调用的 `drive_*` 适配器（**已落地**，2026-08-05）：`examples/lib/llm_boundary.tc` 导出 `drive_llm(prompt) -> string`，走 stdin/stdout 旁路桥协议（`LLMREQ|...` 出 / `__EOM__` 哨兵回）；进程外的 `tools/llm_bridge.py` 接到真实 LLM（Ollama / OpenAI 兼容，不可达回退确定性应答）。运行：`out/dbg/tc.exe build examples/agent_npc_mind_llm.tc --mode dbg --output out/dbg/npc_llm` 后 `python tools/llm_bridge.py out/dbg/npc_llm.exe`。
   - `time` / `ser`（fid）— 已在 M54–M57 / M51 实现的具体功能，亦属可外置模型库。
 > 这些库**不进 `tc.tc`**；主程序因此保持精简，与用户诉求一致。
 
