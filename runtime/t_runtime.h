@@ -166,6 +166,7 @@ TStr     t_atom_str(int64_t id);                          // id→原子名（1-
 //   exit(code: i32)
 //   print(s: string) / eprint(s: string)
 TStr    t_file_read_all(const char* path);          // 失败 → panic + exit(1)
+TStr    t_getenv(const char* name);                 // getenv(name) -> string；未设置返回空串
 bool    t_file_exists(const char* path);            // file_exists(s) -> 可读性探测（fopen 试探）
 bool    t_file_write_all(const char* path, TStr content); // 失败 → panic + exit(1)
 TStr    t_path_resolve(const char* path);           // path_resolve(s) -> 绝对路径（_fullpath/realpath）

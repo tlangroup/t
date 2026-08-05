@@ -1268,6 +1268,13 @@ TStr t_file_read_all(const char* path) {
     TStr r; r.ptr = buf; r.len = (int64_t)sz; return r; // 注意：此处用 malloc，由调用方持有至进程结束
 }
 
+// getenv(name) -> string：读取进程环境变量；未设置返回空串（不 panic）。
+TStr t_getenv(const char* name) {
+    const char* e = getenv(name);
+    if (!e) { e = ""; }
+    return t_str_from_c(e);
+}
+
 TStr t_path_resolve(const char* path) {
     char buf[4096];
 #ifdef _WIN32

@@ -72,6 +72,78 @@ ends_with fn(s: string, suf: string) -> bool {
     return true;
 }
 
+// 将 T_LIB_PATH 风格的分隔串拆成目录列表。
+// 分隔符用 ';'（与 Windows PATH 一致）。注意：不能按 ':' 切分，否则 Windows 盘符
+// 冒号（如 C:/foo）会被误拆。Unix 下若用 ':' 分隔，调用方应自行保证无盘符歧义；
+// 本工具链以 Windows 为主，故仅按 ';' 切分。
+split_path_list fn(s: string) -> []string {
+    var out: []string = [];
+    var cur: StringBuilder = sb_new();
+    var n: u64 = str_len(s);
+    var i: u64 = 0;
+    while (i < n) {
+        var c: u8 = s[i];
+        if (c == 59) {                       // ';' 分隔符
+            var seg: string = sb_to_str(cur);
+            if (str_len(seg) > 0) {
+                append(out, seg);
+            }
+            cur = sb_new();
+        } else {
+            sb_append_char(cur, c);
+        }
+        i = i + 1;
+    }
+    var last: string = sb_to_str(cur);
+    if (str_len(last) > 0) {
+        append(out, last);
+    }
+    return out;
+}
+
+// 用户主目录：Windows 取 USERPROFILE 或 HOMEDRIVE+HOMEPATH；Unix 取 HOME；未设置返回 ""
+home_dir fn() -> string {
+    var up: string = getenv("USERPROFILE");
+    if (str_len(up) > 0) {
+        return up;
+    }
+    var hd: string = getenv("HOMEDRIVE");
+    var hp: string = getenv("HOMEPATH");
+    if (str_len(hd) > 0 && str_len(hp) > 0) {
+        return str_concat2(hd, hp);
+    }
+    return getenv("HOME");
+}
+
+// 把解析出的库目录逐个以 --lib-dir 传给 tc。
+// 关键：tc 自身不读环境变量，包搜索策略（T_LIB_PATH / ~/.tote/libs）完全留在这里——
+// 这正是 tote 作为包管理器/构建驱动的职责；tc 只接受中性输入（类比 cargo 传 -L 给 rustc）。
+append_lib_dirs fn(sb: StringBuilder) -> void {
+    var tp: string = getenv("T_LIB_PATH");
+    var tps: []string = split_path_list(tp);
+    var ti: i64 = 0;
+    var tn: i64 = slice_len(tps) as i64;
+    while (ti < tn) {
+        sb_append_char(sb, 32);
+        sb_append_str(sb, "--lib-dir");
+        sb_append_char(sb, 32);
+        sb_append_char(sb, 34);
+        sb_append_str(sb, to_bs(tps[ti]));
+        sb_append_char(sb, 34);
+        ti = ti + 1;
+    }
+    var hd: string = home_dir();
+    if (str_len(hd) > 0) {
+        var tl: string = str_concat3(hd, "/.tote/libs", "");
+        sb_append_char(sb, 32);
+        sb_append_str(sb, "--lib-dir");
+        sb_append_char(sb, 32);
+        sb_append_char(sb, 34);
+        sb_append_str(sb, to_bs(tl));
+        sb_append_char(sb, 34);
+    }
+}
+
 // 定位 tc 编译器二进制
 find_tc fn() -> string {
     if (path_exists("out/dbg/tc.exe")) {
@@ -339,6 +411,7 @@ cmd_build_or_run fn(cmd: string, argv: []string) -> i32 {
         sb_append_str(sb, entry);
         sb_append_char(sb, 34);
     }
+    append_lib_dirs(sb);          // 注入 T_LIB_PATH / ~/.tote/libs 解析出的 --lib-dir
     ai = 2;
     while (ai < an) {
         sb_append_char(sb, 32);

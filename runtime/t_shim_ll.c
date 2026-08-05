@@ -125,6 +125,7 @@ void    tll_deser_str(int64_t f, TStr* out)                 { *out = t_deser_str
 
 // ── I/O 与进程 ─────────────────────────────────────────────────
 void    tll_file_read_all(TStr* path, TStr* out)     { *out = t_file_read_all(t_cstr(*path)); }
+void    tll_getenv(TStr* name, TStr* out)            { *out = t_getenv(t_cstr(*name)); }
 int32_t tll_file_exists(TStr* path)                  { return t_file_exists(t_cstr(*path)) ? 1 : 0; }
 int32_t tll_file_write_all(TStr* path, TStr* c)      { return t_file_write_all(t_cstr(*path), *c) ? 1 : 0; }
 void    tll_path_resolve(TStr* path, TStr* out)      { *out = t_path_resolve(t_cstr(*path)); }
