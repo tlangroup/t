@@ -64,5 +64,7 @@
 ## agent 主线（本对话聚焦）
 - **定位**：用户明确「本对话负责 agent」。外部库支线已收尾（第七刀 `0cd59cf`），agent 子系统是主线。
 - **已落地**：actor 脱糖（`XState`/`x_spawn`/`x_step`）、Sensor/Edge 分类矩阵、本地 LLM 旁路桥（`fake_llm` 接缝）、agentkit 库层（record/replay/diff，commit d64eeeb）、planner 规划体（`examples/planner_demo.tc`）、**llm_boundary 真 LLM**（2026-08-05 深夜：`examples/lib/llm_boundary.tc` 库 + `tools/llm_bridge.py` 进程外真实 LLM，Ollama/OpenAI 兼容，确定性回退）。
-- **余留主线候选**：① `Spawner`/`Colony Agent` 调度体（运行时 spawn/寻址子 agent，§3.12 标「🟠 待运行时」）；② `agentkit` 时钟注入；③ `Network·OtherAgents` 跨进程消息（候选）。
+- **余留主线候选**：② `agentkit` 时钟注入（库代码已落，文档仍标「待建」）；③ `Network·OtherAgents` 跨进程消息（候选）。
+- **Spawner/Colony 调度体 ✅ 已落地（2026-08-06）**：`examples/lib/colony.tc`（`@colony` 库）+ `examples/colony_demo.tc`。库层纯数据调度体，零编译器改动：`colony_new`/`colony_spawn`(按 id)/`colony_send`/`colony_broadcast`/`colony_tick`(每帧驱动)/`colony_step`/`colony_get`/`colony_count`/`colony_kill`。状态用 **string 指纹 + `fn(string, Msg)->string` 回调**泛型无关复用（Worker 小队 + Counter 跨类型演示）。gate L2 13/0/0。
+  - ⚠ **t 编译器两处限制（实测发现，已规避）**：① **map 值仅支持纯标量**——含 string/slice 的 struct、`map[i64]string`、`map[i64][]X` 均触发内部 panic `t_slice_at index 0 length 0`；② **LLVM 后端对 slice-of-slice（`[][]Msg`）发射非法 IR**（`load %TSlice, ptr 0`）。规避：Colony 用「并行 slice 按 id 下标对齐」(`states/alives`)+「扁平 inbox」(`[]Msg` + 并行 `[]i64 inbox_to`)存储，不用 map 存 agent 状态、不用嵌套 slice。
 - **架构红线**：`t` 无 `extern`/FFI/网络——LLM/工具效应全在进程外；agent `step` 纯函数只记意图（`pending` atom），运行时边界 `drive_*` 回填。本地 LLM = stdin/stdout 旁路桥（sidecar，零编译器改动）。

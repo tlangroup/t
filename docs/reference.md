@@ -1673,7 +1673,7 @@ AgentClause:
 
 - **已示例（Reflex 行）**：State（`Monster`）、Mind（`Receptionist`）——见 `examples/agent_npc.tc`；**Sensor（`Radar`）、Tool（`DbAgent`）、Player（`Hero`）——见 `examples/agent_edge.tc`**（三体演示 Edge 边界差异：`step` 在边界记意图、`drive_*()` 去读感知/调工具/读人类输入，与 Mind 同构，核心 step 纯函数可回放）。
 - **已示例（Planning 行，无 `goal`/`plan` 语法，决策 A 第5条）**：Plan / Scout / Operator / Strategist / Adjutant —— 用纯 `planner(State) -> Msg` 自由 fn 算出「下一步消息」喂同一纯 `step`，**已可写可运行示例**：`examples/planner_demo.tc`（四 planner 自由 fn 共用同一 `robot_step` 原语，差异只在边界驱动）。
-- **元类 待运行时（🟠，需运行时 spawn/寻址，后续里程碑）**：Spawner / Colony Agent 调度体（管理/生成子 agent）。
+- **元类 ✅ 库层落地（examples/lib/colony.tc）**：Spawner / Colony Agent 调度体（管理/生成子 agent）。按收敛决策 A **不进编译器语法**，复用 actor 脱糖产物（XState / x_spawn / x_step）+ slice + 函数指针实现 `spawn` 生成 / 按 `id` 寻址 / `tick` 调度 / 扁平 inbox 延迟邮箱；状态以 **string 指纹 + `fn(string, Msg)->string` 回调**泛型无关复用（任意 agent 类型共用同一调度体）。演示见 `examples/colony_demo.tc`（Worker 小队 + Counter 跨类型复用）。⚠ 规避 t 当前两处限制：① map 值仅支持纯标量（含 string/slice 的 struct、map-of-slice 触发编译器内部 panic）→ 用并行 slice 按 id 下标对齐；② LLVM 后端对 slice-of-slice（`[][]Msg`）发射非法 IR → 邮箱用扁平 `[]Msg` + 并行 `[]i64 inbox_to`。
 - 命名对称：Scout = 规划式感知（先侦察再决策），区别于 Sensor 反应式感知；Adjutant = 人类为指挥官、agent 为副官负责规划协调，区别于 Player 玩家体（纯 Reflex 人类直驱）。完整定义见 `docs/agent_first.md` §6。
 
 **收敛决策 A（2026-08-04 拍板）**：`agent` 在语言层**无能力净增**（脱糖产物 `struct` + 自由 `fn` + 构造器 `t` 均已是一等公民，连 `spawn` 也可用 `XState{...}` struct 字面量替代），故**保留为极简意图标记，绝不再扩语法**——`use` 接线式、`goal`/`plan` 子句、`Spawner`/`Colony` 原语、消息路由均**不进编译器**。上方 10 格分类矩阵是**模式目录（非语法）**：所有 flavor 只是同一 `step` 契约 + 同一边界模型下**边界驱动方式不同**（读世界 / 调工具 / 调 LLM / 读人类 / 规划后喂 `step`），First-class agent ≠ built-in-flavors。支撑「数据流可复现」的工程工具（消息日志 / 回放定位 / 确定性 diff）移至**库层**（详见 `docs/agent_first.md` §8、§9、§10 库层边界协议、§11 ECS 集成与非容器原则、§12 模块与模型库分层）。

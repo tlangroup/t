@@ -108,9 +108,9 @@ Agent 由四个静态可描述部分构成:
 > ⚠ **Planning 体「待 goal」为决策 A 前的旧表述**：2026-08-04 决策 A 第 2/5 条已拍板**永不新增 `goal`/`plan` 语法**，故 Planning 不靠新子句表达，而是用纯 `planner(State) -> Msg` 自由 fn 算出「下一步消息」喂同一纯 `step`（见 §11.5）。**现已可写可运行示例**：`examples/planner_demo.tc`（Operator / Scout / Strategist / Adjutant 四 planner 自由 fn，共用同一 `robot_step` 原语，差异只在边界驱动）。
 
 **元类**:
-- **Spawner / Colony Agent（调度体，元类）** —— 管理/生成子 agent（导演 AI、小队队长、刷怪波次），吃 ECS 海量能力；需运行时 spawn / 寻址支持（后续里程碑，当前不可写）。
+- **Spawner / Colony Agent（调度体，元类）✅ 库层已落地（examples/lib/colony.tc）** —— 管理/生成子 agent（导演 AI、小队队长、刷怪波次）。按决策 A **不进编译器语法**：复用 actor 脱糖产物 + slice + 函数指针，以纯数据调度体实现 `spawn` / `colony_send`（按 id 寻址）/ `colony_tick`（每帧驱动每个存活 agent）/ 扁平 inbox（延迟邮箱）；状态 string 指纹 + `fn(string, Msg)->string` 回调泛型无关。演示 `examples/colony_demo.tc`（Worker 小队 + Counter 跨类型复用同一调度体）。
 
-**优先级（语言侧成本）**: Tool / Player / Sensor Agent = 0（纯模式，现有语法可写，**已示例**）；Scout / Operator / Strategist / Adjutant / Plan Agent = 用纯 `planner(State)->Msg` 自由 fn 表达（**已可写，见 `examples/planner_demo.tc`**，不引 `goal`/`plan` 语法，决策 A 第5条）；Spawner = 运行时最重，后续里程碑。
+**优先级（语言侧成本）**: Tool / Player / Sensor Agent = 0（纯模式，现有语法可写，**已示例**）；Scout / Operator / Strategist / Adjutant / Plan Agent = 用纯 `planner(State)->Msg` 自由 fn 表达（**已可写，见 `examples/planner_demo.tc`**，不引 `goal`/`plan` 语法，决策 A 第5条）；Spawner = ✅ 库层已落地（examples/lib/colony.tc，纯数据调度体，无新语法，见 §12）。
 
 ## 7. 开放问题(待法律化时裁决)
 
