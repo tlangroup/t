@@ -1,0 +1,235 @@
+// colony_wave.tc —— Spawner / Colony + ECS World 主循环（真实小子场景：塔防波次生存）
+//
+// 复用：
+//   · @colony        （examples/lib/colony.tc）—— Spawner 生成 + 调度体
+//   · physics        （examples/physics.tc）  —— ECS MovementSystem（位置积分）
+//
+// 场景：玩家固守网格原点 (0,0)，生命 player_hp。Spawner 按波次在右边缘生成怪物；
+// 每个怪物是一个被 Colony 调度的 agent（状态以 string 指纹存于 Colony 内部 slice）。
+// World 主循环每帧驱动三个 ECS System：
+//   ① AgentSystem    —— colony_broadcast(:tick, 玩家坐标) + colony_tick：
+//                       每个怪物跑一次 step，读玩家位置、算出「移动意图」(ix,iy) 与状态。
+//   ② MovementSystem —— physics.movement_system 按意图把速度积分进位置（ECS 物理）。
+//   ③ CombatSystem   —— 玩家炮塔打「射程内最近的怪物」；怪物若贴脸(adjacent)则攻击玩家。
+//
+// 全部用整数网格 + 定宽零填充指纹，保证 LLVM / C 双后端输出逐字节一致。
+// 无 generics / 无新语法（收敛决策 A）：怪物状态 string 指纹 + fn(string,Msg)->string 回调。
+
+import @colony;
+import physics;
+
+// ───────────────────────── 怪物状态（含 ECS 意图字段）─────────────────────────
+// 指纹布局（定宽零填充、无分隔）：hp(3) st(2) x(4) y(4) ix(1) iy(1)  = 15 字符
+//   hp  : 生命
+//   st  : 0 idle / 1 chase / 2 attack / 3 dead
+//   x,y : 网格坐标
+//   ix,iy: 移动意图（0 不动 / 1 +1 / 2 -1）
+Mon struct {
+    hp: i64;
+    st: i64;
+    x: i64;
+    y: i64;
+    ix: i64;
+    iy: i64;
+}
+
+iabs fn(v: i64) -> i64 {
+    if (v < 0) { return -v; }
+    return v;
+}
+
+// 定宽零填充（复用 colony_demo 的 pad 思路）
+mon_pad fn(v: i64, w: i64) -> string {
+    if (v < 0) { v = 0; }               // 坐标不应为负；兜底防 int_to_str 出负号破坏定宽
+    var s: string = int_to_str(v);
+    var L: i64 = str_len(s);
+    var b: StringBuilder = sb_new();
+    var pad: i64 = w - L;
+    var i: i64 = 0;
+    for (i = 0; i < pad; i = i + 1) { sb_append_char(b, 48); }
+    sb_append_str(b, s);
+    return sb_to_str(b);
+}
+mon_dec_field fn(s: string, off: i64, w: i64) -> i64 {
+    var n: i64 = 0;
+    var i: i64 = 0;
+    for (i = 0; i < w; i = i + 1) {
+        var c: i64 = str_at(s, off + i);
+        n = n * 10 + (c - 48);
+    }
+    return n;
+}
+mon_enc fn(hp: i64, st: i64, x: i64, y: i64, ix: i64, iy: i64) -> string {
+    var b: StringBuilder = sb_new();
+    sb_append_str(b, mon_pad(hp, 3));
+    sb_append_str(b, mon_pad(st, 2));
+    sb_append_str(b, mon_pad(x, 4));
+    sb_append_str(b, mon_pad(y, 4));
+    sb_append_str(b, mon_pad(ix, 1));
+    sb_append_str(b, mon_pad(iy, 1));
+    return sb_to_str(b);
+}
+mon_dec fn(s: string) -> Mon {
+    var m: Mon;
+    m.hp = mon_dec_field(s, 0, 3);
+    m.st = mon_dec_field(s, 3, 2);
+    m.x  = mon_dec_field(s, 5, 4);
+    m.y  = mon_dec_field(s, 9, 4);
+    m.ix = mon_dec_field(s, 13, 1);
+    m.iy = mon_dec_field(s, 14, 1);
+    return m;
+}
+st_name fn(st: i64) -> string {
+    if (st == 0) { return "idle"; }
+    if (st == 1) { return "chase"; }
+    if (st == 2) { return "attack"; }
+    return "dead";
+}
+
+// ───────────────────────── 怪物 step（Colony 通用回调签名）─────────────────────────
+// 只做「决策」：读玩家坐标（消息 arg_i 打包 px*10000+py），算出意图与状态；
+// 不动手改坐标——位置积分留给 World 的 MovementSystem（ECS 关注点分离）。
+monster_step fn(s_str: string, m: colony.Msg) -> string {
+    var s: Mon = mon_dec(s_str);
+    if (s.st == 3) { return s_str; }                 // 已死：no-op
+    if (m.kind == :tick) {
+        var px: i64 = m.arg_i / 10000;
+        var py: i64 = m.arg_i % 10000;
+        var d: i64 = iabs(px - s.x) + iabs(py - s.y);
+        if (d == 0) {
+            s.st = 2;                                // 贴脸 → 攻击
+        } else {
+            s.st = 1;                                // 追击 → 算意图
+            if (px > s.x) { s.ix = 1; } else if (px < s.x) { s.ix = 2; } else { s.ix = 0; }
+            if (py > s.y) { s.iy = 1; } else if (py < s.y) { s.iy = 2; } else { s.iy = 0; }
+        }
+        return mon_enc(s.hp, s.st, s.x, s.y, s.ix, s.iy);
+    }
+    return s_str;
+}
+
+// ───────────────────────── Spawner（生成子 agent）─────────────────────────
+// 在右边缘 x=12 生成 n 个怪物，y 依次铺开；初始 hp=MON_HP、idle、无意图。
+MON_HP fn() -> i64 { return 3; }
+spawn_wave fn(col: colony.Colony, n: i64, base_y: i64) -> colony.Colony {
+    var i: i64 = 0;
+    for (i = 0; i < n; i = i + 1) {
+        var yy: i64 = base_y + i * 4;
+        col = colony.colony_spawn(col, mon_enc(MON_HP(), 0, 12, yy, 0, 0));
+    }
+    return col;
+}
+
+// ───────────────────────── 展示辅助 ─────────────────────────
+pline fn(label: string, v: i64) -> void {
+    var b: StringBuilder = sb_new();
+    sb_append_str(b, label);
+    sb_append_i64(b, v);
+    println(sb_to_str(b));
+}
+
+// ───────────────────────── ECS World 主循环 ─────────────────────────
+@main
+main fn() -> i64 {
+    println("=== ECS World: spawn-wave survival (Spawner/Colony + physics.MovementSystem) ===");
+    var col: colony.Colony = colony.colony_new(monster_step);
+    var player_hp: i64 = 12;
+    var px: i64 = 0;
+    var py: i64 = 0;
+    var TURRET_RNG: i64 = 1;          // 玩家炮塔射程（曼哈顿距离，仅近身命中）
+    var wave2: bool = false;
+
+    // ── Spawner：第 1 波（3 只）在开局即生成 ──
+    col = spawn_wave(col, 3, 0);
+    println("--- WAVE 1 spawned (3 monsters at x=12) ---");
+
+    var t: i64 = 0;
+    for (t = 1; t <= 22; t = t + 1) {
+        // ── Spawner：第 6 帧生成第 2 波（2 只） ──
+        if (t == 6 && wave2 == false) {
+            col = spawn_wave(col, 2, 2);
+            wave2 = true;
+            println("--- WAVE 2 spawned (2 monsters at x=12) ---");
+        }
+
+        // ── System ① AgentSystem：广播 :tick（带玩家坐标）→ colony_tick 驱动决策 ──
+        col = colony.colony_broadcast(col, colony.mk_msg(:tick, px * 10000 + py, ""));
+        col = colony.colony_tick(col);
+
+        // ── System ② + ③ MovementSystem & CombatSystem：遍历存活怪物 ──
+        var min_d: i64 = 100000;
+        var i: i64 = 0;
+        for (i = 0; i < col.n; i = i + 1) {
+            if (col.alives[i] == false) { continue; }
+            var s: Mon = mon_dec(col.states[i]);
+            if (s.st == 2) {
+                player_hp = player_hp - 1;                // 贴脸攻击玩家
+            } else if (s.st == 1) {
+                // MovementSystem：按意图把速度积分进位置
+                var dx: i64 = 0;
+                var dy: i64 = 0;
+                if (s.ix == 1) { dx = 1; } else if (s.ix == 2) { dx = -1; }
+                if (s.iy == 1) { dy = 1; } else if (s.iy == 2) { dy = -1; }
+                var np: physics.Position = physics.movement_system(
+                    physics.Position{ x: s.x, y: s.y, z: 0 },
+                    physics.Velocity{ dx: dx, dy: dy, dz: 0 }, 1);
+                s.x = np.x;
+                s.y = np.y;
+            }
+            // ── CombatSystem：玩家炮塔（AoE）命中射程内全部怪物 ──
+            var d2: i64 = iabs(px - s.x) + iabs(py - s.y);
+            if (d2 < min_d) { min_d = d2; }
+            if (d2 <= TURRET_RNG) {
+                s.hp = s.hp - 1;
+                if (s.hp <= 0) {
+                    s.st = 3;                             // 阵亡
+                    col = colony.colony_kill(col, i);
+                }
+            }
+            col.states[i] = mon_enc(s.hp, s.st, s.x, s.y, s.ix, s.iy);
+        }
+
+        // ── 每帧报告（关键帧打印怪物明细，便于看清 ECS 运动） ──
+        var b: StringBuilder = sb_new();
+        sb_append_str(b, "tick ");
+        sb_append_i64(b, t);
+        sb_append_str(b, ": player_hp=");
+        sb_append_i64(b, player_hp);
+        sb_append_str(b, " alive=");
+        sb_append_i64(b, colony.colony_count(col));
+        sb_append_str(b, " closest=");
+        sb_append_i64(b, min_d);
+        println(sb_to_str(b));
+
+        if (t == 1 || t == 6 || t == 12 || t == 22) {
+            var k: i64 = 0;
+            for (k = 0; k < col.n; k = k + 1) {
+                if (col.alives[k] == false) { continue; }
+                var s: Mon = mon_dec(col.states[k]);
+                var mb: StringBuilder = sb_new();
+                sb_append_str(mb, "    m");
+                sb_append_i64(mb, k);
+                sb_append_str(mb, " (");
+                sb_append_i64(mb, s.x);
+                sb_append_str(mb, ",");
+                sb_append_i64(mb, s.y);
+                sb_append_str(mb, ") ");
+                sb_append_str(mb, st_name(s.st));
+                sb_append_str(mb, " hp=");
+                sb_append_i64(mb, s.hp);
+                println(sb_to_str(mb));
+            }
+        }
+    }
+
+    // ── 终局 ──
+    println("=== final ===");
+    pline("  player_hp   = ", player_hp);
+    pline("  monsters left = ", colony.colony_count(col));
+    if (colony.colony_count(col) == 0) {
+        println("  WORLD CLEARED");
+    } else {
+        println("  WAVE ONGOING");
+    }
+    return 0;
+}
