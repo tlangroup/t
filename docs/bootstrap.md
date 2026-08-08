@@ -260,6 +260,10 @@ tc2 + compiler.tc  →  tc3.exe
 
 ## 7 里程碑清单（执行顺序）
 
+> 路径说明：下表记录的是**当时**的文件位置。M5–M7 那三个独立里程碑程序（lexer / parser / checker）
+> 已于 2026-08-08 归档到 `archive/milestones/`；现役编译器本体在 `src/`，按编译步骤分层为
+> `base → lex → parse → sema → codegen_c → codegen_ll → tc`。
+
 - [x] **M1** runtime/t_runtime.h/c + C 单测（G1~G6 底座）
 - [x] **M2** tc0：checker + emitter 支持 string/切片/map/内置函数/switch；新增 `build`、`lex --json` 命令
 - [x] **M3** mini-lexer 样例（selfhost_probe.tc）编译运行通过 —— *Stage 0.5 完成*

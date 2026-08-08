@@ -65,11 +65,20 @@ export interface AnnotationDef {
 
 export const BUILTIN_ANNOTATIONS: AnnotationDef[] = [
     // ── Category 1: Test annotations (spec 4.2) ──
-    { name: "test",       category: AnnotationCategory.Test, validTargets: [AnnotationTarget.Func], argSpec: "none", description: "Mark function as unit test case" },
-    { name: "test_skip",  category: AnnotationCategory.Test, validTargets: [AnnotationTarget.Func], argSpec: "none", description: "Skip this test case in batch runs" },
-    { name: "test_only",  category: AnnotationCategory.Test, validTargets: [AnnotationTarget.Func], argSpec: "none", description: "Function only exists in test compilation mode" },
-    { name: "expect_fail",category: AnnotationCategory.Test, validTargets: [AnnotationTarget.Func], argSpec: "none", description: "Expect this test to fail/assert" },
-    { name: "test_group", category: AnnotationCategory.Test, validTargets: [AnnotationTarget.Func], argSpec: "string", description: "Group test cases by tag" },
+    // 全部弃用：测试改用并置式声明 `"name" test { ... }` / `"name" suite { ... }`
+    // （tc 侧见 src/parse.tc parse_test_decl、docs/syntax/drafts/decl_test.md）。
+    // tc0 不实现新语法，但必须镜像同样的弃用告警，否则 difftest 的 check 通道
+    // 会在 tests/samples/*.tc 上与 tc 逐字节分叉。
+    { name: "test",       category: AnnotationCategory.Test, validTargets: [AnnotationTarget.Func], argSpec: "none", description: "DEPRECATED: use a juxtaposed test declaration", deprecated: true, replacement: "a `\"name\" test { ... }` declaration" },
+    { name: "test_skip",  category: AnnotationCategory.Test, validTargets: [AnnotationTarget.Func], argSpec: "none", description: "DEPRECATED: use @skip", deprecated: true, replacement: "@skip" },
+    { name: "test_only",  category: AnnotationCategory.Test, validTargets: [AnnotationTarget.Func], argSpec: "none", description: "DEPRECATED: use @only", deprecated: true, replacement: "@only" },
+    { name: "expect_fail",category: AnnotationCategory.Test, validTargets: [AnnotationTarget.Func], argSpec: "none", description: "DEPRECATED: use @should_fail", deprecated: true, replacement: "@should_fail" },
+    { name: "test_group", category: AnnotationCategory.Test, validTargets: [AnnotationTarget.Func], argSpec: "string", description: "DEPRECATED: use a suite block", deprecated: true, replacement: "a `\"name\" suite { ... }` block" },
+    // 新式测试注解：tc0 只需认得它们（不报 unknown），语义由 tc 实现。
+    { name: "skip",        category: AnnotationCategory.Test, validTargets: [AnnotationTarget.Func], argSpec: "mixed", description: "Skip this test (optional reason string)" },
+    { name: "only",        category: AnnotationCategory.Test, validTargets: [AnnotationTarget.Func], argSpec: "none", description: "Run only the tests marked @only" },
+    { name: "should_fail", category: AnnotationCategory.Test, validTargets: [AnnotationTarget.Func], argSpec: "none", description: "The test is expected to fail" },
+    { name: "tag",         category: AnnotationCategory.Test, validTargets: [AnnotationTarget.Func], argSpec: "ident_list", description: "Attach filter tags to a test" },
 
     // ── Category 2: Derive annotations (spec 4.3) ──
     { name: "derive",     category: AnnotationCategory.Derive, validTargets: [AnnotationTarget.Struct, AnnotationTarget.Enum, AnnotationTarget.Flag, AnnotationTarget.FlagSet, AnnotationTarget.Union], argSpec: "ident_list", description: "Auto-generate trait implementations" },

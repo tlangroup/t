@@ -28,10 +28,10 @@
 //
 // 基线文件: tests/ir_baseline.json（应随语义变更一同提交）
 
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import {
-    readFileSync, writeFileSync, readdirSync, existsSync, mkdirSync, rmSync,
+    readFileSync, writeFileSync, readdirSync, existsSync, mkdirSync,
 } from "node:fs";
 import { join, resolve, basename } from "node:path";
 import { createHash } from "node:crypto";
@@ -65,7 +65,41 @@ if (!existsSync(compiler)) {
     process.exit(2);
 }
 
-const WORK = join(ROOT, "out", "dbg", "irsnap");
+// ── 工作目录：每轮独占，绝不复用 ─────────────────────────────────
+// 教训：固定目录 out/dbg/irsnap 会逼着每轮先「清理上一轮残留」，而 Windows 上刚写出的
+// .ll/.c 常被杀软/索引器持有若干分钟 —— rmSync 在 EPERM 上反复重试，实测把「30s 的发射」
+// 变成「10 分钟不返回」的假死，连 renameSync 都会因目录内有打开的文件而失败。
+// 解法是根除依赖：本轮用 irsnap.<pid>，不存在残留，也就不需要在关键路径上清理。
+const WORK_REL = join("out", "dbg", `irsnap.${process.pid}`);
+const WORK = join(ROOT, WORK_REL);
+
+// 分离式后台删除：unref 后本进程可立即退出，不受删除快慢影响。
+function reapDetached(dir) {
+    try {
+        const child = process.platform === "win32"
+            ? spawn("cmd", ["/c", "rd", "/s", "/q", dir], { detached: true, stdio: "ignore", windowsHide: true })
+            : spawn("rm", ["-rf", dir], { detached: true, stdio: "ignore" });
+        child.unref();
+    } catch { /* 删不掉就留着，下次运行再扫 */ }
+}
+
+// 回收本轮目录：同样不等待。
+function discardWork() {
+    if (existsSync(WORK)) reapDetached(WORK);
+}
+
+// 启动时尽力扫掉历史遗留的 irsnap* 目录（含旧版固定目录），全部分离式，不阻塞本轮。
+{
+    const parent = join(ROOT, "out", "dbg");
+    const self = `irsnap.${process.pid}`;
+    if (existsSync(parent)) {
+        for (const e of readdirSync(parent)) {
+            if (e === self) continue;
+            if (e === "irsnap" || e.startsWith("irsnap.")) reapDetached(join(parent, e));
+        }
+    }
+}
+
 mkdirSync(WORK, { recursive: true });
 
 // ── 快照目标：全部示例 + 编译器自身 + 包管理器 ───────────────────
@@ -89,7 +123,7 @@ async function emitOne(rel) {
     const out = {};
 
     if (backends.includes("ll")) {
-        const outBase = join("out", "dbg", "irsnap", tag);
+        const outBase = join(WORK_REL, tag);
         try {
             await pExecFile(compiler, ["emit-ll", rel, "--output", outBase], {
                 cwd: ROOT, encoding: "buffer", maxBuffer: 256 * 1024 * 1024, windowsHide: true,
@@ -104,7 +138,7 @@ async function emitOne(rel) {
 
     if (backends.includes("c")) {
         // emit-c 的 --output 是**目录**；每个目标独立子目录，避免 basename 撞名
-        const outDir = join("out", "dbg", "irsnap", `c__${tag}`);
+        const outDir = join(WORK_REL, `c__${tag}`);
         mkdirSync(join(ROOT, outDir), { recursive: true });
         try {
             await pExecFile(compiler, ["compile", rel, "--emit-c", "--output", outDir], {
@@ -148,7 +182,7 @@ const errors = results.filter((r) => r.error);
 if (errors.length > 0) {
     for (const e of errors) console.log(`  ERROR  ${e.rel}  — ${e.error}`);
     console.log(`\nir_snapshot: ${errors.length} target(s) failed to emit`);
-    if (!keep) rmSync(WORK, { recursive: true, force: true });
+    if (!keep) discardWork();
     process.exit(1);
 }
 
@@ -178,14 +212,14 @@ if (update) {
         `${curKeys.length} entries [${backends.join(",")}] (${elapsed}s)`
     );
     console.log(`  → tests/ir_baseline.json`);
-    if (!keep) rmSync(WORK, { recursive: true, force: true });
+    if (!keep) discardWork();
     process.exit(0);
 }
 
 // ── 比对基线 ─────────────────────────────────────────────────────
 if (!existsSync(BASELINE)) {
     console.error("ir_snapshot: 基线不存在，先运行 `node tools/ir_snapshot.mjs --update`");
-    if (!keep) rmSync(WORK, { recursive: true, force: true });
+    if (!keep) discardWork();
     process.exit(2);
 }
 const base = JSON.parse(readFileSync(BASELINE, "utf8"));
@@ -227,8 +261,8 @@ if (bad === 0) {
 } else {
     console.log(`ir_snapshot: ${diffs.length} 处差异, ${added.length} 个新增, ${removed.length} 个缺失`);
     console.log("  ⇒ 必须确认差异符合预期；确认后 `--update` 重录基线");
-    if (keep) console.log("  发射产物保留在 out/dbg/irsnap/ 便于 diff");
+    if (keep) console.log(`  发射产物保留在 ${WORK_REL}/ 便于 diff`);
     else console.log("  加 --keep 可保留产物用于逐行 diff");
 }
-if (!keep) rmSync(WORK, { recursive: true, force: true });
+if (!keep) discardWork();
 process.exit(bad === 0 ? 0 : 1);

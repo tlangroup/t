@@ -6,7 +6,7 @@
 42 项差分测试 + 17 项符合性用例全部通过。
 
 工具链分工（M38 起重构）：
-- **`tc`** — 纯粹的**编译器**：负责 `lex / check / compile / emit-ll / build / run` 与链接（LLVM 或 C 后端）。源码 `src/tc.tc`，二进制 `out/<mode>/tc.exe`。
+- **`tc`** — 纯粹的**编译器**：负责 `lex / check / compile / emit-ll / build / run` 与链接（LLVM 或 C 后端）。入口 `src/tc.tc`，本体按编译步骤拆分为 `src/{base,lex,parse,sema,codegen_c,codegen_ll}.tc`（见「编译器源码结构」），二进制 `out/<mode>/tc.exe`。
 - **`tote`** — **包管理器与构建系统**：自身不实现编译器，而是把编译/链接委托给 `tc`；并负责包清单 `tote.toml`、`init` 脚手架与依赖登记（`install`）。源码 `src/tote.tc`，二进制 `out/<mode>/tote.exe`。
 - **`totter`**（数据驱动生成器）— **已放弃（abandoned），保留不删除**：`src/totter.tc` 与冻结快照 `gen/tc.tc` 仍在仓库中，已退出 canonical 流水线，不再维护、不再重跑。
 
@@ -14,12 +14,38 @@
 
 | 实现 | 位置 | 状态 |
 |------|------|------|
-| **tc（编译器）** | `src/tc.tc`（t 语言编写，自宿主） | **活跃开发** — 一切语言演进发生在这里 |
+| **tc（编译器）** | `src/tc.tc` + 6 个分层模块（t 语言编写，自宿主） | **活跃开发** — 一切语言演进发生在这里 |
 | **tote（包管理器/构建系统）** | `src/tote.tc`（t 语言编写，自宿主） | **活跃开发** — 编译委托 tc，负责包与构建编排 |
 | totter（数据驱动生成器） | `src/totter.tc` | **已放弃（保留）** — 不再参与构建流水线，不再维护 |
 | tc0（种子） | `seed/tc0/`（TypeScript，冻结副本）；`tc0/`（工作副本，frozen） | **冻结** — 仅作参照实现与灾难恢复信任根，不再演进 |
 
 稳定版：编译器 `out/rls/tc.exe`（发布优化）/ `out/dbg/tc.exe`（调试，由 `src/tc.tc` 编译而来）；包管理器/构建系统 `out/dbg/tote.exe`（由 `src/tote.tc` 编译而来，内部调用 `tc`）。
+
+## 编译器源码结构
+
+编译器本体（原 22 907 行单体 `src/tc.tc`）自 2026-08-08 起**按编译步骤拆分为多模块**，用语言自身的
+`import(src.x :: *)` 组织。模块顺序即 import DAG —— **靠前的模块不得引用靠后模块的符号**。
+
+| 模块 | 编译步骤 | 内容 | 依赖 |
+|------|---------|------|------|
+| `src/base.tc` | 第 0 层 | token 池 / 扁平 Node 池、位置信息、诊断、字符串与切片工具 | — |
+| `src/lex.tc` | 步骤 1 词法 | 字符分类、关键字表、`tokenize`、token 流访问器 | base |
+| `src/parse.tc` | 步骤 2 语法 | 递归下降 parser、顶层声明、前端 lowering（agent / 函数子句脱糖） | base, lex |
+| `src/sema.tc` | 步骤 3 语义 | 类型检查（TypeInfo 池）、meta 泛型单态化、CTFE、TypeDesc（TD）池 | base, lex, parse |
+| `src/codegen_c.tc` | 步骤 4a | C 后端（M8 C Emitter）+ emit 编排 | ↑ 全部 |
+| `src/codegen_ll.tc` | 步骤 4b | LLVM IR 后端（M13 LLVM Emitter） | ↑ 全部 + codegen_c |
+| `src/tc.tc` | 驱动 | import 汇总 + 命令行分发 + `main()` | 全部 |
+
+约束与工具：
+
+- 语言**禁止循环 import**（`T_IMPORT_CYCLE`）。跨模块调用要类型正确，调用方必须 import 被调方 ——
+  否则 sema 找不到签名、返回类型会被错判（表现为链接期 `undefined` 或 IR 类型不匹配，难查）。
+- 新增/移动顶层符号后跑 `node tools/dagcheck.mjs`，必须是「0 处反向引用」。
+- 静态检查工具（`catn_check` / `shadow_check`）默认扫描 `tools/tc_sources.mjs` 里的**全部模块**；
+  只传单个文件时才退化为单文件模式。
+- 拆分前的单体快照不另存文件，需要对照时用 `git show <拆分前的提交>:src/tc.tc`。
+- M5–M7 阶段各自带 `main` 的里程碑程序（早期的 lexer / parser / checker，与 tc0 对拍用）已归档到
+  `archive/milestones/`，不参与 `tc` 的构建，也不再维护。
 
 ## 快速开始
 
@@ -128,8 +154,9 @@ node tools/conformance.mjs --compiler out/dbg/tc.exe
 out/dbg/tc.exe   build src/tc.tc --output out/dbg/tc_b
 out/dbg/tc_b.exe build src/tc.tc --output out/dbg/tc_c
 cmp out/dbg/tc_b.ll out/dbg/tc_c.ll
-# ④ 铁律守卫（catN 实参个数 / 同名局部变量类型）
-node tools/catn_check.mjs src/tc.tc && node tools/shadow_check.mjs src/tc.tc
+# ④ 铁律守卫（catN 实参个数 / 同名局部变量类型 / 模块 DAG 无反向引用）
+#    不带参数即扫描全部编译器模块（tools/tc_sources.mjs）
+node tools/catn_check.mjs && node tools/shadow_check.mjs && node tools/dagcheck.mjs
 # ⑤ UNSUPPORTED call 基线（当前为 2）
 grep -o "UNSUPPORTED call" out/dbg/tc.ll | wc -l
 # ⑥ 运行时语义：examples 实跑，LLVM/C 双后端 + .expected.txt 三方比对

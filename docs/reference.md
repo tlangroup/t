@@ -225,11 +225,15 @@ DiagnosticTable:
   | "T_TAGID_DUP" -> error
 
 AnnotationTable:
-    "test" { spec: "none", targets: "func", repl: "" }
-  | "test_skip" { spec: "none", targets: "func", repl: "" }
-  | "test_only" { spec: "none", targets: "func", repl: "" }
-  | "expect_fail" { spec: "none", targets: "func", repl: "" }
-  | "test_group" { spec: "string", targets: "func", repl: "" }
+    "test" { spec: "none", targets: "func", repl: "a `\"name\" test { ... }` declaration" }
+  | "test_skip" { spec: "none", targets: "func", repl: "@skip" }
+  | "test_only" { spec: "none", targets: "func", repl: "@only" }
+  | "expect_fail" { spec: "none", targets: "func", repl: "@should_fail" }
+  | "test_group" { spec: "string", targets: "func", repl: "a `\"name\" suite { ... }` block" }
+  | "skip" { spec: "mixed", targets: "func", repl: "" }
+  | "only" { spec: "none", targets: "func", repl: "" }
+  | "should_fail" { spec: "none", targets: "func", repl: "" }
+  | "tag" { spec: "ident_list", targets: "func", repl: "" }
   | "derive" { spec: "ident_list", targets: "struct, enum, flag, flag_set, union", repl: "" }
   | "cfg" { spec: "ident", targets: "global, func, struct, enum, var, const", repl: "" }
   | "cfg_attr" { spec: "mixed", targets: "global, func, struct, enum", repl: "" }
@@ -977,7 +981,8 @@ AnnArg:  Expression | StringLiteral
 
 注解可挂于类型、字段、函数、全局节点；全部经 `type_info(T)` 编译期自省读取（字段自省内建已接入，见 §3.6.0；注解元数据表驱注册见 `src/tc.tc` `init_anndefs`）。当前 tc `init_anndefs` 已表驱注册全量注解（spec §4.8）：
 
-- 测试类：`@test` `@test_skip` `@test_only` `@expect_fail` `@test_group("分组")`
+- 测试类：`@skip` `@only` `@should_fail` `@tag(name, ...)`（见 §3.14）
+  - ⚠ 弃用别名（发 `T_ANNOTATION_UNKNOWN` warning，不阻断）：`@test` → `"名字" test { }`；`@test_skip` → `@skip`；`@test_only` → `@only`；`@expect_fail` → `@should_fail`；`@test_group("g")` → `"g" suite { }`
 - 派生类：`@derive(ToString,FromString,Clone,Copy,DebugPrint,BinarySerde,Eq,Hash)`
 - 条件编译：`@cfg()` `@cfg_attr()` ⚠ spec-only
 - 警告管控：`@allow()` `@warn()` `@deny()` `@deprecated("提示")` ⚠ spec-only
@@ -2105,6 +2110,92 @@ main2 fn() -> i32 @main {
 
 ---
 
+### 3.14 Tests（测试声明）✅ tc（2026-08-08）
+
+测试是**并置式声明**，与 `Name fn`/`Name struct`/`Name enum` 同族——只是「名字」位置放的是字符串字面量而非标识符，因为测试名是给人读的句子，不是标识符。
+
+```ebnf
+TestDecl:
+    Annotation* StringLiteral "test" Annotation* Block
+
+SuiteDecl:
+    Annotation* StringLiteral "suite" Annotation* Block   // 体内只许 TestDecl / SuiteDecl
+
+ExpectStatement:
+    "expect" "(" Expression ("," StringLiteral)? ")" ";"
+```
+
+- `test` / `suite` / `expect` 均为**语境关键字**（不进 `keywords_tbl`，不影响同名标识符）：
+  - `test` / `suite`：仅在「声明位置且前一个 token 是字符串字面量」时生效；
+  - `expect`：仅在「语句位置且下一个 token 是 `(`」时生效。
+- 注解可写在字符串前或 `test`/`suite` 后，两处等价（都并进同一条注解链）。
+- `suite` 只做**词法分组**，自身不产生任何声明；suite 上的注解**逐成员复制下沉**，故 `@skip` / `@tag` 写在 suite 上天然作用于整组。suite 可嵌套，路径以 ` / ` 连接。
+
+**脱糖**（`parse_test_decl`）：
+
+```
+"名字" test { BODY }
+  ⇒  __test_<n> fn() bool @test { BODY; return true; }
+     FuncDecl.bd = true   // 是测试
+     FuncDecl.sb = "名字" // 显示名
+     FuncDecl.sc = suite 路径
+```
+
+测试以「跑完没炸」为通过，末尾隐式 `return true;`；`expect` 失败会提前 `return false`。
+
+**`expect` 内建 + CTFE 自省**：`expect(EXPR)` 在解析期就地捕获 `EXPR` 的**源码切片**（`Tok` 只有 `t/v/line/col`、无字节偏移，源文本在 `tokenize()` 后不可达，故必须在解析期用 `rebuild_tokens` 重建），脱糖为：
+
+```
+expect(EXPR[, "说明"]);
+  ⇒  if (!(EXPR)) {
+         eprint(format("  expect failed: {} @ {}:{}[  ({})]\n", "<EXPR 源码>", <file>, <line>[, "说明"]));
+         return false;
+     }
+```
+
+零新增运行时符号（复用 `format`/`eprint`）。**失败详情走 stderr，判定行走 stdout**，故详情自带前后换行以免与判定行交错。
+
+**测试注解**：
+
+| 注解 | 语义 |
+|---|---|
+| `@skip` / `@skip("原因")` | 不执行，计入 skipped |
+| `@only` | 存在任一 `@only` 时，本次只跑被标记的测试 |
+| `@should_fail` | 期望失败；返回 false 才算通过 |
+| `@tag(a, b)` | 打标签，供 `tc test --tag <name>` 过滤 |
+
+**运行器 `tc test`**：
+
+```
+tc test <file.tc> [--filter <substr>] [--tag <name>] [--mode dbg|rls] [--no-run]
+```
+
+单遍解析 + token 追加：先 `tokenize(源码)` 并记录 token 数作标记 → `parse_unit()` 收集测试 → 生成 `@main` runner 源码后 `tokenize` **追加**（`tokenize()` 是 append 语义、`parse_unit()` 遇 `Eof` 即停）→ 把 `pos` 回拨到标记处续 parse。用户代码与 runner 因此走**同一次完整 sema**，无需重置任何全局。文件自带的 `@main` 在本次运行中被摘除（发 note）。输出：
+
+```
+running 8 test(s)
+
+test add 应返回两数之和 ... ok
+test loops / sum_to 应累加到 n ... ok
+test 待补：跳过示例 ... skipped
+
+test result: 7 passed, 0 failed, 1 skipped
+```
+
+有失败时进程退出码非 0。
+
+**旧注解迁移**（弃用别名过渡，发 `T_ANNOTATION_UNKNOWN` **warning**、不阻断）：
+
+| 旧 | 新 |
+|---|---|
+| `name fn() bool @test` | `"name" test { }` |
+| `@test_skip` | `@skip` |
+| `@test_only` | `@only` |
+| `@expect_fail` | `@should_fail` |
+| `@test_group("g")` | `"g" suite { }` |
+
+---
+
 ## 4. Program entry（程序入口） ✅ tote
 
 ```ebnf
@@ -2121,13 +2212,18 @@ EntryPoint: FuncDecl with "@main" annotation
 ```ebnf
 TranslationUnit : ModuleItem*
 ModuleItem      : FuncDecl | StructDecl | FlagDecl | VariantDecl
+                | TestDecl | SuiteDecl
                 | GlobalVarDecl | ConstDecl | InnerAttribute
 FuncDecl        : Ident "fn" "(" Params? ")" ("->")? Type Anns? Block
 StructDecl      : Ident "struct" Anns? "{" Field* "}"
 FlagDecl        : Ident "flag" "[" IntType "]" "{" Slot* "}"
 VariantDecl     : Ident "variant" "{" Case* "}"
+TestDecl        : String "test" Anns? Block
+SuiteDecl       : String "suite" Anns? "{" (TestDecl | SuiteDecl)* "}"
 Block           : "{" Statement* "}"
 Statement       : VarDecl | ConstDecl | Assign | If | While | Return | ExprStmt | Block
+                | ExpectStmt
+ExpectStmt      : "expect" "(" Expression ("," String)? ")" ";"
 Expression      : Literal | Ident | Call | FieldAccess | Unary | Binary | "(" Expression ")"
 Type            : Scalar | "[]" Type | "[" N "]" Type | NamedType
 Annotation      : "@" Ident ("(" ArgList? ")")?
@@ -2151,6 +2247,7 @@ Annotation      : "@" Ident ("(" ArgList? ")")?
 | §7.2 | 外部数据导入 CSV/JSON（CTFE 脱糖） | ✅ 已实现 |
 | §2.3 | 字符串驻留符号 Sym32/Sym16（intern / sym_str / sym_release） | ✅ 已实现（M40） |
 | §3.11 | 时间格式化（strftime `%` 风格）+ 解析/固定时区/locale/M57 增量 | ✅ 已实现（M56 / M57） |
+| §3.14 | 测试声明 `"名" test/suite {}` + `expect` + `tc test` 运行器 | ✅ 已实现（2026-08-08；旧 `@test` 系列转弃用别名） |
 
 > 设计哲学落地：**语法根本源为 `docs/reference.md`**（内含 `ebnf` 产生式块），经 `tools/gen_ebnf.mjs` 生成 `out/ebnf.json`，再由 `src/totter.tc`（已放弃）数据驱动生成 `gen/tc.tc`（冻结快照，见 `src/tc.tc` `kw_lookup` 等标记区间）。⚠ totter 已放弃，此「数据优先」生成管线为历史设计；`src/tc.tc` 现手写维护，`GEN:` 区间为冻结快照。
 

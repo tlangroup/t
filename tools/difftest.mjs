@@ -17,9 +17,14 @@
 //     stdout 类命令无落盘，故并行安全。
 //
 // XFAIL:
-//   tc0 的 emitter 已随参考实现一同冻结，`compile --emit-c` 通道对新语法恒失败，
-//   属既成基线而非回归。以 tc0 为 ref 时该通道自动标记 XFAIL（不计入失败），
-//   可用 --strict 关闭、或用 --xfail <ch,...> 手工指定（通道名: lex/check/emit-c）。
+//   ① 通道级：tc0 的 emitter 已随参考实现一同冻结，`compile --emit-c` 通道对新语法恒失败，
+//      属既成基线而非回归。以 tc0 为 ref 时该通道自动标记 XFAIL（不计入失败），
+//      可用 --strict 关闭、或用 --xfail <ch,...> 手工指定（通道名: lex/check/emit-c）。
+//   ② 文件级：tc0 是**冻结的旧参考实现**，语言继续演进后它必然读不懂新语法。
+//      样例文件可在头部 20 行内自行声明哪些通道对 tc0 恒失败：
+//          // DIFFTEST-XFAIL(tc0): check, emit-c — <理由>
+//      只在 ref 为 tc0 时生效；对代际自对拍（g2↔g3）无效，故不会掩盖真回归。
+//      预期失败却通过时报 XPASS，提示可以摘掉标记。
 
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -153,10 +158,24 @@ if (xfail.size > 0) {
 }
 console.log("");
 
+// 文件级 XFAIL 声明：`// DIFFTEST-XFAIL(tc0): check, emit-c — 理由`
+// 只在 ref 是 tc0（冻结的旧参考实现）时生效。
+function fileXfailChannels(filePath) {
+    if (!refIsTc0 || SELF_CHECK || opts.strict) return new Set();
+    let head;
+    try {
+        head = readFileSync(filePath, "utf8").split(/\r?\n/, 20).join("\n");
+    } catch { return new Set(); }
+    const m = /^\s*\/\/\s*DIFFTEST-XFAIL\(tc0\)\s*:\s*([^\n—]+)/m.exec(head);
+    if (!m) return new Set();
+    return new Set(m[1].split(",").map((s) => s.trim()).filter(Boolean));
+}
+
 // 单个样例的全部通道
 async function runSample(sample) {
     const filePath = join(opts.samples, sample);
-    const rows = []; // { label, ch, err }
+    const fxf = fileXfailChannels(filePath);
+    const rows = []; // { label, ch, err, fxf }
 
     // 1) stdout 类命令
     for (const { ch, mk } of STDOUT_CMDS) {
@@ -226,7 +245,7 @@ async function runSample(sample) {
         rows.push({ label: label5, ch: "tcheck", err: err5 });
     }
 
-    return rows;
+    return fxf.size > 0 ? rows.map((r) => ({ ...r, fxf })) : rows;
 }
 
 const perSample = await runPool(samples, jobs, runSample);
@@ -235,8 +254,8 @@ let pass = 0, fail = 0, nXfail = 0, nXpass = 0;
 const failures = [];
 const xpasses = [];
 for (const rows of perSample) {
-    for (const { label, ch, err } of rows) {
-        const expectFail = xfail.has(ch);
+    for (const { label, ch, err, fxf } of rows) {
+        const expectFail = xfail.has(ch) || (fxf ? fxf.has(ch) : false);
         if (err) {
             if (expectFail) { nXfail++; if (opts.verbose) console.log(`  XFAIL ${label}`); }
             else { fail++; failures.push({ label, err }); console.log(`  FAIL  ${label}`); }

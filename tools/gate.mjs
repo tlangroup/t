@@ -120,13 +120,17 @@ const GR = join("out", "rls", "gr");   // rls 编译器
 
 const steps = [
     {
-        id: "static", lv: 0, name: "静态检查 (catn + shadow)",
+        id: "static", lv: 0, name: "静态检查 (catn + shadow + dag)",
         run: async () => {
             const a = await node("catn_check.mjs");
             if (a.code !== 0) return { ok: false, note: lastLine(a.out, 3) };
             const b = await node("shadow_check.mjs");
             if (b.code !== 0) return { ok: false, note: lastLine(b.out, 3) };
-            return { ok: true, note: `${lastLine(a.out)} | ${lastLine(b.out)}` };
+            // 模块拆分后新增：import DAG 不得有反向引用。未定义的**函数**只会降级为
+            // `; UNSUPPORTED call` 警告并静默产出坏 IR，编译器自身兜不住，必须静态扫。
+            const c = await node("dagcheck.mjs");
+            if (c.code !== 0) return { ok: false, note: lastLine(c.out, 3) };
+            return { ok: true, note: `${lastLine(a.out)} | ${lastLine(b.out)} | ${lastLine(c.out)}` };
         },
     },
     {

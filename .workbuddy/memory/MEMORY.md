@@ -1,71 +1,83 @@
 # t 语言编译器 — 项目笔记
 
-## 协作偏好（用户明示）
-- **不中途停下**：除非确实需要用户拍板（选项无法自行决断 / 会不可逆破坏数据），否则一路跑到底，不要为确认或汇报而停。
+## 协作偏好
+- **不中途停下**：除非需用户拍板（选项无法决断/不可逆破坏数据），否则一路跑到底。
 
 ## 概览
-- **t**：静态类型、数据驱动、ECS 取向，扩展名 `.tc`；宪法 `docs/constitution.md`，手册 `docs/reference.md`。⚠ `spec.md` 冻结废弃。
-- **声明语法（M44 起）并置式**：`Name fn(...) -> Ret {}` / `Name struct {}` / `Name enum : u8 {}` / `Name flag[u16] {}` / `Name variant {}` / typealias `Name Type;`。⚠ `::` 与 `func` 已移除。
-- **`src/tc.tc`**：自举编译器（lex/check/compile/emit-c/emit-ll/build/run，默认 LLVM）→ `out/<mode>/tc.exe`。**`src/tote.tc`**：包管理，委托 tc。`gen/tc.tc` 冻结快照。
-- **命名红线**：`✅ tote`/`status='tote'` 意为「已实现」；裸 `tote` 编译器引用 → `tc`。
+- **t**：静态类型、数据驱动、ECS 取向，`.tc`；宪法 `docs/constitution.md`、手册 `docs/reference.md`（GEN 区真源）。
+- 并置声明式：`Name fn(...) Ret {}` / `Name struct {}` / `Name enum : u8 {}` / `Name flag[u16] {}` / `Name variant {}` / typealias `Name Type;`。`->` 可选。`func` 已移除。
+- **import（08-07 统一）**：`import(Path [ "::" List ] [ "as" Alias ]) ";"`。`Path` 点分；首段 `src` → 本项目源码根（剥 `src`），否则查 `lib/` 再查依赖库。`::` 仅用于选择性列表（`a as b` / `*`）。错误码 `T_IMPORT_{BAD_PATH,NOT_FOUND,CONFLICT}`/`T_MODULE_{NO_SYMBOL,PRIVATE}`。选择性导入 = AST 改名 Pass 3；`ImportModDecl.bd`=is_lib_path、`lb`=item 链。
+- `src/tc.tc` 自举编译器（默认 LLVM）→ `out/<mode>/tc.exe`；`src/tote.tc` 包管理。`gen/tc.tc` 冻结。
+- **测试语法**：见下方「测试语法现代化」节。
 
-## 架构红线（用户多轮裁定）
-1. **tc 只管 lex/parse/sema**：具体功能由可插拔 `.tlib` 实现、靠 `import` 引入，不进编译器。**tc 不读环境变量**——只提供中性原语 `getenv` + 中性开关 `--lib-dir`，策略（`T_LIB_PATH`/`~/.tote/libs`）归 tote。
-2. **agent 非容器**：`state` 只是 Component、`step` 只是众多 System 之一。多能力各自 = 独立 Component+System 对并排组合，`step` 只写意图。
-3. **瘦 agent 声明**：`X agent { state; step }` 唯一写法，绝不再扩语法（无 `use`/`goal`/`plan`/Spawner）。规划体用纯 `planner(State)->Msg` 自由 fn 喂 step。见 `docs/agent_first.md`。
-4. **t 无 `extern`/FFI/内建网络**：Edge 效应全在进程外；`step` 纯函数只记意图，运行时边界 `drive_*` 回填。本地 LLM = stdin/stdout 旁路桥（sidecar，零编译器改动）。
+## 编译器模块结构（08-08 拆分：22907 行单体 → 7 模块）
+- 顺序即 import DAG，**靠前不得引用靠后**：`base`(4349) → `lex`(553) → `parse`(3111) → `sema`(7545) → `codegen_c`(3226) → `codegen_ll`(3915) → `tc.tc`(379，driver+`main`)。清单在 `tools/tc_sources.mjs`。
+- **模块名 = 符号 mangling 前缀**（`@t.base__*`）。改名验证：`ir_snapshot` 不 update 跑一次，差异须**恰好 3 处且全是 `src/tc.tc::{ll,c,h}`**；外溢即踩到真实标识符。批量 `sed` **长名优先**。
+- ⚠ **跨模块调用必须 import 被调方**，否则 sema 找不到签名 → 返回类型错判 → 链接期 undefined。后端裸名回退治标不治本。
+- ⚠ **未定义「变量」硬错误，未定义「函数」只降级 `; UNSUPPORTED call` 并静默产坏 IR** ⇒ 必须 `node tools/dagcheck.mjs`，0 反向引用（已接 gate）。
+- `catn_check`/`shadow_check`/`dagcheck` 各带防假绿下限（934 catN / 634 fn / 3700 var / 590 符号）。**改模块清单要同步下限**。
+- M5–M7 里程碑程序已归档 `archive/milestones/`，不参与构建。拆分前单体用 `git show <提交>:src/tc.tc` 对照。方法论见用户级 skill `monolith-module-split`。
 
-## 构建 & 门禁（gate.mjs）
-- `out/dbg/`（`-O0 -gcodeview`）/ `out/rls/`（`-O2`）。入口 `node tools/gate.mjs L0|L1|L2 [--full]`。**串行、别放后台**。
-- L0（~10s）：静态→自举 g1→IR 双后端比对→conformance→`UNSUPPORTED` 计数 0。L1（+g2==g3）。L2（~139s）：+四代不动点 +`cself` C 自举 + difftest tc0 + rls + tote 冒烟。目标 **13 passed/0 failed/0 warn**。
-- **判不动点只比 emit-ll 的 `.ll` md5，绝不比 exe md5**（`-gcodeview` 写进 `--output` 名）。
-- **IR 基线漂移**：改动 tc.tc/tote.tc 必 WARN。归零 = ① `cp out/dbg/g4.exe out/dbg/tc.exe`；② `node tools/ir_snapshot.mjs --compiler out/dbg/g1.exe --update`；③ 复跑 gate。**必须用当次 g1 重录，否则差一代**。
-- **`t_runtime.lib` 是预编译产物**：新增运行时符号后必须 `node tools/build_runtime.mjs` 重建。
-- **`tc build --output out/dbg/tote`**（不带 `.exe`，tc 自动补）；写成 `tote.exe` 会产出 `tote.exe.exe`。
+## 架构红线
+1. tc 只管 lex/parse/sema；功能走可插拔 `.tlib`+`import`。tc 不读环境变量，只给中性 `getenv`+`--lib-dir`。
+2. agent：`state`=Component、`step`=System 之一；`X agent {state; step}` 唯一写法，不扩语法。
+3. t 无 `extern`/FFI/网络；Edge 进程外；`step` 纯函数记意图，运行时 `drive_*` 回填。
+
+## 构建 & 门禁
+- `out/dbg/`(`-O0 -gcodeview`)/`out/rls/`(`-O2`)。`node tools/gate.mjs L0|L1|L2`。**串行**。
+- L0(~72s，6/0)：static(catn+shadow+dag)→boot_std→boot1(g1)→snapshot(IR 双后端)→conform→unsup=0。L1 +boot23/examples/diffgen。L2(~132-263s，14/0) +boot4 四代不动点/cself(C 自举)/difftc0/rls/tote。
+- **`ir_snapshot` 工作目录每轮独占 `out/dbg/irsnap.<pid>`，清理一律 detached 后台**。别改回固定目录+`rmSync`：Windows 杀软/索引器持有新写文件数分钟，实测 29s → 8 分钟硬超时+误报。
+- **判不动点只比 emit-ll `.ll` md5，不比 exe md5**。
+- **IR 漂移归零**：① `cp out/dbg/g4.exe out/dbg/tc.exe`(+`cp out/rls/gr.exe out/rls/tc.exe`)；② `node tools/ir_snapshot.mjs --compiler out/dbg/g1.exe --update`；③ 复跑 gate。**须用当次 g1 重录**。
+- 新增运行时符号 → `node tools/build_runtime.mjs`。`tc build --output out/dbg/tote`（不带 .exe）。
+- 构建 std：`node tools/build_std.mjs` → `out/lib/std/*.tlib`+`.tlibd`（嵌套路径以匹配 `import(std.mem)`）。
+- ⚠ **gate 不校验 GEN 区**（`totter` 已放弃，`gen_ebnf.mjs`/`out/ebnf.json` 链路冻结）。GEN 区现为**手写维护**，改编译器须**同时改 `docs/reference.md` 与 `src/*.tc` GEN 区**保持同源。
 
 ## 实现铁律（致命坑）
-- `sb_catN` 实参必 == N；LLVM 后端不支持 `sb_cat2..6`，一律 `sb_new`/`sb_append_str`/`sb_to_str`。
-- 同名局部不可异型（shadow_check）；`a=b` 是 `"assign"`。
-- LLVM 避 Win64 聚合 ABI（`tll_*` 指针桥）；clang 用 `-O0` 非 `-Od`；`llvm-ar rcs` 非 `llvm-lib`。
-- **内建注册必须五处齐全**（`builtin_ret`/`td_calls`/C emit/LLVM emit/`llph` declare+检查器实参校验）；只加 declare 会静默 `; UNSUPPORTED call X`。
-- 新增脱糖时旧节点须整组改 `kind` 为下线标记（如 `ClauseDead`）；合成节点须承接锚点（`ln`/`cl`/`tv`）。
-- **Agent 脱糖**：合成 `spawn` 的 `FuncDecl.lc` 必须是**语句链表头**（`list_push(-1,-1,ret)`），绝不可是 `mk_block` 返回的 block（否则 `desugar_lambdas` 越界 panic）。形参类型节点须 `clone_type_node` 深拷贝。
-- **新增关键字前必须全库扫同名标识符**；`string`/`StringBuilder`/`void`/`map` 是关键字，`parse_primary` 不认。
-- **conformance 只跑 check，不覆盖代码生成**；新运行期语义须配示例 + `examples/<name>.expected.txt`。
-- **`defer` 是函数级不是块级**（语法 `defer Block`）。
-- g1 不可信；`out/dbg/g1.exe` 与 `tc.exe` 同样锁定，重建须 `--output` 临时名再 `cp`。
-- C 发射强转数括号；runtime `snprintf` 格式串前导 `%` 别漏。
-- **排查 OOM/死循环**：arena abort 时 `eprint` 缓冲不刷，但**分段打点 stderr 逐级二分**仍能定位。`.ll` 里 `ptr 0` 通常是 `UNSUPPORTED` 占位。验证新特性前先确认测试用例真的调用了它。
+- `sb_catN` 实参必==N；LLVM 不支持 `sb_cat2..6` → `sb_new`/`sb_append_str`/`sb_to_str`。
+- 同名局部不可异型；`a=b` 是 `"assign"`。LLVM 避 Win64 聚合 ABI（`tll_*` 指针桥）；clang `-O0` 非 `-Od`；`llvm-ar rcs` 非 `llvm-lib`。
+- **内建注册六处齐全**：`builtin_ret`(sema GEN区)/`td_calls`(codegen_c GEN区)/C emit/LLVM emit/`llph` declare+实参校验/**runtime 实现**(`runtime/t_runtime.{c,h}`+`t_shim_ll.c`)。漏任一处 → 静默 `; UNSUPPORTED call`。半残先例：`to_string`、`assert_eq/assert_true/assert_false/assert_panic`（只有 `builtin_ret`，后端 no-op）。
+- **顶层声明两条解析路径**：`parse_unit`（入口）+`load_module_file`（import 模块），合成顶层声明两处都要挂钩。
+- `Node` 仅 `na/nb/nc/nd`+`la/lb/lc`（无 `ne/nf`）；`FuncDecl.lc`=语句链表头、`lb`=形参、`na`=返回类型、`sb` 槽空闲。⚠ `la/lb/lc` 是 kids 链表头不是节点 id，须用 `*_in_kids` 遍历。
+- ⚠ **合成函数体必须是语句链表头**（`list_push(-1,-1,stmt)`），绝不能传 `parse_block()` 的 block 节点，否则 `desugar_lambdas` 越界。参考 agent spawn 脱糖 `parse.tc:1570-1612`。
+- ⚠ **`Tok` 只有 `t/v/line/col`，无字节偏移**；源文本在 `tokenize()` 后不可达 ⇒ 需要源码切片必须**解析期就地捕获**。
+- 新增关键字前全库扫同名标识符；`string`/`StringBuilder`/`void`/`map` 是关键字，`parse_primary` 不认（作类型实参须特判）。语境关键字先例：`flag_set`。
+- conformance 只跑 check；新运行期语义配 `examples/<name>.expected.txt`；用例**首行必须 `// EXPECT: pass` / `// EXPECT: error T_XXX`**。
+- ⚠ **stdout 是机器可读通道，编译期输出一律走 stderr**：`check` 输 JSON、`emit-ll` 输 IR，conformance 逐字节对拍 stdout。CTFE 编译期 `print` 与 `eprint` 同义。
+- ⚠ **`examples/` 只能放可编译文件**（`ir_snapshot` 逐个 emit）；设计稿放 `docs/`。
+- ⚠ **透传型表达式节点（`paren`/`comptime`）须查全 4 处**：`expr_type_desc`、`ll_etd`(两个)+`emit_expr`(C)+`emit_lle`(LLVM)。
+- ⚠ **emit 循环跳过泛型须 `if/else` 而非 `continue`**，否则无限循环至 arena abort。
+- ⚠ **单态化缓存命中也必须改写调用点**（`rewrite_generic_callsite` 置 `nodes[e].bb=true`）。
+- ⚠ **`meta T: type` 在 CTFE 不能当值求值**：走 `meta_type_arg_node` 存 `g_menv_ty` 同槽（`-1`=值绑定，≥0=类型节点 id）。
+- ⚠ **CTFE 数组值是值类型**，绑定/赋值/传参三处必须 `meta_val_copy` 深拷贝。
+- ⚠ **`Sym` 一级化兜底必须在查过用户自定义 `Sym` 之后**。
+- ⚠ **弃用别名告警用 `cur_v()` 区分原始拼写**（`meta`/`comptime` 同映射 `KwComptime`，仅 `cur_v()=="comptime"` 发 `W_COMPTIME_ALIAS`）。
+- ⚠ **`src/tc.tc:35` 的 `slice_len(argv) < 3` 门槛**会挡住无参子命令，须在门之前特判。
+- **排查 OOM/死循环**：arena abort 时 `eprint` 不刷，分段打点 stderr 二分定位；`.ll` 里 `ptr 0` 常是 UNSUPPORTED 占位。
 
-## 里程碑（紧凑）
-- M28..M53：map/数组/for/cat/print/type_info/Sym/拆 tc+tote/移除 cat2-6/match 表达式/`::`+`func`→`fn`/FuncType/匿名函数/闭包/Atom/fid 序列化反序列化。
-- M54..M55：字符串格式化（Python 规范子集，`check_fmt_spec` 编译期校验）+ `format(tmpl,a,b,...)`。
-- M56..M57：时间格式化 `now`/`format_time`/`format_time_local`/`parse_time`/`format_time_tz`；方法式 `"tmpl".format(a,b)`；locale 字段码。见 §3.10.6+§3.11。
-- M-A：Agent 脱糖 `X agent { state; step }` → `XState` struct + `x_spawn` + `x_step`。
+## 测试语法现代化（✅ 08-08 已完成，gate L2 14/14 绿）
+- 设计稿：`docs/syntax/drafts/decl_test.md`。用户已拍板：**A 并置式** `"名字" test {}` / `"名字" suite {}`；**`expect` 内建 + CTFE 自省**；**`tc test` 运行器一起做**；旧注解走**弃用别名过渡**（`W_TEST_ANNOTATION_DEPRECATED`，warning 不阻断）。
+- **状态**：迁移全完成（19 处旧注解 / 4 文件 → 新语法），`docs/reference.md` §3.14 已文档化，新增 `tests/conformance/pass/p07b_test_decl.tc` 覆盖。`tc test` 抽样验证通过（basic_syntax 7passed/1skip、game_ecs 5passed/1skip/1expected-fail、protocol 2passed）。
+- 旧写法：`name fn() bool @test [@test_group("g")] [@test_skip] [@test_only] [@expect_fail]`。全仓 19 处注解实例 / 4 文件（`tests/conformance/pass/p07`、`tests/samples/{basic_syntax,game_ecs,protocol}.tc`）。
+- 迁移表：`@test`→`"名字" test{}`；`@test_skip`→`@skip`；`@test_only`→`@only`；`@expect_fail`→`@should_fail`；`@test_group("g")`→`"g" suite{}`。
+- 脱糖：`"名" test {B}` → `__test_<n> fn() bool @test { B; return true; }`，显示名存 `FuncDecl.sb`、suite 路径存 `FuncDecl.sc`。
+- `expect(E)` → `if (!(E)) { __expect_head(src,file,line); __expect_<ty>("left …", …); __expect_tail(); return false; }`。运行时 5 符号：`__expect_head/__expect_i64/__expect_str/__expect_f64/__expect_tail`（拆头+逐值+尾以控参数数）。
+- 拦截点：`parse.tc` `parse_declaration`（L1794）中 L1832 的 `cur_t() != "Identifier"` 硬退出**之前**，判 `cur_t()=="String"`。`test`/`suite` 走**语境关键字**（不进 `keywords_tbl`）。
 
-## 外部库（`import @x`）— 全交付（2026-08-05）
-- 搜索路径 `compute_lib_dirs`（入口 `lib/`/`libs/` 优先 → 各 `<src_root>` 父目录 `lib/`/`libs/` → `out/lib/`）；`resolve_external_lib` 探测 `<libdir>/x.tc`→`/x/index.tc`→`/x/lib.tc`，全失→`T_IMPORT_NOT_FOUND`。
-- 命名空间隔离 `mangle_modules`：`A.sym`→`A__sym`（跨模块访问需导出，否则 `T_MODULE_PRIVATE`）、`A.T`→`A__T`；入口模块别名 `""` 永不重整（单文件 IR 逐字节不变）。`T_MODULE_NO_SYMBOL` 找不到限定符。
-- `.tlib` 真·独立编译+链接：`build --lib <file.tc>` 产 `out/lib/<stem>.tlib`+`.exports.json`；`import @x` 命中 `.tlib`→链接模式（declare 导出符、归档进 `g_ext_link`），未命中→回退内联。
-- **第六刀 getenv + `--lib-dir` + tote 环境变量搜索**：tc 中性 `getenv(name)->string` 内建 + `--lib-dir` 开关；tote 读 `T_LIB_PATH`/`~/.tote/libs`（`split_path_list` 只按 `;` 切）注入 `--lib-dir`。
-- **第七刀 收尾（2026-08-05）**：① `T_IMPORT_CYCLE`——`handle_one_import` DFS 活跃栈 `g_mod_stack`/`g_mod_stack_alias` 检测真环（如 `a→b→a`）；去重仍靠 `in_mod_visited`（菱形共享根只加载一次、不误报）。② `tc check --emit-deps` 输出依赖图 JSON `{"entry":<abs>,"edges":[{"from":<父栈顶|"<entry>">,"to":<子别名>}]}`；边记录置于钻石去重 `return` 之前 → 菱形（`a→b→d`、`a→c→d`）4 边全记（`c→d` 不丢）；flag 位置无关（可前可后）。边闭合用 `sb_append_char(out,34/125)` 逐字符追加 `}"`（避 `t` 字符串字面量「`\"}`→`"}`」陷阱）。③ `tote deps <file>` 委托 `tc check --emit-deps` 并注入 `--lib-dir`。④ `.tlibd` 调试归档：`build --lib --debug` 产 `out/lib/<stem>.tlibd`（`clang -O0 -gcodeview`）+伴随 `.tlibd.exports.json`；`--debug-libs` 令 `resolve_external_lib_archive` 优先 `.tlibd`（回退 `.tlib`→内联）。`tote build`/`run` 未显式 `--mode rls` 自动加 `--debug-libs`。
-- 示例 `examples/lib/{json,csv}.tc` + `examples/extlib_demo.tc`；conformance `f54`/`f55`/`f56`/`f59_import_cycle`(环)/`p35_import_diamond`(菱形 4 边不丢)。
-- **余留待办**：内嵌接口块（当前 `.exports.json` 等价）、链接模式 `.tlib` 下的 `T_IMPORT_CYCLE` 复检、C 互操作导出（`.lib`/`.dll`）。
+## std 库（lib/std）
+- 已落地 `mem` + `math`（均 `export`）。用法 `import(std.mem)` / `import(std.math)`，双后端已验证。详见 `docs/std.md`。
+- **解决 tc↔std 循环依赖**：① std 对 tc 零语义依赖（只依赖内建+运行时）；② 构建期先预编译为 `.tlib`，消费方链接模式消费。
+- **⚠ 链接模式只 `declare` 导出符号**：新增 std 公开 API 务必 `export`，否则消费方**链接期** `undefined @t.math__*`（不是编译失败，难查）。
+- **编译器限制**：泛型函数体内嵌套泛型调用不被单态化（漏类型后缀 → 链接期 undefined）；`clamp`/`reverse`/`contains` 已内联规避。`instantiate_generic` 待修。
+- **`t` 无 `&`/`*` 表达式运算符** ⇒ 无裸指针/字节级 memcpy；`std.mem` 提供切片级等价。浮点超越函数为泰勒近似。
+- **远期蓝图（NOW-SKIP）**：core(`collections`/`search`/`sort`)、text&data(`ascii`/`text`/`str`/`unicode`/`parse`/`fmt`/`codec`/`regex`/`json`/`toml`/`csv`/`pb`/`inet`)、program(`args`/`cli`/`env`/`io`/`fs`/`path`/`url`/`log`/`testing`/`time`/`rand`/`proc`/`term`/`crypto`/`pty`)、runtime&web(`net`/`http`)。
 
-## 技术债 & 已修
-- **用户函数实参校验（已修，2026-08-05）**：直接/间接调用现共用 `check_call_args`——`T_CALL_ARITY`（元数不符）+ 逐位 `ti_equal`/`can_cast`（`T_TYPE_MISMATCH`）。修复引入 `ti_equal` 让 `Named` 与已解析用户具名类型按 name 判等（跨模块同类型不再误判）；variant 助手 `tif_pstart=-1` 加 `pstart<0` 守卫放行；`diag_new` 加去重防兜底补扫重复报错。conformance `f57_call_arity_direct`/`f58_call_arg_type`。
-- fid v1.5：protobuf/聚合类型序列化未实装（待 v2）。
-- 闭包环境不回收（M48 v1 有意泄漏）。
-- `@derive` 9 trait 手写；type_info 仅 struct。
-- **C 后端「大结构体按值返回」崩溃**：含 `[256]T` 定长数组的 struct 按值返回 → C 后端段错误（exit 139），LLVM 正常。规避：用 `[]T` 切片承载大序列。
-- **已修（2026-08-03）**：`compile`/`emit-ll`/`build`/`run` 在 `has_errors()` 时静默 `return 1` 不打印诊断 → 补 `print_json()`。
-- **已修（2026-08-05）**：`compute_src_roots` 用 `path_resolve`/`_fullpath` 向上遍历盘符根 `C:` 被展开成 `C:/Users/xxx` 震荡死循环 OOM → 改纯字符串 `parent_dir_of`+硬上限 `guard<32`；`path_exists` 改调 `file_exists` 内建。
+## 里程碑（近期）
+- M-M / T_UNKNOWN_FIELD：struct 方法糖 flush 两处；`p.zzz` 报错防 `p.clone()` 误报。
+- M-any：`comptime T: any` 编译期类型模板参数→调用点单态化。reference §3.6.2。
+- M-meta A→E：`meta`/`type`、CTFE 求值器、值参数单态化、编译期内建（`@compile_error`/`@type_equal`/`@type_size`/`@type_name`/`@zeroed`/`@str_from_bytes`+`sym_intern`）、弃用别名告警。reference §3.6.3、`docs/meta_design.md`。
+- agent 主线：Colony 调度体 ✅（`examples/lib/colony.tc`）。
 
-## agent 主线（本对话聚焦）
-- **定位**：用户明确「本对话负责 agent」。外部库支线已收尾（第七刀 `0cd59cf`），agent 子系统是主线。
-- **已落地**：actor 脱糖（`XState`/`x_spawn`/`x_step`）、Sensor/Edge 分类矩阵、本地 LLM 旁路桥（`fake_llm` 接缝）、agentkit 库层（record/replay/diff，commit d64eeeb）、planner 规划体（`examples/planner_demo.tc`）、**llm_boundary 真 LLM**（2026-08-05 深夜：`examples/lib/llm_boundary.tc` 库 + `tools/llm_bridge.py` 进程外真实 LLM，Ollama/OpenAI 兼容，确定性回退）。
-- **余留主线候选**：② `agentkit` 时钟注入（库代码已落，文档仍标「待建」）；③ `Network·OtherAgents` 跨进程消息（候选）。
-- **Spawner/Colony 调度体 ✅ 已落地（2026-08-06）**：`examples/lib/colony.tc`（`@colony` 库）+ `examples/colony_demo.tc`。库层纯数据调度体，零编译器改动：`colony_new`/`colony_spawn`(按 id)/`colony_send`/`colony_broadcast`/`colony_tick`(每帧驱动)/`colony_step`/`colony_get`/`colony_count`/`colony_kill`。状态用 **string 指纹 + `fn(string, Msg)->string` 回调**泛型无关复用（Worker 小队 + Counter 跨类型演示）。gate L2 13/0/0。
-  - ⚠ **t 编译器两处限制（实测发现，已规避）**：① **map 值仅支持纯标量**——含 string/slice 的 struct、`map[i64]string`、`map[i64][]X` 均触发内部 panic `t_slice_at index 0 length 0`；② **LLVM 后端对 slice-of-slice（`[][]Msg`）发射非法 IR**（`load %TSlice, ptr 0`）。规避：Colony 用「并行 slice 按 id 下标对齐」(`states/alives`)+「扁平 inbox」(`[]Msg` + 并行 `[]i64 inbox_to`)存储，不用 map 存 agent 状态、不用嵌套 slice。
-  - **刷怪波次 + ECS World 主循环场景 ✅（2026-08-06）**：`examples/colony_wave.tc` + `.expected.txt`。塔防生存：Player(0,0) hp=12；Spawner 按波次 `colony_spawn` 怪物（string 指纹 hp/st/x/y/ix/iy 定宽零填充）；World 主循环每帧三 System——① AgentSystem(`colony_broadcast(:tick,玩家坐标)`+`colony_tick` 出意图) ② MovementSystem(`physics.movement_system` 按意图积分位置) ③ CombatSystem(玩家 AoE 炮塔 `TURRET_RNG` 清怪 + 怪物贴脸攻击玩家)。双后端逐字节一致，gate `run_examples` 验证。
-- **架构红线**：`t` 无 `extern`/FFI/网络——LLM/工具效应全在进程外；agent `step` 纯函数只记意图（`pending` atom），运行时边界 `drive_*` 回填。本地 LLM = stdin/stdout 旁路桥（sidecar，零编译器改动）。
+## 技术债
+- fid v1.5：protobuf/聚合序列化待 v2；闭包环境不回收（有意泄漏）；`@derive` 9 trait 手写；type_info 仅 struct。
+- C 后端大结构体按值返回段错误 → 用 `[]T` 切片规避。
