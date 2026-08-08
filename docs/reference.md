@@ -87,7 +87,11 @@ Keyword:
   | "variant" -> KwVariant
   | "var" -> KwVar
   | "const" -> KwConst
+  | "auto" -> KwAuto
+  | "any" -> KwAny
+  | "type" -> KwType
   | "comptime" -> KwComptime
+  | "meta" -> KwComptime
   | "if" -> KwIf
   | "else" -> KwElse
   | "for" -> KwFor
@@ -109,8 +113,9 @@ Keyword:
   | "StringBuilder" -> KwStringBuilder
 ```
 
-> 关键字由 `lex` 阶段查表（`kw_lookup`，基于 `keywords_tbl`）判定。其权威列表即上方 `Keyword` 产生式中的字面量，由 `tools/gen_ebnf.mjs` 抽取生成 `out/ebnf.json`、`src/totter.tc` 解析后生成进 `gen/tc.tc`（totter 已放弃，该区间现冻结于 `src/tc.tc`、手写维护）。`i8`/`i16`/`i32`/`i64`/`u8`/`u16`/`u32`/`u64`/`f16`/`f32`/`f64`/`bool`/`type` 为**内建类型名**（见 §3.5），不是关键字。
-> ⚠ spec-only（设计中、tc 未接入）：`union`、`enum` 完整语义、`comptime` 表达式。
+> 关键字由 `lex` 阶段查表（`kw_lookup`，基于 `keywords_tbl`）判定。其权威列表即上方 `Keyword` 产生式中的字面量，由 `tools/gen_ebnf.mjs` 抽取生成 `out/ebnf.json`、`src/totter.tc` 解析后生成进 `gen/tc.tc`（totter 已放弃，该区间现冻结于 `src/tc.tc`、手写维护）。`i8`/`i16`/`i32`/`i64`/`u8`/`u16`/`u32`/`u64`/`f16`/`f32`/`f64`/`bool` 为**内建类型名**（见 §3.5），不是关键字。
+> ⚠ `meta` 与 `comptime` 同映射到 `KwComptime`（互为别名，`meta` 为推荐拼写）；`type` 与 `any` 同为「类型之类型」占位关键字。见 §3.6.3。
+> ⚠ spec-only（设计中、tc 未接入）：`union`、`enum` 完整语义、`comptime`/`meta` 表达式的**编译期求值**（CTFE，Phase B；Phase A 已可解析并降级发射）。
 
 ### 2.4 Literals（字面量） ✅ tote（部分）
 
@@ -215,6 +220,7 @@ DiagnosticTable:
   | "T_CLOSURE_CAPTURE" -> error
   | "T_VAR_NO_TYPE" -> error
   | "T_UNDEFINED_IDENT" -> error
+  | "T_UNKNOWN_FIELD" -> error
   | "T_TAGID_MIXED" -> error
   | "T_TAGID_DUP" -> error
 
@@ -832,13 +838,13 @@ ModuleItem:
     | ImportDecl        // ⚠ spec-only（代码模块导入，语法经 L-15 采纳，实现待排期）
 
 FuncDecl:
-    FuncName "fn" "(" (Param ("," Param)*)? ")" "->" Type FuncAnns? Block
+    FuncName "fn" "(" (Param ("," Param)*)? ")" ("->")? Type FuncAnns? Block
 
 FuncName: IDENTIFIER
 Param:    ParamName ":" Type
 ```
 
-- 函数**必须**用 `Name fn(...) -> Ret { ... }` 并置形式声明（spec §1.3：参数类型后置、禁止重载、禁止隐式返回、所有分支显式 `return`）。
+- 函数用**并置形式** `Name fn(...) Ret { ... }` 声明（spec §1.3：参数类型后置、禁止重载、禁止隐式返回、所有分支显式 `return`）。返回类型前的 `->` 记号**已弃用（deprecated）但仍可选接受**，旧代码 `Name fn(...) -> Ret { ... }` 同样合法。
 - ✅ tote：已支持 `fn` 声明、`@main` 入口、`@test` 等注解；`enum` 完整语义、`union` 标记但未实装。
 
 ```ebnf
@@ -911,6 +917,52 @@ VariantCase:
 - ✅ tote：已实装 variant，编译器为每个 case 生成 `Name_from_CaseX`、`Name_is_CaseX`、`Name_as_CaseX` 自由函数（`_tag` 为声明下标，0 起）。
 - ⚠ spec-only：Variant 上 `@derive` 暂未支持。
 
+#### 3.1.1.2 struct 方法声明语法糖（`Self` + 名字重整）✅ tc（M-M）
+
+struct 体内除字段外还可直接书写**方法声明**，语法与顶层 `FuncDecl` 完全一致。方法在**解析期**被脱糖为顶层自由函数，`struct` 本身仍是**纯数据**（字段表不变、内存布局不变、后端零改动）。
+
+```ebnf
+StructDecl:
+    StructName "struct" StructAnns? "{" (StructField ";" | StructMethod)* "}"
+
+StructMethod:
+    MethodName "fn" "(" (Param ("," Param)*)? ")" ("->")? Type FuncAnns? Block
+```
+
+脱糖规则（两条，无例外）：
+
+1. **函数名** = `snake_case(StructName) + "_" + MethodName`，提到顶层。
+2. **类型 `Self`** 在方法签名（形参类型、返回类型）与函数体（局部变量类型标注、struct 字面量名）中全部改写为宿主 struct 名。
+
+```t
+List struct {
+    items: []i64;
+
+    new  fn()    Self                    { var l: Self; return l; }
+    push fn(self: Self, v: i64)    Self  { append(self.items, v); return self; }
+    len  fn(self: Self)    i64           { return slice_len(self.items); }
+}
+```
+
+⇓ 等价于
+
+```t
+List struct { items: []i64; }
+list_new  fn()    List                   { var l: List; return l; }
+list_push fn(self: List, v: i64)    List { append(self.items, v); return self; }
+list_len  fn(self: List)    i64          { return slice_len(self.items); }
+```
+
+约束与说明：
+
+- **没有 receiver 调用语法**。调用一律走自由函数：`list_push(l, 10)`，不是 `l.push(10)`。语法糖只作用于**声明侧**，`.` 仍然只表示字段访问 / 模块限定访问。
+- **`self` 不是关键字**，只是形参名的惯例；第一个形参写什么名字、是否存在，编译器都不关心。因此**无 `self` 形参的「静态方法」**（如 `new`）同样合法，脱糖结果一致。
+- 字段与方法可**任意交错**书写；方法不进字段表，`type_info` / `@derive` / 二进制布局均不受影响。
+- 方法**继承宿主 struct 的 `export` 标记**：`export List struct { ... }` 的所有方法都是模块导出符号，跨模块以 `list.list_push(...)` 访问（重整为 `list__list_push`）。
+- 脱糖后的自由函数与手写的同名顶层函数**完全等价**，因此**不得重名**（否则触发重复定义诊断）；同理，方法之间不构成「函数子句组」——名字已按 `struct_方法` 唯一化。
+- 实现位置：`src/tc.tc` 的 `parse_struct_decl` / `parse_method_decl` / `desugar_self_node` / `flush_struct_methods`（解析期合成真实 `FuncDecl` 节点并按「宿主 struct 在前、方法在后」的顺序并入 `decl_list`）。
+- 参考实现：`examples/lib/list.tc`（切片列表 `List`，10 个方法）+ `examples/list_demo.tc`；conformance `p36_struct_method_ok`。
+
 ### 3.2 Annotations（注解） ✅ tote（注册表已数据化）
 
 > 本节气法由 `annotation.md` 经 L-15 采用并并入（原草稿已标记失效）；部分注解语义仍为 spec-only。
@@ -941,6 +993,7 @@ Statement:
       ";"                                   // 空语句（仍须分号）
     | VarDeclStatement
     | ConstDeclStatement
+    | AutoDeclStatement
     | AssignStatement
     | ExpressionStatement
     | IfStatement
@@ -956,12 +1009,26 @@ Statement:
 Block: "{" Statement* "}"                   // 语句块
 VarDeclStatement:   "var" Ident ":" Type ("=" Expression)? ";"
 ConstDeclStatement: "const" Ident ":" Type "=" Expression ";"
+AutoDeclStatement:   "auto" Ident "=" Expression ";"   // ✅ tc（M-auto）：类型由初始化器推断，禁止显式标注
 AssignStatement:    Expression "=" Expression ";"
 ReturnStatement:    "return" Expression? ";"
 ExpressionStatement: Expression ";"
 DeferStatement:     "defer" Block            // 延迟块，**函数级**：登记到当前函数延迟栈，于 return/函数尾按 LIFO 执行（写在 if/while 块内也到函数退出才触发，非块级作用域退出）
 ComptimeStatement:  "comptime" Block         // 编译期块（块内语句编译期求值）
 ```
+
+**`auto` 局部类型推断（✅ tc，M-auto）：**
+
+- 写法：`auto x = 初始化器;`（强制带初始化器、禁止显式类型标注，否则解析期报错）。
+- 类型在检查期由初始化器经 `infer_expr` 推断并回填声明节点，使发射侧拿到真实类型节点。
+- 与 `var`/`const` 的区别：`var`/`const` **必须**带类型标注（无标注触发 `T_VAR_NO_TYPE`，见 conformance `f27_var_no_type`）；只有 `auto` 走推断。
+- 推断规则同表达式字面量：整数字面量 ≤255 → `u8`、≤65535 → `u16`、……（见 `infer_expr`）；故 `auto x = 42` 推断为 `u8` 而非 `i64`，与 `i64` 混合运算需显式 `as i64`。
+- 示例：
+  ```t
+  auto n = 7 as i64;        // n : i64
+  auto s = "hello";         // s : string
+  auto v = id(i64, 42);     // v : i64（初始化器为泛型单态化调用）
+  ```
 
 **语句强制规则（spec §1.2）：**
 
@@ -1056,14 +1123,14 @@ TypeInfoExpr: "type_info" "(" ident ")"      // 编译期类型信息内建
 StructLit: ident "{" (ident ":" Expr ("," ident ":" Expr)*)? "}"
 ArrayLit:  "[" (Expr ("," Expr)*)? "]"
 MapLit:    "[" (Expr ":" Expr ("," Expr ":" Expr)*)? "]"   // 当首元素后跟 ":"
-FuncLit:   "fn" "(" ParamList? ")" "->" Type Block         // 匿名函数；静态类型即同签名 FuncType
+FuncLit:   "fn" "(" ParamList? ")" ("->")? Type Block         // 匿名函数；静态类型即同签名 FuncType
 ```
 
 - **优先级塔固定（L-03 可预判）**：`||` 最低、`*`/`/`/`%` 最高，10 级全部左结合；赋值 `=` 右结合；无右结合二元运算符。塔层级与 `src/tc.tc` 的 `parse_or → … → parse_mul → parse_unary → parse_postfix → parse_primary` 一一对应，不可调换。
 - **全行为显式（L-02）**：`as` 为唯一显式类型转换（仅一次、不可 `e as T1 as T2`）；无隐式类型转换 / 隐式布尔 / 隐式内存分配；复合字面量（数组 `[...]` / map `[k:v]` / 结构体 `T{...}`）显式构造。
 - **静态类型安全（L-03）**：每个 `Expr` 的静态类型由 checker 推算；元素 / 字段 / 下标 / `type_info` 静态校验；`MapLit` 与 `ArrayLit` 共用 `[ ]`，由首元素后是否跟 `:`` 向前看消歧（无二义）。
-- **唯一写法（L-04 ✅）**：调用 `f(x)`、转换 `e as T`、下标 `e[i]`、成员 `e.f`、结构体 `T{...}`、数组 `[...]`、map `[k:v]`、匿名函数 `fn(...) -> T {...}` 均仅一种标准写法，无等价多写变体。
-- **匿名函数字面量 `FuncLit`** ✅ tote（M46）：与函数**声明**靠「`fn` 前有无名字」区分——声明位先吃名字（`Name fn(...)`），表达式位裸 `fn` 即字面量，无二义。返回类型不可省（`-> Ret` 必写，与声明一致，L-02 全行为显式）。语义与限制见 §3.5。
+- **唯一写法（L-04 ✅）**：调用 `f(x)`、转换 `e as T`、下标 `e[i]`、成员 `e.f`、结构体 `T{...}`、数组 `[...]`、map `[k:v]`、匿名函数 `fn(...) T {...}`（`->` 可选，旧式 `fn(...) -> T {...}` 仍合法）均仅一种标准写法，无等价多写变体。
+- **匿名函数字面量 `FuncLit`** ✅ tote（M46）：与函数**声明**靠「`fn` 前有无名字」区分——声明位先吃名字（`Name fn(...)`），表达式位裸 `fn` 即字面量，无二义。返回类型紧跟参数表（与声明一致）：`fn(...) Ret`，`->` 记号**已弃用但仍可选**（`fn(...) -> Ret` 同义，L-02 全行为显式）。语义与限制见 §3.5。
 - `>>>` 注意：比较/移位序列中 `>>` 不得被词法拆成两个 `>`。
 - **调用实参校验（L-03 静态类型安全，2026-08-05 收紧）**：函数调用（含后缀 `f(x)` 直接调用具名函数，以及经函数类型变量间接调用）**统一校验实参**——元数不符报 `T_CALL_ARITY`，逐位类型不符且不可 `can_cast` 报 `T_TYPE_MISMATCH`。此前**直接调用具名函数完全不校验实参**：少传的形参在函数体内读到未初始化的栈槽；若该形参是 `string`/`[]T` 的 `len` 字段，会拿到随机天文数字，导致循环把 512MB arena 瞬间耗尽（`arena: out of memory`），且报错离真正错误点极远（曾因 `tote` 的 `str_concat3(hd, "/.tote/libs")` 少传一参排查数小时）。校验实现见 `src/tc.tc` 的 `check_call_args`（直接/间接调用共用），variant 合成助手因无签名记录走 `tif_pstart<0` 守卫放行。conformance 用例 `tests/conformance/fail/f57_call_arity_direct` / `f58_call_arg_type`。
 
@@ -1095,11 +1162,11 @@ OptionalType: Type "?"                // 可选 T?
 FlagArrayType: "flag" "[" Integer "]" // 位域数组 flag[N]
 NamedType: Ident                      // 结构体/枚举/flag/variant/别名名
 SymType: "Sym" ("32"|"16") "(" StringLiteral ")"
-FuncType: "fn" "(" TypeList? ")" "->" Type   // ✅ tote 函数类型（函数指针语义：仅顶层具名函数可绑定）
+FuncType: "fn" "(" TypeList? ")" ("->")? Type   // ✅ tote 函数类型（函数指针语义：仅顶层具名函数可绑定）
 TypeList: Type ("," Type)*
 ```
 
-- ✅ tote：标量固定位宽 + `string`/`StringBuilder` + `[]T` 切片 + `[N]T` 定长数组 + `map[K]V` 哈希映射 + `fn(...) -> Ret` 函数类型均实装（函数类型 v1 为函数指针语义：仅顶层具名函数可被绑定到函数类型变量 / 参数 / 返回值 / 结构体字段 / 全局变量；支持间接调用，诊断 T_CALL_ARITY / T_NOT_CALLABLE / T_TYPE_MISMATCH）。
+- ✅ tote：标量固定位宽 + `string`/`StringBuilder` + `[]T` 切片 + `[N]T` 定长数组 + `map[K]V` 哈希映射 + `fn(...) Ret` 函数类型（`->` 已弃用但仍可选：`fn(...) -> Ret` 同义）均实装（函数类型 v1 为函数指针语义：仅顶层具名函数可被绑定到函数类型变量 / 参数 / 返回值 / 结构体字段 / 全局变量；支持间接调用，诊断 T_CALL_ARITY / T_NOT_CALLABLE / T_TYPE_MISMATCH）。
 - **匿名函数字面量 `fn(...) -> Ret { ... }`** ✅ tote（M46）：表达式位的函数字面量，静态类型即同签名 `FuncType`，可赋给函数类型变量 / 作实参 / 作返回值 / 存结构体字段。
   - 字面量在脱糖期被**提升**为顶层合成函数 `__lam_N`。**未引用外层局部**时原节点就地降级为对该函数的引用，完全复用函数指针路径，双后端无额外开销、无堆分配。
 - **闭包：按值捕获** ✅ tote（M48）：字面量若引用了外层作用域的局部/参数，编译期自动捕获。
@@ -1111,6 +1178,7 @@ TypeList: Type ("," Type)*
   - 引用一个既不在闭包内、外层也不存在的名字，报 `T_UNDEFINED_IDENT`（而非捕获错误）。
   - **调用点的被调者可以是任意表达式**（M48）：不限于裸标识符。结构体字段 `h.op(4)`、数组/切片元素 `fs[i](x)`、上一次调用的结果 `make2(1)(2)(3)` 都能直接发起间接调用——只要该表达式的静态类型是 `FuncType`。裸标识符若解析到顶层具名函数则仍走直接调用；否则按函数值解包。此前非标识符被调者在 LLVM 后端会静默降级为 `; UNSUPPORTED call target` 并返回 0，在 C 后端则编不过。
 - **未定义标识符报 `T_UNDEFINED_IDENT`**（M46）：此前 checker 对解析不到的标识符静默退化为 `Unknown`，错误要到 C 后端生成的 `.c` 才暴露，LLVM 后端更直接产出读 0 的垃圾值（静默错编）。现于检查期即报错。同批补上 `T_VAR_NO_TYPE`：局部 `var` 必须写类型标注（发射侧以有标注为前提，无标注声明会被整条丢弃）。
+- **未知结构体字段报 `T_UNKNOWN_FIELD`**（M-M 同批，2026-08-06）：`p.zzz` 形式的成员访问，若对象类型已解析到具体 `StructDecl` 而字段表中无该名字，此前同样静默退化为 `Unknown` → 编译期零诊断、LLVM 后端读 0 垃圾值。现于 `infer_expr` 的 `member` 分支直接报错。**仅在确实解析到 `StructDecl` 时报**：未解析类型、外部类型、Enum 成员、模块限定访问（已在 `mangle_modules` Pass 1 改写为 `ident`）、`"...".format(...)` 之类字符串方法一律不受影响。conformance `f60_unknown_field`。
 - **map 字面量 `[k1: v1, k2: v2]`**：键/值类型取首项推断，整型统一提升为 `i64`（同数组字面量）。仅作为局部 `var` 的初始化器发射：C 后端脱糖为 `t_map_new` + 逐项局部量 + `t_map_put`，LLVM 后端为 `tll_map_new` + 逐项 `tll_map_put`。`var m: map[K]V;` 无初始化时同样建空表。整型键一律按 `int64` 落盘（C 用 C99 复合字面量 `&(int64_t){…}`，LLVM 用 `alloca i64` + 扩宽），故窄整型键不会因高位垃圾而失配，键/值也可以直接写字面量。
 - 类型名解析：先查内建，再查当前单元已声明命名类型。
 - **数组字面量 `[e1, e2, …]`**：元素类型取首元素推断，整型元素统一提升为 `i64`（`[1,2,3]` 是 `[3]i64` 而非 `[3]u8`）；空字面量 `[]` 元素类型未知，可赋给任意 `[]T` / `[N]T`。定长数组与切片之间只要元素可转型即可互赋（目标为定长数组时长度须一致）。赋给 `[]T` 时脱糖为运行期 `slice_new` + 逐元素 `append`；赋给 `[N]T` 时 C 后端用花括号初始化器、LLVM 后端零初始化后按 `getelementptr` 逐元素 `store`。
@@ -1167,6 +1235,227 @@ ImportExpr:   "import_csv" "(" StringLiteral ")" | "import_json" "(" StringLiter
 6. **脱糖产物**：每个导入点合成一个 `__import_N fn() -> []S` 加载函数（append 逐行 struct 字面量）挂入 decl_list 尾部，原初始化器替换为对该函数的调用。运行时零文件 IO。
 
 **诊断码**：`T_IMPORT_IO`（文件读取失败）、`T_IMPORT_HEADER`（表头/键映射不匹配）、`T_IMPORT_VALUE`（值域/类型违规）、`T_IMPORT_CONTEXT`（非法使用上下文）。
+
+#### 3.6.2 类型模板参数 `any` 与单态化（✅ tc，M-any）
+
+`t` 支持 Zig 风格编译期类型参数（`anytype`）：用 `comptime T: any` 声明类型模板参数，调用点以**类型名**作首实参触发**单态化（monomorphization）。
+
+```ebnf
+Param: "comptime" Ident ":" "any"   // 编译期类型模板参数（P.bb = true 标记）
+Call:  Ident "(" TypeName ("," Expression)* ")"   // 首实参为类型名 → 单态化
+```
+
+**机制（零运行时开销）：**
+
+1. 带 `comptime T: any` 的函数在 `decl_list` 中以**模板**存在；检查期与两个发射后端（C / LLVM）均**整体跳过**模板本身，只处理其实例。
+2. 调用点 `f(Typename, args...)` 经 `infer_expr` 的 call 分支识别：模板 `f` + 首实参为类型名 → `instantiate_generic` 深克隆 `f` 的 AST，`T` 全量替换为实际类型节点，剥除 comptime 形参，重命名为 `f__Typename`，改写调用点（callee 指向实例、移除类型实参），追加实例到 `decl_list` 参与检查/发射。
+3. 实例按签名去重（`f__i64` 只生成一次）；未实例化的模板永不进入 IR/C。
+
+**类型实参可接受：**
+
+- 标量/具名类型：`i64`/`f64`/`bool`/`MyStruct` 等（本就是标识符）。
+- 类型专用关键字 `string` / `StringBuilder` / `void` / `map`：`parse_primary` 将其降为 `ident` 节点，故可作类型实参（误作值使用时检查期报「未知标识符」）。
+
+**示例：**
+
+```t
+// 恒等函数：对任意类型 T 单态化
+id fn(comptime T: any, x: T) T { return x; }
+
+// 泛型取大：a/b 同类型，且类型须支持 >
+max fn(comptime T: any, a: T, b: T) T {
+    if (a > b) { return a; }
+    return b;
+}
+
+main fn() i64 @main {
+    auto a = id(i64, 42);        // → id__i64，a : i64
+    auto b = id(f64, 1.5);       // → id__f64，b : f64
+    auto c = id(string, "hi");   // → id__string，c : string
+    auto m = max(i64, 7, 99);    // → max__i64，m : i64
+    if (a == 42 && m == 99 && c == "hi") { return 0; }
+    return 1;
+}
+```
+
+> ⚠ `max(string, ...)` 非法：`string` 无 `>` 运算（发射端会对 `%TStr` 产生错误 IR）。泛型约束目前**仅靠调用点类型合法性保证**，无 `where` 子句。
+
+> 实现位置：`src/tc.tc` — `func_is_generic` / `clone_node` / `subst_type_in_node` / `instantiate_generic`，及 `infer_expr` call 分支、`check_decl`、C 发射 `emit_func_decl` 分发、LLVM 发射 `emit_llunit` 循环四处 `func_is_generic` 门控（⚠ 该循环须用 `if/else` 而非 `continue` 跳过重写 `i++`，否则对泛型函数触发无限循环）。
+
+> 📌 **单态化参数不限于类型**：Phase C 起，`meta` 形参声明为整数族 / `bool` / `string` 时即为
+> **值参数**，实参在调用点 CTFE 求值后按值去重（`repeat("hi", 3)` → `repeat__s2_hi_1748694682_3`），
+> 可与类型参数混用。见 §3.6.3「值参数单态化」。
+
+#### 3.6.3 元编程关键字 `meta`（✅ tc Phase A+B+C+D+E，M-meta）
+
+`meta` 是 `t` 的统一元编程关键字。**`meta` 与 `comptime` 互为别名**（词法层同映射到 `KwComptime`），
+`type` 与 `any` 互为别名（同为「类型之类型」占位）。四种写法组合完全等价，`meta`/`type` 为推荐拼写。
+
+> ⚠ **弃用告警（Phase E，2026-08-07）**：`comptime` / `any` 现为 `meta` / `type` 的**弃用别名**——仍按 `meta` 语义正常编译，但使用会发 `W_COMPTIME_ALIAS` 告警（不阻断编译），保留一个发布周期作为过渡，随后移除关键字。新代码请一律用 `meta` / `type`。仓库内既有用例（`examples/generics_demo.tc`、`examples/meta.tc`、`tests/samples/game_ecs.tc`、`tests/conformance/pass/p37_meta_ok.tc`）已迁移完毕；验证用例见 `tests/conformance/pass/p41_meta_comptime_alias.tc`（`// EXPECT: warning W_COMPTIME_ALIAS`）。
+
+```ebnf
+MetaParam: ("meta"|"comptime") Ident ":" MetaParamType     // 编译期形参（P.bb = true）
+MetaParamType: "type" | "any"                              //   → 类型参数
+             | IntType | "bool" | "string"                 //   → 值参数（Phase C）
+MetaBlock: ("meta"|"comptime") Block                       // 编译期块
+MetaExpr:  ("meta"|"comptime") Expression                  // 编译期表达式前缀
+MetaDecl:  ("meta"|"comptime") ("const"|"var"|Ident "fn" ...)   // 编译期顶层声明
+```
+
+**四类表面：**
+
+| 形态 | 写法 | 行为 |
+| --- | --- | --- |
+| ① 编译期形参 | `f fn(meta T: type, x: T) T`<br>`g fn(meta N: i64) i64` | ✅ 调用点单态化（复用 `instantiate_generic`，见 §3.6.2 与下方「值参数」） |
+| ② 编译期块 | `meta { ... }` | ✅ 编译期执行，**运行期零代码** |
+| ③ 编译期表达式 | `var a: i64 = meta 4 + 2;` | ✅ 编译期求值，**就地折叠为字面量** |
+| ④ 编译期声明 | `meta const K: i64 = 100;` / `meta f fn(...)` | ✅ 进入编译期环境，可被 ②③ 读写 / 调用 |
+
+**值参数单态化（Phase C）：**
+
+`meta` 形参是「类型参数」还是「值参数」，由**声明类型**决定 —— `type` / `any` 是类型参数，
+整数族 / `bool` / `string` 是值参数。二者可在同一函数里混用，单态化键按形参顺序拼接。
+
+```t
+sum_sq  fn(meta N: i64) i64            { var b: [N]i64; ... }   // 值进类型位（数组长度）
+repeat  fn(meta s: string, meta n: i64) string { ... }          // → repeat__s2_hi_1748694682_3
+pick    fn(meta B: bool, a: i64, b: i64) i64   { ... }          // → pick__true / pick__false
+fill    fn(meta T: type, meta N: i64, v: T) T  { ... }          // → fill__i64_4（类型+值混合）
+tagged  fn(meta N: i64, x: i64) i64    { return x + meta N * 100; }  // 实例体内的 meta 照常折叠
+```
+
+- **实参必须编译期可求值**：走 Phase B 的 CTFE 求值器。传运行期变量报 `T_META_READ_RUNTIME`。
+- **类型必须精确匹配**：第 3 条禁隐式转换，`bool` 形参传 `1` 报 `T_META_ARG_TYPE`。
+- **必须落在取值范围内**：`u8` 形参传 `300` 报 `T_META_RANGE`（按标量位宽二进制补码判定）。
+- **浮点值参数未开放**：`meta F: f64` 报 `T_META_VALUE_PARAM_TYPE`（同 CTFE 的浮点约束，见下）。
+- **单态化键**：整数用十进制（负数前缀 `n`，`-5` → `n5`）；`bool` 用 `true` / `false`；
+  字符串用 `"s" + 长度 + "_" + 前 12 个可读字符 + "_" + FNV-1a(32) 哈希`
+  （带哈希是为了避免 `"a-b"` 与 `"a_b"` 在字符清洗后撞名）。同键调用复用同一实例。
+- 值参数在实例体内是**字面量代换**（不是常量绑定），所以能出现在 `[N]i64` 这类要求
+  编译期整数字面量的类型位置上。
+
+**CTFE 求值器（Phase B）能力边界：**
+
+- **类型**：`i64` 整数族、`bool`、`string`。**浮点暂不支持**（报 `T_META_NOT_CONST`）——
+  第 7 条要求求值可复现，浮点结合序须先定死。字符串仅支持 `==` / `!=`，不做拼接 / 切片。
+- **表达式**：算术、位运算（`& | ^ << >>`）、比较、`&&` / `||`（惰性短路）、
+  括号、显式 `as` 转型（按标量位宽做二进制补码窄化）、`meta fn` 调用。
+- **语句**（`meta {}` 与 `meta fn` 体内）：`var` / 赋值 / `if` / `while` / `block` /
+  `return` / `break` / `continue`。
+- **作用域**：`meta fn` 是**纯函数** —— 只能看见自己的形参 / 局部与顶层 `meta const` / `meta var`，
+  **看不见调用方的局部**（不做动态作用域）。
+- **内建**：`print` / `eprint`（编译期日志，**一律写 stderr**，二者同义）、
+  `int_to_str` / `i2s` / `str_len` / `str_at`。
+  触碰运行期世界的内建（`file_*` / `sys_run` / `args` / `exit` / `path_resolve`）报 `T_META_IMPURE`。
+- **护栏**：步数预算（`T_META_BUDGET`）、调用深度 64（`T_META_DEPTH`）、
+  除零（`T_META_DIV_ZERO`）、读运行期变量（`T_META_READ_RUNTIME`）、
+  调用非 `meta fn`（`T_META_NOT_META_FN`）、`meta {}` 内 `return`（`T_META_RETURN_OUTSIDE_FN`）。
+
+**编译期内建（Phase D，`@` 前缀）：**
+
+除 Phase B 复用的运行期内建（`print` / `eprint` / `int_to_str` / `i2s` / `str_len` / `str_at`）外，Phase D 新增一组编译期内建。它们全部走**编译期折叠**，双后端**无需任何新支持**：
+
+| 内建 | 类别 | 作用 | 返回 | 备注 |
+| --- | --- | --- | --- | --- |
+| `@type_name(T)` | 类型查询 | 类型名字符串 | `string` | 可运行期折叠为常量 |
+| `@type_size(T)` | 类型查询 | 类型字节大小 | `i64` | 同上；typealias 展开到底层（`@type_size(MyInt)` == `@type_size(i64)`） |
+| `@type_equal(T1, T2)` | 类型查询 | 类型相等判定 | `bool` | CTFE 已知；`meta T: type` 形参经 `mb_bound_type` 解析为绑定类型 |
+| `@zeroed([N]T)` | 类型查询 | 零初始化定长数组 | `[N]T` | 折成 `array_lit`；CTFE 缓冲区 / 运行期常量皆可 |
+| `@str_from_bytes(buf, len)` | CTFE-only | 由字节造 `string` | `string` | 仅编译期上下文（否则 `T_META_RUNTIME_CTX`） |
+| `@compile_error("msg")` | CTFE-only | 编译期硬错误，终止编译 | noreturn | 同上；被取分支才触发 `T_META_COMPILE_ERROR` |
+| `sym_intern(buf, len)` | CTFE-only | 由字节驻留符号 | `Sym` | 复用既有内建通道，`Sym = "str"` 自动驻留 |
+
+- **`@type_name` / `@type_size` / `@type_equal` / `@zeroed`**：在 CTFE 之前就折成字面量 / `array_lit` 节点，两个后端看到的只是普通字面量 —— 零新支持、零 IR 漂移。运行期位置调用亦合法（检查器随后照常对其做类型检查）。
+- **`@str_from_bytes` / `@compile_error`**：只在编译期求值 / 折叠；在运行期上下文（非 `meta` 块、非 `meta` 形参的 `meta fn`）调用一律报 `T_META_RUNTIME_CTX`，行为显式可追溯。
+- **`Sym` 一级化（Phase D）**：`Sym` 提升为一级符号句柄类型（`bw=32` / `alen=32`），使 `meta fn(meta s: string, meta n: u32) Sym` 这类「返回任意符号」的签名合法；`resolve_ti` / `resolve_type_desc` 仅在查过用户自定义 `Sym` **之后**兜底返回，自举安全（`src/tc.tc` 自带 `Sym struct` 不受影响）。
+
+```t
+meta get_width fn(meta T: type) u32 {        // docs/meta_design.md §6 模式
+    if (@type_equal(T, u32)) { return 32; }
+    else if (@type_equal(T, u64)) { return 64; }
+    else { @compile_error("unsupported type"); }
+    return 0;
+}
+meta repeat fn(meta s: string, meta n: u32) Sym {
+    var buf: [64]u8 = @zeroed([64]u8);
+    var pos: u32 = 0;  var i: u32 = 0;
+    while (i < n) { var j: u32 = 0; var sl = str_len(s) as u32;
+        while (j < sl) { buf[pos] = s[j]; pos = pos + 1; j = j + 1; }
+        i = i + 1; }
+    return sym_intern(buf, pos);            // → "hihihi"（s="hi", n=3）
+}
+```
+
+> ⚠ **`meta { }` 的副作用发生在编译期**。`meta { print("x"); }` 在**编译时**往 stderr 写 `x`，
+> 程序运行时不再输出它。编译期计算要影响运行期，须经 `meta var` 承接、再用 `meta <expr>` 折叠回来：
+> 见下方 `ACC` → `c`。
+
+**示例：**
+
+```t
+id fn(meta T: type, x: T) T { return x; }
+
+meta const KLIMIT: i64 = 100;
+meta var ACC: i64 = 0;
+meta addk fn(a: i64, b: i64) i64 { return a + b; }
+meta fact fn(n: i64) i64 {
+    if (n <= 1) { return 1; }
+    return n * fact(n - 1);
+}
+
+main fn() i64 @main {
+    meta {                              // 编译期执行，运行期零代码
+        print("meta-block\n");          // 编译期日志 → stderr
+        var k: i64 = 1;
+        while (k <= 4) { ACC = ACC + k * k; k = k + 1; }
+    }
+    var a: i64 = meta 4 + 2;            // → store i64 6
+    var b: i64 = meta addk(10, 5);      // → store i64 15
+    var c: i64 = meta ACC;              // → store i64 30（编译期累加结果）
+    var d: i64 = meta fact(10);         // → store i64 3628800（编译期递归展开）
+    auto n = id(i64, 42);               // → id__i64
+    auto s = id(string, "hi");          // → id__string
+    if (a == 6 && b == 15 && c == 30 && d == 3628800 && n == 42
+        && s == "hi" && KLIMIT == 100) { return 0; }
+    return 1;
+}
+```
+
+> 实现位置：`src/tc.tc` — 关键字注册 `kw_reg("meta","KwComptime")` / `kw_reg("type","KwType")`；
+> `parse_type` 的 `KwType` 分支（造 `type` 节点）、`resolve_ti` 的 `type` → `Any`；
+> `parse_declaration` 将 `meta`/`comptime` 前缀提到最前（使其可修饰 `var`/`const`/`fn`）；
+> `parse_primary` 的 `KwComptime` 表达式前缀；`comptime` 表达式节点在
+> `expr_type_desc` / `ll_etd` / `emit_expr`（C） / `emit_lle`（LLVM）四处透传内层表达式。
+> ⚠ 后两处此前缺失 —— `comptime <expr>;` 语句形态早已能解析，但 C 后端会落到
+> `/* unsupported expr */`、LLVM 后端静默丢弃；Phase A 一并补齐。
+>
+> Phase B（CTFE）实现位置：`src/tc.tc` 中 `run_check` 之前的独立模块
+> （`menv_*` 环境 / `meta_eval*` 求值 / `meta_exec` 执行 / `meta_fold_expr` 折叠 /
+> `meta_run_block` 块执行 / `meta_pass` 驱动）。**`meta_pass()` 挂在 checker 之前**
+> （`run_check` 内 `mark_call_callees()` 之后、`check_decl` 之前），
+> 使检查器与双后端看到的已经是折叠后的字面量 —— 二者因此零改动。
+>
+> Phase C（值参数单态化）实现位置：`src/tc.tc` 中 `instantiate_generic` 及其之前的
+> `meta_param_is_type`（形参分流）/ `meta_eval_value_arg`（实参求值 + 类型 / 范围校验）/
+> `meta_val_key`（键编码）/ `meta_subst_val_node` `meta_subst_val_kids`（表达式位置代换）/
+> `rewrite_generic_callsite`（调用点改写，首次生成与缓存命中共用）。
+> ⚠ 同批修掉两处 Phase A 遗留缺陷：① 类型代换误把 kids 链表头 `inn.lc` 当节点 id 传给
+> `subst_type_in_node`，导致函数体类型位置从未被替换（`zero(f64)` 曾发射 `alloca i64` + `ret double`）；
+> ② 缓存命中路径不改写调用点，同一实例被调用第二次即无限重入直至 arena abort。
+>
+> 用例：`examples/meta.tc`（+ `.expected.txt`，L1 覆盖）、
+> `examples/generics_demo.tc`（类型 / 值 / 混合参数全形态，L1 覆盖）、
+> `tests/conformance/pass/p37_meta_ok.tc`（Phase A 表面）、
+> `pass/p38_meta_ctfe_ok.tc`（Phase B 求值器全形态）、
+> `pass/p39_meta_value_param_ok.tc`（Phase C 值参数全形态）、
+> `pass/p40_meta_builtin_ok.tc`（Phase D 编译期内建全形态，运行 `exit=0`）、
+> `fail/f61..f66_meta_*.tc` + `fail/f68..f71_meta_value_*.tc`（Phase A–C 十条护栏，L0 覆盖）、
+> `fail/f72..f77_meta_*.tc`（Phase D 六条护栏：`T_META_COMPILE_ERROR`×2 / `T_META_UNKNOWN_BUILTIN` / `T_META_RUNTIME_CTX` / `T_META_TYPE_AS_VALUE` / `T_META_UNKNOWN_TYPE`，L0 覆盖）；完整设计见 `docs/meta_design.md`，
+> Phase C–D 的目标形态见 `docs/meta_target.tc`（⚠ 该文件刻意**不放在 `examples/`**：
+> `tools/ir_snapshot.mjs` 会对 `examples/*.tc` 逐个 emit，放入不可编译文件会使快照步骤永久 WARN）。
+>
+> 注：`tc0`（TypeScript 引导编译器）只需能编译 `src/tc.tc`，故仅注册了 `meta` 别名而未实现
+> `any`/`type` 类型参数（`tc0` 本就不支持 `comptime T: any`）——这是既有的有意子集边界。
 
 ### 3.7 Flag builtins（位域内建函数） ✅ tote
 
@@ -1682,41 +1971,51 @@ AgentClause:
 
 ---
 
-### 3.13 Modules / Import / Export（代码模块与插件系统）⚠ 部分实现（2026-08-04：parser + 两个诊断 + whole-program inlining 已落地，`module_hello` 双后端真实通过；**工程源码根 + 点分模块名 `import a` / `import d.e` 已落地（commit 71659a3，`proj_demo` 双后端真实通过）**；**`@` 外部库搜索路径 + 命名空间隔离 `lib__name` 重整 + `export` 私有隔离强校验（`T_MODULE_PRIVATE`/`T_MODULE_NO_SYMBOL`）已落地（第四刀，2026-08-05）**；**`.tlib` 真·独立编译 + 链接（build --lib 产 LLVM 归档 + exports.json，import @x 优先链接、私有跳过、未预编译回退内联）已落地（第五刀，2026-08-05）**；**环境变量搜索（`T_LIB_PATH` / `~/.tote/libs`，`getenv` 中性内建 + tote 注入 `--lib-dir`）已落地（第六刀，2026-08-05）**；`.tlibd`（调试态归档）/ `T_IMPORT_CYCLE`（依赖图无环校验）/ tote 依赖图（`tote deps` + `tc --emit-deps`）**已落地（外部库收尾刀，2026-08-05）**；C 互操作导出（`.lib`/`.dll`）待实现）
+### 3.13 Modules / Import / Export（代码模块与插件系统）⚠ 部分实现（2026-08-04：parser + 两个诊断 + whole-program inlining 已落地，`module_hello` 双后端真实通过；**工程源码根 + 点分模块名 `import(src.a)` / `import(src.d.e)` 已落地（`proj_demo` 双后端真实通过）**；**库搜索路径 + 命名空间隔离 `lib__name` 重整 + `export` 私有隔离强校验（`T_MODULE_PRIVATE`/`T_MODULE_NO_SYMBOL`）已落地（第四刀，2026-08-05）**；**`.tlib` 真·独立编译 + 链接（build --lib 产 LLVM 归档 + exports.json，import(x) 优先链接、私有跳过、未预编译回退内联）已落地（第五刀，2026-08-05）**；**环境变量搜索（`T_LIB_PATH` / `~/.tote/libs`，`getenv` 中性内建 + tote 注入 `--lib-dir`）已落地（第六刀，2026-08-05）**；`.tlibd`（调试态归档）/ `T_IMPORT_CYCLE`（依赖图无环校验）/ tote 依赖图（`tote deps` + `tc --emit-deps`）**已落地（外部库收尾刀，2026-08-05）**；**语法统一为 `import(Path [:: List] [as Alias])`（`src.` 前缀走源码根、其余走库；旧 `import @x;` / 裸 `import x;` 删除；选择性导入 `::` 新增）已落地（统一刀，2026-08-08）**；C 互操作导出（`.lib`/`.dll`）待实现）
 
 > 本节气法由 `docs/syntax/drafts/module.md` 经 L-15 采用并并入（原草稿已标记失效）。与 §3.6.1 数据导入（`import_csv`/`import_json` 函数调用）正交：代码模块走 `import xxx` 标识符形式（支持点分 `xxx.yyy`）。
 
 一个 `.tc` 文件即一个模块；发布态为 `xxx.tlib`，调试态为 `xxx.tlibd`（刻意避开 C 静态库 `.lib` 扩展名）。`import xxx` 按名导入，命名空间即 `xxx` 的**最后一段**；跨模块可见的符号须显式 `export`。四法评审：L-04/L-02/L-03 全 ✅，L-14 原则 ✅（门禁用例实现期落）。
 
 ```ebnf
-ModuleName:     IDENTIFIER ("." IDENTIFIER)*        // 模块名，'.' 即路径分隔符；如 math、net.http
-ModuleFile:     <src_root> "/" ModuleName-with-"/" ".tc"
-                                                    // 模块源码（含 export、无 main），如 <src>/math.tc、<src>/net/http.tc
-ModuleArtifact: ModuleStem "." ("tlib" | "tlibd")   // ⚠ spec-only 编译产物（插件形态），如 math.tlib / math.tlibd（待独立编译编排）
-
-ImportDecl:     "import" ModuleName ("as" IDENTIFIER)? ";"   // import math; / import net.http; / import net.http as h;
-ExtLibImport:   "import" "@" IDENTIFIER ("as" IDENTIFIER)? ";"  // import @json; / import @csv as j;
-ExportPrefix:   "export"                            // 前缀修饰顶层声明
+ImportPath:     IDENTIFIER ("." IDENTIFIER)*        // 模块路径；首段 src → 工程源码根，否则 → lib/依赖库
+ImportList:     ImportItem ("," ImportItem)*         // 选择性导入列表（:: 之后）
+ImportItem:     IDENTIFIER ("as" IDENTIFIER)? | "*"  // 选择性导入项；* = 通配
+ImportStmt:     "import" "(" ImportPath ("::" ImportList)? ("as" IDENTIFIER)? ")" ";"
+                                                    // 统一语法：import(std.mem) / import(json :: *) / import(std.math as m2)
+ModuleFile:     <src_root> "/" ImportPath-with-"/" ".tc"   // 模块源码（含 export、无 main），如 <src>/math.tc
+ModuleArtifact: ModuleStem "." ("tlib" | "tlibd")   // 库归档（build --lib 产出），如 std/mem.tlib / json.tlib
+ExportPrefix:   "export"                            // 前缀修饰顶层声明；export import(...) 报 T_EXPORT_SCOPE
 ```
+
+> ⚠ **2026-08-08 语法统一（落地）**：旧的 `import @x;`（外部库）与裸 `import x;`（工程内）两种写法**已删除**，统一为 `import(Path [:: List] [as Alias])`。`import` 不再区分「工程内 / 外部库」——一律走 `import(...)`，由路径首段决定解析策略（见 rule 1 / rule 5）。旧写法在解析期报友好错误并 `exit(1)`。
 
 **规则**：
 
-1. **导入形式**：`import xxx;` 或 `import xxx as m;`。`import` 后是**点分模块名**（标识符，允许 `.` 分段），非字符串路径；与数据导入函数不重名（L-04 唯一语义）。
+1. **导入形式（统一语法）**：`import(Path)`；`Path` 为**点分模块路径**（标识符，允许 `.` 分段），非字符串路径；与数据导入函数（`import_csv`/`import_json`）不重名（L-04 唯一语义）。统一支持三种可选修饰：
+   - **选择性导入** `import(Path :: a, b as c, *)`：只引入列表中的符号（可 `as` 改名；`*` 通配全部导出符号）。
+   - **模块别名** `import(Path as M)`：以 `M.sym` 限定访问（替代原「点分末段」或裸名），如 `import(std.math as m2)` → `m2.abs(-7)`。
+   - 二者可组合：`import(Path :: a, b as c as M)` 不合法（`as` 模块别名写在 `)` 前、`::` 列表外）；选择性列表与模块别名独立。`export import(...)` → `T_EXPORT_SCOPE`（语法不支持模块重导出）。
+   - ⚠ **旧写法已删除**：`import @x;`（外部库标记）与裸 `import x;`（工程内）在解析期报友好错误（`import @x; was removed; write import(x);`）并 `exit(1)`。迁移：`import @json;` → `import(json)`；`import hello;` → `import(src.hello)`。
 2. **默认私有**：顶层符号默认模块内可见；跨模块可见须显式 `export <name> fn/struct/enum/flag/variant/const/typealias`。`export` 修饰非顶层 → `T_EXPORT_SCOPE`（L-02 显式）。
    - ⚠ 语法注意：t 声明为并置式 `Name fn(...)`，`export` 前缀置于**名字之前**：`export add fn(...) { ... }`（非 `export fn add`）。
    - ✅ **私有隔离已强制（2026-08-05 第四刀）**：经 `mangle_modules` 重整，导入模块（别名 `A`）的顶层符号被改写为 `A__name`；未 `export` 的符号**跨模块不可见**——`A.priv()` 触发 `T_MODULE_PRIVATE`，`A.NoSuchType` 触发 `T_MODULE_NO_SYMBOL`。模块**内部**自调用同样脱糖为 `A__name`（库内自洽）。入口模块别名 `""` → **永不重整**，故单文件程序 IR 逐字节不变（已重录基线、L2 gate 全绿验证）。
-3. **名称解析与限定前缀（Go 风格末段）**：`import net.http;` 的命名空间取**模块名最后一段** `http`，以 `http.get(...)` 访问；`import math;` 即 `math.add(...)`；`import net.http as h;` 则 `h.get(...)`；裸名 `get(...)` 亦可直接调用（inlining 进同一单元）。限定前缀**只取末段**，`import net.http` 不能用 `net.http.get`（点分仅用于描述文件路径，不构造多级命名空间）。零碰撞、显式。
+3. **名称解析与限定前缀（Go 风格末段）**：`import(net.http)` 的命名空间取**模块名最后一段** `http`，以 `http.get(...)` 访问；`import(math)` 即 `math.add(...)`；`import(net.http as h)` 则 `h.get(...)`；工程内 `import(src.d.e)` 取末段 `e` 以 `e.deep(...)` 访问（点分仅描述文件路径，不构造多级命名空间，故不能用 `d.e.deep`）。`as M` 模块别名下以 `M.sym` 全限定访问；不取末段。`import(src.hello)` 内联进同一单元后亦可直接裸名调用（如 `greet()`）。零碰撞、显式。
 3b. **限定类型与字面量（跨模块类型引用）**：引用外部/其他模块**导出类型**须带限定前缀——`var v: json.Value;`、字面量 `var p: physics.Position = physics.Position{ x: 1, y: 2 };`。解析期 `named{A.T}` 重整为 `A__T`（找不到 → `T_MODULE_NO_SYMBOL`）；`A.T{}` 结构化字面量同理。`mangle_modules` Pass 1 先处理：识别 object 为模块别名的 `member`、带 `sb != ""` 的 `named`/`struct_lit`，按 `def_lookup` 解析后清 `sb`。未限定的 `Value`/`Position` 只在本模块查找。
-4. **工程源码根（2026-08-04 第三刀，已落地）**：所有工程内 `import` 相对**项目源码根 `<src_root>`** 解析，模块名中的 `.` 即路径分隔符：
-   - `import a;` → `<src_root>/a.tc`
-   - `import d.e;` → `<src_root>/d/e.tc`
+4. **工程源码根（`src.` 前缀，2026-08-08 统一语法）**：工程内源码模块经 `import(src.xxx)` 导入——路径**首段为 `src`** 即表示从本项目源代码根目录解析，编译器剥去 `src` 段后相对 `<src_root>` 取源码整体内联（单命名空间）：
+   - `import(src.a);` → `<src_root>/a.tc`
+   - `import(src.d.e);` → `<src_root>/d/e.tc`
    - 文件不存在 → `T_IMPORT_NOT_FOUND`。
-   - `<src_root>` 取值 = **入口文件所在目录**（取代旧的「相对导入方目录」）。标准布局下你跑 `tc run src/main.tc`，入口目录即 `<root>/src`，于是 `import a` ⇒ `<root>/src/a.tc`、`import d.e` ⇒ `<root>/src/d/e.tc`，完全吻合「工程目录\src 为统一源码根」的设计。
-   - ⚠ **已知限制**：向上查找 `tote.toml` 自动定位 `<root>` 的方案**暂未启用**——编译器内置 `path_exists`（`sys_run`→`cmd /c if exist`）在当前运行时对绝对路径探测不稳定（会触发 `arena: out of memory`），向上遍历会越界。故采用「入口目录 = 源码根」这一对标准布局等价且稳健的折中。**约定用法**始终是 `tc run src/main.tc`（入口置于 `src/` 下）；若从工程根目录直接 `tc run main.tc`（main 不在 `src/` 下），则不会自动下钻 `src/`。
-5. **`@` 外部库（搜索路径 + 命名空间隔离，2026-08-05 第四刀已落地）**：`import @json;` 导入**外部库**（区别于工程内 `import a;` 点分源码）。解析顺序沿**库搜索路径**依次探测 `<libdir>/json.tc` → `<libdir>/json/index.tc` → `<libdir>/json/lib.tc`，命中即载入为别名 `json`；全无命中 → `T_IMPORT_NOT_FOUND`。载入后该库顶层符号经命名空间重整（`json__version` 等），只能经 `json.xxx` 限定访问，未 `export` 符号跨模块不可见（见 rule 2）。版本钉仍归口 `tote.toml`（见 §4），编译器只负责解析与隔离。
-5b. **库搜索路径（`compute_lib_dirs`）**：候选目录顺序 = ① 入口文件目录下的 `lib/`、`libs/`；② 每个工程源码根 `<src_root>` 的**父目录**（工程根）下的 `lib/`、`libs/`；③ **环境变量驱动目录**（第六刀）：`T_LIB_PATH`（`;` 分隔）逐个 + `~/.tote/libs`，二者经 `tote` 以 `--lib-dir` 注入（优先级最高）。故 `examples/extlib_demo.tc` 入口目录 `examples/` 自然命中 `examples/lib/json.tc`、`examples/lib/csv.tc`；标准工程 `src/main.tc` 命中 `<root>/lib`、`<root>/libs`；`set T_LIB_PATH=C:/my/libs` 后还能命中该目录下的库。
-6. **解析序（实际实现）**：`handle_one_import` 将 `ModuleName` 的 `.` 转 `/`，相对 `<src_root>` 取**源码**整体内联（C 的 `#include` 风格、单命名空间），无 `.tlib(d)` 产物查找；嵌套 import 递归、重复自动去重。`import @x`（外部库）走 `resolve_external_lib` + `mangle_modules` 命名空间重整（非单命名空间内联，见第四刀），并自第五刀起支持**双模式**（见第五刀规则 6b）。
-6b. **`@` 外部库双模式（第五刀）**：`handle_one_import` 对 `@x` 先查搜索路径下的预编译归档 `<libdir>/x.tlib`（含伴随 `<libdir>/x.exports.json` 接口块），命中即进入**链接模式**——载入 exports.json 注册导出符号、代码生成阶段对库导出符号发 LLVM `declare`（不发 `define`）、私有符号跳过、归档路径进 `g_ext_link` 供链接器并入；未找到 `.tlib` 则**回退内联源码**（与第四刀行为一致，作过渡安全网，故未预编译时单文件 IR 不变、gate 不漂）。`build --lib <file.tc>` 产出 `out/lib/<stem>.tlib`（= `clang -c` 编出的 `.o` 经 `llvm-ar rcs` 归档）+ `out/lib/<stem>.exports.json`；库以规范别名（源文件名 stem）作重整命名空间，使归档符号 `json__version` 与下游 `import @json` 重整结果一致；库独立编译时跳过进程级全局（`t.__ginit`/`t_atom_table`/`t_atom_count`，由主程序提供，避免重复符号）。
+   - `<src_root>` = **入口文件所在目录**（取代旧「相对导入方目录」）。标准布局下你跑 `tc run src/main.tc`，入口目录即 `<root>/src`，于是 `import(src.a)` ⇒ `<root>/src/a.tc`、`import(src.d.e)` ⇒ `<root>/src/d/e.tc`。
+   - ⚠ **首段非 `src` 一律走库搜索**（rule 5）：故工程内源码**必须**显式加 `src.` 前缀；裸 `import(a)` 会被当作库 `a` 在 `lib/` 与依赖库中查找（找不到 → `T_IMPORT_NOT_FOUND`），不会再回落到源码根。
+   - ⚠ **已知限制**：向上查找 `tote.toml` 自动定位 `<root>` 的方案**暂未启用**——编译器内置 `path_exists` 对绝对路径探测不稳定（触发 `arena: out of memory`）。故以「入口目录 = 源码根」折中，对标准布局等价；约定用法 `tc run src/main.tc`。
+5. **解析序（统一语法，2026-08-08）**：`handle_one_import` 依据 `import(Path)` 的**首段**分流：
+   - **首段为 `src`**（如 `import(src.a)`、`import(src.d.e)`）→ `is_lib_path=false` → 剥 `src` 后相对 `<src_root>` 取**源码**整体内联（单命名空间），无 `.tlib` 查找；嵌套 import 递归、重复自动去重（菱形共享根只加载一次）；文件不存在 → `T_IMPORT_NOT_FOUND`。
+   - **首段非 `src`**（如 `import(json)`、`import(std.mem)`）→ `is_lib_path=true` → 走 `resolve_external_lib` + `mangle_modules` 命名空间重整（非单命名空间内联，见 rule 2 私有隔离），并支持**双模式**（见 rule 6b）。路径 `.` 经 `dots_to_slashes` 转 `/` 定位归档（`import(std.mem)` → `out/lib/std/mem.tlib`）。
+   - 空路径（如 `import(src)` 剥 `src` 后无剩余）→ `T_IMPORT_BAD_PATH`。
+5b. **库搜索路径（`compute_lib_dirs`）**：`is_lib_path=true` 时，候选目录顺序 = ① 入口文件目录下的 `lib/`、`libs/`；② 每个工程源码根 `<src_root>` 的**父目录**（工程根）下的 `lib/`、`libs/`；③ `out/lib`（构建期 std 归档落点）；④ **环境变量驱动目录**（第六刀）：`T_LIB_PATH`（`;` 分隔）逐个 + `~/.tote/libs`，二者经 `tote` 以 `--lib-dir` 注入（优先级最高）。故 `examples/extlib_demo.tc` 入口目录 `examples/` 命中 `examples/lib/json.tc`；标准工程 `src/main.tc` 命中 `<root>/lib`、`out/lib/std/mem.tlib`；`set T_LIB_PATH=C:/my/libs` 后还能命中该目录下的库。
+6b. **库双模式（链接模式 + 内联回退）**：对 `is_lib_path=true` 的 import，先查搜索路径下的预编译归档 `<libdir>/<dots_to_slashes(Path)>.tlib`（含伴随 `<libdir>/...exports.json` 接口块），命中即进入**链接模式**——载入 exports.json 注册导出符号、代码生成阶段对库导出符号发 LLVM `declare`（不发 `define`）、私有符号跳过、归档路径进 `g_ext_link` 供链接器并入；未找到 `.tlib` 则**回退内联源码**（过渡安全网，故未预编译时单文件 IR 不变、gate 不漂）。`build --lib <file.tc>` 产出 `out/lib/<dots_to_slashes(Path)>.tlib`（如 `lib/std/mem.tc` → `out/lib/std/mem.tlib`，`clang -c` 编 `.o` 经 `llvm-ar rcs` 归档）+ 伴随 `out/lib/std/mem.exports.json`；库以「路径末段 stem」作重整命名空间，使归档符号 `mem__len` 与下游 `import(std.mem)` 重整结果一致；库独立编译时跳过进程级全局（`t.__ginit`/`t_atom_table`/`t_atom_count`，由主程序提供，避免重复符号）。
+6c. **选择性导入（`::` 列表，2026-08-08 新增）**：`import(Path :: a as b, c, *)` 的选择性列表在 `mangle_modules` 的 **Pass 3** 实现为 **AST 改名 Pass**——遍历候选符号，将调用点 `a`/`c` 改写为模块限定 mangled 名（`M__a`/`M__c`），`as b` 映射为本地名 `b`，`*` 展开为该模块全部导出符号（受 `export` 可见性约束）。**不引入新的作用域机制**，复用 Pass 2 的 provenance 改写。`*` 通配后若与本地声明或另一选择性导入同名 → `T_IMPORT_CONFLICT`；引用未导出符号 → `T_MODULE_NO_SYMBOL`/`T_MODULE_PRIVATE`；选择性符号在模块中不存在 → `T_MODULE_NO_SYMBOL`。
 7. **依赖图无环（`T_IMPORT_CYCLE` 已发射，2026-08-05 外部库收尾刀）**：靠 `in_mod_visited` 访问集对重复 import **去重**（菱形共享根只加载一次、不报错）；同时 `handle_one_import` 维护 **DFS 活跃栈** `g_mod_stack`/`g_mod_stack_alias`（进入模块压栈、离开弹栈），若**被导入模块已处于当前活跃栈中** → 真成环 → 发射 `T_IMPORT_CYCLE`（如 `a→b→a`）。去重与环检测并存：合法菱形（`a→b→d`、`a→c→d`）只加载一次 `d` 且不报环，非法环必然报错。依赖图边（父=活跃栈顶别名或 `"<entry>"`，子=被导入别名）记录于 `g_dep_from`/`g_dep_to`，供 `--emit-deps` 输出（见 rule 7b）。
 7b. **依赖图导出（`tc --emit-deps`，外部库收尾刀）**：`tc check --emit-deps <file>`（flag **位置无关**，可置于文件名前或后）在类型检查后输出依赖图 JSON：`{"entry":"<abs path>","edges":[{"from":"<parent>","to":"<child>"}...]}`。父=当前活跃栈顶别名（入口文件为 `"<entry>"`），子=被导入模块别名；菱形依赖（如 `a→b→d`、`a→c→d`）记录**全部 4 条边**（`c→d` 不丢，因边记录置于钻石去重 `return` 之前）。该 JSON 为合法 JSON——边闭合用 `sb_append_char(out,34)`+`sb_append_char(out,125)` 逐字符追加 `}"`，规避 `t` 字符串字面量「`\"}` 被词法分析成 `"}`」的转义陷阱。
 7c. **tote 依赖图（`tote deps`，外部库收尾刀）**：`tote deps <file.tc>` 委托 `tc check --emit-deps` 并注入 `--lib-dir`（即 `T_LIB_PATH`/`~/.tote/libs` 搜索路径），输出同上依赖图 JSON。`tote build`/`run`（未显式 `--mode rls`）自动追加 `--debug-libs`，使调试构建优先链接 `.tlibd`（见 rule 7d）。
@@ -1735,19 +2034,39 @@ export add fn(a: i64, b: i64) -> i64 { return a + b; }
 export deep fn(x: i64) -> i64 { return x + 100; }
 
 // src/main.tc —— 入口（与 hello.tc、d/ 同级，统一从 src/ 解析）
-import hello;
-import d.e;
+import(src.hello);
+import(src.d.e);
 main fn() -> i32 @main {
-    println(hello.greet());   // import hello     => src/hello.tc
+    println(hello.greet());   // import(src.hello) => src/hello.tc
     println(i2s(hello.add(2, 3)));
-    println(i2s(e.deep(10))); // import d.e       => src/d/e.tc，限定前缀取末段 e
+    println(i2s(e.deep(10))); // import(src.d.e)    => src/d/e.tc，限定前缀取末段 e
     return 0;
 }
 // 运行：tc run src/main.tc    （输出 hi from hello / 5 / 110）
-//         —— 入口目录即 <root>/src，故 import 自动从 src/ 拉平编译，无需手动列文件
+//         —— 入口目录即 <root>/src，src. 前缀自动从 src/ 拉平编译，无需手动列文件
+
+// 库与选择性导入示例
+import(json);                       // 库（首段非 src）→ lib / 依赖库 / out/lib 搜索
+import(std.math as m2);            // 模块别名：m2.abs(...) 访问
+import(std.mem :: len, reverse as rev);  // 选择性导入 + 改名
+main2 fn() -> i32 @main {
+    println(m2.abs(-7));           // 7
+    println(i2s(len(xs)));         // 直接用 len（选择性导入）
+    rev(i64, xs);                   // 用 rev 代替 reverse
+    return 0;
+}
 ```
 
 - agent 模块契合：actor 脱糖产物 `XState`/`x_spawn`/`x_step` 标 `export` 后可跨模块复用（消息回路边界）。
+- **实现状态（2026-08-08 统一刀 —— 语法统一为 `import(...)`，端到端可跑）**：
+  - ✅ **已落地**：旧的 `import @x;`（外部库标记）与裸 `import x;`（工程内）**两种写法删除**，统一为 `import(Path [:: List] [as Alias])`：
+    - 解析分流由路径首段决定：`src.` 前缀 → 工程源码根内联（`import(src.hello)`）；否则 → `lib`/依赖库/环境变量搜索（`import(json)`、`import(std.mem)`）。
+    - 选择性导入 `:: a as b, *` 经 `mangle_modules` Pass 3（AST 改名）实现，复用 provenance 改写，无新作用域机制。
+    - 模块别名 `import(Path as M)` 以 `M.sym` 全限定访问。
+    - 旧写法在解析期报友好错误并 `exit(1)`（`import @x; was removed` / `import x; was removed`）。
+  - ✅ **配套改动**：`ImportModDecl.bd` 复用为 `is_lib_path`、`lb` 复用为选择性 item 链；新增错误码 `T_IMPORT_BAD_PATH`（空 `src` 路径）、`T_IMPORT_CONFLICT`（选择性名冲突）；`build_std.mjs` 产出嵌套归档 `out/lib/std/{mem,math}.tlib`（匹配 `import(std.mem)` 的 `dots_to_slashes` 解析）；`lib/std/math.tc` 全量补 `export`（链接模式只 `declare` 导出符号，否则 link 期 `undefined`）。
+  - ✅ **验证**：examples/tests/conformance 中全部 `import` 迁移至新语法（含 `import @std.mem` → `import(std.mem)`）；四种形式（限定/`::` 改名/`as` 别名/`:: *`）LLVM 后端实测通过；错误路径（`@`/裸/空路径/未导出符号/名冲突）均报正确码；`std_demo` 等 40 例 `run_examples` 全绿；IR 基线重录（52 targets/156 entries）逐字节一致。L2 gate 目标 13 passed/0 failed/0 warn。
+  - ⚠ **迁移提示**：历史「第四刀 / 第五刀 / 收尾刀」实现状态条目描述的是 `@` 写法时期，现已由本统一刀取代；其底层机制（命名空间重整、`export` 私有隔离、`build --lib` 链接模式、`T_IMPORT_CYCLE`、依赖图导出、`.tlibd`、环境变量搜索）全部保留并继续生效。
 - **实现状态（2026-08-04 第一刀 —— parser + 诊断）**：
   - ✅ **已落地**：parser 支持 `export` 前缀（顶层声明打 `is_export` 标记）、`import xxx [as m]` 标识符形式（旧的 `import "path"` 数据导入保留兼容）；checker 诊断 `T_EXPORT_SCOPE`（`export` 修饰局部/嵌套 `var`/`const` 或 `import` 声明）、`T_IMPORT_NOT_FOUND`（单文件 `tc` 不解析模块，模块解析由 `tote` 构建层完成）。conformance 用例 `p_export_ok` / `f_export_scope` / `f_import_not_found` / `f_export_on_import` 已落地并随 gate 全绿。
 - **实现状态（2026-08-04 第二刀 —— whole-program inlining，端到端可跑）**：
@@ -1803,7 +2122,7 @@ EntryPoint: FuncDecl with "@main" annotation
 TranslationUnit : ModuleItem*
 ModuleItem      : FuncDecl | StructDecl | FlagDecl | VariantDecl
                 | GlobalVarDecl | ConstDecl | InnerAttribute
-FuncDecl        : Ident "fn" "(" Params? ")" "->" Type Anns? Block
+FuncDecl        : Ident "fn" "(" Params? ")" ("->")? Type Anns? Block
 StructDecl      : Ident "struct" Anns? "{" Field* "}"
 FlagDecl        : Ident "flag" "[" IntType "]" "{" Slot* "}"
 VariantDecl     : Ident "variant" "{" Case* "}"

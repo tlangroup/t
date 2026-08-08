@@ -130,6 +130,14 @@ const steps = [
         },
     },
     {
+        id: "boot_std", lv: 0, name: "预编译 std 库 (.tlib)",
+        run: async () => {
+            const r = await node("build_std.mjs", "--tc", BASE_TC);
+            if (r.code !== 0) return { ok: false, note: lastLine(r.out, 4) };
+            return { ok: true, note: "lib/std/{mem,math}.tlib 已就绪" };
+        },
+    },
+    {
         id: "boot1", lv: 0, name: "自举一代 (tc.exe → g1)",
         run: async () => {
             const r = await tc(BASE_TC, "build", "src/tc.tc", "--output", G1);

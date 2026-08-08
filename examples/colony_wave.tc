@@ -1,8 +1,8 @@
 // colony_wave.tc —— Spawner / Colony + ECS World 主循环（真实小子场景：塔防波次生存）
 //
 // 复用：
-//   · @colony        （examples/lib/colony.tc）—— Spawner 生成 + 调度体
-//   · physics        （examples/physics.tc）  —— ECS MovementSystem（位置积分）
+//   · import(colony)        （examples/lib/colony.tc）—— Spawner 生成 + 调度体
+//   · import(src.physics)   （examples/physics.tc）  —— ECS MovementSystem（位置积分）
 //
 // 场景：玩家固守网格原点 (0,0)，生命 player_hp。Spawner 按波次在右边缘生成怪物；
 // 每个怪物是一个被 Colony 调度的 agent（状态以 string 指纹存于 Colony 内部 slice）。
@@ -13,10 +13,11 @@
 //   ③ CombatSystem   —— 玩家炮塔打「射程内最近的怪物」；怪物若贴脸(adjacent)则攻击玩家。
 //
 // 全部用整数网格 + 定宽零填充指纹，保证 LLVM / C 双后端输出逐字节一致。
-// 无 generics / 无新语法（收敛决策 A）：怪物状态 string 指纹 + fn(string,Msg)->string 回调。
+// 运行期动态分发范式（收敛决策 A；t 已有 `comptime T: any` 单态化但此处刻意不用）：
+// 怪物状态 string 指纹 + fn(string,Msg) string 回调。
 
-import @colony;
-import physics;
+import(colony);
+import(src.physics);
 
 // ───────────────────────── 怪物状态（含 ECS 意图字段）─────────────────────────
 // 指纹布局（定宽零填充、无分隔）：hp(3) st(2) x(4) y(4) ix(1) iy(1)  = 15 字符
@@ -33,13 +34,13 @@ Mon struct {
     iy: i64;
 }
 
-iabs fn(v: i64) -> i64 {
+iabs fn(v: i64) i64 {
     if (v < 0) { return -v; }
     return v;
 }
 
 // 定宽零填充（复用 colony_demo 的 pad 思路）
-mon_pad fn(v: i64, w: i64) -> string {
+mon_pad fn(v: i64, w: i64) string {
     if (v < 0) { v = 0; }               // 坐标不应为负；兜底防 int_to_str 出负号破坏定宽
     var s: string = int_to_str(v);
     var L: i64 = str_len(s);
@@ -50,7 +51,7 @@ mon_pad fn(v: i64, w: i64) -> string {
     sb_append_str(b, s);
     return sb_to_str(b);
 }
-mon_dec_field fn(s: string, off: i64, w: i64) -> i64 {
+mon_dec_field fn(s: string, off: i64, w: i64) i64 {
     var n: i64 = 0;
     var i: i64 = 0;
     for (i = 0; i < w; i = i + 1) {
@@ -59,7 +60,7 @@ mon_dec_field fn(s: string, off: i64, w: i64) -> i64 {
     }
     return n;
 }
-mon_enc fn(hp: i64, st: i64, x: i64, y: i64, ix: i64, iy: i64) -> string {
+mon_enc fn(hp: i64, st: i64, x: i64, y: i64, ix: i64, iy: i64) string {
     var b: StringBuilder = sb_new();
     sb_append_str(b, mon_pad(hp, 3));
     sb_append_str(b, mon_pad(st, 2));
@@ -69,7 +70,7 @@ mon_enc fn(hp: i64, st: i64, x: i64, y: i64, ix: i64, iy: i64) -> string {
     sb_append_str(b, mon_pad(iy, 1));
     return sb_to_str(b);
 }
-mon_dec fn(s: string) -> Mon {
+mon_dec fn(s: string) Mon {
     var m: Mon;
     m.hp = mon_dec_field(s, 0, 3);
     m.st = mon_dec_field(s, 3, 2);
@@ -79,7 +80,7 @@ mon_dec fn(s: string) -> Mon {
     m.iy = mon_dec_field(s, 14, 1);
     return m;
 }
-st_name fn(st: i64) -> string {
+st_name fn(st: i64) string {
     if (st == 0) { return "idle"; }
     if (st == 1) { return "chase"; }
     if (st == 2) { return "attack"; }
@@ -89,7 +90,7 @@ st_name fn(st: i64) -> string {
 // ───────────────────────── 怪物 step（Colony 通用回调签名）─────────────────────────
 // 只做「决策」：读玩家坐标（消息 arg_i 打包 px*10000+py），算出意图与状态；
 // 不动手改坐标——位置积分留给 World 的 MovementSystem（ECS 关注点分离）。
-monster_step fn(s_str: string, m: colony.Msg) -> string {
+monster_step fn(s_str: string, m: colony.Msg) string {
     var s: Mon = mon_dec(s_str);
     if (s.st == 3) { return s_str; }                 // 已死：no-op
     if (m.kind == :tick) {
@@ -110,8 +111,8 @@ monster_step fn(s_str: string, m: colony.Msg) -> string {
 
 // ───────────────────────── Spawner（生成子 agent）─────────────────────────
 // 在右边缘 x=12 生成 n 个怪物，y 依次铺开；初始 hp=MON_HP、idle、无意图。
-MON_HP fn() -> i64 { return 3; }
-spawn_wave fn(col: colony.Colony, n: i64, base_y: i64) -> colony.Colony {
+MON_HP fn() i64 { return 3; }
+spawn_wave fn(col: colony.Colony, n: i64, base_y: i64) colony.Colony {
     var i: i64 = 0;
     for (i = 0; i < n; i = i + 1) {
         var yy: i64 = base_y + i * 4;
@@ -121,7 +122,7 @@ spawn_wave fn(col: colony.Colony, n: i64, base_y: i64) -> colony.Colony {
 }
 
 // ───────────────────────── 展示辅助 ─────────────────────────
-pline fn(label: string, v: i64) -> void {
+pline fn(label: string, v: i64) void {
     var b: StringBuilder = sb_new();
     sb_append_str(b, label);
     sb_append_i64(b, v);
@@ -130,7 +131,7 @@ pline fn(label: string, v: i64) -> void {
 
 // ───────────────────────── ECS World 主循环 ─────────────────────────
 @main
-main fn() -> i64 {
+main fn() i64 {
     println("=== ECS World: spawn-wave survival (Spawner/Colony + physics.MovementSystem) ===");
     var col: colony.Colony = colony.colony_new(monster_step);
     var player_hp: i64 = 12;

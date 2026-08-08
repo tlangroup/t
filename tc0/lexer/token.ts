@@ -132,6 +132,7 @@ const KEYWORDS: Record<string, TokenType> = {
     "var": TokenType.KwVar,
     "const": TokenType.KwConst,
     "comptime": TokenType.KwComptime,
+    "meta": TokenType.KwComptime,   // Phase A: `meta` 元编程关键字，暂别名 KwComptime（后续阶段独立语义）
     "if": TokenType.KwIf,
     "else": TokenType.KwElse,
     "for": TokenType.KwFor,

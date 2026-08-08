@@ -151,3 +151,8 @@ node tools/run_examples.mjs --compiler out/rls/tc.exe --mode rls
 
 - 编译器自 M16 起更名为 **tote**（此前叫 tc1）；M38 起拆分为 **tc**（编译器）与 **tote**（包管理器/构建系统）两个独立工具。
 - 自举文档 `docs/bootstrap.md` 中的 tc1/tc2/tc3 指自举代际，为历史术语，保持原样。
+
+
+## 参考
+### 编程语言
+ZeroLang , Karn, zig, rust, erlang, Verse, Flix, MoonBit, Crystal, 

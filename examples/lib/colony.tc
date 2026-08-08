@@ -5,9 +5,10 @@
 // 新语法：本库复用现有 `X agent` 脱糖产物（XState / x_spawn / x_step）+ slice + 函数指针，
 // 以**纯数据调度体**实现「spawn 生成 / 按 id 寻址 / tick 调度 / 邮箱延迟」。
 //
-// 无泛型约束（t 无 generics/any）：沿用 agentkit 的「状态 string 指纹 + fn(string, Msg)->string
-// 回调」范式，使 Colony 对任意 agent 类型泛型无关地复用——用户把具体 XState 序列化成
-// string 指纹、把 x_step 包成 wrapper 传入 colony_new。
+// 泛型无关范式（t 已有 `comptime T: any` 单态化，见 reference §3.6.2）：Colony 仍沿用
+// agentkit 的「状态 string 指纹 + fn(string, Msg) string 回调」范式——这是刻意的**运行期
+// 动态分发**选择（跨类型复用且无需为每类重新单态化），而非语言能力缺失。用户把具体
+// XState 序列化成 string 指纹、把 x_step 包成 wrapper 传入 colony_new。
 //
 // ⚠ 实现约束（编译器当前限制，已规避）：
 //   · map 值仅支持纯标量（含 string/slice 的 struct、map-of-slice 均触发内部 panic）
@@ -24,7 +25,7 @@ export Msg struct {
     arg_s: string;
 }
 
-export mk_msg fn(kind: atom, arg_i: i64, arg_s: string) -> Msg {
+export mk_msg fn(kind: atom, arg_i: i64, arg_s: string) Msg {
     return Msg{ kind: kind, arg_i: arg_i, arg_s: arg_s };
 }
 
@@ -38,11 +39,11 @@ export Colony struct {
     alives: []bool;                   // alives[id] = 是否存活
     inbox: []Msg;                     // 扁平消息队列（所有 agent 的待处理消息）
     inbox_to: []i64;                  // inbox_to[i] = inbox[i] 的目标 agent id
-    step_fn: fn(string, Msg) -> string; // 具体 agent 的 step 包成指纹回调
+    step_fn: fn(string, Msg) string; // 具体 agent 的 step 包成指纹回调
 }
 
 // 新建空 colony：step_fn = 具体 agent 的 wrapper（string 指纹版 step）
-export colony_new fn(step_fn: fn(string, Msg) -> string) -> Colony {
+export colony_new fn(step_fn: fn(string, Msg) string) Colony {
     var c: Colony;
     c.step_fn = step_fn;
     c.n = 0;
@@ -51,7 +52,7 @@ export colony_new fn(step_fn: fn(string, Msg) -> string) -> Colony {
 
 // 生成（spawn）一个子 agent，初始状态指纹 init_state；返回更新后的 colony。
 // 新 id = 当前 n，分配后自增。配套取 id：colony_last_id(c)。
-export colony_spawn fn(c: Colony, init_state: string) -> Colony {
+export colony_spawn fn(c: Colony, init_state: string) Colony {
     var id: i64 = c.n;
     append(c.states, init_state);
     append(c.alives, true);
@@ -60,19 +61,19 @@ export colony_spawn fn(c: Colony, init_state: string) -> Colony {
 }
 
 // 最近一次 spawn 的 id（col = colony_spawn(...); id = colony_last_id(col)）
-export colony_last_id fn(c: Colony) -> i64 {
+export colony_last_id fn(c: Colony) i64 {
     return c.n - 1;
 }
 
 // 按 id 寻址，往该 agent 的延迟邮箱追加一条消息（入扁平 inbox）
-export colony_send fn(c: Colony, id: i64, m: Msg) -> Colony {
+export colony_send fn(c: Colony, id: i64, m: Msg) Colony {
     append(c.inbox, m);
     append(c.inbox_to, id);
     return c;
 }
 
 // 广播：给所有存活 agent 各追加一条消息（小队命令）
-export colony_broadcast fn(c: Colony, m: Msg) -> Colony {
+export colony_broadcast fn(c: Colony, m: Msg) Colony {
     var i: i64 = 0;
     for (i = 0; i < c.n; i = i + 1) {
         if (c.alives[i]) {
@@ -84,7 +85,7 @@ export colony_broadcast fn(c: Colony, m: Msg) -> Colony {
 }
 
 // 立即单步：不进邮箱，直接对 id 指定的 agent 跑一次 step（msg 即消息）
-export colony_step fn(c: Colony, id: i64, m: Msg) -> Colony {
+export colony_step fn(c: Colony, id: i64, m: Msg) Colony {
     var ns: string = c.step_fn(c.states[id], m);
     c.states[id] = ns;
     return c;
@@ -93,7 +94,7 @@ export colony_step fn(c: Colony, id: i64, m: Msg) -> Colony {
 // 调度一帧（tick）：每个存活 agent 从 inbox 弹出「一条」消息并 step（FIFO、每 agent 每帧一条）。
 // 这正是 Spawner/Colony 的「调度」语义——消息先排队、tick 统一驱动。
 // 用 did[] 保证每 agent 每帧至多处理一条；未处理消息留待下帧。
-export colony_tick fn(c: Colony) -> Colony {
+export colony_tick fn(c: Colony) Colony {
     var removed: []bool;
     var did: []bool;
     var k: i64 = 0;
@@ -126,12 +127,12 @@ export colony_tick fn(c: Colony) -> Colony {
 }
 
 // 读某 agent 的当前状态指纹
-export colony_get fn(c: Colony, id: i64) -> string {
+export colony_get fn(c: Colony, id: i64) string {
     return c.states[id];
 }
 
 // 存活 agent 数
-export colony_count fn(c: Colony) -> i64 {
+export colony_count fn(c: Colony) i64 {
     var n: i64 = 0;
     var i: i64 = 0;
     for (i = 0; i < c.n; i = i + 1) {
@@ -141,7 +142,7 @@ export colony_count fn(c: Colony) -> i64 {
 }
 
 // 退役（标记死亡；调度时跳过，但下标/id 保留以便稳定寻址）
-export colony_kill fn(c: Colony, id: i64) -> Colony {
+export colony_kill fn(c: Colony, id: i64) Colony {
     c.alives[id] = false;
     return c;
 }

@@ -240,7 +240,7 @@ t 为 Agent First 能做的，与刻意不做的，同样重要。语言层只�
 
 ### 12.2 组合方式（agent 声明只「引用」，不「包含」）
 ```t
-import physics;          // 运动/碰撞是外置模型库（§3.13 内联机制已落地）
+import(src.physics);     // 运动/碰撞是外置模型库（§3.13 内联机制已落地）
 Guard agent {
   state pos: Position            // Position 来自 physics 模块（Component）
   state pending: atom

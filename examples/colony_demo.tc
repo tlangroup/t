@@ -1,22 +1,22 @@
 // colony_demo.tc —— Spawner / Colony Agent 调度体（库层）演示
 //
-// 复用 examples/lib/colony.tc（@colony 外部库），展示收敛决策 A 下「不进编译器语法」
+// 复用 examples/lib/colony.tc（colony 库，import(colony)），展示收敛决策 A 下「不进编译器语法」
 // 也能实现的 Spawner·Colony 元类能力：
 //   ① spawn 生成子 agent（顺序分配 id，状态以 string 指纹存于 Colony 内部 slice）
 //   ② 按 id 寻址（colony_send / colony_get）
 //   ③ tick 调度（延迟邮箱排队，colony_tick 每帧驱动每个存活 agent）
 //   ④ 同一 Colony 调度体跨 agent 类型复用（Worker 小队 + Counter）
 //
-// 泛型无关范式（t 无 generics）：具体 XState 序列化为 string 指纹，x_step 包成
-// fn(string, colony.Msg) -> string 回调传入 colony_new。
+// 泛型无关范式（t 已有 `comptime T: any` 单态化，此处仍用运行期动态分发范式）：
+// 具体 XState 序列化为 string 指纹，x_step 包成 fn(string, colony.Msg) string 回调传入 colony_new。
 
-import @colony;
+import(colony);
 
 // ───────────────────────── Worker（小队单位）─────────────────────────
 Worker agent {
     state load: i64;     // 已完成工作单元数
     state busy: i64;     // 0=空闲 1=忙碌
-    step fn(s: WorkerState, msg: atom) -> WorkerState {
+    step fn(s: WorkerState, msg: atom) WorkerState {
         if (msg == :assign) { s.busy = 1;          return s; }
         if (msg == :done)   { s.load = s.load + 1; s.busy = 0; return s; }
         return s;
@@ -24,7 +24,7 @@ Worker agent {
 }
 
 // 定宽零填充指纹（12 位/字段，避免解析歧义）；worker_from_finger 用 str_at 手算。
-pad12 fn(v: i64) -> string {
+pad12 fn(v: i64) string {
     var s: string = int_to_str(v);
     var L: i64 = str_len(s);
     var b: StringBuilder = sb_new();
@@ -34,13 +34,13 @@ pad12 fn(v: i64) -> string {
     sb_append_str(b, s);
     return sb_to_str(b);
 }
-worker_to_finger fn(s: WorkerState) -> string {
+worker_to_finger fn(s: WorkerState) string {
     var b: StringBuilder = sb_new();
     sb_append_str(b, pad12(s.load));
     sb_append_str(b, pad12(s.busy));
     return sb_to_str(b);
 }
-parse_field fn(s: string, off: i64) -> i64 {
+parse_field fn(s: string, off: i64) i64 {
     var n: i64 = 0;
     var i: i64 = 0;
     for (i = 0; i < 12; i = i + 1) {
@@ -49,13 +49,13 @@ parse_field fn(s: string, off: i64) -> i64 {
     }
     return n;
 }
-worker_from_finger fn(s: string) -> WorkerState {
+worker_from_finger fn(s: string) WorkerState {
     var load: i64 = parse_field(s, 0);
     var busy: i64 = parse_field(s, 12);
     return worker_spawn(load, busy);
 }
 // 具体 agent 的 step 包成 Colony 通用回调（string 指纹版）
-worker_step_wrap fn(s_str: string, m: colony.Msg) -> string {
+worker_step_wrap fn(s_str: string, m: colony.Msg) string {
     var s: WorkerState = worker_from_finger(s_str);
     s = worker_step(s, m.kind);
     return worker_to_finger(s);
@@ -64,13 +64,13 @@ worker_step_wrap fn(s_str: string, m: colony.Msg) -> string {
 // ───────────────────────── Counter（证明跨类型复用）─────────────────────────
 Counter agent {
     state count: i64;
-    step fn(s: CounterState, msg: i64) -> CounterState {
+    step fn(s: CounterState, msg: i64) CounterState {
         s.count = s.count + msg;
         return s;
     }
 }
-counter_to_finger fn(s: CounterState) -> string { return int_to_str(s.count); }
-parse_i64 fn(s: string) -> i64 {
+counter_to_finger fn(s: CounterState) string { return int_to_str(s.count); }
+parse_i64 fn(s: string) i64 {
     var n: i64 = 0;
     var i: i64 = 0;
     var L: i64 = str_len(s);
@@ -80,21 +80,21 @@ parse_i64 fn(s: string) -> i64 {
     }
     return n;
 }
-counter_from_finger fn(s: string) -> CounterState { return counter_spawn(parse_i64(s)); }
-counter_step_wrap fn(s_str: string, m: colony.Msg) -> string {
+counter_from_finger fn(s: string) CounterState { return counter_spawn(parse_i64(s)); }
+counter_step_wrap fn(s_str: string, m: colony.Msg) string {
     var s: CounterState = counter_from_finger(s_str);
     s = counter_step(s, m.arg_i);
     return counter_to_finger(s);
 }
 
 // ───────────────────────── 展示辅助 ─────────────────────────
-pline fn(label: string, v: i64) -> void {
+pline fn(label: string, v: i64) void {
     var b: StringBuilder = sb_new();
     sb_append_str(b, label);
     sb_append_i64(b, v);
     println(sb_to_str(b));
 }
-show_worker fn(col: colony.Colony, id: i64) -> void {
+show_worker fn(col: colony.Colony, id: i64) void {
     var s: string = colony.colony_get(col, id);
     var load: i64 = parse_field(s, 0);
     var busy: i64 = parse_field(s, 12);
@@ -109,7 +109,7 @@ show_worker fn(col: colony.Colony, id: i64) -> void {
 }
 
 @main
-main fn() -> i64 {
+main fn() i64 {
     println("=== Colony: spawn / 寻址 / 调度 (Worker squad) ===");
     var col: colony.Colony = colony.colony_new(worker_step_wrap);
     col = colony.colony_spawn(col, worker_to_finger(worker_spawn(0, 0)));   // id 0

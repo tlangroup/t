@@ -1,0 +1,82 @@
+// generics_demo.tc —— 编译期参数化（reference §3.6.2 / §3.6.4）
+// ① `meta T: type`（旧写法 `comptime T: any` 已弃用，见 reference §3.6.3）：类型参数，调用点按类型名单态化
+// ② `meta N: i64` / `meta S: string` / `meta B: bool`（M-meta Phase C）：**值参数**，
+//    实参在调用点 CTFE 求值成字面量，既进单态化键，也整体代入实例体与类型位。
+// 双后端（LLVM / C）均验证通过。
+
+id fn(meta T: type, x: T) T { return x; }
+
+max fn(meta T: type, a: T, b: T) T {
+    if (a > b) { return a; }
+    return b;
+}
+
+// 实例**体内**的类型位也必须被替换：`var z: T;` 无初值，类型只能来自替换。
+zero fn(meta T: type) T {
+    var z: T;
+    return z;
+}
+
+// 值参数：字符串 + 整数。替换后 `n` 是字面量，循环边界编译期已知。
+repeat fn(meta s: string, meta n: i64) string {
+    var sb: StringBuilder = sb_new();
+    var i: i64 = 0;
+    while (i < n) { sb_append_str(sb, s); i = i + 1; }
+    return sb_to_str(sb);
+}
+
+// 值参数进类型位：`[N]i64` 的长度要求是 int 字面量节点。
+sum_sq fn(meta N: i64) i64 {
+    var b: [N]i64;
+    var i: i64 = 0;
+    while (i < N) { b[i] = i * i; i = i + 1; }
+    var s: i64 = 0;
+    var j: i64 = 0;
+    while (j < N) { s = s + b[j]; j = j + 1; }
+    return s;
+}
+
+// 实例体内的 `meta` 表达式：值参数代入后在编译期折叠成常量。
+tagged fn(meta N: i64, x: i64) i64 {
+    var base: i64 = meta N * 100;
+    return base + x;
+}
+
+// 类型参数与值参数混用。
+fill fn(meta T: type, meta N: i64, v: T) T {
+    var acc: T = v;
+    var i: i64 = 1;
+    while (i < N) { acc = acc + v; i = i + 1; }
+    return acc;
+}
+
+main fn() i64 @main {
+    auto a = id(i64, 42);        // → id__i64，a : i64
+    auto b = id(f64, 1.5);       // → id__f64，b : f64
+    auto c = id(string, "hi");   // → id__string，c : string
+    auto m = max(i64, 7, 99);    // → max__i64，m : i64
+    auto a2 = id(i64, 43);       // 同键复用 id__i64（不得重复生成，更不得重入）
+    auto zf = zero(f64);         // → zero__f64，体内 `var z: T` 必须是 double
+    auto zu = zero(u8);          // → zero__u8
+    var r1: string = repeat("hi", 3);     // → repeat__s2_hi_<hash>_3
+    var r2: string = repeat("hi", 3);     // 同键复用
+    var r3: string = repeat("ab-c", 2);   // 非标识符字符净化 + 哈希区分
+    var s1: i64 = sum_sq(5);              // 0+1+4+9+16
+    var t1: i64 = tagged(7, 5);           // meta 7*100 折叠成 700，+5
+    var f1: i64 = fill(i64, 4, 6);        // 6*4
+    var f2: u8 = fill(u8, 3, 2);          // 2*3
+    print(int_to_str(a)); print("\n");
+    print(int_to_str(m)); print("\n");
+    print(c); print("\n");
+    print(r1); print("|"); print(r2); print("|"); print(r3); print("\n");
+    print(int_to_str(s1)); print(" ");
+    print(int_to_str(t1)); print(" ");
+    print(int_to_str(f1)); print(" ");
+    print(int_to_str(f2 as i64)); print("\n");
+    // 自校验：类型单态化 / 值单态化 / 同键复用 / 体内类型位 / 体内 meta 折叠
+    if (a == 42 && m == 99 && c == "hi" && b > 1.0 && a2 == 43
+        && zf < 1.0 && zu == 0
+        && r1 == "hihihi" && r2 == "hihihi" && r3 == "ab-cab-c"
+        && s1 == 30 && t1 == 705 && f1 == 24 && f2 == 6) { return 0; }
+    return 1;
+}

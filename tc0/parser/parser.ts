@@ -551,7 +551,11 @@ export class Parser {
         }
 
         this.expect(TokenType.RParen, "expected ')' to close parameter list");
-        this.expect(TokenType.Arrow, "expected '->' before return type");
+        // `->` before return type is deprecated but still accepted (backward compat):
+        // the t language now writes `fn(args) Ret` directly.
+        if (this.match(TokenType.Arrow)) {
+            // optional legacy arrow consumed
+        }
         const returnType = this.parseType();
 
         // Post-declaration annotations

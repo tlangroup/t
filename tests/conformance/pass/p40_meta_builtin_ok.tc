@@ -1,0 +1,116 @@
+// EXPECT: pass
+// M-meta Phase D：编译期内建 `@xxx`。
+// 类型查询（@type_name / @type_size / @type_equal）在 CTFE 之前就折成
+// string / int / bool 字面量 —— 两个后端看到的只有普通字面量，零新支持。
+
+Point struct { x: i32; y: i32; }
+MyInt i64;
+Color enum : u8 { Red; Green; }
+
+// ① 类型查询用在运行期位置：折叠后就是常量
+p40_names fn() bool {
+    if (@type_name(i64) != "i64") { return false; }
+    if (@type_name(Point) != "Point") { return false; }
+    if (@type_name(MyInt) != "i64") { return false; }   // typealias 展开到底层
+    if (@type_name([4]i32) != "[4]i32") { return false; }
+    return true;
+}
+
+p40_sizes fn() bool {
+    if (@type_size(i64) != 8) { return false; }
+    if (@type_size(u8) != 1) { return false; }
+    if (@type_size(Color) != 1) { return false; }
+    if (@type_size(Point) != 8) { return false; }
+    if (@type_size(string) != 16) { return false; }     // TStr { ptr, len }
+    if (@type_size([]i32) != 32) { return false; }      // TSlice
+    return true;
+}
+
+p40_equal fn() bool {
+    if (@type_equal(i64, i64) == false) { return false; }
+    if (@type_equal(i64, u64)) { return false; }
+    if (@type_equal(MyInt, i64) == false) { return false; }
+    if (@type_equal([4]i32, [4]i32) == false) { return false; }
+    if (@type_equal([4]i32, [5]i32)) { return false; }
+    if (@type_equal(*i32, *i64)) { return false; }
+    return true;
+}
+
+// ② `meta T: type` 形参 + @type_equal 分支：docs/meta_design.md §6 的 get_width 模式。
+//    未取分支里的 @compile_error 被 mb_prune_if 剪掉，不误报。
+meta get_width fn(meta T: type) u32 {
+    if (@type_equal(T, u32)) { return 32; }
+    else if (@type_equal(T, u64)) { return 64; }
+    else { @compile_error("unsupported type"); }
+    return 0;
+}
+
+meta twice_size fn(meta T: type) i64 {
+    return @type_size(T) * 2;
+}
+
+// ③ @zeroed + 编译期数组读写 + @str_from_bytes / sym_intern
+meta p40_repeat fn(meta s: string, meta n: u32) Sym {
+    var buf: [64]u8 = @zeroed([64]u8);
+    var pos: u32 = 0;
+    var i: u32 = 0;
+    while (i < n) {
+        var j: u32 = 0;
+        var slen: u32 = str_len(s) as u32;
+        while (j < slen) {
+            buf[pos] = s[j];
+            pos = pos + 1;
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return sym_intern(buf, pos);
+}
+
+meta p40_bytes fn(meta n: i64) string {
+    var b: [8]u8 = @zeroed([8]u8);
+    b[0] = 116;
+    b[1] = 45;
+    b[2] = 108;
+    return @str_from_bytes(b, n);
+}
+
+// ④ 数组是值类型：CTFE 绑定处必须拷贝，不能别名
+meta p40_alias fn(meta unused: i64) i64 {
+    var a: [3]u8 = @zeroed([3]u8);
+    a[0] = 7;
+    var b: [3]u8 = a;
+    b[0] = 9;
+    return (a[0] as i64) * 100 + (b[0] as i64);
+}
+
+@main
+main fn() i32 {
+    if (p40_names() == false) { return 1; }
+    if (p40_sizes() == false) { return 2; }
+    if (p40_equal() == false) { return 3; }
+
+    const W32: u32 = meta get_width(u32);
+    const W64: u32 = meta get_width(u64);
+    if (W32 != 32) { return 4; }
+    if (W64 != 64) { return 5; }
+    if (meta twice_size(Point) != 16) { return 6; }
+
+    var sym: Sym = meta p40_repeat("hi", 3);
+    if (sym_str(sym) != "hihihi") { return 7; }
+    if (meta p40_bytes(3) != "t-l") { return 8; }
+    if (meta p40_alias(0) != 709) { return 9; }
+
+    // @zeroed 也能用在运行期位置（折成普通数组字面量）
+    var z: [4]i32 = @zeroed([4]i32);
+    if (z[0] + z[3] != 0) { return 10; }
+
+    // meta 块：编译期数组读写，不产生运行期代码
+    meta {
+        var t2: [4]u8 = @zeroed([4]u8);
+        t2[0] = 65;
+        var probe: string = @str_from_bytes(t2, 1);
+        if (probe != "A") { print("p40: str_from_bytes 编译期自检失败"); }
+    }
+    return 0;
+}

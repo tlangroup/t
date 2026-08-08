@@ -1,0 +1,205 @@
+// lib/std/math.tc —— 数值工具（纯 t 实现）
+//
+// 设计约束（解决「tc 与 std 相互依赖」的核心）：
+//   * 本模块只依赖语言内建（字面量 / 算术 / 比较 / `as` 转换 / 浮点）与运行时，
+//     绝不引用 tc 编译器自身的任何符号。因此 std 对 tc 没有语义依赖，
+//     循环依赖在此被结构性消除——只有「tc 构建 std」这一构建期方向。
+//   * 可被 `tc build --lib` 独立编译为 .tlib，供任意程序（含 tc 自身后续代际）链接。
+//
+// 用法：
+//   import(std.math);
+//   var m = math.max(i64, 3, 7);          // 泛型有序比较
+//   var r = math.sqrt_f(2.0);             // 浮点
+//   var g = math.gcd(12, 18);             // 整数
+
+// —— 泛型有序比较（i64 / u64 / f64 等支持 < > 的类型）——
+export min fn(meta T: type, a: T, b: T) T {
+    if (a < b) { return a; }
+    return b;
+}
+
+export max fn(meta T: type, a: T, b: T) T {
+    if (a > b) { return a; }
+    return b;
+}
+
+// 注意：当前编译器对「泛型函数体内的嵌套泛型调用」不做单态化（clamp 内若调用
+// min(T, max(T, ...)) 会漏单态化导致链接失败）。改为内联比较，规避该限制。
+export clamp fn(meta T: type, x: T, lo: T, hi: T) T {
+    if (x < lo) { return lo; }
+    if (x > hi) { return hi; }
+    return x;
+}
+
+// —— 整数（i64 / u64）——
+export abs fn(x: i64) i64 {
+    if (x < 0) { return -x; }
+    return x;
+}
+
+export sign fn(x: i64) i64 {
+    if (x > 0) { return 1; }
+    if (x < 0) { return -1; }
+    return 0;
+}
+
+// 截断除法（向零取整），与 C 整数除法一致
+export div_floor fn(a: i64, b: i64) i64 {
+    var q: i64 = a / b;
+    if ((a % b != 0) && ((a < 0) != (b < 0))) { q = q - 1; }
+    return q;
+}
+
+// 向上取整除法（远离零）
+export div_ceil fn(a: i64, b: i64) i64 {
+    var q: i64 = a / b;
+    if ((a % b != 0) && ((a < 0) == (b < 0))) { q = q + 1; }
+    return q;
+}
+
+// 欧几里得取模：结果非负，满足 (a/b)*b + mod_e(a,b) == a
+export mod_e fn(a: i64, b: i64) i64 {
+    var r: i64 = a % b;
+    if (r < 0) {
+        if (b < 0) { r = r - b; } else { r = r + b; }
+    }
+    return r;
+}
+
+// 整数以 2 为底的对数（下取整）；x 须 >= 1
+export log2 fn(x: u64) i64 {
+    var r: i64 = 0;
+    var v: u64 = x;
+    while (v > 1) { v = v / 2; r = r + 1; }
+    return r;
+}
+
+// 2^n（n >= 0）；循环实现，避免对移位运算符的依赖
+export pow2_i fn(n: i64) i64 {
+    var r: i64 = 1;
+    var i: i64 = 0;
+    while (i < n) { r = r * 2; i = i + 1; }
+    return r;
+}
+
+// 是否为 2 的幂
+export is_pow2 fn(x: u64) bool {
+    if (x == 0) { return false; }
+    return (x & (x - 1)) == 0;
+}
+
+// 最大公约数（欧几里得）
+export gcd fn(a: i64, b: i64) i64 {
+    var x: i64 = abs(a);
+    var y: i64 = abs(b);
+    while (y != 0) {
+        var t: i64 = x % y;
+        x = y;
+        y = t;
+    }
+    return x;
+}
+
+// 不小于 x 的 m 的最小倍数（m > 0）
+export next_multiple_of fn(x: i64, m: i64) i64 {
+    return div_ceil(x, m) * m;
+}
+
+// 整数线性插值：a + (b - a) * t / 100（定点，避免浮点）
+export lerp_i fn(a: i64, b: i64, t: i64) i64 {
+    return a + ((b - a) * t) / 100;
+}
+
+// —— 浮点（f64）——
+export const PI: f64 = 3.141592653589793;
+export const E: f64 = 2.718281828459045;
+
+export fabs fn(x: f64) f64 {
+    if (x < 0.0) { return -x; }
+    return x;
+}
+
+export floor_f fn(x: f64) f64 {
+    var fl: f64 = (x as i64) as f64;
+    if (fl > x) { fl = fl - 1.0; }
+    return fl;
+}
+
+export ceil_f fn(x: f64) f64 {
+    var cl: f64 = (x as i64) as f64;
+    if (cl < x) { cl = cl + 1.0; }
+    return cl;
+}
+
+export round_f fn(x: f64) f64 {
+    return floor_f(x + 0.5);
+}
+
+export trunc_f fn(x: f64) f64 {
+    return (x as i64) as f64;
+}
+
+// 牛顿迭代求平方根（x >= 0；x < 0 返回 0）
+export sqrt_f fn(x: f64) f64 {
+    if (x <= 0.0) { return 0.0; }
+    var g: f64 = x;
+    var i: i64 = 0;
+    while (i < 24) {
+        g = (g + x / g) / 2.0;
+        i = i + 1;
+    }
+    return g;
+}
+
+// 幂：x^n，n 为整数（n < 0 时取倒数）
+export pow_f fn(x: f64, n: i64) f64 {
+    if (n < 0) { return 1.0 / pow_f(x, -n); }
+    var r: f64 = 1.0;
+    var i: i64 = 0;
+    while (i < n) { r = r * x; i = i + 1; }
+    return r;
+}
+
+// 浮点线性插值：a + (b - a) * t
+export lerp_f fn(a: f64, b: f64, t: f64) f64 {
+    return a + (b - a) * t;
+}
+
+// 正弦（泰勒展开，适用于 |x| 不太大的输入；大输入建议先范围规约）
+export sin_f fn(x: f64) f64 {
+    var sum: f64 = x;
+    var term: f64 = x;
+    var i: i64 = 1;
+    while (i < 12) {
+        term = -term * x * x / (((2 * i) as f64) * ((2 * i + 1) as f64));
+        sum = sum + term;
+        i = i + 1;
+    }
+    return sum;
+}
+
+// 余弦（泰勒展开）
+export cos_f fn(x: f64) f64 {
+    var sum: f64 = 1.0;
+    var term: f64 = 1.0;
+    var i: i64 = 1;
+    while (i < 12) {
+        term = -term * x * x / (((2 * i - 1) as f64) * ((2 * i) as f64));
+        sum = sum + term;
+        i = i + 1;
+    }
+    return sum;
+}
+
+// 指数 e^x（泰勒展开）
+export exp_f fn(x: f64) f64 {
+    var sum: f64 = 1.0;
+    var term: f64 = 1.0;
+    var i: i64 = 1;
+    while (i < 20) {
+        term = term * x / (i as f64);
+        sum = sum + term;
+        i = i + 1;
+    }
+    return sum;
+}
