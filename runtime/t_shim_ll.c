@@ -127,6 +127,9 @@ int64_t tll_deser_atom(int64_t f)                           { return t_deser_ato
 void    tll_deser_str(int64_t f, TStr* out)                 { *out = t_deser_str(f); }
 
 // ── I/O 与进程 ─────────────────────────────────────────────────
+// REPL 交互输入（M-REPL）：read_line 返回聚合 TStr（out-pointer），stdin_eof 返回标量 i32。
+void    tll_read_line(TStr* out)                     { *out = t_read_line(); }
+int32_t tll_stdin_eof(void)                          { return t_stdin_eof() ? 1 : 0; }
 void    tll_file_read_all(TStr* path, TStr* out)     { *out = t_file_read_all(t_cstr(*path)); }
 void    tll_getenv(TStr* name, TStr* out)            { *out = t_getenv(t_cstr(*name)); }
 int32_t tll_file_exists(TStr* path)                  { return t_file_exists(t_cstr(*path)) ? 1 : 0; }

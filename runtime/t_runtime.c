@@ -19,6 +19,9 @@
 // 全局 arena：编译器单 arena 策略，由 t_runtime_set_arena 在 main 入口注入。
 static TArena* g_arena = NULL;
 
+// REPL 交互输入（M-REPL）：read_line 遇 EOF 后置位，供 stdin_eof() 查询。
+static int g_stdin_eof = 0;
+
 // ── 内部工具 ───────────────────────────────────────────────────
 static void t_fatal(const char* msg) {
     fprintf(stderr, "{\"error\":\"runtime_fatal\",\"message\":\"%s\"}\n", msg);
@@ -1432,6 +1435,45 @@ TStr t_file_read_all(const char* path) {
 }
 
 // getenv(name) -> string：读取进程环境变量；未设置返回空串（不 panic）。
+// ── REPL 交互输入（M-REPL）─────────────────────────────────────
+// read_line()：从标准输入读取一行（去除结尾 \r\n），遇 EOF 返回空串并置 g_stdin_eof。
+// 用于 tc 的 REPL 模式交互读取；行缓冲按需增长，最终副本存进 arena（进程退出时回收）。
+TStr t_read_line(void) {
+    size_t cap = 256;
+    char* buf = (char*)malloc(cap);
+    if (!buf) t_fatal("read_line: malloc failed");
+    int c = fgetc(stdin);
+    if (c == EOF) {
+        g_stdin_eof = 1;
+        free(buf);
+        return t_str_from_c("");
+    }
+    ungetc(c, stdin);   // 把首字符放回，统一在循环里处理（含 CRLF）
+    size_t alloc = cap;
+    size_t len = 0;
+    while (1) {
+        if (len + 1 >= alloc) {
+            alloc *= 2;
+            char* nb = (char*)realloc(buf, alloc);
+            if (!nb) t_fatal("read_line: realloc failed");
+            buf = nb;
+        }
+        c = fgetc(stdin);
+        if (c == EOF || c == '\n') break;
+        if (c == '\r') continue;   // 跳过 Windows 行尾 \r
+        buf[len++] = (char)c;
+    }
+    buf[len] = '\0';
+    uint8_t* p = (uint8_t*)t_arena_alloc(g_arena, len + 1);
+    memcpy(p, buf, len + 1);
+    free(buf);
+    TStr r; r.ptr = p; r.len = (int64_t)len; return r;
+}
+
+int t_stdin_eof(void) {
+    return g_stdin_eof;
+}
+
 TStr t_getenv(const char* name) {
     const char* e = getenv(name);
     if (!e) { e = ""; }

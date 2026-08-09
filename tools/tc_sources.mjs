@@ -9,7 +9,9 @@ export const TC_MODULES = [
   'src/sema.tc',        // step 3 语义（类型检查 / CTFE / TypeDesc 池）
   'src/codegen_c.tc',   // step 4a C 后端
   'src/codegen_ll.tc',  // step 4b LLVM IR 后端
-  'src/tc.tc',          // driver / main
+  'src/test.tc',        // `tc test` 测试收集与运行器（依赖 sema / codegen_ll）
+  'src/repl.tc',        // REPL 模式（依赖 sema / codegen_ll）
+  'src/tc.tc',          // driver / main（import test + repl 并派发）
 ];
 
 // 传入 CLI 参数：无参数或指向编译器入口时展开为全部模块，否则原样返回。
