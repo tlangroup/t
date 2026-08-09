@@ -1860,6 +1860,7 @@ println(f"""long {name} with "quotes" inside""");   // 长式内可直接写 "
   六种转换均可作用于任意值类型：字符串走格式专属转义；标量（整数/浮点/bool）序列化即裸值（`!j`/`!p`/`!c` 等价，均为合法 JSON/protobuf/csv 标量）。转换字段同样对手写模板生效（`format("{0!r}", s)`），模板里写了非法 conv 字母 → **`T_FMT_BAD_CONVERSION`**；f-string 里则在解析期直接报错。`!` 只有在**紧跟一个已完结表达式**时才当转换字段，所以 `f"{!ok}"`（前缀取反）、`f"{a != b}"` 都不受影响。
 - **实现落点**：词法 `src/lex.tc` 把整条 f-string 原文（含插值）扫成一个 `FormatString` token；`src/parse.tc` 的 `parse_fstring` 负责切段、定位 spec 冒号与 `!conv`、把插值文本二次 tokenize 后调 `parse_expr`；`src/sema.tc` 的 `desugar_format_call` 消费 `!conv` 并选择 `sb_append_fmt_str_conv`（按 mode 区分 r/a/j/p/c 转义）；运行期实现在 `runtime/t_runtime.c`（LLVM 经 `tll_*` 指针桥）。
 - conformance：`p44_fstring_ok`(pass)、`f52_fstring_conv_type`（`T_FMT_BAD_CONVERSION`）(fail)；run_examples：`fstring_demo.tc`（双后端实跑比对）。
+- 设计细节（脱糖机制、六处注册点、转换语义表、踩坑与后续）见 [`docs/fstring.md`](./fstring.md)。
 
 ---
 
