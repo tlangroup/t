@@ -454,6 +454,169 @@ void t_sb_append_fmt_str(TSb* b, TStr spec, TStr v)     { t_sb_append_str(b, t_f
 void t_sb_append_fmt_bool(TSb* b, TStr spec, int v)     { t_sb_append_str(b, t_format_bool(spec, v)); }
 void t_sb_append_fmt_char(TSb* b, TStr spec, uint8_t v) { t_sb_append_str(b, t_format_char(spec, v)); }
 
+// ── 转换字段 !s / !r / !a / !j / !c / !p（M-fstr）────────────────────────
+// 与 CPython 同构：**先按 mode 把值转成文本形态，再套 format spec**，
+// 因此这些路径的 spec 一律按「字符串规则」解释（默认左对齐、`.N` 是截断）。
+static const char T_FMT_HEXD[] = "0123456789abcdef";
+
+static void fmt_esc_hex(TSb* b, uint8_t c) {
+    t_sb_append_char(b, (uint8_t)'\\');
+    t_sb_append_char(b, (uint8_t)'x');
+    t_sb_append_char(b, (uint8_t)T_FMT_HEXD[(c >> 4) & 0xF]);
+    t_sb_append_char(b, (uint8_t)T_FMT_HEXD[c & 0xF]);
+}
+
+static void fmt_esc_u16(TSb* b, uint8_t c) {
+    t_sb_append_cstr(b, "\\u00");
+    t_sb_append_char(b, (uint8_t)T_FMT_HEXD[(c >> 4) & 0xF]);
+    t_sb_append_char(b, (uint8_t)T_FMT_HEXD[c & 0xF]);
+}
+
+static void fmt_esc_u_cp(TSb* b, uint32_t cp) {
+    if (cp < 0x100) { fmt_esc_hex(b, (uint8_t)cp); return; }
+    if (cp < 0x10000) {
+        t_sb_append_cstr(b, "\\u");
+        for (int s = 12; s >= 0; s -= 4) t_sb_append_char(b, (uint8_t)T_FMT_HEXD[(cp >> s) & 0xF]);
+        return;
+    }
+    t_sb_append_cstr(b, "\\U");
+    for (int s = 28; s >= 0; s -= 4) t_sb_append_char(b, (uint8_t)T_FMT_HEXD[(cp >> s) & 0xF]);
+}
+
+// UTF-8 解码：成功返回码点并把 *w 置为字节宽度；非法序列返回 -1（w=1）。
+static int32_t fmt_utf8_cp(const uint8_t* p, int64_t n, int64_t i, int* w) {
+    uint8_t c = p[i];
+    *w = 1;
+    if (c < 0x80) return c;
+    int need = 0; uint32_t cp = 0;
+    if ((c & 0xE0) == 0xC0) { need = 1; cp = c & 0x1F; }
+    else if ((c & 0xF0) == 0xE0) { need = 2; cp = c & 0x0F; }
+    else if ((c & 0xF8) == 0xF0) { need = 3; cp = c & 0x07; }
+    else return -1;
+    if (i + need >= n) return -1;
+    for (int k = 1; k <= need; k++) {
+        uint8_t cc = p[i + k];
+        if ((cc & 0xC0) != 0x80) return -1;
+        cp = (cp << 6) | (cc & 0x3F);
+    }
+    *w = need + 1;
+    return (int32_t)cp;
+}
+
+// mode: 'r' repr / 'a' ascii / 'j' json / 'p' pbtxt / 'c' csv；其余原样返回。
+// 字符串类转换统一加一层引号并按格式转义；标量（非字符串）由调用方直接走普通追加，不进本函数。
+//   r  调试表示：\" \\ \n \t \r 转义，控制字符 \xHH，非 ASCII 保留 UTF-8
+//   a  ascii：在 r 之上把非 ASCII 码点转义成 \xHH / \uXXXX / \UXXXXXXXX
+//   j   json：\" \\ \n \t \r 转义，控制字符 \u00XX，非 ASCII 保留 UTF-8
+//   p  pbtxt：同 j 的引号/转义风格（protobuf text 的 \" \\ \n \t \r，控制字符 \xHH），非 ASCII 保留 UTF-8
+//   c   csv：仅当含 , " CR/LF 才加引号，内部 " 翻倍；否则原样返回
+static TStr fmt_str_convert(TStr v, char mode) {
+    if (mode != 'r' && mode != 'a' && mode != 'j' && mode != 'p' && mode != 'c') return v;
+    // CSV：无特殊字符直接原样返回（裸单元格）
+    if (mode == 'c') {
+        int need_q = 0;
+        for (int64_t k = 0; k < v.len; k++) {
+            uint8_t c = v.ptr[k];
+            if (c == ',' || c == '"' || c == '\n' || c == '\r') { need_q = 1; break; }
+        }
+        if (!need_q) return v;
+    }
+    TSb* b = t_sb_new(t_arena_current());
+    t_sb_append_char(b, (uint8_t)'"');
+    int64_t k = 0;
+    while (k < v.len) {
+        uint8_t c = v.ptr[k];
+        if (c == '"') {
+            if (mode == 'c') t_sb_append_cstr(b, "\"\"");   // CSV：双写
+            else t_sb_append_cstr(b, "\\\"");
+            k++; continue;
+        }
+        if (c == '\\') { t_sb_append_cstr(b, "\\\\"); k++; continue; }
+        if (c == '\n') { t_sb_append_cstr(b, "\\n");  k++; continue; }
+        if (c == '\t') { t_sb_append_cstr(b, "\\t");  k++; continue; }
+        if (c == '\r') { t_sb_append_cstr(b, "\\r");  k++; continue; }
+        if (c < 0x20 || c == 0x7F) {
+            if (mode == 'j') fmt_esc_u16(b, c);          // JSON: \u00XX
+            else fmt_esc_hex(b, c);                      // r/a/p: \xHH
+            k++; continue;
+        }
+        if (c < 0x80) { t_sb_append_char(b, c); k++; continue; }
+        if (mode == 'a') {
+            int w = 1;
+            int32_t cp = fmt_utf8_cp(v.ptr, v.len, k, &w);
+            if (cp < 0) { fmt_esc_hex(b, c); k++; continue; }
+            fmt_esc_u_cp(b, (uint32_t)cp);
+            k += w;
+        } else {
+            t_sb_append_char(b, c); k++; continue;       // r/j/p/c：保留原样 UTF-8
+        }
+    }
+    t_sb_append_char(b, (uint8_t)'"');
+    return t_sb_to_str(b);
+}
+
+// 整数码点 → UTF-8 字符（越界给 U+FFFD，绝不产生非法序列）
+static TStr fmt_cp_to_utf8(uint64_t cp) {
+    TSb* b = t_sb_new(t_arena_current());
+    if (cp < 0x80) {
+        t_sb_append_char(b, (uint8_t)cp);
+    } else if (cp < 0x800) {
+        t_sb_append_char(b, (uint8_t)(0xC0 | (cp >> 6)));
+        t_sb_append_char(b, (uint8_t)(0x80 | (cp & 0x3F)));
+    } else if (cp < 0x10000) {
+        t_sb_append_char(b, (uint8_t)(0xE0 | (cp >> 12)));
+        t_sb_append_char(b, (uint8_t)(0x80 | ((cp >> 6) & 0x3F)));
+        t_sb_append_char(b, (uint8_t)(0x80 | (cp & 0x3F)));
+    } else if (cp <= 0x10FFFF) {
+        t_sb_append_char(b, (uint8_t)(0xF0 | (cp >> 18)));
+        t_sb_append_char(b, (uint8_t)(0x80 | ((cp >> 12) & 0x3F)));
+        t_sb_append_char(b, (uint8_t)(0x80 | ((cp >> 6) & 0x3F)));
+        t_sb_append_char(b, (uint8_t)(0x80 | (cp & 0x3F)));
+    } else {
+        t_sb_append_cstr(b, "\xEF\xBF\xBD");
+    }
+    return t_sb_to_str(b);
+}
+
+static TStr fmt_hex_prefixed(uint64_t mag, int neg) {
+    TSb* b = t_sb_new(t_arena_current());
+    if (neg) t_sb_append_char(b, (uint8_t)'-');
+    t_sb_append_cstr(b, "0x");
+    char d[24]; int dn = 0;
+    if (mag == 0) d[dn++] = '0';
+    else { while (mag) { d[dn++] = T_FMT_HEXD[mag & 0xF]; mag >>= 4; } }
+    for (int k = dn - 1; k >= 0; k--) t_sb_append_char(b, (uint8_t)d[k]);
+    return t_sb_to_str(b);
+}
+
+static char fmt_mode_of(TStr mode) { return mode.len > 0 ? (char)mode.ptr[0] : 's'; }
+
+void t_sb_append_fmt_str_conv(TSb* b, TStr spec, TStr v, TStr mode) {
+    t_sb_append_str(b, t_format_str(spec, fmt_str_convert(v, fmt_mode_of(mode))));
+}
+
+void t_sb_append_fmt_int_conv(TSb* b, TStr spec, int64_t v, TStr mode) {
+    char m = fmt_mode_of(mode);
+    if (m == 'c') {
+        t_sb_append_str(b, t_format_str(spec, fmt_cp_to_utf8(v < 0 ? 0xFFFDULL : (uint64_t)v)));
+        return;
+    }
+    if (m == 'p') {
+        int neg = (v < 0);
+        uint64_t mag = neg ? (uint64_t)(-(v + 1)) + 1ULL : (uint64_t)v;
+        t_sb_append_str(b, t_format_str(spec, fmt_hex_prefixed(mag, neg)));
+        return;
+    }
+    t_sb_append_str(b, t_format_int(spec, v));
+}
+
+void t_sb_append_fmt_uint_conv(TSb* b, TStr spec, uint64_t v, TStr mode) {
+    char m = fmt_mode_of(mode);
+    if (m == 'c') { t_sb_append_str(b, t_format_str(spec, fmt_cp_to_utf8(v))); return; }
+    if (m == 'p') { t_sb_append_str(b, t_format_str(spec, fmt_hex_prefixed(v, 0))); return; }
+    t_sb_append_str(b, t_format_uint(spec, v));
+}
+
 // ── 时间格式化（M56）───────────────────────────────────────────
 // 时间值语义：i64 微秒 Unix epoch（见 docs/syntax/drafts/time_fmt.md D1）。
 int64_t t_now(void) {

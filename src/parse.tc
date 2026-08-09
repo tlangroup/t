@@ -1349,6 +1349,7 @@ parse_func_decl fn(name: string, anns: i64, is_comptime: bool) i64 {
         var pwild: bool = false;
         var plit: i64 = -1;
         var pcomp: bool = false;
+        var ppos: i64 = pos;              // 形参名 token 下标（供 C 关键字撞名告警定位）
         if (cur_t() == "KwComptime") {
             // comptime 类型模板参数：`comptime T: any` —— T 在编译期承载「任意类型」，
             // 调用点按实参类型单态化；P.bb = true 标记其为编译期类型参数。
@@ -1385,6 +1386,7 @@ parse_func_decl fn(name: string, anns: i64, is_comptime: bool) i64 {
             pguard = parse_expr();
         }
         var panns: i64 = parse_annotations();
+        if (pname != "" && pname != "_") { validate_c_keyword(pname, ppos); }
         var pid: i64 = mk_P(pname, ptn, panns, -1);
         if (pwild || plit >= 0 || pguard >= 0 || pcomp) {
             var pn: Node = nodes[pid];
@@ -2487,6 +2489,325 @@ desugar_func_clauses fn() void {
 }
 
 
+// ── f-string 字面量（M-fstr）────────────────────────────────────
+//
+// 语法：`f"文本{expr!conv:spec}文本"`，多行形态 `f"""..."""`。
+//
+// 实现策略：**解析期整体重写**为 `format("文本{0!conv:spec}文本", expr)`。
+// 不新建 AST 节点种类、不碰 sema/codegen 的表达式分发 —— 复用 M55 已有的
+// 模板脱糖（提升成 `__fmt_N` 函数、StringBuilder 顺序拼接）。收益有三：
+//   ① 插值实参在调用点求值**一次**（`f"{next()}{'x'}"` 不会重复求值）
+//   ② 格式规范 `:spec` / 转换字段 `!conv` 与 `format()` 完全同源，只有一套文法
+//   ③ 运行期零模板引擎，与「静态优先」的语言宪法一致
+//
+// 词法层已把整段 `f"..."` 连同原始转义整体收进一个 FormatString token
+// （见 lex.tc：插值内的字符串/嵌套花括号在扫描期被跳过），故这里拿到的是
+// **未解码**的原始文本，字面段的转义要在本函数内自行解码。
+
+// 转换字段合法字符：s / r / a / j / c / p
+fstr_is_conv fn(c: i64) bool {
+    return c == 115 || c == 114 || c == 97 || c == 106 || c == 99 || c == 112;
+}
+
+// 跳过一段引号字面量；i0 指向首个 `"`。isf=true 表示这是 f-string 的引号体，
+// 需要在插值 `{}` 内继续跳过其中嵌套的（f-）字符串。返回闭合引号之后的位置。
+// 递归深度 = f-string 嵌套层数，实际写法里最多一两层。
+fstr_skip_quoted fn(raw: string, i0: u64, e: u64, isf: bool) u64 {
+    var i: u64 = i0;
+    var isLong: bool = false;
+    if (i + 2 < e) {
+        if ((raw[i + 1] as i64) == 34 && (raw[i + 2] as i64) == 34) { isLong = true; }
+    }
+    if (isLong) { i = i + 3; } else { i = i + 1; }
+    var depth: i64 = 0;
+    while (i < e) {
+        var c: i64 = raw[i] as i64;
+        if (c == 92) { i = i + 2; continue; }
+        if (depth == 0 && c == 34) {
+            if (isLong == false) { return i + 1; }
+            if (i + 2 < e && (raw[i + 1] as i64) == 34 && (raw[i + 2] as i64) == 34) { return i + 3; }
+            i = i + 1;
+            continue;
+        }
+        if (isf) {
+            if (c == 123) {
+                if (depth == 0 && i + 1 < e && (raw[i + 1] as i64) == 123) { i = i + 2; continue; }
+                depth = depth + 1;
+                i = i + 1;
+                continue;
+            }
+            if (c == 125) {
+                if (depth == 0) {
+                    if (i + 1 < e && (raw[i + 1] as i64) == 125) { i = i + 2; continue; }
+                    i = i + 1;
+                    continue;
+                }
+                depth = depth - 1;
+                i = i + 1;
+                continue;
+            }
+            if (depth > 0 && c == 34) {
+                i = fstr_skip_quoted(raw, i, e, false);
+                continue;
+            }
+            if (depth > 0 && c == 102 && i + 1 < e && (raw[i + 1] as i64) == 34) {
+                i = fstr_skip_quoted(raw, i + 1, e, true);
+                continue;
+            }
+        }
+        i = i + 1;
+    }
+    return i;
+}
+
+// 插值体里的某个 `:` 是不是「格式规范起点」？
+// 只有紧邻在**完整表达式收尾**（标识符/数字/`)`/`]`/`}`/`"`）之后才算；
+// 否则它是原子字面量 `:name` 的前缀（`f"{c == :red}"`），不能当 spec 分隔符。
+fstr_prev_ends_expr fn(s: string, k: u64) bool {
+    var j: u64 = k;
+    while (j > 0) {
+        var c: i64 = s[j - 1] as i64;
+        if (c == 32 || c == 9) { j = j - 1; continue; }
+        if (c == 41 || c == 93 || c == 125 || c == 34 || c == 95) { return true; }
+        if (c >= 48 && c <= 57) { return true; }
+        if (c >= 65 && c <= 90) { return true; }
+        if (c >= 97 && c <= 122) { return true; }
+        if (c >= 128) { return true; }
+        return false;
+    }
+    return false;
+}
+
+// 把插值里的表达式源码文本就地词法 + 语法分析成一个表达式节点。
+// token 追加到全局 toks **尾部**，外层 token 下标不受影响（append-only），
+// 解析完恢复 pos。合成 token 的行列统一改写成 f-string 字面量所在位置，
+// 否则诊断会指向「第 1 行第 1 列」。
+fstr_parse_expr fn(text: string, ti: i64) i64 {
+    var save_pos: i64 = pos;
+    var base: i64 = slice_len(toks) as i64;
+    tokenize(text);
+    var atk: Tok = toks[ti];
+    var m: i64 = slice_len(toks) as i64;
+    var z: i64 = base;
+    while (z < m) {
+        var tz: Tok = toks[z];
+        tz.line = atk.line;
+        tz.col = atk.col;
+        slice_set(toks, z, tz);
+        z = z + 1;
+    }
+    pos = base;
+    if (cur_t() == "Eof") {
+        eprint("parse error: empty interpolation `{}` in f-string\n");
+        exit(1);
+    }
+    var ex: i64 = parse_expr();
+    if (cur_t() != "Eof") {
+        eprint("parse error: trailing tokens in f-string interpolation: ");
+        eprint(cur_v());
+        eprint("\n");
+        exit(1);
+    }
+    pos = save_pos;
+    return ex;
+}
+
+parse_fstring fn(ti: i64) i64 {
+    var raw: string = tk_v(ti);
+    var rn: u64 = str_len(raw);
+    var isLong: bool = false;
+    if (rn >= 6) {
+        if ((raw[1] as i64) == 34 && (raw[2] as i64) == 34 && (raw[3] as i64) == 34) { isLong = true; }
+    }
+    var s0: u64 = 2;          // 跳过 `f"`
+    var e0: u64 = rn - 1;     // 不含闭合 `"`
+    if (isLong) { s0 = 4; e0 = rn - 3; }
+
+    var tb: StringBuilder = sb_new();   // 合成的 format 模板
+    var a_head: i64 = -1;
+    var a_tail: i64 = -1;
+    var argi: i64 = 0;
+    var i: u64 = s0;
+
+    while (i < e0) {
+        var c: i64 = raw[i] as i64;
+
+        // 转义：先解码；解出来若是花括号，要在模板层加倍（模板还会再解一次）
+        if (c == 92) {
+            i = i + 1;
+            if (i >= e0) { break; }
+            var ec: i64 = raw[i] as i64;
+            var dc: i64 = ec;
+            if (ec == 110) { dc = 10; }
+            if (ec == 116) { dc = 9; }
+            if (ec == 114) { dc = 13; }
+            if (ec == 48) { dc = 0; }
+            sb_append_char(tb, dc);
+            if (dc == 123 || dc == 125) { sb_append_char(tb, dc); }
+            i = i + 1;
+            continue;
+        }
+
+        if (c == 125) {                       // `}}` 照抄给模板层解，孤立 `}` 是笔误
+            if (i + 1 < e0 && (raw[i + 1] as i64) == 125) {
+                sb_append_char(tb, 125);
+                sb_append_char(tb, 125);
+                i = i + 2;
+                continue;
+            }
+            eprint("parse error: unmatched `}` in f-string; write `}}` for a literal right brace\n");
+            exit(1);
+        }
+
+        if (c != 123) {
+            sb_append_char(tb, c);
+            i = i + 1;
+            continue;
+        }
+
+        if (i + 1 < e0 && (raw[i + 1] as i64) == 123) {   // `{{`
+            sb_append_char(tb, 123);
+            sb_append_char(tb, 123);
+            i = i + 2;
+            continue;
+        }
+
+        // ── 插值单元 ───────────────────────────────────────
+        // ① 先找配对的 `}`（跳过嵌套 (){}[] 与其中的字符串）
+        i = i + 1;
+        var ds: u64 = i;
+        var depth: i64 = 0;
+        var close: u64 = e0;
+        var found: bool = false;
+        while (i < e0) {
+            var ic: i64 = raw[i] as i64;
+            if (ic == 34) { i = fstr_skip_quoted(raw, i, e0, false); continue; }
+            if (ic == 102 && i + 1 < e0 && (raw[i + 1] as i64) == 34) {
+                i = fstr_skip_quoted(raw, i + 1, e0, true);
+                continue;
+            }
+            if (ic == 40 || ic == 91 || ic == 123) { depth = depth + 1; i = i + 1; continue; }
+            if (ic == 41 || ic == 93) { depth = depth - 1; i = i + 1; continue; }
+            if (ic == 125) {
+                if (depth == 0) { close = i; found = true; break; }
+                depth = depth - 1;
+                i = i + 1;
+                continue;
+            }
+            i = i + 1;
+        }
+        if (found == false) {
+            eprint("parse error: unclosed `{` in f-string interpolation\n");
+            exit(1);
+        }
+        var body: string = str_slice(raw, ds, close);
+        i = close + 1;
+
+        // ② 在插值体内定位 spec 分隔冒号（跳过三目 `?:`、原子 `:name`、嵌套层）
+        var bl: u64 = str_len(body);
+        var d2: i64 = 0;
+        var q2: i64 = 0;
+        var specPos: i64 = -1;
+        var k: u64 = 0;
+        while (k < bl) {
+            var bc: i64 = body[k] as i64;
+            if (bc == 34) { k = fstr_skip_quoted(body, k, bl, false); continue; }
+            if (bc == 102 && k + 1 < bl && (body[k + 1] as i64) == 34) {
+                k = fstr_skip_quoted(body, k + 1, bl, true);
+                continue;
+            }
+            if (bc == 40 || bc == 91 || bc == 123) { d2 = d2 + 1; k = k + 1; continue; }
+            if (bc == 41 || bc == 93 || bc == 125) { d2 = d2 - 1; k = k + 1; continue; }
+            if (d2 == 0 && bc == 63) { q2 = q2 + 1; k = k + 1; continue; }
+            if (d2 == 0 && bc == 58) {
+                if (k + 1 < bl && (body[k + 1] as i64) == 58) { k = k + 2; continue; }
+                if (q2 > 0) { q2 = q2 - 1; k = k + 1; continue; }
+                if (fstr_prev_ends_expr(body, k)) { specPos = k as i64; break; }
+                k = k + 1;
+                continue;
+            }
+            k = k + 1;
+        }
+        var exprEnd: u64 = bl;
+        var spec: string = "";
+        if (specPos >= 0) {
+            exprEnd = specPos as u64;
+            spec = str_slice(body, (specPos as u64) + 1, bl);
+        }
+
+        // ③ 转换字段：只可能紧贴在表达式末尾（`{x!r}` / `{x!r:>8}`），
+        //    故不会与 `!=`、前缀 `!` 混淆。
+        var convc: i64 = 0;
+        if (exprEnd >= 2) {
+            var cm1: i64 = body[exprEnd - 2] as i64;
+            var cm2: i64 = body[exprEnd - 1] as i64;
+            // `!` 前必须是一个「已完结的表达式」，否则那是前缀取反（如 `{!ok}`）
+            if (cm1 == 33 && fstr_prev_ends_expr(body, exprEnd - 2)) {
+                if (fstr_is_conv(cm2) == false) {
+                    eprint("parse error: f-string 转换字段只能是 `!s`/`!r`/`!a`/`!j`/`!c`/`!p`\n");
+                    exit(1);
+                }
+                convc = cm2;
+                exprEnd = exprEnd - 2;
+            }
+        }
+
+        var enode: i64 = fstr_parse_expr(str_slice(body, 0, exprEnd), ti);
+        a_tail = list_push(a_head, a_tail, enode);
+        if (a_head < 0) { a_head = a_tail; }
+
+        // ④ 模板占位：`{N[!conv][:spec]}`（一律手动索引，杜绝自动编号混用）
+        sb_append_char(tb, 123);
+        sb_append_str(tb, i2s(argi));
+        if (convc != 0) {
+            sb_append_char(tb, 33);
+            sb_append_char(tb, convc);
+        }
+        if (str_len(spec) > 0) {
+            sb_append_char(tb, 58);
+            sb_append_str(tb, spec);
+        }
+        sb_append_char(tb, 125);
+        argi = argi + 1;
+    }
+
+    var tmpl: string = sb_to_str(tb);
+
+    // 无插值：退化为普通字符串字面量（把 `{{`/`}}` 就地还原），不生成 __fmt_N
+    if (argi == 0) {
+        var lb: StringBuilder = sb_new();
+        var tn2: u64 = str_len(tmpl);
+        var z2: u64 = 0;
+        while (z2 < tn2) {
+            var zc: i64 = tmpl[z2] as i64;
+            if (zc == 123 || zc == 125) {
+                if (z2 + 1 < tn2 && (tmpl[z2 + 1] as i64) == zc) {
+                    sb_append_char(lb, zc);
+                    z2 = z2 + 2;
+                    continue;
+                }
+            }
+            sb_append_char(lb, zc);
+            z2 = z2 + 1;
+        }
+        return mk_string(sb_to_str(lb), ti);
+    }
+
+    var f_head: i64 = -1;
+    var f_tail: i64 = -1;
+    f_tail = list_push(f_head, f_tail, mk_string(tmpl, ti));
+    if (f_head < 0) { f_head = f_tail; }
+    var ac: i64 = a_head;
+    while (ac >= 0) {
+        var ak: Child = kids[ac];
+        f_tail = list_push(f_head, f_tail, ak.val);
+        if (f_head < 0) { f_head = f_tail; }
+        ac = ak.next;
+    }
+    g_has_format = true;
+    return mk_call(mk_ident("format", ti), f_head, ti);
+}
+
 // >>> GEN:parser_rules (generated by tools/totter.tc from out/ebnf.json grammar -- DO NOT EDIT) >>>
 parse_for_stmt fn() i64 {
     var ti: i64 = advance_i();
@@ -2741,6 +3062,10 @@ parse_primary fn() i64 {
     if (t == "String") {
         var ti_String: i64 = advance_i();
         return parse_prim_str(ti_String);
+    }
+    if (t == "FormatString") {
+        var ti_Fstr: i64 = advance_i();
+        return parse_fstring(ti_Fstr);
     }
     if (t == "KwTrue") {
         var ti_KwTrue: i64 = advance_i();

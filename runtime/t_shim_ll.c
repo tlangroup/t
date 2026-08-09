@@ -59,6 +59,9 @@ void tll_sb_append_fmt_float(TSb* b, TStr* spec, double v)   { t_sb_append_fmt_f
 void tll_sb_append_fmt_str(TSb* b, TStr* spec, TStr* v)      { t_sb_append_fmt_str(b, *spec, *v); }
 void tll_sb_append_fmt_bool(TSb* b, TStr* spec, int8_t v)    { t_sb_append_fmt_bool(b, *spec, v); }
 void tll_sb_append_fmt_char(TSb* b, TStr* spec, int64_t v)       { t_sb_append_fmt_char(b, *spec, (uint8_t)v); }
+void tll_sb_append_fmt_str_conv(TSb* b, TStr* spec, TStr* v, TStr* mode)   { t_sb_append_fmt_str_conv(b, *spec, *v, *mode); }
+void tll_sb_append_fmt_int_conv(TSb* b, TStr* spec, int64_t v, TStr* mode) { t_sb_append_fmt_int_conv(b, *spec, v, *mode); }
+void tll_sb_append_fmt_uint_conv(TSb* b, TStr* spec, uint64_t v, TStr* mode){ t_sb_append_fmt_uint_conv(b, *spec, v, *mode); }
 
 // ── 时间格式化 / 解析（M56 / M57）──
 int64_t tll_now(void) { return t_now(); }

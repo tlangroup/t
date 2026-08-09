@@ -90,6 +90,10 @@ void t_sb_append_fmt_float(TSb* b, TStr spec, double v);
 void t_sb_append_fmt_str(TSb* b, TStr spec, TStr v);
 void t_sb_append_fmt_bool(TSb* b, TStr spec, int v);
 void t_sb_append_fmt_char(TSb* b, TStr spec, uint8_t v);
+// 转换字段 !s/!r/!a/!j（字符串）与 !c/!p（整数）：先转文本形态，再套 spec
+void t_sb_append_fmt_str_conv(TSb* b, TStr spec, TStr v, TStr mode);
+void t_sb_append_fmt_int_conv(TSb* b, TStr spec, int64_t v, TStr mode);
+void t_sb_append_fmt_uint_conv(TSb* b, TStr spec, uint64_t v, TStr mode);
 
 // ── 时间格式化（strftime / Python datetime.strftime 的 % 风格子集，M56/M57）──
 // now() -> 当前时刻微秒 epoch；format_time(spec, t_us, use_local) 按 UTC / 本地时区展开。
@@ -167,6 +171,8 @@ TStr     t_atom_str(int64_t id);                          // id→原子名（1-
 //   print(s: string) / eprint(s: string)
 TStr    t_file_read_all(const char* path);          // 失败 → panic + exit(1)
 TStr    t_getenv(const char* name);                 // getenv(name) -> string；未设置返回空串
+TStr    t_read_line(void);                          // REPL：从 stdin 读一行（去 \r\n），EOF 返回空串
+int     t_stdin_eof(void);                          // REPL：read_line 遇 EOF 后置位，供 stdin_eof() 查询
 bool    t_file_exists(const char* path);            // file_exists(s) -> 可读性探测（fopen 试探）
 bool    t_file_write_all(const char* path, TStr content); // 失败 → panic + exit(1)
 TStr    t_path_resolve(const char* path);           // path_resolve(s) -> 绝对路径（_fullpath/realpath）

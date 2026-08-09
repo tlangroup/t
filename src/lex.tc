@@ -353,6 +353,157 @@ tokenize fn(src: string) void {
             continue;
         }
 
+        // ── f-string 字面量（M-fstr）：`f"..."` / `f"""..."""` ──
+        // 仅当 'f' 紧跟 `"` 且不是标识符/成员访问的一部分时触发（避免 `obj.f"..."`
+        // 或 `xf"..."` 被误判）。插值 `{Expr}` 内的字符串/括号在扫描期被跳过，
+        // 以保证能正确找到终结引号；原始文本（含 `f"`/`f"""` 与闭合引号）整体入池。
+        if (c == 102 && i + 1 < n && src[i + 1] == 34) {
+            var prevOk: bool = true;
+            if (i > 0) {
+                var pc2: u8 = src[i - 1];
+                if (pc2 == 46 || is_ident_cont(pc2 as i64)) { prevOk = false; }
+            }
+            if (prevOk) {
+                var fl: u64 = line;
+                var fcol: u64 = col;
+                var isLong: bool = (i + 3 < n && src[i + 1] == 34 && src[i + 2] == 34 && src[i + 3] == 34);
+                sb_clear(tmp);
+                sb_append_char(tmp, 102);             // 'f'
+                sb_append_char(tmp, 34);              // 起始引号
+                var fsi: u64 = i + 2;
+                var fscol: u64 = col + 2;
+                if (isLong) {
+                    sb_append_char(tmp, 34);
+                    sb_append_char(tmp, 34);
+                    fsi = i + 4;
+                    fscol = col + 4;
+                }
+                var fdepth: i64 = 0;
+                var closed: bool = false;
+                while (fsi < n) {
+                    var fch: u8 = src[fsi];
+                    if (fdepth == 0) {
+                        if (isLong) {
+                            if (fch == 34 && fsi + 2 < n && src[fsi + 1] == 34 && src[fsi + 2] == 34) {
+                                closed = true;
+                                break;
+                            }
+                        } else {
+                            if (fch == 34) {
+                                closed = true;
+                                break;
+                            }
+                        }
+                        if (fch == 123) {             // '{'
+                            if (fsi + 1 < n && src[fsi + 1] == 123) {   // '{{'
+                                sb_append_char(tmp, 123);
+                                sb_append_char(tmp, 123);
+                                fsi = fsi + 2;
+                                fscol = fscol + 2;
+                                continue;
+                            }
+                            fdepth = fdepth + 1;
+                            sb_append_char(tmp, 123);
+                            fsi = fsi + 1;
+                            fscol = fscol + 1;
+                            continue;
+                        }
+                        if (fch == 125) {             // '}'
+                            if (fsi + 1 < n && src[fsi + 1] == 125) {   // '}}'
+                                sb_append_char(tmp, 125);
+                                sb_append_char(tmp, 125);
+                                fsi = fsi + 2;
+                                fscol = fscol + 2;
+                                continue;
+                            }
+                            eprint("error: unmatched '}' in f-string literal\n");
+                            exit(1);
+                        }
+                        if (fch == 92) {              // 反斜杠转义：原样保留
+                            sb_append_char(tmp, 92);
+                            fsi = fsi + 1;
+                            fscol = fscol + 1;
+                            if (fsi >= n) { break; }
+                            var fe2: u8 = src[fsi];
+                            sb_append_char(tmp, fe2);
+                            if (fe2 == 10) { line = line + 1; fscol = 1; }
+                            else { fscol = fscol + 1; }
+                            fsi = fsi + 1;
+                            continue;
+                        }
+                        sb_append_char(tmp, fch);
+                        if (fch == 10) { line = line + 1; fscol = 1; }
+                        else { fscol = fscol + 1; }
+                        fsi = fsi + 1;
+                        continue;
+                    }
+                    // fdepth > 0：插值表达式内部，需跳过其中的字符串字面量与配对括号
+                    if (fch == 34) {                  // 表达式内的字符串字面量
+                        var fsLong2: bool = (fsi + 2 < n && src[fsi + 1] == 34 && src[fsi + 2] == 34);
+                        sb_append_char(tmp, 34);
+                        fsi = fsi + 1;
+                        fscol = fscol + 1;
+                        if (fsLong2) {
+                            sb_append_char(tmp, 34);
+                            sb_append_char(tmp, 34);
+                            fsi = fsi + 2;
+                            fscol = fscol + 2;
+                        }
+                        while (fsi < n) {
+                            var fsc: u8 = src[fsi];
+                            if (fsc == 92) {
+                                sb_append_char(tmp, 92);
+                                fsi = fsi + 1; fscol = fscol + 1;
+                                if (fsi >= n) { break; }
+                                sb_append_char(tmp, src[fsi]);
+                                if (src[fsi] == 10) { line = line + 1; fscol = 1; } else { fscol = fscol + 1; }
+                                fsi = fsi + 1;
+                                continue;
+                            }
+                            if (fsLong2) {
+                                if (fsc == 34 && fsi + 2 < n && src[fsi + 1] == 34 && src[fsi + 2] == 34) {
+                                    sb_append_char(tmp, 34); sb_append_char(tmp, 34); sb_append_char(tmp, 34);
+                                    fsi = fsi + 3; fscol = fscol + 3;
+                                    break;
+                                }
+                            } else {
+                                if (fsc == 34) {
+                                    sb_append_char(tmp, 34);
+                                    fsi = fsi + 1; fscol = fscol + 1;
+                                    break;
+                                }
+                            }
+                            sb_append_char(tmp, fsc);
+                            if (fsc == 10) { line = line + 1; fscol = 1; } else { fscol = fscol + 1; }
+                            fsi = fsi + 1;
+                        }
+                        continue;
+                    }
+                    if (fch == 123) { fdepth = fdepth + 1; sb_append_char(tmp, 123); fsi = fsi + 1; fscol = fscol + 1; continue; }
+                    if (fch == 125) { fdepth = fdepth - 1; sb_append_char(tmp, 125); fsi = fsi + 1; fscol = fscol + 1; continue; }
+                    sb_append_char(tmp, fch);
+                    if (fch == 10) { line = line + 1; fscol = 1; }
+                    else { fscol = fscol + 1; }
+                    fsi = fsi + 1;
+                }
+                if (closed == false) {
+                    eprint("error: unterminated f-string literal\n");
+                    exit(1);
+                }
+                if (isLong) {
+                    sb_append_char(tmp, 34); sb_append_char(tmp, 34); sb_append_char(tmp, 34);
+                    fsi = fsi + 3; fscol = fscol + 3;
+                } else {
+                    sb_append_char(tmp, 34);
+                    fsi = fsi + 1; fscol = fscol + 1;
+                }
+                i = fsi;
+                col = fscol;
+                push_tok("FormatString", sb_to_str(tmp), fl, fcol);
+                continue;
+            }
+        }
+
         if (is_ident_start(utf8_cp_at(src, i as i64, n as i64))) {
             var il: u64 = line;
             var icol: u64 = col;

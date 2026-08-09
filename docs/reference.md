@@ -1108,6 +1108,7 @@ PrimaryExpr:
     | IntLit
     | FloatLit
     | StrLit
+    | FormatStringLiteral     // ✅ f-string 字面量（M-fstr）
     | BoolLit
     | NullLit
     | IdentExpr
@@ -1121,6 +1122,21 @@ PrimaryExpr:
 IntLit:   integer            // 十进制；0x 前缀十六进制；0b 前缀二进制
 FloatLit: float
 StrLit:   string
+
+// f-string：解析期就地脱糖为 format(模板, 实参...)，不引入新运行期机制
+FormatStringLiteral: ShortFormatString | LongFormatString
+ShortFormatString:   "f\"" FormatContent? "\""
+LongFormatString:    "f\"\"\"" LongFormatContent? "\"\"\""
+FormatContent:       FormatSegment+
+LongFormatContent:   LongFormatSegment+
+FormatSegment:       FormatTextRun | EscapeBrace | Interpolation
+LongFormatSegment:   LongFormatTextRun | EscapeBrace | Interpolation
+FormatTextRun:       ( [^{}"\\] | StringEscape )+
+LongFormatTextRun:   ( [^{}\\] | "\"" | StringEscape )+
+EscapeBrace:         "{{" | "}}"
+Interpolation:       "{" Expr ("!" Conversion)? (":" FormatSpec)? "}"
+Conversion:          "s" | "r" | "a" | "j" | "c" | "p"
+FormatSpec:          [^}]+          // 与 format() 的格式规范完全一致
 BoolLit:  "true" | "false"
 NullLit:  "null"
 IdentExpr: ident
@@ -1810,6 +1826,40 @@ var tmpl: string = "x={0}";
 - 接收者**必须是字符串字面量**（`desugar_format_call` 需要把模板提升为匿名函数 `__fmt_N`）；若为变量则编译期报 **`T_FMT_TEMPLATE_NOT_LITERAL`**。
 - 方法式与函数式可自由嵌套：`format("at {0}", "t={0}".format(format_time("%H:%M", now())))`。
 - 归一化发生在 `infer_expr` 的 `call` 分支：仅当 callee 为 member 且方法名 `format`、接收者静态类型为 `string` 时触发；其它成员调用不受影响。conformance：`p34_fmt_method_ok`(pass)、`f51_fmt_method_not_literal`（`T_FMT_TEMPLATE_NOT_LITERAL`）(fail)；run_examples：`fmt_method_demo.tc`。
+
+**§3.10.7 f-string 字面量（`f"..."` / `f"""..."""`）✅ tc（M-fstr）**
+
+第三种写法，与前两种同源：**解析期就地脱糖为 `format(模板, 实参...)`**，随后完全复用 §3.10 的 `desugar_format_call` → `__fmt_N` 提升。因此 f-string 不引入任何新的运行期机制，插值表达式**只求值一次**，与手写 `format()` 产出的 IR 等价。
+
+```t
+var name: string = "world";
+var n: i64 = 42;
+
+println(f"hello {name}!");            // → format("hello {0}!", name)
+println(f"|{name:>10}|{n:05}|");      // 格式规范与 format() 完全一致
+println(f"{name!r} {name!p} {name!c}");    // 转换字段（repr / pbtxt / csv）
+println(f"braces {{{name}}} ok");     // {{ }} 转义 → braces {world} ok
+println(f"nested = {f"inner {n}"}");  // 可嵌套
+println(f"""long {name} with "quotes" inside""");   // 长式内可直接写 "
+```
+
+- **文法**见 §5 `FormatStringLiteral`。触发条件是字符 `f` **紧贴** `"`，且前一个字符不是 `.` 或标识符字符——所以 `obj.f"x"`、`xf"x"` 不会被误判。
+- **零插值退化**：`f"no interpolation"` 直接还原为普通字符串字面量（`{{`/`}}` 就地折叠），不生成 `__fmt_N`。
+- **占位一律手动索引**：脱糖出的模板永远是 `{0}`/`{1}`…，不会与用户模板的自动编号规则混用。
+- **转换字段 `!conv`**（CPython 语义：**先把值转成文本形态，再套 spec**）：
+
+  | conv | 适用类型 | 语义 | 例 |
+  |---|---|---|---|
+  | `!s` | 任意 | 默认，等价于不写 | `{x!s}` |
+  | `!r` | 字符串 | repr：加引号并转义 `"`/`\`/控制字符，非 ASCII 保留 UTF-8 | `"world"` |
+  | `!a` | 字符串 | ascii：在 `!r` 基础上把非 ASCII 转成 `\xHH`/`\uXXXX`/`\UXXXXXXXX` | `"\u4e2d\u6587"` |
+  | `!j` | 字符串 | json：加引号并按 JSON 规则转义（控制字符走 `\u00XX`） | `"x\ny"` |
+  | `!p` | 字符串 | pbtxt：加引号并按 protobuf text 风格转义（`\"` `\\` `\n` `\t` `\r`，控制字符 `\xHH`），非 ASCII 保留 UTF-8 | `"x\ny"` |
+  | `!c` | 字符串 | csv：仅当含 `,` `"` CR/LF 时加引号，内部 `"` 翻倍；否则裸值 | `"x,y"` |
+
+  六种转换均可作用于任意值类型：字符串走格式专属转义；标量（整数/浮点/bool）序列化即裸值（`!j`/`!p`/`!c` 等价，均为合法 JSON/protobuf/csv 标量）。转换字段同样对手写模板生效（`format("{0!r}", s)`），模板里写了非法 conv 字母 → **`T_FMT_BAD_CONVERSION`**；f-string 里则在解析期直接报错。`!` 只有在**紧跟一个已完结表达式**时才当转换字段，所以 `f"{!ok}"`（前缀取反）、`f"{a != b}"` 都不受影响。
+- **实现落点**：词法 `src/lex.tc` 把整条 f-string 原文（含插值）扫成一个 `FormatString` token；`src/parse.tc` 的 `parse_fstring` 负责切段、定位 spec 冒号与 `!conv`、把插值文本二次 tokenize 后调 `parse_expr`；`src/sema.tc` 的 `desugar_format_call` 消费 `!conv` 并选择 `sb_append_fmt_str_conv`（按 mode 区分 r/a/j/p/c 转义）；运行期实现在 `runtime/t_runtime.c`（LLVM 经 `tll_*` 指针桥）。
+- conformance：`p44_fstring_ok`(pass)、`f52_fstring_conv_type`（`T_FMT_BAD_CONVERSION`）(fail)；run_examples：`fstring_demo.tc`（双后端实跑比对）。
 
 ---
 
