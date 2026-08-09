@@ -316,6 +316,25 @@ ll_isagg fn(td: i64) bool {
     return false;
 }
 
+// 把（可能多层）类型别名解析到底层具名类型名。
+// 成员访问的 GEP 必须基于底层聚合类型名，否则对别名类型会落到 null 指针 → 运行期崩溃
+// （变量分配走 resolve 路径用底层类型，而成员 GEP 曾直接用别名名，二者不一致）。
+ll_alias_base_name fn(name: string) string {
+    var cur: string = name;
+    var guard: i64 = 0;
+    while (guard < 64) {
+        var ti: i64 = llt_find(cur);
+        if (ti < 0) { break; }
+        if (llt_kinds[ti] != "alias") { break; }
+        var utd: i64 = llt_atd[ti];
+        if (utd < 0) { break; }
+        if (tds[utd].cat != "named") { break; }
+        cur = tds[utd].name;
+        guard = guard + 1;
+    }
+    return cur;
+}
+
 
 ll_sizeof fn(ty: string) string {
     return sb_cat3("ptrtoint (ptr getelementptr (", ty, ", ptr null, i32 1) to i64)");
@@ -653,6 +672,13 @@ ll_etd fn(e: i64) i64 {
     if (n.kind == "comptime") {
         return ll_etd(n.na);
     }
+    // match 表达式：脱糖合成的 match 节点在 sema 之后才产生，自身 .td 未设；
+    // 其类型取首个 arm 体的类型（与 emit_lle 中 mv_rtd 一致）。否则落到
+    // expr_type_desc 默认 i64，导致 bool 结果在 return 处被当成 i64 真值化 →
+    // `icmp ne i64 %t8` 与槽实际 i8 不符，LLVM 校验失败。
+    if (n.kind == "match") {
+        return ll_etd(match_first_body(e));
+    }
     if (n.kind == "binary") {
         var bop9: string = n.sa;
         if (bop9 == "==" || bop9 == "!=" || bop9 == "<" || bop9 == ">") {
@@ -846,17 +872,19 @@ ll_addr fn(e: i64) string {
         var obt: TD = tds[obd];
         var op: string = emit_lle(n.na);
         if (obt.cat == "named") {
-            var ti: i64 = llt_find(obt.name);
+            // 类型别名须解析到底层聚合类型名，否则 GEP 落到 null（见 ll_alias_base_name）。
+            var base: string = ll_alias_base_name(obt.name);
+            var ti: i64 = llt_find(base);
             if (ti >= 0) {
                 if (llt_kinds[ti] == "struct") {
-                    var fi: i64 = llsf_find(obt.name, n.sa);
+                    var fi: i64 = llsf_find(base, n.sa);
                     if (fi >= 0) {
                         var t: string = ll_tmp();
                         var line: StringBuilder = sb_new();
                         sb_append_str(line, "  ");
                         sb_append_str(line, t);
                         sb_append_str(line, " = getelementptr inbounds %st.");
-                        sb_append_str(line, obt.name);
+                        sb_append_str(line, base);
                         sb_append_str(line, ", ptr ");
                         sb_append_str(line, op);
                         sb_append_str(line, ", i32 0, i32 ");
