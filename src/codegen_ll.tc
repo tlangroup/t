@@ -1031,6 +1031,10 @@ emit_lle fn(e: i64) string {
         return ll_cast_v(lint, td_named_mk("scalar", "i64"), ldtd);
     }
     if (n.kind == "float") {
+        // IEEE-754 特殊值：LLVM 的 FP 常量没有 `inf` / `nan` 记号，
+        // 只能写 double 的 64 位十六进制位模式。
+        if (n.sa == "inf") { return "0x7FF0000000000000"; }
+        if (n.sa == "nan") { return "0x7FF8000000000000"; }
         // 确保带小数点（LLVM 浮点常量语法）
         var has_dot: bool = false;
         var i: u64 = 0;
@@ -1423,7 +1427,10 @@ ll_binary fn(e: i64) string {
         var cc: string = "";
         if (isf) {
             if (op == "==") { cc = "oeq"; }
-            if (op == "!=") { cc = "one"; }
+            // `!=` 必须是**无序**比较 `une`：IEEE-754 下 `x != y` 等价于
+            // `!(x == y)`，故 `nan != nan` 为真。`one` 会在任一侧为 NaN 时
+            // 返回假，与 C 后端（用 `!=`）不一致。其余关系运算保持有序。
+            if (op == "!=") { cc = "une"; }
             if (op == "<") { cc = "olt"; }
             if (op == ">") { cc = "ogt"; }
             if (op == "<=") { cc = "ole"; }
@@ -1510,6 +1517,15 @@ ll_unary fn(e: i64) string {
     var ty: string = scalar_to_ll(sn);
     var v2: string = emit_lle(n.na);
     if (op == "-") {
+        // `-inf` / `-nan`：常量已折成十六进制位模式，前缀 `-` 会被 IR 解析器
+        // 判成「整数常量用于浮点类型」，必须直接给出取反后的位模式。
+        if (n.na >= 0) {
+            var opn: Node = nodes[n.na];
+            if (opn.kind == "float") {
+                if (opn.sa == "inf") { return "0xFFF0000000000000"; }
+                if (opn.sa == "nan") { return "0x7FF8000000000000"; }
+            }
+        }
         if (str_len(v2) > 0) {
             if (v2[0] != 37) {
                 return sb_cat2("-", v2);    // 常量折叠
@@ -1874,6 +1890,27 @@ ll_call fn(e: i64) string {
         sb_append_str(lsb, ")");
         llfb(sb_to_str(lsb));
         return out0;
+    }
+    // 子切片 s[a..b]：与 str_slice 同构——聚合走指针，out 由调用方 alloca 并排末位
+    if (cn == "slice_sub") {
+        var sub_p: string = emit_lle(ae[0]);
+        var sub_lo: string = emit_lle(ae[1]);
+        sub_lo = ll_cast_v(sub_lo, ll_etd(ae[1]), td_i64);
+        var sub_hi: string = emit_lle(ae[2]);
+        sub_hi = ll_cast_v(sub_hi, ll_etd(ae[2]), td_i64);
+        var sub_out: string = ll_scratch("%TSlice");
+        var sub_sb: StringBuilder = sb_new();
+        sb_append_str(sub_sb, "  call void @tll_slice_sub(ptr ");
+        sb_append_str(sub_sb, sub_p);
+        sb_append_str(sub_sb, ", i64 ");
+        sb_append_str(sub_sb, sub_lo);
+        sb_append_str(sub_sb, ", i64 ");
+        sb_append_str(sub_sb, sub_hi);
+        sb_append_str(sub_sb, ", ptr ");
+        sb_append_str(sub_sb, sub_out);
+        sb_append_str(sub_sb, ")");
+        llfb(sb_to_str(sub_sb));
+        return sub_out;
     }
     if (cn == "append") {
         var std: i64 = ll_etd(ae[0]);
@@ -2959,11 +2996,18 @@ emit_llstmt fn(sid: i64) void {
         var etd: i64 = -1;
         if (it0.cat == "slice") {
             etd = it0.elem;
+            // 注册循环变量类型，供 emit_lle 的 ident 分支按 `%v.<name>` 取用
+            // （与 codegen_c 的 collect_local_types 对称；否则 loop var 落到 "null"）。
+            fs_set(em_cur_fn, n.sa, etd);
         }
         // map 的 for-in：按插入序迭代键（tll_map_count + tll_map_key_*_at）
         if (it0.cat == "map") {
             var mfkd: i64 = it0.key;
             var mfkty: string = ll_td(mfkd);
+            fs_set(em_cur_fn, n.sa, mfkd);
+            if (str_len(n.sb) > 0) {
+                fs_set(em_cur_fn, n.sb, it0.val);
+            }
             var mfiter: string = emit_lle(n.na);
             var mfcnt: string = ll_tmp();
             llfb(sb_cat4("  ", mfcnt, " = call i64 @tll_map_count(ptr ", sb_cat2(mfiter, ")")));
@@ -3107,6 +3151,12 @@ emit_llstmt fn(sid: i64) void {
         g_defer_ll_n = 0;
         var rty: string = ll_td(ll_cur_ret);
         if (n.na < 0 || rty == "void") {
+            // 返回类型为 void 却带表达式（`return f(x);` 写在 void 函数里，或简写闭包
+            // `|v| expr` 推断为 void）：先把表达式当语句发射以保留副作用，再 ret void。
+            // 否则会静默丢弃副作用（如 `return print(...);` 什么都不做）。
+            if (n.na >= 0 && rty == "void") {
+                emit_lle(n.na);
+            }
             llfb("  ret void");
             ll_term = true;
             return;
@@ -3384,6 +3434,7 @@ emit_lldeclares fn() void {
     llph("declare ptr @tll_slice_at(ptr, i64)");
     llph("declare void @tll_slice_set(ptr, i64, ptr)");
     llph("declare i64 @tll_slice_len(ptr)");
+    llph("declare void @tll_slice_sub(ptr, i64, i64, ptr)");
     llph("declare ptr @tll_map_new(i64, i64)");
     llph("declare void @tll_map_put(ptr, ptr, ptr)");
     llph("declare ptr @tll_map_val_ptr(ptr, ptr)");
@@ -3931,11 +3982,11 @@ emit_type_info_ll fn(tname: string) string {
     // 字段元数据取自 ll_build_reg 建好的注册表（emit 期唯一可靠来源）
     var lti: i64 = llt_find(tname);
     if (lti < 0) {
-        diag_new("T_TYPE_MISMATCH", "error", sb_cat2("type_info: '", sb_cat2(tname, "' 不是 struct 类型（当前仅支持 struct）")), "", 1, 1, 1, 10);
+        diag_new("T-CDE-E910", "error", sb_cat2("type_info: '", sb_cat2(tname, "' 不是 struct 类型（当前仅支持 struct）")), "", 1, 1, 1, 10);
         return "null";
     }
     if (llt_kinds[lti] != "struct") {
-        diag_new("T_TYPE_MISMATCH", "error", sb_cat2("type_info: '", sb_cat2(tname, "' 不是 struct 类型（当前仅支持 struct）")), "", 1, 1, 1, 10);
+        diag_new("T-CDE-E910", "error", sb_cat2("type_info: '", sb_cat2(tname, "' 不是 struct 类型（当前仅支持 struct）")), "", 1, 1, 1, 10);
         return "null";
     }
     append(ti_done, tname);

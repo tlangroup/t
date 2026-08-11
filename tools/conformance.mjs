@@ -90,7 +90,9 @@ const failures = [];
 for (const file of files) {
   const rel = file.slice(ROOT.length + 1).replace(/\\/g, "/");
   const src = readFileSync(file, "utf8");
-  const m = src.match(/^\/\/ EXPECT: *(pass|(error|warning|build-error) +([A-Z0-9_, ]+))/m);
+  // 码名允许连字符：新机器码形如 `T-LEX-E000`，旧语义名形如 `T_LEX_BAD_ESCAPE`，
+  // 两者都可写在 EXPECT 里（下方按 code / legacy_code 双标识匹配）。
+  const m = src.match(/^\/\/ EXPECT: *(pass|(error|warning|build-error) +([A-Z0-9_,\- ]+))/m);
   if (!m) { failed++; failures.push(`${rel}: missing "// EXPECT:" directive`); continue; }
   const kind = m[2] ?? "pass"; // pass | error | warning | build-error
   const codes = kind === "pass" ? [] : m[3].split(",").map(s => s.trim()).filter(Boolean);
@@ -104,7 +106,14 @@ for (const file of files) {
   if (wantExit === "zero" && r.code !== 0) { ok = false; why = `expected exit 0, got ${r.code}`; }
   if (wantExit === "nonzero" && r.code === 0) { ok = false; why = "expected error, exit=0"; }
   for (const c of codes) {
-    if (!r.stdout.includes(`"code": "${c}"`) && !r.stdout.includes(`"code":"${c}"`)) {
+    // 双标识：同时接受机器码（"code"）与旧语义名（"legacy_code"）。
+    // 见 docs/diagnostics.md §1.2.3（新旧同时采用）。
+    const hit =
+      r.stdout.includes(`"code": "${c}"`) ||
+      r.stdout.includes(`"code":"${c}"`) ||
+      r.stdout.includes(`"legacy_code": "${c}"`) ||
+      r.stdout.includes(`"legacy_code":"${c}"`);
+    if (!hit) {
       ok = false; why += ` missing code ${c};`;
     }
   }

@@ -7,7 +7,10 @@
 //   ③ 交叉验证：两个后端的运行输出必须逐字节一致
 //
 // 并行安全性说明：每个用例的产物是 out/<mode>/<name>.exe 与
-// out/<mode>/cback/<name>.{c,h,exe}，文件名由用例名唯一确定，互不覆盖；
+// out/<mode>/cback/<name>/{<name>.c,<name>.h,导入模块的*.c/*.h,<name>.exe}，
+// 整目录由用例名唯一确定，互不覆盖——导入同模块（如 src.agentkit / src.physics）
+// 的多个用例先前共用 out/<mode>/cback 顶层目录，同名 <module>.c/.h 在并行下
+// 互相踩踏造成偶发 c emit failed / io write 假失败；现改为每用例独立子目录隔离。
 // runtime 静态库 out/<mode>/deps/t_runtime.lib 由 tools/build_runtime.mjs
 // 预编译，本工具只读不写。故用例之间可安全并行。
 // （笔记中"门禁必须串行"约束针对的是**不同工具之间**争抢 out/ 产物，
@@ -71,7 +74,7 @@ const CLANG = findClang();
 const COPT = mode === "rls" ? "-O2" : "-O0";
 
 const OUTDIR = join(ROOT, "out", mode);
-const CBACK = join(OUTDIR, "cback");
+const CBACK = join(OUTDIR, "cback"); // 每用例隔离子目录 CBACK/<name>，见 runCase
 mkdirSync(CBACK, { recursive: true });
 
 async function sh(cmd, args, opts = {}) {
@@ -160,16 +163,18 @@ async function runCase(name) {
         }
     }
 
-    // ② C 后端
-    const c = await sh(compiler, ["compile", src, "--emit-c", "--output", join("out", mode, "cback")]);
+    // ② C 后端 —— 每用例独立子目录，避免并行踩踏导入模块的同名 .c/.h
+    const cdir = join(CBACK, name);
+    mkdirSync(cdir, { recursive: true });
+    const c = await sh(compiler, ["compile", src, "--emit-c", "--output", cdir]);
     if (!c.ok) {
         problems.push(`c emit failed (exit ${c.code})`);
     } else {
-        const cexe = join(CBACK, `${name}.exe`);
+        const cexe = join(cdir, `${name}.exe`);
         const cc = await sh(CLANG, [
             COPT, "-o", cexe,
-            join(CBACK, `${name}.c`), join(RUNTIME, "t_runtime.c"),
-            "-I", RUNTIME, "-I", CBACK, "-Wl,-subsystem:console",
+            join(cdir, `${name}.c`), join(RUNTIME, "t_runtime.c"),
+            "-I", RUNTIME, "-I", cdir, "-Wl,-subsystem:console",
         ]);
         if (!cc.ok) {
             problems.push(`c link failed (exit ${cc.code}): ${tailErr(cc.err)}`);

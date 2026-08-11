@@ -120,6 +120,13 @@ const GR = join("out", "rls", "gr");   // rls 编译器
 
 const steps = [
     {
+        id: "diagdef", lv: 0, name: "诊断注册表不变量 (gen_diag --check)",
+        run: async () => {
+            const r = await node("gen_diag.mjs", "--check");
+            return { ok: r.code === 0, note: lastLine(r.out) };
+        },
+    },
+    {
         id: "static", lv: 0, name: "静态检查 (catn + shadow + dag)",
         run: async () => {
             const a = await node("catn_check.mjs");

@@ -184,7 +184,11 @@ init_node_kinds fn() void {
     append(node_kind_names, "number");
     append(node_kind_names, "optional");
     append(node_kind_names, "paren");
+    append(node_kind_names, "pipe_apply");   // `E |> F` 多态管道：na=左操作数, nb=右函数, ba=分派决议(true=整体应用)
+    append(node_kind_names, "pipe_filter");  // `E |>? F` 元素过滤：na=左操作数, nb=谓词
+    append(node_kind_names, "pipe_map");     // `E |-> F` 元素映射：na=左操作数, nb=映射函数
     append(node_kind_names, "pointer");
+    append(node_kind_names, "range");       // 区间字面量（M-range）：na=起点(-1=省略), nb=终点(-1=省略), ba=是否闭合(`..=`)
     append(node_kind_names, "return");
     append(node_kind_names, "scalar");
     append(node_kind_names, "slice");
@@ -325,6 +329,17 @@ mk_lambda fn(sa: string, na: i64, la: i64, lb: i64, lc: i64, ti: i64) i64 {
     slice_set(nodes, id, n);
     if (ti >= 0) { node_at(id, ti); }
     return id;
+}
+
+// `|v: T| expr` 简写闭包的「返回类型待推断」占位节点。resolve_ti 把它解析成
+// 全局唯一的 g_infer_ti（kind="Infer"），sema 在用到该 lambda 时才扫描其 return
+// 表达式推断真实返回类型（见 infer_lambda_ret_from_decl）。仅简写闭包会产此占位，
+// 既有 `fn (v: T) R {...}` 一律带显式返回类型，不受影响。
+mk_infer_ret fn() i64 {
+    var id: i64 = node_new("infer_ret");
+    slice_set(nodes, id, nodes[id]);
+    return id;
+
 }
 
 // 闭包构造点（M46）：sa=合成函数名, la=捕获 ident 链。emit 时堆分配记录+环境并返回指针。
@@ -842,6 +857,39 @@ mk_paren fn(na: i64, ti: i64) i64 {
     return id;
 }
 
+// 管道算子节点（reference.md §3.15）：na=左操作数，nb=右侧一元函数值。
+// 三者在 sema 的 lower_pipe 被就地改写为 `call`（合成融合函数 / 直接调用），
+// 因此两个后端永不会看到 pipe_* 节点（codegen 侧留 ICE 断言兜底）。
+mk_pipe_map fn(na: i64, nb: i64, ti: i64) i64 {
+    var id: i64 = node_new("pipe_map");
+    var n: Node = nodes[id];
+    n.na = na;
+    n.nb = nb;
+    slice_set(nodes, id, n);
+    if (ti >= 0) { node_at(id, ti); }
+    return id;
+}
+
+mk_pipe_filter fn(na: i64, nb: i64, ti: i64) i64 {
+    var id: i64 = node_new("pipe_filter");
+    var n: Node = nodes[id];
+    n.na = na;
+    n.nb = nb;
+    slice_set(nodes, id, n);
+    if (ti >= 0) { node_at(id, ti); }
+    return id;
+}
+
+mk_pipe_apply fn(na: i64, nb: i64, ti: i64) i64 {
+    var id: i64 = node_new("pipe_apply");
+    var n: Node = nodes[id];
+    n.na = na;
+    n.nb = nb;
+    slice_set(nodes, id, n);
+    if (ti >= 0) { node_at(id, ti); }
+    return id;
+}
+
 mk_pointer fn(na: i64, ti: i64) i64 {
     var id: i64 = node_new("pointer");
     var n: Node = nodes[id];
@@ -849,6 +897,45 @@ mk_pointer fn(na: i64, ti: i64) i64 {
     slice_set(nodes, id, n);
     if (ti >= 0) { node_at(id, ti); }
     return id;
+}
+
+// 区间字面量：na=起点表达式（-1 = 省略），nb=终点表达式（-1 = 省略），ba=闭合区间（`..=`）
+mk_range fn(na: i64, nb: i64, ba: bool, ti: i64) i64 {
+    var id: i64 = node_new("range");
+    var n: Node = nodes[id];
+    n.na = na;
+    n.nb = nb;
+    n.ba = ba;
+    slice_set(nodes, id, n);
+    if (ti >= 0) { node_at(id, ti); }
+    return id;
+}
+
+// 区间的**成员测试**合成：`subj >= lo && subj < hi`（`..=` 用 `<=`）。
+// 端点省略就少一个合取项；两端全省（`..`）恒真。
+//
+// ⚠ subj_a / subj_b 必须是两个**独立**的表达式节点：合成结果里 subject 出现两次，
+//   后端按树发射会各求值一次。调用方要么传两个 mk_ident（match 已把被匹配值绑到
+//   临时量，天然满足），要么先确认 subject 无副作用（sema 的 `in` 走 rng_pure 判定）。
+//
+// 放在 base 而不是 sema：`match` 的范围臂在 codegen 的 match_chain_from 里才合成
+//   （C / LLVM 双后端共用同一份脱糖），那一层看不见 sema。
+mk_range_test fn(subj_a: i64, subj_b: i64, r: i64) i64 {
+    var rn: Node = nodes[r];
+    var lo_t: i64 = -1;
+    var hi_t: i64 = -1;
+    if (rn.na >= 0) { lo_t = mk_binary(">=", subj_a, rn.na, -1); }
+    if (rn.nb >= 0) {
+        var hop: string = "<";
+        if (rn.ba == true) { hop = "<="; }
+        hi_t = mk_binary(hop, subj_b, rn.nb, -1);
+    }
+    if (lo_t < 0) {
+        if (hi_t < 0) { return mk_bool(true, -1); }
+        return hi_t;
+    }
+    if (hi_t < 0) { return lo_t; }
+    return mk_binary("&&", lo_t, hi_t, -1);
 }
 
 mk_return fn(na: i64, ti: i64) i64 {
@@ -982,6 +1069,10 @@ list_push fn(head: i64, tail: i64, val: i64) i64 {
 Diag struct {
     code: string;
     sev: string;
+    cat: string;
+    name: string;
+    legacy: string;
+    note: string;
     msg: string;
     file: string;
     sl: i64;
@@ -1017,13 +1108,1147 @@ var fixes: []FixS;
 
 var g_file: string;
 
-diag_new fn(code: string, sev: string, msg: string, file: string, sl: i64, sc: i64, el: i64, ec: i64) i64 {
-    var d: Diag;
-    d.code = code;
-    if (sev == "") {
-        sev = diag_sev(code);
+// 诊断渲染格式：默认 "json"（机器可读，供 tote/CI/对拍解析）；
+// REPL 通过 `--diagnostics human` 切换为人类可读文本（见 emit_diags）。
+var g_diag_fmt: string = "json";
+
+// 把绝对/相对路径折算为「相对工程根目录（cwd）」的形式：
+// src/main.tc 而非 c:/workspace/tlang/src/main.tc。仅用于诊断信息的 file 字段，
+// 不影响模块解析（compute_*_dirs 内部仍对 g_file 做 path_resolve 取绝对目录）。
+// 分隔符统一规整为 '/'，保证跨平台输出一致（Windows 上 path_resolve 可能给反斜杠）。
+rel_path fn(p: string) string {
+    var abs: string = norm_sep(path_resolve(p));
+    var base: string = norm_sep(path_resolve("."));
+    // 去尾斜杠，避免 base 带尾斜杠时前缀匹配失败
+    var blen: u64 = str_len(base);
+    while (blen > 0) {
+        if (str_at(base, blen - 1) == 47) { blen = blen - 1; } else { break; }
     }
-    d.sev = sev;
+    base = str_slice(base, 0, blen);
+    var alen: u64 = str_len(abs);
+    if (alen > blen && str_slice(abs, 0, blen) == base) {
+        if (str_at(abs, blen) == 47) {
+            return str_slice(abs, blen + 1, alen);
+        }
+    }
+    // 不在 cwd 下（如外部绝对路径）保持原样（同样规整分隔符）
+    return norm_sep(p);
+}
+
+// 分隔符规整：反斜杠 -> 正斜杠（供 rel_path 前缀匹配与输出统一使用）。
+norm_sep fn(s: string) string {
+    var n: u64 = str_len(s);
+    var i: u64 = 0;
+    var out: StringBuilder = sb_new();
+    while (i < n) {
+        var c: i64 = str_at(s, i);
+        if (c == 92) { sb_append_char(out, 47); } else { sb_append_char(out, c); }
+        i = i + 1;
+    }
+    return sb_to_str(out);
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// >>> GEN:diagnostics (generated by tools/gen_diag_t.mjs from tools/diag_defs.json -- DO NOT EDIT) >>>
+// 诊断码单一事实源：tools/diag_defs.json（与 src/diag_table.gen.h 同源）。
+// diag_new 通过 diag_norm 同时接受机器码与旧语义名（双标识，见 docs/diagnostics.md §1.2.3）。
+
+var g_dcode: []string;
+var g_dsev: []string;
+var g_dcat: []string;
+var g_dname: []string;
+var g_dlegacy: []string;
+var g_dnote: []string;
+var g_leg_name: []string;
+var g_leg_idx: []i64;
+
+diag_ensure fn() void {
+    if ((slice_len(g_dcode) as i64) > 0) { return; }
+    append(g_dcode, "T-AGT-I900");
+    append(g_dsev, "info");
+    append(g_dcat, "AGT");
+    append(g_dname, "RESERVED");
+    append(g_dlegacy, "");
+    append(g_dnote, "预留区间，当前无专用码");
+    append(g_dcode, "T-ANN-E450");
+    append(g_dsev, "error");
+    append(g_dcat, "ANN");
+    append(g_dname, "UNKNOWN");
+    append(g_dlegacy, "T_ANNOTATION_UNKNOWN");
+    append(g_dnote, "未知注解");
+    append(g_leg_name, "T_ANNOTATION_UNKNOWN");
+    append(g_leg_idx, 1);
+    append(g_dcode, "T-ANN-E451");
+    append(g_dsev, "error");
+    append(g_dcat, "ANN");
+    append(g_dname, "INVALID_ARG");
+    append(g_dlegacy, "T_ANNOTATION_INVALID_ARG");
+    append(g_dnote, "注解实参非法");
+    append(g_leg_name, "T_ANNOTATION_INVALID_ARG");
+    append(g_leg_idx, 2);
+    append(g_dcode, "T-ANN-E452");
+    append(g_dsev, "error");
+    append(g_dcat, "ANN");
+    append(g_dname, "WRONG_TARGET");
+    append(g_dlegacy, "T_ANNOTATION_WRONG_TARGET");
+    append(g_dnote, "注解作用于错误目标");
+    append(g_leg_name, "T_ANNOTATION_WRONG_TARGET");
+    append(g_leg_idx, 3);
+    append(g_dcode, "T-CDE-E910");
+    append(g_dsev, "error");
+    append(g_dcat, "CDE");
+    append(g_dname, "TYPE_MISMATCH_CGEN");
+    append(g_dlegacy, "T_CGEN_TYPE_MISMATCH");
+    append(g_dnote, "codegen 期 type_info 仅支持 struct；legacy 由 T_TYPE_MISMATCH 拆出以保双标识唯一");
+    append(g_leg_name, "T_CGEN_TYPE_MISMATCH");
+    append(g_leg_idx, 4);
+    append(g_dcode, "T-CLO-E780");
+    append(g_dsev, "error");
+    append(g_dcat, "CLO");
+    append(g_dname, "CAPTURE");
+    append(g_dlegacy, "T_CLOSURE_CAPTURE");
+    append(g_dnote, "闭包捕获错误");
+    append(g_leg_name, "T_CLOSURE_CAPTURE");
+    append(g_leg_idx, 5);
+    append(g_dcode, "T-DER-E500");
+    append(g_dsev, "error");
+    append(g_dcat, "DER");
+    append(g_dname, "UNSUPPORTED");
+    append(g_dlegacy, "T_DERIVE_UNSUPPORTED");
+    append(g_dnote, "@derive 不支持该 trait");
+    append(g_leg_name, "T_DERIVE_UNSUPPORTED");
+    append(g_leg_idx, 6);
+    append(g_dcode, "T-FID-E650");
+    append(g_dsev, "error");
+    append(g_dcat, "FID");
+    append(g_dname, "RESERVED_NAME");
+    append(g_dlegacy, "T_FID_RESERVED_NAME");
+    append(g_dnote, "fid 保留名");
+    append(g_leg_name, "T_FID_RESERVED_NAME");
+    append(g_leg_idx, 7);
+    append(g_dcode, "T-FID-E651");
+    append(g_dsev, "error");
+    append(g_dcat, "FID");
+    append(g_dname, "MODE_NOT_LITERAL");
+    append(g_dlegacy, "T_FID_MODE_NOT_LITERAL");
+    append(g_dnote, "fid mode 非字面量");
+    append(g_leg_name, "T_FID_MODE_NOT_LITERAL");
+    append(g_leg_idx, 8);
+    append(g_dcode, "T-FID-E652");
+    append(g_dsev, "error");
+    append(g_dcat, "FID");
+    append(g_dname, "BAD_MODE");
+    append(g_dlegacy, "T_FID_BAD_MODE");
+    append(g_dnote, "非法 fid mode");
+    append(g_leg_name, "T_FID_BAD_MODE");
+    append(g_leg_idx, 9);
+    append(g_dcode, "T-FID-E653");
+    append(g_dsev, "error");
+    append(g_dcat, "FID");
+    append(g_dname, "BAD_FORMAT");
+    append(g_dlegacy, "T_FID_BAD_FORMAT");
+    append(g_dnote, "非法 fid format");
+    append(g_leg_name, "T_FID_BAD_FORMAT");
+    append(g_leg_idx, 10);
+    append(g_dcode, "T-FID-E654");
+    append(g_dsev, "error");
+    append(g_dcat, "FID");
+    append(g_dname, "UNSERIALIZABLE");
+    append(g_dlegacy, "T_FID_UNSERIALIZABLE");
+    append(g_dnote, "类型不可序列化");
+    append(g_leg_name, "T_FID_UNSERIALIZABLE");
+    append(g_leg_idx, 11);
+    append(g_dcode, "T-FID-E655");
+    append(g_dsev, "error");
+    append(g_dcat, "FID");
+    append(g_dname, "DESER_NEEDS_TYPE");
+    append(g_dlegacy, "T_FID_DESERIALIZE_NEEDS_TYPE");
+    append(g_dnote, "反序列化需类型");
+    append(g_leg_name, "T_FID_DESERIALIZE_NEEDS_TYPE");
+    append(g_leg_idx, 12);
+    append(g_dcode, "T-FID-E656");
+    append(g_dsev, "error");
+    append(g_dcat, "FID");
+    append(g_dname, "DESER_AGG");
+    append(g_dlegacy, "T_FID_DESERIALIZE_AGG");
+    append(g_dnote, "聚合反序列化错误");
+    append(g_leg_name, "T_FID_DESERIALIZE_AGG");
+    append(g_leg_idx, 13);
+    append(g_dcode, "T-FID-E657");
+    append(g_dsev, "error");
+    append(g_dcat, "FID");
+    append(g_dname, "DESER_NEEDS_FID");
+    append(g_dlegacy, "T_FID_DESERIALIZE_NEEDS_FID");
+    append(g_dnote, "反序列化需 fid");
+    append(g_leg_name, "T_FID_DESERIALIZE_NEEDS_FID");
+    append(g_leg_idx, 14);
+    append(g_dcode, "T-FID-E658");
+    append(g_dsev, "error");
+    append(g_dcat, "FID");
+    append(g_dname, "NOT_ORDERED");
+    append(g_dlegacy, "T_FID_NOT_ORDERED");
+    append(g_dnote, "fid 无序");
+    append(g_leg_name, "T_FID_NOT_ORDERED");
+    append(g_leg_idx, 15);
+    append(g_dcode, "T-FID-E659");
+    append(g_dsev, "error");
+    append(g_dcat, "FID");
+    append(g_dname, "ERROR_ARG");
+    append(g_dlegacy, "T_FID_ERROR_ARG");
+    append(g_dnote, "fid error() 实参错误");
+    append(g_leg_name, "T_FID_ERROR_ARG");
+    append(g_leg_idx, 16);
+    append(g_dcode, "T-FID-E660");
+    append(g_dsev, "error");
+    append(g_dcat, "FID");
+    append(g_dname, "EOF_ARG");
+    append(g_dlegacy, "T_FID_EOF_ARG");
+    append(g_dnote, "fid eof() 实参错误");
+    append(g_leg_name, "T_FID_EOF_ARG");
+    append(g_leg_idx, 17);
+    append(g_dcode, "T-FID-E661");
+    append(g_dsev, "error");
+    append(g_dcat, "FID");
+    append(g_dname, "SEEK_ARG");
+    append(g_dlegacy, "T_FID_SEEK_ARG");
+    append(g_dnote, "fid seek() 实参错误");
+    append(g_leg_name, "T_FID_SEEK_ARG");
+    append(g_leg_idx, 18);
+    append(g_dcode, "T-FID-E662");
+    append(g_dsev, "error");
+    append(g_dcat, "FID");
+    append(g_dname, "FORMAT_NOT_LITERAL");
+    append(g_dlegacy, "T_FID_FORMAT_NOT_LITERAL");
+    append(g_dnote, "fid format 非字面量");
+    append(g_leg_name, "T_FID_FORMAT_NOT_LITERAL");
+    append(g_leg_idx, 19);
+    append(g_dcode, "T-FLG-E850");
+    append(g_dsev, "error");
+    append(g_dcat, "FLG");
+    append(g_dname, "OFFSET_CONFLICT");
+    append(g_dlegacy, "T_FLAG_OFFSET_CONFLICT");
+    append(g_dnote, "flag 位偏移冲突");
+    append(g_leg_name, "T_FLAG_OFFSET_CONFLICT");
+    append(g_leg_idx, 20);
+    append(g_dcode, "T-FLG-E851");
+    append(g_dsev, "error");
+    append(g_dcat, "FLG");
+    append(g_dname, "OVERFLOW");
+    append(g_dlegacy, "T_FLAG_OVERFLOW");
+    append(g_dnote, "flag 位溢出");
+    append(g_leg_name, "T_FLAG_OVERFLOW");
+    append(g_leg_idx, 21);
+    append(g_dcode, "T-FST-E300");
+    append(g_dsev, "error");
+    append(g_dcat, "FST");
+    append(g_dname, "BAD_SPEC");
+    append(g_dlegacy, "T_FMT_BAD_SPEC");
+    append(g_dnote, "非法格式说明符");
+    append(g_leg_name, "T_FMT_BAD_SPEC");
+    append(g_leg_idx, 22);
+    append(g_dcode, "T-FST-E301");
+    append(g_dsev, "error");
+    append(g_dcat, "FST");
+    append(g_dname, "BAD_CONVERSION");
+    append(g_dlegacy, "T_FMT_BAD_CONVERSION");
+    append(g_dnote, "非法转换标签");
+    append(g_leg_name, "T_FMT_BAD_CONVERSION");
+    append(g_leg_idx, 23);
+    append(g_dcode, "T-FST-E302");
+    append(g_dsev, "error");
+    append(g_dcat, "FST");
+    append(g_dname, "MULTI_CONV");
+    append(g_dlegacy, "");
+    append(g_dnote, "单个插值含多个 ! 转换标签；short_note: single interpolation allows at most one ! conversion tag");
+    append(g_dcode, "T-FST-E303");
+    append(g_dsev, "error");
+    append(g_dcat, "FST");
+    append(g_dname, "NO_TEMPLATE");
+    append(g_dlegacy, "T_FMT_NO_TEMPLATE");
+    append(g_dnote, "缺模板");
+    append(g_leg_name, "T_FMT_NO_TEMPLATE");
+    append(g_leg_idx, 25);
+    append(g_dcode, "T-FST-E304");
+    append(g_dsev, "error");
+    append(g_dcat, "FST");
+    append(g_dname, "TEMPLATE_NOT_LITERAL");
+    append(g_dlegacy, "T_FMT_TEMPLATE_NOT_LITERAL");
+    append(g_dnote, "模板非编译期字面量");
+    append(g_leg_name, "T_FMT_TEMPLATE_NOT_LITERAL");
+    append(g_leg_idx, 26);
+    append(g_dcode, "T-FST-E305");
+    append(g_dsev, "error");
+    append(g_dcat, "FST");
+    append(g_dname, "TOO_MANY_ARGS");
+    append(g_dlegacy, "T_FMT_TOO_MANY_ARGS");
+    append(g_dnote, "format 实参超过 64");
+    append(g_leg_name, "T_FMT_TOO_MANY_ARGS");
+    append(g_leg_idx, 27);
+    append(g_dcode, "T-FST-E306");
+    append(g_dsev, "error");
+    append(g_dcat, "FST");
+    append(g_dname, "ARG_TYPE");
+    append(g_dlegacy, "T_FMT_ARG_TYPE");
+    append(g_dnote, "实参类型不匹配占位符");
+    append(g_leg_name, "T_FMT_ARG_TYPE");
+    append(g_leg_idx, 28);
+    append(g_dcode, "T-FST-E307");
+    append(g_dsev, "error");
+    append(g_dcat, "FST");
+    append(g_dname, "BAD_TEMPLATE");
+    append(g_dlegacy, "T_FMT_BAD_TEMPLATE");
+    append(g_dnote, "模板语法错误");
+    append(g_leg_name, "T_FMT_BAD_TEMPLATE");
+    append(g_leg_idx, 29);
+    append(g_dcode, "T-FST-E308");
+    append(g_dsev, "error");
+    append(g_dcat, "FST");
+    append(g_dname, "NAMED_FIELD");
+    append(g_dlegacy, "T_FMT_NAMED_FIELD");
+    append(g_dnote, "命名字段不支持");
+    append(g_leg_name, "T_FMT_NAMED_FIELD");
+    append(g_leg_idx, 30);
+    append(g_dcode, "T-FST-E309");
+    append(g_dsev, "error");
+    append(g_dcat, "FST");
+    append(g_dname, "MIXED_NUMBERING");
+    append(g_dlegacy, "T_FMT_MIXED_NUMBERING");
+    append(g_dnote, "混用编号/位置");
+    append(g_leg_name, "T_FMT_MIXED_NUMBERING");
+    append(g_leg_idx, 31);
+    append(g_dcode, "T-FST-E310");
+    append(g_dsev, "error");
+    append(g_dcat, "FST");
+    append(g_dname, "INDEX_RANGE");
+    append(g_dlegacy, "T_FMT_INDEX_RANGE");
+    append(g_dnote, "索引越界");
+    append(g_leg_name, "T_FMT_INDEX_RANGE");
+    append(g_leg_idx, 32);
+    append(g_dcode, "T-FST-E311");
+    append(g_dsev, "error");
+    append(g_dcat, "FST");
+    append(g_dname, "CONV_TYPE");
+    append(g_dlegacy, "T_FMT_CONV_TYPE");
+    append(g_dnote, "冻结占位，当前不可达，不删除");
+    append(g_leg_name, "T_FMT_CONV_TYPE");
+    append(g_leg_idx, 33);
+    append(g_dcode, "T-FST-E312");
+    append(g_dsev, "error");
+    append(g_dcat, "FST");
+    append(g_dname, "SPEC_TYPE");
+    append(g_dlegacy, "T_FMT_SPEC_TYPE");
+    append(g_dnote, "说明符类型错误");
+    append(g_leg_name, "T_FMT_SPEC_TYPE");
+    append(g_leg_idx, 34);
+    append(g_dcode, "T-FUN-E810");
+    append(g_dsev, "error");
+    append(g_dcat, "FUN");
+    append(g_dname, "BIND_CONFLICT");
+    append(g_dlegacy, "T_FUNC_CLAUSE_BIND_CONFLICT");
+    append(g_dnote, "子句绑定冲突");
+    append(g_leg_name, "T_FUNC_CLAUSE_BIND_CONFLICT");
+    append(g_leg_idx, 35);
+    append(g_dcode, "T-FUN-E811");
+    append(g_dsev, "error");
+    append(g_dcat, "FUN");
+    append(g_dname, "ARITY");
+    append(g_dlegacy, "T_FUNC_CLAUSE_ARITY");
+    append(g_dnote, "子句元数错误");
+    append(g_leg_name, "T_FUNC_CLAUSE_ARITY");
+    append(g_leg_idx, 36);
+    append(g_dcode, "T-FUN-E812");
+    append(g_dsev, "error");
+    append(g_dcat, "FUN");
+    append(g_dname, "NO_TYPE");
+    append(g_dlegacy, "T_FUNC_CLAUSE_NO_TYPE");
+    append(g_dnote, "子句无类型");
+    append(g_leg_name, "T_FUNC_CLAUSE_NO_TYPE");
+    append(g_leg_idx, 37);
+    append(g_dcode, "T-FUN-E813");
+    append(g_dsev, "error");
+    append(g_dcat, "FUN");
+    append(g_dname, "RET_TYPE");
+    append(g_dlegacy, "T_FUNC_CLAUSE_RET_TYPE");
+    append(g_dnote, "子句返回类型错误");
+    append(g_leg_name, "T_FUNC_CLAUSE_RET_TYPE");
+    append(g_leg_idx, 38);
+    append(g_dcode, "T-FUN-E814");
+    append(g_dsev, "error");
+    append(g_dcat, "FUN");
+    append(g_dname, "BODY");
+    append(g_dlegacy, "T_FUNC_CLAUSE_BODY");
+    append(g_dnote, "子句体错误");
+    append(g_leg_name, "T_FUNC_CLAUSE_BODY");
+    append(g_leg_idx, 39);
+    append(g_dcode, "T-ICE-E080");
+    append(g_dsev, "error");
+    append(g_dcat, "ICE");
+    append(g_dname, "INTERNAL");
+    append(g_dlegacy, "");
+    append(g_dnote, "内部编译器错误，metadata.stack 携带堆栈");
+    append(g_dcode, "T-ICE-E081");
+    append(g_dsev, "error");
+    append(g_dcat, "ICE");
+    append(g_dname, "LLVM_EMIT");
+    append(g_dlegacy, "");
+    append(g_dnote, "后端 LLVM 发射失败");
+    append(g_dcode, "T-LEX-E000");
+    append(g_dsev, "error");
+    append(g_dcat, "LEX");
+    append(g_dname, "UNTERMINATED_STRING");
+    append(g_dlegacy, "");
+    append(g_dnote, "字符串未终结");
+    append(g_dcode, "T-LEX-E001");
+    append(g_dsev, "error");
+    append(g_dcat, "LEX");
+    append(g_dname, "INVALID_CHAR");
+    append(g_dlegacy, "");
+    append(g_dnote, "非法字符");
+    append(g_dcode, "T-LEX-E002");
+    append(g_dsev, "error");
+    append(g_dcat, "LEX");
+    append(g_dname, "BAD_ESCAPE");
+    append(g_dlegacy, "T_LEX_BAD_ESCAPE");
+    append(g_dnote, "未知转义序列（合法集见 reference.md §2.4）");
+    append(g_leg_name, "T_LEX_BAD_ESCAPE");
+    append(g_leg_idx, 44);
+    append(g_dcode, "T-LEX-E003");
+    append(g_dsev, "error");
+    append(g_dcat, "LEX");
+    append(g_dname, "NEWLINE_IN_STRING");
+    append(g_dlegacy, "T_LEX_NEWLINE_IN_STRING");
+    append(g_dnote, "单引号串内不得出现裸换行，改用 `\\n` 或三引号长字符串");
+    append(g_leg_name, "T_LEX_NEWLINE_IN_STRING");
+    append(g_leg_idx, 45);
+    append(g_dcode, "T-LEX-E004");
+    append(g_dsev, "error");
+    append(g_dcat, "LEX");
+    append(g_dname, "BAD_NUMBER");
+    append(g_dlegacy, "T_LEX_BAD_NUMBER");
+    append(g_dnote, "数字字面量形式非法（无数字位 / 分隔符位置非法 / 指数缺数字）");
+    append(g_leg_name, "T_LEX_BAD_NUMBER");
+    append(g_leg_idx, 46);
+    append(g_dcode, "T-LEX-E005");
+    append(g_dsev, "error");
+    append(g_dcat, "LEX");
+    append(g_dname, "BAD_NUM_SUFFIX");
+    append(g_dlegacy, "T_LEX_BAD_NUM_SUFFIX");
+    append(g_dnote, "位宽后缀非法（合法：u8/u16/u32/u64/i8/i16/i32/i64/f32/f64）");
+    append(g_leg_name, "T_LEX_BAD_NUM_SUFFIX");
+    append(g_leg_idx, 47);
+    append(g_dcode, "T-LEX-E006");
+    append(g_dsev, "error");
+    append(g_dcat, "LEX");
+    append(g_dname, "LIT_OUT_OF_RANGE");
+    append(g_dlegacy, "T_LEX_LIT_OUT_OF_RANGE");
+    append(g_dnote, "带后缀整数字面量超出该类型表示范围");
+    append(g_leg_name, "T_LEX_LIT_OUT_OF_RANGE");
+    append(g_leg_idx, 48);
+    append(g_dcode, "T-LEX-E007");
+    append(g_dsev, "error");
+    append(g_dcat, "LEX");
+    append(g_dname, "BAD_CHAR_LITERAL");
+    append(g_dlegacy, "T_LEX_BAD_CHAR_LITERAL");
+    append(g_dnote, "字节字符字面量非法（须恰好一个 0..255 字节）");
+    append(g_leg_name, "T_LEX_BAD_CHAR_LITERAL");
+    append(g_leg_idx, 49);
+    append(g_dcode, "T-LEX-E008");
+    append(g_dsev, "error");
+    append(g_dcat, "LEX");
+    append(g_dname, "UNTERMINATED_LONG_STRING");
+    append(g_dlegacy, "T_LEX_UNTERMINATED_LONG_STRING");
+    append(g_dnote, "三引号 / 原始字符串未终结");
+    append(g_leg_name, "T_LEX_UNTERMINATED_LONG_STRING");
+    append(g_leg_idx, 50);
+    append(g_dcode, "T-MAT-E740");
+    append(g_dsev, "error");
+    append(g_dcat, "MAT");
+    append(g_dname, "UNKNOWN_CASE");
+    append(g_dlegacy, "T_MATCH_UNKNOWN_CASE");
+    append(g_dnote, "未知 match case");
+    append(g_leg_name, "T_MATCH_UNKNOWN_CASE");
+    append(g_leg_idx, 51);
+    append(g_dcode, "T-MAT-E741");
+    append(g_dsev, "error");
+    append(g_dcat, "MAT");
+    append(g_dname, "ARM_TYPE");
+    append(g_dlegacy, "T_MATCH_ARM_TYPE");
+    append(g_dnote, "分支类型不一致");
+    append(g_leg_name, "T_MATCH_ARM_TYPE");
+    append(g_leg_idx, 52);
+    append(g_dcode, "T-MAT-E742");
+    append(g_dsev, "error");
+    append(g_dcat, "MAT");
+    append(g_dname, "NONEXHAUSTIVE");
+    append(g_dlegacy, "T_MATCH_NONEXHAUSTIVE");
+    append(g_dnote, "match 未穷尽");
+    append(g_leg_name, "T_MATCH_NONEXHAUSTIVE");
+    append(g_leg_idx, 53);
+    append(g_dcode, "T-MOD-E550");
+    append(g_dsev, "error");
+    append(g_dcat, "MOD");
+    append(g_dname, "IMPORT_NOT_FOUND");
+    append(g_dlegacy, "T_IMPORT_NOT_FOUND");
+    append(g_dnote, "导入目标不存在");
+    append(g_leg_name, "T_IMPORT_NOT_FOUND");
+    append(g_leg_idx, 54);
+    append(g_dcode, "T-MOD-E551");
+    append(g_dsev, "error");
+    append(g_dcat, "MOD");
+    append(g_dname, "IMPORT_CYCLE");
+    append(g_dlegacy, "T_IMPORT_CYCLE");
+    append(g_dnote, "导入循环");
+    append(g_leg_name, "T_IMPORT_CYCLE");
+    append(g_leg_idx, 55);
+    append(g_dcode, "T-MOD-E552");
+    append(g_dsev, "error");
+    append(g_dcat, "MOD");
+    append(g_dname, "IMPORT_IO");
+    append(g_dlegacy, "T_IMPORT_IO");
+    append(g_dnote, "导入路径 I/O 失败");
+    append(g_leg_name, "T_IMPORT_IO");
+    append(g_leg_idx, 56);
+    append(g_dcode, "T-MOD-E553");
+    append(g_dsev, "error");
+    append(g_dcat, "MOD");
+    append(g_dname, "IMPORT_HEADER");
+    append(g_dlegacy, "T_IMPORT_HEADER");
+    append(g_dnote, "导入头错误");
+    append(g_leg_name, "T_IMPORT_HEADER");
+    append(g_leg_idx, 57);
+    append(g_dcode, "T-MOD-E554");
+    append(g_dsev, "error");
+    append(g_dcat, "MOD");
+    append(g_dname, "IMPORT_VALUE");
+    append(g_dlegacy, "T_IMPORT_VALUE");
+    append(g_dnote, "导入值非法");
+    append(g_leg_name, "T_IMPORT_VALUE");
+    append(g_leg_idx, 58);
+    append(g_dcode, "T-MOD-E555");
+    append(g_dsev, "error");
+    append(g_dcat, "MOD");
+    append(g_dname, "IMPORT_CONTEXT");
+    append(g_dlegacy, "T_IMPORT_CONTEXT");
+    append(g_dnote, "导入上下文错误");
+    append(g_leg_name, "T_IMPORT_CONTEXT");
+    append(g_leg_idx, 59);
+    append(g_dcode, "T-MOD-E556");
+    append(g_dsev, "error");
+    append(g_dcat, "MOD");
+    append(g_dname, "EXPORT_SCOPE");
+    append(g_dlegacy, "T_EXPORT_SCOPE");
+    append(g_dnote, "export 修饰了非顶层声明");
+    append(g_leg_name, "T_EXPORT_SCOPE");
+    append(g_leg_idx, 60);
+    append(g_dcode, "T-MOD-E557");
+    append(g_dsev, "error");
+    append(g_dcat, "MOD");
+    append(g_dname, "NO_SYMBOL");
+    append(g_dlegacy, "T_MODULE_NO_SYMBOL");
+    append(g_dnote, "模块无该符号");
+    append(g_leg_name, "T_MODULE_NO_SYMBOL");
+    append(g_leg_idx, 61);
+    append(g_dcode, "T-MOD-E558");
+    append(g_dsev, "error");
+    append(g_dcat, "MOD");
+    append(g_dname, "PRIVATE");
+    append(g_dlegacy, "T_MODULE_PRIVATE");
+    append(g_dnote, "符号为私有不可见");
+    append(g_leg_name, "T_MODULE_PRIVATE");
+    append(g_leg_idx, 62);
+    append(g_dcode, "T-MOD-E559");
+    append(g_dsev, "error");
+    append(g_dcat, "MOD");
+    append(g_dname, "IMPORT_BAD_PATH");
+    append(g_dlegacy, "T_IMPORT_BAD_PATH");
+    append(g_dnote, "导入路径非法");
+    append(g_leg_name, "T_IMPORT_BAD_PATH");
+    append(g_leg_idx, 63);
+    append(g_dcode, "T-MOD-E560");
+    append(g_dsev, "error");
+    append(g_dcat, "MOD");
+    append(g_dname, "IMPORT_CONFLICT");
+    append(g_dlegacy, "T_IMPORT_CONFLICT");
+    append(g_dnote, "导入符号冲突");
+    append(g_leg_name, "T_IMPORT_CONFLICT");
+    append(g_leg_idx, 64);
+    append(g_dcode, "T-MTA-E600");
+    append(g_dsev, "error");
+    append(g_dcat, "MTA");
+    append(g_dname, "VALUE_PARAM_TYPE");
+    append(g_dlegacy, "T_META_VALUE_PARAM_TYPE");
+    append(g_dnote, "元值参数类型错误");
+    append(g_leg_name, "T_META_VALUE_PARAM_TYPE");
+    append(g_leg_idx, 65);
+    append(g_dcode, "T-MTA-E601");
+    append(g_dsev, "error");
+    append(g_dcat, "MTA");
+    append(g_dname, "ARG_TYPE");
+    append(g_dlegacy, "T_META_ARG_TYPE");
+    append(g_dnote, "元参类型错误");
+    append(g_leg_name, "T_META_ARG_TYPE");
+    append(g_leg_idx, 66);
+    append(g_dcode, "T-MTA-E602");
+    append(g_dsev, "error");
+    append(g_dcat, "MTA");
+    append(g_dname, "RANGE");
+    append(g_dlegacy, "T_META_RANGE");
+    append(g_dnote, "元范围错误");
+    append(g_leg_name, "T_META_RANGE");
+    append(g_leg_idx, 67);
+    append(g_dcode, "T-MTA-E603");
+    append(g_dsev, "error");
+    append(g_dcat, "MTA");
+    append(g_dname, "COMPTIME_ARG_NOT_TYPE");
+    append(g_dlegacy, "T_COMPTIME_ARG_NOT_TYPE");
+    append(g_dnote, "comptime 实参非类型");
+    append(g_leg_name, "T_COMPTIME_ARG_NOT_TYPE");
+    append(g_leg_idx, 68);
+    append(g_dcode, "T-MTA-E604");
+    append(g_dsev, "error");
+    append(g_dcat, "MTA");
+    append(g_dname, "COMPILE_ERROR");
+    append(g_dlegacy, "T_META_COMPILE_ERROR");
+    append(g_dnote, "编译期求值错误");
+    append(g_leg_name, "T_META_COMPILE_ERROR");
+    append(g_leg_idx, 69);
+    append(g_dcode, "T-MTA-E605");
+    append(g_dsev, "error");
+    append(g_dcat, "MTA");
+    append(g_dname, "RUNTIME_CTX");
+    append(g_dlegacy, "T_META_RUNTIME_CTX");
+    append(g_dnote, "编译期误用运行期上下文");
+    append(g_leg_name, "T_META_RUNTIME_CTX");
+    append(g_leg_idx, 70);
+    append(g_dcode, "T-MTA-E606");
+    append(g_dsev, "error");
+    append(g_dcat, "MTA");
+    append(g_dname, "UNKNOWN_TYPE");
+    append(g_dlegacy, "T_META_UNKNOWN_TYPE");
+    append(g_dnote, "未知元类型");
+    append(g_leg_name, "T_META_UNKNOWN_TYPE");
+    append(g_leg_idx, 71);
+    append(g_dcode, "T-MTA-E607");
+    append(g_dsev, "error");
+    append(g_dcat, "MTA");
+    append(g_dname, "UNKNOWN_BUILTIN");
+    append(g_dlegacy, "T_META_UNKNOWN_BUILTIN");
+    append(g_dnote, "未知元内建");
+    append(g_leg_name, "T_META_UNKNOWN_BUILTIN");
+    append(g_leg_idx, 72);
+    append(g_dcode, "T-MTA-E608");
+    append(g_dsev, "error");
+    append(g_dcat, "MTA");
+    append(g_dname, "TYPE_AS_VALUE");
+    append(g_dlegacy, "T_META_TYPE_AS_VALUE");
+    append(g_dnote, "元类型被当值使用");
+    append(g_leg_name, "T_META_TYPE_AS_VALUE");
+    append(g_leg_idx, 73);
+    append(g_dcode, "T-MTA-E609");
+    append(g_dsev, "error");
+    append(g_dcat, "MTA");
+    append(g_dname, "RETURN_OUTSIDE_FN");
+    append(g_dlegacy, "T_META_RETURN_OUTSIDE_FN");
+    append(g_dnote, "meta 块内 return");
+    append(g_leg_name, "T_META_RETURN_OUTSIDE_FN");
+    append(g_leg_idx, 74);
+    append(g_dcode, "T-MTA-E611");
+    append(g_dsev, "error");
+    append(g_dcat, "MTA");
+    append(g_dname, "ARITY");
+    append(g_dlegacy, "T_META_ARITY");
+    append(g_dnote, "元参数数量错误");
+    append(g_leg_name, "T_META_ARITY");
+    append(g_leg_idx, 75);
+    append(g_dcode, "T-MTA-E612");
+    append(g_dsev, "error");
+    append(g_dcat, "MTA");
+    append(g_dname, "BUDGET");
+    append(g_dlegacy, "T_META_BUDGET");
+    append(g_dnote, "元计算预算超限");
+    append(g_leg_name, "T_META_BUDGET");
+    append(g_leg_idx, 76);
+    append(g_dcode, "T-MTA-E613");
+    append(g_dsev, "error");
+    append(g_dcat, "MTA");
+    append(g_dname, "DEPTH");
+    append(g_dlegacy, "T_META_DEPTH");
+    append(g_dnote, "元递归深度超限");
+    append(g_leg_name, "T_META_DEPTH");
+    append(g_leg_idx, 77);
+    append(g_dcode, "T-MTA-E614");
+    append(g_dsev, "error");
+    append(g_dcat, "MTA");
+    append(g_dname, "DIV_ZERO");
+    append(g_dlegacy, "T_META_DIV_ZERO");
+    append(g_dnote, "元除零");
+    append(g_leg_name, "T_META_DIV_ZERO");
+    append(g_leg_idx, 78);
+    append(g_dcode, "T-MTA-E615");
+    append(g_dsev, "error");
+    append(g_dcat, "MTA");
+    append(g_dname, "IMPURE");
+    append(g_dlegacy, "T_META_IMPURE");
+    append(g_dnote, "meta 内出现不纯操作");
+    append(g_leg_name, "T_META_IMPURE");
+    append(g_leg_idx, 79);
+    append(g_dcode, "T-MTA-E616");
+    append(g_dsev, "error");
+    append(g_dcat, "MTA");
+    append(g_dname, "NO_RETURN");
+    append(g_dlegacy, "T_META_NO_RETURN");
+    append(g_dnote, "meta 块无返回值");
+    append(g_leg_name, "T_META_NO_RETURN");
+    append(g_leg_idx, 80);
+    append(g_dcode, "T-MTA-E617");
+    append(g_dsev, "error");
+    append(g_dcat, "MTA");
+    append(g_dname, "NOT_CONST");
+    append(g_dlegacy, "T_META_NOT_CONST");
+    append(g_dnote, "元实参非常量");
+    append(g_leg_name, "T_META_NOT_CONST");
+    append(g_leg_idx, 81);
+    append(g_dcode, "T-MTA-E618");
+    append(g_dsev, "error");
+    append(g_dcat, "MTA");
+    append(g_dname, "NOT_META_FN");
+    append(g_dlegacy, "T_META_NOT_META_FN");
+    append(g_dnote, "目标非 meta 函数");
+    append(g_leg_name, "T_META_NOT_META_FN");
+    append(g_leg_idx, 82);
+    append(g_dcode, "T-MTA-E619");
+    append(g_dsev, "error");
+    append(g_dcat, "MTA");
+    append(g_dname, "NOT_TYPE");
+    append(g_dlegacy, "T_META_NOT_TYPE");
+    append(g_dnote, "期望类型");
+    append(g_leg_name, "T_META_NOT_TYPE");
+    append(g_leg_idx, 83);
+    append(g_dcode, "T-MTA-E620");
+    append(g_dsev, "error");
+    append(g_dcat, "MTA");
+    append(g_dname, "READ_RUNTIME");
+    append(g_dlegacy, "T_META_READ_RUNTIME");
+    append(g_dnote, "meta 内读取运行期值");
+    append(g_leg_name, "T_META_READ_RUNTIME");
+    append(g_leg_idx, 84);
+    append(g_dcode, "T-MTA-W610");
+    append(g_dsev, "warning");
+    append(g_dcat, "MTA");
+    append(g_dname, "COMPTIME_ALIAS");
+    append(g_dlegacy, "W_COMPTIME_ALIAS");
+    append(g_dnote, "comptime 为 meta 弃用别名");
+    append(g_leg_name, "W_COMPTIME_ALIAS");
+    append(g_leg_idx, 85);
+    append(g_dcode, "T-NAM-W400");
+    append(g_dsev, "warning");
+    append(g_dcat, "NAM");
+    append(g_dname, "TYPE_CAMEL");
+    append(g_dlegacy, "T_NAME_TYPE_CAMEL");
+    append(g_dnote, "类型名应 PascalCase");
+    append(g_leg_name, "T_NAME_TYPE_CAMEL");
+    append(g_leg_idx, 86);
+    append(g_dcode, "T-NAM-W401");
+    append(g_dsev, "warning");
+    append(g_dcat, "NAM");
+    append(g_dname, "VAR_SNAKE");
+    append(g_dlegacy, "T_NAME_VAR_SNAKE");
+    append(g_dnote, "变量名应 snake_case");
+    append(g_leg_name, "T_NAME_VAR_SNAKE");
+    append(g_leg_idx, 87);
+    append(g_dcode, "T-NAM-W402");
+    append(g_dsev, "warning");
+    append(g_dcat, "NAM");
+    append(g_dname, "CONST_UPPER");
+    append(g_dlegacy, "T_NAME_CONST_UPPER");
+    append(g_dnote, "常量名应 UPPER_SNAKE");
+    append(g_leg_name, "T_NAME_CONST_UPPER");
+    append(g_leg_idx, 88);
+    append(g_dcode, "T-NAM-W403");
+    append(g_dsev, "warning");
+    append(g_dcat, "NAM");
+    append(g_dname, "ANNOTATION_LOWER");
+    append(g_dlegacy, "T_NAME_ANNOTATION_LOWER");
+    append(g_dnote, "注解名应小写 snake");
+    append(g_leg_name, "T_NAME_ANNOTATION_LOWER");
+    append(g_leg_idx, 89);
+    append(g_dcode, "T-NAM-W404");
+    append(g_dsev, "warning");
+    append(g_dcat, "NAM");
+    append(g_dname, "C_KEYWORD_IDENT");
+    append(g_dlegacy, "W_C_KEYWORD_IDENT");
+    append(g_dnote, "标识符撞 C 关键字");
+    append(g_leg_name, "W_C_KEYWORD_IDENT");
+    append(g_leg_idx, 90);
+    append(g_dcode, "T-PAR-E100");
+    append(g_dsev, "error");
+    append(g_dcat, "PAR");
+    append(g_dname, "INVALID_EXPR");
+    append(g_dlegacy, "T_PARSE_INVALID_EXPR");
+    append(g_dnote, "无效表达式（解析期）");
+    append(g_leg_name, "T_PARSE_INVALID_EXPR");
+    append(g_leg_idx, 91);
+    append(g_dcode, "T-PAR-E101");
+    append(g_dsev, "error");
+    append(g_dcat, "PAR");
+    append(g_dname, "SYNTAX");
+    append(g_dlegacy, "T_PARSE_SYNTAX");
+    append(g_dnote, "语法错误（解析期致命，解析器无错误恢复）");
+    append(g_leg_name, "T_PARSE_SYNTAX");
+    append(g_leg_idx, 92);
+    append(g_dcode, "T-PAR-E102");
+    append(g_dsev, "error");
+    append(g_dcat, "PAR");
+    append(g_dname, "REMOVED_SYNTAX");
+    append(g_dlegacy, "T_PARSE_REMOVED_SYNTAX");
+    append(g_dnote, "已移除的旧语法，按提示改写");
+    append(g_leg_name, "T_PARSE_REMOVED_SYNTAX");
+    append(g_leg_idx, 93);
+    append(g_dcode, "T-PIP-E860");
+    append(g_dsev, "error");
+    append(g_dcat, "PIP");
+    append(g_dname, "RHS_NOT_FUNC");
+    append(g_dlegacy, "T_PIPE_RHS_NOT_FUNC");
+    append(g_dnote, "管道右操作数不是函数值");
+    append(g_leg_name, "T_PIPE_RHS_NOT_FUNC");
+    append(g_leg_idx, 94);
+    append(g_dcode, "T-PIP-E861");
+    append(g_dsev, "error");
+    append(g_dcat, "PIP");
+    append(g_dname, "RHS_ARITY");
+    append(g_dlegacy, "T_PIPE_RHS_ARITY");
+    append(g_dnote, "管道右侧函数不是一元");
+    append(g_leg_name, "T_PIPE_RHS_ARITY");
+    append(g_leg_idx, 95);
+    append(g_dcode, "T-PIP-E862");
+    append(g_dsev, "error");
+    append(g_dcat, "PIP");
+    append(g_dname, "ARG_TYPE");
+    append(g_dlegacy, "T_PIPE_ARG_TYPE");
+    append(g_dnote, "流入值类型无法转型为右侧形参类型");
+    append(g_leg_name, "T_PIPE_ARG_TYPE");
+    append(g_leg_idx, 96);
+    append(g_dcode, "T-PIP-E863");
+    append(g_dsev, "error");
+    append(g_dcat, "PIP");
+    append(g_dname, "NOT_SEQUENCE");
+    append(g_dlegacy, "T_PIPE_NOT_SEQUENCE");
+    append(g_dnote, "|-> / |>? 的左操作数不是切片或定长数组");
+    append(g_leg_name, "T_PIPE_NOT_SEQUENCE");
+    append(g_leg_idx, 97);
+    append(g_dcode, "T-PIP-E864");
+    append(g_dsev, "error");
+    append(g_dcat, "PIP");
+    append(g_dname, "PRED_TYPE");
+    append(g_dlegacy, "T_PIPE_PRED_TYPE");
+    append(g_dnote, "|>? 的谓词返回类型不是 bool");
+    append(g_leg_name, "T_PIPE_PRED_TYPE");
+    append(g_leg_idx, 98);
+    append(g_dcode, "T-PIP-E865");
+    append(g_dsev, "error");
+    append(g_dcat, "PIP");
+    append(g_dname, "BAD_CONTEXT");
+    append(g_dlegacy, "T_PIPE_BAD_CONTEXT");
+    append(g_dnote, "管道表达式出现在四个许可上下文之外");
+    append(g_leg_name, "T_PIPE_BAD_CONTEXT");
+    append(g_leg_idx, 99);
+    append(g_dcode, "T-PIP-E867");
+    append(g_dsev, "error");
+    append(g_dcat, "PIP");
+    append(g_dname, "NO_MATCH");
+    append(g_dlegacy, "T_PIPE_NO_MATCH");
+    append(g_dnote, "|> 的右侧函数与左操作数无任何匹配形态");
+    append(g_leg_name, "T_PIPE_NO_MATCH");
+    append(g_leg_idx, 100);
+    append(g_dcode, "T-PIP-E869");
+    append(g_dsev, "error");
+    append(g_dcat, "PIP");
+    append(g_dname, "VOID_MAP");
+    append(g_dlegacy, "T_PIPE_VOID_MAP");
+    append(g_dnote, "元素级管道阶段函数返回 void 会产出无意义的 []void，副作用遍历请用 for");
+    append(g_leg_name, "T_PIPE_VOID_MAP");
+    append(g_leg_idx, 101);
+    append(g_dcode, "T-PIP-W866");
+    append(g_dsev, "warning");
+    append(g_dcat, "PIP");
+    append(g_dname, "DISPATCH_AMBIG");
+    append(g_dlegacy, "W_PIPE_DISPATCH_AMBIG");
+    append(g_dnote, "|> 整体应用与逐元素映射同时成立，已按规范取整体应用");
+    append(g_leg_name, "W_PIPE_DISPATCH_AMBIG");
+    append(g_leg_idx, 102);
+    append(g_dcode, "T-PIP-W868");
+    append(g_dsev, "warning");
+    append(g_dcat, "PIP");
+    append(g_dname, "RESULT_UNUSED");
+    append(g_dlegacy, "W_PIPE_RESULT_UNUSED");
+    append(g_dnote, "表达式语句位的管道结果被丢弃");
+    append(g_leg_name, "W_PIPE_RESULT_UNUSED");
+    append(g_leg_idx, 103);
+    append(g_dcode, "T-RNG-E870");
+    append(g_dsev, "error");
+    append(g_dcat, "RNG");
+    append(g_dname, "ITER_NO_START");
+    append(g_dlegacy, "T_RANGE_ITER_NO_START");
+    append(g_dnote, "区间迭代必须有起点：`..n` / `..` 无从开始；双变量 for 也只用于 map");
+    append(g_leg_name, "T_RANGE_ITER_NO_START");
+    append(g_leg_idx, 104);
+    append(g_dcode, "T-RNG-E871");
+    append(g_dsev, "error");
+    append(g_dcat, "RNG");
+    append(g_dname, "INDEX_UNSUPPORTED");
+    append(g_dlegacy, "T_RANGE_INDEX_UNSUPPORTED");
+    append(g_dnote, "只有 string 与 []T 支持区间索引 s[a..b]");
+    append(g_leg_name, "T_RANGE_INDEX_UNSUPPORTED");
+    append(g_leg_idx, 105);
+    append(g_dcode, "T-RNG-E872");
+    append(g_dsev, "error");
+    append(g_dcat, "RNG");
+    append(g_dname, "OPEN_AS_VALUE");
+    append(g_dlegacy, "T_RANGE_OPEN_AS_VALUE");
+    append(g_dnote, "`a..` / `..b` / `..` 只在切片索引里有意义；取值必须两端俱全，否则物化会无界");
+    append(g_leg_name, "T_RANGE_OPEN_AS_VALUE");
+    append(g_leg_idx, 106);
+    append(g_dcode, "T-RNG-E873");
+    append(g_dsev, "error");
+    append(g_dcat, "RNG");
+    append(g_dname, "INDEX_ARRAY");
+    append(g_dlegacy, "T_RANGE_INDEX_ARRAY");
+    append(g_dnote, "[N]T 到 []T 的构造降解尚未落地，先把定长数组放进 []T 变量再切");
+    append(g_leg_name, "T_RANGE_INDEX_ARRAY");
+    append(g_leg_idx, 107);
+    append(g_dcode, "T-RNG-E874");
+    append(g_dsev, "error");
+    append(g_dcat, "RNG");
+    append(g_dname, "INCL_NO_END");
+    append(g_dlegacy, "T_RANGE_INCL_NO_END");
+    append(g_dnote, "`..=` 是闭合区间，右端点不可省；想要开放右端请用 `..`");
+    append(g_leg_name, "T_RANGE_INCL_NO_END");
+    append(g_leg_idx, 108);
+    append(g_dcode, "T-RNG-E875");
+    append(g_dsev, "error");
+    append(g_dcat, "RNG");
+    append(g_dname, "IMPURE_OPERAND");
+    append(g_dlegacy, "T_RANGE_IMPURE_OPERAND");
+    append(g_dnote, "省略上界的索引与 x in a..b 会把操作数展开两次；含调用/副作用时请先绑定到变量");
+    append(g_leg_name, "T_RANGE_IMPURE_OPERAND");
+    append(g_leg_idx, 109);
+    append(g_dcode, "T-RNG-E877");
+    append(g_dsev, "error");
+    append(g_dcat, "RNG");
+    append(g_dname, "IN_RHS_NOT_RANGE");
+    append(g_dlegacy, "T_IN_RHS_NOT_RANGE");
+    append(g_dnote, "x in 1..10 / x in 0..=9；容器成员测试请自己写循环");
+    append(g_leg_name, "T_IN_RHS_NOT_RANGE");
+    append(g_leg_idx, 110);
+    append(g_dcode, "T-SEM-E200");
+    append(g_dsev, "error");
+    append(g_dcat, "SEM");
+    append(g_dname, "UNKNOWN_TYPE");
+    append(g_dlegacy, "T_UNKNOWN_TYPE");
+    append(g_dnote, "未定义类型");
+    append(g_leg_name, "T_UNKNOWN_TYPE");
+    append(g_leg_idx, 111);
+    append(g_dcode, "T-SEM-E201");
+    append(g_dsev, "error");
+    append(g_dcat, "SEM");
+    append(g_dname, "UNDEFINED_IDENT");
+    append(g_dlegacy, "T_UNDEFINED_IDENT");
+    append(g_dnote, "未定义标识符");
+    append(g_leg_name, "T_UNDEFINED_IDENT");
+    append(g_leg_idx, 112);
+    append(g_dcode, "T-SEM-E202");
+    append(g_dsev, "error");
+    append(g_dcat, "SEM");
+    append(g_dname, "TYPE_MISMATCH");
+    append(g_dlegacy, "T_TYPE_MISMATCH");
+    append(g_dnote, "类型不匹配");
+    append(g_leg_name, "T_TYPE_MISMATCH");
+    append(g_leg_idx, 113);
+    append(g_dcode, "T-SEM-E203");
+    append(g_dsev, "error");
+    append(g_dcat, "SEM");
+    append(g_dname, "IMPLICIT_CAST");
+    append(g_dlegacy, "T_TYPE_IMPLICIT_CAST");
+    append(g_dnote, "隐式类型转换不被允许");
+    append(g_leg_name, "T_TYPE_IMPLICIT_CAST");
+    append(g_leg_idx, 114);
+    append(g_dcode, "T-SEM-E204");
+    append(g_dsev, "error");
+    append(g_dcat, "SEM");
+    append(g_dname, "IMPLICIT_BOOL");
+    append(g_dlegacy, "T_STMT_IMPLICIT_BOOL");
+    append(g_dnote, "语句隐式布尔判定不被允许");
+    append(g_leg_name, "T_STMT_IMPLICIT_BOOL");
+    append(g_leg_idx, 115);
+    append(g_dcode, "T-SEM-E205");
+    append(g_dsev, "error");
+    append(g_dcat, "SEM");
+    append(g_dname, "NOT_CALLABLE");
+    append(g_dlegacy, "T_NOT_CALLABLE");
+    append(g_dnote, "目标不可调用");
+    append(g_leg_name, "T_NOT_CALLABLE");
+    append(g_leg_idx, 116);
+    append(g_dcode, "T-SEM-E206");
+    append(g_dsev, "error");
+    append(g_dcat, "SEM");
+    append(g_dname, "CALL_ARITY");
+    append(g_dlegacy, "T_CALL_ARITY");
+    append(g_dnote, "实参数量不符");
+    append(g_leg_name, "T_CALL_ARITY");
+    append(g_leg_idx, 117);
+    append(g_dcode, "T-SEM-E207");
+    append(g_dsev, "error");
+    append(g_dcat, "SEM");
+    append(g_dname, "ARG_TYPE");
+    append(g_dlegacy, "T_ARG_TYPE");
+    append(g_dnote, "实参类型错误");
+    append(g_leg_name, "T_ARG_TYPE");
+    append(g_leg_idx, 118);
+    append(g_dcode, "T-SEM-E208");
+    append(g_dsev, "error");
+    append(g_dcat, "SEM");
+    append(g_dname, "UNKNOWN_FIELD");
+    append(g_dlegacy, "T_UNKNOWN_FIELD");
+    append(g_dnote, "未知字段");
+    append(g_leg_name, "T_UNKNOWN_FIELD");
+    append(g_leg_idx, 119);
+    append(g_dcode, "T-SEM-E209");
+    append(g_dsev, "error");
+    append(g_dcat, "SEM");
+    append(g_dname, "TAGID_DUP");
+    append(g_dlegacy, "T_TAGID_DUP");
+    append(g_dnote, "tag 编号重复");
+    append(g_leg_name, "T_TAGID_DUP");
+    append(g_leg_idx, 120);
+    append(g_dcode, "T-SEM-E210");
+    append(g_dsev, "error");
+    append(g_dcat, "SEM");
+    append(g_dname, "TAGID_MIXED");
+    append(g_dlegacy, "T_TAGID_MIXED");
+    append(g_dnote, "tag 编号风格混用");
+    append(g_leg_name, "T_TAGID_MIXED");
+    append(g_leg_idx, 121);
+    append(g_dcode, "T-SEM-E211");
+    append(g_dsev, "error");
+    append(g_dcat, "SEM");
+    append(g_dname, "VAR_NO_TYPE");
+    append(g_dlegacy, "T_VAR_NO_TYPE");
+    append(g_dnote, "变量缺类型");
+    append(g_leg_name, "T_VAR_NO_TYPE");
+    append(g_leg_idx, 122);
+    append(g_dcode, "T-SEM-W212");
+    append(g_dsev, "warning");
+    append(g_dcat, "SEM");
+    append(g_dname, "OVERFLOW_LITERAL");
+    append(g_dlegacy, "W_OVERFLOW_LITERAL");
+    append(g_dnote, "整数字面量溢出");
+    append(g_leg_name, "W_OVERFLOW_LITERAL");
+    append(g_leg_idx, 123);
+    append(g_dcode, "T-TIM-E700");
+    append(g_dsev, "error");
+    append(g_dcat, "TIM");
+    append(g_dname, "BAD_SPEC");
+    append(g_dlegacy, "T_TIME_BAD_SPEC");
+    append(g_dnote, "非法时间格式说明符");
+    append(g_leg_name, "T_TIME_BAD_SPEC");
+    append(g_leg_idx, 124);
+    append(g_dcode, "T-TIM-E701");
+    append(g_dsev, "error");
+    append(g_dcat, "TIM");
+    append(g_dname, "PARSE_UNSUPPORTED");
+    append(g_dlegacy, "T_TIME_PARSE_UNSUPPORTED");
+    append(g_dnote, "时间解析不支持");
+    append(g_leg_name, "T_TIME_PARSE_UNSUPPORTED");
+    append(g_leg_idx, 125);
+    append(g_dcode, "T-TIM-E702");
+    append(g_dsev, "error");
+    append(g_dcat, "TIM");
+    append(g_dname, "SPEC_TYPE");
+    append(g_dlegacy, "T_TIME_SPEC_TYPE");
+    append(g_dnote, "说明符类型错误");
+    append(g_leg_name, "T_TIME_SPEC_TYPE");
+    append(g_leg_idx, 126);
+    append(g_dcode, "T-TIM-E703");
+    append(g_dsev, "error");
+    append(g_dcat, "TIM");
+    append(g_dname, "ARG_TYPE");
+    append(g_dlegacy, "T_TIME_ARG_TYPE");
+    append(g_dnote, "时间实参类型错误");
+    append(g_leg_name, "T_TIME_ARG_TYPE");
+    append(g_leg_idx, 127);
+}
+
+// 机器码/旧语义名 -> 规范化机器码（双标识）。未知码原样返回。
+diag_norm fn(id: string) string {
+    if ((slice_len(g_dcode) as i64) == 0) { diag_ensure(); }
+    if (diag_find_idx(id) >= 0) { return id; }
+    var i: i64 = 0;
+    while (i < (slice_len(g_leg_name) as i64)) {
+        if (g_leg_name[i] == id) { return g_dcode[g_leg_idx[i]]; }
+        i = i + 1;
+    }
+    return id;
+}
+
+diag_find_idx fn(code: string) i64 {
+    var i: i64 = 0;
+    while (i < (slice_len(g_dcode) as i64)) {
+        if (g_dcode[i] == code) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// 兼容旧 diag_sev(code)：返回规范化后的严重度（未知码回退 error）。
+diag_sev fn(code: string) string {
+    if ((slice_len(g_dcode) as i64) == 0) { diag_ensure(); }
+    var mc: string = diag_norm(code);
+    var idx: i64 = diag_find_idx(mc);
+    if (idx >= 0) { return g_dsev[idx]; }
+    return "error";
+}
+// <<< GEN:diagnostics <<<
+diag_new fn(code: string, sev: string, msg: string, file: string, sl: i64, sc: i64, el: i64, ec: i64) i64 {
+    // 归一化：旧语义名 / 机器码 -> 规范化机器码（双标识，见 docs/diagnostics.md §1.2.3）
+    if ((slice_len(g_dcode) as i64) == 0) { diag_ensure(); }
+    var mc: string = diag_norm(code);
+    var idx: i64 = diag_find_idx(mc);
+    var rsev: string = sev;
+    var rcat: string = "";
+    var rname: string = "";
+    var rlegacy: string = "";
+    var rnote: string = "";
+    if (idx >= 0) {
+        rcat = g_dcat[idx];
+        rname = g_dname[idx];
+        rlegacy = g_dlegacy[idx];
+        rnote = g_dnote[idx];
+        if (rsev == "") { rsev = g_dsev[idx]; }
+    } else {
+        if (rsev == "") { rsev = "error"; }
+    }
+    var d: Diag;
+    d.code = mc;
+    d.sev = rsev;
+    d.cat = rcat;
+    d.name = rname;
+    d.legacy = rlegacy;
+    d.note = rnote;
     d.msg = msg;
     d.file = file;
     d.sl = sl;
@@ -1041,7 +2266,7 @@ diag_new fn(code: string, sev: string, msg: string, file: string, sl: i64, sc: i
     var dqn: i64 = slice_len(diags) as i64;
     while (dq < dqn) {
         var od: Diag = diags[dq];
-        if (od.code == code && od.file == file && od.sl == sl && od.sc == sc && od.msg == msg) {
+        if (od.code == mc && od.file == file && od.sl == sl && od.sc == sc && od.msg == msg) {
             return dq;
         }
         dq = dq + 1;
@@ -1050,31 +2275,7 @@ diag_new fn(code: string, sev: string, msg: string, file: string, sl: i64, sc: i
     return (slice_len(diags) as i64) - 1;
 }
 
-// >>> GEN:diagnostics (generated by tools/totter.tc from out/ebnf.json -- DO NOT EDIT) >>>
-// 诊断码 → 规范严重度查询。diag_new 在 sev=="" 时以此作为兜底默认值；
-// 调用点显式传 sev 时优先（如 T_ANNOTATION_UNKNOWN 的 warning 用例）。
-diag_sev fn(code: string) string {
-    if (code == "T_TYPE_MISMATCH") { return "error"; }
-    if (code == "T_TYPE_IMPLICIT_CAST") { return "error"; }
-    if (code == "T_STMT_IMPLICIT_BOOL") { return "error"; }
-    if (code == "T_PARSE_INVALID_EXPR") { return "error"; }
-    if (code == "T_FLAG_OFFSET_CONFLICT") { return "error"; }
-    if (code == "T_FLAG_OVERFLOW") { return "error"; }
-    if (code == "T_DERIVE_UNSUPPORTED") { return "error"; }
-    if (code == "T_ANNOTATION_INVALID_ARG") { return "error"; }
-    if (code == "T_ANNOTATION_UNKNOWN") { return "error"; }
-    if (code == "T_ANNOTATION_WRONG_TARGET") { return "error"; }
-    if (code == "T_IMPORT_IO") { return "error"; }
-    if (code == "T_IMPORT_HEADER") { return "error"; }
-    if (code == "T_IMPORT_VALUE") { return "error"; }
-    if (code == "T_IMPORT_CONTEXT") { return "error"; }
-    if (code == "T_EXPORT_SCOPE") { return "error"; }
-    if (code == "T_IMPORT_NOT_FOUND") { return "error"; }
-    if (code == "T_IMPORT_CYCLE") { return "error"; }
-    if (code == "T_UNKNOWN_FIELD") { return "error"; }
-    return "";
-}
-// <<< GEN:diagnostics <<<
+
 
 diag_set_vv fn(di: i64, head: i64) void {
     var d: Diag = diags[di];
@@ -1270,7 +2471,7 @@ is_c_keyword fn(name: string) bool {
 
 validate_c_keyword fn(name: string, ti: i64) void {
     if (is_c_keyword(name)) {
-        warn_name("W_C_KEYWORD_IDENT",
+        warn_name("T-NAM-W404",
             sb_cat3("标识符 `", name, "` 与 C 关键字同名：C 后端会原样发射并导致 .c 无法编译，请改名"),
             ti, str_len(name) as i64);
     }
@@ -1285,7 +2486,7 @@ validate_decl_name fn(name: string, ti: i64) void {
     var c0: u8 = name[0];
     if (c0 >= 65 && c0 <= 90) {
         if (is_pascal_rest_ok(name) == false) {
-            warn_name("T_NAME_TYPE_CAMEL", sb_cat3("type name '", name, "' should be PascalCase (e.g. EntityState)"), ti, n as i64);
+            warn_name("T-NAM-W400", sb_cat3("type name '", name, "' should be PascalCase (e.g. EntityState)"), ti, n as i64);
         }
     }
 }
@@ -1293,14 +2494,14 @@ validate_decl_name fn(name: string, ti: i64) void {
 validate_var_name fn(name: string, ti: i64) void {
     validate_c_keyword(name, ti);
     if (is_lower_snake(name) == false) {
-        warn_name("T_NAME_VAR_SNAKE", sb_cat3("variable name '", name, "' should be snake_case (e.g. entity_id)"), ti, str_len(name) as i64);
+        warn_name("T-NAM-W401", sb_cat3("variable name '", name, "' should be snake_case (e.g. entity_id)"), ti, str_len(name) as i64);
     }
 }
 
 validate_const_name fn(name: string, ti: i64) void {
     validate_c_keyword(name, ti);
     if (is_upper_snake_name(name) == false) {
-        warn_name("T_NAME_CONST_UPPER", sb_cat3("constant name '", name, "' should be UPPER_SNAKE_CASE (e.g. MAX_RENDER_LAYER)"), ti, str_len(name) as i64);
+        warn_name("T-NAM-W402", sb_cat3("constant name '", name, "' should be UPPER_SNAKE_CASE (e.g. MAX_RENDER_LAYER)"), ti, str_len(name) as i64);
     }
 }
 
@@ -4373,4 +5574,570 @@ ll_signed fn(name: string) bool {
         return false;
     }
     return name[0] == 105 || name[0] == 102;
+}
+
+// ══════════════════════════════════════════════════════════════════
+// 字面量支撑设施（reference.md §2.4）
+//
+// 转义解码在此处是**单一真相**：`src/lex.tc` 的字符串扫描与 `src/parse.tc`
+// 的 f-string 模板拆解都必须调 `esc_decode`，两处不得各写一份 —— 旧实现正是
+// 因为分头维护，才出现「f-string 的 `!a` 能产出 `\uXXXX`，词法却读不回来」
+// 的 round-trip 断裂。
+// ══════════════════════════════════════════════════════════════════
+
+// 十六进制数字的值；非十六进制返回 -1。
+hex_val fn(c: u8) i64 {
+    if (c >= 48 && c <= 57) { return (c as i64) - 48; }
+    if (c >= 97 && c <= 102) { return (c as i64) - 87; }
+    if (c >= 65 && c <= 70) { return (c as i64) - 55; }
+    return -1;
+}
+
+is_oct_digit fn(c: u8) bool {
+    return c >= 48 && c <= 55;
+}
+
+// 按进制取数字位的值；不属于该进制返回 -1。
+radix_digit_val fn(c: u8, radix: i64) i64 {
+    if (radix == 16) { return hex_val(c); }
+    if (radix == 2) {
+        if (c == 48 || c == 49) { return (c as i64) - 48; }
+        return -1;
+    }
+    if (radix == 8) {
+        if (is_oct_digit(c)) { return (c as i64) - 48; }
+        return -1;
+    }
+    if (c >= 48 && c <= 57) { return (c as i64) - 48; }
+    return -1;
+}
+
+// 2^b（b <= 63）。仅供字面量范围自检使用。
+lit_pow2 fn(b: i64) u64 {
+    var r: u64 = 1;
+    var k: i64 = 0;
+    while (k < b) {
+        r = r * 2;
+        k = k + 1;
+    }
+    return r;
+}
+
+// ASCII 单词字符（后缀候选串的字符集）。
+is_ascii_word fn(c: u8) bool {
+    if (c >= 48 && c <= 57) { return true; }
+    if (c >= 97 && c <= 122) { return true; }
+    if (c >= 65 && c <= 90) { return true; }
+    return c == 95;
+}
+
+// 从**词法已规范化**的数字字面量文本中切出位宽后缀；无后缀返回 ""。
+// token 文本形如 `200u8` / `1.5f32` / `0xFFu8` / `1.0e9`。
+lit_suffix_of fn(v: string) string {
+    var L: u64 = str_len(v);
+    if (L == 0) { return ""; }
+    var k: u64 = L;
+    while (k > 0 && is_digit(v[k - 1])) { k = k - 1; }
+    if (k == 0 || k == L) { return ""; }          // 全数字 / 末位非数字
+    var lead: u8 = v[k - 1];
+    if (lead != 117 && lead != 105 && lead != 102) { return ""; }
+    var cand: string = str_slice(v, k - 1, L);
+    if (num_suffix_bits(cand) < 0) { return ""; }
+    // ⚠ 十六进制里的 `f` 是数字位不是后缀标记：`0x1f32` 必须整体当数值读。
+    if (L >= 2 && v[0] == 48 && (v[1] == 120 || v[1] == 88)) {
+        if (lead == 102) { return ""; }
+    }
+    return cand;
+}
+
+// 去掉位宽后缀后的数值主体。
+lit_body_of fn(v: string) string {
+    var sfx: string = lit_suffix_of(v);
+    if (str_len(sfx) == 0) { return v; }
+    return str_slice(v, 0, str_len(v) - str_len(sfx));
+}
+
+// 整数字面量折算时是否发生了 u64 溢出。`lit_val_u64` 每次调用都会先复位。
+// （t 无 out 参数，故用模块级标志回传第二结果。）
+var g_lit_overflow: bool = false;
+
+// 把整数字面量主体（无后缀、无 `_`；可带 0x/0b/0o 前缀）折算成 u64。
+// 溢出时置 g_lit_overflow 并返回已折算的低位值。
+lit_val_u64 fn(v: string) u64 {
+    g_lit_overflow = false;
+    var n: u64 = str_len(v);
+    var radix: i64 = 10;
+    var i: u64 = 0;
+    if (n >= 2 && v[0] == 48) {
+        var p: u8 = v[1];
+        if (p == 120 || p == 88) { radix = 16; i = 2; }
+        if (p == 98  || p == 66) { radix = 2;  i = 2; }
+        if (p == 111 || p == 79) { radix = 8;  i = 2; }
+    }
+    var lim: u64 = 0xFFFFFFFFFFFFFFFF;
+    var ru: u64 = radix as u64;
+    var r: u64 = 0;
+    while (i < n) {
+        var d: i64 = radix_digit_val(v[i], radix);
+        if (d < 0) { break; }
+        var du: u64 = d as u64;
+        if (r > (lim - du) / ru) {
+            g_lit_overflow = true;
+            return r;
+        }
+        r = r * ru + du;
+        i = i + 1;
+    }
+    return r;
+}
+
+// 位宽后缀允许的**数值主体**上界。
+//   uN → 2^N - 1
+//   iN → 2^(N-1)   （取到上界仅在紧邻前置 `-` 时合法，见 reference.md §2.4）
+lit_suffix_max fn(sfx: string) u64 {
+    var b: i64 = num_suffix_bits(sfx);
+    if (b < 0) { return 0xFFFFFFFFFFFFFFFF; }
+    if (num_suffix_is_signed(sfx)) {
+        if (b >= 64) { return 0x8000000000000000; }
+        return lit_pow2(b - 1);
+    }
+    if (b >= 64) { return 0xFFFFFFFFFFFFFFFF; }
+    return lit_pow2(b) - 1;
+}
+
+// 码点 → UTF-8 字节序列。调用方须已保证 cp 在 0..0x10FFFF 且不在代理区。
+utf8_append_cp fn(out: StringBuilder, cp: i64) void {
+    if (cp < 128) {
+        sb_append_char(out, cp);
+        return;
+    }
+    if (cp < 2048) {
+        sb_append_char(out, 192 + (cp >> 6));
+        sb_append_char(out, 128 + (cp & 63));
+        return;
+    }
+    if (cp < 65536) {
+        sb_append_char(out, 224 + (cp >> 12));
+        sb_append_char(out, 128 + ((cp >> 6) & 63));
+        sb_append_char(out, 128 + (cp & 63));
+        return;
+    }
+    sb_append_char(out, 240 + (cp >> 18));
+    sb_append_char(out, 128 + ((cp >> 12) & 63));
+    sb_append_char(out, 128 + ((cp >> 6) & 63));
+    sb_append_char(out, 128 + (cp & 63));
+}
+
+// 数字字面量的位宽后缀表。刻意不复用 sema 的 `get_bw`：词法在模块 DAG 上先于
+// sema，跨层引用会成环。合法集与 §2.10 ScalarTable 的 int/float 类保持同步 ——
+// 新增标量类型时这里与 ScalarTable 一起改。返回位宽；非法后缀返回 -1。
+num_suffix_bits fn(s: string) i64 {
+    if (s == "u8" || s == "i8") { return 8; }
+    if (s == "u16" || s == "i16") { return 16; }
+    if (s == "u32" || s == "i32" || s == "f32") { return 32; }
+    if (s == "u64" || s == "i64" || s == "f64") { return 64; }
+    return -1;
+}
+
+num_suffix_is_float fn(s: string) bool {
+    return s == "f32" || s == "f64";
+}
+
+num_suffix_is_signed fn(s: string) bool {
+    if (str_len(s) == 0) { return false; }
+    return s[0] == 105;                         // 'i'
+}
+
+// 解码 `\` 之后的一个转义序列。
+//   s     源文本
+//   i0    指向反斜杠**之后**的首字符（调用方已跳过 `\`）
+//   out   解码结果追加处
+//   dl/dc 诊断定位（反斜杠所在的行 / 列）
+// 返回下一个未消费字符的下标。合法转义序列内部不含换行，故调用方可用
+// `(ret - i0) + 1` 直接推进 col，无需重新扫行。
+esc_decode fn(s: string, i0: u64, out: StringBuilder, dl: i64, dc: i64) u64 {
+    var n: u64 = str_len(s);
+    if (i0 >= n) { return i0; }
+    var e: u8 = s[i0];
+    if (e == 110) { sb_append_char(out, 10); return i0 + 1; }    // \n
+    if (e == 116) { sb_append_char(out, 9);  return i0 + 1; }    // \t
+    if (e == 114) { sb_append_char(out, 13); return i0 + 1; }    // \r
+    if (e == 48)  { sb_append_char(out, 0);  return i0 + 1; }    // \0
+    if (e == 34)  { sb_append_char(out, 34); return i0 + 1; }    // \"
+    if (e == 39)  { sb_append_char(out, 39); return i0 + 1; }    // \'
+    if (e == 92)  { sb_append_char(out, 92); return i0 + 1; }    // \\
+
+    if (e == 120) {                                              // \xHH
+        var h1: i64 = -1;
+        var h2: i64 = -1;
+        if (i0 + 1 < n) { h1 = hex_val(s[i0 + 1]); }
+        if (i0 + 2 < n) { h2 = hex_val(s[i0 + 2]); }
+        if (h1 < 0 || h2 < 0) {
+            diag_new("T-LEX-E002", "error",
+                "转义 `\\x` 后必须恰好跟两位十六进制数字（例：`\\x41`）",
+                g_file, dl, dc, dl, dc + 4);
+            sb_append_char(out, 120);
+            return i0 + 1;
+        }
+        sb_append_char(out, h1 * 16 + h2);
+        return i0 + 3;
+    }
+
+    if (e == 117) {                                              // \u{...}
+        if (i0 + 1 >= n || s[i0 + 1] != 123) {
+            diag_new("T-LEX-E002", "error",
+                "转义 `\\u` 必须写成 `\\u{码点}` 形式（例：`\\u{4e2d}`）",
+                g_file, dl, dc, dl, dc + 4);
+            sb_append_char(out, 117);
+            return i0 + 1;
+        }
+        var j: u64 = i0 + 2;
+        var cp: i64 = 0;
+        var cnt: i64 = 0;
+        var okd: bool = true;
+        while (j < n && s[j] != 125) {
+            var hv: i64 = hex_val(s[j]);
+            if (hv < 0) { okd = false; break; }
+            cp = cp * 16 + hv;
+            cnt = cnt + 1;
+            j = j + 1;
+        }
+        if (okd == false || j >= n || cnt == 0 || cnt > 6) {
+            diag_new("T-LEX-E002", "error",
+                "`\\u{...}` 内须为 1..6 位十六进制码点并以 `}` 收尾",
+                g_file, dl, dc, dl, dc + 4);
+            sb_append_char(out, 117);
+            return i0 + 1;
+        }
+        if (cp > 1114111 || (cp >= 55296 && cp <= 57343)) {
+            diag_new("T-LEX-E002", "error",
+                "`\\u{...}` 码点越界或落在 UTF-16 代理区（合法：0..10FFFF 且不含 D800..DFFF）",
+                g_file, dl, dc, dl, dc + 4);
+            return j + 1;
+        }
+        utf8_append_cp(out, cp);
+        return j + 1;
+    }
+
+    // 兜底：未知转义。历史实现在此静默丢弃反斜杠 —— `"\x41"` 会变成 `x41`
+    // 且零诊断，同时违反宪法 L-02（全行为显式）与 L-04（语义确定）。现改硬错误。
+    var badsb: StringBuilder = sb_new();
+    sb_append_char(badsb, 92);
+    sb_append_char(badsb, e);
+    diag_new("T-LEX-E002", "error",
+        sb_cat3("未知转义序列 `", sb_to_str(badsb),
+            "`；合法集：\\n \\t \\r \\0 \\\" \\' \\\\ \\xHH \\u{...}"),
+        g_file, dl, dc, dl, dc + 2);
+    sb_append_char(out, e);
+    return i0 + 1;
+}
+
+
+// ══════════════════════════════════════════════════════════════════
+// 诊断的 JSON 序列化。
+// ⚠ 这段原本住在 sema.tc，导致 **parse.tc 无法输出结构化诊断**（模块 DAG
+//   base→lex→parse→sema 禁止上游引用下游），于是 36 处语法错误只能裸
+//   `eprint` 到 stderr —— IDE / REPL 等只消费 stdout JSON 的通道完全看不见。
+//   诊断数据（Diag/diags/FixS/fixes）本就在 base.tc，打印器理应同处；
+//   下沉后 parse 层即可走 `parse_fatal` 发结构化诊断。
+// ══════════════════════════════════════════════════════════════════
+// ── pretty JSON 输出（复刻 JSON.stringify(x, null, 2)）────────
+
+hex_digit fn(v: u8) u8 {
+    if (v < 10) {
+        return 48 + v;
+    }
+    return 97 + (v - 10);
+}
+
+json_escape_into fn(out: StringBuilder, s: string) void {
+    var i: u64 = 0;
+    var n: u64 = str_len(s);
+    while (i < n) {
+        var b: u8 = s[i];
+        if (b == 34) {
+            sb_append_char(out, 92);
+            sb_append_char(out, 34);
+        } else {
+        if (b == 92) {
+            sb_append_char(out, 92);
+            sb_append_char(out, 92);
+        } else {
+        if (b == 10) {
+            sb_append_char(out, 92);
+            sb_append_char(out, 110);
+        } else {
+        if (b == 9) {
+            sb_append_char(out, 92);
+            sb_append_char(out, 116);
+        } else {
+        if (b == 13) {
+            sb_append_char(out, 92);
+            sb_append_char(out, 114);
+        } else {
+        if (b == 8) {
+            sb_append_char(out, 92);
+            sb_append_char(out, 98);
+        } else {
+        if (b == 12) {
+            sb_append_char(out, 92);
+            sb_append_char(out, 102);
+        } else {
+        if (b < 32) {
+            sb_append_char(out, 92);
+            sb_append_char(out, 117);
+            sb_append_char(out, 48);
+            sb_append_char(out, 48);
+            sb_append_char(out, hex_digit(b / 16));
+            sb_append_char(out, hex_digit(b % 16));
+        } else {
+            sb_append_char(out, b);
+        }}}}}}}}
+        i = i + 1;
+    }
+}
+
+j_qstr fn(out: StringBuilder, s: string) void {
+    sb_append_char(out, 34);
+    json_escape_into(out, s);
+    sb_append_char(out, 34);
+}
+
+// "      \"key\": \"value\",\n" 之类的辅助
+jkv_str fn(out: StringBuilder, ind: string, key: string, val: string, comma: bool) void {
+    sb_append_str(out, ind);
+    sb_append_char(out, 34);
+    sb_append_str(out, key);
+    sb_append_str(out, "\": ");
+    j_qstr(out, val);
+    if (comma) {
+        sb_append_char(out, 44);
+    }
+    sb_append_char(out, 10);
+}
+
+jkv_num fn(out: StringBuilder, ind: string, key: string, val: i64, comma: bool) void {
+    sb_append_str(out, ind);
+    sb_append_char(out, 34);
+    sb_append_str(out, key);
+    sb_append_str(out, "\": ");
+    sb_append_i64(out, val);
+    if (comma) {
+        sb_append_char(out, 44);
+    }
+    sb_append_char(out, 10);
+}
+
+// location/range 对象输出
+j_loc fn(out: StringBuilder, ind: string, ind2: string, key: string, file: string, sl: i64, sc: i64, el: i64, ec: i64, comma: bool) void {
+    sb_append_str(out, ind);
+    sb_append_char(out, 34);
+    sb_append_str(out, key);
+    sb_append_str(out, "\": {");
+    sb_append_char(out, 10);
+    jkv_str(out, ind2, "file", file, true);
+    jkv_num(out, ind2, "startLine", sl, true);
+    jkv_num(out, ind2, "startCol", sc, true);
+    jkv_num(out, ind2, "endLine", el, true);
+    jkv_num(out, ind2, "endCol", ec, false);
+    sb_append_str(out, ind);
+    sb_append_char(out, 125);
+    if (comma) {
+        sb_append_char(out, 44);
+    }
+    sb_append_char(out, 10);
+}
+
+// 字符串链表数组输出（validValues/notes）；head=-1 输出 null
+j_str_list fn(out: StringBuilder, ind: string, ind2: string, key: string, head: i64, comma: bool) void {
+    sb_append_str(out, ind);
+    sb_append_char(out, 34);
+    sb_append_str(out, key);
+    sb_append_str(out, "\": ");
+    if (head < 0) {
+        sb_append_str(out, "null");
+    } else {
+        sb_append_char(out, 91);
+        sb_append_char(out, 10);
+        var c: i64 = head;
+        while (c >= 0) {
+            var it: SI = sitems[c];
+            sb_append_str(out, ind2);
+            j_qstr(out, it.s);
+            if (it.next >= 0) {
+                sb_append_char(out, 44);
+            }
+            sb_append_char(out, 10);
+            c = it.next;
+        }
+        sb_append_str(out, ind);
+        sb_append_char(out, 93);
+    }
+    if (comma) {
+        sb_append_char(out, 44);
+    }
+    sb_append_char(out, 10);
+}
+
+print_json fn() void {
+    var out: StringBuilder = sb_new();
+    var nd: i64 = slice_len(diags) as i64;
+
+    sb_append_str(out, "{\n");
+    if (nd == 0) {
+        sb_append_str(out, "  \"diagnostics\": [],\n");
+    } else {
+        sb_append_str(out, "  \"diagnostics\": [\n");
+        var i: i64 = 0;
+        while (i < nd) {
+            var d: Diag = diags[i];
+            sb_append_str(out, "    {\n");
+            jkv_str(out, "      ", "code", d.code, true);
+            jkv_str(out, "      ", "severity", d.sev, true);
+            jkv_str(out, "      ", "category", d.cat, true);
+            jkv_str(out, "      ", "name", d.name, true);
+            jkv_str(out, "      ", "message", d.msg, true);
+            jkv_str(out, "      ", "short_note", d.note, true);
+            jkv_str(out, "      ", "legacy_code", d.legacy, true);
+            j_loc(out, "      ", "        ", "location", d.file, d.sl, d.sc, d.el, d.ec, true);
+            j_str_list(out, "      ", "        ", "validValues", d.vv, true);
+
+            // fixSuggestions
+            sb_append_str(out, "      \"fixSuggestions\": ");
+            if (d.fs < 0) {
+                sb_append_str(out, "null");
+            } else {
+                sb_append_str(out, "[\n");
+                var f: i64 = d.fs;
+                while (f >= 0) {
+                    var fx: FixS = fixes[f];
+                    sb_append_str(out, "        {\n");
+                    jkv_str(out, "          ", "description", fx.desc, true);
+                    j_loc(out, "          ", "            ", "range", fx.file, fx.sl, fx.sc, fx.el, fx.ec, true);
+                    jkv_str(out, "          ", "replacement", fx.repl, false);
+                    sb_append_str(out, "        }");
+                    if (fx.next >= 0) {
+                        sb_append_char(out, 44);
+                    }
+                    sb_append_char(out, 10);
+                    f = fx.next;
+                }
+                sb_append_str(out, "      ]");
+            }
+            sb_append_str(out, ",\n");
+
+            j_str_list(out, "      ", "        ", "notes", d.nt, false);
+
+            sb_append_str(out, "    }");
+            if (i + 1 < nd) {
+                sb_append_char(out, 44);
+            }
+            sb_append_char(out, 10);
+            i = i + 1;
+        }
+        sb_append_str(out, "  ],\n");
+    }
+
+    var errs: i64 = 0;
+    var warns: i64 = 0;
+    var infos: i64 = 0;
+    var j: i64 = 0;
+    while (j < nd) {
+        var d2: Diag = diags[j];
+        if (d2.sev == "error") {
+            errs = errs + 1;
+        }
+        if (d2.sev == "warning") {
+            warns = warns + 1;
+        }
+        if (d2.sev == "info") {
+            infos = infos + 1;
+        }
+        j = j + 1;
+    }
+    sb_append_str(out, "  \"summary\": {\n");
+    jkv_num(out, "    ", "total", nd, true);
+    jkv_num(out, "    ", "errors", errs, true);
+    jkv_num(out, "    ", "warnings", warns, true);
+    jkv_num(out, "    ", "infos", infos, false);
+    sb_append_str(out, "  }\n");
+    sb_append_str(out, "}");
+
+    print(sb_to_str(out));
+    print("\n");
+}
+
+// 诊断渲染分发：依据 g_diag_fmt 选择 JSON（默认，机器可读）或人类可读文本。
+// 所有驱动层原先直接调 print_json() 的报错点统一改调本函数，以免破坏既有 JSON 工具链。
+emit_diags fn() void {
+    if (g_diag_fmt == "human") {
+        print_human();
+        return;
+    }
+    print_json();
+}
+
+// 人类可读渲染：标准编译器格式 `file:line:col: severity[CODE]: message`，
+// 附带 note / 修复建议（hint）/ 附加 notes，末尾给出错误/警告/信息计数摘要。
+print_human fn() void {
+    var nd: i64 = slice_len(diags) as i64;
+    var i: i64 = 0;
+    while (i < nd) {
+        var d: Diag = diags[i];
+        var loc: string = d.file;
+        if (d.sl > 0 || d.sc > 0) {
+            loc = sb_cat5(d.file, ":", i2s(d.sl), ":", i2s(d.sc));
+        }
+        var tag: string = d.sev;
+        if (str_len(d.code) > 0) {
+            tag = sb_cat3(d.sev, "[", sb_cat3(d.code, "]", ""));
+        }
+        print(sb_cat3(loc, ": ", sb_cat3(tag, ": ", d.msg)));
+        print("\n");
+        if (str_len(d.note) > 0) {
+            print(sb_cat3("  note: ", d.note, ""));
+            print("\n");
+        }
+        var f: i64 = d.fs;
+        while (f >= 0) {
+            var fx: FixS = fixes[f];
+            print(sb_cat3("  hint: ", fx.desc, ""));
+            print("\n");
+            f = fx.next;
+        }
+        var nt: i64 = d.nt;
+        while (nt >= 0) {
+            var it: SI = sitems[nt];
+            print(sb_cat3("  note: ", it.s, ""));
+            print("\n");
+            nt = it.next;
+        }
+        i = i + 1;
+    }
+    var errs: i64 = 0;
+    var warns: i64 = 0;
+    var infos: i64 = 0;
+    var j: i64 = 0;
+    while (j < nd) {
+        var d2: Diag = diags[j];
+        if (d2.sev == "error") { errs = errs + 1; }
+        else if (d2.sev == "warning") { warns = warns + 1; }
+        else if (d2.sev == "info") { infos = infos + 1; }
+        j = j + 1;
+    }
+    var sum: StringBuilder = sb_new();
+    sb_append_str(sum, i2s(errs));
+    sb_append_str(sum, " error(s)");
+    if (warns > 0) {
+        sb_append_str(sum, ", ");
+        sb_append_str(sum, i2s(warns));
+        sb_append_str(sum, " warning(s)");
+    }
+    if (infos > 0) {
+        sb_append_str(sum, ", ");
+        sb_append_str(sum, i2s(infos));
+        sb_append_str(sum, " info(s)");
+    }
+    print(sb_to_str(sum));
+    print("\n");
 }

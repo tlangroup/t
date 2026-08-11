@@ -1037,6 +1037,19 @@ void t_slice_set(TSlice s, int64_t i, const void* elem) {
 int64_t t_slice_len(TSlice s) { return s.len; }
 void*  t_slice_ptr(TSlice s) { return s.ptr; }
 
+// 子切片 `s[a..b]`：O(1) 视图，与源共享底层缓冲。
+// cap 收成 len —— 对子切片 append 必定触发扩容拷贝，不会踩写源切片的后续元素。
+TSlice t_slice_sub(TSlice s, int64_t start, int64_t end) {
+    if (start < 0 || end < start || end > s.len)
+        t_panic_bounds(start < 0 ? start : end, s.len, "t_slice_sub");
+    TSlice r;
+    r.ptr = (uint8_t*)s.ptr + start * s.elem_size;
+    r.len = end - start;
+    r.cap = r.len;
+    r.elem_size = s.elem_size;
+    return r;
+}
+
 // ── map[K]V ──────────────────────────────────────────────────
 typedef struct {
     uint8_t state;        // 0 empty, 1 occupied, 2 tombstone

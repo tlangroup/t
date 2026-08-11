@@ -1,6 +1,6 @@
 # t 语言编译器自举设计文档（bootstrap.md）
 
-> 版本：v1.0（2026-07-28）
+> 版本：v1.0（2026-07-28）；Stage 2 自举判据于 2026-08-11 修订为 gate L2 三件套（见 §4.1）
 > 前置文档：`docs/spec.md`（语言规范，唯一语义权威）
 > 目标：将编译器从 TypeScript 实现（tc0）过渡到 t 语言自身实现，达成自编译不动点，随后进入 AI Agent 自迭代开发模式。
 
@@ -211,7 +211,9 @@ src/
 
 ## 4 Stage 2 — 自编译不动点
 
-### 4.1 流程
+### 4.1 流程（历史定义 + 当前实际判据）
+
+**历史定义（M10 原始判据，已失效）**
 
 ```
 tc0 + compiler.tc  →  tc1.exe
@@ -220,13 +222,24 @@ tc2 + compiler.tc  →  tc3.exe
 断言: tc2 生成的 C 代码 ≡ tc3 生成的 C 代码   （逐字节，不比对 exe，规避链接器时间戳差异）
 ```
 
-脚本化为 `tools/bootstrap.mjs`（后续改写为 `bootstrap.tc`），一条命令完成三轮编译 + 不动点断言 + 全样例回归。
+脚本化于 `tools/bootstrap.mjs`。**该路径当前已不可达**：种子 tc0（冻结于 `v1.0-selfhost`）在解析当前 `import(src.x :: *)` 语法时即报 `T_PARSE_EXPECTED_TOKEN`，无法生成 C 代码；且其 C 后端对 `append(x, sb_to_str(...))` 生成 `&t_sb_to_str(...)`（取临时量地址），MSVC 报 `C2102`。详见 README「遗留/冻结」说明。
+
+**当前实际判据（自举不动点 = `tools/gate.mjs L2` 三件套）**
+
+Stage 2 的「自编译不动点」改由 `tools/gate.mjs L2` 实证，对当前 `src/` 全绿（最近一次 15 passed / 0 failed）：
+
+1. **LLVM 后端四代不动点 `boot4`**：`g2 == g3 == g4`（比对 `.ll` md5）—— 编译器用自身 LLVM 后端把自己编译到不动点。
+2. **C 后端自举 `cself`**：`src/tc.tc` → C（`tc.c`）→ clang 编译 → 再跑 conformance，与 LLVM 后端等价。
+3. **跨后端 / 跨代对拍 `difftc0` + `difftest`**：`g2 ↔ g3` 代际对拍、tc0 外部对拍、examples 双后端三方比对。
+
+判定口径一致：比对 IR / 产物 md5 与诊断 JSON，规避链接器时间戳差异；不比对 exe。
 
 ### 4.2 通过后动作
 
-1. tag `v1.0-selfhost`；tc0（TS 源码 + dist/tc.exe）封存至 `seed/` 目录，**永不删除**——这是从零重建的信任根（参照 Reflections on Trusting Trust 的经典结论，保留独立实现的种子编译器）。
-2. `README` 更新：主实现 = `src/`，TS 版标记 frozen。
-3. `tests/` 升级为规范符合性套件：每条规范条款至少一个正例 + 一个负例（含预期 JSON 错误码）。
+1. tag `v1.0-selfhost`（M11 打在 C 后端三轮不动点当时）；**补打新 tag `v1.0-selfhost-llvm`** 固化当前 LLVM / C 双后端自举不动点（即 gate L2 全绿的那次提交），作为可复现的信任根。
+2. `seed/tc0/` + git tag 双保险封存；tc0 标记 frozen（仅参照实现，已编不出当前 `src`，详见 §4.1）。
+3. `README` 更新：主实现 = `src/`，TS 版 frozen；自举状态改述为 gate L2 三件套判据（见上）。
+4. `tests/` 符合性套件：每条规范条款至少一个正例 + 一个负例（含预期 JSON 错误码）。当前规模 **175 用例（56 pass / 119 fail）**，且仍在扩大（只增不删）。
 
 ---
 
@@ -275,10 +288,10 @@ tc2 + compiler.tc  →  tc3.exe
 - [x] **M8** emitter 移植（实际并入单文件 `src/tc1.tc`：emit_decl/derive/flag 布局/emit 编排；
       flag 布局用 fr_layout，derive 复刻 tc0 全部字符串模板含 `[object Object]` 怪癖）
 - [x] **M9** tc1 驱动（lex/check/compile 派发）+ 全量差分：`difftest --cand tc1.exe` 42/42 逐字节一致 —— *Stage 1 完成*
-- [x] **M10** tools/bootstrap.mjs 三轮自编译：C_a ≡ C_b ≡ C_c（BOOTSTRAP FIXPOINT REACHED）—— *Stage 2 完成，自举达成*
+- [x] **M10** 自举不动点实证：`tools/bootstrap.mjs` 原 C 后端三轮 `C_a≡C_b≡C_c` 因 tc0 已无法解析当前 `import(src.x :: *)` 语法而失效；**改由 `tools/gate.mjs L2` 三件套实证**（LLVM `boot4` g2==g3==g4 + C 后端 `cself` + 跨后端 `difftc0`）全绿 —— *Stage 2 完成，自举达成（LLVM / C 双后端）*
 - [x] **M11** 封存种子（`seed/tc0/` + tag `v1.0-selfhost`）、切换主实现（README：主实现 = src，TS 版 frozen）、
-      建立符合性套件（`tests/conformance/` 16 用例 + `tools/conformance.mjs`，含 tc0 交叉验证）—— *进入 Stage 3 自迭代*
+      建立符合性套件（`tests/conformance/` 175 用例（56 pass / 119 fail）+ `tools/conformance.mjs`，含 tc0 交叉验证）—— *进入 Stage 3 自迭代*
 - [x] **M12** Variant 一等类型（spec §2.3 / G10）：lexer `variant` 关键字 → `parse_variant_decl`（VariantDecl+VC 节点）
       → 类型检查器注册类型与 `Name_from_Case/Name_is_Case/Name_as_Case` 助手符号 → emitter 发射 tagged-union
       struct + 三个 `static inline` 自由函数。`tests/conformance/p08_variant.tc` + `tests/variant_smoke` 运行时验证通过；
-      bootstrap 不动点仍 C_a≡C_b≡C_c，difftest 30/30 无回归。
+      gate L2 不动点仍全绿（boot4 g2==g3==g4 / cself / difftc0），difftest 30/30 无回归。

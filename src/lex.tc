@@ -105,7 +105,10 @@ op2_name fn(a: u8, b: u8) string {
     if (a == 124 && b == 124) { return "Or"; }
     if (a == 60 && b == 60) { return "ShiftLeft"; }
     if (a == 62 && b == 62) { return "ShiftRight"; }
-    if (a == 46 && b == 46) { return "DoubleDot"; }
+    // 区间字面量（M-range）：`..` 半开、`..=` 闭合（三字符形态在扫描主循环先行匹配）。
+    // 与浮点/成员访问零冲突：数字扫描要求 `.` 后紧跟数字才吃小数点，故 `0..10`
+    // 天然切成 `0` / `..` / `10`；`a.b` 的单点仍走 op1_name 的 Dot。
+    if (a == 46 && b == 46) { return "DotDot"; }
     if (a == 43 && b == 61) { return "PlusAssign"; }
     if (a == 45 && b == 61) { return "MinusAssign"; }
     if (a == 42 && b == 61) { return "StarAssign"; }
@@ -113,6 +116,9 @@ op2_name fn(a: u8, b: u8) string {
     if (a == 37 && b == 61) { return "PercentAssign"; }
     if (a == 38 && b == 61) { return "BitAndAssign"; }
     if (a == 124 && b == 61) { return "BitOrAssign"; }
+    // 管道算子（最低二元级 L0）：`|>` 多态管道。三字符 `|->` / `|>?` 在扫描主循环
+    // 的三字符段先行匹配，故此处只需处理两字符形态，最大匹配顺序天然正确。
+    if (a == 124 && b == 62) { return "PipeApply"; }
     if (a == 94 && b == 61) { return "BitXorAssign"; }
     return "";
 }
@@ -143,6 +149,39 @@ op1_name fn(c: u8) string {
     if (c == 44) { return "Comma"; }
     if (c == 59) { return "Semicolon"; }
     return "";
+}
+
+// ── 字面量扫描辅助（reference.md §2.4）────────────────────────
+//
+// 数字位串：从 s0 起按 radix 吃数字位，`_` 是**纯视觉分隔符**、被剥除，
+// 规范化后的数字追加到 out；返回停止处的下标。`_` 必须夹在两个同段数字位
+// 之间，否则报 T-LEX-E004 并停在该 `_` 上（数字段内不含换行，故列号可由
+// 下标差直接推出）。
+lex_digit_run fn(src: string, s0: u64, radix: i64, out: StringBuilder, dl: u64, dc: u64) u64 {
+    var n: u64 = str_len(src);
+    var j: u64 = s0;
+    var prev_digit: bool = false;
+    while (j < n) {
+        var ch: u8 = src[j];
+        if (ch == 95) {
+            var rnext: bool = false;
+            if (j + 1 < n) { rnext = radix_digit_val(src[j + 1], radix) >= 0; }
+            if (prev_digit == false || rnext == false) {
+                var ec: i64 = (dc + (j - s0)) as i64;
+                diag_new("T-LEX-E004", "error",
+                    "数字分隔符 `_` 必须夹在两个数字位之间（例：`1_000_000` / `0xFF_FF`）",
+                    g_file, dl as i64, ec, dl as i64, ec + 1);
+                return j;
+            }
+            j = j + 1;
+            continue;
+        }
+        if (radix_digit_val(ch, radix) < 0) { break; }
+        sb_append_char(out, ch);
+        prev_digit = true;
+        j = j + 1;
+    }
+    return j;
 }
 
 // ── token 入池 ─────────────────────────────────────────────────
@@ -214,141 +253,290 @@ tokenize fn(src: string) void {
             continue;
         }
 
+        // ── 数字字面量（reference.md §2.4）───────────────────────
+        // token 文本已**规范化**：剥除 `_`，浮点尾数补足小数点（`1e9` → `1.0e9`，
+        // 因为 LLVM 的 FP 常量语法要求尾数含 `.`），位宽后缀原样留在末尾交给
+        // parser 用 `lit_suffix_of` / `lit_body_of` 切分。
         if (is_digit(c)) {
             var tl: u64 = line;
             var tcol: u64 = col;
+            sb_clear(tmp);
+            var nradix: i64 = 10;
 
             if (c == 48 && i + 1 < n && (src[i + 1] == 120 || src[i + 1] == 88)) {
-                sb_clear(tmp);
-                sb_append_str(tmp, "0x");
-                i = i + 2;
-                col = col + 2;
-                var hexcnt: u64 = 0;
-                while (i < n && is_hex_digit(src[i])) {
-                    sb_append_char(tmp, src[i]);
-                    i = i + 1;
-                    col = col + 1;
-                    hexcnt = hexcnt + 1;
-                }
-                if (hexcnt == 0) {
-                    eprint("error: hex literal has no digits after 0x\n");
-                    exit(1);
-                }
-                push_tok("Integer", sb_to_str(tmp), tl, tcol);
-                continue;
+                nradix = 16; sb_append_str(tmp, "0x"); i = i + 2; col = col + 2;
+            } else if (c == 48 && i + 1 < n && (src[i + 1] == 98 || src[i + 1] == 66)) {
+                nradix = 2;  sb_append_str(tmp, "0b"); i = i + 2; col = col + 2;
+            } else if (c == 48 && i + 1 < n && (src[i + 1] == 111 || src[i + 1] == 79)) {
+                nradix = 8;  sb_append_str(tmp, "0o"); i = i + 2; col = col + 2;
             }
 
-            if (c == 48 && i + 1 < n && (src[i + 1] == 98 || src[i + 1] == 66)) {
-                sb_clear(tmp);
-                sb_append_str(tmp, "0b");
-                i = i + 2;
-                col = col + 2;
-                var bincnt: u64 = 0;
-                while (i < n && is_bin_digit(src[i])) {
-                    sb_append_char(tmp, src[i]);
-                    i = i + 1;
-                    col = col + 1;
-                    bincnt = bincnt + 1;
-                }
-                if (bincnt == 0) {
-                    eprint("error: binary literal has no digits after 0b\n");
-                    exit(1);
-                }
-                push_tok("Integer", sb_to_str(tmp), tl, tcol);
-                continue;
+            var d0: u64 = i;
+            var di: u64 = lex_digit_run(src, i, nradix, tmp, line, col);
+            col = col + (di - i);
+            i = di;
+            if (i == d0) {
+                diag_new("T-LEX-E004", "error",
+                    "进制前缀 `0x` / `0b` / `0o` 之后必须至少有一位该进制的数字",
+                    g_file, tl as i64, tcol as i64, tl as i64, (tcol + 2) as i64);
             }
 
-            var ns: u64 = i;
-            while (i < n && is_digit(src[i])) {
-                i = i + 1;
-                col = col + 1;
-            }
-
-            if (i < n && src[i] == 46 && i + 1 < n && is_digit(src[i + 1])) {
-                i = i + 1;
-                col = col + 1;
-                while (i < n && is_digit(src[i])) {
+            var is_float: bool = false;
+            if (nradix == 10) {
+                // 小数部分：`.` 之后必须紧跟数字。`1.` 与 `.5` 不是合法字面量
+                // （既保住 `1.method` 的成员访问，也避免与区间语法争抢 `..`）。
+                if (i < n && src[i] == 46 && i + 1 < n && is_digit(src[i + 1])) {
+                    is_float = true;
+                    sb_append_char(tmp, 46);
                     i = i + 1;
                     col = col + 1;
+                    var fi: u64 = lex_digit_run(src, i, 10, tmp, line, col);
+                    col = col + (fi - i);
+                    i = fi;
                 }
+                // 指数部分：`e` / `E` 之后可选符号 + 至少一位十进制数字。
                 if (i < n && (src[i] == 101 || src[i] == 69)) {
-                    i = i + 1;
-                    col = col + 1;
-                    if (i < n && (src[i] == 43 || src[i] == 45)) {
+                    var esign: u64 = 0;
+                    if (i + 1 < n && (src[i + 1] == 43 || src[i + 1] == 45)) { esign = 1; }
+                    var edigit: bool = false;
+                    if (i + 1 + esign < n) { edigit = is_digit(src[i + 1 + esign]); }
+                    if (edigit == false) {
+                        diag_new("T-LEX-E004", "error",
+                            "指数标记 `e` / `E` 之后必须跟（可选 `+` / `-` 加）至少一位数字",
+                            g_file, line as i64, col as i64, line as i64, (col + 1) as i64);
+                    } else {
+                        if (is_float == false) { sb_append_str(tmp, ".0"); is_float = true; }
+                        sb_append_char(tmp, 101);
                         i = i + 1;
                         col = col + 1;
-                    }
-                    while (i < n && is_digit(src[i])) {
-                        i = i + 1;
-                        col = col + 1;
+                        if (esign == 1) {
+                            sb_append_char(tmp, src[i]);
+                            i = i + 1;
+                            col = col + 1;
+                        }
+                        var xi: u64 = lex_digit_run(src, i, 10, tmp, line, col);
+                        col = col + (xi - i);
+                        i = xi;
                     }
                 }
-                push_tok("Float", str_slice(src, ns, i), tl, tcol);
-                continue;
             }
 
-            push_tok("Integer", str_slice(src, ns, i), tl, tcol);
+            // 位宽后缀：仅当 `u`/`i`/`f` 紧跟数字时才按后缀读，否则退回标识符
+            // （`1if` 仍是 `1` + `if`，`10s` 仍是 `10` + `s`）。
+            var nsfx: string = "";
+            if (i < n && (src[i] == 117 || src[i] == 105 || src[i] == 102)
+                && i + 1 < n && is_digit(src[i + 1])) {
+                var sfx0: u64 = i;
+                var wcol: u64 = col;
+                while (i < n && is_ascii_word(src[i])) {
+                    i = i + 1;
+                    col = col + 1;
+                }
+                nsfx = str_slice(src, sfx0, i);
+                if (num_suffix_bits(nsfx) < 0) {
+                    diag_new("T-LEX-E005", "error",
+                        sb_cat3("非法位宽后缀 `", nsfx,
+                            "`；合法集：u8 u16 u32 u64 i8 i16 i32 i64 f32 f64"),
+                        g_file, tl as i64, wcol as i64, tl as i64, col as i64);
+                    nsfx = "";
+                } else if (num_suffix_is_float(nsfx)) {
+                    if (nradix != 10) {
+                        diag_new("T-LEX-E005", "error",
+                            sb_cat3("非十进制字面量不能带浮点后缀 `", nsfx,
+                                "`（`0x` / `0b` / `0o` 只接受整数后缀）"),
+                            g_file, tl as i64, wcol as i64, tl as i64, col as i64);
+                        nsfx = "";
+                    } else if (is_float == false) {
+                        sb_append_str(tmp, ".0");
+                        is_float = true;
+                    }
+                } else if (is_float) {
+                    diag_new("T-LEX-E005", "error",
+                        sb_cat3("浮点字面量不能带整数后缀 `", nsfx,
+                            "`（改用 f32 / f64，或去掉小数点与指数）"),
+                        g_file, tl as i64, wcol as i64, tl as i64, col as i64);
+                    nsfx = "";
+                }
+            }
+            if (str_len(nsfx) > 0) { sb_append_str(tmp, nsfx); }
+
+            if (is_float) {
+                push_tok("Float", sb_to_str(tmp), tl, tcol);
+            } else {
+                push_tok("Integer", sb_to_str(tmp), tl, tcol);
+            }
             continue;
         }
 
+        // ── 字节字符字面量 `'A'`（reference.md §2.4）──────────────
+        // 语义 = 一个 0..255 的字节，直接以整数 token 入池（无独立节点种类）。
+        if (c == 39) {
+            var cl0: u64 = line;
+            var ccol0: u64 = col;
+            sb_clear(tmp);
+            var ci: u64 = i + 1;
+            var ccol: u64 = col + 1;
+            var cclosed: bool = false;
+            while (ci < n) {
+                if (src[ci] == 39) { cclosed = true; break; }
+                if (src[ci] == 10) { break; }
+                if (src[ci] == 92) {
+                    var ce: u64 = esc_decode(src, ci + 1, tmp, cl0 as i64, ccol as i64);
+                    ccol = ccol + (ce - ci);
+                    ci = ce;
+                    continue;
+                }
+                sb_append_char(tmp, src[ci]);
+                ci = ci + 1;
+                ccol = ccol + 1;
+            }
+            var cbody: string = sb_to_str(tmp);
+            if (cclosed == false) {
+                diag_new("T-LEX-E007", "error",
+                    "字节字符字面量未终结（缺少收尾的 `'`）",
+                    g_file, cl0 as i64, ccol0 as i64, cl0 as i64, (ccol0 + 1) as i64);
+                i = ci;
+                col = ccol;
+                push_tok("Integer", "0", cl0, ccol0);
+                continue;
+            }
+            i = ci + 1;
+            col = ccol + 1;
+            if (str_len(cbody) != 1) {
+                diag_new("T-LEX-E007", "error",
+                    "字节字符字面量必须恰好是一个 0..255 的字节；多字节字符请用字符串或 `\\u{...}`",
+                    g_file, cl0 as i64, ccol0 as i64, cl0 as i64, col as i64);
+                push_tok("Integer", "0", cl0, ccol0);
+                continue;
+            }
+            push_tok("Integer", i2s(cbody[0] as i64), cl0, ccol0);
+            continue;
+        }
+
+        // ── 原始字符串 `r"..."` / `r"""..."""`（reference.md §2.4）──
+        // 反斜杠零特权：内容逐字节原样入串。触发条件与 f-string 同构 —— 前一个
+        // 字符不能是标识符续字符或 `.`，否则 `var r = ...; r"x"` 这类会被误判。
+        if (c == 114 && i + 1 < n && src[i + 1] == 34) {
+            var rPrevOk: bool = true;
+            if (i > 0) {
+                var rpc: u8 = src[i - 1];
+                if (rpc == 46 || is_ident_cont(rpc as i64)) { rPrevOk = false; }
+            }
+            if (rPrevOk) {
+                var rl: u64 = line;
+                var rcol: u64 = col;
+                var rLong: bool = (i + 3 < n && src[i + 2] == 34 && src[i + 3] == 34);
+                var rk: u64 = i + 2;
+                col = col + 2;
+                if (rLong) { rk = i + 4; col = col + 2; }
+                sb_clear(tmp);
+                var rClosed: bool = false;
+                while (rk < n) {
+                    if (rLong) {
+                        if (src[rk] == 34 && rk + 2 < n && src[rk + 1] == 34 && src[rk + 2] == 34) {
+                            rk = rk + 3;
+                            col = col + 3;
+                            rClosed = true;
+                            break;
+                        }
+                    } else if (src[rk] == 34) {
+                        rk = rk + 1;
+                        col = col + 1;
+                        rClosed = true;
+                        break;
+                    }
+                    if (src[rk] == 10) {
+                        if (rLong == false) {
+                            // 就地收尾：不吞掉后续源码，避免一个漏引号污染整个文件。
+                            diag_new("T-LEX-E003", "error",
+                                "单引号形态的原始字符串内不得出现裸换行；改用 `r\"\"\"...\"\"\"`",
+                                g_file, line as i64, col as i64, line as i64, (col + 1) as i64);
+                            rClosed = true;
+                            break;
+                        }
+                        line = line + 1;
+                        col = 1;
+                    } else {
+                        col = col + 1;
+                    }
+                    sb_append_char(tmp, src[rk]);
+                    rk = rk + 1;
+                }
+                if (rClosed == false) {
+                    diag_new("T-LEX-E008", "error",
+                        "原始字符串未终结",
+                        g_file, rl as i64, rcol as i64, rl as i64, (rcol + 2) as i64);
+                }
+                i = rk;
+                push_tok("String", sb_to_str(tmp), rl, rcol);
+                continue;
+            }
+        }
+
+        // ── 字符串字面量：`"..."` 单行形态 / `"""..."""` 长字符串 ──
+        // 两者都做转义解码（原始语义请用 `r` 前缀）；区别只在于长字符串允许裸
+        // 换行。单行形态遇裸换行是硬错误 T-LEX-E003：历史实现放行，与 §2.4
+        // 「不得跨行」矛盾，属实现漂移。
         if (c == 34) {
             var sl: u64 = line;
             var scol: u64 = col;
+            var sLong: bool = (i + 2 < n && src[i + 1] == 34 && src[i + 2] == 34);
             i = i + 1;
             col = col + 1;
+            if (sLong) {
+                i = i + 2;
+                col = col + 2;
+            }
             sb_clear(tmp);
-            while (i < n && src[i] != 34) {
-                if (src[i] == 92) {
-                    i = i + 1;
-                    col = col + 1;
-                    if (i >= n) {
+            var sClosed: bool = false;
+            while (i < n) {
+                if (sLong) {
+                    if (src[i] == 34 && i + 2 < n && src[i + 1] == 34 && src[i + 2] == 34) {
+                        i = i + 3;
+                        col = col + 3;
+                        sClosed = true;
                         break;
                     }
-                    var e: u8 = src[i];
-                    if (src[i] == 10) {
-                        line = line + 1;
-                        col = 1;
-                    } else {
-                        col = col + 1;
-                    }
+                } else if (src[i] == 34) {
                     i = i + 1;
-                    if (e == 110) {
-                        sb_append_char(tmp, 10);
-                    } else {
-                    if (e == 116) {
-                        sb_append_char(tmp, 9);
-                    } else {
-                    if (e == 114) {
-                        sb_append_char(tmp, 13);
-                    } else {
-                    if (e == 34) {
-                        sb_append_char(tmp, 34);
-                    } else {
-                    if (e == 92) {
-                        sb_append_char(tmp, 92);
-                    } else {
-                    if (e == 48) {
-                        sb_append_char(tmp, 0);
-                    } else {
-                        sb_append_char(tmp, e);
-                    }}}}}}
+                    col = col + 1;
+                    sClosed = true;
+                    break;
+                }
+                if (src[i] == 92) {
+                    var se: u64 = esc_decode(src, i + 1, tmp, line as i64, col as i64);
+                    col = col + (se - i);
+                    i = se;
+                    continue;
+                }
+                if (src[i] == 10) {
+                    if (sLong == false) {
+                        // 就地收尾：不吞掉后续源码，避免一个漏引号污染整个文件。
+                        diag_new("T-LEX-E003", "error",
+                            "单行字符串内不得出现裸换行；改写成 `\\n` 或改用 `\"\"\"...\"\"\"` 长字符串",
+                            g_file, line as i64, col as i64, line as i64, (col + 1) as i64);
+                        sClosed = true;
+                        break;
+                    }
+                    line = line + 1;
+                    col = 1;
                 } else {
-                    if (src[i] == 10) {
-                        line = line + 1;
-                        col = 1;
-                    } else {
-                        col = col + 1;
-                    }
-                    sb_append_char(tmp, src[i]);
-                    i = i + 1;
+                    col = col + 1;
+                }
+                sb_append_char(tmp, src[i]);
+                i = i + 1;
+            }
+            if (sClosed == false) {
+                if (sLong) {
+                    diag_new("T-LEX-E008", "error",
+                        "长字符串未终结（缺少收尾的 `\"\"\"`）",
+                        g_file, sl as i64, scol as i64, sl as i64, (scol + 3) as i64);
+                } else {
+                    diag_new("T-LEX-E000", "error",
+                        "字符串字面量未终结",
+                        g_file, sl as i64, scol as i64, sl as i64, (scol + 1) as i64);
                 }
             }
-            if (i >= n) {
-                eprint("error: unterminated string literal\n");
-                exit(1);
-            }
-            i = i + 1;
-            col = col + 1;
             push_tok("String", sb_to_str(tmp), sl, scol);
             continue;
         }
@@ -429,6 +617,21 @@ tokenize fn(src: string) void {
                             if (fe2 == 10) { line = line + 1; fscol = 1; }
                             else { fscol = fscol + 1; }
                             fsi = fsi + 1;
+                            // ⚠ `\u{...}` 的 `{` 若落回主循环会被当成插值起点，
+                            // 于是 `f"\u{4e2d}"` 会被拆成一个不存在的表达式。
+                            // 这里把整段码点原样吞进模板，交给 parse 的 esc_decode。
+                            if (fe2 == 117 && fsi < n && src[fsi] == 123) {
+                                while (fsi < n && src[fsi] != 125) {
+                                    sb_append_char(tmp, src[fsi]);
+                                    fsi = fsi + 1;
+                                    fscol = fscol + 1;
+                                }
+                                if (fsi < n) {
+                                    sb_append_char(tmp, 125);
+                                    fsi = fsi + 1;
+                                    fscol = fscol + 1;
+                                }
+                            }
                             continue;
                         }
                         sb_append_char(tmp, fch);
@@ -519,6 +722,12 @@ tokenize fn(src: string) void {
                 col = col + wc as u64;
             }
             var text: string = str_slice(src, is0, i);
+            // `inf` / `nan`：IEEE-754 特殊值字面量（reference.md §2.4）。词法上
+            // 直接归为 Float token，故它们**不能**再当标识符用；负无穷写 `-inf`。
+            if (text == "inf" || text == "nan") {
+                push_tok("Float", text, il, icol);
+                continue;
+            }
             var tname: string = kw_lookup(text);
             if (str_len(tname) == 0) {
                 tname = "Identifier";
@@ -537,6 +746,29 @@ tokenize fn(src: string) void {
             push_tok("Hash", "#", line, col);
             i = i + 1;
             col = col + 1;
+            continue;
+        }
+
+        // 管道算子三字符形态必须先于两字符 `|>` 与单字符 `|` 匹配（最大匹配）。
+        // 零破坏：`| ->` / `| > ?` 在旧文法下从不构成合法序列（reference.md §3.15）。
+        if (i + 2 < n && c == 124 && src[i + 1] == 45 && src[i + 2] == 62) {
+            push_tok("PipeMap", "|->", line, col);
+            i = i + 3;
+            col = col + 3;
+            continue;
+        }
+        if (i + 2 < n && c == 124 && src[i + 1] == 62 && src[i + 2] == 63) {
+            push_tok("PipeFilter", "|>?", line, col);
+            i = i + 3;
+            col = col + 3;
+            continue;
+        }
+
+        // 闭合区间 `..=` 必须先于 `..` 与 `.` 匹配（最大匹配）。
+        if (i + 2 < n && c == 46 && src[i + 1] == 46 && src[i + 2] == 61) {
+            push_tok("DotDotEq", "..=", line, col);
+            i = i + 3;
+            col = col + 3;
             continue;
         }
 
@@ -571,8 +803,12 @@ tokenize fn(src: string) void {
             continue;
         }
 
-        eprint("error: unexpected character\n");
-        exit(1);
+        // 非法字符：报诊断后跳过该字节继续扫描，让一次编译尽量把问题报全。
+        diag_new("T-LEX-E001", "error",
+            "源文件中出现无法构成任何记号的字符",
+            g_file, line as i64, col as i64, line as i64, (col + 1) as i64);
+        i = i + 1;
+        col = col + 1;
     }
 
     push_tok("Eof", "", line, col);
@@ -655,6 +891,16 @@ tk_v fn(idx: i64) string {
     return tk.v;
 }
 
+tk_line fn(idx: i64) u64 {
+    var tk: Tok = toks[idx];
+    return tk.line;
+}
+
+tk_col fn(idx: i64) u64 {
+    var tk: Tok = toks[idx];
+    return tk.col;
+}
+
 cur_t fn() string {
     return tk_t(pos);
 }
@@ -670,7 +916,7 @@ cur_v fn() string {
 warn_comptime_alias fn() void {
     if (cur_v() != "comptime") { return; }
     var tk: Tok = toks[pos];
-    diag_new("W_COMPTIME_ALIAS", "warning",
+    diag_new("T-MTA-W610", "warning",
         "`comptime` 已弃用，请改用 `meta`（语义完全等价；`comptime T: any` → `meta T: type`）。将在后续版本移除。",
         g_file, tk.line as i64, tk.col as i64, tk.line as i64, tk.col as i64 + 8);
 }

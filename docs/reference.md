@@ -115,9 +115,10 @@ Keyword:
 
 > 关键字由 `lex` 阶段查表（`kw_lookup`，基于 `keywords_tbl`）判定。其权威列表即上方 `Keyword` 产生式中的字面量，由 `tools/gen_ebnf.mjs` 抽取生成 `out/ebnf.json`、`src/totter.tc` 解析后生成进 `gen/tc.tc`（totter 已放弃，该区间现冻结于 `src/tc.tc`、手写维护）。`i8`/`i16`/`i32`/`i64`/`u8`/`u16`/`u32`/`u64`/`f16`/`f32`/`f64`/`bool` 为**内建类型名**（见 §3.5），不是关键字。
 > ⚠ `meta` 与 `comptime` 同映射到 `KwComptime`（互为别名，`meta` 为推荐拼写）；`type` 与 `any` 同为「类型之类型」占位关键字。见 §3.6.3。
+> ⚠ `inf` / `nan` 不在 `keywords_tbl` 里，但词法阶段被直接归为**浮点字面量记号**（§2.4），效果等同保留字：不可作标识符、不可作字段名。
 > ⚠ spec-only（设计中、tc 未接入）：`union`、`enum` 完整语义、`comptime`/`meta` 表达式的**编译期求值**（CTFE，Phase B；Phase A 已可解析并降级发射）。
 
-### 2.4 Literals（字面量） ✅ tote（部分）
+### 2.4 Literals（字面量） ✅ tc（2026-08-10 全量落地）
 
 ```ebnf
 Literal:
@@ -125,21 +126,58 @@ Literal:
     | FloatLiteral
     | BoolLiteral
     | StringLiteral
-    | CharLiteral          // ⚠ spec-only（当前 t 以 string 承载字符）
+    | ByteCharLiteral
 
-IntegerLiteral: DecimalLiteral | HexLiteral | BinaryLiteral
-DecimalLiteral: "0" | NonZeroDigit Digit*
-HexLiteral:     "0x" HexDigit+
-BinaryLiteral:  "0b" BinDigit+
-FloatLiteral:   Digit+ "." Digit+ (("e"|"E") ("+"|"-")? Digit+)?
+IntegerLiteral: (DecimalLiteral | HexLiteral | OctalLiteral | BinaryLiteral) IntSuffix?
+DecimalLiteral: Digit (Digit | "_")*
+HexLiteral:     "0x" HexDigit (HexDigit | "_")*
+OctalLiteral:   "0o" OctDigit (OctDigit | "_")*
+BinaryLiteral:  "0b" BinDigit (BinDigit | "_")*
+IntSuffix:      "u8" | "u16" | "u32" | "u64" | "i8" | "i16" | "i32" | "i64"
+
+FloatLiteral:   (DecimalLiteral ("." DecimalLiteral)? Exponent? FloatSuffix?)
+              | "inf" | "nan"
+Exponent:       ("e" | "E") ("+" | "-")? DecimalLiteral
+FloatSuffix:    "f32" | "f64"
+
 BoolLiteral:    "true" | "false"
-StringLiteral:  '"' (~["\\\u{0a}] | Escape)* '"'
-Escape:         "\\" ("n"|"t"|"r"|"\""|"\\")
+
+ByteCharLiteral: "'" (~['\\\u{0a}] | Escape) "'"        // 求值为 u8
+
+StringLiteral:  ShortString | LongString | RawShortString | RawLongString
+ShortString:    '"' (~["\\\u{0a}] | Escape)* '"'
+LongString:     '"""' (~[\\] | Escape)*? '"""'          // 允许裸换行
+RawShortString: 'r"' ~["\u{0a}]* '"'                    // 无转义
+RawLongString:  'r"""' .*? '"""'                        // 无转义、允许裸换行
+
+Escape:         "\\" ("n" | "t" | "r" | "0" | "\\" | '"' | "'"
+                     | "x" HexDigit HexDigit
+                     | "u" "{" HexDigit+ "}")
 ```
 
-- 整型字面量默认类型由上下文推断；带后缀写法 `123u8` ⚠ spec-only（当前未实现显式位宽后缀，靠变量声明类型推导）。
+**数字**
+
+- `_` 是纯视觉分隔符，词法阶段剥除；必须夹在两个**同段**数字位之间（`1_000_000`、`0xFF_FF` 合法，`1__0` / `_1` / `1_` / `0x_F` 报 `T-LEX-E004`）。
+- 进制前缀 `0x` / `0o` / `0b` 后必须至少有一位对应进制的数字（`T-LEX-E004`）。
+- 指数记号 `e` / `E` 之后必须有（可选正负号加）至少一位十进制数字；`1e9` 是**浮点**字面量（词法归一化为 `1.0e9`）。
+- 小数点两侧都必须有数字：`1.` 与 `.5` 均**不是**字面量。前者拆成 `1` + `.`（保住 `1.method()` 形态的成员访问），后者拆成 `.` + `5`。
+- 位宽后缀只在 `u` / `i` / `f` 紧跟数字时才成立，故 `1if` 仍是 `1` + `if`、`10s` 仍是 `10` + `s`。非法后缀集、非十进制带浮点后缀、浮点带整数后缀均报 `T-LEX-E005`。
+- 无后缀整数字面量按**量级**推最小无符号类型（`≤255 → u8`、`≤65535 → u16`…）；带后缀则类型由后缀定死，`-128i8` / `-2147483648i32` 因此可写。超出后缀容量报 `T-LEX-E006`（有符号类型的下界 `-2^(N-1)` 仅在**紧邻**负号时放行）。
+- `f32` 后缀脱糖为 `as f32`（保留 f64 常量 + 转换，因为 LLVM 的 `float` 常量要求字面量在 f32 中精确可表示）；`f64` 后缀是恒等。
+- `inf` / `nan` 是 IEEE-754 特殊值字面量，词法上归为浮点记号，因此**不能**再作标识符；负无穷写 `-inf`。
+
+**字符与字符串**
+
+- `'A'` 是**字节**字面量，类型 `u8`，必须恰好一个 0..255 的字节（`'ab'` / `'中'` 报 `T-LEX-E007`）。
 - 字符串字面量为只读 UTF-8（`string`），`StringBuilder` 为可变拼接类型。
-- 换行 `\u{0a}` 不允许出现在字符串字面量内（多行用拼接/常量）。
+- 短串（`"..."` / `r"..."`）内**不允许裸换行**，违者报 `T-LEX-E003`；跨行请用长串 `"""..."""` 或 `r"""..."""`。
+- 原始串 `r"..."` 内**不做任何转义处理**，反斜杠原样保留（`r"C:\path\n"` 是 11 个字符），故原始串无法表达自身的结束引号。
+- 未终结的短串报 `T-LEX-E000`，未终结的长串/原始长串报 `T-LEX-E008`。
+- **未知转义是硬错误** `T-LEX-E002`（宪法 L-02 显式行为 / L-04 语义确定）：`"\q"` 不再静默退化为 `q`。
+- `\xHH` 写入**单个字节**（可用于构造非 UTF-8 序列）；`\u{...}` 写入码点的 UTF-8 编码，码点上限 `0x10FFFF`。
+- f-string（§3.10.7）与普通字符串共用同一份转义解码器，故 `f"\u{4e2d}"` 中的 `{` 不会被误判为插值起点。
+
+> 词法错误是**阶段闸门**：`tokenize()` 一旦产出 error 级诊断，编译器立即输出诊断并退出，不再进入 parse——否则失去结构的 token 流会撞上无关的 `parse error` 硬中断，把真正的病因盖掉。
 
 ### 2.5 Operators and punctuation（运算符与标点） ✅ tote
 
@@ -148,13 +186,19 @@ OpOrPunct:
     "+" | "-" | "*" | "/" | "%" | "==" | "!=" | "<" | ">" | "<=" | ">="
   | "&&" | "||" | "!" | "&" | "|" | "^" | "~" | "<<" | ">>"
   | "=" | "+=" | "-=" | "*=" | "/=" | "%="
-  | "->" | ":" | ";" | "," | "." | ".."
+  | "|->" | "|>?" | "|>"
+  | "..=" | ".."
+  | "->" | ":" | ";" | "," | "."
   | "(" | ")" | "{" | "}" | "[" | "]" | "@" | "#"
 ```
 
 - 顶层声明为**并置式**：声明名后直接跟声明种类关键字（`Name fn ...`、`Name struct ...`），无绑定算子。⚠ `::` 绑定算子已于 2026-08-01 移除；旧写法 `Name :: func ...` 由 parser 报带迁移指引的硬错误。
+- **管道记号最大匹配**（2026-08-10）：扫描到 `|` 时按长度降序尝试 3 字符 `|->` / `|>?` → 2 字符 `||` / `|>` → 1 字符 `|`。三个新记号对既有合法源码**零破坏**（`a | -> b`、`a | > ? b`、`a | > b` 在旧文法下均非法），语义见 §3.15。
 - `#` 用于内存布局指令 `#aos` / `#soa`（⚠ spec-only 实变换未接入）。
 - `@` 引入注解 `@name(args)`。
+- **区间记号最大匹配**（2026-08-11）：扫描到 `.` 时按长度降序尝试 3 字符 `..=`（`DotDotEq`）→ 2 字符 `..`（`DotDot`）→ 1 字符 `.`（`Dot`）。语义见 §3.16。
+  - 历史：`..` 曾以 `DoubleDot` 记号存在但全库**零消费**（无产生式引用），属幽灵记号，于 2026-08-10 从词法表删除；2026-08-11 随区间字面量落地重新引入，这次带完整消费方。
+  - ⚠ 与浮点字面量的分界靠**数字扫描侧**保证：小数点只在「后随数字」时才被吞（`lex.tc` 数值扫描处 `src[i]=='.' && is_digit(src[i+1])`）。故 `1..5` 切成 `1` `..` `5` 而非 `1.` `.5`，`1.5` 仍是单个浮点。
 
 ### 2.6 Compiler data tables（机器可读数据表）✅ tote
 
@@ -201,28 +245,6 @@ BuiltinTable:
 DeriveTraitTable:
     "ToString" | "FromString" | "Clone" | "Copy" | "DebugPrint"
   | "BinarySerde" | "Eq" | "PartialEq" | "Hash"
-
-DiagnosticTable:
-    "T_TYPE_MISMATCH" -> error
-  | "T_TYPE_IMPLICIT_CAST" -> error
-  | "T_STMT_IMPLICIT_BOOL" -> error
-  | "T_PARSE_INVALID_EXPR" -> error
-  | "T_FLAG_OFFSET_CONFLICT" -> error
-  | "T_FLAG_OVERFLOW" -> error
-  | "T_DERIVE_UNSUPPORTED" -> error
-  | "T_ANNOTATION_INVALID_ARG" -> error
-  | "T_ANNOTATION_UNKNOWN" -> error
-  | "T_ANNOTATION_WRONG_TARGET" -> error
-  | "T_IMPORT_IO" -> error
-  | "T_IMPORT_HEADER" -> error
-  | "T_IMPORT_VALUE" -> error
-  | "T_IMPORT_CONTEXT" -> error
-  | "T_CLOSURE_CAPTURE" -> error
-  | "T_VAR_NO_TYPE" -> error
-  | "T_UNDEFINED_IDENT" -> error
-  | "T_UNKNOWN_FIELD" -> error
-  | "T_TAGID_MIXED" -> error
-  | "T_TAGID_DUP" -> error
 
 AnnotationTable:
     "test" { spec: "none", targets: "func", repl: "a `\"name\" test { ... }` declaration" }
@@ -614,6 +636,9 @@ NodeTable ::
   // @node number sa=str
   // @node optional na=node
   // @node paren na=node
+  // @node pipe_apply na=node nb=node ba=bool
+  // @node pipe_filter na=node nb=node
+  // @node pipe_map na=node nb=node
   // @node pointer na=node
   // @node return na=node
   // @node scalar sa=str
@@ -1079,9 +1104,12 @@ ContinueStatement: "continue" ";"                    // ✅ tote
 Expr: AssignExpr                                    // 顶层为赋值表达式，右结合
 
 // 赋值（右结合，允许 a = b = c）
-AssignExpr: OrExpr ("=" AssignExpr)?
+AssignExpr: PipeExpr ("=" AssignExpr)?
 
 // —— 二元运算符优先级塔（从低到高，全部左结合）——
+// L0 管道级：最低优先级，包在 OrExpr 外层（详见 §3.15）
+PipeExpr:  OrExpr (PipeOp OrExpr)*
+PipeOp:    "|->" | "|>?" | "|>"
 OrExpr:    AndExpr ("||" AndExpr)*
 AndExpr:   BitOrExpr ("&&" BitOrExpr)*
 BitOrExpr: BitXorExpr ("|" BitXorExpr)*
@@ -1147,7 +1175,7 @@ MapLit:    "[" (Expr ":" Expr ("," Expr ":" Expr)*)? "]"   // 当首元素后跟
 FuncLit:   "fn" "(" ParamList? ")" ("->")? Type Block         // 匿名函数；静态类型即同签名 FuncType
 ```
 
-- **优先级塔固定（L-03 可预判）**：`||` 最低、`*`/`/`/`%` 最高，10 级全部左结合；赋值 `=` 右结合；无右结合二元运算符。塔层级与 `src/tc.tc` 的 `parse_or → … → parse_mul → parse_unary → parse_postfix → parse_primary` 一一对应，不可调换。
+- **优先级塔固定（L-03 可预判）**：管道级 L0（`|->`/`|>?`/`|>`）最低、`||` 次低、`*`/`/`/`%` 最高，11 级全部左结合；赋值 `=` 右结合；无右结合二元运算符。塔层级与 `parse_pipe → parse_or → … → parse_mul → parse_unary → parse_postfix → parse_primary` 一一对应，不可调换。管道级为 2026-08-10 在既有 10 级塔**外侧**新增的一层，塔内顺序一字未动。
 - **全行为显式（L-02）**：`as` 为唯一显式类型转换（仅一次、不可 `e as T1 as T2`）；无隐式类型转换 / 隐式布尔 / 隐式内存分配；复合字面量（数组 `[...]` / map `[k:v]` / 结构体 `T{...}`）显式构造。
 - **静态类型安全（L-03）**：每个 `Expr` 的静态类型由 checker 推算；元素 / 字段 / 下标 / `type_info` 静态校验；`MapLit` 与 `ArrayLit` 共用 `[ ]`，由首元素后是否跟 `:`` 向前看消歧（无二义）。
 - **唯一写法（L-04 ✅）**：调用 `f(x)`、转换 `e as T`、下标 `e[i]`、成员 `e.f`、结构体 `T{...}`、数组 `[...]`、map `[k:v]`、匿名函数 `fn(...) T {...}`（`->` 可选，旧式 `fn(...) -> T {...}` 仍合法）均仅一种标准写法，无等价多写变体。
@@ -2247,6 +2275,279 @@ test result: 7 passed, 0 failed, 1 skipped
 
 ---
 
+### 3.15 Pipeline operators（管道算子 `|->` / `|>?` / `|>`）✅ tc（2026-08-10）
+
+> 本节由草稿 `docs/syntax/drafts/pipeline.md` 经 L-15 采纳并并入（原草稿已标记失效）；起草前的外部来稿评审见 `docs/syntax/drafts/pipeline_review.md`。
+> **作用对象**：切片 `[]T` / 定长数组 `[N]T` 的元素级批量变换（映射、过滤）与链尾聚合，外加标量的向右传递。
+> **不含**：Delta 体系（`~>` / `~!` / `!>`）、生成器（`feed` / `stop`）、惰性迭代器、协程 —— 缓议或否决，理由见评审意见书。
+
+#### 3.15.1 记号与文法
+
+| 字面量 | token | 语义 |
+|---|---|---|
+| `\|->` | `PipeMap` | 元素映射 |
+| `\|>?` | `PipeFilter` | 元素过滤 |
+| `\|>` | `PipeApply` | 多态管道：标量→直接应用 / 可迭代→类型定向 |
+
+```ebnf
+AssignExpr: PipeExpr ("=" AssignExpr)?
+PipeExpr:   OrExpr (PipeOp OrExpr)*
+PipeOp:     "|->" | "|>?" | "|>"
+```
+
+- **单一最低二元级 L0**，三个算子**同级、全部左结合**，实现为 `parse_pipe`，包在 `parse_or` 外层。既有 10 级塔顺序一字不变（塔向下扩展，非重排）。
+- 右操作数级别为 `OrExpr`，故右侧可写任意非管道表达式：具名函数 `f`、匿名字面量 `fn(v: i32) i32 { … }`、函数类型变量、结构体字段 `h.op`、下标 `fs[i]`。**t 的闭包字面量一律写作 `fn(x: T) U { … }`，不存在 `|v|` 记号**；右侧只有一条类型规则：静态类型必须是**一元 `FuncType`**。
+- 无需括号即可确定的推论：
+
+```t
+auto a = xs |-> f |>? p;      // ((xs |-> f) |>? p)   左结合
+auto b = n + 1 |-> f;         // ((n + 1) |-> f)      管道最松
+r = xs |-> f;                 // r = (xs |-> f)       赋值在管道之外
+auto c = xs |-> a + b;        // xs |-> (a + b) —— 右侧非函数值，报 T-PIP-E860
+```
+
+#### 3.15.2 类型规则
+
+设 `Seq[T]` 指 `[]T` 或 `[N]T`。
+
+| 形式 | 左操作数 | 右操作数 | 结果类型 |
+|---|---|---|---|
+| `E \|-> F` | `Seq[T]` | `fn(T) U` | `[]U` |
+| `E \|>? F` | `Seq[T]` | `fn(T) bool` | `[]T` |
+| `E \|> F` | 任意类型 `S` | 见 §3.15.3 类型定向 | `U` 或 `[]U` |
+
+1. 右侧函数**元数固定为 1**，否则 `T-PIP-E861`。
+2. **形参类型匹配**沿用调用点判据 `can_cast(流入类型, 形参0类型)`（与 `check_call_args` 同一套规则），不成立报 `T-PIP-E862`。
+3. **`|>?` 谓词返回类型必须严格为 `bool`**（宪法第3条禁止隐式布尔判定），违者 `T-PIP-E864`。
+4. **`|->` / `|>?` 一律产出切片**（`[]U` / `[]T`），即使左侧是 `[N]T`。定长保长度属纯 lowering 优化，不改变静态类型。
+   > ⚠ **当前实现限制（2026-08-10）**：`[N]T` 作左操作数**暂被拒绝**，报 `T-PIP-E863`。
+   > 定长数组在双后端都编译成**裸元素指针**（长度只活在静态类型里），而管道降解出的
+   > `for (x in __ps)` 按 `TSlice{ptr,len,esz}` 去读，直接段错误。待 Array→Slice 的
+   > `t_slice_from_raw(ptr, N, esz)` 构造 lowering 落地后解除。当前请显式声明为 `[]T`。
+5. **元素级阶段函数不得返回 `void`**，否则 `T-PIP-E869`。逐元素映射返回 void 会产出无意义的
+   `[]void`，降解成 `var __pv0: void = f(x);` → LLVM `alloca void` 是非法 IR。
+   管道是**变换**管线，副作用遍历请用 `for (x in xs) { … }`。
+   （「整体应用」形态 `xs |> consume_all`（`fn([]T) void`）返回 void 合法，不受此限。）
+6. **`|->` / `|>?` 不支持** `map[K]V` / `string` / 标量作为左操作数，报 `T-PIP-E863`。map 遍历用既有 `for (k, v in m)`。
+7. 空序列输入产出空序列，无诊断、无特例。
+8. `paren`（`( … )`）为透传节点，判定类型与「是否管道」时先剥壳。
+
+#### 3.15.3 `|>` 多态分派（检查期类型定向）
+
+左操作数 `E` 类型 `S`，右侧 `F` 的形参类型 `P`：
+
+1. **`S` 非可迭代（标量 / struct / …）** → **直接应用**：`E |> F` ⇔ `F(E)`，结果 `U`。形参不匹配报 `T-PIP-E862`。
+   - `PI |> sin` ⇔ `sin(PI)`；`auto y = 3 |> add1;` ⇔ `add1(3)`。
+2. **`S` 为 `Seq[T]`** → 二选一：
+   - ① 若 `can_cast(S, P)`（`F` 接受**整个序列**）→ **整体应用** `F(E)`，结果 `U`；
+   - ② 否则若 `can_cast(T, P)`（`F` 接受**单个元素**）→ **逐元素映射**，结果 `[]U`；
+   - ③ 否则报 `T-PIP-E867`。
+   - **①优先于②**；两者同时成立（罕见）时取①并发 `T-PIP-W866` 提示。
+
+```t
+auto a = xs |> hp_of;                          // 可迭代 → 映射 → []i32
+auto b = PI |> sin;                            // 标量 → 应用 → sin(PI)
+auto d = xs |>? is_alive |> hp_of |> sum_i32;  // 过滤 + 映射，末段整体应用（sum_i32: fn([]i32)i32）
+auto e = 3 |> hp_of;                           // T-PIP-E862：i32 无法流入 Enemy
+```
+
+> **L-04 和解**：`x |> f ⇔ f(x)` 看似制造等价多写法，但它是**有唯一脱糖展开**的语法糖，不引入解析期双路径，与「唯一确定语义」不冲突。这是用户 2026-08-10 的裁定。
+
+#### 3.15.4 规范语义：求值即贪心，融合是语义
+
+管道**不引入惰性**。整条链在其所在语句处**完整求值**，产出真实的 `[]T` 缓冲；结果可重复遍历、无消耗状态、无生命周期约束，与普通切片完全同质。
+
+一条由连续元素级算子构成的链，其语义**权威定义**为：
+
+> 按下标 `0 .. slice_len(src)-1` **升序**遍历源序列；对每个元素，**按链上书写顺序**依次施加各级算子；`|>?` 谓词为假则立即跳过该元素的后续所有级；末级产出的值 `append` 到结果序列。
+
+即「逐元素纵向穿过整条链」，而非「逐级横向物化中间数组」。对纯函数两种展开结果相同，但对**带副作用**的阶段函数调用顺序不同 —— 宪法第7条（确定性可复现）要求语义唯一，故规范写死为融合序。
+
+**右侧函数只求值一次**：管道右操作数在进入循环之前求值，自左向右各一次。`xs |-> make_adder(k)` 只调用一次 `make_adder`。
+
+#### 3.15.5 脱糖（唯一确定，后端零改动）
+
+降解在 **sema**（`lower_pipe` / `pipe_flush`）完成，因为 `|>` 的分派依赖类型信息。策略为**贪心融合**：连续的元素级阶段（`|->`、`|>?`、走映射的 `|>`）合成**一个** `__pipe_N` 函数、**一个** `for` 循环；遇到整体应用的 `|>` 则先冲刷当前段，再把结果包进 `F(...)`。
+
+```t
+auto total = es |>? is_alive |-> hp_of |> sum_i32;
+```
+
+脱糖为（`__pipe_N` 提升为顶层合成函数，管道节点就地改写为透传 `paren` 指向调用点）：
+
+```t
+__pipe_0 fn(__ps: []Enemy, __pf0: fn(Enemy) bool, __pf1: fn(Enemy) i32) []i32 {
+    var __po: []i32 = [];
+    for (__pe in __ps) {
+        if (__pf0(__pe)) {
+            var __pv1: i32 = __pf1(__pe);
+            append(__po, __pv1);
+        }
+    }
+    return __po;
+}
+auto total = sum_i32(__pipe_0(es, is_alive, hp_of));
+```
+
+| 前缀 | 用途 |
+|---|---|
+| `__pipe_<N>` | 合成的融合函数（全局递增计数器，与 `__lam_N` / `__fmt_N` 同族） |
+| `__ps` | 合成函数的源序列形参 |
+| `__pf<j>` | 各阶段函数值形参 |
+| `__pe` | 循环元素变量 |
+| `__pv<j>` | 中间映射结果 |
+| `__po` | 结果序列 |
+
+脱糖产物只含既有节点种类（`FuncDecl` / `var_decl` / `for_each` / `if` / `call` / `return`），**C 与 LLVM 两个后端无任何新增发射分支**；`pipe_*` 节点在降解后被改写成 `paren`，后端永不会见到它们。合成函数经 `register_decl` 注册真实签名，并在 `run_check` 尾部补做类型检查。
+
+#### 3.15.6 上下文限制（分配可追溯）
+
+管道**只允许**出现在下列四类位置（剥 paren 后判定）：
+
+1. `var` / `const` / `auto` 声明的初始化器；
+2. 赋值语句右侧 `Lhs = Pipeline;`；
+3. `return Pipeline;`；
+4. 表达式语句 `Pipeline;`（结果被丢弃时发 `T-PIP-W868`）。
+
+其余位置一律报 `T-PIP-E865`，fix-it 为「先绑定到局部变量」。明确禁止：
+
+| 禁用位置 | 理由 |
+|---|---|
+| `if` / `while` / `for` 条件 | 条件位无提升点 |
+| `&&` / `\|\|` 右操作数 | 提升会破坏短路求值 |
+| `match` 臂体、`when` 守卫 | 臂是条件执行，提升会改变求值时机 |
+| 函数调用实参 | 提升会改变实参间的副作用顺序 |
+| 数组下标、结构体字面量字段值 | 同上 |
+
+这条限制使每一次「新序列的分配」都必然对应一个**具名绑定或显式 return**，满足宪法第3条「无隐式内存分配、可静态追溯」。
+
+#### 3.15.7 诊断
+
+CAT `PIP` 占 860–879（`FLG` 相应收窄为 850–859，无编码被回收）。完整表见 `docs/diagnostics.md`。
+
+| 机器码 | legacy | 等级 | 触发 |
+|---|---|---|---|
+| `T-PIP-E860` | `T_PIPE_RHS_NOT_FUNC` | error | 右操作数静态类型不是 `FuncType` |
+| `T-PIP-E861` | `T_PIPE_RHS_ARITY` | error | 右侧函数不是一元 |
+| `T-PIP-E862` | `T_PIPE_ARG_TYPE` | error | 元素 / 流入值类型无法转型为形参类型 |
+| `T-PIP-E863` | `T_PIPE_NOT_SEQUENCE` | error | `\|->` / `\|>?` 左操作数不是 `[]T` / `[N]T` |
+| `T-PIP-E864` | `T_PIPE_PRED_TYPE` | error | `\|>?` 谓词返回类型不是 `bool` |
+| `T-PIP-E865` | `T_PIPE_BAD_CONTEXT` | error | 管道出现在禁用上下文（§3.15.6） |
+| `T-PIP-W866` | `W_PIPE_DISPATCH_AMBIG` | warning | `\|>` 整体应用与逐元素映射同时成立，已取整体应用 |
+| `T-PIP-E867` | `T_PIPE_NO_MATCH` | error | `\|>` 右侧函数与可迭代左操作数无任何匹配形态 |
+| `T-PIP-W868` | `W_PIPE_RESULT_UNUSED` | warning | 表达式语句位的管道结果被丢弃 |
+| 869–879 | — | — | 预留 |
+
+#### 3.15.8 与既有体系的关系
+
+| 体系 | 关系 |
+|---|---|
+| `for (x in xs)` | 脱糖目标，**不修改**其文法与语义 |
+| `FuncLit` / `FuncType` / 闭包（M46/M48） | 右操作数的唯一来源；统一 TClosure ABI，具名函数与闭包可互换 |
+| `append` / `slice_len` 内建 | 脱糖复用，**无新增内建** |
+| `match` / `when` | 正交；管道禁止出现在臂内 |
+| agent / ECS | 主要受益场景：`components \|>? active \|-> step \|> commit_all` |
+| 模块 / `import` | 右侧函数跨模块时须 `export`，且调用方须 `import` 被调方 |
+| 自举 | 管道**不用于** `src/*.tc` 自身，避免自举期语法依赖 |
+
+#### 3.15.9 v2 预留（本版不涉及）
+
+`[N]T` 的定长保长度 lowering、`map[K]V` 管道形态、`zip` / 笛卡尔积（需先有 tuple 或 `Pair` + 泛型）、ECS 并行 delta 提交原语。（区间字面量已于 2026-08-11 落地，见 §3.16。）
+
+---
+
+### 3.16 Range literals（区间字面量 `a..b` / `a..=b` / `a..` / `..`）✅ tc（2026-08-11）
+
+```ebnf
+RangeExpr:
+    Expr? (".." | "..=") Expr?
+```
+
+四种形态：
+
+| 写法 | 含义 | 端点 |
+|---|---|---|
+| `a..b` | 半开 | 含 `a`，不含 `b` |
+| `a..=b` | 闭合 | 含 `a`，含 `b` |
+| `a..` | 开放右端 | 含 `a`，无上界 |
+| `..b` / `..` | 省略起点 / 全区间 | 仅索引与 match 上下文可用 |
+
+#### 3.16.1 核心设计：区间不是运行期值
+
+**没有 Range 类型，没有迭代器协议，没有运行期 range 对象。** `range` 是纯 AST 节点，由 sema 按**所处上下文**就地降解；两个后端永远看不到裸 `range` 节点（唯一例外是 match 范围臂，由 `match_chain_from` 合成比较链）。
+
+这条选择是刻意的：引入 Range 类型意味着要么给它装迭代器 trait（语言没有 trait 体系），要么让它成为一等值却只有一种消费方式（语义污点）。降解方案零运行期开销、零新增类型、零 ABI 影响。
+
+降解手法统一为「就地退化成 `paren` 透传节点」——与管道 `lower_pipe` 同一套路：`paren` 在四处 emit/etd 都已支持，且重复 infer 天然幂等（第二次走 `paren` 分支）。
+
+#### 3.16.2 五类上下文与各自的降解
+
+| 上下文 | 写法 | 降解目标 |
+|---|---|---|
+| for 迭代 | `for (i in a..b)` | 计数循环（见下） |
+| 切片索引 | `s[a..b]` | `str_slice` / `slice_sub` 调用 |
+| match 臂 | `1..5 => ...` | 比较链 `x >= 1 && x < 5` |
+| 成员测试 | `x in a..b` | 比较合取 `x >= a && x < b` |
+| 其余值位置 | `var xs: []i64 = 2..6;` | 物化成 `[]i64`（`__range_fill` 助手） |
+
+**for 迭代**降解为零分配计数循环，上界先落临时量：
+
+```t
+for (i in 0..n) { body }
+// ⇓
+{ var _rg0_hi: i64 = n;
+  for (var i: i64 = 0; i < _rg0_hi; i = i + 1) { body } }
+```
+
+上界只求值一次是**语义承诺**：`for (i in 0..n) { n = 100; }` 的轮数由进入循环时的 `n` 决定。`..=` 把条件换成 `<=`；开放右端 `a..` 不生成条件（= 无限循环，靠 `break` 收口）。
+
+**切片索引**：缺省下界补 `0`，缺省上界补 `str_len(obj)` / `slice_len(obj)`；`..=hi` 的排他上界取 `hi + 1`。子切片 `slice_sub` 是 O(1) 视图，与源共享底层缓冲，但 `cap` 收成 `len`——对子切片 `append` 必定触发扩容拷贝，不会踩写源切片的后续元素。
+
+**物化**惰性合成整轮编译共用的 `__range_fill(lo, hi) []i64` 助手（与 `__pipe_N` 同一套注入机制）。
+
+#### 3.16.3 约束与理由
+
+- **两端俱全才能取值**：物化要算长度，`1..` 是无穷序列 → `T-RNG-E872`。
+- **迭代必须有起点**：计数循环的初值就是起点，`..n` 无从开始，不默认补 0（那是猜意图）→ `T-RNG-E870`。
+- **可重复求值**：省略上界的索引要补一次 `len(obj)`，`x in r` 要把 `x` 展开两次——操作数在 AST 里出现两次 = 后端求值两次。含调用/副作用的操作数被拒（`T-RNG-E875`），要求先绑定到变量，而不是编译器偷插临时量改变求值次数。
+- **`..` 在 match 里等价 `_`**：两端俱省的范围臂必然命中，参与穷尽性判定。
+- **`[N]T` 暂不支持区间索引**（`T-RNG-E873`）：定长数组在 C 后端是裸 `T*`、LLVM 后端是 `[N x T]`，都不是 `TSlice`；Array→Slice 构造 lowering 未落地前显式拒绝，不把段错误留到运行期（与 §3.15 的 `T-PIP-E863` 同源）。
+
+#### 3.16.4 新增运行期原语
+
+| 原语 | C 端 | LLVM 端 |
+|---|---|---|
+| 子切片视图 | `t_slice_sub(TSlice, i64, i64)` | `tll_slice_sub(ptr, i64, i64, ptr out)` |
+
+字符串区间索引复用既有 `str_slice`，无新增。越界一律 `t_panic_bounds`。
+
+#### 3.16.5 诊断
+
+CAT `RNG` 占 870–879。完整表见 `docs/diagnostics.md`。
+
+| 机器码 | legacy | 等级 | 触发 |
+|---|---|---|---|
+| `T-RNG-E870` | `T_RANGE_ITER_NO_START` | error | 区间迭代缺起点；或对区间用了 `for (k, v in ...)` |
+| `T-RNG-E871` | `T_RANGE_INDEX_UNSUPPORTED` | error | 对 `string` / `[]T` 以外的类型做区间索引 |
+| `T-RNG-E872` | `T_RANGE_OPEN_AS_VALUE` | error | 开放区间出现在取值位置 |
+| `T-RNG-E873` | `T_RANGE_INDEX_ARRAY` | error | 对 `[N]T` 做区间索引（构造降解未落地） |
+| `T-RNG-E874` | `T_RANGE_INCL_NO_END` | error | `..=` 缺右端点（解析期） |
+| `T-RNG-E875` | `T_RANGE_IMPURE_OPERAND` | error | 降解会重复求值，但操作数含调用/副作用 |
+| `T-RNG-E877` | `T_IN_RHS_NOT_RANGE` | error | `in` 右侧不是区间字面量 |
+| 876 / 878 / 879 | — | — | 预留 |
+
+#### 3.16.6 与既有体系的关系
+
+| 体系 | 关系 |
+|---|---|
+| `for (x in xs)` | 迭代形态的降解目标，**不修改**其文法与语义 |
+| `str_slice` / `slice_len` / `append` 内建 | 降解复用；仅新增 `slice_sub` 一个内建 |
+| `match` | 范围臂经 `match_chain_from` 合成比较链，两个后端共用同一份实现 |
+| 管道 `\|>` | 正交且可组合：`(0..10) \|> f` 先物化成 `[]i64` 再入管道 |
+| 自举 | 区间**不用于** `src/*.tc` 自身，避免自举期语法依赖（同管道） |
+
+---
+
 ## 4. Program entry（程序入口） ✅ tote
 
 ```ebnf
@@ -2275,7 +2576,8 @@ Block           : "{" Statement* "}"
 Statement       : VarDecl | ConstDecl | Assign | If | While | Return | ExprStmt | Block
                 | ExpectStmt
 ExpectStmt      : "expect" "(" Expression ("," String)? ")" ";"
-Expression      : Literal | Ident | Call | FieldAccess | Unary | Binary | "(" Expression ")"
+Expression      : Literal | Ident | Call | FieldAccess | Unary | Binary | Pipeline | "(" Expression ")"
+Pipeline        : Expression (("|->" | "|>?" | "|>") Expression)*   // L0 最低级，左结合
 Type            : Scalar | "[]" Type | "[" N "]" Type | NamedType
 Annotation      : "@" Ident ("(" ArgList? ")")?
 ```
@@ -2299,6 +2601,8 @@ Annotation      : "@" Ident ("(" ArgList? ")")?
 | §2.3 | 字符串驻留符号 Sym32/Sym16（intern / sym_str / sym_release） | ✅ 已实现（M40） |
 | §3.11 | 时间格式化（strftime `%` 风格）+ 解析/固定时区/locale/M57 增量 | ✅ 已实现（M56 / M57） |
 | §3.14 | 测试声明 `"名" test/suite {}` + `expect` + `tc test` 运行器 | ✅ 已实现（2026-08-08；旧 `@test` 系列转弃用别名） |
+| §3.15 | 管道算子 `\|->` / `\|>?` / `\|>`（贪心融合脱糖，双后端零改动） | ✅ 已实现（2026-08-10；sema 降解 + 9 条 `PIP` 诊断） |
+| §2.4 | 字面量全量（`_` 分隔符 / `0o` / `1e9` / 位宽后缀 / `'A'` / `\xHH` / `\u{}` / `r"..."` / `"""..."""` / `inf` / `nan`） | ✅ 已实现（2026-08-10；`T-LEX-E000..E008` 九码 + 词法阶段闸门） |
 
 > 设计哲学落地：**语法根本源为 `docs/reference.md`**（内含 `ebnf` 产生式块），经 `tools/gen_ebnf.mjs` 生成 `out/ebnf.json`，再由 `src/totter.tc`（已放弃）数据驱动生成 `gen/tc.tc`（冻结快照，见 `src/tc.tc` `kw_lookup` 等标记区间）。⚠ totter 已放弃，此「数据优先」生成管线为历史设计；`src/tc.tc` 现手写维护，`GEN:` 区间为冻结快照。
 

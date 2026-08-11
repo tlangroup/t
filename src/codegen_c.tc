@@ -701,6 +701,12 @@ expr_type_desc fn(e: i64) i64 {
             if (cn == "sb_append_fmt_int" || cn == "sb_append_fmt_uint" || cn == "sb_append_fmt_float" || cn == "sb_append_fmt_str" || cn == "sb_append_fmt_bool" || cn == "sb_append_fmt_char") { return td_mk("void"); }
             if (cn == "sb_append_fmt_str_conv" || cn == "sb_append_fmt_int_conv" || cn == "sb_append_fmt_uint_conv") { return td_mk("void"); }
 // <<< GEN:td_calls <<<
+            // slice_sub(s, lo, hi) 的子切片与源切片同型：类型由首实参转发。
+            // 依赖实参、不是常量返回，故写在 GEN 区外（生成器只会写单行常量规则）。
+            if (cn == "slice_sub") {
+                if (n.la < 0) { return td_elem_mk("slice", td_mk("unknown")); }
+                return expr_type_desc(kids[n.la].val);
+            }
             // map_get(m, k) 的返回类型 = 映射的 V（从首个实参的 map 类型反查）
             if (cn == "map_get" && n.la >= 0) {
                 var mn: i64 = kids[n.la].val;
@@ -1071,7 +1077,13 @@ match_chain_from fn(c: i64, rname: string, sname: string) i64 {
     var mc_body: i64 = list_push(-1, -1, mc_asg);
     var mc_cond: i64 = -1;
     if (mc_an.na >= 0) {
-        mc_cond = mk_binary("==", mk_ident(sname, -1), mc_an.na, -1);
+        // 范围模式 `1..5` / `1..=5` / `'a'..='z'`：等值比较换成区间成员测试。
+        // 被匹配值此刻已绑在临时量 sname 上，重复引用零代价、零副作用。
+        if (nodes[mc_an.na].kind == "range") {
+            mc_cond = mk_range_test(mk_ident(sname, -1), mk_ident(sname, -1), mc_an.na);
+        } else {
+            mc_cond = mk_binary("==", mk_ident(sname, -1), mc_an.na, -1);
+        }
     }
     if (mc_an.nb >= 0) {
         if (mc_cond < 0) {
@@ -1233,6 +1245,17 @@ emit_expr fn(e: i64) string {
             }
             return sb_cat2("0b", body);
         }
+        if (n.ia == 8) {
+            // t 写作 0o755，C 的八进制前缀是单个 0
+            var ov: string = n.sa;
+            var obody: string = ov;
+            if (str_len(ov) >= 2) {
+                if (ov[0] == 48 && (ov[1] == 111 || ov[1] == 79)) {
+                    obody = str_slice(ov, 2, str_len(ov));
+                }
+            }
+            return sb_cat2("0", obody);
+        }
         return n.sa;
     }
     if (n.kind == "atom") {
@@ -1278,6 +1301,13 @@ emit_expr fn(e: i64) string {
         return sb_cat6("t_deser_int(", dfid, ", ", dbits, ", ", sb_cat2(dsgn, ")"));
     }
     if (n.kind == "float") {
+        // IEEE-754 特殊值：走编译器内建而非 <math.h> 的 INFINITY / NAN。
+        // 引入 math.h 会把 `yn` / `y0` / `j1` / `gamma` 等 libc 名字灌进
+        // 每个翻译单元，与用户函数撞名（examples/fid_error_demo.tc 的 `yn`
+        // 就是实例）。内建无需头文件，clang / gcc 均支持，且 C 后端本就只
+        // 面向 clang。
+        if (n.sa == "inf") { return "__builtin_inf()"; }
+        if (n.sa == "nan") { return "__builtin_nan(\"\")"; }
         return n.sa;
     }
     if (n.kind == "string") {
@@ -1466,6 +1496,11 @@ emit_expr fn(e: i64) string {
             if (cn == "println") { return sb_cat3("t_println(", av[0], ")"); }
             if (cn == "str_slice") {
                 return sb_cat6("t_str_slice(", av[0], ", ", av[1], ", ", sb_cat2(av[2], ")"));
+            }
+            // 子切片：O(1) 视图（共享 ptr、cap 收成 len，故对子切片 append 会另行扩容拷贝）
+            if (cn == "slice_sub") {
+                return sb_cat6("t_slice_sub(", av[0], ", (int64_t)(", av[1], "), (int64_t)(",
+                    sb_cat2(av[2], "))"));
             }
             if (cn == "sb_new") { return "t_sb_new(t_arena_current())"; }
             if (cn == "sb_append_str") { return sb_cat5("t_sb_append_str(", av[0], ", ", av[1], ")"); }
@@ -3195,7 +3230,7 @@ emit_type_info_c fn(tname: string) string {
     }
     var d: i64 = ti_struct_decl(tname);
     if (d < 0) {
-        diag_new("T_TYPE_MISMATCH", "error", sb_cat2("type_info: '", sb_cat2(tname, "' 不是 struct 类型（当前仅支持 struct）")), "", 1, 1, 1, 10);
+        diag_new("T-CDE-E910", "error", sb_cat2("type_info: '", sb_cat2(tname, "' 不是 struct 类型（当前仅支持 struct）")), "", 1, 1, 1, 10);
         return "0";
     }
     append(ti_done, tname);

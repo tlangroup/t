@@ -75,6 +75,8 @@ void    tll_slice_append(TSlice* s, void* elem, int64_t esz) { t_slice_append_si
 void*   tll_slice_at(TSlice* s, int64_t i)                   { return t_slice_at(*s, i); }
 void    tll_slice_set(TSlice* s, int64_t i, void* elem)      { t_slice_set(*s, i, elem); }
 int64_t tll_slice_len(TSlice* s)                             { return t_slice_len(*s); }
+// 子切片：聚合入参与返回一律走指针，out 排末位（与 tll_str_slice 同构）
+void    tll_slice_sub(TSlice* s, int64_t a, int64_t b, TSlice* out) { *out = t_slice_sub(*s, a, b); }
 
 // ── map ────────────────────────────────────────────────────────
 TMap*   tll_map_new(int64_t key_kind, int64_t val_size) { return t_map_new(t_arena_current(), key_kind, val_size); }

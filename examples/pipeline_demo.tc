@@ -1,0 +1,131 @@
+// 管道算子演示（reference.md §3.15）
+//
+//   |->  元素映射      Seq[T] |-> fn(T)U   → []U
+//   |>?  元素过滤      Seq[T] |>? fn(T)bool → []T
+//   |>   多态管道      标量 → 直接应用 F(E)；可迭代 → 整体应用优先，否则逐元素映射
+//
+// 三者同属最低二元级 L0、全左结合。连续的元素级阶段在 sema 期贪心融合成
+// 一个 __pipe_N 合成函数 + 一趟 for 循环（融合是规范语义，不是优化）：
+// 副作用函数的调用顺序因此唯一确定 —— 逐元素纵向穿过整条链。
+
+Enemy struct {
+    name: string;
+    hp: i32;
+    speed: i32;
+}
+
+is_alive fn(e: Enemy) bool {
+    return e.hp > 0;
+}
+
+is_fast fn(e: Enemy) bool {
+    return e.speed >= 3;
+}
+
+hp_of fn(e: Enemy) i32 {
+    return e.hp;
+}
+
+name_of fn(e: Enemy) string {
+    return e.name;
+}
+
+dbl fn(v: i32) i32 {
+    return v * 2;
+}
+
+sum_i32 fn(xs: []i32) i32 {
+    var acc: i32 = 0;
+    for (v in xs) {
+        acc = acc + v;
+    }
+    return acc;
+}
+
+count_of fn(xs: []i32) i32 {
+    return slice_len(xs) as i32;
+}
+
+// 融合序可观测：谓词打印一行，映射再打印一行 —— 输出顺序即「逐元素纵向」
+trace_alive fn(e: Enemy) bool {
+    println(format("  ?  {}", e.name));
+    return e.hp > 0;
+}
+
+trace_hp fn(e: Enemy) i32 {
+    println(format("  -> {} hp={}", e.name, e.hp as i64));
+    return e.hp;
+}
+
+mk fn(nm: string, hp: i32, sp: i32) Enemy {
+    var e: Enemy;
+    e.name = nm;
+    e.hp = hp;
+    e.speed = sp;
+    return e;
+}
+
+main fn() i32 @main {
+    var es: []Enemy;
+    append(es, mk("orc", 12, 2));
+    append(es, mk("ghost", 0, 5));
+    append(es, mk("wolf", 7, 4));
+    append(es, mk("slime", 3, 1));
+
+    // ① 单级映射
+    auto hps = es |-> hp_of;
+    println(format("hps len={} first={} last={}",
+        slice_len(hps) as i64, hps[0] as i64, hps[3] as i64));
+
+    // ② 单级过滤（结果仍是元素类型的切片）
+    auto alive = es |>? is_alive;
+    println(format("alive len={}", slice_len(alive) as i64));
+
+    // ③ 过滤 + 过滤 + 映射：三阶段融合成一趟循环
+    auto fast_alive_hp = es |>? is_alive |>? is_fast |-> hp_of;
+    println(format("fast_alive_hp len={} v0={}",
+        slice_len(fast_alive_hp) as i64, fast_alive_hp[0] as i64));
+
+    // ④ 链尾整体应用：sum_i32 接受 []i32 整体 ⇒ 先冲刷循环再包一层调用
+    auto total = es |>? is_alive |-> hp_of |> sum_i32;
+    println(format("alive hp total={}", total as i64));
+
+    // ⑤ 逐元素 |>：dbl 只接受元素、不接受整体 ⇒ 走映射
+    auto doubled = hps |> dbl;
+    println(format("doubled 0={} 3={}", doubled[0] as i64, doubled[3] as i64));
+
+    // ⑥ 标量 |>：非可迭代左操作数 ⇒ 直接应用，等价 dbl(21)
+    var seed: i32 = 21;
+    auto answer = seed |> dbl;
+    println(format("answer={}", answer as i64));
+
+    // ⑦ 匿名函数字面量作阶段（按值捕获外层 k）
+    var k: i32 = 10;
+    auto boosted = hps |-> fn(v: i32) i32 { return v + k; };
+    println(format("boosted 0={} 3={}", boosted[0] as i64, boosted[3] as i64));
+
+    // ⑧ 映射到 string，再整体应用
+    auto names = es |>? is_alive |-> name_of;
+    println(format("alive names len={} first={}", slice_len(names) as i64, names[0]));
+
+    // ⑨ 赋值右侧 + 左结合（无需括号）
+    var big: []i32 = [];
+    big = hps |-> dbl |>? fn(v: i32) bool { return v > 10; };
+    println(format("big len={}", slice_len(big) as i64));
+
+    // ⑩ 整体应用可续接：count_of 吃整段结果
+    auto cnt = es |>? is_alive |-> hp_of |> count_of;
+    println(format("alive count={}", cnt as i64));
+
+    // ⑪ 融合序可观测：谓词/映射交替出现，证明是逐元素纵向而非逐级横向
+    println("trace:");
+    auto traced = es |>? trace_alive |-> trace_hp;
+    println(format("traced len={}", slice_len(traced) as i64));
+
+    // ⑫ 空序列：产出空序列，无特例
+    var none: []Enemy;
+    auto empty = none |>? is_alive |-> hp_of;
+    println(format("empty len={}", slice_len(empty) as i64));
+
+    return 0;
+}

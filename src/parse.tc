@@ -9,17 +9,34 @@
 import(src.base :: *);
 import(src.lex :: *);
 
+// 解析期致命错误：登记结构化诊断（带文件/行列）→ 输出 JSON → 退出。
+//
+// ⚠ 解析器**没有错误恢复**，任何语法错都必须就地终止；但绝不能再裸 `eprint`
+//   到 stderr —— stdout 的 JSON 才是机器可读通道，IDE / REPL / `tc check`
+//   的消费方只认它。历史上 36 处 parse error 全走裸 eprint，导致语法错在
+//   REPL 里**完全静默**（build.log 空、无人读 build.err），也没有行列信息。
+//   打印器 `print_json` 已从 sema.tc 下沉到 base.tc，parse 层现可直接调用。
+parse_fatal_at fn(code: string, msg: string, ti: i64) void {
+    var l: i64 = tk_line(ti) as i64;
+    var c: i64 = tk_col(ti) as i64;
+    var w: i64 = str_len(tk_v(ti)) as i64;
+    if (w < 1) { w = 1; }
+    diag_new(code, "error", msg, g_file, l, c, l, c + w);
+    emit_diags();
+    exit(1);
+}
+
+// 定位到「当前 token」的致命语法错误（绝大多数站点用这个）。
+parse_fatal fn(msg: string) void {
+    parse_fatal_at("T-PAR-E101", msg, pos);
+}
+
 expect_tok fn(t: string) string {
     if (cur_t() == t) {
         var idx: i64 = advance_i();
         return tk_v(idx);
     }
-    eprint("parse error: expected ");
-    eprint(t);
-    eprint(" but found ");
-    eprint(cur_v());
-    eprint("\n");
-    exit(1);
+    parse_fatal(sb_cat4("语法错误：期待 ", t, "，实际读到 ", cur_v()));
     return "";
 }
 
@@ -97,8 +114,7 @@ parse_annotation_args fn() i64 {
                 made = mk_list(ih, -1);
             }
         } else {
-            eprint("parse error: invalid annotation argument\n");
-            exit(1);
+            parse_fatal("invalid annotation argument");
         }}}
         tail = list_push(head, tail, made);
         if (head < 0) {
@@ -131,7 +147,7 @@ parse_annotations fn() i64 {
             nti = pos - 1;
         }
         if (is_lower_snake(name) == false) {
-            warn_name("T_NAME_ANNOTATION_LOWER", sb_cat3("annotation name '", name, "' should be lowercase snake_case"), nti, str_len(name) as i64);
+            warn_name("T-NAM-W403", sb_cat3("annotation name '", name, "' should be lowercase snake_case"), nti, str_len(name) as i64);
         }
         var args_head: i64 = -1;
         if (cur_t() == "LParen") {
@@ -289,8 +305,7 @@ parse_type fn() i64 {
         var idn: i64 = mk_named(name, -1);
         return idn;
     }
-    eprint("parse error: expected type\n");
-    exit(1);
+    parse_fatal("expected type");
     return -1;
 }
 
@@ -305,8 +320,88 @@ parse_expr fn() i64 {
     return parse_assign_expr();
 }
 
-parse_assign_expr fn() i64 {
+// 管道级（L0，最低二元级，全左结合）—— 包在 parse_or 外层。
+// 既有 10 级塔层级与顺序一字不变（L-03「塔只向下扩展、不重排」）。
+// 三个算子同级：`|->` 映射 / `|>?` 过滤 / `|>` 多态管道。
+parse_pipe fn() i64 {
+    var left: i64 = parse_in();
+    while (cur_t() == "PipeMap" || cur_t() == "PipeFilter" || cur_t() == "PipeApply") {
+        var pk: string = cur_t();
+        var ti: i64 = advance_i();
+        var right: i64 = parse_in();
+        if (pk == "PipeMap") {
+            left = mk_pipe_map(left, right, ti);
+        } else if (pk == "PipeFilter") {
+            left = mk_pipe_filter(left, right, ti);
+        } else {
+            left = mk_pipe_apply(left, right, ti);
+        }
+    }
+    return left;
+}
+
+// ── 区间字面量（M-range）───────────────────────────────────────
+// 塔层新增两级，夹在管道级（L0）与逻辑或级（L1）之间：
+//
+//   assign → pipe → in → range → or → … → primary
+//
+// 放在管道**内侧**是刻意的：`0..10 |> f` 必须读成 `(0..10) |> f`，
+// 而不是 `0..(10 |> f)`；放在逻辑或**外侧**则让 `a..b` 的端点可以是任意
+// 普通表达式（`0..n*2`、`lo..arr[i]`）而无需加括号。
+//
+// 端点缺省的判定：`..` 之后若紧跟这些「表达式不可能开始」的 token，
+// 就认定右端省略（`a..`、`..`）。`FatArrow` / `KwWhen` 是为 match 臂
+// （`5.. => ...`、`1..9 when p => ...`）准备的。
+range_end_omitted fn() bool {
+    var t: string = cur_t();
+    if (t == "RBracket" || t == "RParen" || t == "RBrace") { return true; }
+    if (t == "Comma" || t == "Semicolon" || t == "Eof") { return true; }
+    if (t == "FatArrow" || t == "KwWhen") { return true; }
+    if (t == "LBrace") { return true; }   // `for (i in 0..) { }` 的循环体左花括号
+    return false;
+}
+
+parse_range fn() i64 {
+    // 前缀形态：`..b` / `..=b` / `..`（左端省略）
+    if (cur_t() == "DotDot" || cur_t() == "DotDotEq") {
+        var pincl: bool = cur_t() == "DotDotEq";
+        var pti: i64 = advance_i();
+        var phi: i64 = -1;
+        if (range_end_omitted() == false) { phi = parse_or(); }
+        if (pincl && phi < 0) {
+            parse_fatal_at("T-RNG-E874", "`..=` 是闭合区间，必须给出右端点（想要开放右端请用 `..`）", pti);
+        }
+        return mk_range(-1, phi, pincl, pti);
+    }
     var left: i64 = parse_or();
+    if (cur_t() == "DotDot" || cur_t() == "DotDotEq") {
+        var incl: bool = cur_t() == "DotDotEq";
+        var ti: i64 = advance_i();
+        var hi: i64 = -1;
+        if (range_end_omitted() == false) { hi = parse_or(); }
+        if (incl && hi < 0) {
+            parse_fatal_at("T-RNG-E874", "`..=` 是闭合区间，必须给出右端点（想要开放右端请用 `..`）", ti);
+        }
+        return mk_range(left, hi, incl, ti);
+    }
+    return left;
+}
+
+// 成员测试级：`x in <range>` → bool。右操作数当前只接受区间字面量，
+// 由 sema 就地降解为 `(x >= lo && x <= hi)`，两个后端永远看不到 `in`。
+// 与 `for (x in xs)` 零冲突：for 头部在调用 parse_expr **之前**已自行吃掉 `in`。
+parse_in fn() i64 {
+    var left: i64 = parse_range();
+    while (cur_t() == "KwIn") {
+        var ti: i64 = advance_i();
+        var right: i64 = parse_range();
+        left = mk_binary("in", left, right, ti);
+    }
+    return left;
+}
+
+parse_assign_expr fn() i64 {
+    var left: i64 = parse_pipe();
     if (cur_t() == "Assign") {
         var ti: i64 = advance_i();
         var right: i64 = parse_assign_expr();
@@ -378,6 +473,16 @@ starts_with_0x fn(s: string) bool {
         return false;
     }
     return s[1] == 120 || s[1] == 88;
+}
+
+starts_with_0o fn(s: string) bool {
+    if (str_len(s) < 2) {
+        return false;
+    }
+    if (s[0] != 48) {
+        return false;
+    }
+    return s[1] == 111 || s[1] == 79;
 }
 
 starts_with_0b fn(s: string) bool {
@@ -471,23 +576,75 @@ parse_array_lit fn(ti: i64) i64 {
     return id;
 }
 
+// `-` 紧跟整数 token 时由 parse_unary 置位、由 parse_prim_int 读后即清。
+// 只为一件事：让 `iN::MIN`（数值主体恰为 2^(N-1)）可写，见 reference.md §2.4。
+var g_lit_neg: bool = false;
+
 // primary 胶水 helper（fold=prim 骨架已消费分发 token，ti 为其下标）
 parse_prim_int fn(ti: i64) i64 {
-    var val: string = tk_v(ti);
+    var neg: bool = g_lit_neg;
+    g_lit_neg = false;
+
+    var raw: string = tk_v(ti);
+    var sfx: string = lit_suffix_of(raw);
+    var val: string = lit_body_of(raw);
     var radix: i64 = 10;
     if (starts_with_0x(val)) {
         radix = 16;
-    } else {
-        if (starts_with_0b(val)) {
-            radix = 2;
+    } else if (starts_with_0b(val)) {
+        radix = 2;
+    } else if (starts_with_0o(val)) {
+        radix = 8;
+    }
+
+    // 取值范围自检。无后缀时上界是 u64；有后缀时由后缀类型决定，
+    // `iN` 的上界 2^(N-1) 仅在紧邻前置 `-` 时可取到（即 iN::MIN）。
+    var mag: u64 = lit_val_u64(val);
+    if (g_lit_overflow) {
+        diag_lit_range(ti, raw, "整数字面量超出 u64 可表示范围");
+    } else if (str_len(sfx) > 0) {
+        var cap: u64 = lit_suffix_max(sfx);
+        var over: bool = mag > cap;
+        if (over == false && num_suffix_is_signed(sfx) && mag == cap && neg == false) {
+            over = true;
+        }
+        if (over) {
+            diag_lit_range(ti, raw,
+                sb_cat3("整数字面量超出 `", sfx, "` 可表示范围"));
         }
     }
+
     var id: i64 = mk_int(val, radix, ti);
+    if (str_len(sfx) > 0) {
+        var nn: Node = nodes[id];
+        nn.sb = sfx;
+        slice_set(nodes, id, nn);
+    }
     return id;
 }
 
+diag_lit_range fn(ti: i64, raw: string, msg: string) void {
+    diag_new("T-LEX-E006", "error",
+        sb_cat3(msg, "：", raw),
+        g_file, tk_line(ti) as i64, tk_col(ti) as i64,
+        tk_line(ti) as i64, (tk_col(ti) + str_len(raw)) as i64);
+}
+
+// 浮点后缀不走 `Node.sb`，而是脱糖成 `as f32` 显式转换：LLVM 的 `float` 常量
+// 要求字面量在 f32 中**精确可表示**（`float 0.1` 会被 IR 解析器拒绝），
+// 保留 f64 常量 + `fptrunc` 才是两个后端都成立的写法。f64 后缀是恒等，直接丢弃。
 parse_prim_float fn(ti: i64) i64 {
-    var id: i64 = mk_float(tk_v(ti), ti);
+    var raw: string = tk_v(ti);
+    // IEEE-754 特殊值：文本原样存进 `float` 节点，后端各自翻译
+    // （C → INFINITY / NAN；LLVM → 0x7FF0.. / 0x7FF8.. 位模式）。
+    if (raw == "inf" || raw == "nan") {
+        return mk_float(raw, ti);
+    }
+    var sfx: string = lit_suffix_of(raw);
+    var id: i64 = mk_float(lit_body_of(raw), ti);
+    if (sfx == "f32") {
+        return mk_cast(id, mk_scalar("f32", ti), ti);
+    }
     return id;
 }
 
@@ -600,7 +757,7 @@ parse_local_var fn(is_const: bool, is_export: bool) i64 {
     // 模块系统（M-Module）：export 只能修饰顶层声明；局部/嵌套变量加 export → T_EXPORT_SCOPE
     if (is_export) {
         nodes[id].bc = true;
-        fc_err("T_EXPORT_SCOPE", "export 只能修饰顶层声明，不能修饰局部/嵌套变量", id);
+        fc_err("T-MOD-E556", "export 只能修饰顶层声明，不能修饰局部/嵌套变量", id);
     }
     return id;
 }
@@ -611,12 +768,10 @@ parse_auto_stmt fn() i64 {
     var ti: i64 = advance_i();
     var name: string = expect_tok("Identifier");
     if (cur_t() == "Colon") {
-        eprint("parse error: 'auto' 推断变量不可标注类型，直接写 `auto 名字 = 初值;`\n");
-        exit(1);
+        parse_fatal("'auto' 推断变量不可标注类型，直接写 `auto 名字 = 初值;`");
     }
     if (cur_t() != "Assign") {
-        eprint("parse error: 'auto' 变量必须有初始化器 `auto 名字 = 初值;`\n");
-        exit(1);
+        parse_fatal("'auto' 变量必须有初始化器 `auto 名字 = 初值;`");
     }
     advance_i();
     var init: i64 = parse_expr();
@@ -928,13 +1083,51 @@ parse_lambda_expr fn() i64 {
     if (cur_t() == "LBrace") {
         body = parse_block();
     } else {
-        eprint("parse error: expected '{' after lambda signature\n");
-        exit(1);
+        parse_fatal("expected '{' after lambda signature");
     }
     // 合成名在解析期就定下来，提升阶段直接复用。
     var lname: string = sb_cat2("__lam_", i2s(g_lam_counter));
     g_lam_counter = g_lam_counter + 1;
     var id: i64 = mk_lambda(lname, rt, -1, ph, body, ti0);
+    return id;
+}
+
+// `|v: T, w: U| expr` 闭包简写 → 与 fn 闭包等价的节点，只是返回类型留作「待推断」。
+// 形如 Rust 的 `|x| x*2` / `|x: i32| x*2`；主体只接受单个表达式（会被包成
+// `{ return <expr>; }`）。返回类型在 sema 阶段按主体里的 return 表达式推断
+// （见 infer_lambda_ret_from_decl），故调用方无需标注。
+parse_bar_lambda fn() i64 {
+    var ti0: i64 = advance_i();    // 吃掉起始 '|'
+    var with_paren: bool = cur_t() == "LParen";
+    if (with_paren) { advance_i(); }
+    var ph: i64 = -1;
+    var pt: i64 = -1;
+    while (cur_t() != "BitOr" && cur_t() != "RParen" && cur_t() != "Eof") {
+        var pname: string = expect_tok("Identifier");
+        expect_tok("Colon");
+        var ptn: i64 = parse_type();
+        var pid: i64 = mk_P(pname, ptn, -1, -1);
+        pt = list_push(ph, pt, pid);
+        if (ph < 0) { ph = pt; }
+        if (cur_t() == "Comma") { advance_i(); } else { break; }
+    }
+    if (with_paren) { expect_tok("RParen"); }
+    if (cur_t() != "BitOr") {
+        parse_fatal("expected '|' to close lambda parameters");
+    }
+    advance_i();                    // 吃掉结束 '|'
+    // 主体：单个表达式（停在下一个管道算子，使 `(xs) |> |v| f(v)` 的 `|>` 不被吞掉）
+    var body_expr: i64 = parse_in();
+    // 包成 `{ return <expr>; }`
+    var rstmt: i64 = mk_return(body_expr, -1);
+    var blk: i64 = -1;
+    var blkt: i64 = -1;
+    blkt = list_push(blk, blkt, rstmt);
+    if (blk < 0) { blk = blkt; }
+    var lname: string = sb_cat2("__lam_", i2s(g_lam_counter));
+    g_lam_counter = g_lam_counter + 1;
+    var rt: i64 = mk_infer_ret();
+    var id: i64 = mk_lambda(lname, rt, -1, ph, blk, ti0);
     return id;
 }
 
@@ -1195,7 +1388,7 @@ lift_one_lambda fn(lid: i64) void {
         var ei: i64 = envm_find(nm);
         if (ei >= 0) {
             if (envm_t[ei] < 0) {
-                fc_err("T_CLOSURE_CAPTURE",
+                fc_err("T-CLO-E780",
                     sb_cat3("无法捕获外层绑定 `", nm,
                         "`：它没有显式类型标注（如 for-each 迭代变量），环境结构无法为其定型。请先赋给带类型标注的局部变量再捕获"), lid);
             } else {
@@ -1424,8 +1617,7 @@ parse_func_decl fn(name: string, anns: i64, is_comptime: bool) i64 {
         if (cur_t() == "LBrace") {
             body = parse_block();
         } else {
-            eprint("parse error: expected '{' or ';' after function signature\n");
-            exit(1);
+            parse_fatal("expected '{' or ';' after function signature");
         }
     }
 
@@ -1521,10 +1713,7 @@ parse_agent_decl fn(name: string, anns: i64) i64 {
     while (cur_t() != "RBrace" && cur_t() != "Eof") {
         if (cur_t() == "Semicolon") { advance_i(); continue; }
         if (cur_t() != "Identifier") {
-            eprint("parse error: expected 'state' or 'step' clause in agent '");
-            eprint(name);
-            eprint("'\n");
-            exit(1);
+            parse_fatal(sb_cat3("expected 'state' or 'step' clause in agent '", name, "'"));
         }
         var kwi: i64 = advance_i();
         var kw: string = tk_v(kwi);
@@ -1537,34 +1726,20 @@ parse_agent_decl fn(name: string, anns: i64) i64 {
             }
         } else if (kw == "step") {
             if (step_fn >= 0) {
-                eprint("parse error: agent '");
-                eprint(name);
-                eprint("' has multiple 'step' clauses\n");
-                exit(1);
+                parse_fatal(sb_cat3("agent '", name, "' has multiple 'step' clauses"));
             }
             // 当前 token 应为 fn（parse_func_decl 自吞）；函数名走 snake_case 命名规范
             step_fn = parse_func_decl(sb_cat2(pascal_to_snake(name), "_step"), anns, false);
         } else {
-            eprint("parse error: unknown agent clause '");
-            eprint(kw);
-            eprint("' in agent '");
-            eprint(name);
-            eprint("'\n");
-            exit(1);
+            parse_fatal(sb_cat5("unknown agent clause '", kw, "' in agent '", name, "'"));
         }
     }
     expect_tok("RBrace");
     if (step_fn < 0) {
-        eprint("parse error: agent '");
-        eprint(name);
-        eprint("' is missing a 'step' clause\n");
-        exit(1);
+        parse_fatal(sb_cat3("agent '", name, "' is missing a 'step' clause"));
     }
     if (field_head < 0) {
-        eprint("parse error: agent '");
-        eprint(name);
-        eprint("' has no 'state' fields\n");
-        exit(1);
+        parse_fatal(sb_cat3("agent '", name, "' has no 'state' fields"));
     }
 
     var state_name: string = sb_cat2(name, "State");
@@ -1721,12 +1896,10 @@ parse_import_decl fn(anns: i64) i64 {
     }
     // 已移除的旧写法：给出带迁移指引的硬错误（与 `::` 绑定符、`func`→`fn` 的处理一致）。
     if (cur_t() == "At") {
-        eprint("parse error: `import @x;` was removed; write `import(x);` instead\n");
-        exit(1);
+        parse_fatal_at("T-PAR-E102", "`import @x;` was removed; write `import(x);` instead", pos);
     }
     if (cur_t() == "Identifier") {
-        eprint("parse error: `import x;` was removed; write `import(src.x);` for this project's sources, or `import(x);` for a library\n");
-        exit(1);
+        parse_fatal_at("T-PAR-E102", "`import x;` was removed; write `import(src.x);` for this project's sources, or `import(x);` for a library", pos);
     }
     // 旧数据导入 `import "path" [as x]`（已由 import_csv/json 函数调用取代，仅保留兼容）
     var path: string = expect_tok("String");
@@ -1858,8 +2031,7 @@ parse_test_decl fn(disp: string, anns: i64, ti: i64) void {
     var all: i64 = list_concat(anns, post);
 
     if (cur_t() != "LBrace") {
-        eprint("parse error: expected '{' after 'test' in test declaration\n");
-        exit(1);
+        parse_fatal("expected '{' after 'test' in test declaration");
     }
     var body: i64 = parse_block();
 
@@ -1888,8 +2060,7 @@ parse_suite_decl fn(disp: string, anns: i64, ti: i64) void {
     var all: i64 = list_concat(anns, post);
 
     if (cur_t() != "LBrace") {
-        eprint("parse error: expected '{' after 'suite' in suite declaration\n");
-        exit(1);
+        parse_fatal("expected '{' after 'suite' in suite declaration");
     }
     advance_i();
 
@@ -1909,8 +2080,7 @@ parse_suite_decl fn(disp: string, anns: i64, ti: i64) void {
         // suite 注解逐成员复制下沉（@skip/@tag 因此天然作用于整组）
         mann = list_concat(clone_ann_list(all), mann);
         if (cur_t() != "String") {
-            eprint("parse error: a suite body may only contain `\"name\" test {}` / `\"name\" suite {}` declarations\n");
-            exit(1);
+            parse_fatal("a suite body may only contain `\"name\" test {}` / `\"name\" suite {}` declarations");
         }
         parse_test_or_suite(mann);
     }
@@ -1924,8 +2094,7 @@ parse_test_or_suite fn(anns: i64) i64 {
     var nti: i64 = advance_i();
     var disp: string = tk_v(nti);
     if (str_len(disp) == 0) {
-        eprint("parse error: test/suite name must not be an empty string\n");
-        exit(1);
+        parse_fatal("test/suite name must not be an empty string");
     }
     if (cur_t() == "Identifier" && cur_v() == "test") {
         advance_i();
@@ -1937,12 +2106,7 @@ parse_test_or_suite fn(anns: i64) i64 {
         parse_suite_decl(disp, anns, nti);
         return -1;
     }
-    eprint("parse error: expected 'test' or 'suite' after the name string \"");
-    eprint(disp);
-    eprint("\", found '");
-    eprint(cur_v());
-    eprint("'\n");
-    exit(1);
+    parse_fatal(sb_cat5("expected 'test' or 'suite' after the name string \"", disp, "\", found '", cur_v(), "'"));
     return -1;
 }
 
@@ -2006,8 +2170,7 @@ parse_expect_stmt fn() i64 {
     if (cur_t() == "Comma") {
         advance_i();
         if (cur_t() != "String") {
-            eprint("parse error: expect message must be a string literal\n");
-            exit(1);
+            parse_fatal("expect message must be a string literal");
         }
         msg = mk_string(cur_v(), pos);
         advance_i();
@@ -2097,10 +2260,7 @@ parse_declaration fn() i64 {
     }
 
     if (cur_t() != "Identifier") {
-        eprint("parse error: expected declaration name but found ");
-        eprint(cur_v());
-        eprint("\n");
-        exit(1);
+        parse_fatal(sb_cat2("expected declaration name but found ", cur_v()));
     }
     var ni: i64 = advance_i();
     var name: string = tk_v(ni);
@@ -2111,19 +2271,11 @@ parse_declaration fn() i64 {
     // 声明形态为 `Name fn(...)` / `Name struct {...}`，绑定符 `::` 已移除。
     // 遇到旧写法给出带名字的迁移指引，而非笼统的语法错误。
     if (cur_t() == "DoubleColon") {
-        eprint("parse error: the '::' binder was removed; write `");
-        eprint(name);
-        eprint(" fn(...)` / `");
-        eprint(name);
-        eprint(" struct {...}` instead\n");
-        exit(1);
+        parse_fatal_at("T-PAR-E102", sb_cat5("the '::' binder was removed; write `", name, " fn(...)` / `", name, " struct {...}` instead"), pos);
     }
     // `func` 已更名为 `fn`：否则会落进 type-alias 分支报出无关的 "expected Semicolon"。
     if (cur_t() == "Identifier" && cur_v() == "func") {
-        eprint("parse error: keyword 'func' was renamed to 'fn'; write `");
-        eprint(name);
-        eprint(" fn(...)` instead\n");
-        exit(1);
+        parse_fatal_at("T-PAR-E102", sb_cat3("keyword 'func' was renamed to 'fn'; write `", name, " fn(...)` instead"), pos);
     }
 
     var d: i64 = parse_decl_body(name, anns, is_comptime);
@@ -2274,7 +2426,7 @@ fc_param_name fn(idx: i64, gd: i64) string {
                     nm = ppn.sa;
                 } else {
                     if (nm != ppn.sa) {
-                        fc_err("T_FUNC_CLAUSE_BIND_CONFLICT",
+                        fc_err("T-FUN-E810",
                             sb_cat4("function clause group '", nodes[gd].sa,
                                 "': parameter #", sb_cat3(i2s(idx), " binds different names ('",
                                 sb_cat4(nm, "' vs '", ppn.sa, "'); only parameter #0 may vary"))),
@@ -2337,7 +2489,7 @@ fc_merge fn() void {
     var i: i64 = 1;
     while (i < g_fc_n) {
         if (list_count(nodes[g_fc_d[i]].lb) != arity) {
-            fc_err("T_FUNC_CLAUSE_ARITY",
+            fc_err("T-FUN-E811",
                 sb_cat3("function clause group '", g0.sa, "': all clauses must have the same arity"),
                 g_fc_d[i]);
             return;
@@ -2345,7 +2497,7 @@ fc_merge fn() void {
         i = i + 1;
     }
     if (arity < 1) {
-        fc_err("T_FUNC_CLAUSE_ARITY",
+        fc_err("T-FUN-E811",
             sb_cat3("function clause group '", g0.sa, "': pattern clauses require at least one parameter"),
             gd);
         return;
@@ -2358,7 +2510,7 @@ fc_merge fn() void {
     while (idx < arity) {
         var ptn: i64 = fc_param_type(idx);
         if (ptn < 0) {
-            fc_err("T_FUNC_CLAUSE_NO_TYPE",
+            fc_err("T-FUN-E812",
                 sb_cat4("function clause group '", g0.sa, "': cannot infer type of parameter #",
                     sb_cat2(i2s(idx), "; annotate it as 'name: Type' in one clause")),
                 gd);
@@ -2379,7 +2531,7 @@ fc_merge fn() void {
     var k: i64 = 1;
     while (k < g_fc_n) {
         if (fc_type_key(nodes[g_fc_d[k]].na) != fc_type_key(g0.na)) {
-            fc_err("T_FUNC_CLAUSE_RET_TYPE",
+            fc_err("T-FUN-E813",
                 sb_cat3("function clause group '", g0.sa, "': all clauses must declare the same return type"),
                 g_fc_d[k]);
             return;
@@ -2396,7 +2548,7 @@ fc_merge fn() void {
         var cn: Node = nodes[cd];
         var be: i64 = fc_body_expr(cd);
         if (be < 0) {
-            fc_err("T_FUNC_CLAUSE_BODY",
+            fc_err("T-FUN-E814",
                 sb_cat3("function clause group '", g0.sa,
                     "': clause body must be a single expression (it becomes a match arm)"),
                 cd);
@@ -2598,15 +2750,11 @@ fstr_parse_expr fn(text: string, ti: i64) i64 {
     }
     pos = base;
     if (cur_t() == "Eof") {
-        eprint("parse error: empty interpolation `{}` in f-string\n");
-        exit(1);
+        parse_fatal("empty interpolation `{}` in f-string");
     }
     var ex: i64 = parse_expr();
     if (cur_t() != "Eof") {
-        eprint("parse error: trailing tokens in f-string interpolation: ");
-        eprint(cur_v());
-        eprint("\n");
-        exit(1);
+        parse_fatal(sb_cat2("trailing tokens in f-string interpolation: ", cur_v()));
     }
     pos = save_pos;
     return ex;
@@ -2632,19 +2780,22 @@ parse_fstring fn(ti: i64) i64 {
     while (i < e0) {
         var c: i64 = raw[i] as i64;
 
-        // 转义：先解码；解出来若是花括号，要在模板层加倍（模板还会再解一次）
+        // 转义：走与词法**同一份** `esc_decode`（base.tc）。两处各写一份正是
+        // 旧实现「f-string 能产出 `\uXXXX`、词法却读不回来」的 round-trip 断裂源。
+        // 解出来若是花括号，要在模板层加倍（模板还会再解一次）。
         if (c == 92) {
-            i = i + 1;
-            if (i >= e0) { break; }
-            var ec: i64 = raw[i] as i64;
-            var dc: i64 = ec;
-            if (ec == 110) { dc = 10; }
-            if (ec == 116) { dc = 9; }
-            if (ec == 114) { dc = 13; }
-            if (ec == 48) { dc = 0; }
-            sb_append_char(tb, dc);
-            if (dc == 123 || dc == 125) { sb_append_char(tb, dc); }
-            i = i + 1;
+            var eb: StringBuilder = sb_new();
+            var ni: u64 = esc_decode(raw, i + 1, eb, tk_line(ti) as i64, tk_col(ti) as i64);
+            var es: string = sb_to_str(eb);
+            var eL: u64 = str_len(es);
+            var ek: u64 = 0;
+            while (ek < eL) {
+                var ech: i64 = es[ek] as i64;
+                sb_append_char(tb, ech);
+                if (ech == 123 || ech == 125) { sb_append_char(tb, ech); }
+                ek = ek + 1;
+            }
+            i = ni;
             continue;
         }
 
@@ -2655,8 +2806,7 @@ parse_fstring fn(ti: i64) i64 {
                 i = i + 2;
                 continue;
             }
-            eprint("parse error: unmatched `}` in f-string; write `}}` for a literal right brace\n");
-            exit(1);
+            parse_fatal("unmatched `}` in f-string; write `}}` for a literal right brace");
         }
 
         if (c != 123) {
@@ -2697,8 +2847,7 @@ parse_fstring fn(ti: i64) i64 {
             i = i + 1;
         }
         if (found == false) {
-            eprint("parse error: unclosed `{` in f-string interpolation\n");
-            exit(1);
+            parse_fatal("unclosed `{` in f-string interpolation");
         }
         var body: string = str_slice(raw, ds, close);
         i = close + 1;
@@ -2744,8 +2893,7 @@ parse_fstring fn(ti: i64) i64 {
             // `!` 前必须是一个「已完结的表达式」，否则那是前缀取反（如 `{!ok}`）
             if (cm1 == 33 && fstr_prev_ends_expr(body, exprEnd - 2)) {
                 if (fstr_is_conv(cm2) == false) {
-                    eprint("parse error: f-string 转换字段只能是 `!s`/`!r`/`!a`/`!j`/`!c`/`!p`\n");
-                    exit(1);
+                    parse_fatal("f-string 转换字段只能是 `!s`/`!r`/`!a`/`!j`/`!c`/`!p`");
                 }
                 convc = cm2;
                 exprEnd = exprEnd - 2;
@@ -2943,8 +3091,7 @@ parse_statement fn() i64 {
         var nt: string = cur_t();
         if (nt == "KwVar") { return parse_local_var(false, true); }
         if (nt == "KwConst") { return parse_local_var(true, true); }
-        eprint("parse error: export 只能修饰顶层声明或局部 var/const");
-        exit(1);
+        parse_fatal("export 只能修饰顶层声明或局部 var/const");
     }
     if (t == "KwVar") {
         return parse_var_stmt();
@@ -3034,7 +3181,7 @@ parse_primary fn() i64 {
     if (t == "Colon") {
         var ti_Colon: i64 = advance_i();
         if (cur_t() != "Identifier") {
-            eprint("parse error: expected atom name after ':'\n");
+            parse_fatal("expected atom name after ':'");
             exit(1);
         }
         var ti_Name: i64 = advance_i();
@@ -3047,6 +3194,11 @@ parse_primary fn() i64 {
     }
     if (t == "KwFunc") {
         return parse_lambda_expr();
+    }
+    // `|v: T, w: U| expr` 闭包简写（Rust 式）：表达式起始位的裸 `|` 即 lambda 起点；
+    // 中缀位的 `|` 仍是按位或 BitOr（由 or 级处理），不会走到这里。
+    if (t == "BitOr") {
+        return parse_bar_lambda();
     }
     if (t == "KwMatch") {
         return parse_match_expr();
@@ -3113,10 +3265,7 @@ parse_primary fn() i64 {
         var ti_LBracket: i64 = advance_i();
         return parse_prim_array(ti_LBracket);
     }
-    eprint("parse error: unexpected token in expression: ");
-    eprint(cur_v());
-    eprint("\n");
-    exit(1);
+    parse_fatal(sb_cat2("unexpected token in expression: ", cur_v()));
     return -1;
 }
 
@@ -3142,8 +3291,12 @@ parse_unary fn() i64 {
         var op: string = "!";
         if (t == "Minus") { op = "-"; }
         if (t == "BitNot") { op = "~"; }
+        // 只在 `-` **直接**贴着整数 token 时开窗，`-f(...)` / `-(...)` 都不算，
+        // 保证 iN::MIN 的放宽不会漏进任意深的表达式里（reference.md §2.4）。
+        if (t == "Minus" && peek_t(1) == "Integer") { g_lit_neg = true; }
         var ti: i64 = advance_i();
         var operand: i64 = parse_unary();
+        g_lit_neg = false;
         return mk_un(op, operand, ti);
     }
     return parse_postfix();
@@ -3305,7 +3458,7 @@ parse_sfield fn() i64 {
     }    else if (true) {
     r_type = parse_type();
     } else {
-        eprint("parse error: unexpected token in alternative\n"); exit(1);
+        parse_fatal("unexpected token in alternative");
     }
     var r_anns: i64 = parse_annotations();
     // ── 字段 tagID：`@ Integer`（与 @注解 以「@ 后是否数字」区分；注解循环已跳过 @<int>）──
@@ -3444,7 +3597,7 @@ parse_umember fn() i64 {
     }    else if (cur_t() == "Semicolon") {
     expect_tok("Semicolon");
     } else {
-        eprint("parse error: unexpected token in alternative\n"); exit(1);
+        parse_fatal("unexpected token in alternative");
     }
     }
     var __id: i64 = mk_M(r_Ident, r_type, r_anns, -1);
@@ -3478,7 +3631,7 @@ parse_setmember fn() i64 {
     }    else if (cur_t() == "Semicolon") {
     expect_tok("Semicolon");
     } else {
-        eprint("parse error: unexpected token in alternative\n"); exit(1);
+        parse_fatal("unexpected token in alternative");
     }
     }
     var __id: i64 = mk_SL(r_Ident, parse_int_str(r_Integer), -1, false, r_anns, -1);
@@ -3512,7 +3665,7 @@ parse_slot fn() i64 {
     }    else if (cur_t() == "Semicolon") {
     expect_tok("Semicolon");
     } else {
-        eprint("parse error: unexpected token in alternative\n"); exit(1);
+        parse_fatal("unexpected token in alternative");
     }
     }
     var __id: i64 = mk_SL(r_Ident, parse_int_str(r_Integer), flag_offset_of(r_anns), flag_has_offset(r_anns), r_anns, -1);
@@ -3556,7 +3709,7 @@ parse_case fn(ci: i64) i64 {
     }    else if (cur_t() == "Semicolon") {
     expect_tok("Semicolon");
     } else {
-        eprint("parse error: unexpected token in alternative\n"); exit(1);
+        parse_fatal("unexpected token in alternative");
     }
     }
     var __id: i64 = mk_VC(r_Ident, ci, r_type, r_anns, -1);

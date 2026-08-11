@@ -121,6 +121,7 @@ void*  t_slice_at(TSlice s, int64_t i);        // 越界 → panic + JSON 诊断
 void   t_slice_set(TSlice s, int64_t i, const void* elem); // 越界 → panic
 int64_t t_slice_len(TSlice s);
 void*  t_slice_ptr(TSlice s);                  // 底层数组首地址（供 memset/序列化）
+TSlice t_slice_sub(TSlice s, int64_t a, int64_t b); // s[a..b] 子切片视图；越界 → panic
 
 // ── map[K]V：开放寻址，K 限定 string / 整数 ───────────────────
 // key_kind: 0 = TStr, 1 = int64

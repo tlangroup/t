@@ -10,7 +10,7 @@ export const TC_MODULES = [
   'src/codegen_c.tc',   // step 4a C 后端
   'src/codegen_ll.tc',  // step 4b LLVM IR 后端
   'src/test.tc',        // `tc test` 测试收集与运行器（依赖 sema / codegen_ll）
-  'src/repl.tc',        // REPL 模式（依赖 sema / codegen_ll）
+  'lib/repl.tc',        // REPL 模式（外部库；依赖 base，不修改 tc）
   'src/tc.tc',          // driver / main（import test + repl 并派发）
 ];
 

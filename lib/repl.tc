@@ -1,0 +1,532 @@
+// ══════════════════════════════════════════════════════════════════
+// lib/repl.tc — REPL 模式（无参数裸 tc 进入）
+//
+// 设计（详见 docs/repl.md）：每次输入复用一个「干净子进程」编译+运行模型——
+// 把截至当前的会话声明 decls 与新输入拼成一份完整 .tc，交给自身（`me`）
+// 以 `build` 编译、再直接运行产物 exe；这样完全复用成熟的前端/后端/链接
+// 链路，且每条输入都是全新进程，不存在全局状态在多次求值间被污染的问题。
+// 代价是每条表达式都走一遍 clang 链接（~1-2s），对交互式 REPL 可接受。
+//
+// 作为外部库（lib/repl.tc）承载，契合 docs/repl.md 的「REPL 不修改 tc」红线：
+// 本文件依赖 tc 已公开的导出（src.base 工具 + src.codegen_ll 的 to_bs 等），
+// 复用成熟的前端/后端能力，不往 tc 内塞任何 REPL 专属 patch。tc.tc 通过
+// `import(repl)` 引用（库文件按包名导入，如同 lib/std/math.tc 写作 import(std.math)）。
+//
+// 分类策略（无需解析器介入）：
+//   ① 先试「声明」形态（decls + 输入 + noop @main）——成功则作为会话声明保留；
+//   ② 否则试「值」形态 print(format("{}", 输入))——成功则打印求值结果；
+//   ③ 否则试「语句」形态（输入;）——成功则仅执行不打印；
+//   ④ 全失败则展示最后一次构建的错误日志。
+// 多行输入用花括号/圆括号/方括号配平判定完整性，未配平时继续读取（.. 续行提示）。
+// ══════════════════════════════════════════════════════════════════
+
+import(src.base :: *);
+import(src.lex :: *);
+import(src.parse :: *);
+import(src.sema :: *);
+import(src.codegen_c :: *);
+import(src.codegen_ll :: *);
+
+// 跨输入会话状态（REPL 为单进程，模块级变量在整次会话内保持）。
+var g_repl_decls: string = "";          // 已接受的顶层声明源码（累计）
+var g_repl_last: string = "";           // 上一条表达式/语句的输出（回填 ans）
+var g_repl_hist: []string;               // 本次会话输入历史（含启动时从文件载入）
+var g_repl_decls_list: []string;        // 已接受声明的逐项列表（供 :names/:show）
+
+repl_ltrim fn(s: string) string {
+    var n: u64 = str_len(s);
+    var i: u64 = 0;
+    while (i < n) {
+        var c: i64 = str_at(s, i);
+        if (c == 32 || c == 9) { i = i + 1; } else { break; }
+    }
+    return str_slice(s, i, n);
+}
+
+repl_rtrim fn(s: string) string {
+    var n: u64 = str_len(s);
+    while (n > 0) {
+        var c: i64 = str_at(s, n - 1);
+        if (c == 13 || c == 10) { n = n - 1; } else { break; }
+    }
+    return str_slice(s, 0, n);
+}
+
+repl_starts_with fn(hay: string, needle: string) bool {
+    var hn: u64 = str_len(hay);
+    var nn: u64 = str_len(needle);
+    if (nn > hn) { return false; }
+    return str_slice(hay, 0, nn) == needle;
+}
+
+// 子串首次出现位置（无则 -1）。
+repl_find fn(hay: string, needle: string) i64 {
+    var hn: u64 = str_len(hay);
+    var nn: u64 = str_len(needle);
+    if (nn == 0) { return 0; }
+    if (nn > hn) { return -1; }
+    var i: u64 = 0;
+    while (i + nn <= hn) {
+        if (str_slice(hay, i, i + nn) == needle) { return i as i64; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+repl_balanced fn(s: string) bool {
+    var n: u64 = str_len(s);
+    var i: u64 = 0;
+    var depth: i64 = 0;
+    while (i < n) {
+        var c: i64 = str_at(s, i);
+        if (c == 123) { depth = depth + 1; }
+        else if (c == 125) { depth = depth - 1; }
+        else if (c == 40) { depth = depth + 1; }
+        else if (c == 41) { depth = depth - 1; }
+        else if (c == 91) { depth = depth + 1; }
+        else if (c == 93) { depth = depth - 1; }
+        i = i + 1;
+    }
+    return depth == 0;
+}
+
+repl_contains fn(hay: string, needle: string) bool {
+    var hn: u64 = str_len(hay);
+    var nn: u64 = str_len(needle);
+    if (nn == 0) { return true; }
+    if (nn > hn) { return false; }
+    var i: u64 = 0;
+    while (i + nn <= hn) {
+        if (str_slice(hay, i, i + nn) == needle) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+// 判定一段完整输入是否为「顶层声明」（需保留到会话），而非普通表达式/语句。
+// t 的函数声明是 `Name fn(...) ...` —— fn 关键字在名字之后，不能仅靠首 token 区分，
+// 故用「含 ` fn(`」+ 各声明起始关键字联合判定。仅声明会被保留进 decls；
+// 普通表达式/语句走求值路径，绝不污染会话（否则会每条输入都被重跑）。
+repl_is_decl fn(s: string) bool {
+    if (repl_contains(s, " fn(") || repl_contains(s, " fn (")) { return true; }
+    if (repl_starts_with(s, "struct ")) { return true; }
+    if (repl_starts_with(s, "enum ")) { return true; }
+    if (repl_starts_with(s, "flag ")) { return true; }
+    if (repl_starts_with(s, "variant ")) { return true; }
+    if (repl_starts_with(s, "typealias ")) { return true; }
+    if (repl_starts_with(s, "import")) { return true; }
+    if (repl_starts_with(s, "var ")) { return true; }
+    if (repl_starts_with(s, "const ")) { return true; }
+    return false;
+}
+
+// 提取一条顶层声明的符号名（供 :names / :show）。
+repl_decl_name fn(d: string) string {
+    var fi: i64 = repl_find(d, " fn(");
+    if (fi >= 0) { return repl_ltrim(str_slice(d, 0, fi as u64)); }
+    fi = repl_find(d, " fn (");
+    if (fi >= 0) { return repl_ltrim(str_slice(d, 0, fi as u64)); }
+    var kws: []string = ["struct ", "enum ", "flag ", "variant ", "typealias ", "var ", "const "];
+    var ki: i64 = 0;
+    while (ki < slice_len(kws) as i64) {
+        if (repl_starts_with(d, kws[ki])) {
+            var rest: string = str_slice(d, str_len(kws[ki]), str_len(d));
+            return repl_first_token(rest);
+        }
+        ki = ki + 1;
+    }
+    if (repl_starts_with(d, "import")) { return "(import)"; }
+    return "(?)";
+}
+
+// 取首 token（以空白 / ( / { / ; 分隔）。
+repl_first_token fn(s: string) string {
+    var n: u64 = str_len(s);
+    var i: u64 = 0;
+    while (i < n) {
+        var c: i64 = str_at(s, i);
+        if (c == 32 || c == 9) { i = i + 1; } else { break; }
+    }
+    var j: u64 = i;
+    while (j < n) {
+        var c: i64 = str_at(s, j);
+        if (c == 32 || c == 9 || c == 40 || c == 123 || c == 59) { break; }
+        j = j + 1;
+    }
+    return str_slice(s, i, j);
+}
+
+// i64 -> 字符串（无内置 str_from_i64 时自用）。
+repl_i64_to_str fn(v: i64) string {
+    var sb: StringBuilder = sb_new();
+    sb_append_i64(sb, v);
+    return sb_to_str(sb);
+}
+
+// 字符串 -> i64（无内置 parse_i64 时自用，仅解析可选负号 + 十进制数字）。
+repl_parse_i64 fn(s: string) i64 {
+    var n: u64 = str_len(s);
+    var i: u64 = 0;
+    var neg: bool = false;
+    if (n > 0 && str_at(s, 0) == 45) { neg = true; i = 1; }
+    var v: i64 = 0;
+    while (i < n) {
+        var c: i64 = str_at(s, i);
+        if (c < 48 || c > 57) { break; }
+        v = v * 10 + (c - 48);
+        i = i + 1;
+    }
+    if (neg) { v = -v; }
+    return v;
+}
+
+// 归一化顶层声明：去掉尾随空白，并保证以 `;` 或 `}` 结尾
+//（t 的 var/const/typealias 需要 `;`；fn/struct/enum/flag/variant 以 `}` 结尾）。
+repl_term fn(s: string) string {
+    var t: string = repl_rtrim(s);
+    var n: u64 = str_len(t);
+    if (n == 0) { return t; }
+    var c: i64 = str_at(t, n - 1);
+    if (c != 59 && c != 125) { t = sb_cat2(t, ";"); }
+    return t;
+}
+
+// 把一段字符串转义为可安全嵌入 t 源码字符串字面量的形式：
+// 先转义反斜杠（避免后续引入的 \n 被再次转义），再转义引号与换行/回车。
+// 用于把上一条表达式的输出回填为 `var ans: string = "...";` 注入下一份 snippet。
+repl_escape_str fn(s: string) string {
+    var n: u64 = str_len(s);
+    var i: u64 = 0;
+    var out: StringBuilder = sb_new();
+    while (i < n) {
+        var c: i64 = str_at(s, i);
+        if (c == 92) {            // backslash
+            sb_append_char(out, 92);
+            sb_append_char(out, 92);
+        } else if (c == 34) {     // double quote
+            sb_append_char(out, 92);
+            sb_append_char(out, 34);
+        } else if (c == 10) {     // newline
+            sb_append_char(out, 92);
+            sb_append_char(out, 110);
+        } else if (c == 13) {     // carriage return
+            sb_append_char(out, 92);
+            sb_append_char(out, 114);
+        } else {
+            sb_append_char(out, c);
+        }
+        i = i + 1;
+    }
+    return sb_to_str(out);
+}
+
+// 历史持久化：把内部换行转义为字面 \n，使每条输入在 history.txt 中占一行。
+repl_escape_nl fn(s: string) string {
+    var n: u64 = str_len(s);
+    var i: u64 = 0;
+    var out: StringBuilder = sb_new();
+    while (i < n) {
+        var c: i64 = str_at(s, i);
+        if (c == 10) { sb_append_char(out, 92); sb_append_char(out, 110); }
+        else { sb_append_char(out, c); }
+        i = i + 1;
+    }
+    return sb_to_str(out);
+}
+
+// 历史载入：把字面 \n 还原为内部换行。
+repl_unescape_nl fn(s: string) string {
+    var n: u64 = str_len(s);
+    var i: u64 = 0;
+    var out: StringBuilder = sb_new();
+    while (i < n) {
+        var c: i64 = str_at(s, i);
+        if (c == 92 && i + 1 < n && str_at(s, i + 1) == 110) {
+            sb_append_char(out, 10);
+            i = i + 2;
+        } else {
+            sb_append_char(out, c);
+            i = i + 1;
+        }
+    }
+    return sb_to_str(out);
+}
+
+repl_split_lines fn(s: string) []string {
+    var n: u64 = str_len(s);
+    var i: u64 = 0;
+    var out: []string = [];
+    var cur: StringBuilder = sb_new();
+    while (i < n) {
+        var c: i64 = str_at(s, i);
+        if (c == 10) {
+            append(out, sb_to_str(cur));
+            cur = sb_new();
+        } else if (c == 13) {
+            // 跳过 CR
+        } else {
+            sb_append_char(cur, c);
+        }
+        i = i + 1;
+    }
+    append(out, sb_to_str(cur));
+    return out;
+}
+
+repl_load_history fn(rep_dir: string) void {
+    var hp: string = sb_cat3(rep_dir, "/history.txt", "");
+    if (path_exists(hp) == false) { return; }
+    var lines: []string = repl_split_lines(file_read_all(hp));
+    var i: i64 = 0;
+    while (i < slice_len(lines) as i64) {
+        var e: string = repl_unescape_nl(lines[i]);
+        if (str_len(e) > 0) { append(g_repl_hist, e); }
+        i = i + 1;
+    }
+}
+
+repl_append_hist fn(rep_dir: string, src: string) void {
+    append(g_repl_hist, src);
+    var hp: string = sb_cat3(rep_dir, "/history.txt", "");
+    var cur: string = "";
+    if (path_exists(hp)) { cur = file_read_all(hp); }
+    var buf: StringBuilder = sb_new();
+    sb_append_str(buf, cur);
+    sb_append_str(buf, repl_escape_nl(src));
+    sb_append_char(buf, 10);
+    ensure_parent(hp);
+    file_write_all(hp, sb_to_str(buf));
+}
+
+// 把一份会话源码编译为 out/repl/repl_exe.exe；成功返回 true（exe 存在）。
+repl_build fn(me: string, rep_dir: string, src: string) bool {
+    var sf: string = sb_cat3(rep_dir, "/snippet.tc", "");
+    ensure_parent(sf);
+    file_write_all(sf, src);
+    var exep: string = sb_cat3(rep_dir, "/repl_exe", "");
+    var logp: string = sb_cat3(rep_dir, "/build.log", "");
+    var csb: StringBuilder = sb_new();
+    sb_append_str(csb, "\"");
+    sb_append_str(csb, me);
+    sb_append_str(csb, "\" build \"");
+    sb_append_str(csb, to_bs(sf));
+    sb_append_str(csb, "\" --output \"");
+    sb_append_str(csb, to_bs(exep));
+    // REPL 面向人：内层 tc 诊断默认用人类可读渲染（而非 JSON 机器格式）。
+    sb_append_str(csb, "\" --diagnostics human --mode dbg > \"");
+    sb_append_str(csb, to_bs(logp));
+    sb_append_str(csb, "\" 2> \"");
+    sb_append_str(csb, to_bs(sb_cat2(rep_dir, "/build.err")));
+    sb_append_str(csb, "\"");
+    var rc: i32 = sys_run(sb_to_str(csb));
+    return rc == 0 && path_exists(sb_cat2(to_bs(exep), ".exe"));
+}
+
+// 成功构建后，把 build.log（仅含 tc 的 warning 行，stderr 已单独重定向到 build.err）
+// 回显给用户，使溢出等警告在 REPL 中可见。
+repl_surface_warnings fn(rep_dir: string) void {
+    var lp: string = sb_cat3(rep_dir, "/build.log", "");
+    if (path_exists(lp) == false) { return; }
+    var s: string = file_read_all(lp);
+    if (str_len(s) > 0) { eprint(s); }
+}
+
+// 运行已编译的 out/repl/repl_exe.exe，把 stdout 作为结果打印、stderr 作为运行期错误打印，
+// 并返回捕获到的 stdout（供宿主保存为 ans 特殊变量的内容）。
+repl_run fn(me: string, rep_dir: string) string {
+    var exep: string = sb_cat3(rep_dir, "/repl_exe.exe", "");
+    var outp: string = sb_cat3(rep_dir, "/out.txt", "");
+    var errp: string = sb_cat3(rep_dir, "/err.txt", "");
+    var csb: StringBuilder = sb_new();
+    sb_append_str(csb, "\"");
+    sb_append_str(csb, to_bs(exep));
+    sb_append_str(csb, "\" > \"");
+    sb_append_str(csb, to_bs(outp));
+    sb_append_str(csb, "\" 2> \"");
+    sb_append_str(csb, to_bs(errp));
+    sb_append_str(csb, "\"");
+    sys_run(sb_to_str(csb));
+    var outc: string = file_read_all(outp);
+    if (str_len(outc) > 0) {
+        print(repl_rtrim(outc));
+        print("\n");
+    }
+    var errc: string = file_read_all(errp);
+    if (str_len(errc) > 0) { eprint(errc); }
+    return outc;
+}
+
+// 处理一条非命令输入：声明/值/语句三形态分类、构建、运行，并更新会话状态。
+// 返回是否成功构建（供主循环决定是否记入历史）。
+repl_handle_input fn(me: string, rep_dir: string, src: string) bool {
+    var tsrc: string = repl_rtrim(src);
+    var ans_decl: string = sb_cat3("var ans: string = \"", repl_escape_str(g_repl_last), "\";\n");
+    // 顶层声明：验证后保留到会话（仅声明会进 decls，普通语句绝不污染会话）
+    if (repl_is_decl(src)) {
+        var dform: string = sb_cat5(ans_decl, g_repl_decls, "\n", repl_term(src), "\n__repl_eval fn() i32 @main { return 0; }\n");
+        if (repl_build(me, rep_dir, dform)) {
+            g_repl_decls = sb_cat3(g_repl_decls, "\n", repl_term(src));
+            append(g_repl_decls_list, repl_term(src));
+            eprint("ok\n");
+            // 声明不产生输出，故不更新 last_out（保留上一条 ans 供后续引用）
+            repl_run(me, rep_dir);
+            repl_surface_warnings(rep_dir);
+            return true;
+        }
+        eprint(file_read_all(sb_cat3(rep_dir, "/build.log", "")));
+        return false;
+    }
+    // 表达式/语句：先值形态 print(format("{}", ...))，失败再语句形态
+    var vform: string = sb_cat5(ans_decl, g_repl_decls, "\n__repl_eval fn() i32 @main {\n    println(format(\"{}\", ", tsrc, "));\n    return 0;\n}\n");
+    if (repl_build(me, rep_dir, vform)) {
+        g_repl_last = repl_rtrim(repl_run(me, rep_dir));
+        repl_surface_warnings(rep_dir);
+        return true;
+    }
+    // 语句形态必须用 repl_term 收口：块语句（for/if/match/while）以 `}` 收尾，
+    // 用户也可能自带尾 `;`；repl_term 仅在末字符非 `;`/`}` 时补 `;`，否则会变成
+    // `for (..) {..};` / `print(x);;` 这类非法语句（T-PAR-E101）。
+    var sform: string = sb_cat5(ans_decl, g_repl_decls, "\n__repl_eval fn() i32 @main {\n    ", repl_term(tsrc), "\n    return 0;\n}\n");
+    if (repl_build(me, rep_dir, sform)) {
+        g_repl_last = repl_rtrim(repl_run(me, rep_dir));
+        repl_surface_warnings(rep_dir);
+        return true;
+    }
+    // 全失败：展示最后一次构建错误日志
+    eprint(file_read_all(sb_cat3(rep_dir, "/build.log", "")));
+    return false;
+}
+
+run_repl fn(me: string) i32 {
+    var rep_dir: string = "out/repl";
+    g_repl_decls = "";
+    g_repl_last = "";
+    // 注意：空切片字面量 `[]` 作为表达式（赋值 RHS）LLVM 后端不支持（落 ptr 0），
+    // 须借「局部变量初始化」间接构造后整体拷贝。
+    var __h: []string = [];
+    g_repl_hist = __h;
+    var __d: []string = [];
+    g_repl_decls_list = __d;
+    repl_load_history(rep_dir);
+    eprint("t REPL — 输入表达式即时求值；:help 查看命令；Ctrl+Z 或 :quit 退出\n");
+    var buf: string = "";
+    var quitting: bool = false;
+    while (true) {
+        if (stdin_eof()) { break; }
+        if (buf == "") { eprint("t> "); } else { eprint(".. "); }
+        var line: string = read_line();
+        if (stdin_eof() && str_len(line) == 0) { break; }
+        var lline: string = repl_ltrim(line);
+        // 元命令（仅顶层）：以 : 开头
+        if (buf == "" && str_len(lline) > 0 && str_slice(lline, 0, 1) == ":") {
+            if (lline == ":quit" || lline == ":q") {
+                quitting = true;
+            } else if (lline == ":help" || lline == ":h") {
+                eprint("命令:\n  :help/:h      显示本帮助\n  :quit/:q     退出 REPL\n  :reset       清空已定义的会话声明（含 ans）\n  :dump        打印当前累计的会话声明源码\n  :load <file> 载入 .tc 文件内容到会话\n  :clear       清屏\n  :names       列出当前会话已定义的符号名\n  :show <name> 打印某符号的声明源码\n  :history     列出本次会话的输入历史（跨会话持久化于 out/repl/history.txt）\n  :r <n>       重新执行第 n 条历史输入（编号见 :history）\n  :time <expr> 求值表达式/语句并打印耗时（微秒）\n  ans          特殊变量：保存上一条表达式/语句的输出（字符串）\n");
+            } else if (lline == ":reset") {
+                g_repl_decls = "";
+                g_repl_last = "";
+                var __empty: []string = [];
+                g_repl_decls_list = __empty;
+                eprint("已清空会话声明（含 ans）。\n");
+            } else if (lline == ":dump") {
+                eprint("--- 当前会话声明 ---\n");
+                eprint(g_repl_decls);
+                eprint("\n---------------------\n");
+            } else if (lline == ":clear") {
+                // ANSI 清屏序列（ESC[2J ESC[H）；Windows 10+ 控制台默认可解释。
+                var clr: StringBuilder = sb_new();
+                sb_append_char(clr, 27);
+                sb_append_str(clr, "[2J");
+                sb_append_char(clr, 27);
+                sb_append_str(clr, "[H");
+                eprint(sb_to_str(clr));
+            } else if (lline == ":names") {
+                if (slice_len(g_repl_decls_list) as i64 == 0) {
+                    eprint("(无已定义符号)\n");
+                } else {
+                    var ni: i64 = 0;
+                    while (ni < slice_len(g_repl_decls_list) as i64) {
+                        eprint(sb_cat3("  ", repl_decl_name(g_repl_decls_list[ni]), "\n"));
+                        ni = ni + 1;
+                    }
+                }
+            } else if (repl_starts_with(lline, ":show ")) {
+                var snm: string = repl_ltrim(str_slice(lline, 6, str_len(lline)));
+                var sfound: bool = false;
+                var si: i64 = 0;
+                while (si < slice_len(g_repl_decls_list) as i64) {
+                    if (repl_decl_name(g_repl_decls_list[si]) == snm) {
+                        eprint(sb_cat3(g_repl_decls_list[si], "\n", ""));
+                        sfound = true;
+                    }
+                    si = si + 1;
+                }
+                if (sfound == false) { eprint(sb_cat3("未找到符号: ", snm, "\n")); }
+            } else if (lline == ":history") {
+                var hi: i64 = 0;
+                while (hi < slice_len(g_repl_hist) as i64) {
+                    eprint(sb_cat5("  ", repl_i64_to_str(hi + 1), "  ", g_repl_hist[hi], "\n"));
+                    hi = hi + 1;
+                }
+            } else if (repl_starts_with(lline, ":r ")) {
+                var rns: string = repl_ltrim(str_slice(lline, 3, str_len(lline)));
+                var rn: i64 = repl_parse_i64(rns);
+                if (rn >= 1 && rn <= slice_len(g_repl_hist) as i64) {
+                    repl_handle_input(me, rep_dir, g_repl_hist[rn - 1]);
+                } else {
+                    eprint(sb_cat3("历史索引越界: ", rns, "\n"));
+                }
+            } else if (repl_starts_with(lline, ":time ")) {
+                var texpr: string = repl_ltrim(str_slice(lline, 6, str_len(lline)));
+                if (str_len(texpr) == 0) {
+                    eprint(":time 需要一个表达式\n");
+                } else {
+                    var tsrc2: string = repl_rtrim(texpr);
+                    var ans_decl2: string = sb_cat3("var ans: string = \"", repl_escape_str(g_repl_last), "\";\n");
+                    // 值形态：把表达式求值包在 now() 计时之间。
+                    var tvform: string = sb_cat5(ans_decl2, g_repl_decls, "\n__repl_eval fn() i32 @main {\n    var t0_us: i64 = now();\n    println(format(\"{}\", ", tsrc2, "));\n    println(format(\"[time] {} us\", now() - t0_us));\n    return 0;\n}\n");
+                    if (repl_build(me, rep_dir, tvform)) {
+                        g_repl_last = repl_rtrim(repl_run(me, rep_dir));
+                        repl_surface_warnings(rep_dir);
+                    } else {
+                        // 语句形态：执行后打印耗时。
+                        var tsform: string = sb_cat5(ans_decl2, g_repl_decls, "\n__repl_eval fn() i32 @main {\n    var t0_us: i64 = now();\n    ", repl_term(tsrc2), "\n    println(format(\"[time] {} us\", now() - t0_us));\n    return 0;\n}\n");
+                        if (repl_build(me, rep_dir, tsform)) {
+                            g_repl_last = repl_rtrim(repl_run(me, rep_dir));
+                            repl_surface_warnings(rep_dir);
+                        } else {
+                            eprint(file_read_all(sb_cat3(rep_dir, "/build.log", "")));
+                        }
+                    }
+                }
+            } else if (repl_starts_with(lline, ":load ")) {
+                var fp: string = repl_ltrim(str_slice(lline, 6, str_len(lline)));
+                var content: string = file_read_all(fp);
+                var probe: string = sb_cat3(content, "\n", "__repl_eval fn() i32 @main { return 0; }\n");
+                if (repl_build(me, rep_dir, probe)) {
+                    g_repl_decls = sb_cat4(g_repl_decls, "\n", content, "\n");
+                    g_repl_last = "";
+                    eprint(sb_cat3("已载入 ", fp, "\n"));
+                } else {
+                    eprint(file_read_all(sb_cat3(rep_dir, "/build.log", "")));
+                }
+            } else {
+                eprint(sb_cat3("未知命令: ", lline, "（输入 :help 查看）\n"));
+            }
+            if (quitting) { break; }
+            continue;
+        }
+        buf = sb_cat2(buf, line);
+        buf = sb_cat2(buf, "\n");
+        if (repl_balanced(buf) == false) { continue; }
+        var src: string = buf;
+        buf = "";
+        if (str_len(repl_ltrim(src)) == 0) { continue; }
+        if (repl_handle_input(me, rep_dir, src)) {
+            repl_append_hist(rep_dir, src);
+        }
+    }
+    eprint("再见。\n");
+    return 0;
+}

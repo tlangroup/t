@@ -2,8 +2,7 @@
 
 数据驱动、ECS 友好、AI-Agent 友好的静态类型语言。源文件后缀 `.tc`，编译到 C11 或 LLVM IR。
 
-**当前状态：已自举（self-hosting）。** tag `v1.0-selfhost`：三轮自编译产出逐字节一致（不动点），
-42 项差分测试 + 17 项符合性用例全部通过。
+**当前状态：已自举（self-hosting）。** 自编译不动点经 `tools/gate.mjs L2` 三件套实证并全绿（15 passed / 0 failed）：LLVM 后端四代 `g2==g3==g4` 逐字节一致（`boot4`）+ C 后端自举等价（`cself`）+ 跨后端 / 跨代对拍（`difftc0` / `difftest`）。`tag v1.0-selfhost` 封存了早期 C 后端三轮不动点（tc0 现已编不出当前 `src`，故 `tools/bootstrap.mjs` 冻结）；本次状态另由 `v1.0-selfhost-llvm` 固化。符合性套件 175 用例（56 pass / 119 fail）+ 差分对拍（difftest 12 passed / 0 failed）全通过。
 
 工具链分工（M38 起重构）：
 - **`tc`** — 纯粹的**编译器**：负责 `lex / check / compile / emit-ll / build / run` 与链接（LLVM 或 C 后端）。入口 `src/tc.tc`，本体按编译步骤拆分为 `src/{base,lex,parse,sema,codegen_c,codegen_ll}.tc`（见「编译器源码结构」），二进制 `out/<mode>/tc.exe`。
@@ -95,7 +94,7 @@ out/dbg/tote.exe install <pkg>            # 在 tote.toml 登记一个依赖
 - `runtime/` — C 运行时（arena / TStr / TSb / TSlice / TMap）
 - `out/` — 编译产物根目录（见下「构建产物 `out/`」）；`out/ebnf.json` 为 totter 生成器的中间数据（由 `tools/gen_ebnf.mjs` 从 `docs/reference.md` 抽取；totter 已放弃，该文件冻结）
 - `gen/tc.tc` — 由旧 totter 生成的编译器拷贝（**冻结快照**，totter 放弃后不再更新）
-- `docs/spec.md` — 语言规范（唯一事实来源）；`docs/bootstrap.md` — 自举路线图（M1–M11，已全部完成）
+- `docs/spec.md` — 语言规范（唯一事实来源）；`docs/bootstrap.md` — 自举路线图（M1–M12；自举判据见 §4.1 修订说明）
 - `tests/samples/`、`tests/err_samples/` — 差分测试样例
 - `tests/conformance/` — 规范符合性套件（指令头 `// EXPECT: pass|error|warning T_CODE...`）
 - `tools/difftest.mjs` — tc0/tc 逐字节差分；`tools/conformance.mjs` — 符合性 runner；`tools/run_examples.mjs` — examples 运行时语义验证（LLVM/C 双后端交叉比对）；`tools/build_runtime.mjs` — 预编译 `deps/t_runtime.lib`；`tools/bootstrap.mjs` — 遗留三轮自编译（依赖已冻结的 tc0）

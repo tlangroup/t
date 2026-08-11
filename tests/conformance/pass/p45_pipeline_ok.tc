@@ -1,0 +1,102 @@
+// EXPECT: pass
+// 管道算子（reference.md §3.15）：`|->` 元素映射 / `|>?` 元素过滤 / `|>` 多态管道。
+// 三者同属最低二元级 L0、全部左结合；降解在 sema（lower_pipe）完成：
+// 连续的元素级阶段贪心融合成一个 __pipe_N 合成函数 + 一个 for 循环，
+// 整体应用的 `|>` 先冲刷已累积段再包一层调用。后端不见 pipe_* 节点。
+
+Enemy struct {
+    hp: i32;
+    speed: i32;
+}
+
+is_alive fn(e: Enemy) bool {
+    return e.hp > 0;
+}
+
+hp_of fn(e: Enemy) i32 {
+    return e.hp;
+}
+
+sum_i32 fn(xs: []i32) i32 {
+    var acc: i32 = 0;
+    for (v in xs) {
+        acc = acc + v;
+    }
+    return acc;
+}
+
+dbl fn(v: i32) i32 {
+    return v * 2;
+}
+
+// ── 单级映射：`[]Enemy |-> fn(Enemy)i32` → `[]i32` ──────────────
+all_hp fn(es: []Enemy) []i32 {
+    return es |-> hp_of;
+}
+
+// ── 单级过滤：结果类型仍是元素类型的切片 ────────────────────────
+alive_only fn(es: []Enemy) []Enemy {
+    return es |>? is_alive;
+}
+
+// ── 过滤 + 映射 + 链尾整体应用（融合为单循环、单次分配）──────────
+alive_hp_total fn(es: []Enemy) i32 {
+    return es |>? is_alive |-> hp_of |> sum_i32;
+}
+
+// ── 多态 `|>`：左操作数可迭代且右侧只接受元素 → 逐元素映射 ────────
+doubled fn(xs: []i32) []i32 {
+    return xs |> dbl;
+}
+
+// ── 多态 `|>`：左操作数标量 → 直接应用，等价 dbl(v) ──────────────
+scalar_apply fn(v: i32) i32 {
+    return v |> dbl;
+}
+
+// ── 匿名函数字面量作右操作数（按值捕获外层参数）─────────────────
+scaled fn(xs: []i32, k: i32) []i32 {
+    return xs |-> fn(v: i32) i32 { return v * k; };
+}
+
+// ── 匿名谓词 ──────────────────────────────────────────────────
+positives fn(xs: []i64) []i64 {
+    return xs |>? fn(v: i64) bool { return v > 0; };
+}
+
+// ── 左结合 + 管道优先级最低（无需括号）─────────────────────────
+assoc_ok fn(xs: []i32) []i32 {
+    var r: []i32 = [];
+    r = xs |-> dbl |>? fn(v: i32) bool { return v > 4; };
+    return r;
+}
+
+main fn() i32 @main {
+    var es: []Enemy = [];
+    append(es, Enemy{ hp: 10, speed: 1 });
+    append(es, Enemy{ hp: 0, speed: 2 });
+    append(es, Enemy{ hp: 5, speed: 3 });
+
+    var hps: []i32 = all_hp(es);
+    var alive: []Enemy = alive_only(es);
+    var total: i32 = alive_hp_total(es);
+    var d: []i32 = doubled(hps);
+    var s: i32 = scalar_apply(7);
+    var sc: []i32 = scaled(hps, 3);
+    var raw: []i64 = [];
+    append(raw, 1);
+    append(raw, 0);
+    append(raw, 2);
+    var p: []i64 = positives(raw);
+    var a: []i32 = assoc_ok(hps);
+
+    if (slice_len(hps) != 3) { return 1; }
+    if (slice_len(alive) != 2) { return 2; }
+    if (total != 15) { return 3; }
+    if (slice_len(d) != 3) { return 4; }
+    if (s != 14) { return 5; }
+    if (slice_len(sc) != 3) { return 6; }
+    if (slice_len(p) != 2) { return 7; }
+    if (slice_len(a) != 2) { return 8; }
+    return 0;
+}
