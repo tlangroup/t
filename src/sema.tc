@@ -117,6 +117,9 @@ is_int_name fn(name: string) bool {
     if (name == "u8" || name == "u16" || name == "u32" || name == "u64") {
         return true;
     }
+    if (name == "rune") {
+        return true;
+    }
     return name == "i8" || name == "i16" || name == "i32" || name == "i64";
 }
 
@@ -132,6 +135,9 @@ get_bw fn(name: string) i64 {
         return 16;
     }
     if (name == "u32" || name == "i32" || name == "f32") {
+        return 32;
+    }
+    if (name == "rune") {
         return 32;
     }
     if (name == "u64" || name == "i64" || name == "f64") {
@@ -228,6 +234,7 @@ ti_equal fn(ai: i64, bi: i64) bool {
     if (a.kind == "Scalar") {
         return a.name == b.name;
     }
+    if (a.kind == "Bytes") { return a.name == b.name; }
     if (a.kind == "Void" || a.kind == "String" || a.kind == "StringBuilder") {
         return true;
     }
@@ -462,21 +469,24 @@ scope_new fn(parent: i64) i64 {
     return (slice_len(scope_parents) as i64) - 1;
 }
 
-// 仅在指定 scope 内查找（不上溯）
+// 仅在指定 scope 内查找（不上溯）。返回**最后**一个匹配，使同作用域内后声明的
+// 局部变量 shadow 先声明的（主流语言语义：Rust/JS 同块重定义后者生效）。
+// 非 var 种类在 sym_define 处已做去重（最多一个），故 last==first，无副作用。
 sym_find_in fn(scope: i64, name: string) i64 {
     var n: i64 = slice_len(syms) as i64;
-    var i: i64 = 0;
-    while (i < n) {
+    var i: i64 = n - 1;
+    while (i >= 0) {
         var s: Sym = syms[i];
         if (s.scope == scope && s.name == name) {
             return i;
         }
-        i = i + 1;
+        i = i - 1;
     }
     return -1;
 }
 
-// Map.set 语义：已存在则忽略（首定义保留）
+// Map.set 语义：var 允许同作用域重定义（shadowing，后声明覆盖先声明）；
+// 其余种类（函数 / 类型 / 参数）去重，已存在则忽略（首定义保留）。
 sym_define fn(scope: i64, name: string, kind: string, ti2: i64, decl: i64) void {
     // 保留标识符（M51）：stdin/stdout/stderr 在表达式位置恒为内建 fid 常量，
     // 若允许同名声明，引用点仍会解析成常量 → 静默错编。故声明位置直接拒绝。
@@ -486,8 +496,10 @@ sym_define fn(scope: i64, name: string, kind: string, ti2: i64, decl: i64) void 
             decl);
         return;
     }
-    if (sym_find_in(scope, name) >= 0) {
-        return;
+    if (kind != "var") {
+        if (sym_find_in(scope, name) >= 0) {
+            return;
+        }
     }
     var s: Sym;
     s.name = name;
@@ -550,6 +562,17 @@ check_call_args fn(e: i64, fti: i64, fname: string) void {
             intlit_overflow_warn(k.val, pt);
             if (tip_kind(at) != "Unknown" && ti_equal(pt, at) == false && can_cast(at, pt) == false) {
                 err_type_mismatch(k.val, pt, at);
+            }
+            // #2/#3：Array→Slice / 空数组字面量→Slice 构造。源是 array_lit 或 Array、目标是
+            // Slice 且 can_cast 放行时，包裹 cast 节点让后端构造成 TSlice（零拷贝视图或空切片），
+            // 替代原先的静默段错误（can_cast 放行但无实际转换）。
+            if (tip_kind(pt) == "Slice" && ti_equal(pt, at) == false && can_cast(at, pt)) {
+                var sak: string = nodes[k.val].kind;
+                if (sak == "array_lit" || tip_kind(at) == "Array") {
+                    var ck2: Child = kids[c];
+                    ck2.val = mk_cast(ck2.val, ti_to_td_base(pt), -1);
+                    slice_set(kids, c, ck2);
+                }
             }
         }
         got = got + 1;
@@ -663,9 +686,9 @@ resolve_ti fn(tn: i64) i64 {
         return ti_mk("Any");
     }
     if (n.kind == "scalar") {
-        if (is_scalar_name(n.sa)) {
-            return ti_scalar(n.sa);
-        }
+        // 特名优先于 is_scalar_name：bytes / BytesBuilder 虽被 is_scalar_name 命中，
+        // 但须解析为独立的 Bytes / StringBuilder 种类（而非笼统 Scalar），否则与
+        // bsb_* 内建返回类型永远对不上。string / StringBuilder 亦在此显式分流。
         if (n.sa == "void") {
             return ti_mk("Void");
         }
@@ -674,6 +697,15 @@ resolve_ti fn(tn: i64) i64 {
         }
         if (n.sa == "StringBuilder") {
             return ti_mk("StringBuilder");
+        }
+        if (n.sa == "bytes") {
+            return ti_mk("Bytes");
+        }
+        if (n.sa == "BytesBuilder") {
+            return ti_mk("StringBuilder");
+        }
+        if (is_scalar_name(n.sa)) {
+            return ti_scalar(n.sa);
         }
         return ti_named("Named", n.sa);
     }
@@ -790,6 +822,7 @@ mk_type_node_from_ti fn(ti: i64) i64 {
     if (k == "Void") { return mk_scalar("void", -1); }
     if (k == "String") { return mk_scalar("string", -1); }
     if (k == "StringBuilder") { return mk_scalar("StringBuilder", -1); }
+    if (k == "Bytes") { return mk_scalar("bytes", -1); }
     if (k == "Named") { return mk_named(t.name, -1); }
     if (k == "Slice") { return mk_slice(mk_type_node_from_ti(t.elem), -1); }
     // ⚠ 曾漏掉 Array 分支：定长数组落到末尾兜底的 mk_named(k) → 合成出类型节点
@@ -1145,13 +1178,29 @@ instantiate_generic fn(tmpl: i64, e: i64) i64 {
         var keyp: string = "";
         if (cistype[j]) {
             var an: Node = nodes[cargs[j]];
-            if (an.kind != "ident") {
-                fc_err("T-MTA-E603",
-                    sb_cat3("comptime 类型参数必须是类型名，收到 `", an.sa, "`"), cargs[j]);
-                return -1;
+            if (an.kind == "ident") {
+                cv2 = type_node_from_ident(an.sa);
+                keyp = an.sa;
+            } else {
+                // P4 类型即值：允许「编译期可求值为类型节点」的表达式作为类型实参
+                // （@type_val("i64")、comptime fn 返回的 type 等）。keyp 取规范类型名，
+                // 与字面量类型名路径共用同一单态实例，避免重复生成。
+                if (g_meta_steps < 200000) { g_meta_steps = 200000; }
+                g_meta_err = false;
+                var tv: i64 = meta_eval(cargs[j]);
+                if (tv < 0 || g_meta_err) {
+                    fc_err("T-MTA-E603",
+                        "comptime 类型参数必须是类型名或编译期可求值的类型表达式", cargs[j]);
+                    return -1;
+                }
+                cv2 = tv;
+                keyp = mb_type_key(tv, 0);
+                if (keyp == "") {
+                    fc_err("T-MTA-E603",
+                        "编译期类型表达式求值结果无法规约为类型名", cargs[j]);
+                    return -1;
+                }
             }
-            cv2 = type_node_from_ident(an.sa);
-            keyp = an.sa;
         } else {
             cv2 = meta_eval_value_arg(cnodes[j], cargs[j]);
             if (cv2 < 0) { return -1; }
@@ -1337,10 +1386,57 @@ register_decl fn(d: i64) void {
 }
 // <<< GEN:type_declreg <<<
 
+// 递归 variant 守卫：载荷以**值形态**自引用 ⇒ 类型大小无限，双后端都会发射非法 C/IR。
+// 指针形态 `*Self` 合法（前向引用按名字解析）；切片 `[]Self` / map 也合法（都是间接）。
+// 只有裸 `Self` 与定长数组 `[N]Self` 是真正的值形态自引用 —— 显式报错，绝不静默错编（L-09）。
+variant_payload_recursive_value fn(tn: i64, vname: string) bool {
+    if (tn < 0) {
+        return false;
+    }
+    var t: Node = nodes[tn];
+    if (t.kind == "named") {
+        return t.sa == vname;
+    }
+    if (t.kind == "array") {
+        // 定长数组按值内联，故 `[N]Self` 同样无限大
+        return variant_payload_recursive_value(t.na, vname);
+    }
+    return false;
+}
+
+variant_check_recursion fn(d: i64) void {
+    var n: Node = nodes[d];
+    var c: i64 = n.lb;
+    while (c >= 0) {
+        var k: Child = kids[c];
+        var vc: Node = nodes[k.val];
+        // 多载荷走 lb 类型链；单载荷只有 na
+        if (vc.lb >= 0) {
+            var mp: i64 = vc.lb;
+            while (mp >= 0) {
+                if (variant_payload_recursive_value(kids[mp].val, n.sa)) {
+                    fc_err("T-SEM-E213",
+                        sb_cat5("variant `", n.sa, "` 的 case `", vc.sa,
+                            sb_cat3("` 载荷以值形态自引用 `", n.sa, "`：请改用指针 `*Self`")),
+                        kids[mp].val);
+                }
+                mp = kids[mp].next;
+            }
+        } else if (variant_payload_recursive_value(vc.na, n.sa)) {
+            fc_err("T-SEM-E213",
+                sb_cat5("variant `", n.sa, "` 的 case `", vc.sa,
+                    sb_cat3("` 载荷以值形态自引用 `", n.sa, "`：请改用指针 `*Self`")),
+                vc.na);
+        }
+        c = k.next;
+    }
+}
+
 // 为 Variant 的每个 case 注册合成函数符号（构造器/判别器/取载荷），
 // 指向合成 FuncDecl 节点但不在 decl_list 中，故仅作类型检查可见、不被 emitter 重复发射。
 register_variant_helpers fn(d: i64) void {
     var n: Node = nodes[d];
+    variant_check_recursion(d);
     var c: i64 = n.lb;
     while (c >= 0) {
         var k: Child = kids[c];
@@ -1351,7 +1447,22 @@ register_variant_helpers fn(d: i64) void {
         var retNode: i64 = mk_named(n.sa, -1);
         var plist: i64 = -1;
         var ptail: i64 = -1;
-        if (vc.na >= 0) {
+        if (vc.lb >= 0) {
+            // 多载荷：v0: T0, v1: T1, ...
+            var mp: i64 = vc.lb;
+            var mk_idx: i64 = 0;
+            while (mp >= 0) {
+                var mpt: i64 = kids[mp].val;
+                var mpn: string = sb_cat2("v", i2s(mk_idx));
+                var pid: i64 = mk_P(mpn, mpt, -1, -1);
+                ptail = list_push(plist, ptail, pid);
+                if (plist < 0) {
+                    plist = ptail;
+                }
+                mp = kids[mp].next;
+                mk_idx = mk_idx + 1;
+            }
+        } else if (vc.na >= 0) {
             var pid: i64 = mk_P("v", vc.na, -1, -1);
             ptail = list_push(plist, ptail, pid);
             if (plist < 0) {
@@ -1379,8 +1490,20 @@ register_variant_helpers fn(d: i64) void {
         var fdecl2: i64 = mk_FuncDecl(fis, true, false, retBool, -1, plist2, -2, -1);
         sym_define(global_scope, fis, "func", ti_named("Func", fis), fdecl2);
 
-        // 取载荷 Name_as_Case(self: Name) 载荷（仅当携带载荷）
-        if (vc.na >= 0) {
+        // 取载荷：多载荷逐字段访问器 Name_as_Case_f0 / _f1 / ...；
+        // 单载荷 Name_as_Case(self: Name) 载荷（仅当携带载荷）
+        if (vc.lb >= 0) {
+            var mp: i64 = vc.lb;
+            var mk_idx: i64 = 0;
+            while (mp >= 0) {
+                var mpt: i64 = kids[mp].val;
+                var fas: string = sb_cat5(n.sa, "_as_", cname, "_f", i2s(mk_idx));
+                var fdecl3: i64 = mk_FuncDecl(fas, true, false, mpt, -1, plist2, -2, -1);
+                sym_define(global_scope, fas, "func", ti_named("Func", fas), fdecl3);
+                mp = kids[mp].next;
+                mk_idx = mk_idx + 1;
+            }
+        } else if (vc.na >= 0) {
             var fas: string = sb_cat3(n.sa, "_as_", cname);
             var fdecl3: i64 = mk_FuncDecl(fas, true, false, vc.na, -1, plist2, -2, -1);
             sym_define(global_scope, fas, "func", ti_named("Func", fas), fdecl3);
@@ -1440,6 +1563,13 @@ builtin_ret fn(name: string) i64 {
     if (name == "file_read_all" || name == "path_resolve" || name == "str_slice") {
         return ti_mk("String");
     }
+    // bytes / BytesBuilder 内建：复用 t_str_*/t_sb_* 运行时（布局与 string/StringBuilder 一致）
+    if (name == "bytes_len") { return ti_scalar("u64"); }
+    if (name == "bytes_at") { return ti_scalar("u8"); }
+    if (name == "bytes_slice") { return ti_mk("Bytes"); }
+    if (name == "bsb_new") { return ti_mk("StringBuilder"); }
+    if (name == "bsb_append_u8" || name == "bsb_append_bytes") { return ti_mk("Void"); }
+    if (name == "bsb_to_bytes") { return ti_mk("Bytes"); }
     // slice_sub(s, lo, hi)：真实返回类型 = 首实参类型，在 infer_expr 的调用分支里
     // 反查（与 map_get 同一手法）；这里只是无实参可查时的兜底。
     if (name == "slice_sub") {
@@ -1696,6 +1826,239 @@ enum_missing_cases fn(e: i64, scr: i64) string {
         vc = vk.next;
     }
     return sb_to_str(sb);
+}
+
+// ── ADT：variant 构造器模式 / 穷尽性（docs/syntax/drafts/adt_variant.md）──────
+
+// scrutinee 类型 scr 若是 variant，返回其 VariantDecl 节点索引；否则 -1。
+variant_decl_of fn(scr: i64) i64 {
+    if (tip_kind(scr) != "Variant") {
+        return -1;
+    }
+    var vsi: i64 = sym_lookup(global_scope, tip_name(scr));
+    if (vsi < 0) {
+        return -1;
+    }
+    var vsym: Sym = syms[vsi];
+    if (vsym.decl < 0) {
+        return -1;
+    }
+    if (nodes[vsym.decl].kind != "VariantDecl") {
+        return -1;
+    }
+    return vsym.decl;
+}
+
+// 按名字在 VariantDecl 的 case 链上找 VC 节点；找不到 -1。
+variant_find_case fn(d: i64, cname: string) i64 {
+    if (d < 0) {
+        return -1;
+    }
+    var c: i64 = nodes[d].lb;
+    while (c >= 0) {
+        var k: Child = kids[c];
+        if (nodes[k.val].sa == cname) {
+            return k.val;
+        }
+        c = k.next;
+    }
+    return -1;
+}
+
+// 该 variant 是否为「抽象 / 非穷尽（open）」——声明末位写了 `_`（VariantDecl.ba）。
+variant_is_abstract fn(scr: i64) bool {
+    var d: i64 = variant_decl_of(scr);
+    if (d < 0) {
+        return false;
+    }
+    return nodes[d].ba;
+}
+
+// 合法 case 名列表，形如 `Circle, Rect, Empty`（供 T_MATCH_UNKNOWN_CASE 指路）。
+variant_case_list fn(d: i64) string {
+    var sb: StringBuilder = sb_new();
+    var cnt: i64 = 0;
+    var c: i64 = nodes[d].lb;
+    while (c >= 0) {
+        var k: Child = kids[c];
+        if (cnt > 0) {
+            sb_append_str(sb, ", ");
+        }
+        sb_append_str(sb, nodes[k.val].sa);
+        cnt = cnt + 1;
+        c = k.next;
+    }
+    return sb_to_str(sb);
+}
+
+// 某 case 是否被一条**无守卫**的构造器模式臂覆盖（带守卫不计，同 enum 的 match_covers_case）。
+variant_covers_case fn(e: i64, cname: string) bool {
+    var mn: Node = nodes[e];
+    var mc: i64 = mn.la;
+    while (mc >= 0) {
+        var mk: Child = kids[mc];
+        var arm: Node = nodes[mk.val];
+        if (arm.nb < 0 && arm.na >= 0) {
+            var pat: Node = nodes[arm.na];
+            if (pat.kind == "conpat" && pat.sa == cname) {
+                return true;
+            }
+        }
+        mc = mk.next;
+    }
+    return false;
+}
+
+// A1 推广：variant 的全部具名 case 是否都被无守卫臂覆盖。
+variant_all_cases_covered fn(e: i64, scr: i64) bool {
+    var d: i64 = variant_decl_of(scr);
+    if (d < 0) {
+        return false;
+    }
+    if (nodes[d].lb < 0) {
+        return false;
+    }
+    var covered: bool = true;
+    var vc: i64 = nodes[d].lb;
+    while (vc >= 0) {
+        var vk: Child = kids[vc];
+        if (variant_covers_case(e, nodes[vk.val].sa) == false) {
+            covered = false;
+        }
+        vc = vk.next;
+    }
+    return covered;
+}
+
+// 未覆盖的 case，形如 `Shape.Rect, Shape.Empty`；非 variant 或已全覆盖返回空串。
+variant_missing_cases fn(e: i64, scr: i64) string {
+    var d: i64 = variant_decl_of(scr);
+    if (d < 0) {
+        return "";
+    }
+    var sb: StringBuilder = sb_new();
+    var cnt: i64 = 0;
+    var vc: i64 = nodes[d].lb;
+    while (vc >= 0) {
+        var vk: Child = kids[vc];
+        var vn: Node = nodes[vk.val];
+        if (variant_covers_case(e, vn.sa) == false) {
+            if (cnt > 0) {
+                sb_append_str(sb, ", ");
+            }
+            sb_append_str(sb, tip_name(scr));
+            sb_append_str(sb, ".");
+            sb_append_str(sb, vn.sa);
+            cnt = cnt + 1;
+        }
+        vc = vk.next;
+    }
+    return sb_to_str(sb);
+}
+
+// 构造器模式的语义检查 + 决议（递归，支持嵌套解构）。
+//   pat = conpat 节点，scr = 被解构值的静态类型（ti）
+// 决议结果回填 conpat：ia = case 下标（tag）、sc = variant 类型名（后端据此拼 `<V>_is_<C>`）。
+// 载荷绑定在**当前作用域**（调用方已为该臂开了子作用域）中 sym_define。
+conpat_check fn(pat: i64, scr: i64, rep: bool) void {
+    var pn: Node = nodes[pat];
+    var d: i64 = variant_decl_of(scr);
+    if (d < 0) {
+        if (rep) {
+            fc_err("T-MAT-E740",
+                sb_cat3("构造器模式 `", pn.sa,
+                    "(...)` 只能用于 variant，被匹配值不是 variant 类型"), pat);
+        }
+        return;
+    }
+    var vname: string = tip_name(scr);
+    // 限定写法 `Shape.Circle(...)`：限定符必须与 scrutinee 的 variant 同名
+    if (str_len(pn.sb) > 0 && pn.sb != vname) {
+        if (rep) {
+            fc_err("T-MAT-E740",
+                sb_cat5("构造器模式限定符 `", pn.sb, "` 与被匹配值类型 ", vname, " 不符"), pat);
+        }
+        return;
+    }
+    var vc: i64 = variant_find_case(d, pn.sa);
+    if (vc < 0) {
+        if (rep) {
+            fc_err("T-MAT-E740",
+                sb_cat5("variant ", vname, " 没有名为 `", pn.sa,
+                    sb_cat3("` 的 case —— 合法 case：", variant_case_list(d), "")), pat);
+        }
+        return;
+    }
+    var vcn: Node = nodes[vc];
+    // 载荷个数：单元 0、单载荷 1、多载荷 = vcn.ib（>=2，载荷类型链在 vcn.lb）
+    var want: i64 = 0;
+    if (vcn.lb >= 0) {
+        want = vcn.ib;
+    } else if (vcn.na >= 0) {
+        want = 1;
+    }
+    var got: i64 = pn.ib;
+    if (got != want) {
+        if (rep) {
+            fc_err("T-MAT-E743",
+                sb_cat5("构造器模式 `", pn.sa, "` 载荷个数不符：声明 ",
+                    i2s(want), sb_cat3(" 个，模式写了 ", i2s(got), " 个")), pat);
+        }
+        return;
+    }
+    // 回填决议结果（供双后端脱糖）
+    pn.ia = vcn.ia;
+    pn.sc = vname;
+    // 载荷字段类型节点（供后端取 C 类型拼 `<V>_as_<C>` 绑定；unit case 为 -1）
+    pn.na = vcn.na;
+    slice_set(nodes, pat, pn);
+    if (want == 0) {
+        return;
+    }
+    // 多载荷载荷类型链；单载荷恒为 vcn.na
+    var plist_head: i64 = -1;
+    if (vcn.lb >= 0) {
+        plist_head = vcn.lb;
+    }
+    var bi: i64 = 0;
+    var sc: i64 = pn.la;
+    while (sc >= 0) {
+        var sk: Child = kids[sc];
+        var spn: Node = nodes[sk.val];
+        // 第 bi 个载荷的类型节点
+        var ptnode: i64 = vcn.na;
+        if (plist_head >= 0) {
+            var lt: i64 = plist_head;
+            var lk: i64 = 0;
+            while (lk < bi) {
+                lt = kids[lt].next;
+                lk = lk + 1;
+            }
+            ptnode = kids[lt].val;
+        }
+        var pti: i64 = resolve_ti(ptnode);
+        if (spn.kind == "conpat") {
+            // 嵌套解构：以该载荷类型为新的 scrutinee 递归
+            conpat_check(sk.val, pti, rep);
+        } else if (spn.kind == "ident") {
+            // `_` 只占位不绑定；其余名字绑定该载荷（仅在本臂内可见）
+            if (spn.sa != "_") {
+                sym_define(cur_scope, spn.sa, "var", pti, -1);
+                spn.na = ptnode;
+                slice_set(nodes, sk.val, spn);
+            }
+        } else {
+            // 字面量子模式：与载荷类型比对（等值匹配语义）
+            var lt: i64 = infer_expr(sk.val);
+            if (rep && tip_kind(lt) != "Unknown" && tip_kind(pti) != "Unknown") {
+                if (ti_equal(lt, pti) == false && can_cast(lt, pti) == false) {
+                    err_type_mismatch(sk.val, pti, lt);
+                }
+            }
+        }
+        bi = bi + 1;
+        sc = sk.next;
+    }
 }
 
 // ── 文件描述符内建的编译期校验（M51）──────────────────────────
@@ -2923,6 +3286,84 @@ rng_anchor fn(dst: i64, src: i64) void {
     slice_set(nodes, dst, d);
 }
 
+// 表达式是否为可寻址的 lvalue（可取址 `&x` 的候选）。ident / member / index / deref 均算。
+expr_is_lvalue fn(e: i64) bool {
+    if (e < 0) { return false; }
+    var n: Node = nodes[e];
+    if (n.kind == "ident") { return true; }
+    if (n.kind == "member" || n.kind == "index" || n.kind == "deref") { return true; }
+    return false;
+}
+
+// 取 lvalue 表达式的根绑定名：`x`→"x"；`g.x.y`/`a[i]`/`*p`→沿 na 递归到根 ident。
+// 用于 const 引用静态常量规则与逃逸分析。
+lvalue_root_name fn(e: i64) string {
+    if (e < 0) { return ""; }
+    var k: string = nodes[e].kind;
+    if (k == "ident") { return nodes[e].sa; }
+    if (k == "member" || k == "index" || k == "deref") {
+        return lvalue_root_name(nodes[e].na);
+    }
+    return "";
+}
+
+// const 引用静态常量规则（T-SEM-E763）：const 绑定的引用初始化器 `&Y` 必须指向
+// 静态常量（顶层 const），不得指向全局 var / 全局 let / 局部绑定。
+// 仅在 Y 能在全局作用域解析、却非 const（不在 g_const_decl_ids）时报告，
+// 避免对前向 const / 局部引用误报。
+check_const_ref fn(s: i64) void {
+    if (s < 0) { return; }
+    var d: Node = nodes[s];
+    if (d.nb < 0) { return; }
+    if (nodes[d.nb].kind != "amp") { return; }  // v1：仅直接 &Y
+    var root: string = lvalue_root_name(nodes[d.nb].na);
+    if (str_len(root) == 0) { return; }
+    var gi: i64 = sym_lookup(global_scope, root);
+    if (gi < 0) { return; }  // 全局不可见：可能是前向 const 或局部，v1 不误报
+    var gdecl: i64 = syms[gi].decl;
+    if (gdecl < 0) { return; }
+    // 目标必须是静态常量（顶层 const）。var / let / 局部都不行。
+    if (g_const_decl_has(gdecl) == false) {
+        fc_err("T-SEM-E763",
+            sb_cat5("const 引用 `", d.sa, "` 只能指向静态常量（顶层 const），但 `", root,
+                "` 不是静态常量（const 才能被 const 引用）"),
+            s);
+    }
+}
+
+// 表达式是否含有「指向局部绑定（函数内变量 / 参数）的取址 `&`」。
+// 局部绑定不在全局作用域 → 该引用随函数返回/块结束而失效（悬垂风险）。
+expr_has_local_addr fn(e: i64) bool {
+    if (e < 0) { return false; }
+    var k: string = nodes[e].kind;
+    if (k == "amp") {
+        var root: string = lvalue_root_name(nodes[e].na);
+        if (str_len(root) > 0 && sym_lookup(global_scope, root) < 0) { return true; }
+        return false;
+    }
+    if (expr_has_local_addr(nodes[e].na)) { return true; }
+    if (expr_has_local_addr(nodes[e].nb)) { return true; }
+    if (expr_has_local_addr(nodes[e].nc)) { return true; }
+    if (expr_has_local_addr(nodes[e].nd)) { return true; }
+    return false;
+}
+
+// 赋值目标是否为「更长寿」目标（全局变量 / 全局结构体字段 / 全局数组元素）。
+// 是 → 把 `&局部` 赋给它即逃逸为悬垂指针。
+assign_target_escapable fn(e: i64) bool {
+    if (e < 0) { return false; }
+    var k: string = nodes[e].kind;
+    if (k == "ident") {
+        return sym_lookup(global_scope, nodes[e].sa) >= 0;
+    }
+    if (k == "member" || k == "index") {
+        var root: string = lvalue_root_name(e);
+        if (str_len(root) > 0) { return sym_lookup(global_scope, root) >= 0; }
+        return false;
+    }
+    return false;
+}
+
 // 表达式可否安全重复求值。降解会把 subject / 被索引对象在 AST 里再引用一次
 // （后端按树发射 = 求值两次），只有纯表达式允许；否则报 E875 让用户先绑变量。
 rng_pure fn(e: i64) bool {
@@ -3047,7 +3488,7 @@ lower_range_index fn(e: i64) i64 {
             "定长数组 `[N]T` 暂不支持区间索引：`[N]T` 到 `[]T` 还没有构造降解，请先把它放进 `[]T` 变量再切", e);
         return ti_mk("Unknown");
     }
-    if (k != "String" && k != "Slice") {
+    if (k != "String" && k != "Slice" && k != "Bytes") {
         fc_err("T-RNG-E871",
             sb_cat3("类型 `", ti_str(ot), "` 不支持区间索引：只有 string 与 []T 可以按区间切片"), e);
         return ti_mk("Unknown");
@@ -3064,6 +3505,7 @@ lower_range_index fn(e: i64) i64 {
         }
         var lenf: string = "slice_len";
         if (k == "String") { lenf = "str_len"; }
+        if (k == "Bytes") { lenf = "bytes_len"; }
         var lenargs: i64 = list_push(-1, -1, n.na);
         // str_len / slice_len 返回 u64，切片函数吃 i64 —— 显式转掉，别指望隐式收敛
         hi = mk_cast(mk_call(mk_ident(lenf, -1), lenargs, -1), mk_scalar("i64", -1), -1);
@@ -3072,6 +3514,7 @@ lower_range_index fn(e: i64) i64 {
     if (lo < 0) { lo = rng_lit(0); }
     var fname: string = "slice_sub";
     if (k == "String") { fname = "str_slice"; }
+    if (k == "Bytes") { fname = "bytes_slice"; }
     var ah: i64 = -1;
     var at: i64 = -1;
     at = list_push(ah, at, n.na);
@@ -3089,6 +3532,7 @@ lower_range_index fn(e: i64) i64 {
     on.la = -1;
     slice_set(nodes, e, on);
     if (k == "String") { return ti_mk("String"); }
+    if (k == "Bytes") { return ti_mk("Bytes"); }
     return ot;
 }
 
@@ -3210,6 +3654,13 @@ infer_expr fn(e: i64) i64 {
         } else if (mb_is_type_query(n.sa) || n.sa == "zeroed") {
             fc_err("T-MTA-E606",
                 sb_cat3("`@", n.sa, "` 的类型实参在编译期不可解析"), e);
+        } else if (n.sa == "type_val") {
+            // P4 类型即值：@type_val("T") 还原出的类型节点是一个「类型即值」——
+            // 它不会被折叠成标量，而是作为类型在类型位置（泛型类型实参 / 返回类型）使用，
+            // 故允许它走到 check。其静态类型标为 Any（与 `fn() type` 返回标注解析出的
+            // TypeInfo 一致，见 resolve_ti 对 kind=="type" 的处理），真正的类型节点在
+            // CTFE（meta_eval_mbuiltin）期产出并流入单态化。
+            return ti_mk("Any");
         } else {
             fc_err("T-MTA-E607",
                 sb_cat3("未知的编译期内建 `@", n.sa, "`"), e);
@@ -3269,6 +3720,30 @@ infer_expr fn(e: i64) i64 {
     if (n.kind == "null") {
         return ti_mk("Unknown");
     }
+    // 取址 `&x`：操作数须为可寻址 lvalue，结果类型为 pointer(pointee)。
+    if (n.kind == "amp") {
+        var opti: i64 = infer_expr(n.na);
+        if (expr_is_lvalue(n.na) == false) {
+            fc_err("T-SEM-E760",
+                "取址 `&x` 的操作数必须是可寻址的左值（变量 / 结构体字段 / 下标），不能对临时值取址",
+                e);
+            return ti_mk("Unknown");
+        }
+        return ti_elem_of("Pointer", opti);
+    }
+    // 解引用 `*r`：操作数须为引用/指针类型，结果类型为其指向的元素类型。
+    if (n.kind == "deref") {
+        var opti: i64 = infer_expr(n.na);
+        if (tip_kind(opti) != "Pointer") {
+            fc_err("T-SEM-E761",
+                sb_cat3("解引用 `*r` 的操作数必须是引用/指针类型，但得到 `", ti_str(opti), "`"),
+                e);
+            return ti_mk("Unknown");
+        }
+        var det: i64 = tis[opti].elem;
+        if (det < 0) { return ti_mk("Unknown"); }
+        return det;
+    }
 // <<< GEN:type_infer1 <<<
     if (n.kind == "typeinfo") {
         return ti_mk("TypeInfo");
@@ -3286,6 +3761,8 @@ infer_expr fn(e: i64) i64 {
         var si: i64 = sym_lookup(cur_scope, n.sa);
         if (si >= 0) {
             var s: Sym = syms[si];
+            // 记录该标识符解析到的声明节点，供后端按声明唯一化命名（同作用域重名 shadowing）。
+            idecl_set(e, s.decl);
             // `|v: T| expr` 简写闭包：返回类型占位待推断。凡作为值用到它，就地推断一次
             // （幂等：推断完 tif_ret 不再是占位）。仅影响带 infer_ret 占位的函数。
             if (s.kind == "func" && g_infer_ti >= 0 && tif_ret[s.ti] == g_infer_ti) {
@@ -3338,7 +3815,21 @@ infer_expr fn(e: i64) i64 {
             // （`Case` ⇒ `Enum.Case`），让 checker 与 C/LLVM 双后端复用既有 member 路径。
             // 改写后 sa 清空，故对 infer_expr 的重入天然幂等。
             if (str_len(m_an.sa) > 0 && m_an.na < 0 && m_an.ba == false && starts_upper(m_an.sa)) {
-                if (enum_has_case(m_scr, m_an.sa)) {
+                var cs_vd: i64 = variant_decl_of(m_scr);
+                if (cs_vd >= 0) {
+                    // ADT：variant 的裸大写名 = **单元 case** 构造器模式（`Empty` ⇔ `Empty()`）。
+                    // 统一改写成 conpat，让覆盖分析与双后端脱糖只认一种形态（L-04）。
+                    // 名字拼错不在此处报错——交给 conpat_check 报 T_MATCH_UNKNOWN_CASE 并列出合法 case。
+                    var cs_cp: i64 = mk_conpat(m_an.sa, "", -1, 0, -1);
+                    var cs_cpn: Node = nodes[cs_cp];
+                    cs_cpn.ln = m_an.ln;
+                    cs_cpn.cl = m_an.cl;
+                    cs_cpn.tv = m_an.tv;
+                    slice_set(nodes, cs_cp, cs_cpn);
+                    m_an.na = cs_cp;
+                    m_an.sa = "";
+                    slice_set(nodes, m_k.val, m_an);
+                } else if (enum_has_case(m_scr, m_an.sa)) {
                     var cs_base: i64 = mk_ident(tip_name(m_scr), -1);
                     var cs_bn: Node = nodes[cs_base];
                     cs_bn.ln = m_an.ln;
@@ -3379,7 +3870,11 @@ infer_expr fn(e: i64) i64 {
             if (str_len(m_an.sa) > 0) {
                 sym_define(cur_scope, m_an.sa, "var", m_scr, -1);
             }
-            if (m_an.na >= 0) {
+            if (m_an.na >= 0 && nodes[m_an.na].kind == "conpat") {
+                // ADT：variant 构造器解构。此刻 cur_scope 已是本臂子作用域，
+                // 载荷绑定直接 define 进去（仅本臂可见，遮蔽外层同名）。
+                conpat_check(m_an.na, m_scr, m_rep);
+            } else if (m_an.na >= 0) {
                 // 范围模式（`1..5` / `1..=5` / `1..` / `..5`）**不能**整体 infer——
                 // infer_expr 见到 range 会走 materialize_range，把它物化成 []i64：
                 // 既误报「[]i64 vs i64」类型不符，又把节点退化成 paren，
@@ -3451,10 +3946,22 @@ infer_expr fn(e: i64) i64 {
         if (m_irref == false && enum_all_cases_covered(e, m_scr)) {
             m_irref = true;
         }
+        // ADT：variant 的全 case 覆盖同理（A1 推广到 variant）。
+        if (m_irref == false && variant_all_cases_covered(e, m_scr)) {
+            m_irref = true;
+        }
+        // 抽象 variant（声明末位 `_`）= 开放和类型：**豁免**穷尽性。
+        // 未覆盖的 case 与未知 tag 由 `_` 臂吸收，无 `_` 臂则运行期落确定性 t_panic（L-09 零 UB）。
+        if (m_irref == false && variant_is_abstract(m_scr)) {
+            m_irref = true;
+        }
         if (m_rep && m_irref == false) {
             var m_l: i64 = n_line(e);
             var m_col: i64 = n_col(e);
             var m_miss: string = enum_missing_cases(e, m_scr);
+            if (str_len(m_miss) == 0) {
+                m_miss = variant_missing_cases(e, m_scr);
+            }
             var m_msg: string = "match is not exhaustive: add a `_` wildcard arm or a binding arm without guard";
             if (str_len(m_miss) > 0) {
                 m_msg = sb_cat3("match is not exhaustive: unhandled case(s) ", m_miss,
@@ -3573,6 +4080,33 @@ infer_expr fn(e: i64) i64 {
     if (n.kind == "assign") {
         var atl: i64 = infer_expr(n.na);
         var atr: i64 = infer_expr(n.nb);
+        // 解引用赋值 `*r = v`：仅当 r 为可变绑定（var）时允许，否则就是只读引用。
+        if (nodes[n.na].kind == "deref") {
+            var dop: i64 = nodes[n.na].na;
+            if (dop >= 0 && nodes[dop].kind == "ident") {
+                var dsi: i64 = sym_lookup(cur_scope, nodes[dop].sa);
+                if (dsi < 0) { dsi = sym_lookup(global_scope, nodes[dop].sa); }
+                if (dsi >= 0) {
+                    var ddecl: i64 = syms[dsi].decl;
+                    if (ddecl >= 0 && nodes[ddecl].kind == "var_decl" && nodes[ddecl].ba == true) {
+                        fc_err("T-SEM-E762",
+                            sb_cat3("不能透过只读引用 `", nodes[dop].sa,
+                                "` 写入：它由 `let`/`const` 声明（只读），要用可变引用请改用 `var` 声明"),
+                            n.na);
+                    }
+                }
+            }
+        }
+        // 逃逸分析（T-SEM-E764）：把对局部变量/参数的引用 `&局部` 赋给更长寿的目标
+        // （全局变量 / 全局字段 / 全局元素）会悬垂（dangling）。`g = &a` 中 g 为全局、
+        // &a 指向局部 → 该引用在函数返回后失效，写入全局即逃逸。
+        // 注：普通 `a = b` 语句实际是 assign 节点（见 mk_assign），statement 级 assignment
+        // 节点仅用于复合赋值（a, b = ...），故检查点放在此处而非 assignment 分支。
+        if (expr_has_local_addr(n.nb) && assign_target_escapable(n.na)) {
+            fc_err("T-SEM-E764",
+                "把对局部变量/参数的引用存入更长寿的目标（全局）会产生悬垂指针（dangling）",
+                n.nb);
+        }
         // Sym 赋值：LHS 为 Sym 时，仅允许 string（自动 intern）或同池同类型 Sym；
         // 跨池 Sym→Sym（不同 tag）或其它类型赋值均为 T_TYPE_MISMATCH。
         if (tip_kind(atl) == "Sym" && ti_equal(atl, atr) == false) {
@@ -3967,13 +4501,17 @@ infer_expr fn(e: i64) i64 {
         if (is_range_node(n.nb)) {
             return lower_range_index(e);
         }
+        // 下标操作数 n.nb（如 argv[ai] 中的 ai）也必须经 infer_expr 解析：
+        // 否则其标识符不会走中心识别路径、不会调用 idecl_set，导致后端 shadowing
+        // 反查不到声明节点、发射未唯一化的原名，与声明（已唯一化）不一致。
+        if (n.nb >= 0) { infer_expr(n.nb); }
         var obt2: i64 = infer_expr(n.na);
         var obk2: string = tip_kind(obt2);
         if (obk2 == "Array" || obk2 == "Slice") {
             var t2: TI = tis[obt2];
             return t2.elem;
         }
-        if (obk2 == "String") {
+        if (obk2 == "String" || obk2 == "Bytes") {
             return ti_scalar("u8");
         }
         if (obk2 == "Map") {
@@ -4135,10 +4673,11 @@ check_stmt fn(s: i64) void {
         // 管道许可上下文之一：初始化器（reference.md §3.15.6）
         if (n.nb >= 0) { pipe_mark(n.nb); }
         if (n.na >= 0) {
+            // 显式标注：直接采用（var/const/let 三种局部声明统一路径）
             vt = resolve_ti(n.na);
-        } else if (n.bb == true && n.nb >= 0) {
-            // 仅 `auto 名字 = 初值;` 走类型推断（bb == true 标记 auto）；
-            // `var`/`const` 无类型标注必须报错（见 conformance f27_var_no_type）。
+        } else if (n.nb >= 0) {
+            // 局部声明（var/const/let）无标注时由初始化器静态推断（人类编程友好）。
+            // 此前仅 `auto`(bb) 走此路；现三关键字统一开放，标注语义改为「可选约束/覆盖」。
             var inf_ti: i64 = infer_expr(n.nb);
             if (inf_ti >= 0 && tip_kind(inf_ti) != "Unknown") {
                 vt = inf_ti;
@@ -4146,21 +4685,18 @@ check_stmt fn(s: i64) void {
                 n.na = tn2;
                 slice_set(nodes, s, n);
             }
-            if (vt < 0) {
-                fc_err("T-SEM-E211",
-                    sb_cat3("auto 变量 `", n.sa,
-                        "` 的初始化器类型无法推断：请为初始化器标注显式类型"), s);
-            }
-        } else {
+        }
+        if (vt < 0) {
+            // 既无标注、又无（可推断类型的）初始化器 → 无法定型
             fc_err("T-SEM-E211",
                 sb_cat3("局部变量 `", n.sa,
-                    "` 必须带类型标注：请写成 `var 名字: 类型 = 初值;` 或用 `auto 名字 = 初值;`"), s);
+                    "` 必须带类型标注或提供可推断类型的初始化器"), s);
+            return;
         }
         if (n.nb >= 0) {
-            pipe_mark(n.nb);
             var it: i64 = infer_expr(n.nb);
-            if (vt >= 0) { intlit_overflow_warn(n.nb, vt); }
-            if (vt >= 0 && tip_kind(it) != "Unknown" && ti_equal(it, vt) == false) {
+            intlit_overflow_warn(n.nb, vt);
+            if (tip_kind(it) != "Unknown" && ti_equal(it, vt) == false) {
                 var vk: string = tip_kind(vt);
                 var int_to_fe: bool = (vk == "Flag" || vk == "Enum") && is_int_ti(it);
                 // Sym 字段允许由字符串赋值（自动 intern → id）
@@ -4169,14 +4705,10 @@ check_stmt fn(s: i64) void {
                     err_type_mismatch(n.nb, vt, it);
                 }
             }
-            if (vt < 0) {
-                sym_define(cur_scope, n.sa, "var", it, -1);
-                return;
-            }
         }
-        if (vt >= 0) {
-            sym_define(cur_scope, n.sa, "var", vt, -1);
-        }
+        sym_define(cur_scope, n.sa, "var", vt, s);
+        // const 引用静态常量规则（仅对 const 声明生效；let/var 不受限）
+        if (g_const_decl_has(s)) { check_const_ref(s); }
         return;
     }
     if (n.kind == "if") {
@@ -4297,10 +4829,24 @@ check_stmt fn(s: i64) void {
             // 管道许可上下文之三：return 值
             pipe_mark(n.na);
             var rt: i64 = infer_expr(n.na);
+            // 逃逸分析（T-SEM-E764）：返回对局部变量/参数的引用 → 悬垂指针（dangling）
+            if (expr_has_local_addr(n.na)) {
+                fc_err("T-SEM-E764",
+                    "返回对局部变量/参数的引用会产生悬垂指针（dangling）：该引用随函数返回而失效",
+                    n.na);
+            }
             intlit_overflow_warn(n.na, cur_ret);
             if (tip_kind(rt) != "Unknown" && ti_equal(rt, cur_ret) == false) {
                 if (can_cast(rt, cur_ret) == false) {
                     err_type_mismatch(n.na, cur_ret, rt);
+                }
+            }
+            // #2/#3：同 call 路径，return 值处的 Array→Slice / 空数组字面量→Slice 构造
+            if (tip_kind(cur_ret) == "Slice" && ti_equal(cur_ret, rt) == false && can_cast(rt, cur_ret)) {
+                var rak: string = nodes[n.na].kind;
+                if (rak == "array_lit" || tip_kind(rt) == "Array") {
+                    n.na = mk_cast(n.na, ti_to_td_base(cur_ret), -1);
+                    slice_set(nodes, s, n);
                 }
             }
         }
@@ -4308,7 +4854,28 @@ check_stmt fn(s: i64) void {
     }
     if (n.kind == "assignment") {
         var tt: i64 = infer_expr(n.na);
+        // 解引用赋值 `*r = v`：仅当 r 为可变绑定（var）时允许，否则即「只读引用被写入」。
+        // （原 E762 检查误置于 infer_expr 的 assign 分支，但语句级赋值从不经该分支，
+        //  故从未触发；此处才是赋值语句的真实检查点。）
+        if (nodes[n.na].kind == "deref") {
+            var dop: i64 = nodes[n.na].na;
+            if (dop >= 0 && nodes[dop].kind == "ident") {
+                var dsi: i64 = sym_lookup(cur_scope, nodes[dop].sa);
+                if (dsi < 0) { dsi = sym_lookup(global_scope, nodes[dop].sa); }
+                if (dsi >= 0) {
+                    var ddecl: i64 = syms[dsi].decl;
+                    if (ddecl >= 0 && nodes[ddecl].kind == "var_decl" && nodes[ddecl].ba == true) {
+                        fc_err("T-SEM-E762",
+                            sb_cat3("不能透过只读引用 `", nodes[dop].sa,
+                                "` 写入：它由 `let`/`const` 声明（只读），要用可变引用请改用 `var` 声明"),
+                            n.na);
+                    }
+                }
+            }
+        }
         // 管道许可上下文之二：赋值右侧
+        // （T-SEM-E764 逃逸检查统一放在 infer_expr 的 assign 分支，避免与 compound
+        // 赋值节点重复；此处 LHS 为元组，assign_target_escapable 已天然不匹配。）
         pipe_mark(n.nb);
         var vt2: i64 = infer_expr(n.nb);
         intlit_overflow_warn(n.nb, tt);
@@ -4317,6 +4884,14 @@ check_stmt fn(s: i64) void {
             var str_to_sym2: bool = tip_kind(tt) == "Sym" && tip_kind(vt2) == "String";
             if (str_to_sym2 == false && can_cast(vt2, tt) == false) {
                 err_type_mismatch(n.nb, tt, vt2);
+            }
+            // #2/#3：同 call 路径，赋值 RHS 处的 Array→Slice / 空数组字面量→Slice 构造
+            if (tip_kind(tt) == "Slice" && ti_equal(tt, vt2) == false && can_cast(vt2, tt)) {
+                var aak: string = nodes[n.nb].kind;
+                if (aak == "array_lit" || tip_kind(vt2) == "Array") {
+                    n.nb = mk_cast(n.nb, ti_to_td_base(tt), -1);
+                    slice_set(nodes, s, n);
+                }
             }
         }
         return;
@@ -4691,6 +5266,8 @@ check_decl fn(d: i64) void {
                     }
                 }
             }
+            // const 引用静态常量规则（仅对 const 声明生效；let 不受限）
+            if (g_const_decl_has(d)) { check_const_ref(d); }
         }
         return;
     }
@@ -6237,6 +6814,7 @@ meta_int_wrap fn(v: i64, t: string) i64 {
     if (t == "u16") { bits = 16; sgn = false; }
     if (t == "i32") { bits = 32; sgn = true; }
     if (t == "u32") { bits = 32; sgn = false; }
+    if (t == "rune") { bits = 32; sgn = true; }
     if (bits == 0) { return v; }
     var m: i64 = (1 << bits) - 1;
     var r: i64 = v & m;
@@ -6250,6 +6828,7 @@ meta_int_wrap fn(v: i64, t: string) i64 {
 meta_is_int_type fn(t: string) bool {
     if (t == "i8" || t == "i16" || t == "i32" || t == "i64") { return true; }
     if (t == "u8" || t == "u16" || t == "u32" || t == "u64") { return true; }
+    if (t == "rune") { return true; }
     return false;
 }
 
@@ -6310,6 +6889,8 @@ meta_eval fn(e: i64) i64 {
     if (n.kind == "mbuiltin") { return meta_eval_mbuiltin(e); }
     if (n.kind == "array_lit") { return meta_eval_array_lit(e); }
     if (n.kind == "index") { return meta_eval_index(e); }
+    if (n.kind == "struct_lit") { return meta_eval_struct_lit(e); }
+    if (n.kind == "match") { return meta_eval_match(e); }
     return meta_fail("T-MTA-E617",
         sb_cat3("表达式 `", n.kind, "` 不可编译期求值"), e);
 }
@@ -6386,6 +6967,29 @@ meta_eval_index fn(e: i64) i64 {
         return meta_fail("T-MTA-E602", "编译期数组下标越界", e);
     }
     return kids[ci].val;
+}
+
+// 编译期结构体字面量：递归求值每个字段（FV 节点：sa=字段名, na=值），
+// 重建 struct_lit。类型名 sa 原样保留 —— comptime_fold 在 run_check
+// 之后运行，模块限定已解析进 sa（mangled 名），无需处理 sb。
+meta_eval_struct_lit fn(e: i64) i64 {
+    var n: Node = nodes[e];
+    var h: i64 = -1;
+    var t: i64 = -1;
+    var c: i64 = n.la;
+    while (c >= 0) {
+        var fv: Node = nodes[kids[c].val];
+        if (fv.kind != "FV") {
+            return meta_fail("T-MTA-E617", "编译期结构体字面量字段须为 field-value 节点", e);
+        }
+        var fv_val: i64 = meta_eval(fv.na);
+        if (fv_val < 0) { return -1; }
+        var nfv: i64 = mk_FV(fv.sa, fv_val, -1);
+        t = list_push(h, t, nfv);
+        if (h < 0) { h = t; }
+        c = kids[c].next;
+    }
+    return mk_struct_lit(n.sa, h, -1);
 }
 
 // 编译期数组 → string（取前 len 字节）。-1 = 失败（已报错）
@@ -6487,8 +7091,14 @@ meta_eval_binary fn(e: i64) i64 {
         }
         if (op == "==") { return mv_bool(ln1.sa == rn1.sa); }
         if (op == "!=") { return mv_bool(ln1.sa != rn1.sa); }
+        if (op == "+") {
+            var sbs: StringBuilder = sb_new();
+            sb_append_str(sbs, ln1.sa);
+            sb_append_str(sbs, rn1.sa);
+            return mk_string(sb_to_str(sbs), -1);
+        }
         return meta_fail("T-MTA-E617",
-            sb_cat3("编译期字符串不支持算子 `", op, "`（拼接请用 StringBuilder）"), e);
+            sb_cat3("编译期字符串不支持算子 `", op, "`"), e);
     }
     if (ln1.kind == "bool" && rn1.kind == "bool") {
         if (op == "==") { return mv_bool(ln1.ba == rn1.ba); }
@@ -6640,6 +7250,226 @@ meta_type_arg_node fn(a: i64) i64 {
     return type_node_from_ident(n.sa);
 }
 
+// ── 字符串工具（变体辅助函数名解析用）──────────────────────
+meta_str_find fn(s: string, sub: string) i64 {
+    var n: i64 = str_len(s);
+    var m: i64 = str_len(sub);
+    if (m <= 0 || m > n) { return -1; }
+    var i: i64 = 0;
+    while (i + m <= n) {
+        var ok: bool = true;
+        var j: i64 = 0;
+        while (j < m) {
+            if (s[i + j] != sub[j]) { ok = false; break; }
+            j = j + 1;
+        }
+        if (ok) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+meta_substr fn(s: string, a: i64, b: i64) string {
+    var sb: StringBuilder = sb_new();
+    var i: i64 = a;
+    while (i < b) {
+        sb_append_char(sb, s[i]);
+        i = i + 1;
+    }
+    return sb_to_str(sb);
+}
+
+// ── 编译期变体值（enum/variant 加入 comptime）──────────────
+// 变体辅助函数（Name_from_Case / Name_is_Case / Name_as_Case[_fK]）在编译期
+// 直接求值，无需运行期函数体。必须在普通 meta fn 派发之前拦截。
+// 返回 -2 表示「非变体辅助调用」，交给后续普通派发。
+meta_eval_variant_call fn(e: i64, name: string) i64 {
+    // Name_from_Case(载荷...) → 构造编译期变体值 vval
+    var fi: i64 = meta_str_find(name, "_from_");
+    if (fi >= 0) {
+        var vn: string = meta_substr(name, 0, fi);
+        var cn0: string = meta_substr(name, fi + 6, str_len(name));
+        var vd: i64 = sym_lookup(global_scope, vn);
+        if (vd < 0) { return -2; }
+        if (nodes[syms[vd].decl].kind != "VariantDecl") { return -2; }
+        var vc: i64 = variant_find_case(syms[vd].decl, cn0);
+        if (vc < 0) { return -2; }
+        var n: Node = nodes[e];
+        var h: i64 = -1;
+        var t: i64 = -1;
+        var ac: i64 = n.la;
+        while (ac >= 0) {
+            var pv: i64 = meta_eval(kids[ac].val);
+            if (pv < 0) { return -1; }
+            t = list_push(h, t, pv);
+            if (h < 0) { h = t; }
+            ac = kids[ac].next;
+        }
+        return mk_VVal(vn, nodes[vc].ia, cn0, h, -1);
+    }
+    // Name_is_Case(self) → bool
+    var ii: i64 = meta_str_find(name, "_is_");
+    if (ii >= 0) {
+        var vn: string = meta_substr(name, 0, ii);
+        var cn0: string = meta_substr(name, ii + 4, str_len(name));
+        var vd: i64 = sym_lookup(global_scope, vn);
+        if (vd < 0) { return -2; }
+        if (nodes[syms[vd].decl].kind != "VariantDecl") { return -2; }
+        var vc: i64 = variant_find_case(syms[vd].decl, cn0);
+        if (vc < 0) { return -2; }
+        var n: Node = nodes[e];
+        var sv: i64 = -1;
+        if (n.la >= 0) { sv = meta_eval(kids[n.la].val); }
+        if (sv < 0) { return -1; }
+        if (nodes[sv].kind != "vval") {
+            return meta_fail("T-MTA-E617", "编译期 `is` 的被匹配值须是编译期变体值", e);
+        }
+        return mv_bool(nodes[sv].ia == nodes[vc].ia);
+    }
+    // Name_as_Case(self) / Name_as_Case_fK(self) → 载荷值
+    var ai: i64 = meta_str_find(name, "_as_");
+    if (ai >= 0) {
+        var vn: string = meta_substr(name, 0, ai);
+        var rest: string = meta_substr(name, ai + 4, str_len(name));
+        var vd: i64 = sym_lookup(global_scope, vn);
+        if (vd < 0) { return -2; }
+        if (nodes[syms[vd].decl].kind != "VariantDecl") { return -2; }
+        var fk: i64 = -1;
+        var cn0: string = rest;
+        var uf: i64 = meta_str_find(rest, "_f");
+        if (uf >= 0) {
+            cn0 = meta_substr(rest, 0, uf);
+            var k: i64 = uf + 2;
+            while (k < str_len(rest)) {
+                var ch: i64 = rest[k];
+                if (ch >= 48 && ch <= 57) { fk = fk * 10 + (ch - 48); }
+                k = k + 1;
+            }
+        }
+        var vc: i64 = variant_find_case(syms[vd].decl, cn0);
+        if (vc < 0) { return -2; }
+        var n: Node = nodes[e];
+        var sv: i64 = -1;
+        if (n.la >= 0) { sv = meta_eval(kids[n.la].val); }
+        if (sv < 0) { return -1; }
+        if (nodes[sv].kind != "vval") {
+            return meta_fail("T-MTA-E617", "编译期 `as` 的被匹配值须是编译期变体值", e);
+        }
+        if (nodes[sv].ia != nodes[vc].ia) {
+            return meta_fail("T-MTA-E617",
+                sb_cat5("编译期 `as` 类型不匹配：实际是 `", nodes[sv].sb, "` 而非 `", cn0, "`"), e);
+        }
+        if (fk >= 0) {
+            var c: i64 = nodes[sv].la;
+            var idx: i64 = 0;
+            while (c >= 0) {
+                if (idx == fk) { return kids[c].val; }
+                idx = idx + 1;
+                c = kids[c].next;
+            }
+            return meta_fail("T-MTA-E617", "编译期 `as` 载荷下标越界", e);
+        }
+        if (nodes[sv].la >= 0) { return kids[nodes[sv].la].val; }
+        return meta_fail("T-MTA-E617", "编译期 `as` 的 case 无载荷可取（单元 case）", e);
+    }
+    return -2;
+}
+
+// 字面量相等（match 字面量模式用）
+meta_lit_eq fn(pat: i64, val: i64) bool {
+    var pn: Node = nodes[pat];
+    var vn: Node = nodes[val];
+    if (pn.kind != vn.kind) { return false; }
+    if (pn.kind == "int") { return pn.ia == vn.ia; }
+    if (pn.kind == "bool") { return pn.ba == vn.ba; }
+    if (pn.kind == "string") { return pn.sa == vn.sa; }
+    return false;
+}
+
+// 把 conpat 子模式链（ident / `_` / 嵌套 conpat）绑定到变体载荷值链
+meta_bind_conpat fn(pats: i64, vals: i64) bool {
+    var pc: i64 = pats;
+    var vc: i64 = vals;
+    while (pc >= 0 && vc >= 0) {
+        var pn: Node = nodes[kids[pc].val];
+        var pv: i64 = kids[vc].val;
+        if (pn.kind == "ident") {
+            menv_push(pn.sa, pv);
+        } else if (pn.kind == "conpat") {
+            if (nodes[pv].kind == "vval") {
+                if (nodes[pv].sb != pn.sa) { return false; }
+                if (meta_bind_conpat(pn.la, nodes[pv].la) == false) { return false; }
+            } else { return false; }
+        }
+        // `_` 通配 / 其他：跳过绑定
+        pc = kids[pc].next;
+        vc = kids[vc].next;
+    }
+    return true;
+}
+
+// 编译期 match：scrutinee 求值后按 conpat/`_`/字面量/绑定 选择命中臂
+meta_eval_match fn(e: i64) i64 {
+    var n: Node = nodes[e];
+    var scr: i64 = meta_eval(n.na);
+    if (scr < 0) { return -1; }
+    var mc: i64 = n.la;
+    while (mc >= 0) {
+        var arm: Node = nodes[kids[mc].val];
+        var pat: i64 = arm.na;
+        var guard: i64 = arm.nb;
+        var body: i64 = arm.nc;
+        var sv_base: i64 = g_menv_base;
+        var sv_top: i64 = g_menv_top;
+        var matched: bool = false;
+        if (arm.ba) {
+            matched = true;                                  // `_` 通配
+        } else if (arm.sa != "" && pat < 0) {
+            // 纯绑定臂（`n when ... =>`）：绑定名在 arm.sa，pat 为 -1；
+            // 把整个 scrutinee 值绑到该名字，守卫内可引用。
+            menv_push(arm.sa, scr);
+            matched = true;
+        } else if (pat >= 0 && nodes[pat].kind == "conpat") {
+            if (nodes[pat].sa == "") {
+                // 纯绑定 conpat（罕见）：把 la 里的 ident 绑定到整个 scrutinee
+                var bpi: i64 = nodes[pat].la;
+                while (bpi >= 0) {
+                    var bp: Node = nodes[kids[bpi].val];
+                    if (bp.kind == "ident") { menv_push(bp.sa, scr); }
+                    bpi = kids[bpi].next;
+                }
+                matched = true;
+            } else if (nodes[scr].kind == "vval") {
+                if (nodes[scr].sb == nodes[pat].sa) {
+                    matched = meta_bind_conpat(nodes[pat].la, nodes[scr].la);
+                }
+            }
+        } else if (pat >= 0 && nodes[pat].kind == "ident") {
+            menv_push(nodes[pat].sa, scr);      // 绑定整个 scrutinee 值
+            matched = true;
+        } else if (pat >= 0 && (nodes[pat].kind == "int"
+                || nodes[pat].kind == "string" || nodes[pat].kind == "bool")) {
+            if (meta_lit_eq(pat, scr)) { matched = true; }
+        }
+        if (matched && guard >= 0) {
+            var gv: i64 = meta_eval(guard);
+            if (gv < 0) { g_menv_top = sv_top; g_menv_base = sv_base; return -1; }
+            var gvn: Node = nodes[gv];
+            if (gvn.kind != "bool" || gvn.ba == false) { matched = false; }
+        }
+        if (matched) {
+            var rv: i64 = meta_eval(body);
+            g_menv_top = sv_top;
+            g_menv_base = sv_base;
+            return rv;
+        }
+        g_menv_top = sv_top;
+        g_menv_base = sv_base;
+        mc = kids[mc].next;
+    }
+    return meta_fail("T-MTA-E617", "编译期 match 无可匹配臂（scrutinee 未匹配任何模式）", e);
+}
+
 meta_eval_call fn(e: i64) i64 {
     var n: Node = nodes[e];
     if (n.na < 0) {
@@ -6649,6 +7479,10 @@ meta_eval_call fn(e: i64) i64 {
     if (cn.kind != "ident") {
         return meta_fail("T-MTA-E617", "编译期调用的被调方须是具名 meta 函数", e);
     }
+    // 变体辅助函数（Name_from_Case / Name_is_Case / Name_as_Case[_fK]）在编译期
+    // 直接求值，无需函数体。须在普通 meta fn 派发之前拦截，否则会因「无函数体」失败。
+    var vcall: i64 = meta_eval_variant_call(e, cn.sa);
+    if (vcall != -2) { return vcall; }
     // 内建优先（与运行期解析顺序一致）；-2 表示非内建，继续查具名 meta fn
     var bir: i64 = meta_eval_builtin(e, cn.sa);
     if (bir != -2) { return bir; }
@@ -7054,6 +7888,7 @@ mb_is_known fn(name: string) bool {
     if (mb_is_type_query(name)) { return true; }
     if (mb_is_ctfe_only(name)) { return true; }
     if (name == "compile_error" || name == "zeroed") { return true; }
+    if (name == "type_val") { return true; }   // P4：类型即值 —— 把类型名字符串还原为类型节点
     return false;
 }
 
@@ -7148,9 +7983,12 @@ mb_scalar_size fn(s: string) i64 {
     if (s == "i8" || s == "u8" || s == "bool") { return 1; }
     if (s == "i16" || s == "u16") { return 2; }
     if (s == "i32" || s == "u32" || s == "f32") { return 4; }
+    if (s == "rune") { return 4; }
     if (s == "i64" || s == "u64" || s == "f64") { return 8; }
     if (s == "string") { return 16; }
+    if (s == "bytes") { return 16; }
     if (s == "StringBuilder") { return 8; }
+    if (s == "BytesBuilder") { return 8; }
     return -1;
 }
 
@@ -7425,6 +8263,28 @@ mb_pass fn() void {
 // CTFE 侧：mb_pass 折不掉的（如 meta fn 体内依赖调用点绑定的类型）在求值时再试一次
 meta_eval_mbuiltin fn(e: i64) i64 {
     var n: Node = nodes[e];
+    // P4 类型即值：@type_val("i64") 把类型名字符串还原为类型节点（编译期值）。
+    // 不与 mb_pass 折叠（实参是编译期字符串，非类型查询），只在 CTFE 求值期生效。
+    if (n.sa == "type_val") {
+        var cnt: i64 = 0;
+        var a0: i64 = -1;
+        var c: i64 = n.la;
+        while (c >= 0) {
+            if (cnt == 0) { a0 = kids[c].val; }
+            cnt = cnt + 1;
+            c = kids[c].next;
+        }
+        if (cnt != 1) {
+            return meta_fail("T-MTA-E611", "`@type_val` 需要 1 个字符串实参（类型名）", e);
+        }
+        var mv: i64 = meta_eval(a0);
+        if (mv < 0) { return -1; }
+        var mn: Node = nodes[mv];
+        if (mn.kind != "string") {
+            return meta_fail("T-MTA-E617", "`@type_val` 的实参须求值为字符串（类型名）", e);
+        }
+        return type_node_from_ident(mn.sa);
+    }
     if (n.sa == "compile_error") {
         var cnt: i64 = 0;
         var a0: i64 = -1;
@@ -8402,6 +9262,8 @@ resolve_type_desc fn(tn: i64) i64 {
         if (n.sa == "string") { return td_mk("string"); }
         if (n.sa == "void") { return td_mk("void"); }
         if (n.sa == "StringBuilder") { return td_named_mk("named", "TSb*"); }
+        if (n.sa == "bytes") { return td_mk("bytes"); }
+        if (n.sa == "BytesBuilder") { return td_named_mk("named", "TSb*"); }
         return td_named_mk("scalar", n.sa);
 // <<< GEN:td_scalar <<<
     }
@@ -8410,6 +9272,12 @@ resolve_type_desc fn(tn: i64) i64 {
         return td_elem_mk("slice", resolve_type_desc(n.na));
     }
 // <<< GEN:td_rslice <<<
+    // 引用类型 `*T`：na=元素类型节点。双后端据此映射到各自指针表示
+    // （C 落 long/指针，LLVM 落 ptr）。此前缺失此分支导致 var r1=&a 的
+    // 类型描述被 resolve 成 unknown → LLVM alloca 误判为 i64，store 地址时类型冲突。
+    if (n.kind == "pointer") {
+        return td_elem_mk("pointer", resolve_type_desc(n.na));
+    }
     // 定长数组 [N]T：LLVM 后端映射为 [N x T]，C 后端仍走 T[]／T*
     if (n.kind == "array") {
         var ai: i64 = td_elem_mk("array", resolve_type_desc(n.na));
@@ -8498,6 +9366,7 @@ ti_from_td fn(td: i64) i64 {
     if (td < 0) { return ti_mk("Unknown"); }
     var t: TD = tds[td];
     if (t.cat == "string") { return ti_mk("String"); }
+    if (t.cat == "bytes") { return ti_mk("Bytes"); }
     if (t.cat == "scalar") { return ti_scalar(td_sname(td)); }
     return ti_mk("Unknown");
 }
@@ -8512,6 +9381,7 @@ td_readable fn(td: i64) string {
         return t.name;
     }
     if (t.cat == "string") { return "string"; }
+    if (t.cat == "bytes") { return "bytes"; }
     if (t.cat == "void") { return "void"; }
     if (t.cat == "unknown") { return "unknown"; }
     if (t.cat == "named") { return t.name; }
@@ -8597,6 +9467,45 @@ td_named_mk fn(cat: string, name: string) i64 {
     t.name = name;
     slice_set(tds, i, t);
     return i;
+}
+
+// ── TI → TD（sema 侧副本，供 Array→Slice / 空数组字面量构造 cast 使用）──
+ti_to_td_base fn(ti: i64) i64 {
+    if (ti < 0) {
+        return td_mk("unknown");
+    }
+    var t: TI = tis[ti];
+    if (t.kind == "Scalar") { return td_named_mk("scalar", t.name); }
+    if (t.kind == "String") { return td_mk("string"); }
+    if (t.kind == "StringBuilder") { return td_named_mk("named", "TSb*"); }
+    if (t.kind == "Bytes") { return td_mk("bytes"); }
+    if (t.kind == "Void") { return td_mk("void"); }
+    if (t.kind == "Slice") { return td_elem_mk("slice", ti_to_td_base(t.elem)); }
+    if (t.kind == "Array") {
+        var r: i64 = td_elem_mk("array", ti_to_td_base(t.elem));
+        var at: TD = tds[r];
+        at.alen = t.alen;
+        slice_set(tds, r, at);
+        return r;
+    }
+    if (t.kind == "Map") {
+        var r: i64 = td_mk("map");
+        var mt: TD = tds[r];
+        mt.key = ti_to_td_base(t.key);
+        mt.val = ti_to_td_base(t.val);
+        slice_set(tds, r, mt);
+        return r;
+    }
+    if (t.kind == "Sym") {
+        var rs: i64 = td_named_mk("sym", t.name);
+        var st: TD = tds[rs];
+        st.alen = t.bw;
+        slice_set(tds, rs, st);
+        return rs;
+    }
+    if (t.kind == "Named") { return td_named_mk("named", t.name); }
+    if (t.kind == "Pointer") { return td_elem_mk("pointer", ti_to_td_base(t.elem)); }
+    return td_mk("unknown");
 }
 
 

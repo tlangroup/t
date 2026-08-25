@@ -2,7 +2,7 @@
 
 数据驱动、ECS 友好、AI-Agent 友好的静态类型语言。源文件后缀 `.tc`，编译到 C11 或 LLVM IR。
 
-**当前状态：已自举（self-hosting）。** 自编译不动点经 `tools/gate.mjs L2` 三件套实证并全绿（15 passed / 0 failed）：LLVM 后端四代 `g2==g3==g4` 逐字节一致（`boot4`）+ C 后端自举等价（`cself`）+ 跨后端 / 跨代对拍（`difftc0` / `difftest`）。`tag v1.0-selfhost` 封存了早期 C 后端三轮不动点（tc0 现已编不出当前 `src`，故 `tools/bootstrap.mjs` 冻结）；本次状态另由 `v1.0-selfhost-llvm` 固化。符合性套件 175 用例（56 pass / 119 fail）+ 差分对拍（difftest 12 passed / 0 failed）全通过。
+**当前状态：已自举（self-hosting）。** 自编译不动点经 `tools/gate.mjs L2` 三件套实证并全绿（15 passed / 0 failed）：LLVM 后端四代 `g2==g3==g4` 逐字节一致（`boot4`）+ C 后端自举等价（`cself`）+ 跨后端 / 跨代对拍（`difftc0` / `difftest`）。`tag v1.0-selfhost` 封存了早期 C 后端三轮不动点（tc0 现已编不出当前 `src`，故 `tools/bootstrap.mjs` 冻结）；本次状态另由 `v1.0-selfhost-llvm` 固化。符合性套件 201 用例（57 pass / 144 fail）+ 差分对拍（difftest 12 passed / 0 failed）全通过；诊断码覆盖率 120/128（剩余 8 个为结构性不可触发：AGT 保留 info、FST-E302/E311 未发射/冻结、NAM-W400 死诊断、PIP-W866 不可构造的歧义、ICE/CDE 内部错误）。
 
 工具链分工（M38 起重构）：
 - **`tc`** — 纯粹的**编译器**：负责 `lex / check / compile / emit-ll / build / run` 与链接（LLVM 或 C 后端）。入口 `src/tc.tc`，本体按编译步骤拆分为 `src/{base,lex,parse,sema,codegen_c,codegen_ll}.tc`（见「编译器源码结构」），二进制 `out/<mode>/tc.exe`。
@@ -97,7 +97,7 @@ out/dbg/tote.exe install <pkg>            # 在 tote.toml 登记一个依赖
 - `docs/spec.md` — 语言规范（唯一事实来源）；`docs/bootstrap.md` — 自举路线图（M1–M12；自举判据见 §4.1 修订说明）
 - `tests/samples/`、`tests/err_samples/` — 差分测试样例
 - `tests/conformance/` — 规范符合性套件（指令头 `// EXPECT: pass|error|warning T_CODE...`）
-- `tools/difftest.mjs` — tc0/tc 逐字节差分；`tools/conformance.mjs` — 符合性 runner；`tools/run_examples.mjs` — examples 运行时语义验证（LLVM/C 双后端交叉比对）；`tools/build_runtime.mjs` — 预编译 `deps/t_runtime.lib`；`tools/bootstrap.mjs` — 遗留三轮自编译（依赖已冻结的 tc0）
+- `tools/difftest.mjs` — tc0/tc 逐字节差分；`tools/conformance.mjs` — 符合性 runner；`tools/coverage_scan.mjs` — 诊断码覆盖率审计（扫描 `tests/conformance` 的 EXPECT 头，对照 `tools/diag_defs.json` 找出未覆盖码）；`tools/run_examples.mjs` — examples 运行时语义验证（LLVM/C 双后端交叉比对）；`tools/build_runtime.mjs` — 预编译 `deps/t_runtime.lib`；`tools/bootstrap.mjs` — 遗留三轮自编译（依赖已冻结的 tc0）
 
 ## 构建产物 `out/`
 

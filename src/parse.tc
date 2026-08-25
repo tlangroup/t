@@ -177,6 +177,16 @@ is_scalar_name fn(name: string) bool {
     if (name == "f16" || name == "f32" || name == "f64") {
         return true;
     }
+    // rune：Unicode 码点，内部 i32 描述（见 docs/reference.md §2.4 rune）。
+    // 纳入标量族，算术 / 比较 / i32 互转全免费；与 i32 同名但语义独立。
+    if (name == "rune") {
+        return true;
+    }
+    // bytes：二进制视图（{ptr, len}），与 string 同布局、类型独立；
+    // BytesBuilder：可增长字节缓冲，对应 string 的 StringBuilder。
+    if (name == "bytes" || name == "BytesBuilder") {
+        return true;
+    }
     return name == "bool" || name == "atom" || name == "fid";
 }
 // <<< GEN:scalar_pred <<<
@@ -197,10 +207,8 @@ parse_type fn() i64 {
             }
         }
         expect_tok("RParen");
-        // `->` 在返回类型处已弃用（仍可选接受，向后兼容）：fn(args) Ret
-        if (cur_t() == "Arrow") {
-            advance_i();
-        }
+        // L-04：`->` 返回类型箭头已移除，返回类型紧跟 `:`，不再被编译器接受
+
         var frt: i64 = parse_type();
         return mk_func_type(frt, fphead, -1);
     }
@@ -762,13 +770,14 @@ parse_local_var fn(is_const: bool, is_export: bool) i64 {
     return id;
 }
 
-// `auto 名字 = 初值;` —— 局部类型推断声明（comptime/推断体系的一部分）。
-// 强制带初始化器、禁止显式类型标注；类型由初始化器在检查期推断并回填 n.na。
+// `auto 名字 = 初值;` —— 历史写法，现为 `let`（动态常量）的**弃用别名**。
+// 语义完全等同 `let`：immutable（ba=true）+ is_let 标记（bb=true）；
+// 类型由初始化器在检查期推断并回填 n.na（三关键字模型）。
 parse_auto_stmt fn() i64 {
     var ti: i64 = advance_i();
     var name: string = expect_tok("Identifier");
     if (cur_t() == "Colon") {
-        parse_fatal("'auto' 推断变量不可标注类型，直接写 `auto 名字 = 初值;`");
+        parse_fatal("'auto' 推断变量不可标注类型，直接写 `auto 名字 = 初值;` 或改用 `let 名字 = 初值;`");
     }
     if (cur_t() != "Assign") {
         parse_fatal("'auto' 变量必须有初始化器 `auto 名字 = 初值;`");
@@ -776,9 +785,9 @@ parse_auto_stmt fn() i64 {
     advance_i();
     var init: i64 = parse_expr();
     expect_tok("Semicolon");
-    var aid: i64 = mk_var_decl(name, false, -1, init, ti);
+    var aid: i64 = mk_var_decl(name, true, -1, init, ti);  // ba=true：动态常量不可变
     var ann: Node = nodes[aid];
-    ann.bb = true;   // 标记 auto：检查期从初始化器推断类型（与 var/const 无标注报错区分）
+    ann.bb = true;   // 标记 is_let（动态常量）；检查期从初始化器推断类型
     slice_set(nodes, aid, ann);
     return aid;
 }
@@ -859,7 +868,24 @@ parse_var_stmt fn() i64 {
 }
 
 parse_const_stmt fn() i64 {
-    return parse_local_var(true, false);
+    var cd: i64 = parse_local_var(true, false);
+    append(g_const_decl_ids, cd);
+    return cd;
+}
+
+// `let 名字[: 类型] = 初值;` —— 动态常量（三关键字模型）。
+// 运行期绑定一次、此后不可变；局部可省略类型标注由推断确定（与 var/const 同）。
+// 复用 parse_local_var(is_const=true) 再置 is_let 标记（bb），避免改动其签名。
+parse_local_let fn(is_export: bool) i64 {
+    var id: i64 = parse_local_var(true, is_export);
+    var n: Node = nodes[id];
+    n.bb = true;   // 标记 is_let（动态常量）
+    slice_set(nodes, id, n);
+    return id;
+}
+
+parse_let_stmt fn() i64 {
+    return parse_local_let(false);
 }
 
 // parse_statement 已由 GEN:parser_rules 区间生成（fold=disp 守卫式分发）。
@@ -1074,10 +1100,6 @@ parse_lambda_expr fn() i64 {
         if (cur_t() == "Comma") { advance_i(); } else { break; }
     }
     expect_tok("RParen");
-    // `->` 在返回类型处已弃用（仍可选接受，向后兼容）：fn(args) Ret
-    if (cur_t() == "Arrow") {
-        advance_i();
-    }
     var rt: i64 = parse_type();
     var body: i64 = -2;
     if (cur_t() == "LBrace") {
@@ -1600,10 +1622,6 @@ parse_func_decl fn(name: string, anns: i64, is_comptime: bool) i64 {
         }
     }
     expect_tok("RParen");
-    // `->` 在返回类型处已弃用（仍可选接受，向后兼容）：fn(args) Ret
-    if (cur_t() == "Arrow") {
-        advance_i();
-    }
     var rt: i64 = parse_type();
     var post: i64 = parse_annotations();
     var all: i64 = list_concat(anns, post);
@@ -2239,6 +2257,13 @@ parse_declaration fn() i64 {
         return d;
     }
     if (cur_t() == "KwConst") {
+        var d: i64 = parse_global_var(true, is_comptime);
+        append(g_const_decl_ids, d);
+        if (is_export) { nodes[d].bc = true; }
+        return d;
+    }
+    if (cur_t() == "KwLet") {
+        // 全局 `let`：动态常量，复用 GlobalConstDecl（语义等同；is_let 区分留待 CTFE Phase B）
         var d: i64 = parse_global_var(true, is_comptime);
         if (is_export) { nodes[d].bc = true; }
         return d;
@@ -2956,6 +2981,65 @@ parse_fstring fn(ti: i64) i64 {
     return mk_call(mk_ident("format", ti), f_head, ti);
 }
 
+// ── ADT：variant 构造器模式（match 模式位）─────────────────────
+// `Circle(r)` / `Shape.Circle(r)` / `Node(l, Leaf(x))`。
+// ⚠ 手写代码，刻意置于 GEN:parser_rules 区**之外**（见 docs/fstring.md 同类教训）。
+// 判据：模式位上「首字母大写 Identifier + `(`」（或限定式 `V.Case(`）。
+// 大写是必要条件——否则 `f(x) => ...`（以调用结果做等值匹配）会被误夺。
+// 无括号的裸大写名（单元 case `Empty => ...`）仍走既有 arm.sa 通道，
+// 由 sema 的 C2 消歧统一改写（enum → member，variant → conpat）。
+
+// 首字母是否大写。parse 在 DAG 上位于 sema 之前，不能引用 sema.starts_upper，故本地实现。
+tok_starts_upper fn(s: string) bool {
+    if (str_len(s) == 0) { return false; }
+    var c0: u8 = s[0];
+    return c0 >= 65 && c0 <= 90;
+}
+
+pat_is_conpat fn() bool {
+    if (cur_t() != "Identifier") { return false; }
+    if (tok_starts_upper(cur_v()) == false) { return false; }
+    if (peek_t(1) == "LParen") { return true; }
+    if (peek_t(1) == "Dot" && peek_t(2) == "Identifier" && peek_t(3) == "LParen") { return true; }
+    return false;
+}
+
+// 子模式：嵌套构造器 / `_` 通配 / 裸绑定名 / 字面量
+parse_conpat_sub fn() i64 {
+    if (pat_is_conpat()) { return parse_conpat(); }
+    if (cur_t() == "Identifier") {
+        var sp_ti: i64 = pos;
+        var sp_v: string = cur_v();
+        advance_i();
+        return mk_ident(sp_v, sp_ti);
+    }
+    return parse_expr();
+}
+
+parse_conpat fn() i64 {
+    var cp_ti: i64 = pos;
+    var cp_qual: string = "";
+    var cp_name: string = expect_tok("Identifier");
+    if (cur_t() == "Dot") {
+        advance_i();
+        cp_qual = cp_name;
+        cp_name = expect_tok("Identifier");
+    }
+    expect_tok("LParen");
+    var cp_head: i64 = -1;
+    var cp_tail: i64 = -1;
+    var cp_n: i64 = 0;
+    while (cur_t() != "RParen" && cur_t() != "Eof") {
+        var cp_p: i64 = parse_conpat_sub();
+        cp_tail = list_push(cp_head, cp_tail, cp_p);
+        if (cp_head < 0) { cp_head = cp_tail; }
+        cp_n = cp_n + 1;
+        if (cur_t() == "Comma") { advance_i(); }
+    }
+    expect_tok("RParen");
+    return mk_conpat(cp_name, cp_qual, cp_head, cp_n, cp_ti);
+}
+
 // >>> GEN:parser_rules (generated by tools/totter.tc from out/ebnf.json grammar -- DO NOT EDIT) >>>
 parse_for_stmt fn() i64 {
     var ti: i64 = advance_i();
@@ -2985,12 +3069,17 @@ parse_for_stmt fn() i64 {
             init = parse_local_var(false, exp);
         } else {
         if (cur_t() == "KwConst") {
-            init = parse_local_var(true, exp);
+            var cd: i64 = parse_local_var(true, exp);
+            init = cd;
+            append(g_const_decl_ids, cd);
+        } else {
+        if (cur_t() == "KwLet") {
+            init = parse_local_let(exp);
         } else {
             var e: i64 = parse_expr();
             expect_tok("Semicolon");
             init = mk_expr(e, -1);
-        }}
+        }}}
     } else {
         advance_i();
     }
@@ -3090,14 +3179,18 @@ parse_statement fn() i64 {
         advance_i();
         var nt: string = cur_t();
         if (nt == "KwVar") { return parse_local_var(false, true); }
-        if (nt == "KwConst") { return parse_local_var(true, true); }
-        parse_fatal("export 只能修饰顶层声明或局部 var/const");
+        if (nt == "KwConst") { var cd: i64 = parse_local_var(true, true); append(g_const_decl_ids, cd); return cd; }
+        if (nt == "KwLet") { return parse_local_let(true); }
+        parse_fatal("export 只能修饰顶层声明或局部 var/const/let");
     }
     if (t == "KwVar") {
         return parse_var_stmt();
     }
     if (t == "KwConst") {
         return parse_const_stmt();
+    }
+    if (t == "KwLet") {
+        return parse_let_stmt();
     }
     if (t == "KwAuto") {
         return parse_auto_stmt();
@@ -3124,6 +3217,9 @@ parse_match_arm fn() i64 {
         if (cur_t() == "Identifier" && (am_nt == "FatArrow" || am_nt == "KwWhen")) {
             am_bind = cur_v();
             advance_i();
+        } else if (pat_is_conpat()) {
+            // ADT：variant 构造器解构模式 `Circle(r)` / `Shape.Rect(w, h)`
+            am_pat = parse_conpat();
         } else {
             am_pat = parse_expr();
         }
@@ -3298,6 +3394,19 @@ parse_unary fn() i64 {
         var operand: i64 = parse_unary();
         g_lit_neg = false;
         return mk_un(op, operand, ti);
+    }
+    if (t == "BitAnd") {
+        // 前缀 `&x` = 取址（地址-of）。中缀 `a & b` = 按位与由 parse_bitand 处理，
+        // 因 parse_unary 优先消解前缀，二者不冲突（C/Rust 同款消歧）。
+        var ti: i64 = advance_i();
+        var operand: i64 = parse_unary();
+        return mk_amp(operand, ti);
+    }
+    if (t == "Star") {
+        // 前缀 `*r` = 解引用。中缀 `a * b` = 乘法由 parse_mul 处理（同上前缀优先）。
+        var ti: i64 = advance_i();
+        var operand: i64 = parse_unary();
+        return mk_deref(operand, ti);
     }
     return parse_postfix();
 }
@@ -3697,9 +3806,27 @@ parse_flag_decl fn(name: string, anns: i64) i64 {
 parse_case fn(ci: i64) i64 {
     var r_Ident: string = expect_tok("Identifier");
     var r_type: i64 = -1;
+    var r_types: i64 = -1;
+    var r_types_t: i64 = -1;
+    var r_cnt: i64 = 0;
     if (cur_t() == "LParen") {
     expect_tok("LParen");
     r_type = parse_type();
+    r_cnt = 1;
+    // ADT 多载荷 case `Rect(f64, f64)`：类型链存 VC.lb、个数存 VC.ib。
+    // 单载荷/单元 case 仍**只**用 VC.na（lb=-1），与既有 register_variant_helpers /
+    // emit_variant_decl 完全一致 —— 故既有 variant 的发射逐字节不变。
+    while (cur_t() == "Comma") {
+        expect_tok("Comma");
+        var r_tn: i64 = parse_type();
+        if (r_cnt == 1) {
+            r_types_t = list_push(r_types, r_types_t, r_type);
+            if (r_types < 0) { r_types = r_types_t; }
+        }
+        r_types_t = list_push(r_types, r_types_t, r_tn);
+        if (r_types < 0) { r_types = r_types_t; }
+        r_cnt = r_cnt + 1;
+    }
     expect_tok("RParen");
     }
     var r_anns: i64 = parse_annotations();
@@ -3713,6 +3840,12 @@ parse_case fn(ci: i64) i64 {
     }
     }
     var __id: i64 = mk_VC(r_Ident, ci, r_type, r_anns, -1);
+    if (r_cnt >= 2) {
+        var r_vn: Node = nodes[__id];
+        r_vn.lb = r_types;
+        r_vn.ib = r_cnt;
+        slice_set(nodes, __id, r_vn);
+    }
     return __id;
 }
 
@@ -3723,14 +3856,34 @@ parse_variant_decl fn(name: string, anns: i64) i64 {
     var r_case: i64 = -1;
     var r_case_t: i64 = -1;
     var ci: i64 = 0;
+    var r_abs: bool = false;
     while (cur_t() == "Identifier" && cur_t() != "Eof") {
+        // ADT 抽象标记：末位 `_` 把该 variant 声明为「抽象 / 非穷尽（open）」。
+        // `_` 是**类型级标记**、不是真实 case：不占 tag、不生成构造器（见 adt_variant.md §7.6）。
+        if (cur_v() == "_") {
+            advance_i();
+            r_abs = true;
+            if (cur_t() == "Comma") { advance_i(); }
+            else if (cur_t() == "Semicolon") { advance_i(); }
+            // 只允许出现在末位：其后必须收尾。
+            if (cur_t() != "RBrace") {
+                parse_fatal_at("T-PAR-E103",
+                    "variant 的抽象标记 `_` 只能位于末位（其后不得再有 case）", pos);
+            }
+        } else {
         var __it: i64 = parse_case(ci);
         r_case_t = list_push(r_case, r_case_t, __it);
         if (r_case < 0) { r_case = r_case_t; }
         ci = ci + 1;
+        }
     }
     expect_tok("RBrace");
     var __id: i64 = mk_VariantDecl(name, list_concat(anns, r_anns), r_case, -1);
+    if (r_abs) {
+        var r_dn: Node = nodes[__id];
+        r_dn.ba = true;
+        slice_set(nodes, __id, r_dn);
+    }
     return __id;
 }
 

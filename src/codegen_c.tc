@@ -371,6 +371,9 @@ scalar_to_c fn(name: string) string {
     if (name == "i16") { return "int16_t"; }
     if (name == "i32") { return "int32_t"; }
     if (name == "i64") { return "int64_t"; }
+    if (name == "rune") { return "int32_t"; }
+    if (name == "bytes") { return "TStr"; }
+    if (name == "BytesBuilder") { return "TSb*"; }
     if (name == "f16") { return "_Float16"; }
     if (name == "f32") { return "float"; }
     if (name == "f64") { return "double"; }
@@ -392,6 +395,8 @@ emit_ctype fn(tn: i64) string {
     if (n.kind == "scalar") {
         if (n.sa == "string") { return "TStr"; }
         if (n.sa == "StringBuilder") { return "TSb*"; }
+        if (n.sa == "bytes") { return "TStr"; }
+        if (n.sa == "BytesBuilder") { return "TSb*"; }
         if (n.sa == "atom") { return "int64_t"; }
         return scalar_to_c(n.sa);
     }
@@ -448,6 +453,7 @@ ti_to_td fn(ti: i64) i64 {
     if (t.kind == "Scalar") { return td_named_mk("scalar", t.name); }
     if (t.kind == "String") { return td_mk("string"); }
     if (t.kind == "StringBuilder") { return td_named_mk("named", "TSb*"); }
+    if (t.kind == "Bytes") { return td_mk("bytes"); }
     if (t.kind == "Void") { return td_mk("void"); }
     if (t.kind == "Slice") { return td_elem_mk("slice", ti_to_td(t.elem)); }
     if (t.kind == "Array") {
@@ -473,6 +479,7 @@ ti_to_td fn(ti: i64) i64 {
         return rs;
     }
     if (t.kind == "Named") { return td_named_mk("named", t.name); }
+    if (t.kind == "Pointer") { return td_elem_mk("pointer", ti_to_td(t.elem)); }
     if (t.kind == "Func") {
         var fret: i64 = ti_to_td(tif_ret[ti]);
         var fbuf: []i64;
@@ -502,11 +509,13 @@ desc_to_c fn(td: i64) string {
     }
     var t: TD = tds[td];
     if (t.cat == "string") { return "TStr"; }
+    if (t.cat == "bytes") { return "TStr"; }
     if (t.cat == "typeinfo") { return "TTypeInfo*"; }
     if (t.cat == "fieldinfo") { return "TFieldInfo*"; }
     if (t.cat == "slice") { return "TSlice"; }
     if (t.cat == "array") { return c_ptr_to(t.elem); }
     if (t.cat == "map") { return "TMap*"; }
+    if (t.cat == "pointer") { return c_ptr_to(t.elem); }
     if (t.cat == "sym") {
         if (t.alen == 16) { return "uint16_t"; }
         return "uint32_t";
@@ -626,7 +635,7 @@ expr_type_desc fn(e: i64) i64 {
     if (n.kind == "index") {
         var od: i64 = expr_type_desc(n.na);
         var ot: TD = tds[od];
-        if (ot.cat == "string") {
+        if (ot.cat == "string" || ot.cat == "bytes") {
             return td_named_mk("scalar", "u8");
         }
         if (ot.cat == "slice" || ot.cat == "array") {
@@ -662,6 +671,12 @@ expr_type_desc fn(e: i64) i64 {
             if (cn == "file_write_all") { return td_named_mk("scalar", "bool"); }
             if (cn == "file_exists") { return td_named_mk("scalar", "bool"); }
             if (cn == "str_slice") { return td_mk("string"); }
+            if (cn == "bytes_len") { return td_named_mk("scalar", "u64"); }
+            if (cn == "bytes_at") { return td_named_mk("scalar", "u8"); }
+            if (cn == "bytes_slice") { return td_mk("bytes"); }
+            if (cn == "bsb_new") { return td_named_mk("named", "TSb*"); }
+            if (cn == "bsb_append_u8" || cn == "bsb_append_bytes") { return td_mk("void"); }
+            if (cn == "bsb_to_bytes") { return td_mk("bytes"); }
             if (cn == "sb_to_str") { return td_mk("string"); }
             if (cn == "int_to_str" || cn == "i2s") { return td_mk("string"); }
             if (cn == "sb_new") { return td_named_mk("named", "TSb*"); }
@@ -747,6 +762,29 @@ expr_type_desc fn(e: i64) i64 {
     if (n.kind == "binary") {
         var op: string = n.sa;
         if (op == "==" || op == "!=" || op == "<" || op == ">" || op == "<=" || op == ">=" || op == "&&" || op == "||") {
+            return td_named_mk("scalar", "bool");
+        }
+        return expr_type_desc(n.na);
+    }
+    // 取址 `&x`：结果类型为 pointer(pointee)。
+    if (n.kind == "amp") {
+        return td_elem_mk("pointer", expr_type_desc(n.na));
+    }
+    // 解引用 `*r`：结果类型 = 指针所指元素类型。
+    if (n.kind == "deref") {
+        var ptd: i64 = expr_type_desc(n.na);
+        if (ptd >= 0) {
+            var pt: TD = tds[ptd];
+            if (pt.cat == "pointer" && pt.elem >= 0) {
+                return pt.elem;
+            }
+        }
+        return td_mk("unknown");
+    }
+    // 前缀一元：`!x` 为 bool；`-x` / `~x` 保持操作数类型。
+    // 缺这一支会让 `-1` 之类退化成 unknown，进而把 match 结果临时量声明成 void*（C）/ i8（LLVM）。
+    if (n.kind == "unary") {
+        if (n.sa == "!") {
             return td_named_mk("scalar", "bool");
         }
         return expr_type_desc(n.na);
@@ -1067,6 +1105,114 @@ c_emit_map_lit fn(en: i64, mname: string, pad: string, keytd: i64, valtd: i64) v
 //   when 守卫   → 与等值模式 `&&` 合取；仅有守卫时即为条件本身
 //   不可反驳 arm（`_` / 裸绑定且无守卫）→ 作为 else 体，其后 arm 不可达
 // 返回语句链表头；-2 表示无（对应 mk_if 的「无 else」约定）。
+// conpat 载荷绑定的发射期类型登记。
+// collect_local_types 只遍历语句链，看不到 match_chain_from 在发射期现场合成的
+// `var <bind>: T = <V>_as_<C>(sname);`；而 match 结果临时量 _tmrN 的类型
+// (mq_rtd) 必须在脱糖之前由首臂体推断出来。若首臂体引用了载荷绑定，
+// 类型表里查不到该名字就会退化成 unknown → `void*`（L-09：绝不静默错编）。
+// 故在 match 发射入口先把本 match 全部 conpat 载荷绑定登记进函数作用域类型表。
+// 无 conpat 臂时此函数零副作用，既有程序的发射逐字节不变。
+// 单个 conpat 的载荷绑定登记；嵌套构造器模式递归下钻（`W(L(x))` 的 `x` 同样须登记）
+conpat_binds_register_one fn(p: i64) void {
+    var mr_p: Node = nodes[p];
+    if (mr_p.kind != "conpat" || mr_p.na < 0 || mr_p.la < 0) {
+        return;
+    }
+    var mr_bk: i64 = mr_p.la;
+    while (mr_bk >= 0) {
+        var mr_bn: Node = nodes[kids[mr_bk].val];
+        if (mr_bn.kind == "ident" && mr_bn.sa != "_") {
+            fs_set(em_cur_fn, mr_bn.sa, resolve_type_desc(mr_bn.na));
+        }
+        if (mr_bn.kind == "conpat") {
+            conpat_binds_register_one(kids[mr_bk].val);
+        }
+        mr_bk = kids[mr_bk].next;
+    }
+}
+
+match_conpat_binds_register fn(e: i64) void {
+    var mr_c: i64 = nodes[e].la;
+    while (mr_c >= 0) {
+        var mr_k: Child = kids[mr_c];
+        var mr_an: Node = nodes[mr_k.val];
+        if (mr_an.na >= 0) {
+            conpat_binds_register_one(mr_an.na);
+        }
+        mr_c = mr_k.next;
+    }
+}
+
+// ── conpat 脱糖累加器（match_chain_from 的 conpat 分支专用）─────
+// t 无多返回值，故用全局累加：cp_acc_cond 收集判别条件（AND 链），
+// cp_acc_pre 收集载荷绑定 var_decl（kids 链表，按声明序 append）。
+// 访问器 `<V>_as_<C>[_fk]` 是 static inline 纯函数，subject 表达式节点被
+// is/as 复用多次是安全的（无副作用、无重复求值语义差异）。
+var cp_acc_cond: i64;
+var cp_acc_pre: i64;
+var cp_acc_pre_tail: i64;
+
+cp_acc_and fn(c: i64) void {
+    if (cp_acc_cond < 0) {
+        cp_acc_cond = c;
+        return;
+    }
+    cp_acc_cond = mk_binary("&&", cp_acc_cond, c, -1);
+}
+
+cp_acc_emit fn(s: i64) void {
+    cp_acc_pre_tail = list_push(cp_acc_pre, cp_acc_pre_tail, s);
+    if (cp_acc_pre < 0) {
+        cp_acc_pre = cp_acc_pre_tail;
+    }
+}
+
+// 构造器模式脱糖（递归）：subj 是承载被匹配值的**表达式节点**。
+//   `<V>_is_<C>(subj)` 进条件；每个子模式按位取 `<V>_as_<C>[_fk](subj)`：
+//   ident       → 前置 `var name: T = acc;`
+//   conpat      → 以 acc 为新 subject 递归（嵌套解构）
+//   字面量/其他 → 追加等值条件 `acc == lit`
+conpat_walk fn(p: i64, subj: i64) void {
+    var cp: Node = nodes[p];
+    var cp_v: string = cp.sc;        // variant 类型名
+    var cp_c: string = cp.sa;        // case 名
+    var cp_args: i64 = list_push(-1, -1, subj);
+    cp_acc_and(mk_call(mk_ident(sb_cat3(cp_v, "_is_", cp_c), -1), cp_args, -1));
+    if (cp.na < 0 || cp.la < 0) {
+        return;                       // unit case：无载荷
+    }
+    var bi: i64 = 0;
+    var cpk: i64 = cp.la;
+    while (cpk >= 0) {
+        var cpi: i64 = kids[cpk].val;
+        var cpn: Node = nodes[cpi];
+        // 多载荷（cp.ib >= 2，conpat_check 已保证个数与声明一致）逐字段访问器
+        // `_as_<C>_f<k>`；单载荷沿用 `_as_<C>`，保证既有 variant 发射字节不变。
+        var cp_accn: string;
+        if (cp.ib >= 2) {
+            cp_accn = sb_cat4(cp_v, "_as_", cp_c, sb_cat2("_f", i2s(bi)));
+        } else {
+            cp_accn = sb_cat3(cp_v, "_as_", cp_c);
+        }
+        var cp_ext: i64 = mk_call(mk_ident(cp_accn, -1), cp_args, -1);
+        if (cpn.kind == "ident") {
+            if (cpn.sa != "_") {
+                var cp_vd: i64 = mk_var_decl(cpn.sa, false, cpn.na, cp_ext, -1);
+                append(g_conpat_binds, cp_vd);
+                cp_acc_emit(cp_vd);
+            }
+        } else {
+            if (cpn.kind == "conpat") {
+                conpat_walk(cpi, cp_ext);
+            } else {
+                cp_acc_and(mk_binary("==", cp_ext, cpi, -1));
+            }
+        }
+        cpk = kids[cpk].next;
+        bi = bi + 1;
+    }
+}
+
 match_chain_from fn(c: i64, rname: string, sname: string) i64 {
     if (c < 0) {
         return -2;
@@ -1076,7 +1222,25 @@ match_chain_from fn(c: i64, rname: string, sname: string) i64 {
     var mc_asg: i64 = mk_expr(mk_assign("=", mk_ident(rname, -1), mc_an.nc, -1), -1);
     var mc_body: i64 = list_push(-1, -1, mc_asg);
     var mc_cond: i64 = -1;
-    if (mc_an.na >= 0) {
+    if (mc_an.na >= 0 && nodes[mc_an.na].kind == "conpat") {
+        // ADT 构造器解构（L-15）：条件 = `<V>_is_<C>(sname)`，body 前置载荷绑定。
+        // 双后端共用此脱糖：<V>_is_<C> / <V>_as_<C> 已由 emit_variant_decl 发成 static inline。
+        // 嵌套模式 `W(L(x))` 由 conpat_walk 递归：内层判别并入同一 AND 条件链，
+        // 内层绑定的访问路径是 accessor 调用链 `Inner_as_L(Outer_as_W(s))`。
+        cp_acc_cond = -1;
+        cp_acc_pre = -1;
+        cp_acc_pre_tail = -1;
+        conpat_walk(mc_an.na, mk_ident(sname, -1));
+        mc_cond = cp_acc_cond;
+        // 前置绑定按声明序插到 body 链表头之前
+        // （mc_body / cp_acc_pre 都是 kids 链表下标，绝不可混用 nodes 节点下标）
+        if (cp_acc_pre >= 0) {
+            var pre_tk: Child = kids[cp_acc_pre_tail];
+            pre_tk.next = mc_body;
+            slice_set(kids, cp_acc_pre_tail, pre_tk);
+            mc_body = cp_acc_pre;
+        }
+    } else if (mc_an.na >= 0) {
         // 范围模式 `1..5` / `1..=5` / `'a'..='z'`：等值比较换成区间成员测试。
         // 被匹配值此刻已绑在临时量 sname 上，重复引用零代价、零副作用。
         if (nodes[mc_an.na].kind == "range") {
@@ -1327,6 +1491,13 @@ emit_expr fn(e: i64) string {
     }
     if (n.kind == "ident") {
         var idn: string = mb_sub(n.sa);
+        // 同函数内重名局部（shadowing）：反查该标识符解析到的声明节点，发射唯一化后的名字。
+        if (em_in_fn) {
+            var vdcl: i64 = idecl_get(e);
+            if (vdcl >= 0 && g_local_has(vdcl)) {
+                return sb_cat3(n.sa, "__", i2s(vdcl));
+            }
+        }
         // 顶层具名函数出现在**值位置** → 取其闭包全局的地址（FuncType v2 / M47）。
         // 直接调用的 callee 不经此分支（call 分支直接读 cal.sa），故凡是走到这里
         // 且解析到 FuncDecl 的标识符，必然是「函数作为值」。局部/参数同名时局部优先。
@@ -1383,6 +1554,8 @@ emit_expr fn(e: i64) string {
         fs_set(em_cur_fn, mq_sn, mq_std);
         var mq_sv: string = emit_expr(n.na);
         var mq_pushed: i64 = match_bind_push(e, mq_no);
+        // ADT conpat 臂：先登记载荷绑定类型，否则首臂体引用绑定时 mq_rtd 会退化为 unknown
+        match_conpat_binds_register(e);
         var mq_rtd: i64 = expr_type_desc(match_first_body(e));
         fs_set(em_cur_fn, mq_rn, mq_rtd);
         spush(sb_cat4(mq_pad, desc_to_c(mq_rtd), " ", sb_cat2(mq_rn, ";")));
@@ -1417,6 +1590,14 @@ emit_expr fn(e: i64) string {
     }
     if (n.kind == "unary") {
         return sb_cat4("(", n.sa, emit_expr(n.na), ")");
+    }
+    // 取址 `&x` → C 的 `&(x)`（操作数须为可寻址左值，sema 已校验）。
+    if (n.kind == "amp") {
+        return sb_cat3("&(", emit_expr(n.na), ")");
+    }
+    // 解引用 `*r` → C 的 `*(r)`。赋值 `*r = v` 走下方 assign 通用分支自动得 `(*(r) = v)`。
+    if (n.kind == "deref") {
+        return sb_cat3("*(", emit_expr(n.na), ")");
     }
     if (n.kind == "assign") {
         // m[k] = v : map 索引写须走 t_map_put（find-or-insert），不能对读值再存回
@@ -1497,12 +1678,21 @@ emit_expr fn(e: i64) string {
             if (cn == "str_slice") {
                 return sb_cat6("t_str_slice(", av[0], ", ", av[1], ", ", sb_cat2(av[2], ")"));
             }
+            if (cn == "bytes_len") { return sb_cat3("t_str_len(", av[0], ")"); }
+            if (cn == "bytes_at") { return sb_cat5("t_str_byte_at(", av[0], ", ", av[1], ")"); }
+            if (cn == "bytes_slice") {
+                return sb_cat6("t_str_slice(", av[0], ", ", av[1], ", ", sb_cat2(av[2], ")"));
+            }
             // 子切片：O(1) 视图（共享 ptr、cap 收成 len，故对子切片 append 会另行扩容拷贝）
             if (cn == "slice_sub") {
                 return sb_cat6("t_slice_sub(", av[0], ", (int64_t)(", av[1], "), (int64_t)(",
                     sb_cat2(av[2], "))"));
             }
             if (cn == "sb_new") { return "t_sb_new(t_arena_current())"; }
+            if (cn == "bsb_new") { return "t_sb_new(t_arena_current())"; }
+            if (cn == "bsb_append_u8") { return sb_cat5("t_sb_append_char(", av[0], ", ", av[1], ")"); }
+            if (cn == "bsb_append_bytes") { return sb_cat5("t_sb_append_str(", av[0], ", ", av[1], ")"); }
+            if (cn == "bsb_to_bytes") { return sb_cat3("t_sb_to_str(", av[0], ")"); }
             if (cn == "sb_append_str") { return sb_cat5("t_sb_append_str(", av[0], ", ", av[1], ")"); }
             if (cn == "sb_append_char") { return sb_cat5("t_sb_append_char(", av[0], ", ", av[1], ")"); }
             if (cn == "sb_append_u64") { return sb_cat5("t_sb_append_u64(", av[0], ", ", av[1], ")"); }
@@ -1697,7 +1887,7 @@ emit_expr fn(e: i64) string {
         var ot: TD = tds[od];
         var obj: string = emit_expr(n.na);
         var idx: string = emit_expr(n.nb);
-        if (ot.cat == "string") {
+        if (ot.cat == "string" || ot.cat == "bytes") {
             return sb_cat5("t_str_byte_at(", obj, ", ", idx, ")");
         }
         if (ot.cat == "slice") {
@@ -1822,6 +2012,18 @@ emit_stmt fn(sid: i64, indent: i64) void {
         return;
     }
     if (n.kind == "var_decl") {
+        // 同函数内重名局部变量（shadowing）：与 LLVM 后端同机制。
+        // conpat 载荷绑定（match 构造器解构出的 x）身处各臂独立代码块，不做唯一化重整。
+        if (em_in_fn) {
+            var cname: string = n.sa;
+            var lkey: string = sb_cat3(em_cur_fn, "::", n.sa);
+            if (g_conpat_bind_has(sid) == false && g_seen_has(lkey)) {
+                cname = sb_cat3(n.sa, "__", i2s(sid));
+                append(g_local_decls, sid);
+            }
+            append(g_seen, lkey);
+            n.sa = cname;
+        }
         if (n.na >= 0) {
             var td: i64 = resolve_type_desc(n.na);
             var t: TD = tds[td];
@@ -2678,6 +2880,45 @@ emit_union_decl fn(d: i64) void {
     hpush(sb_cat3("} ", n.sa, ";"));
 }
 
+// 载荷类型（含指针/切片/数组/可选的目标）里是否出现 variant 自身名 —— 用于判断
+// 是否需要前向 typedef（`IList* _f1;` 写在 `typedef struct IList {...} IList;` 内部时，
+// typedef 名尚未可见，必须先前向声明）。
+c_type_mentions_name fn(tn: i64, vname: string) bool {
+    if (tn < 0) {
+        return false;
+    }
+    var t: Node = nodes[tn];
+    if (t.kind == "named") {
+        return t.sa == vname;
+    }
+    if (t.kind == "pointer" || t.kind == "slice" || t.kind == "array" || t.kind == "optional") {
+        return c_type_mentions_name(t.na, vname);
+    }
+    return false;
+}
+
+c_variant_is_recursive fn(d: i64) bool {
+    var n: Node = nodes[d];
+    var c: i64 = n.lb;
+    while (c >= 0) {
+        var k: Child = kids[c];
+        var vc: Node = nodes[k.val];
+        if (vc.lb >= 0) {
+            var mp: i64 = vc.lb;
+            while (mp >= 0) {
+                if (c_type_mentions_name(kids[mp].val, n.sa)) {
+                    return true;
+                }
+                mp = kids[mp].next;
+            }
+        } else if (c_type_mentions_name(vc.na, n.sa)) {
+            return true;
+        }
+        c = k.next;
+    }
+    return false;
+}
+
 // Variant：tagged union。发射 struct { uint32_t _tag; union { 载荷 _uN; } _u; } 及各 case 的
 // static inline 构造器/判别器/取载荷（直接落头文件，函数体用 StringBuilder 拼 tag 整数）。
 emit_variant_decl fn(d: i64) void {
@@ -2686,6 +2927,11 @@ emit_variant_decl fn(d: i64) void {
     sb_append_str(hsb, "// variant ");
     sb_append_str(hsb, n.sa);
     hpush(sb_to_str(hsb));
+    // 递归 variant：先前向 typedef，使载荷里的 `<N>*` 可用。
+    // 仅递归时发射 —— 非递归 variant 的头文件字节保持不变。
+    if (c_variant_is_recursive(d)) {
+        hpush(sb_cat3("typedef struct ", n.sa, sb_cat3(" ", n.sa, ";")));
+    }
     hpush(sb_cat3("typedef struct ", n.sa, " {"));
     hpush("    uint32_t _tag;");
     hpush("    union {");
@@ -2696,7 +2942,24 @@ emit_variant_decl fn(d: i64) void {
         if (vc.na >= 0) {
             var us: StringBuilder = sb_new();
             sb_append_str(us, "        ");
-            sb_append_str(us, emit_ctype(vc.na));
+            if (vc.lb >= 0) {
+                // 多载荷：匿名 struct { T0 _f0; T1 _f1; ... }
+                sb_append_str(us, "struct {");
+                var t: i64 = vc.lb;
+                var fi: i64 = 0;
+                while (t >= 0) {
+                    sb_append_str(us, " ");
+                    sb_append_str(us, emit_ctype(kids[t].val));
+                    sb_append_str(us, " _f");
+                    sb_append_i64(us, fi);
+                    sb_append_str(us, ";");
+                    t = kids[t].next;
+                    fi = fi + 1;
+                }
+                sb_append_str(us, " }");
+            } else {
+                sb_append_str(us, emit_ctype(vc.na));
+            }
             sb_append_str(us, " _u");
             sb_append_i64(us, vc.ia);
             sb_append_str(us, ";");
@@ -2721,7 +2984,23 @@ emit_variant_decl fn(d: i64) void {
         sb_append_str(fsb, n.sa);
         sb_append_str(fsb, "_from_");
         sb_append_str(fsb, cname);
-        if (vc2.na >= 0) {
+        if (vc2.lb >= 0) {
+            // 多载荷：(T0 v0, T1 v1, ...)
+            sb_append_str(fsb, "(");
+            var t: i64 = vc2.lb;
+            var fi: i64 = 0;
+            while (t >= 0) {
+                if (fi > 0) {
+                    sb_append_str(fsb, ", ");
+                }
+                sb_append_str(fsb, emit_ctype(kids[t].val));
+                sb_append_str(fsb, " v");
+                sb_append_i64(fsb, fi);
+                t = kids[t].next;
+                fi = fi + 1;
+            }
+            sb_append_str(fsb, ") {");
+        } else if (vc2.na >= 0) {
             sb_append_str(fsb, "(");
             sb_append_str(fsb, emit_ctype(vc2.na));
             sb_append_str(fsb, " v) {");
@@ -2735,7 +3014,25 @@ emit_variant_decl fn(d: i64) void {
         sb_append_i64(tsb, vc2.ia);
         sb_append_str(tsb, ";");
         hpush(sb_to_str(tsb));
-        if (vc2.na >= 0) {
+        if (vc2.lb >= 0) {
+            // 多载荷：逐字段赋值 `_s._u._uN._fK = vK;`
+            // （C 的 brace-init 只能用于初始化，不能用于赋值；匿名 struct 也无法写复合字面量）
+            var t2: i64 = vc2.lb;
+            var fi2: i64 = 0;
+            while (t2 >= 0) {
+                var asb: StringBuilder = sb_new();
+                sb_append_str(asb, "    _s._u._u");
+                sb_append_i64(asb, vc2.ia);
+                sb_append_str(asb, "._f");
+                sb_append_i64(asb, fi2);
+                sb_append_str(asb, " = v");
+                sb_append_i64(asb, fi2);
+                sb_append_str(asb, ";");
+                hpush(sb_to_str(asb));
+                t2 = kids[t2].next;
+                fi2 = fi2 + 1;
+            }
+        } else if (vc2.na >= 0) {
             var asb: StringBuilder = sb_new();
             sb_append_str(asb, "    _s._u._u");
             sb_append_i64(asb, vc2.ia);
@@ -2760,8 +3057,36 @@ emit_variant_decl fn(d: i64) void {
         sb_append_str(isb2, ";");
         hpush(sb_to_str(isb2));
         hpush("}");
-        // 取载荷
-        if (vc2.na >= 0) {
+        // 取载荷：多载荷逐字段访问器 _as_C_f0 / _f1 / ...；单载荷 _as_C
+        if (vc2.lb >= 0) {
+            var t: i64 = vc2.lb;
+            var fi: i64 = 0;
+            while (t >= 0) {
+                var asb2: StringBuilder = sb_new();
+                sb_append_str(asb2, "static inline ");
+                sb_append_str(asb2, emit_ctype(kids[t].val));
+                sb_append_str(asb2, " ");
+                sb_append_str(asb2, n.sa);
+                sb_append_str(asb2, "_as_");
+                sb_append_str(asb2, cname);
+                sb_append_str(asb2, "_f");
+                sb_append_i64(asb2, fi);
+                sb_append_str(asb2, "(");
+                sb_append_str(asb2, n.sa);
+                sb_append_str(asb2, " self) {");
+                hpush(sb_to_str(asb2));
+                var asb3: StringBuilder = sb_new();
+                sb_append_str(asb3, "    return self._u._u");
+                sb_append_i64(asb3, vc2.ia);
+                sb_append_str(asb3, "._f");
+                sb_append_i64(asb3, fi);
+                sb_append_str(asb3, ";");
+                hpush(sb_to_str(asb3));
+                hpush("}");
+                t = kids[t].next;
+                fi = fi + 1;
+            }
+        } else if (vc2.na >= 0) {
             var asb2: StringBuilder = sb_new();
             sb_append_str(asb2, "static inline ");
             sb_append_str(asb2, emit_ctype(vc2.na));

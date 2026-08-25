@@ -1,7 +1,7 @@
 # t 语言编译器自举设计文档（bootstrap.md）
 
-> 版本：v1.0（2026-07-28）；Stage 2 自举判据于 2026-08-11 修订为 gate L2 三件套（见 §4.1）
-> 前置文档：`docs/spec.md`（语言规范，唯一语义权威）
+> 版本：v1.0（2026-07-28）；Stage 2 自举判据于 2026-08-11 修订为 gate L2 三件套（见 §4.1）；信任根模型于 2026-08-12 明确为 LLVM 自举不动点 + 当前二进制（见 §4.3，G4 决策）
+> 前置文档：`docs/reference.md`（语言规范，唯一语义权威；`docs/spec.md` 已于 2026-08-01 废弃，仅作历史封存）
 > 目标：将编译器从 TypeScript 实现（tc0）过渡到 t 语言自身实现，达成自编译不动点，随后进入 AI Agent 自迭代开发模式。
 
 ---
@@ -26,7 +26,7 @@ Stage 3   自迭代开发          ← 退役 TS，所有演进发生在 compile
 ```
 
 **核心原则**：
-1. `docs/spec.md` 是唯一语义权威。tc0 与 compiler.tc 行为不一致时，以规范为准，两边同时修。
+1. `docs/reference.md` 是唯一语义权威（`docs/spec.md` 已废弃）。tc0 与 compiler.tc 行为不一致时，以规范为准，两边同时修。
 2. 每个阶段都有**机器可验证的等价性判据**（差分测试），不靠人眼。
 3. tc0 在 Stage 2 完成前保持可用，作为「已知正确」的参照实现；完成后打 tag 封存（种子编译器永久保留，用于灾难恢复重建）。
 
@@ -236,10 +236,21 @@ Stage 2 的「自编译不动点」改由 `tools/gate.mjs L2` 实证，对当前
 
 ### 4.2 通过后动作
 
-1. tag `v1.0-selfhost`（M11 打在 C 后端三轮不动点当时）；**补打新 tag `v1.0-selfhost-llvm`** 固化当前 LLVM / C 双后端自举不动点（即 gate L2 全绿的那次提交），作为可复现的信任根。
-2. `seed/tc0/` + git tag 双保险封存；tc0 标记 frozen（仅参照实现，已编不出当前 `src`，详见 §4.1）。
+1. tag `v1.0-selfhost`（M11 打在 C 后端三轮不动点当时，仅历史封存）；**信任根 = 新 tag `v1.0-selfhost-llvm`**（gate L2 全绿的那次提交）+ 当前已自举二进制 `out/dbg/tc.exe`（`=g4`）。任一时刻的「受信任编译器」= 该 tag 源码经 `gate L2` 实证不动点后产出的二进制，而非 tc0。
+2. `seed/tc0/` 保留为 **frozen 参照实现**，仅供诊断差分参照；其引导路径已失效（见 §4.1），**不再作为灾难恢复重建种子**。可复现重建路径 = git tag `v1.0-selfhost-llvm` + LLVM 工具链（clang/llvm）。
 3. `README` 更新：主实现 = `src/`，TS 版 frozen；自举状态改述为 gate L2 三件套判据（见上）。
-4. `tests/` 符合性套件：每条规范条款至少一个正例 + 一个负例（含预期 JSON 错误码）。当前规模 **175 用例（56 pass / 119 fail）**，且仍在扩大（只增不删）。
+4. `tests/` 符合性套件：每条规范条款至少一个正例 + 一个负例（含预期 JSON 错误码）。当前规模 **201 用例（57 pass / 144 fail）**，诊断码覆盖 120/128，且仍在扩大（只增不删）。
+
+### 4.3 信任根模型（Trust Model，G4 决策）
+
+自举达成后，**信任根 = LLVM 自举不动点 + 当前二进制**，具体由 `tools/gate.mjs L2` 三件套实证：
+
+- **信任根定义**：受信任的编译器 = `git tag v1.0-selfhost-llvm`（gate L2 全绿提交）的源码，经 `boot4` 四代 LLVM 不动点（`g2==g3==g4`）+ `cself` C 后端自举 + `difftc0`/`difftest` 跨代跨后端对拍后，产出的二进制 `out/dbg/tc.exe`（`=g4`）。
+- **为何放弃 tc0 作信任根**：种子 tc0（冻结于 `v1.0-selfhost`）解析不了当前 `import(src.x :: *)` 语法，其引导路径在 §4.1 已证不可达；它无法把当前 `src/` 编译成任何可执行产物，故不再具备「已知正确参照」的重建能力，仅作差分诊断的历史基线。
+- **重建路径（灾难恢复）**：信任根可经 `git checkout v1.0-selfhost-llvm && node tools/gate.mjs L2` 在任意装有 LLVM 工具链（clang/llvm）的环境复现；不依赖 tc0、不依赖任何已冻结的 TS 产物。
+- **信任传递**：Stage 3 自迭代中，新编译器必须经「当前稳定版 tcN 编译 → 符合性套件 + difftest → 不动点复验」晋升（§5），复验即重新执行 gate L2 三件套，使信任根随每次绿门禁向前滚动。
+
+> 结论：Stage 2 自举的信任不来自 tc0 种子，而来自 **LLVM 后端自举不动点 + 跨后端对拍** 的可复现实证。tc0 是 frozen 参照实现，不是信任链的一环。
 
 ---
 
@@ -253,7 +264,7 @@ Stage 2 的「自编译不动点」改由 `tools/gate.mjs L2` 实证，对当前
 ```
 
 - **AI Agent 闭环**：编译失败时 JSON 诊断包（错误码、行列、修复建议）直接作为 Agent 输入 → 修改 → 重编译，即规范 §8 的设计目标。
-- **版本晋升规则**：任何语言新特性必须①先改 `docs/spec.md` ②补符合性测试 ③再改 compiler.tc，三步缺一不可（防双实现漂移在自迭代期演化为规范漂移）。
+- **版本晋升规则**：任何语言新特性必须①先改 `docs/reference.md`（权威规范）②补符合性测试 ③再改 compiler.tc，三步缺一不可（防双实现漂移在自迭代期演化为规范漂移）。
 - **待偿技术债**（按优先级）：~~Variant（G10）~~ ✅已实现、`CSV/JSON 数据表 CTFE 导入（§7.2）`、`@soa 布局变换`、通用内存管理（脱离 arena）、优化后端。
 
 ---
@@ -262,12 +273,12 @@ Stage 2 的「自编译不动点」改由 `tools/gate.mjs L2` 实证，对当前
 
 | 风险 | 对策 |
 |------|------|
-| 语言特性蔓延（为自举方便偷加语法） | 一切新语法先过规范 §0 五条铁律 + 写入 spec.md，否则 emitter/checker 拒绝实现 |
+| 语言特性蔓延（为自举方便偷加语法） | 一切新语法先过规范 §0 五条铁律 + 写入 `docs/reference.md`，否则 emitter/checker 拒绝实现 |
 | 双实现语义漂移 | difftest 逐字节比对是硬门禁；输出格式（JSON 字段序、C 代码排版）写死为规范附录 |
 | arena 内存策略被误当语言语义 | 明确标注：arena 是**编译器实现策略**，非语言内存模型；spec 不引用 |
 | C 运行时越界/UB | t_runtime 全部边界检查 + JSON panic 输出；C 单测覆盖边界 |
 | 不动点因非确定性失败（map 迭代序、时间戳） | map 迭代按插入序（链式记录）；产物禁止嵌入时间戳/绝对路径 |
-| 种子丢失导致无法重建 | seed/ 目录 + git tag 双保险；TS 版永久可用 |
+| 种子 tc0 已无法重建当前 `src/`（引导路径失效，见 §4.1） | 信任根改为 tag `v1.0-selfhost-llvm` + LLVM 工具链（`git checkout` + `gate L2` 可复现）；tc0 仅作 frozen 参照，不再是重建保证 |
 
 ---
 
@@ -295,3 +306,4 @@ Stage 2 的「自编译不动点」改由 `tools/gate.mjs L2` 实证，对当前
       → 类型检查器注册类型与 `Name_from_Case/Name_is_Case/Name_as_Case` 助手符号 → emitter 发射 tagged-union
       struct + 三个 `static inline` 自由函数。`tests/conformance/p08_variant.tc` + `tests/variant_smoke` 运行时验证通过；
       gate L2 不动点仍全绿（boot4 g2==g3==g4 / cself / difftc0），difftest 30/30 无回归。
+- [x] **M13** 信任根模型（G4）：接受「信任根 = LLVM 自举不动点 + 当前二进制」—— tc0 种子引导路径已失效，降级为 frozen 参照实现；信任根与灾难恢复改由 tag `v1.0-selfhost-llvm` + `gate L2` 实证（详见 §4.3）。*Stage 2 全闭环*

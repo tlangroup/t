@@ -31,7 +31,7 @@ Agent 由四个静态可描述部分构成:
 | ---------- | ----------------------------- | -------------------------------------------- |
 | 身份         | `atom`(复用 M50 原子)             | 编译期 intern,全局唯一,可作消息路由键                      |
 | 状态         | 纯数据 `struct`                  | 数据第一;显式字段、固定位宽;生命周期显式(第3/8/12条)              |
-| 能力集(tools) | 一组类型化函数 `fn(Input) -> Result` | 声明即契约,调用的类型安全由编译器保证                          |
+| 能力集(tools) | 一组类型化函数 `fn(Input) Result` | 声明即契约,调用的类型安全由编译器保证                          |
 | 消息回路       | 类型化 inbox/outbox(消息即 struct)  | 驱动 `step(state, msg) -> (state, actions)` 推进 |
 
 ## 3. 与既有模型的关系
@@ -48,7 +48,7 @@ Agent 由四个静态可描述部分构成:
   ```
   Counter agent {
     state count: i64
-    step fn(s: CounterState, msg: atom) -> CounterState {
+    step fn(s: CounterState, msg: atom) CounterState {
       return match (msg) {
         :inc => CounterState { count: s.count + 1 }
         :dec => CounterState { count: s.count - 1 }
@@ -61,8 +61,8 @@ Agent 由四个静态可描述部分构成:
 - **struct 无函数（铁律）**：`CounterState` 脱糖为纯数据 struct，函数一律是顶层自由 `fn`，绝不挂进 struct（契合 ECS 数据导向）。
 - 脱糖产物（仅编译器前端完成，后端零改动）:
   - `CounterState struct { count: i64 }`（纯数据）
-  - `Counter_step fn(s: CounterState, msg: atom) -> CounterState { ... }`（自由函数，函数体逐字保留）
-  - `Counter_spawn(init) -> CounterState`（合成构造器）
+  - `Counter_step fn(s: CounterState, msg: atom) CounterState { ... }`（自由函数，函数体逐字保留）
+  - `Counter_spawn(init) CounterState`（合成构造器）
 - 实例构造（显式，无隐式分配）: `var c: CounterState = Counter_spawn(0);`
 - 消息驱动: 调用方手写循环 `c = Counter_step(c, :inc);`
 - **最小实装不含运行时邮箱 / 调度**（`send`/`recv`/`spawn` 的邮箱语义 deferred）；只为演示「agent 一等公民」。
@@ -108,9 +108,9 @@ Agent 由四个静态可描述部分构成:
 > ⚠ **Planning 体「待 goal」为决策 A 前的旧表述**：2026-08-04 决策 A 第 2/5 条已拍板**永不新增 `goal`/`plan` 语法**，故 Planning 不靠新子句表达，而是用纯 `planner(State) -> Msg` 自由 fn 算出「下一步消息」喂同一纯 `step`（见 §11.5）。**现已可写可运行示例**：`examples/planner_demo.tc`（Operator / Scout / Strategist / Adjutant 四 planner 自由 fn，共用同一 `robot_step` 原语，差异只在边界驱动）。
 
 **元类**:
-- **Spawner / Colony Agent（调度体，元类）✅ 库层已落地（examples/lib/colony.tc）** —— 管理/生成子 agent（导演 AI、小队队长、刷怪波次）。按决策 A **不进编译器语法**：复用 actor 脱糖产物 + slice + 函数指针，以纯数据调度体实现 `spawn` / `colony_send`（按 id 寻址）/ `colony_tick`（每帧驱动每个存活 agent）/ 扁平 inbox（延迟邮箱）；状态 string 指纹 + `fn(string, Msg)->string` 回调泛型无关。演示 `examples/colony_demo.tc`（Worker 小队 + Counter 跨类型复用同一调度体）与 `examples/colony_wave.tc`（塔防刷怪波次 + ECS World 主循环：Spawner 按波次 `colony_spawn`、World 主循环每帧 `colony_broadcast(:tick)`+`colony_tick` 驱动决策，再经 `physics.movement_system` 积分位置、玩家炮塔 `CombatSystem` 清怪）。
+- **Spawner / Colony Agent（调度体，元类）✅ 库层已落地（examples/lib/colony.tc）** —— 管理/生成子 agent（导演 AI、小队队长、刷怪波次）。按决策 A **不进编译器语法**：复用 actor 脱糖产物 + slice + 函数指针，以纯数据调度体实现 `spawn` / `colony_send`（按 id 寻址）/ `colony_tick`（每帧驱动每个存活 agent）/ 扁平 inbox（延迟邮箱）；状态 string 指纹 + `fn(string, Msg) string` 回调泛型无关。演示 `examples/colony_demo.tc`（Worker 小队 + Counter 跨类型复用同一调度体）与 `examples/colony_wave.tc`（塔防刷怪波次 + ECS World 主循环：Spawner 按波次 `colony_spawn`、World 主循环每帧 `colony_broadcast(:tick)`+`colony_tick` 驱动决策，再经 `physics.movement_system` 积分位置、玩家炮塔 `CombatSystem` 清怪）。
 
-**优先级（语言侧成本）**: Tool / Player / Sensor Agent = 0（纯模式，现有语法可写，**已示例**）；Scout / Operator / Strategist / Adjutant / Plan Agent = 用纯 `planner(State)->Msg` 自由 fn 表达（**已可写，见 `examples/planner_demo.tc`**，不引 `goal`/`plan` 语法，决策 A 第5条）；Spawner = ✅ 库层已落地（examples/lib/colony.tc，纯数据调度体，无新语法，见 §12）。
+**优先级（语言侧成本）**: Tool / Player / Sensor Agent = 0（纯模式，现有语法可写，**已示例**）；Scout / Operator / Strategist / Adjutant / Plan Agent = 用纯 `planner(State) Msg` 自由 fn 表达（**已可写，见 `examples/planner_demo.tc`**，不引 `goal`/`plan` 语法，决策 A 第5条）；Spawner = ✅ 库层已落地（examples/lib/colony.tc，纯数据调度体，无新语法，见 §12）。
 
 ## 7. 开放问题(待法律化时裁决)
 
@@ -221,7 +221,7 @@ t 为 Agent First 能做的，与刻意不做的，同样重要。语言层只�
 > **最关键**：以上 5 层是 t 该做的；虚线之下（Sensor / Tool / LLM / Human / Network 适配器）是**运行时 / 模型库**的事，不进编译器 intrinsics。一句话：**语言负责确定性，库负责可能性。**
 
 ### 11.5 规划体（Planning）的无语法表达
-§6 说 Planning 行「待 goal」——那是决策 A 前的旧表述。§8 决策 A 第 2/5 条已拍板**永不引入 `goal`/`plan` 语法**，改用纯 `planner(State) -> Msg` 自由 fn。即：规划 Core = 一个算出「下一步消息」的自由 fn，把结果喂同一纯 `step`。不变量不变（step 纯、效应在边界）。这把「最聪明的决策」也压回库层模式，而非新语法。**已落地可运行示例**：`examples/planner_demo.tc` —— `Robot agent` 只有一个纯反射 `step`；Operator/Scout/Strategist/Adjutant 是四个 `fn(RobotState)->atom` 自由 fn（各自不同「边界驱动」：纯执行 / 先侦察 / 能量告急先充电 / 开工前请示人类）；`run_with_planner(p, init, steps)` 是通用循环 `s = robot_step(s, p(s))`，`p` 是唯一变量。
+§6 说 Planning 行「待 goal」——那是决策 A 前的旧表述。§8 决策 A 第 2/5 条已拍板**永不引入 `goal`/`plan` 语法**，改用纯 `planner(State) Msg` 自由 fn。即：规划 Core = 一个算出「下一步消息」的自由 fn，把结果喂同一纯 `step`。不变量不变（step 纯、效应在边界）。这把「最聪明的决策」也压回库层模式，而非新语法。**已落地可运行示例**：`examples/planner_demo.tc` —— `Robot agent` 只有一个纯反射 `step`；Operator/Scout/Strategist/Adjutant 是四个 `fn(RobotState) atom` 自由 fn（各自不同「边界驱动」：纯执行 / 先侦察 / 能量告急先充电 / 开工前请示人类）；`run_with_planner(p, init, steps)` 是通用循环 `s = robot_step(s, p(s))`，`p` 是唯一变量。
 
 ---
 
@@ -245,7 +245,7 @@ Guard agent {
   state pos: Position            // Position 来自 physics 模块（Component）
   state pending: atom
   state intent_dir: Velocity     // 决策意图，MovementSystem 读
-  step fn(s: GuardState, msg: atom) -> GuardState {
+  step fn(s: GuardState, msg: atom) GuardState {
     if (msg == :tick) { return GuardState { pos: s.pos, pending: :llm, intent_dir: steer_patrol(s.pos) }; }
     else if (msg == :llm_reply) { return GuardState { pos: s.pos, pending: :none, intent_dir: s.intent_dir }; }
     return s;

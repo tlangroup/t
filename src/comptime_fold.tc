@@ -1,0 +1,150 @@
+// ══════════════════════════════════════════════════════════════════
+// src/comptime_fold.tc — 全量 comptime（弥漫式折叠）P0+P1 骨架
+//
+// 设计要点（详见 docs/comptime-design.md）：
+//   • t 已有 CTFE 求值器 meta_eval（sema.tc），本模块「复用」它，不重造。
+//   • 「全量 comptime」= 把 meta_eval 的触发范围从「仅 comptime 标记节点」
+//     扩大到「任意全 const 可折的普通表达式节点」。
+//   • 折叠产物是已原地改写为字面量的 AST；C/LLVM 后端照常发射，
+//     comptime 逻辑零后端相关 → 守双后端等价与四代不动点。
+//   • 安全护栏：只折「子树不含 ident/call/index/array_lit」的纯字面量
+//     算术/布尔/cast/paren，绝不触发 meta_eval 的 meta_fail（否则会向诊断
+//     塞伪错误）。运行期内建与运行期变量引用一律跳过。
+//
+// DAG：依赖 base / sema（吃 nodes 池 + meta_eval）。被 tc.tc 在 run_check()
+// 之后调用。当前默认关闭（g_comptime_full=false），以免扰动既有门禁；
+// 翻转该全局即可启用 P0+P1 验证。
+// ══════════════════════════════════════════════════════════════════
+
+import(src.base :: *);
+import(src.sema :: *);
+
+// 总开关：默认关闭，启用即翻转为真并重新构建 tc。
+// P0+P1 验证用；长期默认应由 gate 复核后开启。
+var g_comptime_full: bool = true;
+
+// 候选折叠的表达式节点种类（P0 范围）。
+// 不含 cast：cast 节点承载窄化（u8/i16 等），折掉会丢窄类型信息；
+// P0+P1 让外层 cast 继续正确窄化，故排除。不含 comptime / comptime_block
+// （已由 meta_pass 处理），不含声明节点。
+comptime_is_candidate fn(k: string) bool {
+    if (k == "binary") { return true; }
+    if (k == "unary") { return true; }
+    if (k == "paren") { return true; }
+    if (k == "array_lit") { return true; }
+    if (k == "struct_lit") { return true; }
+    if (k == "index") { return true; }
+    if (k == "match") { return true; }
+    return false;
+}
+
+// 子树是否含运行期引用（ident/call/index/array_lit）。
+// 命中则禁止 meta_eval，避免 meta_fail 塞入伪诊断错误。
+comptime_has_runtime_ref_list fn(head: i64) bool {
+    var c: i64 = head;
+    while (c >= 0) {
+        if (comptime_has_runtime_ref(kids[c].val)) { return true; }
+        c = kids[c].next;
+    }
+    return false;
+}
+
+// 该 call 是否为变体编译期辅助调用（Name_from_Case / Name_is_Case /
+// Name_as_Case[_fK]）。是则放行（仅递归检查实参，不允许整棵被当运行期引用拒掉），
+// 让 meta_eval 内部的变体值求值接管；否（普通运行期调用）仍为硬运行期引用。
+comptime_call_is_variant fn(n: Node) bool {
+    if (n.na < 0) { return false; }
+    var cn: Node = nodes[n.na];
+    if (cn.kind != "ident") { return false; }
+    return meta_str_find(cn.sa, "_from_") >= 0
+        || meta_str_find(cn.sa, "_is_") >= 0
+        || meta_str_find(cn.sa, "_as_") >= 0;
+}
+
+comptime_has_runtime_ref fn(e: i64) bool {
+    if (e < 0) { return false; }
+    var n: Node = nodes[e];
+    // 仅 ident/call 是「硬运行期引用」；index/array_lit/struct_lit 是可折
+    // 容器，交由 meta_eval 内部递归处理（其子树若含 ident/call 会被下面的
+    // 递归检查捕获并阻止）。P2 起不再把它们当运行期引用拒之门外。
+    if (n.kind == "ident") { return true; }
+    if (n.kind == "conpat") {
+        // 纯模式子树：绑定标识符 + 嵌套 conpat，绝不含运行期值引用
+        return false;
+    }
+    if (n.kind == "call") {
+        if (comptime_call_is_variant(n)) {
+            return comptime_has_runtime_ref_list(n.la);
+        }
+        return true;
+    }
+    if (comptime_has_runtime_ref(n.na)) { return true; }
+    if (comptime_has_runtime_ref(n.nb)) { return true; }
+    if (comptime_has_runtime_ref(n.nc)) { return true; }
+    if (comptime_has_runtime_ref(n.nd)) { return true; }
+    if (comptime_has_runtime_ref_list(n.la)) { return true; }
+    if (comptime_has_runtime_ref_list(n.lb)) { return true; }
+    if (comptime_has_runtime_ref_list(n.lc)) { return true; }
+    return false;
+}
+
+// 把节点 e 原地改写为字面量节点 v（复用 meta_fold_expr 的改写模式，
+// 保留 ln/cl/tv 诊断锚点；清零子节点槽，la 仅 array_lit 有元素链）。
+comptime_rewrite_to_literal fn(e: i64, v: i64) void {
+    if (e < 0 || v < 0) { return; }
+    var src: Node = nodes[v];
+    var dst: Node = nodes[e];
+    dst.kind = src.kind;
+    dst.sa = src.sa;
+    dst.ia = src.ia;
+    dst.ba = src.ba;
+    dst.na = -1; dst.nb = -1; dst.nc = -1; dst.nd = -1;
+    dst.la = src.la;
+    slice_set(nodes, e, dst);
+}
+
+// 全量 comptime 折叠 pass：遍历整池节点，对候选表达式尝试 meta_eval，
+// 成功（返回字面量节点 id）则原地改写。仅处理 run_check() 之后、类型已检的 AST。
+//
+// 安全要点：
+//   • 复用 meta_eval 的求值上下文（步数预算 + quiet 抑制伪诊断），但每次调用
+//     后复位 g_meta_err —— 否则一旦某节点不可折，meta_eval 置位 g_meta_err 会让
+//     后续所有调用短路返回 -1，既压低覆盖率又可能把错误态泄漏到 codegen。
+//   • 结束前还原 g_meta_quiet / g_meta_err 原值，不影响其他阶段。
+comptime_fold_pass fn() void {
+    if (g_comptime_full == false) { return; }
+    var sv_quiet: bool = g_meta_quiet;
+    var sv_err: bool = g_meta_err;
+    g_meta_steps = 4000000;
+    g_meta_err = false;
+    g_meta_quiet = true;
+    var i: i64 = 0;
+    var n: i64 = slice_len(nodes) as i64;
+    while (i < n) {
+        var k: string = nodes[i].kind;
+        // 已由 meta_pass 处理的 comptime 节点跳过，避免重复改写
+        if (k == "comptime" || k == "comptime_block") {
+            i = i + 1;
+            continue;
+        }
+        if (comptime_is_candidate(k) == false) {
+            i = i + 1;
+            continue;
+        }
+        // 安全护栏：含运行期引用则跳过（meta_eval 撞运行期引用会 meta_fail）。
+        // match 例外：其 scrutinee/body 引用的「标识符」多为模式绑定（编译期已知），
+        // 由 meta_eval_match 内部按 conpat 绑定到 menv 后求值；故直接尝试，失败则放弃。
+        if (k != "match" && comptime_has_runtime_ref(i)) {
+            i = i + 1;
+            continue;
+        }
+        var v: i64 = meta_eval(i);
+        g_meta_err = false; // 复位：允许后续节点继续尝试折叠
+        if (v >= 0) {
+            comptime_rewrite_to_literal(i, v);
+        }
+        i = i + 1;
+    }
+    g_meta_quiet = sv_quiet;
+    g_meta_err = sv_err;
+}

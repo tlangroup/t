@@ -69,6 +69,7 @@ var llv_v: []string;       // variant case：类型名/case 名/tag/载荷 td(-1
 var llv_c: []string;
 var llv_tag: []i64;
 var llv_ptd: []i64;
+var llv_ptdl: []i64;       // 多载荷 case：载荷类型链头（kids 下标），-1 表示单载荷/单元
 
 var llu_u: []string;       // union 成员：类型名/成员名/td
 var llu_m: []string;
@@ -183,10 +184,12 @@ lla_has fn(name: string) bool {
 // 命中后设置 ll_vm_kind ("from"/"is"/"as") 与池下标 ll_vm_i
 var ll_vm_kind: string;
 var ll_vm_i: i64;
+var ll_vm_fi: i64;          // 多载荷字段下标；-1 表示单载荷（_as_<C>）
 
 llv_match fn(cn: string) bool {
     ll_vm_kind = "";
     ll_vm_i = -1;
+    ll_vm_fi = -1;
     var n: i64 = slice_len(llv_v) as i64;
     var i: i64 = 0;
     while (i < n) {
@@ -206,11 +209,64 @@ llv_match fn(cn: string) bool {
         if (cn == f3) {
             ll_vm_kind = "as";
             ll_vm_i = i;
+            ll_vm_fi = -1;
             return true;
+        }
+        // 多载荷逐字段访问器 _as_<C>_f<k>
+        if (llv_ptdl[i] >= 0) {
+            var fk: i64 = 0;
+            while (fk < 16) {
+                var ff: string = sb_cat5(llv_v[i], "_as_", llv_c[i], "_f", i2s(fk));
+                if (cn == ff) {
+                    ll_vm_kind = "as";
+                    ll_vm_i = i;
+                    ll_vm_fi = fk;
+                    return true;
+                }
+                fk = fk + 1;
+            }
         }
         i = i + 1;
     }
     return false;
+}
+
+// 多载荷 case 的第 fi 个载荷类型描述符；越界或非多载荷时回落到 llv_ptd（单载荷）。
+// 缺这一支时 `_as_C_f1` 会被当成首个载荷的类型（通常 i64），
+// 让 bool 载荷在 ll_cast_v 里发出 `icmp ne i64 %tN`（%tN 实为 i8）→ LLVM 校验失败。
+ll_variant_fi_td fn(vi: i64, fi: i64) i64 {
+    if (fi < 0) {
+        return llv_ptd[vi];
+    }
+    var t: i64 = llv_ptdl[vi];
+    var k: i64 = 0;
+    while (t >= 0) {
+        if (k == fi) {
+            return resolve_type_desc(kids[t].val);
+        }
+        k = k + 1;
+        t = kids[t].next;
+    }
+    return llv_ptd[vi];
+}
+
+// 多载荷 case 的载荷布局类型串 "{T0,Ti...}"（供 blob bitcast / insertvalue / getelementptr）。
+ll_variant_sty fn(vi: i64) string {
+    var sb: StringBuilder = sb_new();
+    sb_append_str(sb, "{");
+    var t: i64 = llv_ptdl[vi];
+    var first: bool = true;
+    while (t >= 0) {
+        var ft: i64 = resolve_type_desc(kids[t].val);
+        if (first == false) {
+            sb_append_str(sb, ", ");
+        }
+        sb_append_str(sb, ll_td(ft));
+        first = false;
+        t = kids[t].next;
+    }
+    sb_append_str(sb, "}");
+    return sb_to_str(sb);
 }
 
 // ── 标量 → LLVM 类型 ───────────────────────────────────────────
@@ -219,7 +275,7 @@ llv_match fn(cn: string) bool {
 scalar_to_ll fn(name: string) string {
     if (name == "u8" || name == "i8" || name == "bool") { return "i8"; }
     if (name == "u16" || name == "i16") { return "i16"; }
-    if (name == "u32" || name == "i32") { return "i32"; }
+    if (name == "u32" || name == "i32" || name == "rune") { return "i32"; }
     if (name == "f32") { return "float"; }
     if (name == "f64") { return "double"; }
     return "i64";
@@ -254,7 +310,8 @@ ll_td fn(td: i64) string {
         return "i64";
     }
     var t: TD = tds[td];
-    if (t.cat == "string") { return "%TStr"; }
+    if (t.cat == "string" || t.cat == "bytes") { return "%TStr"; }
+    if (t.cat == "pointer") { return "ptr"; }
     if (t.cat == "slice") { return "%TSlice"; }
     if (t.cat == "array") {
         var an: i64 = t.alen;
@@ -293,7 +350,7 @@ ll_isagg fn(td: i64) bool {
         return false;
     }
     var t: TD = tds[td];
-    if (t.cat == "string" || t.cat == "slice" || t.cat == "array") {
+    if (t.cat == "string" || t.cat == "bytes" || t.cat == "slice" || t.cat == "array") {
         return true;
     }
     if (t.cat == "named") {
@@ -549,6 +606,7 @@ ll_build_reg fn() void {
                     ptd = resolve_type_desc(vc.na);
                 }
                 append(llv_ptd, ptd);
+                append(llv_ptdl, vc.lb);
                 c4 = k4.next;
             }
         }
@@ -706,7 +764,7 @@ ll_etd fn(e: i64) i64 {
                 if (ll_vm_kind == "is") {
                     return td_named_mk("scalar", "bool");
                 }
-                return llv_ptd[ll_vm_i];
+                return ll_variant_fi_td(ll_vm_i, ll_vm_fi);
             }
         }
         return expr_type_desc(e);
@@ -853,8 +911,24 @@ ll_addr fn(e: i64) string {
     if (n.kind == "paren") {
         return ll_addr(n.na);
     }
+    // 取址 `&x` 作为左值：地址即操作数地址（ptr）。
+    if (n.kind == "amp") {
+        return emit_lle(n.na);
+    }
+    // 解引用 `*r` 作为左值：地址就是引用本身（一个 ptr 值），无需 load。
+    if (n.kind == "deref") {
+        return emit_lle(n.na);
+    }
     if (n.kind == "ident") {
         var la_idn: string = mb_sub(n.sa);
+        // 同函数内重名局部（shadowing）：反查该标识符解析到的声明节点，发射唯一化后的名字。
+        if (em_in_fn) {
+            var vdcl: i64 = idecl_get(e);
+            if (vdcl >= 0 && g_local_has(vdcl)) {
+                var vn: Node = nodes[vdcl];
+                return sb_cat2("%v.", sb_cat3(vn.sa, "__", i2s(vdcl)));
+            }
+        }
         if (em_in_fn) {
             var f: i64 = fs_get(em_cur_fn, la_idn);
             if (f >= 0) {
@@ -1067,14 +1141,30 @@ emit_lle fn(e: i64) string {
     }
     if (n.kind == "ident") {
         var le_idn: string = mb_sub(n.sa);
+        // 解析该标识符最终唯一化后的 alloca 名（同作用域重名 shadowing 走 mangled 名）。
+        var lname: string = "";
         if (em_in_fn) {
+            var vdcl: i64 = idecl_get(e);
+            if (vdcl >= 0 && g_local_has(vdcl)) {
+                var vn: Node = nodes[vdcl];
+                lname = sb_cat2("%v.", sb_cat3(vn.sa, "__", i2s(vdcl)));
+            }
+        }
+        if (lname == "" && em_in_fn) {
             var f: i64 = fs_get(em_cur_fn, le_idn);
             if (f >= 0) {
-                if (ll_isagg(f)) {
-                    return sb_cat2("%v.", le_idn);
-                }
-                return ll_load(ll_td(f), sb_cat2("%v.", le_idn));
+                lname = sb_cat2("%v.", le_idn);
             }
+        }
+        if (lname != "") {
+            // 聚合（struct/variant/union/string/slice/array）：值即其地址，直接返回。
+            // 标量与引用（pointer）：alloca 里存的是值/地址，须 load 成 SSA 值，
+            // 否则下游 `add i32 %v.x, 1` 会把 ptr 当 i32 用 → LLVM 校验报错。
+            var ltd: i64 = ll_etd(e);
+            if (ll_isagg(ltd)) {
+                return lname;
+            }
+            return ll_load(ll_td(ltd), lname);
         }
         var g: i64 = llgv_find(le_idn);
         if (g >= 0) {
@@ -1107,6 +1197,10 @@ emit_lle fn(e: i64) string {
         fs_set(em_cur_fn, mv_sn, mv_std);
         ll_local_decl(mv_sn, mv_std, n.na);
         var mv_pushed: i64 = match_bind_push(e, mv_no);
+        // ADT conpat 臂：与 C 后端同理（见 codegen_c::match_conpat_binds_register），
+        // 先登记载荷绑定类型，否则首臂体引用绑定时 mv_rtd 退化为 unknown，
+        // 且 emit_lle 的 ident 分支 fs_get 落空会直接返回字面量 "0"（静默错编）。
+        match_conpat_binds_register(e);
         var mv_rtd: i64 = ll_etd(match_first_body(e));
         fs_set(em_cur_fn, mv_rn, mv_rtd);
         ll_local_decl(mv_rn, mv_rtd, -1);
@@ -1143,6 +1237,19 @@ emit_lle fn(e: i64) string {
     }
     if (n.kind == "unary") {
         return ll_unary(e);
+    }
+    // 取址 `&x` → 返回操作数的地址（ptr）；操作数须为可寻址左值，sema 已校验。
+    if (n.kind == "amp") {
+        return ll_addr(n.na);
+    }
+    // 解引用 `*r` → 从指针装载元素值。
+    if (n.kind == "deref") {
+        var p: string = emit_lle(n.na);
+        var otd: i64 = ll_etd(n.na);
+        var etd: i64 = -1;
+        if (otd >= 0) { etd = tds[otd].elem; }
+        if (etd < 0) { etd = ll_etd(e); }
+        return ll_load(ll_td(etd), p);
     }
     if (n.kind == "assign") {
         // m[k] = v : map 索引写须走 tll_map_put（find-or-insert）
@@ -1231,7 +1338,7 @@ emit_lle fn(e: i64) string {
     if (n.kind == "index") {
         var od: i64 = ll_etd(n.na);
         var ot: TD = tds[od];
-        if (ot.cat == "string") {
+        if (ot.cat == "string" || ot.cat == "bytes") {
             var sp: string = emit_lle(n.na);
             var iv: string = emit_lle(n.nb);
             var iv2: string = ll_widen_idx(iv, n.nb);
@@ -1565,7 +1672,7 @@ ll_size_bytes fn(td: i64) i64 {
         }
         return ll_bits(t.name) / 8;
     }
-    if (t.cat == "string") {
+    if (t.cat == "string" || t.cat == "bytes") {
         return 16;
     }
     if (t.cat == "slice") {
@@ -1619,8 +1726,22 @@ ll_variant_paymax fn(name: string) i64 {
     var n: i64 = slice_len(llv_v) as i64;
     var i: i64 = 0;
     while (i < n) {
-        if (llv_v[i] == name && llv_ptd[i] >= 0) {
-            var s: i64 = ll_round8(ll_size_bytes(llv_ptd[i]));
+        if (llv_v[i] == name && (llv_ptd[i] >= 0 || llv_ptdl[i] >= 0)) {
+            var s: i64;
+            if (llv_ptdl[i] >= 0) {
+                // 多载荷：struct {T0,T1,...} 的布局尺寸（按字段对齐累加 + 安全余量）
+                var t: i64 = llv_ptdl[i];
+                var off: i64 = 0;
+                while (t >= 0) {
+                    var ft: i64 = resolve_type_desc(kids[t].val);
+                    off = ll_round8(off);
+                    off = off + ll_round8(ll_size_bytes(ft));
+                    t = kids[t].next;
+                }
+                s = ll_round8(off) + 8;
+            } else {
+                s = ll_round8(ll_size_bytes(llv_ptd[i]));
+            }
             if (s > mx) {
                 mx = s;
             }
@@ -1861,6 +1982,12 @@ ll_call fn(e: i64) string {
         llfb(sb_cat6("  ", t0, " = call i64 ", fn2, "(ptr ", sb_cat2(p2, ")")));
         return t0;
     }
+    if (cn == "bytes_len") {
+        var bp: string = emit_lle(ae[0]);
+        var t0b: string = ll_tmp();
+        llfb(sb_cat6("  ", t0b, " = call i64 @tll_str_len(ptr ", bp, ")", ""));
+        return t0b;
+    }
     if (cn == "str_at") {
         var sp: string = emit_lle(ae[0]);
         var iv: string = emit_lle(ae[1]);
@@ -1870,6 +1997,16 @@ ll_call fn(e: i64) string {
         var t2: string = ll_tmp();
         llfb(sb_cat4("  ", t2, " = trunc i64 ", sb_cat2(t1, " to i8")));
         return t2;
+    }
+    if (cn == "bytes_at") {
+        var spb: string = emit_lle(ae[0]);
+        var ivb: string = emit_lle(ae[1]);
+        ivb = ll_cast_v(ivb, ll_etd(ae[1]), td_i64);
+        var t1b: string = ll_tmp();
+        llfb(sb_cat6("  ", t1b, " = call i64 @tll_str_at(ptr ", spb, ", i64 ", sb_cat2(ivb, ")")));
+        var t2b: string = ll_tmp();
+        llfb(sb_cat4("  ", t2b, " = trunc i64 ", sb_cat2(t1b, " to i8")));
+        return t2b;
     }
     if (cn == "str_slice") {
         var sp2: string = emit_lle(ae[0]);
@@ -1890,6 +2027,26 @@ ll_call fn(e: i64) string {
         sb_append_str(lsb, ")");
         llfb(sb_to_str(lsb));
         return out0;
+    }
+    if (cn == "bytes_slice") {
+        var sp2b: string = emit_lle(ae[0]);
+        var a1b: string = emit_lle(ae[1]);
+        a1b = ll_cast_v(a1b, ll_etd(ae[1]), td_i64);
+        var b1b: string = emit_lle(ae[2]);
+        b1b = ll_cast_v(b1b, ll_etd(ae[2]), td_i64);
+        var out0b: string = ll_scratch("%TStr");
+        var lsbb: StringBuilder = sb_new();
+        sb_append_str(lsbb, "  call void @tll_str_slice(ptr ");
+        sb_append_str(lsbb, sp2b);
+        sb_append_str(lsbb, ", i64 ");
+        sb_append_str(lsbb, a1b);
+        sb_append_str(lsbb, ", i64 ");
+        sb_append_str(lsbb, b1b);
+        sb_append_str(lsbb, ", ptr ");
+        sb_append_str(lsbb, out0b);
+        sb_append_str(lsbb, ")");
+        llfb(sb_to_str(lsbb));
+        return out0b;
     }
     // 子切片 s[a..b]：与 str_slice 同构——聚合走指针，out 由调用方 alloca 并排末位
     if (cn == "slice_sub") {
@@ -2113,6 +2270,30 @@ ll_call fn(e: i64) string {
         var out3: string = ll_scratch("%TStr");
         llfb(sb_cat6("  call void @tll_sb_to_str(ptr ", bp3, ", ptr ", out3, ")", ""));
         return out3;
+    }
+    if (cn == "bsb_new") {
+        var t6b: string = ll_tmp();
+        llfb(sb_cat3("  ", t6b, " = call ptr @tll_sb_new()"));
+        return t6b;
+    }
+    if (cn == "bsb_append_u8") {
+        var bp2b: string = emit_lle(ae[0]);
+        var cv2b: string = emit_lle(ae[1]);
+        cv2b = ll_cast_v(cv2b, ll_etd(ae[1]), td_i64);
+        llfb(sb_cat6("  call void ", "@tll_sb_append_char", "(ptr ", bp2b, ", i64 ", sb_cat2(cv2b, ")")));
+        return "0";
+    }
+    if (cn == "bsb_append_bytes") {
+        var bp3b: string = emit_lle(ae[0]);
+        var sv3b: string = emit_lle(ae[1]);
+        llfb(sb_cat6("  call void @tll_sb_append_str(ptr ", bp3b, ", ptr ", sv3b, ")", ""));
+        return "0";
+    }
+    if (cn == "bsb_to_bytes") {
+        var bp4b: string = emit_lle(ae[0]);
+        var out4b: string = ll_scratch("%TStr");
+        llfb(sb_cat6("  call void @tll_sb_to_str(ptr ", bp4b, ", ptr ", out4b, ")", ""));
+        return out4b;
     }
     if (cn == "sb_clear") {
         var bp4: string = emit_lle(ae[0]);
@@ -2478,31 +2659,75 @@ ll_call fn(e: i64) string {
     }
     if (llv_match(cn)) {
         var vi: i64 = ll_vm_i;
+        // 关键：进入本调用即把全局 ll_vm_* 捕获为局部。否则下方
+        // emit_lle(ae[k]) 发射参数时会重入 ll_call→llv_match 把全局冲掉，
+        // 导致嵌套 variant 访问（如 Inner_is_L(Outer_as_W(o))）误判路径。
+        var vkind: string = ll_vm_kind;
+        var vfi: i64 = ll_vm_fi;
         var vty: string = sb_cat2("%vt.", llv_v[vi]);
-        if (ll_vm_kind == "from") {
+        if (vkind == "from") {
             var scv: string = ll_scratch(vty);
             llfb(sb_cat4("  store ", vty, " zeroinitializer, ptr ", scv));
             var tp: string = ll_tmp();
             llfb(sb_cat6("  ", tp, " = getelementptr inbounds ", vty, ", ptr ", sb_cat2(scv, ", i32 0, i32 0")));
             llfb(sb_cat6("  store i64 ", i2s(llv_tag[vi]), ", ptr ", tp, "", ""));
-            if (llv_ptd[vi] >= 0 && argc > 0) {
+            if (argc > 0) {
                 var ppp: string = ll_tmp();
                 llfb(sb_cat6("  ", ppp, " = getelementptr inbounds ", vty, ", ptr ", sb_cat2(scv, ", i32 0, i32 1")));
-                var ptd: i64 = llv_ptd[vi];
-                var pty: string = ll_td(ptd);
-                if (ll_isagg(ptd)) {
-                    var pv: string = emit_lle(ae[0]);
-                    ll_copy(pty, pv, ppp);
-                } else {
-                    var pv2: string = emit_lle(ae[0]);
-                    pv2 = ll_cast_v(pv2, ll_etd(ae[0]), ptd);
-                    llfb(sb_cat6("  store ", pty, " ", pv2, ", ptr ", ppp));
+                if (llv_ptdl[vi] >= 0) {
+                    // 多载荷：blob 按 struct {T0,T1,...} 解释，逐字段 insertvalue 后整体 store。
+                    // 聚合初值直接用 `zeroinitializer` 常量起链（insertvalue 需 3 操作数，
+                    // 不能单独写 `insertvalue T zeroinitializer`）；opaque pointer 下无需 bitcast。
+                    var sty: string = ll_variant_sty(vi);
+                    var sv: string = "zeroinitializer";
+                    var t: i64 = llv_ptdl[vi];
+                    var fk: i64 = 0;
+                    while (t >= 0) {
+                        var ft: i64 = resolve_type_desc(kids[t].val);
+                        var av: string = emit_lle(ae[fk]);
+                        av = ll_cast_v(av, ll_etd(ae[fk]), ft);
+                        // 聚合字段的子表达式（含嵌套 variant 的 from/as）返回 blob 指针，
+                        // insertvalue 必须接收值，故此处加载成值。
+                        if (ll_isagg(ft)) {
+                            av = ll_load(ll_td(ft), av);
+                        }
+                        var sv2: string = ll_tmp();
+                        var isb: StringBuilder = sb_new();
+                        sb_append_str(isb, "  ");
+                        sb_append_str(isb, sv2);
+                        sb_append_str(isb, " = insertvalue ");
+                        sb_append_str(isb, sty);
+                        sb_append_str(isb, " ");
+                        sb_append_str(isb, sv);
+                        sb_append_str(isb, ", ");
+                        sb_append_str(isb, ll_td(ft));
+                        sb_append_str(isb, " ");
+                        sb_append_str(isb, av);
+                        sb_append_str(isb, ", ");
+                        sb_append_i64(isb, fk);
+                        llfb(sb_to_str(isb));
+                        sv = sv2;
+                        t = kids[t].next;
+                        fk = fk + 1;
+                    }
+                    llfb(sb_cat6("  store ", sty, " ", sv, ", ptr ", ppp));
+                } else if (llv_ptd[vi] >= 0) {
+                    var ptd: i64 = llv_ptd[vi];
+                    var pty: string = ll_td(ptd);
+                    if (ll_isagg(ptd)) {
+                        var pv: string = emit_lle(ae[0]);
+                        ll_copy(pty, pv, ppp);
+                    } else {
+                        var pv2: string = emit_lle(ae[0]);
+                        pv2 = ll_cast_v(pv2, ll_etd(ae[0]), ptd);
+                        llfb(sb_cat6("  store ", pty, " ", pv2, ", ptr ", ppp));
+                    }
                 }
             }
             return scv;
         }
         var vp: string = emit_lle(ae[0]);
-        if (ll_vm_kind == "is") {
+        if (vkind == "is") {
             var tp2: string = ll_tmp();
             llfb(sb_cat6("  ", tp2, " = getelementptr inbounds ", vty, ", ptr ", sb_cat2(vp, ", i32 0, i32 0")));
             var tv: string = ll_load("i64", tp2);
@@ -2512,6 +2737,38 @@ ll_call fn(e: i64) string {
         }
         var pp2: string = ll_tmp();
         llfb(sb_cat6("  ", pp2, " = getelementptr inbounds ", vty, ", ptr ", sb_cat2(vp, ", i32 0, i32 1")));
+        if (vfi >= 0) {
+            // 多载荷字段访问：blob 按 struct {T0,T1,...} 解释，取第 fi 个字段
+            // （opaque pointer：直接以 sty 为 GEP 基类型，无需 bitcast）
+            var sty: string = ll_variant_sty(vi);
+            var t: i64 = llv_ptdl[vi];
+            var fk: i64 = 0;
+            var ftd: i64 = -1;
+            while (t >= 0) {
+                if (fk == vfi) {
+                    ftd = resolve_type_desc(kids[t].val);
+                }
+                t = kids[t].next;
+                fk = fk + 1;
+            }
+            var fp: string = ll_tmp();
+            var fpsb: StringBuilder = sb_new();
+            sb_append_str(fpsb, "  ");
+            sb_append_str(fpsb, fp);
+            sb_append_str(fpsb, " = getelementptr inbounds ");
+            sb_append_str(fpsb, sty);
+            sb_append_str(fpsb, ", ptr ");
+            sb_append_str(fpsb, pp2);
+            sb_append_str(fpsb, ", i32 0, i32 ");
+            sb_append_i64(fpsb, vfi);
+            llfb(sb_to_str(fpsb));
+            // 聚合字段（variant/named/struct）按指针返回，与单载荷 as 路径一致：
+            // 下游 _is_/_as_ 辅助函数统一接收 blob 指针，不可按值 load。
+            if (ll_isagg(ftd)) {
+                return fp;
+            }
+            return ll_load(ll_td(ftd), fp);
+        }
         var ptd2: i64 = llv_ptd[vi];
         if (ptd2 >= 0) {
             if (ll_isagg(ptd2)) {
@@ -2820,8 +3077,19 @@ emit_llstmt fn(sid: i64) void {
         return;
     }
     if (n.kind == "var_decl") {
+        // 同函数内重名局部变量（shadowing）：从第二次起唯一化命名，避免 LLVM 局部名碰撞。
+        // conpat 载荷绑定（match 构造器解构出的 x）身处各臂独立代码块，不做唯一化重整。
+        var lname: string = n.sa;
+        if (em_in_fn) {
+            var lkey: string = sb_cat3(em_cur_fn, "::", n.sa);
+            if (g_conpat_bind_has(sid) == false && g_seen_has(lkey)) {
+                lname = sb_cat3(n.sa, "__", i2s(sid));
+                append(g_local_decls, sid);
+            }
+            append(g_seen, lkey);
+        }
         if (n.na >= 0) {
-            ll_local_decl(n.sa, resolve_type_desc(n.na), n.nb);
+            ll_local_decl(lname, resolve_type_desc(n.na), n.nb);
         }
         return;
     }

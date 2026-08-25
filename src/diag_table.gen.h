@@ -66,6 +66,7 @@ static const DiagDef DIAG_DEFS[] = {
   { "T-MAT-E740", "error", "MAT", "T_MATCH_UNKNOWN_CASE", "UNKNOWN_CASE", "unknown match case" },
   { "T-MAT-E741", "error", "MAT", "T_MATCH_ARM_TYPE", "ARM_TYPE", "match arm type mismatch" },
   { "T-MAT-E742", "error", "MAT", "T_MATCH_NONEXHAUSTIVE", "NONEXHAUSTIVE", "match is not exhaustive" },
+  { "T-MAT-E743", "error", "MAT", "T_MATCH_PATTERN_ARITY", "PATTERN_ARITY", "match constructor pattern arity mismatch" },
   { "T-MOD-E550", "error", "MOD", "T_IMPORT_NOT_FOUND", "IMPORT_NOT_FOUND", "import target not found" },
   { "T-MOD-E551", "error", "MOD", "T_IMPORT_CYCLE", "IMPORT_CYCLE", "cyclic import detected" },
   { "T-MOD-E552", "error", "MOD", "T_IMPORT_IO", "IMPORT_IO", "import I/O failure" },
@@ -106,6 +107,8 @@ static const DiagDef DIAG_DEFS[] = {
   { "T-PAR-E100", "error", "PAR", "T_PARSE_INVALID_EXPR", "INVALID_EXPR", "invalid expression" },
   { "T-PAR-E101", "error", "PAR", "T_PARSE_SYNTAX", "SYNTAX", "syntax error" },
   { "T-PAR-E102", "error", "PAR", "T_PARSE_REMOVED_SYNTAX", "REMOVED_SYNTAX", "this syntax has been removed" },
+  { "T-PAR-E103", "error", "PAR", "T_VARIANT_ABSTRACT_MARKER", "VARIANT_ABSTRACT_MARKER", "variant abstract marker `_` must be last" },
+  { "T-PAR-E104", "error", "PAR", "T_VARIANT_MULTI_PAYLOAD", "VARIANT_MULTI_PAYLOAD", "multi-payload variant case not implemented yet" },
   { "T-PIP-E860", "error", "PIP", "T_PIPE_RHS_NOT_FUNC", "RHS_NOT_FUNC", "pipe right operand is not a function value" },
   { "T-PIP-E861", "error", "PIP", "T_PIPE_RHS_ARITY", "RHS_ARITY", "pipe right function must take exactly one parameter" },
   { "T-PIP-E862", "error", "PIP", "T_PIPE_ARG_TYPE", "ARG_TYPE", "piped value type is not assignable to the parameter type" },
@@ -135,13 +138,14 @@ static const DiagDef DIAG_DEFS[] = {
   { "T-SEM-E209", "error", "SEM", "T_TAGID_DUP", "TAGID_DUP", "duplicate tag id" },
   { "T-SEM-E210", "error", "SEM", "T_TAGID_MIXED", "TAGID_MIXED", "mixed tag id styles" },
   { "T-SEM-E211", "error", "SEM", "T_VAR_NO_TYPE", "VAR_NO_TYPE", "variable has no type" },
+  { "T-SEM-E213", "error", "SEM", "T_VARIANT_RECURSIVE_VALUE", "VARIANT_RECURSIVE_VALUE", "variant case payload references its own type by value" },
   { "T-SEM-W212", "warning", "SEM", "W_OVERFLOW_LITERAL", "OVERFLOW_LITERAL", "integer literal overflow" },
   { "T-TIM-E700", "error", "TIM", "T_TIME_BAD_SPEC", "BAD_SPEC", "invalid time format specifier" },
   { "T-TIM-E701", "error", "TIM", "T_TIME_PARSE_UNSUPPORTED", "PARSE_UNSUPPORTED", "time parsing unsupported" },
   { "T-TIM-E702", "error", "TIM", "T_TIME_SPEC_TYPE", "SPEC_TYPE", "time specifier type mismatch" },
   { "T-TIM-E703", "error", "TIM", "T_TIME_ARG_TYPE", "ARG_TYPE", "time argument type mismatch" },
 };
-#define DIAG_COUNT 128
+#define DIAG_COUNT 132
 
 /* legacy (old semantic name) -> machine code alias table */
 static const struct { const char* legacy; const char* code; } DIAG_LEGACY[] = {
@@ -193,6 +197,7 @@ static const struct { const char* legacy; const char* code; } DIAG_LEGACY[] = {
   { "T_MATCH_UNKNOWN_CASE", "T-MAT-E740" },
   { "T_MATCH_ARM_TYPE", "T-MAT-E741" },
   { "T_MATCH_NONEXHAUSTIVE", "T-MAT-E742" },
+  { "T_MATCH_PATTERN_ARITY", "T-MAT-E743" },
   { "T_IMPORT_NOT_FOUND", "T-MOD-E550" },
   { "T_IMPORT_CYCLE", "T-MOD-E551" },
   { "T_IMPORT_IO", "T-MOD-E552" },
@@ -233,6 +238,8 @@ static const struct { const char* legacy; const char* code; } DIAG_LEGACY[] = {
   { "T_PARSE_INVALID_EXPR", "T-PAR-E100" },
   { "T_PARSE_SYNTAX", "T-PAR-E101" },
   { "T_PARSE_REMOVED_SYNTAX", "T-PAR-E102" },
+  { "T_VARIANT_ABSTRACT_MARKER", "T-PAR-E103" },
+  { "T_VARIANT_MULTI_PAYLOAD", "T-PAR-E104" },
   { "T_PIPE_RHS_NOT_FUNC", "T-PIP-E860" },
   { "T_PIPE_RHS_ARITY", "T-PIP-E861" },
   { "T_PIPE_ARG_TYPE", "T-PIP-E862" },
@@ -262,13 +269,14 @@ static const struct { const char* legacy; const char* code; } DIAG_LEGACY[] = {
   { "T_TAGID_DUP", "T-SEM-E209" },
   { "T_TAGID_MIXED", "T-SEM-E210" },
   { "T_VAR_NO_TYPE", "T-SEM-E211" },
+  { "T_VARIANT_RECURSIVE_VALUE", "T-SEM-E213" },
   { "W_OVERFLOW_LITERAL", "T-SEM-W212" },
   { "T_TIME_BAD_SPEC", "T-TIM-E700" },
   { "T_TIME_PARSE_UNSUPPORTED", "T-TIM-E701" },
   { "T_TIME_SPEC_TYPE", "T-TIM-E702" },
   { "T_TIME_ARG_TYPE", "T-TIM-E703" },
 };
-#define DIAG_LEGACY_COUNT 122
+#define DIAG_LEGACY_COUNT 126
 
 const DiagDef* diag_find(const char* code);        /* exact machine-code lookup */
 const DiagDef* diag_find_any(const char* id);      /* machine code OR legacy name */

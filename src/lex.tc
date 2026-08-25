@@ -54,6 +54,7 @@ init_keywords fn() void {
     kw_reg("agent", "KwAgent");
     kw_reg("var", "KwVar");
     kw_reg("const", "KwConst");
+    kw_reg("let", "KwLet");   // 动态常量：运行期绑定一次后不可变（三关键字模型；宪法「人类编程友好」）
     kw_reg("comptime", "KwComptime");
     kw_reg("meta", "KwComptime");   // Phase A: meta 元编程关键字，暂以 KwComptime 承载（别名；后续阶段独立语义/节点）
     kw_reg("type", "KwType");        // meta T: type 的「类型之类型」占位关键字（与 any 同语义）
@@ -402,14 +403,58 @@ tokenize fn(src: string) void {
             }
             i = ci + 1;
             col = ccol + 1;
-            if (str_len(cbody) != 1) {
+            if (str_len(cbody) == 0) {
                 diag_new("T-LEX-E007", "error",
-                    "字节字符字面量必须恰好是一个 0..255 的字节；多字节字符请用字符串或 `\\u{...}`",
+                    "字节字符字面量不能为空",
                     g_file, cl0 as i64, ccol0 as i64, cl0 as i64, col as i64);
                 push_tok("Integer", "0", cl0, ccol0);
                 continue;
             }
-            push_tok("Integer", i2s(cbody[0] as i64), cl0, ccol0);
+            if (str_len(cbody) == 1) {
+                // 单字节 → u8 字节字面量（与既有行为一致，不破坏现有 'A' 用法）
+                push_tok("Integer", i2s(cbody[0] as i64), cl0, ccol0);
+                continue;
+            }
+            // 多字节 UTF-8 → rune 字面量（Unicode 码点，内部 i32）；
+            // `'中'` 因此成为合法的 rune 字面量（见 docs/reference.md §2.4 rune）。
+            // 但整段必须恰好是「一个」合法 UTF-8 码点：前导字节决定应有的字节数，
+            // 正文长度须严丝合缝，续字节须落在 0x80..0xBF；否则（如 'ab' 两个 ASCII
+            // 字节、'中x' 多出尾字节、续字节非法）一律报 BAD_CHAR_LITERAL，绝不静默降级。
+            var rb0: i64 = cbody[0] as i64;
+            var ulen: i64 = 0;
+            var rcp: i64 = 0;
+            var okc: bool = true;
+            if (rb0 >= 0xC2 && rb0 <= 0xDF) {
+                ulen = 2;
+                rcp = ((rb0 & 0x1F) << 6) | (cbody[1] as i64 & 0x3F);
+            } else if ((rb0 & 0xF0) == 0xE0) {
+                ulen = 3;
+                rcp = ((rb0 & 0x0F) << 12) | ((cbody[1] as i64 & 0x3F) << 6) | (cbody[2] as i64 & 0x3F);
+            } else if ((rb0 & 0xF8) == 0xF0) {
+                ulen = 4;
+                rcp = ((rb0 & 0x07) << 18) | ((cbody[1] as i64 & 0x3F) << 12) | ((cbody[2] as i64 & 0x3F) << 6) | (cbody[3] as i64 & 0x3F);
+            } else {
+                okc = false;   // ASCII 前导字节（长度>1 却非单字节）或非法/过长短前导字节
+            }
+            if (okc == true && str_len(cbody) == ulen) {
+                // 续字节须落在 0x80..0xBF（剔除过长/非法序列）
+                var vci: i64 = 1;
+                while (vci < ulen) {
+                    var cb: i64 = cbody[vci] as i64;
+                    if ((cb & 0xC0) != 0x80) { okc = false; }
+                    vci = vci + 1;
+                }
+            } else {
+                okc = false;
+            }
+            if (okc == false) {
+                diag_new("T-LEX-E007", "error",
+                    "字符字面量非法：`'...'` 必须恰好一个字节（byte/u8）或一个合法 UTF-8 码点（rune），不能拼多个字节或含非法续字节",
+                    g_file, cl0 as i64, ccol0 as i64, cl0 as i64, col as i64);
+                push_tok("Integer", "0", cl0, ccol0);
+                continue;
+            }
+            push_tok("Integer", i2s(rcp), cl0, ccol0);
             continue;
         }
 

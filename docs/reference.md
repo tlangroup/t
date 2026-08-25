@@ -1,6 +1,6 @@
 # The t Language Reference
 
-> 版本 v1 (基于 `docs/spec.md` 设计终稿整理)
+> 版本 v1 (基于 `docs/spec.md` 设计终稿整理；`docs/spec.md` 已于 2026-08-01 废弃，本文档为唯一语义权威)
 > 本文档描述 **t** 编程语言的词法与语法形式，采用类似 *The Rust Reference* 的记号约定。
 > 文中每个语法产生式给出 **Syntax**、可选 **Where** 约束、以及 **Examples**。
 > 凡当前 `tc` 编译器尚未实现、仅属 spec 设计目标的条目，以 `⚠ spec-only` 标注；已实现条目以 `✅ tote` 标注。
@@ -87,7 +87,10 @@ Keyword:
   | "variant" -> KwVariant
   | "var" -> KwVar
   | "const" -> KwConst
-  | "auto" -> KwAuto
+  | "let" -> KwLet          // ✅ tc（2026-08-19 宪法采纳并实现：动态常量，不可变、运行期绑定一次）
+  | "auto" -> KwAuto        // ✅ 已同步（弃用别名，等价 let；新代码用 let）
+  | "match" -> KwMatch      // ✅ tc（表达式级模式分发，取代 switch）
+  | "when" -> KwWhen        // ✅ tc（match 卫语句 / 函数子句守卫关键字）
   | "any" -> KwAny
   | "type" -> KwType
   | "comptime" -> KwComptime
@@ -111,12 +114,14 @@ Keyword:
   | "void" -> KwVoid
   | "string" -> KwString
   | "StringBuilder" -> KwStringBuilder
+  | "cell" -> KwCell        // ⚠ spec-only（Notebook 单元块，见 §3.17；经 docs/design.md §2.8 提案，tc 未接入）
 ```
 
 > 关键字由 `lex` 阶段查表（`kw_lookup`，基于 `keywords_tbl`）判定。其权威列表即上方 `Keyword` 产生式中的字面量，由 `tools/gen_ebnf.mjs` 抽取生成 `out/ebnf.json`、`src/totter.tc` 解析后生成进 `gen/tc.tc`（totter 已放弃，该区间现冻结于 `src/tc.tc`、手写维护）。`i8`/`i16`/`i32`/`i64`/`u8`/`u16`/`u32`/`u64`/`f16`/`f32`/`f64`/`bool` 为**内建类型名**（见 §3.5），不是关键字。
 > ⚠ `meta` 与 `comptime` 同映射到 `KwComptime`（互为别名，`meta` 为推荐拼写）；`type` 与 `any` 同为「类型之类型」占位关键字。见 §3.6.3。
+> ⚠ `let` 关键字（动态常量）及「`var`/`const`/`let` 局部标注可选、由初始化器推断」为 2026-08-19 宪法采纳的设计，尚未接入 `tc`；当前唯一实装推断形式是 `auto`，将降级为 `let` 的弃用别名（见 §3.3）。
 > ⚠ `inf` / `nan` 不在 `keywords_tbl` 里，但词法阶段被直接归为**浮点字面量记号**（§2.4），效果等同保留字：不可作标识符、不可作字段名。
-> ⚠ spec-only（设计中、tc 未接入）：`union`、`enum` 完整语义、`comptime`/`meta` 表达式的**编译期求值**（CTFE，Phase B；Phase A 已可解析并降级发射）。
+> ⚠ spec-only（设计中、tc 未接入）：`union`、`enum` 完整语义、`comptime`/`meta` 表达式的**编译期求值**（CTFE，Phase B；Phase A 已可解析并降级发射）；`cell` 块（Notebook 单元作用域，见 §3.17，经 `docs/design.md` §2.8 提案）。
 
 ### 2.4 Literals（字面量） ✅ tc（2026-08-10 全量落地）
 
@@ -142,7 +147,7 @@ FloatSuffix:    "f32" | "f64"
 
 BoolLiteral:    "true" | "false"
 
-ByteCharLiteral: "'" (~['\\\u{0a}] | Escape) "'"        // 求值为 u8
+ByteCharLiteral: "'" (~['\\\u{0a}] | Escape) "'"        // 单字节 → u8；单合法 UTF-8 码点 → rune（见 §3.5.1）
 
 StringLiteral:  ShortString | LongString | RawShortString | RawLongString
 ShortString:    '"' (~["\\\u{0a}] | Escape)* '"'
@@ -162,14 +167,14 @@ Escape:         "\\" ("n" | "t" | "r" | "0" | "\\" | '"' | "'"
 - 指数记号 `e` / `E` 之后必须有（可选正负号加）至少一位十进制数字；`1e9` 是**浮点**字面量（词法归一化为 `1.0e9`）。
 - 小数点两侧都必须有数字：`1.` 与 `.5` 均**不是**字面量。前者拆成 `1` + `.`（保住 `1.method()` 形态的成员访问），后者拆成 `.` + `5`。
 - 位宽后缀只在 `u` / `i` / `f` 紧跟数字时才成立，故 `1if` 仍是 `1` + `if`、`10s` 仍是 `10` + `s`。非法后缀集、非十进制带浮点后缀、浮点带整数后缀均报 `T-LEX-E005`。
-- 无后缀整数字面量按**量级**推最小无符号类型（`≤255 → u8`、`≤65535 → u16`…）；带后缀则类型由后缀定死，`-128i8` / `-2147483648i32` 因此可写。超出后缀容量报 `T-LEX-E006`（有符号类型的下界 `-2^(N-1)` 仅在**紧邻**负号时放行）。
+- 无后缀整数字面量默认 `i32`（2026-08-19 宪法采纳，取代原「按量级推最小无符号类型 `≤255→u8`」规则 ⚠ 待 tc 同步）；仅当上下文需更宽位宽（如与 `i64`/`u64` 运算、赋值目标为更宽类型）时拓宽。带后缀则类型由后缀定死，`-128i8` / `-2147483648i32` 因此可写。超出后缀容量报 `T-LEX-E006`（有符号类型的下界 `-2^(N-1)` 仅在**紧邻**负号时放行）。
 - `f32` 后缀脱糖为 `as f32`（保留 f64 常量 + 转换，因为 LLVM 的 `float` 常量要求字面量在 f32 中精确可表示）；`f64` 后缀是恒等。
 - `inf` / `nan` 是 IEEE-754 特殊值字面量，词法上归为浮点记号，因此**不能**再作标识符；负无穷写 `-inf`。
 
 **字符与字符串**
 
-- `'A'` 是**字节**字面量，类型 `u8`，必须恰好一个 0..255 的字节（`'ab'` / `'中'` 报 `T-LEX-E007`）。
-- 字符串字面量为只读 UTF-8（`string`），`StringBuilder` 为可变拼接类型。
+- 字符字面量 `'...'`：必须恰好是「一个字节」（求值为 `u8`，如 `'A'`）或「一个合法 UTF-8 码点」（求值为 `rune`，如 `'中'`）。`'ab'`（两 ASCII 字节拼）、`'中x'`（多出尾字节）、续字节非 `0x80..0xBF` 的非法序列一律报 `T-LEX-E007`，**绝不静默降级**（`f91_lex_bad_char_literal`）。单字节 `'A'` 同时兼容 `u8` / `rune` / `i32`（按目标类型选，见 §3.5.1）；多字节码点只能落 `rune` / `i32`（超出 `u8` 容量，赋 `u8` 报溢出）。`rune` / `bytes` 均无字面量：`bytes` 只能经 `BytesBuilder` 构造（见 §3.5.1）。
+- 字符串字面量为只读 UTF-8（`string`），`StringBuilder` 为可变拼接类型；其二进制等价物是 `bytes` / `BytesBuilder`（见 §3.5.1）。
 - 短串（`"..."` / `r"..."`）内**不允许裸换行**，违者报 `T-LEX-E003`；跨行请用长串 `"""..."""` 或 `r"""..."""`。
 - 原始串 `r"..."` 内**不做任何转义处理**，反斜杠原样保留（`r"C:\path\n"` 是 11 个字符），故原始串无法表达自身的结束引号。
 - 未终结的短串报 `T-LEX-E000`，未终结的长串/原始长串报 `T-LEX-E008`。
@@ -319,13 +324,13 @@ DeclBodyDispatch:
 - ⚠ 走 `mk_` 路径时，构造块内各 `expr` 的**求值顺序会被重排为 Node 字段序**（`sa sb sc has_* ia ib ba bb na..nd la..lc`），而非书写顺序。因此块内含**有副作用**的表达式时须自查重排后语义不变。当前唯一的副作用调用是 `list_concat`（就地改写 `kids` 链），它在 `flag_decl`/`struct_decl` 重排后仍排在所有读注解链的 `bp_*`/`str_or` 之后，故安全。
 - `// @rule <name> ... fold=bin`：额外元数据，标记该规则是**左结合二元运算塔**（`base (op base)*` 形状）。生成器发射 `while (op 集合) { left = mk_bin(op, left, parse_base(), ti); }`；运算符字面量即 `mk_bin` 的 op 串（如 `"<<"`→`"<<"`、`"&&"`→`"&&"`），其 token kind 由 `tools/gen_ebnf.mjs` 的 `OPKIND` 表映射（覆盖结构标点表）。
 - `// @rule <name> ... fold=pre`：额外元数据，标记该规则是**前缀一元折叠**（`(op)* base` 形状，右结合递归）。生成器发射 `if (cur_t() in ops) { op; operand = parse_<self>(); return mk_un(op, operand, ti); } return parse_<base>();`；运算符字面量即 `mk_un` 的 op 串（如 `"!"`→`"!"`、`"-"`→`"-"`、`"~"`→`"~"`），其 token kind 由 `OPKIND` 映射（`!`→Not、`-`→Minus、`~`→BitNot）。递归目标为规则自身（允许 `!!x` 堆叠），无 op 时落到 `base`。
-- `// @rule <name> ... fold=post`：额外元数据，标记该规则是**左结合后缀折叠**（`base ( lead nt | lead nt | ... )* ( lead nt )?` 形状）。每个后缀分支 = `引导 token 字面量 + 胶水非终结符`；生成器发射 `var e = parse_base(); while (引导 token 集合) { var ti = advance_i(); e = parse_<胶水>(e, ti); }`，尾部 `( lead nt )?` 可选分支发射单次 `if`。胶水 helper（如 `post_member`/`post_index`/`post_call`/`post_cast`）为手写函数，签名 `(e: i64, ti: i64) -> i64`，负责消费引导 token 之后的剩余形态并返回折叠后的节点。`fold` 当前支持 `bin`/`pre`/`post`/`prim`/`disp` 五类通用模式，以及语句体专用的 `whilex`/`returnx`（纯序列 + node_at）/ `ifx`（if/else-if 链）/ `forx`（peek 前瞻分流两段式）/ `swx`（case/default 循环聚合）五种专用模式。
-- `// @rule <name> ... fold=prim`：额外元数据，标记该规则是**终端驱动 dispatch**（`term nt | term nt | ...` 形状）。每个分支 = `分发终端 + 胶水非终结符`；终端可为命名终端（`Integer`/`Float`/`String`/`Ident`）或字面量（关键字/标点）。生成器发射 `if (cur_t() == "K") { var ti = advance_i(); return parse_<胶水>(ti); }` 链，末尾发射错误兜底（`eprint` + `exit(1)`）。胶水 helper 为手写函数，签名 `(ti: i64) -> i64`，负责分发 token 之后的剩余形态并构造节点。
-- `// @rule <name> ... fold=disp`：额外元数据，标记该规则是**守卫式分发**（`term nt | term nt | ... | nt` 形状）。与 `fold=prim` 的区别：骨架**不消费**引导 token（各目标函数自行消费），故发射 `if (cur_t() == "K") { return parse_<目标>(); }` 链；末尾**裸非终结符分支**为兜底（`return parse_<兜底>();`），无错误兜底。目标函数签名一律 `() -> i64`。用于 `statement` 这类「引导 token 只做路由、解析体各自独立」的规则。
+- `// @rule <name> ... fold=post`：额外元数据，标记该规则是**左结合后缀折叠**（`base ( lead nt | lead nt | ... )* ( lead nt )?` 形状）。每个后缀分支 = `引导 token 字面量 + 胶水非终结符`；生成器发射 `var e = parse_base(); while (引导 token 集合) { var ti = advance_i(); e = parse_<胶水>(e, ti); }`，尾部 `( lead nt )?` 可选分支发射单次 `if`。胶水 helper（如 `post_member`/`post_index`/`post_call`/`post_cast`）为手写函数，签名 `(e: i64, ti: i64) i64`，负责消费引导 token 之后的剩余形态并返回折叠后的节点。`fold` 当前支持 `bin`/`pre`/`post`/`prim`/`disp` 五类通用模式，以及语句体专用的 `whilex`/`returnx`（纯序列 + node_at）/ `ifx`（if/else-if 链）/ `forx`（peek 前瞻分流两段式）/ `swx`（case/default 循环聚合）五种专用模式。
+- `// @rule <name> ... fold=prim`：额外元数据，标记该规则是**终端驱动 dispatch**（`term nt | term nt | ...` 形状）。每个分支 = `分发终端 + 胶水非终结符`；终端可为命名终端（`Integer`/`Float`/`String`/`Ident`）或字面量（关键字/标点）。生成器发射 `if (cur_t() == "K") { var ti = advance_i(); return parse_<胶水>(ti); }` 链，末尾发射错误兜底（`eprint` + `exit(1)`）。胶水 helper 为手写函数，签名 `(ti: i64) i64`，负责分发 token 之后的剩余形态并构造节点。
+- `// @rule <name> ... fold=disp`：额外元数据，标记该规则是**守卫式分发**（`term nt | term nt | ... | nt` 形状）。与 `fold=prim` 的区别：骨架**不消费**引导 token（各目标函数自行消费），故发射 `if (cur_t() == "K") { return parse_<目标>(); }` 链；末尾**裸非终结符分支**为兜底（`return parse_<兜底>();`），无错误兜底。目标函数签名一律 `() i64`。用于 `statement` 这类「引导 token 只做路由、解析体各自独立」的规则。
 
 ```ebnf
 // @rule type_alias params=(name: string, anns: i64) ret=i64 node=TypeAliasDecl eatFirst=false
-type_alias :: type ";"
+type_alias : type ";"
 {
     sa = name
     la = anns
@@ -333,7 +338,7 @@ type_alias :: type ";"
 }
 
 // @rule variant_decl params=(name: string, anns: i64) ret=i64 node=VariantDecl eatFirst=true
-variant_decl :: anns "{" case* "}"
+variant_decl : anns "{" case* "}"
 {
     sa = name
     la = list_concat(anns, @anns)
@@ -341,7 +346,7 @@ variant_decl :: anns "{" case* "}"
 }
 
 // @rule case params=(ci: i64) ret=i64 node=VC eatFirst=false
-case :: Ident ( "(" type ")" )? anns ("," | ";")?
+case : Ident ( "(" type ")" )? anns ("," | ";")?
 {
     sa = @Ident
     na = @type
@@ -350,7 +355,7 @@ case :: Ident ( "(" type ")" )? anns ("," | ";")?
 }
 
 // @rule flag_decl params=(name: string, anns: i64) ret=i64 node=FlagDecl eatFirst=true
-flag_decl :: ( "[" Ident "]" )? anns "{" slot* "}"
+flag_decl : ( "[" Ident "]" )? anns "{" slot* "}"
 {
     sa = name
     la = list_concat(anns, @anns)
@@ -359,7 +364,7 @@ flag_decl :: ( "[" Ident "]" )? anns "{" slot* "}"
 }
 
 // @rule slot params=() ret=i64 node=SL eatFirst=false
-slot :: Ident ":" Integer anns ("," | ";")?
+slot : Ident ":" Integer anns ("," | ";")?
 {
     sa = @Ident
     ia = parse_int_str(@Integer)
@@ -369,7 +374,7 @@ slot :: Ident ":" Integer anns ("," | ";")?
 }
 
 // @rule flag_set_decl params=(name: string, anns: i64) ret=i64 node=FlagSetDecl eatFirst=true
-flag_set_decl :: anns "{" setmember* "}"
+flag_set_decl : anns "{" setmember* "}"
 {
     sa = name
     la = list_concat(anns, @anns)
@@ -377,7 +382,7 @@ flag_set_decl :: anns "{" setmember* "}"
 }
 
 // @rule setmember params=() ret=i64 node=SL eatFirst=false
-setmember :: Ident ":" Integer anns ("," | ";")?
+setmember : Ident ":" Integer anns ("," | ";")?
 {
     sa = @Ident
     ia = parse_int_str(@Integer)
@@ -387,7 +392,7 @@ setmember :: Ident ":" Integer anns ("," | ";")?
 }
 
 // @rule union_decl params=(name: string, anns: i64) ret=i64 node=UnionDecl eatFirst=true
-union_decl :: anns "{" umember* "}"
+union_decl : anns "{" umember* "}"
 {
     sa = name
     la = list_concat(anns, @anns)
@@ -395,7 +400,7 @@ union_decl :: anns "{" umember* "}"
 }
 
 // @rule umember params=() ret=i64 node=M eatFirst=false
-umember :: Ident ":" type anns ("," | ";")?
+umember : Ident ":" type anns ("," | ";")?
 {
     sa = @Ident
     na = @type
@@ -405,7 +410,7 @@ umember :: Ident ":" type anns ("," | ";")?
 // @rule struct_decl params=(name: string, anns: i64, layout: string) ret=i64 node=StructDecl eatFirst=true
 // @bitpack 检测下沉为手写 helper（bp_is2/bp_type2/bp_has_type2 在两个注解列表上查找，
 // 避免为检测而重复 list_concat）；成员形态由 sfield 的 FIRST 守卫 alt 区分，无需结构体级状态。
-struct_decl :: anns "{" sfield* "}"
+struct_decl : anns "{" sfield* "}"
 {
     sa = name
     ba = bp_is2(anns, @anns)
@@ -421,7 +426,7 @@ struct_decl :: anns "{" sfield* "}"
 // 类型成员以其余 token 开头——FIRST 可区分，故用 alt 而非结构体级 is_bitpack 状态。
 // mk=inline：sfield_na 在位宽分支里会 mk_scalar("void") 分配节点，若走 mk_F(...) 则
 // 该实参先于 F 自身求值，void 节点索引会挪到 F 之前 → AST 漂移。故保留内联构造。
-sfield :: Ident ":" ( Integer | type ) anns ";"
+sfield : Ident ":" ( Integer | type ) anns ";"
 {
     sa = @Ident
     na = sfield_na(@Integer, @type)
@@ -434,41 +439,41 @@ sfield :: Ident ":" ( Integer | type ) anns ";"
 // 运算符字面量即 mk_bin 的 op 串（"&&"→"&&"、"<<"→"<<"），token kind 由 gen_ebnf 的 OPKIND 映射。
 
 // @rule or params=() ret=i64 node=_ eatFirst=false fold=bin
-or :: and ( "||" and )*
+or : and ( "||" and )*
 
 // @rule and params=() ret=i64 node=_ eatFirst=false fold=bin
-and :: bitor ( "&&" bitor )*
+and : bitor ( "&&" bitor )*
 
 // @rule bitor params=() ret=i64 node=_ eatFirst=false fold=bin
-bitor :: bitxor ( "|" bitxor )*
+bitor : bitxor ( "|" bitxor )*
 
 // @rule bitxor params=() ret=i64 node=_ eatFirst=false fold=bin
-bitxor :: bitand ( "^" bitand )*
+bitxor : bitand ( "^" bitand )*
 
 // @rule bitand params=() ret=i64 node=_ eatFirst=false fold=bin
-bitand :: eq ( "&" eq )*
+bitand : eq ( "&" eq )*
 
 // @rule eq params=() ret=i64 node=_ eatFirst=false fold=bin
-eq :: cmp ( ("==" | "!=") cmp )*
+eq : cmp ( ("==" | "!=") cmp )*
 
 // @rule cmp params=() ret=i64 node=_ eatFirst=false fold=bin
-cmp :: shift ( ("<" | ">" | "<=" | ">=") shift )*
+cmp : shift ( ("<" | ">" | "<=" | ">=") shift )*
 
 // @rule shift params=() ret=i64 node=_ eatFirst=false fold=bin
-shift :: add ( ("<<" | ">>") add )*
+shift : add ( ("<<" | ">>") add )*
 
 // @rule add params=() ret=i64 node=_ eatFirst=false fold=bin
-add :: mul ( ("+" | "-") mul )*
+add : mul ( ("+" | "-") mul )*
 
 // @rule mul params=() ret=i64 node=_ eatFirst=false fold=bin
-mul :: unary ( ("*" | "/" | "%") unary )*
+mul : unary ( ("*" | "/" | "%") unary )*
 
 // ── 表达式前缀一元运算符（fold=pre：右结合前缀折叠）──
 // 形状：( (op | op | ...) )* base  →  if (cur in ops) { op; operand = parse_self(); return mk_un(op, operand, ti); } return parse_base();
 // 运算符字面量（"!"/"-"/"~"）token kind 由 OPKIND 映射（!→Not、-→Minus、~→BitNot）。
 
 // @rule unary params=() ret=i64 node=_ eatFirst=false fold=pre
-unary :: ( "!" | "-" | "~" )* postfix
+unary : ( "!" | "-" | "~" )* postfix
 
 // ── 表达式后缀（fold=post：左结合后缀折叠，胶水 helper 下沉）──
 // 形状：base ( lead nt | ... )* ( lead nt )?  →  e = parse_base(); while (lead 集合) { ti = advance_i(); e = parse_<nt>(e, ti); } 尾部可选分支单次 if。
@@ -476,45 +481,45 @@ unary :: ( "!" | "-" | "~" )* postfix
 // 胶水 helper（手写，GEN 区外）：post_member（.成员）、post_index（[下标]）、post_call（(参数表)）、post_cast（as 类型转换）。
 
 // @rule postfix params=() ret=i64 node=_ eatFirst=false fold=post
-postfix :: primary ( "." post_member | "[" post_index | "(" post_call )* ( "as" post_cast )?
+postfix : primary ( "." post_member | "[" post_index | "(" post_call )* ( "as" post_cast )?
 
 // ── 表达式基底（fold=prim：终端驱动 dispatch，分支体下沉）──
 // 形状：term nt | term nt | ...  →  if (cur_t()==K) { ti = advance_i(); return parse_<nt>(ti); } 链 + 错误兜底（eprint + exit(1)）。
 // 分发 token：Integer/Float/String（命名终端）、"true"→KwTrue、"false"→KwFalse、"null"→KwNull（关键字表）、Ident→Identifier、"("→LParen、"["→LBracket（PUNCT 表）。
-// 胶水 helper（手写，GEN 区外，签名 (ti: i64) -> i64）：prim_int/prim_float/prim_str/prim_true/prim_false/prim_null/prim_ident（含 struct_lit 前瞻）/prim_paren/prim_array（含 map_lit 前瞻）。
+// 胶水 helper（手写，GEN 区外，签名 (ti: i64) i64）：prim_int/prim_float/prim_str/prim_true/prim_false/prim_null/prim_ident（含 struct_lit 前瞻）/prim_paren/prim_array（含 map_lit 前瞻）。
 
 // @rule primary params=() ret=i64 node=_ eatFirst=false fold=prim
-primary :: Integer prim_int | Float prim_float | String prim_str | "true" prim_true | "false" prim_false | "null" prim_null | Ident prim_ident | "(" prim_paren | "[" prim_array
+primary : Integer prim_int | Float prim_float | String prim_str | "true" prim_true | "false" prim_false | "null" prim_null | Ident prim_ident | "(" prim_paren | "[" prim_array
 
 // ── 语句顶层分发（fold=disp：守卫式分发，骨架不消费引导 token）──
 // 形状：term nt | ... | nt（裸 NT 兜底）→ if (cur_t()==K) { return parse_<nt>(); } 链 + return parse_<兜底>();
-// 目标函数一律签名 () -> i64、自行消费引导 token：if/for/while/return 为既有函数原样路由；
+// 目标函数一律签名 () i64、自行消费引导 token：if/for/while/return 为既有函数原样路由；
 // break/continue/defer/comptime/block/var/const 为下沉胶水（block_stmt 用 pos 做位点故不 advance）。
 
 // @rule statement params=() ret=i64 node=_ eatFirst=false fold=disp
-statement :: "if" if_stmt | "for" for_stmt | "while" while_stmt | "return" return_stmt | "break" break_stmt | "continue" continue_stmt | "defer" defer_stmt | "comptime" comptime_stmt | "{" block_stmt | "var" var_stmt | "const" const_stmt | expr_or_assign_stmt
+statement : "if" if_stmt | "for" for_stmt | "while" while_stmt | "return" return_stmt | "break" break_stmt | "continue" continue_stmt | "defer" defer_stmt | "comptime" comptime_stmt | "{" block_stmt | "var" var_stmt | "const" const_stmt | expr_or_assign_stmt
 
 // ── 语句体内部结构（fold=whilex/returnx：纯序列形态，含 node_at 守卫）──
 // 形状：while "(" expr ")" block  /  return expr? ";"  →  通用骨架 + 节点构造，eatFirst 吃掉引导关键字。
 
 // @rule while_stmt params=() ret=i64 node=While eatFirst=true fold=whilex
-while_stmt :: "(" expr ")" block
+while_stmt : "(" expr ")" block
 
 // @rule return_stmt params=() ret=i64 node=Return eatFirst=true fold=returnx
-return_stmt :: expr? ";"
+return_stmt : expr? ";"
 
 // ── 语句体内部结构（fold=ifx：if/else-if 链，else 分支嵌套 if 须包成单元素 list 兜底）──
 // 形状：if "(" expr ")" block ("else" (block | if_stmt))?  →  守卫式骨架识别 else/else-if，递归自身。
 
 // @rule if_stmt params=() ret=i64 node=If eatFirst=true fold=ifx
-if_stmt :: "(" expr ")" block ("else" (block | if_stmt))?
+if_stmt : "(" expr ")" block ("else" (block | if_stmt))?
 
 // ── 语句体内部结构（fold=forx：peek 前瞻分发两段式 for：Identifier [","Ident] KwIn=for_each，否则 C 式三子句）──
 // 形状：for "(" ( Ident ("," Ident)? "in" expr | (expr? ";" expr? ";" expr?) ) ")" block  →  守卫式骨架按 peek_t(1)/peek_t(3) 分流。
 // 双变量形式仅对 map 有意义：第一个绑定键、第二个绑定值（按插入序）。
 
 // @rule for_stmt params=() ret=i64 node=For eatFirst=true fold=forx
-for_stmt :: "(" ( Ident ("," Ident)? "in" expr | expr? ";" expr? ";" expr? ) ")" block
+for_stmt : "(" ( Ident ("," Ident)? "in" expr | expr? ";" expr? ";" expr? ) ")" block
 
 // 🚫 switch_stmt（fold=swx）已于 2026-08-01 废弃并从编译器删除，由 match 表达式取代。
 //    其 @rule / @node 条目连同 KwSwitch/KwCase/KwDefault 三个关键字已从本文法移除，
@@ -557,7 +562,7 @@ for_stmt :: "(" ( Ident ("," Ident)? "in" expr | expr? ";" expr? ";" expr? ) ")"
 槽本身的机器可读定义（`Node` 结构字段序 = 本表行序；totter 由此生成（totter 已放弃，现冻结于 `src/tc.tc`）`Node` 结构体字段、`node_new` 初值，并驱动 `slot_ty`/`slot_default` 查表）。每行 `// @slot <槽名> <记法> <t类型> <初值> [字段注释…]`；锚点槽（记法 `anchor`）不参与 `@node` 标注与构造器参数，仅由 `node_at` 写入：
 
 ```ebnf
-SlotTable ::
+SlotTable :
   // @slot sa str string ""
   // @slot sb str string ""
   // @slot sc str string ""
@@ -581,7 +586,7 @@ SlotTable ::
 ```
 
 ```ebnf
-NodeTable ::
+NodeTable :
   // @node A sa=str la=list
   // @node CS na=node la=list
   // @node EN na=node nb=node
@@ -667,7 +672,7 @@ NodeTable ::
 | `llbits` | LLVM 表示位宽（`bool` 按 i8 存储，故为 8） |
 
 ```ebnf
-ScalarTable ::
+ScalarTable :
   // @scalar u8   int   8  uint8_t  i8     8
   // @scalar u16  int   16 uint16_t i16    16
   // @scalar u32  int   32 uint32_t i32    32
@@ -683,7 +688,7 @@ ScalarTable ::
   // @scalar void none  -1 void     i64    64
 ```
 
-`// @sfn <fn> <ret> <mode> <filter> <col> <fallback> <region>` 声明由上表派生的查询函数。所有派生函数签名固定为 `<fn> fn(name: string) -> <ret>`。
+`// @sfn <fn> <ret> <mode> <filter> <col> <fallback> <region>` 声明由上表派生的查询函数。所有派生函数签名固定为 `<fn> fn(name: string) <ret>`。
 
 - `filter`：`all` = 全表；`scalar` = `class != none`；`int` / `float` / `bool` = 按 class 取。
 - `col`：取值列（`pred` 模式不取值，写 `-`）。
@@ -696,7 +701,7 @@ ScalarTable ::
 - `region`：所属 `GEN:` 生成区间名。同一区间内的函数按表序发射、函数间空一行。区间拆成四段只为贴合各函数在 `tc.tc` 中的既有位置，不影响语义。
 
 ```ebnf
-ScalarFnTable ::
+ScalarFnTable :
   // @sfn is_scalar_name bool   pred   scalar -      -    scalar_pred
   // @sfn is_int_name    bool   pred   int    -      -    scalar_bits
   // @sfn is_float_name  bool   pred   float  -      -    scalar_bits
@@ -705,6 +710,8 @@ ScalarFnTable ::
   // @sfn scalar_to_ll   string group1 all    ll     i64  scalar_llmap
   // @sfn ll_bits        i64    group1 all    llbits 64   scalar_llmap
 ```
+
+> 注：`rune` 是概念上的标量（内部 i32、有符号、归入整数族），但**不进入**上表 `ScalarTable`——它的位宽/符号查询走 `base.tc` 的 `ll_bits` / `ll_signed` 专用分支。`bytes` / `BytesBuilder` **不是标量**（见 §3.5.1）：`bytes` 是与 `string` 同布局 `{ptr, len}` 16B 的值视图（类型独立，`kind=Bytes`、`cat=bytes`），`BytesBuilder` 复用 `TSb*` 堆缓冲；二者在 §2.11/§2.12 经专用分支分派，不在 `ScalarTable` 投影内。
 
 ### 2.11 Type rules（类型检查器规则表）✅ tote
 
@@ -734,7 +741,7 @@ ScalarFnTable ::
 发射体固定为 `if (n.kind == "<kind>") {` + `return <表达式>;` + `}`。
 
 ```ebnf
-TypeRuleTable ::
+TypeRuleTable :
   // @trule type_infer1  infer   float      scalar f64        -           -
   // @trule type_infer1  infer   string     mk     String     -           -
   // @trule type_infer1  infer   bool       scalar bool       -           -
@@ -760,7 +767,7 @@ TypeRuleTable ::
 - `post`：注册后追加调用的钩子（`-` 表示无）。`VariantDecl` 借此登记 case 的合成构造器/判别器符号。
 
 ```ebnf
-DeclRegTable ::
+DeclRegTable :
   // @dreg StructDecl      type  named  Struct  -       -
   // @dreg EnumDecl        type  und    Enum    n.sb    -
   // @dreg FlagDecl        type  und    Flag    n.sb    -
@@ -792,7 +799,7 @@ emitter 侧 `resolve_type_desc` / `expr_type_desc` 的 `td_*` 单行分派规则
 ident/index/call 尾部/binary/member 分支（作用域查找、结构遍历、诊断逻辑）留手写。
 
 ```ebnf
-TdRuleTable ::
+TdRuleTable :
   // @tdrule td_scalar 8  n.sa   string        one mk    string -
   // @tdrule td_scalar 8  n.sa   void          one mk    void   -
   // @tdrule td_scalar 8  n.sa   StringBuilder one named named  TSb*
@@ -851,7 +858,7 @@ TdRuleTable ::
 
 ### 3.1 Items（顶层条目）
 
-> 本节气法由 `decl.md` / `decl_var.md` / `decl_struct.md` / `decl_enum.md` / `decl_flag.md` / `decl_variant.md` / `decl_typealias.md` / `decl_import.md` / `decl_func.md` 经 L-15 采用并并入（原草稿已标记失效）。`match.md` 的函数子句声明形式已于 2026-08-01 用户指令对齐为本节气法（L-04 声明层张力已消解）；match 表达式与函数子句的完整语义**已在 `src/tc.tc` 实装且门禁覆盖**（L-14 已满足），但据 L-15 第5条仍需用户显式「规则采纳」方可并入本手册，故 `match.md` 现维持 DRAFT **待采纳**（而非「未实现」）。代码模块导入 `ImportDecl` 由 `docs/syntax/drafts/module.md` 经 L-15 采用并并入 §3.13（原草稿已标记失效）。函数声明形式固定为 `Name fn(...) -> Ret`（并置式、禁止重载），与 `src/tc.tc` 一致。
+> 本节气法由 `decl.md` / `decl_var.md` / `decl_struct.md` / `decl_enum.md` / `decl_flag.md` / `decl_variant.md` / `decl_typealias.md` / `decl_import.md` / `decl_func.md` 经 L-15 采用并并入（原草稿已标记失效）。`match.md` 的函数子句声明形式已于 2026-08-01 用户指令对齐为本节气法（L-04 声明层张力已消解）；match 表达式与函数子句的完整语义**已在 `src/tc.tc` 实装且门禁覆盖**（L-14 已满足），但据 L-15 第5条仍需用户显式「规则采纳」方可并入本手册，故 `match.md` 现维持 DRAFT **待采纳**（而非「未实现」）。代码模块导入 `ImportDecl` 由 `docs/syntax/drafts/module.md` 经 L-15 采用并并入 §3.13（原草稿已标记失效）。函数声明形式固定为 `Name fn(...) Ret`（并置式、禁止重载），与 `src/tc.tc` 一致。
 
 ```ebnf
 ModuleItem:
@@ -873,7 +880,7 @@ FuncName: IDENTIFIER
 Param:    ParamName ":" Type
 ```
 
-- 函数用**并置形式** `Name fn(...) Ret { ... }` 声明（spec §1.3：参数类型后置、禁止重载、禁止隐式返回、所有分支显式 `return`）。返回类型前的 `->` 记号**已弃用（deprecated）但仍可选接受**，旧代码 `Name fn(...) -> Ret { ... }` 同样合法。
+- 函数用**并置形式** `Name fn(...) Ret { ... }` 声明（spec §1.3：参数类型后置、禁止重载、禁止隐式返回、所有分支显式 `return`）。返回类型**紧跟参数表、无 `->` 记号**（规范唯一写法）。旧代码使用的 `Name fn(...) -> Ret { ... }` 箭头形式**已于编译器移除、不再被接受**，统一改用无箭头并置式 `Name fn(...) Ret { ... }`。
 - ✅ tote：已支持 `fn` 声明、`@main` 入口、`@test` 等注解；`enum` 完整语义、`union` 标记但未实装。
 
 ```ebnf
@@ -943,8 +950,16 @@ VariantCase:
     | CaseName                               // 单元 case
 ```
 
-- ✅ tote：已实装 variant，编译器为每个 case 生成 `Name_from_CaseX`、`Name_is_CaseX`、`Name_as_CaseX` 自由函数（`_tag` 为声明下标，0 起）。
-- ⚠ spec-only：Variant 上 `@derive` 暂未支持。
+- ✅ tc：已实装 variant，编译器为每个 case 生成自由函数（双后端共用，是 `match` 构造器解构的脱糖目标）：
+  - `Name_from_Case(...)` 构造器——**多载荷**时形参为各载荷类型，单元 case 无参；
+  - `Name_is_Case(self)` 判别器（返回 `bool`，按 `_tag` 比较）；
+  - `Name_as_Case(self)` 取载荷——**单载荷**返回该载荷类型；**多载荷**逐字段 `Name_as_Case_fK(self)`（K 从 0 起、位置序）。
+- **match 构造器解构（✅ tc）**：scrutinee 静态类型为 variant 时，模式位首字母大写标识符按构造器解析；带 `(` 即构造器模式，参数**位置式**按声明序绑定到该 case 载荷（数量不符报 `T_MATCH_PATTERN_ARITY`）；支持**嵌套**（`Tree(Leaf(x))` / `Node(l, Node(Leaf(y), r))`）。各臂表达式须推断为同一结果类型（沿用 `T_MATCH_ARM_TYPE`）。
+- **穷尽性（✅ tc，A1 推广）**：variant 所有具名 case 须被**无守卫**臂全覆盖，否则须有 `_` 通配臂兜底，否则报 `T_MATCH_NONEXHAUSTIVE` 并指名未覆盖 case（如 `unhandled case(s) Shape.Rect, Shape.Empty`）。带 `when` 守卫的臂不计覆盖。
+- **抽象 variant（✅ tc）**：variant 声明末位写 `_` 即标记为抽象（open/非穷尽），`match` 对该类型**豁免穷尽性**（可只覆盖部分 case、无需 `_` 兜底臂）；非末位的 `_` 报 `T_VARIANT_ABSTRACT_MARKER`。抽象 variant 与封闭 variant 共用同一套 `from`/`is`/`as` 生成。
+- **递归 variant（✅ tc）**：case 载荷可**指针形态**自引用 `List variant { Nil; Cons(i64, *List) }`（前向引用按名解析，双后端 `Nil→0` 跑通）。**值形态**自引用（裸 `Self` 或 `[N]Self`）报 `T_VARIANT_RECURSIVE_VALUE`（避免无限大小 struct 静默错编，L-09 零 UB）。
+- **`when` 守卫（✅ tc）**：`match` 臂可加 `when <bool-expr>` 守卫，沿用 match.md 的白名单（仅 `bool` 谓词）。
+- ⚠ **未实装（设计预留，详见草稿 `docs/syntax/drafts/adt_variant.md`）**：① `@repr(uN)` 收窄 tag 位宽（报 `T-ANN-E452`）；② `@derive(...)` 目标集含 variant（报 `T-ANN-E452`）；③ 限定写法构造器模式 `Variant.Case(x)`（报 `T-PAR-E101`）。上述三项为后续里程碑，不影响已落地的单/多载荷、嵌套解构、穷尽性、递归指针、抽象 variant。
 
 #### 3.1.1.2 struct 方法声明语法糖（`Self` + 名字重整）✅ tc（M-M）
 
@@ -1023,6 +1038,7 @@ Statement:
       ";"                                   // 空语句（仍须分号）
     | VarDeclStatement
     | ConstDeclStatement
+    | LetDeclStatement
     | AutoDeclStatement
     | AssignStatement
     | ExpressionStatement
@@ -1034,30 +1050,38 @@ Statement:
     | ContinueStatement                      // ✅ tote
     | DeferStatement                         // ✅ tote（已实装，L-15 采用）
     | ComptimeStatement                      // ⚠ partial（块节点已定义，表达式级语义 spec-only）
+    | CellStatement                          // ⚠ spec-only（Notebook 单元块，见 §3.17；经 docs/design.md §2.8 提案）
     | Block
 
 Block: "{" Statement* "}"                   // 语句块
-VarDeclStatement:   "var" Ident ":" Type ("=" Expression)? ";"
-ConstDeclStatement: "const" Ident ":" Type "=" Expression ";"
-AutoDeclStatement:   "auto" Ident "=" Expression ";"   // ✅ tc（M-auto）：类型由初始化器推断，禁止显式标注
+VarDeclStatement:   "var" Ident (":" Type)? ("=" Expression)? ";"   // 局部标注可选（推断），顶层/全局/struct 字段须标注
+ConstDeclStatement: "const" Ident (":" Type)? "=" Expression ";"     // 静态常量；局部标注可选（⚠ 待 tc 同步）
+LetDeclStatement:   "let" Ident (":" Type)? "=" Expression ";"       // 动态常量（⚠ 待实现：2026-08-19 宪法采纳）
+AutoDeclStatement:  "auto" Ident "=" Expression ";"                  // 弃用别名，等价 let（新代码用 let）
 AssignStatement:    Expression "=" Expression ";"
 ReturnStatement:    "return" Expression? ";"
 ExpressionStatement: Expression ";"
 DeferStatement:     "defer" Block            // 延迟块，**函数级**：登记到当前函数延迟栈，于 return/函数尾按 LIFO 执行（写在 if/while 块内也到函数退出才触发，非块级作用域退出）
 ComptimeStatement:  "comptime" Block         // 编译期块（块内语句编译期求值）
+CellStatement:      "cell" Ident "{" (Statement | Item)* "}"   // ⚠ spec-only：带名作用域块（Notebook 单元）；见 §3.17
 ```
 
-**`auto` 局部类型推断（✅ tc，M-auto）：**
+**声明与局部类型推断（三关键字模型 · 2026-08-19 宪法采纳）**
 
-- 写法：`auto x = 初始化器;`（强制带初始化器、禁止显式类型标注，否则解析期报错）。
-- 类型在检查期由初始化器经 `infer_expr` 推断并回填声明节点，使发射侧拿到真实类型节点。
-- 与 `var`/`const` 的区别：`var`/`const` **必须**带类型标注（无标注触发 `T_VAR_NO_TYPE`，见 conformance `f27_var_no_type`）；只有 `auto` 走推断。
-- 推断规则同表达式字面量：整数字面量 ≤255 → `u8`、≤65535 → `u16`、……（见 `infer_expr`）；故 `auto x = 42` 推断为 `u8` 而非 `i64`，与 `i64` 混合运算需显式 `as i64`。
+声明分三关键字：
+- `var` — 变量，可变；局部声明类型标注可选，由初始化器经 `infer_expr` 静态推断（顶层/全局/struct 字段仍须标注）。
+- `const` — 静态常量，编译期可知、不可变；局部标注可选（值编译期求得则推断为对应类型），全局/顶层仍须标注。
+- `let` — 动态常量，运行期绑定一次后不可变；局部标注可选、推断同 `var`（⚠ 待实现：`let` 关键字与语义尚未接入 `tc`）。
+
+推断机制（✅ tc，原 `auto`）：类型在检查期由初始化器经 `infer_expr` 推断并回填声明节点，发射侧拿到真实类型节点；故 `var x = e;` / `let x = e;` / `const x = e;` 皆可省标注。`auto x = e;` 保留为 `let` 的**弃用别名**（⚠ 待 tc 同步，当前 `auto` 为唯一实装推断形式）。
+- 整数字面量默认 `i32`（2026-08-19 宪法采纳，取代原 `≤255→u8` 量级规则 ⚠ 待 tc 同步）：仅当上下文需更宽位宽（如与 `i64`/`u64` 运算、赋值目标为更宽类型）时拓宽；带后缀仍以后缀定死。
+- 推断回填类型节点后，局部绑定默认可被闭包捕获（原 `T_CLOSURE_CAPTURE` 仅针对「无标注且未推断」的绑定，现已消解 ⚠ 待 tc 同步）。
 - 示例：
   ```t
-  auto n = 7 as i64;        // n : i64
-  auto s = "hello";         // s : string
-  auto v = id(i64, 42);     // v : i64（初始化器为泛型单态化调用）
+  var n = 7 as i64;        // n : i64（标注可选）
+  let s = "hello";         // s : string（动态常量，不可变）⚠ 待实现
+  const K = 1024;          // K : i32（静态常量，编译期可知）
+  auto v = id(i64, 42);    // 弃用别名 → let v = id(i64, 42);  v : i64
   ```
 
 **语句强制规则（spec §1.2）：**
@@ -1178,8 +1202,8 @@ FuncLit:   "fn" "(" ParamList? ")" ("->")? Type Block         // 匿名函数；
 - **优先级塔固定（L-03 可预判）**：管道级 L0（`|->`/`|>?`/`|>`）最低、`||` 次低、`*`/`/`/`%` 最高，11 级全部左结合；赋值 `=` 右结合；无右结合二元运算符。塔层级与 `parse_pipe → parse_or → … → parse_mul → parse_unary → parse_postfix → parse_primary` 一一对应，不可调换。管道级为 2026-08-10 在既有 10 级塔**外侧**新增的一层，塔内顺序一字未动。
 - **全行为显式（L-02）**：`as` 为唯一显式类型转换（仅一次、不可 `e as T1 as T2`）；无隐式类型转换 / 隐式布尔 / 隐式内存分配；复合字面量（数组 `[...]` / map `[k:v]` / 结构体 `T{...}`）显式构造。
 - **静态类型安全（L-03）**：每个 `Expr` 的静态类型由 checker 推算；元素 / 字段 / 下标 / `type_info` 静态校验；`MapLit` 与 `ArrayLit` 共用 `[ ]`，由首元素后是否跟 `:`` 向前看消歧（无二义）。
-- **唯一写法（L-04 ✅）**：调用 `f(x)`、转换 `e as T`、下标 `e[i]`、成员 `e.f`、结构体 `T{...}`、数组 `[...]`、map `[k:v]`、匿名函数 `fn(...) T {...}`（`->` 可选，旧式 `fn(...) -> T {...}` 仍合法）均仅一种标准写法，无等价多写变体。
-- **匿名函数字面量 `FuncLit`** ✅ tote（M46）：与函数**声明**靠「`fn` 前有无名字」区分——声明位先吃名字（`Name fn(...)`），表达式位裸 `fn` 即字面量，无二义。返回类型紧跟参数表（与声明一致）：`fn(...) Ret`，`->` 记号**已弃用但仍可选**（`fn(...) -> Ret` 同义，L-02 全行为显式）。语义与限制见 §3.5。
+- **唯一写法（L-04 ✅）**：调用 `f(x)`、转换 `e as T`、下标 `e[i]`、成员 `e.f`、结构体 `T{...}`、数组 `[...]`、map `[k:v]`、匿名函数 `fn(...) T {...}` 均仅一种标准写法，无 `->` 记号。函数返回类型一律并置（`fn(...) T`），编译器已于 2026-08-20 移除对 `fn(...) -> T` 箭头的解析，规范彻底收敛为唯一写法（见 §3.1 声明形式）。
+- **匿名函数字面量 `FuncLit`** ✅ tote（M46）：与函数**声明**靠「`fn` 前有无名字」区分——声明位先吃名字（`Name fn(...)`），表达式位裸 `fn` 即字面量，无二义。返回类型紧跟参数表（与声明一致，无 `->` 记号）：`fn(...) Ret`（L-02 全行为显式）。语义与限制见 §3.5。
 - `>>>` 注意：比较/移位序列中 `>>` 不得被词法拆成两个 `>`。
 - **调用实参校验（L-03 静态类型安全，2026-08-05 收紧）**：函数调用（含后缀 `f(x)` 直接调用具名函数，以及经函数类型变量间接调用）**统一校验实参**——元数不符报 `T_CALL_ARITY`，逐位类型不符且不可 `can_cast` 报 `T_TYPE_MISMATCH`。此前**直接调用具名函数完全不校验实参**：少传的形参在函数体内读到未初始化的栈槽；若该形参是 `string`/`[]T` 的 `len` 字段，会拿到随机天文数字，导致循环把 512MB arena 瞬间耗尽（`arena: out of memory`），且报错离真正错误点极远（曾因 `tote` 的 `str_concat3(hd, "/.tote/libs")` 少传一参排查数小时）。校验实现见 `src/tc.tc` 的 `check_call_args`（直接/间接调用共用），variant 合成助手因无签名记录走 `tif_pstart<0` 守卫放行。conformance 用例 `tests/conformance/fail/f57_call_arity_direct` / `f58_call_arg_type`。
 
@@ -1202,7 +1226,8 @@ Type:
 
 Scalar: "u8" | "u16" | "u32" | "u64"
       | "i8" | "i16" | "i32" | "i64"
-      | "f16" | "f32" | "f64" | "bool" | "void" | "string" | "StringBuilder"
+      | "f16" | "f32" | "f64" | "bool" | "void" | "rune"
+      | "string" | "StringBuilder" | "bytes" | "BytesBuilder"
 ArrayType: "[" Expr "]" Type          // 定长数组 [N]T
 SliceType: "[" "]" Type               // 动态切片 []T
 MapType: "map" "[" Type "]" Type      // 哈希映射 map[K]V  ✅ tote
@@ -1215,24 +1240,59 @@ FuncType: "fn" "(" TypeList? ")" ("->")? Type   // ✅ tote 函数类型（函�
 TypeList: Type ("," Type)*
 ```
 
-- ✅ tote：标量固定位宽 + `string`/`StringBuilder` + `[]T` 切片 + `[N]T` 定长数组 + `map[K]V` 哈希映射 + `fn(...) Ret` 函数类型（`->` 已弃用但仍可选：`fn(...) -> Ret` 同义）均实装（函数类型 v1 为函数指针语义：仅顶层具名函数可被绑定到函数类型变量 / 参数 / 返回值 / 结构体字段 / 全局变量；支持间接调用，诊断 T_CALL_ARITY / T_NOT_CALLABLE / T_TYPE_MISMATCH）。
-- **匿名函数字面量 `fn(...) -> Ret { ... }`** ✅ tote（M46）：表达式位的函数字面量，静态类型即同签名 `FuncType`，可赋给函数类型变量 / 作实参 / 作返回值 / 存结构体字段。
+- ✅ tote：标量固定位宽 + `string`/`StringBuilder` + `[]T` 切片 + `[N]T` 定长数组 + `map[K]V` 哈希映射 + `fn(...) Ret` 函数类型（返回类型并置、无 `->` 记号）均实装（函数类型 v1 为函数指针语义：仅顶层具名函数可被绑定到函数类型变量 / 参数 / 返回值 / 结构体字段 / 全局变量；支持间接调用，诊断 T_CALL_ARITY / T_NOT_CALLABLE / T_TYPE_MISMATCH）。
+- **匿名函数字面量 `fn(...) Ret { ... }`** ✅ tote（M46）：表达式位的函数字面量，静态类型即同签名 `FuncType`，可赋给函数类型变量 / 作实参 / 作返回值 / 存结构体字段。
   - 字面量在脱糖期被**提升**为顶层合成函数 `__lam_N`。**未引用外层局部**时原节点就地降级为对该函数的引用，完全复用函数指针路径，双后端无额外开销、无堆分配。
 - **闭包：按值捕获** ✅ tote（M48）：字面量若引用了外层作用域的局部/参数，编译期自动捕获。
   - 脱糖为三件事：① 合成环境结构 `__env_N`，字段按「自由变量首次出现顺序」排列；② 提升后的 `__lam_N` 前置一个 `void*`/`ptr` 类型的 env 首参，函数体首插入若干 `closure_capture` 语句把环境字段**按值**拷回同名局部；③ 原表达式位置改写为「堆分配 `__env_N` + 逐字段拷入 + 堆分配 `TClosure{fn, env}` + 返回其指针」。
   - **按值语义**：捕获发生在闭包构造那一刻。闭包创建之后外层变量再改变，不回灌到闭包；闭包内改动也不外泄。
   - **统一 ABI**：无论有无捕获，函数值一律是 `TClosure*`（C）/ `ptr`（LLVM），底层被调函数一律 `Ret (*)(void* env, Args...)`。无捕获的顶层函数取值时经惰性生成的 trampoline 适配（`__tramp_g` + 静态 `TClosure`，env 为 `NULL`），故两条路径可自由互赋、互传。
   - **生命周期（v1 限制）**：环境与 `TClosure` 用 `t_alloc` 堆分配且**不回收**（有意为之，先泄漏）。自动释放需引入所有权或 GC，属后续里程碑。
-  - **可捕获的前提**：被捕获的绑定必须有显式类型标注，否则报 `T_CLOSURE_CAPTURE`（环境结构无法为其定型）。典型不可捕获者是 `for-each` 的迭代变量——先赋给带标注的局部再捕获即可。
+  - **可捕获的前提**：被捕获的绑定须有**可确定类型**（显式标注或经初始化器推断均可），否则报 `T_CLOSURE_CAPTURE`（环境结构无法为其定型）。自 2026-08-19 局部类型推断回填类型节点后，`var`/`let`/`const` 局部默认可捕获（⚠ 待 tc 同步）；典型不可捕获者仍是 `for-each` 的迭代变量（无初始化器、无法推断）——先赋给带标注或带初始化器的局部再捕获即可。
   - 引用一个既不在闭包内、外层也不存在的名字，报 `T_UNDEFINED_IDENT`（而非捕获错误）。
   - **调用点的被调者可以是任意表达式**（M48）：不限于裸标识符。结构体字段 `h.op(4)`、数组/切片元素 `fs[i](x)`、上一次调用的结果 `make2(1)(2)(3)` 都能直接发起间接调用——只要该表达式的静态类型是 `FuncType`。裸标识符若解析到顶层具名函数则仍走直接调用；否则按函数值解包。此前非标识符被调者在 LLVM 后端会静默降级为 `; UNSUPPORTED call target` 并返回 0，在 C 后端则编不过。
-- **未定义标识符报 `T_UNDEFINED_IDENT`**（M46）：此前 checker 对解析不到的标识符静默退化为 `Unknown`，错误要到 C 后端生成的 `.c` 才暴露，LLVM 后端更直接产出读 0 的垃圾值（静默错编）。现于检查期即报错。同批补上 `T_VAR_NO_TYPE`：局部 `var` 必须写类型标注（发射侧以有标注为前提，无标注声明会被整条丢弃）。
+- **未定义标识符报 `T_UNDEFINED_IDENT`**（M46）：此前 checker 对解析不到的标识符静默退化为 `Unknown`，错误要到 C 后端生成的 `.c` 才暴露，LLVM 后端更直接产出读 0 的垃圾值（静默错编）。现于检查期即报错。同批补上 `T_VAR_NO_TYPE`：原规定局部 `var` 必须写类型标注（发射侧以有标注为前提，无标注声明会被整条丢弃）；自 2026-08-19 宪法采纳局部类型推断后，局部 `var`/`let`/`const` 标注可选（由初始化器推断），`T_VAR_NO_TYPE` 仅对**全局/顶层声明与 struct 字段**在无标注时触发（⚠ 待 tc 同步）。
 - **未知结构体字段报 `T_UNKNOWN_FIELD`**（M-M 同批，2026-08-06）：`p.zzz` 形式的成员访问，若对象类型已解析到具体 `StructDecl` 而字段表中无该名字，此前同样静默退化为 `Unknown` → 编译期零诊断、LLVM 后端读 0 垃圾值。现于 `infer_expr` 的 `member` 分支直接报错。**仅在确实解析到 `StructDecl` 时报**：未解析类型、外部类型、Enum 成员、模块限定访问（已在 `mangle_modules` Pass 1 改写为 `ident`）、`"...".format(...)` 之类字符串方法一律不受影响。conformance `f60_unknown_field`。
 - **map 字面量 `[k1: v1, k2: v2]`**：键/值类型取首项推断，整型统一提升为 `i64`（同数组字面量）。仅作为局部 `var` 的初始化器发射：C 后端脱糖为 `t_map_new` + 逐项局部量 + `t_map_put`，LLVM 后端为 `tll_map_new` + 逐项 `tll_map_put`。`var m: map[K]V;` 无初始化时同样建空表。整型键一律按 `int64` 落盘（C 用 C99 复合字面量 `&(int64_t){…}`，LLVM 用 `alloca i64` + 扩宽），故窄整型键不会因高位垃圾而失配，键/值也可以直接写字面量。
 - 类型名解析：先查内建，再查当前单元已声明命名类型。
 - **数组字面量 `[e1, e2, …]`**：元素类型取首元素推断，整型元素统一提升为 `i64`（`[1,2,3]` 是 `[3]i64` 而非 `[3]u8`）；空字面量 `[]` 元素类型未知，可赋给任意 `[]T` / `[N]T`。定长数组与切片之间只要元素可转型即可互赋（目标为定长数组时长度须一致）。赋给 `[]T` 时脱糖为运行期 `slice_new` + 逐元素 `append`；赋给 `[N]T` 时 C 后端用花括号初始化器、LLVM 后端零初始化后按 `getelementptr` 逐元素 `store`。
 
 - **字符串驻留符号 `Sym32("tag")` / `Sym16("tag")`** ✅ tote（M40）：字段仅存 32/16 位无符号 id；真实字符串按 tag 分池、运行期不定长存储，由编译器自动维护。`= "str"` 自动 intern 取 id；同池相同字符串去重返回同一 id；`==`/`!=` 按 id 比较（O(1)）；跨池（`Sym32("A")` vs `Sym32("B")`）类型不同，互相赋值报 `T_TYPE_MISMATCH`（f15）；全局变量字符串初始化器自动搬进 `t__ginit`/`t.__ginit`（C / LLVM 双后端一致）。内建 API 与类型规则见 §3.8。
+
+#### 3.5.1 二进制视图类型：rune / bytes / BytesBuilder ✅ tc（2026-08-25）
+
+- **rune — Unicode 码点类型（内部 i32，有符号，归入整数族）**
+  - 表示单个 Unicode 码点（U+0000..U+10FFFF）；位宽 32、有符号，与 `i32` 同位宽同符号。
+  - 字符字面量：`'A'`（单字节，值 65）兼容 `u8` / `rune` / `i32`；`'中'`（单合法 UTF-8 码点，值 20013）只能落 `rune` / `i32`（超出 `u8` 容量，赋 `u8` 报溢出）。
+  - 与整数族无缝互操作：算术（`zh + 1`）、比较（`'中' > 'A'`）、与 `i32` 互转（`var n: i32 = r;` / `var r2: rune = n;`）全免费——`rune` 在类型系统里即「32 位有符号整数」的命名视图。
+  - 诊断：非单字节 / 非单合法码点（如 `'ab'`、`'中x'`、续字节非法）一律 `T-LEX-E007`（词法期，见 §2.4）。conformance `p60_rune_basic`。
+
+- **bytes — 二进制值视图（与 `string` 同布局，类型独立）**
+  - 内存布局 `{ptr, len}` 16B（`TStr`），与 `string` **逐字节同构**但**类型身份独立**（`kind=Bytes`、`cat=bytes`）：`bytes` 与 `string` 不互赋、不等价，避免把任意字节序列误当 UTF-8 文本。
+  - 语义上是「一段裸字节」的不可变值视图，**无自有字面量**；构造一律走 `BytesBuilder`（见下）或运行时来源（文件 / 网络读取等）。
+  - 索引与切片（双后端与 `string` 完全同构）：
+    - 下标 `b[i]` → `bytes_at(b, i)`，返回 `u8`（越界 `t_panic_bounds`）；
+    - 子切片 `b[lo..hi]` / `b[lo..=hi]` → `bytes_slice(b, lo, hi)`，返回 `bytes`（O(1) 视图，与源共享底层缓冲）。
+  - conformance `p61_bytes_basic`。
+
+- **BytesBuilder — 可增长字节缓冲（对应 `string` 的 `StringBuilder`）**
+  - 复用 `string` 后端的 `TSb*` 堆缓冲，类型标注名 `BytesBuilder`（`kind=StringBuilder`），零新增运行时代码。
+  - API：`bsb_new()` 新建空缓冲；`bsb_append_u8(bb, v: u8)` 追加单字节；`bsb_append_bytes(bb, s: bytes)` 追加一段 `bytes`；`bsb_to_bytes(bb)` 取出不可变 `bytes` 视图。
+  - 同 `StringBuilder`，`bsb_to_bytes` 取出的是与缓冲共享存储的视图（非拷贝）；后续再 `append` 可能触发扩容拷贝。
+
+内建总表（双后端均经复用 `t_str_*` / `t_sb_*` / `@tll_*` 实现，逐字节一致）：
+
+| 内建 | 签名 | 返回 | 备注 |
+|---|---|---|---|
+| `bytes_len` | `fn(b: bytes) u64` | 长度 | 复用 `str_len` |
+| `bytes_at` | `fn(b: bytes, i: i64) u8` | 第 i 字节 | 复用 `str_byte_at`；越界 `t_panic_bounds` |
+| `bytes_slice` | `fn(b: bytes, lo: i64, hi: i64) bytes` | 子视图 | 复用 `str_slice`；O(1) |
+| `bsb_new` | `fn() BytesBuilder` | 新缓冲 | 复用 `t_sb_new(t_arena_current())` |
+| `bsb_append_u8` | `fn(bb: BytesBuilder, v: u8) void` | — | 追加单字节，复用 `t_sb_append_char` |
+| `bsb_append_bytes` | `fn(bb: BytesBuilder, s: bytes) void` | — | 追加一段，复用 `t_sb_append_str` |
+| `bsb_to_bytes` | `fn(bb: BytesBuilder) bytes` | 不可变视图 | 复用 `t_sb_to_str` |
+
+> 设计要点：`rune` / `bytes` / `BytesBuilder` 全程**零新增 C/LLVM 运行时代码**——`bytes` 复用 `string` 的 `%TStr`/`TStr` 表示与 `t_str_*` 函数，`BytesBuilder` 复用 `TSb*` 与 `t_sb_*`，LLVM 后端经 `t_shim_ll.c` 的 `@tll_*` 指针桥。给 `t` 编译器新增标量 / 内建类型的完整落地清单见 `.workbuddy/skills/t-add-scalar-type`。
 
 ### 3.6 Comptime & introspection（编译期与自省） ⚠ spec-only（设计目标）
 
@@ -1281,7 +1341,7 @@ ImportExpr:   "import_csv" "(" StringLiteral ")" | "import_json" "(" StringLiter
 3. **CSV 映射**：首行为表头，表头名须与 `S` 的字段名**一一对应**（顺序可异、不可缺、不可多），否则报 `T_IMPORT_HEADER`。单元格按逗号切分，不支持引号转义（值内不得含逗号）。
 4. **JSON 映射**：顶层须为对象数组，每个对象的键集合须与 `S` 字段名一致，否则报 `T_IMPORT_HEADER`。
 5. **值校验（编译期）**：整型字段做位宽值域校验（如 `u8` 越界 256 报错）；`bool` 只接受 `true`/`false`；float 接受十进制小数；string 原样取值。违规报 `T_IMPORT_VALUE`，消息含行列与字段名。字段类型仅支持标量与 string（enum/嵌套 struct 暂不支持，报 `T_IMPORT_VALUE`）。
-6. **脱糖产物**：每个导入点合成一个 `__import_N fn() -> []S` 加载函数（append 逐行 struct 字面量）挂入 decl_list 尾部，原初始化器替换为对该函数的调用。运行时零文件 IO。
+6. **脱糖产物**：每个导入点合成一个 `__import_N fn() []S` 加载函数（append 逐行 struct 字面量）挂入 decl_list 尾部，原初始化器替换为对该函数的调用。运行时零文件 IO。
 
 **诊断码**：`T_IMPORT_IO`（文件读取失败）、`T_IMPORT_HEADER`（表头/键映射不匹配）、`T_IMPORT_VALUE`（值域/类型违规）、`T_IMPORT_CONTEXT`（非法使用上下文）。
 
@@ -1528,7 +1588,7 @@ FlagGetCall: "flag_get" "(" FlagInstance "," SlotName ")"
 SymStrCall:  "sym_str"  "(" SymExpr ")"
 SymReleaseCall: "sym_release" "(" StringLiteral ")"        // 释放指定 tag 整池
 SymReleaseAllCall: "sym_release_all" "(" ")"               // 释放全部池
-// 内部（编译器在 `= "str"` 时自动插入，用户不直接调用）：t_sym_intern(tag, str, bits) -> id
+// 内部（编译器在 `= "str"` 时自动插入，用户不直接调用）：t_sym_intern(tag, str, bits) id
 ```
 
 - `sym_str(v)`：由变量 `v` 的 Sym 类型推出所属 tag，返回该池中 id 对应的原始字符串（`String`）。`Sym16` 的 id 在内部归一到 i32。
@@ -1588,7 +1648,7 @@ CmpExpr: ShiftExpr (("<" | ">" | "<=" | ">=") ShiftExpr)*
 **D3 —— 打开方式与格式解析（L-02 全行为显式）**
 
 ```
-fopen fn(path: string, mode: atom) -> fid
+fopen fn(path: string, mode: atom) fid
 ```
 
 `mode` **必须是 atom 字面量**（编译期可判定），否则报 `T_FID_MODE_NOT_LITERAL`。合法取值：
@@ -1607,13 +1667,13 @@ fopen fn(path: string, mode: atom) -> fid
 **D4 —— 后缀注册表（挂靠注册模式）**
 
 ```
-fmt_register fn(kind: atom, suffix: string, fmt: atom) -> void
+fmt_register fn(kind: atom, suffix: string, fmt: atom) void
 ```
 
 - `kind` ∈ { `:text`, `:binary` }，`fmt` ∈ { `:text`, `:json`, `:rawbin`, `:protobuf` }。非 atom 字面量 ⇒ `T_FID_FORMAT_NOT_LITERAL`；取值越界 ⇒ `T_FID_BAD_FORMAT`。与 `fopen` 的 mode 轴（`T_FID_MODE_NOT_LITERAL` / `T_FID_BAD_MODE`）**分开成码**。
 - `suffix` 不含 `.`，大小写不敏感（内部统一小写）。同 `(kind, suffix)` 重复注册 ⇒ 后覆盖先（运行时行为）。
 - 内建预置：`:text`+`json`→`:json`；`:text` 默认→`:text`；`:binary`+`pb`→`:protobuf`；`:binary` 默认→`:rawbin`。
-- `stdin`/`stdout`/`stderr` 视为 text 类别、空后缀 ⇒ 格式恒 `:text`。查询：`fid_format fn(f: fid) -> atom`。
+- `stdin`/`stdout`/`stderr` 视为 text 类别、空后缀 ⇒ 格式恒 `:text`。查询：`fid_format fn(f: fid) atom`。
 
 **D5 —— 各格式写出语义（L-02 显式、L-09 零 UB）**
 
@@ -1631,23 +1691,23 @@ fmt_register fn(kind: atom, suffix: string, fmt: atom) -> void
 
 **D6 —— 生命周期与错误（L-02 / L-09）**
 
-- `fopen` 失败返回无效句柄；用 `fid_is_open fn(f: fid) -> bool` 显式检测。无隐式异常/重试。
+- `fopen` 失败返回无效句柄；用 `fid_is_open fn(f: fid) bool` 显式检测。无隐式异常/重试。
 - 对无效/已关闭句柄执行 `<`/`fclose`/`fflush` ⇒ 运行时 `t_panic`（确定性中止，非 UB）。
-- `fclose fn(f: fid) -> void` **不幂等**，重复关闭 panic。关闭 `stdin`/`stdout`/`stderr` ⇒ panic。
+- `fclose fn(f: fid) void` **不幂等**，重复关闭 panic。关闭 `stdin`/`stdout`/`stderr` ⇒ panic。
 - **无自动关闭**：句柄不随作用域回收，须显式 `fclose`。
 - ⚠️ `defer` 须跟块（`defer { fclose(f); }`），且为**函数级**（写在 `if`/`while` 块内仍到函数退出才 LIFO 触发）；「打开→写→读回」等需块内落盘的场景须显式 `fclose`，不能靠 defer。
 - 句柄容量硬上限 `T_FID_MAX = 256`（runtime），`0/1/2` 恒为 stdin/stdout/stderr，用户同时最多 253 个；表满 `fopen` 返回 -1（同打开失败表象，靠 `fid_is_open` 探测）。
 - 缓冲：`FILE*` 经 stdio 缓冲，写不保证立即落盘，须 `fflush`/`fclose`；读写回环须先关/刷；stdout/stderr 交织顺序由刷新时机决定。
-- `fid_error fn(f: fid) -> string`（走系统函数，仿 `fid_is_open`）：返回句柄最近一次错误原因，无错误返空串；查 runtime `g_fids[slot].err`，不 panic。
-- `fid_eof fn(f: fid) -> bool`（读路径探针，与 `fid_is_open`/`fid_error` 同族）：语义是**「还有没有下一个字节可读」**，实现为一字节前瞻（`getc` + `ungetc`），**不是** C 的 `feof` —— `feof` 要等一次读越界后才置位，恰好读完全部内容时仍为假，`while (!fid_eof(f))` 会凭空多转一圈。无效/已关闭句柄或流错误返 `true`。单纯 EOF **不写** `fid_error`（EOF 由 `fid_eof` 表达）。实参必须是 `fid`，否则报 `T_FID_EOF_ARG`。
+- `fid_error fn(f: fid) string`（走系统函数，仿 `fid_is_open`）：返回句柄最近一次错误原因，无错误返空串；查 runtime `g_fids[slot].err`，不 panic。
+- `fid_eof fn(f: fid) bool`（读路径探针，与 `fid_is_open`/`fid_error` 同族）：语义是**「还有没有下一个字节可读」**，实现为一字节前瞻（`getc` + `ungetc`），**不是** C 的 `feof` —— `feof` 要等一次读越界后才置位，恰好读完全部内容时仍为假，`while (!fid_eof(f))` 会凭空多转一圈。无效/已关闭句柄或流错误返 `true`。单纯 EOF **不写** `fid_error`（EOF 由 `fid_eof` 表达）。实参必须是 `fid`，否则报 `T_FID_EOF_ARG`。
   - ⚠️ `:text` / `:json` 下文件尾部的空白/换行会被前瞻看见 ⇒ 返 `false`，但其后已无值可读。定长/精确边界场景请用 `:rawbin`。
-- `fseek fn(f: fid, off: i64) -> bool` / `ftell fn(f: fid) -> i64`：绝对定位与取偏移，均不 panic，失败返 `false` / `-1` 并写 `fid_error`。
+- `fseek fn(f: fid, off: i64) bool` / `ftell fn(f: fid) i64`：绝对定位与取偏移，均不 panic，失败返 `false` / `-1` 并写 `fid_error`。
 - `f > Type`（读路径，`>` 操作符）：从 `f` 反序列化一个 `Type` 值，结果类型为裸 `Type`；EOF/错误返默认值。各格式语义见 §3.9.1。
 
 **示例**
 
 ```t
-main fn() -> i64 {
+main fn() i64 {
     stdout < "hello " < "world" < "\n";
     stdout < "n=" < 42 < " ok=" < true < " " < :ready < "\n";
 
@@ -1677,7 +1737,7 @@ main fn() -> i64 {
 
 **与既有构造的关系（L-04）**
 
-- `file_write_all(path, content) -> bool`：**保留**（一次性整文件覆盖写，无句柄/格式/增量，不构成等价多写法）。
+- `file_write_all(path, content) bool`：**保留**（一次性整文件覆盖写，无句柄/格式/增量，不构成等价多写法）。
 - `print`/`println`/`eprint`：**保留**，仍只接受 `string`（与 `tc.tc:8662` 现有检查一致）。`print(s) ≡ stdout < s` 等字节语义等价，已裁定为**文档化语法糖**（A 口径），运行期行为不变，不引入第二套字节语义（L-04 满足）。
 - `<` 小于比较：由 D1 静态类型判定，`fid` 无序故唯一。
 - `atom`：fid 复用 atom 作 mode/格式标记，是使用而非重叠。
@@ -1698,7 +1758,7 @@ main fn() -> i64 {
 
 **§3.9.1 读路径（反序列化）—— `>` 操作符 ✅（M53 已落地，Option B 裁定）**
 
-> **L-15 裁定（M53）**：原设计结果类型 `T?` 因可选类型当时仅为外壳（无值表示、无 `T→?T` 提升、无解包语法）无法实现。裁定改用 **Option B**：`f > Type` 返回**裸 `Type`**，EOF/错误返回该类型的默认值（数值 0 / 空串），是否到尾由新增探针 **`fid_eof(f) -> bool`** 显式表达。这契合 L-02 显式原则，且与 `fid_is_open`/`fid_error` 同族；代价是「零值 vs EOF」需调用方显式查 `fid_eof` 区分。
+> **L-15 裁定（M53）**：原设计结果类型 `T?` 因可选类型当时仅为外壳（无值表示、无 `T→?T` 提升、无解包语法）无法实现。裁定改用 **Option B**：`f > Type` 返回**裸 `Type`**，EOF/错误返回该类型的默认值（数值 0 / 空串），是否到尾由新增探针 **`fid_eof(f) bool`** 显式表达。这契合 L-02 显式原则，且与 `fid_is_open`/`fid_error` 同族；代价是「零值 vs EOF」需调用方显式查 `fid_eof` 区分。
 
 与 `<` 对称，读由 `>` 承担。消歧锚点 = 左操作数为 `fid`（与写路径一致）：`fid > Type` 是读，结果类型为裸 `Type`（EOF 不 panic、不报错）；`fid > 非类型` 报 `T_FID_DESERIALIZE_NEEDS_TYPE`；聚合类型（struct/array/slice/map/pointer）读报 `T_FID_DESERIALIZE_AGG`（属 v2）。`Type` 取子集：标量（`i8..i64`/`u8..u64`/`f32`/`f64`/`bool`/`atom`）与 `string`；命名类型须为上述标量或 string 的别名。
 
@@ -1722,7 +1782,7 @@ conformance：`p27_fid_read_ok`(pass) + `f43_fid_read_needs_type`(fail, `T_FID_D
 
 **§3.9.2 `fid_error` ✅（M52 已落地）**
 
-内建 `fid_error fn(f: fid) -> string`，发射期调 runtime `t_fid_error`/`tll_fid_error`（仿 `fid_is_open`）；runtime `TFidRec` 加 `err[128]` 字段，`fclose`/`fflush`/序列化写失败（`ferror` 探测）时写入，越界/已关闭/未开槽返回空串不 panic。
+内建 `fid_error fn(f: fid) string`，发射期调 runtime `t_fid_error`/`tll_fid_error`（仿 `fid_is_open`）；runtime `TFidRec` 加 `err[128]` 字段，`fclose`/`fflush`/序列化写失败（`ferror` 探测）时写入，越界/已关闭/未开槽返回空串不 panic。
 
 - **错误语义为「最近一次」**：成功路径**不清空** `err`，故可在若干次写之后统一探测；探测到后 `clearerr` 复位流标志。
 - `fopen` 失败返回的哨兵句柄 `-1` 不对应任何槽位，其原因单独存于全局 `g_fid_open_err`，`fid_error(-1)` 取之。
@@ -1741,7 +1801,7 @@ stdio 缓冲；读写回环须先 flush/fclose；stdout/stderr 交织顺序非�
 
 **§3.9.5 定位 / 随机访问（fseek / ftell）✅（M52 已落地）**
 
-`fseek fn(f: fid, off: i64) -> bool`（非法偏移/不可定位句柄返 `false` 并写 `fid_error`）、`ftell fn(f: fid) -> i64`（不可定位返 `-1`）；**均不 panic**。
+`fseek fn(f: fid, off: i64) bool`（非法偏移/不可定位句柄返 `false` 并写 `fid_error`）、`ftell fn(f: fid) i64`（不可定位返 `-1`）；**均不 panic**。
 
 - 偏移是**自文件头起算的绝对位置**，v1 不提供 `SEEK_CUR`/`SEEK_END` 相对定位；负偏移直接判失败（不做 C 式的从尾回绕）。
 - 与 `fclose`/`fflush` 走 `fid_get`（无效句柄即 panic）不同，这两个内建走**非 panic 版访问器**：无效 / 已关闭句柄写 `err` 后返回失败值，由调用方显式取因（L-02 / L-09）。
@@ -1779,20 +1839,20 @@ Python 的 `"{:>10}{:.2f}".format(a, b)` 依赖三样 `t` 目前都没有的东�
 
 ```ebnf
 FormatBuiltins:
-    format_int   fn(spec: string, v: i64)    -> string
-  | format_uint  fn(spec: string, v: u64)    -> string
-  | format_float fn(spec: string, v: f64)    -> string
-  | format_str   fn(spec: string, v: string) -> string
-  | format_bool  fn(spec: string, v: bool)   -> string
-  | format_char  fn(spec: string, v: i64)    -> string   // v 为码点，t 无字符字面量
+    format_int   fn(spec: string, v: i64) string
+  | format_uint  fn(spec: string, v: u64) string
+  | format_float fn(spec: string, v: f64) string
+  | format_str   fn(spec: string, v: string) string
+  | format_bool  fn(spec: string, v: bool) string
+  | format_char  fn(spec: string, v: i64) string   // v 为码点，t 无字符字面量
 
 SbFormatBuiltins:
-    sb_append_fmt_int   fn(sb: StringBuilder, spec: string, v: i64)    -> void
-  | sb_append_fmt_uint  fn(sb: StringBuilder, spec: string, v: u64)    -> void
-  | sb_append_fmt_float fn(sb: StringBuilder, spec: string, v: f64)    -> void
-  | sb_append_fmt_str   fn(sb: StringBuilder, spec: string, v: string) -> void
-  | sb_append_fmt_bool  fn(sb: StringBuilder, spec: string, v: bool)   -> void
-  | sb_append_fmt_char  fn(sb: StringBuilder, spec: string, v: i64)    -> void
+    sb_append_fmt_int   fn(sb: StringBuilder, spec: string, v: i64) void
+  | sb_append_fmt_uint  fn(sb: StringBuilder, spec: string, v: u64) void
+  | sb_append_fmt_float fn(sb: StringBuilder, spec: string, v: f64) void
+  | sb_append_fmt_str   fn(sb: StringBuilder, spec: string, v: string) void
+  | sb_append_fmt_bool  fn(sb: StringBuilder, spec: string, v: bool) void
+  | sb_append_fmt_char  fn(sb: StringBuilder, spec: string, v: i64) void
 ```
 
 `sb_append_fmt_*` 是直写变体：结果直接追加进 `StringBuilder`，省掉中间 `string`。多段拼接一律走 StringBuilder（`t` 无 `string+`，见 §3.4）。
@@ -1903,13 +1963,13 @@ println(f"""long {name} with "quotes" inside""");   // 长式内可直接写 "
 内建直接接入，与 `format_int` 完全同构；时间值复用既有 `i64` 标量，不新增类型或标量管线。
 
 ```ebnf
-now                fn()                       -> i64     // 当前时刻的微秒 epoch
-format_time        fn(spec: string, t: i64)  -> string  // 按 UTC 展开（gmtime）
-format_time_local  fn(spec: string, t: i64)  -> string  // 按本机本地时区展开（localtime）
-format_time_tz     fn(spec: string, t: i64, tz: i64) -> string  // 固定时区偏移（分钟）展开，不依赖平台 tzdata
-parse_time         fn(spec: string, s: string) -> i64  // 按 UTC 解析为微秒 epoch；失败返回 T_TIME_INVALID
-parse_time_local   fn(spec: string, s: string) -> i64  // 按本机本地时区解析；失败返回 T_TIME_INVALID
-time_invalid       fn() -> i64                // 返回 T_TIME_INVALID (= INT64_MIN)，解析失败哨兵
+now                fn() i64     // 当前时刻的微秒 epoch
+format_time        fn(spec: string, t: i64) string  // 按 UTC 展开（gmtime）
+format_time_local  fn(spec: string, t: i64) string  // 按本机本地时区展开（localtime）
+format_time_tz     fn(spec: string, t: i64, tz: i64) string  // 固定时区偏移（分钟）展开，不依赖平台 tzdata
+parse_time         fn(spec: string, s: string) i64  // 按 UTC 解析为微秒 epoch；失败返回 T_TIME_INVALID
+parse_time_local   fn(spec: string, s: string) i64  // 按本机本地时区解析；失败返回 T_TIME_INVALID
+time_invalid       fn() i64                // 返回 T_TIME_INVALID (= INT64_MIN)，解析失败哨兵
 ```
 
 `now()` 无参数；`format_time` / `format_time_local` 的 `spec` 为 `%` 风格格式串，`t` 为 i64 微秒 epoch。三者可与 M55 的 `format(tmpl, ...)` 模板自由组合：`format("到期 {0}", format_time("%Y-%m-%d", now()))`。
@@ -2017,16 +2077,16 @@ Agent 是语言的一等公民（宪法支柱，2026-08-03 用户裁定 B：acto
 AgentDecl:  IDENTIFIER "agent" "{" (AgentClause ";")* "}"
 AgentClause:
       "state" (IDENTIFIER ":" Type ("@" IDENTIFIER)? ("=" Expr)? ";")+
-  |   "step"  FuncDecl            -- 形如 `step fn(s: <Name>State, msg: <Msg>) -> <Name>State { ... }`
+  |   "step"  FuncDecl            -- 形如 `step fn(s: <Name>State, msg: <Msg>) <Name>State { ... }`
 ```
 
-脱糖产物（以 `Counter agent { state count: i64; step fn(s: CounterState, msg: i64) -> CounterState {...} }` 为例）：
+脱糖产物（以 `Counter agent { state count: i64; step fn(s: CounterState, msg: i64) CounterState {...} }` 为例）：
 
 | 生成符号 | 形态 | 命名约定 |
 |---|---|---|
 | `<Name>State` | struct（字段 = `state` 列表，含 `@tag` / `=default`） | PascalCase 类型名（§2.2） |
-| `<name>_spawn` | `fn(init0, ...) -> <Name>State`：一参一字段（按声明顺序），body = `return <Name>State{ f: f, ... }` | **小蛇形** `counter_spawn` |
-| `<name>_step` | `fn(s: <Name>State, msg: <Msg>) -> <Name>State`：用户所写 `step` 体 | **小蛇形** `counter_step` |
+| `<name>_spawn` | `fn(init0, ...) <Name>State`：一参一字段（按声明顺序），body = `return <Name>State{ f: f, ... }` | **小蛇形** `counter_spawn` |
+| `<name>_step` | `fn(s: <Name>State, msg: <Msg>) <Name>State`：用户所写 `step` 体 | **小蛇形** `counter_step` |
 
 **命名红线（M-A 修正）**：编译器先把 PascalCase 的 agent 名经 `pascal_to_snake` 转小写，再拼 `_spawn` / `_step`，故生成的函数名恒为合法 snake_case。若手写 `Counter_step`（大写开头）会触发 `T_NAME_TYPE_CAMEL` 警告——因为命名校验器把「首字母大写」的标识符按**类型名**规则校验（§2.2：普通函数须小蛇形）。脱糖产物从根上规避该警告。
 
@@ -2045,8 +2105,8 @@ AgentClause:
 | **Planning（规划）** | Plan Agent 规划体 | Scout Agent 侦察体 | Operator Agent 操作体 | Strategist Agent 策略体 | Adjutant Agent 副官体 |
 
 - **已示例（Reflex 行）**：State（`Monster`）、Mind（`Receptionist`）——见 `examples/agent_npc.tc`；**Sensor（`Radar`）、Tool（`DbAgent`）、Player（`Hero`）——见 `examples/agent_edge.tc`**（三体演示 Edge 边界差异：`step` 在边界记意图、`drive_*()` 去读感知/调工具/读人类输入，与 Mind 同构，核心 step 纯函数可回放）。
-- **已示例（Planning 行，无 `goal`/`plan` 语法，决策 A 第5条）**：Plan / Scout / Operator / Strategist / Adjutant —— 用纯 `planner(State) -> Msg` 自由 fn 算出「下一步消息」喂同一纯 `step`，**已可写可运行示例**：`examples/planner_demo.tc`（四 planner 自由 fn 共用同一 `robot_step` 原语，差异只在边界驱动）。
-- **元类 ✅ 库层落地（examples/lib/colony.tc）**：Spawner / Colony Agent 调度体（管理/生成子 agent）。按收敛决策 A **不进编译器语法**，复用 actor 脱糖产物（XState / x_spawn / x_step）+ slice + 函数指针实现 `spawn` 生成 / 按 `id` 寻址 / `tick` 调度 / 扁平 inbox 延迟邮箱；状态以 **string 指纹 + `fn(string, Msg)->string` 回调**泛型无关复用（任意 agent 类型共用同一调度体）。演示见 `examples/colony_demo.tc`（Worker 小队 + Counter 跨类型复用）与 `examples/colony_wave.tc`（真实小子场景：塔防刷怪波次 + ECS World 主循环，每帧跑 AgentSystem/MovementSystem(`physics.movement_system`)/CombatSystem 三 System）。⚠ 规避 t 当前两处限制：① map 值仅支持纯标量（含 string/slice 的 struct、map-of-slice 触发编译器内部 panic）→ 用并行 slice 按 id 下标对齐；② LLVM 后端对 slice-of-slice（`[][]Msg`）发射非法 IR → 邮箱用扁平 `[]Msg` + 并行 `[]i64 inbox_to`。
+- **已示例（Planning 行，无 `goal`/`plan` 语法，决策 A 第5条）**：Plan / Scout / Operator / Strategist / Adjutant —— 用纯 `planner(State) Msg` 自由 fn 算出「下一步消息」喂同一纯 `step`，**已可写可运行示例**：`examples/planner_demo.tc`（四 planner 自由 fn 共用同一 `robot_step` 原语，差异只在边界驱动）。
+- **元类 ✅ 库层落地（examples/lib/colony.tc）**：Spawner / Colony Agent 调度体（管理/生成子 agent）。按收敛决策 A **不进编译器语法**，复用 actor 脱糖产物（XState / x_spawn / x_step）+ slice + 函数指针实现 `spawn` 生成 / 按 `id` 寻址 / `tick` 调度 / 扁平 inbox 延迟邮箱；状态以 **string 指纹 + `fn(string, Msg) string` 回调**泛型无关复用（任意 agent 类型共用同一调度体）。演示见 `examples/colony_demo.tc`（Worker 小队 + Counter 跨类型复用）与 `examples/colony_wave.tc`（真实小子场景：塔防刷怪波次 + ECS World 主循环，每帧跑 AgentSystem/MovementSystem(`physics.movement_system`)/CombatSystem 三 System）。⚠ 规避 t 当前两处限制：① map 值仅支持纯标量（含 string/slice 的 struct、map-of-slice 触发编译器内部 panic）→ 用并行 slice 按 id 下标对齐；② LLVM 后端对 slice-of-slice（`[][]Msg`）发射非法 IR → 邮箱用扁平 `[]Msg` + 并行 `[]i64 inbox_to`。
 - 命名对称：Scout = 规划式感知（先侦察再决策），区别于 Sensor 反应式感知；Adjutant = 人类为指挥官、agent 为副官负责规划协调，区别于 Player 玩家体（纯 Reflex 人类直驱）。完整定义见 `docs/agent_first.md` §6。
 
 **收敛决策 A（2026-08-04 拍板）**：`agent` 在语言层**无能力净增**（脱糖产物 `struct` + 自由 `fn` + 构造器 `t` 均已是一等公民，连 `spawn` 也可用 `XState{...}` struct 字面量替代），故**保留为极简意图标记，绝不再扩语法**——`use` 接线式、`goal`/`plan` 子句、`Spawner`/`Colony` 原语、消息路由均**不进编译器**。上方 10 格分类矩阵是**模式目录（非语法）**：所有 flavor 只是同一 `step` 契约 + 同一边界模型下**边界驱动方式不同**（读世界 / 调工具 / 调 LLM / 读人类 / 规划后喂 `step`），First-class agent ≠ built-in-flavors。支撑「数据流可复现」的工程工具（消息日志 / 回放定位 / 确定性 diff）移至**库层**（详见 `docs/agent_first.md` §8、§9、§10 库层边界协议、§11 ECS 集成与非容器原则、§12 模块与模型库分层）。
@@ -2106,21 +2166,21 @@ ExportPrefix:   "export"                            // 前缀修饰顶层声明�
 7d. **调试态归档（`.tlibd`，外部库收尾刀）**：`tc build --lib --debug <file.tc>` 产出**调试态**归档 `out/lib/<stem>.tlibd`（`clang -O0 -gcodeview` 编 `.o` 经 `llvm-ar rcs`）与伴随 `out/lib/<stem>.tlibd.exports.json`（接口块，命名随 `lib_ext`）。`tc` 的 `--debug-libs` 开关令 `resolve_external_lib_archive` **优先探测 `.tlibd`**（未命中回退 `.tlib`，再回退内联源码）——便于调试期保留符号/行号。普通 `build --lib`（无 `--debug`）仍产 `.tlib`（`-O2`）。
 8. **接口自描述**：`.tlib`/`.tlibd` 内嵌接口块（后端无关、确定性可读的 `export` 签名区），importer `check` 只读接口块即可类型检查；未 `export` 符号不进接口块，私有天然不可见。
 9. **C 互操作**：`.tlib` 可经 `tote` 导出为 C 兼容 `.lib`/`.dll`（符号来自接口块），导出表仅含 `export` 符号（见草稿 §11）。
-10. **环境变量搜索（`T_LIB_PATH` / `~/.tote/libs`，2026-08-05 第六刀已落地）**：库搜索路径追加**环境变量驱动**的目录。`tc` 提供**中性**内建 `getenv(name: string) -> string`（读取进程环境变量；未设置返回空串、不 panic；双后端经 `t_getenv` / `tll_getenv` 实现），但 `tc` 自身**不解析**环境变量——包搜索策略完全留给 `tote`（类比 rustc 只收 `-L`、不读 `CARGO_*`）。`tote` 在构造 `tc` 命令时：① 读 `T_LIB_PATH`（`;` 分隔目录列表，与 Windows PATH 一致；**不**按 `:` 切分，以免误拆 Windows 盘符 `C:/...`），逐个以 `--lib-dir <dir>` 注入；② 再追加 `~/.tote/libs`（即 `home_dir() + "/.tote/libs"`，`home_dir` 取自 `USERPROFILE` / `HOMEDRIVE+HOMEPATH` / `HOME`）。`--lib-dir <dir>` 是 `tc` 的中性输入开关，把 `<dir>` 追加进 `g_lib_dirs`（优先级最高，先于工程 `lib/` 命中）。故 `set T_LIB_PATH=C:/my/libs` 后即可 `tote run app.tc` 解析 `import @mylib`（库只放在该目录也能找到）；不设则回退默认搜索路径。验证：库仅置于 `T_LIB_PATH` 目录时 `tote run` 可解析，不设置则 `T_IMPORT_NOT_FOUND`。
+10. **环境变量搜索（`T_LIB_PATH` / `~/.tote/libs`，2026-08-05 第六刀已落地）**：库搜索路径追加**环境变量驱动**的目录。`tc` 提供**中性**内建 `getenv(name: string) string`（读取进程环境变量；未设置返回空串、不 panic；双后端经 `t_getenv` / `tll_getenv` 实现），但 `tc` 自身**不解析**环境变量——包搜索策略完全留给 `tote`（类比 rustc 只收 `-L`、不读 `CARGO_*`）。`tote` 在构造 `tc` 命令时：① 读 `T_LIB_PATH`（`;` 分隔目录列表，与 Windows PATH 一致；**不**按 `:` 切分，以免误拆 Windows 盘符 `C:/...`），逐个以 `--lib-dir <dir>` 注入；② 再追加 `~/.tote/libs`（即 `home_dir() + "/.tote/libs"`，`home_dir` 取自 `USERPROFILE` / `HOMEDRIVE+HOMEPATH` / `HOME`）。`--lib-dir <dir>` 是 `tc` 的中性输入开关，把 `<dir>` 追加进 `g_lib_dirs`（优先级最高，先于工程 `lib/` 命中）。故 `set T_LIB_PATH=C:/my/libs` 后即可 `tote run app.tc` 解析 `import @mylib`（库只放在该目录也能找到）；不设则回退默认搜索路径。验证：库仅置于 `T_LIB_PATH` 目录时 `tote run` 可解析，不设置则 `T_IMPORT_NOT_FOUND`。
 
 ```t
 // 工程布局：yourproj/{tote.toml, src/{main.tc, hello.tc, d/e.tc}}
 // src/hello.tc
-export greet fn() -> string { return "hi from hello"; }
-export add fn(a: i64, b: i64) -> i64 { return a + b; }
+export greet fn() string { return "hi from hello"; }
+export add fn(a: i64, b: i64) i64 { return a + b; }
 
 // src/d/e.tc
-export deep fn(x: i64) -> i64 { return x + 100; }
+export deep fn(x: i64) i64 { return x + 100; }
 
 // src/main.tc —— 入口（与 hello.tc、d/ 同级，统一从 src/ 解析）
 import(src.hello);
 import(src.d.e);
-main fn() -> i32 @main {
+main fn() i32 @main {
     println(hello.greet());   // import(src.hello) => src/hello.tc
     println(i2s(hello.add(2, 3)));
     println(i2s(e.deep(10))); // import(src.d.e)    => src/d/e.tc，限定前缀取末段 e
@@ -2133,7 +2193,7 @@ main fn() -> i32 @main {
 import(json);                       // 库（首段非 src）→ lib / 依赖库 / out/lib 搜索
 import(std.math as m2);            // 模块别名：m2.abs(...) 访问
 import(std.mem :: len, reverse as rev);  // 选择性导入 + 改名
-main2 fn() -> i32 @main {
+main2 fn() i32 @main {
     println(m2.abs(-7));           // 7
     println(i2s(len(xs)));         // 直接用 len（选择性导入）
     rev(i64, xs);                   // 用 rev 代替 reverse
@@ -2486,6 +2546,7 @@ RangeExpr:
 |---|---|---|
 | for 迭代 | `for (i in a..b)` | 计数循环（见下） |
 | 切片索引 | `s[a..b]` | `str_slice` / `slice_sub` 调用 |
+| 字节视图索引 | `b[a..b]` | `bytes_slice` 调用 |
 | match 臂 | `1..5 => ...` | 比较链 `x >= 1 && x < 5` |
 | 成员测试 | `x in a..b` | 比较合取 `x >= a && x < b` |
 | 其余值位置 | `var xs: []i64 = 2..6;` | 物化成 `[]i64`（`__range_fill` 助手） |
@@ -2501,7 +2562,7 @@ for (i in 0..n) { body }
 
 上界只求值一次是**语义承诺**：`for (i in 0..n) { n = 100; }` 的轮数由进入循环时的 `n` 决定。`..=` 把条件换成 `<=`；开放右端 `a..` 不生成条件（= 无限循环，靠 `break` 收口）。
 
-**切片索引**：缺省下界补 `0`，缺省上界补 `str_len(obj)` / `slice_len(obj)`；`..=hi` 的排他上界取 `hi + 1`。子切片 `slice_sub` 是 O(1) 视图，与源共享底层缓冲，但 `cap` 收成 `len`——对子切片 `append` 必定触发扩容拷贝，不会踩写源切片的后续元素。
+**切片索引**：缺省下界补 `0`，缺省上界补 `str_len(obj)` / `slice_len(obj)` / `bytes_len(obj)`；`..=hi` 的排他上界取 `hi + 1`。子切片 `slice_sub` 是 O(1) 视图，与源共享底层缓冲，但 `cap` 收成 `len`——对子切片 `append` 必定触发扩容拷贝，不会踩写源切片的后续元素。
 
 **物化**惰性合成整轮编译共用的 `__range_fill(lo, hi) []i64` 助手（与 `__pipe_N` 同一套注入机制）。
 
@@ -2519,7 +2580,7 @@ for (i in 0..n) { body }
 |---|---|---|
 | 子切片视图 | `t_slice_sub(TSlice, i64, i64)` | `tll_slice_sub(ptr, i64, i64, ptr out)` |
 
-字符串区间索引复用既有 `str_slice`，无新增。越界一律 `t_panic_bounds`。
+字符串区间索引复用既有 `str_slice`，字节视图区间索引复用 `bytes_slice`，均无新增运行期原语。越界一律 `t_panic_bounds`。
 
 #### 3.16.5 诊断
 
@@ -2528,7 +2589,7 @@ CAT `RNG` 占 870–879。完整表见 `docs/diagnostics.md`。
 | 机器码 | legacy | 等级 | 触发 |
 |---|---|---|---|
 | `T-RNG-E870` | `T_RANGE_ITER_NO_START` | error | 区间迭代缺起点；或对区间用了 `for (k, v in ...)` |
-| `T-RNG-E871` | `T_RANGE_INDEX_UNSUPPORTED` | error | 对 `string` / `[]T` 以外的类型做区间索引 |
+| `T-RNG-E871` | `T_RANGE_INDEX_UNSUPPORTED` | error | 对 `string` / `bytes` / `[]T` 以外的类型做区间索引 |
 | `T-RNG-E872` | `T_RANGE_OPEN_AS_VALUE` | error | 开放区间出现在取值位置 |
 | `T-RNG-E873` | `T_RANGE_INDEX_ARRAY` | error | 对 `[N]T` 做区间索引（构造降解未落地） |
 | `T-RNG-E874` | `T_RANGE_INCL_NO_END` | error | `..=` 缺右端点（解析期） |
@@ -2548,13 +2609,38 @@ CAT `RNG` 占 870–879。完整表见 `docs/diagnostics.md`。
 
 ---
 
+### 3.17 Cell blocks（Notebook 单元）⚠ spec-only（设计目标，经 docs/design.md §2.8 提案，tc 未接入）
+
+> **状态**：design-only。本节气法描述一个**轻量作用域块**构造 `cell <name> { ... }`，作为类似 Observable 的 notebook 中「单元格」的语言级对应物。它**不是 notebook 专属语义**——`cell` 是通用语言的作用域块关键字，notebook 只是复用方之一。完整讨论、路线裁定与已锁定决策见 `docs/notebook.md` §13 / §13.8。
+
+```ebnf
+CellStatement: "cell" Ident "{" (Item | Statement)* "}"
+```
+
+**语义（已锁定，来自 docs/notebook.md §13.8）**
+
+1. **带名作用域块**：`cell <name> { ... }` 引入一个带名嵌套作用域，块内可含顶层条目（`fn`/`struct`/`variant`/`type`/模块级 `var`/`import`）与语句。
+2. **可见性：自上而下**：下游 `cell` 可引用更早 `cell` 内绑定，不可反向引用；无需前向声明 / 两遍 sema。
+3. **不隔离**：整本 notebook 落为**单一 Module**（一个 `.tc` 文件），所有 `cell` 共享同一 scope / 同一地址空间；不做 cell 级隔离（notebook 通常正需要 cell 间共享全局状态）。
+4. **跨 cell 值桥**：因共享地址空间，下游 cell 按符号直读上游 cell 值，**无需序列化**（`fid <>` / `to_value` 仅作跨进程兜底，见 `docs/notebook.md` §5）。
+5. **可 `import` 外部**：notebook 作为普通 module，可 `import(<otherNotebook> :: *)` / `import(<systemModule> :: *)` 引用其他 Notebook 或系统级 module（外部引用仍走既有的模块导入契约）。
+6. **编译器按 cell 二进制缓存**：把既有的「文件级 `.tlib` / 链接」增量编译粒度**下放至 cell**——每个 cell 发射为可独立缓存的二进制碎片（键 = 内容哈希），cell 变更时仅重编该碎片并重链（标准分离编译，见 `docs/notebook.md` §6 / §13.7）。
+
+**与 `region` 关键字的关系（治理决定）**：`cell` 仅承载 notebook 作用域单元；未来类 Cone 的**内存区域 / 所有权**语义保留给 `region` 关键字（本次不引入），二者互不抢占。
+
+**编译期 / 运行期影响（来自 design.md §2.8 合规矩阵）**：改动集中在前端（lexer 加 1 关键字、`CellStatement` 解析形）+ sema（嵌套作用域 + 顺序可见性）；codegen 仅脱糖为「带名作用域 + 可选 `fn <name>__run()`」，C/LLVM 后端 ABI 不变；typeck / IR lowering 不动。属**新增路径**，非重写。
+
+**Stage 1 过渡（tc 零改动）**：在 `cell` 关键字经提案落地前，notebook 编排层（host 侧）可直接在 cell 边界切分、把各 cell 源按顺序拼接为单一 `.tc` 复用既有 `emit-ll` / `build --lib` 缓存，等价获得上述语义（见 `docs/notebook.md` §11 Stage 1）。即本语法在 tc 接入前后，notebook 体验一致。
+
+---
+
 ## 4. Program entry（程序入口） ✅ tote
 
 ```ebnf
 EntryPoint: FuncDecl with "@main" annotation
 ```
 
-- 可用 `@main` 显式标记入口（替代固定名 `main`）：`app_entry fn() -> i32 @main { ... }`。
+- 可用 `@main` 显式标记入口（替代固定名 `main`）：`app_entry fn() i32 @main { ... }`。
 - tc 代码生成：被 `@main` 标记的函数发射为 `int32_t t_entry_<name>(void)`，并在生成的 `int main()` 中按序调用 `t_runtime_init` → `t_runtime_set_arena` → `t_entry_<name>()` → `t_runtime_done()`，返回退出码。
 
 ---
@@ -2566,7 +2652,7 @@ TranslationUnit : ModuleItem*
 ModuleItem      : FuncDecl | StructDecl | FlagDecl | VariantDecl
                 | TestDecl | SuiteDecl
                 | GlobalVarDecl | ConstDecl | InnerAttribute
-FuncDecl        : Ident "fn" "(" Params? ")" ("->")? Type Anns? Block
+FuncDecl        : Ident "fn" "(" Params? ")" Type Anns? Block
 StructDecl      : Ident "struct" Anns? "{" Field* "}"
 FlagDecl        : Ident "flag" "[" IntType "]" "{" Slot* "}"
 VariantDecl     : Ident "variant" "{" Case* "}"
@@ -2589,7 +2675,7 @@ Annotation      : "@" Ident ("(" ArgList? ")")?
 | spec 章节 | 能力 | tc 状态 |
 |---|---|---|
 | §1 | 基础语法/命名/函数签名 | ✅ 已实现 |
-| §2 | 固定位宽标量 + string/StringBuilder | ✅ 已实现 |
+| §2 | 固定位宽标量 + rune + string/StringBuilder + bytes/BytesBuilder | ✅ 已实现 |
 | §2.3 | Variant 变体 | ✅ 已实现（自由函数式 helper） |
 | §3.1 | struct（@derive 全能力） | ✅ 结构；⚠ @derive 桩 |
 | §3.1 | #aos / #soa 布局变换 | ⚠ 仅注释 |
