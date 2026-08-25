@@ -25,7 +25,7 @@
 - ⚠ `Tok` 无字节偏移；需源码切片须解析期就地捕获。`diag_new` 的 `sev` 对未注册码须显式 `"warning"`。conformance 首行 `// EXPECT: pass`/`// EXPECT: error T_XXX`；`tc build` 成功时 stdout 只输出 warning（stdout 是机器可读通道）。
 - 透传/匹配节点须查全 4 处 emit/etd；单态化缓存命中须改写调用点（`nodes[e].bb=true`）。
 - ⚠ **空切片字面量 `[]` 的 LLVM 后端限制**：`[]` 只能作**局部变量初始化器**（`var x: []T = [];` codegen 正常）；作为**表达式**（赋值 RHS `g = [];` 或模块级初值器 `var g: []T = [];`）会被发射成 `ptr 0` → clang 拒绝（`load %TSlice, ptr 0` / UNSUPPORTED expr）。间接构造空切片 idiom：`var __e: []T = []; g = __e;`。
-- **Stage 2 规范不动点已改道（重要）**：`docs/bootstrap.md §4.1` 的 C 后端三轮不动点 `tc0→tc1→tc2→tc3 / C_a≡C_b≡C_c` 在当前代码上**物理不可达**——种子 tc0（冻结于 v1.0-selfhost）解析不了当前 `import(src.x :: *)` 语法（gen0 直接 24 个 `T_PARSE_EXPECTED_TOKEN`），且其 C 后端对 `append(x, sb_to_str(...))` 生成 `&t_sb_to_str(...)` 取临时量地址 → MSVC `C2102`（README 第167行已据此把 `tools/bootstrap.mjs` 标为遗留/冻结）。**现行自举不动点由 `gate L2` 实证**：`boot4`（LLVM 四代 `g2==g3==g4` 比 `.ll` md5）+ `cself`（C 后端自举 + 跨后端等价）+ `difftc0`（tc0 外部对拍）全绿。补完 stage2 的缺口=①同步 docs（§4.1/M10-M11/README 数字过时）②把已验证状态提交并打新 tag（当前相对 v1.0-selfhost 有 400 文件改动全部未提交）③审计 conformance 对 spec 条款的 pos+neg 覆盖。
+- **Stage 2 规范不动点已改道（重要）**：`docs/bootstrap.md §4.1` 的 C 后端三轮不动点 `tc0→tc1→tc2→tc3 / C_a≡C_b≡C_c` 在当前代码上**物理不可达**——种子 tc0（冻结于 v1.0-selfhost）解析不了当前 `import(src.x :: *)` 语法（gen0 直接 24 个 `T_PARSE_EXPECTED_TOKEN`），且其 C 后端对 `append(x, sb_to_str(...))` 生成 `&t_sb_to_str(...)` 取临时量地址 → MSVC `C2102`（README 第167行已据此把 `tools/bootstrap.mjs` 标为遗留/冻结）。**现行自举不动点由 `gate L2` 实证**：`boot4`（LLVM 四代 `g2==g3==g4` 比 `.ll` md5）+ `cself`（C 后端自举 + 跨后端等价）+ `difftc0`（tc0 外部对拍）全绿。补完 stage2 的缺口=①同步 docs（§4.1/M10-M11/README 数字过时）②把已验证状态提交并打新 tag（当前相对 v1.0-selfhost 有 400 文件改动全部未提交）③审计 conformance 对 spec 条款的 pos+neg 覆盖。（**①docs 同步 + ②提交+tag `v1.0-selfhost-llvm` + ③G3 覆盖率审计（诊断码 120/128，commit 4d71c8b）+ ④G4 信任根模型（接受 LLVM 自举不动点为信任根，docs/bootstrap.md §4.3 已文档化）均已完成。Stage 2 全闭环。**）
 
 ## REPL（裸 `tc` 进入，clean-subprocess）
 - 每条输入重编 `decls+input`→`out/repl/repl_exe.exe` 再跑；跨行可变状态不持久。元命令 `:help/:quit/:reset/:dump/:load`。
@@ -35,3 +35,7 @@
 
 ## 技术债
 - ⚠ **P0 未根治**：`[N]T`→`[]T` 无转换 lowering，Array↔Slice `can_cast` 无条件放行 ⇒ 传定长数组给 `[]T` 形参静默读垃圾长度段错误。正解 Array→Slice 插 `t_slice_from_raw`；当前仅管道层拦截（`T-PIP-E863`）。勿一刀切拒绝（误伤字面量初始化）。
+
+## 文档治理（冲突防护）
+- `docs/reference.md` = **t 语法唯一权威（single source of truth）**，机器可读（`ebnf` 块）驱动 `tools/gen_ebnf.mjs` 代码生成管线。它是**全局共享规格文件，非会话草稿**。
+- ⚠ **多对话写 reference.md 会冲突**：WorkBuddy 普通文件无锁；Edit 需先 Read 当前快照，并发写者会 last-writer-wins 静默丢改动。规则：①reference.md 只增删语言规格（如 `cell` 关键字须先走 design.md 提案 + gate）；②会话级/跨对话知识走记忆层（`.workbuddy/memory/`），不写进 reference.md；③改规格须隔离操作（改前立即重 Read + 串行）；④多对话各需 reference 时各自落独立草稿，最后单一 owner 合并。
