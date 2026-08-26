@@ -797,15 +797,33 @@ ll_cast_v fn(v: string, ftd: i64, ttd: i64) string {
         return v;
     }
     if (v[0] != 37) {
-        // 常量文本一般随目标类型自适应；唯一例外是 f64 常量窄化到 float：
-        // LLVM 要求 float 的十进制字面量必须能被 f32 **精确表示**，
-        // `store float 0.016` 会被拒（floating point constant invalid for type）。
-        // 降级成一条 fptrunc 指令，由 LLVM 自己做正确舍入。
+        // 常量文本一般随目标类型自适应；例外处理如下——
+        // (1) f64 常量窄化到 float：float 的十进制字面量必须能被 f32 **精确表示**，
+        //     `store float 0.016` 会被拒（floating point constant invalid for type）。
+        //     降级成一条 fptrunc 指令，由 LLVM 自己做正确舍入。
         if (ll_isf(fs) && ll_isf(ts) && ll_bits(fs) > ll_bits(ts)) {
             var fcv: string = ll_tmp();
             llfb(sb_cat6("  ", fcv, " = fptrunc ", scalar_to_ll(fs), " ",
                 sb_cat4(v, " to ", scalar_to_ll(ts), "")));
             return fcv;
+        }
+        // (2) 整型/Bool 常量 → 浮点：LLVM 浮点常量必须带小数点，否则
+        //     `double 7` 被判成「整数常量用于浮点类型」而非法。补 ".0"。
+        if (ll_isf(ts) && ll_isf(fs) == false) {
+            return sb_cat2(v, ".0");
+        }
+        // (3) 浮点常量 → 整型/Bool：LLVM 整数常量不接受小数（`i64 2.9` 非法），
+        //     改用 fptosi/fptoui 指令（常量操作数合法，编译期即求值）。
+        if (ll_isf(fs) && ll_isf(ts) == false) {
+            var tcv: string = ll_tmp();
+            if (ll_signed(ts)) {
+                llfb(sb_cat6("  ", tcv, " = fptosi ", scalar_to_ll(fs), " ",
+                    sb_cat4(v, " to ", scalar_to_ll(ts), "")));
+            } else {
+                llfb(sb_cat6("  ", tcv, " = fptoui ", scalar_to_ll(fs), " ",
+                    sb_cat4(v, " to ", scalar_to_ll(ts), "")));
+            }
+            return tcv;
         }
         return v;    // 常量文本随目标类型自适应
     }
@@ -1108,7 +1126,9 @@ emit_lle fn(e: i64) string {
         // IEEE-754 特殊值：LLVM 的 FP 常量没有 `inf` / `nan` 记号，
         // 只能写 double 的 64 位十六进制位模式。
         if (n.sa == "inf") { return "0x7FF0000000000000"; }
+        if (n.sa == "-inf") { return "0xFFF0000000000000"; }
         if (n.sa == "nan") { return "0x7FF8000000000000"; }
+        if (n.sa == "-nan") { return "0xFFF8000000000000"; }
         // 确保带小数点（LLVM 浮点常量语法）
         var has_dot: bool = false;
         var i: u64 = 0;

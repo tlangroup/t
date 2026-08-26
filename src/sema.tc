@@ -6869,20 +6869,34 @@ meta_eval fn(e: i64) i64 {
             return meta_fail("T-MTA-E617", "编译期类型转换仅支持标量目标类型", e);
         }
         var cvn: Node = nodes[cv];
-        if (tn0.sa == "bool") {
+        var tname: string = tn0.sa;
+        // 目标：浮点
+        if (tname == "f64" || tname == "f32") {
+            if (cvn.kind == "float") { return cv; }
+            if (cvn.kind == "int" || cvn.kind == "bool") {
+                return mk_float(meta_f64_to_str(mv_get_int(cv) as f64), -1);
+            }
+            return meta_fail("T-MTA-E617",
+                "编译期向浮点的转换操作数须为 int / bool / float", e);
+        }
+        // 目标：bool
+        if (tname == "bool") {
             if (cvn.kind != "bool") {
                 return meta_fail("T-MTA-E617", "编译期不支持向 bool 的隐式窄化", e);
             }
             return cv;
         }
-        if (meta_is_int_type(tn0.sa) == false) {
+        // 目标：整数
+        if (meta_is_int_type(tname) == false) {
             return meta_fail("T-MTA-E617",
-                sb_cat3("编译期类型转换暂不支持目标类型 `", tn0.sa, "`"), e);
+                sb_cat3("编译期类型转换暂不支持目标类型 `", tname, "`"), e);
         }
-        if (cvn.kind != "int" && cvn.kind != "bool") {
-            return meta_fail("T-MTA-E617", "编译期整数转换的操作数须为整数", e);
+        if (cvn.kind == "int") { return mv_int(meta_int_wrap(mv_get_int(cv), tname)); }
+        if (cvn.kind == "bool") { return mv_int(meta_int_wrap(mv_get_int(cv), tname)); }
+        if (cvn.kind == "float") {
+            return mv_int(meta_f64_to_int(meta_f64_from_str(cvn.sa)));
         }
-        return mv_int(meta_int_wrap(mv_get_int(cv), tn0.sa));
+        return meta_fail("T-MTA-E617", "编译期整数转换的操作数须为 int / bool / float", e);
     }
     if (n.kind == "call") { return meta_eval_call(e); }
     if (n.kind == "mbuiltin") { return meta_eval_mbuiltin(e); }
@@ -7039,11 +7053,21 @@ meta_eval_unary fn(e: i64) i64 {
     if (v < 0) { return -1; }
     var vn: Node = nodes[v];
     if (n.sa == "+") {
-        if (vn.kind != "int") { return meta_fail("T-MTA-E617", "一元 `+` 的操作数须为整数", e); }
+        if (vn.kind == "float") { return v; }
+        if (vn.kind != "int") { return meta_fail("T-MTA-E617", "一元 `+` 的操作数须为整数或浮点", e); }
         return v;
     }
-    if (n.sa == "-") {
-        if (vn.kind != "int") { return meta_fail("T-MTA-E617", "一元 `-` 的操作数须为整数", e); }
+        if (n.sa == "-") {
+            if (vn.kind == "float") {
+                // IEEE-754 特殊值：t 无 inf/nan 的数值字面量，统一以文本承载；
+                // 取负按位模式翻转（与 codegen_ll 浮点字面量发射器保持一致）。
+                if (vn.sa == "inf") { return mk_float("-inf", -1); }
+                if (vn.sa == "-inf") { return mk_float("inf", -1); }
+                if (vn.sa == "nan") { return mk_float("nan", -1); }
+                if (vn.sa == "-nan") { return mk_float("nan", -1); }
+                return mk_float(meta_f64_to_str( 0.0 - meta_f64_from_str(vn.sa)), -1);
+            }
+        if (vn.kind != "int") { return meta_fail("T-MTA-E617", "一元 `-` 的操作数须为整数或浮点", e); }
         return mv_int(0 - mv_get_int(v));
     }
     if (n.sa == "~") {
@@ -7055,6 +7079,73 @@ meta_eval_unary fn(e: i64) i64 {
         return mv_bool(vn.ba == false);
     }
     return meta_fail("T-MTA-E617", sb_cat3("编译期不支持一元算子 `", n.sa, "`"), e);
+}
+
+// ── 编译期浮点辅助（Phase B.2）─────────────────────────────
+// string -> f64：覆盖常用十进制字面量（符号 / 整数部 / 小数部 / 指数）。
+// 仅用于编译期常量折叠；正常字面量可经 %.17g 精确往返。
+meta_f64_from_str fn(s: string) f64 {
+    var i: i64 = 0;
+    var n: i64 = str_len(s);
+    var neg: bool = false;
+    if (i < n && (str_at(s, i) as i64) == 45) { neg = true; i = i + 1; }   // '-'
+    else if (i < n && (str_at(s, i) as i64) == 43) { i = i + 1; }           // '+'
+    var val: f64 = 0.0;
+    var frac: bool = false;
+    var fscale: f64 = 0.1;
+    var exp: i64 = 0;
+    var have_exp: bool = false;
+    while (i < n) {
+        var ci: i64 = str_at(s, i) as i64;
+        if (ci == 46) {   // '.'
+            if (frac || have_exp) { break; }
+            frac = true; i = i + 1; continue;
+        }
+        if (ci == 101 || ci == 69) {   // 'e' / 'E'
+            if (have_exp) { break; }
+            have_exp = true; i = i + 1;
+            var esign: i64 = 1;
+            if (i < n && (str_at(s, i) as i64) == 45) { esign = -1; i = i + 1; }
+            else if (i < n && (str_at(s, i) as i64) == 43) { i = i + 1; }
+            var ev: i64 = 0;
+            while (i < n) {
+                var ec: i64 = str_at(s, i) as i64;
+                if (ec >= 48 && ec <= 57) { ev = ev * 10 + (ec - 48); i = i + 1; }
+                else { break; }
+            }
+            exp = esign * ev;
+            break;
+        }
+        if (ci >= 48 && ci <= 57) {
+            var d: i64 = ci - 48;
+            if (frac) { val = val + ((d as f64) * fscale); fscale = fscale * 0.1; }
+            else { val = (val * 10.0) + (d as f64); }
+            i = i + 1; continue;
+        }
+        break;
+    }
+    if (exp > 0) { var k: i64 = 0; while (k < exp) { val = val * 10.0; k = k + 1; } }
+    else if (exp < 0) { var k: i64 = 0; while (k > exp) { val = val / 10.0; k = k - 1; } }
+    if (neg) { val = 0.0 - val; }
+    return val;
+}
+
+// f64 -> i64：向零截断（与 C 的 (long long) 语义一致）
+meta_f64_to_int fn(x: f64) i64 {
+    var neg: bool = (x < 0.0);
+    var ax: f64 = x;
+    if (neg) { ax = 0.0 - ax; }
+    var i: i64 = 0;
+    while (((i as f64) + 1.0) <= ax) { i = i + 1; }
+    if (neg) { i = 0 - i; }
+    return i;
+}
+
+// f64 -> 字面量字符串（%.17g，精确保持与运行期一致）。
+// 发射期的「无小数点补 .0」由 codegen_ll 浮点字面量发射器兜底（见该文件 11xx 行），
+// 故此处直接返回格式化结果即可，无需自行拼接。
+meta_f64_to_str fn(v: f64) string {
+    return format_float(".17g", v);
 }
 
 meta_eval_binary fn(e: i64) i64 {
@@ -7103,6 +7194,35 @@ meta_eval_binary fn(e: i64) i64 {
         if (op == "==") { return mv_bool(ln1.ba == rn1.ba); }
         if (op == "!=") { return mv_bool(ln1.ba != rn1.ba); }
         return meta_fail("T-MTA-E617", sb_cat3("bool 不支持编译期算子 `", op, "`"), e);
+    }
+    // 浮点运算：float×float 或 float×int（int 提升为 float）
+    if (ln1.kind == "float" || rn1.kind == "float") {
+        if (ln1.kind != "float" && ln1.kind != "int") {
+            return meta_fail("T-MTA-E617", "编译期浮点运算的左操作数须为 float 或 int", e);
+        }
+        if (rn1.kind != "float" && rn1.kind != "int") {
+            return meta_fail("T-MTA-E617", "编译期浮点运算的右操作数须为 float 或 int", e);
+        }
+        var fa: f64 = 0.0;
+        var fb: f64 = 0.0;
+        if (ln1.kind == "float") { fa = meta_f64_from_str(ln1.sa); }
+        else { fa = mv_get_int(lv) as f64; }
+        if (rn1.kind == "float") { fb = meta_f64_from_str(rn1.sa); }
+        else { fb = mv_get_int(rv) as f64; }
+        if (op == "+") { return mk_float(meta_f64_to_str( fa + fb), -1); }
+        if (op == "-") { return mk_float(meta_f64_to_str( fa - fb), -1); }
+        if (op == "*") { return mk_float(meta_f64_to_str( fa * fb), -1); }
+        if (op == "/") {
+            if (fb == 0.0) { return meta_fail("T-MTA-E614", "编译期浮点除零", e); }
+            return mk_float(meta_f64_to_str( fa / fb), -1);
+        }
+        if (op == "==") { return mv_bool(fa == fb); }
+        if (op == "!=") { return mv_bool(fa != fb); }
+        if (op == "<") { return mv_bool(fa < fb); }
+        if (op == "<=") { return mv_bool(fa <= fb); }
+        if (op == ">") { return mv_bool(fa > fb); }
+        if (op == ">=") { return mv_bool(fa >= fb); }
+        return meta_fail("T-MTA-E617", sb_cat3("编译期不支持浮点算子 `", op, "`"), e);
     }
     if (ln1.kind != "int" || rn1.kind != "int") {
         return meta_fail("T-MTA-E617", "编译期二元运算的操作数类型不一致", e);
