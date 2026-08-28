@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 // tools/gen_ebnf.mjs
 // 从 docs/reference.md 的 ```ebnf 代码块抽取文法 + 5 张机器可读数据表，
-// 生成 out/ebnf.json（中间产物，不进 docs/，已被 .gitignore 忽略）。
+// 生成 ebnf.json：默认写入 tnote 工程的 notebook-web/data/ebnf.json（被 notebook 前端消费，
+// 放在 tnote 工程内，与 t 仓库 out/ 解耦，避免被 t 仓库的清理误操作删除）。
+// 可用环境变量 EBNF_OUT 覆盖输出路径。
 //
 // 数据表规则名（须在 reference.md 中出现）：
 //   Keyword          -> 关键字字面量 -> token kind
@@ -23,7 +25,10 @@ import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REF = path.join(__dirname, '..', 'docs', 'reference.md');
-const OUT = path.join(__dirname, '..', 'out', 'ebnf.json');
+// 默认输出到 tnote 工程的 notebook-web/data/ebnf.json（与 t 仓库 out/ 解耦，避免被清理误删）。
+// 可用环境变量 EBNF_OUT 覆盖绝对/相对输出路径。
+const DEFAULT_EBNF_OUT = path.resolve(__dirname, '..', '..', 'tnote', 'tools', 'notebook-web', 'data', 'ebnf.json');
+const OUT = process.env.EBNF_OUT ? path.resolve(process.env.EBNF_OUT) : DEFAULT_EBNF_OUT;
 
 const md = fs.readFileSync(REF, 'utf8');
 
