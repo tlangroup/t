@@ -998,6 +998,17 @@ TSlice t_slice_new(int64_t elem_size) {
     return s;
 }
 
+// 定长数组 → 切片零拷贝视图：直接把已有缓冲包装成 TSlice，不分配、不拷贝。
+// 用于编译期/运行期的 [N]T → []T 转型（array→slice cast）。
+TSlice t_slice_from_raw(void* ptr, int64_t len, int64_t elem_size) {
+    TSlice s;
+    s.ptr = ptr;
+    s.len = len;
+    s.cap = len;
+    s.elem_size = elem_size;
+    return s;
+}
+
 void t_runtime_set_arena(TArena* a) { g_arena = a; }
 TArena* t_arena_current(void) { return g_arena; }
 

@@ -77,6 +77,8 @@ void    tll_slice_set(TSlice* s, int64_t i, void* elem)      { t_slice_set(*s, i
 int64_t tll_slice_len(TSlice* s)                             { return t_slice_len(*s); }
 // 子切片：聚合入参与返回一律走指针，out 排末位（与 tll_str_slice 同构）
 void    tll_slice_sub(TSlice* s, int64_t a, int64_t b, TSlice* out) { *out = t_slice_sub(*s, a, b); }
+// 定长数组 → 切片零拷贝视图（聚合返回走指针，out 排末位）
+void    tll_slice_from_raw(void* ptr, int64_t len, int64_t elem_size, TSlice* out) { *out = t_slice_from_raw(ptr, len, elem_size); }
 
 // ── map ────────────────────────────────────────────────────────
 TMap*   tll_map_new(int64_t key_kind, int64_t val_size) { return t_map_new(t_arena_current(), key_kind, val_size); }
