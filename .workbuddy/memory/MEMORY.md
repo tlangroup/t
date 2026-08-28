@@ -18,6 +18,18 @@
 - ⚠ **升级锁坑**：`cp out/dbg/g4.exe out/dbg/tc.exe` 偶发 `Device or resource busy` —— 上一轮 gate 的孙进程（clang/lld）或残留 `tc.exe` 仍持有文件锁。`tasklist | grep tc.exe` 找 PID，`taskkill /PID <n> /F` 后再 cp。
 - 改诊断码只动 `tools/diag_defs.json` → `gen_diag.mjs`+`gen_diag_t.mjs`（GEN:diagnostics 区手改必被覆盖）。
 
+## Git / 沙箱红线（致命坑，2026-08-29 实证）
+- ⚠ **Bash 工具沙箱会损坏 `.git`**：默认沙箱对 `.git` 写操作（stash/commit/fetch/reset/repack）在 overlay 下 mishandle——删旧 pack 生效、新对象只落临时层 ⇒ 真实 `.git` 丢 pack、`refs/` 被清空。**每次默认沙箱跑 git 写命令都会复现损坏**。
+- **铁律**：所有 git 写命令（stash/commit/fetch/reset/push）与自举构建（g4 种子 `build` / clang）**必须**加 `dangerouslyDisableSandbox: true`，在真实文件系统操作。否则会悄悄毁掉历史。
+- **本机现状（2026-08-29）**：`df5cd06`（P5 闭包逃逸，6 项修复曾建其上并过 gate L2）**从未 push**，其对象库 `.pack` 已不可恢复；origin 拉回的是 `ce9418f`（浮点 CTFE 等**发散重写线**，且用比 df5cd06 编译器更旧语法方言，`g4` 种子无法解析其 `src/tc.tc` ⇒ 本环境无法构建/验证 ce9418f）。
+- **恢复动作**：从工作树兜底 tarball 重建 `df5cd06+fixes` 为 **orphan 分支 `df5cd06-six-fixes`**（commit b511bd6），保留已验证源码；`main` 仍指向 `ce9418f`。该分支与 main **无共同祖先**，日后合并需 `git merge --allow-unrelated-histories`，且须在能构建 ce9418f 的环境验证后再合。
+- 兜底备份：`/tmp/t_fixes_backup/`（5 源文件 df5cd06+修复版 + 2 example）、`/tmp/t_full_backup.tar.gz`（完整工作树快照，不含 out/ 与 .git）。
+- **（2026-08-29 已 push）** `df5cd06-six-fixes` 分支已推至 `origin` 作远程备份（`git push -u origin df5cd06-six-fixes` 成功，PAT 经一次性 insteadOf 注入、未落盘）。远程提示 `dist/tc.js.exe` 83MB 超 50MB 建议值（仅警告）。
+
+## 6 缺口扫描结论（2026-08-29，针对 ce9418f）
+- ce9418f **已自带** #5 多载荷 variant、#6 `as` 转型、#8 C 后端 match 返回结构体（`struct_lit` 已在 codegen_c.tc:1921 / codegen_ll.tc:688,1437）、#10 浮点 CT（ce9418f 即 CTFE 线）。#9 的 6 处 `; UNSUPPORTED` 是防御性 fallthrough，两线都有，非缺口。
+- **仅 #7 定长数组↔切片真缺**：但 ce9418f 的 `sema.tc:567-569` 已把 array→slice 包成 `cast` 节点（「让后端构造成 TSlice 零拷贝视图」），**缺的只是后端 lowering**——`codegen_c.tc` cast 分支(~1944)仍 `((T)expr)` 硬转、`codegen_ll.tc` cast-lowering(~1471)无 array→slice 分支、runtime 无 `t_slice_from_raw`/`tll_slice_from_raw`。port 时只改这 3 处+声明+example，参考 `df5cd06-six-fixes` 分支即可。
+
 ## 实现铁律（致命坑）
 - `sb_catN` 实参必 ==N，最大 `sb_cat6`；`catn_check` 强制校验 arity（写错直接 gate 失败）。
 - 新增内建须六处齐全：`builtin_ret`/`td_calls`/C emit/LLVM emit/`llph` declare/runtime（漏→静默 `; UNSUPPORTED call`）。
@@ -34,7 +46,8 @@
 - ⚠ **语法红线（踩坑点）**：`t` 的 lambda 是 `fn(name: Type) Ret { body }`，**不是** `|v| ...`（后者会被词法切成 `|` `v` `|` 报 T-PAR-E101）。管道 `|>` 是「整体应用」非逐元素迭代；「遍历区间打印每个」用 `for (i in 1..10) { ... }`（`1..10` 半开到 9，含 10 用 `1..=10`）。
 
 ## 技术债
-- ⚠ **P0 未根治**：`[N]T`→`[]T` 无转换 lowering，Array↔Slice `can_cast` 无条件放行 ⇒ 传定长数组给 `[]T` 形参静默读垃圾长度段错误。正解 Array→Slice 插 `t_slice_from_raw`；当前仅管道层拦截（`T-PIP-E863`）。勿一刀切拒绝（误伤字面量初始化）。
+- ⚠ **P0 — #7 定长数组↔切片（ce9418f 现状）**：`sema.tc:567-569` 已把 array→slice 包成 `cast` 节点（「让后端构造成 TSlice 零拷贝视图」），**但后端 lowering 缺失** ⇒ 传 `[N]T` 给 `[]T` 形参仍是静默段错误。正解：runtime 加 `t_slice_from_raw`(+`tll_slice_from_raw` shim)、`codegen_c.tc` cast 分支(~1944)源=array 目标=slice→`t_slice_from_raw(...)`、`codegen_ll.tc` cast-lowering(~1471)同逻辑+`declare @tll_slice_from_raw`。参考 `df5cd06-six-fixes` 分支实现。管道层 `T-PIP-E863` 拦截仍保留，勿一刀切拒绝（误伤字面量初始化）。
+  - **（2026-08-29 已 draft 进 main 工作树，未验证）**：改了 `runtime/t_runtime.c`(+`t_slice_from_raw`)/`t_runtime.h`/`t_shim_ll.c`(+shim)、`src/codegen_c.tc` cast 分支(1944)、`src/codegen_ll.tc` cast 分支(1471)+`declare`、新增 `examples/array_to_slice.tc`+`.expected.txt`。**本环境无法构建 ce9418f 验证**（g4 种子解析不了其旧语法），须用户在能构建 ce9418f 的机器上 `node tools/gate.mjs L2` 验绿后再 commit/push。LLVM 端切片按 `ptr %TSlice`（alloca+shim+返回指针，同 `args` 内置）约定。
 
 ## 文档治理（冲突防护）
 - `docs/reference.md` = **t 语法唯一权威（single source of truth）**，机器可读（`ebnf` 块）驱动 `tools/gen_ebnf.mjs` 代码生成管线。它是**全局共享规格文件，非会话草稿**。
