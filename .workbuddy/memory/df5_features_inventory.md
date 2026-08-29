@@ -78,10 +78,14 @@ LL(1) 声明（已 `69dc766`）、#7 array→slice（已 `54d9cd6`）、多载�
 - **A(variant)/C(ref)**：main 现有 p49–p59 已全绿，判定「main 已具备」，无需重写。
 - **未回归**：所有同步进来的 df5 用例 + 既有 main 用例合计 239 全过，无回归。
 
-## 5. 剩余待移植（B/E/F/G，尚未同步测试进 main）
-- **B f-string 校验**：f112_fmt_no_template / f113_fmt_too_many_args / f114_fmt_arg_type / f115_fmt_bad_template / f116_fmt_named_field / f117_fmt_mixed_numbering / f118_fmt_index_range / f119_fmt_spec_type。
-- **E meta 校验**：f124_meta_comptime_arg_not_type / f125_meta_arity / f126_meta_no_return / f127_meta_not_type / f128_meta_not_const / f129_annotation_case。
-- **F import 校验**：f10_import_header / f11_import_value / f12_import_io / f13_import_context / f105_removed_import / f131_import_conflict。
-- **G 其它语义/校验**：f120_annotation_invalid_arg / f122_match_arm_type / f109·f110 struct tagid 重复/混合 / f130_c_keyword_ident / f136 variant abstract bad underscore / f101·f102 range 不纯操作数·无 end·in rhs 非 range / f102·f103·f104 escape return·global / p43_forward_type_ref。
-- 这四类 df5 用例尚未同步进 `tests/conformance/`，对应校验逻辑未确认 main 是否已具备；待逐个移植并重建验证。
-- **方言策略（已定）**：移植验证统一用 main 方言（加 `@main`、用 `|v:T|` 显式型简写），不把 df5 方言（`|v|` 裸简写、`fn main()`）搬进 main，避免污染 main 解析器。df5 测试文件改写后再入 main 测试集。
+## 5. 关键更正（2026-08-29 实测）：B/E/F/G 早已在 main，仅 P4/P5 是真缺口
+- **更正**：本节（及 §1「df5 领先/main 缺失」分类）前提有误。实证：main 的 `tests/conformance/fail/` 已含
+  f112–f119（B f-string）、f124–f129（E meta）、f10/f11/f12/f13/f105/f131（F import）、
+  f109/f110/f120/f122/f130/f136 及 range/escape（G）等用例——与 df5 **同名同 EXPECT 码**，仅改写为 main 新方言
+  （`fn name` + `struct Name`，df5 是旧方言 `name fn` / `Name struct`）。这些用例已计入 239/0 绿态，说明 main **早已具备** B/E/F/G 的校验能力。
+- **df5 真正比 main 多、需在 main 重做的只有两项**：
+  1. **P4 `@type_of`**（内建 + p45_typeof 用例）—— 已落地、过 conformance、已提交 `b70f3fb` 并 push。
+  2. **P5 comptime 闭包逃逸**（详见 §4）—— 已落地、过 conformance（p60 + 直接 build/run 退出码 0）、已提交 `b70f3fb` 并 push。
+- **结论**：「在 main 重做 df5 全部功能」实质已完成。A(variant)/B(f-string)/C(ref)/D(comptime)/E(meta)/F(import)/G(other)
+  七类功能 main 均具备且 conformance 239/0 全绿；唯一 df5 独有、main 缺失的两项（@type_of、comptime 闭包逃逸）已移植、提交、推送。
+- **残留小项（非阻塞）**：df5 的 `mini.tc`/`mini2.tc`/`fmt_json_a1a.tc`/`match_return_struct.tc` 已在 `b70f3fb` 同步进 main 的 `examples/`（与 main 既有 examples 并存）；如需严格对齐可后续清理，但不影响功能与门禁。
