@@ -2326,6 +2326,9 @@ fn check_serializable(e: i64, sti: i64) void {
 var g_fmt_counter: i64;
 var g_fmt_ak: [64]i64;   // 各值实参的种类码（见 fmt_kind_of）
 var g_fmt_at: [64]i64;   // 各值实参对应的形参类型节点
+var g_fmt_json_ti: [64]i64;   // A1a：聚合实参的原始 TI（!j 递归编码用）
+var g_fmt_json: [64]bool;     // A1a：第 i 个值实参是否为聚合类型（须用 !j 编码）
+var g_fmt_jsym: i64;          // A1a：JSON 合成体内部局部变量名计数器
 
 // 值类型 → 种类码。-1 表示不可格式化（聚合类型等）。
 // ⚠ 整数字面量按最小无符号宽度推断（`42` 是 u8），故必须按名字判有无符号，
@@ -2384,10 +2387,9 @@ fn fmt_fn_takes_mode(name: string) bool {
     return name == "sb_append_fmt_str_conv" || name == "sb_append_fmt_int_conv" || name == "sb_append_fmt_uint_conv";
 }
 
-// 形参类型节点：string 与各标量都由 mk_scalar 承载（见 parse_type:4959/4993）
+// 形参类型节点：复用 mk_type_node_from_ti 覆盖标量/字符串/结构/切片/映射/数组。
 fn fmt_type_node(t: i64) i64 {
-    if (tip_kind(t) == "String") { return mk_scalar("string", -1); }
-    return mk_scalar(tip_name(t), -1);
+    return mk_type_node_from_ti(t);
 }
 
 // 把一条语句追加进函数体链表。head 为 -1 时同时把它设成表头。
@@ -2396,10 +2398,153 @@ fn fmt_push_stmt(head: i64, tail: i64, stmt: i64) i64 {
     return list_push(head, tail, stmt);
 }
 
+// ── A1a：!j 聚合值的编译期 JSON 编码 ──────────────────────────
+// t 没有运行期 Any / RTTI，故 JSON 编码在脱糖期按各实参的**静态 TI** 生成内联
+// 代码（双后端只编译生成的 t 代码，IR 不受影响）。覆盖标量/字符串/结构/切片/
+// 定长数组/映射；枚举/变体/Pointer/Optional 等无 RTTI 的类型降级为 null。
+fn fmt_jstmt2(fnm: string, a1: i64, a2: i64) i64 {
+    var ah: i64 = -1; var at: i64 = -1;
+    at = list_push(ah, at, a1); if (ah < 0) { ah = at; }
+    at = list_push(ah, at, a2); if (ah < 0) { ah = at; }
+    return mk_expr(mk_call(mk_ident(fnm, -1), ah, -1), -1);
+}
+fn fmt_jstmt3(fnm: string, a1: i64, a2: i64, a3: i64) i64 {
+    var ah: i64 = -1; var at: i64 = -1;
+    at = list_push(ah, at, a1); if (ah < 0) { ah = at; }
+    at = list_push(ah, at, a2); if (ah < 0) { ah = at; }
+    at = list_push(ah, at, a3); if (ah < 0) { ah = at; }
+    return mk_expr(mk_call(mk_ident(fnm, -1), ah, -1), -1);
+}
+fn fmt_jstmt4(fnm: string, a1: i64, a2: i64, a3: i64, a4: i64) i64 {
+    var ah: i64 = -1; var at: i64 = -1;
+    at = list_push(ah, at, a1); if (ah < 0) { ah = at; }
+    at = list_push(ah, at, a2); if (ah < 0) { ah = at; }
+    at = list_push(ah, at, a3); if (ah < 0) { ah = at; }
+    at = list_push(ah, at, a4); if (ah < 0) { ah = at; }
+    return mk_expr(mk_call(mk_ident(fnm, -1), ah, -1), -1);
+}
+fn fmt_one_block(stmt: i64) i64 {
+    // 注：返回的必须是**子节点链表头（kids head）**，与 parse_block() 一致——
+    // if/while/for 的分支在 AST 里就是 kids head，发射期与 collect_local_types 均按
+    // kids head 遍历（见 codegen_ll emit_if / collect_local_types）。绝不可返回
+    // mk_block(h) 的「block 节点 id」，否则 n.la 存成节点 id，kids[la] 越界崩溃
+    // （A1a 多载荷结构体第二个字段即触发 t_slice_at index N length M）。
+    var h: i64 = -1; var t: i64 = -1;
+    t = list_push(h, t, stmt); if (h < 0) { h = t; }
+    return h;
+}
+// 把静态类型为 ti 的值 val（表达式节点）的 JSON 编码追加进 __fmt_N 函数体。
+// head 为已非空的体链表头，tail 为当前尾；返回新尾。
+fn fmt_gen_json(head: i64, tail: i64, val: i64, ti: i64) i64 {
+    var k: string = tip_kind(ti);
+    var kind: i64 = fmt_kind_of(ti);
+    if (kind >= 0) {
+        // 标量 / 字符串叶
+        if (kind == 3) {
+            return fmt_push_stmt(head, tail,
+                fmt_jstmt4("sb_append_fmt_str_conv", mk_ident("__fb", -1), mk_string("", -1), val, mk_string("j", -1)));
+        }
+        return fmt_push_stmt(head, tail,
+            fmt_jstmt3(fmt_append_fn(kind), mk_ident("__fb", -1), mk_string("", -1), val));
+    }
+    if (k == "Struct") {
+        tail = fmt_push_stmt(head, tail, fmt_jstmt2("sb_append_str", mk_ident("__fb", -1), mk_string("{", -1)));
+        var m: i64 = g_fmt_jsym; g_fmt_jsym = g_fmt_jsym + 1;
+        var ff: string = sb_cat2("__ff", i2s(m));
+        tail = fmt_push_stmt(head, tail, mk_var_decl(ff, false, mk_scalar("bool", -1), mk_bool(true, -1), -1));
+        var fh: i64 = find_struct_fields(tip_name(ti));
+        var f0: i64 = fh;
+        while (f0 >= 0) {
+            var fnode: Node = nodes[kids[f0].val];
+            var fname: string = fnode.sa;
+            var fti: i64 = -1;
+            if (fnode.na >= 0) { fti = resolve_ti(fnode.na); }
+            // if (!ff) { sb_append_str(__fb, ","); }
+            tail = fmt_push_stmt(head, tail,
+                mk_if(mk_unary("!", mk_ident(ff, -1), -1),
+                    fmt_one_block(fmt_jstmt2("sb_append_str", mk_ident("__fb", -1), mk_string(",", -1))), -1, -1));
+            tail = fmt_push_stmt(head, tail, mk_assignment("=", mk_ident(ff, -1), mk_bool(false, -1), -1));
+            // 字段名作 JSON 对象键：用 sb_append_fmt_str_conv(..., "j") 做引号 + 转义
+            tail = fmt_push_stmt(head, tail,
+                fmt_jstmt4("sb_append_fmt_str_conv", mk_ident("__fb", -1), mk_string("", -1), mk_string(fname, -1), mk_string("j", -1)));
+            tail = fmt_push_stmt(head, tail, fmt_jstmt2("sb_append_str", mk_ident("__fb", -1), mk_string(":", -1)));
+            // 注：mk_member 的第 3 参是 token index（node_at 用于定位源码位置），
+            // 绝非类型 TI。字段类型信息已用于递归编码 fti，故此处传 -1（不锚定源码）。
+            tail = fmt_gen_json(head, tail, mk_member(fname, val, -1), fti);
+            f0 = kids[f0].next;
+        }
+        tail = fmt_push_stmt(head, tail, fmt_jstmt2("sb_append_str", mk_ident("__fb", -1), mk_string("}", -1)));
+        return tail;
+    }
+    if (k == "Slice" || k == "Array") {
+        tail = fmt_push_stmt(head, tail, fmt_jstmt2("sb_append_str", mk_ident("__fb", -1), mk_string("[", -1)));
+        var m: i64 = g_fmt_jsym; g_fmt_jsym = g_fmt_jsym + 1;
+        var cnt: string = sb_cat2("__ji", i2s(m));
+        var ev: string = sb_cat2("__je", i2s(m));
+        tail = fmt_push_stmt(head, tail, mk_var_decl(cnt, false, mk_scalar("i64", -1), rng_lit(0), -1));
+        var bh: i64 = -1; var bt: i64 = -1;
+        var cond: i64 = mk_binary(">", mk_ident(cnt, -1), rng_lit(0), -1);
+        var ifc: i64 = mk_if(cond,
+            fmt_one_block(fmt_jstmt2("sb_append_str", mk_ident("__fb", -1), mk_string(",", -1))), -1, -1);
+        bt = fmt_push_stmt(bh, bt, ifc); if (bh < 0) { bh = bt; }
+        bt = fmt_push_stmt(bh, bt,
+            mk_assignment("=", mk_ident(cnt, -1), mk_binary("+", mk_ident(cnt, -1), rng_lit(1), -1), -1));
+        if (bh < 0) { bh = bt; }
+        bt = fmt_gen_json(bh, bt, mk_ident(ev, -1), tis[ti].elem);
+        var loop: i64 = mk_for_each(ev, "", val, bh, -1);
+        tail = fmt_push_stmt(head, tail, loop);
+        tail = fmt_push_stmt(head, tail, fmt_jstmt2("sb_append_str", mk_ident("__fb", -1), mk_string("]", -1)));
+        return tail;
+    }
+    if (k == "Map") {
+        tail = fmt_push_stmt(head, tail, fmt_jstmt2("sb_append_str", mk_ident("__fb", -1), mk_string("{", -1)));
+        var m: i64 = g_fmt_jsym; g_fmt_jsym = g_fmt_jsym + 1;
+        var cnt: string = sb_cat2("__ji", i2s(m));
+        var kk: string = sb_cat2("__jk", i2s(m));
+        var vv: string = sb_cat2("__jv", i2s(m));
+        tail = fmt_push_stmt(head, tail, mk_var_decl(cnt, false, mk_scalar("i64", -1), rng_lit(0), -1));
+        var bh: i64 = -1; var bt: i64 = -1;
+        var cond: i64 = mk_binary(">", mk_ident(cnt, -1), rng_lit(0), -1);
+        var ifc: i64 = mk_if(cond,
+            fmt_one_block(fmt_jstmt2("sb_append_str", mk_ident("__fb", -1), mk_string(",", -1))), -1, -1);
+        bt = fmt_push_stmt(bh, bt, ifc); if (bh < 0) { bh = bt; }
+        bt = fmt_push_stmt(bh, bt,
+            mk_assignment("=", mk_ident(cnt, -1), mk_binary("+", mk_ident(cnt, -1), rng_lit(1), -1), -1));
+        if (bh < 0) { bh = bt; }
+        // 键：JSON 对象键须为字符串；仅 string 键完全支持，其余键退化为 "?"
+        if (tip_kind(tis[ti].key) == "String") {
+            bt = fmt_push_stmt(bh, bt,
+                fmt_jstmt4("sb_append_fmt_str_conv", mk_ident("__fb", -1), mk_string("", -1), mk_ident(kk, -1), mk_string("j", -1)));
+        } else {
+            bt = fmt_push_stmt(bh, bt,
+                fmt_jstmt4("sb_append_fmt_str_conv", mk_ident("__fb", -1), mk_string("", -1), mk_string("?", -1), mk_string("j", -1)));
+        }
+        bt = fmt_push_stmt(bh, bt, fmt_jstmt2("sb_append_str", mk_ident("__fb", -1), mk_string(":", -1)));
+        bt = fmt_gen_json(bh, bt, mk_ident(vv, -1), tis[ti].val);
+        var loop: i64 = mk_for_each(kk, vv, val, bh, -1);
+        tail = fmt_push_stmt(head, tail, loop);
+        tail = fmt_push_stmt(head, tail, fmt_jstmt2("sb_append_str", mk_ident("__fb", -1), mk_string("}", -1)));
+        return tail;
+    }
+    // 兜底：无 RTTI 的类型（Enum/Variant/Pointer/Optional 等）输出 null
+    return fmt_push_stmt(head, tail, fmt_jstmt2("sb_append_str", mk_ident("__fb", -1), mk_string("null", -1)));
+}
+
 // format(tmpl, a, b, ...) 的脱糖入口。
 // 成功则**就地改写** e 为 `__fmt_N(a, b, ...)` 并返回 String；失败返回 Unknown。
 fn desugar_format_call(e: i64) i64 {
     var n: Node = nodes[e];
+
+    // A1a：每次脱糖前清理聚合实参槽位 / JSON 局部名计数器，避免上一次 format 调用的残留污染本调用。
+    // g_fmt_counter（__fmt_N 函数序号）跨调用单调、不可重置；g_fmt_jsym（__ff/__ji/... 局部名后缀）
+    // 仅需在单个函数体内唯一，故每次重置为 0——既消除跨调用残留，又让生成名从 0 重新编号。
+    var ri: i64 = 0;
+    while (ri < 64) {
+        g_fmt_json[ri] = false;
+        g_fmt_json_ti[ri] = -1;
+        ri = ri + 1;
+    }
+    g_fmt_jsym = 0;
 
     // ── 1. 模板必须存在且是字面量 ──────────────────────────
     var tmpl_node: i64 = call_arg_node(e, 0);
@@ -2432,17 +2577,22 @@ fn desugar_format_call(e: i64) i64 {
         }
         var at: i64 = infer_expr(ck.val);
         var kind: i64 = fmt_kind_of(at);
-        if (kind < 0 && tip_kind(at) != "Unknown") {
-            fc_err("T-FST-E306",
-                sb_cat3("format 的第 ", i2s(argc),
-                    sb_cat3(" 个值实参类型不可格式化：", ti_str(at),
-                        "；仅支持整数 / 浮点 / bool / string，聚合类型请逐字段写出")),
-                ck.val);
-            return ti_mk("Unknown");
-        }
-        if (kind < 0) { kind = 0; }        // Unknown：已有诊断，按 int 兜底避免级联
-        g_fmt_ak[argc] = kind;
         g_fmt_at[argc] = fmt_type_node(at);
+        if (kind < 0) {
+            if (tip_kind(at) == "Unknown") {
+                // Unknown：已有诊断，按 int 兜底避免级联
+                g_fmt_ak[argc] = 0;
+                g_fmt_json[argc] = false;
+            } else {
+                // 聚合类型：标记为需 JSON 编码（!j 分支在 Step 3 处理）
+                g_fmt_ak[argc] = -1;
+                g_fmt_json[argc] = true;
+                g_fmt_json_ti[argc] = at;
+            }
+        } else {
+            g_fmt_ak[argc] = kind;
+            g_fmt_json[argc] = false;
+        }
         argc = argc + 1;
         c0 = ck.next;
     }
@@ -2587,6 +2737,21 @@ fn desugar_format_call(e: i64) i64 {
             return ti_mk("Unknown");
         }
         if (idx + 1 > used_idx) { used_idx = idx + 1; }
+
+        // A1a：聚合实参（结构体/切片/数组/映射）仅 !j 合法
+        if (g_fmt_json[idx]) {
+            if (conv != 106) {
+                fc_err("T-FST-E306",
+                    sb_cat3("format 的第 ", i2s(idx),
+                        " 个值实参是聚合类型，只能用 !j 转换字段做 JSON 编码（如 {0!j}）；非 !j 转换字段仅支持标量 / 字符串"),
+                    tmpl_node);
+                return ti_mk("Unknown");
+            }
+            body_tail = fmt_gen_json(body_head, body_tail,
+                mk_ident(sb_cat2("a", i2s(idx)), -1), g_fmt_json_ti[idx]);
+            if (body_head < 0) { body_head = body_tail; }
+            continue;
+        }
 
         // sb_append_fmt_X(__fb, "spec", aK[, "conv"]);
         var appfn: string = fmt_conv_fn(g_fmt_ak[idx], conv);
@@ -3649,6 +3814,65 @@ fn lower_for_range(s: i64) void {
     tail = list_push(head, tail, floop);
     if (head < 0) { head = tail; }
 
+    var on: Node = nodes[s];
+    on.kind = "block";
+    on.sa = "";
+    on.sb = "";
+    on.na = -1;
+    on.la = head;
+    slice_set(nodes, s, on);
+}
+
+// `for (v in 定长数组) { body }` → 改写成计数循环，每轮用 `<iter>[i]` 取下标元素
+// （与 lower_for_range 同构，避免改动两后端 for_each）。
+// 背景：LLVM / C 后端 for_each 只处理 slice 与 map，定长数组会掉进 slice 分支、
+// 对数组值调 t_slice_len/t_slice_at 读垃圾 → 运行期段错误。此降级在 sema 层完成，
+// 复用数组下标（基础特性，两后端均已支持）。
+// 注意：直接对原迭代器表达式下标 `<iter>[i]`，不另绑临时数组 —— 定长数组在 var_decl
+// 初始化里不会按元素拷贝（仅 zeroinit），绑临时量会丢失数据。
+fn lower_for_array(s: i64) void {
+    var n: Node = nodes[s];
+    if (str_len(n.sb) > 0) {
+        fc_err("T-SEM-E202",
+            "for (k, v in x): 双变量迭代仅支持 map", n.na);
+        return;
+    }
+    var itt: i64 = infer_expr(n.na);
+    var tt: TI = tis[itt];
+    var eti: i64 = tt.elem;
+    var alen: i64 = tt.alen;
+    if (eti < 0 || alen <= 0) {
+        fc_err("T-SEM-E203",
+            "for (v in x): 定长数组迭代未能解析元素类型 / 长度", n.na);
+        return;
+    }
+    // 循环计数器
+    var iname: string = sb_cat3("_fa", i2s(g_rng_counter), "_i");
+    g_rng_counter = g_rng_counter + 1;
+    // 长度绑进临时量（与 lower_for_range 的 _rgN_hi 同构：避免「字面量直接作比较右操作数」这一未充分测试的发射路径）
+    var lname: string = sb_cat3("_fa", i2s(g_rng_counter), "_len");
+    g_rng_counter = g_rng_counter + 1;
+    var lendcl: i64 = mk_var_decl(lname, false, mk_scalar("i64", -1), mk_int(i2s(alen), 10, -1), -1);
+    // 每轮：var <loopvar>: ElemT = <iter>[i];
+    var elidx: i64 = mk_index(n.na, mk_ident(iname, -1), -1);
+    var eldecl: i64 = mk_var_decl(n.sa, false, mk_type_node_from_ti(eti), elidx, -1);
+    // 新循环体 = 元素声明 + 原 body
+    var bhead: i64 = -1; var btail: i64 = -1;
+    btail = list_push(bhead, btail, eldecl); if (bhead < 0) { bhead = btail; }
+    var bk: i64 = n.la;
+    while (bk >= 0) {
+        btail = list_push(bhead, btail, kids[bk].val);
+        bk = kids[bk].next;
+    }
+    if (bhead < 0) { bhead = btail; }
+    // 计数循环：for (var _faN_i: i64 = 0; _faN_i < _faN_len; _faN_i = _faN_i + 1) { ... }
+    var floop: i64 = mk_for(rng_i64_decl(iname, rng_lit(0)),
+        mk_binary("<", mk_ident(iname, -1), mk_ident(lname, -1), -1),
+        rng_incr(iname), bhead, -1);
+    // block 的 la 必须是 kids 链表头：先放长度声明（供循环条件可见），再放循环本身
+    var head: i64 = -1; var tail: i64 = -1;
+    tail = list_push(head, tail, lendcl); if (head < 0) { head = tail; }
+    tail = list_push(head, tail, floop);
     var on: Node = nodes[s];
     on.kind = "block";
     on.sa = "";
@@ -4838,6 +5062,13 @@ fn check_stmt(s: i64) void {
             return;
         }
         var itt: i64 = infer_expr(n.na);
+        if (tip_kind(itt) == "Array") {
+            lower_for_array(s);
+            if (nodes[s].kind == "block") {
+                check_stmt(s);
+            }
+            return;
+        }
         var prev3: i64 = cur_scope;
         cur_scope = scope_new(prev3);
         var et: i64 = -1;
