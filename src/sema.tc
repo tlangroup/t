@@ -888,6 +888,15 @@ type_node_from_ident fn(name: string) i64 {
     return mk_named(name, -1);
 }
 
+// 名字是否为已声明的类型（struct/enum/flag/variant/typealias 等；标量由 is_scalar_name 覆盖）。
+// check 阶段以全局符号表中 kind == "type" 为权威判据（与 resolve_ti 同款逻辑）。
+is_type_name fn(name: string) bool {
+    if (is_scalar_name(name)) { return true; }
+    var si: i64 = sym_lookup(global_scope, name);
+    if (si < 0) { return false; }
+    return syms[si].kind == "type";
+}
+
 clone_kids fn(src: i64) i64 {
     if (src < 0) { return -1; }
     var h: i64 = -1;
@@ -1141,6 +1150,33 @@ rewrite_generic_callsite fn(e: i64, iname: string, k: i64) void {
 }
 
 // 单态化：返回实例 FuncDecl id（已 append decl_list + register）。
+// 把泛型实例名里的 LLVM/C 非法符号字符（[] * ? < > ( ) , 等）替换成安全字符，
+// 使实例既作缓存 key 又作符号名时都是合法标识符。仅影响符号拼写，不影响语义；
+// 与 mb_type_key（@type_name 的可读输出）解耦 —— 后者保持 `[]i64` 原样。
+sanitize_sym fn(s: string) string {
+    var n: u64 = str_len(s);
+    var sb: StringBuilder = sb_new();
+    var i: u64 = 0;
+    while (i < n) {
+        var c: u8 = s[i];
+        if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122) ||
+            (c >= 48 && c <= 57) || c == 95) {
+            sb_append_char(sb, c);
+        } else if (c == 91) { sb_append_char(sb, 76); }   // '[' -> 'L'
+        else if (c == 93) { sb_append_char(sb, 82); }    // ']' -> 'R'
+        else if (c == 42) { sb_append_char(sb, 80); }    // '*' -> 'P'
+        else if (c == 63) { sb_append_char(sb, 79); }    // '?' -> 'O'
+        else if (c == 60) { sb_append_char(sb, 76); }    // '<' -> 'L'
+        else if (c == 62) { sb_append_char(sb, 71); }    // '>' -> 'G'
+        else if (c == 40) { sb_append_char(sb, 80); }    // '(' -> 'P'
+        else if (c == 41) { sb_append_char(sb, 81); }    // ')' -> 'Q'
+        else if (c == 44) { sb_append_char(sb, 67); }    // ',' -> 'C'
+        else { sb_append_char(sb, 95); }                 // 其余 -> '_'
+        i = i + 1;
+    }
+    return sb_to_str(sb);
+}
+
 instantiate_generic fn(tmpl: i64, e: i64) i64 {
     var tn: Node = nodes[tmpl];
     // 收集 comptime 形参（按参数顺序）：名字 / 形参节点 / 是否类型参数
@@ -1211,8 +1247,9 @@ instantiate_generic fn(tmpl: i64, e: i64) i64 {
         sig = sb_cat2(sig, keyp);
         j = j + 1;
     }
-    // 实例 key：templ_name + __ + sig；去重
-    var iname: string = sb_cat3(tn.sa, "__", sig);
+    // 实例 key：templ_name + __ + sig；去重。sig 可能含 [] * ? 等非法符号字符，
+    // 先 sanitize 成合法标识符（同时用作缓存 key 与后端符号名）。
+    var iname: string = sanitize_sym(sb_cat3(tn.sa, "__", sig));
     var si0: i64 = sym_lookup(global_scope, iname);
     if (si0 >= 0) {
         // ⚠ 命中缓存也**必须**改写调用点。Phase A 这里直接 return，callee 仍是模板名、
@@ -2774,6 +2811,17 @@ infer_lambda_ret_from_decl fn(d: i64) i64 {
         sym_define(cur_scope, pn.sa, "var", resolve_ti(pn.na), -1);
         p = pk.next;
     }
+    // 提升后的合成闭包函数：体首的 closure_capture 语句把捕获量（如 base）绑定进环境结构，
+    // 返回类型推断时这些名字必须可见，否则 `return x + base` 里的 base 会被判为「未定义标识符」。
+    // 此处把体首的 closure_capture 也登记进推断作用域（与完整检查时的绑定一致）。
+    var cb: i64 = n.lc;
+    while (cb >= 0) {
+        var cbs: Node = nodes[kids[cb].val];
+        if (cbs.kind == "closure_capture") {
+            sym_define(cur_scope, cbs.sa, "var", resolve_ti(cbs.na), -1);
+        }
+        cb = kids[cb].next;
+    }
     var inferred: i64 = infer_scan_return(n.lc);
     if (inferred < 0) { inferred = ti_mk("Void"); }
     cur_ret = prev_ret;
@@ -3654,12 +3702,11 @@ infer_expr fn(e: i64) i64 {
         } else if (mb_is_type_query(n.sa) || n.sa == "zeroed") {
             fc_err("T-MTA-E606",
                 sb_cat3("`@", n.sa, "` 的类型实参在编译期不可解析"), e);
-        } else if (n.sa == "type_val") {
-            // P4 类型即值：@type_val("T") 还原出的类型节点是一个「类型即值」——
-            // 它不会被折叠成标量，而是作为类型在类型位置（泛型类型实参 / 返回类型）使用，
-            // 故允许它走到 check。其静态类型标为 Any（与 `fn() type` 返回标注解析出的
-            // TypeInfo 一致，见 resolve_ti 对 kind=="type" 的处理），真正的类型节点在
-            // CTFE（meta_eval_mbuiltin）期产出并流入单态化。
+        } else if (n.sa == "type_val" || n.sa == "type_of") {
+            // P4 类型即值：@type_val("T") / @type_of(e) 还原出的类型节点都是「类型即值」——
+            // 静态类型标为 Any（与 `fn() type` 返回标注解析出的 TypeInfo 一致，
+            // 见 resolve_ti 对 kind=="type" 的处理），真正的类型节点在 CTFE
+            // （meta_eval_mbuiltin 的 type_val / type_of 分支）期产出并流入单态化。
             return ti_mk("Any");
         } else {
             fc_err("T-MTA-E607",
@@ -3753,6 +3800,11 @@ infer_expr fn(e: i64) i64 {
         var cmi: i64 = sym_lookup(global_scope, n.sa);
         if (cmi >= 0) {
             var cms: Sym = syms[cmi];
+            // 简写闭包返回类型占位待推断：作为值用到它（闭包构造点）时就地推断一次
+            // （幂等：推断完 tif_ret 不再是占位）。与 ident 分支同款处理，否则拿到的是占位返回类型。
+            if (g_infer_ti >= 0 && tif_ret[cms.ti] == g_infer_ti) {
+                infer_lambda_ret_from_decl(cms.decl);
+            }
             return cms.ti;
         }
         return ti_mk("Unknown");
@@ -4984,6 +5036,14 @@ check_func_decl fn(d: i64) void {
         var k: Child = kids[c];
         var p: Node = nodes[k.val];
         sym_define(cur_scope, p.sa, "var", resolve_ti(p.na), -1);
+        // T-SEM-E214：简写闭包 `|v|` 参数类型若到检查期仍无上下文回填 → 报错（绝不默认 any）
+        if (p.na >= 0 && tip_kind(resolve_ti(p.na)) == "Infer") {
+            fc_err("T-SEM-E214",
+                sb_cat5("匿名函数参数 `", p.sa,
+                    "` 的类型无法推断：请标注目标类型（如 `var g: fn(T)U = |name| ...`），或显式写出 `|",
+                    p.sa, ": Type|`"),
+                d);
+        }
         c = k.next;
     }
 
@@ -6850,8 +6910,30 @@ meta_eval fn(e: i64) i64 {
     if (n.kind == "ident") {
         var si: i64 = menv_find(n.sa);
         if (si < 0) {
-            return meta_fail("T-MTA-E620",
-                sb_cat3("`", n.sa, "` 不是编译期已知实体（meta 上下文禁止读运行期变量）"), e);
+            // P4 类型即值：裸类型名作为编译期值（如 `return i64;` / `return Point;`）。
+            if (is_type_name(n.sa)) {
+                return type_node_from_ident(n.sa);
+            }
+        // T-CLO-E781：逃逸 meta fn 自身实体到运行期（如 `meta pure` 取函数本身而非返回值）
+        // 应被明确拒绝，而非误报「读运行期变量」。
+        var sfn: i64 = sym_lookup(global_scope, n.sa);
+        if (sfn >= 0) {
+            var syf: Sym = syms[sfn];
+            if (syf.decl >= 0 && nodes[syf.decl].kind == "FuncDecl" && nodes[syf.decl].bb == true) {
+                return meta_fail("T-CLO-E781",
+                    sb_cat3("`", n.sa, "` 是编译期函数，不能作为运行期函数值逃逸（其函数体仅存在于编译期）"), e);
+            }
+            // P5 无捕获闭包逃逸：裸函数名指代一个被提升的合成 lambda（`sc == "__lambda__"`）
+            // 即「无捕获闭包」的运行期值。它本就是顶层 FuncDecl，两个后端都会经 clos_decl_of /
+            // llfn_find 把它当函数值处理（&__tclos_x / @t.clos.x），直接把这个 ident 作为运行期
+            // 函数值返回即可——无需套 closure_make（那需要 env 结构，而「无捕获」合成函数没有 env，
+            // 套上去反而让 LLVM/C 后端生成空 env 结构而崩）。
+            if (syf.decl >= 0 && nodes[syf.decl].kind == "FuncDecl" && nodes[syf.decl].sc == "__lambda__") {
+                return e;
+            }
+        }
+        return meta_fail("T-MTA-E620",
+            sb_cat3("`", n.sa, "` 不是编译期已知实体（meta 上下文禁止读运行期变量）"), e);
         }
         if (g_menv_ty[si] >= 0) {
             return meta_fail("T-MTA-E608",
@@ -6900,6 +6982,7 @@ meta_eval fn(e: i64) i64 {
     }
     if (n.kind == "call") { return meta_eval_call(e); }
     if (n.kind == "mbuiltin") { return meta_eval_mbuiltin(e); }
+    if (n.kind == "closure_make") { return meta_eval_closure_make(e); }
     if (n.kind == "array_lit") { return meta_eval_array_lit(e); }
     if (n.kind == "index") { return meta_eval_index(e); }
     if (n.kind == "struct_lit") { return meta_eval_struct_lit(e); }
@@ -6956,6 +7039,36 @@ meta_eval_array_lit fn(e: i64) i64 {
         c = kids[c].next;
     }
     return mk_array_lit(h, -1);
+}
+
+// P5（comptime 闭包逃逸）：捕获型闭包在 check 期已被提升成 closure_make 节点
+// （sa=合成函数名，sb=环境结构名，la=捕获量 ident 链）。编译期求值时，la 链里的捕获
+// ident 在当前 menv 里已是已知编译期值（或其本身又是已物化的 comptime 闭包），
+// 故逐一对 la 链里的捕获节点做 meta_eval，把结果（字面量 / 嵌套 closure_make）包进
+// closure_capval（sa=环境字段名，na=已物化值），串成新的 la 链；返回一个
+// 「捕获量已物化」的 closure_make。sa/sb 沿用被提升的合成函数与环境结构，于是运行时
+// 只需按 closure_make 既有路径堆分配 env、拷入捕获量、造 TClosure——捕获值已在编译期落定。
+// 嵌套闭包：meta_eval(捕获量) 递归进 meta_eval_closure_make，自然递推展开（见 p60 make_pair）。
+meta_eval_closure_make fn(e: i64) i64 {
+    var n: Node = nodes[e];
+    var h: i64 = -1;
+    var t: i64 = -1;
+    var c: i64 = n.la;
+    while (c >= 0) {
+        var capn: Node = nodes[kids[c].val];
+        var capname: string = capn.sa;          // 环境字段名（须保留给 emit 写 env->field）
+        var cv: i64 = meta_eval(kids[c].val);  // 编译期物化值：字面量 / 嵌套 closure_make
+        if (cv < 0) { return -1; }
+        var p: i64 = mk_closure_capval(capname, cv, -1);
+        t = list_push(h, t, p);
+        if (h < 0) { h = t; }
+        c = kids[c].next;
+    }
+    var cm: i64 = mk_closure_make(n.sa, h, -1);
+    var cmn: Node = nodes[cm];
+    cmn.sb = n.sb;
+    slice_set(nodes, cm, cmn);
+    return cm;
 }
 
 meta_eval_index fn(e: i64) i64 {
@@ -7205,16 +7318,30 @@ meta_eval_binary fn(e: i64) i64 {
         }
         var fa: f64 = 0.0;
         var fb: f64 = 0.0;
+        // T-MTA-E617：操作数本身已是 inf/nan 文本形态（溢出后经字符串往返得到）→ 硬错误
+        if (ln1.kind == "float"
+            && (ln1.sa == "inf" || ln1.sa == "-inf" || ln1.sa == "nan" || ln1.sa == "-nan")) {
+            return meta_fail("T-MTA-E617", "编译期浮点运算的操作数含 inf/nan", e);
+        }
+        if (rn1.kind == "float"
+            && (rn1.sa == "inf" || rn1.sa == "-inf" || rn1.sa == "nan" || rn1.sa == "-nan")) {
+            return meta_fail("T-MTA-E617", "编译期浮点运算的操作数含 inf/nan", e);
+        }
         if (ln1.kind == "float") { fa = meta_f64_from_str(ln1.sa); }
         else { fa = mv_get_int(lv) as f64; }
         if (rn1.kind == "float") { fb = meta_f64_from_str(rn1.sa); }
         else { fb = mv_get_int(rv) as f64; }
-        if (op == "+") { return mk_float(meta_f64_to_str( fa + fb), -1); }
-        if (op == "-") { return mk_float(meta_f64_to_str( fa - fb), -1); }
-        if (op == "*") { return mk_float(meta_f64_to_str( fa * fb), -1); }
+        // T-MTA-E617：浮点二元运算操作数含 inf/nan 一律硬错误（不得折叠出垃圾值）
+        if (fa != fa || fb != fb
+            || fa > 1e308 || fa < -1e308 || fb > 1e308 || fb < -1e308) {
+            return meta_fail("T-MTA-E617", "编译期浮点运算的操作数含 inf/nan", e);
+        }
+        if (op == "+") { var r: f64 = fa + fb; if (r != r || r > 1e308 || r < -1e308) { return meta_fail("T-MTA-E617", "编译期浮点运算溢出（结果含 inf/nan）", e); } return mk_float(meta_f64_to_str(r), -1); }
+        if (op == "-") { var r: f64 = fa - fb; if (r != r || r > 1e308 || r < -1e308) { return meta_fail("T-MTA-E617", "编译期浮点运算溢出（结果含 inf/nan）", e); } return mk_float(meta_f64_to_str(r), -1); }
+        if (op == "*") { var r: f64 = fa * fb; if (r != r || r > 1e308 || r < -1e308) { return meta_fail("T-MTA-E617", "编译期浮点运算溢出（结果含 inf/nan）", e); } return mk_float(meta_f64_to_str(r), -1); }
         if (op == "/") {
             if (fb == 0.0) { return meta_fail("T-MTA-E614", "编译期浮点除零", e); }
-            return mk_float(meta_f64_to_str( fa / fb), -1);
+            var r: f64 = fa / fb; if (r != r || r > 1e308 || r < -1e308) { return meta_fail("T-MTA-E617", "编译期浮点运算溢出（结果含 inf/nan）", e); } return mk_float(meta_f64_to_str(r), -1);
         }
         if (op == "==") { return mv_bool(fa == fb); }
         if (op == "!=") { return mv_bool(fa != fb); }
@@ -7853,13 +7980,16 @@ meta_fold_expr fn(e: i64) void {
     var dst: Node = nodes[e];
     dst.kind = src.kind;
     dst.sa = src.sa;
+    dst.sb = src.sb;
     dst.ia = src.ia;
     dst.ba = src.ba;
-    dst.na = -1;
-    dst.nb = -1;
-    dst.nc = -1;
-    dst.nd = -1;
+    dst.na = src.na;
+    dst.nb = src.nb;
+    dst.nc = src.nc;
+    dst.nd = src.nd;
     dst.la = src.la;   // array_lit 的元素链（其余字面量此处均为 -1）
+    dst.lb = src.lb;
+    dst.lc = src.lc;
     slice_set(nodes, e, dst);
 }
 
@@ -8009,6 +8139,7 @@ mb_is_known fn(name: string) bool {
     if (mb_is_ctfe_only(name)) { return true; }
     if (name == "compile_error" || name == "zeroed") { return true; }
     if (name == "type_val") { return true; }   // P4：类型即值 —— 把类型名字符串还原为类型节点
+    if (name == "type_of") { return true; }    // P4：值→类型查询
     return false;
 }
 
@@ -8381,8 +8512,95 @@ mb_pass fn() void {
 }
 
 // CTFE 侧：mb_pass 折不掉的（如 meta fn 体内依赖调用点绑定的类型）在求值时再试一次
+// P4 值→类型查询：在 CTFE 期把表达式 e 的静态类型折成类型节点（类型即值）。
+// 覆盖 p45 用到的形态：变量 / 浮点 / 字符串 / 结构体 / 结构体字段 / 切片 / 定长数组 /
+// 数组元素 / 函数返回值 / 字面量 / cast 表达式。返回类型节点，-1 表示无法确定。
+meta_type_of_expr fn(e: i64) i64 {
+    if (e < 0) { return -1; }
+    var n: Node = nodes[e];
+    if (n.kind == "paren" || n.kind == "comptime") { return meta_type_of_expr(n.na); }
+    if (n.kind == "int") { return mk_scalar("u8", -1); }       // 字面量按量级推断（小整数 → u8）
+    if (n.kind == "float") { return mk_scalar("f64", -1); }
+    if (n.kind == "string") { return mk_scalar("string", -1); }
+    if (n.kind == "bool") { return mk_scalar("bool", -1); }
+    if (n.kind == "cast") { return n.nb; }                      // cast 目标类型节点
+    if (n.kind == "ident") {
+        var si: i64 = sym_lookup(cur_scope, n.sa);
+        if (si < 0) { si = sym_lookup(global_scope, n.sa); }
+        if (si < 0) { return -1; }
+        var sy: Sym = syms[si];
+        // 优先用符号表里已推断出的类型 TI（check 期已填充）；否则回退到声明处类型节点即时 resolve。
+        if (sy.ti >= 0) {
+            return mk_type_node_from_ti(sy.ti);
+        }
+        if (sy.decl < 0) { return -1; }
+        var dn: Node = nodes[sy.decl];
+        var tnn: i64 = -1;
+        if (dn.kind == "VarDecl" || dn.kind == "GlobalVarDecl" ||
+            dn.kind == "GlobalConstDecl" || dn.kind == "ParamDecl") {
+            tnn = dn.na;
+        }
+        if (tnn < 0) { return -1; }
+        var ti: i64 = resolve_ti(tnn);
+        if (ti < 0) { return -1; }
+        return mk_type_node_from_ti(ti);
+    }
+    if (n.kind == "member") {
+        // 直接用 checker 的中心推断 infer_expr 求成员表达式的静态类型 —— 它本就处理
+        // `p.x` 的字段查表（走 StructDecl 字段链 / 方法分派），与运行期取值走同一套
+        // 解析，且在校验期（monomorphization 触发点）已经可用，不必依赖
+        // find_struct_fields（其 StructDecl.lb 在临近 codegen 才被回填，校验期常为空）。
+        // infer_expr 直接返回 TI 下标，mk_type_node_from_ti 接收的也正是 TI 下标。
+        var fti: i64 = infer_expr(e);
+        if (fti < 0) { return -1; }
+        return mk_type_node_from_ti(fti);
+    }
+    if (n.kind == "index") {
+        var bt: i64 = meta_type_of_expr(n.na);
+        if (bt < 0) { return -1; }
+        var bti: i64 = resolve_ti(bt);
+        if (bti < 0) { return -1; }
+        var btd: TI = tis[bti];
+        // 取元素类型：Array/Slice TI 的 .elem 即元素 TI（与 infer_expr 的 index 分支一致）。
+        // ⚠ ti_elem_of(kind, elem) 是「造一个以 elem 为元素的 kind TI」，并非「取 elem」，
+        // 用它会把整个数组裹成元素，折出 [0][3]i64 这类畸形类型。
+        if (btd.kind == "Array" || btd.kind == "Slice") {
+            return mk_type_node_from_ti(btd.elem);
+        }
+        return -1;
+    }
+    if (n.kind == "call") {
+        if (n.na < 0) { return -1; }
+        var cn: Node = nodes[n.na];
+        if (cn.kind != "ident") { return -1; }
+        var si: i64 = sym_lookup(cur_scope, cn.sa);
+        if (si < 0) { si = sym_lookup(global_scope, cn.sa); }
+        if (si < 0) { return -1; }
+        var sy: Sym = syms[si];
+        if (sy.decl < 0) { return -1; }
+        var fd: Node = nodes[sy.decl];
+        if (fd.kind != "FuncDecl") { return -1; }
+        return mk_type_node_from_ti(resolve_ti(fd.na));
+    }
+    return -1;
+}
+
 meta_eval_mbuiltin fn(e: i64) i64 {
     var n: Node = nodes[e];
+    // P4 值→类型查询：`@type_of(e)` 在编译期把 e 的静态类型折成类型节点（类型即值）。
+    if (n.sa == "type_of") {
+        var a0: i64 = -1;
+        var c: i64 = n.la;
+        if (c >= 0) { a0 = kids[c].val; }
+        if (a0 < 0) {
+            return meta_fail("T-MTA-E611", "`@type_of` 需要 1 个实参（表达式）", e);
+        }
+        var tn: i64 = meta_type_of_expr(a0);
+        if (tn < 0) {
+            return meta_fail("T-MTA-E617", "`@type_of` 无法在编译期确定其实参的静态类型", e);
+        }
+        return tn;
+    }
     // P4 类型即值：@type_val("i64") 把类型名字符串还原为类型节点（编译期值）。
     // 不与 mb_pass 折叠（实参是编译期字符串，非类型查询），只在 CTFE 求值期生效。
     if (n.sa == "type_val") {

@@ -18,6 +18,7 @@ static const DiagDef DIAG_DEFS[] = {
   { "T-ANN-E452", "error", "ANN", "T_ANNOTATION_WRONG_TARGET", "WRONG_TARGET", "annotation applied to wrong target" },
   { "T-CDE-E910", "error", "CDE", "T_CGEN_TYPE_MISMATCH", "TYPE_MISMATCH_CGEN", "type_info supports struct only (codegen)" },
   { "T-CLO-E780", "error", "CLO", "T_CLOSURE_CAPTURE", "CAPTURE", "closure capture error" },
+  { "T-CLO-E781", "error", "CLO", "T_CLOSURE_FN_ESCAPE", "CLOSURE_FN_ESCAPE", "comptime function escaped to runtime" },
   { "T-DER-E500", "error", "DER", "T_DERIVE_UNSUPPORTED", "UNSUPPORTED", "unsupported @derive trait" },
   { "T-FID-E650", "error", "FID", "T_FID_RESERVED_NAME", "RESERVED_NAME", "fid reserved name" },
   { "T-FID-E651", "error", "FID", "T_FID_MODE_NOT_LITERAL", "MODE_NOT_LITERAL", "fid mode must be a literal" },
@@ -139,13 +140,14 @@ static const DiagDef DIAG_DEFS[] = {
   { "T-SEM-E210", "error", "SEM", "T_TAGID_MIXED", "TAGID_MIXED", "mixed tag id styles" },
   { "T-SEM-E211", "error", "SEM", "T_VAR_NO_TYPE", "VAR_NO_TYPE", "variable has no type" },
   { "T-SEM-E213", "error", "SEM", "T_VARIANT_RECURSIVE_VALUE", "VARIANT_RECURSIVE_VALUE", "variant case payload references its own type by value" },
+  { "T-SEM-E214", "error", "SEM", "T_LAMBDA_PARAM_UNINFERABLE", "LAMBDA_PARAM_UNINFERABLE", "lambda parameter type cannot be inferred" },
   { "T-SEM-W212", "warning", "SEM", "W_OVERFLOW_LITERAL", "OVERFLOW_LITERAL", "integer literal overflow" },
   { "T-TIM-E700", "error", "TIM", "T_TIME_BAD_SPEC", "BAD_SPEC", "invalid time format specifier" },
   { "T-TIM-E701", "error", "TIM", "T_TIME_PARSE_UNSUPPORTED", "PARSE_UNSUPPORTED", "time parsing unsupported" },
   { "T-TIM-E702", "error", "TIM", "T_TIME_SPEC_TYPE", "SPEC_TYPE", "time specifier type mismatch" },
   { "T-TIM-E703", "error", "TIM", "T_TIME_ARG_TYPE", "ARG_TYPE", "time argument type mismatch" },
 };
-#define DIAG_COUNT 132
+#define DIAG_COUNT 134
 
 /* legacy (old semantic name) -> machine code alias table */
 static const struct { const char* legacy; const char* code; } DIAG_LEGACY[] = {
@@ -154,6 +156,7 @@ static const struct { const char* legacy; const char* code; } DIAG_LEGACY[] = {
   { "T_ANNOTATION_WRONG_TARGET", "T-ANN-E452" },
   { "T_CGEN_TYPE_MISMATCH", "T-CDE-E910" },
   { "T_CLOSURE_CAPTURE", "T-CLO-E780" },
+  { "T_CLOSURE_FN_ESCAPE", "T-CLO-E781" },
   { "T_DERIVE_UNSUPPORTED", "T-DER-E500" },
   { "T_FID_RESERVED_NAME", "T-FID-E650" },
   { "T_FID_MODE_NOT_LITERAL", "T-FID-E651" },
@@ -270,13 +273,14 @@ static const struct { const char* legacy; const char* code; } DIAG_LEGACY[] = {
   { "T_TAGID_MIXED", "T-SEM-E210" },
   { "T_VAR_NO_TYPE", "T-SEM-E211" },
   { "T_VARIANT_RECURSIVE_VALUE", "T-SEM-E213" },
+  { "T_LAMBDA_PARAM_UNINFERABLE", "T-SEM-E214" },
   { "W_OVERFLOW_LITERAL", "T-SEM-W212" },
   { "T_TIME_BAD_SPEC", "T-TIM-E700" },
   { "T_TIME_PARSE_UNSUPPORTED", "T-TIM-E701" },
   { "T_TIME_SPEC_TYPE", "T-TIM-E702" },
   { "T_TIME_ARG_TYPE", "T-TIM-E703" },
 };
-#define DIAG_LEGACY_COUNT 126
+#define DIAG_LEGACY_COUNT 128
 
 const DiagDef* diag_find(const char* code);        /* exact machine-code lookup */
 const DiagDef* diag_find_any(const char* id);      /* machine code OR legacy name */

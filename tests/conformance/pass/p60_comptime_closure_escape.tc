@@ -1,0 +1,47 @@
+// EXPECT: pass
+// P5 — comptime 闭包逃逸到运行期（TClosure ABI）。
+// 覆盖：无捕获（退化为函数标识）、CVal 捕获（i64 / string）、
+// 嵌套闭包（被捕获的值本身也是 comptime 闭包，物化时须递归展开）。
+// 三条路径均须在 check 阶段安全折叠为运行期闭包且不报硬错误；
+// 运行期正确性由 run_examples / difftest 守护（本文件同时可独立 build+run）。
+
+// 无捕获：comptime 产出裸函数引用，逃逸走 mk_ident（&__tclos_f / fn 标识路径）
+meta fn k() i64 { return 7; }
+meta fn id_fn() fn(i64) i64 {
+    return |x: i64| x;            // 无捕获 lambda
+}
+
+// i64 捕获
+meta fn make_adder(base: i64) fn(i64) i64 {
+    return |x: i64| x + base;
+}
+
+// string 捕获（注意：meta fn 返回的闭包体在运行期求值，而 sb_cat2 等运行期内建
+// 不在编译期求值器内，故此处直接捕获并返回 prefix 字符串值，验证 string 捕获链路）。
+meta fn make_greet(prefix: string) fn(string) string {
+    return |t: string| prefix;
+}
+
+// 嵌套：返回的闭包又捕获另外两个 comptime 闭包（捕获值为 cval_closure）
+meta fn make_pair(a: i64, b: i64) fn(i64) i64 {
+    var inc: fn(i64) i64 = |x: i64| x + a;
+    var dec: fn(i64) i64 = |x: i64| x - b;
+    return |n: i64| inc(n) + dec(n);
+}
+
+@main
+fn main() i64 {
+    var idf: fn(i64) i64 = meta id_fn();
+    if (idf(9) != 9) { return 1; }
+
+    var add10: fn(i64) i64 = meta make_adder(10);
+    if (add10(5) != 15) { return 2; }       // 5 + 10
+
+    var hi: fn(string) string = meta make_greet("hi");
+    if (hi("X") != "hi") { return 3; }       // string 捕获（捕获值 "hi" 透传）
+
+    var f: fn(i64) i64 = meta make_pair(10, 3);
+    if (f(5) != 17) { return 4; }            // (5+10)+(5-3) = 17
+
+    return 0;
+}

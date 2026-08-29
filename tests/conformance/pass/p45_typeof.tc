@@ -1,0 +1,55 @@
+// EXPECT: pass
+// P4 反向 @type_of(e) —— 值→类型查询（稳定子集）
+// 验证：对「静态类型可得」的表达式（变量 / 浮点 / 字符串 / 结构体 / 结构体字段 /
+//       切片 / 定长数组 / 数组元素 / 函数返回值 / 字面量），@type_of(e) 在 CTFE 期把
+// e 的静态类型折成 cval_type，并流入 id(@type_of(x), x) 驱动泛型单态化。
+// 落点：src/base.tc g_node_ty 平行数组 + infer_expr 薄包装登记 TI；
+//       src/sema.tc meta_eval_mbuiltin 的 type_of 分支取回 TI 折成类型节点（mk_type_node_from_ti）。
+// 与 Module 解耦：仅覆盖 i64/f64/string/struct/[]T/[N]T/enum 这类通用类型；带 Module
+// 生命周期/所有权/内存注解的类型留待 Module 落地后设计（消费侧）。
+// 注：定长数组 [N]T 经 @type_of 折出的类型正确（下方 var g2: [3]i64 = g 编译通过即证明），
+//     但「定长数组按值返回」是后端既有 P0（与 @type_of 无关，非泛型函数同样段错误/值错乱），
+//     故此处只验类型不验值；切片 []T 按值传递/返回正常，已用 slice_len 验值。
+struct Point { x: i64; y: i64; }
+
+fn id(meta T: type, x: T) T { return x; }
+
+fn get() i64 { return 123; }
+
+fn main() i64 @main {
+    var xi: i64 = 42;
+    var xf: f64 = 2.5;
+    var xs: string = "hello";
+    var p: Point = Point { x: 1, y: 2 };
+    var sl: []i64 = [1, 2, 3];          // 非空集，绕开空切片 LLVM ptr 0 坑
+    var ar: [3]i64 = [10, 20, 30];
+
+    // 每个 @type_of(x) 在 CTFE 折成 cval_type，作为 id 的 meta T 实参
+    auto a = id(@type_of(xi), xi);          // T = i64
+    auto b = id(@type_of(xf), xf);          // T = f64
+    auto c = id(@type_of(xs), xs);          // T = string
+    auto d = id(@type_of(p), p);            // T = Point
+    auto e = id(@type_of(p.x), p.x);        // T = i64（结构体字段）
+    auto f = id(@type_of(sl), sl);          // T = []i64（切片）
+    auto g = id(@type_of(ar), ar);          // T = [3]i64（定长数组；按值返回是后端 P0，仅验类型见下方 g2）
+    auto h = id(@type_of(ar[1]), ar[1]);    // T = i64（数组元素）
+    auto i = id(@type_of(get()), get());    // T = i64（函数返回值）
+    auto j = id(@type_of(7), 7);            // T = u8（字面量按量级推断）
+    auto k = id(@type_of(xf as i64), xf as i64); // T = i64（cast 表达式：f64→i64）
+
+    // 编译期类型正确性证明：把实例结果按推断出的类型重新标注
+    var f2: []i64 = f;                      // 编译期证明 T == []i64
+    var g2: [3]i64 = g;                     // 编译期证明 T == [3]i64（@type_of 已正确折出定长数组类型）
+
+    if (a == 42 && b == 2.5 && c == "hello"
+        && d.x == 1 && d.y == 2
+        && e == 1
+        && slice_len(f2) as i64 == 3
+        && h == 20
+        && i == 123
+        && j == 7
+        && k == 2) {
+        return 0;
+    }
+    return 1;
+}
