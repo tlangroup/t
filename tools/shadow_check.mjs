@@ -16,8 +16,10 @@ const only = process.argv.slice(3);
 const MIN_FNS = 330;
 const MIN_VARS = 1880;
 
-// 顶层函数头：并置式 `Name fn(` （`::`/`func` 已于 2026-08-01 移除）
-const fnStart = /^(?:comptime\s+)?([\p{XID_Start}_][\p{XID_Continue}_]*)\s+fn\s*\(/u;
+// 顶层函数头：关键字领头 `fn name(` 与并置式 `name fn(` 两种文法（Stage 2 统一为前者）。
+// 前缀修饰符 export / comptime / meta 可出现在名字之前（两种文法都允许）。
+// 旧文法名字在 group1，新文法名字在 group2。
+const fnStart = /^(?:(?:export|comptime|meta)\s+)*(?:(?:([\p{XID_Start}_][\p{XID_Continue}_]*)\s+fn)|fn\s+([\p{XID_Start}_][\p{XID_Continue}_]*))\s*\(/u;
 const varDecl = /^\s*var\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*:\s*([^=;]+?)\s*(?:=|;)/;
 
 let nVars = 0;
@@ -31,7 +33,7 @@ for (const file of files) {
   let cur = null;
   for (let i = 0; i < lines.length; i++) {
     const m = fnStart.exec(lines[i]);
-    if (m) { cur = `${file}:${m[1]}`; if (!fns.has(cur)) fns.set(cur, []); continue; }
+    if (m) { cur = `${file}:${m[1] || m[2]}`; if (!fns.has(cur)) fns.set(cur, []); continue; }
     if (!cur) continue;
     const v = varDecl.exec(lines[i]);
     if (v) { fns.get(cur).push({ name: v[1], ty: v[2].trim(), line: i + 1 }); nVars++; }

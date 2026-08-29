@@ -40,7 +40,7 @@ function blank(text) {
 }
 
 const DECLS = [
-  ['fn',      /^([A-Za-z_][A-Za-z_0-9]*)\s+fn\b/],
+  ['fn',      /^(?:(?:export|comptime|meta)\s+)*(?:(?:([A-Za-z_][A-Za-z_0-9]*)\s+fn)|fn\s+([A-Za-z_][A-Za-z_0-9]*))\b/],
   ['var',     /^var\s+([A-Za-z_][A-Za-z_0-9]*)\s*[:=]/],
   ['const',   /^const\s+([A-Za-z_][A-Za-z_0-9]*)\s*[:=]/],
   ['type',    /^([A-Za-z_][A-Za-z_0-9]*)\s+(?:struct|enum|flag|variant|union)\b/],
@@ -58,7 +58,7 @@ for (const m of TC_MODULES) {
     for (const [kind, re] of DECLS) {
       const mo = re.exec(lines[i]);
       if (!mo) continue;
-      const nm = mo[1];
+      const nm = mo[1] || mo[2];
       if (defs.has(nm)) dups.push([nm, defs.get(nm).mod, m]);
       else defs.set(nm, { mod: m, kind, line: i + 1 });
       break;
