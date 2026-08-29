@@ -10,6 +10,7 @@
 // ═══════════════════════════════════════════════════════════════
 
 #include "t_runtime.h"
+#include <string.h>
 
 // ── string ─────────────────────────────────────────────────────
 void    tll_print(TStr* s)                  { t_print(*s); }
@@ -34,6 +35,16 @@ int64_t    tll_fi_tag(TFieldInfo* fi)                { return t_fi_tag(fi); }
 int64_t tll_str_len(TStr* s)                { return t_str_len(*s); }
 int64_t tll_str_at(TStr* s, int64_t i)      { return (int64_t)t_str_byte_at(*s, i); }
 int32_t tll_str_eq(TStr* a, TStr* b)        { return t_str_eq(*a, *b) ? 1 : 0; }
+// 字符串拼接：在全局 arena 上分配 len_a+len_b+1 字节，拷贝两端，补 \0（UTF-8 视图，
+// 不依赖 \0 结尾但保留以便需要 cstr 的 C API）。返回聚合走末位 out 指针（与 tll_str_slice 同构）。
+void    tll_str_concat(TStr* a, TStr* b, TStr* out) {
+    int64_t n = a->len + b->len;
+    uint8_t* buf = (uint8_t*)t_arena_alloc(t_arena_current(), (size_t)(n + 1));
+    if (a->len > 0) { memcpy(buf, a->ptr, (size_t)a->len); }
+    if (b->len > 0) { memcpy(buf + a->len, b->ptr, (size_t)b->len); }
+    buf[n] = 0;
+    TStr r; r.ptr = buf; r.len = n; *out = r;
+}
 void    tll_str_slice(TStr* s, int64_t a, int64_t b, TStr* out) { *out = t_str_slice(*s, a, b); }
 
 // ── StringBuilder ──────────────────────────────────────────────

@@ -92,6 +92,16 @@ TStr t_str_slice(TStr s, int64_t start, int64_t end) {
     TStr r; r.ptr = s.ptr + start; r.len = end - start; return r;
 }
 
+// 字符串拼接：在全局 arena 上分配 len_a+len_b+1 字节，拷贝两端，补 \0（UTF-8 视图）。
+TStr t_str_concat(TStr a, TStr b) {
+    int64_t n = a.len + b.len;
+    uint8_t* buf = (uint8_t*)t_arena_alloc(t_arena_current(), (size_t)(n + 1));
+    if (a.len > 0) { memcpy(buf, a.ptr, (size_t)a.len); }
+    if (b.len > 0) { memcpy(buf + a.len, b.ptr, (size_t)b.len); }
+    buf[n] = 0;
+    TStr r; r.ptr = buf; r.len = n; return r;
+}
+
 uint8_t t_str_byte_at(TStr s, int64_t i) {
     if (i < 0 || i >= s.len) t_panic_bounds(i, s.len, "t_str_byte_at");
     return s.ptr[i];

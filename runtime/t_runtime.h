@@ -53,6 +53,7 @@ typedef struct { const uint8_t* ptr; int64_t len; } TStr;
 
 TStr    t_str_from_c(const char* s);
 TStr    t_str_slice(TStr s, int64_t start, int64_t end);   // 越界 → panic + JSON 诊断
+TStr    t_str_concat(TStr a, TStr b);                       // 拼接（arena 分配，补 \0）
 uint8_t t_str_byte_at(TStr s, int64_t i);                   // 越界 → panic + JSON 诊断
 bool    t_str_eq(TStr a, TStr b);
 int64_t t_str_len(TStr s);
