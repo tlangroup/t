@@ -1554,7 +1554,6 @@ desugar_lambdas fn() void {
 }
 
 parse_func_decl fn(name: string, anns: i64, is_comptime: bool) i64 {
-    advance_i();
     expect_tok("LParen");
     var ph: i64 = -1;
     var pt: i64 = -1;
@@ -1747,6 +1746,7 @@ parse_agent_decl fn(name: string, anns: i64) i64 {
                 parse_fatal(sb_cat3("agent '", name, "' has multiple 'step' clauses"));
             }
             // 当前 token 应为 fn（parse_func_decl 自吞）；函数名走 snake_case 命名规范
+            advance_i();
             step_fn = parse_func_decl(sb_cat2(pascal_to_snake(name), "_step"), anns, false);
         } else {
             parse_fatal(sb_cat5("unknown agent clause '", kw, "' in agent '", name, "'"));
@@ -1975,6 +1975,7 @@ parse_decl_body fn(name: string, anns: i64, is_comptime: bool) i64 {
         return parse_agent_decl(name, anns);
     }
     if (t == "KwFunc") {
+        advance_i();
         return parse_func_decl(name, anns, is_comptime);
     }
     if (t == "Identifier" && cur_v() == "flag_set") {
@@ -2282,6 +2283,26 @@ parse_declaration fn() i64 {
     // 必须抢在下面「声明名必须是 Identifier」的硬退出之前拦截。
     if (cur_t() == "String") {
         return parse_test_or_suite(anns);
+    }
+
+    // LL(1) 具名函数文法（兼容桥接）：`fn name(params) ret { body }`。
+    // 旧 `name fn(...)` 并置式仍保留兼容（下方名字先行路径），二者由首个 token 消歧、不冲突。
+    if (cur_t() == "KwFunc") {
+        advance_i();   // 吃掉 `fn`
+        if (cur_t() != "Identifier") {
+            parse_fatal("expected function name after 'fn' in function declaration");
+        }
+        var fni: i64 = advance_i();
+        var fname: string = tk_v(fni);
+        g_agent_anchor = fni;
+        g_struct_exported = is_export;
+        validate_decl_name(fname, fni);
+        var fd: i64 = parse_func_decl(fname, anns, is_comptime);
+        if (fd >= 0) {
+            node_at(fd, fni);
+            if (is_export) { nodes[fd].bc = true; }
+        }
+        return fd;
     }
 
     if (cur_t() != "Identifier") {
@@ -3631,6 +3652,7 @@ desugar_self_node fn(nid: i64, sn: string) void {
 //   push fn(self: Self, v: i64) List {...}  →  list_push fn(self: List, v: i64) List {...}
 // 当前 token 应为 fn（parse_func_decl 自吞）；方法名 mname 已由调用方读出。
 parse_method_decl fn(structname: string, mname: string, anns: i64) i64 {
+    advance_i();
     var fd: i64 = parse_func_decl(mname, anns, false);
     var fdn: Node = nodes[fd];
     fdn.sa = sb_cat3(pascal_to_snake(structname), "_", mname);
