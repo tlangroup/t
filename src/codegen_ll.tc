@@ -321,6 +321,7 @@ fn ll_td(td: i64) string {
         return sb_cat5("[", i2s(an), " x ", ll_td(t.elem), "]");
     }
     if (t.cat == "map") { return "ptr"; }
+    if (t.cat == "optional") { return "ptr"; }
     if (t.cat == "sym") {
         if (t.alen == 16) { return "i16"; }
         return "i32";
@@ -1187,6 +1188,9 @@ fn emit_lle(e: i64) string {
         return "0";
     }
     if (n.kind == "null") {
+        return "null";
+    }
+    if (n.kind == "opt_none") {
         return "null";
     }
     if (n.kind == "ident") {
@@ -2620,6 +2624,54 @@ fn ll_call(e: i64) string {
     if (cn == "map_get") {
         return ll_map_get(ae[0], ae[1]);
     }
+    // 可选类型内建（可空指针模型：?T ↔ ptr）：
+    // some(x)→arena 拷贝 x 返指针；unwrap(p)→null 检查后 load 返回元素；is_some/is_none→icmp null。
+    if (cn == "some" || cn == "unwrap" || cn == "is_some" || cn == "is_none") {
+        var oa0ll: i64 = call_arg_node(e, 0);
+        var otdll: i64 = ll_etd(oa0ll);
+        // 元素 TD：some 的实参就是元素本身；其余三个内建的首实参是 `?T`，取其 elem。
+        var oeltd: i64 = otdll;
+        if (otdll >= 0 && tds[otdll].cat == "optional") {
+            oeltd = tds[otdll].elem;
+        }
+        var ell: string = ll_td(oeltd);
+        if (cn == "some") {
+            // ⚠ 聚合（struct/string/…）在 LLVM 后端按 ptr 表示，emit_lle 直接给出指针，
+            // 不能再 alloca+store（会写成 `store %st.Point %v.p` 而 %v.p 是 ptr）。
+            // ll_map_argptr 已封装这一分岔：聚合直接返回其值指针，标量才 alloca+store。
+            var oslot: string = ll_map_argptr(oa0ll, oeltd);
+            var osz0: string = ll_tmp();
+            llfb(sb_cat6("  ", osz0, " = getelementptr inbounds ", ell, ", ", "ptr null, i64 1"));
+            var osz1: string = ll_tmp();
+            llfb(sb_cat6("  ", osz1, " = ptrtoint ptr ", osz0, " to ", "i64"));
+            var ot0: string = ll_tmp();
+            llfb(sb_cat6("  ", ot0, " = call ptr @tll_opt_some(ptr ", oslot, ", i64 ", sb_cat2(osz1, ")")));
+            return ot0;
+        }
+        if (cn == "unwrap") {
+            var ou0: string = emit_lle(oa0ll);
+            var ou1: string = ll_tmp();
+            llfb(sb_cat6("  ", ou1, " = call ptr @tll_opt_unwrap(ptr ", ou0, "", ")"));
+            if (ll_isagg(oeltd)) {
+                // 聚合的「值」就是指针，直接返回 checked 指针即可。
+                return ou1;
+            }
+            var ou2: string = ll_tmp();
+            llfb(sb_cat6("  ", ou2, " = load ", ell, ", ptr ", ou1));
+            return ou2;
+        }
+        if (cn == "is_some") {
+            var os0: string = emit_lle(oa0ll);
+            var os1: string = ll_tmp();
+            llfb(sb_cat6("  ", os1, " = icmp ne ptr ", os0, ", ", "null"));
+            // icmp 产 i1，而 t 的 bool 是 i8，最后一并 zext 回去。
+            return ll_b8(os1);
+        }
+        var on0: string = emit_lle(oa0ll);
+        var on1: string = ll_tmp();
+        llfb(sb_cat6("  ", on1, " = icmp eq ptr ", on0, ", ", "null"));
+        return ll_b8(on1);
+    }
     if (cn == "map_set") {
         var mtd3: i64 = ll_etd(ae[0]);
         var mt3: TD = tds[mtd3];
@@ -3885,6 +3937,8 @@ fn emit_lldeclares() void {
     llph("declare i64 @tll_slice_len(ptr)");
     llph("declare void @tll_slice_sub(ptr, i64, i64, ptr)");
     llph("declare void @tll_slice_from_raw(ptr, i64, i64, ptr)");
+    llph("declare ptr @tll_opt_some(ptr, i64)");
+    llph("declare ptr @tll_opt_unwrap(ptr)");
     llph("declare ptr @tll_map_new(i64, i64)");
     llph("declare void @tll_map_put(ptr, ptr, ptr)");
     llph("declare ptr @tll_map_val_ptr(ptr, ptr)");

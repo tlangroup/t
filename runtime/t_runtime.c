@@ -36,6 +36,23 @@ void t_panic_bounds(int64_t index, int64_t len, const char* ctx) {
     exit(1);
 }
 
+// ── 可选类型 ?T（可空指针模型）──────────────────────────────
+// none = NULL；some(x) 在 arena 上拷贝 x 并返回其指针；unwrap(p) 在 p==NULL 时 panic。
+void* t_opt_some(const void* src, int64_t sz) {
+    void* p = t_arena_alloc(g_arena, (size_t)sz);
+    memcpy(p, src, (size_t)sz);
+    return p;
+}
+
+void* t_opt_unwrap(const void* p) {
+    if (p == NULL) {
+        fprintf(stderr,
+            "{\"error\":\"unwrap_none\",\"message\":\"unwrap of `none` value\"}\n");
+        exit(1);
+    }
+    return (void*)p;
+}
+
 // ── Arena 分配器 ───────────────────────────────────────────────
 struct TArena {
     uint8_t* base;

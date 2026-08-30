@@ -1717,6 +1717,13 @@ fn builtin_ret(name: string) i64 {
     if (name == "map_get") {
         return ti_mk("Unknown");
     }
+    // 可选类型内建：some/unwrap 的真实返回类型由实参类型在调用分支反查；is_some/is_none 返回 bool。
+    if (name == "some" || name == "unwrap") {
+        return ti_mk("Unknown");
+    }
+    if (name == "is_some" || name == "is_none") {
+        return ti_scalar("bool");
+    }
     if (name == "ti_name" || name == "fi_name" || name == "fi_type_name") {
         return ti_mk("String");
     }
@@ -4102,6 +4109,11 @@ fn infer_expr(e: i64) i64 {
     if (n.kind == "null") {
         return ti_mk("Unknown");
     }
+    // `?` none 字面量：与 `null` 同一手法——顶层 Unknown，由赋值/返回的目标 ?T 反推。
+    // （不可用 Optional(Unknown)：统一器只处理顶层 Unknown，嵌套的 Unknown 不会与目标反推。）
+    if (n.kind == "opt_none") {
+        return ti_mk("Unknown");
+    }
     // 取址 `&x`：操作数须为可寻址 lvalue，结果类型为 pointer(pointee)。
     if (n.kind == "amp") {
         var opti: i64 = infer_expr(n.na);
@@ -4611,6 +4623,27 @@ fn infer_expr(e: i64) i64 {
                         return mgti.val;
                     }
                 }
+                return ti_mk("Unknown");
+            }
+            // 可选类型内建：some(x)→Optional(实参类型)；unwrap(x)→Optional 元素类型；is_some/is_none(x)→bool。
+            if ((fname == "some" || fname == "unwrap" || fname == "is_some" || fname == "is_none") && n.la >= 0) {
+                var oan: i64 = call_arg_node(e, 0);
+                var oat: i64 = infer_expr(oan);
+                if (fname == "some") {
+                    // 实参是**元素值**（非可选），结果为 Optional(该实参类型)。
+                    return ti_elem_of("Optional", oat);
+                }
+                if (tip_kind(oat) == "Optional") {
+                    if (fname == "is_some" || fname == "is_none") {
+                        return ti_scalar("bool");
+                    }
+                    // unwrap：返回 Optional 的元素类型
+                    var oati: TI = tis[oat];
+                    return oati.elem;
+                }
+                fc_err("T-SEM-E790",
+                    sb_cat3(fname, " 的实参必须是可选类型 `?T`（当前收到: ", ti_str(oat)),
+                    e);
                 return ti_mk("Unknown");
             }
             // print / println / eprint 的实参必须是字符串。若不校验，LLVM 后端会把标量
@@ -9966,6 +9999,12 @@ fn resolve_type_desc(tn: i64) i64 {
     if (n.kind == "pointer") {
         return td_elem_mk("pointer", resolve_type_desc(n.na));
     }
+    // 可选类型 ?T：双后端统一落「指向元素的指针」（none = 空指针）。
+    // 缺失此分支时 ?T 会被 resolve 成 unknown → LLVM 把 ?i64 的函数返回类型
+    // 误判为 i64（`ret i64 %t`，而 some(x) 实际产出 ptr），clang 报类型冲突。
+    if (n.kind == "optional") {
+        return td_elem_mk("optional", resolve_type_desc(n.na));
+    }
     // 定长数组 [N]T：LLVM 后端映射为 [N x T]，C 后端仍走 T[]／T*
     if (n.kind == "array") {
         var ai: i64 = td_elem_mk("array", resolve_type_desc(n.na));
@@ -10193,6 +10232,7 @@ fn ti_to_td_base(ti: i64) i64 {
     }
     if (t.kind == "Named") { return td_named_mk("named", t.name); }
     if (t.kind == "Pointer") { return td_elem_mk("pointer", ti_to_td_base(t.elem)); }
+    if (t.kind == "Optional") { return td_elem_mk("optional", ti_to_td_base(t.elem)); }
     return td_mk("unknown");
 }
 

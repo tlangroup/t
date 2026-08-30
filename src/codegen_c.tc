@@ -424,7 +424,7 @@ fn emit_ctype(tn: i64) string {
         return sb_cat2(emit_ctype(n.na), "*");
     }
     if (n.kind == "optional") {
-        return emit_ctype(n.na);
+        return sb_cat2(emit_ctype(n.na), "*");
     }
     if (n.kind == "flag") {
         return n.sa;
@@ -516,6 +516,8 @@ fn desc_to_c(td: i64) string {
     if (t.cat == "array") { return c_ptr_to(t.elem); }
     if (t.cat == "map") { return "TMap*"; }
     if (t.cat == "pointer") { return c_ptr_to(t.elem); }
+    // 可选类型 ?T 与引用同构：可空的元素指针（none = NULL）。
+    if (t.cat == "optional") { return c_ptr_to(t.elem); }
     if (t.cat == "sym") {
         if (t.alen == 16) { return "uint16_t"; }
         return "uint32_t";
@@ -1497,6 +1499,9 @@ fn emit_expr(e: i64) string {
     if (n.kind == "null") {
         return "NULL";
     }
+    if (n.kind == "opt_none") {
+        return "NULL";
+    }
     if (n.kind == "ident") {
         var idn: string = mb_sub(n.sa);
         // 同函数内重名局部（shadowing）：反查该标识符解析到的声明节点，发射唯一化后的名字。
@@ -1715,6 +1720,52 @@ fn emit_expr(e: i64) string {
             if (cn == "slice_sub") {
                 return sb_cat6("t_slice_sub(", av[0], ", (int64_t)(", av[1], "), (int64_t)(",
                     sb_cat2(av[2], "))"));
+            }
+            // 可选类型内建（可空指针模型：?T ↔ T*）：
+            // some(x)→arena 拷贝 x 返指针；unwrap(p)→null 检查后解引用返回元素；is_some/is_none→null 比较。
+            if (cn == "some" || cn == "unwrap" || cn == "is_some" || cn == "is_none") {
+                var oa0: i64 = call_arg_node(e, 0);
+                var otd: i64 = expr_type_desc(oa0);
+                var ect: string = "i64";
+                if (otd >= 0) {
+                    if (tds[otd].cat == "optional") {
+                        ect = desc_to_c(tds[otd].elem);
+                    } else {
+                        ect = desc_to_c(otd);
+                    }
+                }
+                if (cn == "some") {
+                    // 实参可能是非左值（字面量 / 运算结果），`&x` 非法 C；
+                    // 用**数组**复合字面量 `(ECT[1]){ 值 }` materialize 出可取址的临时量
+                    // （与 append 同一手法），再取址交给 arena 拷贝。
+                    // ⚠ 括号结构极易写错：`sizeof` 实参一旦被包进第一实参的括号里，
+                    // clang 就报 "too few arguments, expected 2, have 1"。改写时务必数括号。
+                    var osb: StringBuilder = sb_new();
+                    sb_append_str(osb, "((");
+                    sb_append_str(osb, ect);
+                    sb_append_str(osb, "*)t_opt_some((const void*)&((");
+                    sb_append_str(osb, ect);
+                    sb_append_str(osb, "[1]){ ");
+                    sb_append_str(osb, av[0]);
+                    sb_append_str(osb, " })");
+                    sb_append_str(osb, ", (int64_t)sizeof(");
+                    sb_append_str(osb, ect);
+                    sb_append_str(osb, ")))");
+                    return sb_to_str(osb);
+                }
+                if (cn == "unwrap") {
+                    var usb: StringBuilder = sb_new();
+                    sb_append_str(usb, "(*(");
+                    sb_append_str(usb, ect);
+                    sb_append_str(usb, "*)t_opt_unwrap((const void*)(");
+                    sb_append_str(usb, av[0]);
+                    sb_append_str(usb, ")))");
+                    return sb_to_str(usb);
+                }
+                if (cn == "is_some") {
+                    return sb_cat3("(", av[0], " != NULL)");
+                }
+                return sb_cat3("(", av[0], " == NULL)");
             }
             if (cn == "sb_new") { return "t_sb_new(t_arena_current())"; }
             if (cn == "bsb_new") { return "t_sb_new(t_arena_current())"; }

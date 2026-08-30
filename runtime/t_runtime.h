@@ -250,6 +250,11 @@ TStr    t_deser_str(int64_t f);
 // 越界等运行时非法访问：打印 JSON 诊断包后退出，供 AI Agent 消费。
 void    t_panic_bounds(int64_t index, int64_t len, const char* ctx);
 
+// ── 可选类型 ?T（可空指针模型）──────────────────────────────
+// none = NULL；some(x) 在 arena 上拷贝 x 并返回其指针；unwrap(p) 做 null 检查后返回 p。
+void*   t_opt_some(const void* src, int64_t sz);
+void*   t_opt_unwrap(const void* p);
+
 #ifdef __cplusplus
 }
 #endif

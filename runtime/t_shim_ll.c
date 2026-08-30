@@ -47,6 +47,10 @@ void    tll_str_concat(TStr* a, TStr* b, TStr* out) {
 }
 void    tll_str_slice(TStr* s, int64_t a, int64_t b, TStr* out) { *out = t_str_slice(*s, a, b); }
 
+// ── 可选类型 ?T（可空指针模型，与 C 后端共享 t_opt_some / t_opt_unwrap）──
+void*   tll_opt_some(const void* src, int64_t sz)  { return t_opt_some(src, sz); }
+void*   tll_opt_unwrap(const void* p)              { return t_opt_unwrap(p); }
+
 // ── StringBuilder ──────────────────────────────────────────────
 TSb*    tll_sb_new(void)                    { return t_sb_new(t_arena_current()); }
 void    tll_sb_append_str(TSb* b, TStr* s)  { t_sb_append_str(b, *s); }

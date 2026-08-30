@@ -191,7 +191,7 @@ fn is_scalar_name(name: string) bool {
 }
 // <<< GEN:scalar_pred <<<
 
-fn parse_type() i64 {
+fn parse_type_inner() i64 {
     var t: string = cur_t();
     if (t == "KwFunc") {
         advance_i();
@@ -313,8 +313,19 @@ fn parse_type() i64 {
         var idn: i64 = mk_named(name, -1);
         return idn;
     }
-    parse_fatal("expected type");
-    return -1;
+        parse_fatal("expected type");
+        return -1;
+    }
+
+// `T?` 后缀可选类型糖（与 `?T` 前缀等价）：先解析基类型，尾部每个 `?` 再包一层 optional。
+// `?T` 前缀分支在 parse_type_inner 内已直接产出 optional 节点，不在此重复包装。
+fn parse_type() i64 {
+    var t0: i64 = parse_type_inner();
+    while (cur_t() == "Question") {
+        advance_i();
+        t0 = mk_optional(t0, -1);
+    }
+    return t0;
 }
 
 // ── 表达式解析（优先级爬升，逐层照抄 tc0）─────────────────────
@@ -3473,6 +3484,15 @@ fn parse_primary() i64 {
     if (t == "KwNull") {
         var ti_KwNull: i64 = advance_i();
         return parse_prim_null(ti_KwNull);
+    }
+    // `?` 可选类型 none 字面量（表达式起始位此前空闲；`|>` 管道 `|>?` 已被 lexer
+    // 归并为 PipeFilter 三字符记号，不会走到这里）：`var x: ?i64 = ?;` 的 RHS。
+    // 类型 = Optional(Unknown)，由赋值/返回的目标类型反推元素类型。
+    if (t == "Question") {
+        var ti_Q: i64 = advance_i();
+        var id: i64 = node_new("opt_none");
+        node_at(id, ti_Q);
+        return id;
     }
     // 类型专用关键字（string/StringBuilder/void/map）本不是 Identifier，
     // 但允许它们作为 comptime 类型模板参数的实参出现在调用位置

@@ -238,6 +238,8 @@ BuiltinTable:
   | "map_has" / "map_del" => ti_scalar("bool")
   | "map_len" => ti_scalar("i64")
   | "map_get" => ti_mk("Unknown")   // 返回类型 = 映射的 V，由 infer_expr/expr_type_desc 特判
+  | "some" / "unwrap" => ti_mk("Unknown")   // 由实参类型在 infer_expr 调用分支反查（见下）
+  | "is_some" / "is_none" => ti_scalar("bool")
   | "ti_name" / "fi_name" / "fi_type_name" => ti_mk("String")
   | "ti_size" / "ti_kind" / "ti_field_count" / "fi_offset" / "fi_type_size" / "fi_tag" => ti_scalar("i64")
   | "ti_field" => ti_mk("FieldInfo")
@@ -1256,6 +1258,32 @@ TypeList: Type ("," Type)*
 - **map 字面量 `[k1: v1, k2: v2]`**：键/值类型取首项推断，整型统一提升为 `i64`（同数组字面量）。仅作为局部 `var` 的初始化器发射：C 后端脱糖为 `t_map_new` + 逐项局部量 + `t_map_put`，LLVM 后端为 `tll_map_new` + 逐项 `tll_map_put`。`var m: map[K]V;` 无初始化时同样建空表。整型键一律按 `int64` 落盘（C 用 C99 复合字面量 `&(int64_t){…}`，LLVM 用 `alloca i64` + 扩宽），故窄整型键不会因高位垃圾而失配，键/值也可以直接写字面量。
 - 类型名解析：先查内建，再查当前单元已声明命名类型。
 - **数组字面量 `[e1, e2, …]`**：元素类型取首元素推断，整型元素统一提升为 `i64`（`[1,2,3]` 是 `[3]i64` 而非 `[3]u8`）；空字面量 `[]` 元素类型未知，可赋给任意 `[]T` / `[N]T`。定长数组与切片之间只要元素可转型即可互赋（目标为定长数组时长度须一致）。赋给 `[]T` 时脱糖为运行期 `slice_new` + 逐元素 `append`；赋给 `[N]T` 时 C 后端用花括号初始化器、LLVM 后端零初始化后按 `getelementptr` 逐元素 `store`。
+
+#### 3.5.0 可选类型 `T?` ✅ tc（2026-08-30）
+
+- **表示模型（可空指针）**：`?T` 的值就是「指向元素的指针」，`none` 即空指针——C 后端落 `T*`、LLVM 后端落 `ptr`；`sizeof(?T) == sizeof(void*)`，无带标签结构体的额外字段与分支开销。
+- **类型语法**：后缀 `T?`（规范形，等价的前缀 `?T` 亦接受）。元素类型可以是标量，也可以是聚合（struct 等；聚合在 LLVM 后端本就按 `ptr` 表示，`unwrap` 直接返回校验过的指针、不再 `load`）。
+- **`?` none 字面量**：表达式位的裸 `?`。与 `null` 同手法——静态类型是顶层 `Unknown`，由赋值 / 返回的目标 `?T` 反推元素类型，故 `var x: ?i64 = ?;` 与 `return ?;` 均成立。（不可用 `Optional(Unknown)`：统一器只处理顶层 `Unknown`，嵌套的不会被反推。）
+- **内建（类型规则见 §3.8）**
+
+  | 形式 | 结果类型 | 语义 |
+  |---|---|---|
+  | `some(x)` | `?T`（`T` = `x` 的类型） | 在 arena 上拷贝 `x` 并返回其指针。`x` 可为任意表达式（非左值亦合法）。 |
+  | `unwrap(x)` | `T` | 取元素值。`x` 为 `none` 时运行期 panic（stderr 打印 `{"error":"unwrap_none",…}` 后 `exit(1)`）。 |
+  | `is_some(x)` / `is_none(x)` | `bool` | 空值探测，即指针与 null 的比较，零开销。 |
+
+- **`some(x)` 的生命周期（v1 限制）**：值分配在全局 arena 上且**不回收**（与闭包的 v1 限制一致，有意为之）。故在长循环里反复 `some()` 会累积内存；自动释放需引入所有权或 GC，属后续里程碑。
+- **无隐式提升（L-02 显式原则）**：`T` 与 `?T` **不**自动转换——构造必须显式 `some(x)`，取值必须显式 `unwrap(x)`（或先 `is_some` 探测）。与 `f > T` 读路径的 Option B 裁定（§3.11）取舍一致：宁可啰嗦，也不让「空值」在类型层面隐形。
+- **诊断**：`unwrap` / `is_some` / `is_none` 的实参必须是 `?T`，否则报 **`T-SEM-E790`**。该校验在检查期拦下传标量的情形，避免 LLVM 后端把标量当 `ptr` 传给运行时。conformance `f_optional_unwrap_nonopt`；正例 `p_optional_basic`；示例 `examples/optional_demo.tc`。
+
+**新增运行期原语**
+
+| 原语 | C 端 | LLVM 端 |
+|---|---|---|
+| 构造（arena 拷贝 + 返指针） | `void* t_opt_some(const void* src, i64 sz)` | `ptr @tll_opt_some(ptr, i64)` |
+| 取值（null 检查 + 返指针） | `void* t_opt_unwrap(const void* p)` | `ptr @tll_opt_unwrap(ptr)` |
+
+`is_some` / `is_none` 不需要运行期原语，就是指针与 null 的比较（LLVM 侧 `icmp` 后 `zext i1 → i8`，对齐 t 的 `bool` 表示）。元素大小在 LLVM 侧由 `getelementptr <T>, ptr null, i64 1` + `ptrtoint` 求得，与 `src`/`sz` 两个实参对应。
 
 - **字符串驻留符号 `Sym32("tag")` / `Sym16("tag")`** ✅ tote（M40）：字段仅存 32/16 位无符号 id；真实字符串按 tag 分池、运行期不定长存储，由编译器自动维护。`= "str"` 自动 intern 取 id；同池相同字符串去重返回同一 id；`==`/`!=` 按 id 比较（O(1)）；跨池（`Sym32("A")` vs `Sym32("B")`）类型不同，互相赋值报 `T_TYPE_MISMATCH`（f15）；全局变量字符串初始化器自动搬进 `t__ginit`/`t.__ginit`（C / LLVM 双后端一致）。内建 API 与类型规则见 §3.8。
 
