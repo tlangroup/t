@@ -40,10 +40,10 @@ function blank(text) {
 }
 
 const DECLS = [
-  ['fn',      /^(?:(?:export|comptime|meta)\s+)*(?:(?:([A-Za-z_][A-Za-z_0-9]*)\s+fn)|fn\s+([A-Za-z_][A-Za-z_0-9]*))\b/],
-  ['var',     /^var\s+([A-Za-z_][A-Za-z_0-9]*)\s*[:=]/],
-  ['const',   /^const\s+([A-Za-z_][A-Za-z_0-9]*)\s*[:=]/],
-  ['type',    /^([A-Za-z_][A-Za-z_0-9]*)\s+(?:struct|enum|flag|variant|union)\b/],
+  ['fn',      /^(?:(?:export|comptime|meta|pub)\s+)*(?:(?:([A-Za-z_][A-Za-z_0-9]*)\s+fn)|fn\s+([A-Za-z_][A-Za-z_0-9]*))\b/],
+  ['var',     /^(?:(?:pub|export)\s+)?var\s+([A-Za-z_][A-Za-z_0-9]*)\s*[:=]/],
+  ['const',   /^(?:(?:pub|export)\s+)?const\s+([A-Za-z_][A-Za-z_0-9]*)\s*[:=]/],
+  ['type',    /^(?:(?:pub|export)\s+)?(?:struct|enum|flag|variant|union)\s+([A-Za-z_][A-Za-z_0-9]*)\b/],
 ];
 
 const cleaned = new Map();

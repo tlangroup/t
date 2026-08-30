@@ -17,10 +17,11 @@ const MIN_FNS = 330;
 const MIN_VARS = 1880;
 
 // 顶层函数头：关键字领头 `fn name(` 与并置式 `name fn(` 两种文法（Stage 2 统一为前者）。
-// 前缀修饰符 export / comptime / meta 可出现在名字之前（两种文法都允许）。
+// 前缀修饰符 export / comptime / meta / pub 可出现在名字之前（两种文法都允许）。
+// pub 为 2026-08-30 模块可见性重设计新增的声明前缀（取代 export 的可见性语义）。
 // 旧文法名字在 group1，新文法名字在 group2。
-const fnStart = /^(?:(?:export|comptime|meta)\s+)*(?:(?:([\p{XID_Start}_][\p{XID_Continue}_]*)\s+fn)|fn\s+([\p{XID_Start}_][\p{XID_Continue}_]*))\s*\(/u;
-const varDecl = /^\s*var\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*:\s*([^=;]+?)\s*(?:=|;)/;
+const fnStart = /^(?:(?:export|comptime|meta|pub)\s+)*(?:(?:([\p{XID_Start}_][\p{XID_Continue}_]*)\s+fn)|fn\s+([\p{XID_Start}_][\p{XID_Continue}_]*))\s*\(/u;
+const varDecl = /^\s*(?:(?:pub|export)\s+)?var\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*:\s*([^=;]+?)\s*(?:=|;)/;
 
 let nVars = 0;
 let nLines = 0;
