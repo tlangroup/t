@@ -6,8 +6,8 @@
 // 依赖：base, lex。
 // ══════════════════════════════════════════════════════════════════
 
-import(src.base :: *);
-import(src.lex :: *);
+@import("src.base" :: *);
+@import("src.lex" :: *);
 
 // 解析期致命错误：登记结构化诊断（带文件/行列）→ 输出 JSON → 退出。
 //
@@ -134,11 +134,11 @@ pub fn parse_annotations() i64 {
     var tail: i64 = -1;
     // 注解循环只消费 `@名`/`@Export` 形式；`@ <整数>` 是字段 tagID，
     // 必须由 parse_sfield 单独消费，故此处遇 `@` 后接 Integer 即停（留待 tagID 解析）。
-    while (cur_t() == "At" && (peek_t(1) == "Identifier" || peek_t(1) == "KwExport")) {
+    while (cur_t() == "At" && (peek_t(1) == "Identifier")) {
         advance_i();
         var name: string = "";
         var nti: i64 = pos;
-        if (cur_t() == "Identifier" || cur_t() == "KwExport") {
+        if (cur_t() == "Identifier") {
             var idx: i64 = advance_i();
             name = tk_v(idx);
             nti = idx;
@@ -773,10 +773,10 @@ pub fn parse_local_var(is_const: bool, is_export: bool) i64 {
         validate_var_name(name, nti);
     }
     var id: i64 = mk_var_decl(name, is_const, tn, init, ti);
-    // 模块系统（M-Module）：export 只能修饰顶层声明；局部/嵌套变量加 export → T_EXPORT_SCOPE
+    // 模块系统（M-Module）：pub 只能修饰顶层声明；局部/嵌套变量加 pub → T-MOD-E556
     if (is_export) {
         nodes[id].bc = true;
-        fc_err("T-MOD-E556", "export 只能修饰顶层声明，不能修饰局部/嵌套变量", id);
+        fc_err("T-MOD-E556", "pub 只能修饰顶层声明，不能修饰局部/嵌套变量", id);
     }
     return id;
 }
@@ -1892,65 +1892,10 @@ pub fn parse_import_items() i64 {
 //   ImportPath ::= Ident ( "." Ident )*
 // 路径首段为 `src` ⇒ 从本工程源码根导入（剥离该段）；否则一律按库解析：
 // 先本工程 lib/、再工程依赖的库。点号即路径分隔符：std.mem => <libdir>/std/mem.tc。
-pub fn parse_import_decl(anns: i64) i64 {
-    advance_i();
-    if (cur_t() == "LParen") {
-        advance_i();
-        var pti: i64 = pos;
-        var mname: string = expect_tok("Identifier");
-        while (cur_t() == "Dot") {
-            advance_i();
-            mname = sb_cat3(mname, ".", expect_tok("Identifier"));
-        }
-        var items: i64 = -1;
-        if (cur_t() == "DoubleColon") {
-            advance_i();
-            items = parse_import_items();
-        }
-        var alias: string = "";
-        var has_alias: bool = false;
-        if (cur_t() == "KwAs") {
-            advance_i();
-            alias = expect_tok("Identifier");
-            has_alias = true;
-        }
-        expect_tok("RParen");
-        expect_tok("Semicolon");
-        // 首段 `src` = 本工程源码根标记；剥离后按源码根解析，其余按库搜索路径解析。
-        var is_lib_path: bool = true;
-        var rest: string = mname;
-        if (first_segment(mname) == "src") {
-            is_lib_path = false;
-            rest = drop_first_segment(mname);
-        }
-        var id: i64 = mk_ImportModDecl(rest, alias, has_alias, is_lib_path, anns, pti);
-        var idn: Node = nodes[id];
-        idn.lb = items;
-        slice_set(nodes, id, idn);
-        return id;
-    }
-    // 已移除的旧写法：给出带迁移指引的硬错误（与 `::` 绑定符、`func`→`fn` 的处理一致）。
-    if (cur_t() == "At") {
-        parse_fatal_at("T-PAR-E102", "`import @x;` was removed; write `import(x);` instead", pos);
-    }
-    if (cur_t() == "Identifier") {
-        parse_fatal_at("T-PAR-E102", "`import x;` was removed; write `import(src.x);` for this project's sources, or `import(x);` for a library", pos);
-    }
-    // 旧数据导入 `import "path" [as x]`（已由 import_csv/json 函数调用取代，仅保留兼容）
-    var path: string = expect_tok("String");
-    var pti: i64 = pos - 1;
-    var alias: string = "";
-    var has_alias: bool = false;
-    if (cur_t() == "KwAs") {
-        advance_i();
-        alias = expect_tok("Identifier");
-        has_alias = true;
-    }
-    expect_tok("Semicolon");
-
-    var id: i64 = mk_ImportDecl(path, alias, false, has_alias, anns, pti);
-    return id;
-}
+// ⚠ 已删除：旧 `import(X)` 括号形式解析器（见 docs/reference.md §3.13）。
+// 模块导入统一改用 `@import("X")` 字符串路径形式（parse_at_import_decl）。
+// 旧 ImportStmt ::= "import" "(" Ident ("." Ident)* ( "::" ImportList )? ( "as" Ident )? ")" ";"
+// 该形式已废弃，现由字符串路径的 @import 取代，分歧仅在表面（路径由点分标识符改为字符串字面量）。
 
 // ── 文件级指令（文件即模块）──────────────────────────────────────
 // `@module(...)` / `@import("...")` 以注解形状出现在顶层，但**后面不跟任何声明**
@@ -2002,8 +1947,10 @@ pub fn parse_module_decl() i64 {
     return mk_ModuleDecl(attrs, nti);
 }
 
-// @import("src.path.to.module_a") / @import("std.math" as m)
-// 复用 ImportModDecl 节点：sb=剥离 src 后的模块名, sc=别名, bd=true 走库搜索路径。
+// @import("src.path.to.module_a") / @import("std.math" as m) [:: * | :: a, b as c]
+// 复用 ImportModDecl 节点：sb=剥离 src 后的模块名, sc=别名, bd=true 走库搜索路径；
+// lb=选择性/通配导入项链表（与旧 import 的 `::` 同构）。`pub @import(...)` 由
+// parse_declaration 在调用前置 bc=true（模块重导出，见 sema.collect_module_defs）。
 pub fn parse_at_import_decl() i64 {
     advance_i();                    // 吃掉 `@`
     advance_i();                    // 吃掉 `import`（KwImport）
@@ -2017,6 +1964,13 @@ pub fn parse_at_import_decl() i64 {
         alias = expect_tok("Identifier");
         has_alias = true;
     }
+    // 选择性/通配导入项：`:: *` 或 `:: a, b as c`（与旧 import 的 `::` 同构，存于节点 lb）。
+    // ⚠ 顺序：必须在闭合 `)` 之前消费（`@import("x" :: *)` 的 `::` 在括号内）。
+    var items: i64 = -1;
+    if (cur_t() == "DoubleColon") {
+        advance_i();
+        items = parse_import_items();
+    }
     expect_tok("RParen");
     if (cur_t() == "Semicolon") { advance_i(); }
     var is_lib_path: bool = true;
@@ -2025,7 +1979,11 @@ pub fn parse_at_import_decl() i64 {
         is_lib_path = false;
         rest = drop_first_segment(mname);
     }
-    return mk_ImportModDecl(rest, alias, has_alias, is_lib_path, -1, pti);
+    var id: i64 = mk_ImportModDecl(rest, alias, has_alias, is_lib_path, -1, pti);
+    var idn: Node = nodes[id];
+    idn.lb = items;
+    slice_set(nodes, id, idn);
+    return id;
 }
 
 // parse_type_alias 已由 GEN:parser 区间生成（见下方标记区）
@@ -2338,8 +2296,23 @@ pub fn parse_expect_stmt() i64 {
 }
 
 pub fn parse_declaration() i64 {
+    // 可见性/编译期前缀须在 `@` 文件级指令之前消费，使 `pub @import(...)`（模块重导出）
+    // 与 `pub @module(...)` 可正确解析；`@` 指令自身仍不接任何前缀语义。
+    var is_export: bool = false;
+    if (cur_t() == "KwPub") {
+        advance_i();
+        is_export = true;
+    }
+    // `export` 关键字已删除；旧 `export` 同位置修饰（自举过渡）移除，统一用 `pub`（见 §3.13）。
+    // comptime 前缀：置于最前，使其可修饰 var/const/fn/struct/...（编译期声明）
+    var is_comptime: bool = false;
+    if (cur_t() == "KwComptime") {
+        advance_i();
+        is_comptime = true;
+    }
+
     // 文件级指令优先：@module(...) / @import("...") 后面不跟声明，
-    // 必须在 parse_annotations 之前拦截（注解循环只认 `@标识符`，且 `@import`
+    // 在 parse_annotations 之前拦截（注解循环只认 `@标识符`，且 `@import`
     // 的 `import` 是关键字，注解循环本就吞不下它）。一次只处理一条，
     // 其余指令/注解留给下一轮 parse_declaration。
     if (cur_t() == "At") {
@@ -2350,31 +2323,21 @@ pub fn parse_declaration() i64 {
                 return parse_module_decl();
             }
             if (dname == "import") {
-                return parse_at_import_decl();
+                var d: i64 = parse_at_import_decl();
+                if (is_export) {
+                    var dn: Node = nodes[d];
+                    dn.bc = true;
+                    slice_set(nodes, d, dn);
+                }
+                return d;
             }
         }
     }
     var anns: i64 = parse_annotations();
 
     // 模块系统（M-Module）：顶层声明可用 `pub` 修饰，标记对外可见。
-    // ⚠ 旧 `export` 同位置保留仅为自举过渡（迁移完成后删除），二者等价置导出位；
+    // 旧 `export` 同位置修饰已删除（见 §3.13）；`pub` 与 `export` 曾等价置导出位，现统一仅 `pub`；
     // 真正的可见性判据是「文件 @module(pub) ∧ 声明 pub」，在 sema 侧合取。
-    var is_export: bool = false;
-    if (cur_t() == "KwPub") {
-        advance_i();
-        is_export = true;
-    }
-    if (cur_t() == "KwExport") {
-        advance_i();
-        is_export = true;
-    }
-
-    // comptime 前缀：置于最前，使其可修饰 var/const/fn/struct/...（编译期声明）
-    var is_comptime: bool = false;
-    if (cur_t() == "KwComptime") {
-        advance_i();
-        is_comptime = true;
-    }
 
     if (cur_t() == "KwVar") {
         var d: i64 = parse_global_var(false, is_comptime);
@@ -2394,13 +2357,8 @@ pub fn parse_declaration() i64 {
         return d;
     }
     if (cur_t() == "KwImport") {
-        if (is_export) {
-            // export 不能修饰 import 声明
-            var id: i64 = parse_import_decl(anns);
-            nodes[id].bc = true;
-            return id;
-        }
-        return parse_import_decl(anns);
+        // 旧 `import(X)` 括号形式已删除；统一改用 `@import("X")`（见 docs/reference.md §3.13）
+        parse_fatal_at("T-PAR-E102", "`import(X)` was removed; write `@import(\"X\")` instead", pos);
     }
 
     // 测试声明的名字是字符串字面量（`"加法" test {}` / `"math" suite {}`），
@@ -3322,7 +3280,6 @@ pub fn parse_for_stmt() i64 {
     var init: i64 = -1;
     if (cur_t() != "Semicolon") {
         var exp: bool = false;
-        if (cur_t() == "KwExport") { advance_i(); exp = true; }
         if (cur_t() == "KwVar") {
             init = parse_local_var(false, exp);
         } else {
@@ -3431,15 +3388,6 @@ pub fn parse_statement() i64 {
     if (t == "LBrace") {
         return parse_block_stmt();
     }
-    if (t == "KwExport") {
-        // 模块系统（M-Module）：函数体内 export 只能修饰局部 var/const → T_EXPORT_SCOPE
-        advance_i();
-        var nt: string = cur_t();
-        if (nt == "KwVar") { return parse_local_var(false, true); }
-        if (nt == "KwConst") { var cd: i64 = parse_local_var(true, true); append(g_const_decl_ids, cd); return cd; }
-        if (nt == "KwLet") { return parse_local_let(true); }
-        parse_fatal("export 只能修饰顶层声明或局部 var/const/let");
-    }
     if (t == "KwVar") {
         return parse_var_stmt();
     }
@@ -3451,6 +3399,26 @@ pub fn parse_statement() i64 {
     }
     if (t == "KwAuto") {
         return parse_auto_stmt();
+    }
+    if (t == "KwPub") {
+        // 局部作用域：pub 只能修饰顶层声明，不能修饰局部 var/let/const（M-Module）。
+        // 旧 `export` 关键字已删除，可见性统一用 `pub`；局部 pub 误用报 T-MOD-E556。
+        advance_i();   // 吃掉 pub
+        var lt2: string = cur_t();
+        if (lt2 == "KwVar") {
+            return parse_local_var(false, true);
+        }
+        if (lt2 == "KwConst") {
+            var cd2: i64 = parse_local_var(true, true);
+            append(g_const_decl_ids, cd2);
+            return cd2;
+        }
+        if (lt2 == "KwLet") {
+            return parse_local_let(true);
+        }
+        // pub 后不是 var/let/const：非法局部 pub，报错（吃掉该 token 避免级联）
+        parse_fatal_at("T-MOD-E556", "pub 只能修饰顶层声明，不能修饰局部/嵌套声明", pos);
+        return -1;
     }
     return parse_expr_or_assign_stmt();
 }

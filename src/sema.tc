@@ -6,9 +6,9 @@
 // 依赖：base, lex, parse。
 // ══════════════════════════════════════════════════════════════════
 
-import(src.base :: *);
-import(src.lex :: *);
-import(src.parse :: *);
+@import("src.base" :: *);
+@import("src.lex" :: *);
+@import("src.parse" :: *);
 
 // ── TypeDesc 池（复刻 TypeDesc interface）──────────────────────
 // 类型描述库由语义分析阶段产出（构建 TD 索引），供两个代码生成后端消费，
@@ -6514,10 +6514,9 @@ pub fn sel_register(imp: i64, alias: string) void {
 pub fn handle_one_import(imp: i64) void {
     var nm: string = nodes[imp].sb;
     var user_alias: string = nodes[imp].sc;
-    if (nodes[imp].bc) {
-        fc_err("T-MOD-E556", "export 不能修饰 import 声明", imp);
-        return;
-    }
+    // 模块重导出（M-Reexport）：`pub @import(...)` / `export import(...)` 允许 import 声明
+    // 带导出修饰——被导入模块的 pub 符号在本模块再导出（见 collect_module_defs）。
+    // 旧 `export import` 不再报错；`export` 修饰局部/嵌套变量仍报 T-MOD-E556（parse.tc）。
     // `import(src)` / `import(src.)`：剥离首段后为空路径。
     if (nm == "") {
         fc_err("T-MOD-E559",
@@ -6529,6 +6528,14 @@ pub fn handle_one_import(imp: i64) void {
     var alias: string = user_alias;
     if (alias == "") { alias = last_segment(nm); }
     mod_alias_add(nm, alias);
+    // 模块重导出（M-Reexport）：`pub @import(...)` / `export import(...)` 把被导入模块 M 的
+    // pub 符号在本模块（g_cur_mod）再导出。登记到 g_reexport_*，待 collect_module_defs
+    // 把所有模块符号收齐后，把 M 的 pub 符号并入本模块符号集，使下游 `本模块.符号` 可达。
+    // g_cur_mod 在 load_module_file 进入模块时已置为该库别名，入口模块为 ""。
+    if (nodes[imp].bc) {
+        append(g_reexport_owner, g_cur_mod);
+        append(g_reexport_imp, alias);
+    }
 
     // 库导入（路径首段非 src）：走库搜索路径（入口/lib、工程根/lib、out/lib 预编译缓存），
     // 命中 .tc 源码则内联（名字重整后即为命名空间隔离）；若同时命中 .tlib 预编译产物则走外链模式。
@@ -6846,6 +6853,23 @@ pub fn def_lookup(alias: string, name: string) i64 {
     return -1;
 }
 
+// 模块重导出回退（M-Reexport）：模块 X 经 `pub @import(M)` 重导出了 M 的 pub 符号时，
+// 下游 `X.name` 应等价于 `M.name`（重定向到 M 的真实定义 M__name，而非凭空造 X__name）。
+// 仅命中 M 的导出符号（g_def_export 为真）；未命中返回 -1。
+pub fn reexport_lookup(owner: string, name: string) i64 {
+    var rx: i64 = 0;
+    var rnx: i64 = slice_len(g_reexport_owner) as i64;
+    while (rx < rnx) {
+        if (g_reexport_owner[rx] == owner) {
+            var imp: string = g_reexport_imp[rx];
+            var di: i64 = def_lookup(imp, name);
+            if (di >= 0 && g_def_export[di]) { return di; }
+        }
+        rx = rx + 1;
+    }
+    return -1;
+}
+
 // ── 模块属性（文件即模块 / @module(pub|internal)）──────────────
 // 登记点在 handle_one_import（别名 + 是否跨包），attr 由 collect_module_defs
 // 从 ModuleDecl 节点回填。
@@ -7141,9 +7165,14 @@ pub fn mangle_modules() void {
             var ob: Node = nodes[nd.na];
             if (ob.kind == "ident" && in_mod_aliases(ob.sa)) {
                 var di: i64 = def_lookup(ob.sa, nd.sa);
+                // 模块重导出（M-Reexport）：X 重导出了 M 时，`X.name` 回退到 `M.name`
+                // （重定向到 M 的真实定义 M__name）。仅命中 M 的导出符号。
+                if (di < 0) { di = reexport_lookup(ob.sa, nd.sa); }
                 if (di >= 0) {
-                    check_mod_visible(ob.sa, nd.sa, di, i);
-                    nd.sa = mangled_name(ob.sa, nd.sa);
+                    // 真实归属模块 = g_def_alias[di]（重导出时为被重导出的 M，并非 X 本身）
+                    var real_alias: string = g_def_alias[di];
+                    check_mod_visible(real_alias, nd.sa, di, i);
+                    nd.sa = mangled_name(real_alias, nd.sa);
                     nd.kind = "ident";
                     nd.na = -1;                     // 丢弃对象（模块名）子节点
                     slice_set(nodes, i, nd);
@@ -7152,9 +7181,11 @@ pub fn mangle_modules() void {
             }
         } else if (nd.kind == "named" && nd.sb != "") {
             var di2: i64 = def_lookup(nd.sb, nd.sa);
+            if (di2 < 0) { di2 = reexport_lookup(nd.sb, nd.sa); }
             if (di2 >= 0) {
-                check_mod_visible(nd.sb, nd.sa, di2, i);
-                nd.sa = mangled_name(nd.sb, nd.sa);
+                var real_alias2: string = g_def_alias[di2];
+                check_mod_visible(real_alias2, nd.sa, di2, i);
+                nd.sa = mangled_name(real_alias2, nd.sa);
             } else {
                 err_no_symbol(nd.sb, nd.sa, i);
             }
@@ -7162,9 +7193,11 @@ pub fn mangle_modules() void {
             slice_set(nodes, i, nd);
         } else if (nd.kind == "struct_lit" && nd.sb != "") {
             var di3: i64 = def_lookup(nd.sb, nd.sa);
+            if (di3 < 0) { di3 = reexport_lookup(nd.sb, nd.sa); }
             if (di3 >= 0) {
-                check_mod_visible(nd.sb, nd.sa, di3, i);
-                nd.sa = mangled_name(nd.sb, nd.sa);
+                var real_alias3: string = g_def_alias[di3];
+                check_mod_visible(real_alias3, nd.sa, di3, i);
+                nd.sa = mangled_name(real_alias3, nd.sa);
             } else {
                 err_no_symbol(nd.sb, nd.sa, i);
             }

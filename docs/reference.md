@@ -2143,85 +2143,97 @@ AgentClause:
 
 ---
 
-### 3.13 Modules / Import / Export（代码模块与插件系统）⚠ 部分实现（2026-08-04：parser + 两个诊断 + whole-program inlining 已落地，`module_hello` 双后端真实通过；**工程源码根 + 点分模块名 `import(src.a)` / `import(src.d.e)` 已落地（`proj_demo` 双后端真实通过）**；**库搜索路径 + 命名空间隔离 `lib__name` 重整 + `export` 私有隔离强校验（`T_MODULE_PRIVATE`/`T_MODULE_NO_SYMBOL`）已落地（第四刀，2026-08-05）**；**`.tlib` 真·独立编译 + 链接（build --lib 产 LLVM 归档 + exports.json，import(x) 优先链接、私有跳过、未预编译回退内联）已落地（第五刀，2026-08-05）**；**环境变量搜索（`T_LIB_PATH` / `~/.tote/libs`，`getenv` 中性内建 + tote 注入 `--lib-dir`）已落地（第六刀，2026-08-05）**；`.tlibd`（调试态归档）/ `T_IMPORT_CYCLE`（依赖图无环校验）/ tote 依赖图（`tote deps` + `tc --emit-deps`）**已落地（外部库收尾刀，2026-08-05）**；**语法统一为 `import(Path [:: List] [as Alias])`（`src.` 前缀走源码根、其余走库；旧 `import @x;` / 裸 `import x;` 删除；选择性导入 `::` 新增）已落地（统一刀，2026-08-08）**；C 互操作导出（`.lib`/`.dll`）待实现）
+### 3.13 Modules / Import / Export（代码模块与插件系统）✅ 已落地（2026-08-30 模块重设计：文件头 `@module(pub|internal)` + 字符串路径导入 `@import("Path")` + 声明前缀 `pub` 标记可见 + 「模块属性 ∧ 声明 pub」可见性合取 + `pub @import(...)` 模块重导出；旧 `import(Path)` / `export` 语法已删除；双后端自举不动点 g2==g3==g4 保持，L2 gate 全绿；C 互操作导出（`.lib`/`.dll`）待实现）
 
 > 本节气法由 `docs/syntax/drafts/module.md` 经 L-15 采用并并入（原草稿已标记失效）。与 §3.6.1 数据导入（`import_csv`/`import_json` 函数调用）正交：代码模块走 `import xxx` 标识符形式（支持点分 `xxx.yyy`）。
 
-一个 `.tc` 文件即一个模块；发布态为 `xxx.tlib`，调试态为 `xxx.tlibd`（刻意避开 C 静态库 `.lib` 扩展名）。`import xxx` 按名导入，命名空间即 `xxx` 的**最后一段**；跨模块可见的符号须显式 `export`。四法评审：L-04/L-02/L-03 全 ✅，L-14 原则 ✅（门禁用例实现期落）。
+一个 `.tc` 文件即一个模块；发布态为 `xxx.tlib`，调试态为 `xxx.tlibd`（刻意避开 C 静态库 `.lib` 扩展名）。`@import("xxx")` 按名导入，命名空间即 `xxx` 的**最后一段**；跨模块可见的符号须显式 `pub`（且跨包模块还需文件头 `@module(pub)`）。四法评审：L-04/L-02/L-03 全 ✅，L-14 原则 ✅（门禁用例实现期落）。
 
 ```ebnf
-ImportPath:     IDENTIFIER ("." IDENTIFIER)*        // 模块路径；首段 src → 工程源码根，否则 → lib/依赖库
-ImportList:     ImportItem ("," ImportItem)*         // 选择性导入列表（:: 之后）
-ImportItem:     IDENTIFIER ("as" IDENTIFIER)? | "*"  // 选择性导入项；* = 通配
-ImportStmt:     "import" "(" ImportPath ("::" ImportList)? ("as" IDENTIFIER)? ")" ";"
-                                                    // 统一语法：import(std.mem) / import(json :: *) / import(std.math as m2)
-ModuleFile:     <src_root> "/" ImportPath-with-"/" ".tc"   // 模块源码（含 export、无 main），如 <src>/math.tc
+ModuleHeader:  "@module" "(" Attr ("," Attr)* ")"      // 文件头声明模块属性；Attr ∈ {pub, internal}
+Attr:         "pub" | "internal"
+ImportPath:   STRING                                  // 字符串模块路径；首段 src → 工程源码根，否则 → lib/依赖库
+ImportList:   ImportItem ("," ImportItem)*            // 选择性导入列表（:: 之后）
+ImportItem:   IDENTIFIER ("as" IDENTIFIER)? | "*"     // 选择性导入项；* = 通配
+ImportStmt:   "@import" "(" ImportPath ("as" IDENTIFIER)? ("::" ImportList)? ")" ";"
+                                                    // 字符串路径：@import("std.mem") / @import("json" :: *) / @import("std.math" as m2)
+ReExport:     "pub" "@import" "(" ImportPath ("::" ImportList)? ")" ";"
+                                                    // 模块重导出：把 M 的 pub 符号在本模块再导出（下游 `本模块.name` 重定向到 M__name）
+ModuleFile:   <src_root> "/" ImportPath-with-"/" ".tc"   // 模块源码（含 pub、无 main），如 <src>/math.tc
 ModuleArtifact: ModuleStem "." ("tlib" | "tlibd")   // 库归档（build --lib 产出），如 std/mem.tlib / json.tlib
-ExportPrefix:   "export"                            // 前缀修饰顶层声明；export import(...) 报 T_EXPORT_SCOPE
+ExportPrefix: "pub"                                // 前缀修饰顶层声明，标记对外可见（跨包还需文件头 @module(pub)）
 ```
 
-> ⚠ **2026-08-08 语法统一（落地）**：旧的 `import @x;`（外部库）与裸 `import x;`（工程内）两种写法**已删除**，统一为 `import(Path [:: List] [as Alias])`。`import` 不再区分「工程内 / 外部库」——一律走 `import(...)`，由路径首段决定解析策略（见 rule 1 / rule 5）。旧写法在解析期报友好错误并 `exit(1)`。
+> ⚠ **2026-08-30 模块重设计（落地）**：导入语法统一为字符串路径的 `@import("Path")`（取代旧 `import(Path)` 括号形式，旧写法在解析期报 `import(X) was removed; write @import("X") instead`）；可见性前缀由 `export` 改为 `pub`（`export` 关键字已删除）；新增文件头 `@module(pub|internal)` 与「模块属性 ∧ 声明 pub」可见性合取；`pub @import("Path")` 放开模块重导出（旧 `export import(...)` 写法已删除）。
 
 **规则**：
 
-1. **导入形式（统一语法）**：`import(Path)`；`Path` 为**点分模块路径**（标识符，允许 `.` 分段），非字符串路径；与数据导入函数（`import_csv`/`import_json`）不重名（L-04 唯一语义）。统一支持三种可选修饰：
-   - **选择性导入** `import(Path :: a, b as c, *)`：只引入列表中的符号（可 `as` 改名；`*` 通配全部导出符号）。
-   - **模块别名** `import(Path as M)`：以 `M.sym` 限定访问（替代原「点分末段」或裸名），如 `import(std.math as m2)` → `m2.abs(-7)`。
-   - 二者可组合：`import(Path :: a, b as c as M)` 不合法（`as` 模块别名写在 `)` 前、`::` 列表外）；选择性列表与模块别名独立。`export import(...)` → `T_EXPORT_SCOPE`（语法不支持模块重导出）。
-   - ⚠ **旧写法已删除**：`import @x;`（外部库标记）与裸 `import x;`（工程内）在解析期报友好错误（`import @x; was removed; write import(x);`）并 `exit(1)`。迁移：`import @json;` → `import(json)`；`import hello;` → `import(src.hello)`。
-2. **默认私有**：顶层符号默认模块内可见；跨模块可见须显式 `export <name> fn/struct/enum/flag/variant/const/typealias`。`export` 修饰非顶层 → `T_EXPORT_SCOPE`（L-02 显式）。
-   - ⚠ 语法注意：t 声明为并置式 `Name fn(...)`，`export` 前缀置于**名字之前**：`export add fn(...) { ... }`（非 `export fn add`）。
-   - ✅ **私有隔离已强制（2026-08-05 第四刀）**：经 `mangle_modules` 重整，导入模块（别名 `A`）的顶层符号被改写为 `A__name`；未 `export` 的符号**跨模块不可见**——`A.priv()` 触发 `T_MODULE_PRIVATE`，`A.NoSuchType` 触发 `T_MODULE_NO_SYMBOL`。模块**内部**自调用同样脱糖为 `A__name`（库内自洽）。入口模块别名 `""` → **永不重整**，故单文件程序 IR 逐字节不变（已重录基线、L2 gate 全绿验证）。
-3. **名称解析与限定前缀（Go 风格末段）**：`import(net.http)` 的命名空间取**模块名最后一段** `http`，以 `http.get(...)` 访问；`import(math)` 即 `math.add(...)`；`import(net.http as h)` 则 `h.get(...)`；工程内 `import(src.d.e)` 取末段 `e` 以 `e.deep(...)` 访问（点分仅描述文件路径，不构造多级命名空间，故不能用 `d.e.deep`）。`as M` 模块别名下以 `M.sym` 全限定访问；不取末段。`import(src.hello)` 内联进同一单元后亦可直接裸名调用（如 `greet()`）。零碰撞、显式。
-3b. **限定类型与字面量（跨模块类型引用）**：引用外部/其他模块**导出类型**须带限定前缀——`var v: json.Value;`、字面量 `var p: physics.Position = physics.Position{ x: 1, y: 2 };`。解析期 `named{A.T}` 重整为 `A__T`（找不到 → `T_MODULE_NO_SYMBOL`）；`A.T{}` 结构化字面量同理。`mangle_modules` Pass 1 先处理：识别 object 为模块别名的 `member`、带 `sb != ""` 的 `named`/`struct_lit`，按 `def_lookup` 解析后清 `sb`。未限定的 `Value`/`Position` 只在本模块查找。
-4. **工程源码根（`src.` 前缀，2026-08-08 统一语法）**：工程内源码模块经 `import(src.xxx)` 导入——路径**首段为 `src`** 即表示从本项目源代码根目录解析，编译器剥去 `src` 段后相对 `<src_root>` 取源码整体内联（单命名空间）：
-   - `import(src.a);` → `<src_root>/a.tc`
-   - `import(src.d.e);` → `<src_root>/d/e.tc`
-   - 文件不存在 → `T_IMPORT_NOT_FOUND`。
-   - `<src_root>` = **入口文件所在目录**（取代旧「相对导入方目录」）。标准布局下你跑 `tc run src/main.tc`，入口目录即 `<root>/src`，于是 `import(src.a)` ⇒ `<root>/src/a.tc`、`import(src.d.e)` ⇒ `<root>/src/d/e.tc`。
-   - ⚠ **首段非 `src` 一律走库搜索**（rule 5）：故工程内源码**必须**显式加 `src.` 前缀；裸 `import(a)` 会被当作库 `a` 在 `lib/` 与依赖库中查找（找不到 → `T_IMPORT_NOT_FOUND`），不会再回落到源码根。
-   - ⚠ **已知限制**：向上查找 `tote.toml` 自动定位 `<root>` 的方案**暂未启用**——编译器内置 `path_exists` 对绝对路径探测不稳定（触发 `arena: out of memory`）。故以「入口目录 = 源码根」折中，对标准布局等价；约定用法 `tc run src/main.tc`。
-5. **解析序（统一语法，2026-08-08）**：`handle_one_import` 依据 `import(Path)` 的**首段**分流：
-   - **首段为 `src`**（如 `import(src.a)`、`import(src.d.e)`）→ `is_lib_path=false` → 剥 `src` 后相对 `<src_root>` 取**源码**整体内联（单命名空间），无 `.tlib` 查找；嵌套 import 递归、重复自动去重（菱形共享根只加载一次）；文件不存在 → `T_IMPORT_NOT_FOUND`。
-   - **首段非 `src`**（如 `import(json)`、`import(std.mem)`）→ `is_lib_path=true` → 走 `resolve_external_lib` + `mangle_modules` 命名空间重整（非单命名空间内联，见 rule 2 私有隔离），并支持**双模式**（见 rule 6b）。路径 `.` 经 `dots_to_slashes` 转 `/` 定位归档（`import(std.mem)` → `out/lib/std/mem.tlib`）。
-   - 空路径（如 `import(src)` 剥 `src` 后无剩余）→ `T_IMPORT_BAD_PATH`。
+1. **导入形式（字符串路径）**：`@import("Path")`；`Path` 为**字符串模块路径**（点分，允许 `.` 分段），非标识符形式；与数据导入函数（`import_csv`/`import_json`）不重名（L-04 唯一语义）。统一支持三种可选修饰：
+   - **选择性导入** `@import("Path" :: a, b as c, *)`：只引入列表中的符号（可 `as` 改名；`*` 通配全部 pub 符号）。
+   - **模块别名** `@import("Path" as M)`：以 `M.sym` 全限定访问（替代原「点分末段」或裸名），如 `@import("std.math" as m2)` → `m2.abs(-7)`。
+   - 二者可组合：`@import("Path" :: a, b as c as M)` 不合法（`as` 模块别名写在 `)` 前、`::` 列表外）；选择性列表与模块别名独立。
+   - ⚠ **旧括号形式已删除**：`import(Path)`（含旧 `import @x;` / 裸 `import x;`）在解析期报 `import(X) was removed; write @import("X") instead` 并 `exit(1)`。迁移：`import(json)` → `@import("json")`；`import(src.hello)` → `@import("src.hello")`。
+   - **模块重导出** `pub @import("Path")`：把被导入模块 M 的全部 pub 符号在本模块再导出（见 rule 2c）。
+2. **默认私有 + 可见性合取（2026-08-30）**：顶层符号默认模块内可见（无 `pub`）；跨模块可见须显式 `pub`。最终可见性由「模块属性 ∧ 声明 pub」**合取**决定三级规则：
+   - ① 声明无 `pub` ⇒ 模块私有，任何跨模块访问报 `T-MOD-E558`；
+   - ② 声明 `pub` + **同包**（模块来自 `src` 源码根，`mod_is_lib=false`）⇒ 放行（如 `src.base` 各模块彼此同包）；
+   - ③ 声明 `pub` + **跨包**（模块来自库搜索路径，`mod_is_lib=true`）⇒ 还要求被导入模块文件头写 `@module(pub)`，否则 `T-MOD-E558`（同包内仍可见）。
+   - `pub` 修饰非顶层（局部/嵌套 var/const/let）→ `T-MOD-E556`（L-02 显式）。
+   - ⚠ 语法注意：`pub` 是前缀关键字，`pub fn foo() ...` / `pub struct Foo ...`；声明为 `fn` 名前置式 `pub fn name(params) ret { ... }`（`export` 关键字已删除）。
+   - ✅ **私有隔离已强制（2026-08-05 第四刀，前缀由 `export` 改为 `pub`）**：经 `mangle_modules` 重整，导入模块（别名 `A`）的顶层符号被改写为 `A__name`；未 `pub` 的符号**跨模块不可见**——`A.priv()` 触发 `T-MOD-E558`，`A.NoSuchType` 触发 `T-MOD-E557`。模块**内部**自调用同样脱糖为 `A__name`（库内自洽）。入口模块别名 `""` → **永不重整**，故单文件程序 IR 逐字节不变（已重录基线、L2 gate 全绿验证）。
+   - 2c. **模块重导出（已放开）**：`pub @import("Path")` 把 M 的 pub 符号在本模块再导出——下游 `本模块.name` 经 `mangle_modules` 重定向到 M 的真实定义 `M__name`（非凭空造 `本模块__name`）。被重导出的符号仍受 M 的可见性约束（M 须 `@module(pub)` 且符号 `pub`）。旧 `export import(...)` 写法已删除，重导出不再报 `T_EXPORT_SCOPE`（现为合法）。
+3. **名称解析与限定前缀（Go 风格末段）**：`@import("net.http")` 的命名空间取**模块名最后一段** `http`，以 `http.get(...)` 访问；`@import("math")` 即 `math.add(...)`；`@import("net.http" as h)` 则 `h.get(...)`；工程内 `@import("src.d.e")` 取末段 `e` 以 `e.deep(...)` 访问（点分仅描述文件路径，不构造多级命名空间，故不能用 `d.e.deep`）。`as M` 模块别名下以 `M.sym` 全限定访问；不取末段。`@import("src.hello")` 内联进同一单元后亦可直接裸名调用（如 `greet()`）。零碰撞、显式。
+3b. **限定类型与字面量（跨模块类型引用）**：引用外部模块**导出类型**须带限定前缀——`var v: json.Value;`、字面量 `var p: physics.Position = physics.Position{ x: 1, y: 2 };`。解析期 `named{A.T}` 重整为 `A__T`（找不到 → `T-MOD-E557`）；`A.T{}` 结构化字面量同理。`mangle_modules` Pass 1 先处理：识别 object 为模块别名的 `member`、带 `sb != ""` 的 `named`/`struct_lit`，按 `def_lookup`（模块重导出经 `reexport_lookup` 回退到真实定义 `M__T`）解析后清 `sb`。未限定的 `Value`/`Position` 只在本模块查找。
+4. **工程源码根（`src.` 前缀）**：工程内源码模块经 `@import("src.xxx")` 导入——路径**首段为 `src`** 即表示从本项目源代码根目录解析，剥去 `src` 段后相对 `<src_root>` 取源码整体内联（单命名空间）：
+   - `@import("src.a");` → `<src_root>/a.tc`
+   - `@import("src.d.e");` → `<src_root>/d/e.tc`
+   - 文件不存在 → `T-MOD-E550`（legacy `T_IMPORT_NOT_FOUND`）。
+   - `<src_root>` = **入口文件所在目录**（取代旧「相对导入方目录」）。标准布局下 `tc run src/main.tc`，入口目录即 `<root>/src`，于是 `@import("src.a")` ⇒ `<root>/src/a.tc`。
+   - ⚠ **首段非 `src` 一律走库搜索**（rule 5）：故工程内源码**必须**显式加 `src.` 前缀；裸 `@import("a")` 会被当作库 `a` 在 `lib/` 与依赖库中查找（找不到 → `T-MOD-E550`），不会再回落到源码根。
+   - ⚠ **已知限制**：向上查找 `tote.toml` 自动定位 `<root>` 的方案**暂未启用**（内置 `path_exists` 对绝对路径探测不稳定）。故以「入口目录 = 源码根」折中；约定用法 `tc run src/main.tc`。
+5. **解析序**：`handle_one_import` 依据 `@import("Path")` 的**首段**分流：
+   - **首段为 `src`**（如 `@import("src.a")`、`@import("src.d.e")`）→ `is_lib_path=false` → 剥 `src` 后相对 `<src_root>` 取**源码**整体内联（单命名空间），无 `.tlib` 查找；嵌套 import 递归、重复自动去重（菱形共享根只加载一次）；文件不存在 → `T-MOD-E550`。
+   - **首段非 `src`**（如 `@import("json")`、`@import("std.mem")`）→ `is_lib_path=true` → 走 `resolve_external_lib` + `mangle_modules` 命名空间重整（见 rule 2 私有隔离），并支持**双模式**（见 rule 6b）。路径 `.` 经 `dots_to_slashes` 转 `/` 定位归档（`@import("std.mem")` → `out/lib/std/mem.tlib`）。
+   - 空路径（如 `@import("src")` 剥 `src` 后无剩余）→ `T-MOD-E559`。
 5b. **库搜索路径（`compute_lib_dirs`）**：`is_lib_path=true` 时，候选目录顺序 = ① 入口文件目录下的 `lib/`、`libs/`；② 每个工程源码根 `<src_root>` 的**父目录**（工程根）下的 `lib/`、`libs/`；③ `out/lib`（构建期 std 归档落点）；④ **环境变量驱动目录**（第六刀）：`T_LIB_PATH`（`;` 分隔）逐个 + `~/.tote/libs`，二者经 `tote` 以 `--lib-dir` 注入（优先级最高）。故 `examples/extlib_demo.tc` 入口目录 `examples/` 命中 `examples/lib/json.tc`；标准工程 `src/main.tc` 命中 `<root>/lib`、`out/lib/std/mem.tlib`；`set T_LIB_PATH=C:/my/libs` 后还能命中该目录下的库。
 6b. **库双模式（链接模式 + 内联回退）**：对 `is_lib_path=true` 的 import，先查搜索路径下的预编译归档 `<libdir>/<dots_to_slashes(Path)>.tlib`（含伴随 `<libdir>/...exports.json` 接口块），命中即进入**链接模式**——载入 exports.json 注册导出符号、代码生成阶段对库导出符号发 LLVM `declare`（不发 `define`）、私有符号跳过、归档路径进 `g_ext_link` 供链接器并入；未找到 `.tlib` 则**回退内联源码**（过渡安全网，故未预编译时单文件 IR 不变、gate 不漂）。`build --lib <file.tc>` 产出 `out/lib/<dots_to_slashes(Path)>.tlib`（如 `lib/std/mem.tc` → `out/lib/std/mem.tlib`，`clang -c` 编 `.o` 经 `llvm-ar rcs` 归档）+ 伴随 `out/lib/std/mem.exports.json`；库以「路径末段 stem」作重整命名空间，使归档符号 `mem__len` 与下游 `import(std.mem)` 重整结果一致；库独立编译时跳过进程级全局（`t.__ginit`/`t_atom_table`/`t_atom_count`，由主程序提供，避免重复符号）。
-6c. **选择性导入（`::` 列表，2026-08-08 新增）**：`import(Path :: a as b, c, *)` 的选择性列表在 `mangle_modules` 的 **Pass 3** 实现为 **AST 改名 Pass**——遍历候选符号，将调用点 `a`/`c` 改写为模块限定 mangled 名（`M__a`/`M__c`），`as b` 映射为本地名 `b`，`*` 展开为该模块全部导出符号（受 `export` 可见性约束）。**不引入新的作用域机制**，复用 Pass 2 的 provenance 改写。`*` 通配后若与本地声明或另一选择性导入同名 → `T_IMPORT_CONFLICT`；引用未导出符号 → `T_MODULE_NO_SYMBOL`/`T_MODULE_PRIVATE`；选择性符号在模块中不存在 → `T_MODULE_NO_SYMBOL`。
+6c. **选择性导入（`::` 列表，2026-08-08 新增）**：`@import("Path" :: a as b, c, *)` 的选择性列表在 `mangle_modules` 的 **Pass 3** 实现为 **AST 改名 Pass**——遍历候选符号，将调用点 `a`/`c` 改写为模块限定 mangled 名（`M__a`/`M__c`），`as b` 映射为本地名 `b`，`*` 展开为该模块全部导出符号（受 `export` 可见性约束）。**不引入新的作用域机制**，复用 Pass 2 的 provenance 改写。`*` 通配后若与本地声明或另一选择性导入同名 → `T_IMPORT_CONFLICT`；引用未导出符号 → `T_MODULE_NO_SYMBOL`/`T_MODULE_PRIVATE`；选择性符号在模块中不存在 → `T_MODULE_NO_SYMBOL`。
 7. **依赖图无环（`T_IMPORT_CYCLE` 已发射，2026-08-05 外部库收尾刀）**：靠 `in_mod_visited` 访问集对重复 import **去重**（菱形共享根只加载一次、不报错）；同时 `handle_one_import` 维护 **DFS 活跃栈** `g_mod_stack`/`g_mod_stack_alias`（进入模块压栈、离开弹栈），若**被导入模块已处于当前活跃栈中** → 真成环 → 发射 `T_IMPORT_CYCLE`（如 `a→b→a`）。去重与环检测并存：合法菱形（`a→b→d`、`a→c→d`）只加载一次 `d` 且不报环，非法环必然报错。依赖图边（父=活跃栈顶别名或 `"<entry>"`，子=被导入别名）记录于 `g_dep_from`/`g_dep_to`，供 `--emit-deps` 输出（见 rule 7b）。
 7b. **依赖图导出（`tc --emit-deps`，外部库收尾刀）**：`tc check --emit-deps <file>`（flag **位置无关**，可置于文件名前或后）在类型检查后输出依赖图 JSON：`{"entry":"<abs path>","edges":[{"from":"<parent>","to":"<child>"}...]}`。父=当前活跃栈顶别名（入口文件为 `"<entry>"`），子=被导入模块别名；菱形依赖（如 `a→b→d`、`a→c→d`）记录**全部 4 条边**（`c→d` 不丢，因边记录置于钻石去重 `return` 之前）。该 JSON 为合法 JSON——边闭合用 `sb_append_char(out,34)`+`sb_append_char(out,125)` 逐字符追加 `}"`，规避 `t` 字符串字面量「`\"}` 被词法分析成 `"}`」的转义陷阱。
 7c. **tote 依赖图（`tote deps`，外部库收尾刀）**：`tote deps <file.tc>` 委托 `tc check --emit-deps` 并注入 `--lib-dir`（即 `T_LIB_PATH`/`~/.tote/libs` 搜索路径），输出同上依赖图 JSON。`tote build`/`run`（未显式 `--mode rls`）自动追加 `--debug-libs`，使调试构建优先链接 `.tlibd`（见 rule 7d）。
 7d. **调试态归档（`.tlibd`，外部库收尾刀）**：`tc build --lib --debug <file.tc>` 产出**调试态**归档 `out/lib/<stem>.tlibd`（`clang -O0 -gcodeview` 编 `.o` 经 `llvm-ar rcs`）与伴随 `out/lib/<stem>.tlibd.exports.json`（接口块，命名随 `lib_ext`）。`tc` 的 `--debug-libs` 开关令 `resolve_external_lib_archive` **优先探测 `.tlibd`**（未命中回退 `.tlib`，再回退内联源码）——便于调试期保留符号/行号。普通 `build --lib`（无 `--debug`）仍产 `.tlib`（`-O2`）。
-8. **接口自描述**：`.tlib`/`.tlibd` 内嵌接口块（后端无关、确定性可读的 `export` 签名区），importer `check` 只读接口块即可类型检查；未 `export` 符号不进接口块，私有天然不可见。
-9. **C 互操作**：`.tlib` 可经 `tote` 导出为 C 兼容 `.lib`/`.dll`（符号来自接口块），导出表仅含 `export` 符号（见草稿 §11）。
-10. **环境变量搜索（`T_LIB_PATH` / `~/.tote/libs`，2026-08-05 第六刀已落地）**：库搜索路径追加**环境变量驱动**的目录。`tc` 提供**中性**内建 `getenv(name: string) string`（读取进程环境变量；未设置返回空串、不 panic；双后端经 `t_getenv` / `tll_getenv` 实现），但 `tc` 自身**不解析**环境变量——包搜索策略完全留给 `tote`（类比 rustc 只收 `-L`、不读 `CARGO_*`）。`tote` 在构造 `tc` 命令时：① 读 `T_LIB_PATH`（`;` 分隔目录列表，与 Windows PATH 一致；**不**按 `:` 切分，以免误拆 Windows 盘符 `C:/...`），逐个以 `--lib-dir <dir>` 注入；② 再追加 `~/.tote/libs`（即 `home_dir() + "/.tote/libs"`，`home_dir` 取自 `USERPROFILE` / `HOMEDRIVE+HOMEPATH` / `HOME`）。`--lib-dir <dir>` 是 `tc` 的中性输入开关，把 `<dir>` 追加进 `g_lib_dirs`（优先级最高，先于工程 `lib/` 命中）。故 `set T_LIB_PATH=C:/my/libs` 后即可 `tote run app.tc` 解析 `import @mylib`（库只放在该目录也能找到）；不设则回退默认搜索路径。验证：库仅置于 `T_LIB_PATH` 目录时 `tote run` 可解析，不设置则 `T_IMPORT_NOT_FOUND`。
+8. **接口自描述**：`.tlib`/`.tlibd` 内嵌接口块（后端无关、确定性可读的 `pub` 签名区），importer `check` 只读接口块即可类型检查；未 `pub` 符号不进接口块，私有天然不可见。
+9. **C 互操作**：`.tlib` 可经 `tote` 导出为 C 兼容 `.lib`/`.dll`（符号来自接口块），导出表仅含 `pub` 符号（见草稿 §11）。
+10. **环境变量搜索（`T_LIB_PATH` / `~/.tote/libs`，2026-08-05 第六刀已落地）**：库搜索路径追加**环境变量驱动**的目录。`tc` 提供**中性**内建 `getenv(name: string) string`（读取进程环境变量；未设置返回空串、不 panic；双后端经 `t_getenv` / `tll_getenv` 实现），但 `tc` 自身**不解析**环境变量——包搜索策略完全留给 `tote`（类比 rustc 只收 `-L`、不读 `CARGO_*`）。`tote` 在构造 `tc` 命令时：① 读 `T_LIB_PATH`（`;` 分隔目录列表，与 Windows PATH 一致；**不**按 `:` 切分，以免误拆 Windows 盘符 `C:/...`），逐个以 `--lib-dir <dir>` 注入；② 再追加 `~/.tote/libs`（即 `home_dir() + "/.tote/libs"`，`home_dir` 取自 `USERPROFILE` / `HOMEDRIVE+HOMEPATH` / `HOME`）。`--lib-dir <dir>` 是 `tc` 的中性输入开关，把 `<dir>` 追加进 `g_lib_dirs`（优先级最高，先于工程 `lib/` 命中）。故 `set T_LIB_PATH=C:/my/libs` 后即可 `tote run app.tc` 解析 `@import("mylib")`（库只放在该目录也能找到）；不设则回退默认搜索路径。验证：库仅置于 `T_LIB_PATH` 目录时 `tote run` 可解析，不设置则 `T_IMPORT_NOT_FOUND`。
 
 ```t
 // 工程布局：yourproj/{tote.toml, src/{main.tc, hello.tc, d/e.tc}}
 // src/hello.tc
-export greet fn() string { return "hi from hello"; }
-export add fn(a: i64, b: i64) i64 { return a + b; }
+@module(pub)
+pub fn greet() string { return "hi from hello"; }
+pub fn add(a: i64, b: i64) i64 { return a + b; }
 
 // src/d/e.tc
-export deep fn(x: i64) i64 { return x + 100; }
+@module(pub)
+pub fn deep(x: i64) i64 { return x + 100; }
 
 // src/main.tc —— 入口（与 hello.tc、d/ 同级，统一从 src/ 解析）
-import(src.hello);
-import(src.d.e);
-main fn() i32 @main {
-    println(hello.greet());   // import(src.hello) => src/hello.tc
-    println(i2s(hello.add(2, 3)));
-    println(i2s(e.deep(10))); // import(src.d.e)    => src/d/e.tc，限定前缀取末段 e
+@import("src.hello");
+@import("src.d.e");
+@main fn main() i32 {
+    println(src.hello.greet());          // @import("src.hello") => src/hello.tc，强制路径限定访问
+    println(i2s(src.hello.add(2, 3)));
+    println(i2s(src.d.e.deep(10)));      // @import("src.d.e")    => src/d/e.tc
     return 0;
 }
 // 运行：tc run src/main.tc    （输出 hi from hello / 5 / 110）
 //         —— 入口目录即 <root>/src，src. 前缀自动从 src/ 拉平编译，无需手动列文件
 
 // 库与选择性导入示例
-import(json);                       // 库（首段非 src）→ lib / 依赖库 / out/lib 搜索
-import(std.math as m2);            // 模块别名：m2.abs(...) 访问
-import(std.mem :: len, reverse as rev);  // 选择性导入 + 改名
-main2 fn() i32 @main {
+@import("json");                              // 库（首段非 src）→ lib / 依赖库 / out/lib 搜索
+@import("std.math" as m2);                    // 模块别名：m2.abs(...) 访问
+@import("std.mem" :: len, reverse as rev);    // 选择性导入 + 改名
+@main fn main2() i32 {
     println(m2.abs(-7));           // 7
     println(i2s(len(xs)));         // 直接用 len（选择性导入）
     rev(i64, xs);                   // 用 rev 代替 reverse
@@ -2229,8 +2241,17 @@ main2 fn() i32 @main {
 }
 ```
 
-- agent 模块契合：actor 脱糖产物 `XState`/`x_spawn`/`x_step` 标 `export` 后可跨模块复用（消息回路边界）。
-- **实现状态（2026-08-08 统一刀 —— 语法统一为 `import(...)`，端到端可跑）**：
+- agent 模块契合：actor 脱糖产物 `XState`/`x_spawn`/`x_step` 标 `pub` 后可跨模块复用（消息回路边界）。
+- **实现状态（2026-08-30 模块重设计 —— 文件头 `@module(pub|internal)` + 字符串路径导入 `@import("Path")` + 声明前缀 `pub` + 可见性合取 + `pub @import` 模块重导出，端到端可跑）**：
+  - ✅ **已落地**：旧 `import(Path)` / `export` 两种表面语法**删除**，统一为：
+    - **文件头**：`@module(pub)`（库模块，导出声明须 `pub`）/ `@module(internal)`（默认，私有）；入口文件用 `@main` 注解标记 `fn main()`。
+    - **导入**：`@import("Path" ["as" Alias] ["::" 列表])` —— 路径为**字符串字面量**（旧 `import(Path)` 点分标识符升级为字符串）；首段 `src.` ⇒ 工程源码根整体内联，否则走库搜索（见 rule 5b/6b）。
+    - **可见性**：仅 `pub` 声明前缀（旧 `export` 删除）；可见性由「模块 `@module(pub)` ∧ 声明 `pub`」合取决定（见 rule 2 ③）。
+    - **模块重导出**：`pub @import("Path")` 放开（旧 `T-MOD-E556` 不再拦截），下游经 `X.name` 访问时由 `reexport_lookup` + `mangle_modules` Pass 1 重定向到真实定义 `M__name`（非幻影）。
+  - ✅ **配套**：解析期 `import(X)` 报 `T-PAR-E102`（`import(X) was removed; write @import("X") instead`）；`export` 关键字删除，局部 `pub` 仍报 `T-MOD-E556`（legacy 别名 `T_EXPORT_SCOPE`）；`lex`/`parse` 移除旧 `import`/`export` 分支与 `parse_import_decl`（统一为 `parse_at_import_decl`）。`lib/repl.tc`、`lib/std/{math,mem}.tc`、各 `examples/*` 与 conformance 全部迁移至新语法。
+  - ✅ **验证**：`gate L1` conformance + `run_examples` 全绿（53 例双后端），bootstrap 不动点（g2==g3==g4）保持；IR 基线因前端语法变更预期漂移，已 `node tools/ir_snapshot.mjs --compiler out/dbg/g1.exe --update` 归零。
+  - ⚠ **遗留（多会话量级，未做）**：A. `src/*.tc` 5k–10k 处裸名引用路径化改写（`src.foo` 全限定，落实用户「强制路径访问」拍板）；B. 删旧语法后清理过渡兼容分支；C. 模块重导出已放开。
+- **实现状态（2026-08-08 统一刀 —— 语法统一为 `import(Path)`，已废弃；2026-08-30 重设计为 `@import("Path")` + 声明前缀 `pub` + 可见性合取 + `pub @import` 重导出，见上条）**：
   - ✅ **已落地**：旧的 `import @x;`（外部库标记）与裸 `import x;`（工程内）**两种写法删除**，统一为 `import(Path [:: List] [as Alias])`：
     - 解析分流由路径首段决定：`src.` 前缀 → 工程源码根内联（`import(src.hello)`）；否则 → `lib`/依赖库/环境变量搜索（`import(json)`、`import(std.mem)`）。
     - 选择性导入 `:: a as b, *` 经 `mangle_modules` Pass 3（AST 改名）实现，复用 provenance 改写，无新作用域机制。
