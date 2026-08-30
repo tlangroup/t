@@ -31,7 +31,7 @@
 | 第 8 条 零未定义行为 | ✅ 合规 | 禁止 `meta` 上下文读写运行时变量 / 内存；非法访问显式报 `T_META_READ_RUNTIME`；`@compile_error` 显式终止。 |
 | 第 13 条 铁律校验 | ✅ 合规 | 新增语法 / 内建均通过上表校验后入语言。 |
 
-⚠ **已拍板（2026-08-07）**：`comptime T: any` 采用**弃用别名**方案——保留一个发布周期作为别名，使用即报 `W_COMPTIME_ALIAS`（仍按 `meta` 语义单态化、不阻断），随后在下个发布周期移除关键字。Phase E 已落地告警 + 仓库内用例迁移 + conformance 用例。
+⚠ **已拍板（2026-08-07；2026-08-30 修订）**：编译期关键字已统一为 `comptime`——`meta` 不再作为关键字（留作他用），历史 `comptime`/`meta` 别名关系已撤销，`W_COMPTIME_ALIAS` 弃用告警已随 `meta` 关键字移除而一并下线。仓库内用例与 conformance 均已迁移到 `comptime` 拼写。
 
 ---
 
@@ -75,12 +75,12 @@ repeat fn(meta s: string, meta n: u32) Sym { ... }  // 调用：repeat("hi", 3)
 
 ## 3. 与既有 `comptime` 的迁移（满足第 2 条）
 
-| 旧（`comptime`） | 新（`meta`） | 过渡 |
+| 旧（`meta` 别名，已移除） | 新（`comptime`，现行关键字） | 状态 |
 |---|---|---|
-| `comptime T: any` | `meta T: type` | 保留 `comptime T: any` 作弃用别名，报 `W_COMPTIME_ALIAS` |
-| `comptime Block` | `meta { }` | 别名期并行，随后移除 `comptime` 块解析 |
-| `comptime fn` | `meta fn` | 同上 |
-| `comptime expr`（spec-only） | `meta expr` | 直接落地为新语义 |
+| `meta T: any` | `comptime T: type` | `meta` 不再是关键字；统一用 `comptime` |
+| `meta Block` | `comptime { }` | 同上 |
+| `meta fn` | `comptime fn` | 同上 |
+| `meta expr` | `comptime expr` | 同上 |
 
 > 过渡完成后，`comptime` 从关键字表移除，仅 `meta` 承担元编程——彻底消除第 2 条禁止的「等价多写」。
 
@@ -297,11 +297,11 @@ meta get_width fn(meta T: type) u32 {
     7. **分支剪枝**：未取分支里的 `@compile_error` 由 `mb_prune_if` 剪掉，不误报；被取分支则按 Zig 语义在「编译期求值」或「运行期位置 check」任一路径触发 `T_META_COMPILE_ERROR`。
 
     **验收**：51 个快照目标 IR 逐字节零漂移（基线已重录，153 条目）；`tests/conformance/pass/p40_meta_builtin_ok.tc`（类型查询运行期位置 / `MyInt i64` typealias 展开 / get_width 模式 + `T: type` / `@zeroed` + CTFE 数组读写 / `@str_from_bytes` / `sym_intern` / 数组值拷贝 / meta 块）+ `fail/f72..f77_meta_*.tc` 六条护栏全过（`T_META_COMPILE_ERROR` ×2 / `T_META_UNKNOWN_BUILTIN` / `T_META_RUNTIME_CTX` / `T_META_TYPE_AS_VALUE` / `T_META_UNKNOWN_TYPE`）；gate L2 13 passed / 0 failed / 0 warn。
-- **Phase E（迁移 & 弃用）** —— ✅ **已落地（2026-08-07，gate L2 13/0/0，IR 漂移零）**
-  1. **弃用别名告警** `W_COMPTIME_ALIAS`：在 `src/tc.tc` 四个 `KwComptime` 解析点（`parse_func_decl` 形参 / `parse_decl_body` 前缀 / `parse_stmt` 块 / `parse_primary` 表达式）advance 前注入 `warn_comptime_alias()`；用 `cur_v()=="comptime"` 区分 `meta`（不告警），`toks[pos]` 取行列发 `diag_new(...,"warning",...)`，**告警不阻断编译**（`has_errors` 只计 error）。
-  2. **仓库内真实 `comptime` 代码用法已迁移为 `meta`/`type`**：`examples/generics_demo.tc`(7,9)、`examples/meta.tc`(29,30)、`tests/samples/game_ecs.tc`(124)、`tests/conformance/pass/p37_meta_ok.tc`(12-14)；`tests/samples/lexer.tc` 的 `"comptime"` 为字符串字面量测试数据（不动）。
-  3. **conformance 加 `pass/p41_meta_comptime_alias.tc`**：`// EXPECT: warning W_COMPTIME_ALIAS`，故意用 `comptime` 四种形式，验证告警触发且仍 `exit=0`（向后兼容过渡语义）。
-  4. **关键字移除延迟到下一发布周期**（设计 §3）：过渡期内 `comptime` 仍按 `meta` 语义编译，仅发告警。
+- **Phase E（迁移 & 弃用）** —— ✅ **已落地（2026-08-07，gate L2 13/0/0，IR 漂移零）**；**2026-08-30 收尾**：`meta` 别名与 `W_COMPTIME_ALIAS` 告警已彻底移除，编译期关键字统一为 `comptime`，`meta` 留作他用。
+  1. （历史）`W_COMPTIME_ALIAS` 弃用别名告警：曾在四个 `KwComptime` 解析点注入 `warn_comptime_alias()`；现已随 `meta` 关键字移除而一并下线。
+  2. **仓库内真实 `meta` 代码用法已迁移为 `comptime`/`type`**：`examples/generics_demo.tc`、`examples/meta.tc`、`tests/samples/game_ecs.tc`、`tests/conformance/pass/p37_meta_ok.tc`；`tests/samples/lexer.tc` 的 `"comptime"` 为字符串字面量测试数据（不动）。
+  3. （历史）conformance 曾加 `pass/p41_meta_comptime_alias.tc` 验证告警；该用例已随告警下线而删除。
+  4. 关键字统一已在 2026-08-30 完成，无后续过渡期。
 
 ---
 

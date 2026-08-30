@@ -1395,15 +1395,15 @@ main fn() i64 @main {
 > **值参数**，实参在调用点 CTFE 求值后按值去重（`repeat("hi", 3)` → `repeat__s2_hi_1748694682_3`），
 > 可与类型参数混用。见 §3.6.3「值参数单态化」。
 
-#### 3.6.3 元编程关键字 `meta`（✅ tc Phase A+B+C+D+E，M-meta）
+#### 3.6.3 元编程关键字 `comptime`（✅ tc Phase A+B+C+D+E，M-meta）
 
-`meta` 是 `t` 的统一元编程关键字。**`meta` 与 `comptime` 互为别名**（词法层同映射到 `KwComptime`），
-`type` 与 `any` 互为别名（同为「类型之类型」占位）。四种写法组合完全等价，`meta`/`type` 为推荐拼写。
+`comptime` 是 `t` 的统一元编程关键字（词法层 `KwComptime`）。
+`type` 与 `any` 互为别名（同为「类型之类型」占位）。
 
-> ⚠ **弃用告警（Phase E，2026-08-07）**：`comptime` / `any` 现为 `meta` / `type` 的**弃用别名**——仍按 `meta` 语义正常编译，但使用会发 `W_COMPTIME_ALIAS` 告警（不阻断编译），保留一个发布周期作为过渡，随后移除关键字。新代码请一律用 `meta` / `type`。仓库内既有用例（`examples/generics_demo.tc`、`examples/meta.tc`、`tests/samples/game_ecs.tc`、`tests/conformance/pass/p37_meta_ok.tc`）已迁移完毕；验证用例见 `tests/conformance/pass/p41_meta_comptime_alias.tc`（`// EXPECT: warning W_COMPTIME_ALIAS`）。
+> 编译期关键字为 `comptime`；`meta` 已不再作为关键字，留作他用。`type` / `any` 均可作「类型之类型」占位。新代码一律用 `comptime` / `type`。
 
 ```ebnf
-MetaParam: ("meta"|"comptime") Ident ":" MetaParamType     // 编译期形参（P.bb = true）
+MetaParam: "comptime" Ident ":" MetaParamType     // 编译期形参（P.bb = true）
 MetaParamType: "type" | "any"                              //   → 类型参数
              | IntType | "bool" | "string"                 //   → 值参数（Phase C）
 MetaBlock: ("meta"|"comptime") Block                       // 编译期块

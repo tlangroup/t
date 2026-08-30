@@ -99,7 +99,6 @@ static const DiagDef DIAG_DEFS[] = {
   { "T-MTA-E618", "error", "MTA", "T_META_NOT_META_FN", "NOT_META_FN", "target is not a meta function" },
   { "T-MTA-E619", "error", "MTA", "T_META_NOT_TYPE", "NOT_TYPE", "expected a type" },
   { "T-MTA-E620", "error", "MTA", "T_META_READ_RUNTIME", "READ_RUNTIME", "read of runtime value in meta" },
-  { "T-MTA-W610", "warning", "MTA", "W_COMPTIME_ALIAS", "COMPTIME_ALIAS", "comptime is a deprecated alias of meta" },
   { "T-NAM-W400", "warning", "NAM", "T_NAME_TYPE_CAMEL", "TYPE_CAMEL", "type name should be PascalCase" },
   { "T-NAM-W401", "warning", "NAM", "T_NAME_VAR_SNAKE", "VAR_SNAKE", "variable name should be snake_case" },
   { "T-NAM-W402", "warning", "NAM", "T_NAME_CONST_UPPER", "CONST_UPPER", "constant name should be UPPER_SNAKE_CASE" },
@@ -146,7 +145,7 @@ static const DiagDef DIAG_DEFS[] = {
   { "T-TIM-E702", "error", "TIM", "T_TIME_SPEC_TYPE", "SPEC_TYPE", "time specifier type mismatch" },
   { "T-TIM-E703", "error", "TIM", "T_TIME_ARG_TYPE", "ARG_TYPE", "time argument type mismatch" },
 };
-#define DIAG_COUNT 133
+#define DIAG_COUNT 132
 
 /* legacy (old semantic name) -> machine code alias table */
 static const struct { const char* legacy; const char* code; } DIAG_LEGACY[] = {
@@ -231,7 +230,6 @@ static const struct { const char* legacy; const char* code; } DIAG_LEGACY[] = {
   { "T_META_NOT_META_FN", "T-MTA-E618" },
   { "T_META_NOT_TYPE", "T-MTA-E619" },
   { "T_META_READ_RUNTIME", "T-MTA-E620" },
-  { "W_COMPTIME_ALIAS", "T-MTA-W610" },
   { "T_NAME_TYPE_CAMEL", "T-NAM-W400" },
   { "T_NAME_VAR_SNAKE", "T-NAM-W401" },
   { "T_NAME_CONST_UPPER", "T-NAM-W402" },
@@ -278,7 +276,7 @@ static const struct { const char* legacy; const char* code; } DIAG_LEGACY[] = {
   { "T_TIME_SPEC_TYPE", "T-TIM-E702" },
   { "T_TIME_ARG_TYPE", "T-TIM-E703" },
 };
-#define DIAG_LEGACY_COUNT 127
+#define DIAG_LEGACY_COUNT 126
 
 const DiagDef* diag_find(const char* code);        /* exact machine-code lookup */
 const DiagDef* diag_find_any(const char* id);      /* machine code OR legacy name */
