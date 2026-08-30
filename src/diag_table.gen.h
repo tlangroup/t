@@ -123,7 +123,6 @@ static const DiagDef DIAG_DEFS[] = {
   { "T-RNG-E870", "error", "RNG", "T_RANGE_ITER_NO_START", "ITER_NO_START", "range iteration requires a start bound" },
   { "T-RNG-E871", "error", "RNG", "T_RANGE_INDEX_UNSUPPORTED", "INDEX_UNSUPPORTED", "type does not support range indexing" },
   { "T-RNG-E872", "error", "RNG", "T_RANGE_OPEN_AS_VALUE", "OPEN_AS_VALUE", "open-ended range cannot be used as a value" },
-  { "T-RNG-E873", "error", "RNG", "T_RANGE_INDEX_ARRAY", "INDEX_ARRAY", "fixed-size array does not support range indexing yet" },
   { "T-RNG-E874", "error", "RNG", "T_RANGE_INCL_NO_END", "INCL_NO_END", "inclusive range `..=` requires an end bound" },
   { "T-RNG-E875", "error", "RNG", "T_RANGE_IMPURE_OPERAND", "IMPURE_OPERAND", "range lowering would evaluate this operand twice" },
   { "T-RNG-E877", "error", "RNG", "T_IN_RHS_NOT_RANGE", "IN_RHS_NOT_RANGE", "right operand of `in` must be a range literal" },
@@ -147,7 +146,7 @@ static const DiagDef DIAG_DEFS[] = {
   { "T-TIM-E702", "error", "TIM", "T_TIME_SPEC_TYPE", "SPEC_TYPE", "time specifier type mismatch" },
   { "T-TIM-E703", "error", "TIM", "T_TIME_ARG_TYPE", "ARG_TYPE", "time argument type mismatch" },
 };
-#define DIAG_COUNT 134
+#define DIAG_COUNT 133
 
 /* legacy (old semantic name) -> machine code alias table */
 static const struct { const char* legacy; const char* code; } DIAG_LEGACY[] = {
@@ -256,7 +255,6 @@ static const struct { const char* legacy; const char* code; } DIAG_LEGACY[] = {
   { "T_RANGE_ITER_NO_START", "T-RNG-E870" },
   { "T_RANGE_INDEX_UNSUPPORTED", "T-RNG-E871" },
   { "T_RANGE_OPEN_AS_VALUE", "T-RNG-E872" },
-  { "T_RANGE_INDEX_ARRAY", "T-RNG-E873" },
   { "T_RANGE_INCL_NO_END", "T-RNG-E874" },
   { "T_RANGE_IMPURE_OPERAND", "T-RNG-E875" },
   { "T_IN_RHS_NOT_RANGE", "T-RNG-E877" },
@@ -280,7 +278,7 @@ static const struct { const char* legacy; const char* code; } DIAG_LEGACY[] = {
   { "T_TIME_SPEC_TYPE", "T-TIM-E702" },
   { "T_TIME_ARG_TYPE", "T-TIM-E703" },
 };
-#define DIAG_LEGACY_COUNT 128
+#define DIAG_LEGACY_COUNT 127
 
 const DiagDef* diag_find(const char* code);        /* exact machine-code lookup */
 const DiagDef* diag_find_any(const char* id);      /* machine code OR legacy name */

@@ -67,7 +67,7 @@
 | FUN | 函数子句/重载 | 810–849 | `T_FUNC_CLAUSE_BIND_CONFLICT`→E810、`ARITY`→E811、`NO_TYPE`→E812、`RET_TYPE`→E813、`BODY`→E814 |
 | FLG | flag 位域 | 850–859 | `T_FLAG_OFFSET_CONFLICT`→E850、`OVERFLOW`→E851 |
 | PIP | 管道算子 `\|->` `\|>?` `\|>` | 860–869 | `T_PIPE_RHS_NOT_FUNC`→E860、`RHS_ARITY`→E861、`ARG_TYPE`→E862、`NOT_SEQUENCE`→E863、`PRED_TYPE`→E864、`BAD_CONTEXT`→E865、`W_PIPE_DISPATCH_AMBIG`→W866、`NO_MATCH`→E867、`W_PIPE_RESULT_UNUSED`→W868 |
-| RNG | 区间字面量 `a..b` `a..=b` | 870–879 | `T_RANGE_ITER_NO_START`→E870、`INDEX_UNSUPPORTED`→E871、`OPEN_AS_VALUE`→E872、`INDEX_ARRAY`→E873、`INCL_NO_END`→E874、`IMPURE_OPERAND`→E875、`T_IN_RHS_NOT_RANGE`→E877 |
+| RNG | 区间字面量 `a..b` `a..=b` | 870–879 | `T_RANGE_ITER_NO_START`→E870、`INDEX_UNSUPPORTED`→E871、`OPEN_AS_VALUE`→E872、`INCL_NO_END`→E874、`IMPURE_OPERAND`→E875、`T_IN_RHS_NOT_RANGE`→E877 |
 | AGT | agent/colony | 880–909 | 预留（当前无专用码） |
 | CDE | 代码生成/后端 | 910–999 | codegen 期 type_info 仅 struct→CDE-E910（与 SEM-E202 同义但分阶段，独立编码） |
 
@@ -407,7 +407,6 @@ help: add `export` to `Bar` in src/foo/lib.tc, or rename the import
 | T-RNG-E870 | E | T_RANGE_ITER_NO_START | 区间迭代缺起点（`..n` / `..`），或对区间用了双变量 for |
 | T-RNG-E871 | E | T_RANGE_INDEX_UNSUPPORTED | 对 `string` / `[]T` 以外的类型做区间索引 |
 | T-RNG-E872 | E | T_RANGE_OPEN_AS_VALUE | 开放区间出现在取值位置（物化需要两端俱全） |
-| T-RNG-E873 | E | T_RANGE_INDEX_ARRAY | 对 `[N]T` 做区间索引（Array→Slice 构造降解未落地） |
 | T-RNG-E874 | E | T_RANGE_INCL_NO_END | `..=` 缺右端点（解析期硬错） |
 | T-RNG-E875 | E | T_RANGE_IMPURE_OPERAND | 降解会重复求值，但操作数含调用/副作用 |
 | T-RNG-E877 | E | T_IN_RHS_NOT_RANGE | `in` 的右操作数不是区间字面量 |

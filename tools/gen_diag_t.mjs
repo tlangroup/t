@@ -44,7 +44,7 @@ lines.push('var g_dnote: []string;');
 lines.push('var g_leg_name: []string;');
 lines.push('var g_leg_idx: []i64;');
 lines.push('');
-lines.push('diag_ensure fn() void {');
+lines.push('fn diag_ensure() void {');
 lines.push('    if ((slice_len(g_dcode) as i64) > 0) { return; }');
 let idx = 0;
 for (const d of defs) {
@@ -63,7 +63,7 @@ for (const d of defs) {
 lines.push('}');
 lines.push('');
 lines.push('// 机器码/旧语义名 -> 规范化机器码（双标识）。未知码原样返回。');
-lines.push('diag_norm fn(id: string) string {');
+lines.push('fn diag_norm(id: string) string {');
 lines.push('    if ((slice_len(g_dcode) as i64) == 0) { diag_ensure(); }');
 lines.push('    if (diag_find_idx(id) >= 0) { return id; }');
 lines.push('    var i: i64 = 0;');
@@ -74,7 +74,7 @@ lines.push('    }');
 lines.push('    return id;');
 lines.push('}');
 lines.push('');
-lines.push('diag_find_idx fn(code: string) i64 {');
+lines.push('fn diag_find_idx(code: string) i64 {');
 lines.push('    var i: i64 = 0;');
 lines.push('    while (i < (slice_len(g_dcode) as i64)) {');
 lines.push('        if (g_dcode[i] == code) { return i; }');
@@ -84,7 +84,7 @@ lines.push('    return -1;');
 lines.push('}');
 lines.push('');
 lines.push('// 兼容旧 diag_sev(code)：返回规范化后的严重度（未知码回退 error）。');
-lines.push('diag_sev fn(code: string) string {');
+lines.push('fn diag_sev(code: string) string {');
 lines.push('    if ((slice_len(g_dcode) as i64) == 0) { diag_ensure(); }');
 lines.push('    var mc: string = diag_norm(code);');
 lines.push('    var idx: i64 = diag_find_idx(mc);');
@@ -105,14 +105,21 @@ if (!m) {
   process.exit(1);
 }
 const without = src.replace(re, '');
-const anchor = 'diag_new fn(';
-const ai = without.indexOf(anchor);
+// 方言已统一为关键字领头（`fn diag_new(`），旧写法 `diag_new fn(` 仍作回退。
+let anchor = 'fn diag_new(';
+let ai = without.indexOf(anchor);
 if (ai < 0) {
-  console.error('gen_diag_t: anchor "' + anchor + '" not found in ' + BASE);
+  anchor = 'diag_new fn(';
+  ai = without.indexOf(anchor);
+}
+if (ai < 0) {
+  console.error('gen_diag_t: anchor "fn diag_new(" / "diag_new fn(" not found in ' + BASE);
   process.exit(1);
 }
-// 在 anchor 前插入一个空行 + 生成块 + 空行
-const injected = without.slice(0, ai) + '\n' + block + '\n' + without.slice(ai);
+// 在 anchor 前插入生成块。先吃掉 anchor 之前的尾随空行，保证反复运行幂等
+// （否则每跑一次就在块前后多留几个空行，污染 diff）。
+const head = without.slice(0, ai).replace(/\n+$/, '\n');
+const injected = head + block + '\n\n' + without.slice(ai);
 
 if (checkOnly) {
   console.log(`gen_diag_t: --check OK, ${defs.length} diagnostics, would write to ${BASE}`);

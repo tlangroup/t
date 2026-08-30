@@ -2572,7 +2572,7 @@ for (i in 0..n) { body }
 - **迭代必须有起点**：计数循环的初值就是起点，`..n` 无从开始，不默认补 0（那是猜意图）→ `T-RNG-E870`。
 - **可重复求值**：省略上界的索引要补一次 `len(obj)`，`x in r` 要把 `x` 展开两次——操作数在 AST 里出现两次 = 后端求值两次。含调用/副作用的操作数被拒（`T-RNG-E875`），要求先绑定到变量，而不是编译器偷插临时量改变求值次数。
 - **`..` 在 match 里等价 `_`**：两端俱省的范围臂必然命中，参与穷尽性判定。
-- **`[N]T` 暂不支持区间索引**（`T-RNG-E873`）：定长数组在 C 后端是裸 `T*`、LLVM 后端是 `[N x T]`，都不是 `TSlice`；Array→Slice 构造 lowering 未落地前显式拒绝，不把段错误留到运行期（与 §3.15 的 `T-PIP-E863` 同源）。
+- **`[N]T` 区间索引先降级为零拷贝切片视图**：定长数组在 C 后端是裸 `T*`、LLVM 后端是 `[N x T]`，都不是 `TSlice`；`arr[lo..hi]` 由 sema 包一层 Array→Slice cast（`t_slice_from_raw` / `@tll_slice_from_raw`）得到 `[]T` 视图，再走与切片相同的 `slice_sub`。
 
 #### 3.16.4 新增运行期原语
 
@@ -2591,11 +2591,10 @@ CAT `RNG` 占 870–879。完整表见 `docs/diagnostics.md`。
 | `T-RNG-E870` | `T_RANGE_ITER_NO_START` | error | 区间迭代缺起点；或对区间用了 `for (k, v in ...)` |
 | `T-RNG-E871` | `T_RANGE_INDEX_UNSUPPORTED` | error | 对 `string` / `bytes` / `[]T` 以外的类型做区间索引 |
 | `T-RNG-E872` | `T_RANGE_OPEN_AS_VALUE` | error | 开放区间出现在取值位置 |
-| `T-RNG-E873` | `T_RANGE_INDEX_ARRAY` | error | 对 `[N]T` 做区间索引（构造降解未落地） |
 | `T-RNG-E874` | `T_RANGE_INCL_NO_END` | error | `..=` 缺右端点（解析期） |
 | `T-RNG-E875` | `T_RANGE_IMPURE_OPERAND` | error | 降解会重复求值，但操作数含调用/副作用 |
 | `T-RNG-E877` | `T_IN_RHS_NOT_RANGE` | error | `in` 右侧不是区间字面量 |
-| 876 / 878 / 879 | — | — | 预留 |
+| 873 / 876 / 878 / 879 | — | — | 预留 |
 
 #### 3.16.6 与既有体系的关系
 

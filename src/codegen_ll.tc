@@ -1340,9 +1340,19 @@ fn emit_lle(e: i64) string {
                 }
             }
         }
-        var v: string = emit_lle(n.nb);
         var ltd: i64 = ll_etd(n.na);
         var ad: string = ll_addr(n.na);
+        // 空切片字面量作赋值 RHS（`g = []`）：直接朝 LHS 地址发射 tll_slice_new，
+        // 跳过 emit_lle（修 P0-4：空 `[]` 节点自身无 slice 类型，emit_lle 会落到
+        // `UNSUPPORTED expr` → `load %TSlice, ptr 0`）。
+        if (n.sa == "=" && nodes[n.nb].kind == "array_lit" && nodes[n.nb].la < 0
+                && ltd >= 0 && tds[ltd].cat == "slice") {
+            var esz: string = "i64";
+            if (tds[ltd].elem >= 0) { esz = ll_td(tds[ltd].elem); }
+            llfb(sb_cat6("  call void @tll_slice_new(i64 ", ll_sizeof(esz), ", ptr ", ad, ")", ""));
+            return ad;
+        }
+        var v: string = emit_lle(n.nb);
         if (ll_isagg(ltd)) {
             ll_copy(ll_td(ltd), v, ad);
         } else {
@@ -1500,6 +1510,43 @@ fn emit_lle(e: i64) string {
         }
         return s;
     }
+    // 切片字面量作表达式（`g = []` / `g = [a,b,c]`，含模块级初值器表达式位置）：
+    // 局部初始化走 ll_emit_var_init 的同款逻辑（slice_new + 逐元素 append）；这里补
+    // 表达式位置的缺口（修 P0-4：空切片 `[]` 作表达式曾被发射成 `load %TSlice, ptr 0`）。
+    // ⚠ 切片按「值即地址」约定返回 scratch 指针，与 cast/append/slice_sub 的返回一致。
+    if (n.kind == "array_lit" && ll_etd(e) >= 0 && tds[ll_etd(e)].cat == "slice") {
+        var aetd: i64 = ll_etd(e);
+        var aetye: i64 = tds[aetd].elem;
+        var aety: string = "i64";
+        if (aetye >= 0) { aety = ll_td(aetye); }
+        var asp: string = ll_scratch("%TSlice");
+        llfb(sb_cat6("  call void @tll_slice_new(i64 ", ll_sizeof(aety), ", ptr ", asp, ")", ""));
+        var acc: i64 = n.la;
+        while (acc >= 0) {
+            var ack: Child = kids[acc];
+            var aep: string = "";
+            if (ll_isagg(aetye)) {
+                aep = emit_lle(ack.val);
+            } else {
+                var av0: string = emit_lle(ack.val);
+                if (aetye >= 0) { av0 = ll_cast_v(av0, ll_etd(ack.val), aetye); }
+                var asc0: string = ll_scratch(aety);
+                llfb(sb_cat6("  store ", aety, " ", av0, ", ptr ", asc0));
+                aep = asc0;
+            }
+            var asb0: StringBuilder = sb_new();
+            sb_append_str(asb0, "  call void @tll_slice_append(ptr ");
+            sb_append_str(asb0, asp);
+            sb_append_str(asb0, ", ptr ");
+            sb_append_str(asb0, aep);
+            sb_append_str(asb0, ", i64 ");
+            sb_append_str(asb0, ll_sizeof(aety));
+            sb_append_str(asb0, ")");
+            llfb(sb_to_str(asb0));
+            acc = ack.next;
+        }
+        return asp;
+    }
     if (n.kind == "cast") {
         var ftd: i64 = ll_etd(n.na);
         var ttd: i64 = resolve_type_desc(n.nb);
@@ -1530,9 +1577,10 @@ fn emit_lle(e: i64) string {
             sb_append_str(sb2, outp);
             sb_append_str(sb2, ")");
             llfb(sb_to_str(sb2));
-            var rv: string = ll_tmp();
-            llfb(sb_cat4("  ", rv, " = load %TSlice, ptr ", outp));
-            return rv;
+            // slice 是聚合：LLVM 端的统一约定是「值即地址」（与 ident / append /
+            // slice_sub 的返回一致）。这里若 load 成 %TSlice 值，下游
+            // `tll_slice_sub(ptr ...)` 会拿值当指针 → clang 校验失败。
+            return outp;
         }
         var v2: string = emit_lle(n.na);
         var ttd2: i64 = resolve_type_desc(n.nb);

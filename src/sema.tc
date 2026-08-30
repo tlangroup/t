@@ -570,7 +570,7 @@ fn check_call_args(e: i64, fti: i64, fname: string) void {
                 var sak: string = nodes[k.val].kind;
                 if (sak == "array_lit" || tip_kind(at) == "Array") {
                     var ck2: Child = kids[c];
-                    ck2.val = mk_cast(ck2.val, ti_to_td_base(pt), -1);
+                    ck2.val = mk_cast(ck2.val, ti_to_type_node(pt), -1);
                     slice_set(kids, c, ck2);
                 }
             }
@@ -1015,6 +1015,42 @@ fn meta_subst_val_node(nd_id: i64, name: string, lit: i64) i64 {
     return nd_id;
 }
 
+// 类型参数单态化：除 named{U}（类型位置）外，还要替换表达式位置里的 ident{U}
+// （如把类型当作 comptime 实参传递：`map_id(U, x)` 里的 U）。模板本体里这种引用在
+// 检查期不可解（U 未绑定），须随实例一并代换成具体类型，否则嵌套泛型再单态化时读到
+// 未绑定 U → T-SEM-E200。仅用于 instantiate_generic 的实例体（comptime 形参已被剥离，
+// 残余 ident{U} 必是待代换的形参引用，无歧义）。
+fn subst_type_ident_kids(src: i64, name: string, concrete: i64) i64 {
+    if (src < 0) { return -1; }
+    var h: i64 = -1;
+    var t: i64 = -1;
+    var c: i64 = src;
+    while (c >= 0) {
+        var nv: i64 = subst_type_ident_node(kids[c].val, name, concrete);
+        t = list_push(h, t, nv);
+        if (h < 0) { h = t; }
+        c = kids[c].next;
+    }
+    return h;
+}
+
+fn subst_type_ident_node(nd_id: i64, name: string, concrete: i64) i64 {
+    if (nd_id < 0) { return -1; }
+    var n: Node = nodes[nd_id];
+    if ((n.kind == "named" || n.kind == "ident") && n.sa == name) {
+        return clone_node(concrete);
+    }
+    if (n.na >= 0) { n.na = subst_type_ident_node(n.na, name, concrete); }
+    if (n.nb >= 0) { n.nb = subst_type_ident_node(n.nb, name, concrete); }
+    if (n.nc >= 0) { n.nc = subst_type_ident_node(n.nc, name, concrete); }
+    if (n.nd >= 0) { n.nd = subst_type_ident_node(n.nd, name, concrete); }
+    if (n.la >= 0) { n.la = subst_type_ident_kids(n.la, name, concrete); }
+    if (n.lb >= 0) { n.lb = subst_type_ident_kids(n.lb, name, concrete); }
+    if (n.lc >= 0) { n.lc = subst_type_ident_kids(n.lc, name, concrete); }
+    slice_set(nodes, nd_id, n);
+    return nd_id;
+}
+
 // 字面量 → 标识符安全的单态化键片段。
 // 字符串走「长度 + 前 12 个可读字符 + FNV-1a(32)」：可读且不撞
 // —— 只做字符净化的话 `"a-b"` 与 `"a_b"` 会塌成同一个实例。
@@ -1214,7 +1250,19 @@ fn instantiate_generic(tmpl: i64, e: i64) i64 {
         var keyp: string = "";
         if (cistype[j]) {
             var an: Node = nodes[cargs[j]];
-            if (an.kind == "ident") {
+            // P0-2：嵌套泛型再单态化时，comptime 类型实参已是具体类型节点
+            // （由 subst_type_ident 把表达式位置的 ident{U} 代换成具体类型节点）。
+            // 直接采用，勿走 meta_eval（类型节点不可作常量求值）。
+            if (an.kind == "named" || an.kind == "scalar" || an.kind == "slice"
+                    || an.kind == "array" || an.kind == "pointer" || an.kind == "optional") {
+                cv2 = cargs[j];
+                keyp = mb_type_key(cargs[j], 0);
+                if (keyp == "") {
+                    fc_err("T-MTA-E603",
+                        "编译期类型表达式求值结果无法规约为类型名", cargs[j]);
+                    return -1;
+                }
+            } else if (an.kind == "ident") {
                 cv2 = type_node_from_ident(an.sa);
                 keyp = an.sa;
             } else {
@@ -1276,6 +1324,8 @@ fn instantiate_generic(tmpl: i64, e: i64) i64 {
         if (cistype[m]) {
             inn.na = subst_type_in_node(inn.na, cnm, conc);
             inn.lc = subst_type_in_kids(inn.lc, cnm, conc);
+            // 表达式位置里的 ident{U}（把类型当 comptime 实参传递）→ 具体类型节点
+            inn.lc = subst_type_ident_kids(inn.lc, cnm, conc);
         } else {
             inn.na = meta_subst_val_node(inn.na, cnm, conc);
             inn.lc = meta_subst_val_kids(inn.lc, cnm, conc);
@@ -1327,8 +1377,26 @@ fn instantiate_generic(tmpl: i64, e: i64) i64 {
     g_meta_err = false;
     g_menv_top = st2;
     g_menv_base = sb2;
+    // 实例体补齐检查（P0-2 + P0-3）：此刻 comptime 形参已代换成具体类型，故在 body 上
+    // 重跑 check_func_decl（= 走 infer_expr）即可同时完成——
+    //   · 嵌套泛型调用点的再单态化（infer_expr @ line 4590，bb 守卫保证幂等）；
+    //   · 体内 format / !j 脱糖（infer_expr @ line 4619）。
+    // 必须落在实例化这一步（而非 run_check 主循环之后），因为实例是在主检查循环长度冻结后
+    // 才追加的，代码生成的预处理在 run_check 结束后才跑——落在实例化里保证脱糖结果进入
+    // 同一趟检查/发射视图，不再出现「脱糖了却没进 IR」的滞后。
+    // 实例是 FuncDecl 且非泛型（comptime 形参已剥离），check_func_decl 安全幂等；其体内
+    // 的嵌套泛型再单态化会递归触发 instantiate_generic → 同样回到这里自检，直至不动点。
+    if (nodes[inst].lc != -2) {
+        check_func_decl(inst);
+    }
     return inst;
 }
+
+// ── P0-2 + P0-3：实例体补齐检查的落点 ──────────────────────────
+// 实例体的补齐检查（嵌套泛型再单态化 + 体内 format/!j 脱糖）落在 `instantiate_generic`
+// 末尾：克隆+代换后即重跑 check_func_decl（见该函数末尾注释）。理由是该步处于主检查循环
+// 之内、代码生成预处理之前，脱糖结果能进入同一趟发射视图——这也是非泛型函数体被脱糖的
+// 同一时机。故这里不再保留独立的 fixpoint。
 
 // ── 声明注册 registerDecl（复刻 checker.ts:97）────────────────
 
@@ -2329,6 +2397,10 @@ var g_fmt_at: [64]i64;   // 各值实参对应的形参类型节点
 var g_fmt_json_ti: [64]i64;   // A1a：聚合实参的原始 TI（!j 递归编码用）
 var g_fmt_json: [64]bool;     // A1a：第 i 个值实参是否为聚合类型（须用 !j 编码）
 var g_fmt_jsym: i64;          // A1a：JSON 合成体内部局部变量名计数器
+// 当前正在 check 的函数声明 id（check_func_decl 进出时维护）。用于 format 脱糖判据：
+// 若正处于「泛型模板」体内（comptime 形参未绑定），此刻脱糖拿不到实参的静态类型，
+// 须跳过并把 `format` 节点留给实例（单态化、类型已具体）在 instantiate_generic 里再脱糖。
+var g_cur_func_decl: i64 = -1;
 
 // 值类型 → 种类码。-1 表示不可格式化（聚合类型等）。
 // ⚠ 整数字面量按最小无符号宽度推断（`42` 是 u8），故必须按名字判有无符号，
@@ -2571,6 +2643,16 @@ fn desugar_format_call(e: i64) i64 {
         ri = ri + 1;
     }
     g_fmt_jsym = 0;
+
+    // ── 0. 泛型模板体内跳过脱糖 ─────────────────────────────
+    // 处于泛型模板体内时，comptime 形参（如 `meta T: type`）尚未绑定，value 实参的
+    // 静态类型未知（可能是未定型的 T）。此刻脱糖会生成以「未知类型」为编码目标的
+    // __fmt_N，且改写后的 __fmt_N 节点无法再被实例恢复 → 发射期 `UNSUPPORTED call format`。
+    // 故模板体内leave `format` 节点原样，待实例（instantiate_generic 重跑 check_func_decl，
+    // 类型已具体）再脱糖。模板本身永不发射，仅实例发射，故无副作用。
+    if (g_cur_func_decl >= 0 && func_is_generic(g_cur_func_decl)) {
+        return ti_mk("String");
+    }
 
     // ── 1. 模板必须存在且是字面量 ──────────────────────────
     var tmpl_node: i64 = call_arg_node(e, 0);
@@ -3720,12 +3802,15 @@ fn lower_range_index(e: i64) i64 {
     if (r.nb >= 0) { infer_expr(r.nb); }
     if (k == "Unknown") { return ti_mk("Unknown"); }
     if (k == "Array") {
-        // 定长数组在 C 后端是裸 T*、在 LLVM 后端是 [N x T]，都不是 TSlice；
-        // Array→Slice 的构造 lowering 尚未落地（见 can_cast 里的同一条已知缺陷），
-        // 这里宁可明确拒绝，也不发射会读到垃圾长度的代码。
-        fc_err("T-RNG-E873",
-            "定长数组 `[N]T` 暂不支持区间索引：`[N]T` 到 `[]T` 还没有构造降解，请先把它放进 `[]T` 变量再切", e);
-        return ti_mk("Unknown");
+        // 定长数组在 C 后端是裸 T*、在 LLVM 后端是 [N x T]，都不是 TSlice。
+        // Array→Slice 的构造 lowering 已落地（cast 节点 → t_slice_from_raw / @tll_slice_from_raw），
+        // 这里包一层 cast 把它降级成零拷贝切片视图，随后与 `[]T` 走同一条 slice_sub 路径。
+        var ati: TI = tis[ot];
+        var asti: i64 = ti_elem_of("Slice", ati.elem);
+        n.na = mk_cast(n.na, ti_to_type_node(asti), -1);
+        slice_set(nodes, e, n);
+        ot = asti;
+        k = "Slice";
     }
     if (k != "String" && k != "Slice" && k != "Bytes") {
         fc_err("T-RNG-E871",
@@ -5279,6 +5364,9 @@ fn check_func_decl(d: i64) void {
     if (n.lc == -2) {
         return;
     }
+    // 维护 g_cur_func_decl，供 format 脱糖判断当前是否处于泛型模板体内（见 desugar_format_call）。
+    var prev_fd: i64 = g_cur_func_decl;
+    g_cur_func_decl = d;
 
     var prev: i64 = cur_scope;
     cur_scope = scope_new(global_scope);
@@ -5333,6 +5421,7 @@ fn check_func_decl(d: i64) void {
     cur_ret = prev_ret;
     cur_scope = prev;
     g_in_lambda = prev_lam;
+    g_cur_func_decl = prev_fd;
 }
 
 fn check_struct_decl(d: i64) void {
@@ -8999,6 +9088,10 @@ fn run_check() void {
         check_decl(g_pipe_decls[jp]);
         jp = jp + 1;
     }
+    // P0-2 / P0-3：实例体的补齐检查已落在 instantiate_generic 内部（克隆+代换后即重跑
+    // check_func_decl，见 instantiate_generic 末尾注释）——此刻 comptime 形参已具体，
+    // 嵌套泛型再单态化与 format/!j 脱糖一并完成，且落在主检查循环/代码生成预处理之前，
+    // 脱糖结果直接进入同一趟发射视图。主循环之后不再需要 fixpoint。
     scan_fid_format_atoms();
 }
 
@@ -10101,6 +10194,32 @@ fn ti_to_td_base(ti: i64) i64 {
     if (t.kind == "Named") { return td_named_mk("named", t.name); }
     if (t.kind == "Pointer") { return td_elem_mk("pointer", ti_to_td_base(t.elem)); }
     return td_mk("unknown");
+}
+
+// TI → 类型 **AST 节点**（cast 的目标类型必须用这个，不能用 ti_to_td_base 的 td 索引）。
+// ⚠ 踩过的坑：sema 侧的 tds 池与 codegen 侧的各一份、索引不通用。把 td 索引填进
+// cast.nb 后，codegen 的 resolve_type_desc 会把它当**节点号**解析 —— 小整数恰好
+// 命中某个标量节点，于是 Array→Slice 的 cast 退化成 `(i64)arr` 硬转，读垃圾长度。
+fn ti_to_type_node(ti: i64) i64 {
+    if (ti < 0) { return mk_named("unknown", -1); }
+    var t: TI = tis[ti];
+    if (t.kind == "Scalar") { return mk_scalar(t.name, -1); }
+    if (t.kind == "Void") { return mk_scalar("void", -1); }
+    if (t.kind == "String") { return mk_scalar("string", -1); }
+    if (t.kind == "StringBuilder") { return mk_scalar("StringBuilder", -1); }
+    if (t.kind == "Bytes") { return mk_scalar("bytes", -1); }
+    if (t.kind == "Slice") { return mk_slice(ti_to_type_node(t.elem), -1); }
+    // ⚠ mk_int 的第二参数是 RADIX 不是值：长度必须按十进制写。
+    if (t.kind == "Array") {
+        return mk_array(ti_to_type_node(t.elem), mk_int(i2s(t.alen), 10, -1), -1);
+    }
+    if (t.kind == "Map") {
+        return mk_map(ti_to_type_node(t.key), ti_to_type_node(t.val), -1);
+    }
+    if (t.kind == "Pointer") { return mk_pointer(ti_to_type_node(t.elem), -1); }
+    if (t.kind == "Optional") { return mk_optional(ti_to_type_node(t.elem), -1); }
+    if (t.kind == "Sym") { return mk_sym(t.name, t.bw, -1); }
+    return mk_named(t.name, -1);
 }
 
 
