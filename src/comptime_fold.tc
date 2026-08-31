@@ -103,6 +103,62 @@ pub fn comptime_rewrite_to_literal(e: i64, v: i64) void {
     slice_set(base.nodes, e, dst);
 }
 
+// ── 常数枚举：成员显式赋值（`= expr`）编译期求值 ─────────────────────
+// t 的 `enum` 是「常数枚举」：每个成员都是一个具名编译期常量，其值可显式
+// 赋值，赋值表达式在编译期求值并原地折为整数字面量，使 C/LLVM 双后端都得到
+// 正确的常量（含 `comptime fn` 调用）。该语义独立于弥漫式折叠开关，始终启用。
+//
+// 设计要点：
+//   • 仅对 `v.na >= 0`（带显式值）的成员求值；自动编号成员（v.na < 0）跳过。
+//   • 通过 meta_eval 求值：字面量/算术/cast/comptime fn 调用都能折为 int 字面量。
+//   • 失败（非编译期常量 / 折叠结果非整数）→ 复用 T-SEM-E202 报语义错误。
+//   • 求值成功后 comptime_rewrite_to_literal 把 v.na 原地改写为整数字面量，
+//     C/LLVM 后端各自只认 `kind == "int"`，故零后端改动即得正确常量与 auto_val 续推。
+pub fn fold_enum_values() void {
+    var svq: bool = sema.g_meta_quiet;
+    var sve: bool = sema.g_meta_err;
+    sema.g_meta_steps = 4000000;
+    sema.g_meta_err = false;
+    sema.g_meta_quiet = true;
+    var i: i64 = 0;
+    var total: i64 = slice_len(base.nodes) as i64;
+    while (i < total) {
+        if (base.nodes[i].kind == "EnumDecl") {
+            fold_one_enum(i);
+        }
+        i = i + 1;
+    }
+    sema.g_meta_quiet = svq;
+    sema.g_meta_err = sve;
+}
+
+pub fn fold_one_enum(d: i64) void {
+    var n: Node = base.nodes[d];
+    var c: i64 = n.lb;
+    while (c >= 0) {
+        var k: Child = base.kids[c];
+        var v: Node = base.nodes[k.val];
+        if (v.na >= 0) {
+            var vv: i64 = sema.meta_eval(v.na);
+            sema.g_meta_err = false; // 复位：避免不可折节点污染后续枚举成员
+            if (vv < 0) {
+                base.diag_new("T-SEM-E202", "error",
+                    base.sb_cat6("enum '", n.sa, "' 成员 '", v.sa,
+                        "' 的赋值必须是编译期常量（字面量或 comptime fn 调用），无法在编译期求值", ""),
+                    "", 1, 1, 1, 10);
+            } else if (base.nodes[vv].kind != "int") {
+                base.diag_new("T-SEM-E202", "error",
+                    base.sb_cat6("enum '", n.sa, "' 成员 '", v.sa,
+                        "' 的编译期值必须是整数，得到 ", base.nodes[vv].kind),
+                    "", 1, 1, 1, 5);
+            } else {
+                comptime_rewrite_to_literal(v.na, vv);
+            }
+        }
+        c = k.next;
+    }
+}
+
 // 全量 comptime 折叠 pass：遍历整池节点，对候选表达式尝试 meta_eval，
 // 成功（返回字面量节点 id）则原地改写。仅处理 run_check() 之后、类型已检的 AST。
 //
@@ -112,6 +168,8 @@ pub fn comptime_rewrite_to_literal(e: i64, v: i64) void {
 //     后续所有调用短路返回 -1，既压低覆盖率又可能把错误态泄漏到 codegen。
 //   • 结束前还原 g_meta_quiet / g_meta_err 原值，不影响其他阶段。
 pub fn comptime_fold_pass() void {
+    // 常数枚举编译期求值：独立于弥漫式折叠开关，先于全量折叠执行。
+    fold_enum_values();
     if (g_comptime_full == false) { return; }
     var sv_quiet: bool = sema.g_meta_quiet;
     var sv_err: bool = sema.g_meta_err;
