@@ -70,19 +70,19 @@ pub fn tt_has_sub(hay: string, needle: string) bool {
 // 与其把这类文件一票否决，不如让用户入口在**测试运行**这一趟里退位——
 // 函数体照常编译，只是不再是进程入口。
 pub fn tt_strip_main(d: i64) bool {
-    var nd: Node = nodes[d];
+    var nd: Node = base.nodes[d];
     var prev: i64 = -1;
     var c: i64 = nd.la;
     while (c >= 0) {
-        var k: Child = kids[c];
-        if (nodes[k.val].sa == "main") {
+        var k: Child = base.kids[c];
+        if (base.nodes[k.val].sa == "main") {
             if (prev < 0) {
                 nd.la = k.next;
-                slice_set(nodes, d, nd);
+                slice_set(base.nodes, d, nd);
             } else {
-                var pk: Child = kids[prev];
+                var pk: Child = base.kids[prev];
                 pk.next = k.next;
-                slice_set(kids, prev, pk);
+                slice_set(base.kids, prev, pk);
             }
             return true;
         }
@@ -96,13 +96,13 @@ pub fn tt_strip_main(d: i64) bool {
 pub fn tt_has_tag(head: i64, want: string) bool {
     var it: i64 = head;
     while (it >= 0) {
-        var c: Child = kids[it];
-        var an: Node = nodes[c.val];
+        var c: Child = base.kids[it];
+        var an: Node = base.nodes[c.val];
         if (an.sa == "tag") {
             var p: i64 = an.la;
             while (p >= 0) {
-                var pc: Child = kids[p];
-                var pn: Node = nodes[pc.val];
+                var pc: Child = base.kids[p];
+                var pn: Node = base.nodes[pc.val];
                 if (pn.sa == want) { return true; }
                 p = pc.next;
             }
@@ -121,14 +121,14 @@ pub fn tt_gen_runner() string {
     sb_append_str(sb, "    var __tf: i64 = 0;\n");
     sb_append_str(sb, "    var __ts: i64 = 0;\n");
     sb_append_str(sb, "    print(format(\"\\nrunning {} test(s)\\n\\n\", ");
-    sb_append_str(sb, i2s(cnt));
+    sb_append_str(sb, base.i2s(cnt));
     sb_append_str(sb, "));\n");
     // 判定行**在测试跑完之后**才打印：expect 的失败详情走 stderr，判定行走 stdout，
     // 于是详情总在对应判定行之上（编译器诊断式「证据在前、结论在后」），
     // 而单独重定向 stdout 时能得到一份纯净可机读的用例清单。
     var i: i64 = 0;
     while (i < cnt) {
-        var lead: string = sb_cat3("print(\"test ", tt_esc(tt_name[i]), " ... ");
+        var lead: string = base.sb_cat3("print(\"test ", tt_esc(tt_name[i]), " ... ");
         if (tt_skip[i]) {
             sb_append_str(sb, "    ");
             sb_append_str(sb, lead);
@@ -190,7 +190,7 @@ pub fn run_test_cmd(argv: []string) i32 {
             if (ai + 1 < an) { tag = argv[ai + 1]; ai = ai + 2; continue; }
         }
         if (argv[ai] == "--lib-dir") {
-            if (ai + 1 < an) { append(g_lib_dirs, argv[ai + 1]); ai = ai + 2; continue; }
+            if (ai + 1 < an) { append(lex.g_lib_dirs, argv[ai + 1]); ai = ai + 2; continue; }
         }
         if (argv[ai] == "--no-run") { no_run = true; ai = ai + 1; continue; }
         if (has_src == false) { src_file = argv[ai]; has_src = true; }
@@ -200,8 +200,8 @@ pub fn run_test_cmd(argv: []string) i32 {
         eprint("usage: tc test <file.tc> [--filter <substr>] [--tag <name>] [--mode dbg|rls] [--no-run]\n");
         return 2;
     }
-    if (valid_mode(mode) == false) {
-        eprint(sb_cat3("error: unknown --mode `", mode, "` (expected dbg|rls)\n"));
+    if (codegen_ll.valid_mode(mode) == false) {
+        eprint(base.sb_cat3("error: unknown --mode `", mode, "` (expected dbg|rls)\n"));
         return 2;
     }
     if (clang_p == "clang") {
@@ -210,27 +210,27 @@ pub fn run_test_cmd(argv: []string) i32 {
     }
 
     // ── ① 用户源码：tokenize + parse ──────────────────────────
-    g_file = rel_path(src_file);
+    base.g_file = base.rel_path(src_file);
     var src: string = file_read_all(src_file);
-    tokenize(src);
-    if (has_errors()) { emit_diags(); return 1; }
-    var tok_mark: i64 = slice_len(toks) as i64;   // 用户源码 Eof 之后
-    pos = 0;
-    init_anndefs();
-    parse_unit();
+    lex.tokenize(src);
+    if (sema.has_errors()) { base.emit_diags(); return 1; }
+    var tok_mark: i64 = slice_len(base.toks) as i64;   // 用户源码 Eof 之后
+    lex.pos = 0;
+    sema.init_anndefs();
+    parse.parse_unit();
 
     // ── ② 收集测试；先扫一遍看有没有 @only ────────────────────
-    var dn: i64 = slice_len(decl_list) as i64;
+    var dn: i64 = slice_len(lex.decl_list) as i64;
     var has_only: bool = false;
     var di: i64 = 0;
     while (di < dn) {
-        var d0i: i64 = decl_list[di];
-        var d0: Node = nodes[d0i];
+        var d0i: i64 = lex.decl_list[di];
+        var d0: Node = base.nodes[d0i];
         if (d0.kind == "FuncDecl") {
-            if (d0.bd && ann_find(d0.la, "only") >= 0) { has_only = true; }
-            if (d0.bd == false && ann_find(d0.la, "main") >= 0) {
+            if (d0.bd && parse.ann_find(d0.la, "only") >= 0) { has_only = true; }
+            if (d0.bd == false && parse.ann_find(d0.la, "main") >= 0) {
                 if (tt_strip_main(d0i)) {
-                    eprint(sb_cat3("note: `", d0.sa,
+                    eprint(base.sb_cat3("note: `", d0.sa,
                         "` 的 @main 在本次 test 运行中被忽略（测试入口由 tc 合成）\n"));
                 }
             }
@@ -241,28 +241,28 @@ pub fn run_test_cmd(argv: []string) i32 {
     var total: i64 = 0;      // 源码里的测试总数（过滤前）
     di = 0;
     while (di < dn) {
-        var d: i64 = decl_list[di];
-        var nd: Node = nodes[d];
+        var d: i64 = lex.decl_list[di];
+        var nd: Node = base.nodes[d];
         if (nd.kind == "FuncDecl" && nd.bd) {
             total = total + 1;
             var disp: string = nd.sb;
-            if (str_len(nd.sc) > 0) { disp = sb_cat3(nd.sc, " / ", nd.sb); }
+            if (str_len(nd.sc) > 0) { disp = base.sb_cat3(nd.sc, " / ", nd.sb); }
             var keep: bool = true;
-            if (has_only && ann_find(nd.la, "only") < 0) { keep = false; }
+            if (has_only && parse.ann_find(nd.la, "only") < 0) { keep = false; }
             if (str_len(filter) > 0 && tt_has_sub(disp, filter) == false) { keep = false; }
             if (str_len(tag) > 0 && tt_has_tag(nd.la, tag) == false) { keep = false; }
             if (keep) {
                 append(tt_fn, nd.sa);
                 append(tt_name, disp);
-                append(tt_skip, ann_find(nd.la, "skip") >= 0);
-                append(tt_xfail, ann_find(nd.la, "should_fail") >= 0);
+                append(tt_skip, parse.ann_find(nd.la, "skip") >= 0);
+                append(tt_xfail, parse.ann_find(nd.la, "should_fail") >= 0);
             }
         }
         di = di + 1;
     }
     var sel: i64 = slice_len(tt_fn) as i64;
     if (total == 0) {
-        eprint(sb_cat3("error: ", to_bs(src_file), " 中没有任何测试（`\"名字\" test { ... }`）\n"));
+        eprint(base.sb_cat3("error: ", codegen_ll.to_bs(src_file), " 中没有任何测试（`\"名字\" test { ... }`）\n"));
         return 1;
     }
     if (sel == 0) {
@@ -271,34 +271,34 @@ pub fn run_test_cmd(argv: []string) i32 {
     }
 
     // ── ③④⑤ 生成 runner，追加 token 后接着 parse ────────────
-    tokenize(tt_gen_runner());
-    pos = tok_mark;
-    parse_unit();
+    lex.tokenize(tt_gen_runner());
+    lex.pos = tok_mark;
+    parse.parse_unit();
 
     // ── ⑥ 用户代码 + runner 一次性走完整 sema ────────────────
-    run_check();
-    flag_pass();
-    ann_pass();
-    if (has_errors()) {
-        emit_diags();
+    sema.run_check();
+    sema.flag_pass();
+    sema.ann_pass();
+    if (sema.has_errors()) {
+        base.emit_diags();
         return 1;
     }
 
     // ── ⑦ emit → link → run ──────────────────────────────────
-    var mod2: string = base_no_tc(src_file);
-    emit_llunit(mod2);
-    var out_p: string = sb_cat4("out/", mode, "/tests/", mod2);
-    var llp: string = sb_cat2(out_p, ".ll");
-    ensure_parent(llp);
-    file_write_all(llp, ll_join());
-    if (ll_has_main == false) {
+    var mod2: string = codegen_ll.base_no_tc(src_file);
+    codegen_ll.emit_llunit(mod2);
+    var out_p: string = base.sb_cat4("out/", mode, "/tests/", mod2);
+    var llp: string = base.sb_cat2(out_p, ".ll");
+    codegen_ll.ensure_parent(llp);
+    file_write_all(llp, codegen_ll.ll_join());
+    if (codegen_ll.ll_has_main == false) {
         eprint("error: internal: 合成的测试入口未产生 @main\n");
         return 1;
     }
 
-    var exep: string = sb_cat2(out_p, ".exe");
-    var deps_lib: string = sb_cat3("out/", mode, "/deps/t_runtime.lib");
-    var use_lib: bool = path_exists(deps_lib);
+    var exep: string = base.sb_cat2(out_p, ".exe");
+    var deps_lib: string = base.sb_cat3("out/", mode, "/deps/t_runtime.lib");
+    var use_lib: bool = sema.path_exists(deps_lib);
     var opt: string = "-O2";
     if (mode == "dbg") { opt = "-O0 -gcodeview"; }
     var csb: StringBuilder = sb_new();
@@ -325,10 +325,10 @@ pub fn run_test_cmd(argv: []string) i32 {
         sb_append_str(csb, "\"");
     }
     var elk: i64 = 0;
-    var nelk: i64 = slice_len(g_ext_link) as i64;
+    var nelk: i64 = slice_len(lex.g_ext_link) as i64;
     while (elk < nelk) {
         sb_append_str(csb, " \"");
-        sb_append_str(csb, g_ext_link[elk]);
+        sb_append_str(csb, lex.g_ext_link[elk]);
         sb_append_str(csb, "\"");
         elk = elk + 1;
     }
@@ -338,8 +338,8 @@ pub fn run_test_cmd(argv: []string) i32 {
         return 1;
     }
     if (no_run) {
-        print(sb_cat3("Built: ", to_bs(exep), "\n"));
+        print(base.sb_cat3("Built: ", codegen_ll.to_bs(exep), "\n"));
         return 0;
     }
-    return sys_run(sb_cat3("\"", to_bs(exep), "\""));
+    return sys_run(base.sb_cat3("\"", codegen_ll.to_bs(exep), "\""));
 }

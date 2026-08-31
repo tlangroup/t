@@ -79,6 +79,7 @@ static const DiagDef DIAG_DEFS[] = {
   { "T-MOD-E558", "error", "MOD", "T_MODULE_PRIVATE", "PRIVATE", "symbol is private" },
   { "T-MOD-E559", "error", "MOD", "T_IMPORT_BAD_PATH", "IMPORT_BAD_PATH", "import path is malformed" },
   { "T-MOD-E560", "error", "MOD", "T_IMPORT_CONFLICT", "IMPORT_CONFLICT", "import symbol conflict" },
+  { "T-MOD-W561", "warning", "MOD", "T_MOD_UNQUALIFIED", "UNQUALIFIED_XMOD", "cross-module access must use qualified name" },
   { "T-MTA-E600", "error", "MTA", "T_META_VALUE_PARAM_TYPE", "VALUE_PARAM_TYPE", "meta value parameter type error" },
   { "T-MTA-E601", "error", "MTA", "T_META_ARG_TYPE", "ARG_TYPE", "meta argument type error" },
   { "T-MTA-E602", "error", "MTA", "T_META_RANGE", "RANGE", "meta range error" },
@@ -145,7 +146,7 @@ static const DiagDef DIAG_DEFS[] = {
   { "T-TIM-E702", "error", "TIM", "T_TIME_SPEC_TYPE", "SPEC_TYPE", "time specifier type mismatch" },
   { "T-TIM-E703", "error", "TIM", "T_TIME_ARG_TYPE", "ARG_TYPE", "time argument type mismatch" },
 };
-#define DIAG_COUNT 132
+#define DIAG_COUNT 133
 
 /* legacy (old semantic name) -> machine code alias table */
 static const struct { const char* legacy; const char* code; } DIAG_LEGACY[] = {
@@ -210,6 +211,7 @@ static const struct { const char* legacy; const char* code; } DIAG_LEGACY[] = {
   { "T_MODULE_PRIVATE", "T-MOD-E558" },
   { "T_IMPORT_BAD_PATH", "T-MOD-E559" },
   { "T_IMPORT_CONFLICT", "T-MOD-E560" },
+  { "T_MOD_UNQUALIFIED", "T-MOD-W561" },
   { "T_META_VALUE_PARAM_TYPE", "T-MTA-E600" },
   { "T_META_ARG_TYPE", "T-MTA-E601" },
   { "T_META_RANGE", "T-MTA-E602" },
@@ -276,7 +278,7 @@ static const struct { const char* legacy; const char* code; } DIAG_LEGACY[] = {
   { "T_TIME_SPEC_TYPE", "T-TIM-E702" },
   { "T_TIME_ARG_TYPE", "T-TIM-E703" },
 };
-#define DIAG_LEGACY_COUNT 126
+#define DIAG_LEGACY_COUNT 127
 
 const DiagDef* diag_find(const char* code);        /* exact machine-code lookup */
 const DiagDef* diag_find_any(const char* id);      /* machine code OR legacy name */

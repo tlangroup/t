@@ -43,8 +43,8 @@ pub fn comptime_is_candidate(k: string) bool {
 pub fn comptime_has_runtime_ref_list(head: i64) bool {
     var c: i64 = head;
     while (c >= 0) {
-        if (comptime_has_runtime_ref(kids[c].val)) { return true; }
-        c = kids[c].next;
+        if (comptime_has_runtime_ref(base.kids[c].val)) { return true; }
+        c = base.kids[c].next;
     }
     return false;
 }
@@ -54,16 +54,16 @@ pub fn comptime_has_runtime_ref_list(head: i64) bool {
 // 让 meta_eval 内部的变体值求值接管；否（普通运行期调用）仍为硬运行期引用。
 pub fn comptime_call_is_variant(n: Node) bool {
     if (n.na < 0) { return false; }
-    var cn: Node = nodes[n.na];
+    var cn: Node = base.nodes[n.na];
     if (cn.kind != "ident") { return false; }
-    return meta_str_find(cn.sa, "_from_") >= 0
-        || meta_str_find(cn.sa, "_is_") >= 0
-        || meta_str_find(cn.sa, "_as_") >= 0;
+    return sema.meta_str_find(cn.sa, "_from_") >= 0
+        || sema.meta_str_find(cn.sa, "_is_") >= 0
+        || sema.meta_str_find(cn.sa, "_as_") >= 0;
 }
 
 pub fn comptime_has_runtime_ref(e: i64) bool {
     if (e < 0) { return false; }
-    var n: Node = nodes[e];
+    var n: Node = base.nodes[e];
     // 仅 ident/call 是「硬运行期引用」；index/array_lit/struct_lit 是可折
     // 容器，交由 meta_eval 内部递归处理（其子树若含 ident/call 会被下面的
     // 递归检查捕获并阻止）。P2 起不再把它们当运行期引用拒之门外。
@@ -92,15 +92,15 @@ pub fn comptime_has_runtime_ref(e: i64) bool {
 // 保留 ln/cl/tv 诊断锚点；清零子节点槽，la 仅 array_lit 有元素链）。
 pub fn comptime_rewrite_to_literal(e: i64, v: i64) void {
     if (e < 0 || v < 0) { return; }
-    var src: Node = nodes[v];
-    var dst: Node = nodes[e];
+    var src: Node = base.nodes[v];
+    var dst: Node = base.nodes[e];
     dst.kind = src.kind;
     dst.sa = src.sa;
     dst.ia = src.ia;
     dst.ba = src.ba;
     dst.na = -1; dst.nb = -1; dst.nc = -1; dst.nd = -1;
     dst.la = src.la;
-    slice_set(nodes, e, dst);
+    slice_set(base.nodes, e, dst);
 }
 
 // 全量 comptime 折叠 pass：遍历整池节点，对候选表达式尝试 meta_eval，
@@ -113,15 +113,15 @@ pub fn comptime_rewrite_to_literal(e: i64, v: i64) void {
 //   • 结束前还原 g_meta_quiet / g_meta_err 原值，不影响其他阶段。
 pub fn comptime_fold_pass() void {
     if (g_comptime_full == false) { return; }
-    var sv_quiet: bool = g_meta_quiet;
-    var sv_err: bool = g_meta_err;
-    g_meta_steps = 4000000;
-    g_meta_err = false;
-    g_meta_quiet = true;
+    var sv_quiet: bool = sema.g_meta_quiet;
+    var sv_err: bool = sema.g_meta_err;
+    sema.g_meta_steps = 4000000;
+    sema.g_meta_err = false;
+    sema.g_meta_quiet = true;
     var i: i64 = 0;
-    var n: i64 = slice_len(nodes) as i64;
+    var n: i64 = slice_len(base.nodes) as i64;
     while (i < n) {
-        var k: string = nodes[i].kind;
+        var k: string = base.nodes[i].kind;
         // 已由 meta_pass 处理的 comptime 节点跳过，避免重复改写
         if (k == "comptime" || k == "comptime_block") {
             i = i + 1;
@@ -138,13 +138,13 @@ pub fn comptime_fold_pass() void {
             i = i + 1;
             continue;
         }
-        var v: i64 = meta_eval(i);
-        g_meta_err = false; // 复位：允许后续节点继续尝试折叠
+        var v: i64 = sema.meta_eval(i);
+        sema.g_meta_err = false; // 复位：允许后续节点继续尝试折叠
         if (v >= 0) {
             comptime_rewrite_to_literal(i, v);
         }
         i = i + 1;
     }
-    g_meta_quiet = sv_quiet;
-    g_meta_err = sv_err;
+    sema.g_meta_quiet = sv_quiet;
+    sema.g_meta_err = sv_err;
 }
