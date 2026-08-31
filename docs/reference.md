@@ -2143,7 +2143,7 @@ AgentClause:
 
 ---
 
-### 3.13 Modules / Import / Export（代码模块与插件系统）✅ 已落地（2026-08-30 模块重设计：文件头 `@module(pub|internal)` + 字符串路径导入 `@import("Path")` + 声明前缀 `pub` 标记可见 + 「模块属性 ∧ 声明 pub」可见性合取 + `pub @import(...)` 模块重导出；旧 `import(Path)` / `export` 语法已删除；双后端自举不动点 g2==g3==g4 保持，L2 gate 全绿；C 互操作导出（`.lib`/`.dll`）待实现）
+### 3.13 Modules / Import / Export（代码模块与插件系统）✅ 已落地（2026-08-30 模块重设计：文件头 `@module(pub|internal)` + 字符串路径导入 `@import("Path")` + 声明前缀 `pub` 标记可见 + 「模块属性 ∧ 声明 pub」可见性合取 + `pub @import(...)` 模块重导出；旧 `import(Path)` / `export` 语法已删除；双后端自举不动点 g2==g3==g4 保持，L2 gate 全绿；C 互操作导出 `@c_export` ✅ 已实现（2026-08-31））
 
 > 本节气法由 `docs/syntax/drafts/module.md` 经 L-15 采用并并入（原草稿已标记失效）。与 §3.6.1 数据导入（`import_csv`/`import_json` 函数调用）正交：代码模块走 `import xxx` 标识符形式（支持点分 `xxx.yyy`）。
 
@@ -2203,6 +2203,20 @@ ExportPrefix: "pub"                                // 前缀修饰顶层声明�
 7c. **tote 依赖图（`tote deps`，外部库收尾刀）**：`tote deps <file.tc>` 委托 `tc check --emit-deps` 并注入 `--lib-dir`（即 `T_LIB_PATH`/`~/.tote/libs` 搜索路径），输出同上依赖图 JSON。`tote build`/`run`（未显式 `--mode rls`）自动追加 `--debug-libs`，使调试构建优先链接 `.tlibd`（见 rule 7d）。
 7d. **调试态归档（`.tlibd`，外部库收尾刀）**：`tc build --lib --debug <file.tc>` 产出**调试态**归档 `out/lib/<stem>.tlibd`（`clang -O0 -gcodeview` 编 `.o` 经 `llvm-ar rcs`）与伴随 `out/lib/<stem>.tlibd.exports.json`（接口块，命名随 `lib_ext`）。`tc` 的 `--debug-libs` 开关令 `resolve_external_lib_archive` **优先探测 `.tlibd`**（未命中回退 `.tlib`，再回退内联源码）——便于调试期保留符号/行号。普通 `build --lib`（无 `--debug`）仍产 `.tlib`（`-O2`）。
 8. **接口自描述**：`.tlib`/`.tlibd` 内嵌接口块（后端无关、确定性可读的 `pub` 签名区），importer `check` 只读接口块即可类型检查；未 `pub` 符号不进接口块，私有天然不可见。
+
+9. **C 互操作导出（`@c_export`，2026-08-31 已实现）**：把 t 顶层函数以 **clean C 名**导出，供外部 C（或 C++ `extern "C"`）按名链接调用。t 函数统一走 TClosure ABI（函数作为值时是 `{fn, env}` 闭包指针、调用约定为 `Ret(*)(void* env, Args...)`），但顶层具名函数无捕获、无 env 首参；`@c_export` 据此生成一层 **C ABI 平铺入口**，使 C 侧无需理解 TClosure 即可调用。
+   - **语法**：注解置于 `pub` 之后、声明之前（与 `pub @import(...)` 同序）：
+     ```ebnf
+     CExportDecl: "pub" "@c_export" ("fn" | "struct" | "enum") ...   // v1 仅 fn 实装；struct/enum 待补
+     ```
+     ```t
+     pub @c_export fn add(a: i64, b: i64) i64 { return a + b; }
+     ```
+   - **语义约束**：仅顶层、无捕获的函数（顶层具名函数天然无 env，故恒成立）；clean 名 = 声明原名（`n.se`）。两个不同模块导出同名 clean 符号会**链接冲突**——须保证导出的 C 名全局唯一（v1 不强制校验，文档约定）。
+   - **C 后端发射**：入口模块（clean 名 == 函数真名）的函数本就是 `int64_t add(int64_t a, int64_t b)`（C 链接默认可见），无需额外处理；跨包库模块函数真名被重整为 `M__name`，则追加平铺转发器 `int64_t name(...) { return M__name(...); }`。⚠ t 产出的是 **C（非 C++）**，故转发器/定义**不带 `extern "C"` 链接说明符**——该说明符是 C++ 语法，写进 `.c` 会让 clang 以 C 模式编译时报语法错；C 消费者只需普通原型 `int64_t add(int64_t, int64_t);` 即可链接。
+   - **LLVM 后端发射**：对每个 `@c_export` 函数额外发 `define ccc <ret> @<clean>(<params>) { <ret> %cr = call <ret> @t.<mangled>(<typed args>); ret %cr }`——`ccc` = C 调用约定，clean 名即 C 侧符号；入口模块 `@t.add` + `@add` 并存，跨包 `@t.M__add` + `@add` 转发。
+   - **对拍验证**：`examples/c_interop.tc`（入口模块，含 `@main` 自测，预期输出 `5`/`55`）、`examples/c_interop_lib.tc` + `examples/c_interop_driver.c`（无入口库 + C 驱动，clang 链接 `cio.ll`/`cio_lib.c` + `runtime/t_runtime.c` + `runtime/t_shim_ll.c` 跨语言调用，预期 `5`/`55`）、`examples/cxmod/mylib.tc` + `examples/cxmod/cxmod_driver.c`（跨包库 + clean 名转发器桥接，预期 `5`/`55`）。双后端均验证通过。
+   - **已知限制（v1）**：① 仅 `fn` 实装，struct/enum 的 C ABI 类型导出待补；② clean 名全局唯一性由用户保证；③ 暂无独立 `.h` 头文件自动产出（C 消费者自行声明原型，或后续由 `build --lib` 接口块扩展）。
 9. **C 互操作**：`.tlib` 可经 `tote` 导出为 C 兼容 `.lib`/`.dll`（符号来自接口块），导出表仅含 `pub` 符号（见草稿 §11）。
 10. **环境变量搜索（`T_LIB_PATH` / `~/.tote/libs`，2026-08-05 第六刀已落地）**：库搜索路径追加**环境变量驱动**的目录。`tc` 提供**中性**内建 `getenv(name: string) string`（读取进程环境变量；未设置返回空串、不 panic；双后端经 `t_getenv` / `tll_getenv` 实现），但 `tc` 自身**不解析**环境变量——包搜索策略完全留给 `tote`（类比 rustc 只收 `-L`、不读 `CARGO_*`）。`tote` 在构造 `tc` 命令时：① 读 `T_LIB_PATH`（`;` 分隔目录列表，与 Windows PATH 一致；**不**按 `:` 切分，以免误拆 Windows 盘符 `C:/...`），逐个以 `--lib-dir <dir>` 注入；② 再追加 `~/.tote/libs`（即 `home_dir() + "/.tote/libs"`，`home_dir` 取自 `USERPROFILE` / `HOMEDRIVE+HOMEPATH` / `HOME`）。`--lib-dir <dir>` 是 `tc` 的中性输入开关，把 `<dir>` 追加进 `g_lib_dirs`（优先级最高，先于工程 `lib/` 命中）。故 `set T_LIB_PATH=C:/my/libs` 后即可 `tote run app.tc` 解析 `@import("mylib")`（库只放在该目录也能找到）；不设则回退默认搜索路径。验证：库仅置于 `T_LIB_PATH` 目录时 `tote run` 可解析，不设置则 `T_IMPORT_NOT_FOUND`。
 
@@ -2250,7 +2264,7 @@ pub fn deep(x: i64) i64 { return x + 100; }
     - **模块重导出**：`pub @import("Path")` 放开（旧 `T-MOD-E556` 不再拦截），下游经 `X.name` 访问时由 `reexport_lookup` + `mangle_modules` Pass 1 重定向到真实定义 `M__name`（非幻影）。
   - ✅ **配套**：解析期 `import(X)` 报 `T-PAR-E102`（`import(X) was removed; write @import("X") instead`）；`export` 关键字删除，局部 `pub` 仍报 `T-MOD-E556`（legacy 别名 `T_EXPORT_SCOPE`）；`lex`/`parse` 移除旧 `import`/`export` 分支与 `parse_import_decl`（统一为 `parse_at_import_decl`）。`lib/repl.tc`、`lib/std/{math,mem}.tc`、各 `examples/*` 与 conformance 全部迁移至新语法。
   - ✅ **验证**：`gate L1` conformance + `run_examples` 全绿（53 例双后端），bootstrap 不动点（g2==g3==g4）保持；IR 基线因前端语法变更预期漂移，已 `node tools/ir_snapshot.mjs --compiler out/dbg/g1.exe --update` 归零。
-  - ⚠ **遗留（多会话量级，未做）**：A. `src/*.tc` 5k–10k 处裸名引用路径化改写（`src.foo` 全限定，落实用户「强制路径访问」拍板）；B. 删旧语法后清理过渡兼容分支；C. 模块重导出已放开。
+  - ✅ **A. 路径化改写已完成**（2026-08-31，commit 75c5994）：9 模块跨模块裸名全量改写为 `module__name` 限定形式；新增 `T-MOD-W561` 诊断强制跨模块访问使用模块限定名（如 `base.foo`），裸名给修复建议；`gate L2` 14 passed/0 failed（四代自举不动点 + 双后端 53 例 + C 后端自举 + difftc0 + rls + tote）。⚠ **B. 过渡兼容分支清理**：删旧 `import()/export` 语法后残留的兼容分支待清理（低风险，可后续单独做）。C. 模块重导出已在 2026-08-30 放开（见上条 ✅）。
 - **实现状态（2026-08-08 统一刀 —— 语法统一为 `import(Path)`，已废弃；2026-08-30 重设计为 `@import("Path")` + 声明前缀 `pub` + 可见性合取 + `pub @import` 重导出，见上条）**：
   - ✅ **已落地**：旧的 `import @x;`（外部库标记）与裸 `import x;`（工程内）**两种写法删除**，统一为 `import(Path [:: List] [as Alias])`：
     - 解析分流由路径首段决定：`src.` 前缀 → 工程源码根内联（`import(src.hello)`）；否则 → `lib`/依赖库/环境变量搜索（`import(json)`、`import(std.mem)`）。

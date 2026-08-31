@@ -3237,6 +3237,19 @@ pub fn emit_func_decl(d: i64) void {
     }
     var attrs: string = emit_attributes(n.la);
 
+    // C 互操作导出：计算 C ABI 平铺入口名（clean name，无 env 首参）
+    var cx_name: string = "";
+    var cx_self: bool = false;
+    var cx_fwd: bool = false;
+    if (n.be && n.ba == false && parse.ann_find(n.la, "main") < 0) {
+        cx_name = n.se;
+        if (cx_name != "" && cx_name == emit_name) {
+            cx_self = true;       // 入口模块：函数名已是 clean name，仅补 extern "C"
+        } else if (cx_name != "") {
+            cx_fwd = true;        // 跨模块：clean name ≠ 函数名，发转发器
+        }
+    }
+
     var psb: StringBuilder = sb_new();
     var cnt: i64 = 0;
     // 带捕获的合成闭包函数（M48）：env 指针为首参，与 TClosure ABI 一致
@@ -3309,6 +3322,39 @@ pub fn emit_func_decl(d: i64) void {
     em_in_fn = false;
     em_cur_fn = "";
     spush("");
+
+    // C 互操作导出：发 `extern "C"` 平铺转发器（clean name → 真函数名）
+    if (cx_fwd) {
+        var ret_ty: string = emit_ctype(n.na);
+        var asb: StringBuilder = sb_new();
+        var ac: i64 = 0;
+        var pc: i64 = n.lb;
+        while (pc >= 0) {
+            var pk: Child = base.kids[pc];
+            var pp: Node = base.nodes[pk.val];
+            if (ac > 0) { sb_append_str(asb, ", "); }
+            sb_append_str(asb, pp.sa);
+            ac = ac + 1;
+            pc = pk.next;
+        }
+        var arg_str: string = "";
+        if (ac > 0) { arg_str = sb_to_str(asb); }
+        var fsb: StringBuilder = sb_new();
+        sb_append_str(fsb, ret_ty);
+        sb_append_str(fsb, " ");
+        sb_append_str(fsb, cx_name);
+        sb_append_str(fsb, "(");
+        sb_append_str(fsb, param_str);
+        sb_append_str(fsb, ") {");
+        spush(sb_to_str(fsb));
+        if (ret_ty == "void") {
+            spush(base.sb_cat5("    ", emit_name, "(", arg_str, ");"));
+        } else {
+            spush(base.sb_cat5("    return ", emit_name, "(", arg_str, ");"));
+        }
+        spush("}");
+        spush("");
+    }
 }
 
 pub fn emit_global_var(d: i64) void {
