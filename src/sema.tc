@@ -7434,6 +7434,64 @@ pub fn meta_is_int_type(t: string) bool {
 }
 
 // ── 表达式求值：返回字面量节点 id，失败返回 -1 ────────────────
+// ── 枚举成员编译期值注册表（供常数枚举成员间引用）──────────────────
+// fold_enum_values 把每个枚举成员折出的整型值登记于此，key = "Enum.Member"；
+// meta_eval_member 据此解析 `Enum.Member` 为编译期整型字面量。单轮编译
+// comptime_fold_pass 只跑一次，注册表随进程新生，无需显式清空。
+pub var g_enum_cn: []string;   // "Enum.Member"
+pub var g_enum_cvi: []i64;     // 整型值
+
+pub fn enum_const_lookup(ename: string, mname: string) i64 {
+    var key: string = sb_cat2(ename, sb_cat2(".", mname));
+    var i: i64 = 0;
+    var n: i64 = slice_len(g_enum_cn) as i64;
+    while (i < n) {
+        if (g_enum_cn[i] == key) { return base.mk_int(base.i2s(g_enum_cvi[i]), 10, -1); }
+        i = i + 1;
+    }
+    return -1;
+}
+
+pub fn enum_const_set(ename: string, mname: string, val: i64) void {
+    var key: string = sb_cat2(ename, sb_cat2(".", mname));
+    var i: i64 = 0;
+    var n: i64 = slice_len(g_enum_cn) as i64;
+    while (i < n) {
+        if (g_enum_cn[i] == key) { g_enum_cvi[i] = val; return; }
+        i = i + 1;
+    }
+    append(g_enum_cn, key);
+    append(g_enum_cvi, val);
+}
+
+// 编译期解析 `Enum.Member`：对象须是枚举类型，且成员已折出编译期整型值。
+pub fn meta_eval_member(e: i64) i64 {
+    var n: Node = nodes[e];
+    if (n.na < 0) {
+        return meta_fail("T-MTA-E617", "编译期成员访问缺少对象", e);
+    }
+    var obj: Node = nodes[n.na];
+    if (obj.kind != "ident") {
+        return meta_fail("T-MTA-E617", "编译期成员访问的对象须是具名类型", e);
+    }
+    var si: i64 = sym_lookup(global_scope, obj.sa);
+    if (si < 0) {
+        return meta_fail("T-MTA-E617", sb_cat3("未定义的类型 `", obj.sa, "`"), e);
+    }
+    var sy: Sym = syms[si];
+    if (sy.decl < 0 || nodes[sy.decl].kind != "EnumDecl") {
+        return meta_fail("T-MTA-E617",
+            sb_cat3("编译期成员访问仅支持枚举常量（`", obj.sa, "` 不是枚举）"), e);
+    }
+    var cv: i64 = enum_const_lookup(obj.sa, n.sa);
+    if (cv < 0) {
+        return meta_fail("T-MTA-E617",
+            sb_cat5("枚举 `", obj.sa, "` 的成员 `", n.sa,
+                "` 尚无编译期值（成员须先定义，且为编译期常量）"), e);
+    }
+    return cv;
+}
+
 pub fn meta_eval(e: i64) i64 {
     if (e < 0) { return -1; }
     if (g_meta_err) { return -1; }
@@ -7524,6 +7582,7 @@ pub fn meta_eval(e: i64) i64 {
     if (n.kind == "call") { return meta_eval_call(e); }
     if (n.kind == "mbuiltin") { return meta_eval_mbuiltin(e); }
     if (n.kind == "closure_make") { return meta_eval_closure_make(e); }
+    if (n.kind == "member") { return meta_eval_member(e); }
     if (n.kind == "array_lit") { return meta_eval_array_lit(e); }
     if (n.kind == "index") { return meta_eval_index(e); }
     if (n.kind == "struct_lit") { return meta_eval_struct_lit(e); }

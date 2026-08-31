@@ -106,12 +106,16 @@ pub fn comptime_rewrite_to_literal(e: i64, v: i64) void {
 // ── 常数枚举：成员显式赋值（`= expr`）编译期求值 ─────────────────────
 // t 的 `enum` 是「常数枚举」：每个成员都是一个具名编译期常量，其值可显式
 // 赋值，赋值表达式在编译期求值并原地折为整数字面量，使 C/LLVM 双后端都得到
-// 正确的常量（含 `comptime fn` 调用）。该语义独立于弥漫式折叠开关，始终启用。
+// 正确的常量（含 `comptime fn` 调用、以及其它枚举成员的引用）。该语义独立于
+// 弥漫式折叠开关，始终启用。
 //
 // 设计要点：
-//   • 仅对 `v.na >= 0`（带显式值）的成员求值；自动编号成员（v.na < 0）跳过。
-//   • 通过 meta_eval 求值：字面量/算术/cast/comptime fn 调用都能折为 int 字面量。
-//   • 失败（非编译期常量 / 折叠结果非整数）→ 复用 T-SEM-E202 报语义错误。
+//   • 通过 meta_eval 求值：字面量/算术/cast/comptime fn 调用/枚举成员引用
+//     （Enum.Member，含前向引用，靠定点迭代解决）都能折为 int 字面量。
+//   • 每个成员折出的值登记到 sema.g_enum_cn/g_enum_cvi，供后续成员（同枚举或
+//     其它枚举）引用；自动编号成员也登记（值 = 当前 auto_val），故可被引用。
+//   • 定点迭代：显式值成员可能引用尚未折出的成员，多次扫描直至不再变化。
+//   • 失败（非编译期常量 / 折叠结果非整数 / 定点后仍不可解）→ 复用 T-SEM-E202。
 //   • 求值成功后 comptime_rewrite_to_literal 把 v.na 原地改写为整数字面量，
 //     C/LLVM 后端各自只认 `kind == "int"`，故零后端改动即得正确常量与 auto_val 续推。
 pub fn fold_enum_values() void {
@@ -120,39 +124,94 @@ pub fn fold_enum_values() void {
     sema.g_meta_steps = 4000000;
     sema.g_meta_err = false;
     sema.g_meta_quiet = true;
-    var i: i64 = 0;
-    var total: i64 = slice_len(base.nodes) as i64;
-    while (i < total) {
-        if (base.nodes[i].kind == "EnumDecl") {
-            fold_one_enum(i);
+    // 定点迭代：最多扫描（成员总数 + 1）轮，确保任意依赖序都能收敛
+    var guard: i64 = 0;
+    var changed: bool = true;
+    while (changed && guard < 100000) {
+        changed = false;
+        guard = guard + 1;
+        var i: i64 = 0;
+        var total: i64 = slice_len(base.nodes) as i64;
+        while (i < total) {
+            if (base.nodes[i].kind == "EnumDecl") {
+                if (fold_one_enum(i)) { changed = true; }
+            }
+            i = i + 1;
         }
-        i = i + 1;
+    }
+    // 定点后仍未折出的显式值成员 = 非编译期常量 → 报错
+    var i2: i64 = 0;
+    var t2: i64 = slice_len(base.nodes) as i64;
+    while (i2 < t2) {
+        if (base.nodes[i2].kind == "EnumDecl") { report_unfolded_enum(i2); }
+        i2 = i2 + 1;
     }
     sema.g_meta_quiet = svq;
     sema.g_meta_err = sve;
 }
 
-pub fn fold_one_enum(d: i64) void {
+// 折单个枚举：按声明序处理成员，显式值成员尝试编译期求值并原地改写，
+// 所有成员（显式折出 / 自动编号）的值登记到注册表供交叉引用。
+// 返回本轮是否折出了新成员（驱动定点迭代）。
+pub fn fold_one_enum(d: i64) bool {
     var n: Node = base.nodes[d];
+    var changed: bool = false;
+    var auto_val: i64 = 0;
     var c: i64 = n.lb;
     while (c >= 0) {
         var k: Child = base.kids[c];
         var v: Node = base.nodes[k.val];
         if (v.na >= 0) {
+            var vn: Node = base.nodes[v.na];
+            if (vn.kind == "int") {
+                // 已是字面量：登记其值（供其它成员引用）并续推 auto_val
+                var fv: i64 = sema.js_parse_int(vn.sa, vn.ia);
+                sema.enum_const_set(n.sa, v.sa, fv);
+                auto_val = fv + 1;
+                c = k.next;
+                continue;
+            }
+            // 未折：尝试编译期求值
             var vv: i64 = sema.meta_eval(v.na);
-            sema.g_meta_err = false; // 复位：避免不可折节点污染后续枚举成员
+            sema.g_meta_err = false; // 复位：避免不可折节点污染后续成员
+            if (vv >= 0 && base.nodes[vv].kind == "int") {
+                comptime_rewrite_to_literal(v.na, vv);
+                var fv: i64 = sema.js_parse_int(base.nodes[v.na].sa, base.nodes[v.na].ia);
+                sema.enum_const_set(n.sa, v.sa, fv);
+                auto_val = fv + 1;
+                changed = true;
+            }
+            // 否则留待下轮（被引用的成员可能本轮回填）
+        } else {
+            // 自动编号成员：值 = 当前 auto_val，登记供其它成员引用（不改写 v.na）
+            sema.enum_const_set(n.sa, v.sa, auto_val);
+            auto_val = auto_val + 1;
+        }
+        c = k.next;
+    }
+    return changed;
+}
+
+// 定点后仍未折出的显式值成员 → 非编译期常量，复用 T-SEM-E202 报错。
+pub fn report_unfolded_enum(d: i64) void {
+    var n: Node = base.nodes[d];
+    var c: i64 = n.lb;
+    while (c >= 0) {
+        var k: Child = base.kids[c];
+        var v: Node = base.nodes[k.val];
+        if (v.na >= 0 && base.nodes[v.na].kind != "int") {
+            var vv: i64 = sema.meta_eval(v.na);
+            sema.g_meta_err = false;
             if (vv < 0) {
                 base.diag_new("T-SEM-E202", "error",
                     base.sb_cat6("enum '", n.sa, "' 成员 '", v.sa,
-                        "' 的赋值必须是编译期常量（字面量或 comptime fn 调用），无法在编译期求值", ""),
+                        "' 的赋值必须是编译期常量（字面量 / 算术 / const / comptime fn / 枚举成员引用），无法在编译期求值", ""),
                     "", 1, 1, 1, 10);
             } else if (base.nodes[vv].kind != "int") {
                 base.diag_new("T-SEM-E202", "error",
                     base.sb_cat6("enum '", n.sa, "' 成员 '", v.sa,
                         "' 的编译期值必须是整数，得到 ", base.nodes[vv].kind),
                     "", 1, 1, 1, 5);
-            } else {
-                comptime_rewrite_to_literal(v.na, vv);
             }
         }
         c = k.next;

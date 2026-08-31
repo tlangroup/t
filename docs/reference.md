@@ -121,7 +121,7 @@ Keyword:
 > ⚠ `meta` 与 `comptime` 同映射到 `KwComptime`（互为别名，`meta` 为推荐拼写）；`type` 与 `any` 同为「类型之类型」占位关键字。见 §3.6.3。
 > ⚠ `let` 关键字（动态常量）及「`var`/`const`/`let` 局部标注可选、由初始化器推断」为 2026-08-19 宪法采纳的设计，尚未接入 `tc`；当前唯一实装推断形式是 `auto`，将降级为 `let` 的弃用别名（见 §3.3）。
 > ⚠ `inf` / `nan` 不在 `keywords_tbl` 里，但词法阶段被直接归为**浮点字面量记号**（§2.4），效果等同保留字：不可作标识符、不可作字段名。
-> ⚠ spec-only（设计中、tc 未接入）：`union`、`enum` 完整语义、`comptime`/`meta` 表达式的**编译期求值**（CTFE，Phase B；Phase A 已可解析并降级发射）；`cell` 块（Notebook 单元作用域，见 §3.17，经 `docs/design.md` §2.8 提案）。
+> ⚠ spec-only（设计中、tc 未接入）：`union`、`enum` 更广语义（关联数据/方法等；**常数枚举**编译期赋值已实装，见 §3.18）、`comptime`/`meta` 表达式的**编译期求值**（CTFE，Phase B；Phase A 已可解析并降级发射）；`cell` 块（Notebook 单元作用域，见 §3.17，经 `docs/design.md` §2.8 提案）。
 
 ### 2.4 Literals（字面量） ✅ tc（2026-08-10 全量落地）
 
@@ -866,7 +866,7 @@ TdRuleTable :
 ModuleItem:
       FuncDecl
     | StructDecl
-    | EnumDecl          // ⚠ spec-only
+    | EnumDecl          // ✅ 常数枚举（编译期常量）已实装
     | FlagDecl          // ✅ tote
     | VariantDecl       // ✅ tote
     | UnionDecl         // ⚠ spec-only
@@ -883,7 +883,7 @@ Param:    ParamName ":" Type
 ```
 
 - 函数用**并置形式** `Name fn(...) Ret { ... }` 声明（spec §1.3：参数类型后置、禁止重载、禁止隐式返回、所有分支显式 `return`）。返回类型**紧跟参数表、无 `->` 记号**（规范唯一写法）。旧代码使用的 `Name fn(...) -> Ret { ... }` 箭头形式**已于编译器移除、不再被接受**，统一改用无箭头并置式 `Name fn(...) Ret { ... }`。
-- ✅ tote：已支持 `fn` 声明、`@main` 入口、`@test` 等注解；`enum` 完整语义、`union` 标记但未实装。
+- ✅ tote：已支持 `fn` 声明、`@main` 入口、`@test` 等注解；`enum` 常数枚举（编译期常量赋值）已实装（见 §3.18）；`union` 标记但未实装。
 
 ```ebnf
 StructDecl:
@@ -2696,6 +2696,44 @@ CellStatement: "cell" Ident "{" (Item | Statement)* "}"
 
 ---
 
+### 3.18 Enum（常数枚举）✅ tc（2026-08-31）
+
+> **状态**：实装。t 的 `enum` 是**常数枚举**（constant enum）——每个成员是一个**具名编译期常量**，在语义期通过 CTFE 折叠为整型字面量并就地替换；成员值缺省按 `u32` 承载，可显式指定底层整型（`enum Name: i64 { ... }`）。`enum` 与 `variant` 共享关键字族（均为「并置式具名类型声明」），但语义不同：`enum` 成员是编译期整型常量，`variant` 成员是运行期带标签联合体。
+
+```ebnf
+EnumDecl   : Ident "enum" (":" IntType)? EnumAnns? "{" EnumMember ("," EnumMember)* ","? "}"
+EnumMember : Ident ("=" EnumValue)? EnumAnns?
+EnumValue  : IntLiteral | Unary | Binary        // 须为编译期常量
+```
+
+**成员值五种赋值形式（均经 `meta_eval` 折叠为整型字面量，双后端零改动）**
+
+1. **字面量**：`Red = 1`、`Mask = 0xFF`。
+2. **算术表达式**：`C = 20 + 30`、`Flag = 1 << 3`。
+3. **`const` 引用**：`X = K`（其中 `K` 为 `const K: i64 = 7` 编译期常量）。
+4. **`comptime fn` 调用**：`P2 = sq(4)`（被调函数须带 `comptime` 修饰，否则报 `T-MTA-E618`）。
+5. **枚举成员交叉引用**（含前向引用与跨枚举引用）：`B = Arith.A + 5`、`X = Fwd.Y * 2`、`P = Other.Base + 7`。
+
+**自动递增**：未显式赋值的成员取上一个成员值 + 1；首个成员缺省为 `0`。自动成员与显式成员均可被后续成员引用（如 `A0, A1 = AutoRef.A0 + 10, A2`）。
+
+**引用语法**：枚举成员须以 `Enum.Member` 限定名访问（如 `Color.Red`），裸名 `Red` 不是编译期标识符、会报 `T-SEM-E201`。编译期访问经 `meta_eval_member` 解析：对象须为具名枚举类型（`Ident` → `sym_lookup` → `EnumDecl`），再查 `g_enum_cn`/`g_enum_cvi` 编译期值注册表；前向/交叉引用通过 `fold_enum_values` 的**不动点迭代**（最多 100000 轮，每轮扫描全部 `EnumDecl`）逐步就绪。
+
+**错误诊断**
+
+- `T-SEM-E202`：成员值不是编译期常量（如引用非 `comptime` 函数 `rt(1)`、或引用 `enum` 之外的类型成员），或折叠结果不是整数（`"必须是整数"`）。
+- `T-MTA-E617`：编译期成员访问对象不是具名枚举类型，或所引成员尚无编译期值（成员须先定义且为编译期常量）。
+- `T-MTA-E618`：枚举值里调用了非 `comptime` 函数。
+
+**实现要点**
+
+- 折叠入口 `fold_enum_values()`（位于 `src/comptime_fold.tc`）在 `comptime_fold_pass()` 开头无条件执行（常数枚举语义恒开，不依赖 `g_comptime_full` 开关）；先不动点迭代折叠显式值、注册全部成员（字面显式值立即注册、非字面显式值折叠后注册、自动成员注册为 `auto_val`），再对残留未折叠的显式成员逐一 `meta_eval` 并报 `T-SEM-E202`。
+- 双后端（`codegen_c.tc` / `codegen_ll.tc`）仅在 `kind == "int"` 时读取成员值，故折叠为整型字面量即可零后端改动地喂给两个后端。
+- 编译期值注册表与解析：`src/sema.tc` 的 `g_enum_cn`/`g_enum_cvi` + `enum_const_lookup`/`enum_const_set`/`meta_eval_member`，并在 `meta_eval` 的 `member` 节点分支派发。
+
+**示例**：见 `examples/enum_constval.tc` 与一致性用例 `tests/conformance/pass/p_enum_constval.tc`、`tests/conformance/pass/p_enum_xref.tc`（覆盖字面/算术/const/comptime fn/交叉引用/前向/跨枚举/自动成员引用），以及 `tests/conformance/fail/f_enum_runtime_val.tc`（非编译期值须报 `T-SEM-E202`）。
+
+---
+
 ## 4. Program entry（程序入口） ✅ tote
 
 ```ebnf
@@ -2711,13 +2749,16 @@ EntryPoint: FuncDecl with "@main" annotation
 
 ```ebnf
 TranslationUnit : ModuleItem*
-ModuleItem      : FuncDecl | StructDecl | FlagDecl | VariantDecl
+ModuleItem      : FuncDecl | StructDecl | EnumDecl | FlagDecl | VariantDecl
                 | TestDecl | SuiteDecl
                 | GlobalVarDecl | ConstDecl | InnerAttribute
 FuncDecl        : Ident "fn" "(" Params? ")" Type Anns? Block
 StructDecl      : Ident "struct" Anns? "{" Field* "}"
 FlagDecl        : Ident "flag" "[" IntType "]" "{" Slot* "}"
 VariantDecl     : Ident "variant" "{" Case* "}"
+EnumDecl        : Ident "enum" (":" IntType)? EnumAnns? "{" EnumMember ("," EnumMember)* ","? "}"
+EnumMember      : Ident ("=" EnumValue)? EnumAnns?
+EnumValue       : IntLiteral | Unary | Binary            // 编译期常量：字面量/算术/const 引用/comptime fn 调用/枚举成员引用
 TestDecl        : String "test" Anns? Block
 SuiteDecl       : String "suite" Anns? "{" (TestDecl | SuiteDecl)* "}"
 Block           : "{" Statement* "}"
@@ -2741,7 +2782,7 @@ Annotation      : "@" Ident ("(" ArgList? ")")?
 | §2.3 | Variant 变体 | ✅ 已实现（自由函数式 helper） |
 | §3.1 | struct（@derive 全能力） | ✅ 结构；⚠ @derive 桩 |
 | §3.1 | #aos / #soa 布局变换 | ⚠ 仅注释 |
-| §3.2 | enum | ⚠ 标记未实装 |
+| §3.18 | enum（常数枚举：字面量/算术/const/comptime fn/成员交叉引用的编译期赋值） | ✅ 已实现（2026-08-31） |
 | §4 | 注解系统（注册表） | ✅ 注册表数据化；⚠ 多数语义未接入 |
 | §5 | CTFE / type_info(T) 内建 | ⚠ 字段自省已接入（ti_*/fi_*，含 fi_tag）；comptime 求值/注解元数据仍为 partial |
 | §6 | flag[T] 位域 + flag_set/get | ✅ 已实现（含 SlotInfo 自省） |
