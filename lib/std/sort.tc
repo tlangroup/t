@@ -1,0 +1,72 @@
+// lib/std/sort.tc —— 排序（纯 t 实现，泛型 + 比较器回调）
+//
+// 设计约束（同 math.tc / strings.tc）：只依赖语言内建（slice_len / 切片索引与赋值 /
+// 泛型 comptime T / 函数类型 fn(...)Ret 作为一等值），对 tc 无语义依赖。
+//
+// 用法：
+//   import(std.sort);
+//   var xs: []i64 = ...;
+//   sort.sort_slice(i64, xs, sort.less_i64);     // 原地升序
+//   var names: []string = ...;
+//   sort.sort_slice(string, names, sort.less_string);
+//
+// 说明：为避免「泛型函数体内嵌套泛型调用漏单态化」已知限制，排序主体为单一函数、
+// 迭代式插入排序（O(n^2)，对中小规模输入足够；大数组可后续替换为 introsort）。
+// 比较器为顶层具名函数（fn(T,T)bool 一等值），经 TClosure ABI 间接调用，双后端一致。
+
+@module(pub)
+
+// 原地排序：用 less(a,b) 定义升序（less(a,b) 为真时 a 应排在 b 前）。
+pub fn sort_slice(comptime T: type, s: []T, less: fn(T, T) bool) void {
+    var n: i64 = slice_len(s) as i64;
+    var i: i64 = 1;
+    while (i < n) {
+        var key: T = s[i];
+        var j: i64 = i - 1;
+        while (j >= 0 && less(key, s[j])) {
+            s[j + 1] = s[j];
+            j = j - 1;
+        }
+        s[j + 1] = key;
+        i = i + 1;
+    }
+}
+
+// ── 常用比较器（顶层具名函数，可直接作为 less 实参）─────────────────
+pub fn less_i64(a: i64, b: i64) bool { return a < b; }
+pub fn less_u64(a: u64, b: u64) bool { return a < b; }
+pub fn less_f64(a: f64, b: f64) bool { return a < b; }
+
+// 字符串按字节字典序（与 C strcmp 同约定：首个不同字节决定，前缀者更小）。
+pub fn less_string(a: string, b: string) bool {
+    var n: u64 = str_len(a);
+    var m: u64 = str_len(b);
+    var i: u64 = 0;
+    while (i < n && i < m) {
+        var ca: i64 = str_at(a, i);
+        var cb: i64 = str_at(b, i);
+        if (ca != cb) { return ca < cb; }
+        i = i + 1;
+    }
+    return n < m;
+}
+
+// 二分查找：s 必须已按 less 升序排列。找到返回下标（首个等于 key 者），否则返回 -1。
+// 与 sort_slice 共用同一 less 比较器；本函数单一迭代控制流，不调用任何嵌套泛型 helper
+// （规避「泛型函数体内嵌套泛型调用漏单态化」已知限制）。
+pub fn binary_search(comptime T: type, s: []T, key: T, less: fn(T, T) bool) i64 {
+    var lo: i64 = 0;
+    var hi: i64 = slice_len(s) as i64;
+    while (lo < hi) {
+        var mid: i64 = lo + (hi - lo) / 2;
+        var cur: T = s[mid];
+        if (less(cur, key)) {
+            lo = mid + 1;
+        } else if (less(key, cur)) {
+            hi = mid;
+        } else {
+            return mid;
+        }
+    }
+    return -1;
+}

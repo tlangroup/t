@@ -1,0 +1,128 @@
+// lib/std/cli.tc —— 命令行参数解析（纯 t 实现，getopt 风格子集）
+//
+// t 内建已有 `args()` 返回程序参数 `[]string`，但无 getopt 风格解析（gap-scan §三）。
+// 本模块用纯 t 补齐一个最小但确定的解析器，对 tc 无语义依赖；零改编译器、零自举、零 gate。
+//
+// 约定（确定性、无歧义）：
+//   --key=value   长旗标，带值
+//   --key         长旗标，无值 → 视为布尔 "true"
+//   -k=value      短旗标（单字符），带值
+//   -k            短旗标，无值 → 布尔 "true"
+//   --            其后的所有 token 一律视为位置参数
+//   其余          位置参数
+// 注意：值必须用 `=` 形式给出；`-k value`（空格分隔）不被视为「带值」，value 会落为位置参数。
+//
+// 用法：
+//   import(std.cli);
+//   var fl: map[string]string;
+//   var pos: []string = cli.parse_args(args(), fl);
+//   if (cli.has_flag(fl, "verbose")) { ... }
+//   var n: i64 = cli.get_flag_int(fl, "count", 10);
+//
+// 设计：flags 经出参 map（map 为引用语义，callee 内 map_set 对调用方可见）；
+// positionals 经返回值（slice 在函数内 append 后返回，规避 slice 出参的引用语义歧义）。
+
+@module(pub)
+
+// 查找字符 ch 在 s 中的下标；未找到返回 -1。
+fn find_char(s: string, ch: i64) i64 {
+    var n: i64 = str_len(s) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        if (str_at(s, i) == ch) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// 解析 argv：旗标写入 flags（出参），位置参数作为 []string 返回。
+pub fn parse_args(argv: []string, flags: map[string]string) []string {
+    var pos: []string;
+    var i: u64 = 0;
+    var n: u64 = slice_len(argv);
+    var at_dashdash: bool = false;
+    while (i < n) {
+        var a: string = argv[i];
+        var alen: i64 = str_len(a) as i64;
+        if (at_dashdash) {
+            append(pos, a);
+        } else if (alen == 2 && str_slice(a, 0, 2) == "--") {
+            at_dashdash = true;
+        } else if (alen >= 2 && str_slice(a, 0, 2) == "--") {
+            // 长旗标
+            // ⚠ 必须先把 key/val 物化到局部变量再 map_set：C 后端的 map_set 降级为
+            // t_map_put(flags, &key, &val)，若直接传 str_slice(...) 表达式（右值）会生成
+            // &t_str_slice(...) —— 对右值取地址是非法 C（LLVM 后端无此问题）。物化为
+            // 左值变量后 &var 合法。此坑对一切「表达式作 map_set 实参」通用。
+            var eq: i64 = find_char(a, 61);   // '='
+            if (eq >= 0) {
+                var mkey: string = str_slice(a, 2, eq);
+                var mval: string = str_slice(a, eq + 1, alen);
+                map_set(flags, mkey, mval);
+            } else {
+                var mkey: string = str_slice(a, 2, alen);
+                var mval: string = "true";
+                map_set(flags, mkey, mval);
+            }
+        } else if (alen >= 1 && str_slice(a, 0, 1) == "-") {
+            // 短旗标（单字符）
+            var eq: i64 = find_char(a, 61);
+            if (eq >= 0) {
+                var mkey: string = str_slice(a, 1, eq);
+                var mval: string = str_slice(a, eq + 1, alen);
+                map_set(flags, mkey, mval);
+            } else {
+                var mkey: string = str_slice(a, 1, alen);
+                var mval: string = "true";
+                map_set(flags, mkey, mval);
+            }
+        } else {
+            append(pos, a);
+        }
+        i = i + 1;
+    }
+    return pos;
+}
+
+// 取旗标字符串值；缺失返回 ""。
+pub fn get_flag(flags: map[string]string, name: string) string {
+    if (map_has(flags, name)) { return map_get(flags, name); }
+    return "";
+}
+
+// 旗标是否出现（无论其值）。
+pub fn has_flag(flags: map[string]string, name: string) bool {
+    return map_has(flags, name);
+}
+
+// 取旗标整数值；缺失或解析失败返回 default_val。
+pub fn get_flag_int(flags: map[string]string, name: string, default_val: i64) i64 {
+    if (map_has(flags, name)) { return parse_i64(map_get(flags, name)); }
+    return default_val;
+}
+
+// 取旗标字符串值；缺失返回 default_val。
+pub fn get_flag_str(flags: map[string]string, name: string, default_val: string) string {
+    if (map_has(flags, name)) { return map_get(flags, name); }
+    return default_val;
+}
+
+// 十进制字符串 → i64。支持可选前导 '+' / '-'；遇非数字字符停止。空串返回 0。
+pub fn parse_i64(s: string) i64 {
+    var n: i64 = str_len(s) as i64;
+    if (n == 0) { return 0; }
+    var i: i64 = 0;
+    var neg: bool = false;
+    var c0: i64 = str_at(s, 0);
+    if (c0 == 45) { neg = true; i = 1; }        // '-'
+    else if (c0 == 43) { i = 1; }               // '+'
+    var val: i64 = 0;
+    while (i < n) {
+        var c: i64 = str_at(s, i);
+        if (c < 48 || c > 57) { break; }        // 非数字停止（'0'=48, '9'=57）
+        val = val * 10 + (c - 48);
+        i = i + 1;
+    }
+    if (neg) { return -val; }
+    return val;
+}
