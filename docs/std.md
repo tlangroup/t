@@ -58,7 +58,7 @@ import(std.mem);
 
 main_fn fn() i32 @main {
     var m = math.max(i64, 3, 7);          // 泛型有序比较
-    var r = math.sqrt_f(2.0);             // 浮点
+    var r = math.sqrt(2.0);             // 浮点（底层 @sqrt）
     var g = math.gcd(12, 18);             // 整数
 
     var xs: []i64;
