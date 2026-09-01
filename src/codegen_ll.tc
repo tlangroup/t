@@ -330,6 +330,22 @@ pub fn ll_td(td: i64) string {
         if (vln < 1) { vln = 1; }
         return base.sb_cat5("<", base.i2s(vln), " x ", ll_td(t.elem), ">");
     }
+    // 瓦片值模型：`[rows x [cols x T]]` 嵌套数组（行主序，与 C 端扁平 T* 数据布局一致）。
+    if (t.cat == "tile") {
+        var rowtd: i64 = t.elem;
+        var cols: i64 = sema.tds[rowtd].alen;
+        var scal: i64 = sema.tds[rowtd].elem;
+        var sb: StringBuilder = sb_new();
+        sb_append_char(sb, 91);
+        sb_append_i64(sb, t.alen);
+        sb_append_str(sb, " x [");
+        sb_append_i64(sb, cols);
+        sb_append_str(sb, " x ");
+        sb_append_str(sb, ll_td(scal));
+        sb_append_char(sb, 93);
+        sb_append_char(sb, 93);
+        return sb_to_str(sb);
+    }
     if (t.cat == "map") { return "ptr"; }
     if (t.cat == "optional") { return "ptr"; }
     if (t.cat == "sym") {
@@ -364,7 +380,7 @@ pub fn ll_isagg(td: i64) bool {
     // vector 归入聚合：值模型走 ptr（alloca + GEP 取 lane + load/store 整体搬运），
     // 从而直接复用数组那套左值/索引/拷贝机制；算术处再 load 成 `<N x T>` 用向量指令。
     if (t.cat == "string" || t.cat == "bytes" || t.cat == "slice" || t.cat == "array"
-            || t.cat == "vector") {
+            || t.cat == "vector" || t.cat == "tile") {
         return true;
     }
     if (t.cat == "named") {
@@ -1055,7 +1071,7 @@ pub fn ll_addr(e: i64) string {
         // 数组与向量同构：GEP 进 `[N x T]` / `<N x T>` 取第 i 个 lane 的地址。
         // LLVM 允许对内存中的向量做 GEP 下标（与数组同规则），故 lane 读写可完全
         // 复用数组路径，不必绕 extractelement/insertelement + 整体回存。
-        if (ot.cat == "array" || ot.cat == "vector") {
+        if (ot.cat == "array" || ot.cat == "vector" || ot.cat == "tile") {
             var ap: string = ll_addr(n.na);
             var av2: string = ll_widen_idx(emit_lle(n.nb), n.nb);
             var t7: string = ll_tmp();
@@ -1400,7 +1416,9 @@ pub fn emit_lle(e: i64) string {
     if (n.kind == "mbuiltin") {
         if (n.sa == "splat" || n.sa == "reduce_add" || n.sa == "reduce_max"
                 || n.sa == "reduce_min" || n.sa == "vlen" || n.sa == "simd_lanes"
-                || n.sa == "cpu_has") {
+                || n.sa == "cpu_has" || n.sa == "tsplat" || n.sa == "treduce_sum"
+                || n.sa == "treduce_mul" || n.sa == "treduce_min" || n.sa == "treduce_max"
+                || n.sa == "tile_rows" || n.sa == "tile_cols" || n.sa == "tile_flavor") {
             return ll_vec_mbuiltin(e);
         }
     }
@@ -1465,7 +1483,7 @@ pub fn emit_lle(e: i64) string {
             }
             return ll_load("i64", t3);
         }
-        if (ot.cat == "array" || ot.cat == "vector") {
+        if (ot.cat == "array" || ot.cat == "vector" || ot.cat == "tile") {
             var gp2: string = ll_addr(e);
             if (ot.elem >= 0) {
                 if (ll_isagg(ot.elem)) {
@@ -1588,6 +1606,41 @@ pub fn emit_lle(e: i64) string {
             vlc = vlck.next;
         }
         return vlsp;
+    }
+    // 瓦片字面量构造：`[[a,b],[c,d]]` 被 sema 标记为瓦片 TD（n.ib>=0 且 cat==tile）。
+    // 复用向量字面量手法：scratch 一个 `[rows x [cols x T]]`，逐元素 GEP+store，返回 scratch 指针。
+    if (n.kind == "array_lit" && n.ib >= 0 && sema.tds[n.ib].cat == "tile") {
+        var tlvt: i64 = n.ib;
+        var tlvty: string = ll_td(tlvt);
+        var trow: i64 = sema.tds[tlvt].elem;
+        var tlety: string = ll_td(trow);
+        var tsc: i64 = sema.tds[trow].elem;
+        var tscty: string = ll_td(tsc);
+        var tlsp: string = ll_scratch(tlvty);
+        llfb(base.sb_cat6("  store ", tlvty, " ", ll_zero(tlvty), ", ptr ", tlsp));
+        var fri: i64 = n.la;
+        var ri: i64 = 0;
+        while (fri >= 0) {
+            var frow: Node = base.nodes[base.kids[fri].val];
+            var fci: i64 = frow.la;
+            var ci: i64 = 0;
+            while (fci >= 0) {
+                var evs: string = emit_lle(base.kids[fci].val);
+                if (tsc >= 0) { evs = ll_cast_v(evs, ll_etd(base.kids[fci].val), tsc); }
+                var gp: string = ll_tmp();
+                var g1: StringBuilder = sb_new();
+                sb_append_str(g1, "  "); sb_append_str(g1, gp); sb_append_str(g1, " = getelementptr ");
+                sb_append_str(g1, tlvty); sb_append_str(g1, ", ptr "); sb_append_str(g1, tlsp);
+                sb_append_str(g1, ", i64 0, i64 "); sb_append_i64(g1, ri); sb_append_str(g1, ", i64 "); sb_append_i64(g1, ci);
+                llfb(sb_to_str(g1));
+                llfb(base.sb_cat6("  store ", tscty, " ", evs, ", ptr ", gp));
+                ci = ci + 1;
+                fci = base.kids[fci].next;
+            }
+            ri = ri + 1;
+            fri = base.kids[fri].next;
+        }
+        return tlsp;
     }
     if (n.kind == "cast") {
         var ftd: i64 = ll_etd(n.na);
@@ -1793,6 +1846,54 @@ pub fn ll_binary(e: i64) string {
         var vlt: i64 = ll_etd(n.na);
         var vrt: i64 = ll_etd(n.nb);
         if (vlt >= 0 && vrt >= 0) {
+            if (sema.tds[vlt].cat == "tile" && sema.tds[vrt].cat == "tile") {
+                var tty: string = ll_td(vlt);
+                var trow: i64 = sema.tds[vlt].elem;
+                var tsc: i64 = sema.tds[trow].elem;
+                var tscty: string = ll_td(tsc);
+                var tsn: string = sema.td_sname(tsc);
+                if (tsn == "") { tsn = "i64"; }
+                var tins: string = ll_arith_ins(op, tsn);
+                if (tins == "") { llfb("  ; UNSUPPORTED tile binop"); return "0"; }
+                var tlp: string = emit_lle(n.na);
+                var trp: string = emit_lle(n.nb);
+                var tout: string = ll_scratch(tty);
+                llfb(base.sb_cat6("  store ", tty, " ", ll_zero(tty), ", ptr ", tout));
+                var tzlrows: i64 = sema.tds[vlt].alen;
+                var tzlcols: i64 = sema.tds[trow].alen;
+                var tzli2: i64 = 0;
+                while (tzli2 < tzlrows) {
+                    var tzlj2: i64 = 0;
+                    while (tzlj2 < tzlcols) {
+                        var tagp: string = ll_tmp();
+                        var g1: StringBuilder = sb_new();
+                        sb_append_str(g1, "  "); sb_append_str(g1, tagp); sb_append_str(g1, " = getelementptr ");
+                        sb_append_str(g1, tty); sb_append_str(g1, ", ptr "); sb_append_str(g1, tlp);
+                        sb_append_str(g1, ", i64 0, i64 "); sb_append_i64(g1, tzli2); sb_append_str(g1, ", i64 "); sb_append_i64(g1, tzlj2);
+                        llfb(sb_to_str(g1));
+                        var tbgp: string = ll_tmp();
+                        var g2: StringBuilder = sb_new();
+                        sb_append_str(g2, "  "); sb_append_str(g2, tbgp); sb_append_str(g2, " = getelementptr ");
+                        sb_append_str(g2, tty); sb_append_str(g2, ", ptr "); sb_append_str(g2, trp);
+                        sb_append_str(g2, ", i64 0, i64 "); sb_append_i64(g2, tzli2); sb_append_str(g2, ", i64 "); sb_append_i64(g2, tzlj2);
+                        llfb(sb_to_str(g2));
+                        var togp: string = ll_tmp();
+                        var g3: StringBuilder = sb_new();
+                        sb_append_str(g3, "  "); sb_append_str(g3, togp); sb_append_str(g3, " = getelementptr ");
+                        sb_append_str(g3, tty); sb_append_str(g3, ", ptr "); sb_append_str(g3, tout);
+                        sb_append_str(g3, ", i64 0, i64 "); sb_append_i64(g3, tzli2); sb_append_str(g3, ", i64 "); sb_append_i64(g3, tzlj2);
+                        llfb(sb_to_str(g3));
+                        var tlvv: string = ll_load(tscty, tagp);
+                        var trvv: string = ll_load(tscty, tbgp);
+                        var tres: string = ll_tmp();
+                        llfb(base.sb_cat6("  ", tres, " = ", tins, " ", base.sb_cat6(tscty, " ", tlvv, ", ", trvv, "")));
+                        llfb(base.sb_cat6("  store ", tscty, " ", tres, ", ptr ", togp));
+                        tzlj2 = tzlj2 + 1;
+                    }
+                    tzli2 = tzli2 + 1;
+                }
+                return tout;
+            }
             if (sema.tds[vlt].cat == "vector" && sema.tds[vrt].cat == "vector") {
                 var vty: string = ll_td(vlt);
                 var vlane: string = sema.td_sname(sema.tds[vlt].elem);
@@ -1912,6 +2013,13 @@ pub fn ll_binary(e: i64) string {
 // C 端 `__attribute__((vector_size))` + GCC 语句表达式，LLVM 端 `<N x T>` + GEP。
 pub fn ll_vec_mbuiltin(e: i64) string {
     var n: Node = base.nodes[e];
+    // 与 C 后端 mbuiltin 对齐：把各实参递归 emit 成 LLVM 值串，按需取用（tsplat 取 mav[0]）。
+    var mav: []string;
+    var mc2: i64 = n.la;
+    while (mc2 >= 0) {
+        append(mav, emit_lle(base.kids[mc2].val));
+        mc2 = base.kids[mc2].next;
+    }
 
     // @vlen(v)：lane 数编译期已知 → 直接发字面量
     if (n.sa == "vlen") {
@@ -2057,6 +2165,105 @@ pub fn ll_vec_mbuiltin(e: i64) string {
         }
         if (acc == "") { acc = ll_zero(rety); }
         return acc;
+    }
+    // ── 瓦片内建 ──
+    if (n.sa == "tsplat") {
+        // @tsplat(scalar, rows, cols) -> 每元素 = 标量的瓦片
+        var rtd: i64 = -1;
+        if (slice_len(mav) as i64 > 0) { rtd = expr_type_desc(e); }
+        var trow: i64 = sema.tds[rtd].elem;
+        var tsc: i64 = sema.tds[trow].elem;
+        var tscty: string = ll_td(tsc);
+        var trows: i64 = sema.tds[rtd].alen;
+        var tcols: i64 = sema.tds[trow].alen;
+        var total: i64 = trows * tcols;
+        var s: string = "";
+        if (slice_len(mav) as i64 > 0) { s = mav[0]; }
+        var outp: string = ll_scratch(ll_td(rtd));
+        var ii: i64 = 0;
+        while (ii < total) {
+            var ri2: i64 = ii / tcols;
+            var ci2: i64 = ii % tcols;
+            var gp: string = ll_tmp();
+            var g1: StringBuilder = sb_new();
+            sb_append_str(g1, "  "); sb_append_str(g1, gp); sb_append_str(g1, " = getelementptr ");
+            sb_append_str(g1, ll_td(rtd)); sb_append_str(g1, ", ptr "); sb_append_str(g1, outp);
+            sb_append_str(g1, ", i64 0, i64 "); sb_append_i64(g1, ri2); sb_append_str(g1, ", i64 "); sb_append_i64(g1, ci2);
+            llfb(sb_to_str(g1));
+            var ev: string = s;
+            if (tsc >= 0) { ev = ll_cast_v(ev, ll_etd(base.kids[n.la].val), tsc); }
+            llfb(base.sb_cat6("  store ", tscty, " ", ev, ", ptr ", gp));
+            ii = ii + 1;
+        }
+        return outp;
+    }
+    if (n.sa == "treduce_sum" || n.sa == "treduce_mul" || n.sa == "treduce_min" || n.sa == "treduce_max") {
+        var atd: i64 = -1;
+        if (n.la >= 0) { atd = ll_etd(base.kids[n.la].val); }
+        var trow: i64 = sema.tds[atd].elem;
+        var tsc: i64 = sema.tds[trow].elem;
+        var tscty: string = ll_td(tsc);
+        var tsn: string = sema.td_sname(tsc);
+        if (tsn == "") { tsn = "i64"; }
+        var isf: bool = ll_isf(tsn);
+        var sg: bool = base.ll_signed(tsn);
+        var trows: i64 = sema.tds[atd].alen;
+        var tcols: i64 = sema.tds[trow].alen;
+        var vp: string = "null";
+        if (n.la >= 0) { vp = emit_lle(base.kids[n.la].val); }
+        var acc: string = "";
+        var ti3: i64 = 0;
+        while (ti3 < trows) {
+            var tj3: i64 = 0;
+            while (tj3 < tcols) {
+                var gp: string = ll_tmp();
+                var g1: StringBuilder = sb_new();
+                sb_append_str(g1, "  "); sb_append_str(g1, gp); sb_append_str(g1, " = getelementptr ");
+                sb_append_str(g1, ll_td(atd)); sb_append_str(g1, ", ptr "); sb_append_str(g1, vp);
+                sb_append_str(g1, ", i64 0, i64 "); sb_append_i64(g1, ti3); sb_append_str(g1, ", i64 "); sb_append_i64(g1, tj3);
+                llfb(sb_to_str(g1));
+                var lv: string = ll_load(tscty, gp);
+                if (acc == "") { acc = lv; }
+                else {
+                    if (n.sa == "treduce_sum") {
+                        var a1: string = ll_tmp();
+                        llfb(base.sb_cat6("  ", a1, " = ", ll_arith_ins("+", tsn), " ", base.sb_cat6(tscty, " ", acc, ", ", lv, "")));
+                        acc = a1;
+                    } else if (n.sa == "treduce_mul") {
+                        var a2: string = ll_tmp();
+                        llfb(base.sb_cat6("  ", a2, " = ", ll_arith_ins("*", tsn), " ", base.sb_cat6(tscty, " ", acc, ", ", lv, "")));
+                        acc = a2;
+                    } else {
+                        var cc: string = "sgt";
+                        if (isf) { cc = "ogt"; if (n.sa == "treduce_min") { cc = "olt"; } }
+                        else { if (sg) { cc = "sgt"; if (n.sa == "treduce_min") { cc = "slt"; } } else { cc = "ugt"; if (n.sa == "treduce_min") { cc = "ult"; } } }
+                        var cmpt: string = ll_tmp();
+                        var cins: string = "icmp"; if (isf) { cins = "fcmp"; }
+                        var c1sb: StringBuilder = sb_new();
+                        sb_append_str(c1sb, "  "); sb_append_str(c1sb, cmpt); sb_append_str(c1sb, " = "); sb_append_str(c1sb, cins);
+                        sb_append_str(c1sb, " "); sb_append_str(c1sb, cc); sb_append_str(c1sb, " "); sb_append_str(c1sb, tscty); sb_append_str(c1sb, " "); sb_append_str(c1sb, acc); sb_append_str(c1sb, ", "); sb_append_str(c1sb, lv);
+                        llfb(sb_to_str(c1sb));
+                        var selt: string = ll_tmp();
+                        var c2: StringBuilder = sb_new();
+                        sb_append_str(c2, "  "); sb_append_str(c2, selt); sb_append_str(c2, " = select i1 "); sb_append_str(c2, cmpt);
+                        sb_append_str(c2, ", "); sb_append_str(c2, tscty); sb_append_str(c2, " "); sb_append_str(c2, acc); sb_append_str(c2, ", "); sb_append_str(c2, tscty); sb_append_str(c2, " "); sb_append_str(c2, lv);
+                        llfb(sb_to_str(c2));
+                        acc = selt;
+                    }
+                }
+                tj3 = tj3 + 1;
+            }
+            ti3 = ti3 + 1;
+        }
+        if (acc == "") { acc = ll_zero(tscty); }
+        return acc;
+    }
+        if (n.sa == "tile_rows" || n.sa == "tile_cols" || n.sa == "tile_flavor") {
+        var tztvd: i64 = -1;
+        if (n.sa == "tile_rows") { tztvd = n.ia; }
+        else if (n.sa == "tile_cols") { tztvd = n.ib; }
+        else { tztvd = n.lc; }
+        return base.i2s(tztvd);
     }
 
     llfb("  ; UNSUPPORTED vector mbuiltin");

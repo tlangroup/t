@@ -2812,6 +2812,70 @@ VectorType : "@Vector" "(" ComptimeLen "," Type ")"
 
 ---
 
+### 3.20 @Tile（二维硬件 SIMD 瓦片）✅ tc（2026-09-01）
+
+> **状态**：实装。二维定长 SIMD 瓦片类型，编译期确定行数 / 列数 / 元素类型 / flavor，行主序内存布局（`[rows x [cols x T]]`），与 `@Vector` 同构但多一维。两个后端发射两种不同形态的 IR，但 `run_examples` 双后端对拍逐字节相同即过关（`examples/tile_demo.tc` 已实跑守卫）。
+
+```ebnf
+TileType : "@Tile" "(" ComptimeRows "," ComptimeCols "," Type "," Flavor ")"
+Flavor   : "hardware" | "simulate"
+// ComptimeRows / ComptimeCols 必须是编译期常量（整数字面量 / const 声明常量 / 编译期常量算术）
+// Type 必须是定宽数值标量：i8..i64 / u8..u64 / f32 / f64 / bool
+// flavor 决定发射策略：hardware 优先映射到本机向量寄存器，simulate 恒走可移植标量循环（参照实现）
+```
+
+**构造与访问**
+
+- 广播构造：`var a: @Tile(2, 3, i32, hardware) = @tsplat(7i32, 2, 3);` —— 把标量灌满整个 `rows × cols` 瓦片。⚠ 第一实参的**类型**直接决定元素类型（不因声明类型反推），裸字面量按量级猜类型（`7`→`u8`，见 §2.4），要 i64 必须写 `7i64`。
+- **嵌套数组字面量构造**：`var d: @Tile(2, 3, i32, hardware) = [[1, 2, 3], [4, 5, 6]];` —— 外层数组字面量在「期望类型为 `@Tile(rows,cols,T)`」的位置被升格为瓦片构造：外层 = 行序列（须恰好 `rows` 个），每个内层 `[...]` = 一行（须恰好 `cols` 个元素），元素须能隐式转成 `T`；否则 `T-VEC-E945`。内层行字面量清期望后走普通数组字面量路径推成 `[cols x T]`。
+  生效位置（即会注入期望类型的语法点，与 `@Vector` 一致）：`var` 初始化 / 赋值右侧 / `return` / 调用实参 / 模块级 `var` / 模块级 `const`。
+  > **透传规则**：期望类型存全局 `sema.g_tile_expect`，读取后立刻恢复，递归进入子树不主动清除 —— 处于上述位置任意深度的字面量都会升格。⚠ 节点标记位必须用 **`ib`** 而非 **`ia`**（`array_lit` 的 `ia` 在 sema 之后被管线覆写成 `-1`，标记挂错字段会让两个后端都读不到 → 静默落到 `UNSUPPORTED / 裸数组` 路径）。
+- 行 / 列 / flavor 内省：`@tile_rows(t)` / `@tile_cols(t)` / `@tile_flavor(t)` 均返回 `i64`（`hardware`=0，`simulate`=1）。编译期回填到 mbuiltin 节点 `ia`/`ib`/`lc`（`la` 是首个实参子链指针，**绝不可写**，否则二次类型推断取到错节点误报 `T-VEC-E926`）。
+- 逐元素算术：`a + b`、`a - b`、`a * b`、`a / b`、`a % b`、`a & b`、`a | b`、`a ^ b`、`a << b`、`a >> b` —— 两侧必须同行数、同列数、同元素类型，编译期展开成嵌套双层循环逐元素运算（C 后端为 GCC 语句表达式 `({ T _tr[N]; ... })`；LLVM 后端为 GEP + 标量指令）。
+- 归约：`@treduce_sum(t)` / `@treduce_mul(t)` / `@treduce_min(t)` / `@treduce_max(t)` —— 把整个瓦片累加成单个标量，返回**元素类型**（如 `i32` 瓦片 → `i32`；打印时 `as i64` 显式拓宽）。
+
+**内省 / 归约 / 构造内建**
+
+| 内建 | 语义 | 返回类型 |
+|---|---|---|
+| `@tsplat(scalar, rows, cols)` | 标量广播成瓦片 | `@Tile(rows, cols, typeof(scalar), hardware)` |
+| `@tile_rows(t)` | 瓦片行数 | `i64` |
+| `@tile_cols(t)` | 瓦片列数 | `i64` |
+| `@tile_flavor(t)` | flavor 码（`hardware`=0 / `simulate`=1） | `i64` |
+| `@treduce_sum(t)` | 全部元素求和 | 元素类型 |
+| `@treduce_mul(t)` | 全部元素求积 | 元素类型 |
+| `@treduce_min(t)` / `@treduce_max(t)` | 取最小 / 最大元素 | 元素类型 |
+
+**双后端映射**
+
+- C 后端：扁平 `T*` 缓冲（声明处 `T _v[rows*cols];`），算术 / 归约 / 内省经 `emit_expr` 的瓦片分支展开为 GCC 语句表达式嵌套循环（`int64_t` 循环计数）。
+- LLVM 后端：`[rows x [cols x T]]` 嵌套数组（`ll_td` 对 `"tile"` cat 渲染此形态），逐元素经 `getelementptr` + load/store，归约 / 内建经 `ll_vec_mbuiltin` 展开。
+- 门禁只比对**程序输出**，故两种 IR 形态不同但结果一致即过关（双后端对拍）。
+
+**CPU 不支持怎么办**
+
+- `hardware` flavor：当瓦片总字节数（`rows × cols × sizeof(T)`）不是本机向量寄存器（默认 `g_simd_bytes`=16 字节）的整数倍时，报 **`T-VEC-W947`**（warning，不阻断编译），后端退化为标量循环 —— **结果正确**，只是失去单指令并行。例如 `@Tile(2,3,i32)` = 24 字节 → W947。
+- `simulate` flavor：恒走可移植标量循环（不依赖任何向量指令），用于「同一份代码跨机器结果恒定」的场景（如 `@tile_flavor` 探测、参考实现对照）；不报 W947。
+
+**错误诊断**
+
+- `T-VEC-E920`：`@Tile` / `@tsplat` 的 rows / cols 不是编译期常量（`var n = 4; @Tile(2, n, i32, hardware)` 应改为 `const N = 4;`）。
+- `T-VEC-E921`：`@tsplat` 第一实参不是标量（如 `@tsplat([1,2], 2, 3)`）。
+- `T-VEC-E926`：瓦片内建实参非法（如 `@reduce_*`/`@tile_rows` 实参不是瓦片 / 缺实参 / 节点 `la` 被误写导致二次推断取错节点）。
+- `T-VEC-E945`：嵌套数组字面量构造瓦片时行数 ≠ `rows`、某行列数 ≠ `cols`、或某元素无法隐式转成元素类型。
+
+**实现要点**
+
+- 类型解析集中在 `src/sema.tc` 的 `tile_resolve`（元素类型 / 行 / 列 / flavor 回填到类型节点 `ia`/`ib`/`la`），构造 TI 用 `ti_tile(elem, rows, cols, flavor)`（`kind="Tile"`，`elem`=内层 row 数组 TI(`[cols x T]`)，`alen`=行数，`val`=flavor 码）。
+- ⚠ **`ti_to_td_base` 必须含 `Tile` 分支**（见 `src/sema.tc`）：否则嵌套数组字面量升格时 `n.ib = ti_to_td_base(tileTI)` 退化成 `unknown`(-1)，codegen 的 `n.ib >= 0` 判定失败 → `; UNSUPPORTED expr` → `load ..., ptr 0`。修复：复用 Array 的 TI→TD 构造得到行类型 `[cols x T]`，再包一层 `tile` TD（`alen`=行数）。
+- ⚠ **`expr_type_desc` 必须含 `tsplat` / `treduce_*` / `tile_rows|cols|flavor` 分支**（共享于两个后端）：`tsplat` 从节点 `sb`(元素名)/`ia`(行)/`ib`(列) 构造 tile TD；`treduce_*` 返回元素标量类型（供 `as i64` 正确 zext）；三者缺失会让归约结果保持 `i32` 不被 `int_to_str(i64)` 接收 → clang 报 `i32`/`i64` 类型不匹配。
+- 内省 / 归约结果的编译期常量回填到 mbuiltin 节点 `ia`/`ib`/`lc`（自由 scratch 字段）；**绝不可写 `la`**（`la`=首个实参子链指针）。
+- 字面量构造的期望类型经全局 `sema.g_tile_expect` 注入（`infer_expr` 的 `array_lit` 分支消费），注入点与 `@Vector` 同构（七处）；读取后立刻恢复旧值（嵌套安全）。
+
+**示例**：运行期双后端守卫见 `examples/tile_demo.tc` + `examples/tile_demo.expected.txt`（覆盖 `@tsplat` / 逐元素算术 / `@treduce_*` / `@tile_rows|cols|flavor` / 嵌套数组字面量升格 / `simulate` flavor，期望输出 `2 3 0 42 7 7 48 262144 21 6 1 10`）。
+
+---
+
 ## 4. Program entry（程序入口） ✅ tote
 
 ```ebnf

@@ -153,8 +153,16 @@ static const DiagDef DIAG_DEFS[] = {
   { "T-VEC-E925", "error", "VEC", "T_VECTOR_OP_UNSUPPORTED", "VECTOR_OP_UNSUPPORTED", "operator does not support vector operands" },
   { "T-VEC-E926", "error", "VEC", "T_VECTOR_BUILTIN_ARG", "VECTOR_BUILTIN_ARG", "invalid argument to vector builtin" },
   { "T-VEC-W927", "warning", "VEC", "T_VECTOR_WIDER_THAN_NATIVE", "VECTOR_WIDER_THAN_NATIVE", "vector is wider than the native SIMD register and will be split" },
+  { "T-VEC-E940", "error", "VEC", "T_TILE_ROWS_NOT_COMTIME", "TILE_ROWS_NOT_COMTIME", "tile row count must be a comptime constant" },
+  { "T-VEC-E941", "error", "VEC", "T_TILE_COLS_NOT_COMTIME", "TILE_COLS_NOT_COMTIME", "tile column count must be a comptime constant" },
+  { "T-VEC-E942", "error", "VEC", "T_TILE_ELEM_NOT_NUMERIC", "TILE_ELEM_NOT_NUMERIC", "tile element type must be a fixed-width numeric scalar" },
+  { "T-VEC-E943", "error", "VEC", "T_TILE_DIM_RANGE", "TILE_DIM_RANGE", "tile rows and cols must be at least 1" },
+  { "T-VEC-E944", "error", "VEC", "T_TILE_FLAVOR_INVALID", "TILE_FLAVOR_INVALID", "tile flavor must be hardware or simulate" },
+  { "T-VEC-E945", "error", "VEC", "T_TILE_OP_MISMATCH", "TILE_OP_MISMATCH", "tile elementwise operands must have identical rows, cols and element type" },
+  { "T-VEC-E946", "error", "VEC", "T_TILE_OP_UNSUPPORTED", "TILE_OP_UNSUPPORTED", "operator does not support tile operands" },
+  { "T-VEC-W947", "warning", "VEC", "T_TILE_WIDER_THAN_NATIVE", "TILE_WIDER_THAN_NATIVE", "hardware tile is wider than the native SIMD register and will fall back to scalar loops" },
 };
-#define DIAG_COUNT 141
+#define DIAG_COUNT 149
 
 /* legacy (old semantic name) -> machine code alias table */
 static const struct { const char* legacy; const char* code; } DIAG_LEGACY[] = {
@@ -293,8 +301,16 @@ static const struct { const char* legacy; const char* code; } DIAG_LEGACY[] = {
   { "T_VECTOR_OP_UNSUPPORTED", "T-VEC-E925" },
   { "T_VECTOR_BUILTIN_ARG", "T-VEC-E926" },
   { "T_VECTOR_WIDER_THAN_NATIVE", "T-VEC-W927" },
+  { "TILE_ROWS_NOT_COMTIME", "T-VEC-E940" },
+  { "TILE_COLS_NOT_COMTIME", "T-VEC-E941" },
+  { "TILE_ELEM_NOT_NUMERIC", "T-VEC-E942" },
+  { "TILE_DIM_RANGE", "T-VEC-E943" },
+  { "TILE_FLAVOR_INVALID", "T-VEC-E944" },
+  { "TILE_OP_MISMATCH", "T-VEC-E945" },
+  { "TILE_OP_UNSUPPORTED", "T-VEC-E946" },
+  { "TILE_WIDER_THAN_NATIVE", "T-VEC-W947" },
 };
-#define DIAG_LEGACY_COUNT 135
+#define DIAG_LEGACY_COUNT 143
 
 const DiagDef* diag_find(const char* code);        /* exact machine-code lookup */
 const DiagDef* diag_find_any(const char* id);      /* machine code OR legacy name */

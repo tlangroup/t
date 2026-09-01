@@ -449,6 +449,10 @@ pub fn emit_ctype(tn: i64) string {
         var bytes: i64 = vlen * c_scalar_sizeof(lane);
         return base.sb_cat5(lane, " __attribute__((vector_size(", base.i2s(bytes), ")))", "");
     }
+    // 瓦片节点 → 扁平 T*（与 desc_to_c 同构，输入是类型节点）
+    if (n.kind == "tile") {
+        return base.sb_cat2(emit_ctype(n.na), "*");
+    }
     return "void";
 }
 
@@ -572,6 +576,13 @@ pub fn desc_to_c(td: i64) string {
         var bytes: i64 = vlen * c_scalar_sizeof(lane);
         return base.sb_cat5(lane, " __attribute__((vector_size(", base.i2s(bytes), ")))", "");
     }
+    // 瓦片值模型为「扁平 T* 缓冲」（行主序 rows*cols 个元素），与数组同构（指针值）。
+    // 下标 / 字面量 / 算术都按扁平缓冲处理，两个后端数据布局完全一致。
+    if (t.cat == "tile") {
+        var rowtd: i64 = t.elem;            // 内层行数组 TD（[cols x T]）
+        var scal: i64 = sema.tds[rowtd].elem;
+        return c_ptr_to(scal);              // T*
+    }
     return "void*";
 }
 
@@ -670,6 +681,55 @@ pub fn expr_type_desc(e: i64) i64 {
                 return vt;
             }
             return sema.td_mk("unknown");
+        }
+        if (n.sa == "tsplat") {
+            // @tsplat(scalar, rows, cols) -> @Tile(rows, cols, typeof(scalar), hardware)
+            // sema 的 tsplat 分支已回填 n.sb（元素标量类型名）/ n.ia（行）/ n.ib（列）。
+            if (str_len(n.sb) > 0 && n.ia > 0 && n.ib > 0) {
+                var tzsc: i64 = sema.td_named_mk("scalar", n.sb);
+                var tzrow: i64 = sema.td_elem_mk("array", tzsc);
+                var tzrowd: TD = sema.tds[tzrow];
+                tzrowd.alen = n.ib;
+                slice_set(sema.tds, tzrow, tzrowd);
+                var tztil: i64 = sema.td_elem_mk("tile", tzrow);
+                var tztiled: TD = sema.tds[tztil];
+                tztiled.alen = n.ia;
+                slice_set(sema.tds, tztil, tztiled);
+                return tztil;
+            }
+            // 退化路径：回退到首个实参的类型，构造一个 1x1 瓦片描述（不应触发）。
+            var c0t: i64 = n.la;
+            if (c0t >= 0) {
+                var sTDt: i64 = expr_type_desc(base.kids[c0t].val);
+                var tzrow2: i64 = sema.td_elem_mk("array", sTDt);
+                var tzrowd2: TD = sema.tds[tzrow2];
+                tzrowd2.alen = 1;
+                slice_set(sema.tds, tzrow2, tzrowd2);
+                var tztil2: i64 = sema.td_elem_mk("tile", tzrow2);
+                var tztiled2: TD = sema.tds[tztil2];
+                tztiled2.alen = 1;
+                slice_set(sema.tds, tztil2, tztiled2);
+                return tztil2;
+            }
+            return sema.td_mk("unknown");
+        }
+        if (n.sa == "treduce_sum" || n.sa == "treduce_mul" || n.sa == "treduce_min" || n.sa == "treduce_max") {
+            // @Tile 归约返回元素标量类型（与 @Vector reduce_add 同构）。
+            var ctr: i64 = n.la;
+            if (ctr >= 0) {
+                var vTDt: i64 = expr_type_desc(base.kids[ctr].val);
+                if (vTDt >= 0 && sema.tds[vTDt].cat == "tile") {
+                    var rowTDt: i64 = sema.tds[vTDt].elem;
+                    if (rowTDt >= 0) { return sema.tds[rowTDt].elem; }
+                }
+                // 退化路径：若实参类型描述不可用（极少数情形），回退到 i64。
+                return sema.td_named_mk("scalar", "i64");
+            }
+            return sema.td_mk("unknown");
+        }
+        if (n.sa == "tile_rows" || n.sa == "tile_cols" || n.sa == "tile_flavor") {
+            // 编译期内省返回 i64（行数 / 列数 / flavor 码）。
+            return sema.td_named_mk("scalar", "i64");
         }
         if (n.sa == "reduce_add" || n.sa == "reduce_max" || n.sa == "reduce_min") {
             var c: i64 = n.la;
@@ -1768,6 +1828,48 @@ pub fn emit_expr(e: i64) string {
                 return base.sb_cat5("t_str_concat(", emit_expr(n.na), ", ", emit_expr(n.nb), ")");
             }
         }
+        // 瓦片逐元素算术：扁平 T* 缓冲上用 GCC 语句表达式嵌套循环，逐元素 a[i][j] OP b[i][j]。
+        if (op == "+" || op == "-" || op == "*" || op == "/" || op == "%"
+                || op == "&" || op == "|" || op == "^" || op == "<<" || op == ">>") {
+            var tzlt3: i64 = expr_type_desc(n.na);
+            var tzrt3: i64 = expr_type_desc(n.nb);
+            var tzltc: bool = (tzlt3 >= 0 && sema.tds[tzlt3].cat == "tile");
+            var tzrtc: bool = (tzrt3 >= 0 && sema.tds[tzrt3].cat == "tile");
+            if (tzltc || tzrtc) {
+                var tzttd: i64 = tzlt3; if (tzttd < 0) { tzttd = tzrt3; }
+                var tzrowtd: i64 = sema.tds[tzttd].elem;
+                var tzscaltd: i64 = sema.tds[tzrowtd].elem;
+                var tzscalty: string = desc_to_c(tzscaltd);
+                var tzrows: i64 = sema.tds[tzttd].alen;
+                var tzcols: i64 = sema.tds[tzrowtd].alen;
+                var tzav: string = emit_expr(n.na);
+                var tzbv: string = emit_expr(n.nb);
+                var tzsb7: StringBuilder = sb_new();
+                sb_append_str(tzsb7, "({ ");
+                sb_append_str(tzsb7, tzscalty);
+                sb_append_char(tzsb7, 32);
+                sb_append_str(tzsb7, "_tr[");
+                sb_append_i64(tzsb7, tzrows * tzcols);
+                sb_append_str(tzsb7, "]; int64_t _i, _j; for (_i=0; _i<");
+                sb_append_i64(tzsb7, tzrows);
+                sb_append_str(tzsb7, "; _i++) for (_j=0; _j<");
+                sb_append_i64(tzsb7, tzcols);
+                sb_append_str(tzsb7, "; _j++) _tr[_i*");
+                sb_append_i64(tzsb7, tzcols);
+                sb_append_str(tzsb7, "+_j] = (");
+                sb_append_str(tzsb7, tzav);
+                sb_append_str(tzsb7, ")[_i*");
+                sb_append_i64(tzsb7, tzcols);
+                sb_append_str(tzsb7, "+_j] ");
+                sb_append_str(tzsb7, op);
+                sb_append_str(tzsb7, " (");
+                sb_append_str(tzsb7, tzbv);
+                sb_append_str(tzsb7, ")[_i*");
+                sb_append_i64(tzsb7, tzcols);
+                sb_append_str(tzsb7, "+_j]; _tr; })");
+                return sb_to_str(tzsb7);
+            }
+        }
         // 硬件 SIMD 向量逐元素算术：向量 op 向量 / 向量 op 标量（标量广播）直接透传给
         // GCC/Clang 的向量扩展，单条指令映射到 CPU 向量寄存器。仅算术运算符支持。
         if (op == "+" || op == "-" || op == "*" || op == "/") {
@@ -1957,6 +2059,76 @@ pub fn emit_expr(e: i64) string {
             }
             sb_append_str(sb, " _acc; })");
             return sb_to_str(sb);
+        }
+        // ── 瓦片内建 ──
+        if (n.sa == "tsplat") {
+            // @tsplat(scalar, tzrows, tzcols) -> 扁平 T* 缓冲，每元素 = 标量
+            var tzrtd: i64 = expr_type_desc(e);
+            var tzrrowtd: i64 = sema.tds[tzrtd].elem;
+            var tzrscaltd: i64 = sema.tds[tzrrowtd].elem;
+            var tzrscalty: string = desc_to_c(tzrscaltd);
+            var tzrrows: i64 = sema.tds[tzrtd].alen;
+            var tzrcols: i64 = sema.tds[tzrrowtd].alen;
+            var tztotal: i64 = tzrrows * tzrcols;
+            var tzs: string = "";
+            if (slice_len(mav) as i64 > 0) { tzs = mav[0]; }
+            var tzsb8: StringBuilder = sb_new();
+            sb_append_str(tzsb8, "((");
+            sb_append_str(tzsb8, tzrscalty);
+            sb_append_char(tzsb8, 42);
+            sb_append_str(tzsb8, ")&((");
+            sb_append_str(tzsb8, tzrscalty);
+            sb_append_char(tzsb8, 91);
+            sb_append_i64(tzsb8, tztotal);
+            sb_append_char(tzsb8, 93);
+            sb_append_str(tzsb8, "){");
+            var tzfi2: i64 = 0;
+            while (tzfi2 < tztotal) {
+                if (tzfi2 > 0) { sb_append_str(tzsb8, ", "); }
+                sb_append_str(tzsb8, tzs);
+                tzfi2 = tzfi2 + 1;
+            }
+            sb_append_str(tzsb8, "}))");
+            return sb_to_str(tzsb8);
+        }
+        if (n.sa == "treduce_sum" || n.sa == "treduce_mul" || n.sa == "treduce_min" || n.sa == "treduce_max") {
+            var tzatd: i64 = -1;
+            if (n.la >= 0) { tzatd = expr_type_desc(base.kids[n.la].val); }
+            var tzrowtd3: i64 = sema.tds[tzatd].elem;
+            var tzscaltd3: i64 = sema.tds[tzrowtd3].elem;
+            var tzscalty3: string = desc_to_c(tzscaltd3);
+            var tzrows3: i64 = sema.tds[tzatd].alen;
+            var tzcols3: i64 = sema.tds[tzrowtd3].alen;
+            var tztotal3: i64 = tzrows3 * tzcols3;
+            var tzav3: string = "";
+            if (slice_len(mav) as i64 > 0) { tzav3 = mav[0]; }
+            var tzsb9: StringBuilder = sb_new();
+            sb_append_str(tzsb9, "({ ");
+            sb_append_str(tzsb9, tzscalty3);
+            sb_append_char(tzsb9, 32);
+            sb_append_str(tzsb9, "_acc = (");
+            sb_append_str(tzsb9, tzav3);
+            sb_append_str(tzsb9, ")[0]; int64_t _k; for (_k=1; _k<");
+            sb_append_i64(tzsb9, tztotal3);
+            sb_append_str(tzsb9, "; _k++) { ");
+            sb_append_str(tzsb9, tzscalty3);
+            sb_append_char(tzsb9, 32);
+            sb_append_str(tzsb9, "_v = (");
+            sb_append_str(tzsb9, tzav3);
+            sb_append_str(tzsb9, ")[_k]; ");
+            if (n.sa == "treduce_sum") { sb_append_str(tzsb9, "_acc = _acc + _v;"); }
+            else if (n.sa == "treduce_mul") { sb_append_str(tzsb9, "_acc = _acc * _v;"); }
+            else if (n.sa == "treduce_min") { sb_append_str(tzsb9, "if (_v < _acc) _acc = _v;"); }
+            else { sb_append_str(tzsb9, "if (_v > _acc) _acc = _v;"); }
+            sb_append_str(tzsb9, " } _acc; })");
+            return sb_to_str(tzsb9);
+        }
+        if (n.sa == "tile_rows" || n.sa == "tile_cols" || n.sa == "tile_flavor") {
+            var tztvd: i64 = -1;
+            if (n.sa == "tile_rows") { tztvd = n.ia; }
+            else if (n.sa == "tile_cols") { tztvd = n.ib; }
+            else { tztvd = n.lc; }
+            return base.i2s(tztvd);
         }
     }
     if (n.kind == "call") {
@@ -2301,6 +2473,19 @@ pub fn emit_expr(e: i64) string {
         if (ot.cat == "map") {
             return c_map_get(n.na, n.nb);
         }
+        if (ot.cat == "tile") {
+            // `t[i]` → 扁平缓冲的第 i 行起始地址 `t + i*cols`（T*），`t[i][j]` 再由行（T*）的下标分支落到 t[i*cols+j]。
+            var cols: i64 = sema.tds[sema.tds[od].elem].alen;
+            var sb6: StringBuilder = sb_new();
+            sb_append_char(sb6, 40);
+            sb_append_str(sb6, obj);
+            sb_append_str(sb6, " + (");
+            sb_append_str(sb6, idx);
+            sb_append_str(sb6, ") * ");
+            sb_append_i64(sb6, cols);
+            sb_append_char(sb6, 41);
+            return sb_to_str(sb6);
+        }
         return base.sb_cat6("(", obj, "[", idx, "]", ")");
     }
     if (n.kind == "array_lit") {
@@ -2325,6 +2510,42 @@ pub fn emit_expr(e: i64) string {
             }
             sb_append_char(sbv, 125);
             return sb_to_str(sbv);
+        }
+        // 瓦片字面量构造：`[[a,b],[c,d]]` 被 sema 标记为瓦片 TD（n.ib>=0 且 cat==tile）
+        // → 发射扁平 T* 缓冲 `(T*)(&(T[rows*cols]){a,b,c,d})`（行主序），两个后端数据布局一致。
+        if (n.ib >= 0 && sema.tds[n.ib].cat == "tile") {
+            var ttd: i64 = n.ib;
+            var rowtd2: i64 = sema.tds[ttd].elem;
+            var scaltd: i64 = sema.tds[rowtd2].elem;
+            var scalty: string = desc_to_c(scaltd);
+            var rows: i64 = sema.tds[ttd].alen;
+            var cols: i64 = sema.tds[rowtd2].alen;
+            var total: i64 = rows * cols;
+            var sbf: StringBuilder = sb_new();
+            sb_append_str(sbf, "((");
+            sb_append_str(sbf, scalty);
+            sb_append_char(sbf, 42);
+            sb_append_str(sbf, ")&((");
+            sb_append_str(sbf, scalty);
+            sb_append_char(sbf, 91);
+            sb_append_i64(sbf, total);
+            sb_append_char(sbf, 93);
+            sb_append_str(sbf, "){");
+            var firstf: bool = true;
+            var fri: i64 = n.la;
+            while (fri >= 0) {
+                var frow: Node = base.nodes[base.kids[fri].val];
+                var fci: i64 = frow.la;
+                while (fci >= 0) {
+                    if (firstf == false) { sb_append_str(sbf, ", "); }
+                    sb_append_str(sbf, emit_expr(base.kids[fci].val));
+                    firstf = false;
+                    fci = base.kids[fci].next;
+                }
+                fri = base.kids[fri].next;
+            }
+            sb_append_str(sbf, "}))");
+            return sb_to_str(sbf);
         }
         // 空切片字面量作表达式（`g = []`）：目标是 slice 类型时返回零长空切片
         // `t_slice_new(sizeof(elem))`，与 C 局部初始化（ll_emit_var_init 同款）一致。

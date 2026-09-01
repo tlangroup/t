@@ -162,6 +162,11 @@ pub fn ti_vlen(ti: i64) i64 {
 // 数组长度回填等）覆写成 -1，实测拿不到标记；`ib` 未被 array_lit 占用，可安全传递。
 pub var g_vec_expect: i64 = -1;
 
+// 瓦片字面量构造期望类型（与 g_vec_expect 同机制）：var/let/assign/return/call-arg/全局
+// 的期望类型为 @Tile(rows,cols,T,flavor) 时，嵌套数组字面量 `[[a,b],[c,d]]` 被升格为瓦片
+// 构造（标记到节点 ib，供 codegen 发射成 `[rows x [cols x T]]`）。同样是全局、递归中需显式清除。
+pub var g_tile_expect: i64 = -1;
+
 pub fn vec_is_pow2(x: i64) bool {
     if (x <= 0) { return false; }
     return (x & (x - 1)) == 0;
@@ -222,6 +227,17 @@ pub fn vec_checked_has(d: i64) bool {
     var i: i64 = (slice_len(g_vec_checked) as i64) - 1;
     while (i >= 0) {
         if (g_vec_checked[i] == d) { return true; }
+        i = i - 1;
+    }
+    return false;
+}
+
+// 已校验过的瓦片类型节点（同 g_vec_checked 意图）
+pub var g_tile_checked: []i64;
+pub fn tile_checked_has(d: i64) bool {
+    var i: i64 = (slice_len(g_tile_checked) as i64) - 1;
+    while (i >= 0) {
+        if (g_tile_checked[i] == d) { return true; }
         i = i - 1;
     }
     return false;
@@ -320,6 +336,157 @@ pub fn vec_resolve(tn: i64) i64 {
     vn.ia = vlen;
     slice_set(base.nodes, tn, vn);
     return ti_vector(velem, vlen);
+}
+
+// ── 二维 SIMD 瓦片类型（`@Tile(rows, cols, T, flavor)`）──────────────
+// 构造瓦片 TI：kind="Tile"，elem=内层 row 数组 TI([cols x T])，alen=行数，val=flavor 码。
+pub fn ti_tile(elem: i64, rows: i64, cols: i64, flavor: i64) i64 {
+    var rowti: i64 = ti_elem_of("Array", elem);
+    var rt: TI = tis[rowti];
+    rt.alen = cols;
+    slice_set(tis, rowti, rt);
+    var i: i64 = ti_elem_of("Tile", rowti);
+    var t: TI = tis[i];
+    t.alen = rows;
+    t.val = flavor;
+    slice_set(tis, i, t);
+    return i;
+}
+
+pub fn ti_is_tile(ti: i64) bool {
+    if (ti < 0) { return false; }
+    return tis[ti].kind == "Tile";
+}
+
+pub fn ti_trows(ti: i64) i64 {
+    if (ti < 0) { return -1; }
+    if (tis[ti].kind != "Tile") { return -1; }
+    return tis[ti].alen;
+}
+
+pub fn ti_tcols(ti: i64) i64 {
+    if (ti < 0) { return -1; }
+    if (tis[ti].kind != "Tile") { return -1; }
+    var e: i64 = tis[ti].elem;
+    if (e < 0) { return -1; }
+    return tis[e].alen;
+}
+
+pub fn ti_tflavor(ti: i64) i64 {
+    if (ti < 0) { return -1; }
+    if (tis[ti].kind != "Tile") { return -1; }
+    return tis[ti].val;
+}
+
+// 折叠一个子表达式节点为编译期整数（-1 = 不可折叠）。
+// 识别硬件/模拟内建名、const、字面量、常量算术；与 vec_fold_len 同构。
+pub fn tile_fold_child(en: i64) i64 {
+    if (en < 0) { return -1; }
+    var n: Node = base.nodes[en];
+    if (n.kind == "int") { return parse_int_len(n.sa, n.ia); }
+    if (n.kind == "paren" || n.kind == "comptime") {
+        var inner: Node = base.nodes[n.na];
+        if (inner.kind == "int") { return parse_int_len(inner.sa, inner.ia); }
+    }
+    if (n.kind == "ident") {
+        if (n.sa == "hardware") { return 0; }
+        if (n.sa == "simulate") { return 1; }
+        var vsi: i64 = sym_lookup(global_scope, n.sa);
+        if (vsi < 0) { vsi = sym_lookup(cur_scope, n.sa); }
+        if (vsi >= 0 && syms[vsi].kind == "const") {
+            var vsd: i64 = syms[vsi].decl;
+            if (vsd >= 0) {
+                var vsn: Node = base.nodes[vsd];
+                if (vsn.nb >= 0) {
+                    var vin: Node = base.nodes[vsn.nb];
+                    if (vin.kind == "int") { return parse_int_len(vin.sa, vin.ia); }
+                }
+            }
+        }
+    }
+    if (g_meta_steps < 100000) { g_meta_steps = 100000; }
+    var vsave: bool = g_meta_err;
+    var dmsave: bool = base.g_diag_mute;
+    g_meta_err = false;
+    base.g_diag_mute = true;
+    var vmv: i64 = meta_eval(en);
+    base.g_diag_mute = dmsave;
+    var vok: bool = (vmv >= 0) && (g_meta_err == false);
+    g_meta_err = vsave;
+    if (vok == false) { return -1; }
+    var vmv2: Node = base.nodes[vmv];
+    if (vmv2.kind != "int" && vmv2.kind != "bool") { return -1; }
+    return mv_get_int(vmv);
+}
+
+// `@Tile(rows, cols, T, flavor)` 的解析 + 校验。返回 Tile 的 TI。
+pub fn tile_resolve(tn: i64) i64 {
+    var n: Node = base.nodes[tn];
+    var telem: i64 = resolve_ti(n.na);
+    // 已折叠且已校验：直接重建 TI（resolve_ti 可能多次进入同一节点）
+    if (n.ia >= 1 && n.ib >= 1 && n.la >= 0) {
+        return ti_tile(telem, n.ia, n.ib, n.la);
+    }
+    var first: bool = tile_checked_has(tn) == false;
+    if (first) { append(g_tile_checked, tn); }
+    var rows: i64 = tile_fold_child(n.nb);
+    var cols: i64 = tile_fold_child(n.nc);
+    var flavor: i64 = tile_fold_child(n.nd);
+    if (rows < 0) {
+        if (first) { parse.fc_err("T-VEC-E940", "@Tile 的行数必须是编译期常量（整数字面量、`const` 声明或常量算术）；运行期值无法确定瓦片形状", tn); }
+        rows = 1;
+    }
+    if (cols < 0) {
+        if (first) { parse.fc_err("T-VEC-E941", "@Tile 的列数必须是编译期常量（整数字面量、`const` 声明或常量算术）；运行期值无法确定瓦片形状", tn); }
+        cols = 1;
+    }
+    if (tip_kind(telem) != "Scalar" || vec_lane_ok(tip_name(telem)) == false) {
+        if (first) {
+            parse.fc_err("T-VEC-E942",
+                base.sb_cat3("@Tile 的元素类型必须是定宽数值标量（i8..i64 / u8..u64 / f32 / f64 / bool）；当前收到: ",
+                    ti_str(telem), "。聚合类型请先用 `[]T` / `[N]T` 承载，再逐段装入瓦片"), tn);
+        }
+        return ti_mk("Unknown");
+    }
+    if (rows < 1) {
+        if (first) { parse.fc_err("T-VEC-E943", base.sb_cat2("@Tile 的行数必须 >= 1；当前为: ", base.i2s(rows)), tn); }
+        rows = 1;
+    }
+    if (cols < 1) {
+        if (first) { parse.fc_err("T-VEC-E943", base.sb_cat2("@Tile 的列数必须 >= 1；当前为: ", base.i2s(cols)), tn); }
+        cols = 1;
+    }
+    if (flavor < 0 || flavor > 1) {
+        if (first) { parse.fc_err("T-VEC-E944", "@Tile 的 flavor 必须是 `hardware` 或 `simulate`（编译期内建枚举值）", tn); }
+        flavor = 0;
+    }
+    // 硬件瓦片：总字节数须为本机向量寄存器宽度的整数倍，否则退化为标量循环（仍正确）
+    if (first && flavor == 0) {
+        var eb: i64 = vec_lane_bytes(tip_name(telem));
+        var total: i64 = rows * cols * eb;
+        if (total > 0 && (total % g_simd_bytes) != 0) {
+            var sbw: StringBuilder = sb_new();
+            sb_append_str(sbw, "@Tile(");
+            sb_append_i64(sbw, rows);
+            sb_append_str(sbw, ", ");
+            sb_append_i64(sbw, cols);
+            sb_append_str(sbw, ", ");
+            sb_append_str(sbw, tip_name(telem));
+            sb_append_str(sbw, ") 占 ");
+            sb_append_i64(sbw, total);
+            sb_append_str(sbw, " 字节，不是本机向量寄存器（");
+            sb_append_i64(sbw, g_simd_bytes);
+            sb_append_str(sbw, " 字节）的整数倍——将退化为标量循环（结果正确）");
+            base.diag_new("T-VEC-W947", "warning", sb_to_str(sbw),
+                parse.n_file(tn), parse.n_line(tn), parse.n_col(tn), parse.n_line(tn), parse.n_col(tn) + 8);
+        }
+    }
+    var tn2: Node = base.nodes[tn];
+    tn2.ia = rows;
+    tn2.ib = cols;
+    tn2.la = flavor;
+    slice_set(base.nodes, tn, tn2);
+    return ti_tile(telem, rows, cols, flavor);
 }
 
 // ── 标量类型工具（复刻 types.ts）───────────────────────────────
@@ -461,6 +628,13 @@ pub fn ti_equal(ai: i64, bi: i64) bool {
     }
     // 向量：lane 数与 lane 类型都必须一致（SIMD 无隐式提升）
     if (a.kind == "Vector") {
+        if (a.alen != b.alen) {
+            return false;
+        }
+        return ti_equal(a.elem, b.elem);
+    }
+    // 瓦片：行数 + 内层数组（列数 × 元素类型）一致即同类型；flavor 是编译期优化提示，不参与类型判等
+    if (a.kind == "Tile") {
         if (a.alen != b.alen) {
             return false;
         }
@@ -651,6 +825,27 @@ pub fn ti_str(i: i64) string {
     if (t.kind == "Vector") {
         return base.sb_cat5("@Vector(", base.i2s(t.alen), ", ", ti_str(t.elem), ")");
     }
+    if (t.kind == "Tile") {
+        var tcols: i64 = 0;
+        var telem: i64 = -1;
+        if (t.elem >= 0) {
+            tcols = tis[t.elem].alen;
+            telem = tis[t.elem].elem;
+        }
+        var tfl: string = "hardware";
+        if (t.val == 1) { tfl = "simulate"; }
+        var sb: StringBuilder = sb_new();
+        sb_append_str(sb, "@Tile(");
+        sb_append_i64(sb, t.alen);
+        sb_append_str(sb, ", ");
+        sb_append_i64(sb, tcols);
+        sb_append_str(sb, ", ");
+        sb_append_str(sb, ti_str(telem));
+        sb_append_str(sb, ", ");
+        sb_append_str(sb, tfl);
+        sb_append_str(sb, ")");
+        return sb_to_str(sb);
+    }
     if (t.kind == "Variant") {
         return "Variant";
     }
@@ -787,10 +982,14 @@ pub fn check_call_args(e: i64, fti: i64, fname: string) void {
             // 深层子表达式。若此处不清，`v = f([1,2,3,4]) + w`（f 形参为数组/切片）里的
             // `[1,2,3,4]` 会被误判成向量 → 无谓的 T-VEC-E924 / 类型不匹配误报。
             var saved_ve4: i64 = g_vec_expect;
+            var saved_te4: i64 = g_tile_expect;
             var pt0: i64 = tif_params[pstart + got];
-            if (ti_is_vector(pt0)) { g_vec_expect = pt0; } else { g_vec_expect = -1; }
+            if (ti_is_vector(pt0)) { g_vec_expect = pt0; g_tile_expect = -1; }
+            else if (ti_is_tile(pt0)) { g_tile_expect = pt0; g_vec_expect = -1; }
+            else { g_vec_expect = -1; g_tile_expect = -1; }
             var at: i64 = infer_expr(k.val);
             g_vec_expect = saved_ve4;
+            g_tile_expect = saved_te4;
             var pt: i64 = tif_params[pstart + got];
             intlit_overflow_warn(k.val, pt);
             if (tip_kind(at) != "Unknown" && ti_equal(pt, at) == false && can_cast(at, pt) == false) {
@@ -1026,6 +1225,9 @@ pub fn resolve_ti(tn: i64) i64 {
     // 后端会把宽向量合法化为多条指令，语义始终正确——这正是「CPU 不支持」的兜底层。
     if (n.kind == "vector") {
         return vec_resolve(tn);
+    }
+    if (n.kind == "tile") {
+        return tile_resolve(tn);
     }
     if (n.kind == "func_type") {
         // 先把参数类型解析到局部表，再整段搬进 tif_params——
@@ -4335,7 +4537,10 @@ pub fn infer_expr(e: i64) i64 {
             if (str_slice(n.sa, str_len(n.sa) - 1, str_len(n.sa)) == "f") { return ti_scalar("f32"); }
             return ti_scalar("f64");
         } else if (n.sa == "splat" || n.sa == "reduce_add" || n.sa == "reduce_max"
-                || n.sa == "reduce_min" || n.sa == "vlen" || n.sa == "cpu_has" || n.sa == "simd_lanes") {
+                || n.sa == "reduce_min" || n.sa == "vlen" || n.sa == "cpu_has" || n.sa == "simd_lanes"
+                || n.sa == "tsplat" || n.sa == "treduce_sum" || n.sa == "treduce_mul"
+                || n.sa == "treduce_min" || n.sa == "treduce_max" || n.sa == "tile_rows"
+                || n.sa == "tile_cols" || n.sa == "tile_flavor") {
             // 运行期向量内建：类型检查后返回对应 TI；发射见各后端 mbuiltin 分支。
             if (n.sa == "simd_lanes") {
                 // @simd_lanes(T) -> 本机向量寄存器可容纳的 T 的 lane 数（编译期常量值，运行期发射为字面量）
@@ -4368,6 +4573,58 @@ pub fn infer_expr(e: i64) i64 {
                 var ati: i64 = infer_expr(base.kids[c].val);
                 if (ti_is_vector(ati) == false) { parse.fc_err("T-VEC-E926", base.sb_cat3("`", n.sa, "` 的实参必须是向量"), e); return ti_mk("Unknown"); }
                 return tis[ati].elem;
+            }
+            if (n.sa == "tsplat") {
+                // @tsplat(scalar, rows, cols) -> @Tile(rows, cols, typeof(scalar), hardware)
+                var cnt: i64 = 0; var a0: i64 = -1; var a1: i64 = -1; var a2: i64 = -1;
+                var c2: i64 = n.la;
+                while (c2 >= 0) {
+                    if (cnt == 0) { a0 = base.kids[c2].val; }
+                    if (cnt == 1) { a1 = base.kids[c2].val; }
+                    if (cnt == 2) { a2 = base.kids[c2].val; }
+                    cnt = cnt + 1;
+                    c2 = base.kids[c2].next;
+                }
+                if (cnt != 3) { parse.fc_err("T-VEC-E926", "`@tsplat` 需要 3 个实参（标量, 行数, 列数）", e); return ti_mk("Unknown"); }
+                var sti: i64 = infer_expr(a0);
+                if (tip_kind(sti) != "Scalar") { parse.fc_err("T-VEC-E921", "`@tsplat` 的第一实参必须是标量", e); return ti_mk("Unknown"); }
+                var rows: i64 = -1; var mrows: i64 = meta_eval(a1);
+                if (mrows >= 0) { var mvn: Node = base.nodes[mrows]; if (mvn.kind == "int" || mvn.kind == "bool") { rows = mv_get_int(mrows); } }
+                if (rows < 1) { parse.fc_err("T-VEC-E920", "`@tsplat` 的行数必须是编译期整数常量", e); return ti_mk("Unknown"); }
+                var cols: i64 = -1; var mcols: i64 = meta_eval(a2);
+                if (mcols >= 0) { var mvn2: Node = base.nodes[mcols]; if (mvn2.kind == "int" || mvn2.kind == "bool") { cols = mv_get_int(mcols); } }
+                if (cols < 1) { parse.fc_err("T-VEC-E920", "`@tsplat` 的列数必须是编译期整数常量", e); return ti_mk("Unknown"); }
+                // 把元素类型名 / 行 / 列回填到 mbuiltin 节点（sb=元素名, ia=行, ib=列），供后端发射。
+                var spn: Node = base.nodes[e];
+                spn.sb = tip_name(sti);
+                spn.ia = rows;
+                spn.ib = cols;
+                slice_set(base.nodes, e, spn);
+                return ti_tile(sti, rows, cols, 0);
+            }
+            if (n.sa == "treduce_sum" || n.sa == "treduce_mul" || n.sa == "treduce_min" || n.sa == "treduce_max") {
+                var c: i64 = n.la;
+                if (c < 0) { parse.fc_err("T-VEC-E926", base.sb_cat2("`", n.sa), e); return ti_mk("Unknown"); }
+                var ati: i64 = infer_expr(base.kids[c].val);
+                if (ti_is_tile(ati) == false) { parse.fc_err("T-VEC-E926", base.sb_cat3("`", n.sa, "` 的实参必须是瓦片"), e); return ti_mk("Unknown"); }
+                var rowti: i64 = tis[ati].elem;
+                if (rowti < 0) { return ti_mk("Unknown"); }
+                return tis[rowti].elem;
+            }
+            if (n.sa == "tile_rows" || n.sa == "tile_cols" || n.sa == "tile_flavor") {
+                var c: i64 = n.la;
+                if (c < 0) { parse.fc_err("T-VEC-E926", base.sb_cat2("`", n.sa), e); return ti_mk("Unknown"); }
+                var ati: i64 = infer_expr(base.kids[c].val);
+                if (ti_is_tile(ati) == false) { parse.fc_err("T-VEC-E926", base.sb_cat3("`", n.sa, "` 的实参必须是瓦片类型或瓦片值"), e); return ti_mk("Unknown"); }
+                // 把行/列/flavor 回填到节点（ia=行, ib=列, lc=flavor）供后端发射编译期常量。
+                // 注意：绝不可写 n.la —— 对 mbuiltin 节点 la 是「首个实参子节点」的链指针，
+                // 覆盖它会破坏实参解析，使二次类型推断取到错误节点（如 main 函数节点）而误报 E926。
+                var spn2: Node = base.nodes[e];
+                spn2.ia = ti_trows(ati);
+                spn2.ib = ti_tcols(ati);
+                spn2.lc = ti_tflavor(ati);
+                slice_set(base.nodes, e, spn2);
+                return ti_scalar("i64");
             }
             // @splat(scalar, len) -> @Vector(len, typeof(scalar))
             var cnt: i64 = 0; var a0: i64 = -1; var a1: i64 = -1;
@@ -4824,6 +5081,62 @@ pub fn infer_expr(e: i64) i64 {
             }
             return lt;
         }
+        // ── 瓦片逐元素运算（T-VEC-E945 / E946）─────────────────────────────
+        // 与向量同构：须排在比较/逻辑运算之前，否则 `ta == tb` 会静默返回 bool，
+        // 而后端并不发射瓦片比较掩码。非逐元素运算符（含比较）一律硬报错。
+        if (ti_is_tile(lt) || ti_is_tile(rt)) {
+            var tew: bool = op == "+" || op == "-" || op == "*" || op == "/" || op == "%"
+                || op == "&" || op == "|" || op == "^" || op == "<<" || op == ">>";
+            if (tew == false) {
+                var sb26: StringBuilder = sb_new();
+                sb_append_str(sb26, "运算符 `");
+                sb_append_str(sb26, op);
+                sb_append_str(sb26, "` 不支持瓦片操作数；可用的逐元素运算为 `+ - * / % & | ^ << >>`。");
+                sb_append_str(sb26, "判等/比较请先归约（`@tile_reduce_*`），或按 `t[i][j]` 逐个比较");
+                parse.fc_err("T-VEC-E946", sb_to_str(sb26), e);
+                return ti_mk("Unknown");
+            }
+            if (ti_is_tile(lt) == false || ti_is_tile(rt) == false) {
+                var sb27: StringBuilder = sb_new();
+                sb_append_str(sb27, "瓦片逐元素 `");
+                sb_append_str(sb27, op);
+                sb_append_str(sb27, "` 的两侧都必须是瓦片，当前为 ");
+                sb_append_str(sb27, ti_str(lt));
+                sb_append_str(sb27, " 与 ");
+                sb_append_str(sb27, ti_str(rt));
+                sb_append_str(sb27, "；标量请先用 `@tsplat(标量, 行, 列)` 广播成同形瓦片");
+                parse.fc_err("T-VEC-E945", sb_to_str(sb27), e);
+                return ti_mk("Unknown");
+            }
+            if (ti_trows(lt) != ti_trows(rt) || ti_tcols(lt) != ti_tcols(rt)) {
+                var sb28: StringBuilder = sb_new();
+                sb_append_str(sb28, "瓦片逐元素 `");
+                sb_append_str(sb28, op);
+                sb_append_str(sb28, "` 要求两侧形状一致（行×列），当前为 ");
+                sb_append_i64(sb28, ti_trows(lt));
+                sb_append_str(sb28, "×");
+                sb_append_i64(sb28, ti_tcols(lt));
+                sb_append_str(sb28, " 与 ");
+                sb_append_i64(sb28, ti_trows(rt));
+                sb_append_str(sb28, "×");
+                sb_append_i64(sb28, ti_tcols(rt));
+                parse.fc_err("T-VEC-E945", sb_to_str(sb28), e);
+                return ti_mk("Unknown");
+            }
+            if (ti_equal(tis[lt].elem, tis[rt].elem) == false) {
+                var sb29: StringBuilder = sb_new();
+                sb_append_str(sb29, "瓦片逐元素 `");
+                sb_append_str(sb29, op);
+                sb_append_str(sb29, "` 要求两侧元素类型一致，当前为 ");
+                sb_append_str(sb29, ti_str(tis[lt].elem));
+                sb_append_str(sb29, " 与 ");
+                sb_append_str(sb29, ti_str(tis[rt].elem));
+                sb_append_str(sb29, "；瓦片之间没有隐式提升，请显式构造同元素类型的瓦片");
+                parse.fc_err("T-VEC-E945", sb_to_str(sb29), e);
+                return ti_mk("Unknown");
+            }
+            return lt;
+        }
         if (op == "==" || op == "!=" || op == "<" || op == ">" || op == "<=" || op == ">=") {
             return ti_scalar("bool");
         }
@@ -4869,9 +5182,13 @@ pub fn infer_expr(e: i64) i64 {
     if (n.kind == "assign") {
         var atl: i64 = infer_expr(n.na);
         var saved_ve0: i64 = g_vec_expect;
-        if (ti_is_vector(atl)) { g_vec_expect = atl; }
+        var saved_te0: i64 = g_tile_expect;
+        if (ti_is_vector(atl)) { g_vec_expect = atl; g_tile_expect = -1; }
+        else if (ti_is_tile(atl)) { g_tile_expect = atl; g_vec_expect = -1; }
+        else { g_vec_expect = -1; g_tile_expect = -1; }
         var atr: i64 = infer_expr(n.nb);
         g_vec_expect = saved_ve0;
+        g_tile_expect = saved_te0;
         // 解引用赋值 `*r = v`：仅当 r 为可变绑定（var）时允许，否则就是只读引用。
         if (base.nodes[n.na].kind == "deref") {
             var dop: i64 = base.nodes[n.na].na;
@@ -5331,6 +5648,11 @@ pub fn infer_expr(e: i64) i64 {
             var t3: TI = tis[obt2];
             return t3.val;
         }
+        if (obk2 == "Tile") {
+            // `t[i]` 返回内层行数组（[cols x T]）；`t[i][j]` 再由行数组的 index 分支返回 T。
+            var t2: TI = tis[obt2];
+            return t2.elem;
+        }
         return ti_mk("Unknown");
     }
     if (n.kind == "array_lit") {
@@ -5376,6 +5698,72 @@ pub fn infer_expr(e: i64) i64 {
             nn.ib = ti_to_td_base(vc);
             slice_set(base.nodes, e, nn);
             return vc;
+        }
+        // 瓦片字面量构造：`[[a,b],[c,d]]` 在父节点注入的期望类型为 @Tile(rows,cols,T) 时，
+        // 升格为瓦片构造：外层数组字面量 = 行序列（rows 个），每行必须是列数 = cols 的数组
+        // 字面量，元素类型须可转 T。把瓦片 TD 标记到节点 ib（与向量同一约定），供 codegen
+        // 发射成 `[rows x [cols x T]]` 嵌套聚合。内层行数组字面量清期望后走普通 array_lit
+        // 路径推成 `[cols x T]`（即瓦片行类型），不被外层误判。
+        if (g_tile_expect >= 0 && ti_is_tile(g_tile_expect)) {
+            var tc0: i64 = g_tile_expect;
+            var trows: i64 = ti_trows(tc0);
+            var tcols: i64 = ti_tcols(tc0);
+            var trow: i64 = tis[tc0].elem;          // 内层行数组 TI（[cols x T]）
+            var tele: i64 = tis[trow].elem;          // 元素类型 T
+            var rcnt: i64 = parse.list_count(n.la);
+            if (rcnt != trows) {
+                var sbte1: StringBuilder = sb_new();
+                sb_append_str(sbte1, "瓦片字面量 `[[...]]` 的行数必须等于 ");
+                sb_append_i64(sbte1, trows);
+                sb_append_str(sbte1, "，当前为 ");
+                sb_append_i64(sbte1, rcnt);
+                sb_append_str(sbte1, "；可用 `@tsplat(标量, 行, 列)` 广播单值");
+                parse.fc_err("T-VEC-E945", sb_to_str(sbte1), e);
+                return ti_mk("Unknown");
+            }
+            var ri: i64 = 0;
+            var rk: i64 = n.la;
+            while (rk >= 0) {
+                var rchild: Child = base.kids[rk];
+                var rnode: Node = base.nodes[rchild.val];
+                if (rnode.kind != "array_lit") {
+                    parse.fc_err("T-VEC-E945",
+                        "瓦片字面量的每个元素必须是行数组字面量 `[...]`（形如 `[[a,b],[c,d]]`）", rchild.val);
+                    return ti_mk("Unknown");
+                }
+                var ccol: i64 = parse.list_count(rnode.la);
+                if (ccol != tcols) {
+                    var sbte2: StringBuilder = sb_new();
+                    sb_append_str(sbte2, "瓦片第 ");
+                    sb_append_i64(sbte2, ri + 1);
+                    sb_append_str(sbte2, " 行的列数必须等于 ");
+                    sb_append_i64(sbte2, tcols);
+                    sb_append_str(sbte2, "，当前为 ");
+                    sb_append_i64(sbte2, ccol);
+                    parse.fc_err("T-VEC-E945", sb_to_str(sbte2), rchild.val);
+                    return ti_mk("Unknown");
+                }
+                var ck2: i64 = rnode.la;
+                while (ck2 >= 0) {
+                    var cchild: Child = base.kids[ck2];
+                    var saved_te5: i64 = g_tile_expect;
+                    g_tile_expect = -1;
+                    var cet: i64 = infer_expr(cchild.val);
+                    g_tile_expect = saved_te5;
+                    if (tip_kind(cet) != "Unknown" && ti_equal(cet, tele) == false && can_cast(cet, tele) == false) {
+                        parse.fc_err("T-VEC-E945",
+                            "瓦片字面量元素类型与元素类型不兼容：瓦片元素类型必须严格一致且可隐式转换", cchild.val);
+                        return ti_mk("Unknown");
+                    }
+                    ck2 = cchild.next;
+                }
+                ri = ri + 1;
+                rk = rchild.next;
+            }
+            var nnt: Node = base.nodes[e];
+            nnt.ib = ti_to_td_base(tc0);
+            slice_set(base.nodes, e, nnt);
+            return tc0;
         }
         var cnt: i64 = parse.list_count(n.la);
         if (cnt > 0) {
@@ -5551,9 +5939,13 @@ pub fn check_stmt(s: i64) void {
         }
         if (n.nb >= 0) {
             var saved_ve2: i64 = g_vec_expect;
-            if (ti_is_vector(vt)) { g_vec_expect = vt; }
+            var saved_te2: i64 = g_tile_expect;
+            if (ti_is_vector(vt)) { g_vec_expect = vt; g_tile_expect = -1; }
+            else if (ti_is_tile(vt)) { g_tile_expect = vt; g_vec_expect = -1; }
+            else { g_vec_expect = -1; g_tile_expect = -1; }
             var it: i64 = infer_expr(n.nb);
             g_vec_expect = saved_ve2;
+            g_tile_expect = saved_te2;
             intlit_overflow_warn(n.nb, vt);
             if (tip_kind(it) != "Unknown" && ti_equal(it, vt) == false) {
                 var vk: string = tip_kind(vt);
@@ -5695,9 +6087,13 @@ pub fn check_stmt(s: i64) void {
             // 管道许可上下文之三：return 值
             pipe_mark(n.na);
             var saved_ve3: i64 = g_vec_expect;
-            if (ti_is_vector(cur_ret)) { g_vec_expect = cur_ret; }
+            var saved_te3: i64 = g_tile_expect;
+            if (ti_is_vector(cur_ret)) { g_vec_expect = cur_ret; g_tile_expect = -1; }
+            else if (ti_is_tile(cur_ret)) { g_tile_expect = cur_ret; g_vec_expect = -1; }
+            else { g_vec_expect = -1; g_tile_expect = -1; }
             var rt: i64 = infer_expr(n.na);
             g_vec_expect = saved_ve3;
+            g_tile_expect = saved_te3;
             // 逃逸分析（T-SEM-E764）：返回对局部变量/参数的引用 → 悬垂指针（dangling）
             if (expr_has_local_addr(n.na)) {
                 parse.fc_err("T-SEM-E764",
@@ -5747,9 +6143,13 @@ pub fn check_stmt(s: i64) void {
         // 赋值节点重复；此处 LHS 为元组，assign_target_escapable 已天然不匹配。）
         pipe_mark(n.nb);
         var saved_ve1: i64 = g_vec_expect;
-        if (ti_is_vector(tt)) { g_vec_expect = tt; }
+        var saved_te1: i64 = g_tile_expect;
+        if (ti_is_vector(tt)) { g_vec_expect = tt; g_tile_expect = -1; }
+        else if (ti_is_tile(tt)) { g_tile_expect = tt; g_vec_expect = -1; }
+        else { g_vec_expect = -1; g_tile_expect = -1; }
         var vt2: i64 = infer_expr(n.nb);
         g_vec_expect = saved_ve1;
+        g_tile_expect = saved_te1;
         intlit_overflow_warn(n.nb, tt);
         if (tip_kind(tt) != "Unknown" && tip_kind(vt2) != "Unknown" && ti_equal(tt, vt2) == false) {
             // Sym 字段允许由字符串赋值（自动 intern）；跨池 Sym→Sym 仍报错
@@ -6130,10 +6530,14 @@ pub fn check_decl(d: i64) void {
             // 模块级全局的向量字面量构造：`var g: @Vector(4,i32) = [1,2,3,4];`
             // 与局部 var_decl 同一机制，注入期望类型后由 array_lit 分支升格。
             var saved_ve6: i64 = g_vec_expect;
+            var saved_te6: i64 = g_tile_expect;
             var gvt0: i64 = resolve_ti(n.na);
-            if (ti_is_vector(gvt0)) { g_vec_expect = gvt0; }
+            if (ti_is_vector(gvt0)) { g_vec_expect = gvt0; g_tile_expect = -1; }
+            else if (ti_is_tile(gvt0)) { g_tile_expect = gvt0; g_vec_expect = -1; }
+            else { g_vec_expect = -1; g_tile_expect = -1; }
             var it: i64 = infer_expr(n.nb);
             g_vec_expect = saved_ve6;
+            g_tile_expect = saved_te6;
             var vt: i64 = resolve_ti(n.na);
             if (tip_kind(it) != "Unknown" && ti_equal(it, vt) == false) {
                 // Sym 全局变量允许由字符串赋值（自动 intern → id）
@@ -6149,12 +6553,16 @@ pub fn check_decl(d: i64) void {
         if (n.nb >= 0) {
             // 模块级 const 的向量字面量构造（同 GlobalVarDecl）
             var saved_ve7: i64 = g_vec_expect;
+            var saved_te7: i64 = g_tile_expect;
             if (n.na >= 0) {
                 var gct0: i64 = resolve_ti(n.na);
-                if (ti_is_vector(gct0)) { g_vec_expect = gct0; }
+                if (ti_is_vector(gct0)) { g_vec_expect = gct0; g_tile_expect = -1; }
+                else if (ti_is_tile(gct0)) { g_tile_expect = gct0; g_vec_expect = -1; }
+                else { g_vec_expect = -1; g_tile_expect = -1; }
             }
             var it2: i64 = infer_expr(n.nb);
             g_vec_expect = saved_ve7;
+            g_tile_expect = saved_te7;
             if (n.na >= 0) {
                 var ct: i64 = resolve_ti(n.na);
                 if (tip_kind(it2) != "Unknown" && ti_equal(it2, ct) == false) {
@@ -11104,6 +11512,28 @@ pub fn resolve_type_desc(tn: i64) i64 {
         slice_set(tds, vtd, vtd2);
         return vtd;
     }
+    // 二维 SIMD 瓦片 `@Tile(rows, cols, T, flavor)`：内层 row 数组 [cols x T] 承载列，
+    // 外层 alen 承载行，val 承载 flavor 码（0=hardware,1=simulate）。
+    if (n.kind == "tile") {
+        var trows: i64 = n.ia;
+        var tcols: i64 = n.ib;
+        var tfl: i64 = n.la;
+        if (trows < 1) { trows = tile_fold_child(n.nb); }
+        if (tcols < 1) { tcols = tile_fold_child(n.nc); }
+        if (trows < 1) { trows = 1; }
+        if (tcols < 1) { tcols = 1; }
+        var etd: i64 = resolve_type_desc(n.na);
+        var rowtd: i64 = td_elem_mk("array", etd);
+        var rt: TD = tds[rowtd];
+        rt.alen = tcols;
+        slice_set(tds, rowtd, rt);
+        var ttd: i64 = td_elem_mk("tile", rowtd);
+        var tt: TD = tds[ttd];
+        tt.alen = trows;
+        tt.val = tfl;
+        slice_set(tds, ttd, tt);
+        return ttd;
+    }
     // 定长数组 [N]T：LLVM 后端映射为 [N x T]，C 后端仍走 T[]／T*
     if (n.kind == "array") {
         var ai: i64 = td_elem_mk("array", resolve_type_desc(n.na));
@@ -11339,6 +11769,16 @@ pub fn ti_to_td_base(ti: i64) i64 {
         vtd.alen = t.alen;
         slice_set(tds, vt, vtd);
         return vt;
+    }
+    // 瓦片：内层 elem 是「行数组 TI」([cols x T])，t.alen 是行数。
+    // 复用 Array 的 TI→TD 构造得到行类型，再包一层 tile（alen=行数）。
+    if (t.kind == "Tile") {
+        var rowtd_t: i64 = ti_to_td_base(t.elem);   // [cols x T], alen=cols
+        var tilt: i64 = td_elem_mk("tile", rowtd_t);
+        var tild: TD = tds[tilt];
+        tild.alen = t.alen;   // rows
+        slice_set(tds, tilt, tild);
+        return tilt;
     }
     return td_mk("unknown");
 }
