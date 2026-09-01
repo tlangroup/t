@@ -145,8 +145,16 @@ static const DiagDef DIAG_DEFS[] = {
   { "T-TIM-E701", "error", "TIM", "T_TIME_PARSE_UNSUPPORTED", "PARSE_UNSUPPORTED", "time parsing unsupported" },
   { "T-TIM-E702", "error", "TIM", "T_TIME_SPEC_TYPE", "SPEC_TYPE", "time specifier type mismatch" },
   { "T-TIM-E703", "error", "TIM", "T_TIME_ARG_TYPE", "ARG_TYPE", "time argument type mismatch" },
+  { "T-VEC-E920", "error", "VEC", "T_VECTOR_LEN_NOT_COMTIME", "VECTOR_LEN_NOT_COMTIME", "vector lane count must be a comptime constant" },
+  { "T-VEC-E921", "error", "VEC", "T_VECTOR_ELEM_NOT_NUMERIC", "VECTOR_ELEM_NOT_NUMERIC", "vector lane type must be a fixed-width numeric scalar" },
+  { "T-VEC-E922", "error", "VEC", "T_VECTOR_LEN_RANGE", "VECTOR_LEN_RANGE", "vector lane count must be at least 1" },
+  { "T-VEC-E923", "error", "VEC", "T_VECTOR_SIZE_NOT_POW2", "VECTOR_SIZE_NOT_POW2", "vector total size in bytes must be a power of two" },
+  { "T-VEC-E924", "error", "VEC", "T_VECTOR_OP_MISMATCH", "VECTOR_OP_MISMATCH", "vector elementwise operands must have identical lane count and lane type" },
+  { "T-VEC-E925", "error", "VEC", "T_VECTOR_OP_UNSUPPORTED", "VECTOR_OP_UNSUPPORTED", "operator does not support vector operands" },
+  { "T-VEC-E926", "error", "VEC", "T_VECTOR_BUILTIN_ARG", "VECTOR_BUILTIN_ARG", "invalid argument to vector builtin" },
+  { "T-VEC-W927", "warning", "VEC", "T_VECTOR_WIDER_THAN_NATIVE", "VECTOR_WIDER_THAN_NATIVE", "vector is wider than the native SIMD register and will be split" },
 };
-#define DIAG_COUNT 133
+#define DIAG_COUNT 141
 
 /* legacy (old semantic name) -> machine code alias table */
 static const struct { const char* legacy; const char* code; } DIAG_LEGACY[] = {
@@ -277,8 +285,16 @@ static const struct { const char* legacy; const char* code; } DIAG_LEGACY[] = {
   { "T_TIME_PARSE_UNSUPPORTED", "T-TIM-E701" },
   { "T_TIME_SPEC_TYPE", "T-TIM-E702" },
   { "T_TIME_ARG_TYPE", "T-TIM-E703" },
+  { "T_VECTOR_LEN_NOT_COMTIME", "T-VEC-E920" },
+  { "T_VECTOR_ELEM_NOT_NUMERIC", "T-VEC-E921" },
+  { "T_VECTOR_LEN_RANGE", "T-VEC-E922" },
+  { "T_VECTOR_SIZE_NOT_POW2", "T-VEC-E923" },
+  { "T_VECTOR_OP_MISMATCH", "T-VEC-E924" },
+  { "T_VECTOR_OP_UNSUPPORTED", "T-VEC-E925" },
+  { "T_VECTOR_BUILTIN_ARG", "T-VEC-E926" },
+  { "T_VECTOR_WIDER_THAN_NATIVE", "T-VEC-W927" },
 };
-#define DIAG_LEGACY_COUNT 127
+#define DIAG_LEGACY_COUNT 135
 
 const DiagDef* diag_find(const char* code);        /* exact machine-code lookup */
 const DiagDef* diag_find_any(const char* id);      /* machine code OR legacy name */

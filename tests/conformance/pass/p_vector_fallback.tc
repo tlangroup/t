@@ -1,0 +1,58 @@
+// EXPECT: pass
+// `@Vector` 三层「CPU 不支持」方案的语义正确性（不看性能，只看结果）：
+//   第 1 层：宽度 <= 本机向量寄存器 → 单条硬件向量指令
+//   第 2 层：宽度 >  本机寄存器     → 报 T-VEC-W927，后端合法化成多条指令，结果不变
+//   第 3 层：@cpu_has 运行期分派    → 手写宽/窄两条代码路径，按 CPU 选
+// 本用例断言：无论走哪一层，算出来的数必须完全一样。
+@main
+fn main() i64 {
+    // ── 第 1 层：原生宽度（16 字节 = SSE 基线，任何 x86-64 都有）──────
+    var n0: @Vector(4, i32) = @splat(3i32, 4);
+    var n1: @Vector(4, i32) = @splat(4i32, 4);
+    var nsum: i32 = @reduce_add(n0 + n1);        // 7 * 4 = 28
+    if (nsum != 28) { return 1; }
+
+    // ── 第 2 层：超原生宽度，触发 T-VEC-W927 并被拆分执行 ──────────────
+    // 32 字节（无 AVX 时拆 2 条 SSE）与 64 字节（拆 4 条）都必须给出正确结果。
+    var w0: @Vector(8, i32) = @splat(3i32, 8);
+    var w1: @Vector(8, i32) = @splat(4i32, 8);
+    var wsum: i32 = @reduce_add(w0 + w1);        // 7 * 8 = 56
+    if (wsum != 56) { return 2; }
+    if (wsum != nsum * 2) { return 3; }          // 拆分不改变语义
+
+    var q0: @Vector(16, i32) = @splat(3i32, 16);
+    var q1: @Vector(16, i32) = @splat(4i32, 16);
+    if (@reduce_add(q0 + q1) != 112) { return 4; }   // 7 * 16
+    if (@vlen(q0) != 16) { return 5; }               // 逻辑宽度仍是 16，不被降级
+
+    // 超宽向量的 lane 读写、归约极值同样正确
+    w0[0] = 100i32;
+    w0[7] = 200i32;
+    if (@reduce_max(w0) != 200) { return 6; }
+    if (@reduce_min(w0) != 3) { return 7; }          // 中间 6 个 lane 仍是 3
+
+    // ── 第 3 层：运行期分派 —— 同一算法两条路径，结果必须一致 ──────────
+    var lanes: i64 = @simd_lanes(i32);
+    if (lanes < 1) { return 8; }
+
+    var fast: i32 = 0;
+    if (@cpu_has("avx2")) {
+        // 宽路径：一次吃 8 个 lane
+        var v8: @Vector(8, i32) = @splat(6i32, 8);
+        fast = @reduce_add(v8);                      // 48
+    } else {
+        // 窄路径：两次 4 lane，手工累加
+        var v4a: @Vector(4, i32) = @splat(6i32, 4);
+        var v4b: @Vector(4, i32) = @splat(6i32, 4);
+        fast = @reduce_add(v4a) + @reduce_add(v4b);  // 24 + 24 = 48
+    }
+    if (fast != 48) { return 9; }
+
+    // 纯标量参照实现（最坏兜底：完全没有向量单元的目标）
+    var scalar: i32 = 0;
+    var i: i64 = 0;
+    while (i < 8) { scalar = scalar + 6i32; i = i + 1; }
+    if (scalar != fast) { return 10; }               // 三层结果一致
+
+    return 0;
+}

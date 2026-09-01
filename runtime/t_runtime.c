@@ -14,6 +14,7 @@
 #ifdef _WIN32
 #include <io.h>
 #include <fcntl.h>
+#include <intrin.h>
 #endif
 
 // 全局 arena：编译器单 arena 策略，由 t_runtime_set_arena 在 main 入口注入。
@@ -2127,4 +2128,138 @@ TStr t_deser_str(int64_t f) {
     uint8_t* p = (uint8_t*)t_alloc((size_t)n);
     for (int64_t i = 0; i < n; i++) p[i] = (uint8_t)buf[i];
     out.ptr = p; out.len = n; return out;
+}
+
+// ── 数学内建运行时包装实现（t_math_*）──
+#include <math.h>
+double t_math_sin(double x) { return sin(x); }
+float  t_math_sinf(float x) { return sinf(x); }
+double t_math_cos(double x) { return cos(x); }
+float  t_math_cosf(float x) { return cosf(x); }
+double t_math_tan(double x) { return tan(x); }
+float  t_math_tanf(float x) { return tanf(x); }
+double t_math_atan(double x) { return atan(x); }
+float  t_math_atanf(float x) { return atanf(x); }
+double t_math_atan2(double a, double c) { return atan2(a, c); }
+float  t_math_atan2f(float a, float c) { return atan2f(a, c); }
+double t_math_acos(double x) { return acos(x); }
+float  t_math_acosf(float x) { return acosf(x); }
+double t_math_asin(double x) { return asin(x); }
+float  t_math_asinf(float x) { return asinf(x); }
+double t_math_exp(double x) { return exp(x); }
+float  t_math_expf(float x) { return expf(x); }
+double t_math_log(double x) { return log(x); }
+float  t_math_logf(float x) { return logf(x); }
+double t_math_log10(double x) { return log10(x); }
+float  t_math_log10f(float x) { return log10f(x); }
+double t_math_pow(double a, double c) { return pow(a, c); }
+float  t_math_powf(float a, float c) { return powf(a, c); }
+double t_math_sinh(double x) { return sinh(x); }
+float  t_math_sinhf(float x) { return sinhf(x); }
+double t_math_cosh(double x) { return cosh(x); }
+float  t_math_coshf(float x) { return coshf(x); }
+double t_math_tanh(double x) { return tanh(x); }
+float  t_math_tanhf(float x) { return tanhf(x); }
+double t_math_sqrt(double x) { return sqrt(x); }
+float  t_math_sqrtf(float x) { return sqrtf(x); }
+double t_math_fmod(double a, double c) { return fmod(a, c); }
+float  t_math_fmodf(float a, float c) { return fmodf(a, c); }
+double t_math_fabs(double x) { return fabs(x); }
+float  t_math_fabsf(float x) { return fabsf(x); }
+double t_math_floor(double x) { return floor(x); }
+float  t_math_floorf(float x) { return floorf(x); }
+double t_math_ceil(double x) { return ceil(x); }
+float  t_math_ceilf(float x) { return ceilf(x); }
+double t_math_trunc(double x) { return trunc(x); }
+float  t_math_truncf(float x) { return truncf(x); }
+double t_math_round(double x) { return round(x); }
+float  t_math_roundf(float x) { return roundf(x); }
+double t_math_exp2(double x) { return exp2(x); }
+float  t_math_exp2f(float x) { return exp2f(x); }
+double t_math_log2(double x) { return log2(x); }
+float  t_math_log2f(float x) { return log2f(x); }
+double t_math_log1p(double x) { return log1p(x); }
+float  t_math_log1pf(float x) { return log1pf(x); }
+double t_math_expm1(double x) { return expm1(x); }
+float  t_math_expm1f(float x) { return expm1f(x); }
+double t_math_hypot(double a, double c) { return hypot(a, c); }
+float  t_math_hypotf(float a, float c) { return hypotf(a, c); }
+double t_math_cbrt(double x) { return cbrt(x); }
+float  t_math_cbrtf(float x) { return cbrtf(x); }
+
+// ── 扩展数学内建（推荐补充集）──
+double t_math_copysign(double a, double b) { return copysign(a, b); }
+float  t_math_copysignf(float a, float b) { return copysignf(a, b); }
+double t_math_nextafter(double a, double b) { return nextafter(a, b); }
+float  t_math_nextafterf(float a, float b) { return nextafterf(a, b); }
+double t_math_remainder(double a, double b) { return remainder(a, b); }
+float  t_math_remainderf(float a, float b) { return remainderf(a, b); }
+double t_math_fmin(double a, double b) { return fmin(a, b); }
+float  t_math_fminf(float a, float b) { return fminf(a, b); }
+double t_math_fmax(double a, double b) { return fmax(a, b); }
+float  t_math_fmaxf(float a, float b) { return fmaxf(a, b); }
+double t_math_fdim(double a, double b) { return fdim(a, b); }
+float  t_math_fdimf(float a, float b) { return fdimf(a, b); }
+double t_math_fma(double a, double b, double c) { return fma(a, b, c); }
+float  t_math_fmaf(float a, float b, float c) { return fmaf(a, b, c); }
+int32_t t_math_signbit(double x) { return __builtin_signbit(x); }
+int32_t t_math_isnan(double x) { return __builtin_isnan(x); }
+int32_t t_math_isinf(double x) { return __builtin_isinf(x); }
+int32_t t_math_isfinite(double x) { return __builtin_isfinite(x); }
+int32_t t_math_isnormal(double x) { return __builtin_isnormal(x); }
+
+// ── 运行期 CPU 特性探测（@cpu_has 后端）─────────────────────────
+// 返回 1 表示本机 CPU 支持该 ISA 扩展；用于「CPU 不支持向量宽度时」的运行期分派。
+// 特性名对齐 x86 常见扩展：sse/sse2/sse3/ssse3/sse4.1/sse4.2/fma/avx/avx2/avx512f/
+// avx512vl/avx512bw/avx512dq。
+// 核心实现收 (ptr, len)：LLVM 后端直接按这个 C ABI 调（把 TStr 拆成两个标量传，
+// 避免跨后端按值传聚合体的 ABI 分歧）；C 后端经下方 t_cpu_has(TStr) 包一层。
+int t_cpu_has_n(const uint8_t* p, int64_t n) {
+    char buf[32];
+    if (p == 0) { n = 0; }
+    if (n < 0) { n = 0; }
+    if (n > 31) { n = 31; }
+    for (int64_t i = 0; i < n; i++) { buf[i] = (char)p[i]; }
+    buf[n] = 0;
+    return t_cpu_has_cstr(buf);
+}
+
+int t_cpu_has(TStr feat) { return t_cpu_has_n(feat.ptr, feat.len); }
+
+int t_cpu_has_cstr(const char* feat) {
+#ifdef _WIN32
+    int regs[4];
+    if (strcmp(feat, "sse") == 0)     { __cpuid(regs, 1); return (regs[3] >> 25) & 1; }
+    if (strcmp(feat, "sse2") == 0)    { __cpuid(regs, 1); return (regs[3] >> 26) & 1; }
+    if (strcmp(feat, "sse3") == 0)    { __cpuid(regs, 1); return (regs[2] >> 0)  & 1; }
+    if (strcmp(feat, "ssse3") == 0)   { __cpuid(regs, 1); return (regs[2] >> 9)  & 1; }
+    if (strcmp(feat, "sse4.1") == 0)  { __cpuid(regs, 1); return (regs[2] >> 19) & 1; }
+    if (strcmp(feat, "sse4.2") == 0)  { __cpuid(regs, 1); return (regs[2] >> 20) & 1; }
+    if (strcmp(feat, "fma") == 0)     { __cpuid(regs, 1); return (regs[2] >> 12) & 1; }
+    if (strcmp(feat, "avx") == 0) {
+        __cpuid(regs, 1);
+        // 需要 AVX 位 (ECX:28) 且 OSXSAVE (ECX:27)；现代 Windows 均保存 AVX 状态
+        if (((regs[2] >> 28) & 1) == 0) { return 0; }
+        if (((regs[2] >> 27) & 1) == 0) { return 0; }
+        return 1;
+    }
+    if (strcmp(feat, "avx2") == 0)    { __cpuid(regs, 7); return (regs[1] >> 5)  & 1; }
+    if (strcmp(feat, "avx512f") == 0) { __cpuid(regs, 7); return (regs[1] >> 16) & 1; }
+    if (strcmp(feat, "avx512vl") == 0) { __cpuid(regs, 7); return (regs[1] >> 31) & 1; }
+    if (strcmp(feat, "avx512bw") == 0) { __cpuid(regs, 7); return (regs[2] >> 30) & 1; }
+    if (strcmp(feat, "avx512dq") == 0) { __cpuid(regs, 7); return (regs[2] >> 17) & 1; }
+    return 0;
+#else
+    __builtin_cpu_init();
+    if (strcmp(feat, "sse") == 0)     { return __builtin_cpu_supports("sse"); }
+    if (strcmp(feat, "sse2") == 0)    { return __builtin_cpu_supports("sse2"); }
+    if (strcmp(feat, "sse3") == 0)    { return __builtin_cpu_supports("sse3"); }
+    if (strcmp(feat, "ssse3") == 0)   { return __builtin_cpu_supports("ssse3"); }
+    if (strcmp(feat, "sse4.1") == 0)  { return __builtin_cpu_supports("sse4.1"); }
+    if (strcmp(feat, "sse4.2") == 0)  { return __builtin_cpu_supports("sse4.2"); }
+    if (strcmp(feat, "avx") == 0)     { return __builtin_cpu_supports("avx"); }
+    if (strcmp(feat, "avx2") == 0)    { return __builtin_cpu_supports("avx2"); }
+    if (strcmp(feat, "avx512f") == 0) { return __builtin_cpu_supports("avx512f"); }
+    return 0;
+#endif
 }

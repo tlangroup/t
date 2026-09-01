@@ -34,6 +34,8 @@ pub var ll_lblc: i64;         // 标签计数（每函数重置）
 pub var ll_scc: i64;          // scratch alloca 计数（每函数重置）
 pub var ll_strc: i64;         // 字符串常量计数（模块级）
 pub var ll_term: bool;        // 当前块是否已被终结指令封口
+pub var g_fp_hw: bool = true;  // 目标是否支持 LLVM 硬件 FPU intrinsic（WASM 等置 false → 全程回落 libm/fdlibm）
+pub var g_ll_math_decl: []string; // 已发射的数学 libm declare（去重）
 pub var ll_cur_blk: string;   // 当前基本块标签（phi 前驱用）
 pub var ll_cur_ret: i64;      // 当前函数返回类型 td
 pub var ll_has_main: bool;
@@ -320,6 +322,14 @@ pub fn ll_td(td: i64) string {
         }
         return base.sb_cat5("[", base.i2s(an), " x ", ll_td(t.elem), "]");
     }
+    // 硬件 SIMD 向量：LLVM 一等向量类型 `<N x T>`，由 LLVM 直接选到 xmm/ymm/zmm。
+    // 宽度超本机寄存器时 LLVM 后端自动 legalize 成多条本机宽度指令（第 2 层兜底），
+    // 语义不变、只是指令条数变多；sema 侧已给 T-VEC-W927 提醒（见 vec_resolve）。
+    if (t.cat == "vector") {
+        var vln: i64 = t.alen;
+        if (vln < 1) { vln = 1; }
+        return base.sb_cat5("<", base.i2s(vln), " x ", ll_td(t.elem), ">");
+    }
     if (t.cat == "map") { return "ptr"; }
     if (t.cat == "optional") { return "ptr"; }
     if (t.cat == "sym") {
@@ -351,7 +361,10 @@ pub fn ll_isagg(td: i64) bool {
         return false;
     }
     var t: TD = sema.tds[td];
-    if (t.cat == "string" || t.cat == "bytes" || t.cat == "slice" || t.cat == "array") {
+    // vector 归入聚合：值模型走 ptr（alloca + GEP 取 lane + load/store 整体搬运），
+    // 从而直接复用数组那套左值/索引/拷贝机制；算术处再 load 成 `<N x T>` 用向量指令。
+    if (t.cat == "string" || t.cat == "bytes" || t.cat == "slice" || t.cat == "array"
+            || t.cat == "vector") {
         return true;
     }
     if (t.cat == "named") {
@@ -400,8 +413,8 @@ pub fn ll_sizeof(ty: string) string {
 
 pub fn ll_zero(ty: string) string {
     if (str_len(ty) > 0) {
-        // 37 = '%'（具名聚合），91 = '['（定长数组 [N x T]）
-        if (ty[0] == 37 || ty[0] == 91) {
+        // 37 = '%'（具名聚合），91 = '['（定长数组 [N x T]），60 = '<'（向量 <N x T>）
+        if (ty[0] == 37 || ty[0] == 91 || ty[0] == 60) {
             return "zeroinitializer";
         }
     }
@@ -1033,7 +1046,10 @@ pub fn ll_addr(e: i64) string {
             llfb(base.sb_cat6("  ", t2, " = call ptr @tll_slice_at(ptr ", sp, ", i64 ", base.sb_cat2(iv, ")")));
             return t2;
         }
-        if (ot.cat == "array") {
+        // 数组与向量同构：GEP 进 `[N x T]` / `<N x T>` 取第 i 个 lane 的地址。
+        // LLVM 允许对内存中的向量做 GEP 下标（与数组同规则），故 lane 读写可完全
+        // 复用数组路径，不必绕 extractelement/insertelement + 整体回存。
+        if (ot.cat == "array" || ot.cat == "vector") {
             var ap: string = ll_addr(n.na);
             var av2: string = ll_widen_idx(emit_lle(n.nb), n.nb);
             var t7: string = ll_tmp();
@@ -1365,6 +1381,17 @@ pub fn emit_lle(e: i64) string {
         }
         return v;
     }
+    if (n.kind == "mbuiltin" && math_is_mbuiltin_ll(n.sa)) {
+        return ll_emit_math(e);
+    }
+    // 硬件 SIMD 向量内建（见 ll_vec_mbuiltin）
+    if (n.kind == "mbuiltin") {
+        if (n.sa == "splat" || n.sa == "reduce_add" || n.sa == "reduce_max"
+                || n.sa == "reduce_min" || n.sa == "vlen" || n.sa == "simd_lanes"
+                || n.sa == "cpu_has") {
+            return ll_vec_mbuiltin(e);
+        }
+    }
     if (n.kind == "call") {
         return ll_call(e);
     }
@@ -1426,7 +1453,7 @@ pub fn emit_lle(e: i64) string {
             }
             return ll_load("i64", t3);
         }
-        if (ot.cat == "array") {
+        if (ot.cat == "array" || ot.cat == "vector") {
             var gp2: string = ll_addr(e);
             if (ot.elem >= 0) {
                 if (ll_isagg(ot.elem)) {
@@ -1672,6 +1699,36 @@ pub fn ll_binary(e: i64) string {
         }
     }
 
+    // 向量逐元素算术：`add <4 x i32>` 这类向量形指令由 LLVM 直接选到 SIMD；
+    // 本后端把 vector 按聚合建模（值即 ptr），故先 load 两侧成 `<N x T>`，
+    // 算完 store 进 scratch，再把 scratch 的 ptr 当值返回（与字符串拼接同构）。
+    if (op == "+" || op == "-" || op == "*" || op == "/" || op == "%"
+            || op == "&" || op == "|" || op == "^" || op == "<<" || op == ">>") {
+        var vlt: i64 = ll_etd(n.na);
+        var vrt: i64 = ll_etd(n.nb);
+        if (vlt >= 0 && vrt >= 0) {
+            if (sema.tds[vlt].cat == "vector" && sema.tds[vrt].cat == "vector") {
+                var vty: string = ll_td(vlt);
+                var vlane: string = sema.td_sname(sema.tds[vlt].elem);
+                if (vlane == "") { vlane = "i64"; }
+                var vins: string = ll_arith_ins(op, vlane);
+                if (vins == "") {
+                    llfb("  ; UNSUPPORTED vector binop");
+                    return "0";
+                }
+                var vlp: string = emit_lle(n.na);
+                var vrp: string = emit_lle(n.nb);
+                var vlv: string = ll_load(vty, vlp);
+                var vrv: string = ll_load(vty, vrp);
+                var vres: string = ll_tmp();
+                llfb(base.sb_cat6("  ", vres, " = ", vins, " ", base.sb_cat6(vty, " ", vlv, ", ", vrv, "")));
+                var vout: string = ll_scratch(vty);
+                llfb(base.sb_cat6("  store ", vty, " ", vres, ", ptr ", vout));
+                return vout;
+            }
+        }
+    }
+
     var utd: i64 = ll_bin_td(e);
     var sn: string = sema.td_sname(utd);
     if (sn == "") {
@@ -1762,6 +1819,164 @@ pub fn ll_binary(e: i64) string {
     return t3;
 }
 
+// ── 硬件 SIMD 向量内建（LLVM 后端）────────────────────────────
+// @splat / @reduce_add|max|min / @vlen / @simd_lanes / @cpu_has
+// 与 C 后端（codegen_c.emit_expr 的 mbuiltin 向量分支）语义逐位对齐 ——
+// 门禁比的是**程序输出**而非 IR，故两侧可各用自己最自然的形态：
+// C 端 `__attribute__((vector_size))` + GCC 语句表达式，LLVM 端 `<N x T>` + GEP。
+pub fn ll_vec_mbuiltin(e: i64) string {
+    var n: Node = base.nodes[e];
+
+    // @vlen(v)：lane 数编译期已知 → 直接发字面量
+    if (n.sa == "vlen") {
+        var vtd: i64 = -1;
+        if (n.la >= 0) { vtd = ll_etd(base.kids[n.la].val); }
+        var vl: i64 = 0;
+        if (vtd >= 0) {
+            if (sema.tds[vtd].cat == "vector") { vl = sema.tds[vtd].alen; }
+        }
+        return base.i2s(vl);
+    }
+
+    // @simd_lanes(T)：本机向量寄存器能放几个 T（g_simd_bytes / sizeof(T)）
+    if (n.sa == "simd_lanes") {
+        var lanes: i64 = 1;
+        if (n.la >= 0) {
+            var lti: i64 = sema.resolve_ti(base.kids[n.la].val);
+            var leb: i64 = sema.vec_lane_bytes(sema.tip_name(lti));
+            lanes = sema.g_simd_bytes / leb;
+            if (lanes < 1) { lanes = 1; }
+        }
+        return base.i2s(lanes);
+    }
+
+    // @cpu_has("avx")：运行期 CPUID 探测（第 3 层兜底的分派条件）。
+    // 聚合按指针传：string 值在本后端已经是 %TStr*，直接喂 tll_cpu_has。
+    if (n.sa == "cpu_has") {
+        var fp: string = "null";
+        if (n.la >= 0) { fp = emit_lle(base.kids[n.la].val); }
+        var ct: string = ll_tmp();
+        llfb(base.sb_cat5("  ", ct, " = call i32 @tll_cpu_has(ptr ", fp, ")"));
+        var c1: string = ll_tmp();
+        llfb(base.sb_cat4("  ", c1, " = icmp ne i32 ", base.sb_cat2(ct, ", 0")));
+        return ll_b8(c1);
+    }
+
+    // @splat(s, N)：scratch 一个 `<N x T>`，逐 lane GEP + store 同一个标量
+    if (n.sa == "splat") {
+        var rtd: i64 = ll_etd(e);
+        var vty: string = ll_td(rtd);
+        var vln: i64 = 0;
+        var etd: i64 = -1;
+        if (rtd >= 0) {
+            if (sema.tds[rtd].cat == "vector") { vln = sema.tds[rtd].alen; etd = sema.tds[rtd].elem; }
+        }
+        var ety: string = ll_td(etd);
+        var sp: string = ll_scratch(vty);
+        llfb(base.sb_cat6("  store ", vty, " ", ll_zero(vty), ", ptr ", sp));
+        var sv: string = "0";
+        if (n.la >= 0) {
+            var san: i64 = base.kids[n.la].val;
+            sv = emit_lle(san);
+            if (etd >= 0) { sv = ll_cast_v(sv, ll_etd(san), etd); }
+        }
+        var i: i64 = 0;
+        while (i < vln) {
+            var gp: string = ll_tmp();
+            var g1: StringBuilder = sb_new();
+            sb_append_str(g1, "  ");
+            sb_append_str(g1, gp);
+            sb_append_str(g1, " = getelementptr ");
+            sb_append_str(g1, vty);
+            sb_append_str(g1, ", ptr ");
+            sb_append_str(g1, sp);
+            sb_append_str(g1, ", i64 0, i64 ");
+            sb_append_i64(g1, i);
+            llfb(sb_to_str(g1));
+            llfb(base.sb_cat6("  store ", ety, " ", sv, ", ptr ", gp));
+            i = i + 1;
+        }
+        return sp;
+    }
+
+    // @reduce_add / @reduce_max / @reduce_min：逐 lane GEP+load 后串行累加 / select 取极值。
+    // 不用 llvm.vector.reduce.* intrinsic：它对 lane 类型/宽度有额外约束，且 C 端
+    // 是纯 C 语句表达式，串行形态两边完全同构、结果逐位一致（含溢出行为）。
+    if (n.sa == "reduce_add" || n.sa == "reduce_max" || n.sa == "reduce_min") {
+        var an: i64 = -1;
+        if (n.la >= 0) { an = base.kids[n.la].val; }
+        var atd: i64 = -1;
+        if (an >= 0) { atd = ll_etd(an); }
+        var rvln: i64 = 0;
+        var retd: i64 = -1;
+        if (atd >= 0) {
+            if (sema.tds[atd].cat == "vector") { rvln = sema.tds[atd].alen; retd = sema.tds[atd].elem; }
+        }
+        var rvty: string = ll_td(atd);
+        var rety: string = ll_td(retd);
+        var lane_n: string = sema.td_sname(retd);
+        if (lane_n == "") { lane_n = "i64"; }
+        var isf: bool = ll_isf(lane_n);
+        var sg: bool = base.ll_signed(lane_n);
+        var vp: string = "null";
+        if (an >= 0) { vp = emit_lle(an); }
+        var acc: string = "";
+        var j: i64 = 0;
+        while (j < rvln) {
+            var gp2: string = ll_tmp();
+            var g2: StringBuilder = sb_new();
+            sb_append_str(g2, "  ");
+            sb_append_str(g2, gp2);
+            sb_append_str(g2, " = getelementptr ");
+            sb_append_str(g2, rvty);
+            sb_append_str(g2, ", ptr ");
+            sb_append_str(g2, vp);
+            sb_append_str(g2, ", i64 0, i64 ");
+            sb_append_i64(g2, j);
+            llfb(sb_to_str(g2));
+            var lv: string = ll_load(rety, gp2);
+            if (j == 0) {
+                acc = lv;
+            } else {
+                if (n.sa == "reduce_add") {
+                    var ains: string = ll_arith_ins("+", lane_n);
+                    var at: string = ll_tmp();
+                    llfb(base.sb_cat6("  ", at, " = ", ains, " ", base.sb_cat6(rety, " ", acc, ", ", lv, "")));
+                    acc = at;
+                } else {
+                    // max → 「acc 更大则留 acc」；min → 「acc 更小则留 acc」
+                    var cc: string = "sgt";
+                    if (isf) {
+                        cc = "ogt";
+                        if (n.sa == "reduce_min") { cc = "olt"; }
+                    } else {
+                        if (sg) {
+                            cc = "sgt";
+                            if (n.sa == "reduce_min") { cc = "slt"; }
+                        } else {
+                            cc = "ugt";
+                            if (n.sa == "reduce_min") { cc = "ult"; }
+                        }
+                    }
+                    var cmpt: string = ll_tmp();
+                    var cins: string = "icmp";
+                    if (isf) { cins = "fcmp"; }
+                    llfb(base.sb_cat6("  ", cmpt, base.sb_cat3(" = ", cins, " "), cc, " ", base.sb_cat5(rety, " ", acc, ", ", lv)));
+                    var selt: string = ll_tmp();
+                    llfb(base.sb_cat6("  ", selt, " = select i1 ", cmpt, ", ", base.sb_cat5(rety, " ", acc, ", ", base.sb_cat3(rety, " ", lv))));
+                    acc = selt;
+                }
+            }
+            j = j + 1;
+        }
+        if (acc == "") { acc = ll_zero(rety); }
+        return acc;
+    }
+
+    llfb("  ; UNSUPPORTED vector mbuiltin");
+    return "0";
+}
+
 pub fn ll_unary(e: i64) string {
     var n: Node = base.nodes[e];
     var op: string = n.sa;
@@ -1832,6 +2047,13 @@ pub fn ll_size_bytes(td: i64) i64 {
     }
     if (t.cat == "slice") {
         return 32;
+    }
+    // 向量：lane 数 × lane 字节（i32×4 = 16B = 一个 xmm）
+    if (t.cat == "vector") {
+        var vb: i64 = ll_size_bytes(t.elem);
+        var vn2: i64 = t.alen;
+        if (vn2 < 1) { vn2 = 1; }
+        return vb * vn2;
     }
     if (t.cat == "map") {
         return 8;
@@ -2090,6 +2312,156 @@ pub fn ll_call_indirect(e: i64, iftd: i64) string {
     return itmp;
 }
 
+// ── 数学内建辅助：判断是否为数学内建、是否映射到 LLVM 硬件 intrinsic、元数 ──
+// 双精度 f64 名 + 单精度 f32 名（各加 f 后缀）。
+pub fn math_is_mbuiltin_ll(cn: string) bool {
+    // 拆分为多个较短的 || 链，避免单一超长二元表达式触发编译器递归解析栈溢出。
+    if (cn == "sin" || cn == "sinf" || cn == "cos" || cn == "cosf" || cn == "tan" || cn == "tanf"
+        || cn == "atan" || cn == "atanf" || cn == "atan2" || cn == "atan2f" || cn == "acos" || cn == "acosf"
+        || cn == "asin" || cn == "asinf" || cn == "exp" || cn == "expf" || cn == "log" || cn == "logf"
+        || cn == "log10" || cn == "log10f" || cn == "pow" || cn == "powf" || cn == "sinh" || cn == "sinhf") {
+        return true;
+    }
+    if (cn == "cosh" || cn == "coshf" || cn == "tanh" || cn == "tanhf" || cn == "sqrt" || cn == "sqrtf"
+        || cn == "fmod" || cn == "fmodf" || cn == "fabs" || cn == "fabsf" || cn == "floor" || cn == "floorf"
+        || cn == "ceil" || cn == "ceilf" || cn == "trunc" || cn == "truncf" || cn == "round" || cn == "roundf"
+        || cn == "exp2" || cn == "exp2f" || cn == "log2" || cn == "log2f") {
+        return true;
+    }
+    if (cn == "log1p" || cn == "log1pf" || cn == "expm1" || cn == "expm1f" || cn == "hypot" || cn == "hypotf"
+        || cn == "cbrt" || cn == "cbrtf"
+        || cn == "copysign" || cn == "copysignf" || cn == "nextafter" || cn == "nextafterf"
+        || cn == "remainder" || cn == "remainderf" || cn == "fmin" || cn == "fminf"
+        || cn == "fmax" || cn == "fmaxf" || cn == "fdim" || cn == "fdimf") {
+        return true;
+    }
+    if (cn == "fma" || cn == "fmaf"
+        || cn == "signbit" || cn == "isnan" || cn == "isinf" || cn == "isfinite" || cn == "isnormal") {
+        return true;
+    }
+    return false;
+}
+
+// LLVM 提供硬件 intrinsic 的集合（f64/f32 同形态）：sin/cos/exp/exp2/log/log2/log10/
+// pow/sqrt/fabs/floor/ceil/trunc/round，外加 copysign/fma（与 libm 位级一致，安全映射）。
+// 其余（tan/atan/asin/.../fmin/fmax/nextafter/remainder/fdim/谓词）无等价 intrinsic 或语义与 libm
+// 不完全一致，回落 libm，确保与 C 后端逐字节等价。
+pub fn math_is_hw_ll(op: string) bool {
+    if (op == "sin" || op == "cos" || op == "exp" || op == "exp2" || op == "log" || op == "log2"
+        || op == "log10" || op == "pow" || op == "sqrt" || op == "fabs" || op == "floor"
+        || op == "ceil" || op == "trunc" || op == "round"
+        || op == "copysign" || op == "fma") { return true; }
+    return false;
+}
+
+// 数学内建元数：atan2/pow/fmod/hypot/copysign/nextafter/remainder/fmin/fmax/fdim = 2，fma = 3，其余 1。
+pub fn math_arity_ll(op: string) i64 {
+    if (op == "atan2" || op == "pow" || op == "fmod" || op == "hypot"
+        || op == "copysign" || op == "nextafter" || op == "remainder"
+        || op == "fmin" || op == "fmax" || op == "fdim") { return 2; }
+    if (op == "fma") { return 3; }
+    return 1;
+}
+
+// 谓词类数学内建：返回整型（i32，0 / 非 0），而非浮点。一元，无 f 后缀变体。
+pub fn math_is_predicate_ll(cn: string) bool {
+    if (cn == "signbit" || cn == "isnan" || cn == "isinf" || cn == "isfinite" || cn == "isnormal") {
+        return true;
+    }
+    return false;
+}
+
+// f32 变体判定：名以 'f' 结尾，且去掉尾 'f' 后的基名是已知数学内建（如 sinf→sin、fmaf→fma）。
+// 不能用「末字符=='f'」直接判，因为 isinf 这类谓词本身以 'f' 结尾却不是 f32 变体。
+pub fn math_is_f32_variant_ll(cn: string) bool {
+    if (str_slice(cn, str_len(cn) - 1, str_len(cn)) != "f") { return false; }
+    var base: string = str_slice(cn, 0, str_len(cn) - 1);
+    return math_is_mbuiltin_ll(base);
+}
+
+pub fn math_declared_ll(cn: string) bool {
+    var i: i64 = 0;
+    var n: i64 = slice_len(g_ll_math_decl) as i64;
+    while (i < n) {
+        if (g_ll_math_decl[i] == cn) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+// 数学内建发射：@sin/@sinf/...（mbuitin）与 sin/sinf/...（call）共用。
+// 实参统一取自 n.la；名取自 mbuitin.sa 或 call 的 callee ident.sa。
+// 硬件 FPU intrinsic 优先（g_fp_hw 时 sin/cos/exp/exp2/log/log2/log10/pow/sqrt/fabs/floor/ceil/trunc/round），
+// 否则回落 t_runtime 包装 t_math_<name>（内部走系统 libm；WASM 等无 libm 目标编译 fdlibm 进 t_runtime.lib）。
+pub fn ll_emit_math(e: i64) string {
+    var n: Node = base.nodes[e];
+    var cn: string;
+    if (n.kind == "mbuiltin") { cn = n.sa; }
+    else { cn = base.nodes[n.na].sa; }
+    var ae: []i64;
+    var c: i64 = n.la;
+    while (c >= 0) {
+        var k: Child = base.kids[c];
+        append(ae, k.val);
+        c = k.next;
+    }
+    var argc: i64 = slice_len(ae) as i64;
+    var isf: bool = math_is_f32_variant_ll(cn);
+    var op: string = cn;
+    if (isf) { op = str_slice(cn, 0, str_len(cn) - 1); }
+    var ty: string = "double";      // LLVM IR 类型串（double/float）
+    var tname: string = "f64";       // t 标量类型名（f64/f32；注意与 IR 串不同）
+    if (isf) { ty = "float"; tname = "f32"; }
+    var is_pred: bool = math_is_predicate_ll(cn);
+    // 返回值类型：谓词返回 i32，其余返回浮点 ty。实参统一按浮点 td 造型（谓词的实参也是浮点）。
+    var retty: string = ty;
+    var rettd: i64 = sema.td_named_mk("scalar", tname);
+    if (is_pred) {
+        retty = "i32";
+        rettd = sema.td_named_mk("scalar", "i32");
+    }
+    var td: i64 = sema.td_named_mk("scalar", tname);
+    var argv: []string;
+    var i: i64 = 0;
+    while (i < argc) {
+        var ov: string = emit_lle(ae[i]);
+        ov = ll_cast_v(ov, ll_etd(ae[i]), td);
+        append(argv, ov);
+        i = i + 1;
+    }
+    var argstr: string = "";
+    i = 0;
+    while (i < argc) {
+        if (i > 0) { argstr = base.sb_cat2(argstr, ", "); }
+        argstr = base.sb_cat4(argstr, ty, " ", argv[i]);
+        i = i + 1;
+    }
+    var t0: string = ll_tmp();
+    if (g_fp_hw && math_is_hw_ll(op)) {
+        llfb(base.sb_cat6("  ", t0, " = call ", ty, " @llvm.", base.sb_cat6(op, ".", ty, "(", argstr, ")")));
+    } else {
+        // 软件回落 / WASM：调用 t_runtime 包装 t_math_<name>
+        var mfn: string = base.sb_cat3("t_math_", cn, "");
+        if (math_declared_ll(mfn) == false) {
+            var ar: i64 = math_arity_ll(op);
+            var params: string = "";
+            var pi: i64 = 0;
+            while (pi < ar) {
+                if (pi > 0) { params = base.sb_cat2(params, ", "); }
+                params = base.sb_cat2(params, ty);
+                pi = pi + 1;
+            }
+            llph(base.sb_cat2(base.sb_cat3(base.sb_cat4("declare ", retty, " @", mfn), "(", params), ")"));
+            append(g_ll_math_decl, mfn);
+        }
+        var callpre: string = base.sb_cat4("  ", t0, " = call ", retty);
+        var callsite: string = base.sb_cat3(callpre, " @", mfn);
+        var callopen: string = base.sb_cat3(callsite, "(", argstr);
+        llfb(base.sb_cat2(callopen, ")"));
+    }
+    return t0;
+}
+
 pub fn ll_call(e: i64) string {
     var n: Node = base.nodes[e];
     var cal: Node = base.nodes[n.na];
@@ -2114,6 +2486,11 @@ pub fn ll_call(e: i64) string {
     var argc: i64 = slice_len(ae) as i64;
     var td_i64: i64 = sema.td_named_mk("scalar", "i64");
     var td_i32: i64 = sema.td_named_mk("scalar", "i32");
+
+    // ── 数学内建：交予 ll_emit_math 统一处理（call 与 mbuitin 两种来源）──
+    if (math_is_mbuiltin_ll(cn)) {
+        return ll_emit_math(e);
+    }
 
     if (cn == "print" || cn == "eprint" || cn == "println") {
         var p: string = emit_lle(ae[0]);
@@ -3972,6 +4349,8 @@ pub fn emit_lldeclares() void {
     llph("declare i32 @tll_str_eq(ptr, ptr)");
     llph("declare void @tll_str_concat(ptr, ptr, ptr)");
     llph("declare void @tll_str_slice(ptr, i64, i64, ptr)");
+    // @cpu_has 后端（硬件 SIMD 第 3 层兜底：运行期 CPUID 分派）
+    llph("declare i32 @tll_cpu_has(ptr)");
     llph("declare ptr @tll_sb_new()");
     llph("declare void @tll_sb_append_str(ptr, ptr)");
     llph("declare void @tll_sb_append_char(ptr, i64)");

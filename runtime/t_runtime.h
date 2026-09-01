@@ -57,6 +57,14 @@ TStr    t_str_concat(TStr a, TStr b);                       // 拼接（arena �
 uint8_t t_str_byte_at(TStr s, int64_t i);                   // 越界 → panic + JSON 诊断
 bool    t_str_eq(TStr a, TStr b);
 int64_t t_str_len(TStr s);
+// 运行期 CPU 特性探测（@cpu_has 后端）：本机 CPU 是否支持给定 ISA 扩展（见 t_runtime.c）。
+// @cpu_has 后端：三个入口同一份 CPUID 实现
+//   t_cpu_has(TStr)                    —— C 后端（t 的 string 就是 TStr）
+//   t_cpu_has_n(const uint8_t*, int64) —— LLVM 后端（ptr/len 拆开传，避开聚合体 ABI）
+//   t_cpu_has_cstr(const char*)        —— 运行时内部 / 手写 C 调用
+int     t_cpu_has(TStr feat);
+int     t_cpu_has_n(const uint8_t* p, int64_t n);
+int     t_cpu_has_cstr(const char* feat);
 // 返回以 \0 结尾的 C 字符串副本（全局 arena 分配），用于需要 cstr 的 C API（如 fopen）。
 char*   t_cstr(TStr s);
 
@@ -254,6 +262,89 @@ void    t_panic_bounds(int64_t index, int64_t len, const char* ctx);
 // none = NULL；some(x) 在 arena 上拷贝 x 并返回其指针；unwrap(p) 做 null 检查后返回 p。
 void*   t_opt_some(const void* src, int64_t sz);
 void*   t_opt_unwrap(const void* p);
+
+
+// ── 数学内建运行时包装（t_math_*；对应 @sin / sin 等编译期内建）──
+// 仅在此处经由 t_runtime.c 间接 include <math.h>；生成的用户 .c 不会引入 libc 数学名。
+// f64 名 = t_math_<base>，f32 名 = t_math_<base>f；2 元函数 arity=2。
+double t_math_sin(double);
+float  t_math_sinf(float);
+double t_math_cos(double);
+float  t_math_cosf(float);
+double t_math_tan(double);
+float  t_math_tanf(float);
+double t_math_atan(double);
+float  t_math_atanf(float);
+double t_math_atan2(double, double);
+float  t_math_atan2f(float, float);
+double t_math_acos(double);
+float  t_math_acosf(float);
+double t_math_asin(double);
+float  t_math_asinf(float);
+double t_math_exp(double);
+float  t_math_expf(float);
+double t_math_log(double);
+float  t_math_logf(float);
+double t_math_log10(double);
+float  t_math_log10f(float);
+double t_math_pow(double, double);
+float  t_math_powf(float, float);
+double t_math_sinh(double);
+float  t_math_sinhf(float);
+double t_math_cosh(double);
+float  t_math_coshf(float);
+double t_math_tanh(double);
+float  t_math_tanhf(float);
+double t_math_sqrt(double);
+float  t_math_sqrtf(float);
+double t_math_fmod(double, double);
+float  t_math_fmodf(float, float);
+double t_math_fabs(double);
+float  t_math_fabsf(float);
+double t_math_floor(double);
+float  t_math_floorf(float);
+double t_math_ceil(double);
+float  t_math_ceilf(float);
+double t_math_trunc(double);
+float  t_math_truncf(float);
+double t_math_round(double);
+float  t_math_roundf(float);
+double t_math_exp2(double);
+float  t_math_exp2f(float);
+double t_math_log2(double);
+float  t_math_log2f(float);
+double t_math_log1p(double);
+float  t_math_log1pf(float);
+double t_math_expm1(double);
+float  t_math_expm1f(float);
+double t_math_hypot(double, double);
+float  t_math_hypotf(float, float);
+double t_math_cbrt(double);
+float  t_math_cbrtf(float);
+
+// ── 扩展数学内建（推荐补充集）── 与上文 54 个遵循同一包装约定（间接 include <math.h>，用户 .c 不引入 libc 数学名）
+// 双目浮点→浮点：copysign / nextafter / remainder / fmin / fmax / fdim（各带 f32 变体）
+double t_math_copysign(double, double);
+float  t_math_copysignf(float, float);
+double t_math_nextafter(double, double);
+float  t_math_nextafterf(float, float);
+double t_math_remainder(double, double);
+float  t_math_remainderf(float, float);
+double t_math_fmin(double, double);
+float  t_math_fminf(float, float);
+double t_math_fmax(double, double);
+float  t_math_fmaxf(float, float);
+double t_math_fdim(double, double);
+float  t_math_fdimf(float, float);
+// 三目浮点→浮点：fma（融合乘加，精确单舍入）
+double t_math_fma(double, double, double);
+float  t_math_fmaf(float, float, float);
+// 一元浮点→整型谓词（IEEE-754 分类 / 符号位）：返回 int32（0 / 非 0）。无 f 后缀变体（C 库为类型泛型宏）
+int32_t t_math_signbit(double);
+int32_t t_math_isnan(double);
+int32_t t_math_isinf(double);
+int32_t t_math_isfinite(double);
+int32_t t_math_isnormal(double);
 
 #ifdef __cplusplus
 }

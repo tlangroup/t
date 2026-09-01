@@ -261,6 +261,10 @@ const steps = [
                 "-O0", "-o", exe,
                 join(ROOT, dir, "tc.c"), join(ROOT, "runtime", "t_runtime.c"),
                 "-I", join(ROOT, "runtime"), "-I", join(ROOT, dir), "-Wl,-subsystem:console",
+                // C 后端 -O0 自举产物递归处理编译器自身超大源时会超出 1MB 默认 Windows 栈；
+                // LLVM 后端同档 -O0 不溢出（代码生成更省栈），故此处仅给验证用二进制放大栈即可，
+                // 不改变任何发射产物（IR 与 LLVM 后端逐字节相同，已验证）。
+                "-Wl,/STACK:67108864",
             ]);
             if (cc.code !== 0) return { ok: false, note: `clang 构建失败: ${lastLine(cc.out, 3)}` };
             // ① 跨后端等价：C 产物与 LLVM 产物对同一份源必须发射逐字节相同的 IR。

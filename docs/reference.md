@@ -2734,6 +2734,66 @@ EnumValue  : IntLiteral | Unary | Binary        // 须为编译期常量
 
 ---
 
+### 3.19 @Vector（硬件 SIMD 向量）✅ tc（2026-09-01）
+
+> **状态**：实装。硬件 SIMD 向量类型，编译期确定 lane 数与 lane 类型，映射到 CPU 向量寄存器；当目标 CPU 不支持请求宽度时给出三层方案（见下「CPU 不支持怎么办」）。
+
+```ebnf
+VectorType : "@Vector" "(" ComptimeLen "," Type ")"
+// ComptimeLen 必须是编译期常量：整数字面量 / const 声明的常量 / 编译期常量算术
+// Type 必须是定宽数值标量：i8..i64 / u8..u64 / f32 / f64 / bool
+```
+
+**构造与访问**
+
+- 广播构造：`var v: @Vector(4, i32) = @splat(5i32, 4);` —— 把标量灌满全部 lane。⚠ 第一实参的**类型**直接决定 lane 类型（不因声明类型反推），裸字面量按量级猜类型（`7`→`u8`，见 §2.4），要 i64 必须写 `7i64`。
+- lane 读写：向量是可下标的左值，`v[0] = 1i32;` 是单条 `pinsr`/`insertelement`，`x = v[2];` 是单条 `pextr`/`extractelement`。
+- 逐元素算术：`a + b`、`a - b`、`a * b`、`a / b`、`a % b`、`a & b`、`a | b`、`a ^ b`、`a << b`、`a >> b` —— 两侧必须同 lane 数、同 lane 类型，编译期算成**一条** SIMD 指令（不是逐 lane 四次标量运算）。
+
+**内省 / 归约 / 特性探测内建（均为编译期或运行期内建）**
+
+| 内建 | 语义 | 返回类型 |
+|---|---|---|
+| `@splat(scalar, len)` | 标量广播成向量 | `@Vector(len, typeof(scalar))` |
+| `@reduce_add(v)` | 全部 lane 求和 | lane 类型 |
+| `@reduce_max(v)` / `@reduce_min(v)` | 取最大 / 最小 lane | lane 类型 |
+| `@vlen(v)` | 向量的 lane 数（逻辑宽度） | `i64` |
+| `@simd_lanes(T)` | 本机向量寄存器能容纳的 `T` 的 lane 数 = `g_simd_bytes / sizeof(T)`（编译期常量） | `i64` |
+| `@cpu_has("avx")` | 运行期探测 CPU 特性（sse / sse2 / avx / avx2 / avx512f …），未知名返回 false | `bool` |
+
+**双后端映射**
+
+- C 后端：`typedef T __attribute__((vector_size(len * sizeof(T)))) VecN;`（`t` 的 `@Vector(4,i32)` → `int __attribute__((vector_size(16)))`）。
+- LLVM 后端：`<N x T>`（`t` 的 `@Vector(4,i32)` → `<4 x i32>`），逐元素运算 emit 为 `add <4 x i32>` 等向量指令，归约/内建经 `ll_vec_mbuiltin` 展开。
+- 门禁只比对**程序输出**，故两种 IR 形态不同但结果一致即过关（双后端对拍）。
+
+**CPU 不支持怎么办（三层方案）**
+
+1. **第 1 层 · 硬件向量**：宽度 ≤ 本机向量寄存器（`g_simd_bytes`，默认 16 字节 = SSE 基线）— 单条硬件指令，最优。
+2. **第 2 层 · 超宽告警 + 后端合法化**：宽度 > 本机寄存器时，报 **`T-VEC-W927`**（warning，不阻断编译），后端把宽向量拆成多条原生宽度指令（甚至纯标量序列）—— **语义完全不变，只是不再是单条指令**。逻辑 lane 数仍是用户写的 `@Vector(8,i32)`，`@vlen` 仍返回 8。追求单指令用 `@simd_lanes(T)` 查本机宽度改 `@Vector(4,i32)`。
+3. **第 3 层 · 运行期分派**：`@cpu_has("avx2")` 在运行期查询 CPUID，手写「宽路径（吃 8 lane）/ 窄路径（两次 4 lane）」两条代码路径，按机器特性择一执行；纯标量参照实现作为最坏兜底（完全没有向量单元的目标）。
+
+**错误诊断**
+
+- `T-VEC-E920`：`@Vector` 的 lane 数不是编译期常量（`var n = 4; @Vector(n, i32)` 应改为 `const N = 4;`）。
+- `T-VEC-E921`：lane 类型不是定宽数值标量（`@Vector(4, string)`）。
+- `T-VEC-E922`：lane 数 < 1。
+- `T-VEC-E923`：总字节数（lane 数 × lane 宽度）不是 2 的幂（`@Vector(3, i32)` → 建议 `@Vector(4, i32)`）。
+- `T-VEC-E924`：逐元素运算两侧 lane 数或 lane 类型不一致（向量间无隐式提升；标量须先 `@splat` 广播）。
+- `T-VEC-E925`：运算符不支持向量操作数（`==`/`<`/`&&` 等；判等需先 `@reduce_*` 或逐 lane 比较，后端不发射比较掩码）。
+- `T-VEC-E926`：向量内建实参非法（如 `@reduce_add(标量)`、缺实参）。
+- `T-VEC-W927`：向量宽于本机寄存器（第 2 层警告，见上）。
+
+**实现要点**
+
+- 类型解析集中在 `src/sema.tc` 的 `vec_resolve`（lane 类型 / 字节数 / 2 的幂 / 超宽告警 / lane 数回填），常量折叠 `vec_fold_len` 只认 `const`（不认 `var`，否则运行期变量会被误当编译期宽度）。
+- lane 类型名 + lane 数回填到 mbuiltin 节点的 `sb`/`ia` 字段（`expr_type_desc` 走生成区 `int→i64` 规则拿不到 `0i32` 的位宽后缀，必须回填）。
+- `@cpu_has`：C 后端经 `t_cpu_has(TStr)` 走 runtime；LLVM 后端因聚合体按值传的 Win64 ABI 分歧，改拆 `ptr`/`len` 经 `tll_cpu_has(TStr*)` shim 桥接 `t_runtime.c` 的 `t_cpu_has_n`。**改 runtime 后必须 `node tools/build_runtime.mjs` 重预编译 `out/<mode>/deps/t_runtime.lib`**，否则 `build` 会链接过期静态库、报未定义符号 `tll_cpu_has`。**
+
+**示例**：见 `tests/conformance/pass/p_vector_basic.tc`（构造/读写/算术/位运算/归约/内省/特性探测/f32/i64 lane）、`tests/conformance/pass/p_vector_fallback.tc`（三层方案语义一致性）、以及 `tests/conformance/fail/f_vector_*.tc` 全部错误分支；运行期 demo 见 `out/vec_demo.tc`、`out/vec_wide.tc`。
+
+---
+
 ## 4. Program entry（程序入口） ✅ tote
 
 ```ebnf

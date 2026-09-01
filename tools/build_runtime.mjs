@@ -6,7 +6,7 @@
 //
 // 用法：node tools/build_runtime.mjs
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync } from "node:fs";
 import { join, resolve, dirname } from "node:path";
 
 const ROOT = resolve(".");
@@ -33,6 +33,19 @@ const modes = [
   { name: "rls", opt: "-O2" },
 ];
 
+// fdlibm 回落源码（若存在）：WASM / 无系统 libm 目标编译进 t_runtime.lib，
+// 由 t_math_* 包装按符号名链接到 fdlibm 而非系统 libm。目录为空则回落系统 libm。
+const fdDir = join(ROOT, "runtime", "fdlibm");
+const fdSources = [];
+if (existsSync(fdDir)) {
+  for (const f of readdirSync(fdDir)) {
+    if (f.endsWith(".c")) { fdSources.push(join(fdDir, f)); }
+  }
+}
+if (fdSources.length > 0) {
+  console.log(`build_runtime: fdlibm drop-in: ${fdSources.length} source(s) found`);
+}
+
 for (const m of modes) {
   const depsDir = join(ROOT, "out", m.name, "deps");
   mkdirSync(depsDir, { recursive: true });
@@ -42,7 +55,13 @@ for (const m of modes) {
   console.log(`build_runtime: [${m.name}] ${clang} ${m.opt}`);
   execFileSync(clang, ["-c", m.opt, "-I", join(ROOT, "runtime"), "-o", obj1, join(ROOT, "runtime", "t_runtime.c")], { cwd: ROOT, stdio: "inherit" });
   execFileSync(clang, ["-c", m.opt, "-I", join(ROOT, "runtime"), "-o", obj2, join(ROOT, "runtime", "t_shim_ll.c")], { cwd: ROOT, stdio: "inherit" });
-  execFileSync(ar, ["rcs", lib, obj1, obj2], { cwd: ROOT, stdio: "inherit" });
+  const archObjs = [obj1, obj2];
+  for (const src of fdSources) {
+    const o = join(depsDir, "fdlibm_" + fdSources.indexOf(src) + ".obj");
+    execFileSync(clang, ["-c", m.opt, "-I", join(ROOT, "runtime"), "-D_IEEE_LIBM", "-D__STDC__", "-o", o, src], { cwd: ROOT, stdio: "inherit" });
+    archObjs.push(o);
+  }
+  execFileSync(ar, ["rcs", lib, ...archObjs], { cwd: ROOT, stdio: "inherit" });
   console.log(`build_runtime: wrote ${lib}`);
 }
 console.log("build_runtime: done");

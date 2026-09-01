@@ -47,6 +47,10 @@ void    tll_str_concat(TStr* a, TStr* b, TStr* out) {
 }
 void    tll_str_slice(TStr* s, int64_t a, int64_t b, TStr* out) { *out = t_str_slice(*s, a, b); }
 
+// ── 硬件 SIMD @cpu_has 后端 ────────────────────────────────────
+// TStr 按指针传（避开 Win64 聚合传值 ABI），返回 0/1；实现见 t_runtime.c 的 CPUID。
+int32_t tll_cpu_has(TStr* s)                { return (int32_t)t_cpu_has_n(s->ptr, s->len); }
+
 // ── 可选类型 ?T（可空指针模型，与 C 后端共享 t_opt_some / t_opt_unwrap）──
 void*   tll_opt_some(const void* src, int64_t sz)  { return t_opt_some(src, sz); }
 void*   tll_opt_unwrap(const void* p)              { return t_opt_unwrap(p); }
