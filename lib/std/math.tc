@@ -6,11 +6,13 @@
 //     循环依赖在此被结构性消除——只有「tc 构建 std」这一构建期方向。
 //   * 可被 `tc build --lib` 独立编译为 .tlib，供任意程序（含 tc 自身后续代际）链接。
 //
-// 浮点数学（*_f）说明：本模块不手写泰勒近似，而是**薄封装编译器底层的数学内建**
-// （sin/cos/exp/log/...）。这些内建在 CTFE 层有 `ct_*` 系列编译期实现
-// （meta_eval_math 折叠常量实参），运行期映射到 libm / LLVM FPU intrinsic，
-// 精度与 C 标准库一致，且可在编译期上下文中折叠。f32 变体内建（sinf/cosf/...）
-// 亦可直接调用，按需取用。
+// 浮点数学（*_f）说明：本模块不手写泰勒近似，而是**薄封装编译器底层的数学内建**。
+// 底层（编译器 CTFE 层）为这些函数定义了 *编译期可折叠* 的 `@` 前缀内建（如 `@sin`
+// `@cos`...；由 `math_mbuiltin()` 识别，实参为浮点常量时经 `meta_eval_math` 折叠为
+// 字面量，运行期回落 libm / LLVM FPU intrinsic）。本模块统一用 `@` 前缀形式（mbuiltin
+// 节点）做薄封装，使 std.math 的浮点函数在编译期上下文中也能被折叠（而非仅运行期调用）。
+// ⚠ `copysign` / `fmin` / `fmax` 不在 `math_mbuiltin()` 表内、无对应 `@` 内建，
+//   保留裸 call 形式（同样回落 libm）。f32 变体内建（sinf/cosf/...）亦可直接调用。
 //
 // 用法：
 //   import(std.math);
@@ -118,9 +120,10 @@ pub fn lerp_i(a: i64, b: i64, t: i64) i64 {
     return a + ((b - a) * t) / 100;
 }
 
-// —— 浮点（f64）：薄封装底层编译期内建数学 ——
-// 见文件头注释：底层（编译器 CTFE 层）已为这些函数定义了编译期可折叠实现，
-// 运行期映射到 libm / LLVM FPU intrinsic。对应的 f32 内建（sinf/cosf/...）亦可用。
+// —— 浮点（f64）：薄封装底层编译期内建数学（`@` 前缀 mbuiltin 形式）——
+// 见文件头注释：底层已为这些函数定义了 *编译期可折叠* 的 `@` 内建（如 `@sin` `@hypot`），
+// 实参为浮点常量时由 meta_eval_math 折叠，否则回落 libm / LLVM FPU。
+// ⚠ copysign / fmin / fmax 无对应 `@` 内建（不在 math_mbuiltin 表），保留裸 call。
 pub const PI: f64 = 3.141592653589793;
 pub const E: f64 = 2.718281828459045;
 pub const TAU: f64 = 6.283185307179586;
@@ -128,18 +131,18 @@ pub const LN2: f64 = 0.6931471805599453;
 pub const LN10: f64 = 2.302585092994046;
 
 // 绝对值（浮点）。整数绝对值用 abs(x: i64)
-pub fn fabs_f(x: f64) f64 { return fabs(x); }
+pub fn fabs_f(x: f64) f64 { return @fabs(x); }
 
 // 取整类
-pub fn floor_f(x: f64) f64 { return floor(x); }
-pub fn ceil_f(x: f64) f64 { return ceil(x); }
-pub fn round_f(x: f64) f64 { return round(x); }
-pub fn trunc_f(x: f64) f64 { return trunc(x); }
+pub fn floor_f(x: f64) f64 { return @floor(x); }
+pub fn ceil_f(x: f64) f64 { return @ceil(x); }
+pub fn round_f(x: f64) f64 { return @round(x); }
+pub fn trunc_f(x: f64) f64 { return @trunc(x); }
 
 // 基本算术
-pub fn sqrt_f(x: f64) f64 { return sqrt(x); }              // 平方根
-pub fn cbrt_f(x: f64) f64 { return cbrt(x); }              // 立方根
-pub fn pow_f(x: f64, y: f64) f64 { return pow(x, y); }     // x^y（双精度；y 可分数/负）
+pub fn sqrt_f(x: f64) f64 { return @sqrt(x); }              // 平方根
+pub fn cbrt_f(x: f64) f64 { return @cbrt(x); }              // 立方根
+pub fn pow_f(x: f64, y: f64) f64 { return @pow(x, y); }     // x^y（双精度；y 可分数/负）
 pub fn pow_i(x: f64, n: i64) f64 {                        // 整数次幂（精确，无浮点误差）
     if (n < 0) { return 1.0 / pow_i(x, -n); }
     var r: f64 = 1.0;
@@ -147,34 +150,34 @@ pub fn pow_i(x: f64, n: i64) f64 {                        // 整数次幂（精�
     while (i < n) { r = r * x; i = i + 1; }
     return r;
 }
-pub fn hypot_f(x: f64, y: f64) f64 { return hypot(x, y); } // 欧氏距离 sqrt(x^2+y^2)
-pub fn fmod_f(x: f64, y: f64) f64 { return fmod(x, y); }   // 浮点取模
-pub fn copysign_f(x: f64, y: f64) f64 { return copysign(x, y); } // 取 y 的符号
-pub fn fmin_f(x: f64, y: f64) f64 { return fmin(x, y); }   // 较小值（忽略 NaN）
-pub fn fmax_f(x: f64, y: f64) f64 { return fmax(x, y); }   // 较大值（忽略 NaN）
+pub fn hypot_f(x: f64, y: f64) f64 { return @hypot(x, y); } // 欧氏距离 sqrt(x^2+y^2)
+pub fn fmod_f(x: f64, y: f64) f64 { return @fmod(x, y); }   // 浮点取模
+pub fn copysign_f(x: f64, y: f64) f64 { return copysign(x, y); } // 取 y 的符号（无 @ 内建）
+pub fn fmin_f(x: f64, y: f64) f64 { return fmin(x, y); }   // 较小值（忽略 NaN；无 @ 内建）
+pub fn fmax_f(x: f64, y: f64) f64 { return fmax(x, y); }   // 较大值（忽略 NaN；无 @ 内建）
 
 // 指数 / 对数
-pub fn exp_f(x: f64) f64 { return exp(x); }                // e^x
-pub fn exp2_f(x: f64) f64 { return exp2(x); }              // 2^x
-pub fn expm1_f(x: f64) f64 { return expm1(x); }            // e^x - 1（数值更稳）
-pub fn log_f(x: f64) f64 { return log(x); }                // 自然对数 ln(x)
-pub fn log2_f(x: f64) f64 { return log2(x); }              // 以 2 为底（整数版见 ilog2(x: u64)）
-pub fn log10_f(x: f64) f64 { return log10(x); }            // 以 10 为底
-pub fn log1p_f(x: f64) f64 { return log1p(x); }            // ln(1 + x)（数值更稳）
+pub fn exp_f(x: f64) f64 { return @exp(x); }                // e^x
+pub fn exp2_f(x: f64) f64 { return @exp2(x); }              // 2^x
+pub fn expm1_f(x: f64) f64 { return @expm1(x); }            // e^x - 1（数值更稳）
+pub fn log_f(x: f64) f64 { return @log(x); }                // 自然对数 ln(x)
+pub fn log2_f(x: f64) f64 { return @log2(x); }              // 以 2 为底（整数版见 ilog2(x: u64)）
+pub fn log10_f(x: f64) f64 { return @log10(x); }            // 以 10 为底
+pub fn log1p_f(x: f64) f64 { return @log1p(x); }            // ln(1 + x)（数值更稳）
 
 // 三角 / 反三角
-pub fn sin_f(x: f64) f64 { return sin(x); }
-pub fn cos_f(x: f64) f64 { return cos(x); }
-pub fn tan_f(x: f64) f64 { return tan(x); }
-pub fn asin_f(x: f64) f64 { return asin(x); }
-pub fn acos_f(x: f64) f64 { return acos(x); }
-pub fn atan_f(x: f64) f64 { return atan(x); }
-pub fn atan2_f(y: f64, x: f64) f64 { return atan2(y, x); } // 四象限
+pub fn sin_f(x: f64) f64 { return @sin(x); }
+pub fn cos_f(x: f64) f64 { return @cos(x); }
+pub fn tan_f(x: f64) f64 { return @tan(x); }
+pub fn asin_f(x: f64) f64 { return @asin(x); }
+pub fn acos_f(x: f64) f64 { return @acos(x); }
+pub fn atan_f(x: f64) f64 { return @atan(x); }
+pub fn atan2_f(y: f64, x: f64) f64 { return @atan2(y, x); } // 四象限
 
 // 双曲
-pub fn sinh_f(x: f64) f64 { return sinh(x); }
-pub fn cosh_f(x: f64) f64 { return cosh(x); }
-pub fn tanh_f(x: f64) f64 { return tanh(x); }
+pub fn sinh_f(x: f64) f64 { return @sinh(x); }
+pub fn cosh_f(x: f64) f64 { return @cosh(x); }
+pub fn tanh_f(x: f64) f64 { return @tanh(x); }
 
 // 浮点线性插值：a + (b - a) * t
 pub fn lerp_f(a: f64, b: f64, t: f64) f64 {
