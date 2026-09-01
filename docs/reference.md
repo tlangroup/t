@@ -2747,6 +2747,21 @@ VectorType : "@Vector" "(" ComptimeLen "," Type ")"
 **构造与访问**
 
 - 广播构造：`var v: @Vector(4, i32) = @splat(5i32, 4);` —— 把标量灌满全部 lane。⚠ 第一实参的**类型**直接决定 lane 类型（不因声明类型反推），裸字面量按量级猜类型（`7`→`u8`，见 §2.4），要 i64 必须写 `7i64`。
+- **字面量构造**：`var v: @Vector(4, i32) = [1, 2, 3, 4];` —— 数组字面量在「期望类型为 `@Vector(N,T)`」的位置被升格为向量构造，逐 lane 依次取自各元素（可含非常量表达式）。元素个数必须**严格等于** lane 数（不截断、不补零），每个元素须能隐式转成 lane 类型，否则 `T-VEC-E924`。
+  生效位置（即会注入期望类型的语法点）：
+
+  | 位置 | 示例 |
+  |---|---|
+  | `var` 初始化 | `var v: @Vector(4, i32) = [1, 2, 3, 4];` |
+  | 赋值右侧 | `v = [10, 20, 30, 40];` |
+  | `return` | `fn mk() @Vector(4, i32) { return [7, 8, 9, 10]; }` |
+  | 调用实参 | `take([2, 4, 6, 8]);`（形参类型须为 `@Vector`） |
+  | 模块级 `var` | `var gv: @Vector(4, i32) = [1, 2, 3, 4];`（走 `__ginit` 运行期初始化） |
+  | 模块级 `const` | `const CG: @Vector(4, i32) = [5, 6, 7, 8];` |
+
+  > **透传规则**：期望类型存在全局 `sema.g_vec_expect` 里，读取后立刻恢复，**但递归进入子树时不主动清除**。因此处于上述位置**任意深度**的字面量都会升格 —— 例如 `var s: @Vector(4, i32) = v + [1,1,1,1];` 中的右操作数同样生效。
+  > 反之，若整个表达式**没有任何祖先**注入向量期望，字面量就退化成固定长度数组：`@reduce_add(a + [1,1,1,1])` 里的 `[1,1,1,1]` 会被推成 `[4]i64` → `T-VEC-E924`。此时先落到具名向量再计算。
+  > ⚠ 例外：调用实参在形参**非**向量时会主动清除期望，避免在向量期望上下文里调用 `f([1,2,3,4])`（`f` 形参为数组/切片）时误判成向量。
 - lane 读写：向量是可下标的左值，`v[0] = 1i32;` 是单条 `pinsr`/`insertelement`，`x = v[2];` 是单条 `pextr`/`extractelement`。
 - 逐元素算术：`a + b`、`a - b`、`a * b`、`a / b`、`a % b`、`a & b`、`a | b`、`a ^ b`、`a << b`、`a >> b` —— 两侧必须同 lane 数、同 lane 类型，编译期算成**一条** SIMD 指令（不是逐 lane 四次标量运算）。
 
@@ -2779,7 +2794,7 @@ VectorType : "@Vector" "(" ComptimeLen "," Type ")"
 - `T-VEC-E921`：lane 类型不是定宽数值标量（`@Vector(4, string)`）。
 - `T-VEC-E922`：lane 数 < 1。
 - `T-VEC-E923`：总字节数（lane 数 × lane 宽度）不是 2 的幂（`@Vector(3, i32)` → 建议 `@Vector(4, i32)`）。
-- `T-VEC-E924`：逐元素运算两侧 lane 数或 lane 类型不一致（向量间无隐式提升；标量须先 `@splat` 广播）。
+- `T-VEC-E924`：逐元素运算两侧 lane 数或 lane 类型不一致（向量间无隐式提升；标量须先 `@splat` 广播）；**以及** `[a,b,c,d]` 字面量构造向量时元素个数 ≠ lane 数、或某元素无法隐式转成 lane 类型。
 - `T-VEC-E925`：运算符不支持向量操作数（`==`/`<`/`&&` 等；判等需先 `@reduce_*` 或逐 lane 比较，后端不发射比较掩码）。
 - `T-VEC-E926`：向量内建实参非法（如 `@reduce_add(标量)`、缺实参）。
 - `T-VEC-W927`：向量宽于本机寄存器（第 2 层警告，见上）。
@@ -2789,6 +2804,9 @@ VectorType : "@Vector" "(" ComptimeLen "," Type ")"
 - 类型解析集中在 `src/sema.tc` 的 `vec_resolve`（lane 类型 / 字节数 / 2 的幂 / 超宽告警 / lane 数回填），常量折叠 `vec_fold_len` 只认 `const`（不认 `var`，否则运行期变量会被误当编译期宽度）。
 - lane 类型名 + lane 数回填到 mbuiltin 节点的 `sb`/`ia` 字段（`expr_type_desc` 走生成区 `int→i64` 规则拿不到 `0i32` 的位宽后缀，必须回填）。
 - `@cpu_has`：C 后端经 `t_cpu_has(TStr)` 走 runtime；LLVM 后端因聚合体按值传的 Win64 ABI 分歧，改拆 `ptr`/`len` 经 `tll_cpu_has(TStr*)` shim 桥接 `t_runtime.c` 的 `t_cpu_has_n`。**改 runtime 后必须 `node tools/build_runtime.mjs` 重预编译 `out/<mode>/deps/t_runtime.lib`**，否则 `build` 会链接过期静态库、报未定义符号 `tll_cpu_has`。**
+- 字面量构造的期望类型经全局 `sema.g_vec_expect` 注入（`infer_expr` 的 `array_lit` 分支消费），注入点七处：`assign` / `var_decl` / `return` / `assignment` / `check_call_args` / `GlobalVarDecl` / `GlobalConstDecl`；读取后立刻恢复旧值（嵌套安全）。
+  ⚠ `check_call_args` 在形参非向量时必须 `g_vec_expect = -1`（而非「不设置」）—— 期望会透传进子树，不清会在向量上下文里误判普通数组实参。lane 元素推断前同样要清除（防嵌套向量误判）。
+  ⚠ 节点标记位必须用 **`ib`** 而非 **`ia`** —— `array_lit` 的 `ia` 在 sema 之后会被管线覆写成 `-1`（实测 `ia=-1 ib=<td>`），标记挂错字段会让两个后端都读不到，静默落到「UNSUPPORTED / 裸数组」路径。
 
 **示例**：见 `tests/conformance/pass/p_vector_basic.tc`（构造/读写/算术/位运算/归约/内省/特性探测/f32/i64 lane）、`tests/conformance/pass/p_vector_fallback.tc`（三层方案语义一致性）、以及 `tests/conformance/fail/f_vector_*.tc` 全部错误分支；运行期 demo 见 `out/vec_demo.tc`、`out/vec_wide.tc`。
 

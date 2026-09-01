@@ -1,0 +1,56 @@
+// 硬件 SIMD 向量（@Vector）实跑守卫。
+//
+// conformance 只跑「诊断检查」，不碰代码生成 —— 向量构造是否真的emit出正确的
+// `vector_size` 复合字面量（C）/ `<N x T>` 逐 lane store（LLVM），只有本例经
+// run_examples 的「LLVM + C」双后端实跑比对才能守住。
+//
+// 覆盖：`[a,b,c,d]` 字面量构造的全部生效位置（var 初始化 / 赋值 / 二元运算右操作数 /
+// 调用实参 / 模块级全局）+ lane 读写 + 逐元素算术 + 归约 + 运行期非常量构造。
+//
+// ⚠ 不打印机器相关值（@simd_lanes / @cpu_has）：跨机器期望输出必须恒定。
+
+var g_scale: @Vector(4, i32) = [2, 2, 2, 2];
+
+fn scale4(v: @Vector(4, i32), k: @Vector(4, i32)) @Vector(4, i32) {
+    return v * k;
+}
+
+@main
+fn main() i64 {
+    // ① 字面量构造 + 编译期内省 + lane 读取
+    var a: @Vector(4, i32) = [1, 2, 3, 4];
+    println(int_to_str(@vlen(a)));                             // 4
+    println(int_to_str(@reduce_add(a) as i64));                // 10
+    println(int_to_str((a[0] as i64) + (a[3] as i64)));        // 5
+
+    // ② 赋值位置：整体覆盖（不是逐 lane 写）
+    var b: @Vector(4, i32) = @splat(0i32, 4);
+    b = [10, 20, 30, 40];
+    println(int_to_str(@reduce_add(b) as i64));                // 100
+    println(int_to_str(@reduce_max(b) as i64));                // 40
+    println(int_to_str(@reduce_min(b) as i64));                // 10
+
+    // ③ 逐元素算术：字面量直接作右操作数（外层 var 的期望会透传进子树）
+    var c: @Vector(4, i32) = a + [100, 200, 300, 400];         // {101,202,303,404}
+    println(int_to_str(@reduce_add(c) as i64));                // 1010
+
+    // ④ 调用实参位置：形参类型为 @Vector
+    var d: @Vector(4, i32) = scale4(a, [2, 2, 2, 2]);          // {2,4,6,8}
+    println(int_to_str(@reduce_add(d) as i64));                // 20
+
+    // ⑤ 模块级全局向量（LLVM 侧经 __ginit 运行期初始化）
+    println(int_to_str(@reduce_add(g_scale) as i64));          // 8
+    var e: @Vector(4, i32) = a * g_scale;                      // {2,4,6,8}
+    println(int_to_str(@reduce_add(e) as i64));                // 20
+
+    // ⑥ f64 lane：浮点向量求和
+    var f: @Vector(2, f64) = [1.5, 2.5];
+    println(int_to_str(@reduce_add(f) as i64));                // 4
+
+    // ⑦ 运行期构造：元素是非常量表达式
+    var k: i32 = 3;
+    var m: @Vector(4, i32) = [k, k + 1, k * 2, k - 3];         // {3,4,6,0}
+    println(int_to_str(@reduce_add(m) as i64));                // 13
+
+    return 0;
+}

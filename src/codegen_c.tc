@@ -201,6 +201,7 @@ pub var sf_fields: []string;
 pub var sf_tds: []i64;
 
 pub var em_cur_fn: string;    // 当前作用域函数名（"" = 无）
+pub var em_cur_ret: i64 = -1;  // 当前函数返回类型 TD（供 return 字面量切片识别）
 pub var em_in_fn: bool;
 
 pub var em_main_fn: string;   // @main 函数的 mangle 名
@@ -1820,9 +1821,12 @@ pub fn emit_expr(e: i64) string {
         if (n.sa == "=") {
             var rnb: Node = base.nodes[n.nb];
             var lhtd2: i64 = expr_type_desc(n.na);
-            if (rnb.kind == "array_lit" && rnb.la < 0 && lhtd2 >= 0 && sema.tds[lhtd2].cat == "slice") {
-                return base.sb_cat6("(", emit_expr(n.na), " = t_slice_new(sizeof(",
-                    desc_to_c(sema.tds[lhtd2].elem), "))", ")");
+            if (rnb.kind == "array_lit" && lhtd2 >= 0 && sema.tds[lhtd2].cat == "slice") {
+                if (rnb.la < 0) {
+                    return base.sb_cat6("(", emit_expr(n.na), " = t_slice_new(sizeof(",
+                        desc_to_c(sema.tds[lhtd2].elem), "))", ")");
+                }
+                return base.sb_cat6("(", emit_expr(n.na), " = ", c_slice_lit_expr(n.nb, lhtd2), ")", "");
             }
             // 向量赋值 `v = {a,b,c,d}`：C 的 vector 类型不能用裸 `{}` 作 RHS，须加 (VTY) 转换。
             if (rnb.kind == "array_lit" && lhtd2 >= 0 && sema.tds[lhtd2].cat == "vector") {
@@ -1961,11 +1965,17 @@ pub fn emit_expr(e: i64) string {
             var cn: string = cal.sa;
             // 收集参数
             var av: []string;
+            var ftd: i64 = sema.tm_get(cn);
             var c: i64 = n.la;
+            var ai: i64 = 0;
             while (c >= 0) {
                 var k: Child = base.kids[c];
-                var one_arg: string = emit_expr(k.val);
-                append(av, one_arg);
+                var ptd: i64 = -1;
+                if (ftd >= 0 && ai < sema.tdf_pcount[ftd]) { ptd = sema.tdf_params[sema.tdf_pstart[ftd] + ai]; }
+                c_arg_expect_td = ptd;
+                append(av, c_emit_call_arg(k.val));
+                c_arg_expect_td = -1;
+                ai = ai + 1;
                 c = k.next;
             }
             var argc: i64 = slice_len(av) as i64;
@@ -2214,10 +2224,16 @@ pub fn emit_expr(e: i64) string {
             sb_append_str(xcb, td_func_c_fnptr(xctd));
             sb_append_str(xcb, ")(__ic->fn))(__ic->env");
             var xc: i64 = n.la;
+            var xai: i64 = 0;
             while (xc >= 0) {
                 var xk: Child = base.kids[xc];
+                var xptd: i64 = -1;
+                if (xctd >= 0 && xai < sema.tdf_pcount[xctd]) { xptd = sema.tdf_params[sema.tdf_pstart[xctd] + xai]; }
+                c_arg_expect_td = xptd;
                 sb_append_str(xcb, ", ");
-                sb_append_str(xcb, emit_expr(xk.val));
+                sb_append_str(xcb, c_emit_call_arg(xk.val));
+                c_arg_expect_td = -1;
+                xai = xai + 1;
                 xc = xk.next;
             }
             sb_append_str(xcb, "); })");
@@ -2226,15 +2242,23 @@ pub fn emit_expr(e: i64) string {
         var sb2: StringBuilder = sb_new();
         sb_append_str(sb2, emit_expr(n.na));
         sb_append_char(sb2, 40);
+        var c2ftd: i64 = expr_type_desc(n.na);
+        if (c2ftd >= 0 && sema.tds[c2ftd].cat != "func") { c2ftd = -1; }
         var c2: i64 = n.la;
         var first: bool = true;
+        var c2ai: i64 = 0;
         while (c2 >= 0) {
             var k2: Child = base.kids[c2];
             if (!first) {
                 sb_append_str(sb2, ", ");
             }
-            sb_append_str(sb2, emit_expr(k2.val));
+            var c2ptd: i64 = -1;
+            if (c2ftd >= 0 && c2ai < sema.tdf_pcount[c2ftd]) { c2ptd = sema.tdf_params[sema.tdf_pstart[c2ftd] + c2ai]; }
+            c_arg_expect_td = c2ptd;
+            sb_append_str(sb2, c_emit_call_arg(k2.val));
+            c_arg_expect_td = -1;
             first = false;
+            c2ai = c2ai + 1;
             c2 = k2.next;
         }
         sb_append_char(sb2, 41);
@@ -2280,6 +2304,28 @@ pub fn emit_expr(e: i64) string {
         return base.sb_cat6("(", obj, "[", idx, "]", ")");
     }
     if (n.kind == "array_lit") {
+        // 向量字面量构造：`[a,b,c,d]` 被 sema 标记为向量 TD（n.ib>=0 且 cat==vector）
+        // → 发射 C 向量复合字面量 `(VTY){a,b,c,d}`（VTY 含 vector_size 属性）。
+        // ⚠ 标记走 ib 而非 ia：array_lit 的 ia 在 sema 之后会被抹回 -1。
+        if (n.ib >= 0 && sema.tds[n.ib].cat == "vector") {
+            var vty: string = desc_to_c(n.ib);
+            var sbv: StringBuilder = sb_new();
+            sb_append_char(sbv, 40);
+            sb_append_str(sbv, vty);
+            sb_append_str(sbv, "){");
+            var cv: i64 = n.la;
+            var firstv: bool = true;
+            while (cv >= 0) {
+                var ck: Child = base.kids[cv];
+                if (firstv == false) { sb_append_str(sbv, ", "); }
+                var evs: string = emit_expr(ck.val);
+                sb_append_str(sbv, evs);
+                firstv = false;
+                cv = ck.next;
+            }
+            sb_append_char(sbv, 125);
+            return sb_to_str(sbv);
+        }
         // 空切片字面量作表达式（`g = []`）：目标是 slice 类型时返回零长空切片
         // `t_slice_new(sizeof(elem))`，与 C 局部初始化（ll_emit_var_init 同款）一致。
         // ⚠ 修 P0-4：此前空 `[]` 被发射成 `{}` 复合字面量 → 与 TSlice{ptr,len} 结构不符。
@@ -2330,6 +2376,11 @@ pub fn emit_expr(e: i64) string {
     if (n.kind == "cast") {
         var ftd: i64 = expr_type_desc(n.na);
         var ttd: i64 = sema.resolve_type_desc(n.nb);
+        // 数组字面量直接转型成切片（`return [..]` / `f([..])` 的 `as []T` 包装）：
+        // 源是 array_lit，按期望 slice TD 构造 heap 切片（GNU 语句表达式），而非退化为 `{}` 复合字面量。
+        if (base.nodes[n.na].kind == "array_lit" && ttd >= 0 && sema.tds[ttd].cat == "slice") {
+            return c_slice_lit_expr(n.na, ttd);
+        }
         if (ftd >= 0 && ttd >= 0 && sema.tds[ftd].cat == "array" && sema.tds[ttd].cat == "slice") {
             var elemc: string = desc_to_c(sema.tds[ftd].elem);
             var nlen: i64 = sema.tds[ftd].alen;
@@ -2356,6 +2407,102 @@ pub fn is_array_lit(e: i64) bool {
     }
     var an: Node = base.nodes[e];
     return an.kind == "array_lit";
+}
+
+// 调用实参处的数组字面量：`sum4([10,20,30,40])`（`sum4` 形参为 `[4]i64`）。C 不允许裸
+// `{...}` 作表达式（仅能用于初始化器），须包成复合字面量 `(T[N]){...}`。元素类型取首元素
+// 的 expr_type_desc，长度取 kids 计数，与 sema.infer_expr 的 array_lit 分支一致。
+// ⚠ 向量字面量（n.ib>=0，emit_expr 已发 `(VTY){...}`）不在此处二次包裹；空切片（`[]`，
+// emit_expr 已发 `t_slice_new(...)`）因 k0<0 返回 "" 而跳过——两者都不动。
+pub fn c_array_lit_value_ty(e: i64) string {
+    var n: Node = base.nodes[e];
+    var k0: i64 = n.la;
+    if (k0 < 0) {
+        return "";
+    }
+    var etd: i64 = expr_type_desc(base.kids[k0].val);
+    var ct: string = "int64_t";
+    if (etd >= 0) {
+        ct = desc_to_c(etd);
+    }
+    var cnt: i64 = 0;
+    var c: i64 = n.la;
+    while (c >= 0) {
+        cnt = cnt + 1;
+        c = base.kids[c].next;
+    }
+    return base.sb_cat4(ct, "[", base.i2s(cnt), "]");
+}
+
+// 切片字面量作表达式（`s = [1,2,3]` / `return [1,2,3]` / `f([1,2,3])`，期望类型为 `[]T`）。
+// 用 GNU 语句表达式构造 heap 切片（t_slice_new + 逐元素 t_slice_append），返回 TSlice 值。
+// ⚠ 不能用 t_slice_from_raw：它零拷贝只借用指针，而复合字面量是块作用域，离开即失效 → UAF。
+pub var g_sl_id: i64 = 0;
+pub var c_arg_expect_td: i64 = -1;   // 当前调用实参期望的类型（callee 签名注入，供字面量切片识别）
+pub fn c_slice_lit_expr(e: i64, std: i64) string {
+    var n: Node = base.nodes[e];
+    var etd: i64 = sema.tds[std].elem;
+    var et: string = "int64_t";
+    if (etd >= 0) { et = desc_to_c(etd); }
+    g_sl_id = g_sl_id + 1;
+    var id: string = base.i2s(g_sl_id);
+    var sb: StringBuilder = sb_new();
+    sb_append_str(sb, "({ TSlice _sl");
+    sb_append_str(sb, id);
+    sb_append_str(sb, " = t_slice_new(sizeof(");
+    sb_append_str(sb, et);
+    sb_append_str(sb, "));");
+    var c: i64 = n.la;
+    var idx: i64 = 0;
+    while (c >= 0) {
+        var ck: Child = base.kids[c];
+        var ev: string = emit_expr(ck.val);
+        sb_append_str(sb, " ");
+        sb_append_str(sb, et);
+        sb_append_str(sb, " _e");
+        sb_append_str(sb, id);
+        sb_append_str(sb, "_");
+        sb_append_str(sb, base.i2s(idx));
+        sb_append_str(sb, " = (");
+        sb_append_str(sb, et);
+        sb_append_str(sb, ")");
+        sb_append_str(sb, ev);
+        sb_append_str(sb, ";");
+        sb_append_str(sb, " t_slice_append(&_sl");
+        sb_append_str(sb, id);
+        sb_append_str(sb, ", &_e");
+        sb_append_str(sb, id);
+        sb_append_str(sb, "_");
+        sb_append_str(sb, base.i2s(idx));
+        sb_append_str(sb, ");");
+        idx = idx + 1;
+        c = ck.next;
+    }
+    sb_append_str(sb, " _sl");
+    sb_append_str(sb, id);
+    sb_append_str(sb, "; })");
+    return sb_to_str(sb);
+}
+
+pub fn c_emit_call_arg(aen: i64) string {
+    // 先按期望类型判断：若期望为切片且实参是数组字面量，直接构造 heap 切片
+    // （必须在 emit_expr 之前判定，否则字面量会先退化为 `{}` 复合字面量）。
+    // saved 保存调用方注入的期望类型，供嵌套调用（实参内再出现函数调用）正确还原。
+    var saved: i64 = c_arg_expect_td;
+    var s: string = "";
+    if (base.nodes[aen].kind == "array_lit" && c_arg_expect_td >= 0 && sema.tds[c_arg_expect_td].cat == "slice") {
+        s = c_slice_lit_expr(aen, c_arg_expect_td);
+    } else {
+        s = emit_expr(aen);
+        if (base.nodes[aen].kind == "array_lit" && base.nodes[aen].ib < 0) {
+            var aty: string = c_array_lit_value_ty(aen);
+            if (aty != "") {
+                s = base.sb_cat4("(", aty, ")", s);
+            }
+        }
+    }
+    c_arg_expect_td = saved;
+    return s;
 }
 
 pub fn is_map_lit(e: i64) bool {
@@ -2671,7 +2818,11 @@ pub fn emit_stmt(sid: i64, indent: i64) void {
         }
         g_defer_n = 0;
         if (n.na >= 0) {
-            spush(base.sb_cat4(pad, "return ", emit_expr(n.na), ";"));
+            if (em_cur_ret >= 0 && sema.tds[em_cur_ret].cat == "slice" && base.nodes[n.na].kind == "array_lit") {
+                spush(base.sb_cat4(pad, "return ", c_slice_lit_expr(n.na, em_cur_ret), ";"));
+            } else {
+                spush(base.sb_cat4(pad, "return ", emit_expr(n.na), ";"));
+            }
         } else {
             spush(base.sb_cat2(pad, "return;"));
         }
@@ -3593,6 +3744,7 @@ pub fn emit_func_decl(d: i64) void {
 
     em_cur_fn = n.sa;
     em_in_fn = true;
+    em_cur_ret = sema.resolve_type_desc(n.na);
     g_defer_n = 0;   // 每个函数独立延迟栈
     spush(base.sb_cat2(sig, " {"));
     if (n.lc > -2) {
@@ -3623,6 +3775,7 @@ pub fn emit_func_decl(d: i64) void {
     spush("}");
     em_in_fn = false;
     em_cur_fn = "";
+    em_cur_ret = -1;
     spush("");
 
     // C 互操作导出：发 `extern "C"` 平铺转发器（clean name → 真函数名）

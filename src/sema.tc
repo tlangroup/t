@@ -153,6 +153,15 @@ pub fn ti_vlen(ti: i64) i64 {
     return tis[ti].alen;
 }
 
+// 向量字面量构造的「期望类型」：当数组字面量 `[a,b,c,d]` 作为向量类型的 RHS 时，
+// 由赋值 / 变量声明 / return 等父节点注入此全局，infer_expr 据此把字面量推断为向量，
+// 并把向量 TD 标记到节点 `ib`（>=0 即表示「此字面量构造向量」），供 codegen 发射成
+// `(VTY){...}`（C）/ `<N x T>`（LLVM）。普通数组字面量的 ib 恒为 -1，不会误命中。
+//
+// ⚠ 必须用 `ib` 而非 `ia`：`ia` 在 array_lit 节点上会被后续管线（comptime 折叠写回 /
+// 数组长度回填等）覆写成 -1，实测拿不到标记；`ib` 未被 array_lit 占用，可安全传递。
+pub var g_vec_expect: i64 = -1;
+
 pub fn vec_is_pow2(x: i64) bool {
     if (x <= 0) { return false; }
     return (x & (x - 1)) == 0;
@@ -770,7 +779,18 @@ pub fn check_call_args(e: i64, fti: i64, fname: string) void {
     while (c >= 0) {
         var k: Child = base.kids[c];
         if (got < want) {
+            // 实参位置的向量字面量：形参是 @Vector(N,T) 时注入期望类型，让 `[a,b,c,d]`
+            // 按向量构造而非退化成 `[4]i64`（与 assign/var_decl/return 同一机制）。
+            //
+            // ⚠ 形参**非**向量时必须主动清除（不能只是「不设置」）：g_vec_expect 是全局且
+            // 在递归中不自动清除，外层 `var v: @Vector(4,i32) = <expr>` 的期望会一路透传进
+            // 深层子表达式。若此处不清，`v = f([1,2,3,4]) + w`（f 形参为数组/切片）里的
+            // `[1,2,3,4]` 会被误判成向量 → 无谓的 T-VEC-E924 / 类型不匹配误报。
+            var saved_ve4: i64 = g_vec_expect;
+            var pt0: i64 = tif_params[pstart + got];
+            if (ti_is_vector(pt0)) { g_vec_expect = pt0; } else { g_vec_expect = -1; }
             var at: i64 = infer_expr(k.val);
+            g_vec_expect = saved_ve4;
             var pt: i64 = tif_params[pstart + got];
             intlit_overflow_warn(k.val, pt);
             if (tip_kind(at) != "Unknown" && ti_equal(pt, at) == false && can_cast(at, pt) == false) {
@@ -4848,7 +4868,10 @@ pub fn infer_expr(e: i64) i64 {
     }
     if (n.kind == "assign") {
         var atl: i64 = infer_expr(n.na);
+        var saved_ve0: i64 = g_vec_expect;
+        if (ti_is_vector(atl)) { g_vec_expect = atl; }
         var atr: i64 = infer_expr(n.nb);
+        g_vec_expect = saved_ve0;
         // 解引用赋值 `*r = v`：仅当 r 为可变绑定（var）时允许，否则就是只读引用。
         if (base.nodes[n.na].kind == "deref") {
             var dop: i64 = base.nodes[n.na].na;
@@ -5311,6 +5334,49 @@ pub fn infer_expr(e: i64) i64 {
         return ti_mk("Unknown");
     }
     if (n.kind == "array_lit") {
+        // 向量字面量构造：`[a,b,c,d]` 在父节点注入的期望类型为 @Vector(N,T) 时，
+        // 直接按向量构造（校验 lane 数 + 每元素可转 lane 类型），并把向量 TD 标记到
+        // 节点 ib，供 codegen 发射成硬件向量字面量。
+        if (g_vec_expect >= 0 && ti_is_vector(g_vec_expect)) {
+            var vc: i64 = g_vec_expect;
+            var vln: i64 = tis[vc].alen;
+            var velem: i64 = tis[vc].elem;
+            var cnt: i64 = parse.list_count(n.la);
+            if (cnt != vln) {
+                parse.fc_err("T-VEC-E924",
+                    base.sb_cat6("向量字面量 `[...]` 的元素个数必须等于 lane 数 ", base.i2s(vln),
+                        "，当前为 ", base.i2s(cnt), "；可用 `@splat(标量, ",
+                        base.sb_cat2(base.i2s(vln), ") 广播单值")), e);
+                return ti_mk("Unknown");
+            }
+            var ci: i64 = 0;
+            var cc: i64 = n.la;
+            while (cc >= 0) {
+                var ckv: Child = base.kids[cc];
+                // 清期望：lane 元素自身若也是 `[...]`（如 @Vector(4, @Vector(2,i32))），
+                // 不能被外层期望误判成同一向量类型。
+                var saved_ve5: i64 = g_vec_expect;
+                g_vec_expect = -1;
+                var cet: i64 = infer_expr(ckv.val);
+                g_vec_expect = saved_ve5;
+                if (tip_kind(cet) != "Unknown" && ti_equal(cet, velem) == false && can_cast(cet, velem) == false) {
+                    parse.fc_err("T-VEC-E924",
+                        base.sb_cat6("向量字面量第 ", base.i2s(ci + 1),
+                            " 个元素类型与 lane 类型不兼容：向量 lane 类型必须严格一致且可隐式转换",
+                            "", "", ""), ckv.val);
+                    return ti_mk("Unknown");
+                }
+                ci = ci + 1;
+                cc = ckv.next;
+            }
+            // 标记向量 TD 到节点（ib>=0 即「此字面量构造向量」），供两个后端发射。
+            // ⚠ 只能用 ib：array_lit 的 ia 在 sema 之后会被抹回 -1（实测），
+            // 标记若挂在 ia 上，codegen 侧读到 -1 → 落到 UNSUPPORTED/裸数组路径。
+            var nn: Node = base.nodes[e];
+            nn.ib = ti_to_td_base(vc);
+            slice_set(base.nodes, e, nn);
+            return vc;
+        }
         var cnt: i64 = parse.list_count(n.la);
         if (cnt > 0) {
             var k2: Child = base.kids[n.la];
@@ -5484,7 +5550,10 @@ pub fn check_stmt(s: i64) void {
             return;
         }
         if (n.nb >= 0) {
+            var saved_ve2: i64 = g_vec_expect;
+            if (ti_is_vector(vt)) { g_vec_expect = vt; }
             var it: i64 = infer_expr(n.nb);
+            g_vec_expect = saved_ve2;
             intlit_overflow_warn(n.nb, vt);
             if (tip_kind(it) != "Unknown" && ti_equal(it, vt) == false) {
                 var vk: string = tip_kind(vt);
@@ -5625,7 +5694,10 @@ pub fn check_stmt(s: i64) void {
         if (n.na >= 0) {
             // 管道许可上下文之三：return 值
             pipe_mark(n.na);
+            var saved_ve3: i64 = g_vec_expect;
+            if (ti_is_vector(cur_ret)) { g_vec_expect = cur_ret; }
             var rt: i64 = infer_expr(n.na);
+            g_vec_expect = saved_ve3;
             // 逃逸分析（T-SEM-E764）：返回对局部变量/参数的引用 → 悬垂指针（dangling）
             if (expr_has_local_addr(n.na)) {
                 parse.fc_err("T-SEM-E764",
@@ -5674,7 +5746,10 @@ pub fn check_stmt(s: i64) void {
         // （T-SEM-E764 逃逸检查统一放在 infer_expr 的 assign 分支，避免与 compound
         // 赋值节点重复；此处 LHS 为元组，assign_target_escapable 已天然不匹配。）
         pipe_mark(n.nb);
+        var saved_ve1: i64 = g_vec_expect;
+        if (ti_is_vector(tt)) { g_vec_expect = tt; }
         var vt2: i64 = infer_expr(n.nb);
+        g_vec_expect = saved_ve1;
         intlit_overflow_warn(n.nb, tt);
         if (tip_kind(tt) != "Unknown" && tip_kind(vt2) != "Unknown" && ti_equal(tt, vt2) == false) {
             // Sym 字段允许由字符串赋值（自动 intern）；跨池 Sym→Sym 仍报错
@@ -6052,7 +6127,13 @@ pub fn check_decl(d: i64) void {
     }
     if (n.kind == "GlobalVarDecl") {
         if (n.nb >= 0) {
+            // 模块级全局的向量字面量构造：`var g: @Vector(4,i32) = [1,2,3,4];`
+            // 与局部 var_decl 同一机制，注入期望类型后由 array_lit 分支升格。
+            var saved_ve6: i64 = g_vec_expect;
+            var gvt0: i64 = resolve_ti(n.na);
+            if (ti_is_vector(gvt0)) { g_vec_expect = gvt0; }
             var it: i64 = infer_expr(n.nb);
+            g_vec_expect = saved_ve6;
             var vt: i64 = resolve_ti(n.na);
             if (tip_kind(it) != "Unknown" && ti_equal(it, vt) == false) {
                 // Sym 全局变量允许由字符串赋值（自动 intern → id）
@@ -6066,7 +6147,14 @@ pub fn check_decl(d: i64) void {
     }
     if (n.kind == "GlobalConstDecl") {
         if (n.nb >= 0) {
+            // 模块级 const 的向量字面量构造（同 GlobalVarDecl）
+            var saved_ve7: i64 = g_vec_expect;
+            if (n.na >= 0) {
+                var gct0: i64 = resolve_ti(n.na);
+                if (ti_is_vector(gct0)) { g_vec_expect = gct0; }
+            }
             var it2: i64 = infer_expr(n.nb);
+            g_vec_expect = saved_ve7;
             if (n.na >= 0) {
                 var ct: i64 = resolve_ti(n.na);
                 if (tip_kind(it2) != "Unknown" && ti_equal(it2, ct) == false) {

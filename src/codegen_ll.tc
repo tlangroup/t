@@ -693,6 +693,12 @@ pub fn ll_etd(e: i64) i64 {
         return sema.td_mk("unknown");
     }
     var n: Node = base.nodes[e];
+    // 向量字面量 `[a,b,c,d]`：sema 已把向量 TD 标记到 n.ib。ll_etd 没有 array_lit
+    // 通用分支，兜底 expr_type_desc 对 array_lit 返回 unknown —— 那会让 `return
+    // [1,2,3,4]` 之类按 unknown 发射。此处直接返回标记的向量 TD。
+    if (n.kind == "array_lit" && n.ib >= 0 && sema.tds[n.ib].cat == "vector") {
+        return n.ib;
+    }
     if (n.kind == "unary") {
         if (n.sa == "!") {
             return sema.td_named_mk("scalar", "bool");
@@ -1365,11 +1371,17 @@ pub fn emit_lle(e: i64) string {
         // 空切片字面量作赋值 RHS（`g = []`）：直接朝 LHS 地址发射 tll_slice_new，
         // 跳过 emit_lle（修 P0-4：空 `[]` 节点自身无 slice 类型，emit_lle 会落到
         // `UNSUPPORTED expr` → `load %TSlice, ptr 0`）。
-        if (n.sa == "=" && base.nodes[n.nb].kind == "array_lit" && base.nodes[n.nb].la < 0
+        if (n.sa == "=" && base.nodes[n.nb].kind == "array_lit"
                 && ltd >= 0 && sema.tds[ltd].cat == "slice") {
-            var esz: string = "i64";
-            if (sema.tds[ltd].elem >= 0) { esz = ll_td(sema.tds[ltd].elem); }
-            llfb(base.sb_cat6("  call void @tll_slice_new(i64 ", ll_sizeof(esz), ", ptr ", sema.ad, ")", ""));
+            var rnb: Node = base.nodes[n.nb];
+            if (rnb.la < 0) {
+                var esz: string = "i64";
+                if (sema.tds[ltd].elem >= 0) { esz = ll_td(sema.tds[ltd].elem); }
+                llfb(base.sb_cat6("  call void @tll_slice_new(i64 ", ll_sizeof(esz), ", ptr ", sema.ad, ")", ""));
+            } else {
+                var sv: string = ll_build_slice_lit(n.nb, ltd);
+                ll_copy("%TSlice", sv, sema.ad);
+            }
             return sema.ad;
         }
         var v: string = emit_lle(n.nb);
@@ -1546,41 +1558,45 @@ pub fn emit_lle(e: i64) string {
     // 表达式位置的缺口（修 P0-4：空切片 `[]` 作表达式曾被发射成 `load %TSlice, ptr 0`）。
     // ⚠ 切片按「值即地址」约定返回 scratch 指针，与 cast/append/slice_sub 的返回一致。
     if (n.kind == "array_lit" && ll_etd(e) >= 0 && sema.tds[ll_etd(e)].cat == "slice") {
-        var aetd: i64 = ll_etd(e);
-        var aetye: i64 = sema.tds[aetd].elem;
-        var aety: string = "i64";
-        if (aetye >= 0) { aety = ll_td(aetye); }
-        var asp: string = ll_scratch("%TSlice");
-        llfb(base.sb_cat6("  call void @tll_slice_new(i64 ", ll_sizeof(aety), ", ptr ", asp, ")", ""));
-        var acc: i64 = n.la;
-        while (acc >= 0) {
-            var ack: Child = base.kids[acc];
-            var aep: string = "";
-            if (ll_isagg(aetye)) {
-                aep = emit_lle(ack.val);
-            } else {
-                var av0: string = emit_lle(ack.val);
-                if (aetye >= 0) { av0 = ll_cast_v(av0, ll_etd(ack.val), aetye); }
-                var asc0: string = ll_scratch(aety);
-                llfb(base.sb_cat6("  store ", aety, " ", av0, ", ptr ", asc0));
-                aep = asc0;
-            }
-            var asb0: StringBuilder = sb_new();
-            sb_append_str(asb0, "  call void @tll_slice_append(ptr ");
-            sb_append_str(asb0, asp);
-            sb_append_str(asb0, ", ptr ");
-            sb_append_str(asb0, aep);
-            sb_append_str(asb0, ", i64 ");
-            sb_append_str(asb0, ll_sizeof(aety));
-            sb_append_str(asb0, ")");
-            llfb(sb_to_str(asb0));
-            acc = ack.next;
+        return ll_build_slice_lit(e, ll_etd(e));
+    }
+    // 向量字面量构造：`[a,b,c,d]` 被 sema 标记为向量 TD（n.ib>=0 且 cat==vector）。
+    // ⚠ 必须用 n.ib，不能用 ll_etd(e)：ll_etd 无 array_lit 分支，兜底 expr_type_desc
+    // 对 array_lit 返回 unknown；也不能用 n.ia —— array_lit 的 ia 在 sema 之后会被
+    // 抹回 -1（实测 ia=-1 而 ib 存活），只有 ib 能安全携带标记到 codegen。
+    // 复用 splat 的构造手法：scratch 一个 `<N x T>`，逐 lane GEP+store，按「值即 ptr」
+    // 约定返回 scratch 指针（与 @splat / @reduce_* 的向量值表示一致）。
+    if (n.kind == "array_lit" && n.ib >= 0 && sema.tds[n.ib].cat == "vector") {
+        var vlvt: i64 = n.ib;
+        var vlvty: string = ll_td(vlvt);
+        var vlet: i64 = sema.tds[vlvt].elem;
+        var vlety: string = ll_td(vlet);
+        var vlsp: string = ll_scratch(vlvty);
+        llfb(base.sb_cat6("  store ", vlvty, " ", ll_zero(vlvty), ", ptr ", vlsp));
+        var vlc: i64 = n.la;
+        var vli: i64 = 0;
+        while (vlc >= 0) {
+            var vlck: Child = base.kids[vlc];
+            var vlevs: string = emit_lle(vlck.val);
+            if (vlet >= 0) { vlevs = ll_cast_v(vlevs, ll_etd(vlck.val), vlet); }
+            var vlgp: string = ll_tmp();
+            var vl_s1: string = base.sb_cat3("  ", vlgp, " = getelementptr ");
+            var vl_s2: string = base.sb_cat3(vlvty, ", ptr ", vlsp);
+            llfb(base.sb_cat6(vl_s1, vl_s2, ", i64 0, i64 ", base.i2s(vli), "", ""));
+            llfb(base.sb_cat6("  store ", vlety, " ", vlevs, ", ptr ", vlgp));
+            vli = vli + 1;
+            vlc = vlck.next;
         }
-        return asp;
+        return vlsp;
     }
     if (n.kind == "cast") {
         var ftd: i64 = ll_etd(n.na);
         var ttd: i64 = sema.resolve_type_desc(n.nb);
+        // 数组字面量直接转型成切片（`return [..]` / `f([..])` 的 `as []T` 包装）：
+        // 源是 array_lit（无「数组值」形态，emit_lle 会退化成 ptr 0），按期望 slice TD 构造 heap 切片。
+        if (base.nodes[n.na].kind == "array_lit" && ttd >= 0 && sema.tds[ttd].cat == "slice") {
+            return ll_build_slice_lit(n.na, ttd);
+        }
         if (ftd >= 0 && ttd >= 0 && sema.tds[ftd].cat == "array" && sema.tds[ttd].cat == "slice") {
             var v2: string = emit_lle(n.na);
             var aty: string = ll_td(sema.tds[ftd].elem);
@@ -1619,6 +1635,76 @@ pub fn emit_lle(e: i64) string {
     }
     llfb("  ; UNSUPPORTED expr");
     return "0";
+}
+
+// 定长数组字面量作调用实参：`sum4([10,20,30,40])`（`sum4` 形参为 `[4]i64`）。
+// emit_lle 对固定数组字面量没有专门分支（无 array_lit 定长数组的「值」形态，且 llvm
+// 侧会退化成 ptr 0 → `load [N x T], ptr 0`），故在 ll_call 实参循环里按**形参类型**
+// 构造：build 一个 scratch `[N x T]`（T/alen 取自形参 arr_td），逐元素 GEP+store，返回
+// scratch 指针；上层 `ll_load([N x T], ptr)` 得到按值传递的数组。切片 / 向量实参各有
+// 专门路径（cat 不同），此处仅命中 cat=="array" && 实参节点为 array_lit，零连带影响。
+pub fn ll_build_array_lit(e: i64, atd: i64) string {
+    var ne: Node = base.nodes[e];
+    var aetye: i64 = sema.tds[atd].elem;
+    var aety: string = ll_td(aetye);
+    var anlen: i64 = sema.tds[atd].alen;
+    var naty: string = base.sb_cat5("[", base.i2s(anlen), " x ", aety, "]");
+    var asp: string = ll_scratch(naty);
+    llfb(base.sb_cat6("  store ", naty, " ", ll_zero(naty), ", ptr ", asp));
+    var c: i64 = ne.la;
+    var idx: i64 = 0;
+    while (c >= 0) {
+        var ck: Child = base.kids[c];
+        var evs: string = emit_lle(ck.val);
+        if (aetye >= 0) { evs = ll_cast_v(evs, ll_etd(ck.val), aetye); }
+        var gp: string = ll_tmp();
+        var g1: string = base.sb_cat3("  ", gp, " = getelementptr inbounds ");
+        var g2: string = base.sb_cat3(naty, ", ptr ", asp);
+        llfb(base.sb_cat6(g1, g2, ", i64 0, i64 ", base.i2s(idx), "", ""));
+        llfb(base.sb_cat6("  store ", aety, " ", evs, ", ptr ", gp));
+        idx = idx + 1;
+        c = ck.next;
+    }
+    return asp;
+}
+
+// 切片字面量作表达式：`s = [1,2,3]` / `return [1,2,3]` / `f([1,2,3])`（形参/返回/赋值目标
+// 类型为 `[]T`）。emit_lle 对 array_lit 没有「切片值」分支（ll_etd 对 array_lit 返回
+// unknown，slice 期望类型只能从上下文拿到），故在赋值 RHS / return / call-arg 上下文点按
+// 期望的 slice TD 构造：tll_slice_new + 逐元素 tll_slice_append（heap 拷贝，生命周期安全）。
+// 返回 scratch %TSlice 指针（切片「值即地址」约定，与 @splat/append/slice_sub 一致）。
+pub fn ll_build_slice_lit(e: i64, std: i64) string {
+    var ne: Node = base.nodes[e];
+    var aetye: i64 = sema.tds[std].elem;
+    var aety: string = "i64";
+    if (aetye >= 0) { aety = ll_td(aetye); }
+    var asp: string = ll_scratch("%TSlice");
+    llfb(base.sb_cat6("  call void @tll_slice_new(i64 ", ll_sizeof(aety), ", ptr ", asp, ")", ""));
+    var acc: i64 = ne.la;
+    while (acc >= 0) {
+        var ack: Child = base.kids[acc];
+        var aep: string = "";
+        if (ll_isagg(aetye)) {
+            aep = emit_lle(ack.val);
+        } else {
+            var av0: string = emit_lle(ack.val);
+            if (aetye >= 0) { av0 = ll_cast_v(av0, ll_etd(ack.val), aetye); }
+            var asc0: string = ll_scratch(aety);
+            llfb(base.sb_cat6("  store ", aety, " ", av0, ", ptr ", asc0));
+            aep = asc0;
+        }
+        var asb0: StringBuilder = sb_new();
+        sb_append_str(asb0, "  call void @tll_slice_append(ptr ");
+        sb_append_str(asb0, asp);
+        sb_append_str(asb0, ", ptr ");
+        sb_append_str(asb0, aep);
+        sb_append_str(asb0, ", i64 ");
+        sb_append_str(asb0, ll_sizeof(aety));
+        sb_append_str(asb0, ")");
+        llfb(sb_to_str(asb0));
+        acc = ack.next;
+    }
+    return asp;
 }
 
 // 索引值统一拓宽为 i64（str_at/slice_at 的下标参数）
@@ -3390,6 +3476,14 @@ pub fn ll_call(e: i64) string {
             }
             var aty: string = ll_td(ptd3);
             var avv: string = emit_lle(ae[i]);
+            // 定长数组字面量实参：emit_lle 退化为 "0"，改按形参类型构造 scratch 数组。
+            if (ptd3 >= 0 && sema.tds[ptd3].cat == "array" && base.nodes[ae[i]].kind == "array_lit") {
+                avv = ll_build_array_lit(ae[i], ptd3);
+            }
+            // 切片字面量实参：形参类型为 `[]T` 时，按期望 slice TD 构造 heap 切片。
+            if (ptd3 >= 0 && sema.tds[ptd3].cat == "slice" && base.nodes[ae[i]].kind == "array_lit") {
+                avv = ll_build_slice_lit(ae[i], ptd3);
+            }
             if (ptd3 >= 0 && ll_isagg(ptd3)) {
                 avv = ll_load(aty, avv);
             } else {
@@ -4035,6 +4129,14 @@ pub fn emit_llstmt(sid: i64) void {
                 emit_lle(n.na);
             }
             llfb("  ret void");
+            ll_term = true;
+            return;
+        }
+        if (ll_cur_ret >= 0 && sema.tds[ll_cur_ret].cat == "slice" && n.na >= 0
+                && base.nodes[n.na].kind == "array_lit") {
+            var sv: string = ll_build_slice_lit(n.na, ll_cur_ret);
+            var rl: string = ll_load(rty, sv);
+            llfb(base.sb_cat4("  ret ", rty, " ", rl));
             ll_term = true;
             return;
         }
