@@ -645,6 +645,9 @@ pub fn expr_type_desc(e: i64) i64 {
         if (str_slice(n.sa, str_len(n.sa) - 1, str_len(n.sa)) == "f") { return sema.td_named_mk("scalar", "f32"); }
         return sema.td_named_mk("scalar", "f64");
     }
+    if (n.kind == "mbuiltin" && sema.test_mbuiltin(n.sa)) {
+        return sema.td_mk("Void");
+    }
     // 硬件 SIMD 向量内建的类型推导：
     if (n.kind == "mbuiltin") {
         if (n.sa == "splat") {
@@ -1963,6 +1966,22 @@ pub fn emit_expr(e: i64) string {
         }
         var mr: string = emit_math_call(n.sa, mav);
         if (mr != "") { return mr; }
+        // ── 测试内建（@panic / @assert / @assert_eq）── 交 runtime 调用
+        if (sema.test_mbuiltin(n.sa)) {
+            var tp_suf: string = "";
+            if (n.sa == "panic") { return base.sb_cat3("t_panic(", mav[0], ")"); }
+            if (n.sa == "assert") { return base.sb_cat5("t_assert(", mav[0], ", ", mav[1], ")"); }
+            // assert_eq(a, b, msg) —— 有符号整型 cast 到 int64_t，无符号 cast 到 uint64_t
+            var tp_c0: string = mav[0];
+            var tp_c1: string = mav[1];
+            if (n.sb == "i64") { tp_suf = "i64"; tp_c0 = base.sb_cat3("(int64_t)(", mav[0], ")"); tp_c1 = base.sb_cat3("(int64_t)(", mav[1], ")"); }
+            else if (n.sb == "u64") { tp_suf = "u64"; tp_c0 = base.sb_cat3("(uint64_t)(", mav[0], ")"); tp_c1 = base.sb_cat3("(uint64_t)(", mav[1], ")"); }
+            else if (n.sb == "f64") { tp_suf = "f64"; }
+            else if (n.sb == "f32") { tp_suf = "f32"; }
+            else if (n.sb == "b") { tp_suf = "b"; }
+            else if (n.sb == "s") { tp_suf = "s"; }
+            return base.sb_cat3("t_assert_eq_", tp_suf, base.sb_cat6("(", tp_c0, ", ", tp_c1, ", ", base.sb_cat2(mav[2], ")")));
+        }
         // ── 硬件 SIMD 向量内建 ──
         if (n.sa == "splat") {
             // @splat(scalar, len) -> (VecType){s,s,...,s}（结果类型由 expr_type_desc 推导）
@@ -4277,6 +4296,11 @@ pub fn emit_unit(mod: string) void {
     while (i < n) {
         var d: i64 = lex.decl_list[i];
         var k: string = base.nodes[d].kind;
+        // Device 入口 `kernel fn` 由 codegen_dev 发射为 Device Dialect，host C 后端跳过。
+        if (k == "FuncDecl" && base.nodes[d].bf == true) {
+            i = i + 1;
+            continue;
+        }
         // 已在上方按拓扑序发射，主循环跳过，避免重复定义。
         if (k == "StructDecl" || k == "UnionDecl" || k == "VariantDecl") {
             if (str_in_slice(g_emitted_structs, base.nodes[d].sa)) {

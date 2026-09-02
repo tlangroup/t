@@ -17,6 +17,17 @@ void    tll_print(TStr* s)                  { t_print(*s); }
 void    tll_eprint(TStr* s)                 { t_eprint(*s); }
 void    tll_println(TStr* s)                { t_println(*s); }
 
+// ── 测试内建 shim（@panic / @assert / @assert_eq）──
+// 与 tll_eprint 同：聚合（string）按指针传，解引用转调 t_runtime.c 的实现。
+void    tll_panic(TStr* msg)                        { t_panic(*msg); }
+void    tll_assert(int8_t cond, TStr* msg)          { t_assert(cond, *msg); }
+void    tll_assert_eq_i64(int64_t a, int64_t b, TStr* msg) { t_assert_eq_i64(a, b, *msg); }
+void    tll_assert_eq_u64(uint64_t a, uint64_t b, TStr* msg) { t_assert_eq_u64(a, b, *msg); }
+void    tll_assert_eq_f64(double a, double b, TStr* msg)    { t_assert_eq_f64(a, b, *msg); }
+void    tll_assert_eq_f32(float a, float b, TStr* msg)      { t_assert_eq_f32(a, b, *msg); }
+void    tll_assert_eq_b(int8_t a, int8_t b, TStr* msg)      { t_assert_eq_b(a, b, *msg); }
+void    tll_assert_eq_s(TStr* a, TStr* b, TStr* msg)        { t_assert_eq_s(*a, *b, *msg); }
+
 // ── type_info(T) accessor shim（M36）──
 // 约定：返回聚合（string）用 out-pointer，且 out 排在末位——与
 //       tll_file_read_all / tll_str_slice / tll_sb_to_str 一致，顺序不可颠倒；

@@ -313,7 +313,14 @@ pub fn ll_td(td: i64) string {
     }
     var t: TD = sema.tds[td];
     if (t.cat == "string" || t.cat == "bytes") { return "%TStr"; }
-    if (t.cat == "pointer") { return "ptr"; }
+    if (t.cat == "pointer") {
+        // Device 地址空间：dev_ptr[T]/shared[T]/local[T] 携带 TD.memspace（1/3/5），
+        // 发 `ptr addrspace(N)` 与设备侧 !llvm.ptr<as> 对齐；host 普通 *T 仍 `ptr`（as=0）。
+        if (t.memspace > 0) {
+            return base.sb_cat4("ptr addrspace(", base.i2s(t.memspace), ")", "");
+        }
+        return "ptr";
+    }
     if (t.cat == "slice") { return "%TSlice"; }
     if (t.cat == "array") {
         var an: i64 = t.alen;
@@ -714,6 +721,9 @@ pub fn ll_etd(e: i64) i64 {
     // [1,2,3,4]` 之类按 unknown 发射。此处直接返回标记的向量 TD。
     if (n.kind == "array_lit" && n.ib >= 0 && sema.tds[n.ib].cat == "vector") {
         return n.ib;
+    }
+    if (n.kind == "mbuiltin" && sema.test_mbuiltin(n.sa)) {
+        return sema.td_mk("Void");
     }
     if (n.kind == "unary") {
         if (n.sa == "!") {
@@ -1411,6 +1421,9 @@ pub fn emit_lle(e: i64) string {
     }
     if (n.kind == "mbuiltin" && math_is_mbuiltin_ll(n.sa)) {
         return ll_emit_math(e);
+    }
+    if (n.kind == "mbuiltin" && sema.test_mbuiltin(n.sa)) {
+        return ll_emit_test(e);
     }
     // 硬件 SIMD 向量内建（见 ll_vec_mbuiltin）
     if (n.kind == "mbuiltin") {
@@ -2686,6 +2699,60 @@ pub fn math_declared_ll(cn: string) bool {
 // 实参统一取自 n.la；名取自 mbuitin.sa 或 call 的 callee ident.sa。
 // 硬件 FPU intrinsic 优先（g_fp_hw 时 sin/cos/exp/exp2/log/log2/log10/pow/sqrt/fabs/floor/ceil/trunc/round），
 // 否则回落 t_runtime 包装 t_math_<name>（内部走系统 libm；WASM 等无 libm 目标编译 fdlibm 进 t_runtime.lib）。
+// 测试内建发射（@panic / @assert / @assert_eq）：直接交 runtime 调用，无内联控制流。
+pub fn ll_emit_test(e: i64) string {
+    var n: Node = base.nodes[e];
+    var cn: string = n.sa;
+    var av: []string;
+    var anodes: []i64;
+    var mc: i64 = n.la;
+    while (mc >= 0) {
+        append(anodes, base.kids[mc].val);
+        append(av, emit_lle(base.kids[mc].val));
+        mc = base.kids[mc].next;
+    }
+    if (cn == "panic") {
+        llfb(base.sb_cat3("  call void @tll_panic(ptr ", av[0], ")"));
+        return "0";
+    }
+    if (cn == "assert") {
+        llfb(base.sb_cat4("  call void @tll_assert(i8 ", av[0], ", ptr ", base.sb_cat2(av[1], ")")));
+        return "0";
+    }
+    // assert_eq(a, b, msg)
+    var suf: string = "";
+    var pty: string = "i64";
+    var ttd: i64 = -1;   // 整型目标 TD：窄位宽经 ll_cast_v sext/zext 到 64 位
+    if (n.sb == "i64") { suf = "i64"; pty = "i64"; ttd = sema.td_named_mk("scalar", "i64"); }
+    else if (n.sb == "u64") { suf = "u64"; pty = "i64"; ttd = sema.td_named_mk("scalar", "u64"); }
+    else if (n.sb == "f64") { suf = "f64"; pty = "double"; }
+    else if (n.sb == "f32") { suf = "f32"; pty = "float"; }
+    else if (n.sb == "b") { suf = "b"; pty = "i8"; }
+    else if (n.sb == "s") { suf = "s"; pty = "ptr"; }
+    var v0: string = av[0];
+    var v1: string = av[1];
+    if (ttd >= 0) {
+        v0 = ll_cast_v(av[0], ll_etd(anodes[0]), ttd);
+        v1 = ll_cast_v(av[1], ll_etd(anodes[1]), ttd);
+    }
+    var tpsb: StringBuilder = sb_new();
+    sb_append_str(tpsb, "  call void @tll_assert_eq_");
+    sb_append_str(tpsb, suf);
+    sb_append_str(tpsb, "(");
+    sb_append_str(tpsb, pty);
+    sb_append_str(tpsb, " ");
+    sb_append_str(tpsb, v0);
+    sb_append_str(tpsb, ", ");
+    sb_append_str(tpsb, pty);
+    sb_append_str(tpsb, " ");
+    sb_append_str(tpsb, v1);
+    sb_append_str(tpsb, ", ptr ");
+    sb_append_str(tpsb, av[2]);
+    sb_append_str(tpsb, ")");
+    llfb(sb_to_str(tpsb));
+    return "0";
+}
+
 pub fn ll_emit_math(e: i64) string {
     var n: Node = base.nodes[e];
     var cn: string;
@@ -3524,10 +3591,6 @@ pub fn ll_call(e: i64) string {
         var s4: string = ll_tmp();
         llfb(base.sb_cat6("  ", s4, " = or ", fty, " ", base.sb_cat4(s1, ", ", s3, "")));
         llfb(base.sb_cat6("  store ", fty, " ", s4, ", ptr ", ad0));
-        return "0";
-    }
-    if (cn == "assert_eq" || cn == "assert_true" || cn == "assert_false" || cn == "assert_panic") {
-        llfb("  ; assert (test-only, no-op in llvm backend)");
         return "0";
     }
     if (llv_match(cn)) {
@@ -4653,6 +4716,15 @@ pub fn emit_lldeclares() void {
     llph("declare void @tll_print(ptr)");
     llph("declare void @tll_eprint(ptr)");
     llph("declare void @tll_println(ptr)");
+// ── 测试内建（@panic / @assert / @assert_eq）──
+llph("declare void @tll_panic(ptr)");
+llph("declare void @tll_assert(i8, ptr)");
+llph("declare void @tll_assert_eq_i64(i64, i64, ptr)");
+llph("declare void @tll_assert_eq_u64(i64, i64, ptr)");
+llph("declare void @tll_assert_eq_f64(double, double, ptr)");
+llph("declare void @tll_assert_eq_f32(float, float, ptr)");
+llph("declare void @tll_assert_eq_b(i8, i8, ptr)");
+llph("declare void @tll_assert_eq_s(ptr, ptr, ptr)");
     llph("declare i64 @tll_str_len(ptr)");
     llph("declare i64 @tll_str_at(ptr, i64)");
     llph("declare i32 @tll_str_eq(ptr, ptr)");
@@ -4975,7 +5047,10 @@ pub fn emit_llunit(mod: string) void {
         var di: i64 = lex.decl_list[i];
         var dn: Node = base.nodes[di];
         if (dn.kind == "FuncDecl" && sema.func_is_generic(di) == false) {
-            emit_llfunc(di);
+            // Device 入口 `kernel fn` 由 codegen_dev 发射为 Device Dialect，host LLVM 后端跳过。
+            if (dn.bf == false) {
+                emit_llfunc(di);
+            }
         }
         i = i + 1;
     }

@@ -116,6 +116,16 @@ TStr    t_format_time_tz(TStr spec, int64_t t_us, int64_t tz_min);
 int64_t t_parse_time(TStr spec, TStr s, int use_local);
 #define T_TIME_INVALID INT64_MIN
 
+// ── 测试内建（@panic / @assert / @assert_eq）──
+void    t_panic(TStr msg);
+void    t_assert(int8_t cond, TStr msg);
+void    t_assert_eq_i64(int64_t a, int64_t b, TStr msg);
+void    t_assert_eq_u64(uint64_t a, uint64_t b, TStr msg);
+void    t_assert_eq_f64(double a, double b, TStr msg);
+void    t_assert_eq_f32(float a, float b, TStr msg);
+void    t_assert_eq_b(int8_t a, int8_t b, TStr msg);
+void    t_assert_eq_s(TStr a, TStr b, TStr msg);
+
 // ── 切片 []T：泛型经元素宽度单态化 ─────────────────────────────
 // t 语言层不暴露 void*；类型安全由 tc 类型检查器在编译期保证。
 // emitter 规则：tokens[i] → *(Token*)t_slice_at(tokens, i)

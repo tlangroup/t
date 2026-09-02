@@ -340,6 +340,20 @@ pub fn parse_type_inner() i64 {
         if (name == "Variant") {
             return base.mk_variant(-1);
         }
+        // Device 子系统：具名设备指针类型（docs/device-design.md §3.1 / §7）。
+        // `dev_ptr[T]`(global, as=1) / `shared[T]`(as=3) / `local[T]`(as=5)。
+        // 复刻 map/flag 的 `Name[...]` 泛型类型形态：标识符后紧跟 `[` 即吃元素类型。
+        if (name == "dev_ptr" || name == "shared" || name == "local") {
+            if (lex.cur_t() == "LBracket") {
+                lex.advance_i();
+                var etn: i64 = parse_type();
+                expect_tok("RBracket");
+                var aspace: i64 = 1;
+                if (name == "shared") { aspace = 3; }
+                else if (name == "local") { aspace = 5; }
+                return base.mk_dev_ptr(etn, aspace, -1);
+            }
+        }
         if (is_scalar_name(name)) {
             return base.mk_scalar(name, -1);
         }
@@ -1604,7 +1618,7 @@ pub fn desugar_lambdas() void {
     }
 }
 
-pub fn parse_func_decl(name: string, anns: i64, is_comptime: bool) i64 {
+pub fn parse_func_decl(name: string, anns: i64, is_comptime: bool, is_kernel: bool) i64 {
     expect_tok("LParen");
     var ph: i64 = -1;
     var pt: i64 = -1;
@@ -1689,6 +1703,11 @@ pub fn parse_func_decl(name: string, anns: i64, is_comptime: bool) i64 {
     }
 
     var id: i64 = base.mk_FuncDecl(name, is_extern, is_comptime, rt, all, ph, body, -1);
+    if (is_kernel) {
+        var knd: Node = base.nodes[id];
+        knd.bf = true;   // Device 入口：host 双后端跳过，codegen_dev 处理
+        slice_set(base.nodes, id, knd);
+    }
     return id;
 }
 
@@ -1799,7 +1818,7 @@ pub fn parse_agent_decl(name: string, anns: i64) i64 {
             }
             // 当前 token 应为 fn（parse_func_decl 自吞）；函数名走 snake_case 命名规范
             lex.advance_i();
-            step_fn = parse_func_decl(base.sb_cat2(pascal_to_snake(name), "_step"), anns, false);
+            step_fn = parse_func_decl(base.sb_cat2(pascal_to_snake(name), "_step"), anns, false, false);
         } else {
             parse_fatal(base.sb_cat5("unknown agent clause '", kw, "' in agent '", name, "'"));
         }
@@ -2070,7 +2089,7 @@ pub fn parse_decl_body(name: string, anns: i64, is_comptime: bool) i64 {
         // tests/conformance/fail/f22_clause_body.tc（其 EXPECT: error T_FUNC_CLAUSE_BODY）。
         if (name == "step") {
             lex.advance_i();
-            return parse_func_decl(name, anns, is_comptime);
+            return parse_func_decl(name, anns, is_comptime, false);
         }
         parse_fatal_at("T-PAR-E102", base.sb_cat3("function declarations must use the `fn name(...)` form; `", name, " fn(...)` is no longer supported"), lex.pos);
     }
@@ -2345,6 +2364,13 @@ pub fn parse_declaration() i64 {
         lex.advance_i();
         is_comptime = true;
     }
+    // Device 入口限定符：`kernel fn name(params) ret { body }`。置于 comptime 之后、
+    // `fn` 之前消费。`pub kernel fn` / `kernel fn` 均合法；语义位在 bf 标志（见 base.mk_FuncDecl）。
+    var is_kernel: bool = false;
+    if (lex.cur_t() == "KwKernel") {
+        lex.advance_i();
+        is_kernel = true;
+    }
 
     // 文件级指令优先：@module(...) / @import("...") 后面不跟声明，
     // 在 parse_annotations 之前拦截（注解循环只认 `@标识符`，且 `@import`
@@ -2414,7 +2440,7 @@ pub fn parse_declaration() i64 {
         lex.g_agent_anchor = fni;
         lex.g_struct_exported = is_export;
         base.validate_decl_name(fname, fni);
-        var fd: i64 = parse_func_decl(fname, anns, is_comptime);
+        var fd: i64 = parse_func_decl(fname, anns, is_comptime, is_kernel);
         if (fd >= 0) {
             base.node_at(fd, fni);
             if (is_export) { base.nodes[fd].bc = true; }
@@ -3904,7 +3930,7 @@ pub fn desugar_self_node(nid: i64, sn: string) void {
 // 当前 token 应为 fn（parse_func_decl 自吞）；方法名 mname 已由调用方读出。
 pub fn parse_method_decl(structname: string, mname: string, anns: i64) i64 {
     // 注：调用方已消费 `fn` 关键字，当前 token 即为 `(`
-    var fd: i64 = parse_func_decl(mname, anns, false);
+    var fd: i64 = parse_func_decl(mname, anns, false, false);
     var fdn: Node = base.nodes[fd];
     fdn.sa = base.sb_cat3(pascal_to_snake(structname), "_", mname);
     fdn.bc = lex.g_struct_exported;

@@ -1,0 +1,412 @@
+// lib/std/testing.tc —— 轻量测试框架（纯 t 实现，双后端可用）
+//
+// 设计定位
+// ────────
+// 语言本身已提供测试声明语法与运行器：
+//   "用例名" test { ... }          // 解析期脱糖为 __test_k fn() bool
+//   tc test <file.tc>              // 收集所有 test 声明、生成 @main、逐一调用、汇总
+// 但该内置机制缺一个东西：**断言（assertion）**。编译器曾内置 assert_eq /
+// assert_true / assert_false / assert_panic，但 LLVM 后端是 no-op、C 后端缺实现，
+// 属死桩——已在编译器侧移除。因此真实断言只由本模块提供。
+//
+// 本模块补上这块，并尽量与语言机制正交、可独立使用：
+//   * 纯 t 实现：只依赖内建（eprint / exit / StringBuilder / sb_append_str / i2s /
+//     is_some / is_none）与运行期，绝不引用 tc 编译器自身符号（符合 std 设计约束）。
+//   * 既可写在 `"name" test {}` 体内，被 `tc test` 驱动；也可写在任何普通程序里
+//     直接 `tc build`/`tc run` 运行，作为「启动期自检 / 契约检查」。
+//
+// 两种断言风格
+// ────────────
+// ① 硬性断言（assert_*）：失败即向 stderr 打印诊断并以 exit(1) 失败退出（fail-fast）。
+//    语义等同 Rust assert! / Go t.Fatal / Python assert——第一时间暴露、不带歧义。
+//    在 `tc test` 下，某用例里的硬断言失败会让该用例进程以码 1 退出，整体判定为失败
+//    （其余用例由 `tc test` 重新编译运行，互不影响）。
+// ② 软性断言（expect_*）：失败只记录、不退出；用例末尾用
+//    `if (testing.failed()) { return false; }` 把累计失败转成 `tc test` 的 FAILED。
+//    适合「一跑到底、先看全哪些挂了」的场景。
+//
+// 用法示例
+// ────────
+//   @import("std.testing");
+//   "加法" test {
+//       testing.assert_eq_i(1 + 1, 2, "1+1 应等于 2");
+//       testing.assert_true(2 < 3, "2<3");
+//   }
+//
+// ⚠ 诊断字符串化说明：LLVM 后端当前 `sb_append_fmt_*` / `format_*` / `to_string`
+// 系列内建尚不可用（运行期 panic / 链接失败），故本模块自带 u64_to_str / f64_to_str
+// 两个私有诊断用格式化器，保证定型断言的差异文本在双后端都能正常打印。
+
+@module(pub)
+
+// ── 全局计数（供软断言汇总 / 自定义运行器；硬断言不依赖）──
+pub var g_check_count: i64 = 0;     // 已执行的断言次数
+pub var g_fail_count: i64 = 0;      // 已失败的断言次数
+
+// ── 私有诊断格式化器（绕开 LLVM 端暂不可用的 format_* 内建）──
+
+// u64 → 十进制串（仅用于失败诊断文本）。
+fn u64_to_str(x: u64) string {
+    if (x == 0) { return "0"; }
+    var buf: []i64;
+    var v: u64 = x;
+    while (v > 0) {
+        append(buf, (v % 10u64) as i64);
+        v = v / 10u64;
+    }
+    var sb: StringBuilder = sb_new();
+    var n: i64 = slice_len(buf) as i64;
+    var i: i64 = n - 1;
+    while (i >= 0) {
+        sb_append_str(sb, i2s(buf[i]));
+        i = i - 1;
+    }
+    return sb_to_str(sb);
+}
+
+// f64 → 串（诊断级：整数部分 + 6 位小数；非完整 IEEE 格式化，极端量级会截断）。
+fn f64_to_str(x: f64) string {
+    var neg: bool = false;
+    var v: f64 = x;
+    if (v < 0) { neg = true; v = -v; }
+    // 避免 v as i64 溢出导致 UB：截断到 i64 大致范围
+    var ip: i64 = 0;
+    var fp: f64 = 0.0;
+    if (v > 9223372036854774784.0) {
+        ip = 9223372036854775807;
+        fp = 0.0;
+    } else {
+        ip = v as i64;
+        fp = v - (ip as f64);
+    }
+    var sb: StringBuilder = sb_new();
+    if (neg) { sb_append_str(sb, "-"); }
+    sb_append_str(sb, i2s(ip));
+    sb_append_str(sb, ".");
+    var k: i64 = 0;
+    while (k < 6) {
+        fp = fp * 10.0;
+        var d: i64 = fp as i64;
+        sb_append_str(sb, i2s(d));
+        fp = fp - (d as f64);
+        k = k + 1;
+    }
+    return sb_to_str(sb);
+}
+
+// 打印一行失败诊断到 stderr 并累加计数（不退出）。
+// 内部共用：fail() 在它之后 exit(1)；expect_* 只调它。
+pub fn report(msg: string) void {
+    g_fail_count = g_fail_count + 1;
+    eprint("assertion failed: ");
+    eprint(msg);
+    eprint("\n");
+}
+
+// 失败原语：打印诊断并立即以退出码 1 失败退出（fail-fast）。
+// 任意位置均可直接调用以标记一个逻辑失败。
+pub fn fail(msg: string) void {
+    report(msg);
+    exit(1);
+}
+
+// 软断言累计查询：自上次 reset() 以来是否出现过失败。
+pub fn failed() bool {
+    return g_fail_count > 0;
+}
+
+// 复位累计计数（自定义运行器在每组用例前调用）。
+pub fn reset() void {
+    g_check_count = 0;
+    g_fail_count = 0;
+}
+
+// 生成一份汇总文本（"N checks, M failures"），供自定义运行器打印。
+pub fn summary() string {
+    var sb: StringBuilder = sb_new();
+    sb_append_str(sb, i2s(g_check_count));
+    sb_append_str(sb, " checks, ");
+    sb_append_str(sb, i2s(g_fail_count));
+    sb_append_str(sb, " failures");
+    return sb_to_str(sb);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// ① 硬性断言（fail-fast：失败即 exit(1)）
+// ═══════════════════════════════════════════════════════════════
+
+// 布尔断言。assert() 是 assert_true() 的简写别名。
+pub fn assert_true(cond: bool, msg: string) void {
+    g_check_count = g_check_count + 1;
+    if (cond == false) { fail(msg); }
+}
+
+pub fn assert(cond: bool, msg: string) void {
+    assert_true(cond, msg);
+}
+
+pub fn assert_false(cond: bool, msg: string) void {
+    g_check_count = g_check_count + 1;
+    if (cond) { fail(msg); }
+}
+
+// 泛型相等 / 不等（comptime T）。失败时仅打印用户给出的 msg（泛型无法通用地
+// 把任意 T 格式化为可读文本）。需要「期望/实际」差异请改用下方定型变体。
+pub fn assert_eq(comptime T: type, a: T, b: T, msg: string) void {
+    g_check_count = g_check_count + 1;
+    if (a == b) { } else { fail(msg); }
+}
+
+pub fn assert_ne(comptime T: type, a: T, b: T, msg: string) void {
+    g_check_count = g_check_count + 1;
+    if (a == b) { fail(msg); }
+}
+
+// 定型相等变体：失败时打印「expected: X, got: Y」差异。
+pub fn assert_eq_i(a: i64, b: i64, msg: string) void {
+    g_check_count = g_check_count + 1;
+    if (a != b) {
+        var sb: StringBuilder = sb_new();
+        sb_append_str(sb, msg);
+        sb_append_str(sb, "  (expected: ");
+        sb_append_str(sb, i2s(a));
+        sb_append_str(sb, ", got: ");
+        sb_append_str(sb, i2s(b));
+        sb_append_str(sb, ")");
+        fail(sb_to_str(sb));
+    }
+}
+
+pub fn assert_eq_u(a: u64, b: u64, msg: string) void {
+    g_check_count = g_check_count + 1;
+    if (a != b) {
+        var sb: StringBuilder = sb_new();
+        sb_append_str(sb, msg);
+        sb_append_str(sb, "  (expected: ");
+        sb_append_str(sb, u64_to_str(a));
+        sb_append_str(sb, ", got: ");
+        sb_append_str(sb, u64_to_str(b));
+        sb_append_str(sb, ")");
+        fail(sb_to_str(sb));
+    }
+}
+
+pub fn assert_eq_f(a: f64, b: f64, msg: string) void {
+    g_check_count = g_check_count + 1;
+    if (a != b) {
+        var sb: StringBuilder = sb_new();
+        sb_append_str(sb, msg);
+        sb_append_str(sb, "  (expected: ");
+        sb_append_str(sb, f64_to_str(a));
+        sb_append_str(sb, ", got: ");
+        sb_append_str(sb, f64_to_str(b));
+        sb_append_str(sb, ")");
+        fail(sb_to_str(sb));
+    }
+}
+
+pub fn assert_eq_f32(a: f32, b: f32, msg: string) void {
+    g_check_count = g_check_count + 1;
+    if (a != b) {
+        var sb: StringBuilder = sb_new();
+        sb_append_str(sb, msg);
+        sb_append_str(sb, "  (expected: ");
+        sb_append_str(sb, f64_to_str(a as f64));
+        sb_append_str(sb, ", got: ");
+        sb_append_str(sb, f64_to_str(b as f64));
+        sb_append_str(sb, ")");
+        fail(sb_to_str(sb));
+    }
+}
+
+pub fn assert_eq_s(a: string, b: string, msg: string) void {
+    g_check_count = g_check_count + 1;
+    if (a != b) {
+        var sb: StringBuilder = sb_new();
+        sb_append_str(sb, msg);
+        sb_append_str(sb, "  (expected: \"");
+        sb_append_str(sb, a);
+        sb_append_str(sb, "\", got: \"");
+        sb_append_str(sb, b);
+        sb_append_str(sb, "\")");
+        fail(sb_to_str(sb));
+    }
+}
+
+pub fn assert_eq_b(a: bool, b: bool, msg: string) void {
+    g_check_count = g_check_count + 1;
+    if (a != b) {
+        var sb: StringBuilder = sb_new();
+        sb_append_str(sb, msg);
+        sb_append_str(sb, "  (expected: ");
+        if (a) { sb_append_str(sb, "true"); } else { sb_append_str(sb, "false"); }
+        sb_append_str(sb, ", got: ");
+        if (b) { sb_append_str(sb, "true"); } else { sb_append_str(sb, "false"); }
+        sb_append_str(sb, ")");
+        fail(sb_to_str(sb));
+    }
+}
+
+// 可选类型 T? 的空值断言。
+pub fn assert_nil(comptime T: type, x: ?T, msg: string) void {
+    g_check_count = g_check_count + 1;
+    if (is_none(x)) { } else { fail(msg); }
+}
+
+pub fn assert_not_nil(comptime T: type, x: ?T, msg: string) void {
+    g_check_count = g_check_count + 1;
+    if (is_some(x)) { } else { fail(msg); }
+}
+
+// 浮点近似相等（绝对误差 <= tol）。
+pub fn assert_approx_eq(a: f64, b: f64, tol: f64, msg: string) void {
+    g_check_count = g_check_count + 1;
+    var d: f64 = a - b;
+    if (d < 0) { d = -d; }
+    if (d > tol) {
+        var sb: StringBuilder = sb_new();
+        sb_append_str(sb, msg);
+        sb_append_str(sb, "  (|a-b|=");
+        sb_append_str(sb, f64_to_str(d));
+        sb_append_str(sb, " > tol=");
+        sb_append_str(sb, f64_to_str(tol));
+        sb_append_str(sb, ")");
+        fail(sb_to_str(sb));
+    }
+}
+
+pub fn assert_approx_eq_f32(a: f32, b: f32, tol: f32, msg: string) void {
+    g_check_count = g_check_count + 1;
+    var d: f32 = a - b;
+    if (d < 0) { d = -d; }
+    if (d > tol) {
+        var sb: StringBuilder = sb_new();
+        sb_append_str(sb, msg);
+        sb_append_str(sb, "  (|a-b|=");
+        sb_append_str(sb, f64_to_str(d as f64));
+        sb_append_str(sb, " > tol=");
+        sb_append_str(sb, f64_to_str(tol as f64));
+        sb_append_str(sb, ")");
+        fail(sb_to_str(sb));
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// ② 软性断言（记录失败但不退出；用例末尾 `if (testing.failed()) return false;`）
+// ═══════════════════════════════════════════════════════════════
+
+pub fn expect_true(cond: bool, msg: string) void {
+    g_check_count = g_check_count + 1;
+    if (cond) { } else { report(msg); }
+}
+
+pub fn expect_false(cond: bool, msg: string) void {
+    g_check_count = g_check_count + 1;
+    if (cond) { report(msg); }
+}
+
+pub fn expect_eq(comptime T: type, a: T, b: T, msg: string) void {
+    g_check_count = g_check_count + 1;
+    if (a == b) { } else { report(msg); }
+}
+
+pub fn expect_ne(comptime T: type, a: T, b: T, msg: string) void {
+    g_check_count = g_check_count + 1;
+    if (a == b) { report(msg); }
+}
+
+pub fn expect_eq_i(a: i64, b: i64, msg: string) void {
+    g_check_count = g_check_count + 1;
+    if (a != b) {
+        var sb: StringBuilder = sb_new();
+        sb_append_str(sb, msg);
+        sb_append_str(sb, "  (expected: ");
+        sb_append_str(sb, i2s(a));
+        sb_append_str(sb, ", got: ");
+        sb_append_str(sb, i2s(b));
+        sb_append_str(sb, ")");
+        report(sb_to_str(sb));
+    }
+}
+
+pub fn expect_eq_u(a: u64, b: u64, msg: string) void {
+    g_check_count = g_check_count + 1;
+    if (a != b) {
+        var sb: StringBuilder = sb_new();
+        sb_append_str(sb, msg);
+        sb_append_str(sb, "  (expected: ");
+        sb_append_str(sb, u64_to_str(a));
+        sb_append_str(sb, ", got: ");
+        sb_append_str(sb, u64_to_str(b));
+        sb_append_str(sb, ")");
+        report(sb_to_str(sb));
+    }
+}
+
+pub fn expect_eq_f(a: f64, b: f64, msg: string) void {
+    g_check_count = g_check_count + 1;
+    if (a != b) {
+        var sb: StringBuilder = sb_new();
+        sb_append_str(sb, msg);
+        sb_append_str(sb, "  (expected: ");
+        sb_append_str(sb, f64_to_str(a));
+        sb_append_str(sb, ", got: ");
+        sb_append_str(sb, f64_to_str(b));
+        sb_append_str(sb, ")");
+        report(sb_to_str(sb));
+    }
+}
+
+pub fn expect_eq_s(a: string, b: string, msg: string) void {
+    g_check_count = g_check_count + 1;
+    if (a != b) {
+        var sb: StringBuilder = sb_new();
+        sb_append_str(sb, msg);
+        sb_append_str(sb, "  (expected: \"");
+        sb_append_str(sb, a);
+        sb_append_str(sb, "\", got: \"");
+        sb_append_str(sb, b);
+        sb_append_str(sb, "\")");
+        report(sb_to_str(sb));
+    }
+}
+
+pub fn expect_eq_b(a: bool, b: bool, msg: string) void {
+    g_check_count = g_check_count + 1;
+    if (a != b) {
+        var sb: StringBuilder = sb_new();
+        sb_append_str(sb, msg);
+        sb_append_str(sb, "  (expected: ");
+        if (a) { sb_append_str(sb, "true"); } else { sb_append_str(sb, "false"); }
+        sb_append_str(sb, ", got: ");
+        if (b) { sb_append_str(sb, "true"); } else { sb_append_str(sb, "false"); }
+        sb_append_str(sb, ")");
+        report(sb_to_str(sb));
+    }
+}
+
+pub fn expect_nil(comptime T: type, x: ?T, msg: string) void {
+    g_check_count = g_check_count + 1;
+    if (is_none(x)) { } else { report(msg); }
+}
+
+pub fn expect_not_nil(comptime T: type, x: ?T, msg: string) void {
+    g_check_count = g_check_count + 1;
+    if (is_some(x)) { report(msg); } else { }
+}
+
+pub fn expect_approx_eq(a: f64, b: f64, tol: f64, msg: string) void {
+    g_check_count = g_check_count + 1;
+    var d: f64 = a - b;
+    if (d < 0) { d = -d; }
+    if (d > tol) {
+        var sb: StringBuilder = sb_new();
+        sb_append_str(sb, msg);
+        sb_append_str(sb, "  (|a-b|=");
+        sb_append_str(sb, f64_to_str(d));
+        sb_append_str(sb, " > tol=");
+        sb_append_str(sb, f64_to_str(tol));
+        sb_append_str(sb, ")");
+        report(sb_to_str(sb));
+    }
+}

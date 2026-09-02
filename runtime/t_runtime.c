@@ -1589,6 +1589,76 @@ void t_print(TStr s)  { if (s.len > 0) fwrite(s.ptr, 1, (size_t)s.len, stdout); 
 void t_eprint(TStr s) { if (s.len > 0) fwrite(s.ptr, 1, (size_t)s.len, stderr);  fflush(stderr); }
 void t_println(TStr s){ if (s.len > 0) fwrite(s.ptr, 1, (size_t)s.len, stdout); fputc('\n', stdout); fflush(stdout); }
 
+// ── 测试内建（@panic / @assert / @assert_eq）──
+void t_panic(TStr msg) {
+    fwrite("panic: ", 1, 7, stderr);
+    if (msg.len > 0) fwrite(msg.ptr, 1, (size_t)msg.len, stderr);
+    fputc('\n', stderr);
+    fflush(stderr);
+    exit(1);
+}
+
+void t_assert(int8_t cond, TStr msg) {
+    if (!cond) { t_panic(msg); }
+}
+
+static void t_assert_fail(TStr msg, const char* detail) {
+    fwrite("assertion failed: ", 1, 17, stderr);
+    if (msg.len > 0) fwrite(msg.ptr, 1, (size_t)msg.len, stderr);
+    if (detail != NULL) {
+        fputc(' ', stderr);
+        fwrite(detail, 1, strlen(detail), stderr);
+    }
+    fputc('\n', stderr);
+    fflush(stderr);
+    exit(1);
+}
+
+void t_assert_eq_i64(int64_t a, int64_t b, TStr msg) {
+    if (a != b) {
+        char d[64];
+        snprintf(d, sizeof d, "(expected: %lld, got: %lld)", (long long)a, (long long)b);
+        t_assert_fail(msg, d);
+    }
+}
+void t_assert_eq_u64(uint64_t a, uint64_t b, TStr msg) {
+    if (a != b) {
+        char d[64];
+        snprintf(d, sizeof d, "(expected: %llu, got: %llu)", (unsigned long long)a, (unsigned long long)b);
+        t_assert_fail(msg, d);
+    }
+}
+void t_assert_eq_f64(double a, double b, TStr msg) {
+    if (a != b) {
+        char d[64];
+        snprintf(d, sizeof d, "(expected: %g, got: %g)", a, b);
+        t_assert_fail(msg, d);
+    }
+}
+void t_assert_eq_f32(float a, float b, TStr msg) {
+    if (a != b) {
+        char d[64];
+        snprintf(d, sizeof d, "(expected: %g, got: %g)", (double)a, (double)b);
+        t_assert_fail(msg, d);
+    }
+}
+void t_assert_eq_b(int8_t a, int8_t b, TStr msg) {
+    if (a != b) {
+        char d[64];
+        snprintf(d, sizeof d, "(expected: %s, got: %s)", a ? "true" : "false", b ? "true" : "false");
+        t_assert_fail(msg, d);
+    }
+}
+void t_assert_eq_s(TStr a, TStr b, TStr msg) {
+    int eq = (a.len == b.len) && (a.len == 0 || memcmp(a.ptr, b.ptr, (size_t)a.len) == 0);
+    if (!eq) {
+        char d[160];
+        snprintf(d, sizeof d, "(expected: \"%.*s\", got: \"%.*s\")",
+            (int)a.len, (char*)a.ptr, (int)b.len, (char*)b.ptr);
+        t_assert_fail(msg, d);
+    }
+}
+
 // ── type_info(T) accessor 内建（M36）──
 TStr        t_ti_name(TTypeInfo* ti)        { return ti->name; }
 int64_t     t_ti_size(TTypeInfo* ti)        { return ti->size; }
