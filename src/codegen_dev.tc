@@ -1,0 +1,528 @@
+// ════════════════════════════════════════════════════════════════
+// src/codegen_dev.tc — Device MLIR Dialect 发射层（docs/device-design.md §2 L4 / §4）
+//
+// 把从 `kernel fn` 出发可达的设备函数图 emit 成 **Device Dialect 文本**（T 不碰 MLIR C++，
+// 保自托管干净）。C 侧序列化器把这段文本序列化为 bytecode 内嵌 host 二进制（JIT 模式）；
+// 本模块只负责文本生成，文本经 `tools/mlir-t-device` 的 `--device-to-nvvm` 预演 lowering。
+//
+// 地址空间映射：dev_ptr[T] → !llvm.ptr<1>(global) / shared[T] → !llvm.ptr<3>(shared) /
+// local[T] → !llvm.ptr<5>(local)；host 普通 *T 不经此路径。
+//
+// 本模块只读 AST（base.nodes / lex.decl_list）与类型节点（na 携带 memspace），
+// 不依赖 host 双后端的 TD/C 发射，故对 host 编译完全无副作用。
+// ════════════════════════════════════════════════════════════════
+
+@import("src.base" :: *);
+@import("src.sema" :: *);
+
+// ── 模块级发射状态 ─────────────────────────────────────────────
+pub var g_dev_out: StringBuilder;     // 累积的 Device Dialect 文本
+pub var g_dev_dbg: StringBuilder;     // 崩溃存活的调试追踪（即时落盘）
+pub var g_dev_ssa: i64;               // SSA 值计数器（%vN）
+pub var g_dev_rty: string;           // 最近 emit 的表达式 MLIR 类型
+pub var g_dev_elem: string;          // 最近 emit 的指针表达式元素类型（非指针为 ""）
+pub var g_dev_asv: i64;              // 最近 emit 的指针表达式地址空间（非指针为 0）
+
+// 名字 → (ssa, mlir类型, 元素类型, 地址空间) 查找表（kernel 体小，线性查找足够）
+pub var g_dv_n: []string;
+pub var g_dv_v: []string;
+pub var g_dv_t: []string;
+pub var g_dv_e: []string;
+pub var g_dv_a: []i64;
+
+// 越界安全的节点读取：emit-dev 路径下 base.nodes/base.kids 可能未完整填充，
+// 任意索引越界访问都会崩；统一经此函数取节点，越界时回零节点（kind=""）避免崩溃。
+pub fn dev_safe_node(e: i64) Node {
+    var n: Node;
+    n.kind = "";
+    n.sa = "";
+    n.ia = 0;
+    n.na = -1;
+    n.nb = -1;
+    n.nc = -1;
+    n.nd = -1;
+    n.la = -1;
+    n.lb = -1;
+    n.lc = -1;
+    var nlen: i64 = slice_len(base.nodes) as i64;
+    if (e >= 0 && e < nlen) { n = base.nodes[e]; }
+    return n;
+}
+
+pub fn dev_kid_val(c: i64) i64 {
+    var klen: i64 = slice_len(base.kids) as i64;
+    if (c >= 0 && c < klen) { return base.kids[c].val; }
+    return -1;
+}
+
+pub fn dev_kid_next(c: i64) i64 {
+    var klen: i64 = slice_len(base.kids) as i64;
+    if (c >= 0 && c < klen) { return base.kids[c].next; }
+    return -1;
+}
+
+// 类型解析辅助（借 module 全局回传，避免多返回值语法不确定性）
+pub var g_dt_ty: string;
+pub var g_dt_as: i64;
+pub var g_dt_elem: string;
+
+pub fn dev_emit(s: string) void {
+    sb_append_str(g_dev_out, s);
+    sb_append_str(g_dev_out, "\n");
+}
+
+// 崩溃存活追踪：追加到 g_dev_dbg 并立即落盘（file_write_all），SEGV 后内容不丢。
+pub fn dev_trace(s: string) void {
+    sb_append_str(g_dev_dbg, s);
+    file_write_all("out/dbg/devdbg.txt", sb_to_str(g_dev_dbg));
+}
+
+pub fn dev_next() string {
+    var v: i64 = g_dev_ssa;
+    g_dev_ssa = v + 1;
+    return base.sb_cat2("%v", base.i2s(v));
+}
+
+pub fn dev_lookup(name: string) i64 {
+    var i: i64 = 0;
+    var n: i64 = slice_len(g_dv_n) as i64;
+    while (i < n) {
+        if (g_dv_n[i] == name) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+pub fn dev_bind(name: string, ssa: string, ty: string, elem: string, aspace: i64) void {
+    var idx: i64 = dev_lookup(name);
+    if (idx >= 0) {
+        g_dv_v[idx] = ssa;
+        g_dv_t[idx] = ty;
+        g_dv_e[idx] = elem;
+        g_dv_a[idx] = aspace;
+        return;
+    }
+    append(g_dv_n, name);
+    append(g_dv_v, ssa);
+    append(g_dv_t, ty);
+    append(g_dv_e, elem);
+    append(g_dv_a, aspace);
+}
+
+// 标量名 → MLIR 类型（设备侧常用 i32/f32；bool → i1）
+pub fn dev_scalar(name: string) string {
+    if (name == "i32") { return "i32"; }
+    if (name == "i64") { return "i64"; }
+    if (name == "f32") { return "f32"; }
+    if (name == "f64") { return "f64"; }
+    if (name == "bool") { return "i1"; }
+    if (name == "u32") { return "i32"; }
+    if (name == "u64") { return "i64"; }
+    return "i32";
+}
+
+pub fn dev_is_float(ty: string) bool {
+    return ty == "f32" || ty == "f64";
+}
+
+// 类型节点 → MLIR 类型（借 module 全局回传 as / elem）
+pub fn dev_type_of(tn: i64) string {
+    var n: Node = dev_safe_node(tn);
+    if (n.kind == "pointer") {
+        var em: string = dev_type_of(n.na);
+        g_dt_ty = base.sb_cat4("!llvm.ptr<", base.i2s(n.memspace), ">", "");
+        g_dt_as = n.memspace;
+        g_dt_elem = em;
+        return g_dt_ty;
+    }
+    if (n.kind == "scalar") {
+        g_dt_ty = dev_scalar(n.sa);
+        g_dt_as = 0;
+        g_dt_elem = "";
+        return g_dt_ty;
+    }
+    g_dt_ty = "i32";
+    g_dt_as = 0;
+    g_dt_elem = "";
+    return "i32";
+}
+
+pub fn dev_first_arg(callNode: i64) i64 {
+    var nlen: i64 = slice_len(base.nodes) as i64;
+    var klen: i64 = slice_len(base.kids) as i64;
+    if (callNode < 0 || callNode >= nlen) { return -1; }
+    var h: i64 = base.nodes[callNode].la;
+    if (h < 0 || h >= klen) { return -1; }
+    var kv: i64 = base.kids[h].val;
+    if (kv < 0 || kv >= nlen) { return -1; }
+    return kv;
+}
+
+pub fn dev_arg(callNode: i64, idx: i64) i64 {
+    var nlen: i64 = slice_len(base.nodes) as i64;
+    var klen: i64 = slice_len(base.kids) as i64;
+    if (callNode < 0 || callNode >= nlen) { return -1; }
+    var h: i64 = base.nodes[callNode].la;
+    var c: i64 = h;
+    var i: i64 = 0;
+    while (c >= 0 && i < idx) {
+        if (c >= klen) { return -1; }
+        c = base.kids[c].next;
+        i = i + 1;
+    }
+    if (c < 0 || c >= klen) { return -1; }
+    var kv: i64 = base.kids[c].val;
+    if (kv < 0 || kv >= nlen) { return -1; }
+    return kv;
+}
+
+pub fn dev_is_call_name(node: i64, name: string) bool {
+    var nlen: i64 = slice_len(base.nodes) as i64;
+    if (node < 0 || node >= nlen) { return false; }
+    var n: Node = base.nodes[node];
+    if (n.kind != "call") { return false; }
+    if (n.na < 0 || n.na >= nlen) { return false; }
+    var callee: Node = base.nodes[n.na];
+    return callee.kind == "ident" && callee.sa == name;
+}
+
+// emit-dev 跳过 sema，int 字面量的数值 .ia 未填充；此处从 .sa 文本本地解析（decimal，支持负号），
+// 不依赖 sema 模块（emit-dev 路径下 sema 运行时状态可能未初始化，跨模块调用会崩）。
+pub fn dev_parse_int(s: string) i64 {
+    var n: u64 = str_len(s);
+    if (n == 0) { return 0; }
+    var i: u64 = 0;
+    var neg: bool = false;
+    if (s[0] == 45) { neg = true; i = 1; }
+    var r: i64 = 0;
+    while (i < n) {
+        var c: u8 = s[i];
+        if (c < 48 || c > 57) { break; }
+        r = r * 10 + (c - 48) as i64;
+        i = i + 1;
+    }
+    if (neg) { return -r; }
+    return r;
+}
+
+pub fn dev_dim_of(callNode: i64) i64 {
+    var a0: i64 = dev_first_arg(callNode);
+    var nlen: i64 = slice_len(base.nodes) as i64;
+    if (a0 >= 0 && a0 < nlen && base.nodes[a0].kind == "int") {
+        return dev_parse_int(base.nodes[a0].sa);
+    }
+    return 0;
+}
+
+// ── 顶层入口 ───────────────────────────────────────────────────
+pub fn emit_device_module() string {
+    g_dev_dbg = sb_new();
+    g_dev_out = sb_new();
+    dev_trace("[EMIT_DEV] start\n");
+    var n: i64 = slice_len(lex.decl_list) as i64;
+    var i: i64 = 0;
+    var found: bool = false;
+    while (i < n) {
+        var d: i64 = lex.decl_list[i];
+        var dn: Node = dev_safe_node(d);
+        if (dn.kind == "FuncDecl" && dn.bf == true) {
+            emit_dev_kernel(d);
+            found = true;
+        }
+        i = i + 1;
+    }
+    if (found == false) {
+        dev_emit("// (no device kernels in this module)");
+    }
+    return sb_to_str(g_dev_out);
+}
+
+pub fn emit_dev_kernel(d: i64) void {
+    dev_trace("[EMIT_DEV] kernel: ");
+    dev_trace(dev_safe_node(d).sa);
+    dev_trace("\n");
+    g_dev_ssa = 0;
+    // 空切片字面量 `[]` 仅可作局部变量初始化器（LLVM 限制）；用局部临时中转后再赋给模块级 slice。
+    var e_n: []string = []; g_dv_n = e_n;
+    var e_v: []string = []; g_dv_v = e_v;
+    var e_t: []string = []; g_dv_t = e_t;
+    var e_e: []string = []; g_dv_e = e_e;
+    var e_a: []i64 = []; g_dv_a = e_a;
+    var dn: Node = dev_safe_node(d);
+
+    // 形参类型签名 + 块参数
+    var psb: StringBuilder = sb_new();
+    var asb: StringBuilder = sb_new();
+    var first: bool = true;
+    var c: i64 = dn.lb;
+    while (c >= 0) {
+        var kval: i64 = dev_kid_val(c);
+        if (kval < 0) { break; }
+        dev_trace("[EMIT_DEV] param k.val=");
+        dev_trace(base.i2s(kval));
+        dev_trace("\n");
+        var p: Node = dev_safe_node(kval);
+        var mty: string = dev_type_of(p.na);
+        dev_trace("[EMIT_DEV] param type=");
+        dev_trace(mty);
+        dev_trace("\n");
+        var aspace: i64 = g_dt_as;
+        var elem: string = g_dt_elem;
+        if (first == false) {
+            sb_append_str(psb, ", ");
+            sb_append_str(asb, ", ");
+        }
+        sb_append_str(psb, mty);
+        sb_append_str(asb, "%");
+        sb_append_str(asb, p.sa);
+        sb_append_str(asb, " : ");
+        sb_append_str(asb, mty);
+        dev_bind(p.sa, base.sb_cat2("%", p.sa), mty, elem, aspace);
+        first = false;
+        c = dev_kid_next(c);
+    }
+
+    dev_trace("[EMIT_DEV] before dev_emit kernel header\n");
+    dev_emit(base.sb_cat6("device.kernel_func @", dn.sa, " : (", sb_to_str(psb), ") -> () {", ""));
+    dev_trace("[EMIT_DEV] after dev_emit kernel header\n");
+    dev_emit(base.sb_cat3("^entry(", sb_to_str(asb), ") :"));
+    dev_trace("[EMIT_DEV] after ^entry emit\n");
+
+    var b: i64 = dn.lc;
+    while (b >= 0) {
+        var bkval: i64 = dev_kid_val(b);
+        if (bkval < 0) { break; }
+        emit_dev_stmt(bkval);
+        b = dev_kid_next(b);
+    }
+
+    dev_emit("  \"device.return\"() : () -> ()");
+    dev_emit("}");
+    dev_emit("");
+}
+
+pub fn emit_dev_stmt(s: i64) void {
+    dev_trace("[EMIT_DEV] stmt kind=");
+    dev_trace(dev_safe_node(s).kind);
+    dev_trace(" nb=");
+    dev_trace(base.i2s(base.nodes[s].nb));
+    dev_trace(" nlen=");
+    dev_trace(base.i2s(slice_len(base.nodes) as i64));
+    dev_trace("\n");
+    var n: Node = dev_safe_node(s);
+    if (n.kind == "var_decl") {
+        // 共享内存分配：`var sh: shared[T] = shared_alloc(N)`
+        if (n.nb >= 0 && dev_is_call_name(n.nb, "shared_alloc")) {
+            var mty: string = dev_type_of(n.na);    // !llvm.ptr<3>
+            var elem: string = g_dt_elem;           // f32 / i32
+            var cnt: string = emit_dev_expr(dev_first_arg(n.nb));
+            var v: string = dev_next();
+            dev_emit(base.sb_cat8("  ", v, " = \"device.shared_alloc\"(", cnt, ") {elem = ", elem, "} : (i32) -> !llvm.ptr<3>", ""));
+            dev_bind(n.sa, v, "!llvm.ptr<3>", elem, 3);
+            return;
+        }
+        if (n.nb >= 0) {
+            var v: string = emit_dev_expr(n.nb);
+            dev_bind(n.sa, v, g_dev_rty, g_dev_elem, g_dev_asv);
+            return;
+        }
+        // 无初始化声明：默认绑空，后续赋值覆盖
+        dev_bind(n.sa, "", "i32", "", 0);
+        return;
+    }
+    if (n.kind == "assign" || n.kind == "assignment") {
+        emit_dev_assign(n.na, n.nb);
+        return;
+    }
+    if (n.kind == "return") {
+        dev_emit("  \"device.return\"() : () -> ()");
+        return;
+    }
+    if (n.kind == "expr") {
+        emit_dev_expr(n.na);
+        return;
+    }
+    // if / while / for 等控制在垂直切片里暂不展开（straight-line；bounds guard 由 launch 端保证）
+}
+
+// 赋值：ident 重绑；index 走 gep + store
+pub fn emit_dev_assign(lhs: i64, rhs: i64) void {
+    var ln: Node = dev_safe_node(lhs);
+    if (ln.kind == "ident") {
+        var v: string = emit_dev_expr(rhs);
+        dev_bind(ln.sa, v, g_dev_rty, g_dev_elem, g_dev_asv);
+        return;
+    }
+    if (ln.kind == "index") {
+        var b: string = emit_dev_expr(ln.na);
+        var bas: i64 = g_dev_asv;
+        var belem: string = g_dev_elem;
+        var i: string = emit_dev_expr(ln.nb);
+        var val: string = emit_dev_expr(rhs);
+        var vty: string = g_dev_rty;
+        var gep: string = dev_next();
+        dev_emit(base.sb_cat13("  ", gep, " = llvm.getelementptr ", b, "[", i, "] : (!llvm.ptr<", base.i2s(bas), ">, i32) -> !llvm.ptr<", base.i2s(bas), ">, ", belem, ""));
+        dev_emit(base.sb_cat10("  llvm.store ", val, ", ", gep, " : ", vty, ", !llvm.ptr<", base.i2s(bas), ">", ""));
+        return;
+    }
+    // 其它 lhs 形式：尽力 emit rhs 并丢弃
+    emit_dev_expr(rhs);
+}
+
+// 取地址：&x 返回 x 的指针（GEP 结果），不 load。用于 atomic_add(&ptr[i], v) 等。
+pub fn emit_dev_addr(e: i64) string {
+    var n: Node = dev_safe_node(e);
+    if (n.kind == "index") {
+        var b: string = emit_dev_expr(n.na);
+        var bas: i64 = g_dev_asv;
+        var belem: string = g_dev_elem;
+        var i: string = emit_dev_expr(n.nb);
+        var gep: string = dev_next();
+        dev_emit(base.sb_cat13("  ", gep, " = llvm.getelementptr ", b, "[", i, "] : (!llvm.ptr<", base.i2s(bas), ">, i32) -> !llvm.ptr<", base.i2s(bas), ">, ", belem, ""));
+        g_dev_rty = base.sb_cat4("!llvm.ptr<", base.i2s(bas), ">", "");
+        g_dev_elem = belem;
+        g_dev_asv = bas;
+        return gep;
+    }
+    // ident / 其它：已是 !llvm.ptr<as>，直接回传
+    return emit_dev_expr(e);
+}
+
+pub fn emit_dev_expr(e: i64) string {
+    var n: Node = dev_safe_node(e);
+    if (n.kind == "assign" || n.kind == "assignment") {
+        emit_dev_assign(n.na, n.nb);
+        return "";
+    }
+    if (n.kind == "ident") {
+        var idx: i64 = dev_lookup(n.sa);
+        if (idx < 0) {
+            g_dev_rty = "i32";
+            g_dev_elem = "";
+            g_dev_asv = 0;
+            return base.sb_cat2("%undef_", n.sa);
+        }
+        g_dev_rty = g_dv_t[idx];
+        g_dev_elem = g_dv_e[idx];
+        g_dev_asv = g_dv_a[idx];
+        return g_dv_v[idx];
+    }
+    if (n.kind == "int") {
+        var v: string = dev_next();
+        g_dev_rty = "i32";
+        g_dev_elem = "";
+        g_dev_asv = 0;
+        dev_emit(base.sb_cat7("  ", v, " = arith.constant ", n.sa, " : i32", "", ""));
+        return v;
+    }
+    if (n.kind == "float") {
+        var v: string = dev_next();
+        g_dev_rty = "f32";
+        g_dev_elem = "";
+        g_dev_asv = 0;
+        dev_emit(base.sb_cat7("  ", v, " = arith.constant ", n.sa, " : f32", "", ""));
+        return v;
+    }
+    if (n.kind == "paren") {
+        return emit_dev_expr(n.na);
+    }
+    if (n.kind == "binary") {
+        var l: string = emit_dev_expr(n.na);
+        var lt: string = g_dev_rty;
+        var r: string = emit_dev_expr(n.nb);
+        var rt: string = g_dev_rty;
+        var isf: bool = dev_is_float(lt) || dev_is_float(rt);
+        var op: string = "addi";
+        if (n.sa == "+") { op = "addi"; if (isf) { op = "addf"; } }
+        else if (n.sa == "-") { op = "subi"; if (isf) { op = "subi"; } if (isf) { op = "subf"; } }
+        else if (n.sa == "*") { op = "muli"; if (isf) { op = "mulf"; } }
+        else if (n.sa == "/") { op = "divsi"; if (isf) { op = "divf"; } }
+        var ty: string = "i32";
+        if (isf) { ty = "f32"; }
+        var v: string = dev_next();
+        dev_emit(base.sb_cat11("  ", v, " = arith.", op, " ", l, ", ", r, " : ", ty, ""));
+        g_dev_rty = ty;
+        g_dev_elem = "";
+        g_dev_asv = 0;
+        return v;
+    }
+    if (n.kind == "amp") {
+        // &x：取 x 的地址（GEP 指针），不 load。x 为 index 时发 GEP 返回 ptr<as>；
+        // x 为指针型 ident 时其值已是 !llvm.ptr<as>，直接回传。
+        return emit_dev_addr(n.na);
+    }
+    if (n.kind == "index") {
+        // 读：gep + load（结果值，非指针）
+        var b: string = emit_dev_expr(n.na);
+        var bas: i64 = g_dev_asv;
+        var belem: string = g_dev_elem;
+        var i: string = emit_dev_expr(n.nb);
+        var gep: string = dev_next();
+        dev_emit(base.sb_cat13("  ", gep, " = llvm.getelementptr ", b, "[", i, "] : (!llvm.ptr<", base.i2s(bas), ">, i32) -> !llvm.ptr<", base.i2s(bas), ">, ", belem, ""));
+        var ld: string = dev_next();
+        dev_emit(base.sb_cat9("  ", ld, " = llvm.load ", gep, " : !llvm.ptr<", base.i2s(bas), "> -> ", belem, ""));
+        g_dev_rty = belem;
+        g_dev_elem = "";
+        g_dev_asv = 0;
+        return ld;
+    }
+    if (n.kind == "call") {
+        return emit_dev_call(e);
+    }
+    // 未识别表达式：回退未定义，避免崩溃
+    g_dev_rty = "i32";
+    g_dev_elem = "";
+    g_dev_asv = 0;
+    return "%undef";
+}
+
+pub fn emit_dev_call(n: i64) string {
+    var nn: Node = dev_safe_node(n);
+    var cn: i64 = nn.na;
+    var nlen: i64 = slice_len(base.nodes) as i64;
+    // emit-dev 路径下 base.nodes 可能未完整填充；越界访问 callee 会崩，故先判界。
+    var name: string = "";
+    if (cn >= 0 && cn < nlen) {
+        var callee: Node = base.nodes[cn];
+        name = callee.sa;
+    } else {
+        g_dev_rty = "i32";
+        g_dev_elem = "";
+        g_dev_asv = 0;
+        return "%undef";
+    }
+    if (name == "thread_id" || name == "block_id" || name == "block_dim" || name == "grid_dim") {
+        var dim: i64 = dev_dim_of(n);
+        var v: string = dev_next();
+        dev_emit(base.sb_cat9("  ", v, " = \"device.", name, "\"() {dim = ", base.i2s(dim), " : i32} : () -> i32", "", ""));
+        g_dev_rty = "i32";
+        g_dev_elem = "";
+        g_dev_asv = 0;
+        return v;
+    }
+    if (name == "barrier") {
+        dev_emit("  \"device.barrier\"() : () -> ()");
+        g_dev_rty = "i32";
+        g_dev_elem = "";
+        g_dev_asv = 0;
+        return "";
+    }
+    if (name == "atomic_add") {
+        var ps: string = emit_dev_expr(dev_arg(n, 0));
+        var pas: i64 = g_dev_asv;
+        var pt: string = g_dev_rty;
+        var vs: string = emit_dev_expr(dev_arg(n, 1));
+        var vt: string = g_dev_rty;
+        var v: string = dev_next();
+        dev_emit(base.sb_cat14("  ", v, " = \"device.atomic_add\"(", ps, ", ", vs, ") : (!llvm.ptr<", base.i2s(pas), ">, ", vt, ") -> ", vt, "", ""));
+        g_dev_rty = vt;
+        g_dev_elem = "";
+        g_dev_asv = 0;
+        return v;
+    }
+    // 其它 call：尽力 emit 首个实参占位（垂直切片不展开通用调用）
+    g_dev_rty = "i32";
+    g_dev_elem = "";
+    g_dev_asv = 0;
+    return "%undef";
+}

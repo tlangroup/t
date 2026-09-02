@@ -1,0 +1,29 @@
+// Device 子系统垂直切片示例（docs/device-design.md §10.1 M1+M2，atomic/shared 属 M4 预演）
+//
+// 本文件用于 `tc emit-dev examples/vecadd_device.tc --output out/dbg/vecadd_device.mlir`
+// 验证 Device Dialect 文本生成；再用 tools/mlir-t-device 的 --device-to-nvvm 预演
+// lowering → PTX。运行时 launch（device.launch / t_runtime_gpu）属 M3，尚未实现。
+//
+// 设备安全子集（§8）与 host 类型检查在 kernel 体暂不做（design §8 为 M4 未来工作），
+// 故 thread_id / atomic_add / barrier / shared_alloc 等 device-only 内建在 host sema 阶段被跳过。
+
+// 基础向量加：global 指针 + thread_id + 索引 load/store + arith + barrier
+kernel fn vec_add(a: dev_ptr[f32], b: dev_ptr[f32], c: dev_ptr[f32], n: i32) void {
+    var tid = thread_id(0);
+    var i = tid;
+    var av = a[i];
+    var bv = b[i];
+    var s = av + bv;
+    c[i] = s;
+    barrier();
+}
+
+// 共享内存归约 + 全局 atomic_add：shared[T] 分配 + 跨线程 atomic 累加
+kernel fn reduce_atomic(inp: dev_ptr[f32], outp: dev_ptr[f32], n: i32) void {
+    var tid = thread_id(0);
+    var sh: shared[f32] = shared_alloc(256);
+    var v = inp[tid];
+    sh[tid] = v;
+    barrier();
+    atomic_add(&outp[tid], v);
+}
