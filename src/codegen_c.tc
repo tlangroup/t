@@ -9,6 +9,7 @@
 @import("src.lex" :: *);
 @import("src.parse" :: *);
 @import("src.sema" :: *);
+@import("src.codegen_dev" :: *);   // Device M3：含 kernel 时内嵌 Device Dialect 文本
 
 // ═══════════════════════════════════════════════════════════════
 // M8: C Emitter（复刻 tc0/codegen/emitter.ts）
@@ -547,7 +548,11 @@ pub fn desc_to_c(td: i64) string {
     if (t.cat == "slice") { return "TSlice"; }
     if (t.cat == "array") { return c_ptr_to(t.elem); }
     if (t.cat == "map") { return "TMap*"; }
-    if (t.cat == "pointer") { return c_ptr_to(t.elem); }
+    if (t.cat == "pointer") {
+        // host 后端：设备指针是不透明句柄 i64（CUdeviceptr），与 codegen_ll 对齐；host *T 仍 *elem。
+        if (t.memspace > 0) { return "int64_t"; }
+        return c_ptr_to(t.elem);
+    }
     // 可选类型 ?T 与引用同构：可空的元素指针（none = NULL）。
     if (t.cat == "optional") { return c_ptr_to(t.elem); }
     if (t.cat == "sym") {
@@ -2152,6 +2157,13 @@ pub fn emit_expr(e: i64) string {
     }
     if (n.kind == "call") {
         var cal: Node = base.nodes[n.na];
+        // Device host 内建 trampoline（docs/device-design.md §6 M3）
+        if (cal.kind == "member") {
+            var db: Node = base.nodes[cal.na];
+            if (db.kind == "ident" && db.sa == "device") {
+                return c_device_call(e, cal.sa);
+            }
+        }
         if (cal.kind == "ident") {
             var cn: string = cal.sa;
             // 收集参数
@@ -2751,6 +2763,64 @@ pub fn is_map_lit(e: i64) bool {
     }
     var mln: Node = base.nodes[e];
     return mln.kind == "map_lit";
+}
+
+// ── Device host 内建发射（docs/device-design.md §6 M3）────────────
+// 全部设备指针以 int64_t 句柄交换；launch 把变长实参打包成 int64_t[] 传给 tll_gpu_launch。
+pub fn c_device_call(e: i64, fname: string) string {
+    var n: Node = base.nodes[e];
+    var ae: []i64;
+    var c: i64 = n.la;
+    while (c >= 0) {
+        append(ae, base.kids[c].val);
+        c = base.kids[c].next;
+    }
+    var argc: i64 = slice_len(ae) as i64;
+    if (fname == "alloc_bytes") {
+        return base.sb_cat3("tll_gpu_alloc((int64_t)(", c_emit_call_arg(ae[0]), "))");
+    }
+    if (fname == "free") {
+        return base.sb_cat3("tll_gpu_free((int64_t)(", c_emit_call_arg(ae[0]), "))");
+    }
+    if (fname == "h2d") {
+        return base.sb_cat7("tll_gpu_h2d((int64_t)(", c_emit_call_arg(ae[0]), "), (int64_t)(",
+            c_emit_call_arg(ae[1]), "), (int64_t)(", c_emit_call_arg(ae[2]), "))");
+    }
+    if (fname == "d2h") {
+        return base.sb_cat7("tll_gpu_d2h((int64_t)(", c_emit_call_arg(ae[0]), "), (int64_t)(",
+            c_emit_call_arg(ae[1]), "), (int64_t)(", c_emit_call_arg(ae[2]), "))");
+    }
+    if (fname == "launch") {
+        // device.launch(name: String, grid: i32, block: i32, args...) -> i32
+        var name: string = c_emit_call_arg(ae[0]);   // TStr 值
+        var grid: string = c_emit_call_arg(ae[1]);   // i32
+        var block: string = c_emit_call_arg(ae[2]);  // i32
+        var nargs: i64 = argc - 3;
+        if (nargs < 0) { nargs = 0; }
+        var sb: StringBuilder = sb_new();
+        sb_append_str(sb, "tll_gpu_launch(__t_devmod_blob, t_cstr(");
+        sb_append_str(sb, name);
+        sb_append_str(sb, "), (int32_t)(");
+        sb_append_str(sb, grid);
+        sb_append_str(sb, "), (int32_t)(");
+        sb_append_str(sb, block);
+        sb_append_str(sb, "), (int32_t)(");
+        sb_append_str(sb, base.i2s(nargs));
+        sb_append_str(sb, "), (int64_t[]){");
+        var i: i64 = 0;
+        var first: bool = true;
+        while (i < nargs) {
+            if (first == false) { sb_append_str(sb, ", "); }
+            sb_append_str(sb, "(int64_t)(");
+            sb_append_str(sb, c_emit_call_arg(ae[3 + i]));
+            sb_append_str(sb, ")");
+            first = false;
+            i = i + 1;
+        }
+        sb_append_str(sb, "})");
+        return sb_to_str(sb);
+    }
+    return "0";
 }
 
 // ── emitStmt（复刻 emitter.ts emitStmt；输出到 slines）─────────
@@ -4264,6 +4334,21 @@ pub fn emit_c_atom_table() void {
     spush(sb_to_str(sb2));
 }
 
+// Device M3：本模块是否含 `kernel fn`（驱动 __t_devmod_blob 内嵌）。
+// 与 tc.tc 的 module_has_kernels 同义，但独立实现以避免 base→lex 反向依赖。
+pub fn c_dev_has_kernels() bool {
+    var n: i64 = slice_len(lex.decl_list) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        var dn: Node = base.nodes[lex.decl_list[i]];
+        if (dn.kind == "FuncDecl" && dn.bf == true) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
 pub fn emit_unit(mod: string) void {
     var guard: string = base.sb_cat3("TC_", to_upper(mod), "_H");
     hpush(base.sb_cat2("#ifndef ", guard));
@@ -4283,6 +4368,18 @@ pub fn emit_unit(mod: string) void {
     spush("#include <string.h>");
     spush("#include \"t_runtime.h\"");
     spush("");
+
+    // Device 子系统 M3：本模块含 `kernel fn` 时，把 Device Dialect 文本内嵌为 C 全局常量，
+    // 供 tll_gpu_launch 读取（docs/device-design.md §6）。定义在文件顶（函数体之前），
+    // 使下方 emit 出的 launch 调用可见该符号。定义放在 emit_unit 内、emit_decl 之前，
+    // 保证在所有函数之前出现，满足 C 前向可见性。
+    if (c_dev_has_kernels()) {
+        var blob: string = codegen_dev.emit_device_module();
+        var lit: string = esc_c(blob);
+        spush("#include \"t_runtime_gpu.h\"");
+        spush(base.sb_cat3("const char __t_devmod_blob[] = \"", lit, "\";"));
+        spush("");
+    }
 
     build_type_map();
 

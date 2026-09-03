@@ -314,10 +314,12 @@ pub fn ll_td(td: i64) string {
     var t: TD = sema.tds[td];
     if (t.cat == "string" || t.cat == "bytes") { return "%TStr"; }
     if (t.cat == "pointer") {
-        // Device 地址空间：dev_ptr[T]/shared[T]/local[T] 携带 TD.memspace（1/3/5），
-        // 发 `ptr addrspace(N)` 与设备侧 !llvm.ptr<as> 对齐；host 普通 *T 仍 `ptr`（as=0）。
+        // host 后端：dev_ptr[T]/shared[T]/local[T] 在 host 上是「设备指针句柄」（CUdeviceptr，
+        // 即不透明 i64），由 tll_gpu_* 运行时持有；发射为 i64（非 ptr addrspace(N)，后者在 host
+        // 非法）。仅在模块含 kernel 时才会进此分支（host 普通 *T 的 memspace 恒 0 → 仍 `ptr`）。
+        // 设备侧地址空间（!llvm.ptr<as>）由 codegen_dev 独立发射，与此无关。
         if (t.memspace > 0) {
-            return base.sb_cat4("ptr addrspace(", base.i2s(t.memspace), ")", "");
+            return "i64";
         }
         return "ptr";
     }
@@ -795,6 +797,15 @@ pub fn ll_etd(e: i64) i64 {
     }
     if (n.kind == "call") {
         var cal: Node = base.nodes[n.na];
+        // Device host 内建：callee = member(device, fn)。返回类型走 i64/void/i32（句柄模型）。
+        if (cal.kind == "member") {
+            var db: Node = base.nodes[cal.na];
+            if (db.kind == "ident" && db.sa == "device") {
+                if (cal.sa == "alloc_bytes") { return sema.td_named_mk("scalar", "i64"); }
+                if (cal.sa == "launch") { return sema.td_named_mk("scalar", "i32"); }
+                return sema.td_mk("void");
+            }
+        }
         if (cal.kind == "ident") {
             var cn: string = cal.sa;
             if (cn == "flag_get") {
@@ -836,6 +847,24 @@ pub fn ll_bin_td(e: i64) i64 {
 pub fn ll_cast_v(v: string, ftd: i64, ttd: i64) string {
     var fs: string = sema.td_sname(ftd);
     var ts: string = sema.td_sname(ttd);
+    // 指针 ↔ 整数（device FFI：host 指针 / dev_ptr 句柄以 i64 交换，docs/device-design.md §6）
+    // 用 TD 类别判定，避免依赖 td_sname(ptr) 是否为空；且必须在空名早退前处理。
+    if (ftd >= 0 && ttd >= 0 && sema.tds[ftd].cat == "pointer" && sema.tds[ttd].cat != "pointer") {
+        if (str_len(v) > 0) {
+            var t: string = ll_tmp();
+            llfb(base.sb_cat7("  ", t, " = ptrtoint ptr ", v, " to ", scalar_to_ll(ts), ""));
+            return t;
+        }
+        return v;
+    }
+    if (ftd >= 0 && ttd >= 0 && sema.tds[ttd].cat == "pointer" && sema.tds[ftd].cat != "pointer") {
+        if (str_len(v) > 0) {
+            var t: string = ll_tmp();
+            llfb(base.sb_cat8("  ", t, " = inttoptr ", scalar_to_ll(fs), " ", v, " to ptr", ""));
+            return t;
+        }
+        return v;
+    }
     if (fs == "" || ts == "") {
         return v;
     }
@@ -2825,6 +2854,13 @@ pub fn ll_emit_math(e: i64) string {
 pub fn ll_call(e: i64) string {
     var n: Node = base.nodes[e];
     var cal: Node = base.nodes[n.na];
+    // Device host 内建 trampoline（docs/device-design.md §6 M3）
+    if (cal.kind == "member") {
+        var db: Node = base.nodes[cal.na];
+        if (db.kind == "ident" && db.sa == "device") {
+            return ll_device_call(e, cal.sa);
+        }
+    }
     if (cal.kind != "ident") {
         // callee 是任意表达式（结构体字段 / 数组元素 / 调用结果…）：只要它的静态类型
         // 是函数类型，就按闭包解包间接调用；否则才是真的不支持。
@@ -3793,6 +3829,101 @@ pub fn ll_call(e: i64) string {
     return "0";
 }
 
+// ── Device host 内建发射（docs/device-design.md §6 M3）────────────
+// 全部设备指针以 i64 句柄交换；launch 把变长实参打包成 i64[] 传给 tll_gpu_launch。
+pub fn ll_device_arg_i64(aen: i64) string {
+    var v: string = emit_lle(aen);
+    var atd: i64 = ll_etd(aen);
+    var sty: string = ll_td(atd);
+    if (sty == "i64") { return v; }
+    if (sty == "i32") {
+        var cv: string = ll_tmp();
+        llfb(base.sb_cat6("  ", cv, " = zext i32 ", v, " to i64", ""));
+        return cv;
+    }
+    if (sty == "i1") {
+        var cv: string = ll_tmp();
+        llfb(base.sb_cat6("  ", cv, " = zext i1 ", v, " to i64", ""));
+        return cv;
+    }
+    // 其它：ptr 用 ptrtoint（LLVM 不允许 bitcast ptr↔int）；其余位等价 bitcast 安全
+    if (sty == "ptr") {
+        var cv2: string = ll_tmp();
+        llfb(base.sb_cat6("  ", cv2, " = ptrtoint ptr ", v, " to i64", ""));
+        return cv2;
+    }
+    var cv2: string = ll_tmp();
+    llfb(base.sb_cat8("  ", cv2, " = bitcast ", sty, " ", v, " to i64", ""));
+    return cv2;
+}
+
+pub fn ll_device_call(e: i64, fname: string) string {
+    var n: Node = base.nodes[e];
+    var ae: []i64;
+    var c: i64 = n.la;
+    while (c >= 0) {
+        append(ae, base.kids[c].val);
+        c = base.kids[c].next;
+    }
+    var argc: i64 = slice_len(ae) as i64;
+    if (fname == "alloc_bytes") {
+        var bytes: string = ll_device_arg_i64(ae[0]);
+        var t: string = ll_tmp();
+        llfb(base.sb_cat6("  ", t, " = call i64 @tll_gpu_alloc(i64 ", bytes, ")", ""));
+        return t;
+    }
+    if (fname == "free") {
+        var p: string = ll_device_arg_i64(ae[0]);
+        llfb(base.sb_cat4("  call void @tll_gpu_free(i64 ", p, ")", ""));
+        return "0";
+    }
+    if (fname == "h2d") {
+        var dst: string = ll_device_arg_i64(ae[0]);
+        var src: string = ll_device_arg_i64(ae[1]);
+        var by: string = ll_device_arg_i64(ae[2]);
+        llfb(base.sb_cat8("  call void @tll_gpu_h2d(i64 ", dst, ", i64 ", src, ", i64 ", by, ")", ""));
+        return "0";
+    }
+    if (fname == "d2h") {
+        var dst: string = ll_device_arg_i64(ae[0]);
+        var src: string = ll_device_arg_i64(ae[1]);
+        var by: string = ll_device_arg_i64(ae[2]);
+        llfb(base.sb_cat8("  call void @tll_gpu_d2h(i64 ", dst, ", i64 ", src, ", i64 ", by, ")", ""));
+        return "0";
+    }
+    if (fname == "launch") {
+        // device.launch(name: String, grid: i32, block: i32, args...) -> i32
+        // name 是 TStr 聚合 ptr；运行时 tll_gpu_launch 要 const char*（data 字段 field0），
+        // 故 GEP 取 field0 再 load 出 char* 数据指针（与 C 端 t_cstr 对齐）。
+        var namep: string = emit_lle(ae[0]);   // TStr 聚合 ptr
+        var nameg: string = ll_tmp();
+        llfb(base.sb_cat6("  ", nameg, " = getelementptr %TStr, ptr ", namep, ", i32 0, i32 0", ""));
+        var name: string = ll_tmp();
+        llfb(base.sb_cat5("  ", name, " = load ptr, ptr ", nameg, ""));
+        var grid: string = emit_lle(ae[1]);   // i32
+        var block: string = emit_lle(ae[2]);  // i32
+        var nargs: i64 = argc - 3;
+        if (nargs < 0) { nargs = 0; }
+        var argv: string = ll_tmp();
+        llfb(base.sb_cat6("  ", argv, " = alloca [", base.i2s(nargs), " x i64], align 8", ""));
+        var i: i64 = 0;
+        while (i < nargs) {
+            var av: string = ll_device_arg_i64(ae[3 + i]);
+            var slot: string = ll_tmp();
+            llfb(base.sb_cat9("  ", slot, " = getelementptr inbounds [", base.i2s(nargs),
+                " x i64], ptr ", argv, ", i64 0, i64 ", base.i2s(i), ""));
+            llfb(base.sb_cat6("  store i64 ", av, ", ptr ", slot, "", ""));
+            i = i + 1;
+        }
+        var t: string = ll_tmp();
+        llfb(base.sb_cat14("  ", t, " = call i32 @tll_gpu_launch(ptr @__t_devmod_blob, ptr ", name,
+            ", i32 ", grid, ", i32 ", block, ", i32 ", base.i2s(nargs), ", ptr ", argv, ")", ""));
+        return t;
+    }
+    llfb("  ; UNSUPPORTED device call");
+    return "0";
+}
+
 // 2^n（flag 掩码用；n < 63）
 pub fn pow2_i64(n: i64) i64 {
     var r: i64 = 1;
@@ -4752,6 +4883,14 @@ llph("declare void @tll_assert_eq_s(ptr, ptr, ptr)");
     llph("declare void @tll_format_char(ptr, i64, ptr)");
     llph("declare void @tll_sb_append_fmt_int(ptr, ptr, i64)");
     llph("declare void @tll_sb_append_fmt_uint(ptr, ptr, i64)");
+// ── Device 子系统 host 运行时（docs/device-design.md §5/§6 M3）──
+// blob 为内嵌的 Device Dialect 序列化文本（JIT 模式）；name 为内核名 C 串；
+// argv 为打包的 i64 句柄（dev_ptr 句柄 / 标量零扩展）。CUDA 缺失时由 t_runtime_gpu.c 桩返回错误。
+    llph("declare i64 @tll_gpu_alloc(i64)");
+    llph("declare void @tll_gpu_free(i64)");
+    llph("declare void @tll_gpu_h2d(i64, i64, i64)");
+    llph("declare void @tll_gpu_d2h(i64, i64, i64)");
+    llph("declare i32 @tll_gpu_launch(ptr, ptr, i32, i32, i32, ptr)");
     llph("declare void @tll_sb_append_fmt_float(ptr, ptr, double)");
     llph("declare void @tll_sb_append_fmt_str(ptr, ptr, ptr)");
     llph("declare void @tll_sb_append_fmt_bool(ptr, ptr, i8)");

@@ -51,11 +51,13 @@ for (const m of modes) {
   mkdirSync(depsDir, { recursive: true });
   const obj1 = join(depsDir, "t_runtime.obj");
   const obj2 = join(depsDir, "t_shim_ll.obj");
+  const obj3 = join(depsDir, "t_runtime_gpu.obj");
   const lib = join(depsDir, "t_runtime.lib");
   console.log(`build_runtime: [${m.name}] ${clang} ${m.opt}`);
   execFileSync(clang, ["-c", m.opt, "-I", join(ROOT, "runtime"), "-o", obj1, join(ROOT, "runtime", "t_runtime.c")], { cwd: ROOT, stdio: "inherit" });
   execFileSync(clang, ["-c", m.opt, "-I", join(ROOT, "runtime"), "-o", obj2, join(ROOT, "runtime", "t_shim_ll.c")], { cwd: ROOT, stdio: "inherit" });
-  const archObjs = [obj1, obj2];
+  execFileSync(clang, ["-c", m.opt, "-I", join(ROOT, "runtime"), "-o", obj3, join(ROOT, "runtime", "t_runtime_gpu.c")], { cwd: ROOT, stdio: "inherit" });
+  const archObjs = [obj1, obj2, obj3];
   for (const src of fdSources) {
     const o = join(depsDir, "fdlibm_" + fdSources.indexOf(src) + ".obj");
     execFileSync(clang, ["-c", m.opt, "-I", join(ROOT, "runtime"), "-D_IEEE_LIBM", "-D__STDC__", "-o", o, src], { cwd: ROOT, stdio: "inherit" });

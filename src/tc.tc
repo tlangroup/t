@@ -18,6 +18,21 @@
 @import("src.test" :: *);
 @import("repl" :: *);
 
+// ── Device 子系统：host 模块是否含 kernel（驱动注入 __t_devmod_blob 用）──
+pub fn module_has_kernels() bool {
+    var n: i64 = slice_len(lex.decl_list) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        var d: i64 = lex.decl_list[i];
+        var dn: Node = base.nodes[d];
+        if (dn.kind == "FuncDecl" && dn.bf == true) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
 fn main() i32 @main {
     var argv: []string = args();
     lex.init_keywords();
@@ -374,6 +389,18 @@ fn main() i32 @main {
         var mod2: string = codegen_ll.base_no_tc(src_file);
         codegen_ll.emit_llunit(mod2);
 
+        // Device 子系统 M3：若本模块含 `kernel fn`，把 Device Dialect 文本作为
+        // @__t_devmod_blob 全局常量注入 host LLVM 模块，供 tll_gpu_launch 读取
+        // （docs/device-design.md §6）。tc.tc 自身无 kernel → 此分支不触发，
+        // 自举不动点 / IR 基线零漂移。
+        if (module_has_kernels()) {
+            var blob: string = codegen_dev.emit_device_module();
+            var lit: string = codegen_ll.esc_ll(blob);     // 正确 LLVM 转义（\22/\5C/\0A 十六进制）
+            var blen: i64 = (str_len(blob) as i64) + 1;   // +1：末尾 null 终结符（供运行时 strlen）
+            codegen_ll.llpg(base.sb_cat7("@__t_devmod_blob = private constant [",
+                base.i2s(blen), " x i8] c\"", lit, "\\00", "\", align 1", ""));
+        }
+
         // 输出目录：--output 指定 exe/目录前缀；缺省按 --mode 落入 out/dbg|out/rls
         if (has_outp == false) {
             if (is_lib) {
@@ -433,7 +460,9 @@ fn main() i32 @main {
             sb_append_str(csb2, rt_dir);
             sb_append_str(csb2, "/t_runtime.c\" \"");
             sb_append_str(csb2, rt_dir);
-            sb_append_str(csb2, "/t_shim_ll.c\" -I \"");
+            sb_append_str(csb2, "/t_shim_ll.c\" \"");
+            sb_append_str(csb2, rt_dir);
+            sb_append_str(csb2, "/t_runtime_gpu.c\" -I \"");
             sb_append_str(csb2, rt_dir);
             sb_append_str(csb2, "\"");
         }

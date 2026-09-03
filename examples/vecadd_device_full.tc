@@ -1,0 +1,71 @@
+// Device 子系统 M3 端到端垂直切片（docs/device-design.md §10.2）
+//
+// 完整 host 程序：分配 device 缓冲 → h2d 拷入 → device.launch 内核 → d2h 拷回 → free。
+// 编译双后端、链接桩运行时（runtime/t_runtime_gpu.c：本机无 CUDA / 无 GPU），运行优雅降级：
+//   launch 返回 -1 并打印「no CUDA available」，host 照常退出（0）。
+// 在装有 MLIR + CUDA driver 的机器上，blob 会被真实 JIT 引擎喂给 device-to-nvvm → PTX →
+// cuLaunchKernel 执行 vec_add（见 §5），届时 rc==0 且 hc[i] == ha[i] + hb[i]。
+//
+// 所有 device 句柄以 i64 交换（见 §6 设计）：alloc 返回 i64；用户按需 `as dev_ptr[T]`
+// 在 kernel 侧解释（host 侧 launch 变长实参打包为 int64_t[]，由 JIT 重建指针）。
+
+// 设备内核（host 双后端跳过发射，codegen_dev 消费 AST 发射为 Device Dialect）
+kernel fn vec_add(a: dev_ptr[f32], b: dev_ptr[f32], c: dev_ptr[f32], n: i32) void {
+    var tid = thread_id(0);
+    var i = tid;
+    var av = a[i];
+    var bv = b[i];
+    var s = av + bv;
+    c[i] = s;
+}
+
+// 共享内存归约 + 全局 atomic_add（M4 预演；本切片一并 embed 进 blob 但不 launch）
+kernel fn reduce_atomic(inp: dev_ptr[f32], outp: dev_ptr[f32], n: i32) void {
+    var tid = thread_id(0);
+    var sh: shared[f32] = shared_alloc(256);
+    var v = inp[tid];
+    sh[tid] = v;
+    barrier();
+    atomic_add(&outp[tid], v);
+}
+
+fn main() i32 @main {
+    var n_elems: i32 = 256;
+    var nb: i64 = (n_elems as i64) * 4;   // f32 = 4 字节
+
+    // host 侧输入缓冲（定长栈数组）；取数组基址用 `&arr`（元素 `&arr[0]` 非可寻址左值）
+    var ha: [256]f32;
+    var hb: [256]f32;
+    var hc: [256]f32;
+    var k: i32 = 0;
+    while (k < n_elems) {
+        ha[k] = (k as f32);
+        hb[k] = (2.0 as f32);
+        k = k + 1;
+    }
+
+    // 设备缓冲（原始 i64 句柄）
+    var da = device.alloc_bytes(nb);
+    var db = device.alloc_bytes(nb);
+    var dc = device.alloc_bytes(nb);
+
+    // host → device（&ha 即数组基址；括号不可省：`as` 优先级高于 `&`，须写成 (&ha) as i64）
+    device.h2d(da, (&ha) as i64, nb);
+    device.h2d(db, (&hb) as i64, nb);
+
+    // 启动内核：grid=1, block=n（1D，覆盖全部元素）
+    var rc = device.launch("vec_add", 1, n_elems, da, db, dc, n_elems);
+
+    // device → host
+    device.d2h((&hc) as i64, dc, nb);
+
+    // 桩运行时：rc == -1（无 CUDA）。真实机器上 rc==0 且 hc[i] == ha[i] + hb[i]。
+    print("device.launch(vec_add) -> rc=");
+    print(int_to_str(rc as i64));
+    print("\n");
+
+    device.free(da);
+    device.free(db);
+    device.free(dc);
+    return 0;
+}

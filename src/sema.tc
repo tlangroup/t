@@ -4481,6 +4481,24 @@ pub fn lower_for_array(s: i64) void {
 
 // ── 表达式类型推断 inferExprType（复刻 checker.ts:479）────────
 
+// Device 子系统 host 内建类型检查（docs/device-design.md §6 M3）。
+// 全部以 i64 句柄交换设备指针，避免引入 dev_ptr 的 TI 地址空间（TI→TD 会丢 memspace）。
+pub fn infer_device_call(e: i64, fname: string) i64 {
+    var n: Node = base.nodes[e];
+    // 实参类型推导（保证嵌套表达式被检查）
+    var c: i64 = n.la;
+    while (c >= 0) {
+        infer_expr(base.kids[c].val);
+        c = base.kids[c].next;
+    }
+    if (fname == "alloc_bytes") { return ti_scalar("i64"); }
+    if (fname == "free") { return ti_mk("Void"); }
+    if (fname == "h2d" || fname == "d2h") { return ti_mk("Void"); }
+    if (fname == "launch") { return ti_scalar("i32"); }
+    parse.fc_err("T-SEM-E201", base.sb_cat3("未知 device 内建 `", fname, "`"), e);
+    return ti_mk("Unknown");
+}
+
 pub fn infer_expr(e: i64) i64 {
     var n: Node = base.nodes[e];
     if (is_pipe_kind(n.kind) == true) {
@@ -5328,6 +5346,15 @@ pub fn infer_expr(e: i64) i64 {
                     "`.format(...)` 的接收者必须是字符串**字面量**（编译期解析，运行期无模板引擎）；变量模板请改用 StringBuilder 逐段拼接",
                     mfa_recv);
                 return ti_mk("Unknown");
+            }
+        }
+        // Device 子系统 host 内建（docs/device-design.md §6 M3）：
+        // device.alloc_bytes / free / h2d / d2h / launch。callee = member(device, fn)。
+        // 全部以 i64 句柄（CUdeviceptr）交换设备指针，调用点用 `as dev_ptr[T]` 还原类型。
+        if (cn.kind == "member") {
+            var dbase: Node = base.nodes[cn.na];
+            if (dbase.kind == "ident" && dbase.sa == "device") {
+                return infer_device_call(e, cn.sa);
             }
         }
         if (cn.kind == "ident") {

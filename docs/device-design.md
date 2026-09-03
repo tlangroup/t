@@ -165,7 +165,7 @@ device-only 内建仅允许出现在 device 上下文。
   ⚠ 本机无 MLIR/CUDA，仅产出代码、在他机编译运行验证。
 - **M1 T 类型系统**：`pointer.as` + `dev_ptr[T]/shared[T]/local[T]` 解析 + `ll_td` addrspace（host 路径 gate 可验证）。
 - **M2 `codegen_dev`**：单 kernel `vec_add` emit Device Dialect 文本 + C 侧序列化 bytecode。
-- **M3 `device` 模块 + trampoline + `t_runtime_gpu` launch**：`vec_add` 真在 GPU 跑通（垂直切片闭环）。
+- **M3 `device` 模块 + trampoline + `t_runtime_gpu` launch**：✅ 主机侧端到端闭环（2026-09-03）。`device.alloc/free/h2d/d2h/launch` 双后端发射 + `__t_devmod_blob` 内嵌 + `t_runtime_gpu` 桩运行时：C/LLVM 双后端均 `build→link→run` 成功、exit 0、launch 内核名正确打印（`tll_gpu_launch("vec_add")`）。GPU 真执行仍需在他机（无 CUDA/GPU）。
 
 ### 10.2 准备实现（planned）
 - **M4** device-only 内建（atomic/barrier/math 映射）+ 安全子集 sema 校验（§8）。
@@ -191,7 +191,7 @@ device-only 内建仅允许出现在 device 上下文。
 | M0 | MLIR→PTX→launch 全栈跑通（他机） | ❌ 需 MLIR+CUDA |
 | M1 | `dev_ptr[T]` 解析 + `ll_td` addrspace + host gate 全绿 | ✅ |
 | M2 | `vec_add` emit Device Dialect 文本 + 序列化 bytecode | △ 文本可查；bytecode 需 MLIR |
-| M3 | `vec_add` 真在 GPU 算出正确结果 | ❌ 需 GPU |
+| M3 | `vec_add` 真在 GPU 算出正确结果；主机侧发射/链接/运行 + 内核名传递 双后端闭环 | △ 主机发射/链接/运行本机已验（桩运行时，exit 0，名正确）；GPU 真执行 ❌ 需 GPU |
 | M4 | atomic/barrier/math + 安全子集拦截 | △ 拦截本机可验；运行需 GPU |
 | M5 | gate device 示例 + IR 快照 | △ snapshot 本机可验 |
 
