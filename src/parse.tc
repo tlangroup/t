@@ -2113,23 +2113,21 @@ pub fn parse_decl_body(name: string, anns: i64, is_comptime: bool) i64 {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// 测试声明（并置式 / docs/syntax/drafts/decl_test.md）
+// 测试声明（关键字领头式 LL(1) / docs/syntax/drafts/decl_test.md）
 //
-//   "加法应返回两数之和" test {
+//   test "加法应返回两数之和" {
 //       expect(add(2, 3) == 5);
 //   }
 //
-//   "math" suite {
-//       "加法" test { ... }
-//       "取模" suite { "负数被除" test { ... } }
+//   suite "math" {
+//       test "加法" { ... }
+//       suite "取模" { test "负数被除" { ... } }
 //   }
 //
-// 与 `Name struct {}` / `Name fn() Ret {}` 同构：名字在前、种类在后（L-02）。
-// 差别只在名字是**字符串字面量**而非标识符，故必须在 parse_declaration 的
-// 「声明名必须是 Identifier」硬退出之前拦截。
-//
-// `test` / `suite` 是**语境关键字**：不进 keywords_tbl，只有紧跟在声明位
-// 置的字符串字面量之后才被识别，因此对存量标识符零冲突（先例：flag_set）。
+// 与 `fn name(...)` / `struct Name {}` / `enum Name {}` 同构：关键字领头、
+// 名字在后（LL(1) 关键字领头桥，见下方 flag_set 桥）。`test`/`suite` 是**语境
+// 标识符**：不进 keywords_tbl，只在声明位、紧跟测试名字符串前被识别，因此对
+// 存量标识符零冲突（含 `test` 模块名、`fn test()`；先例：flag_set）。
 //
 // 脱糖到一个普通的布尔函数，sema 主通路与两个后端零改动：
 //
@@ -2171,19 +2169,31 @@ pub fn clone_ann_list(head: i64) i64 {
     return nh;
 }
 
-// `"名字" test { ... }` → 合成 `__test_<n> fn() bool @test { ... return true; }`
-pub fn parse_test_decl(disp: string, anns: i64, ti: i64) void {
+// `test "名字" { ... }` → 合成 `__test_<n> fn() bool { ... return true; }`
+// 关键字领头（LL(1)）：`test`/`suite` 是语境标识符，只在声明位、紧跟测试名
+// 字符串前被识别，对 `test` 模块名 / `fn test()` 等存量标识符零冲突（同 flag_set）。
+pub fn parse_test_decl(anns: i64, is_export: bool) i64 {
+    if (lex.cur_t() != "String") {
+        parse_fatal("expected test name string after 'test'");
+    }
+    var nti: i64 = lex.advance_i();
+    var disp: string = lex.tk_v(nti);
+    if (str_len(disp) == 0) {
+        parse_fatal("test name must not be an empty string");
+    }
+    // 名字后可跟修饰注解（@skip/@only/@should_fail/@tag），与 `test` 前的
+    // 前导注解（anns）等价，二者合并进同一条注解链。
     var post: i64 = parse_annotations();
     var all: i64 = list_concat(anns, post);
 
     if (lex.cur_t() != "LBrace") {
-        parse_fatal("expected '{' after 'test' in test declaration");
+        parse_fatal("expected '{' after test name / annotations");
     }
     var body: i64 = parse_block();
 
     // 隐式 `return true;`：测试块以「跑完没炸」为通过，无需显式返回。
     // 显式 `return false;` 或 expect 失败会提前返回，此句即成死代码。
-    var rt: i64 = base.mk_return(base.mk_bool(true, ti), ti);
+    var rt: i64 = base.mk_return(base.mk_bool(true, nti), nti);
     body = list_concat(body, base.list_push(-1, -1, rt));
 
     var name: string = base.sb_cat2("__test_", base.i2s(g_test_seq));
@@ -2191,22 +2201,36 @@ pub fn parse_test_decl(disp: string, anns: i64, ti: i64) void {
 
     // 返回类型必须走 mk_scalar（`bool` 是标量名）；用 mk_named 会造出一个
     // 同名但不同种类的类型节点，报出 "expected bool but got bool" 的怪错。
-    var fd: i64 = base.mk_FuncDecl(name, false, false, base.mk_scalar("bool", -1), all, -1, body, ti);
+    var fd: i64 = base.mk_FuncDecl(name, false, false, base.mk_scalar("bool", -1), all, -1, body, nti);
     var fn_n: Node = base.nodes[fd];
     fn_n.bd = true;             // 是测试
     fn_n.sb = disp;             // 显示名
     fn_n.sc = g_suite_path;     // suite 路径
+    fn_n.bc = is_export;        // 模块可见性（`pub test "..." {}` 时为真）
     slice_set(base.nodes, fd, fn_n);
-    append(lex.decl_list, fd);
+    // 注意：入列由调用方负责（顶层经 parse_unit 的 append；suite 体内由
+    // parse_suite_decl 的循环 append），此处**不再**自 append，否则会与
+    // parse_unit 重复入列造成同名 FuncDecl 双份 → 子句组合并误报 E811。
+    return fd;
 }
 
-// `"名字" suite { ... }` → 纯词法分组，自身不产生任何声明。
-pub fn parse_suite_decl(disp: string, anns: i64, ti: i64) void {
+// `suite "名字" { ... }` → 纯词法分组，自身不产生任何声明。
+pub fn parse_suite_decl(anns: i64) i64 {
+    if (lex.cur_t() != "String") {
+        parse_fatal("expected suite name string after 'suite'");
+    }
+    var nti: i64 = lex.advance_i();
+    var disp: string = lex.tk_v(nti);
+    if (str_len(disp) == 0) {
+        parse_fatal("suite name must not be an empty string");
+    }
+    // 名字后可跟修饰注解；前导注解（anns）来自 suite 外的 `@xxx suite "g" {}`，
+    // 与名字后注解合并后逐成员下沉。
     var post: i64 = parse_annotations();
     var all: i64 = list_concat(anns, post);
 
     if (lex.cur_t() != "LBrace") {
-        parse_fatal("expected '{' after 'suite' in suite declaration");
+        parse_fatal("expected '{' after suite name / annotations");
     }
     lex.advance_i();
 
@@ -2225,34 +2249,19 @@ pub fn parse_suite_decl(disp: string, anns: i64, ti: i64) void {
         var mann: i64 = parse_annotations();
         // suite 注解逐成员复制下沉（@skip/@tag 因此天然作用于整组）
         mann = list_concat(clone_ann_list(all), mann);
-        if (lex.cur_t() != "String") {
-            parse_fatal("a suite body may only contain `\"name\" test {}` / `\"name\" suite {}` declarations");
+        if (lex.cur_t() == "Identifier" && lex.cur_v() == "test") {
+            lex.advance_i();
+            var tb: i64 = parse_test_decl(mann, false);
+            if (tb >= 0) { append(lex.decl_list, tb); }
+        } else if (lex.cur_t() == "Identifier" && lex.cur_v() == "suite") {
+            lex.advance_i();
+            parse_suite_decl(mann);
+        } else {
+            parse_fatal("a suite body may only contain `test \"name\" {}` / `suite \"name\" {}` declarations");
         }
-        parse_test_or_suite(mann);
     }
     expect_tok("RBrace");
     g_suite_path = saved;
-}
-
-// 声明位置遇到字符串字面量时的入口（调用时 cur_t() == "String"）。
-// 自行 append 到 decl_list，故一律返回 -1。
-pub fn parse_test_or_suite(anns: i64) i64 {
-    var nti: i64 = lex.advance_i();
-    var disp: string = lex.tk_v(nti);
-    if (str_len(disp) == 0) {
-        parse_fatal("test/suite name must not be an empty string");
-    }
-    if (lex.cur_t() == "Identifier" && lex.cur_v() == "test") {
-        lex.advance_i();
-        parse_test_decl(disp, anns, nti);
-        return -1;
-    }
-    if (lex.cur_t() == "Identifier" && lex.cur_v() == "suite") {
-        lex.advance_i();
-        parse_suite_decl(disp, anns, nti);
-        return -1;
-    }
-    parse_fatal(base.sb_cat5("expected 'test' or 'suite' after the name string \"", disp, "\", found '", lex.cur_v(), "'"));
     return -1;
 }
 
@@ -2434,12 +2443,6 @@ pub fn parse_declaration() i64 {
         parse_fatal_at("T-PAR-E102", "`import(X)` was removed; write `@import(\"X\")` instead", lex.pos);
     }
 
-    // 测试声明的名字是字符串字面量（`"加法" test {}` / `"math" suite {}`），
-    // 必须抢在下面「声明名必须是 Identifier」的硬退出之前拦截。
-    if (lex.cur_t() == "String") {
-        return parse_test_or_suite(anns);
-    }
-
     // LL(1) 具名函数文法（兼容桥接）：`fn name(params) ret { body }`。
     // 旧 `name fn(...)` 并置式仍保留兼容（下方名字先行路径），二者由首个 token 消歧、不冲突。
     if (lex.cur_t() == "KwFunc") {
@@ -2575,6 +2578,19 @@ pub fn parse_declaration() i64 {
         var fs_b: i64 = parse_flag_set_decl(fsname, anns);
         if (fs_b >= 0) { base.node_at(fs_b, fsidx); if (is_export) { base.nodes[fs_b].bc = true; } }
         return fs_b;
+    }
+
+    // test/suite 关键字领头（LL(1)）：`test "名字" {}` / `suite "名字" {}`。
+    // 与 flag_set 同款语境标识符路线：只有声明位、紧跟测试名字符串前才识别，
+    // 对存量标识符（含 `test` 模块名、`fn test()`）零冲突。进入此分支即确定
+    // 是测试/suite 声明，后续由下一个 token（String 名）完成 LL(1) 派发。
+    if (lex.cur_t() == "Identifier" && lex.cur_v() == "test") {
+        lex.advance_i();   // 吃掉 `test`
+        return parse_test_decl(anns, is_export);
+    }
+    if (lex.cur_t() == "Identifier" && lex.cur_v() == "suite") {
+        lex.advance_i();   // 吃掉 `suite`
+        return parse_suite_decl(anns);
     }
 
     if (lex.cur_t() != "Identifier") {

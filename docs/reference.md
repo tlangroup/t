@@ -254,11 +254,11 @@ DeriveTraitTable:
   | "BinarySerde" | "Eq" | "PartialEq" | "Hash"
 
 AnnotationTable:
-    "test" { spec: "none", targets: "func", repl: "a `\"name\" test { ... }` declaration" }
+    "test" { spec: "none", targets: "func", repl: "a `test \"name\" { ... }` declaration" }
   | "test_skip" { spec: "none", targets: "func", repl: "@skip" }
   | "test_only" { spec: "none", targets: "func", repl: "@only" }
   | "expect_fail" { spec: "none", targets: "func", repl: "@should_fail" }
-  | "test_group" { spec: "string", targets: "func", repl: "a `\"name\" suite { ... }` block" }
+  | "test_group" { spec: "string", targets: "func", repl: "a `suite \"name\" { ... }` block" }
   | "skip" { spec: "mixed", targets: "func", repl: "" }
   | "only" { spec: "none", targets: "func", repl: "" }
   | "should_fail" { spec: "none", targets: "func", repl: "" }
@@ -1024,7 +1024,7 @@ AnnArg:  Expression | StringLiteral
 注解可挂于类型、字段、函数、全局节点；全部经 `type_info(T)` 编译期自省读取（字段自省内建已接入，见 §3.6.0；注解元数据表驱注册见 `src/tc.tc` `init_anndefs`）。当前 tc `init_anndefs` 已表驱注册全量注解（spec §4.8）：
 
 - 测试类：`@skip` `@only` `@should_fail` `@tag(name, ...)`（见 §3.14）
-  - ⚠ 弃用别名（发 `T_ANNOTATION_UNKNOWN` warning，不阻断）：`@test` → `"名字" test { }`；`@test_skip` → `@skip`；`@test_only` → `@only`；`@expect_fail` → `@should_fail`；`@test_group("g")` → `"g" suite { }`
+  - ⚠ 弃用别名（发 `T_ANNOTATION_UNKNOWN` warning，不阻断）：`@test` → `test "名字" { }`；`@test_skip` → `@skip`；`@test_only` → `@only`；`@expect_fail` → `@should_fail`；`@test_group("g")` → `suite "g" { }`
 - 派生类：`@derive(ToString,FromString,Clone,Copy,DebugPrint,BinarySerde,Eq,Hash)`
 - 条件编译：`@cfg()` `@cfg_attr()` ⚠ spec-only
 - 警告管控：`@allow()` `@warn()` `@deny()` `@deprecated("提示")` ⚠ spec-only
@@ -2314,31 +2314,31 @@ pub fn deep(x: i64) i64 { return x + 100; }
 
 ### 3.14 Tests（测试声明）✅ tc（2026-08-08）
 
-测试是**并置式声明**，与 `Name fn`/`Name struct`/`Name enum` 同族——只是「名字」位置放的是字符串字面量而非标识符，因为测试名是给人读的句子，不是标识符。
+测试是**关键字领头声明**，与 `fn Name`/`struct Name`/`enum Name`/`flag_set Name` 同族——关键字 `test`/`suite` 在前，测试名（字符串字面量）在后，因为测试名是给人读的句子，不是标识符。
 
 ```ebnf
 TestDecl:
-    Annotation* StringLiteral "test" Annotation* Block
+    Annotation* "test" StringLiteral Annotation* Block
 
 SuiteDecl:
-    Annotation* StringLiteral "suite" Annotation* Block   // 体内只许 TestDecl / SuiteDecl
+    Annotation* "suite" StringLiteral Annotation* "{" SuiteMember* "}"   // 体内只许 TestDecl / SuiteDecl
 
 ExpectStatement:
     "expect" "(" Expression ("," StringLiteral)? ")" ";"
 ```
 
-- `test` / `suite` / `expect` 均为**语境关键字**（不进 `keywords_tbl`，不影响同名标识符）：
-  - `test` / `suite`：仅在「声明位置且前一个 token 是字符串字面量」时生效；
+- `test` / `suite` / `expect` 均为**语境关键字**（不进 `keywords_tbl`，不影响同名标识符，含 `test` 模块名与 `fn test()`）：
+  - `test` / `suite`：仅在「声明位置、关键字后紧跟字符串字面量」时生效；
   - `expect`：仅在「语句位置且下一个 token 是 `(`」时生效。
-- 注解可写在字符串前或 `test`/`suite` 后，两处等价（都并进同一条注解链）。
+- 注解可写在 `test`/`suite` 前或测试名后，两处等价（都并进同一条注解链）。
 - `suite` 只做**词法分组**，自身不产生任何声明；suite 上的注解**逐成员复制下沉**，故 `@skip` / `@tag` 写在 suite 上天然作用于整组。suite 可嵌套，路径以 ` / ` 连接。
 
 **脱糖**（`parse_test_decl`）：
 
 ```
-"名字" test { BODY }
-  ⇒  __test_<n> fn() bool @test { BODY; return true; }
-     FuncDecl.bd = true   // 是测试
+test "名字" { BODY }
+  ⇒  __test_<n> fn() bool { BODY; return true; }
+     FuncDecl.bd = true   // 是测试（不挂 @test 注解，@test 已弃用）
      FuncDecl.sb = "名字" // 显示名
      FuncDecl.sc = suite 路径
 ```
@@ -2390,11 +2390,11 @@ test result: 7 passed, 0 failed, 1 skipped
 
 | 旧 | 新 |
 |---|---|
-| `name fn() bool @test` | `"name" test { }` |
+| `name fn() bool @test` | `test "name" { }` |
 | `@test_skip` | `@skip` |
 | `@test_only` | `@only` |
 | `@expect_fail` | `@should_fail` |
-| `@test_group("g")` | `"g" suite { }` |
+| `@test_group("g")` | `suite "g" { }` |
 
 ---
 
@@ -2901,8 +2901,8 @@ VariantDecl     : Ident "variant" "{" Case* "}"
 EnumDecl        : Ident "enum" (":" IntType)? EnumAnns? "{" EnumMember ("," EnumMember)* ","? "}"
 EnumMember      : Ident ("=" EnumValue)? EnumAnns?
 EnumValue       : IntLiteral | Unary | Binary            // 编译期常量：字面量/算术/const 引用/comptime fn 调用/枚举成员引用
-TestDecl        : String "test" Anns? Block
-SuiteDecl       : String "suite" Anns? "{" (TestDecl | SuiteDecl)* "}"
+TestDecl        : "test" String Anns? Block
+SuiteDecl       : "suite" String Anns? "{" (TestDecl | SuiteDecl)* "}"
 Block           : "{" Statement* "}"
 Statement       : VarDecl | ConstDecl | Assign | If | While | Return | ExprStmt | Block
                 | ExpectStmt
@@ -2931,7 +2931,7 @@ Annotation      : "@" Ident ("(" ArgList? ")")?
 | §7.2 | 外部数据导入 CSV/JSON（CTFE 脱糖） | ✅ 已实现 |
 | §2.3 | 字符串驻留符号 Sym32/Sym16（intern / sym_str / sym_release） | ✅ 已实现（M40） |
 | §3.11 | 时间格式化（strftime `%` 风格）+ 解析/固定时区/locale/M57 增量 | ✅ 已实现（M56 / M57） |
-| §3.14 | 测试声明 `"名" test/suite {}` + `expect` + `tc test` 运行器 | ✅ 已实现（2026-08-08；旧 `@test` 系列转弃用别名） |
+| §3.14 | 测试声明 `test "名" / suite "名" {}` + `expect` + `tc test` 运行器 | ✅ 已实现（2026-08-08；旧 `@test` 系列转弃用别名） |
 | §3.15 | 管道算子 `\|->` / `\|>?` / `\|>`（贪心融合脱糖，双后端零改动） | ✅ 已实现（2026-08-10；sema 降解 + 9 条 `PIP` 诊断） |
 | §2.4 | 字面量全量（`_` 分隔符 / `0o` / `1e9` / 位宽后缀 / `'A'` / `\xHH` / `\u{}` / `r"..."` / `"""..."""` / `inf` / `nan`） | ✅ 已实现（2026-08-10；`T-LEX-E000..E008` 九码 + 词法阶段闸门） |
 

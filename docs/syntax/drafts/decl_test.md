@@ -116,7 +116,7 @@ expect add 2 3 == 5                            -- Roc
 
 ## 2. EBNF（§1 Notation）
 
-采纳 **范式 A**，并置形态与 `Name struct {}` / `Name fn() {}` 同构 —— 名字在前、种类在后。
+采纳 **范式 A**，关键字领头形态与 `fn Name {}` / `struct Name {}` / `enum Name {}` 同构 —— 关键字在前、名字（字符串字面量）在后。**〔2026-09-03 裁定推翻原 §2 结论〕**：原草稿选择并置式 `"名字" test {}` 以贴合 L-04 并置宪法；现改为关键字领头 `test "名字" {}`，与全语言正在推进的「LL(1) 关键字领头桥接」（`fn`/`struct`/`enum`/`flag_set`）一致。`test`/`suite` 仍是**语境标识符**（不进 `keywords_tbl`），只在声明位、紧跟测试名字符串前识别，故**不破坏** `test` 模块名与 `fn test()` 等存量标识符，L-04 的唯一语义由「单一关键字领头语序」继续满足。
 
 ```ebnf
 TopLevelDecl:
@@ -124,8 +124,8 @@ TopLevelDecl:
   | TestDecl
   | SuiteDecl
 
-TestDecl:    String "test" TestAnn* Block
-SuiteDecl:   String "suite" TestAnn* "{" SuiteMember* "}"
+TestDecl:    "test" String TestAnn* Block
+SuiteDecl:   "suite" String TestAnn* "{" SuiteMember* "}"
 SuiteMember: TestDecl | SuiteDecl
 
 TestAnn:
@@ -137,18 +137,18 @@ TestAnn:
 ExpectStmt:  "expect" "(" Expr ( "," String )? ")" ";"
 ```
 
-### 为何是 `"名字" test {}` 而非 Zig 式 `test "名字" {}`
+### 为何是 `test "名字" {}`（关键字领头）而非并置式 `"名字" test {}`
 
-`t` 的**并置声明宪法**：一切声明皆为 `Name kind { ... }`。
+`t` 的声明正全面转向「**关键字领头**」的 LL(1) 形态：`fn Name` / `struct Name` / `enum Name` / `flag_set Name` 皆关键字在前。测试声明跟随同一语序，使「声明派发」在整个编译单元内保持单一 LL(1) 判别（首 token 定种类），不再为测试引入并置特例。
 
 ```t
 Vec2   struct { x: f32; y: f32; }
 Color  enum : u8 { Red; Green; }
 add    fn(a: i64, b: i64) i64 { return a + b; }
-"加法应返回两数之和" test { expect(add(2, 3) == 5); }
+test "加法应返回两数之和" { expect(add(2, 3) == 5); }
 ```
 
-前置式 `test "名字" {}` 会引入**第二种声明语序**，直接违反 L-04（唯一语义）。并置式则是「名字槽从标识符放宽到字符串字面量」这一处最小改动。
+`test`/`suite` 作为语境标识符（而非全局保留字）即避免了「第二种语序破坏 L-04」的担忧：它们仅在声明位、后接字符串测试名时才被解读为测试关键字，其余位置（如模块名 `test`、函数名 `test`）照常作为标识符，唯一语义不被破坏。
 
 ---
 
@@ -159,11 +159,11 @@ add    fn(a: i64, b: i64) i64 { return a + b; }
 `test` 块**不是新的运行时构造**，它是既有 `@test` 函数的语法糖。脱糖在 parse 期完成：
 
 ```t
-"加法应返回两数之和" test { expect(add(2, 3) == 5); }
+test "加法应返回两数之和" { expect(add(2, 3) == 5); }
 ```
 脱糖为等价于：
 ```t
-__test_0 fn() bool @test {
+__test_0 fn() bool {
     expect(add(2, 3) == 5);      // 见 §4，进一步脱糖为 if + return false
     return true;                  // 隐式追加
 }
@@ -171,8 +171,8 @@ __test_0 fn() bool @test {
 
 - 合成函数名 `__test_<序号>`（序号为编译单元内单调计数，保证唯一且不与用户标识符冲突）。
 - 返回类型固定 `bool`；函数体末尾**隐式追加 `return true;`**。
-- 原始字符串名存入 `FuncDecl.sb`（显示名），suite 路径存入 `FuncDecl.sc`。
-- 自动挂 `@test` 注解，从而完全复用既有注解校验、收集、发射通路。
+- 原始字符串名存入 `FuncDecl.sb`（显示名），suite 路径存入 `FuncDecl.sc`，测试身份记在 `FuncDecl.bd = true`。
+- **不挂 `@test` 注解**：`@test` 是弃用注解、在 tc 内零消费者，合成节点挂上去只会误触发弃用告警；测试身份由 `bd` 槽承载，完全复用既有 `register_decl`/`check_decl`/`emit_llfunc` 通路。
 
 > **设计要点**：脱糖到既有构造，而不是新增 AST 种类。代价是 `Node` 零改动、`register_decl`/`check_decl`/`emit_llfunc` 全部零改动。
 
@@ -181,10 +181,10 @@ __test_0 fn() bool @test {
 `suite` 不产生任何代码，只在脱糖期把名字前缀拼进内层 test 的显示名：
 
 ```t
-"math" suite {
-    "加法" test { expect(add(2, 3) == 5); }
-    "边界" suite {
-        "零元" test { expect(add(0, 0) == 0); }
+suite "math" {
+    test "加法" { expect(add(2, 3) == 5); }
+    suite "边界" {
+        test "零元" { expect(add(0, 0) == 0); }
     }
 }
 ```
@@ -316,11 +316,11 @@ test result: 10 passed, 1 failed, 1 skipped  —  3.2ms
 
 | 旧 | 新 | 处置 |
 |---|---|---|
-| `f fn() bool @test { }` | `"名字" test { }` | 保留可编译，发 `W_TEST_ANNOTATION_DEPRECATED` warning |
+| `f fn() bool @test { }` | `test "名字" { }` | 保留可编译，发 `W_TEST_ANNOTATION_DEPRECATED` warning |
 | `@test_skip` | `@skip` | 同上 |
 | `@test_only` | `@only` | 同上 |
 | `@expect_fail` | `@should_fail` | 同上 |
-| `@test_group("g")` | `"g" suite { }` | 同上 |
+| `@test_group("g")` | `suite "g" { }` | 同上 |
 
 - warning 不阻断编译（`has_errors()` 只看 `sev == "error"`）。
 - 仓内存量 17 处（`tests/conformance/pass/p07_test_annotations.tc` 3 处、`tests/samples/{basic_syntax,game_ecs,protocol}.tc` 14 处）同步迁移到新写法。
@@ -332,7 +332,7 @@ test result: 10 passed, 1 failed, 1 skipped  —  3.2ms
 
 | 法律 | 评级 | 依据 |
 |---|---|---|
-| L-04 唯一语义 | ⚠→✅ | 过渡期新旧并存，**是明确的临时状态**：旧写法带 deprecated warning，一个发布周期后移除，届时回归唯一。并置式 `"名字" test {}` 与 `Name struct {}` 同构，不引入第二种声明语序。 |
+| L-04 唯一语义 | ✅ | 关键字领头式 `test "名字" {}` / `suite "名字" {}` 与 `fn Name`/`struct Name`/`enum Name` 同属「关键字领头」单一语序，不引入第二种声明语序；`test`/`suite` 为语境标识符，对 `test` 模块名 / `fn test()` 零冲突。 |
 | L-02 显式 | ✅ | 测试名显式；`@should_fail` 显式表达期望失败；`expect` 显式断言，不依赖返回值约定 |
 | L-03 静态类型 | ✅ | 脱糖目标是普通 `fn() bool`，类型静态确定；`expect` 的类型分派在 sema 期完成 |
 | L-14 铁律校验 | ✅ | 新增 conformance 用例（含弃用告警用例）；`tc test` 自身接入 gate |
@@ -352,7 +352,7 @@ test result: 10 passed, 1 failed, 1 skipped  —  3.2ms
 
 ## 9. 与既有构造的关系
 
-- **声明分发**：`parse_decl_body`（`parse.tc:1747`）的并置第二 token 分发；`test`/`suite` 走 `flag_set` 同款**语境关键字**路线（`cur_t()=="Identifier" && cur_v()=="test"`），**不进 `keywords_tbl`**，零关键字冲突风险。但名字槽是 `String` 而非 `Identifier`，须在 `parse_declaration`（`parse.tc:1830`）的 `cur_t() != "Identifier"` 硬退出**之前**拦截。
+- **声明分发**：`parse_declaration`（`parse.tc`）的声明派发；`test`/`suite` 走 `flag_set` 同款**语境标识符**路线（`cur_t()=="Identifier" && cur_v()=="test"/"suite"`），**不进 `keywords_tbl`**，零关键字冲突风险，且在 `parse_declaration` 的 `flag_set` 桥之后、通用「标识符 → 名字先行声明」路径**之前**拦截（关键字领头，LL(1) 单 token 判别）。
 - **两条解析路径**：`parse_unit`（`parse.tc:1870`，入口文件）与 `load_module_file`（`sema.tc:4265`，import 模块）。分发本身在 `parse_declaration` 内，两路径自动覆盖；仅当需要维护侧表（如 suite 栈）时才须两处都改。
 - **注解系统**：`ad(name, spec, targets)`（`sema.tc:6472`）；`targets` 是 `", "` 分隔的严格格式。新增目标 `test` / `suite` 需扩 `decl_target`（`sema.tc:6845`）。
 - **弃用告警先例**：`warn_comptime_alias`（`lex.tc:519`）用 `cur_v()` 区分原始拼写；注解层弃用见 `ann_validate`（`sema.tc:6739`），复用 error 码 + 显式传 `"warning"` 降级。
