@@ -1,0 +1,56 @@
+// 临时验证（CPU 设备模拟运行时）：打印 kernel 实际计算结果，确认非桩 0。
+kernel fn vec_add(a: dev_ptr[f32], b: dev_ptr[f32], c: dev_ptr[f32], n: i32) void {
+    var tid = thread_id(0);
+    c[tid] = a[tid] + b[tid];
+}
+
+kernel fn reduce_atomic(inp: dev_ptr[f32], outp: dev_ptr[f32], n: i32) void {
+    var tid = thread_id(0);
+    var sh: shared[f32] = shared_alloc(256);
+    var v = inp[tid];
+    sh[tid] = v;
+    barrier();
+    atomic_add(&outp[tid], v);
+}
+
+fn main() i32 @main {
+    var n_elems: i32 = 256;
+    var nb: i64 = (n_elems as i64) * 4;
+
+    var ha: [256]f32;
+    var hb: [256]f32;
+    var hc: [256]f32;
+    var k: i32 = 0;
+    while (k < n_elems) {
+        ha[k] = (k as f32);
+        hb[k] = (2.0 as f32);
+        hc[k] = (0.0 as f32);
+        k = k + 1;
+    }
+
+    var da = device.alloc_bytes(nb);
+    var db = device.alloc_bytes(nb);
+    var dc = device.alloc_bytes(nb);
+    device.h2d(da, (&ha) as i64, nb);
+    device.h2d(db, (&hb) as i64, nb);
+    var rc = device.launch("vec_add", 1, n_elems, da, db, dc, n_elems);
+    device.d2h((&hc) as i64, dc, nb);
+    println(f"vec_add rc={rc} hc[0..3]={hc[0]},{hc[1]},{hc[2]},{hc[3]} (expect 2,3,4,5)");
+
+    // reduce_atomic：outp 先清零，launch 后 outp[tid] += inp[tid] => outp[tid]==tid
+    var hi: [256]f32;
+    var ho: [256]f32;
+    var j: i32 = 0;
+    while (j < n_elems) { hi[j] = (j as f32); ho[j] = (0.0 as f32); j = j + 1; }
+    var di = device.alloc_bytes(nb);
+    var dout = device.alloc_bytes(nb);
+    device.h2d(di, (&hi) as i64, nb);
+    device.h2d(dout, (&ho) as i64, nb);
+    var rc2 = device.launch("reduce_atomic", 1, n_elems, di, dout, n_elems);
+    device.d2h((&ho) as i64, dout, nb);
+    println(f"reduce_atomic rc={rc2} ho[0..3]={ho[0]},{ho[1]},{ho[2]},{ho[3]} (expect 0,1,2,3)");
+
+    device.free(da); device.free(db); device.free(dc);
+    device.free(di); device.free(dout);
+    return 0;
+}
