@@ -187,6 +187,12 @@ pub fn is_scalar_name(name: string) bool {
     if (name == "bytes" || name == "BytesBuilder") {
         return true;
     }
+    // 任意位宽整数 `i<N>` / `u<N>`（N ∈ [2, 65535]）：位宽即名字尾数。
+    // 只在此处（类型位）生效 —— 标识符位不受影响，故编译器源码里大量存在的
+    // `i0..i7` 循环变量名不会被误判成类型（已全量核对：它们从不出现在类型位）。
+    if (base.is_awi_name(name)) {
+        return true;
+    }
     return name == "bool" || name == "atom" || name == "fid";
 }
 // <<< GEN:scalar_pred <<<
@@ -663,22 +669,28 @@ pub fn parse_prim_int(ti: i64) i64 {
         radix = 8;
     }
 
-    // 取值范围自检。无后缀时上界是 u64；有后缀时由后缀类型决定，
+    // 取值范围自检。
+    // 任意位宽整数：词法器不再以 u64 为硬上界拒绝字面量——无后缀时字面量
+    // 将按上下文推断为足够宽的类型；有后缀时仅对「≤64 位窄后缀」做范围校验，
+    // 宽后缀（>64 位）无法用 u64 cap 表示，交给 sema/codegen 按目标类型处理。
     // `iN` 的上界 2^(N-1) 仅在紧邻前置 `-` 时可取到（即 iN::MIN）。
     var mag: u64 = base.lit_val_u64(val);
-    if (base.g_lit_overflow) {
-        diag_lit_range(ti, raw, "整数字面量超出 u64 可表示范围");
-    } else if (str_len(sfx) > 0) {
-        var cap: u64 = base.lit_suffix_max(sfx);
-        var over: bool = mag > cap;
-        if (over == false && base.num_suffix_is_signed(sfx) && mag == cap && neg == false) {
-            over = true;
+    if (str_len(sfx) > 0) {
+        var sw: i64 = base.num_suffix_bits(sfx);
+        if (sw >= 2 && sw <= 64) {
+            var cap: u64 = base.lit_suffix_max(sfx);
+            var over: bool = base.g_lit_overflow || mag > cap;
+            if (over == false && base.num_suffix_is_signed(sfx) && mag == cap && neg == false) {
+                over = true;
+            }
+            if (over) {
+                diag_lit_range(ti, raw,
+                    base.sb_cat3("整数字面量超出 `", sfx, "` 可表示范围"));
+            }
         }
-        if (over) {
-            diag_lit_range(ti, raw,
-                base.sb_cat3("整数字面量超出 `", sfx, "` 可表示范围"));
-        }
+        // 宽后缀（sw > 64）或未知后缀：范围由 sema/codegen 按目标类型校验
     }
+    // 无后缀：跳过 u64 上界检查（字面量将按上下文推断为足够宽的类型）
 
     var id: i64 = base.mk_int(val, radix, ti);
     if (str_len(sfx) > 0) {

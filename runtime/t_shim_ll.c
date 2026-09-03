@@ -92,6 +92,10 @@ void tll_sb_append_fmt_char(TSb* b, TStr* spec, int64_t v)       { t_sb_append_f
 void tll_sb_append_fmt_str_conv(TSb* b, TStr* spec, TStr* v, TStr* mode)   { t_sb_append_fmt_str_conv(b, *spec, *v, *mode); }
 void tll_sb_append_fmt_int_conv(TSb* b, TStr* spec, int64_t v, TStr* mode) { t_sb_append_fmt_int_conv(b, *spec, v, *mode); }
 void tll_sb_append_fmt_uint_conv(TSb* b, TStr* spec, uint64_t v, TStr* mode){ t_sb_append_fmt_uint_conv(b, *spec, v, *mode); }
+// 任意位宽整数（>64）格式化：spec 按值经指针传入（LLVM byval），值按地址传
+void tll_sb_append_fmt_big(TSb* b, TStr* spec, const void* p, int64_t nbits, int8_t is_signed) {
+    t_sb_append_fmt_big(b, *spec, p, nbits, (int)is_signed);
+}
 
 // ── 时间格式化 / 解析（M56 / M57）──
 int64_t tll_now(void) { return t_now(); }

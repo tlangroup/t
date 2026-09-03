@@ -380,6 +380,117 @@ TStr t_format_uint(TStr spec, uint64_t v) {
     return fmt_int_core(f, 0, v);
 }
 
+// ── 任意位宽整数（>64）的十进制/二八十六进制格式化 ───────────────────────
+// 值以「小端字节序」存放在 p 指向的 nbytes = ceil(nbits/8) 字节里（与宿主端的
+// LLVM iN / C _BitInt(N) 内存布局一致；t 的目标平台均为小端）。运行时按 256
+// 进制从低字节向高字节逐位做除法，生成十进制（或 2/8/16 进制）数字串。
+#define T_BIG_MAXBYTES 8192   // 65535 位 → 8192 字节
+
+static int big_is_zero(const uint8_t* m, int n) {
+    for (int i = 0; i < n; i++) if (m[i]) return 0;
+    return 1;
+}
+
+// 原地 floor(m / base)，返回余数（base ≤ 16，cur = rem*256 + byte 不会溢出 uint64）。
+static uint64_t big_divmod(uint8_t* m, int n, uint64_t base) {
+    uint64_t rem = 0;
+    for (int i = n - 1; i >= 0; i--) {
+        uint64_t cur = (rem << 8) | m[i];
+        m[i] = (uint8_t)(cur / base);
+        rem = cur % base;
+    }
+    return rem;
+}
+
+// 原地二补码取负（用于有符号负数的绝对值）。
+static void big_negate(uint8_t* m, int n) {
+    for (int i = 0; i < n; i++) m[i] = (uint8_t)~m[i];
+    int carry = 1;
+    for (int i = 0; i < n; i++) {
+        int v = (int)m[i] + carry;
+        m[i] = (uint8_t)v;
+        carry = v >> 8;
+        if (!carry) break;
+    }
+}
+
+// 与 fmt_int_core 同构，但 magnitude 是任意宽度的小端字节缓冲。
+static TStr fmt_big_core(FmtSpec f, int neg, const uint8_t* magin, int nbytes) {
+    if (f.zero && f.align == 0) { f.align = '='; f.fill = '0'; }
+    if (f.align == 0) f.align = '>';
+    if (f.type == 'c') {
+        TSb* b = t_sb_new(t_arena_current());
+        t_sb_append_char(b, (uint8_t)(magin[0]));
+        int64_t L = b->len;
+        return fmt_pad(b, f.align, f.width, (f.fill >= 0 ? (char)f.fill : ' '), L);
+    }
+    int base = 10, upper = 0;
+    if (f.type == 'b') base = 2;
+    else if (f.type == 'o') base = 8;
+    else if (f.type == 'x') base = 16;
+    else if (f.type == 'X') { base = 16; upper = 1; }
+    char signc = 0;
+    if (neg) signc = '-';
+    else if (f.sign == '+') signc = '+';
+    else if (f.sign == ' ') signc = ' ';
+    const char* altp = "";
+    if (f.alt) {
+        if (base == 2) altp = "0b";
+        else if (base == 8) altp = "0o";
+        else if (base == 16) altp = (upper ? "0X" : "0x");
+    }
+    int64_t mind = f.has_prec ? f.prec : 1;
+    uint8_t m[T_BIG_MAXBYTES];
+    int n = nbytes; if (n > T_BIG_MAXBYTES) n = T_BIG_MAXBYTES;
+    memcpy(m, magin, (size_t)n);
+    char digits[20000]; int dn = 0;
+    if (big_is_zero(m, n)) digits[dn++] = '0';
+    else { while (!big_is_zero(m, n)) { int d = (int)big_divmod(m, n, (uint64_t)base); digits[dn++] = (char)(d < 10 ? '0' + d : (upper ? 'A' : 'a') + (d - 10)); } }
+    int total = dn; if (total < mind) total = (int)mind;
+    int step = 0;
+    if (f.group == ',') step = 3;
+    else if (f.group == '_') step = (base == 10 ? 3 : 4);
+    TSb* bdy = t_sb_new(t_arena_current());
+    for (int i = 0; i < total; i++) {
+        // digits[] 由低位到高位存放（反复除 base 得到），故第 i 位（高位→低位）取 digits[total-1-i]
+        char c = (i < total - dn) ? '0' : digits[total - 1 - i];
+        t_sb_append_char(bdy, (uint8_t)c);
+        int remain = total - (i + 1);
+        if (step > 0 && remain > 0 && (remain % step) == 0) t_sb_append_char(bdy, (uint8_t)(f.group == ',' ? ',' : '_'));
+    }
+    TStr body = t_sb_to_str(bdy);
+    char pbuf[8]; int pn = 0;
+    if (signc) pbuf[pn++] = signc;
+    for (const char* p = altp; *p; p++) pbuf[pn++] = *p;
+    TStr prefix = t_str_view((const uint8_t*)pbuf, pn);
+    char fillc = (f.fill >= 0 ? (char)f.fill : ' ');
+    if (f.align == '=') return fmt_pad_eq(prefix, body, f.width, fillc);
+    TSb* full = t_sb_new(t_arena_current());
+    t_sb_append_str(full, prefix);
+    t_sb_append_str(full, body);
+    int64_t L = full->len;
+    return fmt_pad(full, f.align, f.width, fillc, L);
+}
+
+// 任意位宽整数（>64）格式化追加：p 指向值的小端字节，nbits 为位宽，is_signed 为符号。
+void t_sb_append_fmt_big(TSb* b, TStr spec, const void* p, int64_t nbits, int is_signed) {
+    FmtSpec f = fmt_parse(spec);
+    int nbytes = (int)((nbits + 7) / 8);
+    if (nbytes > T_BIG_MAXBYTES) nbytes = T_BIG_MAXBYTES;
+    uint8_t buf[T_BIG_MAXBYTES];
+    memcpy(buf, p, (size_t)nbytes);
+    int neg = 0;
+    if (is_signed) {
+        int byteidx = nbytes - 1;
+        int bits_in_top = ((int)nbits) % 8; if (bits_in_top == 0) bits_in_top = 8;
+        uint8_t top = buf[byteidx];
+        uint8_t mask = (uint8_t)(1u << (bits_in_top - 1));
+        if (top & mask) { neg = 1; big_negate(buf, nbytes); }
+    }
+    TStr r = fmt_big_core(f, neg, buf, nbytes);
+    t_sb_append_str(b, r);
+}
+
 // 浮点整数部分按 group 插入分隔符（小数点/e/E 前的整数段）。
 static void append_float_grouped(TSb* b, const char* s, char group) {
     const char* dot = s;

@@ -103,6 +103,8 @@ void t_sb_append_fmt_char(TSb* b, TStr spec, uint8_t v);
 void t_sb_append_fmt_str_conv(TSb* b, TStr spec, TStr v, TStr mode);
 void t_sb_append_fmt_int_conv(TSb* b, TStr spec, int64_t v, TStr mode);
 void t_sb_append_fmt_uint_conv(TSb* b, TStr spec, uint64_t v, TStr mode);
+// 任意位宽整数（>64）格式化：p 指向值的小端字节，nbits 为位宽，is_signed 为符号
+void t_sb_append_fmt_big(TSb* b, TStr spec, const void* p, int64_t nbits, int is_signed);
 
 // ── 时间格式化（strftime / Python datetime.strftime 的 % 风格子集，M56/M57）──
 // now() -> 当前时刻微秒 epoch；format_time(spec, t_us, use_local) 按 UTC / 本地时区展开。

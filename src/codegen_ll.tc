@@ -280,6 +280,12 @@ pub fn scalar_to_ll(name: string) string {
     if (name == "u32" || name == "i32" || name == "rune") { return "i32"; }
     if (name == "f32") { return "float"; }
     if (name == "f64") { return "double"; }
+    // 任意位宽整数 `i<N>` / `u<N>`：LLVM 的 `iN` 本身就是原生一等类型（N 上限
+    // 2^23-1，远超本语言的 65535），add/sub/mul/udiv/sdiv/urem/srem/and/or/xor/
+    // shl/lshr/ashr/icmp 全部直通，无需任何软件模拟 —— 这是本特性的主要收益面。
+    // 固定宽度仍先于此处判定，故既有 IR 逐字节不变。
+    var ab: i64 = base.awi_bits(name);
+    if (ab > 0) { return base.sb_cat2("i", base.i2s(ab)); }
     return "i64";
 }
 
@@ -1133,6 +1139,80 @@ pub fn ll_addr(e: i64) string {
 
 // ── 表达式发射 ─────────────────────────────────────────────────
 
+// 整数字面量按文本原样发射为 LLVM IR 字面量。
+// 改用文本直发而非 js_parse_int：后者把 >2^63-1 的值截断到 i64
+// （2^64-1 绕成 -1），导致宽无符号字面量被错误发射成 -1。
+// LLVM IR 接受十进制与 0x 十六进制任意位宽；二进制/八进制先转十六进制
+// （纯位映射，无算术，零精度损失）。与 C 后端 emit_expr 行为一致。
+pub fn ll_emit_int_lit(sa: string, radix: i64) string {
+    // 十进制字面量原样发射（LLVM IR 接受任意位宽十进制整数字面量）。
+    if (radix == 10) {
+        return sa;
+    }
+    // 十六/二/八进制 → 十进制字符串。
+    // 注：本工具链的 LLVM IR 解析器拒绝 `0x` 十六进制整数字面量（连 `0x0F` 都
+    // 被误判为浮点常量），故统一转十进制发射；任意位宽需全精度，走 base-10^9
+    // 大数累加，避免 js_parse_int 截断到 64 位。
+    return ll_lit_to_decimal(sa, radix);
+}
+
+// 十六/二/八进制字面量 → 十进制字符串（任意位宽，全精度）。
+// big 用小端 base-10^9 块数组表示，逐位「big = big * radix + d」累加。
+pub fn ll_lit_to_decimal(sa: string, radix: i64) string {
+    var neg: bool = false;
+    var body: string = sa;
+    if (str_len(body) > 0 && body[0] == 45) {
+        neg = true;
+        body = str_slice(body, 1, str_len(body));
+    }
+    var i: u64 = 0;
+    var n: u64 = str_len(body);
+    if (radix == 16 && n >= 2 && body[0] == 48 && (body[1] == 120 || body[1] == 88)) { i = 2; }
+    else if (radix == 2 && n >= 2 && body[0] == 48 && (body[1] == 98 || body[1] == 66)) { i = 2; }
+    else if (radix == 8 && n >= 2 && body[0] == 48 && (body[1] == 111 || body[1] == 79)) { i = 2; }
+    var big: []i64;
+    append(big, 0);
+    while (i < n) {
+        var c: u8 = body[i];
+        var d: i64 = -1;
+        if (c >= 48 && c <= 57) { d = (c - 48) as i64; }
+        else if (c >= 97 && c <= 122) { d = (c - 87) as i64; }
+        else if (c >= 65 && c <= 90) { d = (c - 55) as i64; }
+        if (d < 0 || d >= radix) { break; }
+        var carry: i64 = d;
+        var k: u64 = 0;
+        var m: u64 = slice_len(big);
+        while (k < m) {
+            var v: i64 = big[k] * radix + carry;
+            slice_set(big, k, v % 1000000000);
+            carry = v / 1000000000;
+            k = k + 1;
+        }
+        while (carry > 0) {
+            append(big, carry % 1000000000);
+            carry = carry / 1000000000;
+        }
+        i = i + 1;
+    }
+    var out: string = "";
+    var j: u64 = slice_len(big);
+    while (j > 0) {
+        j = j - 1;
+        var chunk: i64 = big[j];
+        if (j == slice_len(big) - 1) {
+            out = base.sb_cat2(out, base.i2s(chunk));
+        } else {
+            var cs: string = base.i2s(chunk);
+            var pad: u64 = 9 - str_len(cs);
+            var p: u64 = 0;
+            while (p < pad) { out = base.sb_cat2(out, "0"); p = p + 1; }
+            out = base.sb_cat2(out, cs);
+        }
+    }
+    if (neg) { return base.sb_cat2("-", out); }
+    return out;
+}
+
 pub fn emit_lle(e: i64) string {
     if (e < 0) {
         return "0";
@@ -1144,7 +1224,7 @@ pub fn emit_lle(e: i64) string {
         if (r < 2) {
             r = 10;
         }
-        return base.i2s(sema.js_parse_int(n.sa, r));
+        return ll_emit_int_lit(n.sa, r);
     }
     if (n.kind == "atom") {
         if (n.ia <= 0) { n.ia = sema.atom_intern(n.sa); slice_set(base.nodes, e, n); }
@@ -2375,7 +2455,9 @@ pub fn ll_size_bytes(td: i64) i64 {
         if (t.name == "") {
             return 8;
         }
-        return base.ll_bits(t.name) / 8;
+        // 向上取整到字节：`i7` 是 1 字节而非 0。既有 8/16/32/64 的结果不变
+        // （(8+7)/8 == 8/8 == 1），故不产生 IR 漂移。
+        return (base.ll_bits(t.name) + 7) / 8;
     }
     if (t.cat == "string" || t.cat == "bytes") {
         return 16;
@@ -2403,7 +2485,7 @@ pub fn ll_size_bytes(td: i64) i64 {
         }
         var k: string = sema.llt_kinds[i];
         if (k == "enum" || k == "flag") {
-            return base.ll_bits(sema.llt_unders[i]) / 8;
+            return (base.ll_bits(sema.llt_unders[i]) + 7) / 8;
         }
         if (k == "alias") {
             return ll_size_bytes(sema.llt_atd[i]);
@@ -3330,6 +3412,16 @@ pub fn ll_call(e: i64) string {
         var spg2: string = emit_lle(ae[1]);
         var vvg2: string = ll_cast_v(emit_lle(ae[2]), ll_etd(ae[2]), td_i64);
         llfb(base.sb_cat6("  call void @tll_sb_append_fmt_uint(ptr ", bpg, ", ptr ", spg2, ", i64 ", base.sb_cat2(vvg2, ")")));
+        return "0";
+    }
+    if (cn == "sb_append_fmt_big") {
+        var bpb: string = emit_lle(ae[0]);       // StringBuilder*  (ptr)
+        var spb2: string = emit_lle(ae[1]);      // spec TStr       (ptr, byval)
+        var vpb2: string = ll_addr(ae[2]);       // 宽整数实参的地址（按地址传值，避免 i64 截断）
+        var npbb: string = emit_lle(ae[3]);      // 位宽 i64
+        var spbb: string = emit_lle(ae[4]);      // 是否带符号 i8(bool)
+        llfb(base.sb_cat8("  call void @tll_sb_append_fmt_big(ptr ", bpb, ", ptr ", spb2,
+            ", ptr ", vpb2, ", i64 ", base.sb_cat4(npbb, ", i8 ", spbb, ")")));
         return "0";
     }
     if (cn == "sb_append_fmt_float") {
@@ -4883,6 +4975,8 @@ llph("declare void @tll_assert_eq_s(ptr, ptr, ptr)");
     llph("declare void @tll_format_char(ptr, i64, ptr)");
     llph("declare void @tll_sb_append_fmt_int(ptr, ptr, i64)");
     llph("declare void @tll_sb_append_fmt_uint(ptr, ptr, i64)");
+    // 任意位宽整数（>64）格式化：按地址传值 + 位宽(i64) + 符号(i8)
+    llph("declare void @tll_sb_append_fmt_big(ptr, ptr, ptr, i64, i8)");
 // ── Device 子系统 host 运行时（docs/device-design.md §5/§6 M3）──
 // blob 为内嵌的 Device Dialect 序列化文本（JIT 模式）；name 为内核名 C 串；
 // argv 为打包的 i64 句柄（dev_ptr 句柄 / 标量零扩展）。CUDA 缺失时由 t_runtime_gpu.c 桩返回错误。

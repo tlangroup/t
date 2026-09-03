@@ -383,6 +383,30 @@ pub fn scalar_to_c(name: string) string {
     if (name == "void") { return "void"; }
     if (name == "atom") { return "int64_t"; }
     if (name == "fid") { return "int64_t"; }
+    // 任意位宽整数 `i<N>` / `u<N>`（N ∈ [2, 65535]，N ∉ {8,16,32,64}）。
+    //
+    // C 没有任意位宽整数，只有两条路：
+    //   ① 向上取整到 8/16/32/64 原生类型 + 每次运算后手工回绕/符号扩展 ——
+    //      移植性最好，但要在每一处算术/移位/取反发射点插掩码，漏一处就是
+    //      静默算错，且 N > 64 还得自研多字运算（约千行运行时）。
+    //   ② C23 的 `_BitInt(N)` —— 语义与 LLVM 的 `iN` 逐位相同，含 N > 64，
+    //      全部运算由编译器直出，与 LLVM 后端天然对拍一致。
+    //
+    // 取 ②。理由：本仓库的 C 产物本来就由 clang 消费（`_Float16` 同样是
+    // clang/GCC 专有），门禁 cself 与 run_examples 的 C 通道都是 clang；
+    // 且 N ∈ {8,16,32,64} 仍走上方原生类型分支，故**既有代码完全不依赖
+    // _BitInt** —— 不用任意位宽整数的程序，可移植性与改动前逐字节一致。
+    var ab: i64 = base.awi_bits(name);
+    if (ab > 0) {
+        if (ab == 8) { return "int8_t"; }
+        if (ab == 16) { return "int16_t"; }
+        if (ab == 32) { return "int32_t"; }
+        if (ab == 64) { return "int64_t"; }
+        if (name[0] == 117) {                        // 'u' → 无符号
+            return base.sb_cat4("unsigned _BitInt(", base.i2s(ab), ")", "");
+        }
+        return base.sb_cat3("_BitInt(", base.i2s(ab), ")");
+    }
     return name;
 }
 // <<< GEN:scalar_ctype <<<
@@ -1624,6 +1648,26 @@ pub fn emit_math_call(cn: string, av: []string) string {
     return base.sb_cat3(base.sb_cat3("t_math_", cn, "("), cargs, ")");
 }
 
+// 计算 C 后端整数字面量需追加的 C23 _BitInt 后缀；空串表示无需。
+//   * 有类型后缀：位宽 > 64 时按符号性补 uwb / wb。
+//   * 无后缀：t 推断为无符号宽类型；数值 > 2^64-1 时补 uwb
+//     （clang 拒绝无后缀且溢出 unsigned long long 的整数字面量）。
+// 与 LLVM 后端（转十进制发射）不同，C 后端保留原进制、仅补后缀即可。
+pub fn c_bitint_suffix(n: Node) string {
+    if (str_len(n.sb) > 0) {
+        var bw: i64 = base.num_suffix_bits(n.sb);
+        if (bw > 64) {
+            if (base.num_suffix_is_signed(n.sb)) { return "wb"; }
+            return "uwb";
+        }
+        return "";
+    }
+    // 无后缀：用 lit_val_u64 探测是否溢出 2^64-1（溢出即说明需 _BitInt）。
+    base.lit_val_u64(n.sa);
+    if (base.g_lit_overflow) { return "uwb"; }
+    return "";
+}
+
 pub fn emit_expr(e: i64) string {
     if (e < 0) {
         return "";
@@ -1631,11 +1675,11 @@ pub fn emit_expr(e: i64) string {
     var n: Node = base.nodes[e];
 
     if (n.kind == "int") {
-        if (n.ia == 16) {
-            return n.sa;
-        }
-        if (n.ia == 2) {
-            // value.replace(/^0b/i, "") 再加 0b 前缀
+        var r: i64 = n.ia;
+        if (r < 2) { r = 10; }
+        var s: string = n.sa;
+        if (r == 2) {
+            // t 写作 0b…，C 的二进制前缀也是 0b；去掉再重加保持规范形式
             var v: string = n.sa;
             var body: string = v;
             if (str_len(v) >= 2) {
@@ -1643,9 +1687,8 @@ pub fn emit_expr(e: i64) string {
                     body = str_slice(v, 2, str_len(v));
                 }
             }
-            return base.sb_cat2("0b", body);
-        }
-        if (n.ia == 8) {
+            s = base.sb_cat2("0b", body);
+        } else if (r == 8) {
             // t 写作 0o755，C 的八进制前缀是单个 0
             var ov: string = n.sa;
             var obody: string = ov;
@@ -1654,9 +1697,12 @@ pub fn emit_expr(e: i64) string {
                     obody = str_slice(ov, 2, str_len(ov));
                 }
             }
-            return base.sb_cat2("0", obody);
+            s = base.sb_cat2("0", obody);
         }
-        return n.sa;
+        // 宽于 64 位的字面量补 _BitInt 后缀（见 c_bitint_suffix）。
+        var suf: string = c_bitint_suffix(n);
+        if (str_len(suf) > 0) { s = base.sb_cat2(s, suf); }
+        return s;
     }
     if (n.kind == "atom") {
         if (n.ia <= 0) { n.ia = sema.atom_intern(n.sa); slice_set(base.nodes, e, n); }
@@ -2309,6 +2355,16 @@ pub fn emit_expr(e: i64) string {
             if (cn == "now") { return "t_now()"; }
             if (cn == "sb_append_fmt_int") { return base.sb_cat6("t_sb_append_fmt_int(", av[0], ", ", av[1], ", ", base.sb_cat2(av[2], ")")); }
             if (cn == "sb_append_fmt_uint") { return base.sb_cat6("t_sb_append_fmt_uint(", av[0], ", ", av[1], ", (uint64_t)(", base.sb_cat2(av[2], "))")); }
+            if (cn == "sb_append_fmt_big") {
+                // 宽整数：按地址传值（&aK）+ 位宽(i64) + 符号(int)；值经 _BitInt(N)* 隐式转 void*
+                var s: string = base.sb_cat3("t_sb_append_fmt_big(", av[0], ", ");
+                s = base.sb_cat3(s, av[1], ", &(");
+                s = base.sb_cat3(s, av[2], "), (int64_t)(");
+                s = base.sb_cat3(s, av[3], "), ");
+                s = base.sb_cat2(s, av[4]);
+                s = base.sb_cat2(s, ")");
+                return s;
+            }
             if (cn == "sb_append_fmt_float") { return base.sb_cat6("t_sb_append_fmt_float(", av[0], ", ", av[1], ", ", base.sb_cat2(av[2], ")")); }
             if (cn == "sb_append_fmt_str") { return base.sb_cat6("t_sb_append_fmt_str(", av[0], ", ", av[1], ", ", base.sb_cat2(av[2], ")")); }
             if (cn == "sb_append_fmt_bool") { return base.sb_cat6("t_sb_append_fmt_bool(", av[0], ", ", av[1], ", ", base.sb_cat2(av[2], ")")); }

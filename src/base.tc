@@ -6120,10 +6120,61 @@ pub fn is_digit(c: u8) bool {
 // 标识符首字符：XID_Start + 下划线（向后兼容 ASCII 习惯）。
 
 
+// ══════════════════════════════════════════════════════════════════
+// 任意位宽整数类型名 `i<N>` / `u<N>`（N ∈ [2, 65535]）
+//
+// 既有的 i8/i16/i32/i64、u8/u16/u32/u64 是这套命名在 N = 8/16/32/64 上的实例，
+// 表示与运算路径一律不变 —— 本设施只放宽「哪些 N 合法」。既有 8/16/32/64 的
+// 分支全部保留在前，故对自举不动点是中立的。
+//
+// 为什么放在 base：词法（字面量后缀 `100u7`）与语法（类型位 `i7`）在模块 DAG
+// 上都先于 sema，不能引用 sema 的 `get_bw`。与 `num_suffix_bits` 同层是唯一
+// 不破坏 DAG 的位置。
+// ══════════════════════════════════════════════════════════════════
+
+pub fn awi_min_bits() i64 {
+    return 2;
+}
+
+pub fn awi_max_bits() i64 {
+    return 65535;
+}
+
+// 解析 `i<N>` / `u<N>` 的位宽 N；不是该形态、越界或有前导零一律返回 -1。
+// 空串 / 单字符亦可安全调用。前导零被拒（`i07` 非法），否则同一个宽度会
+// 有两个拼写，类型同一性判定将被绕过。
+pub fn awi_bits(name: string) i64 {
+    var n: u64 = str_len(name);
+    if (n < 2) { return -1; }
+    var c0: u8 = name[0];
+    if (c0 != 105 && c0 != 117) { return -1; }        // 'i' / 'u'
+    var acc: i64 = 0;
+    var i: u64 = 1;
+    while (i < n) {
+        var c: u8 = name[i];
+        if (c < 48 || c > 57) { return -1; }
+        if (i == 1 && c == 48) { return -1; }         // '0' 前导零
+        acc = acc * 10 + ((c as i64) - 48);
+        if (acc > 65535) { return -1; }               // 早退，杜绝溢出
+        i = i + 1;
+    }
+    if (acc < awi_min_bits()) { return -1; }
+    if (acc > awi_max_bits()) { return -1; }
+    return acc;
+}
+
+// 是否为合法的任意位宽整数类型名。
+pub fn is_awi_name(name: string) bool {
+    return awi_bits(name) > 0;
+}
+
 pub fn ll_bits(name: string) i64 {
     if (name == "u8" || name == "i8" || name == "bool") { return 8; }
     if (name == "u16" || name == "i16") { return 16; }
     if (name == "u32" || name == "i32" || name == "rune" || name == "f32") { return 32; }
+    // 任意位宽整数 `i7` / `u200`：位宽即名字尾数，先于下方 64 兜底判定。
+    var ab: i64 = awi_bits(name);
+    if (ab > 0) { return ab; }
     return 64;
 }
 
@@ -6291,12 +6342,17 @@ pub fn utf8_append_cp(out: StringBuilder, cp: i64) void {
 // 数字字面量的位宽后缀表。刻意不复用 sema 的 `get_bw`：词法在模块 DAG 上先于
 // sema，跨层引用会成环。合法集与 §2.10 ScalarTable 的 int/float 类保持同步 ——
 // 新增标量类型时这里与 ScalarTable 一起改。返回位宽；非法后缀返回 -1。
+//
+// 任意位宽整数后缀（`100u7` / `5i200`）走 `awi_bits`，与类型位 `u7` 共用
+// 同一套解析，避免「类型位合法但字面量后缀不合法」的割裂。
 pub fn num_suffix_bits(s: string) i64 {
     if (s == "u8" || s == "i8") { return 8; }
     if (s == "u16" || s == "i16") { return 16; }
     if (s == "u32" || s == "i32" || s == "f32") { return 32; }
     if (s == "u64" || s == "i64" || s == "f64") { return 64; }
-    return -1;
+    // ⚠ 刻意不补 `f16`：既有表里它本来就不合法，放开是独立的行为变更，
+    // 会让 `1.0f16` 从「非法后缀」悄悄变成 f16 字面量。不属本次改动范围。
+    return awi_bits(s);
 }
 
 pub fn num_suffix_is_float(s: string) bool {

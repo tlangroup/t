@@ -500,7 +500,11 @@ pub fn is_int_name(name: string) bool {
     if (name == "rune") {
         return true;
     }
-    return name == "i8" || name == "i16" || name == "i32" || name == "i64";
+    if (name == "i8" || name == "i16" || name == "i32" || name == "i64") {
+        return true;
+    }
+    // 任意位宽整数 `i<N>` / `u<N>`（N ∈ [2, 65535]）
+    return base.is_awi_name(name);
 }
 
 pub fn is_float_name(name: string) bool {
@@ -528,6 +532,12 @@ pub fn get_bw(name: string) i64 {
     }
     if (name == "atom" || name == "fid") {
         return 64;
+    }
+    // 任意位宽整数 `i<N>` / `u<N>`：位宽即名字尾数。放在 8/16/32/64 分支之后
+    // 仅为可读性 —— awi_bits 对它们给出同样结果，行为不依赖先后顺序。
+    var ab: i64 = base.awi_bits(name);
+    if (ab > 0) {
+        return ab;
     }
     return -1;
 }
@@ -762,6 +772,10 @@ pub fn intlit_overflow_warn(e: i64, target: i64) void {
     if (nn.kind != "int") { return; }
     var v: u64 = lit_u64(nn.sa);
     var bits: i64 = get_bw(tname);
+    // ≥ 64 位时 `u64_pow2` 会绕回 0，算出的 `lim - 1` 反而等于 u64 上界，
+    // 等价于「永不告警」—— 这正是既有 i64/u64 的实际行为，此处显式化并早退，
+    // 顺带让 N > 64 的任意位宽整数不会因绕回产生假阳性告警。
+    if (bits <= 0 || bits >= 64) { return; }
     var is_uns: bool = tname[0] == 117;               // 'u' == 117（不叫 unsigned：C 关键字）
     var lim: u64;
     if (is_uns) {
@@ -2243,6 +2257,10 @@ pub fn builtin_ret(name: string) i64 {
     if (name == "sb_append_fmt_int" || name == "sb_append_fmt_uint" || name == "sb_append_fmt_float" || name == "sb_append_fmt_str" || name == "sb_append_fmt_bool" || name == "sb_append_fmt_char") {
         return ti_mk("Void");
     }
+    // 任意位宽整数（>64）的通用格式化追加：按地址传值 + 位宽 + 符号
+    if (name == "sb_append_fmt_big") {
+        return ti_mk("Void");
+    }
     // 转换字段（!r/!a/!j/!c/!p）专用追加函数：末位多一个模式串实参
     if (name == "sb_append_fmt_str_conv" || name == "sb_append_fmt_int_conv" || name == "sb_append_fmt_uint_conv") {
         return ti_mk("Void");
@@ -2880,6 +2898,7 @@ pub fn check_serializable(e: i64, sti: i64) void {
 pub var g_fmt_counter: i64;
 pub var g_fmt_ak: [64]i64;   // 各值实参的种类码（见 fmt_kind_of）
 pub var g_fmt_at: [64]i64;   // 各值实参对应的形参类型节点
+pub var g_fmt_ti: [64]i64;   // 各值实参对应的静态 TI（取位宽/符号用）
 pub var g_fmt_json_ti: [64]i64;   // A1a：聚合实参的原始 TI（!j 递归编码用）
 pub var g_fmt_json: [64]bool;     // A1a：第 i 个值实参是否为聚合类型（须用 !j 编码）
 pub var g_fmt_jsym: i64;          // A1a：JSON 合成体内部局部变量名计数器
@@ -2898,7 +2917,9 @@ pub fn fmt_kind_of(t: i64) i64 {
         var nm: string = tip_name(t);
         if (nm == "bool") { return 4; }
         if (is_float_name(nm)) { return 2; }
-        if (nm == "u8" || nm == "u16" || nm == "u32" || nm == "u64") { return 1; }
+        // 任意位宽整数：无符号 u<N> → 1，有符号 i<N> → 0（含 u8..u64 / i8..i64 /
+        // u2..u65535 / i2..i65535）。'u' 的 ASCII 是 117，'i' 是 105。
+        if (str_len(nm) > 0 && nm[0] == 117) { return 1; }
         if (is_int_name(nm)) { return 0; }
     }
     return -1;
@@ -3172,6 +3193,7 @@ pub fn desugar_format_call(e: i64) i64 {
         var at: i64 = infer_expr(ck.val);
         var kind: i64 = fmt_kind_of(at);
         g_fmt_at[argc] = fmt_type_node(at);
+        g_fmt_ti[argc] = at;
         if (kind < 0) {
             if (tip_kind(at) == "Unknown") {
                 // Unknown：已有诊断，按 int 兜底避免级联
@@ -3356,6 +3378,17 @@ pub fn desugar_format_call(e: i64) i64 {
                 tmpl_node);
             return ti_mk("Unknown");
         }
+        // 任意位宽整数：宽度 > 64 时走通用大整数格式化（按地址传值 + 位宽/符号），
+        // 避免既有的 sb_append_fmt_int/uint 把值塞进 i64 而静默截断。
+        if (g_fmt_ak[idx] == 0 || g_fmt_ak[idx] == 1) {
+            var wti: i64 = g_fmt_ti[idx];
+            if (tip_kind(wti) == "Scalar") {
+                var wnm: string = tip_name(wti);
+                if (is_int_name(wnm) && base.ll_bits(wnm) > 64) {
+                    appfn = "sb_append_fmt_big";
+                }
+            }
+        }
         var fa_head: i64 = -1;
         var fa_tail: i64 = -1;
         fa_tail = base.list_push(fa_head, fa_tail, base.mk_ident("__fb", -1));
@@ -3364,6 +3397,16 @@ pub fn desugar_format_call(e: i64) i64 {
         if (fa_head < 0) { fa_head = fa_tail; }
         fa_tail = base.list_push(fa_head, fa_tail, base.mk_ident(base.sb_cat2("a", base.i2s(idx)), -1));
         if (fa_head < 0) { fa_head = fa_tail; }
+        // 宽整数：补两位实参 —— 位宽(i64) 与 是否带符号(bool)。
+        // ⚠ mk_int(sa, ia, ti) 的 ia 是「进制」不是「值」：十进制字面量必须传 10，
+        //    值由 sa 承载；若把位宽当 ia 传，LLVM 会按该进制解析 sa（72 当进制 → 506）。
+        if (appfn == "sb_append_fmt_big") {
+            var wbw: i64 = base.ll_bits(tip_name(g_fmt_ti[idx]));
+            fa_tail = base.list_push(fa_head, fa_tail, base.mk_int(base.i2s(wbw), 10, -1));
+            if (fa_head < 0) { fa_head = fa_tail; }
+            fa_tail = base.list_push(fa_head, fa_tail, base.mk_bool(g_fmt_ak[idx] == 0, -1));
+            if (fa_head < 0) { fa_head = fa_tail; }
+        }
         if (fmt_fn_takes_mode(appfn)) {
             fa_tail = base.list_push(fa_head, fa_tail, base.mk_string(fmt_conv_name(conv), -1));
             if (fa_head < 0) { fa_head = fa_tail; }
@@ -8540,6 +8583,13 @@ pub fn meta_int_wrap(v: i64, t: string) i64 {
     if (t == "i32") { bits = 32; sgn = true; }
     if (t == "u32") { bits = 32; sgn = false; }
     if (t == "rune") { bits = 32; sgn = true; }
+    // 任意位宽整数 `i<N>` / `u<N>`：位宽即名字尾数。N ≥ 64 时宿主 i64 装不下，
+    // 沿用「原样返回」——编译期折叠只对能装进 i64 的宽度做回绕。
+    var ab: i64 = base.awi_bits(t);
+    if (ab > 0 && ab < 64) {
+        bits = ab;
+        sgn = t[0] == 105;                       // 'i' == 105
+    }
     if (bits == 0) { return v; }
     var m: i64 = (1 << bits) - 1;
     var r: i64 = v & m;
@@ -8554,7 +8604,7 @@ pub fn meta_is_int_type(t: string) bool {
     if (t == "i8" || t == "i16" || t == "i32" || t == "i64") { return true; }
     if (t == "u8" || t == "u16" || t == "u32" || t == "u64") { return true; }
     if (t == "rune") { return true; }
-    return false;
+    return base.is_awi_name(t);
 }
 
 // ── 表达式求值：返回字面量节点 id，失败返回 -1 ────────────────
