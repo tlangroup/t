@@ -4499,6 +4499,158 @@ pub fn infer_device_call(e: i64, fname: string) i64 {
     return ti_mk("Unknown");
 }
 
+// ── Device 安全子集校验（M4，docs/device-design.md §8）──────────────
+// 在 kernel fn 体内禁止：闭包 / 动态分配(append) / host 运行时调用；device 专用内建
+// 只能出现在 kernel 内；kernel 间调用/递归禁止。emit-dev(parse-only) 与 check/build
+// 双路径共用：仅消费 AST 节点类型，不依赖 sema 类型状态（tc.tc 无 kernel → 不影响自举）。
+var g_dev_builtins: []string;   // 设备专用内建名（与 g_dev_arity 平行）
+var g_dev_arity: []i64;          // 对应期望实参数
+var g_dev_forbid: []string;      // kernel 内禁用的 host 运行时内建名
+var g_dev_inited: bool;
+
+pub fn dev_init_sets() void {
+    if (g_dev_inited) { return; }
+    g_dev_inited = true;
+    append(g_dev_builtins, "thread_id");     append(g_dev_arity, 1);
+    append(g_dev_builtins, "block_id");      append(g_dev_arity, 1);
+    append(g_dev_builtins, "block_dim");     append(g_dev_arity, 1);
+    append(g_dev_builtins, "grid_dim");      append(g_dev_arity, 1);
+    append(g_dev_builtins, "barrier");       append(g_dev_arity, 0);
+    append(g_dev_builtins, "atomic_add");    append(g_dev_arity, 2);
+    append(g_dev_builtins, "shared_alloc");  append(g_dev_arity, 1);
+    append(g_dev_forbid, "print");
+    append(g_dev_forbid, "println");
+    append(g_dev_forbid, "eprint");
+    append(g_dev_forbid, "@panic");
+    append(g_dev_forbid, "@assert");
+    append(g_dev_forbid, "@assert_eq");
+}
+
+pub fn dev_name_in(names: []string, s: string) bool {
+    var i: i64 = 0;
+    while (i < (slice_len(names) as i64)) {
+        if (names[i] == s) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+pub fn dev_builtin_arity(name: string) i64 {
+    var i: i64 = 0;
+    while (i < (slice_len(g_dev_builtins) as i64)) {
+        if (g_dev_builtins[i] == name) { return g_dev_arity[i]; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+pub fn dev_callee_name(callNode: i64) string {
+    if (callNode < 0) { return ""; }
+    var nlen: i64 = slice_len(base.nodes) as i64;
+    if (callNode >= nlen) { return ""; }
+    var na: i64 = base.nodes[callNode].na;
+    if (na < 0 || na >= nlen) { return ""; }
+    var cn: Node = base.nodes[na];
+    if (cn.kind == "ident") { return cn.sa; }
+    return "";
+}
+
+pub fn dev_arg_count(callNode: i64) i64 {
+    if (callNode < 0) { return 0; }
+    var h: i64 = base.nodes[callNode].la;
+    var c: i64 = h;
+    var n: i64 = 0;
+    var klen: i64 = slice_len(base.kids) as i64;
+    while (c >= 0 && c < klen) {
+        n = n + 1;
+        c = base.kids[c].next;
+    }
+    return n;
+}
+
+pub fn dev_check_list(h: i64, in_kernel: bool, cur: string, knames: []string) void {
+    var klen: i64 = slice_len(base.kids) as i64;
+    var c: i64 = h;
+    while (c >= 0 && c < klen) {
+        dev_check_node(base.kids[c].val, in_kernel, cur, knames);
+        c = base.kids[c].next;
+    }
+}
+
+pub fn dev_check_node(e: i64, in_kernel: bool, cur: string, knames: []string) void {
+    if (e < 0) { return; }
+    var nlen: i64 = slice_len(base.nodes) as i64;
+    if (e >= nlen) { return; }
+    var n: Node = base.nodes[e];
+    if (n.kind == "call") {
+        var fname: string = dev_callee_name(e);
+        if (in_kernel == false && dev_name_in(g_dev_builtins, fname)) {
+            parse.fc_err("T-DEV-E950",
+                base.sb_cat3("device-only builtin `", fname, "` 只能用于 kernel fn 体内"), e);
+        }
+        if (in_kernel && dev_name_in(g_dev_builtins, fname)) {
+            var exp: i64 = dev_builtin_arity(fname);
+            var got: i64 = dev_arg_count(e);
+            if (exp != got) {
+                parse.fc_err("T-DEV-E953",
+                    base.sb_cat7("device builtin `", fname, "` 期望 ", base.i2s(exp),
+                        " 个实参，收到 ", base.i2s(got), ""), e);
+            }
+        }
+        if (in_kernel && dev_name_in(g_dev_forbid, fname)) {
+            parse.fc_err("T-DEV-E951",
+                base.sb_cat3("kernel 内禁止调用 host 运行时 `", fname, "`"), e);
+        }
+        if (in_kernel && dev_name_in(knames, fname)) {
+            parse.fc_err("T-DEV-E952",
+                base.sb_cat5("kernel `", cur, "` 调用了 kernel `", fname,
+                    "`（kernel 间调用/递归在设备安全子集内禁止）"), e);
+        }
+        if (in_kernel && fname == "append") {
+            parse.fc_err("T-DEV-E951", "kernel 内禁止动态 append（动态分配）", e);
+        }
+    }
+    if (in_kernel && (n.kind == "closure_make" || n.kind == "closure_capture" || n.kind == "lambda")) {
+        parse.fc_err("T-DEV-E951", base.sb_cat3("kernel 内禁止闭包（", n.kind, "）"), e);
+    }
+    // 无捕获闭包在 sema 提升阶段就地降级为 ident(__lam_N)；仍是「kernel 内禁止闭包」
+    if (in_kernel && n.kind == "ident" && str_len(n.sa) >= 6 && str_slice(n.sa, 0, 6) == "__lam_") {
+        parse.fc_err("T-DEV-E951", "kernel 内禁止闭包（无捕获闭包降级为 ident）", e);
+    }
+    // 递归子节点（AST 为树，无环，无需 visited 去重）
+    dev_check_node(n.na, in_kernel, cur, knames);
+    dev_check_node(n.nb, in_kernel, cur, knames);
+    dev_check_node(n.nc, in_kernel, cur, knames);
+    dev_check_node(n.nd, in_kernel, cur, knames);
+    dev_check_list(n.la, in_kernel, cur, knames);
+    dev_check_list(n.lb, in_kernel, cur, knames);
+    dev_check_list(n.lc, in_kernel, cur, knames);
+}
+
+pub fn run_device_check() void {
+    dev_init_sets();
+    // 收集本模块全部 kernel fn 名（递归检测）
+    var knames: []string = [];
+    var i: i64 = 0;
+    var nlen: i64 = slice_len(base.nodes) as i64;
+    while (i < nlen) {
+        var nd: Node = base.nodes[i];
+        if (nd.kind == "FuncDecl" && nd.bf == true) {
+            append(knames, nd.sa);
+        }
+        i = i + 1;
+    }
+    // 逐个函数走 body：kernel 体内 in_kernel=true，host 函数 in_kernel=false
+    i = 0;
+    while (i < nlen) {
+        var nd: Node = base.nodes[i];
+        if (nd.kind == "FuncDecl") {
+            dev_check_list(nd.lc, nd.bf, nd.sa, knames);
+        }
+        i = i + 1;
+    }
+}
+
 pub fn infer_expr(e: i64) i64 {
     var n: Node = base.nodes[e];
     if (is_pipe_kind(n.kind) == true) {

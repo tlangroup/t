@@ -147,6 +147,24 @@ device.kernel_func @vec_add(%a: !device.ptr<global, f32>,
 - 调用纯 host 函数（仅 device 模块内函数可达）。
 device-only 内建仅允许出现在 device 上下文。
 
+**M4 已落地（2026-09-03）**：新增 `run_device_check()` sema 校验 pass（`src/sema.tc`），在
+`tc check` / `build` / `run` / `emit-dev` 四路径共用（仅消费 AST 节点类型，不依赖 sema 类型状态；
+`tc.tc` 无 kernel → 自举不动点 / IR 基线零漂移）。`kernel fn` 体由 `check_decl` 在 `run_check`
+阶段整体跳过（`src/sema.tc` `if (n.bf == true) return;`），故 `run_device_check` 是 kernel 体的
+唯一 sema 校验。四类违例映射到诊断码（`tools/diag_defs.json` 的 `DEV` 类，区间 `[950,979]`）：
+- **T-DEV-E950** device-only 内建（`thread_id`/`block_id`/`block_dim`/`grid_dim`/`barrier`/
+  `atomic_add`/`shared_alloc`）只能出现在 `kernel fn` 体内（host 上下文禁用）；
+- **T-DEV-E951** kernel 内禁止闭包（`closure_make`/`closure_capture`/`lambda`，及无捕获闭包在
+  sema 提升阶段就地降级后的 `ident(__lam_N)`）、动态 `append`、host 运行时调用
+  （`print`/`println`/`eprint`/`@panic`/`@assert`/`@assert_eq`）；
+- **T-DEV-E952** kernel 间调用 / 递归（kernel 名集合内互调，含自递归）；
+- **T-DEV-E953** device builtin 实参数不匹配（按 `g_dev_arity` 校验）。
+注：设备安全子集**不**拦截 kernel 调用普通 user 函数（属 §8 列明的未来收紧项）；当前仅拦截上述
+显式清单。诊断码登记三处：`tools/diag_defs.json` + `node tools/gen_diag.mjs` 重生成
+`src/diag_table.gen.h` + `src/base.tc` `diag_ensure()` 手工登记（`gen_diag_t.mjs` 已损坏，勿用它）。
+conformance 夹具：`tests/conformance/device/d0{0..5}_*.tc`（d00 合法 kernel `// EXPECT: pass`；
+d01 E950 / d02 E951-host-runtime / d03 E951-closure / d04 E952 / d05 E953）。
+
 ---
 
 ## 9. 构建 / 门禁 / 自举影响
@@ -168,7 +186,7 @@ device-only 内建仅允许出现在 device 上下文。
 - **M3 `device` 模块 + trampoline + `t_runtime_gpu` launch**：✅ 主机侧端到端闭环（2026-09-03）。`device.alloc/free/h2d/d2h/launch` 双后端发射 + `__t_devmod_blob` 内嵌 + `t_runtime_gpu` 桩运行时：C/LLVM 双后端均 `build→link→run` 成功、exit 0、launch 内核名正确打印（`tll_gpu_launch("vec_add")`）。GPU 真执行仍需在他机（无 CUDA/GPU）。
 
 ### 10.2 准备实现（planned）
-- **M4** device-only 内建（atomic/barrier/math 映射）+ 安全子集 sema 校验（§8）。
+- **M4** device-only 内建（atomic/barrier/math 映射）+ 安全子集 sema 校验（§8）：✅ `run_device_check()` pass 已落地（2026-09-03），四类违例映射到 T-DEV-E950..953，conformance 夹具 `tests/conformance/device/d0{0..5}` 全绿。
 - **M5** gate 接入 device 示例集；devmlir 文本 md5 进 IR 快照；无 GPU CI 跳过 run。
 - **AOT 模式 `--aot-gpu`**：编译期 Device MLIR → PTX/cubin 落 `.tpu`（必须指定 arch）。
 
@@ -192,7 +210,7 @@ device-only 内建仅允许出现在 device 上下文。
 | M1 | `dev_ptr[T]` 解析 + `ll_td` addrspace + host gate 全绿 | ✅ |
 | M2 | `vec_add` emit Device Dialect 文本 + 序列化 bytecode | △ 文本可查；bytecode 需 MLIR |
 | M3 | `vec_add` 真在 GPU 算出正确结果；主机侧发射/链接/运行 + 内核名传递 双后端闭环 | △ 主机发射/链接/运行本机已验（桩运行时，exit 0，名正确）；GPU 真执行 ❌ 需 GPU |
-| M4 | atomic/barrier/math + 安全子集拦截 | △ 拦截本机可验；运行需 GPU |
+| M4 | atomic/barrier/math + 安全子集拦截 | ✅ 拦截本机已验（T-DEV-E950..953 + conformance 夹具全绿）；运行需 GPU |
 | M5 | gate device 示例 + IR 快照 | △ snapshot 本机可验 |
 
 ## 12. 本地验证工具链（2026-09-02 增补）
