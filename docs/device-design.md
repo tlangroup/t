@@ -187,7 +187,7 @@ d01 E950 / d02 E951-host-runtime / d03 E951-closure / d04 E952 / d05 E953）。
 
 ### 10.2 准备实现（planned）
 - **M4** device-only 内建（atomic/barrier/math 映射）+ 安全子集 sema 校验（§8）：✅ `run_device_check()` pass 已落地（2026-09-03），四类违例映射到 T-DEV-E950..953，conformance 夹具 `tests/conformance/device/d0{0..5}` 全绿。
-- **M5** gate 接入 device 示例集；devmlir 文本 md5 进 IR 快照；无 GPU CI 跳过 run。
+- **M5** gate 接入 device 示例集；devmlir 文本 md5 进 IR 快照；无 GPU CI 跳过 run：✅ `ir_snapshot.mjs` 新增 `dev` 后端（2026-09-03），对 `emit-dev` 产物含 `device.kernel_func` 的目标登记 `::dev` md5，无 kernel 空壳文件不进快照；`ir_baseline.json` 现有 `examples/vecadd_device.tc::dev` + `examples/vecadd_device_full.tc::dev` 两项。device 示例（conformance `d0{0..5}` + `vecadd_device_full.tc`）已在 gate L2 的 conformance / run_examples 步覆盖（桩运行时 exit 0）；无 GPU 时仅比对 devmlir 文本、不执行。
 - **AOT 模式 `--aot-gpu`**：编译期 Device MLIR → PTX/cubin 落 `.tpu`（必须指定 arch）。
 
 ### 10.3 规划内容（roadmap / future）
@@ -211,7 +211,7 @@ d01 E950 / d02 E951-host-runtime / d03 E951-closure / d04 E952 / d05 E953）。
 | M2 | `vec_add` emit Device Dialect 文本 + 序列化 bytecode | △ 文本可查；bytecode 需 MLIR |
 | M3 | `vec_add` 真在 GPU 算出正确结果；主机侧发射/链接/运行 + 内核名传递 双后端闭环 | △ 主机发射/链接/运行本机已验（桩运行时，exit 0，名正确）；GPU 真执行 ❌ 需 GPU |
 | M4 | atomic/barrier/math + 安全子集拦截 | ✅ 拦截本机已验（T-DEV-E950..953 + conformance 夹具全绿）；运行需 GPU |
-| M5 | gate device 示例 + IR 快照 | △ snapshot 本机可验 |
+| M5 | gate device 示例 + IR 快照 | ✅ device 示例已进 gate（conformance `d0{0..5}` + `vecadd_device_full.tc`）；`ir_snapshot` `dev` 后端追踪 devmlir 漂移（2 kernel 示例 `::dev` 项），无 GPU 仅比对文本 |
 
 ## 12. 本地验证工具链（2026-09-02 增补）
 

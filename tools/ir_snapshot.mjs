@@ -16,6 +16,10 @@
 //   * runtime (runtime/t_runtime.c) 的改动；
 //   * clang 自身版本变化。
 //
+// `dev` 后端（emit-dev 产出的 Device Dialect MLIR 文本 md5）追踪 device 代码生成漂移：
+//   仅对发射产物含 `device.kernel_func` 的目标登记 ::dev 项；无 kernel 的文件 emit-dev
+//   只产空壳，不进快照避免噪声。无 GPU 时本后端仅比对文本、不执行。
+//
 // 反之，一旦出现 DIFF，必须人工确认该差异是否为改动的预期效果；
 // 确认无误后用 --update 重录基线。
 //
@@ -45,7 +49,7 @@ const BASELINE = join(ROOT, "tests", "ir_baseline.json");
 let compiler = join(ROOT, "out", "dbg", "tc.exe");
 let update = false;
 let keep = false;
-let backends = ["ll", "c"];
+let backends = ["ll", "c", "dev"];
 let jobs = Math.min(8, Math.max(1, cpus().length));
 const argv = process.argv.slice(2);
 for (let i = 0; i < argv.length; i++) {
@@ -154,6 +158,29 @@ async function emitOne(rel) {
         }
     }
 
+    if (backends.includes("dev")) {
+        // 预过滤：源文件不含 "kernel" 关键字则不可能有 kernel fn，跳过 emit-dev
+        // （避免对 80+ 普通示例各跑一次编译器）。含 kernel 关键字者再真实发射判定。
+        let hasKernelKw = false;
+        try { hasKernelKw = readFileSync(join(ROOT, rel), "utf8").includes("kernel"); } catch { /* 读不到则跳过 */ }
+        if (hasKernelKw) {
+            const devPath = join(ROOT, WORK_REL, `${tag}.mlir`);
+            try {
+                await pExecFile(compiler, ["emit-dev", rel, "--output", devPath], {
+                    cwd: ROOT, encoding: "buffer", maxBuffer: 256 * 1024 * 1024, windowsHide: true,
+                });
+            } catch (e) {
+                return { rel, entries: null, error: `emit-dev failed (exit ${e.code ?? -1})` };
+            }
+            if (existsSync(devPath)) {
+                // 仅登记真正含 device.kernel_func 的目标；无 kernel 的空壳不进快照。
+                if (readFileSync(devPath, "utf8").includes("device.kernel_func")) {
+                    out[`${rel}::dev`] = md5File(devPath);
+                }
+            }
+        }
+    }
+
     return { rel, entries: out, error: null };
 }
 
@@ -232,7 +259,8 @@ for (const k of curKeys) {
     else if (base[k] !== current[k]) diffs.push({ k, was: base[k], now: current[k] });
 }
 // 只报告本次实际发射过的后端的缺失项，避免 --backends ll 时误报所有 ::c/::h
-const activeSuffix = new Set(backends.includes("c") ? ["ll", "c", "h"] : backends);
+const activeSuffix = new Set(backends.includes("c") ? ["ll", "c", "h"] : [...backends]);
+if (backends.includes("dev")) activeSuffix.add("dev");
 const removed = baseKeys.filter((k) => {
     const suf = k.split("::")[1];
     return activeSuffix.has(suf) && !(k in current);
