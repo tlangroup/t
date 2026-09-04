@@ -478,6 +478,15 @@ pub fn emit_ctype(tn: i64) string {
     if (n.kind == "tile") {
         return base.sb_cat2(emit_ctype(n.na), "*");
     }
+    // 结构体字面量：命名 struct 直接用其名（C 端为 typedef struct Name Name），
+    // 匿名 struct（sa==""）按字段签名合成 __anon_N 名（值位/类型注解位共用）。
+    if (n.kind == "struct_lit") {
+        var sname: string = n.sa;
+        if (sname == "") {
+            sname = sema.anon_resolve_name(tn);
+        }
+        return sname;
+    }
     return "void";
 }
 
@@ -784,8 +793,13 @@ pub fn expr_type_desc(e: i64) i64 {
     // 结构体字面量：类型名在 n.sa（与 LLVM 后端 ll_etd 的 struct_lit 分支对齐）。
     // 缺这一支会让 match 首臂体为结构体字面量时 mq_rtd 退化为 unknown，
     // 进而把 match 结果临时量 _tmrN 声明成 void*（见 examples/match_return_struct.tc）。
+    // 匿名结构体（sa==""）走统一规范化表合成 __anon_N 名，值位与类型注解位共用。
     if (n.kind == "struct_lit") {
-        return sema.td_named_mk("named", n.sa);
+        var sname: string = n.sa;
+        if (sname == "") {
+            sname = sema.anon_resolve_name(e);
+        }
+        return sema.td_named_mk("named", sname);
     }
     // 闭包构造点（M48）：值类型 = 合成函数的函数类型（build_type_map 已按裸名登记）
     if (n.kind == "closure_make") {
@@ -2203,7 +2217,7 @@ pub fn emit_expr(e: i64) string {
     }
     if (n.kind == "call") {
         var cal: Node = base.nodes[n.na];
-        // Device host 内建 trampoline（docs/device-design.md §6 M3）
+        // Device host 内建 trampoline（docs/compiler/device-design.md §6 M3）
         if (cal.kind == "member") {
             var db: Node = base.nodes[cal.na];
             if (db.kind == "ident" && db.sa == "device") {
@@ -2821,7 +2835,7 @@ pub fn is_map_lit(e: i64) bool {
     return mln.kind == "map_lit";
 }
 
-// ── Device host 内建发射（docs/device-design.md §6 M3）────────────
+// ── Device host 内建发射（docs/compiler/device-design.md §6 M3）────────────
 // 全部设备指针以 int64_t 句柄交换；launch 把变长实参打包成 int64_t[] 传给 tll_gpu_launch。
 pub fn c_device_call(e: i64, fname: string) string {
     var n: Node = base.nodes[e];
@@ -4426,7 +4440,7 @@ pub fn emit_unit(mod: string) void {
     spush("");
 
     // Device 子系统 M3：本模块含 `kernel fn` 时，把 Device Dialect 文本内嵌为 C 全局常量，
-    // 供 tll_gpu_launch 读取（docs/device-design.md §6）。定义在文件顶（函数体之前），
+    // 供 tll_gpu_launch 读取（docs/compiler/device-design.md §6）。定义在文件顶（函数体之前），
     // 使下方 emit 出的 launch 调用可见该符号。定义放在 emit_unit 内、emit_decl 之前，
     // 保证在所有函数之前出现，满足 C 前向可见性。
     if (c_dev_has_kernels()) {

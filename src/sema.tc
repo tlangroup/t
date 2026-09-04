@@ -1202,7 +1202,7 @@ pub fn resolve_ti(tn: i64) i64 {
             var s: Sym = syms[si];
             return s.ti;
         }
-        // 裸 `Sym` = 默认 32 位池的一级符号句柄（docs/meta_design.md §8）。
+        // 裸 `Sym` = 默认 32 位池的一级符号句柄（docs/compiler/meta_design.md §8）。
         // 刻意放在用户查找**之后**：谁自己声明了 `Sym` 类型谁说了算（tc.tc 自身就有）。
         if (n.sa == "Sym") {
             var syd: i64 = ti_named("Sym", "");
@@ -1263,6 +1263,10 @@ pub fn resolve_ti(tn: i64) i64 {
             fj0 = fj0 + 1;
         }
         return ti_func(fret, fpstart, fpc);
+    }
+    // 匿名结构体「类型」注解：FV.na 是类型节点，按字段签名合成/复用 __anon_N 后按具名 Struct 处理。
+    if (n.kind == "struct_lit" && n.sa == "") {
+        return ti_named("Struct", anon_resolve_name(tn));
     }
     return ti_mk("Unknown");
 }
@@ -4524,7 +4528,7 @@ pub fn lower_for_array(s: i64) void {
 
 // ── 表达式类型推断 inferExprType（复刻 checker.ts:479）────────
 
-// Device 子系统 host 内建类型检查（docs/device-design.md §6 M3）。
+// Device 子系统 host 内建类型检查（docs/compiler/device-design.md §6 M3）。
 // 全部以 i64 句柄交换设备指针，避免引入 dev_ptr 的 TI 地址空间（TI→TD 会丢 memspace）。
 pub fn infer_device_call(e: i64, fname: string) i64 {
     var n: Node = base.nodes[e];
@@ -4542,7 +4546,7 @@ pub fn infer_device_call(e: i64, fname: string) i64 {
     return ti_mk("Unknown");
 }
 
-// ── Device 安全子集校验（M4，docs/device-design.md §8）──────────────
+// ── Device 安全子集校验（M4，docs/compiler/device-design.md §8）──────────────
 // 在 kernel fn 体内禁止：闭包 / 动态分配(append) / host 运行时调用；device 专用内建
 // 只能出现在 kernel 内；kernel 间调用/递归禁止。emit-dev(parse-only) 与 check/build
 // 双路径共用：仅消费 AST 节点类型，不依赖 sema 类型状态（tc.tc 无 kernel → 不影响自举）。
@@ -4692,6 +4696,119 @@ pub fn run_device_check() void {
         }
         i = i + 1;
     }
+}
+
+// ── 匿名结构体字面量（`{ f: v, ... }`）──────────────────────────
+// 推断期按「字段名 + 字段类型签名」规范化合成具名 struct 类型（__anon_N），使结构
+// 相同的两个字面量共享同一类型（可互赋 / 比较 / 传参），并完整复用既有 struct 机制
+// （双后端发射、成员访问、type_info、cast 解析）。struct_lit 节点 sa=="" 即匿名。
+// 合成 StructDecl 注册进 global_scope（find_struct_fields / resolve_type_desc / 成员访问）
+// 并追加到 lex.decl_list（两个后端据此发射类型定义），故下游无需任何特判。
+
+pub var g_anon_sig: []string;   // 字段签名 → 合成名 的规范化表
+pub var g_anon_name: []string;
+pub var g_anon_ti: []i64;
+pub var g_anon_cnt: i64 = 0;
+
+pub fn anon_ti_sig(ti: i64) string {
+    if (ti < 0) { return "?"; }
+    var t: TI = tis[ti];
+    var k: string = t.kind;
+    if (k == "Scalar" || k == "Bytes") { return base.sb_cat2("s:", t.name); }
+    if (k == "Void" || k == "String" || k == "StringBuilder") { return base.sb_cat2("x:", k); }
+    if (k == "Named") { return base.sb_cat2("n:", t.name); }
+    if (k == "Struct") { return base.sb_cat2("S:", t.name); }
+    if (k == "Enum" || k == "Flag" || k == "FlagSet" || k == "Union" || k == "Variant") { return base.sb_cat3(k, ":", t.name); }
+    if (k == "Slice") { return base.sb_cat2("[]", anon_ti_sig(t.elem)); }
+    if (k == "Array") { return base.sb_cat4("[", base.i2s(t.alen), "]", anon_ti_sig(t.elem)); }
+    if (k == "Pointer") { return base.sb_cat2("*", anon_ti_sig(t.elem)); }
+    if (k == "Optional") { return base.sb_cat2("?", anon_ti_sig(t.elem)); }
+    if (k == "Map") { return base.sb_cat3("{}", anon_ti_sig(t.key), anon_ti_sig(t.val)); }
+    if (k == "Vector") { return base.sb_cat3("<", base.i2s(t.alen), anon_ti_sig(t.elem)); }
+    if (k == "Func") { return "func"; }
+    return base.sb_cat2("o:", k);
+}
+
+// 按字段签名（name:ti_sig;...）规范化出合成 struct 名：结构相同即同一类型（可互赋/比较/作参）。
+// 首次出现的签名新建 __anon_N 并注册进 global_scope（符号表查字段 / 成员访问）+
+// lex.decl_list（两后端据此发射类型定义），下游无需任何特判。
+pub fn anon_canonicalize(names: []string, tis: []i64) string {
+    var sig: StringBuilder = sb_new();
+    var i: i64 = 0;
+    var first: bool = true;
+    while (i < slice_len(names)) {
+        if (first == false) { sb_append_str(sig, ";"); }
+        first = false;
+        sb_append_str(sig, names[i]);
+        sb_append_str(sig, ":");
+        sb_append_str(sig, anon_ti_sig(tis[i]));
+        i = i + 1;
+    }
+    var ssig: string = sb_to_str(sig);
+    var m: i64 = slice_len(g_anon_sig) as i64;
+    var j: i64 = 0;
+    while (j < m) {
+        if (g_anon_sig[j] == ssig) {
+            return g_anon_name[j];
+        }
+        j = j + 1;
+    }
+    var name: string = base.sb_cat2("__anon_", base.i2s(g_anon_cnt));
+    g_anon_cnt = g_anon_cnt + 1;
+    var fhead: i64 = -1;
+    var ftail: i64 = -1;
+    var k: i64 = 0;
+    while (k < slice_len(names)) {
+        var tn: i64 = ti_to_type_node(tis[k]);
+        var fid: i64 = base.mk_F(names[k], -1, tn, -1, -1);
+        ftail = base.list_push(fhead, ftail, fid);
+        if (fhead < 0) { fhead = ftail; }
+        k = k + 1;
+    }
+    var sd: i64 = base.mk_StructDecl(name, "default", "", false, false, -1, fhead, -1);
+    sym_define(global_scope, name, "type", ti_named("Struct", name), sd);
+    append(lex.decl_list, sd);
+    append(g_anon_sig, ssig);
+    append(g_anon_name, name);
+    append(g_anon_ti, ti_named("Struct", name));
+    return name;
+}
+
+// 类型注解位的匿名 struct（struct_lit{sa=="", FV.na=类型节点}）→ 合成名。
+// 与值位字面量共用同一规范化表，故注解与字面量结构相同即同一类型。
+pub fn anon_resolve_name(tn: i64) string {
+    var n: Node = base.nodes[tn];
+    var names: []string;
+    var tis: []i64;
+    var c: i64 = n.la;
+    while (c >= 0) {
+        var fv: Node = base.nodes[base.kids[c].val];
+        append(names, fv.sa);
+        append(tis, resolve_ti(fv.na));
+        c = base.kids[c].next;
+    }
+    return anon_canonicalize(names, tis);
+}
+
+// 值位匿名结构体字面量：把每个字段「值」推成 TI，再走统一规范化。
+pub fn infer_anon_struct(e: i64) i64 {
+    var n: Node = base.nodes[e];
+    if (n.sa != "") {
+        return ti_named("Struct", n.sa);   // 已推断过 → 幂等
+    }
+    var names: []string;
+    var tis: []i64;
+    var c: i64 = n.la;
+    while (c >= 0) {
+        var fv: Node = base.nodes[base.kids[c].val];
+        append(names, fv.sa);
+        append(tis, infer_expr(fv.na));
+        c = base.kids[c].next;
+    }
+    var name: string = anon_canonicalize(names, tis);
+    n.sa = name;
+    slice_set(base.nodes, e, n);
+    return ti_named("Struct", name);
 }
 
 pub fn infer_expr(e: i64) i64 {
@@ -5543,7 +5660,7 @@ pub fn infer_expr(e: i64) i64 {
                 return ti_mk("Unknown");
             }
         }
-        // Device 子系统 host 内建（docs/device-design.md §6 M3）：
+        // Device 子系统 host 内建（docs/compiler/device-design.md §6 M3）：
         // device.alloc_bytes / free / h2d / d2h / launch。callee = member(device, fn)。
         // 全部以 i64 句柄（CUdeviceptr）交换设备指针，调用点用 `as dev_ptr[T]` 还原类型。
         if (cn.kind == "member") {
@@ -6112,6 +6229,10 @@ pub fn infer_expr(e: i64) i64 {
         return mi2;
     }
 // >>> GEN:type_infer2 (generated by tools/totter.tc from out/ebnf.json -- DO NOT EDIT) >>>
+    // 匿名结构体字面量（sa==""）：合成具名 struct 类型后再走既有命名 struct 路径
+    if (n.kind == "struct_lit" && n.sa == "") {
+        return infer_anon_struct(e);
+    }
     if (n.kind == "struct_lit") {
         // 默认填充：struct 字段有默认值(expr)但未在字面量中给出 → 合成 FV 追加进 n.la。
         // 后端以「指定符初始化器」按名映射，故追加在尾部与顺序无关，天然幂等。
@@ -6808,7 +6929,7 @@ pub fn check_decl(d: i64) void {
     var n: Node = base.nodes[d];
     if (n.kind == "FuncDecl") {
         // Device 入口 `kernel fn`：设备体不在 host 阶段做类型检查（设备安全子集属 M4 未来工作，
-        // 见 docs/device-design.md §8）；host 双后端跳过发射、codegen_dev 直接消费 AST。
+        // 见 docs/compiler/device-design.md §8）；host 双后端跳过发射、codegen_dev 直接消费 AST。
         if (n.bf == true) { return; }
         if (func_is_generic(d)) { return; }
         check_func_decl(d);
@@ -8468,13 +8589,13 @@ pub fn mangle_modules() void {
 
 // ══════════════════════════════════════════════════════════════
 // Phase B —— CTFE 编译期求值器（meta）
-// 设计：docs/meta_design.md §9 Phase B
+// 设计：docs/compiler/meta_design.md §9 Phase B
 //
 // 求值结果统一以「字面量节点 id」承载（int / bool / string）：
 //   ① 规避结构体按值返回的 Win64 聚合 ABI 坑；
 //   ② 「折叠」退化为把字面量内容就地拷回 meta 节点 —— 无需回溯父节点重连指针。
 // 支持标量：i64 整数 / bool / string。浮点暂不支持（第 7 条字节级可复现性
-// 需先就浮点求值顺序定案，见 docs/meta_design.md §10）。
+// 需先就浮点求值顺序定案，见 docs/compiler/meta_design.md §10）。
 // ══════════════════════════════════════════════════════════════
 
 pub var g_menv_name: []string;   // 编译期环境：名字（平栈）
@@ -8889,7 +9010,13 @@ pub fn meta_eval_struct_lit(e: i64) i64 {
         if (h < 0) { h = t; }
         c = kids[c].next;
     }
-    return mk_struct_lit(n.sa, h, -1);
+    var lit: i64 = mk_struct_lit(n.sa, h, -1);
+    // 匿名结构体字面量在编译期求值后仍需保留可解析的类型名：推断合成 __anon_N 并回填 sa，
+    // 使下游发射 / 成员访问走既有命名 struct 路径。
+    if (n.sa == "") {
+        infer_anon_struct(lit);
+    }
+    return lit;
 }
 
 // 编译期数组 → string（取前 len 字节）。-1 = 失败（已报错）
@@ -10283,7 +10410,7 @@ pub fn meta_pass() void {
 }
 
 // ══════════════════════════════════════════════════════════════
-// M-meta Phase D —— 编译期内建 `@xxx`（docs/meta_design.md §5）
+// M-meta Phase D —— 编译期内建 `@xxx`（docs/compiler/meta_design.md §5）
 //
 // 表面：表达式位置的 `@name(args)` → `mbuiltin` 节点（sa = 名字，la = 实参链）。
 //
@@ -10626,7 +10753,7 @@ pub fn mb_fold_inplace(e: i64) void {
 
 // `if (@type_equal(...)) A else B` —— 条件折成 bool 字面量后剪掉未取分支。
 // 为什么必须剪：未取分支里的 `@compile_error` 会漏到 check 触发误报，
-// docs/meta_design.md §6 的 get_width 模式正依赖此；剪掉后运行期亦零代码。
+// docs/compiler/meta_design.md §6 的 get_width 模式正依赖此；剪掉后运行期亦零代码。
 // **只对「条件原本是 @ 内建」的 if 生效** —— 普通 `if (true)` 分毫不动，零 IR 漂移。
 pub fn mb_prune_if(c: i64, v: i64) void {
     var vn: Node = nodes[v];
@@ -10914,7 +11041,7 @@ pub fn run_check() void {
     mb_pass();
     // Phase B：CTFE —— 折叠 `meta <expr>`、执行 `meta { }`。
     // 必须在 check_decl 之前：折叠后 checker 看到的是普通字面量，
-    // 双后端也因此无需为 meta 单独发射（见 docs/meta_design.md §9 Phase B）。
+    // 双后端也因此无需为 meta 单独发射（见 docs/compiler/meta_design.md §9 Phase B）。
     meta_pass();
     // desugar 可能追加合成的 __import_N 函数，重新取长度以便一并检查
     var n2: i64 = slice_len(decl_list) as i64;
@@ -11888,7 +12015,7 @@ pub fn resolve_type_desc(tn: i64) i64 {
     // 必须放在 GEN:td_rnamed 之前——生成区间由 build/ebnf.json 驱动，手改会被覆盖。
     if (n.kind == "named" && n.sa == "TypeInfo") { return td_named_mk("typeinfo", n.sa); }
     if (n.kind == "named" && n.sa == "FieldInfo") { return td_named_mk("fieldinfo", n.sa); }
-    // 裸 `Sym` = 默认 32 位池的一级符号句柄（docs/meta_design.md §8）。
+    // 裸 `Sym` = 默认 32 位池的一级符号句柄（docs/compiler/meta_design.md §8）。
     // 用户自己声明过 `Sym` 类型时以用户为准（tc.tc 自身就有一个 Sym struct）。
     if (n.kind == "named" && n.sa == "Sym" && mb_type_decl("Sym") < 0) {
         var bsy: i64 = td_named_mk("sym", "");
@@ -11930,6 +12057,11 @@ pub fn resolve_type_desc(tn: i64) i64 {
             fj = fj + 1;
         }
         return td_func(fret, fpstart, fpc);
+    }
+    // 匿名结构体类型注解（TD 位）：合成 __anon_N 并以具名类型引用；字段布局由已注册进
+    // lex.decl_list 的 StructDecl 在后端发射，故此处只需按名引用该类型。
+    if (n.kind == "struct_lit" && n.sa == "") {
+        return td_named_mk("named", anon_resolve_name(tn));
     }
     return td_mk("unknown");
 }
