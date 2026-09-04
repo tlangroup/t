@@ -27,9 +27,17 @@ import { spawn } from "node:child_process";
 import { readFileSync, existsSync, copyFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { createHash } from "node:crypto";
+import { ensureMsvcEnv } from "./msvc_env.mjs";
 
 const ROOT = resolve(new URL("..", import.meta.url).pathname.replace(/^\/([A-Za-z]):/, "$1:"));
 const NODE = process.execPath;
+
+// 自动探测并注入 MSVC/Windows SDK 的 LIB+INCLUDE（非交互 shell / CI 下常缺，
+// 会导致 C 后端 clang 编译 #include 找不到头而假失败）。详见 tools/msvc_env.mjs。
+{
+    const s = ensureMsvcEnv();
+    if (s) console.log(`[env] ${s}`);
+}
 
 // ── 参数 ─────────────────────────────────────────────────────────
 let level = "L1";

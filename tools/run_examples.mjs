@@ -27,11 +27,18 @@ import { promisify } from "node:util";
 import { readFileSync, readdirSync, existsSync, mkdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { cpus } from "node:os";
+import { ensureMsvcEnv } from "./msvc_env.mjs";
 
 const pExecFile = promisify(execFile);
 const ROOT = resolve(new URL("..", import.meta.url).pathname.replace(/^\/([A-Za-z]):/, "$1:"));
 const EX = join(ROOT, "examples");
 const RUNTIME = join(ROOT, "runtime");
+
+// 自动注入 LIB+INCLUDE，使 C 后端 clang 编译能找到系统头/库（详见 tools/msvc_env.mjs）。
+{
+    const s = ensureMsvcEnv();
+    if (s) console.error(`[env] ${s}`);
+}
 
 // ── 参数 ─────────────────────────────────────────────────────────
 let mode = "dbg";

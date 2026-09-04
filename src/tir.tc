@@ -1,0 +1,914 @@
+// ══════════════════════════════════════════════════════════════════
+// src/tir.tc — TIR 后端桥（compiler-pipeline-design.md §4.4 / tir-design.md）
+//
+// 职责：在 sema(+单态化+CTFE) 之后、codegen_c/codegen_ll 之前，把已擦除类型的
+// 编译单元降级为「类型擦除·文件级·线性」的 TIR（memory-first）。本模块是新增的
+// 加性层：旧 C/LLVM 后端完全不动，本模块只被 `tc emit-tir` 命令消费。
+//
+// 本文件实现：
+//   - TIR 内存结构（TIRModule / TIRType / TIRInst / TIRFunc）
+//   - 文本序列化 tir.to_text()（tir-design.md §4 规范真相源）
+//   - TD → ST 映射 tir.st_of_td()（tir-design.md §5/§7，三处偏离 LLVM）
+//   - lower_unit() 降级 pass（Stage 0 + Stage 1 子集）
+//
+// 内存表示取「扁平 TIRInst 数组」范式（tir-design.md §4.1），与 base.nodes 同构；
+// 每条指令以完整文本行存储（序列化即按行展开），Stage 4b 二进制格式在其上叠加。
+// ══════════════════════════════════════════════════════════════════
+
+@import("src.base" :: *);
+@import("src.sema" :: *);
+@import("src.lex" :: *);
+
+// ── 内存结构 ───────────────────────────────────────────────────
+pub struct TIRType {
+    name: string;   // %Name（TT 条目引用）
+    body: string;   // 字段 ST 列表文本，如 "f0: i64, f1: i64"
+}
+
+pub struct TIRInst {
+    text: string;       // 完整指令文本（不含前导缩进）
+    is_comment: bool;   // true → 作为注释行（不支持构造的兜底）
+    line: u64;          // 源锚点行（诊断用）
+}
+
+pub struct TIRFunc {
+    name: string;        // @name（不含 @）
+    params: []string;    // "$p: ST" 文本列表
+    ret_st: string;      // 返回存储类型
+    body: []TIRInst;     // 线性指令数组
+    is_extern: bool;
+    is_kernel: bool;
+}
+
+pub struct TIRModule {
+    mod: string;         // 来源模块名（去 .tc）
+    source: string;      // 源文件路径
+    types: []TIRType;    // TT 类型表
+    strings: []string;   // 字符串表
+    funcs: []TIRFunc;    // 函数 + extern 声明
+}
+
+// ── 模块级状态 ─────────────────────────────────────────────────
+pub var g_mod: TIRModule;
+pub var g_cur_func: TIRFunc;
+pub var g_cur_line: u64;
+pub var g_term: bool = false;       // 当前基本块是否已终止（ret/br 之后不再发射指令）
+
+pub var g_tmpc: i64;             // 临时 slot 计数（$tN）
+pub var g_lblc: i64;             // 基本块标签计数（@LN）
+pub var g_slotc: i64;            // 具名局部 slot 唯一化计数
+
+pub var g_local_names: []string; // 与下面两个并行：局部名 → slot / ST
+pub var g_local_slots: []string;
+pub var g_local_sts: []string;
+
+// ══════════════════════════════════════════════════════════════════
+// 基础工具
+// ══════════════════════════════════════════════════════════════════
+
+pub fn tir_reset() void {
+    var zt: []TIRType = [];
+    var zs: []string = [];
+    var zf: []TIRFunc = [];
+    g_mod = TIRModule{ mod: "", source: "", types: zt, strings: zs, funcs: zf };
+    var zp: []string = [];
+    var zb: []TIRInst = [];
+    g_cur_func = TIRFunc{ name: "", params: zp, ret_st: "void", body: zb, is_extern: false, is_kernel: false };
+    g_tmpc = 0;
+    g_lblc = 0;
+    g_slotc = 0;
+    var zln: []string = [];
+    g_local_names = zln;
+    var zls: []string = [];
+    g_local_slots = zls;
+    var zlt: []string = [];
+    g_local_sts = zlt;
+}
+
+pub fn tir_tmp() string {
+    var v: i64 = g_tmpc;
+    g_tmpc = v + 1;
+    return base.sb_cat2("$t", base.i2s(v));
+}
+
+pub fn tir_lbl(p: string) string {
+    var v: i64 = g_lblc;
+    g_lblc = v + 1;
+    return base.sb_cat2("@L", base.sb_cat2(p, base.i2s(v)));
+}
+
+pub fn tir_line(text: string) void {
+    if (g_term) { return; }   // 终止符之后当前块不再发射（避免 ret 后出现死指令）
+    append(g_cur_func.body, TIRInst{ text: text, is_comment: false, line: g_cur_line });
+    // 终止符（ret / br / br_cond）之后当前块终止
+    if (str_len(text) >= 2 && str_slice(text, 0, 2) == "br") { g_term = true; }
+    else if (str_len(text) >= 3 && str_slice(text, 0, 3) == "ret") { g_term = true; }
+}
+
+pub fn tir_cmt(text: string) void {
+    if (g_term) { return; }
+    append(g_cur_func.body, TIRInst{ text: text, is_comment: true, line: g_cur_line });
+}
+
+pub fn tir_block(label: string) void {
+    g_term = false;   // 进入新块：重置终止状态
+    tir_line(base.sb_cat2("block ", label));
+}
+
+// 小写标量类型名 → 带符号性的 ST（tir-design.md §5.1 偏离 1）
+pub fn tir_scalar_st(name: string) string {
+    if (name == "i8") { return "i8"; }
+    if (name == "u8") { return "u8"; }
+    if (name == "i16") { return "i16"; }
+    if (name == "u16") { return "u16"; }
+    if (name == "i32") { return "i32"; }
+    if (name == "u32") { return "u32"; }
+    if (name == "i64") { return "i64"; }
+    if (name == "u64") { return "u64"; }
+    if (name == "f32") { return "f32"; }
+    if (name == "f64") { return "f64"; }
+    if (name == "bool") { return "i8"; }     // 存储型 i8（tir-design.md §5.2）
+    if (name == "atom" || name == "fid") { return "u64"; }
+    if (name == "char") { return "i8"; }
+    return "i64";
+}
+
+// TD → ST 映射（tir-design.md §7，对齐 ll_td 但输出 TIR 记号）
+pub fn tir_st_of_td(td: i64) string {
+    if (td < 0) { return "i64"; }
+    var t: TD = sema.tds[td];
+    if (t.cat == "string" || t.cat == "bytes") { return "%TStr"; }
+    if (t.cat == "pointer") {
+        if (t.memspace > 0) { return "i64"; }   // 设备指针句柄（不透明 i64）
+        return base.sb_cat2("ptr<", tir_st_of_td(t.elem));
+    }
+    if (t.cat == "slice") { return "%TSlice"; }
+    if (t.cat == "array") {
+        var an: i64 = t.alen;
+        if (an < 0) { an = 0; }
+        return base.sb_cat5("arr<", tir_st_of_td(t.elem), " x ", base.i2s(an), ">");
+    }
+    if (t.cat == "vector") {
+        var vln: i64 = t.alen;
+        if (vln < 1) { vln = 1; }
+        return base.sb_cat5("vec<", tir_st_of_td(t.elem), " x ", base.i2s(vln), ">");
+    }
+    if (t.cat == "map") { return "ptr<void>"; }
+    if (t.cat == "optional") { return base.sb_cat2("ptr<", tir_st_of_td(t.elem)); }  // Stage 1 opt.boxed
+    if (t.cat == "sym") {
+        if (t.alen == 16) { return "u16"; }
+        return "u32";
+    }
+    if (t.cat == "typeinfo" || t.cat == "fieldinfo") { return "ptr<void>"; }
+    if (t.cat == "func") { return "ptr<void>"; }
+    if (t.cat == "void") { return "void"; }
+    if (t.cat == "scalar") {
+        if (t.name == "") { return "i64"; }
+        return tir_scalar_st(t.name);
+    }
+    if (t.cat == "named") {
+        if (t.name == "") { return "ptr<void>"; }
+        return base.sb_cat2("%", t.name);    // 具名聚合 → %Name（偏离 3）
+    }
+    return "i64";
+}
+
+pub fn tir_strip_pct(s: string) string {
+    if (str_len(s) > 0 && s[0] == 37) { return str_slice(s, 1, str_len(s)); }
+    return s;
+}
+
+pub fn tir_expr_st(e: i64) string {
+    return tir_st_of_td(sema.resolve_type_desc(e));
+}
+
+// ══════════════════════════════════════════════════════════════════
+// 局部符号表
+// ══════════════════════════════════════════════════════════════════
+
+pub fn tir_find_local_idx(name: string) i64 {
+    var n: i64 = slice_len(g_local_names) as i64;
+    var i: i64 = n - 1;
+    while (i >= 0) {
+        if (g_local_names[i] == name) { return i; }
+        i = i - 1;
+    }
+    return -1;
+}
+
+pub fn tir_new_named_slot(st: string, name: string) string {
+    var slot: string = base.sb_cat2("$", name);
+    var idx: i64 = tir_find_local_idx(name);
+    if (idx >= 0) {
+        // 同作用域重名（shadowing）：唯一化 slot 名，避免文本歧义
+        slot = base.sb_cat4("$", name, "__", base.i2s(g_slotc));
+        g_slotc = g_slotc + 1;
+    }
+    append(g_local_names, name);
+    append(g_local_slots, slot);
+    append(g_local_sts, st);
+    tir_line(base.sb_cat4("slot ", st, " ", slot));
+    return slot;
+}
+
+// ══════════════════════════════════════════════════════════════════
+// TT 类型表构建
+// ══════════════════════════════════════════════════════════════════
+
+pub fn tir_add_std_types() void {
+    append(g_mod.types, TIRType{ name: "%TStr", body: "f0: ptr<i8>, f1: i64" });
+    append(g_mod.types, TIRType{ name: "%TSlice", body: "f0: ptr<void>, f1: i64, f2: i64, f3: i64" });
+    append(g_mod.types, TIRType{ name: "%TClosure", body: "f0: ptr<void>, f1: ptr<void>" });
+}
+
+// 字段 ST：尽力从字段类型节点解析（非标量退化为 i64；TT 可读性为主，顺序才关键）
+pub fn tir_field_st(structname: string, fieldname: string) string {
+    var fh: i64 = sema.find_struct_fields(structname);
+    if (fh < 0) { return "i64"; }
+    var c: i64 = fh;
+    while (c >= 0) {
+        var k: Child = base.kids[c];
+        var f: Node = base.nodes[k.val];
+        if (f.sa == fieldname) {
+            if (f.na >= 0) {
+                var ft: i64 = sema.resolve_type_desc(f.na);
+                if (ft >= 0) { return tir_st_of_td(ft); }
+            }
+            return "i64";
+        }
+        c = k.next;
+    }
+    return "i64";
+}
+
+pub fn tir_field_index(structname: string, fieldname: string) i64 {
+    var fh: i64 = sema.find_struct_fields(structname);
+    if (fh < 0) { return 0; }
+    var c: i64 = fh;
+    var idx: i64 = 0;
+    while (c >= 0) {
+        var k: Child = base.kids[c];
+        var f: Node = base.nodes[k.val];
+        if (f.sa == fieldname) { return idx; }
+        idx = idx + 1;
+        c = k.next;
+    }
+    return 0;
+}
+
+pub fn tir_add_struct_tt(name: string, field_head: i64) void {
+    var sb: StringBuilder = sb_new();
+    var c: i64 = field_head;
+    var first: bool = true;
+    while (c >= 0) {
+        var k: Child = base.kids[c];
+        var f: Node = base.nodes[k.val];
+        var fst: string = "i64";
+        if (f.na >= 0) {
+            var ft: i64 = sema.resolve_type_desc(f.na);
+            if (ft >= 0) { fst = tir_st_of_td(ft); }
+        }
+        if (first == false) { sb_append_str(sb, ", "); }
+        sb_append_str(sb, base.sb_cat2(f.sa, ": "));
+        sb_append_str(sb, fst);
+        first = false;
+        c = k.next;
+    }
+    append(g_mod.types, TIRType{ name: base.sb_cat2("%", name), body: sb_to_str(sb) });
+}
+
+pub fn tir_add_variant_tt(name: string) void {
+    // variant 擦除为 { i8 tag, <data...> }；Stage 1 仅登记 %Name 占位（data 布局后续补全）
+    append(g_mod.types, TIRType{ name: base.sb_cat2("%", name), body: "f0: i8" });
+}
+
+pub fn tir_add_union_tt(name: string) void {
+    // union 擦除为 { i8 tag, <max-member ST> }；Stage 1 仅登记 %Name 占位
+    append(g_mod.types, TIRType{ name: base.sb_cat2("%", name), body: "f0: i8" });
+}
+
+// ══════════════════════════════════════════════════════════════════
+// 顶层降级入口
+// ══════════════════════════════════════════════════════════════════
+
+pub fn lower_unit(mod: string, source: string) void {
+    tir_reset();
+    g_mod.mod = mod;
+    g_mod.source = source;
+    tir_add_std_types();
+
+    var n: i64 = slice_len(lex.decl_list) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        var d: i64 = lex.decl_list[i];
+        var dn: Node = base.nodes[d];
+        if (dn.kind == "StructDecl") { tir_add_struct_tt(dn.sa, dn.lb); }
+        else if (dn.kind == "VariantDecl") { tir_add_variant_tt(dn.sa); }
+        else if (dn.kind == "UnionDecl") { tir_add_union_tt(dn.sa); }
+        i = i + 1;
+    }
+
+    var j: i64 = 0;
+    while (j < n) {
+        var d: i64 = lex.decl_list[j];
+        var dn: Node = base.nodes[d];
+        if (dn.kind == "FuncDecl") {
+            if (sema.func_is_generic(d) == false && dn.bf == false) {
+                if (lex.in_link_libs(base.g_node_mod[d])) {
+                    if (dn.bc) { tir_emit_extern(d); }
+                } else if (dn.ba) {
+                    tir_emit_extern(d);
+                } else {
+                    tir_lower_func(d);
+                }
+            }
+        }
+        j = j + 1;
+    }
+}
+
+pub fn tir_emit_extern(d: i64) void {
+    var n: Node = base.nodes[d];
+    var ep: []string = [];
+    var eb: []TIRInst = [];
+    g_cur_func = TIRFunc{ name: n.sa, ret_st: tir_st_of_td(tir_func_ret_td(d)), params: ep, body: eb, is_extern: true, is_kernel: false };
+    var c: i64 = n.lb;
+    while (c >= 0) {
+        var k: Child = base.kids[c];
+        var p: Node = base.nodes[k.val];
+        var pst: string = tir_st_of_td(sema.resolve_type_desc(p.na));
+        append(g_cur_func.params, base.sb_cat4("$", p.sa, ": ", pst));
+        c = k.next;
+    }
+    append(g_mod.funcs, g_cur_func);
+}
+
+pub fn tir_func_ret_td(d: i64) i64 {
+    // FuncDecl 的返回类型 desc 存于 n.la 链之后的类型信息；复用 resolve_type_desc 取函数返回。
+    // 现有实现中函数返回类型在 sema 通过 ti 记录，这里用 fn 签名 td 解析：
+    var n: Node = base.nodes[d];
+    // n.na 通常为返回类型 desc 节点（见 mk_FuncDecl 布局）；退回用 resolve_type_desc(n.la 首个 child 的父)
+    if (n.na >= 0) {
+        var rt: i64 = sema.resolve_type_desc(n.na);
+        if (rt >= 0) { return rt; }
+    }
+    return sema.resolve_type_desc(d);
+}
+
+pub fn tir_lower_func(d: i64) void {
+    var n: Node = base.nodes[d];
+    var fp: []string = [];
+    var fb: []TIRInst = [];
+    g_cur_func = TIRFunc{ name: n.sa, ret_st: tir_st_of_td(tir_func_ret_td(d)), params: fp, body: fb, is_extern: false, is_kernel: false };
+    var fln: []string = [];
+    g_local_names = fln;
+    var fls: []string = [];
+    g_local_slots = fls;
+    var flt: []string = [];
+    g_local_sts = flt;
+    g_slotc = 0;
+    g_term = false;
+
+    // 参数：以 $name 作预填充 slot（memory-first：参数即本地 slot）
+    var c: i64 = n.lb;
+    while (c >= 0) {
+        var k: Child = base.kids[c];
+        var p: Node = base.nodes[k.val];
+        var pst: string = tir_st_of_td(sema.resolve_type_desc(p.na));
+        var pslot: string = base.sb_cat2("$", p.sa);
+        append(g_cur_func.params, base.sb_cat4(pslot, ": ", pst, ""));
+        append(g_local_names, p.sa);
+        append(g_local_slots, pslot);
+        append(g_local_sts, pst);
+        tir_line(base.sb_cat4("slot ", pst, " ", pslot));
+        c = k.next;
+    }
+
+    if (n.lc > -2) {
+        var b: i64 = n.lc;
+        while (b >= 0) {
+            var bk: Child = base.kids[b];
+            tir_emit_stmt(bk.val);
+            b = bk.next;
+        }
+    }
+
+    // 函数尾兜底返回（无显式 return 的路径）
+    if (g_cur_func.ret_st == "void") {
+        tir_line("ret.void");
+    } else {
+        var z: string = tir_tmp();
+        tir_line(base.sb_cat5("const ", g_cur_func.ret_st, " ", z, " 0"));
+        tir_line(base.sb_cat4("ret ", g_cur_func.ret_st, " ", z));
+    }
+    append(g_mod.funcs, g_cur_func);
+}
+
+// ══════════════════════════════════════════════════════════════════
+// 语句发射（dispatch on node.kind）
+// ══════════════════════════════════════════════════════════════════
+
+pub fn tir_emit_stmt(sid: i64) void {
+    g_cur_line = base.nodes[sid].ln;
+    var n: Node = base.nodes[sid];
+    var kd: string = n.kind;
+    if (g_term) { return; }   // 当前块已终止：后续语句均为死代码，跳过
+
+    if (kd == "var_decl") {
+        var st: string = "i64";
+        if (n.na >= 0) { var t: i64 = sema.resolve_type_desc(n.na); if (t >= 0) { st = tir_st_of_td(t); } }
+        var slot: string = tir_new_named_slot(st, n.sa);
+        if (n.nb >= 0) {
+            var init: string = tir_emit_expr(n.nb);
+            tir_line(base.sb_cat4("store ", init, " ", slot));
+        }
+        return;
+    }
+    if (kd == "expr") {
+        var _x: string = tir_emit_expr(n.na);
+        return;
+    }
+    if (kd == "if") { tir_emit_if(n); return; }
+    if (kd == "for") { tir_emit_for(n); return; }
+    if (kd == "while") { tir_emit_while(n); return; }
+    if (kd == "block") {
+        var c: i64 = n.la;
+        while (c >= 0) {
+            var k: Child = base.kids[c];
+            tir_emit_stmt(k.val);
+            c = k.next;
+        }
+        return;
+    }
+    if (kd == "comptime_block") {
+        var c: i64 = n.la;
+        while (c >= 0) {
+            var k: Child = base.kids[c];
+            tir_emit_stmt(k.val);
+            c = k.next;
+        }
+        return;
+    }
+    if (kd == "return") {
+        if (n.na >= 0) {
+            var s: string = tir_emit_expr(n.na);
+            tir_line(base.sb_cat4("ret ", g_cur_func.ret_st, " ", s));
+        } else {
+            tir_line("ret.void");
+        }
+        return;
+    }
+    if (kd == "assignment" || kd == "assign") { tir_emit_assign(n); return; }
+    if (kd == "defer") { tir_cmt("defer (unsupported in Stage 1)"); return; }
+    if (kd == "match") { tir_cmt("match (unsupported in Stage 1)"); return; }
+    if (kd == "break") { tir_cmt("break (unsupported in Stage 1)"); return; }
+    if (kd == "continue") { tir_cmt("continue (unsupported in Stage 1)"); return; }
+    tir_cmt(base.sb_cat3("unsupported stmt: ", kd, ""));
+}
+
+pub fn tir_emit_if(n: Node) void {
+    var cond: string = tir_emit_expr(n.na);
+    var thenL: string = tir_lbl("if.t");
+    var endL: string = tir_lbl("if.e");
+    var has_else: bool = n.lb > -2;
+    var elseL: string = endL;
+    if (has_else) { elseL = tir_lbl("if.f"); }
+    tir_line(base.sb_cat6("br_cond ", cond, " ", thenL, " ", elseL));
+    tir_block(thenL);
+    var tb: i64 = n.la;
+    while (tb >= 0) {
+        tir_emit_stmt(base.kids[tb].val);
+        tb = base.kids[tb].next;
+    }
+    tir_line(base.sb_cat3("br ", endL, ""));
+    if (has_else) {
+        tir_block(elseL);
+        var eb: i64 = n.lb;
+        while (eb >= 0) {
+            tir_emit_stmt(base.kids[eb].val);
+            eb = base.kids[eb].next;
+        }
+        tir_line(base.sb_cat3("br ", endL, ""));
+    }
+    tir_block(endL);
+}
+
+pub fn tir_emit_for(n: Node) void {
+    if (n.na >= 0) { tir_emit_stmt(n.na); }    // 初始化（通常 var_decl）
+    var headL: string = tir_lbl("for.h");
+    var bodyL: string = tir_lbl("for.b");
+    var endL: string = tir_lbl("for.e");
+    tir_line(base.sb_cat3("br ", headL, ""));
+    tir_block(headL);
+    if (n.nb >= 0) {
+        var cond: string = tir_emit_expr(n.nb);
+        tir_line(base.sb_cat6("br_cond ", cond, " ", bodyL, " ", endL));
+    } else {
+        tir_line(base.sb_cat3("br ", bodyL, ""));
+    }
+    tir_block(bodyL);
+    var bc: i64 = n.la;
+    while (bc >= 0) {
+        tir_emit_stmt(base.kids[bc].val);
+        bc = base.kids[bc].next;
+    }
+    if (n.nc >= 0) { tir_emit_stmt(n.nc); }     // 增量（通常 assignment）
+    tir_line(base.sb_cat3("br ", headL, ""));
+    tir_block(endL);
+}
+
+pub fn tir_emit_while(n: Node) void {
+    var headL: string = tir_lbl("while.h");
+    var bodyL: string = tir_lbl("while.b");
+    var endL: string = tir_lbl("while.e");
+    tir_line(base.sb_cat3("br ", headL, ""));
+    tir_block(headL);
+    var cond: string = tir_emit_expr(n.na);
+    tir_line(base.sb_cat6("br_cond ", cond, " ", bodyL, " ", endL));
+    tir_block(bodyL);
+    var bc: i64 = n.la;
+    while (bc >= 0) {
+        tir_emit_stmt(base.kids[bc].val);
+        bc = base.kids[bc].next;
+    }
+    tir_line(base.sb_cat3("br ", headL, ""));
+    tir_block(endL);
+}
+
+pub fn tir_emit_assign(n: Node) string {
+    var op: string = n.sa;
+    if (op == "=") {
+        var rhs: string = tir_emit_expr(n.nb);
+        var lhs: Node = base.nodes[n.na];
+        if (lhs.kind == "ident") {
+            var idx: i64 = tir_find_local_idx(lhs.sa);
+            if (idx >= 0) {
+                tir_line(base.sb_cat4("store ", rhs, " ", g_local_slots[idx]));
+                return rhs;
+            } else {
+                tir_cmt(base.sb_cat3("assign to global: ", lhs.sa, " (unsupported in Stage 1)"));
+            }
+        } else if (lhs.kind == "member") {
+            var faddr: string = tir_member_addr(lhs);
+            if (faddr != "") {
+                tir_line(base.sb_cat4("store ", rhs, " ", faddr));
+                return rhs;
+            } else {
+                tir_cmt("assign to member (unsupported base)");
+            }
+        } else if (lhs.kind == "index") {
+            tir_cmt("assign to index (unsupported in Stage 1)");
+        } else {
+            tir_cmt(base.sb_cat3("unsupported assign lhs: ", lhs.kind, ""));
+        }
+        var z: string = tir_tmp();
+        tir_line(base.sb_cat4("const.i64 ", z, " 0", ""));
+        return z;
+    }
+    // 复合赋值：仅支持 ident 左值标量
+    var baseop: string = str_slice(op, 0, str_len(op) - 1);
+    var lhs: Node = base.nodes[n.na];
+    if (lhs.kind == "ident") {
+        var idx: i64 = tir_find_local_idx(lhs.sa);
+        if (idx >= 0) {
+            var lst: string = g_local_sts[idx];
+            var cur: string = tir_tmp();
+            tir_line(base.sb_cat6("load ", lst, " ", cur, " ", g_local_slots[idx]));
+            var rs: string = tir_emit_expr(n.nb);
+            var dst: string = tir_tmp();
+            tir_line(base.sb_cat7(tir_binop(baseop, lst), " ", dst, " ", cur, " ", rs));
+            tir_line(base.sb_cat4("store ", dst, " ", g_local_slots[idx]));
+            return dst;
+        }
+    }
+    tir_cmt(base.sb_cat3("unsupported compound assign: ", op, ""));
+    var z: string = tir_tmp();
+    tir_line(base.sb_cat4("const.i64 ", z, " 0", ""));
+    return z;
+}
+
+// ══════════════════════════════════════════════════════════════════
+// 表达式发射：返回承载值的 slot（memory-first）
+// ══════════════════════════════════════════════════════════════════
+
+pub fn tir_emit_expr(e: i64) string {
+    g_cur_line = base.nodes[e].ln;
+    var n: Node = base.nodes[e];
+    var kd: string = n.kind;
+
+    if (kd == "assign" || kd == "assignment") { return tir_emit_assign(n); }
+    if (kd == "int") {
+        var st: string = tir_expr_st(e);
+        var d: string = tir_tmp();
+        tir_line(base.sb_cat6("const ", st, " ", d, " ", n.sa));
+        return d;
+    }
+    if (kd == "float") {
+        var st: string = tir_expr_st(e);
+        var d: string = tir_tmp();
+        tir_line(base.sb_cat6("const ", st, " ", d, " ", n.sa));
+        return d;
+    }
+    if (kd == "string") {
+        var id: i64 = slice_len(g_mod.strings) as i64;
+        append(g_mod.strings, n.sa);
+        var d: string = tir_tmp();
+        tir_line(base.sb_cat4("const.str ", d, " ", base.i2s(id)));
+        return d;
+    }
+    if (kd == "bool") {
+        var d: string = tir_tmp();
+        if (n.ba) { tir_line(base.sb_cat3("const.i8 ", d, " 1")); }
+        else { tir_line(base.sb_cat3("const.i8 ", d, " 0")); }
+        return d;
+    }
+    if (kd == "null" || kd == "opt_none") {
+        var d: string = tir_tmp();
+        tir_line(base.sb_cat3("const.ptr.null ptr<void> ", d, ""));
+        return d;
+    }
+    if (kd == "ident") {
+        var idx: i64 = tir_find_local_idx(n.sa);
+        if (idx >= 0) { return g_local_slots[idx]; }
+        // 全局符号：Stage 1 直接引用 @name（聚合按地址、标量按值，调用方处理）
+        return base.sb_cat2("@", n.sa);
+    }
+    if (kd == "paren" || kd == "comptime") { return tir_emit_expr(n.na); }
+    if (kd == "binary") { return tir_emit_binary(n); }
+    if (kd == "unary") { return tir_emit_unary(n); }
+    if (kd == "call") { return tir_emit_call(e); }
+    if (kd == "member") { return tir_member_read(n); }
+    if (kd == "cast") { return tir_emit_cast(n); }
+    if (kd == "struct_lit" || kd == "struct") { return tir_emit_struct_lit(e); }
+    // 兜底：不支持的表达式 → 零 slot，绝不崩溃
+    tir_cmt(base.sb_cat3("unsupported expr: ", kd, ""));
+    var z: string = tir_tmp();
+    tir_line(base.sb_cat4("const.i64 ", z, " 0", ""));
+    return z;
+}
+
+pub fn tir_emit_binary(n: Node) string {
+    var ls: string = tir_emit_expr(n.na);
+    var rs: string = tir_emit_expr(n.nb);
+    var ost: string = tir_expr_st(n.na);
+    var d: string = tir_tmp();
+    tir_line(base.sb_cat7(tir_binop(n.sa, ost), " ", d, " ", ls, " ", rs));
+    return d;
+}
+
+pub fn tir_binop(op: string, st: string) string {
+    if (op == "+") { return base.sb_cat2("add.", st); }
+    if (op == "-") { return base.sb_cat2("sub.", st); }
+    if (op == "*") { return base.sb_cat2("mul.", st); }
+    if (op == "/") { return base.sb_cat2(tir_divop(st), st); }
+    if (op == "%") { return base.sb_cat2(tir_remop(st), st); }
+    if (op == "&") { return "and"; }
+    if (op == "|") { return "or"; }
+    if (op == "^") { return "xor"; }
+    if (op == "<<") { return "shl"; }
+    if (op == ">>") { return "ashr"; }
+    if (op == "==") { return base.sb_cat2("eq.", st); }
+    if (op == "!=") { return base.sb_cat2("ne.", st); }
+    if (op == "<") { return base.sb_cat2(tir_cmpop(op, st), st); }
+    if (op == "<=") { return base.sb_cat2(tir_cmpop("<=", st), st); }
+    if (op == ">") { return base.sb_cat2(tir_cmpop(">", st), st); }
+    if (op == ">=") { return base.sb_cat2(tir_cmpop(">=", st), st); }
+    return "unsupported_binop";
+}
+
+pub fn tir_divop(st: string) string {
+    if (str_len(st) > 0 && st[0] == 117) { return "udiv"; }   // 'u'
+    return "sdiv";
+}
+
+pub fn tir_remop(st: string) string {
+    if (str_len(st) > 0 && st[0] == 117) { return "urem"; }
+    return "srem";
+}
+
+pub fn tir_cmpop(op: string, st: string) string {
+    var uns: bool = false;
+    if (str_len(st) > 0 && st[0] == 117) { uns = true; }
+    if (op == "<") { if (uns) { return "ult"; } return "slt"; }
+    if (op == "<=") { if (uns) { return "ule"; } return "sle"; }
+    if (op == ">") { if (uns) { return "ugt"; } return "sgt"; }
+    if (op == ">=") { if (uns) { return "uge"; } return "sge"; }
+    return "slt";
+}
+
+pub fn tir_emit_unary(n: Node) string {
+    var a: string = tir_emit_expr(n.na);
+    var st: string = tir_expr_st(n.na);
+    var d: string = tir_tmp();
+    if (n.sa == "-") {
+        tir_line(base.sb_cat6("neg.", st, " ", d, " ", a));
+        return d;
+    }
+    if (n.sa == "!") {
+        tir_line(base.sb_cat4("not.i8 ", d, " ", a));
+        return d;
+    }
+    if (n.sa == "~") {
+        tir_line(base.sb_cat8("xor.", st, " ", d, " ", a, " -1", ""));
+        return d;
+    }
+    tir_cmt(base.sb_cat3("unsupported unary: ", n.sa, ""));
+    return d;
+}
+
+pub fn tir_emit_call(e: i64) string {
+    var n: Node = base.nodes[e];
+    var callee: Node = base.nodes[n.na];
+    var cname: string = callee.sa;
+    var retst: string = tir_expr_st(e);
+    var d: string = tir_tmp();
+    var sb: StringBuilder = sb_new();
+    var first: bool = true;
+    var ac: i64 = n.la;
+    while (ac >= 0) {
+        var k: Child = base.kids[ac];
+        var aslot: string = tir_emit_expr(k.val);
+        if (first == false) { sb_append_str(sb, " "); }
+        sb_append_str(sb, aslot);
+        first = false;
+        ac = k.next;
+    }
+    tir_line(base.sb_cat7("call ", retst, " ", d, " @", cname, base.sb_cat3(" (", sb_to_str(sb), ")")));
+    return d;
+}
+
+pub fn tir_emit_cast(n: Node) string {
+    var inner: string = tir_emit_expr(n.na);
+    var inner_st: string = tir_expr_st(n.na);
+    var target_st: string = tir_st_of_td(sema.resolve_type_desc(n.nb));
+    if (inner_st == target_st) { return inner; }
+    var d: string = tir_tmp();
+    var wi: i64 = tir_width(inner_st);
+    var wt: i64 = tir_width(target_st);
+    if (wi < wt) {
+        if (str_len(inner_st) > 0 && inner_st[0] == 117) { tir_line(base.sb_cat8("zext ", target_st, " ", d, " ", inner_st, " ", inner)); }
+        else { tir_line(base.sb_cat8("sext ", target_st, " ", d, " ", inner_st, " ", inner)); }
+    } else if (wi > wt) {
+        tir_line(base.sb_cat8("trunc ", target_st, " ", d, " ", inner_st, " ", inner));
+    } else {
+        tir_line(base.sb_cat8("bitcast ", target_st, " ", d, " ", inner_st, " ", inner));
+    }
+    return d;
+}
+
+pub fn tir_width(st: string) i64 {
+    if (st == "i8" || st == "u8") { return 8; }
+    if (st == "i16" || st == "u16") { return 16; }
+    if (st == "i32" || st == "u32") { return 32; }
+    if (st == "i64" || st == "u64") { return 64; }
+    if (st == "f32") { return 32; }
+    if (st == "f64") { return 64; }
+    return 64;
+}
+
+pub fn tir_emit_struct_lit(e: i64) string {
+    var n: Node = base.nodes[e];
+    var target_st: string = tir_expr_st(e);
+    var d: string = tir_tmp();
+    var sb: StringBuilder = sb_new();
+    var first: bool = true;
+    var fc: i64 = n.la;
+    while (fc >= 0) {
+        var k: Child = base.kids[fc];
+        var fs: string = tir_emit_expr(k.val);
+        if (first == false) { sb_append_str(sb, " "); }
+        sb_append_str(sb, fs);
+        first = false;
+        fc = k.next;
+    }
+    tir_line(base.sb_cat6("struct_new ", target_st, " ", d, " (", base.sb_cat3(sb_to_str(sb), ")", "")));
+    return d;
+}
+
+// 字段地址（ptr<ST>）：用于 member 读/写
+pub fn tir_member_addr(mnode: Node) string {
+    var base_st: string = tir_expr_st(mnode.na);
+    var base_slot: string = tir_emit_expr(mnode.na);
+    var addr: string = tir_tmp();
+    tir_line(base.sb_cat6("addr_of ptr<", base_st, "> ", addr, " ", base_slot));
+    var sname: string = tir_strip_pct(base_st);
+    var fidx: i64 = tir_field_index(sname, mnode.sa);
+    var fldst: string = tir_field_st(sname, mnode.sa);
+    var faddr: string = tir_tmp();
+    tir_line(base.sb_cat8("gep ", fldst, " ", faddr, " ", addr, " ", base.i2s(fidx)));
+    return faddr;
+}
+
+pub fn tir_member_read(mnode: Node) string {
+    var base_st: string = tir_expr_st(mnode.na);
+    var faddr: string = tir_member_addr(mnode);
+    var sname: string = tir_strip_pct(base_st);
+    var fldst: string = tir_field_st(sname, mnode.sa);
+    var ld: string = tir_tmp();
+    tir_line(base.sb_cat6("load ", fldst, " ", ld, " ", faddr));
+    return ld;
+}
+
+// ══════════════════════════════════════════════════════════════════
+// 文本序列化（tir-design.md §4 / §12.1 规范真相源）
+// ══════════════════════════════════════════════════════════════════
+
+pub fn tir_esc(s: string) string {
+    var sb: StringBuilder = sb_new();
+    var i: u64 = 0;
+    var L: u64 = str_len(s);
+    while (i < L) {
+        var c: u8 = s[i];
+        if (c >= 32 && c <= 126 && c != 34 && c != 92) {
+            sb_append_char(sb, c);
+        } else {
+            sb_append_char(sb, 92);   // backslash
+            sb_append_char(sb, base.hex_digit(c / 16));
+            sb_append_char(sb, base.hex_digit(c % 16));
+        }
+        i = i + 1;
+    }
+    return sb_to_str(sb);
+}
+
+pub fn tir_to_text() string {
+    var sb: StringBuilder = sb_new();
+    sb_append_str(sb, "module \"");
+    sb_append_str(sb, g_mod.mod);
+    sb_append_str(sb, "\"\n");
+    sb_append_str(sb, "source: \"");
+    sb_append_str(sb, g_mod.source);
+    sb_append_str(sb, "\"\n\n");
+
+    sb_append_str(sb, "types:\n");
+    var ti: i64 = 0;
+    var tn: i64 = slice_len(g_mod.types) as i64;
+    while (ti < tn) {
+        var t: TIRType = g_mod.types[ti];
+        sb_append_str(sb, "  ");
+        sb_append_str(sb, t.name);
+        sb_append_str(sb, " = struct { ");
+        sb_append_str(sb, t.body);
+        sb_append_str(sb, " }\n");
+        ti = ti + 1;
+    }
+    sb_append_str(sb, "\n");
+
+    if (slice_len(g_mod.strings) > 0) {
+        sb_append_str(sb, "strings:\n");
+        var si: i64 = 0;
+        var sn: i64 = slice_len(g_mod.strings) as i64;
+        while (si < sn) {
+            sb_append_str(sb, "  ");
+            sb_append_i64(sb, si);
+            sb_append_str(sb, ": \"");
+            sb_append_str(sb, tir_esc(g_mod.strings[si]));
+            sb_append_str(sb, "\"\n");
+            si = si + 1;
+        }
+        sb_append_str(sb, "\n");
+    }
+
+    var fi: i64 = 0;
+    var fncount: i64 = slice_len(g_mod.funcs) as i64;
+    while (fi < fncount) {
+        var f: TIRFunc = g_mod.funcs[fi];
+        var head: StringBuilder = sb_new();
+        if (f.is_extern) { sb_append_str(head, "extern "); }
+        else { sb_append_str(head, "func "); }
+        sb_append_str(head, "@");
+        sb_append_str(head, f.name);
+        sb_append_str(head, "(");
+        var pi: i64 = 0;
+        var pn: i64 = slice_len(f.params) as i64;
+        while (pi < pn) {
+            if (pi > 0) { sb_append_str(head, ", "); }
+            sb_append_str(head, f.params[pi]);
+            pi = pi + 1;
+        }
+        sb_append_str(head, "): ");
+        sb_append_str(head, f.ret_st);
+        sb_append_str(sb, sb_to_str(head));
+        sb_append_str(sb, "\n");
+        if (f.is_extern == false) {
+            sb_append_str(sb, "{\n");
+            var bi: i64 = 0;
+            var bn: i64 = slice_len(f.body) as i64;
+            while (bi < bn) {
+                var inst: TIRInst = f.body[bi];
+                if (inst.is_comment) {
+                    sb_append_str(sb, "  ; ");
+                    sb_append_str(sb, inst.text);
+                } else {
+                    sb_append_str(sb, "  ");
+                    sb_append_str(sb, inst.text);
+                }
+                sb_append_str(sb, "\n");
+                bi = bi + 1;
+            }
+            sb_append_str(sb, "}\n\n");
+        }
+        fi = fi + 1;
+    }
+    return sb_to_str(sb);
+}
