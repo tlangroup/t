@@ -168,6 +168,12 @@ pub var g_vec_expect: i64 = -1;
 // 构造（标记到节点 ib，供 codegen 发射成 `[rows x [cols x T]]`）。同样是全局、递归中需显式清除。
 pub var g_tile_expect: i64 = -1;
 
+// 前导点语法的上下文期望类型（`.{...}` / `.a` 用）：var/let/const 注解、return、赋值左值、
+// 函数实参等处的「已知具名类型」会注入此处，供 `.{...}` 推断结构体名、`.a` 解析枚举·联合体变体。
+// 同样是全局、递归中需显式 save/restore（仿 g_vec_expect）。仅当注入类型为 Struct/Enum/Union
+// 时消费者才真正使用，否则忽略（不会误伤）。
+pub var g_lead_expect: i64 = -1;
+
 pub fn vec_is_pow2(x: i64) bool {
     if (x <= 0) { return false; }
     return (x & (x - 1)) == 0;
@@ -998,13 +1004,16 @@ pub fn check_call_args(e: i64, fti: i64, fname: string) void {
             // `[1,2,3,4]` 会被误判成向量 → 无谓的 T-VEC-E924 / 类型不匹配误报。
             var saved_ve4: i64 = g_vec_expect;
             var saved_te4: i64 = g_tile_expect;
+            var saved_le4: i64 = g_lead_expect;
             var pt0: i64 = tif_params[pstart + got];
             if (ti_is_vector(pt0)) { g_vec_expect = pt0; g_tile_expect = -1; }
             else if (ti_is_tile(pt0)) { g_tile_expect = pt0; g_vec_expect = -1; }
             else { g_vec_expect = -1; g_tile_expect = -1; }
+            g_lead_expect = pt0;
             var at: i64 = infer_expr(k.val);
             g_vec_expect = saved_ve4;
             g_tile_expect = saved_te4;
+            g_lead_expect = saved_le4;
             var pt: i64 = tif_params[pstart + got];
             intlit_overflow_warn(k.val, pt);
             if (tip_kind(at) != "Unknown" && ti_equal(pt, at) == false && can_cast(at, pt) == false) {
@@ -1263,10 +1272,6 @@ pub fn resolve_ti(tn: i64) i64 {
             fj0 = fj0 + 1;
         }
         return ti_func(fret, fpstart, fpc);
-    }
-    // 匿名结构体「类型」注解：FV.na 是类型节点，按字段签名合成/复用 __anon_N 后按具名 Struct 处理。
-    if (n.kind == "struct_lit" && n.sa == "") {
-        return ti_named("Struct", anon_resolve_name(tn));
     }
     return ti_mk("Unknown");
 }
@@ -4698,117 +4703,23 @@ pub fn run_device_check() void {
     }
 }
 
-// ── 匿名结构体字面量（`{ f: v, ... }`）──────────────────────────
-// 推断期按「字段名 + 字段类型签名」规范化合成具名 struct 类型（__anon_N），使结构
-// 相同的两个字面量共享同一类型（可互赋 / 比较 / 传参），并完整复用既有 struct 机制
-// （双后端发射、成员访问、type_info、cast 解析）。struct_lit 节点 sa=="" 即匿名。
-// 合成 StructDecl 注册进 global_scope（find_struct_fields / resolve_type_desc / 成员访问）
-// 并追加到 lex.decl_list（两个后端据此发射类型定义），故下游无需任何特判。
-
-pub var g_anon_sig: []string;   // 字段签名 → 合成名 的规范化表
-pub var g_anon_name: []string;
-pub var g_anon_ti: []i64;
-pub var g_anon_cnt: i64 = 0;
-
-pub fn anon_ti_sig(ti: i64) string {
-    if (ti < 0) { return "?"; }
-    var t: TI = tis[ti];
-    var k: string = t.kind;
-    if (k == "Scalar" || k == "Bytes") { return base.sb_cat2("s:", t.name); }
-    if (k == "Void" || k == "String" || k == "StringBuilder") { return base.sb_cat2("x:", k); }
-    if (k == "Named") { return base.sb_cat2("n:", t.name); }
-    if (k == "Struct") { return base.sb_cat2("S:", t.name); }
-    if (k == "Enum" || k == "Flag" || k == "FlagSet" || k == "Union" || k == "Variant") { return base.sb_cat3(k, ":", t.name); }
-    if (k == "Slice") { return base.sb_cat2("[]", anon_ti_sig(t.elem)); }
-    if (k == "Array") { return base.sb_cat4("[", base.i2s(t.alen), "]", anon_ti_sig(t.elem)); }
-    if (k == "Pointer") { return base.sb_cat2("*", anon_ti_sig(t.elem)); }
-    if (k == "Optional") { return base.sb_cat2("?", anon_ti_sig(t.elem)); }
-    if (k == "Map") { return base.sb_cat3("{}", anon_ti_sig(t.key), anon_ti_sig(t.val)); }
-    if (k == "Vector") { return base.sb_cat3("<", base.i2s(t.alen), anon_ti_sig(t.elem)); }
-    if (k == "Func") { return "func"; }
-    return base.sb_cat2("o:", k);
-}
-
-// 按字段签名（name:ti_sig;...）规范化出合成 struct 名：结构相同即同一类型（可互赋/比较/作参）。
-// 首次出现的签名新建 __anon_N 并注册进 global_scope（符号表查字段 / 成员访问）+
-// lex.decl_list（两后端据此发射类型定义），下游无需任何特判。
-pub fn anon_canonicalize(names: []string, tis: []i64) string {
-    var sig: StringBuilder = sb_new();
-    var i: i64 = 0;
-    var first: bool = true;
-    while (i < slice_len(names)) {
-        if (first == false) { sb_append_str(sig, ";"); }
-        first = false;
-        sb_append_str(sig, names[i]);
-        sb_append_str(sig, ":");
-        sb_append_str(sig, anon_ti_sig(tis[i]));
-        i = i + 1;
-    }
-    var ssig: string = sb_to_str(sig);
-    var m: i64 = slice_len(g_anon_sig) as i64;
-    var j: i64 = 0;
-    while (j < m) {
-        if (g_anon_sig[j] == ssig) {
-            return g_anon_name[j];
-        }
-        j = j + 1;
-    }
-    var name: string = base.sb_cat2("__anon_", base.i2s(g_anon_cnt));
-    g_anon_cnt = g_anon_cnt + 1;
-    var fhead: i64 = -1;
-    var ftail: i64 = -1;
-    var k: i64 = 0;
-    while (k < slice_len(names)) {
-        var tn: i64 = ti_to_type_node(tis[k]);
-        var fid: i64 = base.mk_F(names[k], -1, tn, -1, -1);
-        ftail = base.list_push(fhead, ftail, fid);
-        if (fhead < 0) { fhead = ftail; }
-        k = k + 1;
-    }
-    var sd: i64 = base.mk_StructDecl(name, "default", "", false, false, -1, fhead, -1);
-    sym_define(global_scope, name, "type", ti_named("Struct", name), sd);
-    append(lex.decl_list, sd);
-    append(g_anon_sig, ssig);
-    append(g_anon_name, name);
-    append(g_anon_ti, ti_named("Struct", name));
-    return name;
-}
-
-// 类型注解位的匿名 struct（struct_lit{sa=="", FV.na=类型节点}）→ 合成名。
-// 与值位字面量共用同一规范化表，故注解与字面量结构相同即同一类型。
-pub fn anon_resolve_name(tn: i64) string {
-    var n: Node = base.nodes[tn];
-    var names: []string;
-    var tis: []i64;
-    var c: i64 = n.la;
+// ── 前导点语法的上下文辅助 ────────────────────────────────────
+// 查具名结构体某字段的类型 TI（按名在 StructDecl 字段链 sd.lb 中匹配）。供 `.{...}` 推断
+// 嵌套结构体字段、`.a` 解析 self 字段类型。查不到返回 -1（调用方退化为 Unknown / 报错）。
+pub fn struct_field_ti(sname: string, fname: string) i64 {
+    var si: i64 = sym_lookup(global_scope, sname);
+    if (si < 0) { return -1; }
+    var s: Sym = syms[si];
+    if (s.decl < 0) { return -1; }
+    var sd: Node = base.nodes[s.decl];
+    if (sd.kind != "StructDecl") { return -1; }
+    var c: i64 = sd.lb;
     while (c >= 0) {
-        var fv: Node = base.nodes[base.kids[c].val];
-        append(names, fv.sa);
-        append(tis, resolve_ti(fv.na));
+        var f: Node = base.nodes[base.kids[c].val];
+        if (f.sa == fname) { return resolve_ti(f.na); }
         c = base.kids[c].next;
     }
-    return anon_canonicalize(names, tis);
-}
-
-// 值位匿名结构体字面量：把每个字段「值」推成 TI，再走统一规范化。
-pub fn infer_anon_struct(e: i64) i64 {
-    var n: Node = base.nodes[e];
-    if (n.sa != "") {
-        return ti_named("Struct", n.sa);   // 已推断过 → 幂等
-    }
-    var names: []string;
-    var tis: []i64;
-    var c: i64 = n.la;
-    while (c >= 0) {
-        var fv: Node = base.nodes[base.kids[c].val];
-        append(names, fv.sa);
-        append(tis, infer_expr(fv.na));
-        c = base.kids[c].next;
-    }
-    var name: string = anon_canonicalize(names, tis);
-    n.sa = name;
-    slice_set(base.nodes, e, n);
-    return ti_named("Struct", name);
+    return -1;
 }
 
 pub fn infer_expr(e: i64) i64 {
@@ -5581,12 +5492,16 @@ pub fn infer_expr(e: i64) i64 {
         var atl: i64 = infer_expr(n.na);
         var saved_ve0: i64 = g_vec_expect;
         var saved_te0: i64 = g_tile_expect;
+        var saved_le0: i64 = g_lead_expect;
         if (ti_is_vector(atl)) { g_vec_expect = atl; g_tile_expect = -1; }
         else if (ti_is_tile(atl)) { g_tile_expect = atl; g_vec_expect = -1; }
         else { g_vec_expect = -1; g_tile_expect = -1; }
+        // 前导点 `.{...}` 右侧：按 LHS 类型注入上下文（与 var_decl/return/assignment 一致）
+        g_lead_expect = atl;
         var atr: i64 = infer_expr(n.nb);
         g_vec_expect = saved_ve0;
         g_tile_expect = saved_te0;
+        g_lead_expect = saved_le0;
         // 解引用赋值 `*r = v`：仅当 r 为可变绑定（var）时允许，否则就是只读引用。
         if (base.nodes[n.na].kind == "deref") {
             var dop: i64 = base.nodes[n.na].na;
@@ -5631,7 +5546,7 @@ pub fn infer_expr(e: i64) i64 {
         // 实现取「归一化」而非「另起一套」——就地把 receiver 挪成第 0 个实参、callee 换成
         // 裸 `format`，随后交给同一个 desugar_format_call。两种写法因此共享同一份模板文法、
         // 同一组诊断码，永远不会各自漂移。
-        if (cn.kind == "member" && cn.sa == "format") {
+        if (cn.kind == "member" && cn.na >= 0 && cn.sa == "format") {
             var mfa_recv: i64 = cn.na;
             var mfa_rn: Node = base.nodes[mfa_recv];
             if (mfa_rn.kind == "string") {
@@ -5663,7 +5578,7 @@ pub fn infer_expr(e: i64) i64 {
         // Device 子系统 host 内建（docs/compiler/device-design.md §6 M3）：
         // device.alloc_bytes / free / h2d / d2h / launch。callee = member(device, fn)。
         // 全部以 i64 句柄（CUdeviceptr）交换设备指针，调用点用 `as dev_ptr[T]` 还原类型。
-        if (cn.kind == "member") {
+        if (cn.kind == "member" && cn.na >= 0) {
             var dbase: Node = base.nodes[cn.na];
             if (dbase.kind == "ident" && dbase.sa == "device") {
                 return infer_device_call(e, cn.sa);
@@ -5995,6 +5910,56 @@ pub fn infer_expr(e: i64) i64 {
         return ti_mk("Unknown");
     }
     if (n.kind == "member") {
+        // 前导点成员引用 `.a`：无接收者（na<0），依上下文解析。
+        if (n.lb == 1 && n.na < 0) {
+            var msa: string = n.sa;
+            // 1) 方法体内的结构体字段：隐式 self → 改写为 `self.a`（常规 receiver member），
+            //    使下游类型推断与双后端发射都走既有 `obj.field` 路径。
+            var si_self: i64 = sym_lookup(cur_scope, "self");
+            if (si_self >= 0) {
+                var sti: i64 = syms[si_self].ti;
+                var stk: string = tip_kind(sti);
+                if (stk == "Struct" || stk == "Named") {
+                    var ft: i64 = struct_field_ti(tip_name(sti), msa);
+                    if (ft >= 0) {
+                        var self_id: i64 = base.mk_ident("self", -1);
+                        n.na = self_id;
+                        n.lb = 0;
+                        slice_set(base.nodes, e, n);
+                        return ft;
+                    }
+                }
+            }
+            // 2) 枚举 / 联合体变体：期望类型为 enum/union 时，`.Variant` 即该类型的值
+            //    → 改写为 `Type.Variant`（receiver = 期望类型名）。
+            if (g_lead_expect >= 0) {
+                var ek: string = tip_kind(g_lead_expect);
+                if (ek == "Enum" || ek == "Union") {
+                    var recv_id: i64 = base.mk_ident(tip_name(g_lead_expect), -1);
+                    n.na = recv_id;
+                    n.lb = 0;
+                    slice_set(base.nodes, e, n);
+                    return g_lead_expect;
+                }
+            }
+            // 3) 模块导出项：`.foo` → 当前模块 `mangled(模块, foo)`（退化全局裸名）
+            //    → 改写为裸 ident（真实符号名），双后端按普通标识符发射。
+            var mname: string = mangled_name(g_cur_mod, msa);
+            var mi: i64 = sym_lookup(global_scope, mname);
+            if (mi < 0) { mi = sym_lookup(global_scope, msa); }
+            if (mi >= 0) {
+                n.kind = "ident";
+                n.sa = syms[mi].name;
+                n.na = -1;
+                n.lb = 0;
+                slice_set(base.nodes, e, n);
+                return syms[mi].ti;
+            }
+            parse.fc_err("T-DOT-E102",
+                base.sb_cat4("`.", msa, "` 无法按上下文解析为结构体字段 / 枚举·联合体变体 / 模块导出项",
+                    "（self / 期望类型 / 当前模块均无可匹配项）"), e);
+            return ti_mk("Unknown");
+        }
         var obt: i64 = infer_expr(n.na);
         var obk: string = tip_kind(obt);
         if (obk == "Struct" || obk == "Named") {
@@ -6230,10 +6195,32 @@ pub fn infer_expr(e: i64) i64 {
     }
 // >>> GEN:type_infer2 (generated by tools/totter.tc from out/ebnf.json -- DO NOT EDIT) >>>
     // 匿名结构体字面量（sa==""）：合成具名 struct 类型后再走既有命名 struct 路径
-    if (n.kind == "struct_lit" && n.sa == "") {
-        return infer_anon_struct(e);
-    }
     if (n.kind == "struct_lit") {
+        // 前导点 `.{...}`：省略类型名，类型由上下文（g_lead_expect）提供的具名结构体推断。
+        // 接受 Struct 与 Named 两种 TI 种类——具名结构体注解经 resolve_ti 可能落为 Named，
+        // 故统一按「期望类型名解析到 StructDecl」判定，避免漏判。
+        if (n.lb == 1 && n.sa == "") {
+            var ok: bool = false;
+            if (g_lead_expect >= 0) {
+                var exp_name: string = tip_name(g_lead_expect);
+                var si_exp: i64 = sym_lookup(global_scope, exp_name);
+                if (si_exp >= 0) {
+                    var s_exp: Sym = syms[si_exp];
+                    if (s_exp.decl >= 0) {
+                        if (base.nodes[s_exp.decl].kind == "StructDecl") {
+                            n.sa = exp_name;
+                            slice_set(base.nodes, e, n);
+                            ok = true;
+                        }
+                    }
+                }
+            }
+            if (ok == false) {
+                parse.fc_err("T-DOT-E101",
+                    "`.{...}` 需由上下文（变量注解 / 返回值 / 实参 / 赋值左值）推断出具名结构体类型", e);
+                return ti_mk("Unknown");
+            }
+        }
         // 默认填充：struct 字段有默认值(expr)但未在字面量中给出 → 合成 FV 追加进 n.la。
         // 后端以「指定符初始化器」按名映射，故追加在尾部与顺序无关，天然幂等。
         var sname: string = n.sa;
@@ -6271,6 +6258,27 @@ pub fn infer_expr(e: i64) i64 {
                 c = base.kids[c].next;
             }
             slice_set(base.nodes, e, n);
+        }
+        // 前导点嵌套：仅对「字段值是结构体字面量（struct_lit）」的字段，按字段类型回填
+        // g_lead_expect 后就地推断，使嵌套 `.{...}` 拿到正确的结构体上下文（标量/标识符字段
+        // 交由后端在发射期推断即可，避免重复推断）。
+        if (n.lb == 1 && fh >= 0) {
+            var c2: i64 = n.la;
+            while (c2 >= 0) {
+                var fv: Node = base.nodes[base.kids[c2].val];
+                var fvna: i64 = fv.na;
+                var fvsa: string = fv.sa;
+                if (base.nodes[fvna].kind == "struct_lit") {
+                    var fti: i64 = struct_field_ti(sname, fvsa);
+                    if (fti >= 0) {
+                        var saved_le: i64 = g_lead_expect;
+                        g_lead_expect = fti;
+                        infer_expr(fvna);
+                        g_lead_expect = saved_le;
+                    }
+                }
+                c2 = base.kids[c2].next;
+            }
         }
         return ti_named("Struct", n.sa);
     }
@@ -6359,12 +6367,15 @@ pub fn check_stmt(s: i64) void {
         if (n.nb >= 0) {
             var saved_ve2: i64 = g_vec_expect;
             var saved_te2: i64 = g_tile_expect;
+            var saved_le2: i64 = g_lead_expect;
             if (ti_is_vector(vt)) { g_vec_expect = vt; g_tile_expect = -1; }
             else if (ti_is_tile(vt)) { g_tile_expect = vt; g_vec_expect = -1; }
             else { g_vec_expect = -1; g_tile_expect = -1; }
+            g_lead_expect = vt;
             var it: i64 = infer_expr(n.nb);
             g_vec_expect = saved_ve2;
             g_tile_expect = saved_te2;
+            g_lead_expect = saved_le2;
             intlit_overflow_warn(n.nb, vt);
             if (tip_kind(it) != "Unknown" && ti_equal(it, vt) == false) {
                 var vk: string = tip_kind(vt);
@@ -6507,12 +6518,15 @@ pub fn check_stmt(s: i64) void {
             pipe_mark(n.na);
             var saved_ve3: i64 = g_vec_expect;
             var saved_te3: i64 = g_tile_expect;
+            var saved_le3: i64 = g_lead_expect;
             if (ti_is_vector(cur_ret)) { g_vec_expect = cur_ret; g_tile_expect = -1; }
             else if (ti_is_tile(cur_ret)) { g_tile_expect = cur_ret; g_vec_expect = -1; }
             else { g_vec_expect = -1; g_tile_expect = -1; }
+            g_lead_expect = cur_ret;
             var rt: i64 = infer_expr(n.na);
             g_vec_expect = saved_ve3;
             g_tile_expect = saved_te3;
+            g_lead_expect = saved_le3;
             // 逃逸分析（T-SEM-E764）：返回对局部变量/参数的引用 → 悬垂指针（dangling）
             if (expr_has_local_addr(n.na)) {
                 parse.fc_err("T-SEM-E764",
@@ -6563,12 +6577,15 @@ pub fn check_stmt(s: i64) void {
         pipe_mark(n.nb);
         var saved_ve1: i64 = g_vec_expect;
         var saved_te1: i64 = g_tile_expect;
+        var saved_le1: i64 = g_lead_expect;
         if (ti_is_vector(tt)) { g_vec_expect = tt; g_tile_expect = -1; }
         else if (ti_is_tile(tt)) { g_tile_expect = tt; g_vec_expect = -1; }
         else { g_vec_expect = -1; g_tile_expect = -1; }
+        g_lead_expect = tt;
         var vt2: i64 = infer_expr(n.nb);
         g_vec_expect = saved_ve1;
         g_tile_expect = saved_te1;
+        g_lead_expect = saved_le1;
         intlit_overflow_warn(n.nb, tt);
         if (tip_kind(tt) != "Unknown" && tip_kind(vt2) != "Unknown" && ti_equal(tt, vt2) == false) {
             // Sym 字段允许由字符串赋值（自动 intern）；跨池 Sym→Sym 仍报错
@@ -9011,11 +9028,6 @@ pub fn meta_eval_struct_lit(e: i64) i64 {
         c = kids[c].next;
     }
     var lit: i64 = mk_struct_lit(n.sa, h, -1);
-    // 匿名结构体字面量在编译期求值后仍需保留可解析的类型名：推断合成 __anon_N 并回填 sa，
-    // 使下游发射 / 成员访问走既有命名 struct 路径。
-    if (n.sa == "") {
-        infer_anon_struct(lit);
-    }
     return lit;
 }
 
@@ -12057,11 +12069,6 @@ pub fn resolve_type_desc(tn: i64) i64 {
             fj = fj + 1;
         }
         return td_func(fret, fpstart, fpc);
-    }
-    // 匿名结构体类型注解（TD 位）：合成 __anon_N 并以具名类型引用；字段布局由已注册进
-    // lex.decl_list 的 StructDecl 在后端发射，故此处只需按名引用该类型。
-    if (n.kind == "struct_lit" && n.sa == "") {
-        return td_named_mk("named", anon_resolve_name(tn));
     }
     return td_mk("unknown");
 }

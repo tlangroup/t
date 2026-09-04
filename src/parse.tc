@@ -199,12 +199,6 @@ pub fn is_scalar_name(name: string) bool {
 
 pub fn parse_type_inner() i64 {
     var t: string = lex.cur_t();
-    // 匿名结构体「类型」注解：`{x: Type, y: Type}`。复用 struct_lit 节点（sa=="",
-    // la = FV 链，每个 FV.na 是字段「类型」节点）；sema 的 resolve_ti / resolve_type_desc
-    // 据此按字段签名合成/复用 __anon_N 具名 struct，与值位字面量走同一规范化表。
-    if (t == "LBrace" && looks_like_struct_lit()) {
-        return parse_struct_type(-1);
-    }
     // 硬件 SIMD 向量类型 `@Vector(comptime len, BaseT)`（类型位）。
     // 类型位的 `@` 此前完全空闲（注解只在声明前，编译期内建 `@name(...)` 只在表达式位），
     // 故 `@Vector(` 无歧义。`comptime` 前缀可选，仅作文档性强调——长度必须是编译期常量。
@@ -604,33 +598,6 @@ pub fn parse_struct_lit(type_name: string, ti: i64) i64 {
     }
     expect_tok("RBrace");
     var id: i64 = base.mk_struct_lit(type_name, head, ti);
-    return id;
-}
-
-// 匿名结构体「类型」注解解析：`{name: Type, ...}` → struct_lit 节点（sa=="",
-// la = FV 链，每个 FV.na 是字段「类型」节点）。值位字面量走 parse_struct_lit（FV.na=值）。
-// 两处共用 struct_lit 节点种类，靠「出现位置 + 入口（resolve_ti / infer_expr）」区分语义。
-pub fn parse_struct_type(ti: i64) i64 {
-    lex.advance_i();
-    var head: i64 = -1;
-    var tail: i64 = -1;
-    while (lex.cur_t() != "RBrace" && lex.cur_t() != "Eof") {
-        var fname: string = expect_tok("Identifier");
-        expect_tok("Colon");
-        var ty: i64 = parse_type();
-        var fid: i64 = base.mk_FV(fname, ty, -1);
-        tail = base.list_push(head, tail, fid);
-        if (head < 0) {
-            head = tail;
-        }
-        if (lex.cur_t() == "Comma") {
-            lex.advance_i();
-        } else {
-            break;
-        }
-    }
-    expect_tok("RBrace");
-    var id: i64 = base.mk_struct_lit("", head, ti);
     return id;
 }
 
@@ -3720,12 +3687,29 @@ pub fn parse_primary() i64 {
         var ti_LBracket: i64 = lex.advance_i();
         return parse_prim_array(ti_LBracket);
     }
-    // 匿名结构体字面量：`{ f: v, ... }`（表达式位置的 `{` 此前是语法错误）。
-    // 复用 struct_lit 节点，sa 留空（""）表示匿名；sema 推断期按字段签名合成具名 struct 类型。
-    if (t == "LBrace" && looks_like_struct_lit()) {
-        // 匿名结构体字面量（值位）：复用 struct_lit 节点，sa 留空；sema 推断期合成具名 struct。
-        // LBrace 不在此预消费——parse_struct_lit 内部自行消费，保持与各具名字面量调用一致。
-        return parse_struct_lit("", -1);
+    // 前导点语法（上下文推断，v2）：
+    //   `.{ f: v, ... }` —— 省略类型名的具名结构体字面量；类型由上下文（变量注解 / 返回值 /
+    //     函数参数 / 赋值左值类型）推断。语义上仍是「已知的具名结构体」，不自动合成新类型。
+    //   `.a`            —— 上下文成员引用：结构体字段（方法体隐式 self）/ 枚举·联合体变体
+    //     （期望类型为 enum/union 时）/ 模块导出项；不再按全局/局部变量解析。
+    if (t == "Dot" && lex.peek_t(1) == "LBrace") {
+        lex.advance_i();                          // 消费 Dot
+        var id: i64 = parse_struct_lit("", -1);   // 内部消费 LBrace … RBrace
+        var sln: Node = base.nodes[id];
+        sln.lb = 1;                               // 标记 leading-dot struct literal
+        slice_set(base.nodes, id, sln);
+        return id;
+    }
+    if (t == "Dot" && lex.peek_t(1) == "Identifier") {
+        lex.advance_i();                          // 消费 Dot
+        var ti_Name: i64 = lex.advance_i();
+        var mname: string = lex.tk_v(ti_Name);
+        var id: i64 = base.mk_member(mname, -1, -1); // na=-1：无接收者
+        var mn: Node = base.nodes[id];
+        mn.lb = 1;                                // 标记 leading-dot member
+        slice_set(base.nodes, id, mn);
+        base.node_at(id, ti_Name);
+        return id;
     }
     parse_fatal(base.sb_cat2("unexpected token in expression: ", lex.cur_v()));
     return -1;
