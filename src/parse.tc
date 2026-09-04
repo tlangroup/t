@@ -509,6 +509,10 @@ pub fn parse_post_index(e: i64, ti: i64) i64 {
 // 置位点选在建 call 节点时，方法式 `"...".format(x)` 与函数式 `format("...", x)` 同时覆盖。
 pub var g_has_format: bool;
 
+// match 臂 body 解析期间置位：阻止 body 的 postfix `.` 贪婪吞掉下一个臂的 `.X =>` 模式
+//（`.X` 看起来像 `obj.field`）。详见 parse_postfix 的防贪婪判断。
+pub var g_in_match_body: bool;
+
 pub fn parse_post_call(e: i64, ti: i64) i64 {
     var ce: Node = base.nodes[e];
     if (ce.sa == "format" && (ce.kind == "ident" || ce.kind == "member")) { g_has_format = true; }
@@ -3548,7 +3552,10 @@ pub fn parse_match_arm() i64 {
         am_guard = parse_expr();
     }
     expect_tok("FatArrow");
+    var am_body_sav: bool = g_in_match_body;
+    g_in_match_body = true;
     var am_body: i64 = parse_expr();
+    g_in_match_body = am_body_sav;
     if (lex.cur_t() == "Comma") {
         lex.advance_i();
     }
@@ -3719,6 +3726,11 @@ pub fn parse_postfix() i64 {
     var e: i64 = parse_primary();
     while (lex.cur_t() == "Dot" || lex.cur_t() == "LBracket" || lex.cur_t() == "LParen") {
         var t: string = lex.cur_t();
+        // 防贪婪：match 臂 body 结束后，下一个臂以 `.X` 开头（`.X =>` 是模式，非 postfix 字段）
+        // 此时不要把 `.X` 当成本臂 body 的字段访问吞掉，直接结束 postfix 解析。
+        if (t == "Dot" && g_in_match_body && lex.peek_t(2) == "FatArrow") {
+            break;
+        }
         var ti: i64 = lex.advance_i();
         if (t == "Dot") { e = parse_post_member(e, ti); }
         if (t == "LBracket") { e = parse_post_index(e, ti); }
