@@ -2483,6 +2483,57 @@ pub fn variant_find_case(d: i64, cname: string) i64 {
     return -1;
 }
 
+// 反向查表：case 名 → 它所属 variant 的类型名（如 Circle → Shape）。
+// 扫描 decl_list 找含该 case 的 VariantDecl；找不到返回 ""。供 variant 构造器裸名
+// 脱糖用（Circle(5) → Shape_from_Circle(5)）。同名 case 跨 variant 时取首个匹配。
+pub fn variant_name_of_case(cname: string) string {
+    var n: i64 = slice_len(decl_list) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        var d: i64 = decl_list[i];
+        var nd: Node = base.nodes[d];
+        if (nd.kind == "VariantDecl") {
+            if (variant_find_case(d, cname) >= 0) {
+                return nd.sa;
+            }
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+// 把 match 臂里的前导点变体模式（`.Empty` / `.Circle(r)`）改写成与之等价的 conpat 节点，
+// 使其与 `Shape.Circle(r)` 具名形式走同一条 conpat_check 解构路径。非变体前导点模式返回 -1。
+pub fn leading_dot_to_conpat(pat: i64, scr: i64) i64 {
+    if (pat < 0) { return -1; }
+    if (tip_kind(scr) != "Variant") { return -1; }
+    var pn: Node = base.nodes[pat];
+    // 无 payload：`.Empty` → member{sa, na=-1, lb=1}
+    if (pn.kind == "member" && pn.lb == 1 && pn.na < 0) {
+        if (str_len(variant_name_of_case(pn.sa)) as i64 > 0) {
+            return base.mk_conpat(pn.sa, "", -1, 0, -1);
+        }
+        return -1;
+    }
+    // 带 payload：`.Circle(r)` → call{na=member(.Circle), la=[r]}
+    if (pn.kind == "call") {
+        var cn: Node = base.nodes[pn.na];
+        if (cn.kind == "member" && cn.lb == 1 && cn.na < 0) {
+            if (str_len(variant_name_of_case(cn.sa)) as i64 > 0) {
+                var argc: i64 = 0;
+                var hp: i64 = pn.la;
+                while (hp >= 0) {
+                    argc = argc + 1;
+                    hp = base.kids[hp].next;
+                }
+                return base.mk_conpat(cn.sa, "", pn.la, argc, -1);
+            }
+        }
+        return -1;
+    }
+    return -1;
+}
+
 // 该 variant 是否为「抽象 / 非穷尽（open）」——声明末位写了 `_`（VariantDecl.ba）。
 pub fn variant_is_abstract(scr: i64) bool {
     var d: i64 = variant_decl_of(scr);
@@ -5174,6 +5225,19 @@ pub fn infer_expr(e: i64) i64 {
                     }
                 }
             }
+            // 前导点变体模式：`.Empty` / `.Circle(r)` 改写成等价 conpat（与 `Shape.Circle(r)` 同一条
+            // conpat_check 解构路径）。仅当 scrutinee 是 Variant 且模式为「前导点 member/call」时触发；
+            // 裸大写名（已被上方 C2 改写）或 enum 模式不受影响。
+            // 仅当本臂确有模式节点（na>=0）时才尝试前导点变体改写；
+            // `_` 通配臂与裸单元 case（na=-1）无模式节点，base.nodes[-1] 会越界。
+            if (m_an.na >= 0 && tip_kind(m_scr) == "Variant") {
+                var ld_cp: i64 = leading_dot_to_conpat(m_an.na, m_scr);
+                if (ld_cp >= 0) {
+                    m_an.na = ld_cp;
+                    m_an.sa = "";
+                    slice_set(base.nodes, m_k.val, m_an);
+                }
+            }
             var m_prev: i64 = cur_scope;
             cur_scope = scope_new(m_prev);
             if (str_len(m_an.sa) > 0) {
@@ -5592,10 +5656,40 @@ pub fn infer_expr(e: i64) i64 {
                 return infer_device_call(e, cn.sa);
             }
         }
+        // 前导点变体构造器：`.Circle(7)` → Shape_from_Circle(7)。callee 是 member(.Circle, lb=1, na=-1)，
+        // 查它是否为某 variant 的 case 名；是则把 callee 改写成 ident(<Variant>_from_<Case>)，
+        // 随后走下方 ident 分支正常解析。幂等（改写后不含 case 名）。
+        if (cn.kind == "member" && cn.lb == 1 && cn.na < 0) {
+            var vname: string = variant_name_of_case(cn.sa);
+            if (str_len(vname) as i64 > 0) {
+                var ctor_name: string = base.sb_cat3(vname, "_from_", cn.sa);
+                var ctor_id: i64 = base.mk_ident(ctor_name, -1);
+                var cidn: Node = base.nodes[ctor_id];
+                cidn.ln = cn.ln; cidn.cl = cn.cl; cidn.tv = cn.tv;
+                slice_set(base.nodes, ctor_id, cidn);
+                n.na = ctor_id;
+                base.nodes[e] = n;
+                cn = base.nodes[n.na];
+            }
+        }
         if (cn.kind == "ident") {
             var fname: string = cn.sa;
             var si2: i64 = sym_lookup(global_scope, fname);
             if (si2 < 0) { si2 = sym_lookup(cur_scope, fname); }
+            // variant 构造器裸名脱糖：Circle(5) → Shape_from_Circle(5)。
+            // call 分支里若 fname 不是已注册函数，则查它是否为某 variant 的 case 名；是则把
+            // callee 名改写成 <Variant>_from_<Case>（双后端已正确发射该真实构造器）。幂等：
+            // 改写后的 <Variant>_from_<Case> 不含 case 名本身，二次进入不会重复改写。
+            if (si2 < 0) {
+                var vname: string = variant_name_of_case(fname);
+                if (str_len(vname) as i64 > 0) {
+                    var ctor_name: string = base.sb_cat3(vname, "_from_", fname);
+                    cn.sa = ctor_name;
+                    base.nodes[n.na] = cn;
+                    si2 = sym_lookup(global_scope, ctor_name);
+                    if (si2 < 0) { si2 = sym_lookup(cur_scope, ctor_name); }
+                }
+            }
             if (si2 >= 0) {
                 var s2: Sym = syms[si2];
                 if (tip_kind(s2.ti) == "Func") {
@@ -5938,8 +6032,7 @@ pub fn infer_expr(e: i64) i64 {
                     }
                 }
             }
-            // 2) 枚举 / 联合体变体：期望类型为 enum/union 时，`.Variant` 即该类型的值
-            //    → 改写为 `Type.Variant`（receiver = 期望类型名）。
+            // 2) 枚举 / 联合体 / 变体：期望类型为 enum/union/variant 时，`.Variant` 即该类型的值。
             if (g_lead_expect >= 0) {
                 var ek: string = tip_kind(g_lead_expect);
                 if (ek == "Enum" || ek == "Union") {
@@ -5948,6 +6041,24 @@ pub fn infer_expr(e: i64) i64 {
                     n.lb = 0;
                     slice_set(base.nodes, e, n);
                     return g_lead_expect;
+                }
+                if (ek == "Variant") {
+                    // 前导点变体值 `.Empty`（无 payload）→ Shape_from_Empty()（构造器调用）。
+                    // 把节点改写回 call 形，复用 call 分支既有构造器发射路径。幂等：改写后
+                    // callee 为 <Variant>_from_<Case>，不再含前导点，二次进入不会重复改写。
+                    var vname: string = variant_name_of_case(msa);
+                    if (str_len(vname) as i64 > 0) {
+                        var ctor_id: i64 = base.mk_ident(base.sb_cat3(vname, "_from_", msa), -1);
+                        var cidn: Node = base.nodes[ctor_id];
+                        cidn.ln = n.ln; cidn.cl = n.cl; cidn.tv = n.tv;
+                        slice_set(base.nodes, ctor_id, cidn);
+                        var call_id: i64 = base.mk_call(ctor_id, -1, -1);
+                        var cln: Node = base.nodes[call_id];
+                        cln.ln = n.ln; cln.cl = n.cl; cln.tv = n.tv;
+                        slice_set(base.nodes, call_id, cln);
+                        base.nodes[e] = cln;
+                        return infer_expr(e);
+                    }
                 }
             }
             // 3) 模块导出项：`.foo` → 当前模块 `mangled(模块, foo)`（退化全局裸名）
