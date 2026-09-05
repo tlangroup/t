@@ -186,7 +186,7 @@ pub fn tir_st_of_td(td: i64) string {
     if (t.cat == "string" || t.cat == "bytes") { return "%TStr"; }
     if (t.cat == "pointer") {
         if (t.memspace > 0) { return "i64"; }   // 设备指针句柄（不透明 i64）
-        return base.sb_cat2("ptr<", tir_st_of_td(t.elem));
+        return base.sb_cat3("ptr<", tir_st_of_td(t.elem), ">");
     }
     if (t.cat == "slice") { return "%TSlice"; }
     if (t.cat == "array") {
@@ -200,7 +200,7 @@ pub fn tir_st_of_td(td: i64) string {
         return base.sb_cat5("vec<", tir_st_of_td(t.elem), " x ", base.i2s(vln), ">");
     }
     if (t.cat == "map") { return "ptr<void>"; }
-    if (t.cat == "optional") { return base.sb_cat2("ptr<", tir_st_of_td(t.elem)); }  // Stage 1 opt.boxed
+    if (t.cat == "optional") { return base.sb_cat3("ptr<", tir_st_of_td(t.elem), ">"); }  // Stage 1 opt.boxed
     if (t.cat == "sym") {
         if (t.alen == 16) { return "u16"; }
         return "u32";
@@ -993,6 +993,10 @@ pub fn tir_emit_assign(n: Node) string {
             var eptr: string = tir_emit_index_addr(n.na);
             tir_line(base.sb_cat4("store ", rhs, " ", eptr));
             return rhs;
+        } else if (lhs.kind == "deref") {
+            var eptr: string = tir_addr_of(n.na);   // *r 作为左值：地址即指针值本身
+            tir_line(base.sb_cat4("store ", rhs, " ", eptr));
+            return rhs;
         } else {
             tir_cmt(base.sb_cat3("unsupported assign lhs: ", lhs.kind, ""));
         }
@@ -1092,6 +1096,7 @@ pub fn tir_emit_expr(e: i64) string {
     if (kd == "index") { return tir_emit_index_read(e); }
     if (kd == "closure_make") { return tir_emit_closure_make(n); }
     if (kd == "amp") { return tir_emit_amp(n); }
+    if (kd == "deref") { return tir_emit_deref(e); }
     // 兜底：不支持的表达式 → 零 slot，绝不崩溃
     tir_cmt(base.sb_cat3("unsupported expr: ", kd, ""));
     var z: string = tir_tmp();
@@ -1134,6 +1139,18 @@ pub fn tir_addr_of(e: i64) string {
 
 pub fn tir_emit_amp(n: Node) string {
     return tir_addr_of(n.na);
+}
+
+// 解引用 `*r` 作为右值：从指针 slot load 出元素值。
+// 镜像 codegen_ll.tc ll_addr 的 *r 语义（r 本身即 ptr 值），但 rvalue 需 load。
+// 元素 ST 直接取 deref 节点自身类型（meta_type_of_expr 对 *r 解析为被指类型）。
+pub fn tir_emit_deref(e: i64) string {
+    var n: Node = base.nodes[e];
+    var addr: string = tir_emit_expr(n.na);   // ptr<ST> 承载 slot
+    var st: string = tir_expr_st(e);           // 解引用值类型 = 元素 ST
+    var d: string = tir_tmp();
+    tir_line(base.sb_cat6("load ", st, " ", d, " ", addr));
+    return d;
 }
 
 // 闭包构造（Stage 6）：在栈上构造环境结构 %<n.sb>，逐字段存入被捕获量的值，
