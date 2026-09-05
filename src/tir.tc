@@ -1126,12 +1126,59 @@ pub fn tir_emit_closure_make(n: Node) string {
 }
 
 pub fn tir_emit_binary(n: Node) string {
+    var op: string = n.sa;
+    if (op == "&&" || op == "||") {
+        return tir_emit_logical(n, op == "&&");
+    }
     var ls: string = tir_emit_expr(n.na);
     var rs: string = tir_emit_expr(n.nb);
     var ost: string = tir_expr_st(n.na);
+    var opc: string = tir_binop(n.sa, ost);
     var d: string = tir_tmp();
-    tir_line(base.sb_cat7(tir_binop(n.sa, ost), " ", d, " ", ls, " ", rs));
+    tir_line(base.sb_cat7(opc, " ", d, " ", ls, " ", rs));
     return d;
+}
+
+// 短路逻辑 && / ||（memory-first，无 phi；镜像 codegen_ll.tc:1898-1922 的 br i1+phi 短路控制流，
+// 但 TIR 走 memory-first：两臂各自 store 同一结果 slot，汇合点无需 φ）。
+//   a && b → a 假则 res=false（不求值 b）；a 真则 res=b（求值 b）
+//   a || b → a 真则 res=true（不求值 b）；a 假则 res=b（求值 b）
+// 实测探针 out/dbg/sc_probe.tc 确认 t 的 &&/|| 短路生效，与 codegen_ll 一致
+// （项目记忆「t 的 && 不短路」已证伪——以 codegen_ll 运行时行为为准）。
+pub fn tir_emit_logical(n: Node, is_and: bool) string {
+    var lst: string = tir_expr_st(n.na);   // 操作数存储型（bool → i8）
+    var ls: string = tir_emit_expr(n.na);
+    var res: string = tir_tmp();
+    tir_line(base.sb_cat4("slot ", lst, " ", res));
+    var thenL: string = tir_lbl("sc.t");
+    var elseL: string = tir_lbl("sc.f");
+    var endL: string = tir_lbl("sc.e");
+    tir_line(base.sb_cat6("br_cond ", ls, " ", thenL, " ", elseL));
+    // then 臂
+    tir_block(thenL);
+    if (is_and) {
+        var rs: string = tir_emit_expr(n.nb);
+        tir_line(base.sb_cat4("store ", rs, " ", res));
+    } else {
+        var one: string = tir_tmp();
+        tir_line(base.sb_cat5("const.", lst, " ", one, " 1"));
+        tir_line(base.sb_cat4("store ", one, " ", res));
+    }
+    tir_line(base.sb_cat3("br ", endL, ""));
+    // else 臂
+    tir_block(elseL);
+    if (is_and) {
+        var zero: string = tir_tmp();
+        tir_line(base.sb_cat5("const.", lst, " ", zero, " 0"));
+        tir_line(base.sb_cat4("store ", zero, " ", res));
+    } else {
+        var rse: string = tir_emit_expr(n.nb);
+        tir_line(base.sb_cat4("store ", rse, " ", res));
+    }
+    tir_line(base.sb_cat3("br ", endL, ""));
+    // 汇合点：两臂均已 store 进同一 $res，无需 φ
+    tir_block(endL);
+    return res;
 }
 
 pub fn tir_binop(op: string, st: string) string {
