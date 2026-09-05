@@ -569,6 +569,7 @@ pub fn tir_emit_stmt(sid: i64) void {
     if (kd == "if") { tir_emit_if(n); return; }
     if (kd == "for") { tir_emit_for(n); return; }
     if (kd == "while") { tir_emit_while(n); return; }
+    if (kd == "for_each") { tir_emit_for_each(n); return; }
     if (kd == "block") {
         var c: i64 = n.la;
         while (c >= 0) {
@@ -698,6 +699,98 @@ pub fn tir_emit_while(n: Node) void {
     tir_loop_pop();
 }
 
+// for_each 降级（Stage 4）：slice / 定长数组迭代。
+// n.sa=循环变量名, n.sb=可选第二变量(map 双变量, 本期不覆盖), n.na=集合表达式, n.la=循环体。
+// slice 长度自 %TSlice 字段 1 读取（不依赖 tll_slice_len 运行时）；定长数组用编译期 N。
+pub fn tir_emit_for_each(n: Node) void {
+    if (g_term) { return; }
+    var coll_td: i64 = tir_expr_td(n.na);
+    if (coll_td < 0) { tir_cmt("unsupported for_each: untyped collection"); return; }
+    var ct: TD = sema.tds[coll_td];
+    var etd: i64 = -1;
+    var is_arr: bool = false;
+    var arr_n: i64 = -1;
+    if (ct.cat == "slice") { etd = ct.elem; }
+    else if (ct.cat == "array") { etd = ct.elem; is_arr = true; arr_n = ct.alen; }
+    else if (ct.cat == "map") {
+        tir_cmt("unsupported for_each collection: map");
+        return;
+    } else {
+        tir_cmt(base.sb_cat3("unsupported for_each collection: ", ct.cat, ""));
+        return;
+    }
+    var elem_st: string = tir_st_of_td(etd);
+    var iter: string = tir_emit_expr(n.na);   // slot of %TSlice / arr<...>
+    // 循环变量：按 n.sa 登记进 ident 查找表，循环体 ident 解析到本 slot
+    var lv: string = tir_new_named_slot(etd, elem_st, n.sa);
+    var idx: string = tir_new_named_slot(-1, "i64", "__fe_idx");
+    // 长度
+    var len: string;
+    if (is_arr) {
+        len = tir_tmp();
+        tir_line(base.sb_cat4("const.i64 ", len, " ", base.i2s(arr_n)));
+    } else {
+        var laddr: string = tir_tmp();
+        tir_line(base.sb_cat5("gep i64 ", laddr, " ", iter, " 1"));
+        len = tir_tmp();
+        tir_line(base.sb_cat4("load i64 ", len, " ", laddr));
+    }
+    // idx = 0
+    var z: string = tir_tmp();
+    tir_line(base.sb_cat4("const.i64 ", z, " 0", ""));
+    tir_line(base.sb_cat4("store ", z, " ", idx));
+    // 循环骨架
+    var headL: string = tir_lbl("fe.h");
+    var bodyL: string = tir_lbl("fe.b");
+    var stepL: string = tir_lbl("fe.s");
+    var endL: string = tir_lbl("fe.e");
+    tir_loop_push(headL, endL);
+    tir_line(base.sb_cat3("br ", headL, ""));
+    tir_block(headL);
+    var cidx: string = tir_tmp();
+    tir_line(base.sb_cat4("load i64 ", cidx, " ", idx));
+    var ccmp: string = tir_tmp();
+    tir_line(base.sb_cat6("slt.i64 ", ccmp, " ", cidx, " ", len));
+    tir_line(base.sb_cat6("br_cond ", ccmp, " ", bodyL, " ", endL));
+    tir_block(bodyL);
+    // 元素地址
+    var eptr: string;
+    if (is_arr) {
+        var bptr: string = tir_tmp();
+        tir_line(base.sb_cat6("addr_of ptr<", tir_st_of_td(coll_td), "> ", bptr, " ", iter));
+        eptr = tir_tmp();
+        tir_line(base.sb_cat8("gep_idx ", elem_st, " ", eptr, " ", bptr, " ", cidx));
+    } else {
+        var vaddr: string = tir_tmp();
+        tir_line(base.sb_cat5("gep ptr<void> ", vaddr, " ", iter, " 0"));
+        var vptr: string = tir_tmp();
+        tir_line(base.sb_cat4("load ptr<void> ", vptr, " ", vaddr));
+        var eptr0: string = tir_tmp();
+        tir_line(base.sb_cat8("bitcast ", elem_st, " ", eptr0, " ", "ptr<void>", " ", vptr));
+        eptr = tir_tmp();
+        tir_line(base.sb_cat8("gep_idx ", elem_st, " ", eptr, " ", eptr0, " ", cidx));
+    }
+    var ev: string = tir_tmp();
+    tir_line(base.sb_cat6("load ", elem_st, " ", ev, " ", eptr));
+    tir_line(base.sb_cat4("store ", ev, " ", lv));
+    // 循环体
+    var bc: i64 = n.la;
+    while (bc >= 0) {
+        tir_emit_stmt(base.kids[bc].val);
+        bc = base.kids[bc].next;
+    }
+    tir_line(base.sb_cat3("br ", stepL, ""));
+    tir_block(stepL);
+    var cidx2: string = tir_tmp();
+    tir_line(base.sb_cat4("load i64 ", cidx2, " ", idx));
+    var cidx3: string = tir_tmp();
+    tir_line(base.sb_cat5("add.i64 ", cidx3, " ", cidx2, " 1"));
+    tir_line(base.sb_cat4("store ", cidx3, " ", idx));
+    tir_line(base.sb_cat3("br ", headL, ""));
+    tir_block(endL);
+    tir_loop_pop();
+}
+
 pub fn tir_emit_assign(n: Node) string {
     var op: string = n.sa;
     if (op == "=") {
@@ -818,6 +911,17 @@ pub fn tir_emit_expr(e: i64) string {
     if (kd == "member") { return tir_member_read(n); }
     if (kd == "cast") { return tir_emit_cast(n); }
     if (kd == "struct_lit" || kd == "struct") { return tir_emit_struct_lit(e); }
+    if (kd == "atom") {
+        if (n.ia <= 0) { n.ia = sema.atom_intern(n.sa); slice_set(base.nodes, e, n); }
+        var d: string = tir_tmp();
+        tir_line(base.sb_cat4("const.u64 ", d, " ", base.i2s(n.ia)));
+        return d;
+    }
+    if (kd == "fidconst") {
+        var d: string = tir_tmp();
+        tir_line(base.sb_cat4("const.i64 ", d, " ", base.i2s(n.ia)));
+        return d;
+    }
     if (kd == "array_lit") { return tir_emit_array_lit(e, -1); }
     if (kd == "index") { return tir_emit_index_read(e); }
     // 兜底：不支持的表达式 → 零 slot，绝不崩溃
@@ -1167,6 +1271,16 @@ pub fn tir_match_pattern_cond(arm: Node, scr: string, scr_st: string, scr_td: i6
         var pv: string = tir_emit_expr(arm.na);
         var cond: string = tir_tmp();
         tir_line(base.sb_cat8("eq.", scr_st, " ", cond, " ", scr, " ", pv));
+        return cond;
+    }
+    // ── 原子字面量模式：u64 相等 ──
+    if (p.kind == "atom") {
+        var aid: i64 = p.ia;
+        if (aid <= 0) { aid = sema.atom_intern(p.sa); slice_set(base.nodes, arm.na, p); }
+        var pv: string = tir_tmp();
+        tir_line(base.sb_cat4("const.u64 ", pv, " ", base.i2s(aid)));
+        var cond: string = tir_tmp();
+        tir_line(base.sb_cat6("eq.u64 ", cond, " ", scr, " ", pv));
         return cond;
     }
     // ── 字符串字面量模式：tll_str_eq == 0 ──
