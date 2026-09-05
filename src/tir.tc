@@ -585,15 +585,18 @@ pub fn tir_lower_func(d: i64) void {
         }
     }
 
-    // 函数尾兜底返回（无显式 return 的路径）：先排空 defer（LIFO）
-    g_term = false;
-    tir_flush_defer();
-    if (g_cur_func.ret_st == "void") {
-        tir_line("ret.void");
-    } else {
-        var z: string = tir_tmp();
-        tir_line(base.sb_cat5("const ", g_cur_func.ret_st, " ", z, " 0"));
-        tir_line(base.sb_cat4("ret ", g_cur_func.ret_st, " ", z));
+    // 函数尾兜底返回：仅当函数体未以终止指令收尾（g_term==false）时发兜底 ret。
+    // 若已有显式 return / br 收尾，g_term==true → 此处是死代码，跳过以避免线性块内重复终止符
+    // （设计 §6.8：控制流显式终止；重复 ret 会破坏 Stage 2/3 的 tir→c/tir→ll 后端 verifier）。
+    if (g_term == false) {
+        tir_flush_defer();
+        if (g_cur_func.ret_st == "void") {
+            tir_line("ret.void");
+        } else {
+            var z: string = tir_tmp();
+            tir_line(base.sb_cat5("const ", g_cur_func.ret_st, " ", z, " 0"));
+            tir_line(base.sb_cat4("ret ", g_cur_func.ret_st, " ", z));
+        }
     }
     append(g_mod.funcs, g_cur_func);
 }
@@ -1329,14 +1332,21 @@ pub fn tir_width(st: string) i64 {
 
 pub fn tir_emit_struct_lit(e: i64) string {
     var n: Node = base.nodes[e];
-    var target_st: string = tir_expr_st(e);
+    // 目标存储类型：具名结构体字面量名在 n.sa（与 codegen_c.tc:789 / ll_etd struct_lit 分支对齐，
+    // 类型名即 TT 条目名）；匿名（n.sa 空）退回 meta 推断（tir-design.md §7 named → %Name）。
+    var target_st: string = "i64";
+    if (str_len(n.sa) > 0) { target_st = base.sb_cat2("%", n.sa); }
+    else { target_st = tir_expr_st(e); }
     var d: string = tir_tmp();
     var sb: StringBuilder = sb_new();
     var first: bool = true;
     var fc: i64 = n.la;
     while (fc >= 0) {
         var k: Child = base.kids[fc];
-        var fs: string = tir_emit_expr(k.val);
+        // 字段以 FV（field-value）节点存储：na = 字段值表达式（见 base.mk_FV）；
+        // 直接 emit FV 节点会落到 unsupported 兜底，故必须解包到其 .na 值子节点。
+        var fv: Node = base.nodes[k.val];
+        var fs: string = tir_emit_expr(fv.na);
         if (first == false) { sb_append_str(sb, " "); }
         sb_append_str(sb, fs);
         first = false;
