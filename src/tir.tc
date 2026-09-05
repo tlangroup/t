@@ -1359,6 +1359,10 @@ pub fn tir_emit_cast(n: Node) string {
     }
     var inner: string = tir_emit_expr(n.na);
     var inner_st: string = tir_expr_st(n.na);
+    // 枚举在 TIR 中被擦除为整数，但其 expr_st 仍是 %Name（未声明的 LLVM 类型）。
+    // 把枚举操作数按 i64 看待，使 as 转换走正确的整数宽度逻辑（no-op/trunc/zext/sext），
+    // 而不是 emit 引用未声明 %Color 的 `bitcast`。
+    if (sema.tip_kind(tir_expr_td(n.na)) == "Enum") { inner_st = "i64"; }
     var target_st: string = tir_st_of_td(sema.resolve_type_desc(n.nb));
     if (inner_st == target_st) { return inner; }
     var d: string = tir_tmp();
@@ -1529,6 +1533,19 @@ pub fn tir_member_addr(mnode: Node) string {
 }
 
 pub fn tir_member_read(mnode: Node) string {
+    // 枚举用例常量：Color.Red → const.i64 <val>（枚举被擦除为整数，用例值即编译期整型）。
+    // 此前误走结构体字段路径（addr_of @Color + gep + load），把类型名当值，生成非法 `store ptr Color`。
+    // 检测：基为类型名 ident 且 `Enum.Case` 命中枚举常量表；struct 字段访问不在枚举表中，安全回退。
+    var bn: Node = base.nodes[mnode.na];
+    if (bn.kind == "ident") {
+        var cvnode: i64 = sema.enum_const_lookup(bn.sa, mnode.sa);
+        if (cvnode >= 0) {
+            var cval: i64 = sema.js_parse_int(base.nodes[cvnode].sa, base.nodes[cvnode].ia);
+            var d: string = tir_tmp();
+            tir_line(base.sb_cat4("const.i64 ", d, " ", base.i2s(cval)));
+            return d;
+        }
+    }
     var base_st: string = tir_expr_st(mnode.na);
     var faddr: string = tir_member_addr(mnode);
     var sname: string = tir_strip_pct(base_st);
