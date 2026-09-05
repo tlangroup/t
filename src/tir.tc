@@ -269,6 +269,7 @@ pub fn tir_elem_st(td: i64) string {
     if (t.cat == "slice") { return tir_st_of_td(t.elem); }
     if (t.cat == "array") { return tir_st_of_td(t.elem); }
     if (t.cat == "vector") { return tir_st_of_td(t.elem); }
+    if (t.cat == "map") { return tir_st_of_td(t.val); }
     return "i64";
 }
 
@@ -555,6 +556,9 @@ pub fn tir_emit_stmt(sid: i64) void {
             if (base.nodes[n.nb].kind == "array_lit") {
                 var init: string = tir_emit_array_lit(n.nb, t);
                 tir_line(base.sb_cat4("store ", init, " ", slot));
+            } else if (base.nodes[n.nb].kind == "map_lit") {
+                var init: string = tir_emit_map_lit(n.nb, t);
+                tir_line(base.sb_cat4("store ", init, " ", slot));
             } else {
                 var init: string = tir_emit_expr(n.nb);
                 tir_line(base.sb_cat4("store ", init, " ", slot));
@@ -713,7 +717,72 @@ pub fn tir_emit_for_each(n: Node) void {
     if (ct.cat == "slice") { etd = ct.elem; }
     else if (ct.cat == "array") { etd = ct.elem; is_arr = true; arr_n = ct.alen; }
     else if (ct.cat == "map") {
-        tir_cmt("unsupported for_each collection: map");
+        var keytd: i64 = ct.key;
+        var keyst: string = tir_st_of_td(keytd);
+        var valtd: i64 = -1;
+        var valst: string = "i64";
+        var has_val: bool = false;
+        if (ct.val >= 0) { valtd = ct.val; valst = tir_st_of_td(valtd); has_val = true; }
+        var iter: string = tir_emit_expr(n.na);
+        var lv: string = tir_new_named_slot(keytd, keyst, n.sa);
+        var lvval: string = "";
+        if (has_val && str_len(n.sb) > 0) { lvval = tir_new_named_slot(valtd, valst, n.sb); }
+        var cnt: string = tir_tmp();
+        tir_line(base.sb_cat5("call i64 ", cnt, " @tll_map_count (", iter, ")"));
+        var idx: string = tir_new_named_slot(-1, "i64", "__fe_idx");
+        var z: string = tir_tmp();
+        tir_line(base.sb_cat4("const.i64 ", z, " 0", ""));
+        tir_line(base.sb_cat4("store ", z, " ", idx));
+        var headL: string = tir_lbl("fe.h");
+        var bodyL: string = tir_lbl("fe.b");
+        var stepL: string = tir_lbl("fe.s");
+        var endL: string = tir_lbl("fe.e");
+        tir_loop_push(headL, endL);
+        tir_line(base.sb_cat3("br ", headL, ""));
+        tir_block(headL);
+        var cidx: string = tir_tmp();
+        tir_line(base.sb_cat4("load i64 ", cidx, " ", idx));
+        var ccmp: string = tir_tmp();
+        tir_line(base.sb_cat6("slt.i64 ", ccmp, " ", cidx, " ", cnt));
+        tir_line(base.sb_cat6("br_cond ", ccmp, " ", bodyL, " ", endL));
+        tir_block(bodyL);
+        if (sema.tds[keytd].cat == "string") {
+            var kaddr: string = tir_tmp();
+            tir_line(base.sb_cat6("addr_of ptr<", keyst, "> ", kaddr, " ", lv));
+            tir_line(base.sb_cat7("call void @tll_map_key_str_at (", iter, ", ", cidx, ", ", kaddr, ")"));
+        } else {
+            var kv: string = tir_tmp();
+            tir_line(base.sb_cat7("call i64 ", kv, " @tll_map_key_int_at (", iter, ", ", cidx, ")"));
+            if (keyst != "i64") {
+                var ktr: string = tir_tmp();
+                tir_line(base.sb_cat6("trunc ", keyst, " ", ktr, " i64 ", kv));
+                tir_line(base.sb_cat4("store ", ktr, " ", lv));
+            } else {
+                tir_line(base.sb_cat4("store ", kv, " ", lv));
+            }
+        }
+        if (has_val && str_len(n.sb) > 0) {
+            var vp: string = tir_tmp();
+            tir_line(base.sb_cat9("call ptr<", valst, "> ", vp, " @tll_map_val_at (", iter, ", ", cidx, ")"));
+            var vv: string = tir_tmp();
+            tir_line(base.sb_cat6("load ", valst, " ", vv, " ", vp));
+            tir_line(base.sb_cat4("store ", vv, " ", lvval));
+        }
+        var bc: i64 = n.la;
+        while (bc >= 0) {
+            tir_emit_stmt(base.kids[bc].val);
+            bc = base.kids[bc].next;
+        }
+        tir_line(base.sb_cat3("br ", stepL, ""));
+        tir_block(stepL);
+        var cidx2: string = tir_tmp();
+        tir_line(base.sb_cat4("load i64 ", cidx2, " ", idx));
+        var cidx3: string = tir_tmp();
+        tir_line(base.sb_cat5("add.i64 ", cidx3, " ", cidx2, " 1"));
+        tir_line(base.sb_cat4("store ", cidx3, " ", idx));
+        tir_line(base.sb_cat3("br ", headL, ""));
+        tir_block(endL);
+        tir_loop_pop();
         return;
     } else {
         tir_cmt(base.sb_cat3("unsupported for_each collection: ", ct.cat, ""));
@@ -804,6 +873,14 @@ pub fn tir_emit_assign(n: Node) string {
                 if (idx >= 0) { lhstd = g_local_tds[idx]; }
             }
             rhs = tir_emit_array_lit(n.nb, lhstd);
+        } else if (base.nodes[n.nb].kind == "map_lit") {
+            var lhstd: i64 = -1;
+            var lhn: Node = base.nodes[n.na];
+            if (lhn.kind == "ident") {
+                var idx: i64 = tir_find_local_idx(lhn.sa);
+                if (idx >= 0) { lhstd = g_local_tds[idx]; }
+            }
+            rhs = tir_emit_map_lit(n.nb, lhstd);
         } else {
             rhs = tir_emit_expr(n.nb);
         }
@@ -923,6 +1000,7 @@ pub fn tir_emit_expr(e: i64) string {
         return d;
     }
     if (kd == "array_lit") { return tir_emit_array_lit(e, -1); }
+    if (kd == "map_lit") { return tir_emit_map_lit(e, -1); }
     if (kd == "index") { return tir_emit_index_read(e); }
     // 兜底：不支持的表达式 → 零 slot，绝不崩溃
     tir_cmt(base.sb_cat3("unsupported expr: ", kd, ""));
@@ -1018,6 +1096,13 @@ pub fn tir_emit_call(e: i64) string {
             var ptd: i64 = tir_callee_param_td(cname, argi);
             if (ptd >= 0 && sema.tds[ptd].cat == "array") {
                 aslot = tir_emit_array_lit(k.val, ptd);
+            } else {
+                aslot = tir_emit_expr(k.val);
+            }
+        } else if (ak.kind == "map_lit") {
+            var ptd: i64 = tir_callee_param_td(cname, argi);
+            if (ptd >= 0 && sema.tds[ptd].cat == "map") {
+                aslot = tir_emit_map_lit(k.val, ptd);
             } else {
                 aslot = tir_emit_expr(k.val);
             }
@@ -1220,9 +1305,78 @@ pub fn tir_member_read(mnode: Node) string {
 // ══════════════════════════════════════════════════════════════════
 
 // 计算下标元素地址（ptr<elem_st>），写回 g_idx_elem_st。不支持的基类型降级为注释。
+pub fn tir_sizeof(st: string) i64 {
+    if (st == "i64" || st == "u64" || st == "f64") { return 8; }
+    if (st == "i32" || st == "u32" || st == "f32") { return 4; }
+    if (st == "i16" || st == "u16") { return 2; }
+    if (st == "i8" || st == "u8" || st == "bool") { return 1; }
+    if (st == "%TStr") { return 16; }
+    return 8;
+}
+
+pub fn tir_emit_map_lit(e: i64, force_td: i64) string {
+    var n: Node = base.nodes[e];
+    var td: i64 = force_td;
+    if (td < 0) { td = tir_expr_td(e); }
+    if (td < 0) {
+        tir_cmt("unsupported expr: map_lit (untyped)");
+        var z: string = tir_tmp();
+        tir_line(base.sb_cat4("const.i64 ", z, " 0", ""));
+        return z;
+    }
+    var mt: TD = sema.tds[td];
+    var valtd: i64 = mt.val;
+    if (valtd >= 0 && (sema.tds[valtd].cat == "string" || sema.tds[valtd].cat == "named" ||
+        sema.tds[valtd].cat == "array" || sema.tds[valtd].cat == "struct" || sema.tds[valtd].cat == "slice" ||
+        sema.tds[valtd].cat == "map")) {
+        tir_cmt("unsupported expr: map_lit (aggregate val)");
+        var z: string = tir_tmp();
+        tir_line(base.sb_cat4("const.i64 ", z, " 0", ""));
+        return z;
+    }
+    var keykind: i64 = 1;
+    if (sema.tds[mt.key].cat == "string") { keykind = 0; }
+    var valst: string = tir_st_of_td(valtd);
+    var valsz: i64 = tir_sizeof(valst);
+    var kk: string = tir_tmp();
+    tir_line(base.sb_cat4("const.i64 ", kk, " ", base.i2s(keykind)));
+    var vsz: string = tir_tmp();
+    tir_line(base.sb_cat4("const.i64 ", vsz, " ", base.i2s(valsz)));
+    var m: string = tir_tmp();
+    tir_line(base.sb_cat4("slot ptr<void> ", m, "", ""));
+    tir_line(base.sb_cat7("call ptr<void> ", m, " @tll_map_new (", kk, ", ", vsz, ")"));
+    var ec: i64 = n.la;
+    while (ec >= 0) {
+        var en: Node = base.nodes[base.kids[ec].val];
+        var ks: string = tir_emit_expr(en.na);
+        var kst: string = tir_expr_st(en.na);
+        var kc: string = ks;
+        if (kst != "i64") { kc = tir_tmp(); tir_line(base.sb_cat8("zext ", "i64", " ", kc, " ", kst, " ", ks)); }
+        var kp: string = tir_tmp();
+        if (sema.tds[mt.key].cat == "string") {
+            tir_line(base.sb_cat4("addr_of %TStr ", kp, " ", ks));
+        } else {
+            tir_line(base.sb_cat4("addr_of ptr<i64> ", kp, " ", kc));
+        }
+        var vs: string = tir_emit_expr(en.nb);
+        var vp: string = tir_tmp();
+        tir_line(base.sb_cat6("addr_of ", valst, " ", vp, " ", vs));
+        tir_line(base.sb_cat7("call void @tll_map_put (", m, ", ", kp, ", ", vp, ")"));
+        ec = base.kids[ec].next;
+    }
+    return m;
+}
+
 pub fn tir_emit_index_addr(ine: i64) string {
     var n: Node = base.nodes[ine];
     var base_td: i64 = tir_expr_td(n.na);
+    if (base_td < 0) {
+        tir_cmt("unsupported index base (untyped)");
+        var z: string = tir_tmp();
+        tir_line(base.sb_cat4("const.i64 ", z, " 0", ""));
+        g_idx_elem_st = "i64";
+        return z;
+    }
     var base_st: string = tir_st_of_td(base_td);
     var base_slot: string = tir_emit_expr(n.na);
     var idx: string = tir_emit_expr(n.nb);
@@ -1240,6 +1394,33 @@ pub fn tir_emit_index_addr(ine: i64) string {
     } else if (str_len(base_st) >= 4 && str_slice(base_st, 0, 4) == "vec<") {
         dptr = tir_tmp();
         tir_line(base.sb_cat6("addr_of ptr<", base_st, "> ", dptr, " ", base_slot));
+    } else if (sema.tds[base_td].cat == "map") {
+        var mt: TD = sema.tds[base_td];
+        var valtd: i64 = mt.val;
+        var valst: string = tir_st_of_td(valtd);
+        if (valtd >= 0 && (sema.tds[valtd].cat == "string" || sema.tds[valtd].cat == "named" ||
+            sema.tds[valtd].cat == "array" || sema.tds[valtd].cat == "struct" || sema.tds[valtd].cat == "slice" ||
+            sema.tds[valtd].cat == "map")) {
+            tir_cmt("unsupported map index val (aggregate)");
+            var zz: string = tir_tmp();
+            tir_line(base.sb_cat4("const.i64 ", zz, " 0", ""));
+            g_idx_elem_st = "i64";
+            return zz;
+        }
+        g_idx_elem_st = valst;
+        var ks: string = tir_emit_expr(n.nb);
+        var kst: string = tir_expr_st(n.nb);
+        var kc: string = ks;
+        if (kst != "i64") { kc = tir_tmp(); tir_line(base.sb_cat8("zext ", "i64", " ", kc, " ", kst, " ", ks)); }
+        var kp: string = tir_tmp();
+        if (sema.tds[mt.key].cat == "string") {
+            tir_line(base.sb_cat4("addr_of %TStr ", kp, " ", ks));
+        } else {
+            tir_line(base.sb_cat4("addr_of ptr<i64> ", kp, " ", kc));
+        }
+        var vp: string = tir_tmp();
+        tir_line(base.sb_cat7("call ptr<void> ", vp, " @tll_map_val_ptr (", base_slot, ", ", kp, ")"));
+        return vp;
     } else {
         tir_cmt(base.sb_cat3("unsupported index base: ", base_st, ""));
         var z: string = tir_tmp();
