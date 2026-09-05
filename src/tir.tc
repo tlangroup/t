@@ -287,6 +287,18 @@ pub fn tir_find_local_idx(name: string) i64 {
     return -1;
 }
 
+// 判定 name 是否为模块内某个函数（含泛型/库函数）的名字。
+// 用于函数值作为闭包值（ptr<void>）包裹成 %TClosure 的判定。
+pub fn tir_is_func_name(name: string) bool {
+    var m: i64 = slice_len(g_tir_func_names) as i64;
+    var i: i64 = 0;
+    while (i < m) {
+        if (g_tir_func_names[i] == name) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
 // 查被调函数第 argidx 个形参的类型 TD。
 // call 实参为 array_lit 时，按形参是否定长数组决定降级为 arr<elem x N> 还是 %TSlice。
 pub fn tir_callee_param_td(cname: string, argidx: i64) i64 {
@@ -374,6 +386,31 @@ pub fn tir_field_index(structname: string, fieldname: string) i64 {
     return 0;
 }
 
+// 在栈上构造一个 %TClosure 值（与 TClosure ABI 一致），返回 ptr<void> 槽。
+// fnref：函数指针值文本（如 "@__lam_0" 或 "$fnptr"）；envref：环境指针值文本，"" 表示 null 环境。
+// 设计锚点：tir-design.md §6.6 closure_new / §6.7 call_ind / %TClosure={fnptr,envptr}。
+pub fn tir_make_closure_value(fnref: string, envref: string) string {
+    var clo: string = tir_tmp();
+    tir_line(base.sb_cat2("slot %TClosure ", clo));
+    var cloaddr: string = tir_tmp();
+    tir_line(base.sb_cat4("addr_of ptr<%TClosure> ", cloaddr, " ", clo));
+    var fpaddr: string = tir_tmp();
+    tir_line(base.sb_cat5("gep ptr<void> ", fpaddr, " ", cloaddr, " 0 0"));
+    tir_line(base.sb_cat4("store ", fnref, " ", fpaddr));
+    var epaddr: string = tir_tmp();
+    tir_line(base.sb_cat5("gep ptr<void> ", epaddr, " ", cloaddr, " 0 1"));
+    if (str_len(envref) == 0) {
+        var nul: string = tir_tmp();
+        tir_line(base.sb_cat2("const.ptr.null ptr<void> ", nul));
+        tir_line(base.sb_cat4("store ", nul, " ", epaddr));
+    } else {
+        tir_line(base.sb_cat4("store ", envref, " ", epaddr));
+    }
+    var dst: string = tir_tmp();
+    tir_line(base.sb_cat6("bitcast ptr<void> ", dst, " ", "ptr<%TClosure>", " ", cloaddr));
+    return dst;
+}
+
 pub fn tir_add_struct_tt(name: string, field_head: i64) void {
     var sb: StringBuilder = sb_new();
     var c: i64 = field_head;
@@ -426,13 +463,24 @@ pub fn lower_unit(mod: string, source: string) void {
         i = i + 1;
     }
 
+    // 预收集全部函数名（含泛型/库函数），供函数值闭包包装判定（tir_is_func_name）使用，
+    // 不依赖函数体降级顺序。
+    var j0: i64 = 0;
+    while (j0 < n) {
+        var d0: i64 = lex.decl_list[j0];
+        var dn0: Node = base.nodes[d0];
+        if (dn0.kind == "FuncDecl") {
+            append(g_tir_func_names, dn0.sa);
+            append(g_tir_func_decls, d0);
+        }
+        j0 = j0 + 1;
+    }
+
     var j: i64 = 0;
     while (j < n) {
         var d: i64 = lex.decl_list[j];
         var dn: Node = base.nodes[d];
         if (dn.kind == "FuncDecl") {
-            append(g_tir_func_names, dn.sa);
-            append(g_tir_func_decls, d);
             if (sema.func_is_generic(d) == false && dn.bf == false) {
                 if (lex.in_link_libs(base.g_node_mod[d])) {
                     if (dn.bc) { tir_emit_extern(d); }
@@ -500,6 +548,19 @@ pub fn tir_lower_func(d: i64) void {
     g_tir_defer = zde;
 
     // 参数：以 $name 作预填充 slot（memory-first：参数即本地 slot）
+    // 闭包合成函数（M48）：仅 lambda 提升出的 FuncDecl（sc=="__lambda__"）且携带环境结构名
+    // 时，前置 env 首参（与 TClosure ABI 一致）。普通函数（含 @__test_N 等）sc 非 __lambda__，
+    // 即便 sb 被复用也不得加 env 形参，否则会向无关函数注入未被调用的 $__env 槽。
+    if (n.sc == "__lambda__" && str_len(n.sb) > 0) {
+        var envst: string = "ptr<void>";
+        var envslot: string = "$__env";
+        append(g_cur_func.params, base.sb_cat4(envslot, ": ", envst, ""));
+        append(g_local_names, "__env");
+        append(g_local_slots, envslot);
+        append(g_local_sts, envst);
+        append(g_local_tds, -1);
+        tir_line(base.sb_cat4("slot ", envst, " ", envslot));
+    }
     var c: i64 = n.lb;
     while (c >= 0) {
         var k: Child = base.kids[c];
@@ -559,6 +620,10 @@ pub fn tir_emit_stmt(sid: i64) void {
             } else if (base.nodes[n.nb].kind == "map_lit") {
                 var init: string = tir_emit_map_lit(n.nb, t);
                 tir_line(base.sb_cat4("store ", init, " ", slot));
+            } else if (st == "ptr<void>" && base.nodes[n.nb].kind == "ident" && tir_is_func_name(base.nodes[n.nb].sa)) {
+                // 函数作为闭包值：包进 %TClosure（与 codegen_ll 的 @t.clos.X 全局一致）
+                var clo: string = tir_make_closure_value(base.sb_cat2("@", base.nodes[n.nb].sa), "");
+                tir_line(base.sb_cat4("store ", clo, " ", slot));
             } else {
                 var init: string = tir_emit_expr(n.nb);
                 tir_line(base.sb_cat4("store ", init, " ", slot));
@@ -627,7 +692,27 @@ pub fn tir_emit_stmt(sid: i64) void {
         else { tir_cmt("continue outside loop"); }
         return;
     }
+    if (kd == "closure_capture") { tir_emit_closure_capture(n); return; }
     tir_cmt(base.sb_cat3("unsupported stmt: ", kd, ""));
+}
+
+// 闭包捕获（Stage 6）：从 lambda 首参 $__env（ptr<void>）按字段拷回被捕获量到本地 slot。
+// n.sa=变量名, n.sb=环境结构名(__env_N), n.na=类型 desc, n.ia=字段索引。
+// 镜像 codegen_ll.tc:4259 closure_capture（gep %st.<sb>, ptr %__env, 0, n.ia）。
+pub fn tir_emit_closure_capture(n: Node) void {
+    var cctd: i64 = sema.resolve_type_desc(n.na);
+    var ccst: string = "i64";
+    if (cctd >= 0) { ccst = tir_st_of_td(cctd); }
+    // 登记为本地 slot，使 lambda 体内对该变量的 ident 引用解析到本地（而非 @全局）
+    var cvslot: string = tir_new_named_slot(cctd, ccst, n.sa);
+    var envty: string = base.sb_cat2("%", n.sb);
+    var eptr: string = tir_tmp();
+    tir_line(base.sb_cat5("bitcast ptr<", envty, "> ", eptr, " ptr<void> $__env"));
+    var faddr: string = tir_tmp();
+    tir_line(base.sb_cat8("gep ", ccst, " ", faddr, " ", eptr, " 0 ", base.i2s(n.ia)));
+    var ld: string = tir_tmp();
+    tir_line(base.sb_cat6("load ", ccst, " ", ld, " ", faddr));
+    tir_line(base.sb_cat4("store ", ld, " ", cvslot));
 }
 
 pub fn tir_emit_if(n: Node) void {
@@ -1002,11 +1087,42 @@ pub fn tir_emit_expr(e: i64) string {
     if (kd == "array_lit") { return tir_emit_array_lit(e, -1); }
     if (kd == "map_lit") { return tir_emit_map_lit(e, -1); }
     if (kd == "index") { return tir_emit_index_read(e); }
+    if (kd == "closure_make") { return tir_emit_closure_make(n); }
     // 兜底：不支持的表达式 → 零 slot，绝不崩溃
     tir_cmt(base.sb_cat3("unsupported expr: ", kd, ""));
     var z: string = tir_tmp();
     tir_line(base.sb_cat4("const.i64 ", z, " 0", ""));
     return z;
+}
+
+// 闭包构造（Stage 6）：在栈上构造环境结构 %<n.sb>，逐字段存入被捕获量的值，
+// 再构造 %TClosure { fnptr=@<n.sa>, envptr=env } 并以 ptr<void> 返回（与 TClosure ABI 一致）。
+// n.sa=合成 lambda 名(__lam_N), n.sb=环境结构名(__env_N), n.la=捕获量链(kids, 每节点 sa=变量名)。
+// 镜像 codegen_ll.tc:1627 closure_make（per-capture gep %st.<sb> + store；再 %TClosure {fnptr,envptr}）。
+pub fn tir_emit_closure_make(n: Node) string {
+    var envty: string = base.sb_cat2("%", n.sb);
+    var env: string = tir_tmp();
+    tir_line(base.sb_cat4("slot ", envty, " ", env));
+    var envaddr: string = tir_tmp();
+    tir_line(base.sb_cat6("addr_of ptr<", envty, "> ", envaddr, " ", env));
+    var cmc: i64 = n.la;
+    while (cmc >= 0) {
+        var cmk: Child = base.kids[cmc];
+        var cmf: Node = base.nodes[cmk.val];
+        var cvname: string = cmf.sa;
+        var fidx: i64 = tir_field_index(tir_strip_pct(envty), cvname);
+        var cvval: string = tir_emit_expr(cmk.val);
+        var cvst: string = tir_expr_st(cmk.val);
+        var faddr: string = tir_tmp();
+        tir_line(base.sb_cat8("gep ", cvst, " ", faddr, " ", envaddr, " 0 ", base.i2s(fidx)));
+        tir_line(base.sb_cat4("store ", cvval, " ", faddr));
+        cmc = cmk.next;
+    }
+    var envptr: string = tir_tmp();
+    tir_line(base.sb_cat6("addr_of ptr<", envty, "> ", envptr, " ", env));
+    var envpv: string = tir_tmp();
+    tir_line(base.sb_cat7("bitcast ptr<void> ", envpv, " ", "ptr<", envty, "> ", envptr));
+    return tir_make_closure_value(base.sb_cat2("@", n.sa), envpv);
 }
 
 pub fn tir_emit_binary(n: Node) string {
@@ -1115,7 +1231,17 @@ pub fn tir_emit_call(e: i64) string {
         argi = argi + 1;
         ac = k.next;
     }
-    tir_line(base.sb_cat7("call ", retst, " ", d, " @", cname, base.sb_cat3(" (", sb_to_str(sb), ")")));
+    // 间接调用：被调者是本地槽（闭包值，ptr<void> 指向 %TClosure）→ call_ind；
+    // 否则是被调函数名 → 直接 call。镜像 codegen_ll.tc ll_call（局部/全局函数类型变量 → 间接）。
+    var callee_ref: string = base.sb_cat2("@", cname);
+    var is_ind: bool = false;
+    if (tir_find_local_idx(cname) >= 0) {
+        callee_ref = base.sb_cat2("$", cname);
+        is_ind = true;
+    }
+    var op: string = "call";
+    if (is_ind) { op = "call_ind"; }
+    tir_line(base.sb_cat8(op, " ", retst, " ", d, " ", callee_ref, base.sb_cat3(" (", sb_to_str(sb), ")")));
     return d;
 }
 
