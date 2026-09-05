@@ -73,9 +73,10 @@ pub fn ll_llname(tname: string) string {
     // $x -> %curfn.x (值寄存器，按函数加前缀) ; @fn -> fn (全局函数名，去 @)
     if (str_len(tname) < 1) { return tname; }
     if (tname[0] == 36) {
-        return base.sb_cat3("%", g_ll_curfn, base.sb_cat2(".", str_slice(tname, 1, str_len(tname))));
+        var s: string = str_slice(tname, 1, str_len(tname));
+        return base.sb_cat3("%", g_ll_curfn, base.sb_cat2(".", ll_mangle(s)));
     }
-    if (tname[0] == 64) { return str_slice(tname, 1, str_len(tname)); }                        // '@'
+    if (tname[0] == 64) { return ll_mangle(str_slice(tname, 1, str_len(tname))); }                        // '@'
     return tname;
 }
 
@@ -84,6 +85,33 @@ pub fn ll_label(name: string) string {
     var s: string = name;
     if (str_len(s) > 0 && s[0] == 64) { s = str_slice(s, 1, str_len(s)); }
     return base.sb_cat2(g_ll_curfn, base.sb_cat2(".", s));
+}
+
+// 标识符 LLVM 合法化：非 [A-Za-z0-9_.$\u0080-] 字符转义为 _uXXXX_，确保首字符合法（LLVM 标识符首字符须为字母/_/./$）
+pub fn ll_mangle(s: string) string {
+    var n: i64 = str_len(s);
+    if (n == 0) { return "_"; }
+    var sb: StringBuilder = sb_new();
+    var i: i64 = 0;
+    while (i < n) {
+        var c: i64 = str_at(s, i);
+        if ((c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95 || c == 46 || c == 36) {
+            sb_append_char(sb, c);
+        } else {
+            sb_append_char(sb, 95);
+            sb_append_char(sb, 117);
+            sb_append_char(sb, base.hex_digit((c >> 12) & 15) as i64);
+            sb_append_char(sb, base.hex_digit((c >> 8) & 15) as i64);
+            sb_append_char(sb, base.hex_digit((c >> 4) & 15) as i64);
+            sb_append_char(sb, base.hex_digit(c & 15) as i64);
+            sb_append_char(sb, 95);
+        }
+        i = i + 1;
+    }
+    var r: string = sb_to_str(sb);
+    var fc: i64 = str_at(r, 0);
+    if (fc >= 48 && fc <= 57) { r = base.sb_cat2("_", r); }
+    return r;
 }
 
 pub fn ll_ensure_slot(tname: string, st: string) void {
@@ -423,7 +451,7 @@ pub fn ll_tokens(line: string) []string {
 // 解析 func 行，结果写入 g_pf_name / g_pf_params / g_pf_ret（t 不支持多返回值）
 pub fn ll_parse_func(line: string) void {
     var toks: []string = ll_tokens(line);   // func @name($a: ST, $b: ST): ST {
-    g_pf_name = str_slice(toks[1], 1, str_len(toks[1]));   // 去 @
+    g_pf_name = ll_mangle(str_slice(toks[1], 1, str_len(toks[1])));   // 去 @ 并 LLVM 合法化
     g_pf_params = [];
     g_pf_ret = "void";
     var i: i64 = 2;
