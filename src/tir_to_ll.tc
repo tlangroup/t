@@ -1,0 +1,1066 @@
+// tir_to_ll: TIR (memory-first linear IR) -> LLVM IR 薄后端（设计 §9.2 / Stage 3）
+//
+// 设计要点：TIR 是 memory-first（非 SSA）。每个 TIR slot `$x` 映射为 LLVM `alloca`；
+// 任意对 $x 的值读取 = `load`，写入 = `store`。LLVM 的 mem2reg/SROA 会自动把
+// 这些 alloca 提升回寄存器，故等价性由 TIR 文本保证（设计 §9.2 结论）。
+//
+// 本模块只读 `tir.tir_to_text()` 产出的文本（格式见 tir-design.md §4，已验证），
+// 做两遍扫描：第 1 遍收集函数签名 + 发射 TT 类型；第 2 遍发射函数体。
+// 通过新子命令 `emit-tir-ll` 暴露；不动现有 `emit-ll`/`build`，保留自举不动点。
+
+@import("src.base" :: *);
+
+pub var g_ll: StringBuilder;
+pub var g_ll_tmpc: i64;
+pub var g_ll_names: []string;   // TIR 槽名($x) -> LLVM 类型(ST) 并行数组
+pub var g_ll_sts: []string;
+pub var g_func_names: []string;       // 函数名 -> 参数 ST 列表（供 call 用）
+pub var g_func_paramsts: [][]string;
+pub var g_ll_func_rets: []string;     // 兼容保留
+pub var g_pf_name: string;            // ll_parse_func 结果（t 不支持多返回值，用全局传递）
+pub var g_pf_params: []string;
+pub var g_pf_ret: string;
+pub var g_ll_curfn: string;           // 当前函数名前缀：LLVM 寄存器/标签是模块全局，按函数加前缀避免重名
+pub var g_ll_declared: []string;       // 已 emit 过 declare 的外部函数名
+pub var g_ll_declbuf: StringBuilder;   // 外部 declare 缓冲（函数体扫描后追加到模块末尾）
+pub var g_opaque_emitted: []string;    // 已 emit 过 opaque 定义的运行时结构类型名（如 TSb）
+
+pub fn ll_tmp() string {
+    var v: i64 = g_ll_tmpc;
+    g_ll_tmpc = v + 1;
+    return base.sb_cat3("%", g_ll_curfn, base.sb_cat2(".llt", base.i2s(v)));
+}
+
+pub fn ll_reset() void {
+    g_ll = sb_new();
+    g_ll_tmpc = 0;
+    g_ll_names = [];
+    g_ll_sts = [];
+    g_func_names = [];
+    g_func_paramsts = [];
+    g_ll_func_rets = [];
+    g_pf_name = "";
+    g_pf_params = [];
+    g_pf_ret = "void";
+    g_ll_curfn = "";
+    g_ll_declared = [];
+    g_ll_declbuf = sb_new();
+    g_opaque_emitted = [];
+}
+
+pub fn ll_get_st(name: string) string {
+    var n: i64 = slice_len(g_ll_names) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        if (g_ll_names[i] == name) { return g_ll_sts[i]; }
+        i = i + 1;
+    }
+    return "i64";
+}
+
+pub fn ll_set_st(name: string, st: string) void {
+    var n: i64 = slice_len(g_ll_names) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        if (g_ll_names[i] == name) { g_ll_sts[i] = st; return; }
+        i = i + 1;
+    }
+    append(g_ll_names, name);
+    append(g_ll_sts, st);
+}
+
+pub fn ll_llname(tname: string) string {
+    // $x -> %curfn.x (值寄存器，按函数加前缀) ; @fn -> fn (全局函数名，去 @)
+    if (str_len(tname) < 1) { return tname; }
+    if (tname[0] == 36) {
+        return base.sb_cat3("%", g_ll_curfn, base.sb_cat2(".", str_slice(tname, 1, str_len(tname))));
+    }
+    if (tname[0] == 64) { return str_slice(tname, 1, str_len(tname)); }                        // '@'
+    return tname;
+}
+
+// 分支标签：@Lx -> curfn.Lx（LLVM 标签是函数局域，需加函数前缀避免跨函数重名）
+pub fn ll_label(name: string) string {
+    var s: string = name;
+    if (str_len(s) > 0 && s[0] == 64) { s = str_slice(s, 1, str_len(s)); }
+    return base.sb_cat2(g_ll_curfn, base.sb_cat2(".", s));
+}
+
+pub fn ll_ensure_slot(tname: string, st: string) void {
+    var n: i64 = slice_len(g_ll_names) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        if (g_ll_names[i] == tname) { return; }
+        i = i + 1;
+    }
+    append(g_ll_names, tname);
+    append(g_ll_sts, st);
+    sb_append_str(g_ll, "  ");
+    sb_append_str(g_ll, ll_llname(tname));
+    sb_append_str(g_ll, " = alloca ");
+    sb_append_str(g_ll, st_to_ll(st));
+    sb_append_str(g_ll, "\n");
+}
+
+// 取 $x 承载值的 LLVM 寄存器（load 出 alloca）
+pub fn ll_load(tname: string, st: string) string {
+    var r: string = ll_tmp();
+    sb_append_str(g_ll, "  ");
+    sb_append_str(g_ll, r);
+    sb_append_str(g_ll, " = load ");
+    sb_append_str(g_ll, st_to_ll(st));
+    sb_append_str(g_ll, ", ptr ");
+    sb_append_str(g_ll, ll_llname(tname));
+    sb_append_str(g_ll, "\n");
+    return r;
+}
+
+pub fn ll_store(tname: string, st: string, val: string) void {
+    sb_append_str(g_ll, "  store ");
+    sb_append_str(g_ll, st_to_ll(st));
+    sb_append_str(g_ll, " ");
+    sb_append_str(g_ll, val);
+    sb_append_str(g_ll, ", ptr ");
+    sb_append_str(g_ll, ll_llname(tname));
+    sb_append_str(g_ll, "\n");
+}
+
+pub fn ll_find(s: string, sub: string) i64 {
+    var n: i64 = str_len(s);
+    var m: i64 = str_len(sub);
+    var i: i64 = 0;
+    while (i + m <= n) {
+        var j: i64 = 0;
+        var ok: bool = true;
+        while (j < m) {
+            if (str_at(s, i + j) != str_at(sub, j)) { ok = false; break; }
+            j = j + 1;
+        }
+        if (ok) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// 真·前缀判断（t 内置 str_starts 实为相等判断，不可用）
+pub fn ll_starts(s: string, pre: string) bool {
+    var n: i64 = str_len(pre);
+    if (str_len(s) < n) { return false; }
+    var i: i64 = 0;
+    while (i < n) {
+        if (str_at(s, i) != str_at(pre, i)) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+// TIR ST -> LLVM 类型
+pub fn st_to_ll(st: string) string {
+    if (st == "void") { return "void"; }
+    if (st == "bool") { return "i8"; }
+    if (st == "u8") { return "i8"; }
+    if (st == "u16") { return "i16"; }
+    if (st == "u32") { return "i32"; }
+    if (st == "u64") { return "i64"; }
+    if (st == "f32") { return "float"; }
+    if (st == "f64") { return "double"; }
+    if (ll_starts(st, "ptr<")) {
+        return "ptr";
+    }
+    if (ll_starts(st, "arr<")) {
+        var inner: string = str_slice(st, 4, str_len(st) - 1);
+        var sp: i64 = ll_find(inner, " x ");
+        var elem: string = str_slice(inner, 0, sp);
+        var nn: string = str_slice(inner, sp + 3, str_len(inner));
+        return base.sb_cat5("[", nn, " x ", st_to_ll(elem), "]");
+    }
+    if (ll_starts(st, "vec<")) {
+        var inner: string = str_slice(st, 4, str_len(st) - 1);
+        var sp: i64 = ll_find(inner, " x ");
+        var elem: string = str_slice(inner, 0, sp);
+        var nn: string = str_slice(inner, sp + 3, str_len(inner));
+        return base.sb_cat5("<", nn, " x ", st_to_ll(elem), ">");
+    }
+    if (ll_starts(st, "fn<")) {
+        return "ptr";
+    }
+    return st;
+}
+
+pub fn ll_arg_types(args: string) string {
+    if (str_len(args) == 0) { return ""; }
+    var out: StringBuilder = sb_new();
+    var n: i64 = str_len(args);
+    var i: i64 = 0;
+    var cur: StringBuilder = sb_new();
+    var first: bool = true;
+    while (i < n) {
+        var c: i64 = str_at(args, i);
+        if (c == 44) {   // ','
+            if (first == false) { sb_append_str(out, ", "); }
+            sb_append_str(out, st_to_ll(sb_to_str(cur)));
+            cur = sb_new();
+            first = false;
+        } else {
+            sb_append_char(cur, c);
+        }
+        i = i + 1;
+    }
+    if (first == false) { sb_append_str(out, ", "); }
+    sb_append_str(out, st_to_ll(sb_to_str(cur)));
+    return sb_to_str(out);
+}
+
+pub fn ll_ptr_inner(st: string) string {
+    // ptr<ST> -> 元素 ST（已转 LLVM 类型）
+    return st_to_ll(str_slice(st, 4, str_len(st) - 1));
+}
+
+pub fn ll_is_int(st: string) bool {
+    return ll_starts(st, "i") || ll_starts(st, "u") || st == "bool";
+}
+
+pub fn ll_is_float(st: string) bool {
+    return st == "f32" || st == "f64";
+}
+
+// 八进制整数字面量 -> 十进制（LLVM IR 不支持 0o755，但支持 0x.. 与十进制）
+pub fn ll_oct_to_dec(s: string) string {
+    var n: i64 = str_len(s);
+    var i: i64 = 2;   // 跳过 "0o"
+    if (i >= n) { return "0"; }
+    var val: i64 = 0;
+    while (i < n) {
+        var c: i64 = str_at(s, i);
+        var d: i64 = c - 48;   // '0' = 48
+        if (d < 0 || d > 7) { d = 0; }
+        val = val * 8 + d;
+        i = i + 1;
+    }
+    return base.i2s(val);
+}
+
+// 十六进制整数字面量 -> 十进制（裸 0x.. 在 LLVM IR 中易被误判为浮点，转十进制最稳）
+pub fn ll_hex_to_dec(s: string) string {
+    var n: i64 = str_len(s);
+    var i: i64 = 2;   // 跳过 "0x"
+    var val: i64 = 0;
+    while (i < n) {
+        var c: i64 = str_at(s, i);
+        var d: i64;
+        if (c >= 48 && c <= 57) { d = c - 48; }        // '0'-'9'
+        else if (c >= 65 && c <= 70) { d = c - 55; }   // 'A'-'F'
+        else if (c >= 97 && c <= 102) { d = c - 87; }  // 'a'-'f'
+        else { d = 0; }
+        val = val * 16 + d;
+        i = i + 1;
+    }
+    return base.i2s(val);
+}
+
+// 二进制整数字面量 -> 十进制（LLVM IR 不支持 0b..）
+pub fn ll_bin_to_dec(s: string) string {
+    var n: i64 = str_len(s);
+    var i: i64 = 2;   // 跳过 "0b"
+    if (i >= n) { return "0"; }
+    var val: i64 = 0;
+    while (i < n) {
+        var c: i64 = str_at(s, i);
+        var d: i64 = c - 48;   // '0'=48 '1'=49
+        if (d < 0 || d > 1) { d = 0; }
+        val = val * 2 + d;
+        i = i + 1;
+    }
+    return base.i2s(val);
+}
+
+// 归一化立即数：浮点处理 inf/nan，二/八/十六进制转十进制；十进制/负数 LLVM 原生支持
+pub fn ll_norm_imm(imm: string, st: string) string {
+    if (ll_starts(st, "f")) {
+        if (imm == "inf") { if (st == "f32") { return "0x7F800000"; } return "0x7FF0000000000000"; }
+        if (imm == "-inf") { if (st == "f32") { return "0xFF800000"; } return "0xFFF0000000000000"; }
+        if (imm == "nan") { if (st == "f32") { return "0x7FC00000"; } return "0x7FF8000000000000"; }
+        return imm;
+    }
+    if (ll_starts(imm, "0b") || ll_starts(imm, "0B")) { return ll_bin_to_dec(imm); }
+    if (ll_starts(imm, "0o") || ll_starts(imm, "0O")) { return ll_oct_to_dec(imm); }
+    if (ll_starts(imm, "0x") || ll_starts(imm, "0X")) { return ll_hex_to_dec(imm); }
+    return imm;
+}
+
+// 为模块内未定义的被调函数 emit declare（可被多次调用，仅首见时声明一次）
+pub fn ll_maybe_declare(fname: string, retst: string, argsts: []string) void {
+    var i: i64 = 0;
+    var n: i64 = slice_len(g_func_names) as i64;
+    while (i < n) {
+        if (g_func_names[i] == fname) { return; }   // 本模块已定义
+        i = i + 1;
+    }
+    var j: i64 = 0;
+    var m: i64 = slice_len(g_ll_declared) as i64;
+    while (j < m) {
+        if (g_ll_declared[j] == fname) { return; }  // 已声明
+        j = j + 1;
+    }
+    append(g_ll_declared, fname);
+    var sb: StringBuilder = sb_new();
+    sb_append_str(sb, "declare ");
+    sb_append_str(sb, st_to_ll(retst));
+    sb_append_str(sb, " @");
+    sb_append_str(sb, fname);
+    sb_append_str(sb, "(");
+    var k: i64 = 0;
+    var am: i64 = slice_len(argsts) as i64;
+    var first: bool = true;
+    while (k < am) {
+        if (first == false) { sb_append_str(sb, ", "); }
+        sb_append_str(sb, st_to_ll(argsts[k]));
+        first = false;
+        k = k + 1;
+    }
+    sb_append_str(sb, ")\n");
+    sb_append_str(g_ll_declbuf, sb_to_str(sb));
+}
+
+pub fn ll_binop(op: string) string {
+    if (op == "add") { return "add"; }
+    if (op == "sub") { return "sub"; }
+    if (op == "mul") { return "mul"; }
+    if (op == "sdiv") { return "sdiv"; }
+    if (op == "udiv") { return "udiv"; }
+    if (op == "srem") { return "srem"; }
+    if (op == "urem") { return "urem"; }
+    if (op == "and") { return "and"; }
+    if (op == "or") { return "or"; }
+    if (op == "xor") { return "xor"; }
+    if (op == "shl") { return "shl"; }
+    if (op == "lshr") { return "lshr"; }
+    if (op == "ashr") { return "ashr"; }
+    return "add";
+}
+
+pub fn ll_icmp(op: string) string {
+    if (op == "slt") { return "slt"; }
+    if (op == "sgt") { return "sgt"; }
+    if (op == "sge") { return "sge"; }
+    if (op == "sle") { return "sle"; }
+    if (op == "ult") { return "ult"; }
+    if (op == "ugt") { return "ugt"; }
+    if (op == "ule") { return "ule"; }
+    if (op == "uge") { return "uge"; }
+    if (op == "eq") { return "eq"; }
+    if (op == "ne") { return "ne"; }
+    return "eq";
+}
+
+// 浮点比较谓词（icmp 仅接受整数类型，浮点必须用 fcmp）
+pub fn ll_fcmp(op: string) string {
+    if (op == "eq") { return "oeq"; }
+    if (op == "ne") { return "one"; }
+    if (op == "slt") { return "olt"; }
+    if (op == "sgt") { return "ogt"; }
+    if (op == "sle") { return "ole"; }
+    if (op == "sge") { return "oge"; }
+    if (op == "ult") { return "ult"; }
+    if (op == "ugt") { return "ugt"; }
+    if (op == "ule") { return "ule"; }
+    if (op == "uge") { return "uge"; }
+    return "oeq";
+}
+
+// 取比较 op 的前缀：无点形式 slti64 -> "slt"（算术用点 slt.i64，比较用无点 slti64）
+pub fn ll_cmp_prefix(op: string) string {
+    if (ll_starts(op, "slt")) { return "slt"; }
+    if (ll_starts(op, "sgt")) { return "sgt"; }
+    if (ll_starts(op, "sge")) { return "sge"; }
+    if (ll_starts(op, "sle")) { return "sle"; }
+    if (ll_starts(op, "ult")) { return "ult"; }
+    if (ll_starts(op, "ugt")) { return "ugt"; }
+    if (ll_starts(op, "ule")) { return "ule"; }
+    if (ll_starts(op, "uge")) { return "uge"; }
+    if (ll_starts(op, "eq")) { return "eq"; }
+    if (ll_starts(op, "ne")) { return "ne"; }
+    return "";
+}
+
+// 取 op.ST 的 '.' 分隔位置（op 与 st 在调用处就地拆分，t 不支持多返回值）
+pub fn ll_split_dot(s: string) i64 {
+    return ll_find(s, ".");
+}
+
+// 简单空白分词（先把 ( ) , 换成空格）
+pub fn ll_tokens(line: string) []string {
+    var n: i64 = str_len(line);
+    var i: i64 = 0;
+    var out: StringBuilder = sb_new();
+    while (i < n) {
+        var c: i64 = str_at(line, i);
+        if (c == 40 || c == 41 || c == 44) { sb_append_char(out, 32); }   // ( ) , -> space
+        else { sb_append_char(out, c); }
+        i = i + 1;
+    }
+    var s2: string = sb_to_str(out);
+    var n2: i64 = str_len(s2);
+    var j: i64 = 0;
+    var buf: StringBuilder = sb_new();
+    var toks: []string = [];
+    while (j < n2) {
+        var c: i64 = str_at(s2, j);
+        if (c == 32 || c == 9 || c == 10 || c == 13) {
+            if (str_len(sb_to_str(buf)) > 0) {
+                append(toks, sb_to_str(buf));
+                buf = sb_new();
+            }
+        } else {
+            sb_append_char(buf, c);
+        }
+        j = j + 1;
+    }
+    if (str_len(sb_to_str(buf)) > 0) { append(toks, sb_to_str(buf)); }
+    return toks;
+}
+
+// 解析 func 行，结果写入 g_pf_name / g_pf_params / g_pf_ret（t 不支持多返回值）
+pub fn ll_parse_func(line: string) void {
+    var toks: []string = ll_tokens(line);   // func @name($a: ST, $b: ST): ST {
+    g_pf_name = str_slice(toks[1], 1, str_len(toks[1]));   // 去 @
+    g_pf_params = [];
+    g_pf_ret = "void";
+    var i: i64 = 2;
+    var m: i64 = slice_len(toks) as i64;
+    while (i < m) {
+        if (toks[i] == ":") {
+            g_pf_ret = toks[i + 1];
+            break;
+        }
+        var p: string = toks[i];
+        if (str_at(p, str_len(p) - 1) == 58) { p = str_slice(p, 0, str_len(p) - 1); }   // 去末尾 ':'
+        append(g_pf_params, p);
+        append(g_pf_params, toks[i + 1]);
+        i = i + 2;
+    }
+}
+
+pub fn ll_lookup_params(fname: string) []string {
+    var i: i64 = 0;
+    var n: i64 = slice_len(g_func_names) as i64;
+    while (i < n) {
+        if (g_func_names[i] == fname) { return g_func_paramsts[i]; }
+        i = i + 1;
+    }
+    var __ll_empty: []string = [];
+    return __ll_empty;
+}
+
+pub fn ll_emit_func(name: string, params: []string, ret: string) void {
+    g_ll_curfn = name;
+    g_ll_tmpc = 0;
+    g_ll_names = [];
+    g_ll_sts = [];
+    append(g_ll_func_rets, ret);
+    var sig: StringBuilder = sb_new();
+    sb_append_str(sig, "define ");
+    sb_append_str(sig, st_to_ll(ret));
+    sb_append_str(sig, " @");
+    sb_append_str(sig, name);
+    sb_append_str(sig, "(");
+    var m: i64 = slice_len(params) as i64;
+    var i: i64 = 0;
+    var first: bool = true;
+    while (i < m) {
+        var pname: string = params[i];
+        var pst: string = params[i + 1];
+        if (first == false) { sb_append_str(sig, ", "); }
+        sb_append_str(sig, st_to_ll(pst));
+        sb_append_str(sig, " ");
+        sb_append_str(sig, ll_llname(pname));
+        sb_append_str(sig, ".in");
+        first = false;
+        i = i + 2;
+    }
+    sb_append_str(sig, ") {\n");
+    sb_append_str(g_ll, sb_to_str(sig));
+    // 参数 alloca + store
+    i = 0;
+    while (i < m) {
+        var pname: string = params[i];
+        var pst: string = params[i + 1];
+        ll_ensure_slot(pname, pst);
+        ll_set_st(pname, pst);
+        sb_append_str(g_ll, "  store ");
+        sb_append_str(g_ll, st_to_ll(pst));
+        sb_append_str(g_ll, " ");
+        sb_append_str(g_ll, ll_llname(pname));
+        sb_append_str(g_ll, ".in, ptr ");
+        sb_append_str(g_ll, ll_llname(pname));
+        sb_append_str(g_ll, "\n");
+        i = i + 2;
+    }
+}
+
+pub fn ll_emit_inst(toks: []string) void {
+    var m: i64 = slice_len(toks) as i64;
+    if (m < 1) { return; }
+    var op: string = toks[0];
+    if (m < 2) { return; }   // 防御：裸 '{' 等畸形行
+    if (op == "slot") {
+        ll_ensure_slot(toks[2], toks[1]);
+        ll_set_st(toks[2], toks[1]);
+        return;
+    }
+    if (op == "const.str") {
+        // 字符串常量：核心子集不做真实现，仅分配 %TStr slot 使引用不悬空；
+        // 真实字符串数据 + 运行时 shim（@println->@tll_println 等）属 §4。
+        var d: string = toks[1];
+        ll_ensure_slot(d, "%TStr");
+        ll_set_st(d, "%TStr");
+        return;
+    }
+    if (op == "const.ptr.null") {
+        // 空指针常量：const.ptr.null <TYPE> <DST>  ->  DST 持有 null 指针
+        var ty: string = toks[1];   // 形如 ptr<void> / ptr<X>
+        var d: string = toks[2];
+        ll_ensure_slot(d, "ptr");
+        ll_set_st(d, "ptr");
+        ll_store(d, "ptr", "null");
+        return;
+    }
+    if (op == "const" || ll_starts(op, "const.")) {
+        var st: string;
+        var d: string;
+        var imm: string;
+        if (op == "const") {
+            st = toks[1]; d = toks[2]; imm = toks[3];
+        } else {
+            st = str_slice(op, 6, str_len(op));   // const.i64 -> i64
+            d = toks[1]; imm = toks[2];
+        }
+        var nimm: string = ll_norm_imm(imm, st);
+        ll_ensure_slot(d, st);
+        ll_set_st(d, st);
+        ll_store(d, st, nimm);
+        return;
+    }
+    if (op == "store") {
+        var src: string = toks[1];
+        var dst: string = toks[2];
+        var dstst: string = ll_get_st(dst);
+        if (ll_starts(dstst, "ptr<")) {
+            var inner: string = ll_ptr_inner(dstst);
+            var srcst: string = ll_get_st(src);
+            if (srcst == inner) {
+                // *dst = src  (store-through：$dst 承载指针，把 $src 写到该地址)
+                var p: string = ll_load(dst, dstst);
+                var v: string = ll_load(src, inner);
+                sb_append_str(g_ll, "  store ");
+                sb_append_str(g_ll, st_to_ll(inner));
+                sb_append_str(g_ll, " ");
+                sb_append_str(g_ll, v);
+                sb_append_str(g_ll, ", ptr ");
+                sb_append_str(g_ll, p);
+                sb_append_str(g_ll, "\n");
+            } else {
+                // dst = src  (指针拷贝：$src 也是 ptr<X>)
+                var v: string = ll_load(src, dstst);
+                ll_store(dst, dstst, v);
+            }
+        } else {
+            var v: string = ll_load(src, dstst);
+            ll_store(dst, dstst, v);
+        }
+        return;
+    }
+    if (op == "load") {
+        var st: string = toks[1];
+        var d: string = toks[2];
+        var addr: string = toks[3];
+        ll_ensure_slot(d, st);
+        ll_set_st(d, st);
+        var pst: string = ll_get_st(addr);
+        var p: string = ll_load(addr, pst);
+        var inner: string = ll_ptr_inner(pst);
+        var v: string = ll_tmp();
+        sb_append_str(g_ll, "  ");
+        sb_append_str(g_ll, v);
+        sb_append_str(g_ll, " = load ");
+        sb_append_str(g_ll, st_to_ll(st));
+        sb_append_str(g_ll, ", ptr ");
+        sb_append_str(g_ll, p);
+        sb_append_str(g_ll, "\n");
+        ll_store(d, st, v);
+        return;
+    }
+    if (op == "addr_of") {
+        var st: string = toks[1];   // ptr<ST>
+        var d: string = toks[2];
+        var x: string = toks[3];
+        ll_ensure_slot(d, st);
+        ll_set_st(d, st);
+        // $x 已是 alloca（指针值），直接存入 $d
+        sb_append_str(g_ll, "  store ");
+        sb_append_str(g_ll, st_to_ll(st));
+        sb_append_str(g_ll, " ");
+        sb_append_str(g_ll, ll_llname(x));
+        sb_append_str(g_ll, ", ptr ");
+        sb_append_str(g_ll, ll_llname(d));
+        sb_append_str(g_ll, "\n");
+        return;
+    }
+    if (op == "gep") {
+        var st: string = toks[1];
+        var g: string = toks[2];
+        var p: string = toks[3];
+        ll_ensure_slot(g, base.sb_cat3("ptr<", st, ">"));
+        ll_set_st(g, base.sb_cat3("ptr<", st, ">"));
+        var pst: string = ll_get_st(p);
+        var pv: string = ll_load(p, pst);
+        var r: string = ll_tmp();
+        sb_append_str(g_ll, "  ");
+        sb_append_str(g_ll, r);
+        sb_append_str(g_ll, " = getelementptr inbounds ");
+        sb_append_str(g_ll, ll_ptr_inner(pst));
+        sb_append_str(g_ll, ", ptr ");
+        sb_append_str(g_ll, pv);
+        sb_append_str(g_ll, ", i32 0");
+        var k: i64 = 4;
+        var m: i64 = slice_len(toks) as i64;
+        while (k < m) {
+            var gidx: string = toks[k];
+            if (ll_starts(gidx, "$")) {
+                var gist: string = ll_get_st(gidx);
+                sb_append_str(g_ll, ", ");
+                sb_append_str(g_ll, st_to_ll(gist));
+                sb_append_str(g_ll, " ");
+                sb_append_str(g_ll, ll_load(gidx, gist));
+            } else {
+                sb_append_str(g_ll, ", i32 ");
+                sb_append_str(g_ll, gidx);
+            }
+            k = k + 1;
+        }
+        sb_append_str(g_ll, "\n");
+        ll_store(g, base.sb_cat3("ptr<", st, ">"), r);
+        return;
+    }
+    if (op == "struct_new") {
+        // struct_new %Name $d ($f0 $f1 ...) ：按字段顺序构造具名聚合值
+        var tyname: string = toks[1];          // "%Point"
+        var d: string = toks[2];               // "$t1" 目标 slot
+        var ap: string = ll_tmp();
+        sb_append_str(g_ll, "  ");
+        sb_append_str(g_ll, ap);
+        sb_append_str(g_ll, " = alloca ");
+        sb_append_str(g_ll, tyname);
+        sb_append_str(g_ll, "\n");
+        var fi: i64 = 3;
+        var fm: i64 = slice_len(toks) as i64;
+        while (fi < fm) {
+            var fs: string = toks[fi];
+            var fst: string = ll_get_st(fs);
+            var fv: string = ll_load(fs, fst);
+            var gp: string = ll_tmp();
+            sb_append_str(g_ll, "  ");
+            sb_append_str(g_ll, gp);
+            sb_append_str(g_ll, " = getelementptr inbounds ");
+            sb_append_str(g_ll, tyname);
+            sb_append_str(g_ll, ", ptr ");
+            sb_append_str(g_ll, ap);
+            sb_append_str(g_ll, ", i32 0, i32 ");
+            sb_append_str(g_ll, base.i2s(fi - 3));
+            sb_append_str(g_ll, "\n");
+            sb_append_str(g_ll, "  store ");
+            sb_append_str(g_ll, st_to_ll(fst));
+            sb_append_str(g_ll, " ");
+            sb_append_str(g_ll, fv);
+            sb_append_str(g_ll, ", ptr ");
+            sb_append_str(g_ll, gp);
+            sb_append_str(g_ll, "\n");
+            fi = fi + 1;
+        }
+        var val: string = ll_tmp();
+        sb_append_str(g_ll, "  ");
+        sb_append_str(g_ll, val);
+        sb_append_str(g_ll, " = load ");
+        sb_append_str(g_ll, tyname);
+        sb_append_str(g_ll, ", ptr ");
+        sb_append_str(g_ll, ap);
+        sb_append_str(g_ll, "\n");
+        ll_ensure_slot(d, tyname);
+        ll_set_st(d, tyname);
+        ll_store(d, tyname, val);
+        return;
+    }
+    if (op == "call") {
+        var st: string = toks[1];
+        var d: string = toks[2];
+        var fname: string = ll_llname(toks[3]);   // "@add" -> "add"
+        var m: i64 = slice_len(toks) as i64;
+        var k: i64 = 4;
+        var argsb: StringBuilder = sb_new();
+        var declargs: []string = [];
+        var first: bool = true;
+        while (k < m) {
+            var a: string = toks[k];
+            var ast: string = ll_get_st(a);   // 用实参槽真实类型（比签名更准）
+            var v: string = ll_load(a, ast);
+            if (first == false) { sb_append_str(argsb, ", "); }
+            sb_append_str(argsb, st_to_ll(ast));
+            sb_append_str(argsb, " ");
+            sb_append_str(argsb, v);
+            append(declargs, ast);
+            first = false;
+            k = k + 1;
+        }
+        ll_maybe_declare(fname, st, declargs);
+        if (st == "void") {
+            sb_append_str(g_ll, "  call void @");
+            sb_append_str(g_ll, fname);
+            sb_append_str(g_ll, "(");
+            sb_append_str(g_ll, sb_to_str(argsb));
+            sb_append_str(g_ll, ")\n");
+            return;
+        }
+        var r: string = ll_tmp();
+        sb_append_str(g_ll, "  ");
+        sb_append_str(g_ll, r);
+        sb_append_str(g_ll, " = call ");
+        sb_append_str(g_ll, st_to_ll(st));
+        sb_append_str(g_ll, " @");
+        sb_append_str(g_ll, fname);
+        sb_append_str(g_ll, "(");
+        sb_append_str(g_ll, sb_to_str(argsb));
+        sb_append_str(g_ll, ")\n");
+        ll_ensure_slot(d, st);
+        ll_set_st(d, st);
+        ll_store(d, st, r);
+        return;
+    }
+    if (op == "ret" || op == "ret.void") {
+        if (op == "ret.void" || slice_len(toks) as i64 < 3) {
+            sb_append_str(g_ll, "  ret void\n");
+        } else {
+            var st: string = toks[1];
+            var d: string = toks[2];
+            var v: string = ll_load(d, st);
+            sb_append_str(g_ll, "  ret ");
+            sb_append_str(g_ll, st_to_ll(st));
+            sb_append_str(g_ll, " ");
+            sb_append_str(g_ll, v);
+            sb_append_str(g_ll, "\n");
+        }
+        return;
+    }
+    if (op == "br") {
+        sb_append_str(g_ll, "  br label %");
+        sb_append_str(g_ll, ll_label(toks[1]));
+        sb_append_str(g_ll, "\n");
+        return;
+    }
+    if (op == "br_cond") {
+        var c: string = toks[1];
+        var l1: string = toks[2];
+        var l2: string = toks[3];
+        var cst: string = ll_get_st(c);
+        var cv: string = ll_load(c, cst);
+        if (cst != "i1") {
+            var t: string = ll_tmp();
+            sb_append_str(g_ll, "  ");
+            sb_append_str(g_ll, t);
+            sb_append_str(g_ll, " = icmp ne ");
+            sb_append_str(g_ll, st_to_ll(cst));
+            sb_append_str(g_ll, " ");
+            sb_append_str(g_ll, cv);
+            sb_append_str(g_ll, ", 0\n");
+            cv = t;
+        }
+        sb_append_str(g_ll, "  br i1 ");
+        sb_append_str(g_ll, cv);
+        sb_append_str(g_ll, ", label %");
+        sb_append_str(g_ll, ll_label(l1));
+        sb_append_str(g_ll, ", label %");
+        sb_append_str(g_ll, ll_label(l2));
+        sb_append_str(g_ll, "\n");
+        return;
+    }
+    if (op == "block") {
+        sb_append_str(g_ll, ll_label(toks[1]));
+        sb_append_str(g_ll, ":\n");
+        return;
+    }
+    // 类型转换：trunc/zext/sext/fpext/sitofp/uitofp/fptosi/fptoui
+    // 布局 OP DST_ST $d SRC_ST $s  ->  LLVM: %d = OP SRC_ST $s to DST_ST
+    if (op == "trunc" || op == "zext" || op == "sext" || op == "fpext" ||
+        op == "sitofp" || op == "uitofp" || op == "fptosi" || op == "fptoui") {
+        var dstst: string = toks[1];
+        var d: string = toks[2];
+        var srcst: string = toks[3];
+        var s: string = toks[4];
+        var sv: string = ll_load(s, srcst);
+        ll_ensure_slot(d, dstst);
+        ll_set_st(d, dstst);
+        var r: string = ll_tmp();
+        // trunc 是泛型窄化：按类型派生真正的 LLVM cast 助记符
+        var llvmop: string = op;
+        if (op == "trunc") {
+            if (ll_is_float(srcst) && ll_is_float(dstst)) { llvmop = "fptrunc"; }
+            else if (ll_is_float(srcst) && ll_is_int(dstst)) { llvmop = "fptosi"; }
+            else if (ll_is_int(srcst) && ll_is_float(dstst)) { llvmop = "sitofp"; }
+            else { llvmop = "trunc"; }
+        }
+        sb_append_str(g_ll, "  ");
+        sb_append_str(g_ll, r);
+        sb_append_str(g_ll, " = ");
+        sb_append_str(g_ll, llvmop);
+        sb_append_str(g_ll, " ");
+        sb_append_str(g_ll, st_to_ll(srcst));
+        sb_append_str(g_ll, " ");
+        sb_append_str(g_ll, sv);
+        sb_append_str(g_ll, " to ");
+        sb_append_str(g_ll, st_to_ll(dstst));
+        sb_append_str(g_ll, "\n");
+        ll_store(d, dstst, r);
+        return;
+    }
+    // 二元 / 比较：op.ST $d $a $b  （算术用点 add.i64；比较用无点 slti64）
+    var o: string;
+    var st: string;
+    var dot: i64 = ll_find(op, ".");
+    if (dot >= 0) {
+        o = str_slice(op, 0, dot);
+        st = str_slice(op, dot + 1, str_len(op));
+    } else {
+        var pre: string = ll_cmp_prefix(op);
+        if (str_len(pre) > 0) { o = pre; st = str_slice(op, str_len(pre), str_len(op)); }
+        else { o = op; st = "i64"; }
+    }
+    if (o == "slt" || o == "sgt" || o == "sge" || o == "sle" || o == "ult" || o == "ugt" ||
+        o == "ule" || o == "uge" || o == "eq" || o == "ne") {
+        var d: string = toks[1];
+        var a: string = toks[2];
+        var b: string = toks[3];
+        var da: string = ll_load(a, st);
+        var db: string = ll_load(b, st);
+        var r: string = ll_tmp();
+        sb_append_str(g_ll, "  ");
+        sb_append_str(g_ll, r);
+        sb_append_str(g_ll, " = ");
+        if (ll_is_float(st)) {
+            sb_append_str(g_ll, "fcmp ");
+            sb_append_str(g_ll, ll_fcmp(o));
+        } else {
+            sb_append_str(g_ll, "icmp ");
+            sb_append_str(g_ll, ll_icmp(o));
+        }
+        sb_append_str(g_ll, " ");
+        sb_append_str(g_ll, st_to_ll(st));
+        sb_append_str(g_ll, " ");
+        sb_append_str(g_ll, da);
+        sb_append_str(g_ll, ", ");
+        sb_append_str(g_ll, db);
+        sb_append_str(g_ll, "\n");
+        ll_ensure_slot(d, "i1");
+        ll_set_st(d, "i1");
+        ll_store(d, "i1", r);
+        return;
+    }
+    // 普通二元
+    var d: string = toks[1];
+    var a: string = toks[2];
+    var b: string = toks[3];
+    var da: string = ll_load(a, st);
+    var db: string = ll_load(b, st);
+    var r: string = ll_tmp();
+    sb_append_str(g_ll, "  ");
+    sb_append_str(g_ll, r);
+    sb_append_str(g_ll, " = ");
+    sb_append_str(g_ll, ll_binop(o));
+    sb_append_str(g_ll, " ");
+    sb_append_str(g_ll, st);
+    sb_append_str(g_ll, " ");
+    sb_append_str(g_ll, da);
+    sb_append_str(g_ll, ", ");
+    sb_append_str(g_ll, db);
+    sb_append_str(g_ll, "\n");
+    ll_ensure_slot(d, st);
+    ll_set_st(d, st);
+    ll_store(d, st, r);
+}
+
+// ── 文本扫描辅助 ─────────────────────────────────────────────────
+pub fn ll_split_lines(text: string) []string {
+    var out: []string = [];
+    var cur: StringBuilder = sb_new();
+    var n: i64 = str_len(text);
+    var i: i64 = 0;
+    while (i < n) {
+        var c: i64 = str_at(text, i);
+        if (c == 10) {   // '\n'
+            append(out, sb_to_str(cur));
+            cur = sb_new();
+        } else if (c != 13) {   // skip '\r'
+            sb_append_char(cur, c);
+        }
+        i = i + 1;
+    }
+    if (str_len(sb_to_str(cur)) > 0) { append(out, sb_to_str(cur)); }
+    return out;
+}
+
+pub fn ll_trim(s: string) string {
+    var n: i64 = str_len(s);
+    var i: i64 = 0;
+    while (i < n) {
+        var c: i64 = str_at(s, i);
+        if (c != 32 && c != 9) { break; }
+        i = i + 1;
+    }
+    var j: i64 = n;
+    while (j > i) {
+        var c: i64 = str_at(s, j - 1);
+        if (c == 32 || c == 9) { j = j - 1; } else { break; }
+    }
+    return str_slice(s, i, j);
+}
+
+pub fn ll_emit_type_line(line: string) void {
+    var eq: i64 = ll_find(line, " = struct {");
+    if (eq < 0) { return; }
+    var name: string = str_slice(line, 0, eq);
+    var lbrace: i64 = ll_find(line, "{");
+    var rbrace: i64 = ll_find(line, "}");
+    if (lbrace < 0 || rbrace < 0) { return; }
+    var inner: string = ll_trim(str_slice(line, lbrace + 1, rbrace));
+    var fields: StringBuilder = sb_new();
+    var cur: StringBuilder = sb_new();
+    var first: bool = true;
+    var m: i64 = str_len(inner);
+    var i: i64 = 0;
+    while (i < m) {
+        var c: i64 = str_at(inner, i);
+        if (c == 44) {   // ','
+            if (first == false) { sb_append_str(fields, ", "); }
+            sb_append_str(fields, st_to_ll(ll_trim(sb_to_str(cur))));
+            cur = sb_new();
+            first = false;
+        } else if (c == 58) {   // ':' 跳过字段名 (f0:)
+            cur = sb_new();
+        } else {
+            sb_append_char(cur, c);
+        }
+        i = i + 1;
+    }
+    if (first == false) { sb_append_str(fields, ", "); }
+    sb_append_str(fields, st_to_ll(ll_trim(sb_to_str(cur))));
+    sb_append_str(g_ll, name);
+    sb_append_str(g_ll, " = type { ");
+    sb_append_str(g_ll, sb_to_str(fields));
+    sb_append_str(g_ll, " }\n");
+}
+
+// 为 TIR 引用但未在 types: 段内联定义的运行时结构类型（如 %TSb）补 opaque 定义；
+// 与外部函数 declare 同理——链接器再解析真实布局。类型名均以大写 T 起头（%TStr 等）。
+pub fn ll_emit_opaque_defs() void {
+    var text: string = sb_to_str(g_ll);
+    var n: i64 = str_len(text);
+    var i: i64 = 0;
+    var buf: StringBuilder = sb_new();
+    while (i < n) {
+        var c: i64 = str_at(text, i);
+        if (c == 37 && (i + 1) < n && str_at(text, i + 1) == 84) {   // '%' + 'T'
+            var j: i64 = i + 2;
+            while (j < n) {
+                var d: i64 = str_at(text, j);
+                if ((d >= 65 && d <= 90) || (d >= 97 && d <= 122) || (d >= 48 && d <= 57) || d == 95) { j = j + 1; }
+                else { break; }
+            }
+            var name: string = str_slice(text, i + 1, j);   // 含 'T'，如 "TSb"
+            var seen: bool = false;
+            var k: i64 = 0;
+            var km: i64 = slice_len(g_opaque_emitted) as i64;
+            while (k < km) {
+                if (g_opaque_emitted[k] == name) { seen = true; break; }
+                k = k + 1;
+            }
+            if (seen == false) {
+                var pat: string = base.sb_cat3("%", name, " = type");
+                if (ll_find(sb_to_str(g_ll), pat) < 0) {
+                    sb_append_str(buf, "%");
+                    sb_append_str(buf, name);
+                    sb_append_str(buf, " = type opaque\n");
+                    append(g_opaque_emitted, name);
+                }
+            }
+            i = j;
+        } else {
+            i = i + 1;
+        }
+    }
+    var old: string = sb_to_str(g_ll);
+    g_ll = sb_new();
+    sb_append_str(g_ll, sb_to_str(buf));
+    sb_append_str(g_ll, old);
+}
+
+// 主入口：消费 tir.tir_to_text() 文本，产出 .ll 文本
+pub fn tir_to_ll_translate(text: string) string {
+    ll_reset();
+    var lines: []string = ll_split_lines(text);
+    var n: i64 = slice_len(lines) as i64;
+    // 第 1 遍：收集函数签名 + 发射 TT 类型
+    var k: i64 = 0;
+    while (k < n) {
+        var line: string = lines[k];
+        var toks: []string = ll_tokens(line);
+        var m: i64 = slice_len(toks) as i64;
+        if (m == 0) { k = k + 1; continue; }
+        if (toks[0] == "func") {
+            ll_parse_func(line);
+            var ps: []string = [];
+            var pi: i64 = 0;
+            var plen: i64 = slice_len(g_pf_params) as i64;
+            while (pi < plen) {
+                append(ps, g_pf_params[pi + 1]);
+                pi = pi + 2;
+            }
+            append(g_func_names, g_pf_name);
+            append(g_func_paramsts, ps);
+            k = k + 1;
+            continue;
+        }
+        if (ll_starts(toks[0], "%")) {
+            ll_emit_type_line(line);
+            k = k + 1;
+            continue;
+        }
+        k = k + 1;
+    }
+    // 第 2 遍：发射函数体
+    var in_func: bool = false;
+    k = 0;
+    while (k < n) {
+        var line: string = lines[k];
+        var tl: string = ll_trim(line);
+        if (tl == "" || tl == "}" || tl == "{") { k = k + 1; continue; }
+        var toks: []string = ll_tokens(line);
+        var m: i64 = slice_len(toks) as i64;
+        if (m == 0) { k = k + 1; continue; }
+        if (toks[0] == "module" || toks[0] == "source:" || toks[0] == "types:" || toks[0] == "strings:") {
+            k = k + 1;
+            continue;
+        }
+        if (toks[0] == "func") {
+            if (in_func) { sb_append_str(g_ll, "}\n\n"); }
+            ll_parse_func(line);
+            ll_emit_func(g_pf_name, g_pf_params, g_pf_ret);
+            in_func = true;
+            k = k + 1;
+            continue;
+        }
+        if (in_func) { ll_emit_inst(toks); }
+        k = k + 1;
+    }
+    if (in_func) { sb_append_str(g_ll, "}\n\n"); }
+    sb_append_str(g_ll, sb_to_str(g_ll_declbuf));   // 外部函数 declare 置于模块末尾
+    ll_emit_opaque_defs();                          // 运行时结构类型补 opaque 定义
+    return sb_to_str(g_ll);
+}
