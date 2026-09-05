@@ -1091,11 +1091,49 @@ pub fn tir_emit_expr(e: i64) string {
     if (kd == "map_lit") { return tir_emit_map_lit(e, -1); }
     if (kd == "index") { return tir_emit_index_read(e); }
     if (kd == "closure_make") { return tir_emit_closure_make(n); }
+    if (kd == "amp") { return tir_emit_amp(n); }
     // 兜底：不支持的表达式 → 零 slot，绝不崩溃
     tir_cmt(base.sb_cat3("unsupported expr: ", kd, ""));
     var z: string = tir_tmp();
     tir_line(base.sb_cat4("const.i64 ", z, " 0", ""));
     return z;
+}
+
+// 取址 `&x`：x 为左值（局部/全局/字段/下标/解引用）。
+// 镜像 codegen_ll.tc ll_addr：返回 x 的地址（ptr<ST>）；x 已是 ptr（&p / *p）则直接取其值。
+pub fn tir_addr_of(e: i64) string {
+    var o: Node = base.nodes[e];
+    var okd: string = o.kind;
+    if (okd == "amp" || okd == "deref") {
+        return tir_emit_expr(e);   // 已是指针值
+    }
+    if (okd == "paren") {
+        return tir_addr_of(o.na);   // 递归到内层
+    }
+    if (okd == "ident") {
+        var idx: i64 = tir_find_local_idx(o.sa);
+        if (idx >= 0) {
+            var st: string = tir_expr_st(e);
+            var d: string = tir_tmp();
+            tir_line(base.sb_cat6("addr_of ptr<", st, "> ", d, " ", g_local_slots[idx]));
+            return d;
+        }
+        return base.sb_cat2("@", o.sa);   // 全局符号即地址
+    }
+    if (okd == "index") {
+        return tir_emit_index_addr(e);
+    }
+    if (okd == "member") {
+        return tir_member_addr(o);
+    }
+    tir_cmt(base.sb_cat3("unsupported expr: amp (", okd, ")"));
+    var z: string = tir_tmp();
+    tir_line(base.sb_cat4("const.i64 ", z, " 0", ""));
+    return z;
+}
+
+pub fn tir_emit_amp(n: Node) string {
+    return tir_addr_of(n.na);
 }
 
 // 闭包构造（Stage 6）：在栈上构造环境结构 %<n.sb>，逐字段存入被捕获量的值，
