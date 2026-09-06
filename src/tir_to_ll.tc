@@ -132,6 +132,19 @@ pub fn ll_ensure_slot(tname: string, st: string) void {
 
 // 取 $x 承载值的 LLVM 寄存器（load 出 alloca）
 pub fn ll_load(tname: string, st: string) string {
+    // 全局引用 @name（函数或全局变量）：全局符号在 LLVM 中恒为指针，作值操作数时必须 load 出其值。
+    // 对函数引用：load ptr, ptr @fn 等价于直接使用 @fn（取其地址）；对全局变量：load 出存储值。两种情形都正确。
+    if (str_len(tname) >= 1 && tname[0] == 64) {
+        var r: string = ll_tmp();
+        sb_append_str(g_ll, "  ");
+        sb_append_str(g_ll, r);
+        sb_append_str(g_ll, " = load ");
+        sb_append_str(g_ll, st_to_ll(st));
+        sb_append_str(g_ll, ", ptr @");
+        sb_append_str(g_ll, ll_mangle(str_slice(tname, 1, str_len(tname))));
+        sb_append_str(g_ll, "\n");
+        return r;
+    }
     var r: string = ll_tmp();
     sb_append_str(g_ll, "  ");
     sb_append_str(g_ll, r);
@@ -703,7 +716,6 @@ pub fn ll_emit_inst(toks: []string) void {
         sb_append_str(g_ll, ll_ptr_inner(pst));
         sb_append_str(g_ll, ", ptr ");
         sb_append_str(g_ll, pv);
-        sb_append_str(g_ll, ", i32 0");
         var k: i64 = 4;
         var m: i64 = slice_len(toks) as i64;
         while (k < m) {
@@ -783,6 +795,16 @@ pub fn ll_emit_inst(toks: []string) void {
         var first: bool = true;
         while (k < m) {
             var a: string = toks[k];
+            if (str_len(a) >= 1 && a[0] == 64) {
+                // @fn 全局函数引用实参：本身即指针值，类型恒为 ptr（tir 未包装成闭包时的兜底）
+                if (first == false) { sb_append_str(argsb, ", "); }
+                sb_append_str(argsb, "ptr ");
+                sb_append_str(argsb, ll_load(a, "ptr<void>"));
+                append(declargs, "ptr<void>");
+                first = false;
+                k = k + 1;
+                continue;
+            }
             var ast: string = ll_get_st(a);   // 用实参槽真实类型（比签名更准）
             var v: string = ll_load(a, ast);
             if (first == false) { sb_append_str(argsb, ", "); }
@@ -809,6 +831,83 @@ pub fn ll_emit_inst(toks: []string) void {
         sb_append_str(g_ll, st_to_ll(st));
         sb_append_str(g_ll, " @");
         sb_append_str(g_ll, fname);
+        sb_append_str(g_ll, "(");
+        sb_append_str(g_ll, sb_to_str(argsb));
+        sb_append_str(g_ll, ")\n");
+        ll_ensure_slot(d, st);
+        ll_set_st(d, st);
+        ll_store(d, st, r);
+        return;
+    }
+    if (op == "call_ind") {
+        // 间接/闭包调用：函数值是指向 %TClosure { ptr code; ptr env } 的指针。
+        // 约定（与 legacy codegen_ll / FuncType 一致）：真实函数签名为 Ret (ptr env, Args...)，
+        // env 作首参由本处理器从闭包结构提取并前置。
+        var st: string = toks[1];
+        var d: string = toks[2];
+        var fp: string = ll_llname(toks[3]);   // 闭包指针（ptr<void> 擦除）
+        var g0: string = ll_tmp();
+        sb_append_str(g_ll, "  ");
+        sb_append_str(g_ll, g0);
+        sb_append_str(g_ll, " = getelementptr inbounds %TClosure, ptr ");
+        sb_append_str(g_ll, fp);
+        sb_append_str(g_ll, ", i32 0, i32 0\n");
+        var code: string = ll_tmp();
+        sb_append_str(g_ll, "  ");
+        sb_append_str(g_ll, code);
+        sb_append_str(g_ll, " = load ptr, ptr ");
+        sb_append_str(g_ll, g0);
+        sb_append_str(g_ll, "\n");
+        var g1: string = ll_tmp();
+        sb_append_str(g_ll, "  ");
+        sb_append_str(g_ll, g1);
+        sb_append_str(g_ll, " = getelementptr inbounds %TClosure, ptr ");
+        sb_append_str(g_ll, fp);
+        sb_append_str(g_ll, ", i32 0, i32 1\n");
+        var env: string = ll_tmp();
+        sb_append_str(g_ll, "  ");
+        sb_append_str(g_ll, env);
+        sb_append_str(g_ll, " = load ptr, ptr ");
+        sb_append_str(g_ll, g1);
+        sb_append_str(g_ll, "\n");
+        var m: i64 = slice_len(toks) as i64;
+        var k: i64 = 4;
+        var argsb: StringBuilder = sb_new();
+        sb_append_str(argsb, "ptr ");
+        sb_append_str(argsb, env);
+        while (k < m) {
+            var a: string = toks[k];
+            if (a == "(" || a == ")") { k = k + 1; continue; }
+            if (str_len(a) >= 1 && a[0] == 64) {
+                // @fn 全局函数引用实参：本身即指针值，类型恒为 ptr
+                sb_append_str(argsb, ", ptr ");
+                sb_append_str(argsb, ll_load(a, "ptr<void>"));
+                k = k + 1;
+                continue;
+            }
+            var ast: string = ll_get_st(a);
+            var v: string = ll_load(a, ast);
+            sb_append_str(argsb, ", ");
+            sb_append_str(argsb, st_to_ll(ast));
+            sb_append_str(argsb, " ");
+            sb_append_str(argsb, v);
+            k = k + 1;
+        }
+        if (st == "void") {
+            sb_append_str(g_ll, "  call void ");
+            sb_append_str(g_ll, code);
+            sb_append_str(g_ll, "(");
+            sb_append_str(g_ll, sb_to_str(argsb));
+            sb_append_str(g_ll, ")\n");
+            return;
+        }
+        var r: string = ll_tmp();
+        sb_append_str(g_ll, "  ");
+        sb_append_str(g_ll, r);
+        sb_append_str(g_ll, " = call ");
+        sb_append_str(g_ll, st_to_ll(st));
+        sb_append_str(g_ll, " ");
+        sb_append_str(g_ll, code);
         sb_append_str(g_ll, "(");
         sb_append_str(g_ll, sb_to_str(argsb));
         sb_append_str(g_ll, ")\n");
