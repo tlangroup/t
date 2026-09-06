@@ -790,10 +790,9 @@ pub fn ll_emit_inst(toks: []string) void {
         var x: string = toks[3];
         ll_ensure_slot(d, st);
         ll_set_st(d, st);
-        // $x 已是 alloca（指针值），直接存入 $d；若 x 是全局 @name 须保留 '@'（用 ll_llname_ptr）
-        sb_append_str(g_ll, "  store ");
-        sb_append_str(g_ll, st_to_ll(st));
-        sb_append_str(g_ll, " ");
+        // $x 是变量（alloca，LLVM 中即 ptr）或全局 @name（地址亦为 ptr）；取址结果一律为 ptr。
+        // 故 store 源操作数类型必须是 ptr，而非 st_to_ll(st)（否则 %TStr 等聚合类型与 ptr 不匹配）。
+        sb_append_str(g_ll, "  store ptr ");
         sb_append_str(g_ll, ll_llname_ptr(x));
         sb_append_str(g_ll, ", ptr ");
         sb_append_str(g_ll, ll_llname(d));
@@ -1086,6 +1085,10 @@ pub fn ll_emit_inst(toks: []string) void {
         } else if (op == "zext" || op == "sext") {
             // 浮点间扩宽（f32→f64）走 fpext，而非整数的 zext/sext
             if (ll_is_float(srcst) && ll_is_float(dstst)) { llvmop = "fpext"; }
+            // 防御：zext/sext 源类型须为整数标量。前端在 map 索引降级时偶发对聚合类型
+            // （如 %TStr 键）误插一条 zext（结果 $d 从未被使用），该指令在 LLVM 中非法；
+            // 仅当源为结构体聚合类型时丢弃之。命名标量类型（%Perm 等底层 i64）仍合法保留。
+            if (ll_is_struct_type(srcst)) { return; }
         }
         sb_append_str(g_ll, "  ");
         sb_append_str(g_ll, r);
@@ -1408,7 +1411,14 @@ pub fn tir_to_ll_translate(text: string) string {
     while (k < n) {
         var line: string = lines[k];
         var tl: string = ll_trim(line);
-        if (tl == "" || tl == "}" || tl == "{") { k = k + 1; continue; }
+        if (tl == "") { k = k + 1; continue; }
+        if (tl == "{") { k = k + 1; continue; }
+        if (tl == "}") {
+            // 函数体闭合：收尾 '}' 并复位 in_func，否则后续顶层声明（extern/global）会被误当函数体指令
+            if (in_func) { sb_append_str(g_ll, "}\n\n"); in_func = false; }
+            k = k + 1;
+            continue;
+        }
         var toks: []string = ll_tokens(line);
         var m: i64 = slice_len(toks) as i64;
         if (m == 0) { k = k + 1; continue; }
