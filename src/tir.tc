@@ -40,12 +40,20 @@ pub struct TIRFunc {
     is_kernel: bool;
 }
 
+pub struct TIRGlobal {
+    name: string;        // 全局变量名（不含 @）
+    td: i64;             // 类型描述符
+    init: i64;           // 初始化表达式节点（-1 表示无）
+    is_link: i64;        // 0=本模块, 1/2=链接库（跳过初始化）
+}
+
 pub struct TIRModule {
     mod: string;         // 来源模块名（去 .tc）
     source: string;      // 源文件路径
     types: []TIRType;    // TT 类型表
     strings: []string;   // 字符串表
     funcs: []TIRFunc;    // 函数 + extern 声明
+    globals: []TIRGlobal; // 模块级全局变量（Stage 4 降级目标）
 }
 
 // ── 模块级状态 ─────────────────────────────────────────────────
@@ -80,7 +88,8 @@ pub fn tir_reset() void {
     var zt: []TIRType = [];
     var zs: []string = [];
     var zf: []TIRFunc = [];
-    g_mod = TIRModule{ mod: "", source: "", types: zt, strings: zs, funcs: zf };
+    var zg: []TIRGlobal = [];
+    g_mod = TIRModule{ mod: "", source: "", types: zt, strings: zs, funcs: zf, globals: zg };
     var zp: []string = [];
     var zb: []TIRInst = [];
     g_cur_func = TIRFunc{ name: "", params: zp, ret_st: "void", body: zb, is_extern: false, is_kernel: false };
@@ -1532,6 +1541,40 @@ pub fn tir_member_addr(mnode: Node) string {
     return faddr;
 }
 
+// 2^n（i64，n < 63），用于 flag 槽位掩码计算（与 emit-ll flag_get 同一公式）。
+pub fn tir_pow2_i64(n: i64) i64 {
+    var r: i64 = 1;
+    var i: i64 = 0;
+    while (i < n) { r = r * 2; i = i + 1; }
+    return r;
+}
+
+// flag 槽位掩码：flag F { slot: len; ... } 中 slot 的掩码 = (2^len - 1) << start。
+// 显式 offset 用 sl.bb/sl.ib，否则沿 auto_off 顺序累加（与 sema.fr_resolve_flag 一致）。
+pub fn tir_flag_mask_lookup(fname: string, sname: string) i64 {
+    var si: i64 = sema.sym_lookup(sema.global_scope, fname);
+    if (si < 0) { return -1; }
+    var decl: i64 = sema.syms[si].decl;
+    if (decl < 0) { return -1; }
+    var dn: Node = base.nodes[decl];
+    if (dn.kind != "FlagDecl") { return -1; }
+    var auto_off: i64 = 0;
+    var c: i64 = dn.lb;
+    while (c >= 0) {
+        var k: Child = base.kids[c];
+        var sl: Node = base.nodes[k.val];
+        var start: i64 = auto_off;
+        if (sl.bb) { start = sl.ib; }
+        var len: i64 = sl.ia;
+        if (sl.sa == sname) {
+            return (tir_pow2_i64(len) - 1) * tir_pow2_i64(start);
+        }
+        auto_off = start + len;
+        c = k.next;
+    }
+    return -1;
+}
+
 pub fn tir_member_read(mnode: Node) string {
     // 枚举用例常量：Color.Red → const.i64 <val>（枚举被擦除为整数，用例值即编译期整型）。
     // 此前误走结构体字段路径（addr_of @Color + gep + load），把类型名当值，生成非法 `store ptr Color`。
@@ -1544,6 +1587,15 @@ pub fn tir_member_read(mnode: Node) string {
             var d: string = tir_tmp();
             tir_line(base.sb_cat4("const.i64 ", d, " ", base.i2s(cval)));
             return d;
+        }
+        // flag 槽位常量：Perm.readable → const.i64 <mask>（与 emit-ll flag_get 同一公式）。
+        // 此前未处理此分支，误走结构体字段路径（addr_of @Perm + gep + load），把类型名当值、
+        // 且从不声明 @Perm 全局，导致 emit-tir-ll 生成非法 `store ptr @Perm`（@Perm 未定义）。
+        var fmask: i64 = tir_flag_mask_lookup(bn.sa, mnode.sa);
+        if (fmask >= 0) {
+            var d2: string = tir_tmp();
+            tir_line(base.sb_cat4("const.i64 ", d2, " ", base.i2s(fmask)));
+            return d2;
         }
     }
     var base_st: string = tir_expr_st(mnode.na);

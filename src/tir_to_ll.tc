@@ -27,6 +27,8 @@ pub var g_opaque_emitted: []string;    // 已 emit 过 opaque 定义的运行时
 pub var g_ll_globals: []string;         // 模块级全局变量名（@ 已剥离）
 pub var g_ll_globalsts: []string;       // 对应的存储类型 ST（与 g_ll_globals 并行）
 pub var g_in_globals: bool = false;     // 当前是否处于 TIR globals: 段
+pub var g_ll_named_types: []string;     // 引用但未在 types: 段声明的命名类型（%Perm 等位标志/枚举，i64 底类型）
+pub var g_ll_struct_types: []string;     // types: 段内已声明为 struct 的命名类型（%Node 等用户聚合，禁止被误判为 i64 标量）
 
 pub fn ll_tmp() string {
     var v: i64 = g_ll_tmpc;
@@ -52,6 +54,8 @@ pub fn ll_reset() void {
     g_ll_globals = [];
     g_ll_globalsts = [];
     g_in_globals = false;
+    g_ll_struct_types = [];
+    g_ll_named_types = [];
 }
 
 pub fn ll_get_st(name: string) string {
@@ -171,6 +175,9 @@ pub fn ll_ensure_slot(tname: string, st: string) void {
 
 // 取 $x 承载值的 LLVM 寄存器（load 出 alloca）
 pub fn ll_load(tname: string, st: string) string {
+    // 字面量立即数（整数/浮点，如 0 / -1 / 1.5）：直接作为值返回，不可按临时量去 load，
+    // 否则会生成非法的 `load X, ptr 0`。
+    if (str_len(tname) >= 1 && tname[0] != 36 && tname[0] != 64) { return tname; }
     // 全局引用 @name（函数或全局变量）：全局符号在 LLVM 中恒为指针，作值操作数时必须 load 出其值。
     // 对函数引用：load ptr, ptr @fn 等价于直接使用 @fn（取其地址）；对全局变量：load 出存储值。两种情形都正确。
     if (str_len(tname) >= 1 && tname[0] == 64) {
@@ -271,6 +278,31 @@ pub fn st_to_ll(st: string) string {
         return "ptr";
     }
     return st;
+}
+
+// 收集引用但未在 types: 段声明的命名类型（%Perm 等位标志/枚举，i64 底类型）。
+// 排除运行期结构类型 %T*（%TStr 等已由 types: 段或 opaque 处理）。
+// 类型是否已由 types: 段声明为 struct（%Node 等用户聚合），若是则不应被盖成 i64 标量。
+pub fn ll_is_struct_type(st: string) bool {
+    var n: i64 = slice_len(g_ll_struct_types) as i64;
+    var i: i64 = 0;
+    while (i < n) { if (g_ll_struct_types[i] == st) { return true; } i = i + 1; }
+    return false;
+}
+
+pub fn ll_register_named_type(st: string) void {
+    // 仅处理命名类型（%X，非运行期结构 %T*）；且须排除 types: 段已声明为 struct 的用户聚合
+    // （%Node 等）——那些已是正确 struct 定义，不可再被盖成 `type i64`。
+    if (ll_starts(st, "%") && ll_starts(st, "%T") == false && ll_is_struct_type(st) == false) {
+        var n: i64 = slice_len(g_ll_named_types) as i64;
+        var i: i64 = 0;
+        var seen: bool = false;
+        while (i < n) {
+            if (g_ll_named_types[i] == st) { seen = true; break; }
+            i = i + 1;
+        }
+        if (seen == false) { append(g_ll_named_types, st); }
+    }
 }
 
 pub fn ll_arg_types(args: string) string {
@@ -614,6 +646,23 @@ pub fn ll_emit_inst(toks: []string) void {
     var m: i64 = slice_len(toks) as i64;
     if (m < 1) { return; }
     var op: string = toks[0];
+    // ret / ret.void 仅 1 个 token（ret.void 或 ret 无操作数），须先于 m<2 守卫处理，
+    // 否则 m<2 直接 return 会丢弃函数终止符，导致函数体缺 ret（clang 报 expected instruction opcode）
+    if (op == "ret" || op == "ret.void") {
+        if (op == "ret.void" || m < 3) {
+            sb_append_str(g_ll, "  ret void\n");
+        } else {
+            var st: string = toks[1];
+            var d: string = toks[2];
+            var v: string = ll_load(d, st);
+            sb_append_str(g_ll, "  ret ");
+            sb_append_str(g_ll, st_to_ll(st));
+            sb_append_str(g_ll, " ");
+            sb_append_str(g_ll, v);
+            sb_append_str(g_ll, "\n");
+        }
+        return;
+    }
     if (m < 2) { return; }   // 防御：裸 '{' 等畸形行
     if (op == "slot") {
         ll_ensure_slot(toks[2], toks[1]);
@@ -741,11 +790,11 @@ pub fn ll_emit_inst(toks: []string) void {
         var x: string = toks[3];
         ll_ensure_slot(d, st);
         ll_set_st(d, st);
-        // $x 已是 alloca（指针值），直接存入 $d
+        // $x 已是 alloca（指针值），直接存入 $d；若 x 是全局 @name 须保留 '@'（用 ll_llname_ptr）
         sb_append_str(g_ll, "  store ");
         sb_append_str(g_ll, st_to_ll(st));
         sb_append_str(g_ll, " ");
-        sb_append_str(g_ll, ll_llname(x));
+        sb_append_str(g_ll, ll_llname_ptr(x));
         sb_append_str(g_ll, ", ptr ");
         sb_append_str(g_ll, ll_llname(d));
         sb_append_str(g_ll, "\n");
@@ -758,12 +807,24 @@ pub fn ll_emit_inst(toks: []string) void {
         ll_ensure_slot(g, base.sb_cat3("ptr<", st, ">"));
         ll_set_st(g, base.sb_cat3("ptr<", st, ">"));
         var pst: string = ll_get_st(p);
-        var pv: string = ll_load(p, pst);
+        // 基址类型分两种情形：
+        //  - 指针型 ptr<X>：$p 是存放指针的临时量，GEP 基址取其指针值（load 出）
+        //  - 值型 X（如 %TStr）：临时量本身就是 alloca 的地址，GEP 基址直接用该地址，
+        //    元素类型即 X（struct 字段访问经此支持）
+        var gtypename: string;
+        var pv: string;
+        if (ll_starts(pst, "ptr<")) {
+            gtypename = ll_ptr_inner(pst);
+            pv = ll_load(p, pst);
+        } else {
+            gtypename = ll_ptr_inner(st);
+            pv = ll_llname(p);
+        }
         var r: string = ll_tmp();
         sb_append_str(g_ll, "  ");
         sb_append_str(g_ll, r);
         sb_append_str(g_ll, " = getelementptr inbounds ");
-        sb_append_str(g_ll, ll_ptr_inner(pst));
+        sb_append_str(g_ll, gtypename);
         sb_append_str(g_ll, ", ptr ");
         sb_append_str(g_ll, pv);
         var k: i64 = 4;
@@ -964,21 +1025,6 @@ pub fn ll_emit_inst(toks: []string) void {
         ll_ensure_slot(d, st);
         ll_set_st(d, st);
         ll_store(d, st, r);
-        return;
-    }
-    if (op == "ret" || op == "ret.void") {
-        if (op == "ret.void" || slice_len(toks) as i64 < 3) {
-            sb_append_str(g_ll, "  ret void\n");
-        } else {
-            var st: string = toks[1];
-            var d: string = toks[2];
-            var v: string = ll_load(d, st);
-            sb_append_str(g_ll, "  ret ");
-            sb_append_str(g_ll, st_to_ll(st));
-            sb_append_str(g_ll, " ");
-            sb_append_str(g_ll, v);
-            sb_append_str(g_ll, "\n");
-        }
         return;
     }
     if (op == "br") {
@@ -1210,7 +1256,13 @@ pub fn ll_trim(s: string) string {
 pub fn ll_emit_type_line(line: string) void {
     var eq: i64 = ll_find(line, " = struct {");
     if (eq < 0) { return; }
-    var name: string = str_slice(line, 0, eq);
+    var name: string = ll_trim(str_slice(line, 0, eq));
+    // 记录已在 types: 段声明为 struct 的命名类型，供 ll_register_named_type 跳过（避免误判为 i64 标量）。
+    var sn: i64 = slice_len(g_ll_struct_types) as i64;
+    var si: i64 = 0;
+    var sseen: bool = false;
+    while (si < sn) { if (g_ll_struct_types[si] == name) { sseen = true; break; } si = si + 1; }
+    if (sseen == false) { append(g_ll_struct_types, name); }
     var lbrace: i64 = ll_find(line, "{");
     var rbrace: i64 = ll_find(line, "}");
     if (lbrace < 0 || rbrace < 0) { return; }
@@ -1315,6 +1367,14 @@ pub fn tir_to_ll_translate(text: string) string {
         }
         if (toks[0] == "func") {
             ll_parse_func(line);
+            // 收集命名类型（%Perm 等位标志/枚举，i64 底类型），供后续 emit `%Name = type i64` 声明
+            ll_register_named_type(g_pf_ret);
+            var pi2: i64 = 0;
+            var plen2: i64 = slice_len(g_pf_params) as i64;
+            while (pi2 < plen2) {
+                ll_register_named_type(g_pf_params[pi2 + 1]);
+                pi2 = pi2 + 2;
+            }
             var ps: []string = [];
             var pi: i64 = 0;
             var plen: i64 = slice_len(g_pf_params) as i64;
@@ -1333,6 +1393,14 @@ pub fn tir_to_ll_translate(text: string) string {
             continue;
         }
         k = k + 1;
+    }
+    // 命名类型声明（%Perm 等位标志/枚举，i64 底类型）置于函数之前，类型前向引用在 clang -c 下不被接受
+    var ni: i64 = 0;
+    var nn: i64 = slice_len(g_ll_named_types) as i64;
+    while (ni < nn) {
+        sb_append_str(g_ll, g_ll_named_types[ni]);
+        sb_append_str(g_ll, " = type i64\n");
+        ni = ni + 1;
     }
     // 第 2 遍：发射函数体
     var in_func: bool = false;
