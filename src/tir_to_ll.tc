@@ -235,6 +235,25 @@ pub fn ll_find(s: string, sub: string) i64 {
     return -1;
 }
 
+// 最右一次子串出现位置（数组计数分隔符 " x " 须取最右，因元素类型本身可嵌套 arr<... x ...>）
+pub fn ll_rfind(s: string, sub: string) i64 {
+    var n: i64 = str_len(s);
+    var m: i64 = str_len(sub);
+    if (m <= 0 || m > n) { return -1; }
+    var i: i64 = n - m;
+    while (i >= 0) {
+        var j: i64 = 0;
+        var ok: bool = true;
+        while (j < m) {
+            if (str_at(s, i + j) != str_at(sub, j)) { ok = false; break; }
+            j = j + 1;
+        }
+        if (ok) { return i; }
+        i = i - 1;
+    }
+    return -1;
+}
+
 // 真·前缀判断（t 内置 str_starts 实为相等判断，不可用）
 pub fn ll_starts(s: string, pre: string) bool {
     var n: i64 = str_len(pre);
@@ -262,14 +281,17 @@ pub fn st_to_ll(st: string) string {
     }
     if (ll_starts(st, "arr<")) {
         var inner: string = str_slice(st, 4, str_len(st) - 1);
-        var sp: i64 = ll_find(inner, " x ");
+        // 计数分隔符 " x " 取最右一次：元素类型本身可能嵌套 arr<... x ...>（如 arr<arr<i32 x 3> x 2>）
+        var sp: i64 = ll_rfind(inner, " x ");
+        if (sp < 0) { return "ptr"; }   // 兜底：无计数的动态数组降级为缓冲指针，防越界 panic
         var elem: string = str_slice(inner, 0, sp);
         var nn: string = str_slice(inner, sp + 3, str_len(inner));
         return base.sb_cat5("[", nn, " x ", st_to_ll(elem), "]");
     }
     if (ll_starts(st, "vec<")) {
         var inner: string = str_slice(st, 4, str_len(st) - 1);
-        var sp: i64 = ll_find(inner, " x ");
+        var sp: i64 = ll_rfind(inner, " x ");
+        if (sp < 0) { return "ptr"; }
         var elem: string = str_slice(inner, 0, sp);
         var nn: string = str_slice(inner, sp + 3, str_len(inner));
         return base.sb_cat5("<", nn, " x ", st_to_ll(elem), ">");
@@ -330,12 +352,21 @@ pub fn ll_arg_types(args: string) string {
 }
 
 pub fn ll_ptr_inner(st: string) string {
-    // ptr<ST> -> 元素 ST（已转 LLVM 类型）
+    // ptr<ST> -> 元素 ST（已转 LLVM 类型）。防御：非 ptr< 前缀（如 gep 值型基址分支传入标量 i64，
+    // 或 bitcast 把 ptr<%__env> 擦成 ptr 后）直接整体转译，避免对标量做 str_slice(st,4,...) 越界 panic。
+    if (ll_starts(st, "ptr<") == false) { return st_to_ll(st); }
     return st_to_ll(str_slice(st, 4, str_len(st) - 1));
 }
 
 pub fn ll_is_int(st: string) bool {
     return ll_starts(st, "i") || ll_starts(st, "u") || st == "bool";
+}
+
+// 是否为标量类型（整数/浮点/布尔）。聚合/指针/命名类型返回 false。
+pub fn ll_is_scalar_st(st: string) bool {
+    return st == "bool" || st == "i1" || st == "i8" || st == "i16" ||
+           st == "i32" || st == "i64" || st == "u8" || st == "u16" ||
+           st == "u32" || st == "u64" || st == "f32" || st == "f64";
 }
 
 pub fn ll_is_float(st: string) bool {
@@ -532,14 +563,19 @@ pub fn ll_split_dot(s: string) i64 {
     return ll_find(s, ".");
 }
 
-// 简单空白分词（先把 ( ) , 换成空格）
+// 简单空白分词（先把 ( ) , 换成空格）。类型参数（arr<T x N> / vec<T x N>）内含空格，
+// 须按 '<' 深度计数保留其为类型 token 的一部分，否则会被切成 arr<i64 / x / 3> 多个 token，
+// 导致函数签名与 bitcast/slot 等指令的类型解析错位（st_to_ll 收到缺 '>' 的残缺类型而越界 panic）。
 pub fn ll_tokens(line: string) []string {
     var n: i64 = str_len(line);
     var i: i64 = 0;
     var out: StringBuilder = sb_new();
+    var depth: i64 = 0;   // '<' 深度
     while (i < n) {
         var c: i64 = str_at(line, i);
-        if (c == 40 || c == 41 || c == 44) { sb_append_char(out, 32); }   // ( ) , -> space
+        if (c == 60) { depth = depth + 1; sb_append_char(out, c); }            // '<' 进入类型参数
+        else if (c == 62) { if (depth > 0) { depth = depth - 1; } sb_append_char(out, c); }  // '>' 退出
+        else if (c == 40 || c == 41 || c == 44) { sb_append_char(out, 32); }   // ( ) , -> space
         else { sb_append_char(out, c); }
         i = i + 1;
     }
@@ -548,9 +584,12 @@ pub fn ll_tokens(line: string) []string {
     var j: i64 = 0;
     var buf: StringBuilder = sb_new();
     var toks: []string = [];
+    var d2: i64 = 0;   // 第二遍同样按 '<' 深度，避免切分类型参数内的空格
     while (j < n2) {
         var c: i64 = str_at(s2, j);
-        if (c == 32 || c == 9 || c == 10 || c == 13) {
+        if (c == 60) { d2 = d2 + 1; }
+        else if (c == 62) { if (d2 > 0) { d2 = d2 - 1; } }
+        if ((c == 32 || c == 9 || c == 10 || c == 13) && d2 == 0) {
             if (str_len(sb_to_str(buf)) > 0) {
                 append(toks, sb_to_str(buf));
                 buf = sb_new();
@@ -612,6 +651,7 @@ pub fn ll_emit_func(name: string, params: []string, ret: string) void {
     var i: i64 = 0;
     var first: bool = true;
     while (i < m) {
+        if (i + 1 >= m) { break; }
         var pname: string = params[i];
         var pst: string = params[i + 1];
         if (first == false) { sb_append_str(sig, ", "); }
@@ -627,6 +667,7 @@ pub fn ll_emit_func(name: string, params: []string, ret: string) void {
     // 参数 alloca + store
     i = 0;
     while (i < m) {
+        if (i + 1 >= m) { break; }
         var pname: string = params[i];
         var pst: string = params[i + 1];
         ll_ensure_slot(pname, pst);
@@ -704,30 +745,57 @@ pub fn ll_emit_inst(toks: []string) void {
     }
     if (op == "bitcast") {
         // TIR: `bitcast <DST_ST> <DST> <SRC_ST> <SRC>`。
-        // 枚举等被擦除命名类型在 TIR 中无对应 LLVM 类型声明（如 %Color），按 i64 处理；
-        // 位宽一致时退化为恒等 bitcast。对齐真实类型（ptr<...> 等）原样透传。
+        // opaque-pointer 模型下所有指针都是 `ptr`；TIR 类型信息仅用于 GEP 元素类型与 load/store 宽度，
+        // 故 bitcast 一律在指针层面做，且尽量保留源的真实 pointee 类型（避免后续 GEP/load 丢失结构信息）：
+        //   - 源是指针/聚合，目标被擦成 ptr<void>/ptr：保留源 pointee（如 ptr<%__env_0>），供结构体 GEP 使用；
+        //   - 源是指针，目标是标量（切片数据指针 `bitcast i64 ptr<void>`）：还原为 ptr<i64>，使 gep_idx 能按标量索引；
+        //   - 目标是聚合/命名类型（arr<TxN> / %TSlice 等）：bitcast 结果为 ptr，但 slot ST 记录原类型供导航。
         var dstst0: string = toks[1];
         var dst: string = toks[2];
         var srcst0: string = toks[3];
         var src: string = toks[4];
+        var src_is_ptr: bool = ll_starts(srcst0, "ptr<") || srcst0 == "ptr" ||
+                                ll_starts(srcst0, "arr<") || ll_starts(srcst0, "vec<");
+        var dstst_eff: string = dstst0;
+        if (src_is_ptr && ll_starts(dstst0, "ptr<") == false && ll_starts(dstst0, "%") == false && ll_is_scalar_st(dstst0)) {
+            dstst_eff = base.sb_cat3("ptr<", dstst0, ">");   // 切片数据指针：i64 -> ptr<i64>
+        }
+        if (dstst0 == "ptr<void>" || dstst0 == "ptr") {
+            dstst_eff = srcst0;                              // 保留源真实 pointee
+        }
+        var dll: string = st_to_ll(dstst_eff);
+        if (ll_starts(dstst_eff, "arr<") || ll_starts(dstst_eff, "vec<") || ll_starts(dstst_eff, "%")) { dll = "ptr"; }
+        // 源操作数：指针/聚合取地址（alloca 即 ptr），标量则 load 出值
         var sll: string = st_to_ll(srcst0);
-        var dll: string = st_to_ll(dstst0);
-        if (ll_starts(sll, "%")) { sll = "i64"; }
-        if (ll_starts(dll, "%")) { dll = "i64"; }
-        ll_ensure_slot(dst, dll);
-        ll_set_st(dst, dll);
-        var v: string = ll_load(src, sll);
+        var srcv: string;
+        if (src_is_ptr) {
+            srcv = ll_llname_ptr(src);
+        } else {
+            if (ll_starts(sll, "%")) { sll = "i64"; }
+            srcv = ll_load(src, sll);
+        }
         var t: string = ll_tmp();
         sb_append_str(g_ll, "  ");
         sb_append_str(g_ll, t);
         sb_append_str(g_ll, " = bitcast ");
-        sb_append_str(g_ll, sll);
-        sb_append_str(g_ll, " ");
-        sb_append_str(g_ll, v);
+        if (src_is_ptr) { sb_append_str(g_ll, "ptr "); } else { sb_append_str(g_ll, sll); }
+        sb_append_str(g_ll, srcv);
         sb_append_str(g_ll, " to ");
         sb_append_str(g_ll, dll);
         sb_append_str(g_ll, "\n");
-        ll_store(dst, dll, t);
+        // 聚合（arr<...>/vec<...>/%Struct）在 memory-first 模型下恒以指针表示：
+        // bitcast 结果 t 是 ptr，槽类型也必须记 ptr，否则下游把 ptr 当作聚合值使用
+        // （struct_new 字段 / gep_idx 基址 / 数组字面量存储）会生成
+        // "ptr defined but expected [N x T]/%Struct" 的非法 IR（Cluster Y）。
+        if (ll_starts(dstst_eff, "arr<") || ll_starts(dstst_eff, "vec<") || ll_starts(dstst_eff, "%")) {
+            ll_ensure_slot(dst, "ptr");
+            ll_set_st(dst, "ptr");
+            ll_store(dst, "ptr", t);
+        } else {
+            ll_ensure_slot(dst, dstst_eff);
+            ll_set_st(dst, dstst_eff);
+            ll_store(dst, dstst_eff, t);
+        }
         return;
     }
     if (op == "store") {
@@ -771,8 +839,16 @@ pub fn ll_emit_inst(toks: []string) void {
         ll_ensure_slot(d, st);
         ll_set_st(d, st);
         var pst: string = ll_get_st(addr);
-        var p: string = ll_load(addr, pst);
-        var inner: string = ll_ptr_inner(pst);
+        var p: string;
+        // TIR `load ST $d $addr` 语义：把 $addr 视为「指向 ST 的地址」取出 ST。
+        //  - 若 $addr 自身持有指针（ptr<X>/ptr，如 gep 结果、闭包字段）：先 load 出指针值，再解引用。
+        //  - 若 $addr 持有普通值（i64 等）：memory-first 下其槽本身即地址，直接 `load ST, ptr %addr`
+        //    读出其值；若仍按指针二次解引用会生成 `load ST, ptr <i64 值>` 非法 IR（Cluster X）。
+        if (ll_starts(pst, "ptr<") || pst == "ptr") {
+            p = ll_load(addr, pst);
+        } else {
+            p = ll_llname_ptr(addr);
+        }
         var v: string = ll_tmp();
         sb_append_str(g_ll, "  ");
         sb_append_str(g_ll, v);
@@ -788,6 +864,7 @@ pub fn ll_emit_inst(toks: []string) void {
         var st: string = toks[1];   // ptr<ST>
         var d: string = toks[2];
         var x: string = toks[3];
+        if (str_len(x) >= 1 && x[0] == 64) { ll_register_global(str_slice(x, 1, str_len(x)), ll_ptr_inner(st)); }
         ll_ensure_slot(d, st);
         ll_set_st(d, st);
         // $x 是变量（alloca，LLVM 中即 ptr）或全局 @name（地址亦为 ptr）；取址结果一律为 ptr。
@@ -816,7 +893,8 @@ pub fn ll_emit_inst(toks: []string) void {
             gtypename = ll_ptr_inner(pst);
             pv = ll_load(p, pst);
         } else {
-            gtypename = ll_ptr_inner(st);
+            // 值型基址（%TStr / 被 bitcast 擦成 ptr 的指针）：GEP 元素类型即该值自身类型 st
+            gtypename = st_to_ll(st);
             pv = ll_llname(p);
         }
         var r: string = ll_tmp();
@@ -850,11 +928,12 @@ pub fn ll_emit_inst(toks: []string) void {
         // struct_new %Name $d ($f0 $f1 ...) ：按字段顺序构造具名聚合值
         var tyname: string = toks[1];          // "%Point"
         var d: string = toks[2];               // "$t1" 目标 slot
+        var llt: string = st_to_ll(tyname);
         var ap: string = ll_tmp();
         sb_append_str(g_ll, "  ");
         sb_append_str(g_ll, ap);
         sb_append_str(g_ll, " = alloca ");
-        sb_append_str(g_ll, tyname);
+        sb_append_str(g_ll, llt);
         sb_append_str(g_ll, "\n");
         var fi: i64 = 3;
         var fm: i64 = slice_len(toks) as i64;
@@ -866,7 +945,7 @@ pub fn ll_emit_inst(toks: []string) void {
             sb_append_str(g_ll, "  ");
             sb_append_str(g_ll, gp);
             sb_append_str(g_ll, " = getelementptr inbounds ");
-            sb_append_str(g_ll, tyname);
+            sb_append_str(g_ll, llt);
             sb_append_str(g_ll, ", ptr ");
             sb_append_str(g_ll, ap);
             sb_append_str(g_ll, ", i32 0, i32 ");
@@ -881,23 +960,23 @@ pub fn ll_emit_inst(toks: []string) void {
             sb_append_str(g_ll, "\n");
             fi = fi + 1;
         }
-        var val: string = ll_tmp();
-        sb_append_str(g_ll, "  ");
-        sb_append_str(g_ll, val);
-        sb_append_str(g_ll, " = load ");
-        sb_append_str(g_ll, tyname);
-        sb_append_str(g_ll, ", ptr ");
+        // 聚合变量本质为 alloca（指针）。结构体不能按值 load，数组按值 load 合法；
+        // 统一让 $d 承载该地址指针，避免对结构体做非法 load（且下游 load/store 一致走指针语义）。
+        ll_ensure_slot(d, base.sb_cat3("ptr<", tyname, ">"));
+        ll_set_st(d, base.sb_cat3("ptr<", tyname, ">"));
+        sb_append_str(g_ll, "  store ptr ");
         sb_append_str(g_ll, ap);
+        sb_append_str(g_ll, ", ptr ");
+        sb_append_str(g_ll, ll_llname(d));
         sb_append_str(g_ll, "\n");
-        ll_ensure_slot(d, tyname);
-        ll_set_st(d, tyname);
-        ll_store(d, tyname, val);
         return;
     }
     if (op == "call") {
         var st: string = toks[1];
         var d: string = toks[2];
-        var fname: string = ll_llname(toks[3]);   // "@add" -> "add"
+        var callee: string = toks[3];
+        var is_indirect: bool = (str_len(callee) >= 1 && callee[0] == 36);  // '$' -> 函数指针间接调用，不加 @
+        var fname: string = ll_llname(callee);   // "@add" -> "add" ; "$t12" -> "%curfn.t12"
         var m: i64 = slice_len(toks) as i64;
         var k: i64 = 4;
         var argsb: StringBuilder = sb_new();
@@ -924,6 +1003,39 @@ pub fn ll_emit_inst(toks: []string) void {
             append(declargs, ast);
             first = false;
             k = k + 1;
+        }
+        if (is_indirect) {
+            // 间接调用：callee 是持有函数指针的变量（$sum_vals.m / $main.t56 等闭包/方法变量）。
+            // 该变量是局部寄存器（opaque ptr 值），直接 load 出函数指针，由 call 指令语法
+            // 提供函数签名间接调用即可；LLVM opaque-pointer 下 `ptr(void,...)` 等函数指针类型
+            // 非法（void 不允许出现在函数类型里），故不做 bitcast。此路径按指针调用，无需 declare 符号。
+            var fpv: string = ll_load(callee, ll_get_st(callee));
+            if (st == "void") {
+                sb_append_str(g_ll, "  call void ");
+                sb_append_str(g_ll, fpv);
+                sb_append_str(g_ll, "(");
+                sb_append_str(g_ll, sb_to_str(argsb));
+                sb_append_str(g_ll, ")\n");
+                return;
+            }
+            var r: string = ll_tmp();
+            sb_append_str(g_ll, "  ");
+            sb_append_str(g_ll, r);
+            sb_append_str(g_ll, " = call ");
+            sb_append_str(g_ll, st_to_ll(st));
+            sb_append_str(g_ll, " ");
+            sb_append_str(g_ll, fpv);
+            sb_append_str(g_ll, "(");
+            sb_append_str(g_ll, sb_to_str(argsb));
+            sb_append_str(g_ll, ")\n");
+            ll_ensure_slot(d, st);
+            ll_set_st(d, st);
+            ll_store(d, st, r);
+            return;
+        }
+        // 直接调用：callee 为 @funcname（或 %funcname，剥 % 兜底）
+        if (str_len(fname) >= 1 && fname[0] == 37) {
+            fname = ll_mangle(str_slice(fname, 1, str_len(fname)));
         }
         ll_maybe_declare(fname, st, declargs);
         if (st == "void") {
@@ -1072,6 +1184,14 @@ pub fn ll_emit_inst(toks: []string) void {
         var srcst: string = toks[3];
         var s: string = toks[4];
         var sv: string = ll_load(s, srcst);
+        if (st_to_ll(srcst) == st_to_ll(dstst)) {
+            // 无操作转换（如 zext i64->i64、i32->i32）：源与目标 LLVM 类型相同，直接复制值，
+            // 避免生成非法的 `zext i64 to i64` / `trunc i32 to i32` 等 cast（clang 报 invalid cast opcode）。
+            ll_ensure_slot(d, dstst);
+            ll_set_st(d, dstst);
+            ll_store(d, dstst, sv);
+            return;
+        }
         ll_ensure_slot(d, dstst);
         ll_set_st(d, dstst);
         var r: string = ll_tmp();
@@ -1191,6 +1311,104 @@ pub fn ll_emit_inst(toks: []string) void {
         ll_ensure_slot(d, "i1");
         ll_set_st(d, "i1");
         ll_store(d, "i1", r);
+        return;
+    }
+    // 一元运算：not / lnot（逻辑非）、neg（取负）。TIR 形态 op.ST $d $a（仅 3 token），
+    // 须先于普通二元处理，否则下方 toks[3] 越界 panic。语义对齐 legacy codegen_ll。
+    if (o == "not" || o == "lnot") {
+        var d: string = toks[1];
+        var a: string = toks[2];
+        var da: string = ll_load(a, st);
+        var r1: string = ll_tmp();
+        sb_append_str(g_ll, "  ");
+        sb_append_str(g_ll, r1);
+        sb_append_str(g_ll, " = icmp eq ");
+        sb_append_str(g_ll, st_to_ll(st));
+        sb_append_str(g_ll, " ");
+        sb_append_str(g_ll, da);
+        sb_append_str(g_ll, ", 0\n");
+        var r2: string = ll_tmp();
+        sb_append_str(g_ll, "  ");
+        sb_append_str(g_ll, r2);
+        sb_append_str(g_ll, " = zext i1 ");
+        sb_append_str(g_ll, r1);
+        sb_append_str(g_ll, " to ");
+        sb_append_str(g_ll, st_to_ll(st));
+        sb_append_str(g_ll, "\n");
+        ll_ensure_slot(d, st);
+        ll_set_st(d, st);
+        ll_store(d, st, r2);
+        return;
+    }
+    if (o == "neg") {
+        var d: string = toks[1];
+        var a: string = toks[2];
+        var da: string = ll_load(a, st);
+        var r: string = ll_tmp();
+        sb_append_str(g_ll, "  ");
+        sb_append_str(g_ll, r);
+        sb_append_str(g_ll, " = ");
+        if (ll_is_float(st)) { sb_append_str(g_ll, "fneg "); }
+        else { sb_append_str(g_ll, "sub "); }
+        sb_append_str(g_ll, st_to_ll(st));
+        sb_append_str(g_ll, " ");
+        if (ll_is_float(st)) {
+            sb_append_str(g_ll, da);
+        } else {
+            sb_append_str(g_ll, "0, ");
+            sb_append_str(g_ll, da);
+        }
+        sb_append_str(g_ll, "\n");
+        ll_ensure_slot(d, st);
+        ll_set_st(d, st);
+        ll_store(d, st, r);
+        return;
+    }
+    // 数组/切片元素索引：gep_idx <ST> <DST> <BASE> <IDX>
+    // BASE 为指向数组/切片的指针（ptr<void> / ptr<X> / ptr<arr<...>>），生成
+    //   getelementptr inbounds <ST>, ptr %base, i64 %idx
+    // 结果 ST 记录为 ptr<ST>，供后续 load/store 使用。
+    if (op == "gep_idx") {
+        var st: string = toks[1];
+        var d: string = toks[2];
+        var base: string = toks[3];
+        var idx: string = toks[4];
+        var dstst: string = base.sb_cat3("ptr<", st, ">");
+        ll_ensure_slot(d, dstst);
+        ll_set_st(d, dstst);
+        var pst: string = ll_get_st(base);
+        var p: string;
+        if (ll_starts(pst, "ptr<") || pst == "ptr") {
+            p = ll_load(base, pst);
+        } else {
+            p = ll_llname_ptr(base);
+        }
+        var ist: string = ll_get_st(idx);
+        var iv: string = ll_load(idx, ist);
+        // GEP 第二索引必须是 i64。窄整数索引（i32/u32 等）zext 到 i64；但 u64/i64 经 st_to_ll 已是 i64，
+        // 若按 TIR 类型字面比较会误判为需要 cast，生成非法的 `zext i64 to i64`。故比较 LLVM 翻译后的类型。
+        if (ll_is_int(ist) && st_to_ll(ist) != "i64") {
+            var iv64: string = ll_tmp();
+            sb_append_str(g_ll, "  ");
+            sb_append_str(g_ll, iv64);
+            sb_append_str(g_ll, " = zext ");
+            sb_append_str(g_ll, st_to_ll(ist));
+            sb_append_str(g_ll, " ");
+            sb_append_str(g_ll, iv);
+            sb_append_str(g_ll, " to i64\n");
+            iv = iv64;
+        }
+        var r: string = ll_tmp();
+        sb_append_str(g_ll, "  ");
+        sb_append_str(g_ll, r);
+        sb_append_str(g_ll, " = getelementptr inbounds ");
+        sb_append_str(g_ll, st_to_ll(st));
+        sb_append_str(g_ll, ", ptr ");
+        sb_append_str(g_ll, p);
+        sb_append_str(g_ll, ", i64 ");
+        sb_append_str(g_ll, iv);
+        sb_append_str(g_ll, "\n");
+        ll_store(d, dstst, r);
         return;
     }
     // 普通二元（整数/浮点统一）
