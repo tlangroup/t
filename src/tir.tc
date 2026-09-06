@@ -38,6 +38,7 @@ pub struct TIRFunc {
     body: []TIRInst;     // 线性指令数组
     is_extern: bool;
     is_kernel: bool;
+    is_main: bool;       // @main 入口标注（供 emit-tir-ll 补 @main 包装器）
 }
 
 pub struct TIRGlobal {
@@ -92,7 +93,7 @@ pub fn tir_reset() void {
     g_mod = TIRModule{ mod: "", source: "", types: zt, strings: zs, funcs: zf, globals: zg };
     var zp: []string = [];
     var zb: []TIRInst = [];
-    g_cur_func = TIRFunc{ name: "", params: zp, ret_st: "void", body: zb, is_extern: false, is_kernel: false };
+    g_cur_func = TIRFunc{ name: "", params: zp, ret_st: "void", body: zb, is_extern: false, is_kernel: false, is_main: false };
     g_tmpc = 0;
     g_lblc = 0;
     g_slotc = 0;
@@ -508,7 +509,7 @@ pub fn tir_emit_extern(d: i64) void {
     var n: Node = base.nodes[d];
     var ep: []string = [];
     var eb: []TIRInst = [];
-    g_cur_func = TIRFunc{ name: n.sa, ret_st: tir_st_of_td(tir_func_ret_td(d)), params: ep, body: eb, is_extern: true, is_kernel: false };
+    g_cur_func = TIRFunc{ name: n.sa, ret_st: tir_st_of_td(tir_func_ret_td(d)), params: ep, body: eb, is_extern: true, is_kernel: false, is_main: false };
     g_cur_ret_td = tir_func_ret_td(d);
     var c: i64 = n.lb;
     while (c >= 0) {
@@ -533,11 +534,23 @@ pub fn tir_func_ret_td(d: i64) i64 {
     return sema.resolve_type_desc(d);
 }
 
+pub fn tir_ann_has(head: i64, name: string) bool {
+    // 本地复刻 parse.ann_find：tir.tc 未导入 parse，但 base.kids/Node 可见。
+    var it: i64 = head;
+    while (it >= 0) {
+        var c: Child = base.kids[it];
+        var an: Node = base.nodes[c.val];
+        if (an.sa == name) { return true; }
+        it = c.next;
+    }
+    return false;
+}
+
 pub fn tir_lower_func(d: i64) void {
     var n: Node = base.nodes[d];
     var fp: []string = [];
     var fb: []TIRInst = [];
-    g_cur_func = TIRFunc{ name: n.sa, ret_st: tir_st_of_td(tir_func_ret_td(d)), params: fp, body: fb, is_extern: false, is_kernel: false };
+    g_cur_func = TIRFunc{ name: n.sa, ret_st: tir_st_of_td(tir_func_ret_td(d)), params: fp, body: fb, is_extern: false, is_kernel: false, is_main: tir_ann_has(n.la, "main") };
     g_cur_ret_td = tir_func_ret_td(d);
     var fln: []string = [];
     g_local_names = fln;
@@ -1994,6 +2007,7 @@ pub fn tir_to_text() string {
         }
         sb_append_str(head, "): ");
         sb_append_str(head, f.ret_st);
+        if (f.is_main) { sb_append_str(head, " @main"); }
         sb_append_str(sb, sb_to_str(head));
         sb_append_str(sb, "\n");
         if (f.is_extern == false) {

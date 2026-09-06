@@ -28,7 +28,11 @@ pub var g_ll_globals: []string;         // 模块级全局变量名（@ 已剥�
 pub var g_ll_globalsts: []string;       // 对应的存储类型 ST（与 g_ll_globals 并行）
 pub var g_in_globals: bool = false;     // 当前是否处于 TIR globals: 段
 pub var g_ll_named_types: []string;     // 引用但未在 types: 段声明的命名类型（%Perm 等位标志/枚举，i64 底类型）
+pub var g_str_table: []string;          // TIR strings: 段内容（tir_esc 转义后的字面量，可直接用作 LLVM c"..." 内容）
+pub var g_in_strings: bool = false;     // 当前是否处于 TIR strings: 段
 pub var g_ll_struct_types: []string;     // types: 段内已声明为 struct 的命名类型（%Node 等用户聚合，禁止被误判为 i64 标量）
+pub var g_has_main: bool = false;        // TIR 是否含入口函数（@main 标注），用于补 @main 包装器
+pub var g_main_fn: string = "";          // 入口函数 LLVM 名（mangled），如 main_fn
 
 pub fn ll_tmp() string {
     var v: i64 = g_ll_tmpc;
@@ -54,8 +58,12 @@ pub fn ll_reset() void {
     g_ll_globals = [];
     g_ll_globalsts = [];
     g_in_globals = false;
+    g_str_table = [];
+    g_in_strings = false;
     g_ll_struct_types = [];
     g_ll_named_types = [];
+    g_has_main = false;
+    g_main_fn = "";
 }
 
 pub fn ll_get_st(name: string) string {
@@ -233,6 +241,35 @@ pub fn ll_find(s: string, sub: string) i64 {
         i = i + 1;
     }
     return -1;
+}
+
+// 十进制字符串 → i64（用于 const.str 的索引解析）。忽略非数字前缀；空/非法返回 0。
+pub fn ll_atoi(s: string) i64 {
+    var n: i64 = str_len(s);
+    var i: i64 = 0;
+    var v: i64 = 0;
+    var neg: bool = false;
+    if (n >= 1 && str_at(s, 0) == 45) { neg = true; i = 1; }   // '-'
+    while (i < n) {
+        var c: i64 = str_at(s, i);
+        if (c < 48 || c > 57) { break; }
+        v = v * 10 + (c - 48);
+        i = i + 1;
+    }
+    if (neg) { v = 0 - v; }
+    return v;
+}
+
+// 计算 tir_esc 转义串的原始字节长度（\XX 计 1 字节，其余计 1 字节）
+pub fn ll_str_rawlen(content: string) i64 {
+    var cn: i64 = str_len(content);
+    var ci: i64 = 0;
+    var blen: i64 = 0;
+    while (ci < cn) {
+        if (str_at(content, ci) == 92) { ci = ci + 3; } else { ci = ci + 1; }
+        blen = blen + 1;
+    }
+    return blen;
 }
 
 // 最右一次子串出现位置（数组计数分隔符 " x " 须取最右，因元素类型本身可嵌套 arr<... x ...>）
@@ -488,6 +525,57 @@ pub fn ll_maybe_declare(fname: string, retst: string, argsts: []string) void {
     sb_append_str(g_ll_declbuf, sb_to_str(sb));
 }
 
+// 发射一条 `call void @fname(...)`（参数类型/值并行给出）。内建降级统一走此helper，
+// 避免手写 sb_append_str 时误把 ll_load 的副作用（load 指令）注入到 call 实参中间。
+pub fn ll_call_void(fname: string, argsts: []string, argv: []string) void {
+    ll_maybe_declare(fname, "void", argsts);
+    var sb: StringBuilder = sb_new();
+    sb_append_str(sb, "  call void @");
+    sb_append_str(sb, fname);
+    sb_append_str(sb, "(");
+    var i: i64 = 0;
+    var n: i64 = slice_len(argsts) as i64;
+    var first: bool = true;
+    while (i < n) {
+        if (first == false) { sb_append_str(sb, ", "); }
+        sb_append_str(sb, argsts[i]);
+        sb_append_str(sb, " ");
+        sb_append_str(sb, argv[i]);
+        first = false;
+        i = i + 1;
+    }
+    sb_append_str(sb, ")\n");
+    sb_append_str(g_ll, sb_to_str(sb));
+}
+
+// 发射一条 `call <retst> @fname(...)` 并把结果存入 dest 槽 d（结果类型即 retst）。
+pub fn ll_call_ret(fname: string, retst: string, argsts: []string, argv: []string, d: string) void {
+    ll_maybe_declare(fname, retst, argsts);
+    var r: string = ll_tmp();
+    var sb: StringBuilder = sb_new();
+    sb_append_str(sb, "  ");
+    sb_append_str(sb, r);
+    sb_append_str(sb, " = call ");
+    sb_append_str(sb, retst);
+    sb_append_str(sb, " @");
+    sb_append_str(sb, fname);
+    sb_append_str(sb, "(");
+    var i: i64 = 0;
+    var n: i64 = slice_len(argsts) as i64;
+    var first: bool = true;
+    while (i < n) {
+        if (first == false) { sb_append_str(sb, ", "); }
+        sb_append_str(sb, argsts[i]);
+        sb_append_str(sb, " ");
+        sb_append_str(sb, argv[i]);
+        first = false;
+        i = i + 1;
+    }
+    sb_append_str(sb, ")\n");
+    sb_append_str(g_ll, sb_to_str(sb));
+    ll_ensure_slot(d, retst); ll_set_st(d, retst); ll_store(d, retst, r);
+}
+
 pub fn ll_binop(op: string) string {
     if (op == "add") { return "add"; }
     if (op == "sub") { return "sub"; }
@@ -645,6 +733,9 @@ pub fn ll_emit_func(name: string, params: []string, ret: string) void {
     sb_append_str(sig, "define ");
     sb_append_str(sig, st_to_ll(ret));
     sb_append_str(sig, " @");
+    // 入口函数（@main 标注）改名 @t.<name>，避免与下方补的 @main 包装器重名
+    // （用户若把入口命名为 main，直接发 @main 会与包装器 @main 冲突：invalid redefinition）。
+    if (g_has_main && name == g_main_fn) { sb_append_str(sig, "t."); }
     sb_append_str(sig, name);
     sb_append_str(sig, "(");
     var m: i64 = slice_len(params) as i64;
@@ -683,6 +774,586 @@ pub fn ll_emit_func(name: string, params: []string, ret: string) void {
     }
 }
 
+// ── 内建降级（§4）：TIR 路径把高层内建（@println/@int_to_str/@sb_*…）桥接到 runtime 的 tll_*。
+// TIR 前端给这些内建猜了错误的结果类型（多为 i64），翻译器在此按真实 ABI 重写：
+//   - runtime 的 tll_* 一律按「指针传聚合」约定：TStr 参数 = TStr*（即 %TStr slot 的 alloca 指针），
+//     故消费 %TStr 的内建直接把参数 slot 的 alloca 指针（ll_llname）传入，无需 GEP 取 data 指针。
+//   - 返回 %TStr 的内建（int_to_str/sb_to_str/str_slice/str_concat）把 DST slot 直接当作 %TStr alloca，
+//     作为 out 参数传给 tll_*，使下游以 %TStr 类型正确消费该 slot。
+//   - 返回标量（i64/i32）的内建走 ll_store 写回 DST。
+pub fn ll_emit_builtin(cn: string, toks: []string) bool {
+    var d: string = toks[2];
+    if (cn == "println" || cn == "print") {
+        var ap: string = ll_llname(toks[4]);
+        var rt: string = "tll_println";
+        if (cn == "print") { rt = "tll_print"; }
+        ll_maybe_declare(rt, "void", ["ptr"]);
+        sb_append_str(g_ll, "  call void @");
+        sb_append_str(g_ll, rt);
+        sb_append_str(g_ll, "(ptr ");
+        sb_append_str(g_ll, ap);
+        sb_append_str(g_ll, ")\n");
+        return true;
+    }
+    if (cn == "str_len") {
+        var ap: string = ll_llname(toks[4]);
+        ll_maybe_declare("tll_str_len", "i64", ["ptr"]);
+        var r: string = ll_tmp();
+        sb_append_str(g_ll, "  ");
+        sb_append_str(g_ll, r);
+        sb_append_str(g_ll, " = call i64 @tll_str_len(ptr ");
+        sb_append_str(g_ll, ap);
+        sb_append_str(g_ll, ")\n");
+        ll_ensure_slot(d, "i64"); ll_set_st(d, "i64"); ll_store(d, "i64", r);
+        return true;
+    }
+    if (cn == "str_at") {
+        var ap: string = ll_llname(toks[4]);
+        var iv: string = ll_load(toks[5], "i64");
+        ll_maybe_declare("tll_str_at", "i64", ["ptr", "i64"]);
+        var r: string = ll_tmp();
+        sb_append_str(g_ll, "  ");
+        sb_append_str(g_ll, r);
+        sb_append_str(g_ll, " = call i64 @tll_str_at(ptr ");
+        sb_append_str(g_ll, ap);
+        sb_append_str(g_ll, ", i64 ");
+        sb_append_str(g_ll, iv);
+        sb_append_str(g_ll, ")\n");
+        ll_ensure_slot(d, "i64"); ll_set_st(d, "i64"); ll_store(d, "i64", r);
+        return true;
+    }
+    if (cn == "str_eq") {
+        var ap: string = ll_llname(toks[4]);
+        var bp: string = ll_llname(toks[5]);
+        ll_maybe_declare("tll_str_eq", "i32", ["ptr", "ptr"]);
+        var r: string = ll_tmp();
+        sb_append_str(g_ll, "  ");
+        sb_append_str(g_ll, r);
+        sb_append_str(g_ll, " = call i32 @tll_str_eq(ptr ");
+        sb_append_str(g_ll, ap);
+        sb_append_str(g_ll, ", ptr ");
+        sb_append_str(g_ll, bp);
+        sb_append_str(g_ll, ")\n");
+        ll_ensure_slot(d, "i32"); ll_set_st(d, "i32"); ll_store(d, "i32", r);
+        return true;
+    }
+    if (cn == "slice_len") {
+        var ap: string = ll_llname(toks[4]);
+        ll_maybe_declare("tll_slice_len", "i64", ["ptr"]);
+        var r: string = ll_tmp();
+        sb_append_str(g_ll, "  ");
+        sb_append_str(g_ll, r);
+        sb_append_str(g_ll, " = call i64 @tll_slice_len(ptr ");
+        sb_append_str(g_ll, ap);
+        sb_append_str(g_ll, ")\n");
+        ll_ensure_slot(d, "i64"); ll_set_st(d, "i64"); ll_store(d, "i64", r);
+        return true;
+    }
+    if (cn == "sb_new") {
+        ll_maybe_declare("tll_sb_new", "ptr", []);
+        var r: string = ll_tmp();
+        sb_append_str(g_ll, "  ");
+        sb_append_str(g_ll, r);
+        sb_append_str(g_ll, " = call ptr @tll_sb_new()\n");
+        ll_ensure_slot(d, "ptr"); ll_set_st(d, "ptr"); ll_store(d, "ptr", r);
+        return true;
+    }
+    if (cn == "sb_append_str") {
+        var bp: string = ll_load(toks[4], "ptr");
+        var ap: string = ll_llname(toks[5]);
+        ll_maybe_declare("tll_sb_append_str", "void", ["ptr", "ptr"]);
+        sb_append_str(g_ll, "  call void @tll_sb_append_str(ptr ");
+        sb_append_str(g_ll, bp);
+        sb_append_str(g_ll, ", ptr ");
+        sb_append_str(g_ll, ap);
+        sb_append_str(g_ll, ")\n");
+        return true;
+    }
+    if (cn == "sb_append_char") {
+        var bp: string = ll_load(toks[4], "ptr");
+        var iv: string = ll_load(toks[5], "i64");
+        ll_maybe_declare("tll_sb_append_char", "void", ["ptr", "i64"]);
+        sb_append_str(g_ll, "  call void @tll_sb_append_char(ptr ");
+        sb_append_str(g_ll, bp);
+        sb_append_str(g_ll, ", i64 ");
+        sb_append_str(g_ll, iv);
+        sb_append_str(g_ll, ")\n");
+        return true;
+    }
+    if (cn == "sb_append_i64" || cn == "sb_append_u64") {
+        var bp: string = ll_load(toks[4], "ptr");
+        var iv: string = ll_load(toks[5], "i64");
+        if (cn == "sb_append_i64") {
+            ll_maybe_declare("tll_sb_append_i64", "void", ["ptr", "i64"]);
+            sb_append_str(g_ll, "  call void @tll_sb_append_i64(ptr ");
+        } else {
+            ll_maybe_declare("tll_sb_append_u64", "void", ["ptr", "i64"]);
+            sb_append_str(g_ll, "  call void @tll_sb_append_u64(ptr ");
+        }
+        sb_append_str(g_ll, bp);
+        sb_append_str(g_ll, ", i64 ");
+        sb_append_str(g_ll, iv);
+        sb_append_str(g_ll, ")\n");
+        return true;
+    }
+    if (cn == "sb_to_str") {
+        var bp: string = ll_load(toks[4], "ptr");
+        ll_ensure_slot(d, "%TStr"); ll_set_st(d, "%TStr");
+        var outp: string = ll_llname(d);
+        ll_maybe_declare("tll_sb_to_str", "void", ["ptr", "ptr"]);
+        sb_append_str(g_ll, "  call void @tll_sb_to_str(ptr ");
+        sb_append_str(g_ll, bp);
+        sb_append_str(g_ll, ", ptr ");
+        sb_append_str(g_ll, outp);
+        sb_append_str(g_ll, ")\n");
+        return true;
+    }
+    if (cn == "int_to_str" || cn == "i2s") {
+        var iv: string = ll_load(toks[4], "i64");
+        ll_ensure_slot(d, "%TStr"); ll_set_st(d, "%TStr");
+        var outp: string = ll_llname(d);
+        ll_maybe_declare("tll_int_to_str", "void", ["i64", "ptr"]);
+        sb_append_str(g_ll, "  call void @tll_int_to_str(i64 ");
+        sb_append_str(g_ll, iv);
+        sb_append_str(g_ll, ", ptr ");
+        sb_append_str(g_ll, outp);
+        sb_append_str(g_ll, ")\n");
+        return true;
+    }
+    if (cn == "str_slice") {
+        var ap: string = ll_llname(toks[4]);
+        var lo: string = ll_load(toks[5], "i64");
+        var hi: string = ll_load(toks[6], "i64");
+        ll_ensure_slot(d, "%TStr"); ll_set_st(d, "%TStr");
+        var outp: string = ll_llname(d);
+        ll_maybe_declare("tll_str_slice", "void", ["ptr", "i64", "i64", "ptr"]);
+        sb_append_str(g_ll, "  call void @tll_str_slice(ptr ");
+        sb_append_str(g_ll, ap);
+        sb_append_str(g_ll, ", i64 ");
+        sb_append_str(g_ll, lo);
+        sb_append_str(g_ll, ", i64 ");
+        sb_append_str(g_ll, hi);
+        sb_append_str(g_ll, ", ptr ");
+        sb_append_str(g_ll, outp);
+        sb_append_str(g_ll, ")\n");
+        return true;
+    }
+    if (cn == "str_concat") {
+        var ap: string = ll_llname(toks[4]);
+        var bp: string = ll_llname(toks[5]);
+        ll_ensure_slot(d, "%TStr"); ll_set_st(d, "%TStr");
+        var outp: string = ll_llname(d);
+        ll_maybe_declare("tll_str_concat", "void", ["ptr", "ptr", "ptr"]);
+        sb_append_str(g_ll, "  call void @tll_str_concat(ptr ");
+        sb_append_str(g_ll, ap);
+        sb_append_str(g_ll, ", ptr ");
+        sb_append_str(g_ll, bp);
+        sb_append_str(g_ll, ", ptr ");
+        sb_append_str(g_ll, outp);
+        sb_append_str(g_ll, ")\n");
+        return true;
+    }
+    // ── 直通重命名降级：TIR 已给出正确实参类型，仅缺 runtime 符号/返回类型 ──
+    if (cn == "ti_size" || cn == "ti_kind" || cn == "ti_field_count" ||
+        cn == "fi_offset" || cn == "fi_type_size" || cn == "fi_is_ptr") {
+        var tlln: string = base.sb_cat2("tll_", cn);
+        ll_maybe_declare(tlln, "i64", ["ptr"]);
+        var r: string = ll_tmp();
+        sb_append_str(g_ll, "  ");
+        sb_append_str(g_ll, r);
+        sb_append_str(g_ll, " = call i64 @");
+        sb_append_str(g_ll, tlln);
+        sb_append_str(g_ll, "(ptr ");
+        sb_append_str(g_ll, ll_llname_ptr(toks[4]));
+        sb_append_str(g_ll, ")\n");
+        ll_ensure_slot(d, "i64"); ll_set_st(d, "i64"); ll_store(d, "i64", r);
+        return true;
+    }
+    if (cn == "map_len") {
+        ll_maybe_declare("tll_map_len", "i64", ["ptr"]);
+        var r: string = ll_tmp();
+        sb_append_str(g_ll, "  ");
+        sb_append_str(g_ll, r);
+        sb_append_str(g_ll, " = call i64 @tll_map_len(ptr ");
+        sb_append_str(g_ll, ll_llname_ptr(toks[4]));
+        sb_append_str(g_ll, ")\n");
+        ll_ensure_slot(d, "i64"); ll_set_st(d, "i64"); ll_store(d, "i64", r);
+        return true;
+    }
+    if (cn == "map_has") {
+        ll_maybe_declare("tll_map_has", "i32", ["ptr", "ptr"]);
+        var r: string = ll_tmp();
+        sb_append_str(g_ll, "  ");
+        sb_append_str(g_ll, r);
+        sb_append_str(g_ll, " = call i32 @tll_map_has(ptr ");
+        sb_append_str(g_ll, ll_llname_ptr(toks[4]));
+        sb_append_str(g_ll, ", ptr ");
+        sb_append_str(g_ll, ll_llname(toks[5]));
+        sb_append_str(g_ll, ")\n");
+        ll_ensure_slot(d, "i32"); ll_set_st(d, "i32"); ll_store(d, "i32", r);
+        return true;
+    }
+    if (cn == "map_new") {
+        ll_maybe_declare("tll_map_new", "ptr", ["i64", "i64"]);
+        var r: string = ll_tmp();
+        sb_append_str(g_ll, "  ");
+        sb_append_str(g_ll, r);
+        sb_append_str(g_ll, " = call ptr @tll_map_new(i64 ");
+        sb_append_str(g_ll, ll_load(toks[4], "i64"));
+        sb_append_str(g_ll, ", i64 ");
+        sb_append_str(g_ll, ll_load(toks[5], "i64"));
+        sb_append_str(g_ll, ")\n");
+        ll_ensure_slot(d, "ptr"); ll_set_st(d, "ptr"); ll_store(d, "ptr", r);
+        return true;
+    }
+    if (cn == "map_put" || cn == "map_del" || cn == "map_set") {
+        var tlln: string = "tll_map_put";
+        if (cn == "map_del") { tlln = "tll_map_del"; }
+        ll_maybe_declare(tlln, "void", ["ptr", "ptr", "ptr"]);
+        sb_append_str(g_ll, "  call void @");
+        sb_append_str(g_ll, tlln);
+        sb_append_str(g_ll, "(ptr ");
+        sb_append_str(g_ll, ll_llname_ptr(toks[4]));
+        sb_append_str(g_ll, ", ptr ");
+        sb_append_str(g_ll, ll_llname(toks[5]));
+        sb_append_str(g_ll, ", ptr ");
+        sb_append_str(g_ll, ll_llname(toks[6]));
+        sb_append_str(g_ll, ")\n");
+        return true;
+    }
+    if (cn == "sym_release") {
+        ll_maybe_declare("tll_sym_release", "void", ["ptr"]);
+        sb_append_str(g_ll, "  call void @tll_sym_release(ptr ");
+        sb_append_str(g_ll, ll_llname(toks[4]));
+        sb_append_str(g_ll, ")\n");
+        return true;
+    }
+    if (cn == "sym_release_all") {
+        ll_maybe_declare("tll_sym_release_all", "void", []);
+        sb_append_str(g_ll, "  call void @tll_sym_release_all()\n");
+        return true;
+    }
+    if (cn == "unwrap") {
+        ll_maybe_declare("tll_opt_unwrap", "ptr", ["ptr"]);
+        var r: string = ll_tmp();
+        sb_append_str(g_ll, "  ");
+        sb_append_str(g_ll, r);
+        sb_append_str(g_ll, " = call ptr @tll_opt_unwrap(ptr ");
+        sb_append_str(g_ll, ll_llname_ptr(toks[4]));
+        sb_append_str(g_ll, ")\n");
+        ll_ensure_slot(d, "ptr"); ll_set_st(d, "ptr"); ll_store(d, "ptr", r);
+        return true;
+    }
+    // ── out 参数聚合返回：DST 直接作为 %TStr/%TSlice alloca 传给 tll_* ──
+    // ⚠ 必须内联拼写 call：t 数组字面量末尾/中间 var 元素会被丢弃（见 _fix_tirll 记录），
+    //    走 ll_call_void([..., var]) 会丢末参 → IR 非法。仿 map_get 直接 sb_append_str 构造。
+    if (cn == "atom_str") {
+        var idv: string = ll_load(toks[4], "i64");
+        ll_ensure_slot(d, "%TStr"); ll_set_st(d, "%TStr");
+        var outp: string = ll_llname(d);
+        ll_maybe_declare("tll_atom_str", "void", ["i64", "ptr"]);
+        sb_append_str(g_ll, "  call void @tll_atom_str(i64 ");
+        sb_append_str(g_ll, idv);
+        sb_append_str(g_ll, ", ptr ");
+        sb_append_str(g_ll, outp);
+        sb_append_str(g_ll, ")\n");
+        return true;
+    }
+    if (cn == "slice_sub") {
+        var lo: string = ll_load(toks[5], "i64");
+        var hi: string = ll_load(toks[6], "i64");
+        ll_ensure_slot(d, "%TSlice"); ll_set_st(d, "%TSlice");
+        var outp: string = ll_llname(d);
+        ll_maybe_declare("tll_slice_sub", "void", ["ptr", "i64", "i64", "ptr"]);
+        sb_append_str(g_ll, "  call void @tll_slice_sub(ptr ");
+        sb_append_str(g_ll, ll_llname_ptr(toks[4]));
+        sb_append_str(g_ll, ", i64 ");
+        sb_append_str(g_ll, lo);
+        sb_append_str(g_ll, ", i64 ");
+        sb_append_str(g_ll, hi);
+        sb_append_str(g_ll, ", ptr ");
+        sb_append_str(g_ll, outp);
+        sb_append_str(g_ll, ")\n");
+        return true;
+    }
+    // ── append：runtime t_slice_append 自切片元数据推断元素大小，返回 void；TIR 期望 i64，补 0 ──
+    if (cn == "append") {
+        ll_call_void("t_slice_append", ["ptr", "ptr"],
+                     [ll_llname(toks[4]), ll_llname(toks[5])]);
+        ll_ensure_slot(d, "i64"); ll_set_st(d, "i64"); ll_store(d, "i64", "0");
+        return true;
+    }
+    // ── map_get：value 字节写入 dest 槽（%TStr 16B 足够覆盖 i64 标量）；
+    //    返回 i32(found) 丢弃，d 保持 %TStr 承载取出的 value ──
+    if (cn == "map_get") {
+        var mp: string = ll_llname(toks[4]);
+        var kp: string = ll_llname(toks[5]);
+        ll_ensure_slot(d, "%TStr"); ll_set_st(d, "%TStr");
+        var outp: string = ll_llname(d);
+        ll_maybe_declare("tll_map_get", "i32", ["ptr", "ptr", "ptr"]);
+        var r: string = ll_tmp();
+        sb_append_str(g_ll, "  ");
+        sb_append_str(g_ll, r);
+        sb_append_str(g_ll, " = call i32 @tll_map_get(ptr ");
+        sb_append_str(g_ll, mp);
+        sb_append_str(g_ll, ", ptr ");
+        sb_append_str(g_ll, kp);
+        sb_append_str(g_ll, ", ptr ");
+        sb_append_str(g_ll, outp);
+        sb_append_str(g_ll, ")\n");
+        return true;
+    }
+    // ── 可选类型 ?T（可空指针模型）：some(x) 取 x 的地址作为 optional 指针 ──
+    if (cn == "some") {
+        var c0: string = toks[4];
+        var pv: string;
+        if (str_len(c0) >= 1 && (c0[0] == 36 || c0[0] == 64)) {
+            pv = ll_llname(c0);   // $slot / @global → 其地址即聚合/标量的存放地址
+        } else {
+            var ns: string = ll_tmp();
+            sb_append_str(g_ll, "  "); sb_append_str(g_ll, ns); sb_append_str(g_ll, " = alloca i64\n");
+            sb_append_str(g_ll, "  store i64 "); sb_append_str(g_ll, c0); sb_append_str(g_ll, ", ptr ");
+            sb_append_str(g_ll, ns); sb_append_str(g_ll, "\n");
+            pv = ns;
+        }
+        var pi: string = ll_tmp();
+        sb_append_str(g_ll, "  "); sb_append_str(g_ll, pi);
+        sb_append_str(g_ll, " = ptrtoint ptr "); sb_append_str(g_ll, pv); sb_append_str(g_ll, " to i64\n");
+        ll_ensure_slot(d, "i64"); ll_set_st(d, "i64"); ll_store(d, "i64", pi);
+        return true;
+    }
+    if (cn == "is_some" || cn == "is_none") {
+        var pv: string = ll_load(toks[4], "ptr");
+        var pred: string = "ne";
+        if (cn == "is_none") { pred = "eq"; }
+        var cmp: string = ll_tmp();
+        sb_append_str(g_ll, "  "); sb_append_str(g_ll, cmp);
+        sb_append_str(g_ll, " = icmp "); sb_append_str(g_ll, pred);
+        sb_append_str(g_ll, " ptr "); sb_append_str(g_ll, pv); sb_append_str(g_ll, ", null\n");
+        var z: string = ll_tmp();
+        sb_append_str(g_ll, "  "); sb_append_str(g_ll, z);
+        sb_append_str(g_ll, " = zext i1 "); sb_append_str(g_ll, cmp); sb_append_str(g_ll, " to i64\n");
+        ll_ensure_slot(d, "i64"); ll_set_st(d, "i64"); ll_store(d, "i64", z);
+        return true;
+    }
+    // ── time_invalid：编译期宏 T_TIME_INVALID = INT64_MIN ──
+    if (cn == "time_invalid") {
+        ll_ensure_slot(d, "i64"); ll_set_st(d, "i64"); ll_store(d, "i64", "-9223372036854775808");
+        return true;
+    }
+    // ── format_*：spec, value → TStr out ──
+    if (cn == "format_int" || cn == "format_uint" || cn == "format_float" ||
+        cn == "format_str" || cn == "format_bool" || cn == "format_char") {
+        var fn2: string = base.sb_cat2("tll_", cn);
+        var specp: string = ll_llname(toks[4]);
+        var argv2: []string = [specp];
+        var argsts2: []string = ["ptr"];
+        if (cn == "format_str") { append(argv2, ll_llname(toks[5])); append(argsts2, "ptr"); }
+        else if (cn == "format_bool") { append(argv2, ll_load(toks[5], "i8")); append(argsts2, "i8"); }
+        else { append(argv2, ll_load(toks[5], "i64")); append(argsts2, "i64"); }
+        append(argv2, ll_llname(d)); append(argsts2, "ptr");
+        ll_ensure_slot(d, "%TStr"); ll_set_st(d, "%TStr");
+        ll_call_void(fn2, argsts2, argv2);
+        return true;
+    }
+    // ── parse_time / parse_time_local：spec, s, use_local → i64（正常返回，d 存 i64 结果）──
+    if (cn == "parse_time" || cn == "parse_time_local") {
+        var ul: string = "0";
+        if (cn == "parse_time_local") { ul = "1"; } else { ul = ll_load(toks[6], "i64"); }
+        ll_ensure_slot(d, "i64"); ll_set_st(d, "i64");
+        var outp: string = ll_llname(d);
+        ll_maybe_declare("tll_parse_time", "i64", ["ptr", "ptr", "i64"]);
+        var r: string = ll_tmp();
+        sb_append_str(g_ll, "  "); sb_append_str(g_ll, r);
+        sb_append_str(g_ll, " = call i64 @tll_parse_time(ptr ");
+        sb_append_str(g_ll, ll_llname(toks[4]));
+        sb_append_str(g_ll, ", ptr ");
+        sb_append_str(g_ll, ll_llname(toks[5]));
+        sb_append_str(g_ll, ", i64 ");
+        sb_append_str(g_ll, ul);
+        sb_append_str(g_ll, ")\n");
+        ll_store(d, "i64", r);
+        return true;
+    }
+    // ── format_time / format_time_local / format_time_tz：spec, t, [tz] → TStr out ──
+    if (cn == "format_time" || cn == "format_time_local") {
+        var ul: string = "0";
+        if (cn == "format_time_local") { ul = "1"; } else { ul = ll_load(toks[6], "i64"); }
+        ll_ensure_slot(d, "%TStr"); ll_set_st(d, "%TStr");
+        var outp: string = ll_llname(d);
+        ll_maybe_declare("tll_format_time", "void", ["ptr", "i64", "i64", "ptr"]);
+        sb_append_str(g_ll, "  call void @tll_format_time(ptr ");
+        sb_append_str(g_ll, ll_llname(toks[4]));
+        sb_append_str(g_ll, ", i64 ");
+        sb_append_str(g_ll, ll_load(toks[5], "i64"));
+        sb_append_str(g_ll, ", i64 ");
+        sb_append_str(g_ll, ul);
+        sb_append_str(g_ll, ", ptr ");
+        sb_append_str(g_ll, outp);
+        sb_append_str(g_ll, ")\n");
+        return true;
+    }
+    if (cn == "format_time_tz") {
+        ll_ensure_slot(d, "%TStr"); ll_set_st(d, "%TStr");
+        var outp: string = ll_llname(d);
+        ll_maybe_declare("tll_format_time_tz", "void", ["ptr", "i64", "i64", "ptr"]);
+        sb_append_str(g_ll, "  call void @tll_format_time_tz(ptr ");
+        sb_append_str(g_ll, ll_llname(toks[4]));
+        sb_append_str(g_ll, ", i64 ");
+        sb_append_str(g_ll, ll_load(toks[5], "i64"));
+        sb_append_str(g_ll, ", i64 ");
+        sb_append_str(g_ll, ll_load(toks[6], "i64"));
+        sb_append_str(g_ll, ", ptr ");
+        sb_append_str(g_ll, outp);
+        sb_append_str(g_ll, ")\n");
+        return true;
+    }
+    // ── fid_error：f → TStr out ──
+    if (cn == "fid_error") {
+        ll_ensure_slot(d, "%TStr"); ll_set_st(d, "%TStr");
+        ll_call_void("tll_fid_error", ["i64", "ptr"],
+                     [ll_load(toks[4], "i64"), ll_llname(d)]);
+        return true;
+    }
+    // ── fid_is_open / fid_eof：f → i32→i64 ──
+    if (cn == "fid_is_open" || cn == "fid_eof") {
+        var fn2: string = base.sb_cat2("tll_", cn);
+        ll_call_ret(fn2, "i32", ["i64"], [ll_load(toks[4], "i64")], d);
+        return true;
+    }
+    // ── file_read_all / path_resolve / getenv：path → TStr out ──
+    if (cn == "file_read_all" || cn == "path_resolve" || cn == "getenv") {
+        var fn2: string = "tll_getenv";
+        if (cn == "file_read_all") { fn2 = "tll_file_read_all"; }
+        else if (cn == "path_resolve") { fn2 = "tll_path_resolve"; }
+        ll_ensure_slot(d, "%TStr"); ll_set_st(d, "%TStr");
+        ll_call_void(fn2, ["ptr", "ptr"], [ll_llname(toks[4]), ll_llname(d)]);
+        return true;
+    }
+    // ── fid_format：f, a_text, a_json, a_raw, a_pb → i64 ──
+    if (cn == "fid_format") {
+        ll_call_ret("tll_fid_format", "i64", ["i64", "i64", "i64", "i64", "i64"],
+                    [ll_load(toks[4], "i64"), ll_load(toks[5], "i64"), ll_load(toks[6], "i64"),
+                     ll_load(toks[7], "i64"), ll_load(toks[8], "i64")], d);
+        return true;
+    }
+    // ── fopen / fclose / fseek / ftell / fmt_register ──
+    if (cn == "fopen") {
+        ll_call_ret("tll_fopen", "i64", ["ptr", "i32"],
+                    [ll_llname(toks[4]), ll_load(toks[5], "i32")], d);
+        return true;
+    }
+    if (cn == "fclose") {
+        ll_call_void("tll_fclose", ["i64"], [ll_load(toks[4], "i64")]);
+        return true;
+    }
+    if (cn == "fseek") {
+        ll_call_ret("tll_fseek", "i32", ["i64", "i64"],
+                    [ll_load(toks[4], "i64"), ll_load(toks[5], "i64")], d);
+        return true;
+    }
+    if (cn == "ftell") {
+        ll_call_ret("tll_ftell", "i64", ["i64"], [ll_load(toks[4], "i64")], d);
+        return true;
+    }
+    if (cn == "fmt_register") {
+        ll_call_void("tll_fmt_register", ["i32", "ptr", "i32"],
+                     [ll_load(toks[4], "i32"), ll_llname(toks[5]), ll_load(toks[6], "i32")]);
+        return true;
+    }
+    // ── ti_name / fi_name / fi_type_name：ti/fi → TStr out ──
+    if (cn == "ti_name" || cn == "fi_name" || cn == "fi_type_name") {
+        var fn2: string = base.sb_cat2("tll_", cn);
+        ll_ensure_slot(d, "%TStr"); ll_set_st(d, "%TStr");
+        ll_call_void(fn2, ["ptr", "ptr"], [ll_llname(toks[4]), ll_llname(d)]);
+        return true;
+    }
+    // ── ti_field：ti, i → TFieldInfo* (ptr) ──
+    if (cn == "ti_field") {
+        ll_call_ret("tll_ti_field", "ptr", ["ptr", "i64"],
+                    [ll_llname(toks[4]), ll_load(toks[5], "i64")], d);
+        return true;
+    }
+    // ── fi_tag：fi → i64 ──
+    if (cn == "fi_tag") {
+        ll_call_ret("tll_fi_tag", "i64", ["ptr"], [ll_llname(toks[4])], d);
+        return true;
+    }
+    // ── sb_append_fmt_*：void，忽略 i64 返回 ──
+    if (ll_starts(cn, "sb_append_fmt")) {
+        var fn2: string = base.sb_cat2("tll_", cn);
+        var bp: string = ll_llname(toks[4]);
+        var specp: string = ll_llname(toks[5]);
+        var argv2: []string = [bp, specp];
+        var argsts2: []string = ["ptr", "ptr"];
+        if (cn == "sb_append_fmt_int" || cn == "sb_append_fmt_uint" || cn == "sb_append_fmt_char") {
+            append(argv2, ll_load(toks[6], "i64")); append(argsts2, "i64");
+        } else if (cn == "sb_append_fmt_float") {
+            append(argv2, ll_load(toks[6], "double")); append(argsts2, "double");
+        } else if (cn == "sb_append_fmt_bool") {
+            append(argv2, ll_load(toks[6], "i8")); append(argsts2, "i8");
+        } else if (cn == "sb_append_fmt_str") {
+            append(argv2, ll_llname(toks[6])); append(argsts2, "ptr");
+        } else if (cn == "sb_append_fmt_str_conv" || cn == "sb_append_fmt_int_conv" || cn == "sb_append_fmt_uint_conv") {
+            append(argv2, ll_llname(toks[6])); append(argsts2, "ptr");
+            append(argv2, ll_llname(toks[7])); append(argsts2, "ptr");
+        } else if (cn == "sb_append_fmt_big") {
+            append(argv2, ll_llname(toks[6])); append(argsts2, "ptr");
+            append(argv2, ll_load(toks[7], "i64")); append(argsts2, "i64");
+            append(argv2, ll_load(toks[8], "i8")); append(argsts2, "i8");
+        }
+        ll_call_void(fn2, argsts2, argv2);
+        ll_ensure_slot(d, "i64"); ll_set_st(d, "i64"); ll_store(d, "i64", "0");
+        return true;
+    }
+    // ── math__*：裸名 → t_math_<base>（f32 变体名以 f 结尾或 _f）──
+    if (ll_starts(cn, "math__")) {
+        var base2: string = str_slice(cn, 6, str_len(cn));
+        var isf: bool = false;
+        var L: i64 = str_len(base2);
+        if (L >= 2 && str_at(base2, L - 2) == 95 && str_at(base2, L - 1) == 102) {
+            base2 = base.sb_cat2(str_slice(base2, 0, L - 2), "f");
+            isf = true;
+        } else if (L >= 1 && str_at(base2, L - 1) == 102) {
+            isf = true;
+        }
+        var ty: string = "double";
+        if (isf) { ty = "float"; }
+        if (base2 == "pow_i") {
+            var a0: string = ll_load(toks[4], "double");
+            var a1i: string = ll_load(toks[5], "i64");
+            var a1: string = ll_tmp();
+            sb_append_str(g_ll, "  "); sb_append_str(g_ll, a1);
+            sb_append_str(g_ll, " = sitofp i64 "); sb_append_str(g_ll, a1i);
+            sb_append_str(g_ll, " to double\n");
+            ll_call_ret("t_math_pow", "double", ["double", "double"], [a0, a1], d);
+            return true;
+        }
+        var fn2: string = base.sb_cat2("t_math_", base2);
+        var argc: i64 = slice_len(toks) as i64 - 4;
+        var argv2: []string = [];
+        var argsts2: []string = [];
+        var i: i64 = 0;
+        while (i < argc) {
+            var av: string = ll_load(toks[4 + i], "double");
+            if (isf) {
+                var fv: string = ll_tmp();
+                sb_append_str(g_ll, "  "); sb_append_str(g_ll, fv);
+                sb_append_str(g_ll, " = fptrunc double "); sb_append_str(g_ll, av);
+                sb_append_str(g_ll, " to float\n");
+                append(argv2, fv);
+            } else {
+                append(argv2, av);
+            }
+            append(argsts2, ty);
+            i = i + 1;
+        }
+        ll_call_ret(fn2, ty, argsts2, argv2, d);
+        return true;
+    }
+    return false;
+}
+
 pub fn ll_emit_inst(toks: []string) void {
     var m: i64 = slice_len(toks) as i64;
     if (m < 1) { return; }
@@ -711,11 +1382,24 @@ pub fn ll_emit_inst(toks: []string) void {
         return;
     }
     if (op == "const.str") {
-        // 字符串常量：核心子集不做真实现，仅分配 %TStr slot 使引用不悬空；
-        // 真实字符串数据 + 运行时 shim（@println->@tll_println 等）属 §4。
+        // 字符串常量：分配 %TStr slot，并从 strings: 段对应的全局常量 @.tirll_tstr<idx> load 进来。
+        // @.tirll_tstr<i> 在 ll_emit_string_globals 阶段发射（constant %TStr { ptr @.tirll_str<i>, i64 N }）。
+        // 用 load+store 而非内联聚合，避免全局变量直接作为值引用（LLVM 要求全局引用是 pointer 类型）。
         var d: string = toks[1];
         ll_ensure_slot(d, "%TStr");
         ll_set_st(d, "%TStr");
+        var gp: string = base.sb_cat2("@.tirll_tstr", toks[2]);
+        var tmp: string = ll_tmp();
+        sb_append_str(g_ll, "  ");
+        sb_append_str(g_ll, tmp);
+        sb_append_str(g_ll, " = load %TStr, ptr ");
+        sb_append_str(g_ll, gp);
+        sb_append_str(g_ll, "\n");
+        sb_append_str(g_ll, "  store %TStr ");
+        sb_append_str(g_ll, tmp);
+        sb_append_str(g_ll, ", ptr ");
+        sb_append_str(g_ll, ll_llname(d));
+        sb_append_str(g_ll, "\n");
         return;
     }
     if (op == "const.ptr.null") {
@@ -977,6 +1661,7 @@ pub fn ll_emit_inst(toks: []string) void {
         var callee: string = toks[3];
         var is_indirect: bool = (str_len(callee) >= 1 && callee[0] == 36);  // '$' -> 函数指针间接调用，不加 @
         var fname: string = ll_llname(callee);   // "@add" -> "add" ; "$t12" -> "%curfn.t12"
+        if (ll_emit_builtin(fname, toks)) { return; }   // §4 内建降级优先于通用函数调用
         var m: i64 = slice_len(toks) as i64;
         var k: i64 = 4;
         var argsb: StringBuilder = sb_new();
@@ -1559,6 +2244,40 @@ pub fn ll_emit_opaque_defs() void {
     sb_append_str(g_ll, old);
 }
 
+// 发射 TIR strings: 段里每个字面量为 LLVM 全局常量：
+//   @.tirll_str<i>  = constant [N x i8] c"<esc>"   （tir_esc 的 \XX 转义本就是合法 LLVM c"" 内容）
+//   @.tirll_tstr<i> = constant %TStr { ptr @.tirll_str<i>, i64 N }
+// const.str $tN <i> 随后直接 `store %TStr @.tirll_tstr<i>, ptr %curfn.tN`，使字符串字面量承载真实数据。
+pub fn ll_emit_string_globals() void {
+    var i: i64 = 0;
+    var n: i64 = slice_len(g_str_table) as i64;
+    while (i < n) {
+        var content: string = g_str_table[i];          // tir_esc 形式（\XX 合法 LLVM c"" 内容）
+        var blen: i64 = 0;
+        var cn: i64 = str_len(content);
+        var ci: i64 = 0;
+        while (ci < cn) {                              // 计算原始字节长度（\XX 记 1 字节）
+            if (str_at(content, ci) == 92) { ci = ci + 3; } else { ci = ci + 1; }
+            blen = blen + 1;
+        }
+        sb_append_str(g_ll, "@.tirll_str");
+        sb_append_i64(g_ll, i);
+        sb_append_str(g_ll, " = private unnamed_addr constant [");
+        sb_append_i64(g_ll, blen);
+        sb_append_str(g_ll, " x i8] c\"");
+        sb_append_str(g_ll, content);
+        sb_append_str(g_ll, "\", align 1\n");
+        sb_append_str(g_ll, "@.tirll_tstr");
+        sb_append_i64(g_ll, i);
+        sb_append_str(g_ll, " = constant %TStr { ptr @.tirll_str");
+        sb_append_i64(g_ll, i);
+        sb_append_str(g_ll, ", i64 ");
+        sb_append_i64(g_ll, blen);
+        sb_append_str(g_ll, " }\n");
+        i = i + 1;
+    }
+}
+
 // 主入口：消费 tir.tir_to_text() 文本，产出 .ll 文本
 pub fn tir_to_ll_translate(text: string) string {
     ll_reset();
@@ -1586,8 +2305,40 @@ pub fn tir_to_ll_translate(text: string) string {
                 continue;
             }
         }
+        if (toks[0] == "strings:") { g_in_strings = true; k = k + 1; continue; }
+        if (g_in_strings) {
+            if (toks[0] == "func" || toks[0] == "types:" || toks[0] == "module" ||
+                toks[0] == "source:" || toks[0] == "globals:") {
+                g_in_strings = false;   // 段结束，交给后续正常处理（不 continue）
+            } else {
+                // "  N: \"content\"" —— 取首 ':' 之后、最外一对双引号之间的内容
+                var ci: i64 = ll_find(line, ":");
+                if (ci >= 0) {
+                    var rest: string = str_slice(line, ci + 1, str_len(line));
+                    var q1: i64 = ll_find(rest, "\"");
+                    if (q1 >= 0) {
+                        var q2: i64 = ll_rfind(rest, "\"");
+                        if (q2 > q1) {
+                            var content: string = str_slice(rest, q1 + 1, q2);
+                            append(g_str_table, content);
+                        }
+                    }
+                }
+                k = k + 1; continue;
+            }
+        }
         if (toks[0] == "func") {
             ll_parse_func(line);
+            // 入口函数检测：tir.tc 对 @main 标注函数追加 "@main" 标记 token，
+            // 仅在第 1 遍（且每个模块至多一次）捕获，避免第 2 遍 ll_parse_func 重复覆盖。
+            if (g_has_main == false) {
+                var mi: i64 = 0;
+                var mn: i64 = slice_len(toks) as i64;
+                while (mi < mn) {
+                    if (toks[mi] == "@main") { g_has_main = true; g_main_fn = g_pf_name; break; }
+                    mi = mi + 1;
+                }
+            }
             // 收集命名类型（%Perm 等位标志/枚举，i64 底类型），供后续 emit `%Name = type i64` 声明
             ll_register_named_type(g_pf_ret);
             var pi2: i64 = 0;
@@ -1669,6 +2420,48 @@ pub fn tir_to_ll_translate(text: string) string {
         sb_append_str(g_ll, " zeroinitializer\n");
         gi = gi + 1;
     }
+    ll_emit_string_globals();                         // 字符串字面量全局常量（const.str 引用）
     ll_emit_opaque_defs();                          // 运行时结构类型补 opaque 定义
+    ll_emit_main_wrapper();                         // 补 @main 入口包装（emit-tir-ll 此前缺此，导致无法链接运行）
     return sb_to_str(g_ll);
+}
+
+// 补 @main 入口包装：emit-tir-ll 此前只发函数体，缺 main 入口，故 clang 链接阶段因无入口失败。
+// 与 legacy emit-ll 一致：t_runtime_init -> arena -> t.__ginit -> 用户入口 -> t_runtime_done。
+// 运行期函数（t_runtime_init/t_arena_new/...）由 t_runtime.lib 提供，此处仅发 declare。
+pub fn ll_emit_main_wrapper() void {
+    if (g_has_main == false) { return; }
+    sb_append_str(g_ll, "declare void @t_runtime_init(i32, ptr)\n");
+    sb_append_str(g_ll, "declare ptr @t_arena_new()\n");
+    sb_append_str(g_ll, "declare void @t_runtime_set_arena(ptr)\n");
+    sb_append_str(g_ll, "declare void @t_runtime_done()\n");
+    // 运行期 t_atom_str/t_deser_atom 总是引用 @t_atom_table/@t_atom_count，
+    // legacy emit-ll 始终发射（无 atom 时为 1 元素占位）；TIR 路径此前缺此导致链接 undefined symbol。
+    sb_append_str(g_ll, "@.tirll_as0 = private unnamed_addr constant [1 x i8] zeroinitializer\n");
+    sb_append_str(g_ll, "@.tirll_ats0 = private unnamed_addr constant %TStr { ptr @.tirll_as0, i64 0 }\n");
+    sb_append_str(g_ll, "@t_atom_table = global [1 x %TStr] [ %TStr { ptr @.tirll_as0, i64 0 } ]\n");
+    sb_append_str(g_ll, "@t_atom_count = global i64 1\n");
+    // 仅当模块未自带 t.__ginit 时补空实现（模块级全局初始化由 tir.tc 路径暂未生成，留空无害）
+    var have_ginit: bool = false;
+    var gi_i: i64 = 0;
+    var gi_n: i64 = slice_len(g_func_names) as i64;
+    while (gi_i < gi_n) {
+        if (g_func_names[gi_i] == "t.__ginit") { have_ginit = true; break; }
+        gi_i = gi_i + 1;
+    }
+    if (have_ginit == false) {
+        sb_append_str(g_ll, "define void @t.__ginit() {\n  ret void\n}\n");
+    }
+    sb_append_str(g_ll, "define i32 @main(i32 %argc, ptr %argv) {\n");
+    sb_append_str(g_ll, "entry:\n");
+    sb_append_str(g_ll, "  call void @t_runtime_init(i32 %argc, ptr %argv)\n");
+    sb_append_str(g_ll, "  %a = call ptr @t_arena_new()\n");
+    sb_append_str(g_ll, "  call void @t_runtime_set_arena(ptr %a)\n");
+    sb_append_str(g_ll, "  call void @t.__ginit()\n");
+    sb_append_str(g_ll, "  %r = call i32 @t.");
+    sb_append_str(g_ll, g_main_fn);
+    sb_append_str(g_ll, "()\n");
+    sb_append_str(g_ll, "  call void @t_runtime_done()\n");
+    sb_append_str(g_ll, "  ret i32 %r\n");
+    sb_append_str(g_ll, "}\n");
 }
