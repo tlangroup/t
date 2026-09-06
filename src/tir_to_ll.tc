@@ -303,11 +303,28 @@ pub fn ll_bin_to_dec(s: string) string {
 }
 
 // 归一化立即数：浮点处理 inf/nan，二/八/十六进制转十进制；十进制/负数 LLVM 原生支持
-pub fn ll_norm_imm(imm: string, st: string) string {
-    if (ll_starts(st, "f")) {
+// 判断立即数是否为纯整数字面量（可选前导 '-' + 数字，不含 '.'/'e'/'x' 等）
+pub fn ll_imm_is_int(s: string) bool {
+    var n: i64 = str_len(s);
+    if (n == 0) { return false; }
+    var i: i64 = 0;
+    if (str_at(s, 0) == 45) { i = 1; }   // '-'
+    if (i == n) { return false; }
+    while (i < n) {
+        var c: i64 = str_at(s, i);
+        if (c < 48 || c > 57) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+pub fn ll_norm_imm(imm: string, st: string) string {    if (ll_starts(st, "f")) {
         if (imm == "inf") { if (st == "f32") { return "0x7F800000"; } return "0x7FF0000000000000"; }
         if (imm == "-inf") { if (st == "f32") { return "0xFF800000"; } return "0xFFF0000000000000"; }
         if (imm == "nan") { if (st == "f32") { return "0x7FC00000"; } return "0x7FF8000000000000"; }
+        // 整数字面量（如 -1、1000）作为浮点常量需补 .0，否则 LLVM 报
+        // "integer constant must have integer type"（store double -1 非法）。
+        if (ll_imm_is_int(imm)) { return base.sb_cat2(imm, ".0"); }
         return imm;
     }
     if (ll_starts(imm, "0b") || ll_starts(imm, "0B")) { return ll_bin_to_dec(imm); }
@@ -365,6 +382,15 @@ pub fn ll_binop(op: string) string {
     if (op == "lshr") { return "lshr"; }
     if (op == "ashr") { return "ashr"; }
     return "add";
+}
+// 浮点二元助记符：整数 binop 的浮点对应（add.f64 → fadd 等）
+pub fn ll_fbinop(op: string) string {
+    if (op == "add") { return "fadd"; }
+    if (op == "sub") { return "fsub"; }
+    if (op == "mul") { return "fmul"; }
+    if (op == "sdiv" || op == "udiv" || op == "div") { return "fdiv"; }
+    if (op == "srem" || op == "urem" || op == "mod") { return "frem"; }
+    return "fadd";
 }
 
 pub fn ll_icmp(op: string) string {
@@ -862,6 +888,9 @@ pub fn ll_emit_inst(toks: []string) void {
             else if (ll_is_float(srcst) && ll_is_int(dstst)) { llvmop = "fptosi"; }
             else if (ll_is_int(srcst) && ll_is_float(dstst)) { llvmop = "sitofp"; }
             else { llvmop = "trunc"; }
+        } else if (op == "zext" || op == "sext") {
+            // 浮点间扩宽（f32→f64）走 fpext，而非整数的 zext/sext
+            if (ll_is_float(srcst) && ll_is_float(dstst)) { llvmop = "fpext"; }
         }
         sb_append_str(g_ll, "  ");
         sb_append_str(g_ll, r);
@@ -908,6 +937,34 @@ pub fn ll_emit_inst(toks: []string) void {
         sb_append_str(g_ll, ")\n");
         return;
     }
+    // 字符串相等比较：eq.%TStr / ne.%TStr → 调 tll_str_eq（返回 i32，非 0 为真）
+    // 其余构造的 struct 比较暂未支持（需 memcmp 降级），与 legacy codegen_ll 仅特判字符串一致。
+    if ((o == "eq" || o == "ne") && st == "%TStr") {
+        var d: string = toks[1];
+        var a: string = toks[2];
+        var b: string = toks[3];
+        var da: string = ll_llname(a);   // 槽地址（ptr），tll_str_eq 收 TStr*
+        var db: string = ll_llname(b);
+        ll_maybe_declare("tll_str_eq", "i32", ["ptr", "ptr"]);
+        var r: string = ll_tmp();
+        sb_append_str(g_ll, "  ");
+        sb_append_str(g_ll, r);
+        sb_append_str(g_ll, " = call i32 @tll_str_eq(ptr ");
+        sb_append_str(g_ll, da);
+        sb_append_str(g_ll, ", ptr ");
+        sb_append_str(g_ll, db);
+        sb_append_str(g_ll, ")\n");
+        var b1: string = ll_tmp();
+        sb_append_str(g_ll, "  ");
+        sb_append_str(g_ll, b1);
+        sb_append_str(g_ll, " = icmp ne i32 ");
+        sb_append_str(g_ll, r);
+        sb_append_str(g_ll, ", 0\n");
+        ll_ensure_slot(d, "i1");
+        ll_set_st(d, "i1");
+        ll_store(d, "i1", b1);
+        return;
+    }
     if (o == "slt" || o == "sgt" || o == "sge" || o == "sle" || o == "ult" || o == "ugt" ||
         o == "ule" || o == "uge" || o == "eq" || o == "ne") {
         var d: string = toks[1];
@@ -938,7 +995,7 @@ pub fn ll_emit_inst(toks: []string) void {
         ll_store(d, "i1", r);
         return;
     }
-    // 普通二元
+    // 普通二元（整数/浮点统一）
     var d: string = toks[1];
     var a: string = toks[2];
     var b: string = toks[3];
@@ -948,9 +1005,13 @@ pub fn ll_emit_inst(toks: []string) void {
     sb_append_str(g_ll, "  ");
     sb_append_str(g_ll, r);
     sb_append_str(g_ll, " = ");
-    sb_append_str(g_ll, ll_binop(o));
+    if (ll_is_float(st)) {
+        sb_append_str(g_ll, ll_fbinop(o));
+    } else {
+        sb_append_str(g_ll, ll_binop(o));
+    }
     sb_append_str(g_ll, " ");
-    sb_append_str(g_ll, st);
+    sb_append_str(g_ll, st_to_ll(st));
     sb_append_str(g_ll, " ");
     sb_append_str(g_ll, da);
     sb_append_str(g_ll, ", ");
