@@ -24,6 +24,9 @@ pub var g_ll_curfn: string;           // 当前函数名前缀：LLVM 寄存器/
 pub var g_ll_declared: []string;       // 已 emit 过 declare 的外部函数名
 pub var g_ll_declbuf: StringBuilder;   // 外部 declare 缓冲（函数体扫描后追加到模块末尾）
 pub var g_opaque_emitted: []string;    // 已 emit 过 opaque 定义的运行时结构类型名（如 TSb）
+pub var g_ll_globals: []string;         // 模块级全局变量名（@ 已剥离）
+pub var g_ll_globalsts: []string;       // 对应的存储类型 ST（与 g_ll_globals 并行）
+pub var g_in_globals: bool = false;     // 当前是否处于 TIR globals: 段
 
 pub fn ll_tmp() string {
     var v: i64 = g_ll_tmpc;
@@ -46,6 +49,9 @@ pub fn ll_reset() void {
     g_ll_declared = [];
     g_ll_declbuf = sb_new();
     g_opaque_emitted = [];
+    g_ll_globals = [];
+    g_ll_globalsts = [];
+    g_in_globals = false;
 }
 
 pub fn ll_get_st(name: string) string {
@@ -78,6 +84,39 @@ pub fn ll_llname(tname: string) string {
     }
     if (tname[0] == 64) { return ll_mangle(str_slice(tname, 1, str_len(tname))); }                        // '@'
     return tname;
+}
+
+// 指针目的地（store/load 的 ptr 操作数、addr_of 目标）用此变体：@name 全局引用保留 '@' 前缀。
+// 例：store i32 %v, ptr @gNpc —— 全局变量作为存放目标必须带 '@'。
+pub fn ll_llname_ptr(tname: string) string {
+    if (str_len(tname) >= 1 && tname[0] == 64) {
+        return "@" + ll_mangle(str_slice(tname, 1, str_len(tname)));
+    }
+    return ll_llname(tname);
+}
+
+// @name 是否为已声明的函数（避免把函数名误当作全局变量声明）
+pub fn ll_is_func(name: string) bool {
+    var n: i64 = slice_len(g_func_names) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        if (g_func_names[i] == name) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+// 遇到引用但未声明的 @name 全局：登记为 `global <st> zeroinitializer`，模块末尾统一 emit。
+// （tir.tc 暂不建模模块级全局变量声明，此处由翻译器兜底，使 legacy emit-ll 能编译的示例在 TIR 路径同样可编译。）
+pub fn ll_register_global(name: string, st: string) void {
+    var n: i64 = slice_len(g_ll_globals) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        if (g_ll_globals[i] == name) { return; }
+        i = i + 1;
+    }
+    append(g_ll_globals, name);
+    append(g_ll_globalsts, st_to_ll(st));
 }
 
 // 分支标签：@Lx -> curfn.Lx（LLVM 标签是函数局域，需加函数前缀避免跨函数重名）
@@ -135,13 +174,15 @@ pub fn ll_load(tname: string, st: string) string {
     // 全局引用 @name（函数或全局变量）：全局符号在 LLVM 中恒为指针，作值操作数时必须 load 出其值。
     // 对函数引用：load ptr, ptr @fn 等价于直接使用 @fn（取其地址）；对全局变量：load 出存储值。两种情形都正确。
     if (str_len(tname) >= 1 && tname[0] == 64) {
+        var gnm: string = str_slice(tname, 1, str_len(tname));
+        if (ll_is_func(gnm) == false) { ll_register_global(gnm, st); }
         var r: string = ll_tmp();
         sb_append_str(g_ll, "  ");
         sb_append_str(g_ll, r);
         sb_append_str(g_ll, " = load ");
         sb_append_str(g_ll, st_to_ll(st));
         sb_append_str(g_ll, ", ptr @");
-        sb_append_str(g_ll, ll_mangle(str_slice(tname, 1, str_len(tname))));
+        sb_append_str(g_ll, ll_mangle(gnm));
         sb_append_str(g_ll, "\n");
         return r;
     }
@@ -151,18 +192,22 @@ pub fn ll_load(tname: string, st: string) string {
     sb_append_str(g_ll, " = load ");
     sb_append_str(g_ll, st_to_ll(st));
     sb_append_str(g_ll, ", ptr ");
-    sb_append_str(g_ll, ll_llname(tname));
+    sb_append_str(g_ll, ll_llname_ptr(tname));
     sb_append_str(g_ll, "\n");
     return r;
 }
 
 pub fn ll_store(tname: string, st: string, val: string) void {
+    if (str_len(tname) >= 1 && tname[0] == 64) {
+        var gnm: string = str_slice(tname, 1, str_len(tname));
+        if (ll_is_func(gnm) == false) { ll_register_global(gnm, st); }
+    }
     sb_append_str(g_ll, "  store ");
     sb_append_str(g_ll, st_to_ll(st));
     sb_append_str(g_ll, " ");
     sb_append_str(g_ll, val);
     sb_append_str(g_ll, ", ptr ");
-    sb_append_str(g_ll, ll_llname(tname));
+    sb_append_str(g_ll, ll_llname_ptr(tname));
     sb_append_str(g_ll, "\n");
 }
 
@@ -660,8 +705,13 @@ pub fn ll_emit_inst(toks: []string) void {
                 ll_store(dst, dstst, v);
             }
         } else {
-            var v: string = ll_load(src, dstst);
-            ll_store(dst, dstst, v);
+            var vst: string = ll_get_st(src);
+            if (str_len(dst) >= 1 && dst[0] == 64) {
+                var gnm: string = str_slice(dst, 1, str_len(dst));
+                if (ll_is_func(gnm) == false) { ll_register_global(gnm, vst); }
+            }
+            var v: string = ll_load(src, vst);
+            ll_store(dst, vst, v);
         }
         return;
     }
@@ -1248,6 +1298,21 @@ pub fn tir_to_ll_translate(text: string) string {
         var toks: []string = ll_tokens(line);
         var m: i64 = slice_len(toks) as i64;
         if (m == 0) { k = k + 1; continue; }
+        if (toks[0] == "globals:") { g_in_globals = true; k = k + 1; continue; }
+        if (g_in_globals) {
+            // globals: 段内每行 "@name ST"（或 "name ST"），收集用于 emit 全局声明
+            if (toks[0] == "func" || toks[0] == "types:" || toks[0] == "strings:" || toks[0] == "module" || toks[0] == "source:") {
+                g_in_globals = false;
+            } else {
+                var gnm: string = toks[0];
+                if (str_len(gnm) >= 1 && gnm[0] == 64) { gnm = str_slice(gnm, 1, str_len(gnm)); }
+                append(g_ll_globals, gnm);
+                append(g_ll_globalsts, toks[1]);
+                ll_set_st("@" + gnm, toks[1]);   // 注册全局类型，供 store/load 目标类型推断
+                k = k + 1;
+                continue;
+            }
+        }
         if (toks[0] == "func") {
             ll_parse_func(line);
             var ps: []string = [];
@@ -1297,6 +1362,17 @@ pub fn tir_to_ll_translate(text: string) string {
     }
     if (in_func) { sb_append_str(g_ll, "}\n\n"); }
     sb_append_str(g_ll, sb_to_str(g_ll_declbuf));   // 外部函数 declare 置于模块末尾
+    // 模块级全局变量声明：@name = global <ST> zeroinitializer（运行期初始化由 t.__ginit 完成）
+    var gi: i64 = 0;
+    var gn: i64 = slice_len(g_ll_globals) as i64;
+    while (gi < gn) {
+        sb_append_str(g_ll, "@");
+        sb_append_str(g_ll, ll_mangle(g_ll_globals[gi]));
+        sb_append_str(g_ll, " = global ");
+        sb_append_str(g_ll, st_to_ll(g_ll_globalsts[gi]));
+        sb_append_str(g_ll, " zeroinitializer\n");
+        gi = gi + 1;
+    }
     ll_emit_opaque_defs();                          // 运行时结构类型补 opaque 定义
     return sb_to_str(g_ll);
 }
