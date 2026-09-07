@@ -72,6 +72,11 @@ pub var g_local_slots: []string;
 pub var g_local_sts: []string;
 pub var g_local_tds: []i64;      // emit 期唯一可靠的局部类型来源（符号表在 emit 期无效）
 
+// 最近一次 tir_emit_expr 发射出的「真实 LLVM 类型」（如 mul.f64 → "f64"）。
+// 用于在 tir_emit_cast 中取内层表达式的实际发射类型，避免 meta_type_of_expr 在
+// `as i64` 整数语境下把浮点操作数强制推断成 i64 而丢失 fptosi 转换。
+pub var g_tir_last_st: string = "i64";
+
 // 循环标签栈（break/continue 目标；支持嵌套循环）
 pub var g_loop_head: []string;   // 栈顶 = 最内层循环头（continue 目标）
 pub var g_loop_end: []string;    // 栈顶 = 最内层循环尾（break 目标）
@@ -80,6 +85,15 @@ pub var g_tir_defer: []i64;          // 延迟语句节点栈（defer → LIFO�
 pub var g_tir_func_names: []string;   // 模块内函数名 → FuncDecl 节点（call 实参定长数组降级用）
 pub var g_tir_func_decls: []i64;
 pub var g_cur_ret_td: i64 = -1;       // 当前函数返回类型 TD（return 字面量定长数组降级用）
+
+// ── 模块级全局变量（Stage 4 降级目标，解锁 func_type/lambda/map 全局等示例）──
+pub var g_globals_section: StringBuilder;   // 缓冲 `globals:` 段文本（@name ST 每行）
+pub var g_global_names: []string;            // 顶层全局变量名（与下行并行）
+pub var g_global_fnval: []bool;              // 是否函数值（%TClosure）全局
+pub var g_global_map: []bool;                // 是否 map 全局（需 ginit 运行期建表）
+pub var g_global_td: []i64;                  // 各全局的类型描述符（map/标量 init 用）
+pub var g_global_vdecl: []i64;               // 各全局的 var_decl 节点索引（取 init 用）
+pub var g_global_fnref: []string;            // fn 值全局：函数符号文本（"@add" / "@__lam_N"）
 
 // ══════════════════════════════════════════════════════════════════
 // 基础工具
@@ -117,6 +131,13 @@ pub fn tir_reset() void {
     g_vf_nodes = zvn;
     var zvt: [][]i64 = [];
     g_vf_tds = zvt;
+    g_globals_section = sb_new();
+    g_global_names = [];
+    g_global_fnval = [];
+    g_global_map = [];
+    g_global_td = [];
+    g_global_vdecl = [];
+    g_global_fnref = [];
 }
 
 pub fn tir_tmp() string {
@@ -644,6 +665,10 @@ pub fn lower_unit(mod: string, source: string) void {
         j0 = j0 + 1;
     }
 
+    // 模块级全局变量元数据收集：必须在函数体发射前完成，供 tir_emit_call 判定
+    // 全局函数值变量走 call_ind。globals: 段文本在此缓冲，t.__ginit 在末尾追加。
+    tir_emit_globals();
+
     var j: i64 = 0;
     while (j < n) {
         var d: i64 = lex.decl_list[j];
@@ -765,6 +790,152 @@ pub fn lower_unit(mod: string, source: string) void {
         }
         iv = iv + 1;
     }
+    // 模块级全局变量降级：元数据（g_global_names 等）必须在函数体发射前收集，
+    // 否则 tir_emit_call 判定全局函数值变量（走 call_ind）时 g_global_names 尚为空 → 直调崩溃。
+    // t.__ginit 初始化函数仍在末尾追加（函数体顺序无关，翻译器统一收集）。
+    tir_emit_ginit();
+}
+
+// ── 模块级全局变量降级 ───────────────────────────────────────────────
+// 收集顶层 var_decl 进 g_globals_section（"@name ST" 每行，供 t.__ginit 运行期初始化
+// 与翻译器 globals: 段声明），并记录分类元数据供 tir_emit_ginit / tir_emit_call 使用。
+pub fn tir_emit_globals() void {
+    var n: i64 = slice_len(lex.decl_list) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        var d: i64 = lex.decl_list[i];
+        var dn: Node = base.nodes[d];
+        if (dn.kind != "var_decl" && dn.kind != "GlobalVarDecl" && dn.kind != "GlobalConstDecl") { i = i + 1; continue; }
+        var nm: string = dn.sa;
+        var t: i64 = -1;
+        if (dn.na >= 0) { t = sema.resolve_type_desc(dn.na); }
+        var st: string = "i64";
+        if (t >= 0) { st = tir_st_of_td(t); }
+        // 函数值全局：ABI 上以 %TClosure 形态存在（call_ind 直接 GEP 其上取 code/env）
+        if (t >= 0 && sema.tds[t].cat == "func") {
+            sb_append_str(g_globals_section, "  @");
+            sb_append_str(g_globals_section, nm);
+            sb_append_str(g_globals_section, " %TClosure\n");
+            var ref: string = "";
+            if (dn.nb >= 0) {
+                var initn: Node = base.nodes[dn.nb];
+                if (initn.kind == "ident") { ref = base.sb_cat2("@", initn.sa); }
+                else if (initn.kind == "closure_make") { ref = base.sb_cat2("@", initn.sa); }
+            }
+            append(g_global_names, nm);
+            append(g_global_fnval, true);
+            append(g_global_map, false);
+            append(g_global_td, t);
+            append(g_global_vdecl, d);
+            append(g_global_fnref, ref);
+            i = i + 1;
+            continue;
+        }
+        // map 全局：ptr<void> 句柄，ginit 运行期建表
+        if (t >= 0 && sema.tds[t].cat == "map") {
+            sb_append_str(g_globals_section, "  @");
+            sb_append_str(g_globals_section, nm);
+            sb_append_str(g_globals_section, " ptr<void>\n");
+            append(g_global_names, nm);
+            append(g_global_fnval, false);
+            append(g_global_map, true);
+            append(g_global_td, t);
+            append(g_global_vdecl, d);
+            append(g_global_fnref, "");
+            i = i + 1;
+            continue;
+        }
+        // 标量/聚合全局：声明 + ginit 设常量初值（无 init 则零初始化）
+        sb_append_str(g_globals_section, "  @");
+        sb_append_str(g_globals_section, nm);
+        sb_append_str(g_globals_section, " ");
+        sb_append_str(g_globals_section, st);
+        sb_append_str(g_globals_section, "\n");
+        append(g_global_names, nm);
+        append(g_global_fnval, false);
+        append(g_global_map, false);
+        append(g_global_td, t);
+        append(g_global_vdecl, d);
+        append(g_global_fnref, "");
+        i = i + 1;
+    }
+}
+
+// 是否函数值（%TClosure）全局变量（供 tir_emit_call 走 call_ind）
+pub fn tir_is_global_fnval(cname: string) bool {
+    var n: i64 = slice_len(g_global_names) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        if (g_global_names[i] == cname && g_global_fnval[i]) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+// 取全局函数值变量的 FuncType TD（cat=="func"），供 tir_emit_call 取真实返回类型覆盖默认 retst。
+pub fn tir_global_fnval_td(name: string) i64 {
+    var n: i64 = slice_len(g_global_names) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        if (g_global_names[i] == name && g_global_fnval[i]) { return g_global_td[i]; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// 发射 t.__ginit 函数：运行期初始化各全局（函数值闭包 / map 建表 / 标量常量）。
+// 仅当存在全局时生成；翻译器 main 包装器会调用之。
+pub fn tir_emit_ginit() void {
+    if (slice_len(g_global_names) as i64 == 0) { return; }
+    var eb: []TIRInst = [];
+    var gpp: []string = [];
+    g_cur_func = TIRFunc{ name: "t.__ginit", params: gpp, ret_st: "void", body: eb, is_extern: false, is_kernel: false, is_main: false };
+    g_term = false;
+    g_cur_line = 0;
+    var n: i64 = slice_len(g_global_names) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        var nm: string = g_global_names[i];
+        if (g_global_fnval[i]) {
+            // 在 @nm（%TClosure 全局）上构造闭包：addr_of 取址 → gep 0 0 写 code → gep 0 1 写 env(null)
+            var ga: string = tir_tmp();
+            tir_line(base.sb_cat4("addr_of ptr<%TClosure> ", ga, " @", nm));
+            var fp: string = tir_tmp();
+            tir_line(base.sb_cat5("gep ptr<void> ", fp, " ", ga, " 0 0"));
+            tir_line(base.sb_cat4("store ", g_global_fnref[i], " ", fp));
+            var ep: string = tir_tmp();
+            tir_line(base.sb_cat5("gep ptr<void> ", ep, " ", ga, " 0 1"));
+            var nul: string = tir_tmp();
+            tir_line(base.sb_cat2("const.ptr.null ptr<void> ", nul));
+            tir_line(base.sb_cat4("store ", nul, " ", ep));
+        } else if (g_global_map[i]) {
+            var vd: i64 = g_global_vdecl[i];
+            var nb: i64 = base.nodes[vd].nb;
+            if (nb >= 0 && base.nodes[nb].kind == "map_lit") {
+                var m: string = tir_emit_map_lit(nb, g_global_td[i]);
+                tir_line(base.sb_cat4("store ", m, " @", nm));
+            }
+        } else {
+            // 标量：仅当 init 是字面量（int/float）时 store 常量；否则零初始化
+            var vd: i64 = g_global_vdecl[i];
+            var nb: i64 = base.nodes[vd].nb;
+            if (nb >= 0) {
+                var initn: Node = base.nodes[nb];
+                if (initn.kind == "int") {
+                    tir_line(base.sb_cat4("store ", initn.sa, " @", nm));
+                } else if (initn.kind == "float") {
+                    // 浮点字面量须先 materialize 到 f64 槽：直接 store 字面量会被翻译器按 i64 解读
+                    // （裸字面量无类型槽），写出 `store i64 3.14` → clang 报错。
+                    var ts: string = tir_tmp();
+                    tir_line(base.sb_cat4("const f64 ", ts, " ", initn.sa));
+                    tir_line(base.sb_cat4("store ", ts, " @", nm));
+                }
+            }
+        }
+        i = i + 1;
+    }
+    tir_line("ret.void");
+    append(g_mod.funcs, g_cur_func);
 }
 
 pub fn tir_emit_extern(d: i64) void {
@@ -900,6 +1071,19 @@ pub fn tir_emit_stmt(sid: i64) void {
         var t: i64 = -1;
         if (n.na >= 0) { t = sema.resolve_type_desc(n.na); if (t >= 0) { st = tir_st_of_td(t); } }
         var slot: string = tir_new_named_slot(t, st, n.sa);
+        // map 类型变量声明：无初始化器时按 canonical 同构自动建空表（tll_map_new），
+        // 否则后续 map_set/map_get/map_del 会解引用未初始化的句柄槽 → 运行时段错误。
+        // 带 map_lit 初始化器时由 tir_emit_map_lit 负责建表+插入，此处跳过。
+        // ⚠ 不可写 `sema.tds[t].key.cat`（两级 TD 字段链），emit-tir-ll 翻译嵌套
+        // slice_at 会产出 `load i64, ptr null`；须先把 keytd 取到局部变量再单级访问。
+        if (t >= 0 && sema.tds[t].cat == "map" && n.nb < 0) {
+            var keytd: i64 = sema.tds[t].key;
+            var keykind: i64 = 1;
+            if (sema.tds[keytd].cat == "string") { keykind = 0; }
+            var valst: string = tir_st_of_td(sema.tds[t].val);
+            var valsz: i64 = tir_sizeof(valst);
+            tir_line(base.sb_cat7("call ptr<void> ", slot, " @map_new (", base.i2s(keykind), ", ", base.i2s(valsz), ")"));
+        }
         if (n.nb >= 0) {
             if (base.nodes[n.nb].kind == "array_lit") {
                 var init: string = tir_emit_array_lit(n.nb, t);
@@ -1318,6 +1502,7 @@ pub fn tir_emit_expr(e: i64) string {
     g_cur_line = base.nodes[e].ln;
     var n: Node = base.nodes[e];
     var kd: string = n.kind;
+    g_tir_last_st = tir_expr_st(e);   // 默认取 sema 推断类型；具体发射器（如 binary）会覆盖为真实发射类型
 
     if (kd == "assign" || kd == "assignment") { return tir_emit_assign(n); }
     if (kd == "match") { return tir_emit_match(n, false); }
@@ -1478,6 +1663,7 @@ pub fn tir_emit_binary(n: Node) string {
     var opc: string = tir_binop(n.sa, ost);
     var d: string = tir_tmp();
     tir_line(base.sb_cat7(opc, " ", d, " ", ls, " ", rs));
+    g_tir_last_st = ost;   // 发射结果类型 = 操作数存储型（mul.f64 → "f64"），供上层 cast 取真实源类型
     return d;
 }
 
@@ -1628,6 +1814,23 @@ pub fn tir_emit_call(e: i64) string {
         tir_line(base.sb_cat9("call void ", d, " @", cname, " ( ", d, " ", sb_to_str(sb), ")"));
         return d;
     }
+    if (cname == "map_new") {
+        // map_new(m) 内建降级：从实参 map 的静态类型推导 key kind / val size，
+        // 发射 @map_new (kk, vsz) 字面量实参。否则 translator 会把 $m（未初始化的 map 句柄值）
+        // 当 kk/vsz 传入 → tll_map_new 用非法 val_size 分配 → 运行时段错误。
+        var mtd: i64 = ret_td;
+        if (mtd < 0 && n.la >= 0) { mtd = tir_expr_td(base.kids[n.la].val); }
+        var keykind: i64 = 1;
+        var valsz: i64 = 8;
+        if (mtd >= 0 && sema.tds[mtd].cat == "map") {
+            var mt: TD = sema.tds[mtd];
+            if (sema.tds[mt.key].cat == "string" || sema.tds[mt.key].name == "string") { keykind = 0; }
+            valsz = tir_sizeof(tir_st_of_td(mt.val));
+        }
+        var md: string = tir_tmp();
+        tir_line(base.sb_cat7("call ptr<void> ", md, " @map_new (", base.i2s(keykind), ", ", base.i2s(valsz), ")"));
+        return md;
+    }
     // 常规调用：发射各实参 → 直接 call
     ac = n.la;
     while (ac >= 0) {
@@ -1664,9 +1867,29 @@ pub fn tir_emit_call(e: i64) string {
     if (tir_find_local_idx(cname) >= 0) {
         callee_ref = base.sb_cat2("$", cname);
         is_ind = true;
+    } else if (tir_is_global_fnval(cname)) {
+        // 全局函数值变量（@name 持有 %TClosure）：call_ind 经 GEP 取其 code/env 间接调用
+        callee_ref = base.sb_cat2("@", cname);
+        is_ind = true;
     }
     var op: string = "call";
     if (is_ind) { op = "call_ind"; }
+    // 间接闭包调用（被调为局部/全局函数值变量）：其 TIR 槽类型是 ptr<void>，
+    // tir_expr_st 对函数值变量默认回退 i64，会令聚合返回（%TStr 等）经 call_ind 时签名错配 → 末行 <hello> 丢失。
+    // 此处从被调函数值变量的 FuncType TD（cat=="func"）取真实返回类型，覆盖默认 retst。
+    // ⚠ g_local_tds 存的是 TD 索引（查 sema.tds[].cat），不是 TI 索引——误用 tip_kind 会索引错表、永不命中。
+    if (is_ind) {
+        var ctd: i64 = -1;
+        if (tir_find_local_idx(cname) >= 0) {
+            ctd = g_local_tds[tir_find_local_idx(cname)];
+        } else if (tir_is_global_fnval(cname)) {
+            ctd = tir_global_fnval_td(cname);
+        }
+        if (ctd >= 0 && sema.tds[ctd].cat == "func") {
+            ret_td = sema.tdf_ret[ctd];
+            retst = tir_st_of_td(ret_td);
+        }
+    }
     tir_line(base.sb_cat8(op, " ", retst, " ", d, " ", callee_ref, base.sb_cat3(" (", sb_to_str(sb), ")")));
     return d;
 }
@@ -1679,7 +1902,15 @@ pub fn tir_emit_cast(n: Node) string {
         return tir_emit_array_lit(n.na, ttd);
     }
     var inner: string = tir_emit_expr(n.na);
-    var inner_st: string = tir_expr_st(n.na);
+    // ⚠ 关键：源类型必须用「实际发射类型」(g_tir_last_st，由内层 emit 设置，如 mul.f64→f64)，
+    // 不能用 tir_expr_st（走 meta_type_of_expr，在 `as i64` 整数语境下会把浮点操作数
+    // 强制推断成 i64，导致 inner_st==target_st 早返回、丢失 fptosi 转换 → 打印位模式而非数值）。
+    // canonical codegen_ll 用 ll_etd(内层) 取发射类型，此处对齐。
+    var inner_st: string = g_tir_last_st;
+    if (inner_st == "" || inner_st == "i64") {
+        var is2: string = tir_expr_st(n.na);
+        if (is2 != "" && is2 != "i64") { inner_st = is2; }
+    }
     // 枚举在 TIR 中被擦除为整数，但其 expr_st 仍是 %Name（未声明的 LLVM 类型）。
     // 把枚举操作数按 i64 看待，使 as 转换走正确的整数宽度逻辑（no-op/trunc/zext/sext），
     // 而不是 emit 引用未声明 %Color 的 `bitcast`。
@@ -1687,10 +1918,25 @@ pub fn tir_emit_cast(n: Node) string {
     var target_st: string = tir_st_of_td(sema.resolve_type_desc(n.nb));
     if (inner_st == target_st) { return inner; }
     var d: string = tir_tmp();
+    var fi: bool = (inner_st == "f32" || inner_st == "f64");
+    var ft: bool = (target_st == "f32" || target_st == "f64");
+    var ui: bool = (str_len(inner_st) >= 1 && inner_st[0] == 117) || inner_st == "bool";
     var wi: i64 = tir_width(inner_st);
     var wt: i64 = tir_width(target_st);
-    if (wi < wt) {
-        if (str_len(inner_st) > 0 && inner_st[0] == 117) { tir_line(base.sb_cat8("zext ", target_st, " ", d, " ", inner_st, " ", inner)); }
+    if (fi && ft) {
+        // 浮点 → 浮点：按宽窄选 fptrunc / fpext（同宽按 fpext 兜底，下游无操作）。
+        if (wi > wt) { tir_line(base.sb_cat8("fptrunc ", target_st, " ", d, " ", inner_st, " ", inner)); }
+        else { tir_line(base.sb_cat8("fpext ", target_st, " ", d, " ", inner_st, " ", inner)); }
+    } else if (fi && ft == false) {
+        // 浮点 → 整数：有符号 fptosi / 无符号 fptoui（修复原 bitcast 误把位模式当整数）。
+        if (ui) { tir_line(base.sb_cat8("fptoui ", target_st, " ", d, " ", inner_st, " ", inner)); }
+        else { tir_line(base.sb_cat8("fptosi ", target_st, " ", d, " ", inner_st, " ", inner)); }
+    } else if (fi == false && ft) {
+        // 整数 → 浮点：有符号 sitofp / 无符号 uitofp。
+        if (ui) { tir_line(base.sb_cat8("uitofp ", target_st, " ", d, " ", inner_st, " ", inner)); }
+        else { tir_line(base.sb_cat8("sitofp ", target_st, " ", d, " ", inner_st, " ", inner)); }
+    } else if (wi < wt) {
+        if (ui) { tir_line(base.sb_cat8("zext ", target_st, " ", d, " ", inner_st, " ", inner)); }
         else { tir_line(base.sb_cat8("sext ", target_st, " ", d, " ", inner_st, " ", inner)); }
     } else if (wi > wt) {
         tir_line(base.sb_cat8("trunc ", target_st, " ", d, " ", inner_st, " ", inner));
@@ -1945,10 +2191,11 @@ pub fn tir_emit_map_lit(e: i64, force_td: i64) string {
     }
     var mt: TD = sema.tds[td];
     var valtd: i64 = mt.val;
-    if (valtd >= 0 && (sema.tds[valtd].cat == "string" || sema.tds[valtd].cat == "named" ||
-        sema.tds[valtd].cat == "array" || sema.tds[valtd].cat == "struct" || sema.tds[valtd].cat == "slice" ||
-        sema.tds[valtd].cat == "map")) {
-        tir_cmt("unsupported expr: map_lit (aggregate val)");
+    // ⚠ 放宽「聚合值」限制：tll_map_put(ptr, ptr, ptr) 按 val_size 字节指针拷贝，
+    //   字符串/具名/结构/切片/数组值均可通过 addr_of + sizeof 正确落库（与 emit-ll 的 ll_build_map_lit 对齐）。
+    //   仅嵌套 map 值（递归构造）保留为不支持，避免构造期递归复杂度。
+    if (valtd >= 0 && sema.tds[valtd].cat == "map") {
+        tir_cmt("unsupported expr: map_lit (nested map val)");
         var z: string = tir_tmp();
         tir_line(base.sb_cat4("const.i64 ", z, " 0", ""));
         return z;
@@ -2015,17 +2262,18 @@ pub fn tir_emit_index_addr(ine: i64) string {
         tir_line(base.sb_cat6("addr_of ptr<", base_st, "> ", dptr, " ", base_slot));
     } else if (sema.tds[base_td].cat == "map") {
         var mt: TD = sema.tds[base_td];
+        // ⚠ map 变量是「句柄存于 slot 内」的聚合：base_slot 是 slot 地址(ptr*)，
+        // 须 load 出真正的 TMap* 句柄再传给 tll_map_val_ptr
+        // （与 map_get builtin 里 ll_load(toks[4], "ptr") 同构；否则 tll_map_val_ptr 收到
+        // 的是 slot 地址而非句柄，查表错乱 → 索引读恒返回 0）。
+        var mhp: string = tir_tmp();
+        tir_line(base.sb_cat4("load ptr ", mhp, " ", base_slot));
         var valtd: i64 = mt.val;
         var valst: string = tir_st_of_td(valtd);
-        if (valtd >= 0 && (sema.tds[valtd].cat == "string" || sema.tds[valtd].cat == "named" ||
-            sema.tds[valtd].cat == "array" || sema.tds[valtd].cat == "struct" || sema.tds[valtd].cat == "slice" ||
-            sema.tds[valtd].cat == "map")) {
-            tir_cmt("unsupported map index val (aggregate)");
-            var zz: string = tir_tmp();
-            tir_line(base.sb_cat4("const.i64 ", zz, " 0", ""));
-            g_idx_elem_st = "i64";
-            return zz;
-        }
+        // 聚合值（string/named/struct/array/slice）与标量同构：runtime 按 val_size 字节
+        // 把值 memcpy 进 arena，@tll_map_val_ptr 返回其字节首地址；下游 load <valst> 即取回
+        // 该聚合值。故不再拒绝聚合值，统一走下方的 @tll_map_val_ptr 路径（与 for-in 双变量
+        // @tll_map_val_at 一致）。嵌套 map 值（递归构造）仍交由 map_lit 处拒绝。
         g_idx_elem_st = valst;
         var ks: string = tir_emit_expr(n.nb);
         var kst: string = tir_expr_st(n.nb);
@@ -2038,7 +2286,7 @@ pub fn tir_emit_index_addr(ine: i64) string {
             tir_line(base.sb_cat4("addr_of ptr<i64> ", kp, " ", kc));
         }
         var vp: string = tir_tmp();
-        tir_line(base.sb_cat7("call ptr<void> ", vp, " @tll_map_val_ptr (", base_slot, ", ", kp, ")"));
+        tir_line(base.sb_cat7("call ptr<void> ", vp, " @tll_map_val_ptr (", mhp, ", ", kp, ")"));
         return vp;
     } else {
         tir_cmt(base.sb_cat3("unsupported index base: ", base_st, ""));
@@ -2445,6 +2693,12 @@ pub fn tir_to_text() string {
             si = si + 1;
         }
         sb_append_str(sb, "\n");
+    }
+
+    // 模块级全局变量段（@name ST 每行；运行期初始化由 t.__ginit 完成）
+    if (slice_len(g_global_names) as i64 > 0) {
+        sb_append_str(sb, "globals:\n");
+        sb_append_str(sb, sb_to_str(g_globals_section));
     }
 
     var fi: i64 = 0;
