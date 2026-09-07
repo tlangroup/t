@@ -921,7 +921,33 @@ pub fn tir_emit_ginit() void {
             var nb: i64 = base.nodes[vd].nb;
             if (nb >= 0) {
                 var initn: Node = base.nodes[nb];
-                if (initn.kind == "int") {
+                // Sym 全局 = 字符串字面量：ginit 内 call sym_intern 取 id 存入 @nm（与局部 Sym 初始化一致）。
+                var gsymtd: i64 = g_global_td[i];
+                if (gsymtd >= 0 && sema.tds[gsymtd].cat == "sym" && initn.kind == "string") {
+                    var valslot: string = tir_emit_expr(nb);
+                    var tagid: i64 = slice_len(g_mod.strings) as i64;
+                    append(g_mod.strings, sema.tds[gsymtd].name);
+                    var tagslot: string = tir_tmp();
+                    tir_line(base.sb_cat4("const.str ", tagslot, " ", base.i2s(tagid)));
+                    var bitsslot: string = tir_tmp();
+                    tir_line(base.sb_cat4("const.i64 ", bitsslot, " ", base.i2s(sema.tds[gsymtd].alen)));
+                    var gst: string = tir_st_of_td(gsymtd);
+                    if (gst == "i16" || gst == "u16") {
+                        // 16 位：intern 结果先落临时槽，trunc 到 i16 再 store（绕开 translator store 的非法 trunc）。
+                        var sidv: string = tir_tmp();
+                        tir_line(base.sb_cat9("call i32 ", sidv, " @sym_intern ( ", tagslot, " ", valslot, " ", bitsslot, " )"));
+                        var st16: string = tir_tmp();
+                        tir_line(base.sb_cat6("trunc i16 ", st16, " i32 ", sidv, "", ""));
+                        tir_line(base.sb_cat4("store ", st16, " @", nm));
+                    } else {
+                        // 32 位：intern 结果先落临时槽（translator 的 `call` 解析器不支持
+                        // 全局 DST —— toks[2] 以 '@' 开头会被当成 callee）。再 store 进全局；
+                        // @nm 声明为 i32，两侧同宽，不会触发 translator store 的窄化 trunc。
+                        var sidv: string = tir_tmp();
+                        tir_line(base.sb_cat9("call i32 ", sidv, " @sym_intern ( ", tagslot, " ", valslot, " ", bitsslot, " )"));
+                        tir_line(base.sb_cat4("store ", sidv, " @", nm));
+                    }
+                } else if (initn.kind == "int") {
                     tir_line(base.sb_cat4("store ", initn.sa, " @", nm));
                 } else if (initn.kind == "float") {
                     // 浮点字面量须先 materialize 到 f64 槽：直接 store 字面量会被翻译器按 i64 解读
@@ -1083,6 +1109,30 @@ pub fn tir_emit_stmt(sid: i64) void {
             var valst: string = tir_st_of_td(sema.tds[t].val);
             var valsz: i64 = tir_sizeof(valst);
             tir_line(base.sb_cat7("call ptr<void> ", slot, " @map_new (", base.i2s(keykind), ", ", base.i2s(valsz), ")"));
+        }
+        // Sym 类型 = 字符串字面量：自动 intern，slot 存 id（而非字符串本身）。
+        // 与 canonical codegen_ll 同构：`call i32 @tll_sym_intern(ptr tag, ptr val, i64 bits)`。
+        if (t >= 0 && sema.tds[t].cat == "sym" && n.nb >= 0 && base.nodes[n.nb].kind == "string") {
+            var valslot: string = tir_emit_expr(n.nb);
+            var tagid: i64 = slice_len(g_mod.strings) as i64;
+            append(g_mod.strings, sema.tds[t].name);
+            var tagslot: string = tir_tmp();
+            tir_line(base.sb_cat4("const.str ", tagslot, " ", base.i2s(tagid)));
+            var bitsslot: string = tir_tmp();
+            tir_line(base.sb_cat4("const.i64 ", bitsslot, " ", base.i2s(sema.tds[t].alen)));
+            // 32 位 Sym：直接把 intern 结果写进变量槽（call 的 DST=slot），绕开 TIR store 指令
+            // 触发的 translator 窄化 trunc bug（store i32 -> u32 槽会生成非法 `trunc i64 i32 to i32`）。
+            // 16 位 Sym：call 落 tmp，再 trunc i32->i16 后 store i16（同宽，安全）。
+            if (st == "i16" || st == "u16") {
+                var sidv: string = tir_tmp();
+                tir_line(base.sb_cat9("call i32 ", sidv, " @sym_intern ( ", tagslot, " ", valslot, " ", bitsslot, " )"));
+                var st16: string = tir_tmp();
+                tir_line(base.sb_cat6("trunc i16 ", st16, " i32 ", sidv, "", ""));
+                tir_line(base.sb_cat4("store ", st16, " ", slot));
+            } else {
+                tir_line(base.sb_cat9("call i32 ", slot, " @sym_intern ( ", tagslot, " ", valslot, " ", bitsslot, " )"));
+            }
+            return;
         }
         if (n.nb >= 0) {
             if (base.nodes[n.nb].kind == "array_lit") {
@@ -1444,6 +1494,27 @@ pub fn tir_emit_assign(n: Node) string {
         if (lhs.kind == "ident") {
             var idx: i64 = tir_find_local_idx(lhs.sa);
             if (idx >= 0) {
+                // Sym 类型 = 字符串字面量：自动 intern（LHS 存 id，而非字符串本身）。
+                // 否则会把 %TStr 字面量塞进 i32/i16 槽 → sym_str 拿到垃圾 id → 输出空串。
+                var lhstd: i64 = g_local_tds[idx];
+                if (lhstd >= 0 && sema.tds[lhstd].cat == "sym" && base.nodes[n.nb].kind == "string") {
+                    var tagid: i64 = slice_len(g_mod.strings) as i64;
+                    append(g_mod.strings, sema.tds[lhstd].name);
+                    var tagslot: string = tir_tmp();
+                    tir_line(base.sb_cat4("const.str ", tagslot, " ", base.i2s(tagid)));
+                    var bitsslot: string = tir_tmp();
+                    tir_line(base.sb_cat4("const.i64 ", bitsslot, " ", base.i2s(sema.tds[lhstd].alen)));
+                    var lst: string = g_local_sts[idx];
+                    var sidv: string = g_local_slots[idx];
+                    if (lst == "i16" || lst == "u16") { sidv = tir_tmp(); }
+                    tir_line(base.sb_cat9("call i32 ", sidv, " @sym_intern ( ", tagslot, " ", rhs, " ", bitsslot, " )"));
+                    if (lst == "i16" || lst == "u16") {
+                        var st16: string = tir_tmp();
+                        tir_line(base.sb_cat6("trunc i16 ", st16, " i32 ", sidv, "", ""));
+                        tir_line(base.sb_cat4("store ", st16, " ", g_local_slots[idx]));
+                    }
+                    return sidv;
+                }
                 tir_line(base.sb_cat4("store ", rhs, " ", g_local_slots[idx]));
                 return rhs;
             } else {
@@ -1780,6 +1851,41 @@ pub fn tir_emit_call(e: i64) string {
     var first: bool = true;
     var argi: i64 = 0;
     var ac: i64 = n.la;
+    // sym_str(v)：参数 v 的静态类型即 Sym 类型（如 Sym32("NPCName")），其 TD 的 name 字段就是池 tag。
+    // 把 tag 作为首个实参（字符串字面量）注入，供 translator 映射 tll_sym_str(ptr tag, i32 id, ptr out)。
+    // 否则 translator 只能看到被擦除的 i32 id，无法定位池 → 输出空串/段错误。
+    if (cname == "sym_str") {
+        var argnode: i64 = -1;
+        if (n.la >= 0) { argnode = base.kids[n.la].val; }
+        var tag: string = "Sym";
+        if (argnode >= 0 && base.nodes[argnode].kind == "ident") {
+            // 全局变量 ident：tir_expr_td 返回的 Sym TD（name="Sym"）与全局真实 TD 不同，
+            // 必须以 g_global_td 为准（其 name 才是池 tag，如 "NPCName"）。查到即用。
+            var gi: i64 = 0;
+            var gn: i64 = slice_len(g_global_names) as i64;
+            while (gi < gn) {
+                if (g_global_names[gi] == base.nodes[argnode].sa) {
+                    var gtd: i64 = g_global_td[gi];
+                    if (gtd >= 0 && sema.tds[gtd].cat == "sym") { tag = sema.tds[gtd].name; }
+                    break;
+                }
+                gi = gi + 1;
+            }
+            // 局部变量（未命中全局表）：走 tir_expr_td 取 Sym TD
+            if (tag == "Sym") {
+                var atd: i64 = tir_expr_td(argnode);
+                if (atd >= 0 && sema.tds[atd].cat == "sym") { tag = sema.tds[atd].name; }
+            }
+        }
+        var sid: i64 = slice_len(g_mod.strings) as i64;
+        append(g_mod.strings, tag);
+        var tagd: string = tir_tmp();
+        tir_line(base.sb_cat4("const.str ", tagd, " ", base.i2s(sid)));
+        var idd: string = "";
+        if (argnode >= 0) { idd = tir_emit_expr(argnode); }
+        tir_line(base.sb_cat7("call %TStr ", d, " @sym_str ( ", tagd, " ", idd, " )"));
+        return d;
+    }
     // 变体构造器（返回类型为变体）：统一走 sret——先开 ptr<%V> 槽，构造器写入该槽，调用返回 void。
     // 这样变体值始终以 ptr<%V> 形态流转（对齐 struct_new / match 提取 / 跨函数传参），避免结构体按值返回 ABI 坑。
     if (ret_td >= 0 && t_td_is_variant(ret_td)) {
