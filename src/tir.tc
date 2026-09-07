@@ -111,6 +111,12 @@ pub fn tir_reset() void {
     g_loop_end = zle;
     var zde: []i64 = [];
     g_tir_defer = zde;
+    var zvk: []string = [];
+    g_vf_keys = zvk;
+    var zvn: [][]i64 = [];
+    g_vf_nodes = zvn;
+    var zvt: [][]i64 = [];
+    g_vf_tds = zvt;
 }
 
 pub fn tir_tmp() string {
@@ -190,9 +196,55 @@ pub fn tir_scalar_st(name: string) string {
 }
 
 // TD → ST 映射（tir-design.md §7，对齐 ll_td 但输出 TIR 记号）
+// 判断 TD 是否为变体类型。注意：sema.tip_kind 读 tis[]（TypeInfo 索引），而此处 td 是
+// sema.tds[]（TypeDef 索引），二者不可混用；故直接扫 decl_list 的 VariantDecl 判定。
+pub fn t_td_is_variant(td: i64) bool {
+    if (td < 0) { return false; }
+    var t: TD = sema.tds[td];
+    if (t.cat != "named") { return false; }
+    var n: i64 = slice_len(lex.decl_list) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        var d: i64 = lex.decl_list[i];
+        if (base.nodes[d].kind == "VariantDecl" && base.nodes[d].sa == t.name) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+// 按变体名查找 VariantDecl 节点索引（emit 期 lex.decl_list 可靠，无需 sym 表）。
+pub fn t_variant_decl_of_name(vname: string) i64 {
+    if (vname == "") { return -1; }
+    var n: i64 = slice_len(lex.decl_list) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        var d: i64 = lex.decl_list[i];
+        if (base.nodes[d].kind == "VariantDecl" && base.nodes[d].sa == vname) { return d; }
+        i = i + 1;
+    }
+    return -1;
+}
+// 按变体 case/ident 名反查其所属变体名（emit 期 lex.decl_list 可靠，无需 sym 表）。
+pub fn t_variant_name_of_case(cname: string) string {
+    if (cname == "") { return ""; }
+    var n: i64 = slice_len(lex.decl_list) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        var d: i64 = lex.decl_list[i];
+        if (base.nodes[d].kind == "VariantDecl") {
+            var cc: i64 = base.nodes[d].lb;
+            while (cc >= 0) {
+                if (base.nodes[base.kids[cc].val].sa == cname) { return base.nodes[d].sa; }
+                cc = base.kids[cc].next;
+            }
+        }
+        i = i + 1;
+    }
+    return "";
+}
 pub fn tir_st_of_td(td: i64) string {
     if (td < 0) { return "i64"; }
     var t: TD = sema.tds[td];
+    if (t_td_is_variant(td)) { return base.sb_cat3("ptr<%", t.name, ">"); }   // 变体值统一以指针形态流转（对齐 struct_new/匹配提取）
     if (t.cat == "string" || t.cat == "bytes") { return "%TStr"; }
     if (t.cat == "pointer") {
         if (t.memspace > 0) { return "i64"; }   // 设备指针句柄（不透明 i64）
@@ -238,9 +290,50 @@ pub fn tir_strip_pct(s: string) string {
 //  - ident 局部/形参：直接取本模块维护的 g_local_tds（符号表在 emit 期无效，不可 sym_lookup）
 //  - 其它（member/index/call/cast/struct_lit/...）：用 sema.meta_type_of_expr 推断
 //  - 字面量不进 meta_type_of_expr（其 u8 推断会把 const.i64 改成 const.u8，破坏 Stage 0+1 基线）
+
+// 按类型名查 TypeDef 索引（named 类型，含 variant）。用于变体构造器调用绕过 meta_type_of_expr。
+pub fn t_td_of_named(vname: string) i64 {
+    var m: i64 = slice_len(sema.tds) as i64;
+    var i: i64 = 0;
+    while (i < m) {
+        if (sema.tds[i].cat == "named" && sema.tds[i].name == vname) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// 判定 e 是否为变体构造器调用（callee 为 ident 且名为 <V>_from_<C>，且 <V> 确为已声明变体）。
+// 返回变体名；非构造器调用返回 ""。
+pub fn tir_is_variant_ctor_call(e: i64) string {
+    if (e < 0) { return ""; }
+    var n: Node = base.nodes[e];
+    if (n.kind != "call") { return ""; }
+    if (n.na < 0) { return ""; }
+    var cn: Node = base.nodes[n.na];
+    if (cn.kind != "ident") { return ""; }
+    var cname: string = cn.sa;
+    var L: i64 = str_len(cname) as i64;
+    var k: i64 = 0;
+    while (k < L) {
+        if (k + 6 <= L && str_slice(cname, k, k + 6) == "_from_") {
+            var vn: string = str_slice(cname, 0, k);
+            if (t_variant_decl_of_name(vn) >= 0) { return vn; }
+            return "";
+        }
+        k = k + 1;
+    }
+    return "";
+}
+
 pub fn tir_expr_td(e: i64) i64 {
     if (e < 0) { return -1; }
     var n: Node = base.nodes[e];
+    // 变体构造器调用 V_from_C：直接返回变体 TD，绕过 meta_type_of_expr。
+    // 构造器在 emit 期才合成、符号表的 decl 指向越界节点 → 走常规路径会 index_out_of_bounds。
+    if (n.kind == "call") {
+        var vn: string = tir_is_variant_ctor_call(e);
+        if (vn != "") { return t_td_of_named(vn); }
+    }
     if (n.kind == "ident") {
         var idx: i64 = tir_find_local_idx(n.sa);
         if (idx >= 0) { return g_local_tds[idx]; }
@@ -442,15 +535,39 @@ pub fn tir_add_struct_tt(name: string, field_head: i64) void {
     append(g_mod.types, TIRType{ name: base.sb_cat2("%", name), body: sb_to_str(sb) });
 }
 
-pub fn tir_add_variant_tt(name: string) void {
-    // variant 擦除为 { i8 tag, <data...> }；Stage 1 仅登记 %Name 占位（data 布局后续补全）
-    append(g_mod.types, TIRType{ name: base.sb_cat2("%", name), body: "f0: i8" });
-}
-
 pub fn tir_add_union_tt(name: string) void {
     // union 擦除为 { i8 tag, <max-member ST> }；Stage 1 仅登记 %Name 占位
     append(g_mod.types, TIRType{ name: base.sb_cat2("%", name), body: "f0: i8" });
 }
+
+// ── 变体 ADT 辅助（T1：构造器发射 + conpat 绑定提取）──────────────────
+pub fn tir_round8(v: i64) i64 {
+    var r: i64 = v % 8;
+    if (r == 0) { return v; }
+    return v + (8 - r);
+}
+// 类型 TD → 字节尺寸（前端可用；递归变体按 16 兜底，避免无限递归；与 legacy ll_size_bytes 近似一致）。
+pub fn tir_size_bytes(td: i64) i64 {
+    if (td < 0) { return 8; }
+    var k: string = sema.tip_kind(td);
+    var nm: string = sema.tip_name(td);
+    if (k == "i8" || k == "u8" || k == "bool") { return 1; }
+    if (k == "i16" || k == "u16") { return 2; }
+    if (k == "i32" || k == "u32" || k == "rune" || k == "f32") { return 4; }
+    if (k == "i64" || k == "u64" || k == "f64") { return 8; }
+    if (str_len(nm) >= 4 && str_slice(nm, 0, 4) == "ptr<") { return 8; }
+    if (k == "Struct" || k == "Union" || k == "Variant") { return 16; }
+    return 8;
+}
+// 变体 case 载荷字段缓存：在类型表构建期（VC 节点尚未被后续 match 降级改动）预填充
+// 「类型描述节点索引」列表（pristine）。字段尺寸解析推迟到类型系统完全解析（func 降级之后），
+// 否则 resolve_type_desc 返回未就绪 TD（size 错 → paymax 错 → 结构体内存布局错位）。
+pub var g_vf_keys: []string;
+pub var g_vf_nodes: [][]i64;
+// 与 g_vf_nodes 同索引：各 case 字段「已解析 TD 列表」（在构造器发射期解析——此时 variant 声明节点
+// 尚未被后续 match 降级改写，resolve_type_desc 结果正确）。提取端复用此缓存，规避「节点索引后被改写为
+// Variant/Struct 类导致 tir_size_bytes 兜底 16、偏移错位」的坑。TF 数字常量，不受节点改写影响。
+pub var g_vf_tds: [][]i64;
 
 // ══════════════════════════════════════════════════════════════════
 // 顶层降级入口
@@ -468,9 +585,50 @@ pub fn lower_unit(mod: string, source: string) void {
         var d: i64 = lex.decl_list[i];
         var dn: Node = base.nodes[d];
         if (dn.kind == "StructDecl") { tir_add_struct_tt(dn.sa, dn.lb); }
-        else if (dn.kind == "VariantDecl") { tir_add_variant_tt(dn.sa); }
+        // VariantDecl 的 type-table 在 func 降级之后发射：paymax 需 resolve_type_desc 完全就绪，
+        // 否则变体字段尺寸取未解析 TD（Struct/Union/Variant 兜底 16）→ paymax 偏大、布局错位。
         else if (dn.kind == "UnionDecl") { tir_add_union_tt(dn.sa); }
         i = i + 1;
+    }
+
+    // 变体 ADT：在 type-table 期快照各 case 的载荷字段（VC 节点在后续降级期可能被改写，
+    // 必须在此缓存，否则构造器字段数会与 paymax 不一致，导致堆损坏 / link 失败）。
+    // 直接内联于 lower_unit：base.nodes/base.kids 在此以全局方式访问（规避跨模块全局快照 bug）。
+    var vf_ci: i64 = 0;
+    while (vf_ci < n) {
+        var vf_cd: i64 = lex.decl_list[vf_ci];
+        var vf_cdn: Node = base.nodes[vf_cd];
+        if (vf_cdn.kind == "VariantDecl") {
+            var vf_cc: i64 = vf_cdn.lb;
+            while (vf_cc >= 0) {
+                var vf_ckc: Child = base.kids[vf_cc];
+                var vf_cvc: i64 = vf_ckc.val;
+                var vf_cvcn: Node = base.nodes[vf_cvc];
+                var vf_ckey: string = base.sb_cat3(vf_cdn.sa, "_", vf_cvcn.sa);
+                var vf_cnodes: []i64 = [];
+                if (vf_cvcn.lb >= 0) {
+                    var vf_ct: i64 = vf_cvcn.lb;
+                    while (vf_ct >= 0) { var vf_ckt: Child = base.kids[vf_ct]; append(vf_cnodes, vf_ckt.val); vf_ct = vf_ckt.next; }
+                } else if (vf_cvcn.na >= 0) {
+                    append(vf_cnodes, vf_cvcn.na);
+                }
+                append(g_vf_keys, vf_ckey);
+                append(g_vf_nodes, vf_cnodes);
+                // 预热 TD 注册表：在 func 降级之前对每个字段类型节点调用一次 resolve_type_desc，
+                // 触发类型系统完成注册（type-table / TD 表），否则提取端在 match 降级期调用
+                // resolve_type_desc(cflds[bi3]) 时注册表尚未就绪 → 返回兜底 16 字节 → 偏移错位。
+                // 此处仅预热，不缓存（首遍解析出的 TD 可能尚未完全就绪，见下方 g_vf_tds 占位）。
+                var vf_wi: i64 = 0;
+                while (vf_wi < slice_len(vf_cnodes) as i64) {
+                    sema.resolve_type_desc(vf_cnodes[vf_wi]);
+                    vf_wi = vf_wi + 1;
+                }
+                var vf_cvt: []i64 = [];
+                append(g_vf_tds, vf_cvt);
+                vf_cc = vf_ckc.next;
+            }
+        }
+        vf_ci = vf_ci + 1;
     }
 
     // 预收集全部函数名（含泛型/库函数），供函数值闭包包装判定（tir_is_func_name）使用，
@@ -502,6 +660,110 @@ pub fn lower_unit(mod: string, source: string) void {
             }
         }
         j = j + 1;
+    }
+    // 变体 ADT：type-table + 构造器在 func 降级之后发射（paymax 需类型系统完全解析，见上方注释）。
+    // 直接内联于 lower_unit：base.nodes/base.kids 以全局方式访问，规避跨模块全局快照 bug。
+    var vf_keys: []string = g_vf_keys;
+    var vf_nodes: [][]i64 = g_vf_nodes;
+    var iv: i64 = 0;
+    while (iv < n) {
+        var dv: i64 = lex.decl_list[iv];
+        var dvn: Node = base.nodes[dv];
+        if (dvn.kind == "VariantDecl") {
+            var vname: string = dvn.sa;
+            // paymax：查缓存字段节点 → resolve_type_desc → 8 对齐累加
+            var mx: i64 = 8;
+            var pc: i64 = dvn.lb;
+            while (pc >= 0) {
+                var pkc: Child = base.kids[pc];
+                var pvc: i64 = pkc.val;
+                var pvcn: Node = base.nodes[pvc];
+                var pkey: string = base.sb_cat3(vname, "_", pvcn.sa);
+                var pflds: []i64 = [];
+                var pki: i64 = 0;
+                var pmax: i64 = slice_len(vf_keys) as i64;
+                if (slice_len(vf_nodes) as i64 < pmax) { pmax = slice_len(vf_nodes) as i64; }
+                while (pki < pmax) {
+                    if (vf_keys[pki] == pkey) { pflds = vf_nodes[pki]; break; }
+                    pki = pki + 1;
+                }
+                if (slice_len(pflds) as i64 == 0) { tir_cmt(base.sb_cat6("DBG miss pkey=", pkey, " keys=", base.i2s(slice_len(vf_keys) as i64), " nodes=", base.i2s(slice_len(vf_nodes) as i64))); }
+                var pm: i64 = slice_len(pflds) as i64;
+                var poff: i64 = 0;
+                var pfi: i64 = 0;
+                while (pfi < pm) {
+                    poff = tir_round8(poff) + tir_size_bytes(sema.resolve_type_desc(pflds[pfi]));
+                    pfi = pfi + 1;
+                }
+                poff = tir_round8(poff) + 8;
+                if (poff > mx) { mx = poff; }
+                pc = pkc.next;
+            }
+            // %V type：tag 用 i64（8 字节）→ payload 固定在字节偏移 8，提取端可硬编码 8 基线（镜像 legacy ll_variant_paymax 的 +8）
+            append(g_mod.types, TIRType{ name: base.sb_cat2("%", vname), body: base.sb_cat3("f0: i64, f1: [", base.i2s(mx), " x i8]") });
+            // 各 case 构造器 @<V>_from_<C>
+            var cc2: i64 = dvn.lb;
+            while (cc2 >= 0) {
+                var kc2: Child = base.kids[cc2];
+                var vc2: i64 = kc2.val;
+                var vcn2: Node = base.nodes[vc2];
+                var cname: string = vcn2.sa;
+                var key2: string = base.sb_cat3(vname, "_", cname);
+                var flds2: []i64 = [];
+                var ki2: i64 = 0;
+                var kmax: i64 = slice_len(vf_keys) as i64;
+                if (slice_len(vf_nodes) as i64 < kmax) { kmax = slice_len(vf_nodes) as i64; }
+                while (ki2 < kmax) {
+                    if (vf_keys[ki2] == key2) { flds2 = vf_nodes[ki2]; break; }
+                    ki2 = ki2 + 1;
+                }
+                if (slice_len(flds2) as i64 == 0) { tir_cmt(base.sb_cat6("DBG miss key=", key2, " keys=", base.i2s(slice_len(vf_keys) as i64), " nodes=", base.i2s(slice_len(vf_nodes) as i64))); }
+                var nf2: i64 = slice_len(flds2) as i64;
+                // 解析并缓存字段 TD（构造器发射期：variant 声明节点尚未被后续 match 降级改写，
+                // resolve_type_desc 结果正确且与载荷布局一致）。提取端复用 g_vf_tds，规避节点改写坑。
+                var flds2_tds: []i64 = [];
+                var fi2a: i64 = 0;
+                while (fi2a < nf2) {
+                    append(flds2_tds, sema.resolve_type_desc(flds2[fi2a]));
+                    fi2a = fi2a + 1;
+                }
+                if (ki2 >= 0 && ki2 < slice_len(g_vf_tds) as i64) { g_vf_tds[ki2] = flds2_tds; }
+                // sret 形式：首参 $dest: ptr<%V>，构造器写入该指针所指结构体，返回 void
+                var params2: []string = [base.sb_cat3("$dest: ptr<%", vname, ">")];
+                var fi2: i64 = 0;
+                while (fi2 < nf2) {
+                    append(params2, base.sb_cat4("$f", base.i2s(fi2), ": ", tir_st_of_td(flds2_tds[fi2])));
+                    fi2 = fi2 + 1;
+                }
+                var eb2: []TIRInst = [];
+                g_cur_func = TIRFunc{ name: base.sb_cat4(vname, "_from_", cname, ""), params: params2, ret_st: "void", body: eb2, is_extern: false, is_kernel: false, is_main: false };
+                g_term = false;
+                g_cur_line = 0;
+                // 写 tag 到 $dest 字段 0（i64）
+                tir_line("gep i64 $tagp $dest 0 0");
+                tir_line(base.sb_cat2("const.i64 $tagv ", base.i2s(vcn2.ia)));
+                tir_line("store $tagv $tagp");
+                // 写载荷到 $dest 字段 1（[mx x i8]）
+                tir_line(base.sb_cat6("gep arr<i8 x ", base.i2s(mx), "> ", "$pay ", "$dest", " 0 1"));
+                var off2: i64 = 0;
+                var fi3: i64 = 0;
+                while (fi3 < nf2) {
+                    var ftd2: i64 = flds2_tds[fi3];
+                    var fsz2: i64 = tir_size_bytes(ftd2);
+                    off2 = tir_round8(off2);
+                    // 直接 store <ftd2> 于 gep 结果（ptr i8）：LLVM 允许以任意类型经 ptr 存储，无需 bitcast
+                    // （bitcast 在本翻译器会误把 slot 地址当值，导致单载荷写入错乱）。
+                    tir_line(base.sb_cat4("gep i8 $fp", base.i2s(fi3), " $pay ", base.i2s(off2)));
+                    tir_line(base.sb_cat4("store $f", base.i2s(fi3), " $fp", base.i2s(fi3)));
+                    off2 = off2 + fsz2;
+                    fi3 = fi3 + 1;
+                }
+                tir_line("ret.void");
+                append(g_mod.funcs, g_cur_func);
+                cc2 = kc2.next;
+            }
+        }
+        iv = iv + 1;
     }
 }
 
@@ -1326,11 +1588,48 @@ pub fn tir_emit_call(e: i64) string {
     var callee: Node = base.nodes[n.na];
     var cname: string = callee.sa;
     var retst: string = tir_expr_st(e);
+    var ret_td: i64 = tir_expr_td(e);
     var d: string = tir_tmp();
     var sb: StringBuilder = sb_new();
     var first: bool = true;
     var argi: i64 = 0;
     var ac: i64 = n.la;
+    // 变体构造器（返回类型为变体）：统一走 sret——先开 ptr<%V> 槽，构造器写入该槽，调用返回 void。
+    // 这样变体值始终以 ptr<%V> 形态流转（对齐 struct_new / match 提取 / 跨函数传参），避免结构体按值返回 ABI 坑。
+    if (ret_td >= 0 && t_td_is_variant(ret_td)) {
+        var vname: string = sema.tds[ret_td].name;
+        // $d 承载 ptr<%V>（struct_new 使 $d = ptr<%V>）
+        tir_line(base.sb_cat5("struct_new %", vname, " ", d, " ()"));
+        first = true;
+        argi = 0;
+        ac = n.la;
+        while (ac >= 0) {
+            var k: Child = base.kids[ac];
+            var ak: Node = base.nodes[k.val];
+            var aslot: string;
+            if (ak.kind == "array_lit") {
+                var ptd: i64 = tir_callee_param_td(cname, argi);
+                if (ptd >= 0 && sema.tds[ptd].cat == "array") { aslot = tir_emit_array_lit(k.val, ptd); }
+                else { aslot = tir_emit_expr(k.val); }
+            } else if (ak.kind == "map_lit") {
+                var ptd: i64 = tir_callee_param_td(cname, argi);
+                if (ptd >= 0 && sema.tds[ptd].cat == "map") { aslot = tir_emit_map_lit(k.val, ptd); }
+                else { aslot = tir_emit_expr(k.val); }
+            } else {
+                aslot = tir_emit_expr(k.val);
+            }
+            if (first == false) { sb_append_str(sb, " "); }
+            sb_append_str(sb, aslot);
+            first = false;
+            argi = argi + 1;
+            ac = k.next;
+        }
+        // call void $d @<V>_from_<C> ( $d <字段实参...> )：$d 既作（被忽略的）结果槽，又作首参 dest
+        tir_line(base.sb_cat9("call void ", d, " @", cname, " ( ", d, " ", sb_to_str(sb), ")"));
+        return d;
+    }
+    // 常规调用：发射各实参 → 直接 call
+    ac = n.la;
     while (ac >= 0) {
         var k: Child = base.kids[ac];
         var ak: Node = base.nodes[k.val];
@@ -1765,7 +2064,7 @@ pub fn tir_emit_index_read(e: i64) string {
 // ══════════════════════════════════════════════════════════════════
 
 // 单臂模式条件（布尔 slot）；不支持的模式返回 ""（调用方降级为注释并跳过该臂）。
-pub fn tir_match_pattern_cond(arm: Node, scr: string, scr_st: string, scr_td: i64) string {
+pub fn tir_match_pattern_cond(arm: Node, scr: string, scr_base: string, scr_st: string, scr_td: i64, scr_vname: string) string {
     var p: Node = base.nodes[arm.na];
     // ── 字面量模式 ──
     if (p.kind == "int" || p.kind == "float" || p.kind == "bool" || p.kind == "char" || p.kind == "null" || p.kind == "opt_none") {
@@ -1813,8 +2112,8 @@ pub fn tir_match_pattern_cond(arm: Node, scr: string, scr_st: string, scr_td: i6
                 tir_line(base.sb_cat8("eq.", scr_st, " ", cond, " ", scr, " ", pv));
                 return cond;
             }
-        } else if (sema.tip_kind(scr_td) == "Variant") {
-            var vd: i64 = sema.variant_decl_of(scr_td);
+        } else if (t_td_is_variant(scr_td)) {
+            var vd: i64 = t_variant_decl_of_name(scr_vname);
             var ci: i64 = sema.variant_find_case(vd, cname);
             if (ci >= 0) {
                 var idx: i64 = 0;
@@ -1824,17 +2123,44 @@ pub fn tir_match_pattern_cond(arm: Node, scr: string, scr_st: string, scr_td: i6
                     idx = idx + 1;
                     cc = base.kids[cc].next;
                 }
-                var tagp_addr: string = tir_tmp();
-                tir_line(base.sb_cat6("addr_of ptr<", tagp_addr, " ", scr_st, "> ", scr));
                 var tagp: string = tir_tmp();
-                tir_line(base.sb_cat5("gep i8 ", tagp, " ", tagp_addr, " 0"));
+                tir_line(base.sb_cat6("gep i64 ", tagp, " ", scr_base, " 0", " 0"));
                 var tagv: string = tir_tmp();
-                tir_line(base.sb_cat4("load i8 ", tagv, " ", tagp));
+                tir_line(base.sb_cat4("load i64 ", tagv, " ", tagp));
                 var pv: string = tir_tmp();
-                tir_line(base.sb_cat4("const.i8 ", pv, " ", base.i2s(idx)));
+                tir_line(base.sb_cat4("const.i64 ", pv, " ", base.i2s(idx)));
                 var cond: string = tir_tmp();
-                tir_line(base.sb_cat6("eq.i8 ", cond, " ", tagv, " ", pv));
+                tir_line(base.sb_cat6("eq.i64 ", cond, " ", tagv, " ", pv));
                 return cond;
+            }
+        }
+        return "";
+    }
+    // ── 变体构造器模式（conpat：带绑定，如 Circle(r) / Rect(w, h) / Empty）──
+    // 仅生成 tag 判别条件；载荷绑定提取在 tir_emit_match 的对应 body 块内完成。
+    if (p.kind == "conpat") {
+        if (t_td_is_variant(scr_td)) {
+            // B1 修复：scr_td 是 TypeId 索引，variant_decl_of 期望 TypeInfo 索引 → 必用 vname 反查
+            var vd2: i64 = t_variant_decl_of_name(scr_vname);
+            var cname2: string = p.sa;
+            var ci2: i64 = sema.variant_find_case(vd2, cname2);
+            if (ci2 >= 0) {
+                var idx2: i64 = 0;
+                var cc2: i64 = base.nodes[vd2].lb;
+                while (cc2 >= 0) {
+                    if (base.nodes[base.kids[cc2].val].sa == cname2) { break; }
+                    idx2 = idx2 + 1;
+                    cc2 = base.kids[cc2].next;
+                }
+                var tagp2: string = tir_tmp();
+                tir_line(base.sb_cat6("gep i64 ", tagp2, " ", scr_base, " 0", " 0"));
+                var tagv2: string = tir_tmp();
+                tir_line(base.sb_cat4("load i64 ", tagv2, " ", tagp2));
+                var pv2: string = tir_tmp();
+                tir_line(base.sb_cat4("const.i64 ", pv2, " ", base.i2s(idx2)));
+                var cond2: string = tir_tmp();
+                tir_line(base.sb_cat6("eq.i64 ", cond2, " ", tagv2, " ", pv2));
+                return cond2;
             }
         }
         return "";
@@ -1851,15 +2177,76 @@ pub fn tir_emit_match(n: Node, as_stmt: bool) string {
     g_term = false;
     var scr: string = tir_emit_expr(n.na);
     var scr_st: string = tir_expr_st(n.na);
-    var scr_td: i64 = sema.resolve_type_desc(n.na);
+    var scr_td: i64 = tir_expr_td(n.na);
     var endL: string = tir_lbl("m.e");
     var res: string = "";
-    if (as_stmt == false) { res = tir_new_named_slot(scr_td, scr_st, "__mres"); }
     // 收集所有臂
     var armIds: []i64 = [];
     var c: i64 = n.la;
     while (c >= 0) { append(armIds, base.kids[c].val); c = base.kids[c].next; }
     var nArm: i64 = slice_len(armIds);
+    if (as_stmt == false) {
+        // 结果槽类型须取「match 表达式自身的返回类型」而非 scrutinee 类型：
+        // 变体 match 的 scrutinee 是 ptr<%V>，但 body 返回 i64 —— 误用 scrutinee 类型会把 __mres
+        // 建为 alloca ptr，翻译器按 sret 解引用未初始化的指针 → 段错/读脏值。
+        // 取首臂 body 的发射类型（store 即以该类型定宽），保证 res 槽宽与 body 值一致。
+        var rtd: i64 = scr_td;
+        var rst: string = scr_st;
+        if (nArm > 0) {
+            var fbn: Node = base.nodes[armIds[0]];
+            if (fbn.nc >= 0) {
+                rtd = tir_expr_td(fbn.nc);
+                if (rtd < 0) { rtd = scr_td; }
+                rst = tir_expr_st(fbn.nc);
+            }
+        }
+        if (rst == "" || rst == "ptr") { rst = "i64"; }
+        res = tir_new_named_slot(rtd, rst, "__mres");
+    }
+    // 取变体名：优先从 scr_td 直接取（t_td_is_variant 已确认是变体时，其 .name 即变体名，最可靠）；
+    // 否则回退到「首个 conpat 臂的 case 名反查 VariantDecl」（覆盖 ident-variant 臂无 conpat 的情况）。
+    var scr_vname: string = "";
+    if (scr_td >= 0 && t_td_is_variant(scr_td)) { scr_vname = sema.tds[scr_td].name; }
+    var fi_v: i64 = 0;
+    while (fi_v < nArm) {
+        var armv: Node = base.nodes[armIds[fi_v]];
+        if (armv.na >= 0 && base.nodes[armv.na].kind == "conpat") {
+            var cv: string = base.nodes[armv.na].sa;
+            var di: i64 = 0;
+            var dn2: i64 = slice_len(lex.decl_list) as i64;
+            while (di < dn2) {
+                var dvi: i64 = lex.decl_list[di];
+                var dvn: Node = base.nodes[dvi];
+                if (dvn.kind == "VariantDecl") {
+                    var ccx: i64 = dvn.lb;
+                    while (ccx >= 0) {
+                        if (base.nodes[base.kids[ccx].val].sa == cv) { scr_vname = dvn.sa; break; }
+                        ccx = base.kids[ccx].next;
+                    }
+                }
+                if (scr_vname != "") { break; }
+                di = di + 1;
+            }
+        }
+        if (scr_vname != "") { break; }
+        fi_v = fi_v + 1;
+    }
+    if (scr_vname == "") {
+        var svd2: i64 = sema.variant_decl_of(scr_td);
+        if (svd2 >= 0) { scr_vname = base.nodes[svd2].sa; }
+    }
+    // 取 scrutinee 的「指针基址」：变体以聚合值形态落在局部 slot（%Shape），需 addr_of 取其地址；
+    // 若已是 ptr<%Shape>（如构造器返回值），直接作为基址。依据「实际 slot 类型」判断。
+    var scr_base: string = scr;
+    var scr_slot_st: string = scr_st;
+    var scr_lname: string = str_slice(scr, 1, str_len(scr));
+    var scr_li: i64 = tir_find_local_idx(scr_lname);
+    if (scr_li >= 0) { scr_slot_st = g_local_sts[scr_li]; }
+    if (scr_slot_st[0] != 112 && scr_vname != "") {
+        scr_base = tir_tmp();
+        var scr_ptrst: string = base.sb_cat3("ptr<%", scr_vname, ">");
+        tir_line(base.sb_cat6("addr_of ", scr_ptrst, " ", scr_base, " ", scr));
+    }
     // 预声明绑定名 slot（match entry）：使守卫/体都引用局部 slot，且声明早于使用
     var i: i64 = 0;
     while (i < nArm) {
@@ -1871,11 +2258,28 @@ pub fn tir_emit_match(n: Node, as_stmt: bool) string {
                 var bs: string = tir_new_named_slot(scr_td, scr_st, arm.sa);
                 tir_line(base.sb_cat4("store ", scr, " ", bs));
             }
+        } else if (arm.na >= 0 && base.nodes[arm.na].kind == "conpat") {
+            // conpat 载荷绑定：预声明 slot（类型取绑定 .na），提取在 body 块内进行
+            var cp2: Node = base.nodes[arm.na];
+            var bk2: i64 = cp2.la;
+            while (bk2 >= 0) {
+                var bn2: Node = base.nodes[base.kids[bk2].val];
+                if (bn2.kind == "ident" && bn2.sa != "_") {
+                    var bidx2: i64 = tir_find_local_idx(bn2.sa);
+                    if (bidx2 < 0) {
+                        var btd2: i64 = sema.resolve_type_desc(bn2.na);
+                        var bst2: string = tir_st_of_td(btd2);
+                        tir_new_named_slot(btd2, bst2, bn2.sa);
+                    }
+                }
+                bk2 = base.kids[bk2].next;
+            }
         }
         i = i + 1;
     }
     var armLabels: []string = [];
     // 第一遍：条件链（每臂的 br_cond/br 紧随上一臂打开的 next 块，确保 cond 落在该 next 块内）
+    var last_opened_next: bool = false;   // 末臂为条件臂时，条件链末尾会留一个空 fallthrough 块，需补终止指令
     i = 0;
     while (i < nArm) {
         var arm: Node = base.nodes[armIds[i]];
@@ -1884,7 +2288,7 @@ pub fn tir_emit_match(n: Node, as_stmt: bool) string {
         var cond: string = "";
         var skip_arm: bool = false;
         if (arm.na >= 0) {
-            cond = tir_match_pattern_cond(arm, scr, scr_st, scr_td);
+            cond = tir_match_pattern_cond(arm, scr, scr_base, scr_st, scr_td, scr_vname);
             if (cond == "") {
                 tir_cmt(base.sb_cat2("unsupported match arm pattern: ", base.nodes[arm.na].kind));
                 skip_arm = true;
@@ -1898,21 +2302,76 @@ pub fn tir_emit_match(n: Node, as_stmt: bool) string {
         var is_term: bool = (arm.na < 0 && arm.nb < 0);   // 纯 _ 或纯绑定：无条件臂
         if (skip_arm) {
             tir_line(base.sb_cat3("br ", armL, ""));        // 不支持模式：降级为终极端（兜底，永不崩溃）
+            last_opened_next = false;
         } else if (is_term) {
             tir_line(base.sb_cat3("br ", armL, ""));
+            last_opened_next = false;
         } else {
             var nextL: string = tir_lbl("m.n");
             tir_line(base.sb_cat6("br_cond ", cond, " ", armL, " ", nextL));
             tir_block(nextL);   // 打开 next 块，后续臂条件链落于此
+            last_opened_next = true;
         }
         i = i + 1;
     }
+    // 末臂为条件臂时，条件链末尾的 fallthrough 块无终止指令（且第二遍会紧接打开首臂体块关闭它），
+    // 导致空基本块 → LLVM 报 "expected instruction opcode"。穷尽匹配下该块不可达，补 br <end> 即可正确终止。
+    if (last_opened_next) { tir_line(base.sb_cat3("br ", endL, "")); }
     // 第二遍：body 块（绑定名已在 entry 绑定，无需重复 store）
     i = 0;
     while (i < nArm) {
         var arm: Node = base.nodes[armIds[i]];
         var armL: string = armLabels[i];
         tir_block(armL);
+        // conpat 载荷提取：把 scrutinee 各字段 load 进预声明 slot（仅本臂命中时执行）
+        if (arm.na >= 0 && base.nodes[arm.na].kind == "conpat") {
+            var cp3: Node = base.nodes[arm.na];
+            // 取得该 case 的字段 TD 列表（与构造器同源：variant 声明 case 的 pristine 字段类型节点），
+            // 保证提取偏移与构造器载荷布局逐字节一致。conpat 绑定 .na 在 match 降级后解析不稳定，
+            // 故统一由 variant 声明侧查表（构造器正是这么做的）。
+            var ckey: string = base.sb_cat3(scr_vname, "_", cp3.sa);
+            var cflds: []i64 = [];
+            var cki: i64 = 0;
+            var ckmax: i64 = slice_len(g_vf_keys) as i64;
+            if (slice_len(g_vf_nodes) as i64 < ckmax) { ckmax = slice_len(g_vf_nodes) as i64; }
+            while (cki < ckmax) {
+                if (g_vf_keys[cki] == ckey) { cflds = g_vf_nodes[cki]; break; }
+                cki = cki + 1;
+            }
+            var off3: i64 = 0;
+            var bi3: i64 = 0;
+            var bk3: i64 = cp3.la;
+            while (bk3 >= 0) {
+                var bn3: Node = base.nodes[base.kids[bk3].val];
+                // 字段 TD：优先取 g_vf_tds（构造器发射期解析的「pristine 字段 TD」，不受后续 match 降级
+                // 改写 variant 声明节点的影响），保证提取偏移与构造器载荷布局逐字节一致；cflds/bn3.na
+                // 仅作回退。
+                var ftd3: i64 = -1;
+                if (bi3 < slice_len(cflds) as i64 && cki >= 0 && cki < slice_len(g_vf_tds) as i64 && bi3 < slice_len(g_vf_tds[cki]) as i64) {
+                    ftd3 = g_vf_tds[cki][bi3];
+                }
+                if (ftd3 < 0 && bi3 < slice_len(cflds) as i64) { ftd3 = sema.resolve_type_desc(cflds[bi3]); }
+                if (ftd3 < 0 && bn3.na >= 0) { ftd3 = sema.resolve_type_desc(bn3.na); }
+                var fsz3: i64 = tir_size_bytes(ftd3);
+                if (bn3.kind == "ident" && bn3.sa != "_") {
+                    var fst3: string = tir_st_of_td(ftd3);
+                    off3 = tir_round8(off3);
+                    var aoff3: i64 = off3;   // payload 内偏移（与构造器载荷布局逐字节一致）
+                    var fpi3: string = tir_tmp();
+                    tir_line(base.sb_cat6("gep i8 ", fpi3, " ", scr_base, " 0 1 ", base.i2s(aoff3)));
+                    var vi3: string = tir_tmp();
+                    tir_line(base.sb_cat6("load ", fst3, " ", vi3, " ", fpi3));
+                    var bidx3: i64 = tir_find_local_idx(bn3.sa);
+                    if (bidx3 >= 0) {
+                        var bslot3: string = g_local_slots[bidx3];
+                        tir_line(base.sb_cat4("store ", vi3, " ", bslot3));
+                    }
+                }
+                off3 = off3 + fsz3;
+                bi3 = bi3 + 1;
+                bk3 = base.kids[bk3].next;
+            }
+        }
         if (as_stmt) {
             tir_emit_stmt(arm.nc);
         } else {

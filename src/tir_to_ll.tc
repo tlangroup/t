@@ -1145,8 +1145,8 @@ pub fn ll_emit_builtin(cn: string, toks: []string) bool {
     if (cn == "format_int" || cn == "format_uint" || cn == "format_float" ||
         cn == "format_str" || cn == "format_bool" || cn == "format_char") {
         var fn2: string = base.sb_cat2("tll_", cn);
-        var specp: string = ll_llname(toks[4]);
-        var argv2: []string = [specp];
+        var fmt_spec: string = ll_llname(toks[4]);
+        var argv2: []string = [fmt_spec];
         var argsts2: []string = ["ptr"];
         if (cn == "format_str") { append(argv2, ll_llname(toks[5])); append(argsts2, "ptr"); }
         else if (cn == "format_bool") { append(argv2, ll_load(toks[5], "i8")); append(argsts2, "i8"); }
@@ -1283,8 +1283,8 @@ pub fn ll_emit_builtin(cn: string, toks: []string) bool {
     if (ll_starts(cn, "sb_append_fmt")) {
         var fn2: string = base.sb_cat2("tll_", cn);
         var bp: string = ll_llname(toks[4]);
-        var specp: string = ll_llname(toks[5]);
-        var argv2: []string = [bp, specp];
+        var fmt_spec_b: string = ll_llname(toks[5]);
+        var argv2: []string = [bp, fmt_spec_b];
         var argsts2: []string = ["ptr", "ptr"];
         if (cn == "sb_append_fmt_int" || cn == "sb_append_fmt_uint" || cn == "sb_append_fmt_char") {
             append(argv2, ll_load(toks[6], "i64")); append(argsts2, "i64");
@@ -1489,8 +1489,13 @@ pub fn ll_emit_inst(toks: []string) void {
         if (ll_starts(dstst, "ptr<")) {
             var inner: string = ll_ptr_inner(dstst);
             var srcst: string = ll_get_st(src);
-            if (srcst == inner) {
-                // *dst = src  (store-through：$dst 承载指针，把 $src 写到该地址)
+            var src_is_ptr: bool = ll_starts(srcst, "ptr<") || srcst == "ptr";
+            if (src_is_ptr) {
+                // dst = src  (指针拷贝：$src 也是指针类型，整槽赋值)
+                var v: string = ll_load(src, srcst);
+                ll_store(dst, srcst, v);
+            } else if (srcst == inner) {
+                // *dst = src  (store-through：类型恰好匹配)
                 var p: string = ll_load(dst, dstst);
                 var v: string = ll_load(src, inner);
                 sb_append_str(g_ll, "  store ");
@@ -1501,9 +1506,17 @@ pub fn ll_emit_inst(toks: []string) void {
                 sb_append_str(g_ll, p);
                 sb_append_str(g_ll, "\n");
             } else {
-                // dst = src  (指针拷贝：$src 也是 ptr<X>)
-                var v: string = ll_load(src, dstst);
-                ll_store(dst, dstst, v);
+                // *dst = src  (store-through：标量 src 按自身类型写入 $dst 承载指针所指内存；
+                // 例如 i64 值写入 ptr<i8> payload slot，合法且必要——变体载荷擦除为 i8 字节序列)
+                var p: string = ll_load(dst, dstst);
+                var v: string = ll_load(src, srcst);
+                sb_append_str(g_ll, "  store ");
+                sb_append_str(g_ll, st_to_ll(srcst));
+                sb_append_str(g_ll, " ");
+                sb_append_str(g_ll, v);
+                sb_append_str(g_ll, ", ptr ");
+                sb_append_str(g_ll, p);
+                sb_append_str(g_ll, "\n");
             }
         } else {
             var vst: string = ll_get_st(src);
@@ -1588,6 +1601,11 @@ pub fn ll_emit_inst(toks: []string) void {
         sb_append_str(g_ll, gtypename);
         sb_append_str(g_ll, ", ptr ");
         sb_append_str(g_ll, pv);
+        // 关键修复：GEP 基址类型若是「数组」（如 payload 的 [N x i8]），
+        // 单索引会按「整个数组」步长（N 字节）跳动，而非按元素（1 字节）。
+        // 前置 i32 0 先「进入」数组，再由其后的元素索引按元素大小步长跳动。
+        // 例：gep i8 $f $pay 8  →  getelementptr [24 x i8], ptr %pay, i32 0, i32 8  =  字节 8。
+        if (ll_starts(gtypename, "[")) { sb_append_str(g_ll, ", i32 0"); }
         var k: i64 = 4;
         var m: i64 = slice_len(toks) as i64;
         while (k < m) {
