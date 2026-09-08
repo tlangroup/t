@@ -4,11 +4,13 @@
 // 任意对 $x 的值读取 = `load`，写入 = `store`。LLVM 的 mem2reg/SROA 会自动把
 // 这些 alloca 提升回寄存器，故等价性由 TIR 文本保证（设计 §9.2 结论）。
 //
-// 本模块只读 `tir.tir_to_text()` 产出的文本（格式见 tir-design.md §4，已验证），
+// 本模块同时支持两种入口：① `tir_to_ll_translate(text)` 兼容旧文本路径；② `tir_to_ll_emit(module)` 直接消费
+// 结构化 TIRModule（§5.6），跨层接口为结构体，不再经 tir_to_text() 文本 round-trip。
 // 做两遍扫描：第 1 遍收集函数签名 + 发射 TT 类型；第 2 遍发射函数体。
 // 通过新子命令 `emit-tir-ll` 暴露；不动现有 `emit-ll`/`build`，保留自举不动点。
 
 @import("src.base" :: *);
+@import("src.tir" :: *);   // 结构化入口消费 TIRModule / tir.g_globals_section（tir.tc 不反向导入本模块，无环）
 
 pub var g_ll: StringBuilder;
 pub var g_ll_tmpc: i64;
@@ -2821,7 +2823,121 @@ pub fn ll_emit_string_globals() void {
     sb_append_str(g_ll, "\n");
 }
 
-// 主入口：消费 tir.tir_to_text() 文本，产出 .ll 文本
+// 结构化入口（§5.6）：直接消费 TIRModule，不再经 tir_to_text() 文本 round-trip。
+// 跨层接口为结构体：types/strings/funcs 读 module 字段，globals 读 tir.g_globals_section 缓冲；
+// 每条指令直接消费 inst.tokens（结构化 token 列表，发射期由 tir_line 解析，无整行文本字段）。
+// 产出 .ll 与 tir_to_ll_translate(tir_to_text()) 逐字节一致（对拍基线不变）。
+pub fn tir_to_ll_emit(module: TIRModule) string {
+    ll_reset();
+    // 第 1 遍：TT 类型 + 字符串表 + 全局 + 函数签名
+    var ti: i64 = 0;
+    var tn: i64 = slice_len(module.types) as i64;
+    while (ti < tn) {
+        var t: TIRType = module.types[ti];
+        // t.name 已含前导 '%'（如 "%TStr"），ll_emit_type_line 内部会再取 name 段并 emit "name = type"，故此处不可再加 '%'。
+        ll_emit_type_line(base.sb_cat3(t.name, " = struct { ", base.sb_cat2(t.body, " }")));
+        ti = ti + 1;
+    }
+    // 字符串表（module.strings 已是原始内容，无需 esc/unesc，等价于 translate 解析 strings: 段）
+    var si: i64 = 0;
+    var sn: i64 = slice_len(module.strings) as i64;
+    // 字符串表：旧路径 tir_to_text 对内容做 tir_esc 后再 emit，translate 提取的是「已转义」串；
+    // 故此处直接存 tir_esc(module.strings[si])，与旧 g_str_table 内容逐字节一致（供 ll_emit_string_globals）。
+    while (si < sn) { append(g_str_table, tir_esc(module.strings[si])); si = si + 1; }
+    // 模块级全局（沿用 g_globals_section 文本缓冲，格式与 translate 解析 globals: 段一致）
+    var glines: []string = ll_split_lines(sb_to_str(tir.g_globals_section));
+    var gi: i64 = 0;
+    var gn: i64 = slice_len(glines) as i64;
+    while (gi < gn) {
+        var gt: []string = ll_tokens(glines[gi]);
+        var gm: i64 = slice_len(gt) as i64;
+        if (gm >= 2) {
+            var gnm: string = gt[0];
+            if (str_len(gnm) >= 1 && gnm[0] == 64) { gnm = str_slice(gnm, 1, str_len(gnm)); }
+            append(g_ll_globals, gnm);
+            append(g_ll_globalsts, gt[1]);
+            ll_set_st("@" + gnm, gt[1]);
+        }
+        gi = gi + 1;
+    }
+    // 函数签名 + 变体/main/命名类型收集（与 translate 第 1 遍一致）
+    var fi: i64 = 0;
+    var fn_count: i64 = slice_len(module.funcs) as i64;
+    while (fi < fn_count) {
+        var f: TIRFunc = module.funcs[fi];
+        var head: StringBuilder = sb_new();
+        if (f.is_extern) { sb_append_str(head, "extern "); } else { sb_append_str(head, "func "); }
+        sb_append_str(head, "@"); sb_append_str(head, f.name);
+        sb_append_str(head, "(");
+        var pi: i64 = 0; var pn: i64 = slice_len(f.params) as i64;
+        while (pi < pn) { if (pi > 0) { sb_append_str(head, ", "); } sb_append_str(head, f.params[pi]); pi = pi + 1; }
+        sb_append_str(head, "): "); sb_append_str(head, f.ret_st);
+        if (f.is_main) { sb_append_str(head, " @main"); }
+        ll_parse_func(sb_to_str(head));
+        var fnm: string = g_pf_name;
+        var ffi: i64 = ll_find(fnm, "_from_");
+        if (ffi >= 0 && ffi + 6 <= str_len(fnm)) {
+            var vn: string = str_slice(fnm, 0, ffi);
+            if (str_len(vn) >= 1 && vn[0] >= 65 && vn[0] <= 90) {
+                var seen: bool = false; var k2: i64 = 0; var k2n: i64 = slice_len(g_ll_variant_types) as i64;
+                while (k2 < k2n) { if (g_ll_variant_types[k2] == vn) { seen = true; break; } k2 = k2 + 1; }
+                if (seen == false) { append(g_ll_variant_types, vn); }
+            }
+        }
+        // 入口函数检测：直接用结构化字段 f.is_main（等价于旧路径在 func 头 token 中找 "@main"）。
+        // 注意 @main 是头标记 token，不在 g_pf_params（参数表）中，故旧路径的「在参数表里找 @main」写法是错误的。
+        if (g_has_main == false && f.is_main) {
+            g_has_main = true; g_main_fn = g_pf_name; g_main_ret = g_pf_ret;
+        }
+        ll_register_named_type(g_pf_ret);
+        var pi2: i64 = 0; var plen2: i64 = slice_len(g_pf_params) as i64;
+        while (pi2 < plen2) { ll_register_named_type(g_pf_params[pi2 + 1]); pi2 = pi2 + 2; }
+        var ps: []string = []; var pi3: i64 = 0; var plen3: i64 = slice_len(g_pf_params) as i64;
+        while (pi3 < plen3) { append(ps, g_pf_params[pi3 + 1]); pi3 = pi3 + 2; }
+        append(g_func_names, g_pf_name); append(g_func_paramsts, ps);
+        fi = fi + 1;
+    }
+    // 命名类型声明（%Perm 等位标志/枚举，i64 底类型）置于函数之前
+    var ni: i64 = 0; var nn: i64 = slice_len(g_ll_named_types) as i64;
+    while (ni < nn) { sb_append_str(g_ll, g_ll_named_types[ni]); sb_append_str(g_ll, " = type i64\n"); ni = ni + 1; }
+    // 第 2 遍：发射函数体
+    var fi2: i64 = 0;
+    while (fi2 < fn_count) {
+        var f: TIRFunc = module.funcs[fi2];
+        if (f.is_extern) { fi2 = fi2 + 1; continue; }
+        var head2: StringBuilder = sb_new();
+        sb_append_str(head2, "func @"); sb_append_str(head2, f.name); sb_append_str(head2, "(");
+        var pj: i64 = 0; var pjn: i64 = slice_len(f.params) as i64;
+        while (pj < pjn) { if (pj > 0) { sb_append_str(head2, ", "); } sb_append_str(head2, f.params[pj]); pj = pj + 1; }
+        sb_append_str(head2, "): "); sb_append_str(head2, f.ret_st);
+        if (f.is_main) { sb_append_str(head2, " @main"); }
+        ll_parse_func(sb_to_str(head2));
+        ll_emit_func(g_pf_name, g_pf_params, g_pf_ret);
+        var bi: i64 = 0; var bn: i64 = slice_len(f.body) as i64;
+        while (bi < bn) {
+            var inst: TIRInst = f.body[bi];
+            if (inst.is_comment) { bi = bi + 1; continue; }
+            ll_emit_inst(inst.tokens);
+            bi = bi + 1;
+        }
+        sb_append_str(g_ll, "}\n\n");
+        fi2 = fi2 + 1;
+    }
+    sb_append_str(g_ll, sb_to_str(g_ll_declbuf));
+    var gi2: i64 = 0; var gn2: i64 = slice_len(g_ll_globals) as i64;
+    while (gi2 < gn2) {
+        sb_append_str(g_ll, "@"); sb_append_str(g_ll, ll_mangle(g_ll_globals[gi2]));
+        sb_append_str(g_ll, " = global "); sb_append_str(g_ll, st_to_ll(g_ll_globalsts[gi2]));
+        sb_append_str(g_ll, " zeroinitializer\n"); gi2 = gi2 + 1;
+    }
+    ll_emit_string_globals();
+    sb_append_str(g_ll, sb_to_str(g_clo_constbuf));
+    ll_emit_opaque_defs();
+    ll_emit_main_wrapper();
+    return sb_to_str(g_ll);
+}
+
+// 主入口：消费 tir.tir_to_text() 文本，产出 .ll 文本（保留以兼容旧调用/对照）
 pub fn tir_to_ll_translate(text: string) string {
     ll_reset();
     var lines: []string = ll_split_lines(text);
