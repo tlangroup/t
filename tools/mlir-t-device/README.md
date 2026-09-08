@@ -1,7 +1,7 @@
 # tools/mlir-t-device — T `device` dialect + `device-to-nvvm` pass
 
 Out-of-tree MLIR project that implements the **target-independent Device Dialect**
-and its lowering to NVVM / LLVM, exactly as specified in `docs/device-design.md §3`
+and its lowering to NVVM / LLVM, exactly as specified in `docs/compiler/device-design.md §3`
 and §12.3. This is the 1:1 pre-play of the lowering stage that will later live
 inside the `t_runtime_gpu` JIT engine (§5).
 
@@ -12,7 +12,7 @@ inside the `t_runtime_gpu` JIT engine (§5).
 
 ## Prerequisites
 
-Install the prebuilt MLIR for Windows (see `docs/device-design.md §12.2 / §12.6`):
+Install the prebuilt MLIR for Windows (see `docs/compiler/device-design.md §12.2 / §12.6`):
 
 ```powershell
 powershell -ExecutionPolicy ByPass -c "irm https://github.com/munich-quantum-software/setup-mlir/releases/latest/download/setup-mlir.ps1 | iex; setup-mlir.ps1 -llvm_version 22.1.1 -install_prefix C:/tools/mlir"

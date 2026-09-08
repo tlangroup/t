@@ -16,7 +16,7 @@ def Device_Dialect : Dialect {
   let description = [{
     Minimal target-independent dialect for T's Device subsystem. Lowered to
     NVVM / LLVM by the device-to-nvvm pass, then to PTX by the LLVM NVPTX
-    backend. See docs/device-design.md §3.
+    backend. See docs/compiler/device-design.md §3.
   }];
 }
 
@@ -73,7 +73,7 @@ def AtomicAddOp : Device_Op<"atomic_add", []> {
   let results = (outs AnyType:$result);
 }
 
-// 共享内存分配（docs/device-design.md §3.2）：在地址空间 3（shared）分配 `count` 个
+// 共享内存分配（docs/compiler/device-design.md §3.2）：在地址空间 3（shared）分配 `count` 个
 // `elem` 元素的缓冲区，结果 !llvm.ptr<3>。lowering 降为 llvm.alloca（addrspace 3），
 // 由 NVVM/PTX 后端落到 .shared。本 op 补上设计 §3.2 的 `device.shared_alloc`。
 def DeviceSharedAllocOp : Device_Op<"shared_alloc", []> {

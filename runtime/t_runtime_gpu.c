@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════════════
-// runtime/t_runtime_gpu.c — Device 子系统 host 运行时（docs/device-design.md §5/§6 M3）
+// runtime/t_runtime_gpu.c — Device 子系统 host 运行时（docs/compiler/device-design.md §5/§6 M3）
 //
 // 本机构建（无 CUDA toolkit / 无 GPU）走 CPU 设备模拟分支：
 //   device.alloc       → host malloc（返回真实指针句柄，i64）
@@ -222,5 +222,5 @@ int32_t tll_gpu_launch(const char* blob, const char* name,
 }
 
 #else
-#error "HAVE_CUDA path not yet implemented on this machine (see docs/device-design.md §5)"
+#error "HAVE_CUDA path not yet implemented on this machine (see docs/compiler/device-design.md §5)"
 #endif

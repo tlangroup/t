@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════════════
-// runtime/t_runtime_gpu.h — Device 子系统 host 运行时 FFI 声明（docs/device-design.md §6 M3）
+// runtime/t_runtime_gpu.h — Device 子系统 host 运行时 FFI 声明（docs/compiler/device-design.md §6 M3）
 //
 // 单一真相源：所有 t 编译器发射的 `device.*` host 调用（alloc / free / h2d /
 // d2h / launch）都通过这里声明的符号链接到 runtime/t_runtime_gpu.c。
