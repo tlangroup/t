@@ -1657,10 +1657,87 @@ pub fn math_is_predicate_c(cn: string) bool {
 
 // f32 变体判定：见 codegen_ll.tc 同名注释（isinf 以 'f' 结尾但非 f32 变体，须按基名判断）。
 pub fn math_is_f32_variant_c(cn: string) bool {
+    // ⚠ 空/短名守卫：cn 长度 < 1 时 `str_slice(cn, len-1, len)` 下标 -1 会触发越界崩溃
+    // （此前 S2 实验性 builtin_ret_td 对 maps 空名 callee 调用即崩）。先长度守卫再切尾。
+    if (str_len(cn) < 1) { return false; }
     if (str_slice(cn, str_len(cn) - 1, str_len(cn)) != "f") { return false; }
     var base: string = str_slice(cn, 0, str_len(cn) - 1);
     return math_is_mbuiltin_c(base);
 }
+// S2（v3 §5.3 收口）：内建返回类型「单一真相源」——供 TIR 后端（tir_expr_td /
+// tir_annotate_types）在降级期直接查询内建调用的返回 TD，避免依赖 sema.meta_type_of_expr
+// 对内建的退化（内建无 FuncDecl，meta_type_of_expr 退化为参数/错类型，如 slice_len→%TSlice）。
+// 与上方 expr_type_desc 的 GEN:td_calls 块逐行对齐（该块为生成器产物；本函数是它对 TIR 后端的
+// 纯 callee 名镜像，不含 slice_sub/map_get 等依赖节点的转发规则）。math 辅助已对空/短名守卫，
+// 故对任意 callee 名均安全；未命中内建返回 -1。
+pub fn builtin_ret_td(cn: string) i64 {
+    if (cn == "file_read_all") { return sema.td_mk("string"); }
+    if (cn == "path_resolve") { return sema.td_mk("string"); }
+    if (cn == "getenv") { return sema.td_mk("string"); }
+    if (cn == "str_len") { return sema.td_named_mk("scalar", "u64"); }
+    if (cn == "slice_len") { return sema.td_named_mk("scalar", "u64"); }
+    if (cn == "str_at") { return sema.td_named_mk("scalar", "u8"); }
+    if (cn == "args") {
+        return sema.td_elem_mk("slice", sema.td_mk("string"));
+    }
+    if (cn == "read_line") { return sema.td_mk("string"); }
+    if (cn == "stdin_eof") { return sema.td_named_mk("scalar", "bool"); }
+    if (cn == "file_write_all") { return sema.td_named_mk("scalar", "bool"); }
+    if (cn == "file_exists") { return sema.td_named_mk("scalar", "bool"); }
+    if (cn == "str_slice") { return sema.td_mk("string"); }
+    if (cn == "bytes_len") { return sema.td_named_mk("scalar", "u64"); }
+    if (cn == "bytes_at") { return sema.td_named_mk("scalar", "u8"); }
+    if (cn == "bytes_slice") { return sema.td_mk("bytes"); }
+    if (cn == "bsb_new") { return sema.td_named_mk("named", "TSb*"); }
+    if (cn == "bsb_append_u8" || cn == "bsb_append_bytes") { return sema.td_mk("void"); }
+    if (cn == "bsb_to_bytes") { return sema.td_mk("bytes"); }
+    if (cn == "sb_to_str") { return sema.td_mk("string"); }
+    if (cn == "int_to_str" || cn == "i2s") { return sema.td_mk("string"); }
+    if (cn == "sb_new") { return sema.td_named_mk("named", "TSb*"); }
+    if (cn == "map_has") { return sema.td_named_mk("scalar", "bool"); }
+    if (cn == "map_del") { return sema.td_named_mk("scalar", "bool"); }
+    if (cn == "map_len") { return sema.td_named_mk("scalar", "i64"); }
+    if (cn == "map_set") { return sema.td_mk("void"); }
+    // ⚠ map_new 返回类型依赖实参（被 new 的 map 变量的 key/val 类型），不可在此返回空壳 td_mk("map")：
+    // 空壳 td 的 key/val == -1，map_new 分支会访问 sema.tds[mt.key]→sema.tds[-1] 越界 panic（maps 崩溃同型）。
+    // 返回 -1 让其回退到 tir_expr_td 的 meta_type_of_expr（拿到真实 map td），与基线行为一致。
+    if (cn == "map_new") { return -1; }
+    if (cn == "ti_name") { return sema.td_mk("string"); }
+    if (cn == "fi_name") { return sema.td_mk("string"); }
+    if (cn == "fi_type_name") { return sema.td_mk("string"); }
+    if (cn == "ti_size") { return sema.td_named_mk("scalar", "i64"); }
+    if (cn == "ti_kind") { return sema.td_named_mk("scalar", "i64"); }
+    if (cn == "ti_field_count") { return sema.td_named_mk("scalar", "i64"); }
+    if (cn == "fi_offset") { return sema.td_named_mk("scalar", "i64"); }
+    if (cn == "fi_tag") { return sema.td_named_mk("scalar", "i64"); }
+    if (cn == "fi_type_size") { return sema.td_named_mk("scalar", "i64"); }
+    if (cn == "ti_field") { return sema.td_named_mk("fieldinfo", "FieldInfo"); }
+    if (cn == "fi_is_ptr") { return sema.td_named_mk("scalar", "bool"); }
+    if (cn == "sym_str") { return sema.td_mk("string"); }
+    if (cn == "sym_release") { return sema.td_mk("void"); }
+    if (cn == "sym_release_all") { return sema.td_mk("void"); }
+    if (cn == "atom_str") { return sema.td_mk("string"); }
+    if (cn == "fopen") { return sema.td_named_mk("scalar", "fid"); }
+    if (cn == "fclose" || cn == "fflush" || cn == "fmt_register") { return sema.td_mk("void"); }
+    if (cn == "fid_is_open") { return sema.td_named_mk("scalar", "bool"); }
+    if (cn == "fid_eof") { return sema.td_named_mk("scalar", "bool"); }
+    if (cn == "fid_format") { return sema.td_named_mk("scalar", "atom"); }
+    if (cn == "fid_error") { return sema.td_mk("string"); }
+    if (cn == "fseek") { return sema.td_named_mk("scalar", "bool"); }
+    if (cn == "ftell") { return sema.td_named_mk("scalar", "i64"); }
+    if (cn == "now" || cn == "time_invalid" || cn == "parse_time" || cn == "parse_time_local") { return sema.td_named_mk("scalar", "i64"); }
+    if (cn == "format_time" || cn == "format_time_local" || cn == "format_time_tz") { return sema.td_mk("string"); }
+    if (cn == "format_int" || cn == "format_uint" || cn == "format_float" || cn == "format_str" || cn == "format_bool" || cn == "format_char") { return sema.td_mk("string"); }
+    if (cn == "sb_append_fmt_int" || cn == "sb_append_fmt_uint" || cn == "sb_append_fmt_float" || cn == "sb_append_fmt_str" || cn == "sb_append_fmt_bool" || cn == "sb_append_fmt_char") { return sema.td_mk("void"); }
+    if (cn == "sb_append_fmt_str_conv" || cn == "sb_append_fmt_int_conv" || cn == "sb_append_fmt_uint_conv") { return sema.td_mk("void"); }
+    if (math_is_mbuiltin_c(cn)) {
+        if (math_is_predicate_c(cn)) { return sema.td_named_mk("scalar", "i32"); }
+        if (math_is_f32_variant_c(cn)) { return sema.td_named_mk("scalar", "f32"); }
+        return sema.td_named_mk("scalar", "f64");
+    }
+    return -1;
+}
+
 pub fn emit_math_call(cn: string, av: []string) string {
     if (math_is_mbuiltin_c(cn) == false) { return ""; }
     var mty: string = "double";

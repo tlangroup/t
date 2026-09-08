@@ -906,6 +906,31 @@ pub fn ll_emit_func(name: string, params: []string, ret: string) void {
 //   - 返回 %TStr 的内建（int_to_str/sb_to_str/str_slice/str_concat）把 DST slot 直接当作 %TStr alloca，
 //     作为 out 参数传给 tll_*，使下游以 %TStr 类型正确消费该 slot。
 //   - 返回标量（i64/i32）的内建走 ll_store 写回 DST。
+// 格式化内建（sb_append_fmt_int/uint/char）的第三实参：runtime 形参恒为 i64，
+// 但实参槽可能是 i8/u8/i16/i32/bool。直接 `load i64, ptr <窄槽>` 会跨槽读到相邻栈字节
+// （如 u8 变量打印成 36019311685495551），须按槽的真实宽度 sext/zext 到 i64
+// （对齐 canonical codegen_ll 的 ll_cast_v(v, ll_etd(e), td_i64)）。
+pub fn ll_fmt_int_arg(name: string, cn: string) string {
+    var st: string = ll_get_st(name);
+    var isu: bool = false;
+    if (st == "bool") { st = "i8"; isu = true; }
+    else if (st == "u8" || st == "u16" || st == "u32") { isu = true; }
+    if (st == "" || st == "i64" || st == "u64" || st == "ptr" || str_len(st) == 0) { return ll_load(name, "i64"); }
+    if (st != "i8" && st != "i16" && st != "i32" && st != "u8" && st != "u16" && st != "u32") { return ll_load(name, "i64"); }
+    if (cn == "sb_append_fmt_uint") { isu = true; }
+    var raw: string = ll_load(name, st);
+    var r: string = ll_tmp();
+    sb_append_str(g_ll, "  ");
+    sb_append_str(g_ll, r);
+    if (isu) { sb_append_str(g_ll, " = zext "); }
+    else { sb_append_str(g_ll, " = sext "); }
+    sb_append_str(g_ll, st_to_ll(st));
+    sb_append_str(g_ll, " ");
+    sb_append_str(g_ll, raw);
+    sb_append_str(g_ll, " to i64\n");
+    return r;
+}
+
 pub fn ll_emit_builtin(cn: string, toks: []string) bool {
     var d: string = toks[2];
     if (cn == "println" || cn == "print") {
@@ -1007,7 +1032,9 @@ pub fn ll_emit_builtin(cn: string, toks: []string) bool {
     }
     if (cn == "sb_append_i64" || cn == "sb_append_u64") {
         var bp: string = ll_load(toks[4], "ptr");
-        var iv: string = ll_load(toks[5], "i64");
+        var fmode: string = "sb_append_fmt_int";
+        if (cn == "sb_append_u64") { fmode = "sb_append_fmt_uint"; }
+        var iv: string = ll_fmt_int_arg(toks[5], fmode);
         if (cn == "sb_append_i64") {
             ll_maybe_declare("tll_sb_append_i64", "void", ["ptr", "i64"]);
             sb_append_str(g_ll, "  call void @tll_sb_append_i64(ptr ");
@@ -1295,6 +1322,25 @@ pub fn ll_emit_builtin(cn: string, toks: []string) bool {
         sb_append_str(g_ll, ")\n");
         return true;
     }
+    // 定长数组 → 切片：tll_slice_from_raw(数组基址, alen, sizeof(elem), out)
+    // （不先构造 %TSlice 就会把 [N]T 当切片结构体读 → 长度/步长错 → 段错误）。
+    if (cn == "slice_from_raw") {
+        var nraw: string = ll_load(toks[5], "i64");
+        var esz: string = ll_load(toks[6], "i64");
+        ll_ensure_slot(d, "%TSlice"); ll_set_st(d, "%TSlice");
+        var outp2: string = ll_llname(d);
+        ll_maybe_declare("tll_slice_from_raw", "void", ["ptr", "i64", "i64", "ptr"]);
+        sb_append_str(g_ll, "  call void @tll_slice_from_raw(ptr ");
+        sb_append_str(g_ll, ll_llname_ptr(toks[4]));
+        sb_append_str(g_ll, ", i64 ");
+        sb_append_str(g_ll, nraw);
+        sb_append_str(g_ll, ", i64 ");
+        sb_append_str(g_ll, esz);
+        sb_append_str(g_ll, ", ptr ");
+        sb_append_str(g_ll, outp2);
+        sb_append_str(g_ll, ")\n");
+        return true;
+    }
     // ── append：runtime t_slice_append 自切片元数据推断元素大小，返回 void；TIR 期望 i64，补 0 ──
     if (cn == "append") {
         ll_call_void("t_slice_append", ["ptr", "ptr"],
@@ -1530,12 +1576,15 @@ pub fn ll_emit_builtin(cn: string, toks: []string) bool {
     // ── sb_append_fmt_*：void，忽略 i64 返回 ──
     if (ll_starts(cn, "sb_append_fmt")) {
         var fn2: string = base.sb_cat2("tll_", cn);
-        var bp: string = ll_llname(toks[4]);
+        // ⚠ 首实参（StringBuilder 句柄 __fb）必须 ll_load 取值，不能像 sb_append_fmt_str 的
+        // 字符串实参那样直接取槽地址：槽 __fb 持有的是 ptr 句柄，取址会传 TSb** 给
+        // tll_sb_append_fmt_*（其形参为 ptr）→ 写入野指针 → 段错误（波及全部 format()/f-string 插值）。
+        var bp: string = ll_load(toks[4], "ptr");
         var fmt_spec_b: string = ll_llname(toks[5]);
         var argv2: []string = [bp, fmt_spec_b];
         var argsts2: []string = ["ptr", "ptr"];
         if (cn == "sb_append_fmt_int" || cn == "sb_append_fmt_uint" || cn == "sb_append_fmt_char") {
-            append(argv2, ll_load(toks[6], "i64")); append(argsts2, "i64");
+            append(argv2, ll_fmt_int_arg(toks[6], cn)); append(argsts2, "i64");
         } else if (cn == "sb_append_fmt_float") {
             append(argv2, ll_load(toks[6], "double")); append(argsts2, "double");
         } else if (cn == "sb_append_fmt_bool") {

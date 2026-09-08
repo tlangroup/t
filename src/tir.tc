@@ -18,6 +18,9 @@
 @import("src.base" :: *);
 @import("src.sema" :: *);
 @import("src.lex" :: *);
+// S2：内建返回类型单一真相源（codegen_c.builtin_ret_td），供降级期查询内建调用返回 TD。
+// 单向导入 codegen_c（codegen_c 不导入 tir），无环；tc.tc 已先加载 codegen_c，顺序安全。
+@import("src.codegen_c" :: builtin_ret_td);
 
 // ── 内存结构 ───────────────────────────────────────────────────
 pub struct TIRType {
@@ -264,6 +267,9 @@ pub fn t_variant_name_of_case(cname: string) string {
 }
 pub fn tir_st_of_td(td: i64) string {
     if (td < 0) { return "i64"; }
+    // ⚠ 越界 TD 索引掩盖（meta_type_of_expr+resolve_type_desc 潜伏缺陷：偶发返回 == TD 表长的越界索引，
+    // 多因 node.td 缓存值取自更大 sema.tds 上下文后该表被重置/收窄。对齐 tir_maybe_array_to_slice 既有范式）。
+    if (td >= slice_len(sema.tds) as i64) { return "i64"; }
     var t: TD = sema.tds[td];
     if (t_td_is_variant(td)) { return base.sb_cat3("ptr<%", t.name, ">"); }   // 变体值统一以指针形态流转（对齐 struct_new/匹配提取）
     if (t.cat == "string" || t.cat == "bytes") { return "%TStr"; }
@@ -348,28 +354,51 @@ pub fn tir_is_variant_ctor_call(e: i64) string {
 
 pub fn tir_expr_td(e: i64) i64 {
     if (e < 0) { return -1; }
+    // v3 §5.3：优先读 HIR 类型槽（sema 一次性填入），避免每次重推导 + 影子表反推。
+    // ⚠ 缓存值须做越界检查：node.td 可能取自更大 sema.tds 上下文的残留索引，直接返回会毒化下游 sema.tds[td] 索引。
+    var cached_td: i64 = base.nodes[e].td;
+    if (cached_td > 0 && cached_td < slice_len(sema.tds) as i64) { return cached_td; }
+    if (cached_td > 0) { base.nodes[e].td = -1; }   // 越界缓存：丢弃，回落下方重新推导
     var n: Node = base.nodes[e];
+    var d: i64 = -1;
     // 变体构造器调用 V_from_C：直接返回变体 TD，绕过 meta_type_of_expr。
     // 构造器在 emit 期才合成、符号表的 decl 指向越界节点 → 走常规路径会 index_out_of_bounds。
     if (n.kind == "call") {
         var vn: string = tir_is_variant_ctor_call(e);
-        if (vn != "") { return t_td_of_named(vn); }
+        if (vn != "") { d = t_td_of_named(vn); }
     }
-    if (n.kind == "ident") {
+    // 内建调用：variant 构造器未命中时，优先走 builtin_ret_td 单一真相源（meta_type_of_expr 退化为错类型）。
+    if (d < 0 && n.kind == "call") {
+        var cal: Node = base.nodes[n.na];
+        if (cal.kind == "ident") {
+            var brt: i64 = builtin_ret_td(cal.sa);
+            if (brt >= 0) { d = brt; }
+        }
+    }
+    if (d < 0 && n.kind == "ident") {
         var idx: i64 = tir_find_local_idx(n.sa);
-        if (idx >= 0) { return g_local_tds[idx]; }
+        if (idx >= 0) { d = g_local_tds[idx]; }
     }
-    var tnode: i64 = sema.meta_type_of_expr(e);
-    if (tnode >= 0) { return sema.resolve_type_desc(tnode); }
-    return -1;
+    if (d < 0) {
+        var tnode: i64 = sema.meta_type_of_expr(e);
+        if (tnode >= slice_len(base.nodes) as i64) { }
+        if (tnode >= 0) { d = sema.resolve_type_desc(tnode); }
+    }
+    // ⚠ 越界 TD 索引掩盖（潜伏缺陷）：resolve_type_desc 偶发返回越界索引，须拦下，否则下游 sema.tds[td] panic。
+    if (d >= slice_len(sema.tds) as i64) { d = -1; }
+    if (d > 0) { base.nodes[e].td = d; }   // 回填类型槽：后续查询走槽而非影子表
+    return d;
 }
 
 pub fn tir_expr_st(e: i64) string {
     if (e < 0) { return "i64"; }
     var n: Node = base.nodes[e];
     var kd: string = n.kind;
-    // 局部/形参：emit 期唯一可靠来源
+    // 局部/形参：优先读 HIR 类型槽（S1 预标注已填），影子表 `g_local_sts` 仅兜底
     if (kd == "ident") {
+        // ⚠ 缓存的 node.td 须越界检查；越界则丢弃并回落影子表 g_local_sts（持有本模块真实发射类型）。
+        if (n.td > 0 && n.td < slice_len(sema.tds) as i64) { return tir_st_of_td(n.td); }
+        if (n.td > 0) { n.td = -1; }
         var idx: i64 = tir_find_local_idx(n.sa);
         if (idx >= 0) { return g_local_sts[idx]; }
     }
@@ -436,8 +465,12 @@ pub fn tir_callee_param_td(cname: string, argidx: i64) i64 {
             var j: i64 = 0;
             while (c >= 0) {
                 if (j == argidx) {
-                    var p: Node = base.nodes[base.kids[c].val];
-                    return sema.resolve_type_desc(p.na);
+                                        var p: Node = base.nodes[base.kids[c].val];
+                    var ptd: i64 = sema.resolve_type_desc(p.na);
+                    // ⚠ 越界 TD 索引掩盖（resolve_type_desc 潜伏缺陷：偶发返回越界索引，
+                    // 直接作 sema.tds[aptd] 索引会 panic）。越界则视为无类型信息，回落调用点兜底。
+                    if (ptd >= slice_len(sema.tds) as i64) { return -1; }
+                    return ptd;
                 }
                 j = j + 1;
                 c = base.kids[c].next;
@@ -568,16 +601,19 @@ pub fn tir_round8(v: i64) i64 {
     return v + (8 - r);
 }
 // 类型 TD → 字节尺寸（前端可用；递归变体按 16 兜底，避免无限递归；与 legacy ll_size_bytes 近似一致）。
+// ⚠ TD-vs-TI：td 是 sema.tds[]（TypeDef）索引，必须用 TD 字段（cat/name）判定，
+// 绝不可喂给 sema.tip_kind/tip_name（读 tis[]，会越界 panic）。
 pub fn tir_size_bytes(td: i64) i64 {
-    if (td < 0) { return 8; }
-    var k: string = sema.tip_kind(td);
-    var nm: string = sema.tip_name(td);
-    if (k == "i8" || k == "u8" || k == "bool") { return 1; }
-    if (k == "i16" || k == "u16") { return 2; }
-    if (k == "i32" || k == "u32" || k == "rune" || k == "f32") { return 4; }
-    if (k == "i64" || k == "u64" || k == "f64") { return 8; }
+    if (td < 0 || td >= slice_len(sema.tds) as i64) { return 8; }
+    var t: TD = sema.tds[td];
+    var k: string = t.cat;
+    var nm: string = t.name;
+    if (nm == "i8" || nm == "u8" || nm == "bool") { return 1; }
+    if (nm == "i16" || nm == "u16") { return 2; }
+    if (nm == "i32" || nm == "u32" || nm == "rune" || nm == "f32") { return 4; }
+    if (nm == "i64" || nm == "u64" || nm == "f64") { return 8; }
     if (str_len(nm) >= 4 && str_slice(nm, 0, 4) == "ptr<") { return 8; }
-    if (k == "Struct" || k == "Union" || k == "Variant") { return 16; }
+    if (k == "struct" || k == "union" || k == "variant" || k == "enum") { return 16; }
     return 8;
 }
 // 变体 case 载荷字段缓存：在类型表构建期（VC 节点尚未被后续 match 降级改动）预填充
@@ -593,6 +629,43 @@ pub var g_vf_tds: [][]i64;
 // ══════════════════════════════════════════════════════════════════
 // 顶层降级入口
 // ══════════════════════════════════════════════════════════════════
+
+// S1（v3 §5.3）：在降级前把当前模块全部表达式节点的 HIR 类型槽 **预标注** 好，
+// 使 `node.td` 成为权威类型源，后续 `tir_expr_td`/`tir_expr_st` 一律读槽、影子表
+// （`g_local_tds`/`g_local_sts`）仅作兜底。类型经 `sema.meta_type_of_expr` 一次性
+// 推导并 `resolve_type_desc` 落槽，避免发射期逐次重推导带来的不一致（S0 已实证缓存
+// 可消 4 例不一致）。按 `base.g_node_mod` 作用域隔离，避免跨模块节点被错标。
+//
+// ⚠ 仅对表达式节点调用类型推导（非 expr 节点不写槽）。内建调用优先走 builtin_ret_td 单一真相源，
+// 避免 meta_type_of_expr 退化（内建无 FuncDecl → 退化为 %TSlice 等错类型，毒化 node.td）。
+// builtin_ret_td 已对空/短 callee 名做守卫，对任意 call 节点均安全；未命中内建才回退 meta_type_of_expr。
+pub fn tir_annotate_types(mod: string) void {
+    var tot: i64 = slice_len(base.nodes) as i64;
+    var i: i64 = 0;
+    while (i < tot) {
+        // ⚠ 入口模块节点 g_node_mod == ""（base.tc node_new 用 g_cur_mod，入口为 ""），
+        // 而 mod 取自 base_no_tc(文件名)（如 "maps"），故须同时匹配 "" 才能注解入口模块节点。
+        // 否则注解空跑、node.td 永不填充，tir_expr_td 只能回落 meta_type_of_expr（有越界 TD 索引缺陷）。
+        if (base.g_node_mod[i] == mod || base.g_node_mod[i] == "") {
+            var rtd: i64 = -1;
+            var n: Node = base.nodes[i];
+            if (n.kind == "call") {
+                var cal: Node = base.nodes[n.na];
+                if (cal.kind == "ident") {
+                    rtd = builtin_ret_td(cal.sa);   // 内建返回类型优先：写槽即权威，后续 emit 不再重推
+                }
+            }
+            if (rtd < 0) {
+                var mt: i64 = sema.meta_type_of_expr(i);
+                if (mt >= 0) { rtd = sema.resolve_type_desc(mt); }
+            }
+            // ⚠ 越界检查：resolve_type_desc 偶发返回越界 TD 索引，缓存后会毒化下游 sema.tds[td] 索引 → panic。
+            // 越界则不写槽，让发射期回落 meta_type_of_expr / 影子表（与基线行为一致）。
+            if (rtd >= 0 && rtd < slice_len(sema.tds) as i64) { base.nodes[i].td = rtd; }
+        }
+        i = i + 1;
+    }
+}
 
 pub fn lower_unit(mod: string, source: string) void {
     tir_reset();
@@ -668,6 +741,9 @@ pub fn lower_unit(mod: string, source: string) void {
     // 模块级全局变量元数据收集：必须在函数体发射前完成，供 tir_emit_call 判定
     // 全局函数值变量走 call_ind。globals: 段文本在此缓冲，t.__ginit 在末尾追加。
     tir_emit_globals();
+
+    // S1（v3 §5.3）：预标注当前模块全部表达式节点的 HIR 类型槽，使 `node.td` 成为权威源。
+    tir_annotate_types(mod);
 
     var j: i64 = 0;
     while (j < n) {
@@ -1147,6 +1223,7 @@ pub fn tir_emit_stmt(sid: i64) void {
                 tir_line(base.sb_cat4("store ", clo, " ", slot));
             } else {
                 var init: string = tir_emit_expr(n.nb);
+                if (st == "%TSlice") { init = tir_maybe_array_to_slice(init, n.nb); }
                 tir_line(base.sb_cat4("store ", init, " ", slot));
             }
         }
@@ -1515,6 +1592,8 @@ pub fn tir_emit_assign(n: Node) string {
                     }
                     return sidv;
                 }
+                // 目标为切片而右值是定长数组 → 补 array→slice 视图构造（否则长度字段是脏栈）。
+                if (idx >= 0 && g_local_sts[idx] == "%TSlice") { rhs = tir_maybe_array_to_slice(rhs, n.nb); }
                 tir_line(base.sb_cat4("store ", rhs, " ", g_local_slots[idx]));
                 return rhs;
             } else {
@@ -1573,7 +1652,7 @@ pub fn tir_emit_expr(e: i64) string {
     g_cur_line = base.nodes[e].ln;
     var n: Node = base.nodes[e];
     var kd: string = n.kind;
-    g_tir_last_st = tir_expr_st(e);   // 默认取 sema 推断类型；具体发射器（如 binary）会覆盖为真实发射类型
+        g_tir_last_st = tir_expr_st(e);   // 默认取 sema 推断类型；具体发射器（如 binary）会覆盖为真实发射类型
 
     if (kd == "assign" || kd == "assignment") { return tir_emit_assign(n); }
     if (kd == "match") { return tir_emit_match(n, false); }
@@ -1959,6 +2038,9 @@ pub fn tir_emit_call(e: i64) string {
             }
         } else {
             aslot = tir_emit_expr(k.val);
+            // 形参是 []T 而实参是 [N]T：补 array→slice 视图（否则被调用方读到脏长度 → 段错误）。
+            var aptd: i64 = tir_callee_param_td(cname, argi);
+            if (aptd >= 0 && sema.tds[aptd].cat == "slice") { aslot = tir_maybe_array_to_slice(aslot, k.val); }
         }
         if (first == false) { sb_append_str(sb, " "); }
         sb_append_str(sb, aslot);
@@ -1984,19 +2066,42 @@ pub fn tir_emit_call(e: i64) string {
     // tir_expr_st 对函数值变量默认回退 i64，会令聚合返回（%TStr 等）经 call_ind 时签名错配 → 末行 <hello> 丢失。
     // 此处从被调函数值变量的 FuncType TD（cat=="func"）取真实返回类型，覆盖默认 retst。
     // ⚠ g_local_tds 存的是 TD 索引（查 sema.tds[].cat），不是 TI 索引——误用 tip_kind 会索引错表、永不命中。
+    var ctd: i64 = -1;
     if (is_ind) {
-        var ctd: i64 = -1;
         if (tir_find_local_idx(cname) >= 0) {
             ctd = g_local_tds[tir_find_local_idx(cname)];
         } else if (tir_is_global_fnval(cname)) {
             ctd = tir_global_fnval_td(cname);
         }
-        if (ctd >= 0 && sema.tds[ctd].cat == "func") {
+        if (ctd >= 0 && ctd < slice_len(sema.tds) as i64 && sema.tds[ctd].cat == "func") {
             ret_td = sema.tdf_ret[ctd];
             retst = tir_st_of_td(ret_td);
         }
     }
     tir_line(base.sb_cat8(op, " ", retst, " ", d, " ", callee_ref, base.sb_cat3(" (", sb_to_str(sb), ")")));
+    return d;
+}
+
+// 定长数组 [N]T → []T 零拷贝切片视图。
+// sema 对 `var s: []i64 = arr;` / `f(arr)`（形参 []T）不插 cast 节点，直接把 [N]T 的
+// N*esz 字节写进 %TSlice 槽 → 长度/步长字段是脏栈 → 读切片即段错误。
+// 故在「目标为切片」的写入点（var_decl 初始器 / assign / call 实参）统一补 @slice_from_raw。
+pub fn tir_maybe_array_to_slice(src: string, srce: i64) string {
+    var std: i64 = tir_expr_td(srce);
+    if (std < 0) { return src; }
+    // ⚠ tir_expr_td 在部分路径（meta_type_of_expr + resolve_type_desc）会返回等于 TD 表长度的
+    // 越界索引（潜伏缺陷，adt_multi 的 `t_slice_at index==length` panic 同型）。
+    // 此处必须先做上界检查再索引 sema.tds，否则把已有 PASS 的用例（vdot_all）打成编译期 panic。
+    if (std >= slice_len(sema.tds) as i64) { return src; }
+    if (sema.tds[std].cat != "array") { return src; }
+    var d: string = tir_tmp();
+    var nl: string = tir_tmp();
+    tir_line(base.sb_cat4("const i64 ", nl, " ", base.i2s(sema.tds[std].alen)));
+    var ez: string = tir_tmp();
+    tir_line(base.sb_cat4("const i64 ", ez, " ", base.i2s(tir_sizeof(tir_st_of_td(sema.tds[std].elem)))));
+    var a3: string = base.sb_cat5(src, " ", nl, " ", ez);
+    tir_line(base.sb_cat6("call %TSlice ", d, " @slice_from_raw ( ", a3, " )", ""));
+    g_tir_last_st = "%TSlice";
     return d;
 }
 
@@ -2006,6 +2111,21 @@ pub fn tir_emit_cast(n: Node) string {
     if (base.nodes[n.na].kind == "array_lit") {
         var ttd: i64 = sema.resolve_type_desc(n.nb);
         return tir_emit_array_lit(n.na, ttd);
+    }
+    // 定长数组 → 切片（零拷贝视图）：cast 节点形态的 [N]T → []T。
+var cft: i64 = tir_expr_td(n.na);
+    var ctt: i64 = sema.resolve_type_desc(n.nb);
+    if (cft >= 0 && ctt >= 0 && sema.tds[cft].cat == "array" && sema.tds[ctt].cat == "slice") {
+        var av: string = tir_emit_expr(n.na);
+        var dsl: string = tir_tmp();
+        var nl: string = tir_tmp();
+        tir_line(base.sb_cat4("const i64 ", nl, " ", base.i2s(sema.tds[cft].alen)));
+        var ez: string = tir_tmp();
+        tir_line(base.sb_cat4("const i64 ", ez, " ", base.i2s(tir_sizeof(tir_st_of_td(sema.tds[cft].elem)))));
+        var a3: string = base.sb_cat5(av, " ", nl, " ", ez);
+        tir_line(base.sb_cat6("call %TSlice ", dsl, " @slice_from_raw ( ", a3, " )", ""));
+        g_tir_last_st = "%TSlice";
+        return dsl;
     }
     var inner: string = tir_emit_expr(n.na);
     // ⚠ 关键：源类型必须用「实际发射类型」(g_tir_last_st，由内层 emit 设置，如 mul.f64→f64)，
@@ -2020,7 +2140,10 @@ pub fn tir_emit_cast(n: Node) string {
     // 枚举在 TIR 中被擦除为整数，但其 expr_st 仍是 %Name（未声明的 LLVM 类型）。
     // 把枚举操作数按 i64 看待，使 as 转换走正确的整数宽度逻辑（no-op/trunc/zext/sext），
     // 而不是 emit 引用未声明 %Color 的 `bitcast`。
-    if (sema.tip_kind(tir_expr_td(n.na)) == "Enum") { inner_st = "i64"; }
+    // ⚠ TD-vs-TI：tir_expr_td 返回 TD 索引，tir_emit_cast 此处需用 TD 字段判定枚举，
+    // 绝不可把 TD 索引喂给 sema.tip_kind（读 tis[]，会越界 panic）。
+    var cast_src_td: i64 = tir_expr_td(n.na);
+    if (cast_src_td >= 0 && cast_src_td < slice_len(sema.tds) as i64 && sema.tds[cast_src_td].cat == "enum") { inner_st = "i64"; }
     var target_st: string = tir_st_of_td(sema.resolve_type_desc(n.nb));
     if (inner_st == target_st) { return inner; }
     var d: string = tir_tmp();
@@ -2454,12 +2577,14 @@ pub fn tir_match_pattern_cond(arm: Node, scr: string, scr_base: string, scr_st: 
     var cname: string = p.sa;
     if (p.kind == "member") { cname = p.sa; }
     if (p.kind == "ident" || p.kind == "member") {
-        if (sema.tip_kind(scr_td) == "Enum") {
-            var ename: string = sema.tip_name(scr_td);
-            if (sema.enum_has_case(scr_td, cname)) {
-                var cn: i64 = sema.enum_const_lookup(ename, cname);
-                var val: i64 = -1;
-                if (cn >= 0) { val = base.nodes[cn].ia; }
+        // ⚠ TD-vs-TI：scr_td 是 TD 索引（tir_expr_td 返回），必须用 TD 字段判定枚举，
+        // 不可喂给 sema.tip_kind/tip_name/enum_has_case（读 tis[] 或期望 TI 索引，会越界 panic）。
+        // enum_const_lookup 取枚举名（字符串）即可，无需 TI 索引。
+        if (scr_td >= 0 && scr_td < slice_len(sema.tds) as i64 && sema.tds[scr_td].cat == "enum") {
+            var ename: string = sema.tds[scr_td].name;
+            var cn: i64 = sema.enum_const_lookup(ename, cname);
+            if (cn >= 0) {
+                var val: i64 = base.nodes[cn].ia;
                 var pv: string = tir_tmp();
                 tir_line(base.sb_cat6("const ", scr_st, " ", pv, " ", base.i2s(val)));
                 var cond: string = tir_tmp();
