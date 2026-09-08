@@ -31,7 +31,7 @@
 | 第 8 条 零未定义行为 | ✅ 合规 | 禁止 `meta` 上下文读写运行时变量 / 内存；非法访问显式报 `T_META_READ_RUNTIME`；`@compile_error` 显式终止。 |
 | 第 13 条 铁律校验 | ✅ 合规 | 新增语法 / 内建均通过上表校验后入语言。 |
 
-⚠ **已拍板（2026-08-07；2026-08-30 修订）**：编译期关键字已统一为 `comptime`——`meta` 不再作为关键字（留作他用），历史 `comptime`/`meta` 别名关系已撤销，`W_COMPTIME_ALIAS` 弃用告警已随 `meta` 关键字移除而一并下线。仓库内用例与 conformance 均已迁移到 `comptime` 拼写。
+⚠ **已拍板（2026-08-07；2026-08-30 修订；2026-09-04 再修订）**：编译期关键字已统一为 `comptime`——历史 `comptime`/`meta` 别名关系已撤销，`W_COMPTIME_ALIAS` 弃用告警已随别名移除而一并下线，仓库内用例与 conformance 均已迁移到 `comptime` 拼写。**`meta` 现为保留关键字 `KwMeta`**（见 `src/lex.tc` `init_keywords`）：当前无语义、留作他用，且禁止用户将其用作标识符——声明位由 `expect_tok("Identifier")` 直接拒绝（`meta` 是 `KwMeta` 而非 `Identifier`），表达式位由顶层 default 分支拒绝。
 
 ---
 
@@ -178,7 +178,7 @@ meta get_width fn(meta T: type) u32 {
   实现取「**复用既有 `comptime` 节点**」路线（而非并列新增 `meta`/`meta_block`），理由：
   `comptime` 的解析 / 检查 / 双后端发射链路已存在且被 M-any 单态化依赖，复用即零风险、零 IR 漂移。
   具体落点：
-  1. `src/tc.tc` `init_keywords`：`kw_reg("meta","KwComptime")`（别名）+ `kw_reg("type","KwType")`（新）。
+  1. `src/lex.tc` `init_keywords`：历史曾 `kw_reg("meta","KwComptime")`（别名，已撤销）；现 `meta` 改为 `kw_reg("meta","KwMeta")` 登记为保留关键字（无语义、留作他用），`comptime` 保留 `KwComptime`；新增 `kw_reg("type","KwType")`。
   2. `parse_type` 新增 `KwType` 分支 → `node_new("type")`；`resolve_ti` 中 `type` → `ti_mk("Any")`（与 `any` 同语义）。
   3. `parse_declaration`：把 `meta`/`comptime` 前缀**提到最前**，使其可修饰 `var`/`const`（原先只能修饰 `fn`）；
      `parse_global_var` 增加 `is_comptime` 形参并写入 `bb` 槽。
@@ -299,7 +299,7 @@ meta get_width fn(meta T: type) u32 {
     **验收**：51 个快照目标 IR 逐字节零漂移（基线已重录，153 条目）；`tests/conformance/pass/p40_meta_builtin_ok.tc`（类型查询运行期位置 / `MyInt i64` typealias 展开 / get_width 模式 + `T: type` / `@zeroed` + CTFE 数组读写 / `@str_from_bytes` / `sym_intern` / 数组值拷贝 / meta 块）+ `fail/f72..f77_meta_*.tc` 六条护栏全过（`T_META_COMPILE_ERROR` ×2 / `T_META_UNKNOWN_BUILTIN` / `T_META_RUNTIME_CTX` / `T_META_TYPE_AS_VALUE` / `T_META_UNKNOWN_TYPE`）；gate L2 13 passed / 0 failed / 0 warn。
 - **Phase E（迁移 & 弃用）** —— ✅ **已落地（2026-08-07，gate L2 13/0/0，IR 漂移零）**；**2026-08-30 收尾**：`meta` 别名与 `W_COMPTIME_ALIAS` 告警已彻底移除，编译期关键字统一为 `comptime`，`meta` 留作他用。
   1. （历史）`W_COMPTIME_ALIAS` 弃用别名告警：曾在四个 `KwComptime` 解析点注入 `warn_comptime_alias()`；现已随 `meta` 关键字移除而一并下线。
-  2. **仓库内真实 `meta` 代码用法已迁移为 `comptime`/`type`**：`examples/generics_demo.tc`、`examples/meta.tc`、`tests/samples/game_ecs.tc`、`tests/conformance/pass/p37_meta_ok.tc`；`tests/samples/lexer.tc` 的 `"comptime"` 为字符串字面量测试数据（不动）。
+  2. **仓库内真实 `meta` 代码用法已迁移为 `comptime`/`type`**：`examples/generics_demo.tc`、`examples/meta.tc`、`tests/samples/game_ecs.tc`、`tests/conformance/pass/p37_meta_ok.tc`；`tests/samples/lexer.tc` 的 `"comptime"` 为字符串字面量测试数据（不动）。**`meta` 现为保留关键字 `KwMeta`（见 `src/lex.tc` `init_keywords`），不再可作为标识符使用。**
   3. （历史）conformance 曾加 `pass/p41_meta_comptime_alias.tc` 验证告警；该用例已随告警下线而删除。
   4. 关键字统一已在 2026-08-30 完成，无后续过渡期。
 
@@ -322,7 +322,7 @@ meta get_width fn(meta T: type) u32 {
 
 原始用例是 Zig 风格语法，与 `t` 文法几乎全不兼容（方括号类型参数、`meta if`/`meta while` 前缀、
 `undefined`、`info.fields` 成员糖、`@type_info[T]()`、缺分号等），已全部按 `t` 真实文法修正。
-修正后的完整目标形态存于 **`docs/meta_target.tc`**，覆盖：编译期常量 / 编译期函数 / 类型参数泛型 /
+修正后的完整目标形态存于 **`docs/compiler/meta_target.tc`**，覆盖：编译期常量 / 编译期函数 / 类型参数泛型 /
 类型反射遍历 / 编译期条件分支 / 编译期字符串构造 / 编译期求值块 / 静态查表 / 编译期类型检查 / 编译期诊断。
 它依赖 Phase B–D 的 CTFE 与内建，**当前不可编译**，仅作设计与语法对齐用途。
 

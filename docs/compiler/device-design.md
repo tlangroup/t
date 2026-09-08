@@ -115,8 +115,25 @@ device.kernel_func @vec_add(%a: !device.ptr<global, f32>,
 - **Launch**：`cuLaunchKernel` 带 grid/block + 打包 `void*` 参数（v1 同步）。
 - **依赖**：运行时链接 **MLIR + CUDA driver (libcuda)**。
 
+### 5.1 ML autotuning 层（G-8，对标 AutoTVM / XLA）
+
+- **问题**：GPU kernel 性能对 tile size / unroll factor / vectorization width / memory coalescing 极度敏感；固定启发式在跨 arch（sm_70/80/90、AMD CDNA、NPU）上无法泛化。这是「手写一遍 lowering」之外，**设备侧独有的第二道性能墙**。
+- **方案**（对标 AutoTVM 的 cost-model autotuning + XLA 的 learned schedule）：
+  - **搜索空间**：对 device kernel 暴露 schedule 旋钮（block/grid 维度、tile、unroll、vectorize、shared-mem staging）；搜索器（random / evolutionary / RL）在代表输入形状上采样候选 schedule。
+  - **learned cost model**：训练轻量回归/图神经网络，以 `(IR feature, schedule, target_desc)` → 实测时延 拟合，预测未采样 schedule 的代价，避免每次真跑 GPU（GPU 稀缺时尤其关键）。
+  - **缓存最优 schedule**：按 `(kernel 名, 输入形状签名, arch, target_desc 版本)` 内容寻址缓存最优 schedule，落独立 `.autotune.json` 或并入远端缓存（呼应 G-6）；运行期 JIT 直接取用，零搜索开销。
+  - **ML for pass ordering（更前沿，预留接口）**：用 RL 模型决定 MLIR pass 顺序/参数，作为 LLVM MLGO 在设备侧的延伸——一期不实现，仅预留 hook。
+- **与现有 JIT 衔接**：复用 §5 的 XLA 式 executable cache 键 `(kernel 名, arch, module_hash)`，扩展为 `(kernel 名, arch, schedule_hash)`；schedule 由 autotuner 离线/首次运行填充，之后命中缓存。
+- **门禁/工具链缺口**：autotuning 需 GPU 真机或 cycle-accurate 模拟器采集时延——本机无 GPU（见 §1 结论），故 autotuning 离线在他机跑、缓存结果随仓库/远端缓存分发。
+
 ---
 
+
+**治理约束（与正确性/供应链维度绑定，缺一不可 ship）**：learned autotuning 是"决策带模型权重"的优化，必须满足三条才允许进入默认路径（对标审查维度 D3-D / D7-9 / D8）：
+
+- **(1) hermetic key 含模型身份**：最优 schedule 缓存键（§5.1 现有 `(kernel 名, 输入形状签名, arch, target_desc 版本)`）必须**追加 autotuner 自身版本 + 模型权重哈希 + 搜索种子/空间哈希**——否则换模型/换训练数据会得到不同 schedule 却命中旧缓存，击穿确定性构建（D3-D1）。
+- **(2) 正确性回归门禁 + 自动回退**：每个缓存/选用的 schedule 必须过「等价性」校验（同一 kernel 在启用/禁用 autotuning 下数值结果一致，容差内）；失败即**自动回退**到安全 schedule（如固定启发式）并告警，绝不静默用可能误编译的 schedule（D7-9）。
+- **(3) 缓存条目可信**：远端/仓库分发的 `.autotune.json` 须带来源签名或内容校验（D8-4/8-6），CI 拒绝未校验条目，避免污染整条构建链。
 ## 6. Host 启动 API 与 trampoline
 
 - `device.launch(kernel, grid, block, args...)`：T 为每个 kernel 生成 host trampoline

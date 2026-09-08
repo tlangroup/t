@@ -94,7 +94,7 @@ Keyword:
   | "any" -> KwAny
   | "type" -> KwType
   | "comptime" -> KwComptime
-  | "meta" -> KwComptime
+  | "meta" -> KwMeta           // 保留关键字（当前无语义，留作他用，禁止用户用作标识符）
   | "if" -> KwIf
   | "else" -> KwElse
   | "for" -> KwFor
@@ -118,10 +118,10 @@ Keyword:
 ```
 
 > 关键字由 `lex` 阶段查表（`kw_lookup`，基于 `keywords_tbl`）判定。其权威列表即上方 `Keyword` 产生式中的字面量，由 `tools/gen_ebnf.mjs` 抽取生成 `out/ebnf.json`、`src/totter.tc` 解析后生成进 `gen/tc.tc`（totter 已放弃，该区间现冻结于 `src/tc.tc`、手写维护）。`i8`/`i16`/`i32`/`i64`/`u8`/`u16`/`u32`/`u64`/`f16`/`f32`/`f64`/`bool` 为**内建类型名**（见 §3.5），不是关键字。
-> ⚠ `meta` 与 `comptime` 同映射到 `KwComptime`（互为别名，`meta` 为推荐拼写）；`type` 与 `any` 同为「类型之类型」占位关键字。见 §3.6.3。
+> ⚠ `meta` 现为**保留关键字** `KwMeta`（当前无语义、留作他用，禁止用户用作标识符），与 `comptime` 不再有任何别名关系；`comptime` 是唯一的编译期关键字（`KwComptime`），承载全部元编程功能。`type` 与 `any` 同为「类型之类型」占位关键字。见 §3.6.3。
 > ⚠ `let` 关键字（动态常量）及「`var`/`const`/`let` 局部标注可选、由初始化器推断」为 2026-08-19 宪法采纳的设计，尚未接入 `tc`；当前唯一实装推断形式是 `auto`，将降级为 `let` 的弃用别名（见 §3.3）。
 > ⚠ `inf` / `nan` 不在 `keywords_tbl` 里，但词法阶段被直接归为**浮点字面量记号**（§2.4），效果等同保留字：不可作标识符、不可作字段名。
-> ⚠ spec-only（设计中、tc 未接入）：`union`、`enum` 更广语义（关联数据/方法等；**常数枚举**编译期赋值已实装，见 §3.18）、`comptime`/`meta` 表达式的**编译期求值**（CTFE，Phase B；Phase A 已可解析并降级发射）；`cell` 块（Notebook 单元作用域，见 §3.17，经 `docs/design.md` §2.8 提案）。
+> ⚠ spec-only（设计中、tc 未接入）：`union`、`enum` 更广语义（关联数据/方法等；**常数枚举**编译期赋值已实装，见 §3.18）、`comptime` 表达式的**编译期求值**（CTFE，Phase B；Phase A 已可解析并降级发射）；`cell` 块（Notebook 单元作用域，见 §3.17，经 `docs/design.md` §2.8 提案）。
 
 ### 2.4 Literals（字面量） ✅ tc（2026-08-10 全量落地）
 
@@ -1419,7 +1419,7 @@ main fn() i64 @main {
 
 > 实现位置：`src/tc.tc` — `func_is_generic` / `clone_node` / `subst_type_in_node` / `instantiate_generic`，及 `infer_expr` call 分支、`check_decl`、C 发射 `emit_func_decl` 分发、LLVM 发射 `emit_llunit` 循环四处 `func_is_generic` 门控（⚠ 该循环须用 `if/else` 而非 `continue` 跳过重写 `i++`，否则对泛型函数触发无限循环）。
 
-> 📌 **单态化参数不限于类型**：Phase C 起，`meta` 形参声明为整数族 / `bool` / `string` 时即为
+> 📌 **单态化参数不限于类型**：Phase C 起，`comptime` 形参声明为整数族 / `bool` / `string` 时即为
 > **值参数**，实参在调用点 CTFE 求值后按值去重（`repeat("hi", 3)` → `repeat__s2_hi_1748694682_3`），
 > 可与类型参数混用。见 §3.6.3「值参数单态化」。
 
@@ -1428,43 +1428,43 @@ main fn() i64 @main {
 `comptime` 是 `t` 的统一元编程关键字（词法层 `KwComptime`）。
 `type` 与 `any` 互为别名（同为「类型之类型」占位）。
 
-> 编译期关键字为 `comptime`；`meta` 已不再作为关键字，留作他用。`type` / `any` 均可作「类型之类型」占位。新代码一律用 `comptime` / `type`。
+> 编译期关键字为 `comptime`；`meta` 现为保留关键字 `KwMeta`（当前无语义、留作他用，禁止用户用作标识符），不再承担编译期功能。`type` / `any` 均可作「类型之类型」占位。新代码一律用 `comptime` / `type`。
 
 ```ebnf
-MetaParam: "comptime" Ident ":" MetaParamType     // 编译期形参（P.bb = true）
-MetaParamType: "type" | "any"                              //   → 类型参数
+ComptimeParam: "comptime" Ident ":" ComptimeParamType     // 编译期形参（P.bb = true）
+ComptimeParamType: "type" | "any"                              //   → 类型参数
              | IntType | "bool" | "string"                 //   → 值参数（Phase C）
-MetaBlock: ("meta"|"comptime") Block                       // 编译期块
-MetaExpr:  ("meta"|"comptime") Expression                  // 编译期表达式前缀
-MetaDecl:  ("meta"|"comptime") ("const"|"var"|Ident "fn" ...)   // 编译期顶层声明
+ComptimeBlock: "comptime" Block                       // 编译期块
+ComptimeExpr:  "comptime" Expression                  // 编译期表达式前缀
+ComptimeDecl:  "comptime" ("const"|"var"|Ident "fn" ...)   // 编译期顶层声明
 ```
 
 **四类表面：**
 
 | 形态 | 写法 | 行为 |
 | --- | --- | --- |
-| ① 编译期形参 | `f fn(meta T: type, x: T) T`<br>`g fn(meta N: i64) i64` | ✅ 调用点单态化（复用 `instantiate_generic`，见 §3.6.2 与下方「值参数」） |
-| ② 编译期块 | `meta { ... }` | ✅ 编译期执行，**运行期零代码** |
-| ③ 编译期表达式 | `var a: i64 = meta 4 + 2;` | ✅ 编译期求值，**就地折叠为字面量** |
-| ④ 编译期声明 | `meta const K: i64 = 100;` / `meta f fn(...)` | ✅ 进入编译期环境，可被 ②③ 读写 / 调用 |
+| ① 编译期形参 | `f fn(comptime T: type, x: T) T`<br>`g fn(comptime N: i64) i64` | ✅ 调用点单态化（复用 `instantiate_generic`，见 §3.6.2 与下方「值参数」） |
+| ② 编译期块 | `comptime { ... }` | ✅ 编译期执行，**运行期零代码** |
+| ③ 编译期表达式 | `var a: i64 = comptime 4 + 2;` | ✅ 编译期求值，**就地折叠为字面量** |
+| ④ 编译期声明 | `comptime const K: i64 = 100;` / `comptime f fn(...)` | ✅ 进入编译期环境，可被 ②③ 读写 / 调用 |
 
 **值参数单态化（Phase C）：**
 
-`meta` 形参是「类型参数」还是「值参数」，由**声明类型**决定 —— `type` / `any` 是类型参数，
+`comptime` 形参是「类型参数」还是「值参数」，由**声明类型**决定 —— `type` / `any` 是类型参数，
 整数族 / `bool` / `string` 是值参数。二者可在同一函数里混用，单态化键按形参顺序拼接。
 
 ```t
-sum_sq  fn(meta N: i64) i64            { var b: [N]i64; ... }   // 值进类型位（数组长度）
-repeat  fn(meta s: string, meta n: i64) string { ... }          // → repeat__s2_hi_1748694682_3
-pick    fn(meta B: bool, a: i64, b: i64) i64   { ... }          // → pick__true / pick__false
-fill    fn(meta T: type, meta N: i64, v: T) T  { ... }          // → fill__i64_4（类型+值混合）
-tagged  fn(meta N: i64, x: i64) i64    { return x + meta N * 100; }  // 实例体内的 meta 照常折叠
+sum_sq  fn(comptime N: i64) i64            { var b: [N]i64; ... }   // 值进类型位（数组长度）
+repeat  fn(comptime s: string, comptime n: i64) string { ... }          // → repeat__s2_hi_1748694682_3
+pick    fn(comptime B: bool, a: i64, b: i64) i64   { ... }          // → pick__true / pick__false
+fill    fn(comptime T: type, comptime N: i64, v: T) T  { ... }          // → fill__i64_4（类型+值混合）
+tagged  fn(comptime N: i64, x: i64) i64    { return x + comptime N * 100; }  // 实例体内的 comptime 照常折叠
 ```
 
 - **实参必须编译期可求值**：走 Phase B 的 CTFE 求值器。传运行期变量报 `T_META_READ_RUNTIME`。
 - **类型必须精确匹配**：第 3 条禁隐式转换，`bool` 形参传 `1` 报 `T_META_ARG_TYPE`。
 - **必须落在取值范围内**：`u8` 形参传 `300` 报 `T_META_RANGE`（按标量位宽二进制补码判定）。
-- **浮点值参数未开放**：`meta F: f64` 报 `T_META_VALUE_PARAM_TYPE`（同 CTFE 的浮点约束，见下）。
+- **浮点值参数未开放**：`comptime F: f64` 报 `T_META_VALUE_PARAM_TYPE`（同 CTFE 的浮点约束，见下）。
 - **单态化键**：整数用十进制（负数前缀 `n`，`-5` → `n5`）；`bool` 用 `true` / `false`；
   字符串用 `"s" + 长度 + "_" + 前 12 个可读字符 + "_" + FNV-1a(32) 哈希`
   （带哈希是为了避免 `"a-b"` 与 `"a_b"` 在字符清洗后撞名）。同键调用复用同一实例。
@@ -1476,17 +1476,17 @@ tagged  fn(meta N: i64, x: i64) i64    { return x + meta N * 100; }  // 实例�
 - **类型**：`i64` 整数族、`bool`、`string`。**浮点暂不支持**（报 `T_META_NOT_CONST`）——
   第 7 条要求求值可复现，浮点结合序须先定死。字符串仅支持 `==` / `!=`，不做拼接 / 切片。
 - **表达式**：算术、位运算（`& | ^ << >>`）、比较、`&&` / `||`（惰性短路）、
-  括号、显式 `as` 转型（按标量位宽做二进制补码窄化）、`meta fn` 调用。
-- **语句**（`meta {}` 与 `meta fn` 体内）：`var` / 赋值 / `if` / `while` / `block` /
+  括号、显式 `as` 转型（按标量位宽做二进制补码窄化）、`comptime fn` 调用。
+- **语句**（`comptime {}` 与 `comptime fn` 体内）：`var` / 赋值 / `if` / `while` / `block` /
   `return` / `break` / `continue`。
-- **作用域**：`meta fn` 是**纯函数** —— 只能看见自己的形参 / 局部与顶层 `meta const` / `meta var`，
+- **作用域**：`comptime fn` 是**纯函数** —— 只能看见自己的形参 / 局部与顶层 `comptime const` / `comptime var`，
   **看不见调用方的局部**（不做动态作用域）。
 - **内建**：`print` / `eprint`（编译期日志，**一律写 stderr**，二者同义）、
   `int_to_str` / `i2s` / `str_len` / `str_at`。
   触碰运行期世界的内建（`file_*` / `sys_run` / `args` / `exit` / `path_resolve`）报 `T_META_IMPURE`。
 - **护栏**：步数预算（`T_META_BUDGET`）、调用深度 64（`T_META_DEPTH`）、
   除零（`T_META_DIV_ZERO`）、读运行期变量（`T_META_READ_RUNTIME`）、
-  调用非 `meta fn`（`T_META_NOT_META_FN`）、`meta {}` 内 `return`（`T_META_RETURN_OUTSIDE_FN`）。
+  调用非 `comptime fn`（`T_META_NOT_META_FN`）、`comptime {}` 内 `return`（`T_META_RETURN_OUTSIDE_FN`）。
 
 **编译期内建（Phase D，`@` 前缀）：**
 
@@ -1496,24 +1496,24 @@ tagged  fn(meta N: i64, x: i64) i64    { return x + meta N * 100; }  // 实例�
 | --- | --- | --- | --- | --- |
 | `@type_name(T)` | 类型查询 | 类型名字符串 | `string` | 可运行期折叠为常量 |
 | `@type_size(T)` | 类型查询 | 类型字节大小 | `i64` | 同上；typealias 展开到底层（`@type_size(MyInt)` == `@type_size(i64)`） |
-| `@type_equal(T1, T2)` | 类型查询 | 类型相等判定 | `bool` | CTFE 已知；`meta T: type` 形参经 `mb_bound_type` 解析为绑定类型 |
+| `@type_equal(T1, T2)` | 类型查询 | 类型相等判定 | `bool` | CTFE 已知；`comptime T: type` 形参经 `mb_bound_type` 解析为绑定类型 |
 | `@zeroed([N]T)` | 类型查询 | 零初始化定长数组 | `[N]T` | 折成 `array_lit`；CTFE 缓冲区 / 运行期常量皆可 |
 | `@str_from_bytes(buf, len)` | CTFE-only | 由字节造 `string` | `string` | 仅编译期上下文（否则 `T_META_RUNTIME_CTX`） |
 | `@compile_error("msg")` | CTFE-only | 编译期硬错误，终止编译 | noreturn | 同上；被取分支才触发 `T_META_COMPILE_ERROR` |
 | `sym_intern(buf, len)` | CTFE-only | 由字节驻留符号 | `Sym` | 复用既有内建通道，`Sym = "str"` 自动驻留 |
 
 - **`@type_name` / `@type_size` / `@type_equal` / `@zeroed`**：在 CTFE 之前就折成字面量 / `array_lit` 节点，两个后端看到的只是普通字面量 —— 零新支持、零 IR 漂移。运行期位置调用亦合法（检查器随后照常对其做类型检查）。
-- **`@str_from_bytes` / `@compile_error`**：只在编译期求值 / 折叠；在运行期上下文（非 `meta` 块、非 `meta` 形参的 `meta fn`）调用一律报 `T_META_RUNTIME_CTX`，行为显式可追溯。
-- **`Sym` 一级化（Phase D）**：`Sym` 提升为一级符号句柄类型（`bw=32` / `alen=32`），使 `meta fn(meta s: string, meta n: u32) Sym` 这类「返回任意符号」的签名合法；`resolve_ti` / `resolve_type_desc` 仅在查过用户自定义 `Sym` **之后**兜底返回，自举安全（`src/tc.tc` 自带 `Sym struct` 不受影响）。
+- **`@str_from_bytes` / `@compile_error`**：只在编译期求值 / 折叠；在运行期上下文（非 `comptime` 块、非 `comptime` 形参的 `comptime fn`）调用一律报 `T_META_RUNTIME_CTX`，行为显式可追溯。
+- **`Sym` 一级化（Phase D）**：`Sym` 提升为一级符号句柄类型（`bw=32` / `alen=32`），使 `comptime fn(comptime s: string, comptime n: u32) Sym` 这类「返回任意符号」的签名合法；`resolve_ti` / `resolve_type_desc` 仅在查过用户自定义 `Sym` **之后**兜底返回，自举安全（`src/tc.tc` 自带 `Sym struct` 不受影响）。
 
 ```t
-meta get_width fn(meta T: type) u32 {        // docs/meta_design.md §6 模式
+comptime get_width fn(comptime T: type) u32 {        // docs/compiler/meta_design.md §6 模式
     if (@type_equal(T, u32)) { return 32; }
     else if (@type_equal(T, u64)) { return 64; }
     else { @compile_error("unsupported type"); }
     return 0;
 }
-meta repeat fn(meta s: string, meta n: u32) Sym {
+comptime repeat fn(comptime s: string, comptime n: u32) Sym {
     var buf: [64]u8 = @zeroed([64]u8);
     var pos: u32 = 0;  var i: u32 = 0;
     while (i < n) { var j: u32 = 0; var sl = str_len(s) as u32;
@@ -1523,33 +1523,33 @@ meta repeat fn(meta s: string, meta n: u32) Sym {
 }
 ```
 
-> ⚠ **`meta { }` 的副作用发生在编译期**。`meta { print("x"); }` 在**编译时**往 stderr 写 `x`，
-> 程序运行时不再输出它。编译期计算要影响运行期，须经 `meta var` 承接、再用 `meta <expr>` 折叠回来：
+> ⚠ **`comptime { }` 的副作用发生在编译期**。`comptime { print("x"); }` 在**编译时**往 stderr 写 `x`，
+> 程序运行时不再输出它。编译期计算要影响运行期，须经 `comptime var` 承接、再用 `comptime <expr>` 折叠回来：
 > 见下方 `ACC` → `c`。
 
 **示例：**
 
 ```t
-id fn(meta T: type, x: T) T { return x; }
+id fn(comptime T: type, x: T) T { return x; }
 
-meta const KLIMIT: i64 = 100;
-meta var ACC: i64 = 0;
-meta addk fn(a: i64, b: i64) i64 { return a + b; }
-meta fact fn(n: i64) i64 {
+comptime const KLIMIT: i64 = 100;
+comptime var ACC: i64 = 0;
+comptime addk fn(a: i64, b: i64) i64 { return a + b; }
+comptime fact fn(n: i64) i64 {
     if (n <= 1) { return 1; }
     return n * fact(n - 1);
 }
 
 main fn() i64 @main {
-    meta {                              // 编译期执行，运行期零代码
+    comptime {                          // 编译期执行，运行期零代码
         print("meta-block\n");          // 编译期日志 → stderr
         var k: i64 = 1;
         while (k <= 4) { ACC = ACC + k * k; k = k + 1; }
     }
-    var a: i64 = meta 4 + 2;            // → store i64 6
-    var b: i64 = meta addk(10, 5);      // → store i64 15
-    var c: i64 = meta ACC;              // → store i64 30（编译期累加结果）
-    var d: i64 = meta fact(10);         // → store i64 3628800（编译期递归展开）
+    var a: i64 = comptime 4 + 2;        // → store i64 6
+    var b: i64 = comptime addk(10, 5);  // → store i64 15
+    var c: i64 = comptime ACC;          // → store i64 30（编译期累加结果）
+    var d: i64 = comptime fact(10);     // → store i64 3628800（编译期递归展开）
     auto n = id(i64, 42);               // → id__i64
     auto s = id(string, "hi");          // → id__string
     if (a == 6 && b == 15 && c == 30 && d == 3628800 && n == 42
@@ -1558,9 +1558,9 @@ main fn() i64 @main {
 }
 ```
 
-> 实现位置：`src/tc.tc` — 关键字注册 `kw_reg("meta","KwComptime")` / `kw_reg("type","KwType")`；
+> 实现位置：`src/tc.tc` — 关键字注册 `kw_reg("comptime","KwComptime")` / `kw_reg("meta","KwMeta")` / `kw_reg("type","KwType")`；
 > `parse_type` 的 `KwType` 分支（造 `type` 节点）、`resolve_ti` 的 `type` → `Any`；
-> `parse_declaration` 将 `meta`/`comptime` 前缀提到最前（使其可修饰 `var`/`const`/`fn`）；
+> `parse_declaration` 将 `comptime` 前缀提到最前（使其可修饰 `var`/`const`/`fn`）；`meta` 现为保留字 `KwMeta`，不再作为前缀；
 > `parse_primary` 的 `KwComptime` 表达式前缀；`comptime` 表达式节点在
 > `expr_type_desc` / `ll_etd` / `emit_expr`（C） / `emit_lle`（LLVM）四处透传内层表达式。
 > ⚠ 后两处此前缺失 —— `comptime <expr>;` 语句形态早已能解析，但 C 后端会落到
@@ -1587,11 +1587,11 @@ main fn() i64 @main {
 > `pass/p39_meta_value_param_ok.tc`（Phase C 值参数全形态）、
 > `pass/p40_meta_builtin_ok.tc`（Phase D 编译期内建全形态，运行 `exit=0`）、
 > `fail/f61..f66_meta_*.tc` + `fail/f68..f71_meta_value_*.tc`（Phase A–C 十条护栏，L0 覆盖）、
-> `fail/f72..f77_meta_*.tc`（Phase D 六条护栏：`T_META_COMPILE_ERROR`×2 / `T_META_UNKNOWN_BUILTIN` / `T_META_RUNTIME_CTX` / `T_META_TYPE_AS_VALUE` / `T_META_UNKNOWN_TYPE`，L0 覆盖）；完整设计见 `docs/meta_design.md`，
-> Phase C–D 的目标形态见 `docs/meta_target.tc`（⚠ 该文件刻意**不放在 `examples/`**：
+> `fail/f72..f77_meta_*.tc`（Phase D 六条护栏：`T_META_COMPILE_ERROR`×2 / `T_META_UNKNOWN_BUILTIN` / `T_META_RUNTIME_CTX` / `T_META_TYPE_AS_VALUE` / `T_META_UNKNOWN_TYPE`，L0 覆盖）；完整设计见 `docs/compiler/meta_design.md`，
+> Phase C–D 的目标形态见 `docs/compiler/meta_target.tc`（⚠ 该文件刻意**不放在 `examples/`**：
 > `tools/ir_snapshot.mjs` 会对 `examples/*.tc` 逐个 emit，放入不可编译文件会使快照步骤永久 WARN）。
 >
-> 注：`tc0`（TypeScript 引导编译器）只需能编译 `src/tc.tc`，故仅注册了 `meta` 别名而未实现
+> 注：`tc0`（TypeScript 引导编译器）只需能编译 `src/tc.tc`，故仅注册了 `comptime` 关键字（`meta` 别名已撤销，现 `meta` 为保留字 `KwMeta`）而未实现
 > `any`/`type` 类型参数（`tc0` 本就不支持 `comptime T: any`）——这是既有的有意子集边界。
 
 ### 3.7 Flag builtins（位域内建函数） ✅ tote
