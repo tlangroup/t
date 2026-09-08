@@ -28,11 +28,152 @@ pub struct TIRType {
     body: string;   // 字段 ST 列表文本，如 "f0: i64, f1: i64"
 }
 
+// 操作数：仅承载「名字」（含 $/@ 前缀，handler 自行按前缀区分 slot/global）。
+// 类型一律由翻译期 g_ll_* 表按名字恢复（codegen 内部状态，非层间字符串传递）。
+pub struct TirOperand {
+    name: string;
+}
+
+// 结构化指令：op 为单一 opcode 标记（非位置编码整行文本）；st 为值/结果存储类型；
+// dst/args 为结构化操作数。层间不再传递字符串或整行文本（§5.6）。
+
+// 构造单个操作数（避免切片字面量作为表达式位/字段初始化，绕过种子代码生成对 `[]` 的限制）。
+pub fn tir_op(name: string) TirOperand { return TirOperand{ name: name }; }
+
+// 构造操作数列表。关键：经「顶层返回」让切片堆提升（t 对返回结构体中的切片字段不做堆提升，
+// 局部切片随 tir_parse_inst 返回被释放 → 结构化 TIRInst.args 在发射期悬空段错误）。
+// 顶层切片返回与 tir_tokens 返回 []string 同理，由编译器堆提升，发射期可安全随机访问。
+pub fn tir_build_args(tk: []string, start: i64, skip_paren: bool) []TirOperand {
+    var za: []TirOperand = [];
+    var k: i64 = start;
+    var m: i64 = slice_len(tk) as i64;
+    while (k < m) {
+        if (skip_paren && (tk[k] == "(" || tk[k] == ")")) { k = k + 1; continue; }
+        append(za, tir_op(tk[k]));
+        k = k + 1;
+    }
+    return za;
+}
+
+
 pub struct TIRInst {
-    op: string;         // 操作码（tokens[0]），结构化字段，非整行文本
-    tokens: []string;   // 完整操作数 token 列表（含 opcode），与 ll_tokens(text) 逐 token 一致
+    op: string;         // 操作码标记（"store"/"add.i64"/"trunc"…）
+    st: string;         // 值/结果存储类型（ST 字符串，LLVM 类型拼写）
+    dst: TirOperand;    // 目标操作数
+    args: []TirOperand; // 源操作数列表
     is_comment: bool;   // true → 注释行（不支持构造的兜底）
     line: u64;          // 源锚点行（诊断用）
+    cmt: string;        // 注释内容（is_comment 时有效）
+}
+
+// 把一条 TIR 文本指令解析为结构化 TIRInst。tir_line 调用此函数，
+// 使发射器仍可用文本构造、但层间传递的是结构化 TIRInst（不传整行文本）。
+// 操作数位置布局严格复刻 ll_emit_inst 的取值约定，确保字节一致。
+pub fn tir_parse_inst(text: string) TIRInst {
+    var tk: []string = tir_tokens(text);
+    var m: i64 = slice_len(tk) as i64;
+    if (m < 1) {
+        return TIRInst{ op: "", st: "", dst: TirOperand{ name: "" }, args: tir_build_args(tk, m, false), is_comment: false, line: 0, cmt: "" };
+    }
+    var raw: string = tk[0];
+    if (raw == "ret.void") {
+        return TIRInst{ op: raw, st: "", dst: TirOperand{ name: "" }, args: tir_build_args(tk, m, false), is_comment: false, line: g_cur_line, cmt: "" };
+    }
+    if (raw == "ret") {
+        if (m >= 3) {
+            return TIRInst{ op: raw, st: tk[1], dst: TirOperand{ name: tk[2] }, args: tir_build_args(tk, m, false), is_comment: false, line: g_cur_line, cmt: "" };
+        }
+        return TIRInst{ op: raw, st: "", dst: TirOperand{ name: "" }, args: tir_build_args(tk, m, false), is_comment: false, line: g_cur_line, cmt: "" };
+    }
+    if (raw == "slot") {
+        return TIRInst{ op: raw, st: tk[1], dst: TirOperand{ name: tk[2] }, args: tir_build_args(tk, m, false), is_comment: false, line: g_cur_line, cmt: "" };
+    }
+    if (raw == "const.str") {
+        return TIRInst{ op: raw, st: "", dst: TirOperand{ name: tk[1] }, args: tir_build_args(tk, 2, false), is_comment: false, line: g_cur_line, cmt: "" };
+    }
+    if (raw == "const.ptr.null") {
+        return TIRInst{ op: raw, st: tk[1], dst: TirOperand{ name: tk[2] }, args: tir_build_args(tk, m, false), is_comment: false, line: g_cur_line, cmt: "" };
+    }
+    if (raw == "const") {
+        return TIRInst{ op: raw, st: tk[1], dst: TirOperand{ name: tk[2] }, args: tir_build_args(tk, 3, false), is_comment: false, line: g_cur_line, cmt: "" };
+    }
+    // ⚠ 此处禁止调用 `tir_to_ll.ll_starts`：tir.tc 不 import tir_to_ll（反向依赖会成环），
+    //   种子编译器解析不到该 callee → 静默发出 `; UNSUPPORTED call ll_starts` + `br i1 false`，
+    //   使整个 `const.*` 分支在 g1 里变成死代码（gate 的 unsup 步专抓这类静默错编）。
+    //   一律用模块内判定（与 base 的 `str_slice(x,0,n)==prefix` 惯例一致）。
+    if ((str_len(raw) as i64) > 6 && str_slice(raw, 0, 6) == "const.") {
+        return TIRInst{ op: raw, st: str_slice(raw, 6, str_len(raw)), dst: TirOperand{ name: tk[1] }, args: tir_build_args(tk, 2, false), is_comment: false, line: g_cur_line, cmt: "" };
+    }
+    if (raw == "bitcast") {
+        // 文本格式：bitcast <target_st> <dst> <inner_st> <inner>
+        // emit 通过 ll_get_st(args[0]) 反推源类型，故 args 须放「源值」(tk[4])，而非源类型 (tk[3])。
+        return TIRInst{ op: raw, st: tk[1], dst: TirOperand{ name: tk[2] }, args: tir_build_args(tk, 4, false), is_comment: false, line: g_cur_line, cmt: "" };
+    }
+    if (raw == "store") {
+        // 发射侧恒产出 2 操作数「store <value> <dst>」，translator 亦只支持该形式（ST 由 g_ll_* 恢复）。
+        // ⚠ 不可仅凭「tk[1] 不以 $/@ 开头」判为带类型形式：裸整数字面量（`store 100 @g`，见全局
+        //   int 初始化）同样无前缀，会被误吃进 st、args 变空 → translator `inst.args[0]` 索引空切片 panic。
+        //   带类型形式至少 4 token（store + st + dst + value），且 st 记号不会以数字/负号开头。
+        var st_like: bool = (tk[1][0] != 45 && (tk[1][0] < 48 || tk[1][0] > 57));
+        if (m >= 4 && tk[1][0] != 36 && tk[1][0] != 64 && st_like) {
+            return TIRInst{ op: raw, st: tk[1], dst: TirOperand{ name: tk[2] }, args: tir_build_args(tk, 3, false), is_comment: false, line: g_cur_line, cmt: "" };
+        }
+        return TIRInst{ op: raw, st: "", dst: TirOperand{ name: tk[2] }, args: tir_build_args(tk, 1, false), is_comment: false, line: g_cur_line, cmt: "" };
+    }
+    if (raw == "load") {
+        return TIRInst{ op: raw, st: tk[1], dst: TirOperand{ name: tk[2] }, args: tir_build_args(tk, 3, false), is_comment: false, line: g_cur_line, cmt: "" };
+    }
+    if (raw == "addr_of") {
+        return TIRInst{ op: raw, st: tk[1], dst: TirOperand{ name: tk[2] }, args: tir_build_args(tk, 3, false), is_comment: false, line: g_cur_line, cmt: "" };
+    }
+    if (raw == "gep") {
+        return TIRInst{ op: raw, st: tk[1], dst: TirOperand{ name: tk[2] }, args: tir_build_args(tk, 3, false), is_comment: false, line: g_cur_line, cmt: "" };
+    }
+    if (raw == "gep_idx") {
+        return TIRInst{ op: raw, st: tk[1], dst: TirOperand{ name: tk[2] }, args: tir_build_args(tk, 3, false), is_comment: false, line: g_cur_line, cmt: "" };
+    }
+    if (raw == "slice_at") {
+        // slice_at <dst> <base_slot> <idx> → 返回元素地址 ptr（dst 即元素地址槽）
+        return TIRInst{ op: raw, st: "", dst: TirOperand{ name: tk[1] }, args: tir_build_args(tk, 2, false), is_comment: false, line: g_cur_line, cmt: "" };
+    }
+    if (raw == "str_at") {
+        // str_at <dst> <base_slot> <idx> → 返回字节值 i64（dst 即值槽）
+        return TIRInst{ op: raw, st: "", dst: TirOperand{ name: tk[1] }, args: tir_build_args(tk, 2, false), is_comment: false, line: g_cur_line, cmt: "" };
+    }
+    if (raw == "struct_new") {
+        return TIRInst{ op: raw, st: tk[1], dst: TirOperand{ name: tk[2] }, args: tir_build_args(tk, 3, false), is_comment: false, line: g_cur_line, cmt: "" };
+    }
+    if (raw == "call") {
+        if (m >= 2 && tk[2][0] == 64) {
+            return TIRInst{ op: raw, st: tk[1], dst: TirOperand{ name: "" }, args: tir_build_args(tk, 2, false), is_comment: false, line: g_cur_line, cmt: "" };
+        }
+        return TIRInst{ op: raw, st: tk[1], dst: TirOperand{ name: tk[2] }, args: tir_build_args(tk, 3, false), is_comment: false, line: g_cur_line, cmt: "" };
+    }
+    if (raw == "call_ind") {
+        return TIRInst{ op: raw, st: tk[1], dst: TirOperand{ name: tk[2] }, args: tir_build_args(tk, 3, true), is_comment: false, line: g_cur_line, cmt: "" };
+    }
+    if (raw == "br") {
+        return TIRInst{ op: raw, st: "", dst: TirOperand{ name: "" }, args: tir_build_args(tk, 1, false), is_comment: false, line: g_cur_line, cmt: "" };
+    }
+    if (raw == "br_cond") {
+        return TIRInst{ op: raw, st: "", dst: TirOperand{ name: "" }, args: tir_build_args(tk, 1, false), is_comment: false, line: g_cur_line, cmt: "" };
+    }
+    if (raw == "block") {
+        return TIRInst{ op: raw, st: "", dst: TirOperand{ name: tk[1] }, args: tir_build_args(tk, m, false), is_comment: false, line: g_cur_line, cmt: "" };
+    }
+    if (raw == "trunc" || raw == "zext" || raw == "sext" || raw == "fpext" || raw == "fptrunc" ||
+        raw == "sitofp" || raw == "uitofp" || raw == "fptosi" || raw == "fptoui") {
+        return TIRInst{ op: raw, st: tk[1], dst: TirOperand{ name: tk[2] }, args: tir_build_args(tk, 4, false), is_comment: false, line: g_cur_line, cmt: "" };
+    }
+    var dot: i64 = -1;
+    var di: i64 = 0;
+    while (di < str_len(raw)) { if (raw[di] == 46) { dot = di; break; } di = di + 1; }
+    if (dot >= 0) {
+        var stp: string = str_slice(raw, dot + 1, str_len(raw));
+        var opb: string = str_slice(raw, 0, dot);
+        return TIRInst{ op: opb, st: stp, dst: TirOperand{ name: tk[1] }, args: tir_build_args(tk, 2, false), is_comment: false, line: g_cur_line, cmt: "" };
+    }
+    return TIRInst{ op: raw, st: "i64", dst: TirOperand{ name: tk[1] }, args: tir_build_args(tk, 2, false), is_comment: false, line: g_cur_line, cmt: "" };
 }
 
 pub struct TIRFunc {
@@ -85,6 +226,7 @@ pub var g_tir_last_st: string = "i64";
 pub var g_loop_head: []string;   // 栈顶 = 最内层循环头（continue 目标）
 pub var g_loop_end: []string;    // 栈顶 = 最内层循环尾（break 目标）
 pub var g_idx_elem_st: string = "i64";  // tir_emit_index_addr 写回的元素 ST（read/write 共用）
+pub var g_idx_is_value: bool = false;    // true: 下标返回「值」(str_at → i64 字节，read 不 load)；false: 返回「地址」(slice_at → ptr)
 pub var g_tir_defer: []i64;          // 延迟语句节点栈（defer → LIFO，遇 return/函数尾排空）
 pub var g_tir_func_names: []string;   // 模块内函数名 → FuncDecl 节点（call 实参定长数组降级用）
 pub var g_tir_func_decls: []i64;
@@ -209,10 +351,22 @@ pub fn tir_join_toks(tk: []string) string {
     return sb_to_str(sb);
 }
 
+// 结构化指令 → 可读文本行（仅调试/快照；非层间接口）。
+pub fn tir_inst_to_text(inst: TIRInst) string {
+    var sb: StringBuilder = sb_new();
+    sb_append_str(sb, inst.op);
+    if (str_len(inst.st) > 0) { sb_append_str(sb, " "); sb_append_str(sb, inst.st); }
+    if (str_len(inst.dst.name) > 0) { sb_append_str(sb, " "); sb_append_str(sb, inst.dst.name); }
+    var ai: i64 = 0;
+    var an: i64 = slice_len(inst.args) as i64;
+    while (ai < an) { sb_append_str(sb, " "); sb_append_str(sb, inst.args[ai].name); ai = ai + 1; }
+    return sb_to_str(sb);
+}
+
 pub fn tir_line(text: string) void {
     if (g_term) { return; }   // 终止符之后当前块不再发射（避免 ret 后出现死指令）
-    var tk: []string = tir_tokens(text);
-    append(g_cur_func.body, TIRInst{ op: tk[0], tokens: tk, is_comment: false, line: g_cur_line });
+    // 文本构造 → 结构化 TIRInst（层间只传结构，不传整行文本）。
+    append(g_cur_func.body, tir_parse_inst(text));
     // 终止符（ret / br / br_cond）之后当前块终止
     if (str_len(text) >= 2 && str_slice(text, 0, 2) == "br") { g_term = true; }
     else if (str_len(text) >= 3 && str_slice(text, 0, 3) == "ret") { g_term = true; }
@@ -220,7 +374,8 @@ pub fn tir_line(text: string) void {
 
 pub fn tir_cmt(text: string) void {
     if (g_term) { return; }
-    append(g_cur_func.body, TIRInst{ op: ";", tokens: tir_tokens(text), is_comment: true, line: g_cur_line });
+        var __cmt_args: []TirOperand = [];
+    append(g_cur_func.body, TIRInst{ op: ";", st: "", dst: TirOperand{ name: "" }, args: __cmt_args, is_comment: true, line: g_cur_line, cmt: text });
 }
 
 pub fn tir_block(label: string) void {
@@ -279,6 +434,7 @@ pub fn tir_scalar_st(name: string) string {
 // sema.tds[]（TypeDef 索引），二者不可混用；故直接扫 decl_list 的 VariantDecl 判定。
 pub fn t_td_is_variant(td: i64) bool {
     if (td < 0) { return false; }
+    if (td >= slice_len(sema.tds) as i64) { return false; }
     var t: TD = sema.tds[td];
     if (t.cat != "named") { return false; }
     var n: i64 = slice_len(lex.decl_list) as i64;
@@ -455,7 +611,11 @@ pub fn tir_expr_st(e: i64) string {
         if (n.td > 0 && n.td < slice_len(sema.tds) as i64) { return tir_st_of_td(n.td); }
         if (n.td > 0) { n.td = -1; }
         var idx: i64 = tir_find_local_idx(n.sa);
-        if (idx >= 0) { return g_local_sts[idx]; }
+        if (idx >= 0) {
+            // 影子表理论上同步（tir_new_named_slot 四表同时 append），此处为防御性上界保护。
+            if (idx >= slice_len(g_local_sts) as i64) { return "i64"; }
+            return g_local_sts[idx];
+        }
     }
     // 字面量保持旧行为（避免 meta_type_of_expr 的 u8 推断改变 const 宽度，破坏基线）
     if (kd == "float") { return "f64"; }   // 浮点字面量固定 f64：st_of_td 对字面节点返回 -1 → i64（错编）
@@ -472,6 +632,8 @@ pub fn tir_expr_st(e: i64) string {
 // 索引元素存储型：slice/array/vector → 元素 ST；string/bytes → i8；其余退化为 i64
 pub fn tir_elem_st(td: i64) string {
     if (td < 0) { return "i64"; }
+    // ⚠ 越界 TD 索引掩盖（同 tir_st_of_td 范式）：否则 match_demo 等用例 sema.tds[td] panic。
+    if (td >= slice_len(sema.tds) as i64) { return "i64"; }
     var t: TD = sema.tds[td];
     if (t.cat == "string" || t.cat == "bytes") { return "i8"; }
     if (t.cat == "slice") { return tir_st_of_td(t.elem); }
@@ -1821,9 +1983,16 @@ pub fn tir_emit_amp(n: Node) string {
 pub fn tir_emit_deref(e: i64) string {
     var n: Node = base.nodes[e];
     var addr: string = tir_emit_expr(n.na);   // ptr<ST> 承载 slot
-    var st: string = tir_expr_st(e);           // 解引用值类型 = 元素 ST
+    // 解引用值类型 = 指针元素类型：从 r 的 sema TD（ptr<ST>）剥离 ptr<>，避免 ll_get_st 跨模块调用
+    // 与 tir_expr_st 对 *r 的 meta_type_of_expr 越界退化。
+    var rst: string = tir_st_of_td(tir_expr_td(n.na));
+    var st: string = "i64";
+    if (str_len(rst) >= 5 && str_slice(rst, 0, 4) == "ptr<") {
+        st = str_slice(rst, 4, str_len(rst) - 1);
+    }
     var d: string = tir_tmp();
     tir_line(base.sb_cat6("load ", st, " ", d, " ", addr));
+    g_tir_last_st = st;
     return d;
 }
 
@@ -1863,12 +2032,25 @@ pub fn tir_emit_binary(n: Node) string {
         return tir_emit_logical(n, op == "&&");
     }
     var ls: string = tir_emit_expr(n.na);
+    // ⚠ 操作数存储型取「实际发射类型」g_tir_last_st（内层 emitter 已置为真实发射类型，
+    // 如 index_read→f64 / member_read→成员型），绝不走 tir_expr_st（meta_type_of_expr
+    // 对下标/字段表达式偶发返回越界 TD → 退化为 i64，导致 f64/u32 错编为 i64 整数运算）。
+    // 必须在发射 rs 之前捕获（发射 rs 会覆盖 g_tir_last_st）。tir_expr_st 仅作兜底。
+    var ost: string = g_tir_last_st;
+    if (ost == "i64") {
+        var s2: string = tir_expr_st(n.na);
+        if (s2 != "i64") { ost = s2; }
+    }
     var rs: string = tir_emit_expr(n.nb);
-    var ost: string = tir_expr_st(n.na);
     var opc: string = tir_binop(n.sa, ost);
     var d: string = tir_tmp();
     tir_line(base.sb_cat7(opc, " ", d, " ", ls, " ", rs));
-    g_tir_last_st = ost;   // 发射结果类型 = 操作数存储型（mul.f64 → "f64"），供上层 cast 取真实源类型
+    // 比较运算结果存储型为 i1（icmp/fcmp），其余（算术）为操作数存储型 ost。
+    if (n.sa == "==" || n.sa == "!=" || n.sa == "<" || n.sa == ">" || n.sa == "<=" || n.sa == ">=") {
+        g_tir_last_st = "i1";
+    } else {
+        g_tir_last_st = ost;   // 发射结果类型 = 操作数存储型（mul.f64 → "f64"），供上层 cast 取真实源类型
+    }
     return d;
 }
 
@@ -1927,10 +2109,10 @@ pub fn tir_binop(op: string, st: string) string {
     if (op == ">>") { return "ashr"; }
     if (op == "==") { return base.sb_cat2("eq.", st); }
     if (op == "!=") { return base.sb_cat2("ne.", st); }
-    if (op == "<") { return base.sb_cat2(tir_cmpop(op, st), st); }
-    if (op == "<=") { return base.sb_cat2(tir_cmpop("<=", st), st); }
-    if (op == ">") { return base.sb_cat2(tir_cmpop(">", st), st); }
-    if (op == ">=") { return base.sb_cat2(tir_cmpop(">=", st), st); }
+    if (op == "<") { return base.sb_cat3(tir_cmpop(op, st), ".", st); }
+    if (op == "<=") { return base.sb_cat3(tir_cmpop("<=", st), ".", st); }
+    if (op == ">") { return base.sb_cat3(tir_cmpop(">", st), ".", st); }
+    if (op == ">=") { return base.sb_cat3(tir_cmpop(">=", st), ".", st); }
     return "unsupported_binop";
 }
 
@@ -1956,7 +2138,12 @@ pub fn tir_cmpop(op: string, st: string) string {
 
 pub fn tir_emit_unary(n: Node) string {
     var a: string = tir_emit_expr(n.na);
-    var st: string = tir_expr_st(n.na);
+    // 同 binary：操作数存储型取实际发射类型 g_tir_last_st（内层 emitter 已置）。
+    var st: string = g_tir_last_st;
+    if (st == "i64") {
+        var s2: string = tir_expr_st(n.na);
+        if (s2 != "i64") { st = s2; }
+    }
     var d: string = tir_tmp();
     if (n.sa == "-") {
         tir_line(base.sb_cat6("neg.", st, " ", d, " ", a));
@@ -2331,7 +2518,9 @@ pub fn tir_emit_array_lit(e: i64, force_td: i64) string {
     var scap: string = tir_tmp();
     tir_line(base.sb_cat4("const.i64 ", scap, " ", base.i2s(N)));
     var szero: string = tir_tmp();
-    tir_line(base.sb_cat3("const.i64 ", szero, " 0"));
+    // ⚠ elem_size 必须是元素真实字节大小：tll_slice_at/append 用 data+idx*elem_size 寻址，
+    // 填 0 会让所有下标都返回元素 0（实测 sum_slice([10,20,30])=30、s[1]=1）。
+    tir_line(base.sb_cat4("const.i64 ", szero, " ", base.i2s(tir_sizeof(elem_st))));
     var fsb: StringBuilder = sb_new();
     sb_append_str(fsb, vptr);
     sb_append_str(fsb, " ");
@@ -2446,6 +2635,7 @@ pub fn tir_member_read(mnode: Node) string {
     var fldst: string = tir_field_st(sname, mnode.sa);
     var ld: string = tir_tmp();
     tir_line(base.sb_cat6("load ", fldst, " ", ld, " ", faddr));
+    g_tir_last_st = fldst;   // 字段读值类型 = 字段存储型（f64/u32 等），供上层 binary/unary/cast 取真实源类型
     return ld;
 }
 
@@ -2460,6 +2650,7 @@ pub fn tir_sizeof(st: string) i64 {
     if (st == "i16" || st == "u16") { return 2; }
     if (st == "i8" || st == "u8" || st == "bool") { return 1; }
     if (st == "%TStr") { return 16; }
+    if (st == "%TSlice") { return 32; }
     return 8;
 }
 
@@ -2518,6 +2709,7 @@ pub fn tir_emit_map_lit(e: i64, force_td: i64) string {
 }
 
 pub fn tir_emit_index_addr(ine: i64) string {
+    g_idx_is_value = false;   // 默认返回地址；str_at 分支内改为 true（见下）
     var n: Node = base.nodes[ine];
     var base_td: i64 = tir_expr_td(n.na);
     if (base_td < 0) {
@@ -2533,11 +2725,20 @@ pub fn tir_emit_index_addr(ine: i64) string {
     g_idx_elem_st = tir_elem_st(base_td);
     var dptr: string = base_slot;
     if (base_st == "%TSlice") {
-        dptr = tir_tmp();
-        tir_line(base.sb_cat5("gep ptr<void> ", dptr, " ", base_slot, " 0"));
+        // 切片下标：tll_slice_at(ptr <切片结构地址>, i64 <下标>) 返回元素地址（与旧轨 codegen_ll 逐字一致）。
+        // ⚠ 必须传「切片结构地址」(base_slot 即 alloca %TSlice，本就是地址)，绝不可 load 出 %TSlice 值当 ptr 传。
+        // 旧手写 gep ptr<void> 取出 .data 字段的方式在 TIR 结构化路径下会退化成「把结构当 i64 数组读」，故改用内建调用。
+        g_idx_is_value = false;
+        var eptr: string = tir_tmp();
+        tir_line(base.sb_cat6("slice_at ", eptr, " ", base_slot, " ", idx));
+        return eptr;
     } else if (base_st == "%TStr") {
-        dptr = tir_tmp();
-        tir_line(base.sb_cat5("gep ptr<i8> ", dptr, " ", base_slot, " 0"));
+        // 字符串下标：tll_str_at(ptr <结构地址>, i64 <下标>) 直接返回字节值(i64)，不可再 load。
+        g_idx_is_value = true;
+        g_idx_elem_st = "i64";
+        var eptr: string = tir_tmp();
+        tir_line(base.sb_cat6("str_at ", eptr, " ", base_slot, " ", idx));
+        return eptr;
     } else if (str_len(base_st) >= 4 && str_slice(base_st, 0, 4) == "arr<") {
         dptr = tir_tmp();
         tir_line(base.sb_cat6("addr_of ptr<", base_st, "> ", dptr, " ", base_slot));
@@ -2586,8 +2787,14 @@ pub fn tir_emit_index_addr(ine: i64) string {
 
 pub fn tir_emit_index_read(e: i64) string {
     var eptr: string = tir_emit_index_addr(e);
+    if (g_idx_is_value) {
+        // str_at：eptr 已是 i64 字节值，read 直接返回，无需 load。
+        g_tir_last_st = g_idx_elem_st;   // = "i64"
+        return eptr;
+    }
     var ld: string = tir_tmp();
     tir_line(base.sb_cat6("load ", g_idx_elem_st, " ", ld, " ", eptr));
+    g_tir_last_st = g_idx_elem_st;   // 下标读值类型 = 元素存储型（f64/u32 等，供上层 binary/unary/cast 取真实源类型）
     return ld;
 }
 
@@ -2765,9 +2972,14 @@ pub fn tir_emit_match(n: Node, as_stmt: bool) string {
         if (scr_vname != "") { break; }
         fi_v = fi_v + 1;
     }
+    // ⚠ 禁止 sema.variant_decl_of(scr_td)：它内部走 tip_kind/tip_name → 索引 tis[]（TypeInfo），
+    // 而 scr_td 是 sema.tds[] 索引；两表长度不同（如 tds=216 / tis=209）→ index_out_of_bounds。
+    // 按 TD 名走 decl_list 查 VariantDecl（与 t_td_is_variant 同一判定口径）。
     if (scr_vname == "") {
-        var svd2: i64 = sema.variant_decl_of(scr_td);
-        if (svd2 >= 0) { scr_vname = base.nodes[svd2].sa; }
+        if (scr_td >= 0 && scr_td < slice_len(sema.tds) as i64) {
+            var svd2: i64 = t_variant_decl_of_name(sema.tds[scr_td].name);
+            if (svd2 >= 0) { scr_vname = base.nodes[svd2].sa; }
+        }
     }
     // 取 scrutinee 的「指针基址」：变体以聚合值形态落在局部 slot（%Shape），需 addr_of 取其地址；
     // 若已是 ptr<%Shape>（如构造器返回值），直接作为基址。依据「实际 slot 类型」判断。
@@ -3017,10 +3229,10 @@ pub fn tir_to_text() string {
                 var inst: TIRInst = f.body[bi];
                 if (inst.is_comment) {
                     sb_append_str(sb, "  ; ");
-                    sb_append_str(sb, tir_join_toks(inst.tokens));
+                    sb_append_str(sb, inst.cmt);
                 } else {
                     sb_append_str(sb, "  ");
-                    sb_append_str(sb, tir_join_toks(inst.tokens));
+                    sb_append_str(sb, tir_inst_to_text(inst));
                 }
                 sb_append_str(sb, "\n");
                 bi = bi + 1;

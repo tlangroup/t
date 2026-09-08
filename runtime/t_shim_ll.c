@@ -103,6 +103,10 @@ void    tll_format_time(TStr* spec, int64_t t_us, int64_t use_local, TStr* out) 
 void    tll_format_time_tz(TStr* spec, int64_t t_us, int64_t tz_min, TStr* out) { *out = t_format_time_tz(*spec, t_us, tz_min); }
 int64_t tll_parse_time(TStr* spec, TStr* s, int64_t use_local) { return t_parse_time(*spec, *s, (int)use_local); }
 
+// ── 通用堆分配（定长数组槽用；栈 alloca 在数组地址流入逃逸 TSlice 并返回时会悬空，
+//     故改走持久堆，堆是栈的超集，对全部用例安全。基于 t_alloc（持久 malloc，非 arena）──
+void*   tll_alloc(int64_t size)                             { return t_alloc((size_t)size); }
+
 // ── slice ──────────────────────────────────────────────────────
 void    tll_slice_new(int64_t esz, TSlice* out)              { *out = t_slice_new(esz); }
 void    tll_slice_append(TSlice* s, void* elem, int64_t esz) { t_slice_append_sized(s, elem, esz); }

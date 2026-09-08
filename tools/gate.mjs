@@ -243,6 +243,18 @@ const steps = [
         },
     },
     {
+        // v3 S-1 安全机制：双轨对拍基线，冻结新管线退化。
+        // warn 级 —— 永不直接阻断门禁；任何不一致只记录，待切片推进逐步收敛。
+        // 不随 irClean 跳过：对拍基线必须随每次提交累积，否则退化为一次性数字。
+        id: "diffpipe", lv: 1, name: "双轨对拍 (旧轨 LLVM vs 新轨 TIR, warn)",
+        run: async () => {
+            const r = await node("_diffpipe.mjs", "--mode", "dbg", "--jobs", "4");
+            const lines = r.out.split("\n").filter((l) => l.startsWith("_diffpipe:"));
+            const summary = lines.length ? lines[lines.length - 1].replace(/^_diffpipe:\s*/, "") : lastLine(r.out, 2);
+            return { ok: true, warn: true, note: summary };
+        },
+    },
+    {
         id: "boot4", lv: 2, name: "自举四代不动点 (g2 == g3 == g4)",
         run: async () => {
             const r4 = await tc(`${G3}.exe`, "build", "src/tc.tc", "--output", G4);
