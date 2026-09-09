@@ -4782,8 +4782,30 @@ pub fn struct_field_ti(sname: string, fname: string) i64 {
 pub fn sema_idecl_infer_idents(m: i64) void {
     var mnd: Node = base.nodes[m];
     if (mnd.kind == "ident") {
-        infer_expr(m);
+        // 仅登记 idecl（供后端 shadowing 改名），不跑完整 infer_expr：完整推断会对
+        // 跨模块/类型名标识符误报「未定义」，且会重复做类型检查。这里只反查声明节点并
+        // 登记，解析不到（如跨模块名在兜底调用上下文不可见）则跳过——那些标识符本就不是
+        // 被 shadow 的局部，后端发裸名即可，无需 idecl。
+        var si: i64 = sym_lookup(cur_scope, mnd.sa);
+        if (si < 0) { si = sym_lookup(global_scope, mnd.sa); }
+        if (si >= 0) {
+            var s: Sym = syms[si];
+            if (s.decl >= 0) { base.idecl_set(m, s.decl); }
+        }
         return;
+    }
+    // 表达式子操作数常存于 na/nb（index/member/call/binary/unary/paren/deref/range/cast），
+    // 仅走 la 链会漏掉其中的标识符 → 其 idecl 表缺登记 → 后端 shadowing 改名时 idecl_get
+    // 查不到，发未唯一化的原名 → C 后端 clang 报 undeclared 'idx'/'lhstd'（cself 门禁炸点）。
+    // 对这些承载表达式的节点种类下探 na/nb；cast.nb 是类型描述（非表达式）须跳过，否则会把
+    // 类型名当值反查 idecl 误报未定义标识符。
+    if (mnd.kind == "index" || mnd.kind == "member" || mnd.kind == "call"
+        || mnd.kind == "binary" || mnd.kind == "unary" || mnd.kind == "paren"
+        || mnd.kind == "deref" || mnd.kind == "range") {
+        if (mnd.na >= 0) { sema_idecl_infer_idents(mnd.na); }
+        if (mnd.nb >= 0) { sema_idecl_infer_idents(mnd.nb); }
+    } else if (mnd.kind == "cast") {
+        if (mnd.na >= 0) { sema_idecl_infer_idents(mnd.na); }
     }
     var c: i64 = mnd.la;
     while (c >= 0) {
