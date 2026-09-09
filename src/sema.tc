@@ -4773,6 +4773,25 @@ pub fn struct_field_ti(sname: string, fname: string) i64 {
     return -1;
 }
 
+// ⚠ 兜底 idecl 回填（FS-2b 收尾）：递归收集节点子树内所有标识符并补调 infer_expr，
+// 使 C 后端 shadowing 改名能覆盖「嵌套在调用实参中的标识符」。
+// 典型现场：TirEmitRes{ name: d, st: tir_st_from_str(st) } —— 字段值 tir_st_from_str(st)
+// 是 call 节点，st 作为其实参位于结构体字面量字段内部，旧「仅 direct 字段值 ident」补调
+// 漏掉它 → C 后端发射改名时 idecl_get 查不到 st → 报 undeclared identifier。
+// 仅对 ident 调 infer_expr（记录其解析到的声明节点），不改写 IR、对 LLVM 后端无碍、幂等。
+pub fn sema_idecl_infer_idents(m: i64) void {
+    var mnd: Node = base.nodes[m];
+    if (mnd.kind == "ident") {
+        infer_expr(m);
+        return;
+    }
+    var c: i64 = mnd.la;
+    while (c >= 0) {
+        sema_idecl_infer_idents(base.kids[c].val);
+        c = base.kids[c].next;
+    }
+}
+
 pub fn infer_expr(e: i64) i64 {
     var n: Node = base.nodes[e];
     if (is_pipe_kind(n.kind) == true) {
@@ -6398,6 +6417,21 @@ pub fn infer_expr(e: i64) i64 {
                 }
                 c2 = base.kids[c2].next;
             }
+        }
+        // ⚠ 兜底：对结构体字面量「所有字段值」递归收集其中标识符并补调 infer_expr，
+        // 使其进入 idecl 表（记录该标识符解析到的声明节点），供 C 后端按声明唯一化命名
+        // （shadowing）。否则 TirEmitRes{name: z} / {name: d} 等字段内的标识符、以及
+        // TirEmitRes{ st: tir_st_from_str(st) } 这类「标识符嵌套在调用实参中」的现场不会进
+        // idecl 表 → C 后端发射改名时 idecl_get 查不到 → 报 undeclared identifier。
+        // 仅对 ident 调 infer_expr，不重写 IR、不改变广义类型推断，对 LLVM 后端无碍、幂等。
+        // 嵌套 struct_lit 字段值由上方 g_lead_expect 上下文块处理，此处递归会自动覆盖其
+        // 内部标识符（其自身 struct_lit 分支会再补调本兜底，故不漏）。
+        // 注意：fv3.na 才是字段「值节点」；fv3（FV 节点）本身无子节点可遍历，必须传 .na。
+        var c3: i64 = n.la;
+        while (c3 >= 0) {
+            var fv3: Node = base.nodes[base.kids[c3].val];
+            if (fv3.na >= 0) { sema_idecl_infer_idents(fv3.na); }
+            c3 = base.kids[c3].next;
         }
         return ti_named("Struct", n.sa);
     }
