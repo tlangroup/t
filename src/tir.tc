@@ -968,6 +968,30 @@ pub fn tir_expr_td(e: i64) i64 {
         var idx: i64 = tir_find_local_idx(n.sa);
         if (idx >= 0) { d = g_local_tds[idx]; }
     }
+    // 结构体字段访问（member）：用基底类型 + 字段名查字段 TD。
+    // ⚠ 缺此分支时 tir_expr_td(c.opts) 退化到 meta_type_of_expr 返回错类型（i64），
+    // 导致 map 索引读 tir_emit_index_addr 永不进入 cat=="map" 分支 → 返回 0（c.opts[k] 恒为 0）。
+    // ⚠ 注意：tir_expr_td 顶部有 node.td 缓存早返回，member 节点 .td 易残留污染，
+    //   故本分支对「缓存命中但类型不对」的情况无效；map 索引读路径在 tir_emit_index_addr 另做强制校正。
+    if (d < 0 && n.kind == "member") {
+        var base_e: i64 = n.na;
+        var btd: i64 = tir_expr_td(base_e);
+        if (btd >= 0) {
+            var bst: string = tir_st_of_td(btd);
+            if (str_len(bst) > 0 && bst[0] == '%') {
+                var sname: string = str_slice(bst, 1, str_len(bst));
+                d = tir_field_td(sname, n.sa);
+            }
+        }
+    }
+    // 嵌套索引 m[k1][k2]：lhs.na 是 index 节点（非 ident），meta_type_of_expr 在发射期
+    // cur_scope 非本函数作用域 → sym_lookup 取不到局部 → 返回 -1。直接递归 tir_expr_td
+    // （ident 分支走 g_local_tds，与 cur_scope 无关）并从 TD 的 val/elem 取元素类型。
+    if (d < 0 && n.kind == "index") {
+        var btd: i64 = tir_expr_td(n.na);
+        if (btd >= 0 && sema.tds[btd].cat == "map") { d = sema.tds[btd].val; }
+        else if (btd >= 0 && (sema.tds[btd].cat == "array" || sema.tds[btd].cat == "slice")) { d = sema.tds[btd].elem; }
+    }
     if (d < 0) {
         var tnode: i64 = sema.meta_type_of_expr(e);
         if (tnode >= slice_len(base.nodes) as i64) { }
@@ -1129,6 +1153,22 @@ pub fn tir_field_st(structname: string, fieldname: string) string {
         c = k.next;
     }
     return "i64";
+}
+
+pub fn tir_field_td(structname: string, fieldname: string) i64 {
+    var fh: i64 = sema.find_struct_fields(structname);
+    if (fh < 0) { return -1; }
+    var c: i64 = fh;
+    while (c >= 0) {
+        var k: Child = base.kids[c];
+        var f: Node = base.nodes[k.val];
+        if (f.sa == fieldname) {
+            if (f.na >= 0) { return sema.resolve_type_desc(f.na); }
+            return -1;
+        }
+        c = k.next;
+    }
+    return -1;
 }
 
 pub fn tir_field_index(structname: string, fieldname: string) i64 {
@@ -1867,11 +1907,16 @@ pub fn tir_emit_stmt(sid: i64) void {
         if (n.na >= 0) {
             var rk: Node = base.nodes[n.na];
             var s: string;
-            if (rk.kind == "array_lit" && g_cur_ret_td >= 0 && sema.tds[g_cur_ret_td].cat == "array") {
-                var __er1: TirEmitRes = tir_emit_array_lit(n.na, g_cur_ret_td); s = __er1.name;
-            } else {
-                var __er2: TirEmitRes = tir_emit_expr(n.na); s = __er2.name;
-            }
+        if (rk.kind == "array_lit" && g_cur_ret_td >= 0 && sema.tds[g_cur_ret_td].cat == "array") {
+            var __er1: TirEmitRes = tir_emit_array_lit(n.na, g_cur_ret_td); s = __er1.name;
+        } else if (rk.kind == "map_lit" && g_cur_ret_td >= 0 && sema.tds[g_cur_ret_td].cat == "map") {
+            // ⚠ map 字面量作返回值：tir_emit_expr 落到 map_lit 分支时 force_td=-1，
+            // 而 tir_expr_td 对 map_lit 不可靠（sema 不回填 .td），会触发 untyped 兜底返回 0 指针 → 段错误。
+            // 故此处显式用函数返回类型 TD 构造（与 array_lit 返回降级同构）。
+            var __er1m: TirEmitRes = tir_emit_map_lit(n.na, g_cur_ret_td); s = __er1m.name;
+        } else {
+            var __er2: TirEmitRes = tir_emit_expr(n.na); s = __er2.name;
+        }
             tir_emit(tir_emit_ret(g_cur_func.ret_st, s));
         } else {
             tir_emit(tir_emit_ret_void());
@@ -2001,6 +2046,20 @@ pub fn tir_emit_while(n: Node) void {
 pub fn tir_emit_for_each(n: Node) void {
     if (g_term) { return; }
     var coll_td: i64 = tir_expr_td(n.na);
+    // ⚠ member 基底（如 c.opts）：tir_expr_td 对 member 节点不可靠（node.td 缓存易污染，
+    //   常返回 i64 等错类型），导致 for_each 走入 unsupported 分支、迭代 0 次（map_advanced 末段
+    //   for (ck, cv in c.opts) 漏迭代）。用「结构体基底类型 + 字段名」强制查字段 TD 校正
+    //   （与 tir_emit_index_addr 的 member 校正同构）。
+    if (base.nodes[n.na].kind == "member") {
+        var mbtd: i64 = tir_expr_td(base.nodes[n.na].na);
+        if (mbtd >= 0) {
+            var mbst: string = tir_st_of_td(mbtd);
+            if (str_len(mbst) > 0 && mbst[0] == '%') {
+                var ftd: i64 = tir_field_td(str_slice(mbst, 1, str_len(mbst)), base.nodes[n.na].sa);
+                if (ftd >= 0) { coll_td = ftd; }
+            }
+        }
+    }
     if (coll_td < 0) { tir_cmt("unsupported for_each: untyped collection"); return; }
     var ct: TD = sema.tds[coll_td];
     var etd: i64 = -1;
@@ -2171,6 +2230,10 @@ pub fn tir_emit_assign(n: Node, est: i64) TirEmitRes {
             if (lhn.kind == "ident") {
                 var idx: i64 = tir_find_local_idx(lhn.sa);
                 if (idx >= 0) { lhstd = g_local_tds[idx]; }
+            } else if (lhn.kind == "index") {
+                // 嵌套 map：LHS 是 m[k]，值类型 = 外层 map 的 val TD（递归构造内层的上下文类型）。
+                var btd: i64 = tir_expr_td(lhn.na);
+                if (btd >= 0 && sema.tds[btd].cat == "map") { lhstd = sema.tds[btd].val; }
             }
             var __er4: TirEmitRes = tir_emit_map_lit(n.nb, lhstd); rhs = __er4.name;
         } else {
@@ -2217,6 +2280,40 @@ pub fn tir_emit_assign(n: Node, est: i64) TirEmitRes {
                 tir_cmt("assign to member (unsupported base)");
             }
         } else if (lhs.kind == "index") {
+            // map 索引写：tll_map_put 插入/覆盖。
+            // ⚠ 不能用 tll_map_val_ptr + store：val_ptr 是「查表返回已有值地址」，
+            // 对新键不登记键，store 进的是未注册内存 → 读回恒为 0（map_assign 整例 "00000"）。
+            // 与 tir_emit_map_lit(3089) 同构：mhp=load 句柄槽、kp=键指针、vp=addr_of(右值)、call tll_map_put。
+            var base_td: i64 = tir_expr_td(lhs.na);
+            if (base_td >= 0 && sema.tds[base_td].cat == "map") {
+            var mt: TD = sema.tds[base_td];
+            var mbslotr: TirEmitRes = tir_emit_expr(lhs.na); var mbs: string = mbslotr.name;
+            // ⚠ 嵌套 map 写（如 deep["a"]["x"]=v）：lhs.na 为 index/deref 时 tir_emit_expr 已返回
+            // 「容器句柄值」，直接作 tll_map_put 的容器句柄；若再 load 会双重解引用，把值存进
+            // *容器 而非容器本身。ident/member 基址返回 slot，须 load 取出句柄。
+            var sbkind: string = base.nodes[lhs.na].kind;
+            var mhp: string;
+            if (sbkind == "index" || sbkind == "deref") { mhp = mbs; }
+            else {
+                mhp = tir_tmp();
+                tir_emit(TIRInst{ op: TIR_OP_LOAD, st: tir_st_from_str("ptr<void>"), dst: tir_op(mhp), args: tir_a1(mbs), is_comment: false, line: g_cur_line, cmt: "" });
+            }
+                var vst: string = tir_st_of_td(mt.val);
+                var ksr: TirEmitRes = tir_emit_expr(lhs.nb); var ks: string = ksr.name;
+                var kst: string = tir_expr_st(lhs.nb);
+                var kc: string = ks;
+                if (kst != "i64") { kc = tir_tmp(); tir_emit(TIRInst{ op: TIR_OP_ZEXT, st: tir_st_from_str("i64"), dst: tir_op(kc), args: tir_a1(ks), is_comment: false, line: g_cur_line, cmt: "" }); }
+                var kp: string = tir_tmp();
+                if (sema.tds[mt.key].cat == "string") {
+                    tir_emit(TIRInst{ op: TIR_OP_ADDR_OF, st: tir_st_from_str("%TStr"), dst: tir_op(kp), args: tir_a1(ks), is_comment: false, line: g_cur_line, cmt: "" });
+                } else {
+                    tir_emit(TIRInst{ op: TIR_OP_ADDR_OF, st: tir_st_from_str("ptr<i64>"), dst: tir_op(kp), args: tir_a1(kc), is_comment: false, line: g_cur_line, cmt: "" });
+                }
+                var vp: string = tir_tmp();
+                tir_emit(TIRInst{ op: TIR_OP_ADDR_OF, st: tir_st_from_str(vst), dst: tir_op(vp), args: tir_a1(rhs), is_comment: false, line: g_cur_line, cmt: "" });
+                tir_emit(TIRInst{ op: TIR_OP_CALL, st: tir_st_from_str("void"), dst: tir_op(""), args: tir_a4("@tll_map_put", mhp, kp, vp), is_comment: false, line: g_cur_line, cmt: "" });
+                return TirEmitRes{ name: rhs, st: est };
+            }
             var eptr: string = tir_emit_index_addr(n.na);
             tir_emit(TIRInst{ op: TIR_OP_STORE, st: ST_NONE, dst: tir_op(eptr), args: tir_a1(rhs), is_comment: false, line: g_cur_line, cmt: "" });
             return TirEmitRes{ name: rhs, st: est };
@@ -2841,7 +2938,19 @@ pub fn tir_emit_struct_lit(e: i64) TirEmitRes {
         // 字段以 FV（field-value）节点存储：na = 字段值表达式（见 base.mk_FV）；
         // 直接 emit FV 节点会落到 unsupported 兜底，故必须解包到其 .na 值子节点。
         var fv: Node = base.nodes[k.val];
-        var fsr: TirEmitRes = tir_emit_expr(fv.na); var fs: string = fsr.name;
+        var fs: string;
+        if (str_len(n.sa) > 0 && base.nodes[fv.na].kind == "map_lit") {
+            // ⚠ map 字面量作具名结构体字段值：tir_emit_expr 落到 map_lit 分支时 force_td=-1，
+            // tir_expr_td 不可靠 → untyped 兜底返回 0 指针。显式用字段类型 TD 构造。
+            var ftd: i64 = tir_field_td(n.sa, fv.sa);
+            if (ftd >= 0 && sema.tds[ftd].cat == "map") {
+                var fsrm: TirEmitRes = tir_emit_map_lit(fv.na, ftd); fs = fsrm.name;
+            } else {
+                var fsr2: TirEmitRes = tir_emit_expr(fv.na); fs = fsr2.name;
+            }
+        } else {
+            var fsr: TirEmitRes = tir_emit_expr(fv.na); fs = fsr.name;
+        }
         append(__sl_args, tir_op(fs));
         fc = k.next;
     }
@@ -2952,7 +3061,11 @@ pub fn tir_member_addr(mnode: Node) string {
     var fidx: i64 = tir_field_index(sname, mnode.sa);
     var fldst: string = tir_field_st(sname, mnode.sa);
     var faddr: string = tir_tmp();
-    tir_emit(TIRInst{ op: TIR_OP_GEP, st: tir_st_from_str(fldst), dst: tir_op(faddr), args: tir_a2(addr, base.i2s(fidx)), is_comment: false, line: g_cur_line, cmt: "" });
+    // ⚠ 结构体字段 GEP 必须带前导 i32 0（索引「结构体数组第 0 个」），再接字段下标：
+    // `getelementptr %S, ptr %base, i32 0, i32 <fidx>`。若只给单下标 `i32 <fidx>` 会被 LLVM 当作
+    // 「结构体数组第 <fidx> 个元素」→ 越界读到结构体之外的垃圾地址（单字段结构 field0 因偏移 0 巧合正确，
+    // 多字段结构 field1+ 必然读错 / 段错误）。闭包 GEP 自己已带前导 0，不受影响。
+    tir_emit(TIRInst{ op: TIR_OP_GEP, st: tir_st_from_str(fldst), dst: tir_op(faddr), args: tir_a3(addr, "0", base.i2s(fidx)), is_comment: false, line: g_cur_line, cmt: "" });
     return faddr;
 }
 
@@ -3052,13 +3165,8 @@ pub fn tir_emit_map_lit(e: i64, force_td: i64) TirEmitRes {
     var valtd: i64 = mt.val;
     // ⚠ 放宽「聚合值」限制：tll_map_put(ptr, ptr, ptr) 按 val_size 字节指针拷贝，
     //   字符串/具名/结构/切片/数组值均可通过 addr_of + sizeof 正确落库（与 emit-ll 的 ll_build_map_lit 对齐）。
-    //   仅嵌套 map 值（递归构造）保留为不支持，避免构造期递归复杂度。
-    if (valtd >= 0 && sema.tds[valtd].cat == "map") {
-        tir_cmt("unsupported expr: map_lit (nested map val)");
-        var z: string = tir_tmp();
-        tir_emit(TIRInst{ op: TIR_OP_CONST, st: tir_st_from_str("i64"), dst: tir_op(z), args: tir_a1("0"), is_comment: false, line: g_cur_line, cmt: "" });
-        return TirEmitRes{ name: z, st: tir_st_from_str(tir_expr_st(e)) };
-    }
+    //   嵌套 map 值现支持：map 的 val 即内层 map 句柄(ptr<void>, 8B)，构造期递归 emit 内层字面量，
+    //   外层 tll_map_put 按 8B 把句柄指针拷贝入库（见下方 entry 循环 map_val 分支）。
     var keykind: i64 = 1;
     if (sema.tds[mt.key].cat == "string") { keykind = 0; }
     var valst: string = tir_st_of_td(valtd);
@@ -3083,7 +3191,14 @@ pub fn tir_emit_map_lit(e: i64, force_td: i64) TirEmitRes {
         } else {
             tir_emit(TIRInst{ op: TIR_OP_ADDR_OF, st: tir_st_from_str("ptr<i64>"), dst: tir_op(kp), args: tir_a1(kc), is_comment: false, line: g_cur_line, cmt: "" });
         }
-        var vsr: TirEmitRes = tir_emit_expr(en.nb); var vs: string = vsr.name;
+        var vsr: TirEmitRes;
+        if (valtd >= 0 && sema.tds[valtd].cat == "map" && base.nodes[en.nb].kind == "map_lit") {
+            // 嵌套 map 值：递归构造内层字面量（force_td=valtd 提供内层类型上下文），返回内层句柄。
+            vsr = tir_emit_map_lit(en.nb, valtd);
+        } else {
+            vsr = tir_emit_expr(en.nb);
+        }
+        var vs: string = vsr.name;
         var vp: string = tir_tmp();
         tir_emit(TIRInst{ op: TIR_OP_ADDR_OF, st: tir_st_from_str(valst), dst: tir_op(vp), args: tir_a1(vs), is_comment: false, line: g_cur_line, cmt: "" });
         tir_emit(TIRInst{ op: TIR_OP_CALL, st: tir_st_from_str("void"), dst: tir_op(""), args: tir_a4("@tll_map_put", m, kp, vp), is_comment: false, line: g_cur_line, cmt: "" });
@@ -3096,6 +3211,19 @@ pub fn tir_emit_index_addr(ine: i64) string {
     g_idx_is_value = false;   // 默认返回地址；str_at 分支内改为 true（见下）
     var n: Node = base.nodes[ine];
     var base_td: i64 = tir_expr_td(n.na);
+    // ⚠ member 基底（如 c.opts[k]）：tir_expr_td 对 member 节点不可靠（node.td 缓存易污染 /
+    //   历史无 member 分支），会返回 i64 等错类型，导致下方 map 分支永不进入、索引读恒为 0。
+    // 故此处用「结构体基底类型 + 字段名」强制查字段 TD 校正（与 tir_field_td 同构）。
+    if (base.nodes[n.na].kind == "member") {
+        var mbtd: i64 = tir_expr_td(base.nodes[n.na].na);
+        if (mbtd >= 0) {
+            var mbst: string = tir_st_of_td(mbtd);
+            if (str_len(mbst) > 0 && mbst[0] == '%') {
+                var ftd: i64 = tir_field_td(str_slice(mbst, 1, str_len(mbst)), base.nodes[n.na].sa);
+                if (ftd >= 0) { base_td = ftd; }
+            }
+        }
+    }
     if (base_td < 0) {
         tir_cmt("unsupported index base (untyped)");
         var z: string = tir_tmp();
@@ -3135,8 +3263,19 @@ pub fn tir_emit_index_addr(ine: i64) string {
         // 须 load 出真正的 TMap* 句柄再传给 tll_map_val_ptr
         // （与 map_get builtin 里 ll_load(toks[4], "ptr") 同构；否则 tll_map_val_ptr 收到
         // 的是 slot 地址而非句柄，查表错乱 → 索引读恒返回 0）。
-        var mhp: string = tir_tmp();
-        tir_emit(TIRInst{ op: TIR_OP_LOAD, st: tir_st_from_str("ptr"), dst: tir_op(mhp), args: tir_a1(base_slot), is_comment: false, line: g_cur_line, cmt: "" });
+        // ⚠ 容器句柄来源的统一规则（取决于 tir_emit_expr 对各类基底返回的是 slot 还是值）：
+        //   - ident 局部 map 变量：tir_emit_expr 返回 slot（alloca），须 load 取出句柄；
+        //   - member 结构体字段 / call 返回值 / index·deref 嵌套 map：tir_emit_expr 已返回「句柄值」，
+        //     直接作为容器句柄传给 tll_map_val_ptr；若再 load 会双重解引用 → 段错误 / 读错容器。
+        // （旧注释称 ident/member 均返回 slot 是错误的：tir_member_read 末段 `load fldst` 已取回字段值。）
+        var bkind: string = base.nodes[n.na].kind;
+        var mhp: string;
+        if (bkind == "ident") {
+            mhp = tir_tmp();
+            tir_emit(TIRInst{ op: TIR_OP_LOAD, st: tir_st_from_str("ptr"), dst: tir_op(mhp), args: tir_a1(base_slot), is_comment: false, line: g_cur_line, cmt: "" });
+        } else {
+            mhp = base_slot;
+        }
         var valtd: i64 = mt.val;
         var valst: string = tir_st_of_td(valtd);
         // 聚合值（string/named/struct/array/slice）与标量同构：runtime 按 val_size 字节

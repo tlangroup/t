@@ -41,6 +41,9 @@ pub var g_clo_consts: []string;          // 已发射的「裸函数引用 → %
 pub var g_clo_constbuf: StringBuilder;    // 闭包常量全局声明缓冲（模块末尾统一 emit，避免插进函数体）
 pub var g_cur_sret: string = "";          // 当前函数若以 sret 返回聚合（>16B struct），记录 sret 槽名；否则空串
 pub var g_ll_struct_fieldtys: [][]string; // 用户聚合类型名 → 字段存储类型列表（并行 g_ll_struct_types），供 sizeof 计算
+pub var g_ll_valptr: []string;   // 槽名集合：内容为「值字节指针(val_ptr，如 tll_map_val_ptr 返回值)」。
+                                  // load 此类槽须解引用（load ptr, ptr (load ptr, ptr %x)）取回真正的值；
+                                  // 普通 ptr 槽（如 map_new 句柄）load 只取槽中值本身，两者均属 ptr 类型故需显式标记区分。
 
 pub fn ll_tmp() string {
     var v: i64 = g_ll_tmpc;
@@ -78,6 +81,7 @@ pub fn ll_reset() void {
     g_clo_constbuf = sb_new();
     g_cur_sret = "";
     g_ll_struct_fieldtys = [];
+    g_ll_valptr = [];
 }
 
 // 剥离操作数名尾部的 .s<ST码> 后缀（与 tir.tc tir_op_tok 同义），使带类型后缀的
@@ -158,6 +162,22 @@ pub fn ll_is_func(name: string) bool {
 // 必须包装成 %TClosure { ptr @fn, ptr null } 方能接入 call_ind 的 code/env 解包 ABI
 // （否则 call_ind 会把函数机器码首字节当 code 指针 → 段错误）。
 // 返回一个指向该常量 %TClosure 的全局符号名（opaque ptr，可作 ptr<void> 用）。
+
+// 标记/查询某槽是否为「值字节指针(val_ptr)」：内容是 ptr，load 该槽须二次解引用取回值。
+pub fn ll_mark_valptr(name: string) void {
+    name = ll_strip_suf(name);
+    var n: i64 = slice_len(g_ll_valptr) as i64;
+    var i: i64 = 0;
+    while (i < n) { if (g_ll_valptr[i] == name) { return; } i = i + 1; }
+    append(g_ll_valptr, name);
+}
+pub fn ll_is_valptr(name: string) bool {
+    name = ll_strip_suf(name);
+    var n: i64 = slice_len(g_ll_valptr) as i64;
+    var i: i64 = 0;
+    while (i < n) { if (g_ll_valptr[i] == name) { return true; } i = i + 1; }
+    return false;
+}
 pub fn ll_emit_closure_const(fnname: string) string {
     var sym: string = "@" + fnname;            // 含 @ 前缀，如 @__lam_4
     var gname: string = "@.tirll_clo_" + fnname;
@@ -260,6 +280,17 @@ pub fn ll_ensure_slot(tname: string, st: string) void {
     sb_append_str(g_ll, " = alloca ");
     sb_append_str(g_ll, st_to_ll(st));
     sb_append_str(g_ll, "\n");
+    // ⚠ 聚合槽零初始化：无初始化器的 slice/string 局部变量（如 `var out: []K;`）alloca 后
+    // 若不置零，t_slice_append / t_str_* 会读到垃圾 ptr/len/cap → arena OOM 或越界
+    // （maputil_demo 的 maputil.keys/values 即此：未初始化 slice 被 append 撑爆 arena）。
+    // 与 canonical codegen_ll 的 `TSlice out = {0}` 同构。定长数组(arr<>) 走上方堆分配分支，不在此处理。
+    if (st == "%TSlice" || st == "%TStr") {
+        sb_append_str(g_ll, "  store ");
+        sb_append_str(g_ll, st_to_ll(st));
+        sb_append_str(g_ll, " zeroinitializer, ptr ");
+        sb_append_str(g_ll, ll_llname(tname));
+        sb_append_str(g_ll, "\n");
+    }
 }
 
 // 取 $x 承载值的 LLVM 寄存器（load 出 alloca）
@@ -552,6 +583,10 @@ pub fn ll_ptr_inner(st: string) string {
 //      故装载后 sext/zext 到 i64 再存 scratch，返回 scratch 地址。
 pub fn ll_map_argptr(tname: string, st: string) string {
     if (ll_starts(st, "ptr<") || st == "ptr") {
+        // ⚠ 仅用于「字面量降级」路径（tir.tc 已对 map 值做 TIR_OP_ADDR_OF，vp 槽持 &vs）：
+        // ll_load 取出 &vs（值存储地址），tll_map_put 据此 memcpy 入库，正确。
+        // 「map_set/map_put 内置」路径的值槽持「句柄/指针值本身」（未 addr_of），不能走此分支，
+        // 须在其处理器内用 ll_llname_ptr 取 &slot（见 map_set/put handler 的 cn 分支）。
         return ll_load(tname, st);
     }
     if (ll_is_scalar_st(st) == false) {
@@ -1293,7 +1328,17 @@ pub fn ll_emit_builtin(cn: string, toks: []string) bool {
             return true;
         }
         var vst: string = ll_get_st(toks[argbase + 2]);
-        var vr: string = ll_map_argptr(toks[argbase + 2], vst);
+        var vr: string;
+        if (cn == "tll_map_put") {
+            // 字面量降级：tir.tc 已对值做 TIR_OP_ADDR_OF（vp 槽持 &vs），ll_map_argptr 的 ll_load
+            // 取出 &vs（值存储地址），tll_map_put 据此 memcpy 入库，正确。
+            vr = ll_map_argptr(toks[argbase + 2], vst);
+        } else {
+            // ⚠ map_set/map_put 通用内置：值槽持「句柄/指针值本身」（未 addr_of），
+            // 不能 ll_load 出值再当 val 传（runtime 会 memcpy 从「值指向的内存」读 8 字节 → 损坏/段错误）。
+            // 须取槽地址 &slot：tll_map_put 按 val_size 字节从「槽地址」memcpy 入库（句柄/指针值即正确）。
+            vr = ll_llname_ptr(toks[argbase + 2]);
+        }
         var tlln: string = "tll_map_put";
         ll_maybe_declare(tlln, "void", ["ptr", "ptr", "ptr"]);
         var mr: string = ll_load(toks[argbase], "ptr");
@@ -1432,10 +1477,34 @@ pub fn ll_emit_builtin(cn: string, toks: []string) bool {
         sb_append_str(g_ll, ")\n");
         return true;
     }
-    // ── append：runtime t_slice_append 自切片元数据推断元素大小，返回 void；TIR 期望 i64，补 0 ──
+    // ── append：用 t_slice_append_sized 携带元素大小 ──
+    // ⚠ 零初始化的 slice（FIX 5 已置 zeroinitializer）elem_size==0，runtime 首 append 时
+    // 按传入 elem_size 自动定型。若用 t_slice_append（自元数据推断）则 elem_size 恒 0 →
+    // memcpy 0 字节 → 元素全垃圾（maputil_demo 曾输出 "2010044703744..."）。
+    // 元素大小由「待追加值」的 LLVM 类型推导：getelementptr <est>, ptr null, i32 1 → ptrtoint to i64。
     if (cn == "append") {
-        ll_call_void("t_slice_append", ["ptr", "ptr"],
-                     [ll_llname(toks[4]), ll_llname(toks[5])]);
+        var est: string = ll_get_st(toks[5]);          // 元素 LLVM 类型（%TStr/i64/ptr…）
+        var esz: string = ll_tmp();                    // 临时名承载 sizeof(元素)
+        ll_maybe_declare("t_slice_append_sized", "void", ["ptr", "ptr", "i64"]);
+        // 计算 sizeof(元素)
+        sb_append_str(g_ll, "  ");
+        sb_append_str(g_ll, esz);
+        sb_append_str(g_ll, ".gep = getelementptr ");
+        sb_append_str(g_ll, est);
+        sb_append_str(g_ll, ", ptr null, i32 1\n");
+        sb_append_str(g_ll, "  ");
+        sb_append_str(g_ll, esz);
+        sb_append_str(g_ll, " = ptrtoint ptr ");
+        sb_append_str(g_ll, esz);
+        sb_append_str(g_ll, ".gep to i64\n");
+        // 调用 t_slice_append_sized(slice_ptr, elem_ptr, elem_size)
+        sb_append_str(g_ll, "  call void @t_slice_append_sized(ptr ");
+        sb_append_str(g_ll, ll_llname(toks[4]));
+        sb_append_str(g_ll, ", ptr ");
+        sb_append_str(g_ll, ll_llname(toks[5]));
+        sb_append_str(g_ll, ", i64 ");
+        sb_append_str(g_ll, esz);
+        sb_append_str(g_ll, ")\n");
         ll_ensure_slot(d, "i64"); ll_set_st(d, "i64"); ll_store(d, "i64", "0");
         return true;
     }
@@ -2024,8 +2093,22 @@ pub fn ll_emit_inst(inst: TIRInst) void {
         var pst: string = ll_get_st(addr);
         var p: string;
         if (ll_starts(pst, "ptr<") || pst == "ptr") {
-            if (st == "ptr" || ll_starts(st, "ptr<")) {
-                p = ll_llname_ptr(addr);
+            // ⚠ 源槽为 val_ptr（tll_map_val_ptr 返回值，内容是「值字节指针」）：
+            // load 须先取槽中指针(vb)、再解引用取回真值（handle / 值）。
+            // 普通 ptr 槽（map_new 句柄）load 只取槽中值本身，不能解引用。两者类型同为 ptr
+            // 故用 g_ll_valptr 显式区分：val_ptr 槽走 ll_load 取 vb 后再 load，普通 ptr 槽走 ll_llname_ptr。
+            if (ll_is_valptr(addr)) {
+                p = ll_load(addr, pst);
+            } else if (st == "ptr" || ll_starts(st, "ptr<")) {
+                // ⚠ 源槽 st == ptr<目标> 时，源槽持有「指向目标的指针（地址）」（典型：GEP 结果 /
+                // 结构体 ptr 字段读取 —— 结构体字段 GEP 返回字段地址，槽 st 记为 ptr<fldst>）。
+                // 此时 load 须先解引用取回真值（如 map 句柄），不能把地址当值读出。
+                // 源槽 st == 目标 st 时（map_new 句柄等直接持有值的 ptr 槽）用槽地址读出即可。
+                if (pst == base.sb_cat3("ptr<", st, ">")) {
+                    p = ll_load(addr, pst);
+                } else {
+                    p = ll_llname_ptr(addr);
+                }
             } else {
                 p = ll_load(addr, pst);
             }
@@ -2326,6 +2409,10 @@ pub fn ll_emit_inst(inst: TIRInst) void {
         ll_ensure_slot(d, st);
         ll_set_st(d, st);
         ll_store(d, st, r);
+        // ⚠ val_ptr 标记：tll_map_val_ptr/tll_map_val_at 返回「值字节指针」，内容是 ptr；
+        // 存于槽后 load 此槽须二次解引用（load ptr, ptr (load ptr, ptr %x)）取回真值。
+        // 不标记则 load 只取槽中指针本身(val_ptr)，嵌套读/写会把 val_ptr 当容器 → 段错误。
+        if (fname == "tll_map_val_ptr" || fname == "tll_map_val_at") { ll_mark_valptr(d); }
         return;
     }
     if (op == TIR_OP_CALL_IND) {
