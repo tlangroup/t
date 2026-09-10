@@ -996,7 +996,15 @@ pub fn tir_expr_st(e: i64) string {
         }
     }
     // 字面量保持旧行为（避免 meta_type_of_expr 的 u8 推断改变 const 宽度，破坏基线）
-    if (kd == "float") { return "f64"; }   // 浮点字面量固定 f64：st_of_td 对字面节点返回 -1 → i64（错编）
+    if (kd == "float") {
+        // 浮点字面量按上下文真实类型（f32/f64）发射：否则 `var x: float = 1.5` 会存成
+        // f64 常量进 f32 槽 → 值错配（literal_demo: single=1.5 打成 -1.1e-17）。
+        // 越界/非浮点 TD 回落 f64，避免 tir_st_of_td(-1)→i64 误编。
+        var ftd: i64 = sema.resolve_type_desc(e);
+        var fst: string = tir_st_of_td(ftd);
+        if (fst == "f32" || fst == "f64") { return fst; }
+        return "f64";
+    }
     if (kd == "int" || kd == "bool" || kd == "char" ||
         kd == "null" || kd == "opt_none" || kd == "string") {
         return tir_st_of_td(sema.resolve_type_desc(e));
@@ -2734,8 +2742,7 @@ pub fn tir_maybe_array_to_slice(src: string, srce: i64) string {
     tir_emit(TIRInst{ op: TIR_OP_CONST, st: tir_st_from_str("i64"), dst: tir_op(nl), args: tir_a1(base.i2s(sema.tds[std].alen)), is_comment: false, line: g_cur_line, cmt: "" });
     var ez: string = tir_tmp();
     tir_emit(TIRInst{ op: TIR_OP_CONST, st: tir_st_from_str("i64"), dst: tir_op(ez), args: tir_a1(base.i2s(tir_sizeof(tir_st_of_td(sema.tds[std].elem)))), is_comment: false, line: g_cur_line, cmt: "" });
-    var a3: string = base.sb_cat5(src, " ", nl, " ", ez);
-    tir_emit(TIRInst{ op: TIR_OP_CALL, st: tir_st_from_str("%TSlice"), dst: tir_op(d), args: tir_a2("@slice_from_raw", a3), is_comment: false, line: g_cur_line, cmt: "" });
+    tir_emit(TIRInst{ op: TIR_OP_CALL, st: tir_st_from_str("%TSlice"), dst: tir_op(d), args: tir_a4("@slice_from_raw", src, nl, ez), is_comment: false, line: g_cur_line, cmt: "" });
     return d;
 }
 
@@ -2756,8 +2763,7 @@ var cft: i64 = tir_expr_td(n.na);
         tir_emit(TIRInst{ op: TIR_OP_CONST, st: tir_st_from_str("i64"), dst: tir_op(nl), args: tir_a1(base.i2s(sema.tds[cft].alen)), is_comment: false, line: g_cur_line, cmt: "" });
         var ez: string = tir_tmp();
         tir_emit(TIRInst{ op: TIR_OP_CONST, st: tir_st_from_str("i64"), dst: tir_op(ez), args: tir_a1(base.i2s(tir_sizeof(tir_st_of_td(sema.tds[cft].elem)))), is_comment: false, line: g_cur_line, cmt: "" });
-        var a3: string = base.sb_cat5(av, " ", nl, " ", ez);
-        tir_emit(TIRInst{ op: TIR_OP_CALL, st: tir_st_from_str("%TSlice"), dst: tir_op(dsl), args: tir_a2("@slice_from_raw", a3), is_comment: false, line: g_cur_line, cmt: "" });
+        tir_emit(TIRInst{ op: TIR_OP_CALL, st: tir_st_from_str("%TSlice"), dst: tir_op(dsl), args: tir_a4("@slice_from_raw", av, nl, ez), is_comment: false, line: g_cur_line, cmt: "" });
         return TirEmitRes{ name: dsl, st: tir_st_from_str("%TSlice") };
     }
     var innerr: TirEmitRes = tir_emit_expr(n.na); var inner: string = innerr.name;
@@ -2828,8 +2834,7 @@ pub fn tir_emit_struct_lit(e: i64) TirEmitRes {
     if (str_len(n.sa) > 0) { target_st = base.sb_cat2("%", n.sa); }
     else { target_st = tir_expr_st(e); }
     var d: string = tir_tmp();
-    var sb: StringBuilder = sb_new();
-    var first: bool = true;
+    var __sl_args: []TirOperand = [];
     var fc: i64 = n.la;
     while (fc >= 0) {
         var k: Child = base.kids[fc];
@@ -2837,12 +2842,10 @@ pub fn tir_emit_struct_lit(e: i64) TirEmitRes {
         // 直接 emit FV 节点会落到 unsupported 兜底，故必须解包到其 .na 值子节点。
         var fv: Node = base.nodes[k.val];
         var fsr: TirEmitRes = tir_emit_expr(fv.na); var fs: string = fsr.name;
-        if (first == false) { sb_append_str(sb, " "); }
-        sb_append_str(sb, fs);
-        first = false;
+        append(__sl_args, tir_op(fs));
         fc = k.next;
     }
-    tir_emit(TIRInst{ op: TIR_OP_STRUCT_NEW, st: tir_st_from_str(target_st), dst: tir_op(d), args: tir_a1(sb_to_str(sb)), is_comment: false, line: g_cur_line, cmt: "" });
+    tir_emit(TIRInst{ op: TIR_OP_STRUCT_NEW, st: tir_st_from_str(target_st), dst: tir_op(d), args: __sl_args, is_comment: false, line: g_cur_line, cmt: "" });
     return TirEmitRes{ name: d, st: tir_st_from_str(target_st) };
 }
 
@@ -2875,17 +2878,14 @@ pub fn tir_emit_array_lit(e: i64, force_td: i64) TirEmitRes {
     if (cat == "array") {
         var arrst: string = base.sb_cat5("arr<", elem_st, " x ", base.i2s(N), ">");
         var d: string = tir_tmp();
-        var sb: StringBuilder = sb_new();
-        var first: bool = true;
+        var __al_args: []TirOperand = [];
         var i: i64 = 0;
         while (i < N) {
             var esr: TirEmitRes = tir_emit_expr(elems[i]); var es: string = esr.name;
-            if (first == false) { sb_append_str(sb, " "); }
-            sb_append_str(sb, es);
-            first = false;
+            append(__al_args, tir_op(es));
             i = i + 1;
         }
-        tir_emit(TIRInst{ op: TIR_OP_STRUCT_NEW, st: tir_st_from_str(arrst), dst: tir_op(d), args: tir_a1(sb_to_str(sb)), is_comment: false, line: g_cur_line, cmt: "" });
+        tir_emit(TIRInst{ op: TIR_OP_STRUCT_NEW, st: tir_st_from_str(arrst), dst: tir_op(d), args: __al_args, is_comment: false, line: g_cur_line, cmt: "" });
         return TirEmitRes{ name: d, st: tir_st_from_str(tir_expr_st(e)) };
     }
     // 切片字面量：后备槽 + %TSlice
