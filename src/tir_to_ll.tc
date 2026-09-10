@@ -40,11 +40,17 @@ pub var g_main_fn: string = "";          // 入口函数 LLVM 名（mangled）�
 pub var g_main_ret: string = "i32";      // 入口函数真实返回类型（wrapper 须按此类型调用，再适配成 i32 给 @main）
 pub var g_clo_consts: []string;          // 已发射的「裸函数引用 → %TClosure 常量」全局名（避免重复声明）
 pub var g_clo_constbuf: StringBuilder;    // 闭包常量全局声明缓冲（模块末尾统一 emit，避免插进函数体）
+pub var g_clo_thunk_req: []string;         // 待生成 thunk 的普通函数名（模块末尾统一生成，确保被包装函数已 emit、ret 已知）
 pub var g_cur_sret: string = "";          // 当前函数若以 sret 返回聚合（>16B struct），记录 sret 槽名；否则空串
 pub var g_ll_struct_fieldtys: [][]string; // 用户聚合类型名 → 字段存储类型列表（并行 g_ll_struct_types），供 sizeof 计算
 pub var g_ll_valptr: []string;   // 槽名集合：内容为「值字节指针(val_ptr，如 tll_map_val_ptr 返回值)」。
                                   // load 此类槽须解引用（load ptr, ptr (load ptr, ptr %x)）取回真正的值；
                                   // 普通 ptr 槽（如 map_new 句柄）load 只取槽中值本身，两者均属 ptr 类型故需显式标记区分。
+pub var g_ll_addrslot: []string;  // 槽名集合：GEP 结果（struct/closure 字段地址，l-value）。
+                                  // 写此类槽须「解引用写穿」：store v, ptr *dst（dst 槽内容是字段地址）；
+                                  // 指针变量槽不是地址槽，store 直接把值拷进槽（store v, ptr dst）。
+                                  // ⚠ 区分根因：TIR_OP_STORE 写 GEP 字段时 dst 是临时量(持有地址)，
+                                  // 旧逻辑在 src 也为指针时误把值拷进临时量(覆盖地址)→字段永不被写入→闭包捕获读到垃圾。
 
 pub fn ll_tmp() string {
     var v: i64 = g_ll_tmpc;
@@ -83,6 +89,7 @@ pub fn ll_reset() void {
     g_cur_sret = "";
     g_ll_struct_fieldtys = [];
     g_ll_valptr = [];
+    g_ll_addrslot = [];
 }
 
 // 剥离操作数名尾部的 .s<ST码> 后缀（与 tir.tc tir_op_tok 同义），使带类型后缀的
@@ -179,7 +186,28 @@ pub fn ll_is_valptr(name: string) bool {
     while (i < n) { if (g_ll_valptr[i] == name) { return true; } i = i + 1; }
     return false;
 }
-pub fn ll_emit_closure_const(fnname: string) string {
+// 标记/查询某槽是否为「GEP 地址槽（l-value）」：store 该槽须解引用写穿（store v, ptr *dst），
+// 而非把值拷进槽本身。指针变量槽不是地址槽（store 直接拷进槽）。详见 g_ll_addrslot 注释。
+pub fn ll_mark_addrslot(name: string) void {
+    name = ll_strip_suf(name);
+    var n: i64 = slice_len(g_ll_addrslot) as i64;
+    var i: i64 = 0;
+    while (i < n) { if (g_ll_addrslot[i] == name) { return; } i = i + 1; }
+    append(g_ll_addrslot, name);
+}
+pub fn ll_is_addrslot(name: string) bool {
+    name = ll_strip_suf(name);
+    var n: i64 = slice_len(g_ll_addrslot) as i64;
+    var i: i64 = 0;
+    while (i < n) { if (g_ll_addrslot[i] == name) { return true; } i = i + 1; }
+    return false;
+}
+// 发射「裸函数引用 → %TClosure 常量」。retst 为被包装函数的真实返回类型（用于 thunk 转发）。
+// 统一 TClosure ABI：CALL_IND 总是 code(env, args)。
+//   - 合成闭包函数（params[0]=="$__env"）：code 直接是它（env 是其真实首参），不产生 thunk。
+//   - 普通函数（无 env 首参）：生成 @fn.__clo_thunk(ptr %__env, <params...>) 转发，避免 code(env, a, b)
+//     把 env 当首参塞给无 env 函数导致 ABI 错乱（func_type_demo/lambda_demo 的 f(3,4) 返回垃圾根因）。
+pub fn ll_emit_closure_const(fnname: string, retst: string) string {
     var sym: string = "@" + fnname;            // 含 @ 前缀，如 @__lam_4
     var gname: string = "@.tirll_clo_" + fnname;
     var n: i64 = slice_len(g_clo_consts) as i64;
@@ -189,11 +217,102 @@ pub fn ll_emit_closure_const(fnname: string) string {
         i = i + 1;
     }
     append(g_clo_consts, fnname);
-    sb_append_str(g_clo_constbuf, gname);
-    sb_append_str(g_clo_constbuf, " = global %TClosure { ptr ");
-    sb_append_str(g_clo_constbuf, sym);
-    sb_append_str(g_clo_constbuf, ", ptr null }\n");
+    var params: []string = ll_lookup_params(fnname);
+    var has_env: bool = (slice_len(params) as i64 >= 1 && params[0] == "ptr<void>");
+    if (has_env) {
+        sb_append_str(g_clo_constbuf, gname);
+        sb_append_str(g_clo_constbuf, " = global %TClosure { ptr ");
+        sb_append_str(g_clo_constbuf, sym);
+        sb_append_str(g_clo_constbuf, ", ptr null }\n");
+        return gname;
+    }
+    // 普通函数 → 延迟到模块末尾生成 thunk（ret 在全部函数 emit 后才已知；
+    // store/ret 引用时该函数可能尚未 emit，立即生成会得到空返回类型）。
+    append(g_clo_thunk_req, fnname);
     return gname;
+}
+
+// 返回函数对应的「code 指针」：供 store 处理器写 closure.field0（CALL_IND 解包后直接调用）。
+// 普通函数经 thunk（env 首参适配）；合成闭包（has_env）即其裸函数名。
+// 注意：与 ll_emit_closure_const 不同，本函数返回 code（函数指针），而非 %TClosure 全局（闭包值）。
+// 根因：store 处理器若把「%TClosure 全局」写进 field0，则 field0 成了「指向闭包的指针」而非 code，
+// CALL_IND 把该数据地址当函数入口 → 段错误。field0 必须是 code（@fn 或 @fn.__clo_thunk）。
+pub fn ll_closure_code(mref: string) string {
+    ll_emit_closure_const(mref, "");   // 登记 thunk 需求（延迟生成，确保 ret 已知）
+    var params: []string = ll_lookup_params(mref);
+    var has_env: bool = (slice_len(params) as i64 >= 1 && params[0] == "ptr<void>");
+    if (has_env) { return "@" + mref; }
+    return "@" + mref + ".__clo_thunk";
+}
+
+// 模块末尾统一生成「普通函数 → %TClosure 常量」的 thunk 转发（延迟原因见 ll_emit_closure_const）。
+// 统一 TClosure ABI：CALL_IND 总是 code(env, args)；聚合返回则 code(sret, env, args)。
+// 普通函数无 env 首参、且聚合返回走 LLVM 自动 sret，故 thunk 须适配：
+//   - 标量返回：define R @fn.__clo_thunk(ptr %__env, <args>) { %r = call R @fn(<args>); ret R %r }
+//   - 聚合返回：define void @fn.__clo_thunk(ptr %__sret, ptr %__env, <args>) { call void @fn(ptr %__sret, <args>); ret; }
+//     （显式 sret 首参，与合成闭包聚合返回 ABI 逐字一致，使 CALL_IND 的 (sret, env, args) 调用正确落地。）
+pub fn ll_flush_clo_thunks() void {
+    var n: i64 = slice_len(g_clo_thunk_req) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        var fnname: string = g_clo_thunk_req[i];
+        var sym: string = "@" + fnname;
+        var gname: string = "@.tirll_clo_" + fnname;
+        var params: []string = ll_lookup_params(fnname);   // 类型表 [st0, st1, ...]
+        var retst: string = ll_lookup_ret(fnname);
+        var thunk: string = "@" + fnname + ".__clo_thunk";
+        var is_sret: bool = ll_needs_sret(retst);
+        // 用户实参串（不含 env / sret）
+        var argsb: StringBuilder = sb_new();
+        var pi: i64 = 0;
+        var pn: i64 = slice_len(params) as i64;
+        var first: bool = true;
+        while (pi < pn) {
+            if (first == false) { sb_append_str(argsb, ", "); }
+            sb_append_str(argsb, st_to_ll(params[pi]));
+            sb_append_str(argsb, " %__p");
+            sb_append_i64(argsb, pi);
+            first = false;
+            pi = pi + 1;
+        }
+        var argstr: string = sb_to_str(argsb);
+        if (is_sret) {
+            sb_append_str(g_clo_constbuf, "define void ");
+            sb_append_str(g_clo_constbuf, thunk);
+            sb_append_str(g_clo_constbuf, "(ptr %__sret, ptr %__env");
+            if (str_len(argstr) > 0) { sb_append_str(g_clo_constbuf, ", "); sb_append_str(g_clo_constbuf, argstr); }
+            sb_append_str(g_clo_constbuf, ") {\n");
+            sb_append_str(g_clo_constbuf, "  call void ");
+            sb_append_str(g_clo_constbuf, sym);
+            sb_append_str(g_clo_constbuf, "(ptr %__sret");
+            if (str_len(argstr) > 0) { sb_append_str(g_clo_constbuf, ", "); sb_append_str(g_clo_constbuf, argstr); }
+            sb_append_str(g_clo_constbuf, ")\n");
+            sb_append_str(g_clo_constbuf, "  ret void\n}\n");
+        } else {
+            sb_append_str(g_clo_constbuf, "define ");
+            sb_append_str(g_clo_constbuf, st_to_ll(retst));
+            sb_append_str(g_clo_constbuf, " ");
+            sb_append_str(g_clo_constbuf, thunk);
+            sb_append_str(g_clo_constbuf, "(ptr %__env");
+            if (str_len(argstr) > 0) { sb_append_str(g_clo_constbuf, ", "); sb_append_str(g_clo_constbuf, argstr); }
+            sb_append_str(g_clo_constbuf, ") {\n");
+            sb_append_str(g_clo_constbuf, "  %__r = call ");
+            sb_append_str(g_clo_constbuf, st_to_ll(retst));
+            sb_append_str(g_clo_constbuf, " ");
+            sb_append_str(g_clo_constbuf, sym);
+            sb_append_str(g_clo_constbuf, "(");
+            sb_append_str(g_clo_constbuf, argstr);
+            sb_append_str(g_clo_constbuf, ")\n");
+            sb_append_str(g_clo_constbuf, "  ret ");
+            sb_append_str(g_clo_constbuf, st_to_ll(retst));
+            sb_append_str(g_clo_constbuf, " %__r\n}\n");
+        }
+        sb_append_str(g_clo_constbuf, gname);
+        sb_append_str(g_clo_constbuf, " = global %TClosure { ptr ");
+        sb_append_str(g_clo_constbuf, thunk);
+        sb_append_str(g_clo_constbuf, ", ptr null }\n");
+        i = i + 1;
+    }
 }
 
 // 遇到引用但未声明的 @name 全局：登记为 `global <st> zeroinitializer`，模块末尾统一 emit。
@@ -954,6 +1073,21 @@ pub fn ll_lookup_params(fname: string) []string {
     }
     var __ll_empty: []string = [];
     return __ll_empty;
+}
+
+// 查函数返回值 LLVM 类型（与 g_func_names 同步 append，见 ll_emit_func）。
+pub fn ll_lookup_ret(fname: string) string {
+    var i: i64 = 0;
+    var n: i64 = slice_len(g_func_names) as i64;
+    while (i < n) {
+        if (g_func_names[i] == fname) {
+            var m: i64 = slice_len(g_ll_func_rets) as i64;
+            if (i < m) { return g_ll_func_rets[i]; }
+            return "";
+        }
+        i = i + 1;
+    }
+    return "";
 }
 
 pub fn ll_emit_func(name: string, params: []string, ret: string) void {
@@ -1869,7 +2003,7 @@ pub fn ll_emit_inst(inst: TIRInst) void {
             var v: string = ll_load(d, st);
             if (str_len(d) >= 1 && d[0] == 64) {
                 var mref: string = ll_mangle(str_slice(d, 1, str_len(d)));
-                if (ll_is_func(mref)) { v = ll_emit_closure_const(mref); }
+                if (ll_is_func(mref)) { v = ll_emit_closure_const(mref, st); }
             }
             if (g_cur_sret != "") {
                 // 聚合 sret 返回：把值写入 sret 槽，ret void
@@ -2004,7 +2138,9 @@ pub fn ll_emit_inst(inst: TIRInst) void {
         var dst: string = inst.dst.name;
         var dstst: string = ll_get_st(dst);
         if (str_len(src) >= 1 && src[0] == 64 && ll_is_func(ll_mangle(str_slice(src, 1, str_len(src))))) {
-            var fptr: string = "@" + ll_mangle(str_slice(src, 1, str_len(src)));
+            var mref: string = ll_mangle(str_slice(src, 1, str_len(src)));
+            // field0 必须存 code（@fn 或 @fn.__clo_thunk），不能存 %TClosure 全局（否则双重包裹 → 段错误）
+            var fptr: string = ll_closure_code(mref);
             var p: string = ll_load(dst, dstst);
             sb_append_str(g_ll, "  store ptr ");
             sb_append_str(g_ll, fptr);
@@ -2017,20 +2153,9 @@ pub fn ll_emit_inst(inst: TIRInst) void {
             var inner: string = ll_ptr_inner(dstst);
             var srcst: string = ll_get_st(src);
             var src_is_ptr: bool = ll_starts(srcst, "ptr<") || srcst == "ptr";
-            if (src_is_ptr) {
-                var v: string = ll_load(src, srcst);
-                ll_store(dst, srcst, v);
-            } else if (srcst == inner) {
-                var p: string = ll_load(dst, dstst);
-                var v: string = ll_load(src, inner);
-                sb_append_str(g_ll, "  store ");
-                sb_append_str(g_ll, st_to_ll(inner));
-                sb_append_str(g_ll, " ");
-                sb_append_str(g_ll, v);
-                sb_append_str(g_ll, ", ptr ");
-                sb_append_str(g_ll, p);
-                sb_append_str(g_ll, "\n");
-            } else {
+            if (ll_is_addrslot(dst)) {
+                // dst 是 GEP 地址槽（l-value，槽内容=字段地址）：解引用写穿（store v, ptr *dst）。
+                // 旧逻辑在 src 也为指针时误把值拷进临时量(覆盖地址)→字段永不写入→闭包捕获读到垃圾。
                 var p: string = ll_load(dst, dstst);
                 var v: string = ll_load(src, srcst);
                 sb_append_str(g_ll, "  store ");
@@ -2040,6 +2165,36 @@ pub fn ll_emit_inst(inst: TIRInst) void {
                 sb_append_str(g_ll, ", ptr ");
                 sb_append_str(g_ll, p);
                 sb_append_str(g_ll, "\n");
+            } else {
+                // dst 是值槽（普通指针变量，槽内容=指针值）：保留旧语义，勿解引用。
+                //   - src 为指针：把指针值拷进槽（p = x，值语义）。
+                //   - src 为标量：解引用写穿（*p = v，指针变量当缓冲用）。
+                // ⚠ 不可改回 ll_store(dst,...)：那会把值写进槽自身的 alloca 而非 *p，破坏 *p=v 语义
+                //   （adt_*/fixed_array/generics/vdot 等指针变量缓冲用例会回归）。
+                if (src_is_ptr) {
+                    var v: string = ll_load(src, srcst);
+                    ll_store(dst, srcst, v);
+                } else if (srcst == inner) {
+                    var p: string = ll_load(dst, dstst);
+                    var v: string = ll_load(src, inner);
+                    sb_append_str(g_ll, "  store ");
+                    sb_append_str(g_ll, st_to_ll(inner));
+                    sb_append_str(g_ll, " ");
+                    sb_append_str(g_ll, v);
+                    sb_append_str(g_ll, ", ptr ");
+                    sb_append_str(g_ll, p);
+                    sb_append_str(g_ll, "\n");
+                } else {
+                    var p: string = ll_load(dst, dstst);
+                    var v: string = ll_load(src, srcst);
+                    sb_append_str(g_ll, "  store ");
+                    sb_append_str(g_ll, st_to_ll(srcst));
+                    sb_append_str(g_ll, " ");
+                    sb_append_str(g_ll, v);
+                    sb_append_str(g_ll, ", ptr ");
+                    sb_append_str(g_ll, p);
+                    sb_append_str(g_ll, "\n");
+                }
             }
         } else {
             var vst: string = ll_get_st(src);
@@ -2215,6 +2370,7 @@ pub fn ll_emit_inst(inst: TIRInst) void {
             ll_store(g, st, lv);
             return;
         }
+        ll_mark_addrslot(g);   // GEP 结果是字段/元素地址(l-value)；store 该槽须解引用写穿
         ll_store(g, base.sb_cat3("ptr<", st, ">"), r);
         return;
     }
@@ -2307,7 +2463,7 @@ pub fn ll_emit_inst(inst: TIRInst) void {
             if (str_len(a) >= 1 && a[0] == 64) {
                 var mref: string = ll_mangle(str_slice(a, 1, str_len(a)));
                 if (ll_is_func(mref)) {
-                    var clo: string = ll_emit_closure_const(mref);
+                    var clo: string = ll_emit_closure_const(mref, st);
                     if (first == false) { sb_append_str(argsb, ", "); }
                     sb_append_str(argsb, "ptr ");
                     sb_append_str(argsb, clo);
@@ -2489,7 +2645,7 @@ pub fn ll_emit_inst(inst: TIRInst) void {
                 var mref: string = ll_mangle(str_slice(a, 1, str_len(a)));
                 if (ll_is_func(mref)) {
                     sb_append_str(argsb, ", ptr ");
-                    sb_append_str(argsb, ll_emit_closure_const(mref));
+                    sb_append_str(argsb, ll_emit_closure_const(mref, st));
                 } else {
                     sb_append_str(argsb, ", ptr ");
                     sb_append_str(argsb, ll_load(a, "ptr<void>"));
@@ -3150,6 +3306,7 @@ pub fn tir_to_ll_emit(module: TIRModule) string {
         sb_append_str(g_ll, " zeroinitializer\n"); gi2 = gi2 + 1;
     }
     ll_emit_string_globals();
+    ll_flush_clo_thunks();
     sb_append_str(g_ll, sb_to_str(g_clo_constbuf));
     ll_emit_opaque_defs();
     ll_emit_main_wrapper();

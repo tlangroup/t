@@ -1186,14 +1186,19 @@ pub fn tir_field_index(structname: string, fieldname: string) i64 {
     return 0;
 }
 
-// 在栈上构造一个 %TClosure 值（与 TClosure ABI 一致），返回 ptr<void> 槽。
+// 构造一个 %TClosure 值（与 TClosure ABI 一致），返回 ptr<void> 槽。
 // fnref：函数指针值文本（如 "@__lam_0" 或 "$fnptr"）；envref：环境指针值文本，"" 表示 null 环境。
 // 设计锚点：tir-design.md §6.6 closure_new / §6.7 call_ind / %TClosure={fnptr,envptr}。
+// ⚠ %TClosure 必须**堆分配**：闭包值可逃逸出创建帧（如 make_adder 返回闭包），若栈分配则
+// 返回后指针悬垂 → use-after-free（call_ind 经 field0/field1 读垃圾 → 段错误）。
+// 对齐 codegen_ll.tc:1652 的 call ptr @t_alloc(i64 sizeof(%TClosure))；sizeof(%TClosure)=16（双 ptr）。
 pub fn tir_make_closure_value(fnref: string, envref: string) string {
-    var clo: string = tir_tmp();
-    tir_emit(TIRInst{ op: TIR_OP_SLOT, st: tir_st_from_str("%TClosure"), dst: tir_op(clo), args: tir_a0(), is_comment: false, line: g_cur_line, cmt: "" });
-    var cloaddr: string = tir_tmp();
-    tir_emit(TIRInst{ op: TIR_OP_ADDR_OF, st: tir_st_from_str("ptr<%TClosure>"), dst: tir_op(cloaddr), args: tir_a1(clo), is_comment: false, line: g_cur_line, cmt: "" });
+    var szslot: string = tir_tmp();
+    tir_emit(TIRInst{ op: TIR_OP_CONST, st: tir_st_from_str("i64"), dst: tir_op(szslot), args: tir_a1("16"), is_comment: false, line: g_cur_line, cmt: "" });
+    var heap: string = tir_tmp();   // t_alloc 返回 ptr<void>（堆 %TClosure）
+    tir_emit(tir_e_call("ptr<void>", heap, "@t_alloc", [szslot]));
+    var cloaddr: string = tir_tmp();  // 降到 ptr<%TClosure> 供字段 GEP（translator 据此索引 %TClosure）
+    tir_emit(tir_emit_bitcast("ptr<%TClosure>", cloaddr, heap));
     var fpaddr: string = tir_tmp();
     tir_emit(TIRInst{ op: TIR_OP_GEP, st: tir_st_from_str("ptr<void>"), dst: tir_op(fpaddr), args: tir_a3(cloaddr, "0", "0"), is_comment: false, line: g_cur_line, cmt: "" });
     tir_emit(TIRInst{ op: TIR_OP_STORE, st: ST_NONE, dst: tir_op(fpaddr), args: tir_a1(fnref), is_comment: false, line: g_cur_line, cmt: "" });
@@ -1206,9 +1211,8 @@ pub fn tir_make_closure_value(fnref: string, envref: string) string {
     } else {
         tir_emit(TIRInst{ op: TIR_OP_STORE, st: ST_NONE, dst: tir_op(epaddr), args: tir_a1(envref), is_comment: false, line: g_cur_line, cmt: "" });
     }
-    var dst: string = tir_tmp();
-    tir_emit(TIRInst{ op: TIR_OP_BITCAST, st: tir_st_from_str("ptr<void>"), dst: tir_op(dst), args: tir_a1(cloaddr), is_comment: false, line: g_cur_line, cmt: "" });
-    return dst;
+    // 返回值是堆 %TClosure 的 ptr<void>（call_ind 解包 ABI：field0=code, field1=env）。
+    return heap;
 }
 
 pub fn tir_add_struct_tt(name: string, field_head: i64) void {
@@ -2402,6 +2406,7 @@ pub fn tir_emit_expr(e: i64) TirEmitRes {
     if (kd == "binary") { return tir_emit_binary(n, e); }
     if (kd == "unary") { return tir_emit_unary(n); }
     if (kd == "call") { return tir_emit_call(e); }
+    if (kd == "mbuiltin") { return tir_emit_call(e); }   // @name(args) 在表达式位统一为 mbuiltin 节点；降级为普通调用发射
     if (kd == "member") { return tir_member_read(e); }
     if (kd == "cast") { return tir_emit_cast(n, est); }
     if (kd == "struct_lit" || kd == "struct") { return tir_emit_struct_lit(e); }
@@ -2491,10 +2496,22 @@ pub fn tir_emit_deref(e: i64) TirEmitRes {
 // 镜像 codegen_ll.tc:1627 closure_make（per-capture gep %st.<sb> + store；再 %TClosure {fnptr,envptr}）。
 pub fn tir_emit_closure_make(n: Node, e: i64) TirEmitRes {
     var envty: string = base.sb_cat2("%", n.sb);
-    var env: string = tir_tmp();
-    tir_emit(tir_emit_slot(envty, env));
-    var envaddr: string = tir_tmp();
-    tir_emit(tir_emit_addr_of(base.sb_cat3("ptr<", envty, ">"), envaddr, env));
+    // 环境按字段尺寸求和（tir_sizeof 对 %__env_N 未知类型兜底返 8，多字段环境会欠分配 → 必须逐字段加总）。
+    // 闭包可逃逸出创建帧（如 make_adder 返回的闭包），环境必须**堆分配**（对齐 codegen_ll.tc:1630 的 t_alloc），
+    // 否则 stack alloca 在创建帧返回后即悬垂 → use-after-free（add100(5) 段错误/垃圾）。
+    var envsz: i64 = 0;
+    var sc: i64 = n.la;
+    while (sc >= 0) {
+        var sk: Child = base.kids[sc];
+        envsz = envsz + tir_sizeof(tir_expr_st(base.kids[sc].val));
+        sc = sk.next;
+    }
+    var szslot: string = tir_tmp();
+    tir_emit(TIRInst{ op: TIR_OP_CONST, st: tir_st_from_str("i64"), dst: tir_op(szslot), args: tir_a1(base.i2s(envsz)), is_comment: false, line: g_cur_line, cmt: "" });
+    var envptr: string = tir_tmp();   // t_alloc 返回 ptr<void>（堆环境）
+    tir_emit(tir_e_call("ptr<void>", envptr, "@t_alloc", [szslot]));
+    var envcast: string = tir_tmp();  // 降到 ptr<%__env_N> 供字段 GEP
+    tir_emit(tir_emit_bitcast(base.sb_cat3("ptr<", envty, ">"), envcast, envptr));
     var cmc: i64 = n.la;
     while (cmc >= 0) {
         var cmk: Child = base.kids[cmc];
@@ -2504,15 +2521,12 @@ pub fn tir_emit_closure_make(n: Node, e: i64) TirEmitRes {
         var cvvalr: TirEmitRes = tir_emit_expr(cmk.val); var cvval: string = cvvalr.name;
         var cvst: string = tir_expr_st(cmk.val);
         var faddr: string = tir_tmp();
-        tir_emit(tir_emit_gep(cvst, faddr, envaddr, tir_idxs2("0", base.i2s(fidx))));
+        tir_emit(tir_emit_gep(cvst, faddr, envcast, tir_idxs2("0", base.i2s(fidx))));
         tir_emit(tir_emit_store(cvval, faddr));
         cmc = cmk.next;
     }
-    var envptr: string = tir_tmp();
-    tir_emit(tir_emit_addr_of(base.sb_cat3("ptr<", envty, ">"), envptr, env));
-    var envpv: string = tir_tmp();
-    tir_emit(tir_emit_bitcast("ptr<void>", envpv, envptr));
-    return TirEmitRes{ name: tir_make_closure_value(base.sb_cat2("@", n.sa), envpv), st: tir_st_from_str(tir_expr_st(e)) };
+    // TClosure 的 env 字段用堆指针 envptr（ptr<void>）；TClosure 自身仍栈分配（本例不逃逸创建帧）。
+    return TirEmitRes{ name: tir_make_closure_value(base.sb_cat2("@", n.sa), envptr), st: tir_st_from_str(tir_expr_st(e)) };
 }
 
 pub fn tir_emit_binary(n: Node, e: i64) TirEmitRes {
@@ -2783,6 +2797,22 @@ pub fn tir_emit_call(e: i64) TirEmitRes {
         first = false;
         argi = argi + 1;
         ac = k.next;
+    }
+    // 成员函数指针字段调用（如 h.op(4) / c.step_fn(...)）：callee 是 member 节点，字段类型为 func。
+    // 必须保留接收者、经字段槽里的 %TClosure 走 call_ind（code+env 解包），绝不能降级成裸全局 @op 调用
+    // （接收者丢失 → link failed: op / step_fn）。tir_member_read 取出字段中的 %TClosure(ptr<void>) 槽，
+    // 与本地闭包变量 f1(2) 走 call_ind 的 ABI 完全一致（translator 从槽解包 code/env）。
+    if (callee.kind == "member") {
+        var field_res: TirEmitRes = tir_member_read(n.na);
+        var call_ind_retst: string = retst;
+        var recv_st: string = tir_expr_st(callee.na);
+        var sname: string = tir_strip_pct(recv_st);
+        var ftd: i64 = tir_field_td(sname, callee.sa);
+        if (ftd >= 0 && ftd < slice_len(sema.tds) as i64 && sema.tds[ftd].cat == "func") {
+            call_ind_retst = tir_st_of_td(sema.tdf_ret[ftd]);
+        }
+        tir_emit(tir_emit_call_ind(call_ind_retst, d, field_res.name, cargs));
+        return TirEmitRes{ name: d, st: tir_st_from_str(call_ind_retst) };
     }
     // 间接调用：被调者是本地槽（闭包值，ptr<void> 指向 %TClosure）→ call_ind；
     // 否则是被调函数名 → 直接 call。镜像 codegen_ll.tc ll_call（局部/全局函数类型变量 → 间接）。
