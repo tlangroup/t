@@ -1,5 +1,6 @@
 // tir_to_ll: TIR (memory-first linear IR) -> LLVM IR 薄后端（设计 §9.2 / Stage 3）
 //
+
 // 设计要点：TIR 是 memory-first（非 SSA）。每个 TIR slot `$x` 映射为 LLVM `alloca`；
 // 任意对 $x 的值读取 = `load`，写入 = `store`。LLVM 的 mem2reg/SROA 会自动把
 // 这些 alloca 提升回寄存器，故等价性由 TIR 文本保证（设计 §9.2 结论）。
@@ -2053,9 +2054,15 @@ pub fn ll_emit_inst(inst: TIRInst) void {
                     if (ll_bits(vst) > ll_bits(dstst)) { opcode = "fptrunc"; }
                     else { opcode = "fpext"; }
                 } else if (ll_is_float(dstst) == false && ll_is_float(vst) == false) {
-                    // 整型/Bool 宽度换算（原逻辑）
+                    // 整型/Bool 宽度换算
                     opcode = "trunc";
-                    if (ll_bits(vst) < ll_bits(dstst)) {
+                    if (vst == "i1" && ll_is_int(dstst)) {
+                        // ⚠ bool 比较结果(i1) 拓宽到更宽整型/布尔：必须 zext（0/1→0/1）。
+                        // base.tc 的 ll_bits("i1") 兜底返回 64，会误判为「源比目标宽」→ 错发
+                        // trunc i1 to i8（非法，i1 比 i8 窄）；sext 则把 bool 1 扩成 -1。
+                        // 故 i1→任意整型一律 zext。colony_demo/colony_wave 命中。
+                        opcode = "zext";
+                    } else if (ll_bits(vst) < ll_bits(dstst)) {
                         if (ll_is_unsigned_st(vst)) { opcode = "zext"; } else { opcode = "sext"; }
                     }
                 }
@@ -2177,10 +2184,17 @@ pub fn ll_emit_inst(inst: TIRInst) void {
                 operands = base.sb_cat2(operands, ", i32 ");
                 operands = base.sb_cat2(operands, gidx);
             }
-            ki = ki + 1;
-        }
-        sb_append_str(g_ll, "  ");
-        sb_append_str(g_ll, r);
+        ki = ki + 1;
+    }
+    // ⚠ 标量子类型 + 路径 `i32 0, i32 0`：`getelementptr inbounds i64, ptr %x, i32 0, i32 0`
+    // 非法（标量只能承受单索引解引用）。字段 0 恰在偏移 0，故降级为单索引 `i32 0`（= &字段0），合法。
+    // 根因：通用 ptr 基底经 tir lowering 丢失内类型，GEP inbounds 被错置为字段标量类型而非外层结构。
+    // ptr<Struct> 基底走上层分支（gtypename=结构名，非标量），不会误伤。agent_npc_mind/agentkit_demo 命中。
+    if (ll_is_scalar_st(gtypename) && operands == ", i32 0, i32 0") {
+        operands = ", i32 0";
+    }
+    sb_append_str(g_ll, "  ");
+    sb_append_str(g_ll, r);
         sb_append_str(g_ll, " = getelementptr inbounds ");
         sb_append_str(g_ll, gtypename);
         sb_append_str(g_ll, ", ptr ");
@@ -2580,6 +2594,9 @@ pub fn ll_emit_inst(inst: TIRInst) void {
             if (ll_is_float(srcst) && ll_is_float(dstst)) { llvmop = "fptrunc"; }
             else if (ll_is_float(srcst) && ll_is_int(dstst)) { llvmop = "fptosi"; }
             else if (ll_is_int(srcst) && ll_is_float(dstst)) { llvmop = "sitofp"; }
+            // ⚠ i1（bool 比较结果）拓宽到更宽整型（如 i8）用 trunc 非法（src 比 dst 窄），
+            // 必须 zext：bool 0/1 零扩展为 0/1，而非符号扩展成 0/-1。colony_demo/colony_wave 命中。
+            else if (srcst == "i1") { llvmop = "zext"; }
             else { llvmop = "trunc"; }
         } else if (op == TIR_OP_ZEXT || op == TIR_OP_SEXT) {
             if (ll_is_float(srcst) && ll_is_float(dstst)) { llvmop = "fpext"; }
