@@ -2312,10 +2312,14 @@ pub fn tir_emit_expr(e: i64) TirEmitRes {
         return TirEmitRes{ name: d, st: ST_PTR_VOID };
     }
     if (kd == "ident") {
-        var idx: i64 = tir_find_local_idx(n.sa);
+        // ⚠ 同 tir_addr_of：前端可能改名局部（out→l），须按声明节点解析槽（对齐旧轨 emit_lle ident）。
+        var lname: string = n.sa;
+        var decl: i64 = base.idecl_get(e);
+        if (decl >= 0) { lname = base.nodes[decl].sa; }
+        var idx: i64 = tir_find_local_idx(lname);
         if (idx >= 0) { return TirEmitRes{ name: g_local_slots[idx], st: tir_st_from_str(tir_expr_st(e)) }; }
         // 全局符号：Stage 1 直接引用 @name（聚合按地址、标量按值，调用方处理）
-        return TirEmitRes{ name: base.sb_cat2("@", n.sa), st: est };
+        return TirEmitRes{ name: base.sb_cat2("@", lname), st: est };
     }
     if (kd == "paren" || kd == "comptime") { return tir_emit_expr(n.na); }
     if (kd == "binary") { return tir_emit_binary(n, e); }
@@ -2526,14 +2530,20 @@ pub fn tir_addr_of(e: i64) TirEmitRes {
         return tir_addr_of(o.na);   // 递归到内层
     }
     if (okd == "ident") {
-        var idx: i64 = tir_find_local_idx(o.sa);
+        // ⚠ 前端可能对局部变量改名（如 pop 内 `out`→`l`），但槽仍按声明名注册（$out）。
+        // 若直接 t_find_local_idx(o.sa) 字符串匹配会失败、退回全局 → append 改错副本/段错误。
+        // 须用 base.idecl_get(e) 取该节点对应的声明节点，按声明名解析槽（对齐旧轨 emit_lle ident）。
+        var lname: string = o.sa;
+        var decl: i64 = base.idecl_get(e);
+        if (decl >= 0) { lname = base.nodes[decl].sa; }
+        var idx: i64 = tir_find_local_idx(lname);
         if (idx >= 0) {
             var st: string = tir_expr_st(e);
             var d: string = tir_tmp();
             tir_emit(TIRInst{ op: TIR_OP_ADDR_OF, st: tir_st_from_str(st), dst: tir_op(d), args: tir_a1(tir_os(g_local_slots[idx], tir_st_from_str(st))), is_comment: false, line: g_cur_line, cmt: "" });
             return TirEmitRes{ name: d, st: tir_st_from_str(tir_expr_st(e)) };
         }
-        return TirEmitRes{ name: base.sb_cat2("@", o.sa), st: tir_st_from_str(tir_expr_st(e)) };   // 全局符号即地址
+        return TirEmitRes{ name: base.sb_cat2("@", lname), st: tir_st_from_str(tir_expr_st(e)) };   // 全局符号即地址
     }
     if (okd == "index") {
         return TirEmitRes{ name: tir_emit_index_addr(e), st: tir_st_from_str(tir_expr_st(e)) };
@@ -2902,6 +2912,38 @@ pub fn tir_emit_call(e: i64) TirEmitRes {
         var f_slot: string = "";
         if (n.la >= 0) { f_slot = tir_emit_expr(base.kids[n.la].val).name; }
         tir_emit(tir_e_call("void", d, "@tll_fflush", tir_cargs1(f_slot)));
+        return TirEmitRes{ name: d, st: tir_st_from_str(retst) };
+    }
+    // ── append：首参是被原地修改的 slice 左值（局部变量 / 结构体字段 / 切片下标）──
+    // ⚠ 必须发射其「地址」（同旧轨 getelementptr 取字段地址），绝不能发射值拷贝：
+    // 旧轨 list_push 用 `getelementptr ... %v.self, 0, 0` 取 items 字段地址传给 t_slice_append_sized，
+    // 原地改 slice 头。新轨若把 self.items 当值 load 进临时 %TSlice 再取地址，t_slice_append_sized 改的是
+    // 临时副本 → 真实 items 头不变 → list_push 后 len 恒为 0（list_demo arena OOM 修复后的残留 bug）。
+    // 用 tir_addr_of 发射左值地址（指针槽），translator 的 append 特判直接拿该 ptr 传给 t_slice_append_sized。
+    if (cname == "append") {
+        // slice 首参须按「存储位置」发射（ptr<%TSlice>），翻译器 append 处理器把它当作
+        // t_slice_append_sized 的 slice_ptr 原地改头：
+        //   - 局部 ident(out)：tir_emit_expr 返回槽名即地址（alloca 即 ptr<%TSlice>）
+        //   - 字段 self.items / 下标：tir_addr_of 取 GEP 地址
+        // 元素次参按值发射，翻译器 append 处理器用 ll_map_argptr 转指针（含字面量/右值）。
+        // ⚠ n.la 是 kids 数组索引，须 base.kids[n.la].val 取真实首参 NODE 索引。
+        var a0n: i64 = -1;
+        if (n.la >= 0) { a0n = base.kids[n.la].val; }
+        var sl: string = "";
+        if (a0n >= 0) {
+            var ak: Node = base.nodes[a0n];
+            if (ak.kind == "member" || ak.kind == "index" || ak.kind == "deref") {
+                sl = tir_addr_of(a0n).name;        // GEP：字段/元素地址（ptr<%TSlice>）
+            } else {
+                sl = tir_emit_expr(a0n).name;       // 局部 ident：槽名即 ptr<%TSlice> 存储位置
+            }
+        }
+        var vn: i64 = -1;
+        var a1: i64 = base.kids[n.la].next;
+        if (a1 >= 0) { vn = base.kids[a1].val; }
+        var vs: string = "";
+        if (vn >= 0) { vs = tir_emit_expr(vn).name; }      // 待追加元素值（翻译器转指针）
+        tir_emit(tir_e_call(retst, d, "@append", tir_cargs2(sl, vs)));
         return TirEmitRes{ name: d, st: tir_st_from_str(retst) };
     }
     // 常规调用：发射各实参 → 直接 call

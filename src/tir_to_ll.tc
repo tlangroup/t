@@ -400,11 +400,13 @@ pub fn ll_ensure_slot(tname: string, st: string) void {
     sb_append_str(g_ll, " = alloca ");
     sb_append_str(g_ll, st_to_ll(st));
     sb_append_str(g_ll, "\n");
-    // ⚠ 聚合槽零初始化：无初始化器的 slice/string 局部变量（如 `var out: []K;`）alloca 后
-    // 若不置零，t_slice_append / t_str_* 会读到垃圾 ptr/len/cap → arena OOM 或越界
-    // （maputil_demo 的 maputil.keys/values 即此：未初始化 slice 被 append 撑爆 arena）。
-    // 与 canonical codegen_ll 的 `TSlice out = {0}` 同构。定长数组(arr<>) 走上方堆分配分支，不在此处理。
-    if (st == "%TSlice" || st == "%TStr") {
+    // ⚠ 聚合槽零初始化：所有 `%` 命名聚合类型（slice/string/结构体/Map/闭包）的无初始化器局部
+    // alloca 后若不置零，其内含的指针字段（slice 的 data/len/cap、Map 句柄、闭包 env、结构体里的
+    // slice 字段）会被读成垃圾 → t_slice_append / t_str_* / map_* 撑爆 arena 或越界。
+    // 典型：list_new 的 `var l: Self;` 返回含垃圾 items 切片头的 List → append 撑爆 arena（list_demo 崩溃）；
+    // colony/agent/type_info 等含聚合字段的结构体局部同理。与 canonical codegen_ll 的 `T out = {0}` 同构。
+    // 定长数组(arr<>) 走上方堆分配分支，不在此处理；标量(i64/ptr/...) 不置零（旧轨同）。
+    if (ll_starts(st, "%")) {
         sb_append_str(g_ll, "  store ");
         sb_append_str(g_ll, st_to_ll(st));
         sb_append_str(g_ll, " zeroinitializer, ptr ");
@@ -1651,10 +1653,26 @@ pub fn ll_emit_builtin(cn: string, toks: []string) bool {
         sb_append_str(g_ll, esz);
         sb_append_str(g_ll, ".gep to i64\n");
         // 调用 t_slice_append_sized(slice_ptr, elem_ptr, elem_size)
+        // ⚠ 元素次参 tir.tc 按值发射，须用 ll_map_argptr 转指针（含字面量/右值，对齐旧轨
+        //   emit-ll 的 `alloca elem; store v; → ptr` 模式；直接 ll_llname 当 ptr 会类型错配/段错误）。
+        //   ll_map_argptr 会向 g_ll 追加 load/alloca/store 指令，必须先于 call 行求值发射，
+        //   故先取到 elemptr 再写整条 call（否则指令会嵌进 call 操作数 → 语法错误）。
+        var elemptr: string = ll_map_argptr(toks[5], ll_get_st(toks[5]));
+        // ⚠ slice 首参地址解析：
+        //   - ident 局部槽(%TSlice) → ll_llname 直接即首参地址(alloca 即 ptr<%TSlice>)
+        //   - 字段 GEP 结果被翻译器存进 alloca(ST=ptr<%TSlice>) → 须 ll_load 取出内部字段地址，
+        //     否则传 ptr-to-ptr(t_slice_append_sized 解引用错层 → 段错误)。
+        var slicest: string = ll_get_st(toks[4]);
+        var sliceptr: string;
+        if (ll_starts(slicest, "ptr<") || slicest == "ptr") {
+            sliceptr = ll_load(toks[4], slicest);
+        } else {
+            sliceptr = ll_llname(toks[4]);
+        }
         sb_append_str(g_ll, "  call void @t_slice_append_sized(ptr ");
-        sb_append_str(g_ll, ll_llname(toks[4]));
+        sb_append_str(g_ll, sliceptr);
         sb_append_str(g_ll, ", ptr ");
-        sb_append_str(g_ll, ll_llname(toks[5]));
+        sb_append_str(g_ll, elemptr);
         sb_append_str(g_ll, ", i64 ");
         sb_append_str(g_ll, esz);
         sb_append_str(g_ll, ")\n");
