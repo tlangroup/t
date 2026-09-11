@@ -20,7 +20,7 @@
 @import("src.lex" :: *);
 // S2：内建返回类型单一真相源（codegen_c.builtin_ret_td），供降级期查询内建调用返回 TD。
 // 单向导入 codegen_c（codegen_c 不导入 tir），无环；tc.tc 已先加载 codegen_c，顺序安全。
-@import("src.codegen_c" :: builtin_ret_td);
+@import("src.codegen_c" :: builtin_ret_td, fid_code_of);
 // 除/取余 op 文本→整数判别码的小模块（见 opmap.tc 注释：规避种子对 tir.tc 大模块的错编）。
 // 单向导入，opmap 自包含无回依赖，无环。
 @import("src.opmap" :: *);
@@ -829,8 +829,28 @@ pub fn tir_is_variant_ctor_call(e: i64) string {
     return "";
 }
 
+// 返回 "atom" 标量类型的 TD 索引（首次扫描后缓存到 g_atom_td）。
+// 仅用于 serialize/deserialize 选择器对齐旧轨 ser_sel；运行时序列化按 atom id 走 tll_ser_atom。
+var g_atom_td: i64 = -1;
+pub fn tir_atom_td() i64 {
+    if (g_atom_td >= 0) { return g_atom_td; }
+    var n: i64 = slice_len(sema.tds) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        if (sema.td_sname(i) == "atom") { g_atom_td = i; return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
 pub fn tir_expr_td(e: i64) i64 {
     if (e < 0) { return -1; }
+    var n0: Node = base.nodes[e];
+    // 原子字面量 :x 的类型恒为 64 位标量 "atom"。其 node.td 缓存与 meta_type_of_expr
+    // 在 N 轨下常回落到非 atom TD（导致 serialize 误判为 int），故在此直接返回 atom TD。
+    // 注意：此处 base.nodes[e].kind 为单层成员访问，且本函数无 TirEmitRes 局部，
+    // 旧轨 emit-ll 不会触发 str_eq 槽位冲突 / null 指针访问。
+    if (n0.kind == "atom") { return tir_atom_td(); }
     // v3 §5.3：优先读 HIR 类型槽（sema 一次性填入），避免每次重推导 + 影子表反推。
     // ⚠ 缓存值须做越界检查：node.td 可能取自更大 sema.tds 上下文的残留索引，直接返回会毒化下游 sema.tds[td] 索引。
     var cached_td: i64 = base.nodes[e].td;
@@ -2322,11 +2342,176 @@ pub fn tir_emit_expr(e: i64) TirEmitRes {
     if (kd == "closure_make") { return tir_emit_closure_make(n, e); }
     if (kd == "amp") { return tir_emit_amp(n, est); }
     if (kd == "deref") { return tir_emit_deref(e); }
+    // ── 序列化 / 反序列化操作符（M51/M52）：`f < v` / `f > Type` ──
+    // 新轨此前无此分支，< 被当普通小于比较发射 → fid 序列化整段失效。
+    if (kd == "serialize") { return tir_emit_serialize(n); }
+    if (kd == "deserialize") { return tir_emit_deserialize(n); }
     // 兜底：不支持的表达式 → 零 slot，绝不崩溃
     tir_cmt(base.sb_cat3("unsupported expr: ", kd, ""));
     var z: string = tir_tmp();
     tir_emit(TIRInst{ op: TIR_OP_CONST, st: tir_st_from_str("i64"), dst: tir_op(z), args: tir_a1("0"), is_comment: false, line: g_cur_line, cmt: "" });
     return TirEmitRes{ name: z, st: ST_I64 };
+}
+
+// ── 序列化 / 反序列化操作符发射（新轨）────────────────────────────
+// 选择器与旧轨 codegen_c.ser_sel 一致：按右值 TD / 类型 TD 选 str/atom/bool/f/i。
+// 返回整数选择器，避免 string 局部与 TirEmitRes 局部在旧轨 emit-ll 自举时槽位冲突。
+// 0=str / 1=atom / 2=bool / 3=f / 4=i
+pub fn tir_ser_sel(td: i64) i64 {
+    if (td < 0 || td >= slice_len(sema.tds) as i64) { return 4; }
+    var t: TD = sema.tds[td];
+    if (t.cat == "string") { return 0; }
+    var sn: string = sema.td_sname(td);
+    if (sn == "atom") { return 1; }
+    if (sn == "bool") { return 2; }
+    if (sn == "f16" || sn == "f32" || sn == "f64") { return 3; }
+    return 4;
+}
+
+// 序列化右值的类型描述：双轨对齐旧轨 codegen_ll.ll_etd（一律走 codegen_c.expr_type_desc）。
+// ⚠ 但 expr_type_desc 的 ident 分支依赖 codegen_c 的 fs/tm 符号表（由旧轨 emit 填充），
+//   新轨（tir）不填充那些表 → 变量会回落成 unknown → 误判为 int → 串口宽度错乱
+//   （例：row(f,"n",7) 把字符串变量 k 当 i64 序列化，fid_read_demo 字节流错位→长度前缀爆炸→malloc failed）。
+// 故：字面量（int/float/bool/string/atom）用 expr_type_desc 拿默认位宽（整型→i64，规避 sema 把裸字面量
+//   标成 i8 的缓存污染）；变量 / 成员 / 索引 / 调用用 tir_expr_td（走新轨 g_local_tds / builtin_ret_td）。
+pub fn tir_ser_val_td(e: i64) i64 {
+    if (e < 0) { return -1; }
+    var k: string = base.nodes[e].kind;
+    if (k == "int" || k == "float" || k == "bool" || k == "string" || k == "atom") {
+        return codegen_c.expr_type_desc(e);
+    }
+    return tir_expr_td(e);
+}
+
+// 仅 float 分支调用：f64→0(无需 fpext)，f32/f16→1(需 fpext 到 f64)。
+// 分离成独立函数，内部 string 比较不与 TirEmitRes 局部共存，避开旧轨槽位冲突。
+pub fn tir_td_flt_needs_fpext(td: i64) i64 {
+    if (td < 0 || td >= slice_len(sema.tds) as i64) { return 1; }
+    var sn: string = sema.td_sname(td);
+    if (sn == "f64") { return 0; }
+    return 1;
+}
+
+// 仅 int 分支调用：0=无需扩展, 1=符号扩展(SEXT), 2=零扩展(ZEXT)。
+pub fn tir_td_int_needs_ext(td: i64) i64 {
+    var sn: string = sema.td_sname(td);
+    if (sn == "i64" || sn == "u64") { return 0; }
+    if (base.ll_signed(sn)) { return 1; }
+    return 2;
+}
+
+pub fn tir_const_i32(v: i64) string {
+    var d: string = tir_tmp();
+    tir_emit(TIRInst{ op: TIR_OP_CONST, st: tir_st_from_str("i32"), dst: tir_op(d), args: tir_a1(base.i2s(v)), is_comment: false, line: g_cur_line, cmt: "" });
+    return d;
+}
+
+pub fn tir_const_i64(v: i64) string {
+    var d: string = tir_tmp();
+    tir_emit(TIRInst{ op: TIR_OP_CONST, st: tir_st_from_str("i64"), dst: tir_op(d), args: tir_a1(base.i2s(v)), is_comment: false, line: g_cur_line, cmt: "" });
+    return d;
+}
+
+// `f < v`：按 v 的类型选 tll_ser_*，返回目标 fid（i64）。
+pub fn tir_emit_serialize(n: Node) TirEmitRes {
+    var fslot: string = tir_emit_expr(n.na).name;   // fid (i64)
+    var vres: TirEmitRes = tir_emit_expr(n.nb);
+    var vslot: string = vres.name;
+    // ⚠ 值类型：字面量走 codegen_c.expr_type_desc（拿默认位宽 i64，规避 sema 把裸整数字面量
+    //   标成 i8 的缓存污染 → ser_int 误用 bits=8 → rawbin 少写字节）；变量/成员/索引/调用走
+    //   tir_expr_td（新轨 g_local_tds / builtin_ret_td，expr_type_desc 的 fs/tm 分支在新轨未填充）。
+    var vtd: i64 = tir_ser_val_td(n.nb);
+    var sel: i64 = tir_ser_sel(vtd);
+    var d: string = tir_tmp();
+    if (sel == 0) {
+        tir_emit(tir_e_call("i64", d, "@tll_ser_str", tir_cargs2(fslot, vslot)));
+    } else if (sel == 1) {
+        tir_emit(tir_e_call("i64", d, "@tll_ser_atom", tir_cargs2(fslot, vslot)));
+    } else if (sel == 2) {
+        tir_emit(tir_e_call("i64", d, "@tll_ser_bool", tir_cargs2(fslot, vslot)));
+    } else if (sel == 3) {
+        var fv: string = vslot;
+        if (tir_td_flt_needs_fpext(vtd) == 1) {
+            fv = tir_tmp();
+            tir_emit(TIRInst{ op: TIR_OP_FPEXT, st: tir_st_from_str("f64"), dst: tir_op(fv), args: tir_a1(vslot), is_comment: false, line: g_cur_line, cmt: "" });
+        }
+        var bits: string = tir_const_i32(base.ll_bits(sema.td_sname(vtd)));
+        tir_emit(tir_e_call("i64", d, "@tll_ser_f64", tir_cargs3(fslot, fv, bits)));
+    } else {
+        var iv: string = vslot;
+        var extop: i64 = tir_td_int_needs_ext(vtd);   // 0=none, 1=sext, 2=zext
+        if (extop != 0) {
+            // 窄整型按签名零扩展/符号扩展到 i64（ser 运行时按 sgn 解释）
+            var cop: i64 = TIR_OP_SEXT;
+            if (extop == 2) { cop = TIR_OP_ZEXT; }
+            iv = tir_tmp();
+            tir_emit(TIRInst{ op: cop, st: tir_st_from_str("i64"), dst: tir_op(iv), args: tir_a1(vslot), is_comment: false, line: g_cur_line, cmt: "" });
+        }
+        var bits: string = tir_const_i32(base.ll_bits(sema.td_sname(vtd)));
+        var sgnv: i64 = 0;
+        if (base.ll_signed(sema.td_sname(vtd))) { sgnv = 1; }
+        var sgn: string = tir_const_i32(sgnv);
+        var cargs4: []string = [];
+        append(cargs4, fslot); append(cargs4, iv); append(cargs4, bits); append(cargs4, sgn);
+        tir_emit(tir_e_call("i64", d, "@tll_ser_int", cargs4));
+    }
+    return TirEmitRes{ name: d, st: ST_I64 };
+}
+
+// `f > Type`：按 Type 选 tll_deser_*，返回裸 Type 值（窄整型/浮点按需收窄）。
+pub fn tir_emit_deserialize(n: Node) TirEmitRes {
+    var fslot: string = tir_emit_expr(n.na).name;   // fid (i64)
+    var ldtd: i64 = sema.deser_type_of(n.nb);
+    var sel: i64 = tir_ser_sel(ldtd);
+    var sn: string = sema.td_sname(ldtd);
+    if (sel == 0) {
+        // tll_deser_str 为 void + 显式 sret（out 末位 ptr）；tir 层把 %TStr 槽作为第二实参传入，
+        // 翻译器特判 tll_deser_str 负责 ll_ensure_slot + declare。
+        var d: string = tir_tmp();
+        tir_emit(tir_e_call("void", d, "@tll_deser_str", tir_cargs2(fslot, d)));
+        return TirEmitRes{ name: d, st: tir_st_from_str("%TStr") };
+    }
+    if (sel == 1) {
+        var d: string = tir_tmp();
+        tir_emit(tir_e_call("i64", d, "@tll_deser_atom", tir_cargs1(fslot)));
+        return TirEmitRes{ name: d, st: ST_U64 };
+    }
+    if (sel == 2) {
+        var d: string = tir_tmp();
+        tir_emit(tir_e_call("i8", d, "@tll_deser_bool", tir_cargs1(fslot)));
+        return TirEmitRes{ name: d, st: ST_I8 };
+    }
+    if (sel == 3) {
+        var d: string = tir_tmp();
+        tir_emit(tir_e_call("f64", d, "@tll_deser_f64", tir_cargs2(fslot, tir_const_i32(base.ll_bits(sn)))));
+        if (sn == "f32" || sn == "f16") {
+            var d2: string = tir_tmp();
+            tir_emit(TIRInst{ op: TIR_OP_FPTRUNC, st: tir_st_from_str(sn), dst: tir_op(d2), args: tir_a1(d), is_comment: false, line: g_cur_line, cmt: "" });
+            return TirEmitRes{ name: d2, st: tir_st_from_str(sn) };
+        }
+        return TirEmitRes{ name: d, st: ST_F64 };
+    }
+    // int：tll_deser_int 返回 i64，按目标宽度截断（与旧轨运行期桥接最宽标量返回对齐）
+    var iv: string = tir_tmp();
+    var dsgnv: i64 = 0;
+    if (base.ll_signed(sn)) { dsgnv = 1; }
+    tir_emit(tir_e_call("i64", iv, "@tll_deser_int", tir_cargs3(fslot, tir_const_i32(base.ll_bits(sn)), tir_const_i32(dsgnv))));
+    if (sn == "i8" || sn == "u8") {
+        var d: string = tir_tmp();
+        tir_emit(TIRInst{ op: TIR_OP_TRUNC, st: tir_st_from_str("i8"), dst: tir_op(d), args: tir_a1(iv), is_comment: false, line: g_cur_line, cmt: "" });
+        return TirEmitRes{ name: d, st: ST_I8 };
+    }
+    if (sn == "i16" || sn == "u16") {
+        var d: string = tir_tmp();
+        tir_emit(TIRInst{ op: TIR_OP_TRUNC, st: tir_st_from_str("i16"), dst: tir_op(d), args: tir_a1(iv), is_comment: false, line: g_cur_line, cmt: "" });
+        return TirEmitRes{ name: d, st: tir_st_from_str("i16") };
+    }
+    if (sn == "i32" || sn == "u32") {
+        var d: string = tir_tmp();
+        tir_emit(TIRInst{ op: TIR_OP_TRUNC, st: tir_st_from_str("i32"), dst: tir_op(d), args: tir_a1(iv), is_comment: false, line: g_cur_line, cmt: "" });
+        return TirEmitRes{ name: d, st: ST_I32 };
+    }
+    return TirEmitRes{ name: iv, st: ST_I64 };
 }
 
 // 取址 `&x`：x 为左值（局部/全局/字段/下标/解引用）。
@@ -2646,6 +2831,78 @@ pub fn tir_emit_call(e: i64) TirEmitRes {
         append(__car, aslot);
         tir_emit(tir_e_call(dstst, d, base.sb_cat2("@", cname), __car));
         return TirEmitRes{ name: d, st: tir_st_from_str(dstst) };
+    }
+    // ── fid 文件模式 / 格式内建（M51，与旧轨 codegen_ll 对齐）────────
+    // fopen 的 mode、fmt_register 的 kind/fmt 实参是白名单 atom 字面量（:read_binary 等），
+    // 必须按 codegen_c.fid_code_of 降为整数码传给运行时，不能发射 atom 自身 id
+    // （新轨此前误把 :write_binary 当 id=1 → 落到 "w" 文本模式 → 二进制文件损坏 / 反序列化垃圾）。
+    // fid_format 须注入 4 个格式 atom 的 id（text/json/rawbin/protobuf）作为运行期比对实参。
+    if (cname == "fopen" || cname == "fmt_register" || cname == "fid_format") {
+        var a0: i64 = -1;
+        var a1: i64 = -1;
+        var a2: i64 = -1;
+        if (n.la >= 0) {
+            a0 = base.kids[n.la].val;
+            var nx1: i64 = base.kids[n.la].next;
+            if (nx1 >= 0) { a1 = base.kids[nx1].val; var nx2: i64 = base.kids[nx1].next; if (nx2 >= 0) { a2 = base.kids[nx2].val; } }
+        }
+        if (cname == "fopen") {
+            var p_slot: string = "";
+            if (a0 >= 0) { p_slot = tir_emit_expr(a0).name; }
+            var m_slot: string;
+            if (a1 >= 0 && base.nodes[a1].kind == "atom") {
+                m_slot = tir_const_i32(codegen_c.fid_code_of("mode", base.nodes[a1].sa));
+            } else if (a1 >= 0) {
+                m_slot = tir_emit_expr(a1).name;
+            } else {
+                m_slot = tir_const_i32(0);
+            }
+            tir_emit(tir_e_call("i64", d, "@tll_fopen", tir_cargs2(p_slot, m_slot)));
+            return TirEmitRes{ name: d, st: tir_st_from_str(retst) };
+        }
+        if (cname == "fmt_register") {
+            var kind_slot: string;
+            if (a0 >= 0 && base.nodes[a0].kind == "atom") {
+                kind_slot = tir_const_i32(codegen_c.fid_code_of("kind", base.nodes[a0].sa));
+            } else if (a0 >= 0) {
+                kind_slot = tir_emit_expr(a0).name;
+            } else {
+                kind_slot = tir_const_i32(0);
+            }
+            var suf_slot: string = "";
+            if (a1 >= 0) { suf_slot = tir_emit_expr(a1).name; }
+            var fmt_slot: string;
+            if (a2 >= 0 && base.nodes[a2].kind == "atom") {
+                fmt_slot = tir_const_i32(codegen_c.fid_code_of("fmt", base.nodes[a2].sa));
+            } else if (a2 >= 0) {
+                fmt_slot = tir_emit_expr(a2).name;
+            } else {
+                fmt_slot = tir_const_i32(0);
+            }
+            var fr_args: []string = [];
+            append(fr_args, kind_slot); append(fr_args, suf_slot); append(fr_args, fmt_slot);
+            tir_emit(tir_e_call("void", d, "@tll_fmt_register", fr_args));
+            return TirEmitRes{ name: d, st: tir_st_from_str(retst) };
+        }
+        // fid_format(f)：注入 4 个格式 atom id（与旧轨 ll_fmt_atom_args 完全一致）
+        var f_slot: string = "";
+        if (a0 >= 0) { f_slot = tir_emit_expr(a0).name; }
+        var ff_args: []string = [];
+        append(ff_args, f_slot);
+        append(ff_args, tir_const_i64(sema.atom_intern("text")));
+        append(ff_args, tir_const_i64(sema.atom_intern("json")));
+        append(ff_args, tir_const_i64(sema.atom_intern("rawbin")));
+        append(ff_args, tir_const_i64(sema.atom_intern("protobuf")));
+        tir_emit(tir_e_call("i64", d, "@tll_fid_format", ff_args));
+        return TirEmitRes{ name: d, st: tir_st_from_str(retst) };
+    }
+    // fflush(f)：旧轨 codegen_ll 特判为 @tll_fflush（fid 感知，参数 i64 句柄），
+    // 新轨若直接发射 @fflush 会落到 libc fflush(FILE*) → 把 i64 句柄当指针解引用 → 段错误。
+    if (cname == "fflush") {
+        var f_slot: string = "";
+        if (n.la >= 0) { f_slot = tir_emit_expr(base.kids[n.la].val).name; }
+        tir_emit(tir_e_call("void", d, "@tll_fflush", tir_cargs1(f_slot)));
+        return TirEmitRes{ name: d, st: tir_st_from_str(retst) };
     }
     // 常规调用：发射各实参 → 直接 call
     ac = n.la;
