@@ -21,6 +21,9 @@
 // S2：内建返回类型单一真相源（codegen_c.builtin_ret_td），供降级期查询内建调用返回 TD。
 // 单向导入 codegen_c（codegen_c 不导入 tir），无环；tc.tc 已先加载 codegen_c，顺序安全。
 @import("src.codegen_c" :: builtin_ret_td);
+// 除/取余 op 文本→整数判别码的小模块（见 opmap.tc 注释：规避种子对 tir.tc 大模块的错编）。
+// 单向导入，opmap 自包含无回依赖，无环。
+@import("src.opmap" :: *);
 
 // ── 内存结构 ───────────────────────────────────────────────────
 pub struct TIRType {
@@ -131,10 +134,14 @@ pub const TIR_OP_FPTOUI: i64 = 30;
 pub const TIR_OP_ADD: i64 = 31;
 pub const TIR_OP_SUB: i64 = 32;
 pub const TIR_OP_MUL: i64 = 33;
-pub const TIR_OP_SDIV: i64 = 34;
-pub const TIR_OP_UDIV: i64 = 35;
-pub const TIR_OP_SREM: i64 = 36;
-pub const TIR_OP_UREM: i64 = 37;
+// ⚠ 种子编译器（旧 LLVM 后端自举）对「返回 const 值 34-37 的分支」存在静默错编
+// （分支被丢弃 → 落到默认 TIR_OP_OTHER），导致新轨 / 与 % 全部降级为 add。
+// 将 SDIV/UDIV/SREM/UREM 的判别值挪到 58-61（已知可正确编译区间），规避该错编。
+// 所有引用均用名字 TIR_OP_*，值变更自动传播；旧轨 codegen_ll 不消费 TIR_OP_*，无副作用。
+pub const TIR_OP_SDIV: i64 = 58;
+pub const TIR_OP_UDIV: i64 = 59;
+pub const TIR_OP_SREM: i64 = 60;
+pub const TIR_OP_UREM: i64 = 61;
 pub const TIR_OP_AND: i64 = 38;
 pub const TIR_OP_OR: i64 = 39;
 pub const TIR_OP_XOR: i64 = 40;
@@ -229,125 +236,6 @@ pub fn tir_st_to_str(code: i64) string {
     return "i64";
 }
 
-// 文本 op 基名 → 整数判别码（解析期调用；const.<x> 一律归并到 TIR_OP_CONST，st 已由解析器写入 inst.st）
-pub fn tir_op_from_str(s: string) i64 {
-    if (s == "ret.void") { return TIR_OP_RET_VOID; }
-    if (s == "ret") { return TIR_OP_RET; }
-    if (s == "slot") { return TIR_OP_SLOT; }
-    if (s == "const.str") { return TIR_OP_CONST_STR; }
-    if (s == "const.ptr.null") { return TIR_OP_CONST_PTR_NULL; }
-    if (s == "const") { return TIR_OP_CONST; }
-    if (str_len(s) > 6 && str_slice(s, 0, 6) == "const.") { return TIR_OP_CONST; }
-    if (s == "bitcast") { return TIR_OP_BITCAST; }
-    if (s == "store") { return TIR_OP_STORE; }
-    if (s == "load") { return TIR_OP_LOAD; }
-    if (s == "addr_of") { return TIR_OP_ADDR_OF; }
-    if (s == "gep") { return TIR_OP_GEP; }
-    if (s == "gep_idx") { return TIR_OP_GEP_IDX; }
-    if (s == "slice_at") { return TIR_OP_SLICE_AT; }
-    if (s == "str_at") { return TIR_OP_STR_AT; }
-    if (s == "struct_new") { return TIR_OP_STRUCT_NEW; }
-    if (s == "call") { return TIR_OP_CALL; }
-    if (s == "call_ind") { return TIR_OP_CALL_IND; }
-    if (s == "br") { return TIR_OP_BR; }
-    if (s == "br_cond") { return TIR_OP_BR_COND; }
-    if (s == "block") { return TIR_OP_BLOCK; }
-    if (s == "trunc") { return TIR_OP_TRUNC; }
-    if (s == "zext") { return TIR_OP_ZEXT; }
-    if (s == "sext") { return TIR_OP_SEXT; }
-    if (s == "fpext") { return TIR_OP_FPEXT; }
-    if (s == "fptrunc") { return TIR_OP_FPTRUNC; }
-    if (s == "sitofp") { return TIR_OP_SITOFP; }
-    if (s == "uitofp") { return TIR_OP_UITOFP; }
-    if (s == "fptosi") { return TIR_OP_FPTOSI; }
-    if (s == "fptoui") { return TIR_OP_FPTOUI; }
-    if (s == "add") { return TIR_OP_ADD; }
-    if (s == "sub") { return TIR_OP_SUB; }
-    if (s == "mul") { return TIR_OP_MUL; }
-    if (s == "sdiv") { return TIR_OP_SDIV; }
-    if (s == "udiv") { return TIR_OP_UDIV; }
-    if (s == "srem") { return TIR_OP_SREM; }
-    if (s == "urem") { return TIR_OP_UREM; }
-    if (s == "and") { return TIR_OP_AND; }
-    if (s == "or") { return TIR_OP_OR; }
-    if (s == "xor") { return TIR_OP_XOR; }
-    if (s == "shl") { return TIR_OP_SHL; }
-    if (s == "lshr") { return TIR_OP_LSHR; }
-    if (s == "ashr") { return TIR_OP_ASHR; }
-    if (s == "slt") { return TIR_OP_SLT; }
-    if (s == "sgt") { return TIR_OP_SGT; }
-    if (s == "sge") { return TIR_OP_SGE; }
-    if (s == "sle") { return TIR_OP_SLE; }
-    if (s == "ult") { return TIR_OP_ULT; }
-    if (s == "ugt") { return TIR_OP_UGT; }
-    if (s == "ule") { return TIR_OP_ULE; }
-    if (s == "uge") { return TIR_OP_UGE; }
-    if (s == "eq") { return TIR_OP_EQ; }
-    if (s == "ne") { return TIR_OP_NE; }
-    if (s == "not") { return TIR_OP_NOT; }
-    if (s == "lnot") { return TIR_OP_LNOT; }
-    if (s == "neg") { return TIR_OP_NEG; }
-    // 算术/比较类文本形态带类型后缀 "add.i64" "slt.i64"：剥离首点后的基名再匹配。
-    // 必须在 const 族精确匹配之后做（const.str / const.ptr.null / ret.void 含点，已在上文命中）。
-    var dot: i64 = -1;
-    var di: i64 = 0;
-    while (di < str_len(s)) { if (s[di] == 46) { dot = di; break; } di = di + 1; }
-    if (dot >= 0) {
-        var base: string = str_slice(s, 0, dot);
-        if (base == "ret") { return TIR_OP_RET; }
-        if (base == "slot") { return TIR_OP_SLOT; }
-        if (base == "bitcast") { return TIR_OP_BITCAST; }
-        if (base == "store") { return TIR_OP_STORE; }
-        if (base == "load") { return TIR_OP_LOAD; }
-        if (base == "addr_of") { return TIR_OP_ADDR_OF; }
-        if (base == "gep") { return TIR_OP_GEP; }
-        if (base == "gep_idx") { return TIR_OP_GEP_IDX; }
-        if (base == "slice_at") { return TIR_OP_SLICE_AT; }
-        if (base == "str_at") { return TIR_OP_STR_AT; }
-        if (base == "struct_new") { return TIR_OP_STRUCT_NEW; }
-        if (base == "call") { return TIR_OP_CALL; }
-        if (base == "call_ind") { return TIR_OP_CALL_IND; }
-        if (base == "br") { return TIR_OP_BR; }
-        if (base == "br_cond") { return TIR_OP_BR_COND; }
-        if (base == "block") { return TIR_OP_BLOCK; }
-        if (base == "trunc") { return TIR_OP_TRUNC; }
-        if (base == "zext") { return TIR_OP_ZEXT; }
-        if (base == "sext") { return TIR_OP_SEXT; }
-        if (base == "fpext") { return TIR_OP_FPEXT; }
-        if (base == "fptrunc") { return TIR_OP_FPTRUNC; }
-        if (base == "sitofp") { return TIR_OP_SITOFP; }
-        if (base == "uitofp") { return TIR_OP_UITOFP; }
-        if (base == "fptosi") { return TIR_OP_FPTOSI; }
-        if (base == "fptoui") { return TIR_OP_FPTOUI; }
-        if (base == "add") { return TIR_OP_ADD; }
-        if (base == "sub") { return TIR_OP_SUB; }
-        if (base == "mul") { return TIR_OP_MUL; }
-        if (base == "sdiv") { return TIR_OP_SDIV; }
-        if (base == "udiv") { return TIR_OP_UDIV; }
-        if (base == "srem") { return TIR_OP_SREM; }
-        if (base == "urem") { return TIR_OP_UREM; }
-        if (base == "and") { return TIR_OP_AND; }
-        if (base == "or") { return TIR_OP_OR; }
-        if (base == "xor") { return TIR_OP_XOR; }
-        if (base == "shl") { return TIR_OP_SHL; }
-        if (base == "lshr") { return TIR_OP_LSHR; }
-        if (base == "ashr") { return TIR_OP_ASHR; }
-        if (base == "slt") { return TIR_OP_SLT; }
-        if (base == "sgt") { return TIR_OP_SGT; }
-        if (base == "sge") { return TIR_OP_SGE; }
-        if (base == "sle") { return TIR_OP_SLE; }
-        if (base == "ult") { return TIR_OP_ULT; }
-        if (base == "ugt") { return TIR_OP_UGT; }
-        if (base == "ule") { return TIR_OP_ULE; }
-        if (base == "uge") { return TIR_OP_UGE; }
-        if (base == "eq") { return TIR_OP_EQ; }
-        if (base == "ne") { return TIR_OP_NE; }
-        if (base == "not") { return TIR_OP_NOT; }
-        if (base == "lnot") { return TIR_OP_LNOT; }
-        if (base == "neg") { return TIR_OP_NEG; }
-    }
-    return TIR_OP_OTHER;
-}
 
 // 整数判别码 → 文本基名（仅 tir_inst_to_text 调试序列化与 ll_emit_inst 取 LLVM 助记符用）
 pub fn tir_op_to_str(o: i64) string {
@@ -385,10 +273,10 @@ pub fn tir_op_to_str(o: i64) string {
     if (o == TIR_OP_ADD) { return "add"; }
     if (o == TIR_OP_SUB) { return "sub"; }
     if (o == TIR_OP_MUL) { return "mul"; }
-    if (o == TIR_OP_SDIV) { return "sdiv"; }
-    if (o == TIR_OP_UDIV) { return "udiv"; }
-    if (o == TIR_OP_SREM) { return "srem"; }
-    if (o == TIR_OP_UREM) { return "urem"; }
+    if (o == TIR_OP_SDIV) { return "div_s"; }
+    if (o == TIR_OP_UDIV) { return "div_u"; }
+    if (o == TIR_OP_SREM) { return "rem_s"; }
+    if (o == TIR_OP_UREM) { return "rem_u"; }
     if (o == TIR_OP_AND) { return "and"; }
     if (o == TIR_OP_OR) { return "or"; }
     if (o == TIR_OP_XOR) { return "xor"; }
@@ -1029,8 +917,12 @@ pub fn tir_expr_st(e: i64) string {
         if (fst == "f32" || fst == "f64") { return fst; }
         return "f64";
     }
+    // 字符串/字节字面量在 TIR ABI 中恒为 %TStr（tir_st_of_td 的 cat=="string"/"bytes" 分支亦如此）。
+    // 直接返回，避免 meta_type_of_expr/resolve_type_desc 对字面量推断退化成 i64，
+    // 否则 match 返回 string/struct 时 __mres 槽宽不足（8 字节 i64 槽存 16 字节 %TStr）→ 返回脏结构。
+    if (kd == "string" || kd == "bytes") { return "%TStr"; }
     if (kd == "int" || kd == "bool" || kd == "char" ||
-        kd == "null" || kd == "opt_none" || kd == "string") {
+        kd == "null" || kd == "opt_none") {
         return tir_st_of_td(sema.resolve_type_desc(e));
     }
     // 其它表达式：用 meta_type_of_expr 推断
@@ -2601,46 +2493,6 @@ pub fn tir_emit_logical(n: Node, is_and: bool, e: i64) TirEmitRes {
     return TirEmitRes{ name: res, st: tir_st_from_str(tir_expr_st(e)) };
 }
 
-pub fn tir_binop(op: string, st: string) string {
-    if (op == "+") { return base.sb_cat2("add.", st); }
-    if (op == "-") { return base.sb_cat2("sub.", st); }
-    if (op == "*") { return base.sb_cat2("mul.", st); }
-    if (op == "/") { return base.sb_cat2(tir_divop(st), st); }
-    if (op == "%") { return base.sb_cat2(tir_remop(st), st); }
-    if (op == "&") { return "and"; }
-    if (op == "|") { return "or"; }
-    if (op == "^") { return "xor"; }
-    if (op == "<<") { return "shl"; }
-    if (op == ">>") { return "ashr"; }
-    if (op == "==") { return base.sb_cat2("eq.", st); }
-    if (op == "!=") { return base.sb_cat2("ne.", st); }
-    if (op == "<") { return base.sb_cat3(tir_cmpop(op, st), ".", st); }
-    if (op == "<=") { return base.sb_cat3(tir_cmpop("<=", st), ".", st); }
-    if (op == ">") { return base.sb_cat3(tir_cmpop(">", st), ".", st); }
-    if (op == ">=") { return base.sb_cat3(tir_cmpop(">=", st), ".", st); }
-    return "unsupported_binop";
-}
-
-pub fn tir_divop(st: string) string {
-    if (str_len(st) > 0 && st[0] == 117) { return "udiv"; }   // 'u'
-    return "sdiv";
-}
-
-pub fn tir_remop(st: string) string {
-    if (str_len(st) > 0 && st[0] == 117) { return "urem"; }
-    return "srem";
-}
-
-pub fn tir_cmpop(op: string, st: string) string {
-    var uns: bool = false;
-    if (str_len(st) > 0 && st[0] == 117) { uns = true; }
-    if (op == "<") { if (uns) { return "ult"; } return "slt"; }
-    if (op == "<=") { if (uns) { return "ule"; } return "sle"; }
-    if (op == ">") { if (uns) { return "ugt"; } return "sgt"; }
-    if (op == ">=") { if (uns) { return "uge"; } return "sge"; }
-    return "slt";
-}
-
 pub fn tir_emit_unary(n: Node) TirEmitRes {
     var ar: TirEmitRes = tir_emit_expr(n.na); var a: string = ar.name;
     // 同 binary：操作数存储型取实际发射类型（内层 emitter 已置）。
@@ -3373,17 +3225,15 @@ pub fn tir_match_pattern_cond(arm: Node, scr: string, scr_base: string, scr_st: 
         tir_emit(TIRInst{ op: TIR_OP_EQ, st: tir_st_from_str("u64"), dst: tir_op(cond), args: tir_a2(scr, pv), is_comment: false, line: g_cur_line, cmt: "" });
         return cond;
     }
-    // ── 字符串字面量模式：tll_str_eq == 0 ──
+    // ── 字符串字面量模式：tll_str_eq != 0（runtime 返回 1=相等，与旧轨 icmp ne t0,0 一致） ──
+    // ⚠ tll_str_eq 接受 TStr*（即 %TStr 的地址）。scr 与字面量槽都是 %TStr 指针，须直接传入，
+    // 不可取 data 指针（gep ... 0）——否则运行期把 data 指针当 TStr* 解引用读垃圾 → 恒匹配首臂。
     if (p.kind == "string") {
-        var sp: string = tir_tmp();
-        tir_emit(TIRInst{ op: TIR_OP_GEP, st: tir_st_from_str("ptr<i8>"), dst: tir_op(sp), args: tir_a2(scr, "0"), is_comment: false, line: g_cur_line, cmt: "" });
         var pvslotr: TirEmitRes = tir_emit_expr(arm.na); var pvslot: string = pvslotr.name;
-        var pp: string = tir_tmp();
-        tir_emit(TIRInst{ op: TIR_OP_GEP, st: tir_st_from_str("ptr<i8>"), dst: tir_op(pp), args: tir_a2(pvslot, "0"), is_comment: false, line: g_cur_line, cmt: "" });
         var cmp: string = tir_tmp();
-        tir_emit(TIRInst{ op: TIR_OP_CALL, st: tir_st_from_str("i32"), dst: tir_op(cmp), args: tir_a3("@tll_str_eq", sp, pp), is_comment: false, line: g_cur_line, cmt: "" });
+        tir_emit(TIRInst{ op: TIR_OP_CALL, st: tir_st_from_str("i32"), dst: tir_op(cmp), args: tir_a3("@tll_str_eq", scr, pvslot), is_comment: false, line: g_cur_line, cmt: "" });
         var cond: string = tir_tmp();
-        tir_emit(TIRInst{ op: TIR_OP_EQ, st: tir_st_from_str("i32"), dst: tir_op(cond), args: tir_a2(cmp, "0"), is_comment: false, line: g_cur_line, cmt: "" });
+        tir_emit(TIRInst{ op: TIR_OP_NE, st: tir_st_from_str("i32"), dst: tir_op(cond), args: tir_a2(cmp, "0"), is_comment: false, line: g_cur_line, cmt: "" });
         return cond;
     }
     // ── 枚举 / 变体构造器模式（ident 或 Enum.Case / Variant.Case 的 member）──
@@ -3478,12 +3328,13 @@ pub fn tir_emit_match(n: Node, as_stmt: bool, est: i64) TirEmitRes {
     while (c >= 0) { append(armIds, base.kids[c].val); c = base.kids[c].next; }
     var nArm: i64 = slice_len(armIds);
     if (as_stmt == false) {
-        // 结果槽类型须取「match 表达式自身的返回类型」而非 scrutinee 类型：
-        // 变体 match 的 scrutinee 是 ptr<%V>，但 body 返回 i64 —— 误用 scrutinee 类型会把 __mres
-        // 建为 alloca ptr，翻译器按 sret 解引用未初始化的指针 → 段错/读脏值。
-        // 取首臂 body 的发射类型（store 即以该类型定宽），保证 res 槽宽与 body 值一致。
-        var rtd: i64 = scr_td;
-        var rst: string = scr_st;
+        // 结果槽类型优先取「首臂 body 发射类型」：tir_expr_st 对字符串/字节字面量现已直接返回 %TStr，
+        // 对结构体字面量走 meta_type_of_expr 亦可靠；而 est（match 整体类型）在 match 返回 string/struct 时
+        // 易退化为 i64，导致 __mres 槽宽不足（8 字节 i64 槽存 16 字节 %TStr）→ 栈溢出 / 返回脏结构
+        // → match 返回 string/struct 全错（atom / match_demo / type_info_demo / tagid_typeinfo 等）。
+        // 变体 match 的 scrutinee 是 ptr<%V> 但 body 返回 i64，首臂 body 类型同样正确，无 scrutinee 误用问题。
+        var rtd: i64 = -1;
+        var rst: string = "i64";
         if (nArm > 0) {
             var fbn: Node = base.nodes[armIds[0]];
             if (fbn.nc >= 0) {
@@ -3491,6 +3342,12 @@ pub fn tir_emit_match(n: Node, as_stmt: bool, est: i64) TirEmitRes {
                 if (rtd < 0) { rtd = scr_td; }
                 rst = tir_expr_st(fbn.nc);
             }
+        }
+        if (rst == "" || rst == "ptr" || rst == "i64") {
+            // 首臂 body 类型仍不可靠（如确为 i64 返回），回退 est（match 整体类型）
+            var est_st: string = tir_st_to_str(est);
+            if (est_st != "" && est_st != "ptr") { rst = est_st; }
+            if (rtd < 0) { rtd = scr_td; }
         }
         if (rst == "" || rst == "ptr") { rst = "i64"; }
         res = tir_new_named_slot(rtd, rst, "__mres");
