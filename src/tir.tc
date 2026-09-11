@@ -2620,6 +2620,33 @@ pub fn tir_emit_call(e: i64) TirEmitRes {
         tir_emit(TIRInst{ op: TIR_OP_CALL, st: tir_st_from_str("ptr<void>"), dst: tir_op(md), args: tir_a3("@map_new", base.i2s(keykind), base.i2s(valsz)), is_comment: false, line: g_cur_line, cmt: "" });
         return TirEmitRes{ name: md, st: tir_st_from_str(retst) };
     }
+    // 可选类型内建（可空指针模型）：some(x) → ?T = ptr<elem>；unwrap(p) → elem（标量值或聚合值）。
+    // 与旧轨 codegen_ll 对齐：some 经 tll_opt_some 拷贝、unwrap 解引用。须在此显式给出正确返回 ST，
+    // 否则 some 被 builtin_ret 退化为 Unknown→i64，下游 tir_expr_st 拿到错类型（unwrap(some(x)) 嵌套、
+    // make_opt 返回 some(x) 均会槽类型错配 → unwrap 读出垃圾）。
+    if (cname == "some" || cname == "unwrap") {
+        var argnode: i64 = -1;
+        if (n.la >= 0) { argnode = base.kids[n.la].val; }
+        var dstst: string = "i64";
+        if (cname == "some") {
+            var ed: i64 = tir_expr_td(argnode);
+            var est: string = "i64";
+            if (ed >= 0 && ed < slice_len(sema.tds) as i64) { est = tir_st_of_td(ed); }
+            dstst = base.sb_cat3("ptr<", est, ">");
+        } else {
+            var otd: i64 = tir_expr_td(argnode);
+            if (otd >= 0 && otd < slice_len(sema.tds) as i64 && sema.tds[otd].cat == "optional") {
+                var ed: i64 = sema.tds[otd].elem;
+                if (ed >= 0 && ed < slice_len(sema.tds) as i64) { dstst = tir_st_of_td(ed); }
+            }
+        }
+        var aslot: string = "";
+        if (argnode >= 0) { aslot = tir_emit_expr(argnode).name; }
+        var __car: []string = [];
+        append(__car, aslot);
+        tir_emit(tir_e_call(dstst, d, base.sb_cat2("@", cname), __car));
+        return TirEmitRes{ name: d, st: tir_st_from_str(dstst) };
+    }
     // 常规调用：发射各实参 → 直接 call
     ac = n.la;
     while (ac >= 0) {

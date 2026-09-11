@@ -1551,14 +1551,32 @@ pub fn ll_emit_builtin(cn: string, toks: []string) bool {
         return true;
     }
     if (cn == "unwrap") {
+        // ?T ↔ ptr 模型：unwrap(p) 调 tll_opt_unwrap 取「指向元素值的指针」，再 load 出元素值。
+        // 标量 load 出 i64/u8…；聚合(%Point 等) load 出 %Struct 值——与旧轨 codegen_ll 对齐。
+        var argst: string = ll_get_st(toks[4]);
+        var elem: string = "i64";
+        if (ll_starts(argst, "ptr<")) { elem = ll_ptr_inner(argst); }
+        else if (argst == "ptr") { elem = "i8"; }
+        else { elem = argst; }
+        // ⚠ ll_load 会立即把 load 语句 append 到 g_ll，必须先在 call 行之外取好值寄存器名，
+        // 再拼 call 行，否则 load 语句会被插进 call 行中间导致 IR 非法。
+        var argval: string = ll_load(toks[4], argst);
         ll_maybe_declare("tll_opt_unwrap", "ptr", ["ptr"]);
         var r: string = ll_tmp();
         sb_append_str(g_ll, "  ");
         sb_append_str(g_ll, r);
         sb_append_str(g_ll, " = call ptr @tll_opt_unwrap(ptr ");
-        sb_append_str(g_ll, ll_llname_ptr(toks[4]));
+        sb_append_str(g_ll, argval);
         sb_append_str(g_ll, ")\n");
-        ll_ensure_slot(d, "ptr"); ll_set_st(d, "ptr"); ll_store(d, "ptr", r);
+        var v: string = ll_tmp();
+        sb_append_str(g_ll, "  ");
+        sb_append_str(g_ll, v);
+        sb_append_str(g_ll, " = load ");
+        sb_append_str(g_ll, st_to_ll(elem));
+        sb_append_str(g_ll, ", ptr ");
+        sb_append_str(g_ll, r);
+        sb_append_str(g_ll, "\n");
+        ll_ensure_slot(d, elem); ll_set_st(d, elem); ll_store(d, elem, v);
         return true;
     }
     // ── out 参数聚合返回：DST 直接作为 %TStr/%TSlice alloca 传给 tll_* ──
@@ -1670,23 +1688,31 @@ pub fn ll_emit_builtin(cn: string, toks: []string) bool {
         sb_append_str(g_ll, ")\n");
         return true;
     }
-    // ── 可选类型 ?T（可空指针模型）：some(x) 取 x 的地址作为 optional 指针 ──
+    // ── 可选类型 ?T（可空指针模型）：some(x) 经 tll_opt_some 把 x arena 拷贝并返回指针 ──
+    // 元素 LLVM 类型从实参槽类型取：标量 argst 即元素；聚合 argst 形如 %Point 即元素；指针 argst 即元素。
+    // 旧实现仅取 x 的栈地址→ptrtoint（无拷贝），返回即悬空指针，unwrap 读出垃圾（optional_demo 现 42→1.3e11）。
     if (cn == "some") {
-        var c0: string = toks[4];
-        var pv: string;
-        if (str_len(c0) >= 1 && (c0[0] == 36 || c0[0] == 64)) {
-            pv = ll_llname(c0);   // $slot / @global → 其地址即聚合/标量的存放地址
-        } else {
-            var ns: string = ll_tmp();
-            sb_append_str(g_ll, "  "); sb_append_str(g_ll, ns); sb_append_str(g_ll, " = alloca i64\n");
-            sb_append_str(g_ll, "  store i64 "); sb_append_str(g_ll, c0); sb_append_str(g_ll, ", ptr ");
-            sb_append_str(g_ll, ns); sb_append_str(g_ll, "\n");
-            pv = ns;
-        }
-        var pi: string = ll_tmp();
-        sb_append_str(g_ll, "  "); sb_append_str(g_ll, pi);
-        sb_append_str(g_ll, " = ptrtoint ptr "); sb_append_str(g_ll, pv); sb_append_str(g_ll, " to i64\n");
-        ll_ensure_slot(d, "i64"); ll_set_st(d, "i64"); ll_store(d, "i64", pi);
+        var argst: string = ll_get_st(toks[4]);
+        var elem: string = argst;
+        var oslot: string = ll_map_argptr(toks[4], argst);
+        // sizeof(elem) = getelementptr <elem>, ptr null, i32 1 → ptrtoint to i64
+        var szg: string = ll_tmp();
+        sb_append_str(g_ll, "  "); sb_append_str(g_ll, szg);
+        sb_append_str(g_ll, " = getelementptr "); sb_append_str(g_ll, st_to_ll(elem));
+        sb_append_str(g_ll, ", ptr null, i32 1\n");
+        var sz: string = ll_tmp();
+        sb_append_str(g_ll, "  "); sb_append_str(g_ll, sz);
+        sb_append_str(g_ll, " = ptrtoint ptr "); sb_append_str(g_ll, szg);
+        sb_append_str(g_ll, " to i64\n");
+        ll_maybe_declare("tll_opt_some", "ptr", ["ptr", "i64"]);
+        var r: string = ll_tmp();
+        sb_append_str(g_ll, "  "); sb_append_str(g_ll, r);
+        sb_append_str(g_ll, " = call ptr @tll_opt_some(ptr ");
+        sb_append_str(g_ll, oslot);
+        sb_append_str(g_ll, ", i64 "); sb_append_str(g_ll, sz);
+        sb_append_str(g_ll, ")\n");
+        var dstst: string = base.sb_cat3("ptr<", elem, ">");
+        ll_ensure_slot(d, dstst); ll_set_st(d, dstst); ll_store(d, dstst, r);
         return true;
     }
     if (cn == "is_some" || cn == "is_none") {
@@ -3313,6 +3339,48 @@ pub fn tir_to_ll_emit(module: TIRModule) string {
     return sb_to_str(g_ll);
 }
 
+// 全局 atom 名表（TIR 路径）：@t_atom_table = [M x %TStr]，index 0 占位空串，
+// 其后按 sema.g_atom_names 顺序；atom_intern 返回 1-based id → t_atom_table[id] 命中。
+// 与旧轨 emit_ll_atom_table 完全一致：运行期 t_atom_str/t_deser_atom 经 extern 引用此表。
+// 旧轨此前硬编码 1 元素占位表，导致 :ok/:error/:ready 等真实原子未入表 → atom_str 返回空。
+pub fn ll_emit_atom_table() void {
+    var cnt: i64 = sema.g_atom_cnt;
+    var elems: StringBuilder = sb_new();
+    sb_append_str(elems, "%TStr { ptr @.tirll_as0, i64 0 }");   // index 0 占位空串
+    var i: i64 = 0;
+    while (i < cnt) {
+        var esc: string = tir_esc(sema.g_atom_names[i]);
+        var blen: i64 = 0;
+        var cn: i64 = str_len(esc);
+        var ci: i64 = 0;
+        while (ci < cn) {
+            if (str_at(esc, ci) == 92) { ci = ci + 3; } else { ci = ci + 1; }
+            blen = blen + 1;
+        }
+        sb_append_str(g_ll, "@.tirll_aStr");
+        sb_append_i64(g_ll, i);
+        sb_append_str(g_ll, " = private unnamed_addr constant [");
+        sb_append_i64(g_ll, blen);
+        sb_append_str(g_ll, " x i8] c\"");
+        sb_append_str(g_ll, esc);
+        sb_append_str(g_ll, "\", align 1\n");
+        sb_append_str(elems, ", %TStr { ptr @.tirll_aStr");
+        sb_append_i64(elems, i);
+        sb_append_str(elems, ", i64 ");
+        sb_append_i64(elems, blen);
+        sb_append_str(elems, " }");
+        i = i + 1;
+    }
+    sb_append_str(g_ll, "@t_atom_table = global [");
+    sb_append_i64(g_ll, cnt + 1);
+    sb_append_str(g_ll, " x %TStr] [ ");
+    sb_append_str(g_ll, sb_to_str(elems));
+    sb_append_str(g_ll, " ]\n");
+    sb_append_str(g_ll, "@t_atom_count = global i64 ");
+    sb_append_i64(g_ll, cnt + 1);
+    sb_append_str(g_ll, "\n");
+}
+
 // 主入口：消费 tir.tir_to_text() 文本，产出 .ll 文本（保留以兼容旧调用/对照）
 pub fn ll_emit_main_wrapper() void {
     if (g_has_main == false) { return; }
@@ -3325,8 +3393,8 @@ pub fn ll_emit_main_wrapper() void {
     // legacy emit-ll 始终发射（无 atom 时为 1 元素占位）；TIR 路径此前缺此导致链接 undefined symbol。
     sb_append_str(g_ll, "@.tirll_as0 = private unnamed_addr constant [1 x i8] zeroinitializer\n");
     sb_append_str(g_ll, "@.tirll_ats0 = private unnamed_addr constant %TStr { ptr @.tirll_as0, i64 0 }\n");
-    sb_append_str(g_ll, "@t_atom_table = global [1 x %TStr] [ %TStr { ptr @.tirll_as0, i64 0 } ]\n");
-    sb_append_str(g_ll, "@t_atom_count = global i64 1\n");
+    // 真实原子名表：按 sema.g_atom_names 顺序发射 [cnt+1 x %TStr]（index 0 占位），使 atom_str 正确解析。
+    ll_emit_atom_table();
     // 仅当模块未自带 t.__ginit 时补空实现（模块级全局初始化由 tir.tc 路径暂未生成，留空无害）
     var have_ginit: bool = false;
     var gi_i: i64 = 0;
