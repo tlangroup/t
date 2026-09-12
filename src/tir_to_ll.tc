@@ -112,7 +112,7 @@ pub fn ll_strip_suf(n: string) string {
 }
 
 pub fn ll_get_st(name: string) string {
-    name = ll_strip_suf(name);
+    name = ll_llname(name);
     var n: i64 = slice_len(g_ll_names) as i64;
     var i: i64 = 0;
     while (i < n) {
@@ -123,7 +123,7 @@ pub fn ll_get_st(name: string) string {
 }
 
 pub fn ll_set_st(name: string, st: string) void {
-    name = ll_strip_suf(name);
+    name = ll_llname(name);
     var n: i64 = slice_len(g_ll_names) as i64;
     var i: i64 = 0;
     while (i < n) {
@@ -364,7 +364,7 @@ pub fn ll_mangle(s: string) string {
 }
 
 pub fn ll_ensure_slot(tname: string, st: string) void {
-    tname = ll_strip_suf(tname);
+    tname = ll_llname(tname);
     var n: i64 = slice_len(g_ll_names) as i64;
     var i: i64 = 0;
     while (i < n) {
@@ -427,6 +427,10 @@ pub fn ll_load(tname: string, st: string) string {
         // 函数引用：符号本身即其地址（ptr 值），直接返回，禁止 load（那会读出函数代码字节而非地址，
         // 用作闭包 code 后 call_ind 调用即段错误）。仅当 @name 确为全局变量时才 load 出其存储值。
         if (ll_is_func(ll_mangle(gnm))) { return "@" + ll_mangle(gnm); }
+        // ⚠ 优先用 globals 段已注册的真实全局类型：tir 侧 tir_expr_st 对向量全局会回退 i64，
+        // 若直接以 i64 重注册会覆盖正确类型 → reduce/vlen 内建解析 N=0、逐元素运算类型错配。
+        var gst: string = ll_get_st("@" + gnm);
+        if (ll_starts(gst, "vec<") || ll_starts(gst, "arr<") || ll_starts(gst, "%")) { st = gst; }
         ll_register_global(gnm, st);
         var r: string = ll_tmp();
         sb_append_str(g_ll, "  ");
@@ -754,7 +758,12 @@ pub fn ll_is_scalar_st(st: string) bool {
 }
 
 pub fn ll_is_float(st: string) bool {
-    return st == "f32" || st == "f64";
+    if (st == "f32" || st == "f64") { return true; }
+    // 浮点向量（vec<f32 x N> / vec<f64 x N>）：本身是浮点类型，逐元素算术须走 fadd/fmul/fcmp，
+    // 不能当整数（否则 emit 出非法的 `add <2 x double>`，链接期即被 LLVM 拒绝）。
+    // 与标量对称：vec 的 cast（sitofp/fpext/fptrunc）在 LLVM 中同样合法，宽化无副作用。
+    if (ll_starts(st, "vec<f32") || ll_starts(st, "vec<f64")) { return true; }
+    return false;
 }
 
 // 无符号整型（用于拓宽时选 zext 而非 sext）。
@@ -1092,11 +1101,34 @@ pub fn ll_lookup_ret(fname: string) string {
     return "";
 }
 
+// 每个函数翻译前 ll_emit_func 会清空 g_ll_names/g_ll_sts（局部槽表），
+// 这会把模块 setup 阶段注册的全局类型一并抹掉 → 函数体内 ll_get_st(@global) 返回 MISSING
+// （向量全局被当 i64 → reduce/vlen 解析 N=0、逐元素运算类型错配）。故每函数开始 re-register 全局类型。
+pub fn ll_reregister_globals() void {
+    var glines: []string = ll_split_lines(sb_to_str(tir.g_globals_section));
+    var gi: i64 = 0;
+    var gn: i64 = slice_len(glines) as i64;
+    while (gi < gn) {
+        var gt: []string = ll_tokens(glines[gi]);
+        var gm: i64 = slice_len(gt) as i64;
+        if (gm >= 2) {
+            var gnm: string = gt[0];
+            if (str_len(gnm) >= 1 && gnm[0] == 64) { gnm = str_slice(gnm, 1, str_len(gnm)); }
+            var gst: string = gt[1];
+            var ti: i64 = 2;
+            while (ti < gm) { gst = base.sb_cat3(gst, " ", gt[ti]); ti = ti + 1; }
+            ll_set_st("@" + gnm, gst);
+        }
+        gi = gi + 1;
+    }
+}
+
 pub fn ll_emit_func(name: string, params: []string, ret: string) void {
     g_ll_curfn = name;
     g_ll_tmpc = 0;
     g_ll_names = [];
     g_ll_sts = [];
+    ll_reregister_globals();
     append(g_ll_func_rets, ret);
     // 聚合返回 ABI：>16B 结构经 sret 隐藏指针返回。
     // 关键：仅当「函数同时是闭包(env 首参)且返回结构」时才用显式 sret 槽——此时 sret 占 arg0、env 后移 arg1，
@@ -1195,7 +1227,9 @@ pub fn ll_fmt_int_arg(name: string, cn: string) string {
 }
 
 pub fn ll_emit_builtin(cn: string, toks: []string) bool {
-    var d: string = toks[2];
+    // ⚠ d 归一成 LLVM 名（剥 `$` 前缀）：否则槽表注册 "$main.tN" 而下游 ll_get_st 用 "%main.tN"
+    // 查不到 → 回退 i64 → reduce 等返回窄类型的向量内建结果被当 i64 读，高字节栈垃圾。
+    var d: string = ll_llname(toks[2]);
     if (cn == "println" || cn == "print") {
         var ap: string = ll_llname(toks[4]);
         var rt: string = "tll_println";
@@ -2035,6 +2069,358 @@ pub fn ll_emit_builtin(cn: string, toks: []string) bool {
         ll_call_ret(fn2, ty, argsts2, argv2, d);
         return true;
     }
+    // ── SIMD 向量内建（@vlen / @reduce_* / @splat）──────────────────────
+    // 与旧轨 codegen_ll.ll_vec_mbuiltin 语义逐位对齐：门禁比的是程序输出而非 IR，
+    // 故此处直接用 LLVM 原生 `<N x T>` 向量指令（extractelement 逐 lane 折叠 / shufflevector 广播），
+    // 不依赖 llvm.vector.reduce.* intrinsic（其 lane 类型约束更严）。
+    // 与旧轨同构：reduce 用串行 extractelement + 标量 fold（含溢出行为一致），max/min 用
+    // icmp/fcmp + select（signed→sgt/slt，unsigned→ugt/ult，float→ogt/olt）。
+    if (cn == "vlen" || cn == "reduce_add" || cn == "reduce_max" || cn == "reduce_min" ||
+        cn == "reduce_mul" || cn == "reduce_or" || cn == "reduce_and" || cn == "splat") {
+        var vst: string = "";
+        if (cn == "splat") { vst = toks[1]; }            // @splat 的返回类型即 vec<elem x N>
+        else { vst = ll_get_st(toks[4]); }               // 其余：首实参（向量）的类型
+        // 解析 vec<elem x N> → (elem_st, N)
+        var inner: string = "";
+        var elem: string = "i32";
+        var N: i64 = 0;
+        if (ll_starts(vst, "vec<")) {
+            inner = str_slice(vst, 4, str_len(vst) - 1);
+            var sp: i64 = ll_rfind(inner, " x ");
+            if (sp >= 0) {
+                elem = str_slice(inner, 0, sp);
+                var nn: string = str_slice(inner, sp + 3, str_len(inner));
+                N = ll_atoi(nn);
+            }
+        }
+        var llst: string = st_to_ll(elem);   // 元素 LLVM 类型（i32 / double ...）
+        if (cn == "vlen") {
+            // @vlen(v)：lane 数编译期已知 → 直接发字面量 i64
+            var nv: string = base.i2s(N);
+            ll_ensure_slot(d, "i64"); ll_set_st(d, "i64"); ll_store(d, "i64", nv);
+            return true;
+        }
+        if (cn == "splat") {
+            // @splat(s, N)：insertelement 写 lane0 + shufflevector 全 0 掩码广播
+            var sval: string = ll_load(toks[4], llst);
+            var vty: string = st_to_ll(vst);
+            var ins: string = ll_tmp();
+            sb_append_str(g_ll, "  ");
+            sb_append_str(g_ll, ins);
+            sb_append_str(g_ll, " = insertelement ");
+            sb_append_str(g_ll, vty);
+            sb_append_str(g_ll, " undef, ");
+            sb_append_str(g_ll, llst);
+            sb_append_str(g_ll, " ");
+            sb_append_str(g_ll, sval);
+            sb_append_str(g_ll, ", i32 0\n");
+            var mask: StringBuilder = sb_new();
+            sb_append_str(mask, "<");
+            sb_append_str(mask, base.i2s(N));
+            sb_append_str(mask, " x i32> <");
+            var mi: i64 = 0;
+            while (mi < N) {
+                if (mi > 0) { sb_append_str(mask, ", "); }
+                sb_append_str(mask, "i32 0");
+                mi = mi + 1;
+            }
+            sb_append_str(mask, ">");
+            var res: string = ll_tmp();
+            sb_append_str(g_ll, "  ");
+            sb_append_str(g_ll, res);
+            sb_append_str(g_ll, " = shufflevector ");
+            sb_append_str(g_ll, vty);
+            sb_append_str(g_ll, " ");
+            sb_append_str(g_ll, ins);
+            sb_append_str(g_ll, ", ");
+            sb_append_str(g_ll, vty);
+            sb_append_str(g_ll, " undef, ");
+            sb_append_str(g_ll, sb_to_str(mask));
+            sb_append_str(g_ll, "\n");
+            ll_ensure_slot(d, vst); ll_set_st(d, vst); ll_store(d, vst, res);
+            return true;
+        }
+        // ── reduce_*：extractelement 逐 lane 后串行折叠 ──
+        var val: string = ll_load(toks[4], vst);
+        var lanes: []string = [];
+        var j: i64 = 0;
+        while (j < N) {
+            var le: string = ll_tmp();
+            sb_append_str(g_ll, "  ");
+            sb_append_str(g_ll, le);
+            sb_append_str(g_ll, " = extractelement ");
+            sb_append_str(g_ll, st_to_ll(vst));
+            sb_append_str(g_ll, " ");
+            sb_append_str(g_ll, val);
+            sb_append_str(g_ll, ", i32 ");
+            sb_append_str(g_ll, base.i2s(j));
+            sb_append_str(g_ll, "\n");
+            append(lanes, le);
+            j = j + 1;
+        }
+        if (slice_len(lanes) as i64 == 0) {
+            // 空向量：reduce 退化为零值（与旧轨 ll_zero(elem) 一致）
+            var z: string = "0";
+            if (ll_is_float(elem)) { z = "0.0"; }
+            ll_ensure_slot(d, llst); ll_set_st(d, llst); ll_store(d, llst, z);
+            return true;
+        }
+        var acc: string = lanes[0];
+        var k: i64 = 1;
+        while (k < slice_len(lanes) as i64) {
+            var lv: string = lanes[k];
+            if (cn == "reduce_add" || cn == "reduce_mul") {
+                var r: string = ll_tmp();
+                sb_append_str(g_ll, "  ");
+                sb_append_str(g_ll, r);
+                sb_append_str(g_ll, " = ");
+                if (cn == "reduce_add") {
+                    if (ll_is_float(elem)) { sb_append_str(g_ll, "fadd"); } else { sb_append_str(g_ll, "add"); }
+                } else {
+                    if (ll_is_float(elem)) { sb_append_str(g_ll, "fmul"); } else { sb_append_str(g_ll, "mul"); }
+                }
+                sb_append_str(g_ll, " ");
+                sb_append_str(g_ll, llst);
+                sb_append_str(g_ll, " ");
+                sb_append_str(g_ll, acc);
+                sb_append_str(g_ll, ", ");
+                sb_append_str(g_ll, lv);
+                sb_append_str(g_ll, "\n");
+                acc = r;
+            } else if (cn == "reduce_or" || cn == "reduce_and") {
+                var r: string = ll_tmp();
+                sb_append_str(g_ll, "  ");
+                sb_append_str(g_ll, r);
+                sb_append_str(g_ll, " = ");
+                if (cn == "reduce_or") { sb_append_str(g_ll, "or"); } else { sb_append_str(g_ll, "and"); }
+                sb_append_str(g_ll, " ");
+                sb_append_str(g_ll, llst);
+                sb_append_str(g_ll, " ");
+                sb_append_str(g_ll, acc);
+                sb_append_str(g_ll, ", ");
+                sb_append_str(g_ll, lv);
+                sb_append_str(g_ll, "\n");
+                acc = r;
+            } else {
+                // reduce_max / reduce_min：icmp/fcmp + select
+                var is_max: bool = (cn == "reduce_max");
+                var pred: string = "sgt";
+                var cmpkind: string = "icmp";
+                if (ll_is_float(elem)) {
+                    cmpkind = "fcmp";
+                    if (is_max) { pred = "ogt"; } else { pred = "olt"; }
+                } else if (ll_is_unsigned_st(elem)) {
+                    if (is_max) { pred = "ugt"; } else { pred = "ult"; }
+                } else {
+                    if (is_max) { pred = "sgt"; } else { pred = "slt"; }
+                }
+                var cmpt: string = ll_tmp();
+                sb_append_str(g_ll, "  ");
+                sb_append_str(g_ll, cmpt);
+                sb_append_str(g_ll, " = ");
+                sb_append_str(g_ll, cmpkind);
+                sb_append_str(g_ll, " ");
+                sb_append_str(g_ll, pred);
+                sb_append_str(g_ll, " ");
+                sb_append_str(g_ll, llst);
+                sb_append_str(g_ll, " ");
+                sb_append_str(g_ll, acc);
+                sb_append_str(g_ll, ", ");
+                sb_append_str(g_ll, lv);
+                sb_append_str(g_ll, "\n");
+                var selt: string = ll_tmp();
+                sb_append_str(g_ll, "  ");
+                sb_append_str(g_ll, selt);
+                sb_append_str(g_ll, " = select i1 ");
+                sb_append_str(g_ll, cmpt);
+                sb_append_str(g_ll, ", ");
+                sb_append_str(g_ll, llst);
+                sb_append_str(g_ll, " ");
+                sb_append_str(g_ll, acc);
+                sb_append_str(g_ll, ", ");
+                sb_append_str(g_ll, llst);
+                sb_append_str(g_ll, " ");
+                sb_append_str(g_ll, lv);
+                sb_append_str(g_ll, "\n");
+                acc = selt;
+            }
+            k = k + 1;
+        }
+        ll_ensure_slot(d, llst); ll_set_st(d, llst); ll_store(d, llst, acc);
+        return true;
+    }
+    // ── @Tile 瓦片内建（@tsplat 构造 / @treduce_* 归约）────────────────
+    // 与旧轨 ll_vec_mbuiltin 的 tsplat/treduce_* 分支逐位对齐：瓦片 = 嵌套定长数组
+    // arr<arr<elem x cols> x rows>，逐元素 GEP 写/读后折叠（max/min 用 icmp/fcmp + select）。
+    // 类型解析用「末位顶层 " x "」定行数、内层 " x " 定列数（元素为标量/向量均无空格，rfind 安全）。
+    if (cn == "tsplat") {
+        var vst: string = toks[1];
+        if (ll_starts(vst, "ptr<arr<arr<")) { vst = str_slice(vst, 4, str_len(vst) - 1); }
+        var elem: string = "i32";
+        var rows: i64 = 1;
+        var cols: i64 = 1;
+        var p2: i64 = ll_rfind(vst, " x ");
+        if (p2 >= 0) {
+            rows = ll_atoi(str_slice(vst, p2 + 3, str_len(vst)));
+            var rowType: string = str_slice(vst, 0, p2);
+            var inner: string = str_slice(rowType, 4, str_len(rowType) - 1);
+            var p1: i64 = ll_rfind(inner, " x ");
+            if (p1 >= 0) {
+                elem = str_slice(inner, 0, p1);
+                cols = ll_atoi(str_slice(inner, p1 + 3, str_len(inner)));
+            }
+        }
+        var llst: string = st_to_ll(elem);
+        var sval: string = ll_load(toks[4], llst);
+        ll_ensure_slot(d, vst); ll_set_st(d, vst);
+        var total: i64 = rows * cols;
+        var ii: i64 = 0;
+        while (ii < total) {
+            var ri2: i64 = ii / cols;
+            var ci2: i64 = ii % cols;
+            var gp: string = ll_tmp();
+            sb_append_str(g_ll, "  ");
+            sb_append_str(g_ll, gp);
+            sb_append_str(g_ll, " = getelementptr inbounds ");
+            sb_append_str(g_ll, st_to_ll(vst));
+            sb_append_str(g_ll, ", ptr ");
+            sb_append_str(g_ll, d);
+            sb_append_str(g_ll, ", i64 0, i64 ");
+            sb_append_str(g_ll, base.i2s(ri2));
+            sb_append_str(g_ll, ", i64 ");
+            sb_append_str(g_ll, base.i2s(ci2));
+            sb_append_str(g_ll, "\n");
+            sb_append_str(g_ll, "  store ");
+            sb_append_str(g_ll, llst);
+            sb_append_str(g_ll, " ");
+            sb_append_str(g_ll, sval);
+            sb_append_str(g_ll, ", ptr ");
+            sb_append_str(g_ll, gp);
+            sb_append_str(g_ll, "\n");
+            ii = ii + 1;
+        }
+        return true;
+    }
+    if (cn == "treduce_sum" || cn == "treduce_mul" || cn == "treduce_min" || cn == "treduce_max") {
+        var vst: string = ll_get_st(toks[4]);
+        if (ll_starts(vst, "ptr<arr<arr<")) { vst = str_slice(vst, 4, str_len(vst) - 1); }
+        var elem: string = "i32";
+        var rows: i64 = 1;
+        var cols: i64 = 1;
+        var p2b: i64 = ll_rfind(vst, " x ");
+        if (p2b >= 0) {
+            rows = ll_atoi(str_slice(vst, p2b + 3, str_len(vst)));
+            var rowType2: string = str_slice(vst, 0, p2b);
+            var inner2: string = str_slice(rowType2, 4, str_len(rowType2) - 1);
+            var p1b: i64 = ll_rfind(inner2, " x ");
+            if (p1b >= 0) {
+                // ⚠ 瓦片 2 层嵌套：inner2 形如 "arr<i32 x 3>"，需再剥一层 "arr<" 才得元素类型 i32
+                elem = str_slice(inner2, 4, p1b);
+                cols = ll_atoi(str_slice(inner2, p1b + 3, str_len(inner2)));
+            }
+        }
+        var llst2: string = st_to_ll(elem);
+        var total2: i64 = rows * cols;
+        var lanes2: []string = [];
+        var ii2: i64 = 0;
+        while (ii2 < total2) {
+            var ri3: i64 = ii2 / cols;
+            var ci3: i64 = ii2 % cols;
+            var gp2: string = ll_tmp();
+            sb_append_str(g_ll, "  ");
+            sb_append_str(g_ll, gp2);
+            sb_append_str(g_ll, " = getelementptr inbounds ");
+            sb_append_str(g_ll, st_to_ll(vst));
+            sb_append_str(g_ll, ", ptr ");
+            sb_append_str(g_ll, ll_llname(toks[4]));
+            sb_append_str(g_ll, ", i64 0, i64 ");
+            sb_append_str(g_ll, base.i2s(ri3));
+            sb_append_str(g_ll, ", i64 ");
+            sb_append_str(g_ll, base.i2s(ci3));
+            sb_append_str(g_ll, "\n");
+            var lv2: string = ll_tmp();
+            sb_append_str(g_ll, "  ");
+            sb_append_str(g_ll, lv2);
+            sb_append_str(g_ll, " = load ");
+            sb_append_str(g_ll, llst2);
+            sb_append_str(g_ll, ", ptr ");
+            sb_append_str(g_ll, gp2);
+            sb_append_str(g_ll, "\n");
+            append(lanes2, lv2);
+            ii2 = ii2 + 1;
+        }
+        if (slice_len(lanes2) as i64 == 0) {
+            var z2: string = "0";
+            if (ll_is_float(elem)) { z2 = "0.0"; }
+            ll_ensure_slot(d, llst2); ll_set_st(d, llst2); ll_store(d, llst2, z2);
+            return true;
+        }
+        var acc2: string = lanes2[0];
+        var k2: i64 = 1;
+        while (k2 < slice_len(lanes2) as i64) {
+            var lv3: string = lanes2[k2];
+            if (cn == "treduce_sum" || cn == "treduce_mul") {
+                var r2: string = ll_tmp();
+                sb_append_str(g_ll, "  ");
+                sb_append_str(g_ll, r2);
+                sb_append_str(g_ll, " = ");
+                if (cn == "treduce_sum") { if (ll_is_float(elem)) { sb_append_str(g_ll, "fadd"); } else { sb_append_str(g_ll, "add"); } }
+                else { if (ll_is_float(elem)) { sb_append_str(g_ll, "fmul"); } else { sb_append_str(g_ll, "mul"); } }
+                sb_append_str(g_ll, " ");
+                sb_append_str(g_ll, llst2);
+                sb_append_str(g_ll, " ");
+                sb_append_str(g_ll, acc2);
+                sb_append_str(g_ll, ", ");
+                sb_append_str(g_ll, lv3);
+                sb_append_str(g_ll, "\n");
+                acc2 = r2;
+            } else {
+                var is_max2: bool = (cn == "treduce_max");
+                var pred2: string = "sgt";
+                var cmpkind2: string = "icmp";
+                if (ll_is_float(elem)) {
+                    cmpkind2 = "fcmp";
+                    if (is_max2) { pred2 = "ogt"; } else { pred2 = "olt"; }
+                } else if (ll_is_unsigned_st(elem)) {
+                    if (is_max2) { pred2 = "ugt"; } else { pred2 = "ult"; }
+                } else {
+                    if (is_max2) { pred2 = "sgt"; } else { pred2 = "slt"; }
+                }
+                var cmpt2: string = ll_tmp();
+                sb_append_str(g_ll, "  ");
+                sb_append_str(g_ll, cmpt2);
+                sb_append_str(g_ll, " = ");
+                sb_append_str(g_ll, cmpkind2);
+                sb_append_str(g_ll, " ");
+                sb_append_str(g_ll, pred2);
+                sb_append_str(g_ll, " ");
+                sb_append_str(g_ll, llst2);
+                sb_append_str(g_ll, " ");
+                sb_append_str(g_ll, acc2);
+                sb_append_str(g_ll, ", ");
+                sb_append_str(g_ll, lv3);
+                sb_append_str(g_ll, "\n");
+                var selt2: string = ll_tmp();
+                sb_append_str(g_ll, "  ");
+                sb_append_str(g_ll, selt2);
+                sb_append_str(g_ll, " = select i1 ");
+                sb_append_str(g_ll, cmpt2);
+                sb_append_str(g_ll, ", ");
+                sb_append_str(g_ll, llst2);
+                sb_append_str(g_ll, " ");
+                sb_append_str(g_ll, acc2);
+                sb_append_str(g_ll, ", ");
+                sb_append_str(g_ll, llst2);
+                sb_append_str(g_ll, " ");
+                sb_append_str(g_ll, lv3);
+                sb_append_str(g_ll, "\n");
+                acc2 = selt2;
+            }
+            k2 = k2 + 1;
+        }
+        ll_ensure_slot(d, llst2); ll_set_st(d, llst2); ll_store(d, llst2, acc2);
+        return true;
+    }
     return false;
 }
 
@@ -2310,6 +2696,13 @@ pub fn ll_emit_inst(inst: TIRInst) void {
         var st: string = tir_st_to_str(inst.st);
         var d: string = inst.dst.name;
         var addr: string = inst.args[0].name;
+        // 全局变量 @name：TIR 指令里的 st 可能因前端对向量/聚合全局退回 i64，
+        // 而 globals: 段声明的是真实类型（如 vec<i32 x 4>）。优先用全局已注册类型，
+        // 否则 g_scale 之类向量全局被当 i64 加载（只读首 8 字节）→ 运行期全 0。
+        if (str_len(addr) >= 1 && addr[0] == 64) {
+            var gst: string = ll_get_st(addr);
+            if (ll_starts(gst, "vec<") || ll_starts(gst, "arr<") || ll_starts(gst, "%")) { st = gst; }
+        }
         ll_ensure_slot(d, st);
         ll_set_st(d, st);
         var pst: string = ll_get_st(addr);
@@ -2478,12 +2871,47 @@ pub fn ll_emit_inst(inst: TIRInst) void {
         }
         ll_ensure_slot(d, tyname);
         ll_set_st(d, tyname);
+        // 聚合元素目标类型（vec<elem x N> / arr<elem x N>）：用于把字段值 cast 到正确位宽后
+        // store，否则 i64 字面量会被原样 store 进 i32 槽 → 越界写内存（reduce 读到垃圾）。
+        var etgt: string = "";
+        if (ll_starts(tyname, "vec<") || ll_starts(tyname, "arr<")) {
+            var inner2: string = str_slice(tyname, 4, str_len(tyname) - 1);
+            var sp2: i64 = ll_rfind(inner2, " x ");
+            if (sp2 >= 0) { etgt = str_slice(inner2, 0, sp2); }
+        }
         var fi2: i64 = 0;
         var an2: i64 = slice_len(inst.args) as i64;
         while (fi2 < an2) {
             var fs: string = inst.args[fi2].name;
             var fst: string = ll_get_st(fs);
             var fv: string = ll_load(fs, fst);
+            // 向量/数组字面量：元素位宽与目标不一致时先 cast（int→trunc/zext/sext，float→fptrunc/fpext）
+            if (str_len(etgt) > 0 && etgt != fst) {
+                var vb: i64 = base.ll_bits(fst);
+                var eb: i64 = base.ll_bits(etgt);
+                if (vb != eb) {
+                    var cv: string = ll_tmp();
+                    sb_append_str(g_ll, "  ");
+                    sb_append_str(g_ll, cv);
+                    if (ll_is_float(fst) && ll_is_float(etgt)) {
+                        if (vb > eb) { sb_append_str(g_ll, " = fptrunc "); }
+                        else { sb_append_str(g_ll, " = fpext "); }
+                    } else if (vb > eb) {
+                        sb_append_str(g_ll, " = trunc ");
+                    } else if (base.ll_signed(fst)) {
+                        sb_append_str(g_ll, " = sext ");
+                    } else {
+                        sb_append_str(g_ll, " = zext ");
+                    }
+                    sb_append_str(g_ll, st_to_ll(fst));
+                    sb_append_str(g_ll, " ");
+                    sb_append_str(g_ll, fv);
+                    sb_append_str(g_ll, " to ");
+                    sb_append_str(g_ll, st_to_ll(etgt));
+                    sb_append_str(g_ll, "\n");
+                    fv = cv; fst = etgt;
+                }
+            }
             var gp: string = ll_tmp();
             sb_append_str(g_ll, "  ");
             sb_append_str(g_ll, gp);
@@ -3071,6 +3499,87 @@ pub fn ll_emit_inst(inst: TIRInst) void {
     var d: string = inst.dst.name;
     var a: string = inst.args[0].name;
     var b: string = inst.args[1].name;
+    // 瓦片逐元素二元（arr<arr<elem x cols> x rows>）：嵌套 GEP 循环，逐元素 apply op。
+    // 与旧轨 codegen_ll tile binop 分支对齐（值级输出一致即可；IR 不必逐字相同）。
+    // binop 的 inst.st 常为 ptr（瓦片以指针存储），或操作数槽注册为 ptr<arr<arr<...>>；
+    // 归一化为值聚合类型 arr<arr<elem x cols> x rows> 后再走瓦片分支。
+    var tst: string = "";
+    if (ll_starts(st, "ptr<arr<arr<")) { tst = str_slice(st, 4, str_len(st) - 1); }
+    else if (ll_starts(st, "arr<arr<")) { tst = st; }
+    else if (st == "ptr") {
+        var areg: string = ll_get_st(ll_llname(a));
+        if (ll_starts(areg, "ptr<arr<arr<")) { tst = str_slice(areg, 4, str_len(areg) - 1); }
+        else if (ll_starts(areg, "arr<arr<")) { tst = areg; }
+    }
+    if (str_len(tst) > 0) {
+        var elem: string = "i32";
+        var rows: i64 = 1;
+        var cols: i64 = 1;
+        var p2t: i64 = ll_rfind(tst, " x ");
+        if (p2t >= 0) {
+            rows = ll_atoi(str_slice(tst, p2t + 3, str_len(tst)));
+            var rowTypeT: string = str_slice(tst, 0, p2t);
+            var innerT: string = str_slice(rowTypeT, 4, str_len(rowTypeT) - 1);
+            var p1t: i64 = ll_rfind(innerT, " x ");
+            if (p1t >= 0) {
+                // ⚠ 瓦片是 2 层嵌套：innerT 形如 "arr<i32 x 3>"，需再剥一层 "arr<" 才得元素类型 i32
+                elem = str_slice(innerT, 4, p1t);
+                cols = ll_atoi(str_slice(innerT, p1t + 3, str_len(innerT)));
+            }
+        }
+        var llstT: string = st_to_ll(elem);
+        var lhsp: string = ll_llname(a);
+        var rhsp: string = ll_llname(b);
+        ll_ensure_slot(d, tst); ll_set_st(d, tst);
+        sb_append_str(g_ll, "  store ");
+        sb_append_str(g_ll, st_to_ll(tst));
+        sb_append_str(g_ll, " zeroinitializer, ptr ");
+        sb_append_str(g_ll, ll_llname(d));
+        sb_append_str(g_ll, "\n");
+        var totalT: i64 = rows * cols;
+        var iiT: i64 = 0;
+        while (iiT < totalT) {
+            var riT: i64 = iiT / cols;
+            var ciT: i64 = iiT % cols;
+            var lg: string = ll_tmp();
+            sb_append_str(g_ll, "  "); sb_append_str(g_ll, lg);
+            sb_append_str(g_ll, " = getelementptr inbounds ");
+            sb_append_str(g_ll, st_to_ll(tst));
+            sb_append_str(g_ll, ", ptr "); sb_append_str(g_ll, lhsp);
+            sb_append_str(g_ll, ", i64 0, i64 "); sb_append_str(g_ll, base.i2s(riT));
+            sb_append_str(g_ll, ", i64 "); sb_append_str(g_ll, base.i2s(ciT)); sb_append_str(g_ll, "\n");
+            var rg: string = ll_tmp();
+            sb_append_str(g_ll, "  "); sb_append_str(g_ll, rg);
+            sb_append_str(g_ll, " = getelementptr inbounds ");
+            sb_append_str(g_ll, st_to_ll(tst));
+            sb_append_str(g_ll, ", ptr "); sb_append_str(g_ll, rhsp);
+            sb_append_str(g_ll, ", i64 0, i64 "); sb_append_str(g_ll, base.i2s(riT));
+            sb_append_str(g_ll, ", i64 "); sb_append_str(g_ll, base.i2s(ciT)); sb_append_str(g_ll, "\n");
+            var og: string = ll_tmp();
+            sb_append_str(g_ll, "  "); sb_append_str(g_ll, og);
+            sb_append_str(g_ll, " = getelementptr inbounds ");
+            sb_append_str(g_ll, st_to_ll(tst));
+            sb_append_str(g_ll, ", ptr "); sb_append_str(g_ll, ll_llname(d));
+            sb_append_str(g_ll, ", i64 0, i64 "); sb_append_str(g_ll, base.i2s(riT));
+            sb_append_str(g_ll, ", i64 "); sb_append_str(g_ll, base.i2s(ciT)); sb_append_str(g_ll, "\n");
+            var lvT: string = ll_tmp();
+            sb_append_str(g_ll, "  "); sb_append_str(g_ll, lvT);
+            sb_append_str(g_ll, " = load "); sb_append_str(g_ll, llstT); sb_append_str(g_ll, ", ptr "); sb_append_str(g_ll, lg); sb_append_str(g_ll, "\n");
+            var rvT: string = ll_tmp();
+            sb_append_str(g_ll, "  "); sb_append_str(g_ll, rvT);
+            sb_append_str(g_ll, " = load "); sb_append_str(g_ll, llstT); sb_append_str(g_ll, ", ptr "); sb_append_str(g_ll, rg); sb_append_str(g_ll, "\n");
+            var resT: string = ll_tmp();
+            sb_append_str(g_ll, "  "); sb_append_str(g_ll, resT);
+            sb_append_str(g_ll, " = ");
+            if (ll_is_float(elem)) { sb_append_str(g_ll, ll_fbinop(o)); } else { sb_append_str(g_ll, ll_binop(o)); }
+            sb_append_str(g_ll, " "); sb_append_str(g_ll, llstT); sb_append_str(g_ll, " ");
+            sb_append_str(g_ll, lvT); sb_append_str(g_ll, ", "); sb_append_str(g_ll, rvT); sb_append_str(g_ll, "\n");
+            sb_append_str(g_ll, "  store "); sb_append_str(g_ll, llstT); sb_append_str(g_ll, " ");
+            sb_append_str(g_ll, resT); sb_append_str(g_ll, ", ptr "); sb_append_str(g_ll, og); sb_append_str(g_ll, "\n");
+            iiT = iiT + 1;
+        }
+        return;
+    }
     var da: string = ll_load(a, st);
     var db: string = ll_load(b, st);
     var r: string = ll_tmp();
@@ -3289,9 +3798,14 @@ pub fn tir_to_ll_emit(module: TIRModule) string {
         if (gm >= 2) {
             var gnm: string = gt[0];
             if (str_len(gnm) >= 1 && gnm[0] == 64) { gnm = str_slice(gnm, 1, str_len(gnm)); }
+            // ⚠ st 可能含空格（如向量 `vec<i32 x 4>` 被 ll_tokens 拆成多条），须把 gt[1..] 重拼成一个完整类型串，
+            // 否则全局类型被截断成 `vec<i32`（缺 ` x 4>`）→ ll_get_st 返回残串、reduce 内建解析 N=0 → 全 0。
+            var gst: string = gt[1];
+            var ti: i64 = 2;
+            while (ti < gm) { gst = base.sb_cat3(gst, " ", gt[ti]); ti = ti + 1; }
             append(g_ll_globals, gnm);
-            append(g_ll_globalsts, gt[1]);
-            ll_set_st("@" + gnm, gt[1]);
+            append(g_ll_globalsts, gst);
+            ll_set_st("@" + gnm, gst);
         }
         gi = gi + 1;
     }
