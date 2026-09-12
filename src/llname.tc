@@ -1,0 +1,230 @@
+// llname.tc —— LLVM 命名 / 槽分配子系统（飞地规避小模块）
+//
+// ⚠ 背景：tir_to_ll.tc 是巨型模块，被自举种子错编（寄存器复用 / 非确定性），导致 ll_llname 等
+// 命名函数在特定调用上下文把槽名压成函数名 "main"（alloca 成 %main、store 文本却是 %main.s1）。
+// 把命名/槽分配子系统抽到本小模块（仅 @import base，种子对小模块 100% 正确编译），打破错编死循环。
+// g_ll（IR 缓冲）留 in tir_to_ll.tc；本模块 ll_emit_alloca 返回要追加的字符串，由 wrapper 写入 g_ll。
+
+@import("src.base" :: *);
+
+pub var g_ll_names: []string;   // TIR 槽名($x) -> LLVM 类型(ST) 并行数组
+pub var g_ll_sts: []string;     // 与 g_ll_names 并行：槽的 ST
+pub var g_ll_emitted: []string; // 已发射 alloca 的槽名（去重用；与 g_ll_names 分离以对抗 ll_set_st 预注册未发射）
+pub var g_ll_curfn: string;     // 当前函数名前缀：LLVM 寄存器/标签是模块全局，按函数加前缀避免重名
+
+pub fn ll_set_curfn(n: string) void { g_ll_curfn = n; }
+pub fn ll_reset_slots() void { g_ll_names = []; g_ll_sts = []; g_ll_emitted = []; }
+
+// 最右一次子串出现位置（数组计数分隔符 " x " 须取最右，因元素类型本身可嵌套 arr<... x ...>）
+pub fn ll_rfind(s: string, sub: string) i64 {
+    var n: i64 = str_len(s);
+    var m: i64 = str_len(sub);
+    if (m <= 0 || m > n) { return -1; }
+    var i: i64 = n - m;
+    while (i >= 0) {
+        var j: i64 = 0;
+        var ok: bool = true;
+        while (j < m) {
+            if (str_at(s, i + j) != str_at(sub, j)) { ok = false; break; }
+            j = j + 1;
+        }
+        if (ok) { return i; }
+        i = i - 1;
+    }
+    return -1;
+}
+
+pub fn ll_strip_suf(n: string) string {
+    var L: i64 = str_len(n) as i64;
+    var i: i64 = L - 1;
+    while (i >= 1) {
+        if (n[i] == 115 && n[i - 1] == 46) {
+            var suf: string = str_slice(n, i + 1, L);
+            var okd: bool = str_len(suf) > 0;
+            var j: i64 = 0;
+            while (j < str_len(suf)) { if (suf[j] < 48 || suf[j] > 57) { okd = false; } j = j + 1; }
+            if (okd) { return str_slice(n, 0, i - 1); }
+        }
+        i = i - 1;
+    }
+    return n;
+}
+
+pub fn ll_mangle(s: string) string {
+    var n: i64 = str_len(s);
+    if (n == 0) { return "_"; }
+    var sb: StringBuilder = sb_new();
+    var i: i64 = 0;
+    while (i < n) {
+        var c: i64 = str_at(s, i);
+        if ((c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95 || c == 46 || c == 36) {
+            sb_append_char(sb, c);
+        } else {
+            sb_append_char(sb, 95);
+            sb_append_char(sb, 117);
+            sb_append_char(sb, base.hex_digit((c >> 12) & 15) as i64);
+            sb_append_char(sb, base.hex_digit((c >> 8) & 15) as i64);
+            sb_append_char(sb, base.hex_digit((c >> 4) & 15) as i64);
+            sb_append_char(sb, base.hex_digit(c & 15) as i64);
+            sb_append_char(sb, 95);
+        }
+        i = i + 1;
+    }
+    var r: string = sb_to_str(sb);
+    sb_free(sb);
+    var fc: i64 = str_at(r, 0);
+    if (fc >= 48 && fc <= 57) { r = base.sb_cat2("_", r); }
+    return r;
+}
+
+pub fn ll_starts(s: string, pre: string) bool {
+    var n: i64 = str_len(pre);
+    if (str_len(s) < n) { return false; }
+    var i: i64 = 0;
+    while (i < n) {
+        if (str_at(s, i) != str_at(pre, i)) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+// TIR ST -> LLVM 类型
+pub fn st_to_ll(st: string) string {
+    if (st == "void") { return "void"; }
+    if (st == "bool") { return "i8"; }
+    if (st == "u8") { return "i8"; }
+    if (st == "u16") { return "i16"; }
+    if (st == "u32") { return "i32"; }
+    if (st == "u64") { return "i64"; }
+    if (st == "f32") { return "float"; }
+    if (st == "f64") { return "double"; }
+    if (ll_starts(st, "ptr<")) {
+        return "ptr";
+    }
+    if (ll_starts(st, "arr<")) {
+        var inner: string = str_slice(st, 4, str_len(st) - 1);
+        var sp: i64 = ll_rfind(inner, " x ");
+        if (sp < 0) { return "ptr"; }
+        var elem: string = str_slice(inner, 0, sp);
+        var nn: string = str_slice(inner, sp + 3, str_len(inner));
+        return base.sb_cat5("[", nn, " x ", st_to_ll(elem), "]");
+    }
+    if (ll_starts(st, "vec<")) {
+        var inner: string = str_slice(st, 4, str_len(st) - 1);
+        var sp: i64 = ll_rfind(inner, " x ");
+        if (sp < 0) { return "ptr"; }
+        var elem: string = str_slice(inner, 0, sp);
+        var nn: string = str_slice(inner, sp + 3, str_len(inner));
+        return base.sb_cat5("<", nn, " x ", st_to_ll(elem), ">");
+    }
+    if (ll_starts(st, "fn<")) {
+        return "ptr";
+    }
+    return st;
+}
+
+pub fn ll_llname(tname: string) string {
+    // $x -> %curfn.x (值寄存器，按函数加前缀) ; @fn -> fn (全局函数名，去 @)
+    if (str_len(tname) < 1) { return tname; }
+    // ⚠ 已带 '%' 前缀的名是「已 mangle 的合法 LLVM 名」（如 %main.s2、%main.t12）。
+    // 原样返回，禁止再走 ll_strip_suf——否则 %main.s2 的 ".s2" 会被当成 TIR 子索引后缀剥掉，
+    // 槽名错压成函数名 "%main"，store/load 文本与 alloca 文本不一致 → 段错误（map_iter 的 s2 变量即此坑）。
+    // 调用方（如 ll_store）偶会因飞地错编把 $x 传成 %curfn.x，此处幂等化可自愈。
+    if (tname[0] == 37) { return tname; }
+    tname = ll_strip_suf(tname);
+    if (tname[0] == 36) {
+        var s: string = str_slice(tname, 1, str_len(tname));
+        return base.sb_cat3("%", g_ll_curfn, base.sb_cat2(".", ll_mangle(s)));
+    }
+    if (tname[0] == 64) { return ll_mangle(str_slice(tname, 1, str_len(tname))); }                        // '@'
+    return tname;
+}
+
+// 指针目的地（store/load 的 ptr 操作数、addr_of 目标）用此变体：@name 全局引用保留 '@' 前缀。
+pub fn ll_llname_ptr(tname: string) string {
+    if (str_len(tname) >= 1 && tname[0] == 64) {
+        return "@" + ll_mangle(str_slice(tname, 1, str_len(tname)));
+    }
+    return ll_llname(tname);
+}
+
+pub fn ll_get_st(name: string) string {
+    name = ll_llname(name);
+    var n: i64 = slice_len(g_ll_names) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        if (g_ll_names[i] == name) { return g_ll_sts[i]; }
+        i = i + 1;
+    }
+    return "i64";
+}
+
+pub fn ll_set_st(name: string, st: string) void {
+    name = ll_llname(name);
+    var n: i64 = slice_len(g_ll_names) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        if (g_ll_names[i] == name) { g_ll_sts[i] = st; return; }
+        i = i + 1;
+    }
+    append(g_ll_names, name);
+    append(g_ll_sts, st);
+}
+
+// 发射单个槽的 alloca（含定长数组堆分配与聚合零初始化），返回要写入 g_ll 的字符串。
+// 以「是否已发射」(g_ll_emitted) 去重，而非「是否已注册」：ll_set_st 会对 dst 预注册类型但不发射 alloca。
+pub fn ll_emit_alloca(tname: string, st: string) string {
+    tname = ll_llname(tname);
+    var n2: i64 = slice_len(g_ll_emitted) as i64;
+    var j: i64 = 0;
+    while (j < n2) { if (g_ll_emitted[j] == tname) { return ""; } j = j + 1; }
+    var n: i64 = slice_len(g_ll_names) as i64;
+    var i: i64 = 0;
+    var found: i64 = -1;
+    while (i < n) { if (g_ll_names[i] == tname) { found = i; break; } i = i + 1; }
+    if (found < 0) { append(g_ll_names, tname); append(g_ll_sts, st); }
+    else { g_ll_sts[found] = st; }
+    append(g_ll_emitted, tname);
+    var sb: StringBuilder = sb_new();
+    // 定长数组槽：栈 alloca 在地址流入逃逸 TSlice（如 first3 返回切片）时会悬空 → use-after-free。
+    // 改为堆分配（tll_alloc）；堆是栈的超集，对所有用例语义安全（数据指针生命周期延长到堆上）。
+    if (ll_starts(st, "arr<")) {
+        var llt: string = st_to_ll(st);
+        sb_append_str(sb, "  ");
+        sb_append_str(sb, tname);
+        sb_append_str(sb, ".sz = getelementptr ");
+        sb_append_str(sb, llt);
+        sb_append_str(sb, ", ptr null, i32 1\n");
+        sb_append_str(sb, "  ");
+        sb_append_str(sb, tname);
+        sb_append_str(sb, ".bytes = ptrtoint ptr ");
+        sb_append_str(sb, tname);
+        sb_append_str(sb, ".sz to i64\n");
+        sb_append_str(sb, "  ");
+        sb_append_str(sb, tname);
+        sb_append_str(sb, " = call ptr @tll_alloc(i64 ");
+        sb_append_str(sb, tname);
+        sb_append_str(sb, ".bytes)\n");
+        var r: string = sb_to_str(sb);
+        sb_free(sb);
+        return r;
+    }
+    sb_append_str(sb, "  ");
+    sb_append_str(sb, tname);
+    sb_append_str(sb, " = alloca ");
+    sb_append_str(sb, st_to_ll(st));
+    sb_append_str(sb, "\n");
+    // ⚠ 聚合槽零初始化：所有 `%` 命名聚合类型（slice/string/结构体/Map/闭包）的无初始化器局部
+    // alloca 后若不置零，其内含的指针字段（slice 的 data/len/cap、Map 句柄、闭包 env、结构体里的
+    // slice 字段）会被读成垃圾 → t_slice_append / t_str_* / map_* 撑爆 arena 或越界。
+    if (ll_starts(st, "%")) {
+        sb_append_str(sb, "  store ");
+        sb_append_str(sb, st_to_ll(st));
+        sb_append_str(sb, " zeroinitializer, ptr ");
+        sb_append_str(sb, tname);
+        sb_append_str(sb, "\n");
+    }
+    var r2: string = sb_to_str(sb);
+    sb_free(sb);
+    return r2;
+}

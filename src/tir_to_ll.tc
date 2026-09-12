@@ -12,18 +12,16 @@
 
 @import("src.base" :: *);
 @import("src.tir" :: *);   // 结构化入口消费 TIRModule / tir.g_globals_section（tir.tc 不反向导入本模块，无环）
+@import("src.llname" :: *);  // ⚠ 飞地规避：命名/槽分配子系统抽到小模块（种子对小模块 100% 正确编译）
 
 pub var g_ll: StringBuilder;
 pub var g_ll_tmpc: i64;
-pub var g_ll_names: []string;   // TIR 槽名($x) -> LLVM 类型(ST) 并行数组
-pub var g_ll_sts: []string;
 pub var g_func_names: []string;       // 函数名 -> 参数 ST 列表（供 call 用）
 pub var g_func_paramsts: [][]string;
 pub var g_ll_func_rets: []string;     // 兼容保留
 pub var g_pf_name: string;            // ll_parse_func 结果（t 不支持多返回值，用全局传递）
 pub var g_pf_params: []string;
 pub var g_pf_ret: string;
-pub var g_ll_curfn: string;           // 当前函数名前缀：LLVM 寄存器/标签是模块全局，按函数加前缀避免重名
 pub var g_ll_declared: []string;       // 已 emit 过 declare 的外部函数名
 pub var g_ll_declbuf: StringBuilder;   // 外部 declare 缓冲（函数体扫描后追加到模块末尾）
 pub var g_opaque_emitted: []string;    // 已 emit 过 opaque 定义的运行时结构类型名（如 TSb）
@@ -61,15 +59,13 @@ pub fn ll_tmp() string {
 pub fn ll_reset() void {
     g_ll = sb_new();
     g_ll_tmpc = 0;
-    g_ll_names = [];
-    g_ll_sts = [];
+    ll_reset_slots();   // ⚠ 飞地规避：槽状态(g_ll_names/g_ll_sts/g_ll_emitted/g_ll_curfn)在 llname.tc，经本函数重置
     g_func_names = [];
     g_func_paramsts = [];
     g_ll_func_rets = [];
     g_pf_name = "";
     g_pf_params = [];
     g_pf_ret = "void";
-    g_ll_curfn = "";
     g_ll_declared = [];
     g_ll_declbuf = sb_new();
     g_opaque_emitted = [];
@@ -92,70 +88,8 @@ pub fn ll_reset() void {
     g_ll_addrslot = [];
 }
 
-// 剥离操作数名尾部的 .s<ST码> 后缀（与 tir.tc tir_op_tok 同义），使带类型后缀的
-// 操作数名在翻译器内按裸槽名定位（FS-4 发射器用 tir_os 附加后缀，部分站点未用
-// tir_op_tok 预剥离，故在此兜底，避免引用 %x.s5 这类从未分配的槽）。
-pub fn ll_strip_suf(n: string) string {
-    var L: i64 = str_len(n) as i64;
-    var i: i64 = L - 1;
-    while (i >= 1) {
-        if (n[i] == 115 && n[i - 1] == 46) {
-            var suf: string = str_slice(n, i + 1, L);
-            var okd: bool = str_len(suf) > 0;
-            var j: i64 = 0;
-            while (j < str_len(suf)) { if (suf[j] < 48 || suf[j] > 57) { okd = false; } j = j + 1; }
-            if (okd) { return str_slice(n, 0, i - 1); }
-        }
-        i = i - 1;
-    }
-    return n;
-}
-
-pub fn ll_get_st(name: string) string {
-    name = ll_llname(name);
-    var n: i64 = slice_len(g_ll_names) as i64;
-    var i: i64 = 0;
-    while (i < n) {
-        if (g_ll_names[i] == name) { return g_ll_sts[i]; }
-        i = i + 1;
-    }
-    return "i64";
-}
-
-pub fn ll_set_st(name: string, st: string) void {
-    name = ll_llname(name);
-    var n: i64 = slice_len(g_ll_names) as i64;
-    var i: i64 = 0;
-    while (i < n) {
-        if (g_ll_names[i] == name) { g_ll_sts[i] = st; return; }
-        i = i + 1;
-    }
-    append(g_ll_names, name);
-    append(g_ll_sts, st);
-}
-
-pub fn ll_llname(tname: string) string {
-    // $x -> %curfn.x (值寄存器，按函数加前缀) ; @fn -> fn (全局函数名，去 @)
-    if (str_len(tname) < 1) { return tname; }
-    tname = ll_strip_suf(tname);
-    if (tname[0] == 36) {
-        var s: string = str_slice(tname, 1, str_len(tname));
-        return base.sb_cat3("%", g_ll_curfn, base.sb_cat2(".", ll_mangle(s)));
-    }
-    if (tname[0] == 64) { return ll_mangle(str_slice(tname, 1, str_len(tname))); }                        // '@'
-    return tname;
-}
-
-// 指针目的地（store/load 的 ptr 操作数、addr_of 目标）用此变体：@name 全局引用保留 '@' 前缀。
-// 例：store i32 %v, ptr @gNpc —— 全局变量作为存放目标必须带 '@'。
-pub fn ll_llname_ptr(tname: string) string {
-    if (str_len(tname) >= 1 && tname[0] == 64) {
-        return "@" + ll_mangle(str_slice(tname, 1, str_len(tname)));
-    }
-    return ll_llname(tname);
-}
-
 // @name 是否为已声明的函数（避免把函数名误当作全局变量声明）
+// ⚠ ll_strip_suf/ll_get_st/ll_set_st/ll_llname/ll_llname_ptr 已迁至 src.llname.tc（飞地规避小模块）
 pub fn ll_is_func(name: string) bool {
     var n: i64 = slice_len(g_func_names) as i64;
     var i: i64 = 0;
@@ -336,94 +270,24 @@ pub fn ll_label(name: string) string {
     return base.sb_cat2(g_ll_curfn, base.sb_cat2(".", s));
 }
 
-// 标识符 LLVM 合法化：非 [A-Za-z0-9_.$\u0080-] 字符转义为 _uXXXX_，确保首字符合法（LLVM 标识符首字符须为字母/_/./$）
-pub fn ll_mangle(s: string) string {
-    var n: i64 = str_len(s);
-    if (n == 0) { return "_"; }
-    var sb: StringBuilder = sb_new();
-    var i: i64 = 0;
-    while (i < n) {
-        var c: i64 = str_at(s, i);
-        if ((c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95 || c == 46 || c == 36) {
-            sb_append_char(sb, c);
-        } else {
-            sb_append_char(sb, 95);
-            sb_append_char(sb, 117);
-            sb_append_char(sb, base.hex_digit((c >> 12) & 15) as i64);
-            sb_append_char(sb, base.hex_digit((c >> 8) & 15) as i64);
-            sb_append_char(sb, base.hex_digit((c >> 4) & 15) as i64);
-            sb_append_char(sb, base.hex_digit(c & 15) as i64);
-            sb_append_char(sb, 95);
-        }
-        i = i + 1;
-    }
-    var r: string = sb_to_str(sb);
-    var fc: i64 = str_at(r, 0);
-    if (fc >= 48 && fc <= 57) { r = base.sb_cat2("_", r); }
-    return r;
-}
-
-pub fn ll_ensure_slot(tname: string, st: string) void {
-    tname = ll_llname(tname);
-    var n: i64 = slice_len(g_ll_names) as i64;
-    var i: i64 = 0;
-    while (i < n) {
-        if (g_ll_names[i] == tname) { return; }
-        i = i + 1;
-    }
-    append(g_ll_names, tname);
-    append(g_ll_sts, st);
-    // 定长数组槽：栈 alloca 在地址流入逃逸 TSlice（如 first3 返回切片）时会悬空 → use-after-free。
-    // 改为堆分配（tll_alloc）；堆是栈的超集，对所有用例语义安全（数据指针生命周期延长到堆上）。
-    // 字节数由 `getelementptr [N x T], ptr null, i32 1` 取地址差算得，避免手写各元素类型 sizeof。
-    if (ll_starts(st, "arr<")) {
-        var llt: string = st_to_ll(st);   // "[N x T]"
-        sb_append_str(g_ll, "  ");
-        sb_append_str(g_ll, ll_llname(tname));
-        sb_append_str(g_ll, ".sz = getelementptr ");
-        sb_append_str(g_ll, llt);
-        sb_append_str(g_ll, ", ptr null, i32 1\n");
-        sb_append_str(g_ll, "  ");
-        sb_append_str(g_ll, ll_llname(tname));
-        sb_append_str(g_ll, ".bytes = ptrtoint ptr ");
-        sb_append_str(g_ll, ll_llname(tname));
-        sb_append_str(g_ll, ".sz to i64\n");
-        sb_append_str(g_ll, "  ");
-        sb_append_str(g_ll, ll_llname(tname));
-        sb_append_str(g_ll, " = call ptr @tll_alloc(i64 ");
-        sb_append_str(g_ll, ll_llname(tname));
-        sb_append_str(g_ll, ".bytes)\n");
-        return;
-    }
-    sb_append_str(g_ll, "  ");
-    sb_append_str(g_ll, ll_llname(tname));
-    sb_append_str(g_ll, " = alloca ");
-    sb_append_str(g_ll, st_to_ll(st));
-    sb_append_str(g_ll, "\n");
-    // ⚠ 聚合槽零初始化：所有 `%` 命名聚合类型（slice/string/结构体/Map/闭包）的无初始化器局部
-    // alloca 后若不置零，其内含的指针字段（slice 的 data/len/cap、Map 句柄、闭包 env、结构体里的
-    // slice 字段）会被读成垃圾 → t_slice_append / t_str_* / map_* 撑爆 arena 或越界。
-    // 典型：list_new 的 `var l: Self;` 返回含垃圾 items 切片头的 List → append 撑爆 arena（list_demo 崩溃）；
-    // colony/agent/type_info 等含聚合字段的结构体局部同理。与 canonical codegen_ll 的 `T out = {0}` 同构。
-    // 定长数组(arr<>) 走上方堆分配分支，不在此处理；标量(i64/ptr/...) 不置零（旧轨同）。
-    if (ll_starts(st, "%")) {
-        sb_append_str(g_ll, "  store ");
-        sb_append_str(g_ll, st_to_ll(st));
-        sb_append_str(g_ll, " zeroinitializer, ptr ");
-        sb_append_str(g_ll, ll_llname(tname));
-        sb_append_str(g_ll, "\n");
-    }
+// ⚠ ll_mangle / ll_ensure_slot 已迁至 src.llname.tc（飞地规避小模块）。本 wrapper 把小模块返回的
+// alloca 文本追加进 g_ll（IR 缓冲留在本模块，避免跨模块写 g_ll）。
+pub fn ll_ensure_slot(name: string, st: string) void {
+    sb_append_str(g_ll, ll_emit_alloca(name, st));
 }
 
 // 取 $x 承载值的 LLVM 寄存器（load 出 alloca）
 pub fn ll_load(tname: string, st: string) string {
+    var dn: string = tname;   // ⚠ 飞地规避：同 ll_store，缓存避免 clobber
     // 字面量立即数（整数/浮点，如 0 / -1 / 1.5）：直接作为值返回，不可按临时量去 load，
     // 否则会生成非法的 `load X, ptr 0`。
-    if (str_len(tname) >= 1 && tname[0] != 36 && tname[0] != 64) { return tname; }
+    if (str_len(dn) >= 1 && dn[0] != 36 && dn[0] != 64) { return dn; }
+    // ⚠ 飞地规避：SLOT 分支被错编无法分配槽；此处（LOAD 分支读名正确）惰性分配局部槽（仅 $ 局部，@ 全局不处理）。
+    if (str_len(dn) >= 1 && dn[0] == 36) { ll_ensure_slot(dn, st); }
     // 全局引用 @name（函数或全局变量）：全局符号在 LLVM 中恒为指针，作值操作数时必须 load 出其值。
     // 对函数引用：load ptr, ptr @fn 等价于直接使用 @fn（取其地址）；对全局变量：load 出存储值。两种情形都正确。
-    if (str_len(tname) >= 1 && tname[0] == 64) {
-        var gnm: string = str_slice(tname, 1, str_len(tname));
+    if (str_len(dn) >= 1 && dn[0] == 64) {
+        var gnm: string = str_slice(dn, 1, str_len(dn));
         // 函数引用：符号本身即其地址（ptr 值），直接返回，禁止 load（那会读出函数代码字节而非地址，
         // 用作闭包 code 后 call_ind 调用即段错误）。仅当 @name 确为全局变量时才 load 出其存储值。
         if (ll_is_func(ll_mangle(gnm))) { return "@" + ll_mangle(gnm); }
@@ -448,22 +312,27 @@ pub fn ll_load(tname: string, st: string) string {
     sb_append_str(g_ll, " = load ");
     sb_append_str(g_ll, st_to_ll(st));
     sb_append_str(g_ll, ", ptr ");
-    sb_append_str(g_ll, ll_llname_ptr(tname));
+    sb_append_str(g_ll, ll_llname_ptr(dn));
     sb_append_str(g_ll, "\n");
     return r;
 }
 
 pub fn ll_store(tname: string, st: string, val: string) void {
-    if (str_len(tname) >= 1 && tname[0] == 64) {
-        var gnm: string = str_slice(tname, 1, str_len(tname));
+    var dn: string = tname;   // ⚠ 飞地规避：tname 在错编模块内被寄存器复用（clobber），缓存一次保证 alloca 与 store 文本同名
+    if (str_len(dn) >= 1 && dn[0] == 64) {
+        var gnm: string = str_slice(dn, 1, str_len(dn));
         if (ll_is_func(gnm) == false) { ll_register_global(gnm, st); }
+    } else {
+        // ⚠ 飞地规避：SLOT 分支被错编无法分配槽；此处（STORE 分支读名正确）惰性分配局部槽。
+        // ll_ensure_slot 自带 g_ll_names 去重，重复调用安全。
+        ll_ensure_slot(dn, st);
     }
     sb_append_str(g_ll, "  store ");
     sb_append_str(g_ll, st_to_ll(st));
     sb_append_str(g_ll, " ");
     sb_append_str(g_ll, val);
     sb_append_str(g_ll, ", ptr ");
-    sb_append_str(g_ll, ll_llname_ptr(tname));
+    sb_append_str(g_ll, ll_llname_ptr(dn));
     sb_append_str(g_ll, "\n");
 }
 
@@ -513,72 +382,7 @@ pub fn ll_str_rawlen(content: string) i64 {
     return blen;
 }
 
-// 最右一次子串出现位置（数组计数分隔符 " x " 须取最右，因元素类型本身可嵌套 arr<... x ...>）
-pub fn ll_rfind(s: string, sub: string) i64 {
-    var n: i64 = str_len(s);
-    var m: i64 = str_len(sub);
-    if (m <= 0 || m > n) { return -1; }
-    var i: i64 = n - m;
-    while (i >= 0) {
-        var j: i64 = 0;
-        var ok: bool = true;
-        while (j < m) {
-            if (str_at(s, i + j) != str_at(sub, j)) { ok = false; break; }
-            j = j + 1;
-        }
-        if (ok) { return i; }
-        i = i - 1;
-    }
-    return -1;
-}
-
-// 真·前缀判断（t 内置 str_starts 实为相等判断，不可用）
-pub fn ll_starts(s: string, pre: string) bool {
-    var n: i64 = str_len(pre);
-    if (str_len(s) < n) { return false; }
-    var i: i64 = 0;
-    while (i < n) {
-        if (str_at(s, i) != str_at(pre, i)) { return false; }
-        i = i + 1;
-    }
-    return true;
-}
-
-// TIR ST -> LLVM 类型
-pub fn st_to_ll(st: string) string {
-    if (st == "void") { return "void"; }
-    if (st == "bool") { return "i8"; }
-    if (st == "u8") { return "i8"; }
-    if (st == "u16") { return "i16"; }
-    if (st == "u32") { return "i32"; }
-    if (st == "u64") { return "i64"; }
-    if (st == "f32") { return "float"; }
-    if (st == "f64") { return "double"; }
-    if (ll_starts(st, "ptr<")) {
-        return "ptr";
-    }
-    if (ll_starts(st, "arr<")) {
-        var inner: string = str_slice(st, 4, str_len(st) - 1);
-        // 计数分隔符 " x " 取最右一次：元素类型本身可能嵌套 arr<... x ...>（如 arr<arr<i32 x 3> x 2>）
-        var sp: i64 = ll_rfind(inner, " x ");
-        if (sp < 0) { return "ptr"; }   // 兜底：无计数的动态数组降级为缓冲指针，防越界 panic
-        var elem: string = str_slice(inner, 0, sp);
-        var nn: string = str_slice(inner, sp + 3, str_len(inner));
-        return base.sb_cat5("[", nn, " x ", st_to_ll(elem), "]");
-    }
-    if (ll_starts(st, "vec<")) {
-        var inner: string = str_slice(st, 4, str_len(st) - 1);
-        var sp: i64 = ll_rfind(inner, " x ");
-        if (sp < 0) { return "ptr"; }
-        var elem: string = str_slice(inner, 0, sp);
-        var nn: string = str_slice(inner, sp + 3, str_len(inner));
-        return base.sb_cat5("<", nn, " x ", st_to_ll(elem), ">");
-    }
-    if (ll_starts(st, "fn<")) {
-        return "ptr";
-    }
-    return st;
-}
+// ⚠ ll_rfind/ll_starts/st_to_ll 已迁至 src.llname.tc（飞地规避小模块），此处经 import 解析。
 
 // 收集引用但未在 types: 段声明的命名类型（%Perm 等位标志/枚举，i64 底类型）。
 // 排除运行期结构类型 %T*（%TStr 等已由 types: 段或 opaque 处理）。
@@ -1124,10 +928,9 @@ pub fn ll_reregister_globals() void {
 }
 
 pub fn ll_emit_func(name: string, params: []string, ret: string) void {
-    g_ll_curfn = name;
+    ll_reset_slots();   // ⚠ 飞地规避：槽状态在 llname.tc，经本函数重置（清 g_ll_names/g_ll_sts/g_ll_emitted/g_ll_curfn）
+    ll_set_curfn(name); // 重置后再置当前函数前缀
     g_ll_tmpc = 0;
-    g_ll_names = [];
-    g_ll_sts = [];
     ll_reregister_globals();
     append(g_ll_func_rets, ret);
     // 聚合返回 ABI：>16B 结构经 sret 隐藏指针返回。
@@ -1673,6 +1476,11 @@ pub fn ll_emit_builtin(cn: string, toks: []string) bool {
     // 元素大小由「待追加值」的 LLVM 类型推导：getelementptr <est>, ptr null, i32 1 → ptrtoint to i64。
     if (cn == "append") {
         var est: string = ll_get_st(toks[5]);          // 元素 LLVM 类型（%TStr/i64/ptr…）
+        // ⚠ 聚合元素在 TIR 中常按「指针」承载（槽 ST=ptr<%TStr>），但其真实元素是 %TStr 本身；
+        // 若直接拿 ptr<%TStr> 算 sizeof → 得 8（指针宽）而非 16（结构体宽），t_slice_append_sized
+        // 据此只拷 8 字节 → 字符串/结构体内容残缺（maputil_demo / pipeline_demo / list_demo 等）。
+        // 解引用取真元素类型：ptr<%TStr>→%TStr(16)，标量 i64/真 ptr 不受影响。
+        if (ll_starts(est, "ptr<")) { est = ll_ptr_inner(est); }
         var esz: string = ll_tmp();                    // 临时名承载 sizeof(元素)
         ll_maybe_declare("t_slice_append_sized", "void", ["ptr", "ptr", "i64"]);
         // 计算 sizeof(元素)
@@ -2471,8 +2279,10 @@ pub fn ll_emit_inst(inst: TIRInst) void {
         return;
     }
     if (op == TIR_OP_SLOT) {
-        ll_ensure_slot(inst.dst.name, tir_st_to_str(inst.st));
-        ll_set_st(inst.dst.name, tir_st_to_str(inst.st));
+        // ⚠ 飞地规避：tir_to_ll.tc 大模块 SLOT 分支读 inst 任意字符串字段（dst.name/args[0].name/cmt）
+        // 均被种子错编成函数名 "main"，导致槽漏分配/错命名（generics_demo/fid_read_demo/map_iter clang 失败）。
+        // 故 SLOT 不再在此分配槽；改由 STORE/LOAD 分支（编译正确）惰性 ll_ensure_slot（见 ll_store/ll_load），
+        // 其 tname 读取正确，能产出 %main.<var> 正确名。
         return;
     }
     if (op == TIR_OP_CONST_STR) {
@@ -2643,6 +2453,31 @@ pub fn ll_emit_inst(inst: TIRInst) void {
                 }
             }
         } else {
+            // ⚠ 裸 ptr 槽（如 tll_slice_at / 聚合取地址返回值，st 记为 ptr 而非 ptr<inner>）：
+            // 与 load 侧对称 —— 槽内容可能是「指向目标的地址(l-value)」而非「指针值」。
+            //   - src 为指针：值语义，把指针值拷进槽（p = q）。
+            //   - src 非指针：槽存地址，解引用写穿（*p = v）。
+            // 旧逻辑把裸 ptr 当普通标量槽，直接 ll_store 把值写进槽自身 → slice 元素赋值 /
+            // 聚合字段写失效（sort_slice 整体成 no-op、cli/colony append 后乱序）。
+            if (dstst == "ptr") {
+                var srcst: string = ll_get_st(src);
+                var src_is_ptr: bool = (srcst == "ptr" || ll_starts(srcst, "ptr<"));
+                if (src_is_ptr) {
+                    var v: string = ll_load(src, srcst);
+                    ll_store(dst, srcst, v);
+                } else {
+                    var v: string = ll_load(src, srcst);
+                    var p: string = ll_load(dst, "ptr");
+                    sb_append_str(g_ll, "  store ");
+                    sb_append_str(g_ll, st_to_ll(srcst));
+                    sb_append_str(g_ll, " ");
+                    sb_append_str(g_ll, v);
+                    sb_append_str(g_ll, ", ptr ");
+                    sb_append_str(g_ll, p);
+                    sb_append_str(g_ll, "\n");
+                }
+                return;
+            }
             var vst: string = ll_get_st(src);
             var v: string = ll_load(src, vst);
             if (dstst != vst && ll_is_scalar_st(dstst) && ll_is_scalar_st(vst)
@@ -2750,6 +2585,9 @@ pub fn ll_emit_inst(inst: TIRInst) void {
             dstst = base.sb_cat3("ptr<", st, ">");
         }
         if (str_len(x) >= 1 && x[0] == 64) { ll_register_global(str_slice(x, 1, str_len(x)), ll_ptr_inner(st)); }
+        // ⚠ 飞地规避 + SLOT no-op 后：被取地址的局部槽（如固定数组 var b:[5]i64，仅经 &b[i] 引用）
+        // 不会经 store/load 惰性分配，必须在此显式 ensure，否则其 tll_alloc 堆分配永不发射 → undefined。
+        if (str_len(x) >= 1 && x[0] == 36) { ll_ensure_slot(x, st); }
         ll_ensure_slot(d, dstst);
         ll_set_st(d, dstst);
         sb_append_str(g_ll, "  store ptr ");
@@ -3862,6 +3700,22 @@ pub fn tir_to_ll_emit(module: TIRModule) string {
         if (f.is_main) { sb_append_str(head2, " @main"); }
         ll_parse_func(sb_to_str(head2));
         ll_emit_func(g_pf_name, g_pf_params, g_pf_ret);
+        // ⚠ 函数入口预扫描：把局部 $dst 槽的 alloca 集中在函数入口发射，解决 lazy 分配把 alloca 落进
+        // 首次使用块（如 if 分支）导致另一分支引用 undefined / does-not-dominate。所有类型（i*/f*/ptr/arr</vec<
+        // 及 % 命名聚合 %TStr/%TSlice/%TPoint 等）均在模块顶部 module.types 处已定义（tir_to_ll_emit 第 1 遍，
+        // 早于本函数体），故入口分配尺寸确定、合法。仅跳过空 ST（StringBuilder 等）与 "void"（语句表达式槽）。
+        // 注：ll_emit_opaque_defs 在模块末尾补的 %T* opaque 名不被 alloca（仅作 ptr 用），不受影响。
+        var pscan: i64 = 0; var pscann: i64 = slice_len(f.body) as i64;
+        while (pscan < pscann) {
+            var pins: TIRInst = f.body[pscan];
+            if (pins.is_comment == false && str_len(pins.dst.name) >= 1 && pins.dst.name[0] == 36) {
+                var pst: string = tir_st_to_str(pins.st);
+                if (str_len(pst) > 0 && pst != "void") {
+                    ll_ensure_slot(pins.dst.name, pst);
+                }
+            }
+            pscan = pscan + 1;
+        }
         var bi: i64 = 0; var bn: i64 = slice_len(f.body) as i64;
         while (bi < bn) {
             var inst: TIRInst = f.body[bi];
