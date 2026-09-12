@@ -199,6 +199,9 @@ TStr t_sb_to_str(TSb* b) {
 
 void t_sb_clear(TSb* b) { b->len = 0; }
 
+// sb_free：TSb 与其 buf 都由 arena 拥有，不可单独释放，故 no-op。
+void t_sb_free(TSb* b) { (void)b; }
+
 // int_to_str(v: i64) -> string —— 十进制文本（负数带前导 '-'）。
 // 走 arena，语义与 sb_new + sb_append_i64 + sb_to_str 完全一致。
 TStr t_int_to_str(int64_t v) {
