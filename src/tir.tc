@@ -1862,6 +1862,10 @@ pub fn tir_emit_stmt(sid: i64) void {
             var __er1m: TirEmitRes = tir_emit_map_lit(n.na, g_cur_ret_td); s = __er1m.name;
         } else {
             var __er2: TirEmitRes = tir_emit_expr(n.na); s = __er2.name;
+            // 返回值按函数返回类型对齐（修复 i64 字面量/表达式直接 ret 给 i32 函数 →
+            // LLVM `ret i32 <i64 值>` 类型错配：翻译器按槽真实宽度 load（i64）却 ret i32）。
+            var rsts: string = g_cur_func.ret_st;
+            if (tir_st_to_str(__er2.st) != rsts) { s = tir_cast_slot(s, __er2.st, rsts); }
         }
             tir_emit(tir_emit_ret(g_cur_func.ret_st, s));
         } else {
@@ -3186,8 +3190,18 @@ pub fn tir_emit_call(e: i64) TirEmitRes {
             }
         } else {
             var __er11: TirEmitRes = tir_emit_expr(k.val); aslot = __er11.name;
-            // 形参是 []T 而实参是 [N]T：补 array→slice 视图（否则被调用方读到脏长度 → 段错误）。
+            // 形参是标量时，按形参实际类型对齐实参（仅浮点互转）：修复 f64 折叠的 f32 字面量/
+            // 运算结果（如 -(3.5f32)）直接传给 f32 形参 → LLVM 类型错配（t_math_fabsf(float) 收到
+            // double → 低位字节为 0 → 返回 0）的 bug。
             var aptd: i64 = tir_callee_param_td(cname, argi);
+            if (aptd >= 0 && sema.tds[aptd].cat == "scalar") {
+                var pst: string = tir_st_of_td(aptd);
+                var isrc: string = tir_st_to_str(__er11.st);
+                if (pst != "" && isrc != "" && isrc != pst && (isrc == "f32" || isrc == "f64") && (pst == "f32" || pst == "f64")) {
+                    aslot = tir_cast_slot(aslot, __er11.st, pst);
+                }
+            }
+            // 形参是 []T 而实参是 [N]T：补 array→slice 视图（否则被调用方读到脏长度 → 段错误）。
             if (aptd >= 0 && sema.tds[aptd].cat == "slice") { aslot = tir_maybe_array_to_slice(aslot, k.val); }
         }
         if (first == false) { sb_append_str(sb, " "); }
@@ -3350,6 +3364,41 @@ pub fn tir_width(st: string) i64 {
     if (st == "f32") { return 32; }
     if (st == "f64") { return 64; }
     return 64;
+}
+
+// 把已发射临时 src（类型 src_stc，i64 st 常量）对齐到目标类型 dst_st（字符串），返回新临时。
+// 用于调用实参按形参实际类型对齐：修复 f64 折叠的 f32 字面量/运算结果（如 -(3.5f32)）直接传给
+// f32 形参 → LLVM 类型错配（t_math_fabsf(float) 收到 double → 低位字节为 0 → 返回 0）的 bug。
+// ⚠ 仅处理浮点互转（其余整型/聚合宽度对齐由各自写入点负责）；发射结构化 TIRInst，
+// 种子对结构化 TIRInst 可靠保留，不会像手动 sb_append_str("fptrunc...") 那样被静默丢弃。
+pub fn tir_cast_slot(src: string, src_stc: i64, dst_st: string) string {
+    var src_st: string = tir_st_to_str(src_stc);
+    if (src_st == dst_st) { return src; }
+    var d: string = tir_tmp();
+    var inner_tok: string = tir_os(src, src_stc);
+    var fi: bool = (src_st == "f32" || src_st == "f64");
+    var ft: bool = (dst_st == "f32" || dst_st == "f64");
+    var ui: bool = (str_len(src_st) >= 1 && src_st[0] == 117) || src_st == "bool";
+    var wi: i64 = tir_width(src_st);
+    var wt: i64 = tir_width(dst_st);
+    if (fi && ft) {
+        if (wi > wt) { tir_emit(TIRInst{ op: TIR_OP_FPTRUNC, st: tir_st_from_str(dst_st), dst: tir_op(d), args: tir_a1(inner_tok), is_comment: false, line: g_cur_line, cmt: "" }); }
+        else { tir_emit(TIRInst{ op: TIR_OP_FPEXT, st: tir_st_from_str(dst_st), dst: tir_op(d), args: tir_a1(inner_tok), is_comment: false, line: g_cur_line, cmt: "" }); }
+    } else if (fi && ft == false) {
+        if (ui) { tir_emit(TIRInst{ op: TIR_OP_FPTOUI, st: tir_st_from_str(dst_st), dst: tir_op(d), args: tir_a1(inner_tok), is_comment: false, line: g_cur_line, cmt: "" }); }
+        else { tir_emit(TIRInst{ op: TIR_OP_FPTOSI, st: tir_st_from_str(dst_st), dst: tir_op(d), args: tir_a1(inner_tok), is_comment: false, line: g_cur_line, cmt: "" }); }
+    } else if (fi == false && ft) {
+        if (ui) { tir_emit(TIRInst{ op: TIR_OP_UITOFP, st: tir_st_from_str(dst_st), dst: tir_op(d), args: tir_a1(inner_tok), is_comment: false, line: g_cur_line, cmt: "" }); }
+        else { tir_emit(TIRInst{ op: TIR_OP_SITOFP, st: tir_st_from_str(dst_st), dst: tir_op(d), args: tir_a1(inner_tok), is_comment: false, line: g_cur_line, cmt: "" }); }
+    } else if (wi < wt) {
+        if (ui) { tir_emit(TIRInst{ op: TIR_OP_ZEXT, st: tir_st_from_str(dst_st), dst: tir_op(d), args: tir_a1(inner_tok), is_comment: false, line: g_cur_line, cmt: "" }); }
+        else { tir_emit(TIRInst{ op: TIR_OP_SEXT, st: tir_st_from_str(dst_st), dst: tir_op(d), args: tir_a1(inner_tok), is_comment: false, line: g_cur_line, cmt: "" }); }
+    } else if (wi > wt) {
+        tir_emit(TIRInst{ op: TIR_OP_TRUNC, st: tir_st_from_str(dst_st), dst: tir_op(d), args: tir_a1(inner_tok), is_comment: false, line: g_cur_line, cmt: "" });
+    } else {
+        tir_emit(TIRInst{ op: TIR_OP_BITCAST, st: tir_st_from_str(dst_st), dst: tir_op(d), args: tir_a1(inner_tok), is_comment: false, line: g_cur_line, cmt: "" });
+    }
+    return d;
 }
 
 pub fn tir_emit_struct_lit(e: i64) TirEmitRes {
