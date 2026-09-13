@@ -1681,10 +1681,23 @@ pub fn emit_lle(e: i64) string {
                 sb_append_i64(line, llsf_idx[fi2]);
                 llfb(sb_to_str(line));
                 var ftd: i64 = llsf_td[fi2];
-                var fvv: string = emit_lle(fv.na);
-                if (ll_isagg(ftd)) {
+                // slice 字段三种情形（避免 emit_lle 对空 `[]` 落 UNSUPPORTED → load %TSlice, ptr 0）：
+                //  1) 数组字面量初值器（含空 `[]`）→ ll_build_slice_lit（空即 tll_slice_new(0)）
+                //  2) 无初值器 → 显式 tll_slice_new(0)（zeroinitializer 也是合法空切片，显式更稳）
+                //  3) 其余 slice 表达式（如函数返回的切片）→ 原 ll_isagg 路径（emit_lle 已是合法 ptr）
+                if (ftd >= 0 && sema.tds[ftd].cat == "slice" && fv.na >= 0
+                        && base.nodes[fv.na].kind == "array_lit") {
+                    var sv: string = ll_build_slice_lit(fv.na, ftd);
+                    ll_copy("%TSlice", sv, fp);
+                } else if (ftd >= 0 && sema.tds[ftd].cat == "slice" && fv.na < 0) {
+                    var ety2: string = "i64";
+                    if (sema.tds[ftd].elem >= 0) { ety2 = ll_td(sema.tds[ftd].elem); }
+                    llfb(base.sb_cat6("  call void @tll_slice_new(i64 ", ll_sizeof(ety2), ", ptr ", fp, ")", ""));
+                } else if (ll_isagg(ftd)) {
+                    var fvv: string = emit_lle(fv.na);
                     ll_copy(ll_td(ftd), fvv, fp);
                 } else {
+                    var fvv: string = emit_lle(fv.na);
                     var cv2: string = ll_cast_v(fvv, ll_etd(fv.na), ftd);
                     llfb(base.sb_cat6("  store ", ll_td(ftd), " ", cv2, ", ptr ", fp));
                 }
@@ -5128,12 +5141,20 @@ pub fn emit_llginit() void {
                 llfb(base.sb_cat4("  store ", ty, " 0, ptr ", gp));
             }
         } else if (llgv_init[i] >= 0) {
-            var v: string = emit_lle(llgv_init[i]);
-            if (ll_isagg(td)) {
-                ll_copy(ty, v, gp);
+            // slice 全局 + 空/未定型 array_lit 初值器（`var g: []T = []`）：emit_lle 对
+            // 无元素 `[]` 落 UNSUPPORTED expr（`load %TSlice, ptr 0`）。特判走
+            // ll_build_slice_lit（空 slice 即 tll_slice_new(0)），与 `g = []` 赋值修复同构。
+            if (t0.cat == "slice" && base.nodes[llgv_init[i]].kind == "array_lit") {
+                var sv: string = ll_build_slice_lit(llgv_init[i], td);
+                ll_copy(ty, sv, gp);
             } else {
-                v = ll_cast_v(v, ll_etd(llgv_init[i]), td);
-                llfb(base.sb_cat6("  store ", ty, " ", v, ", ptr ", gp));
+                var v: string = emit_lle(llgv_init[i]);
+                if (ll_isagg(td)) {
+                    ll_copy(ty, v, gp);
+                } else {
+                    v = ll_cast_v(v, ll_etd(llgv_init[i]), td);
+                    llfb(base.sb_cat6("  store ", ty, " ", v, ", ptr ", gp));
+                }
             }
         } else {
             var t: TD = sema.tds[td];
