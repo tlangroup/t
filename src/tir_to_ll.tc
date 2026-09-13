@@ -306,14 +306,27 @@ pub fn ll_load(tname: string, st: string) string {
         sb_append_str(g_ll, "\n");
         return r;
     }
+    // ⚠ 按槽真实 alloca 宽度(realst)加载，再按需转换到请求类型 st：
+    // 对抗「f32 实参被 alloca 成 double 后又 ll_set_st retag 成 float」导致 ll_get_st 失真、
+    // 按 st=float 误读 double 槽低位字节 → math fabsf/fmin_f/fmax_f/copysign_f 返回 0。
+    var realst: string = ll_alloca_st(dn);
+    if (realst == "") { realst = st; }
     var r: string = ll_tmp();
     sb_append_str(g_ll, "  ");
     sb_append_str(g_ll, r);
     sb_append_str(g_ll, " = load ");
-    sb_append_str(g_ll, st_to_ll(st));
+    sb_append_str(g_ll, st_to_ll(realst));
     sb_append_str(g_ll, ", ptr ");
     sb_append_str(g_ll, ll_llname_ptr(dn));
     sb_append_str(g_ll, "\n");
+    if (realst != st && (realst == "float" || realst == "double") && (st == "float" || st == "double")) {
+        var r2: string = ll_tmp();
+        sb_append_str(g_ll, "  "); sb_append_str(g_ll, r2);
+        sb_append_str(g_ll, " = ");
+        if (realst == "double") { sb_append_str(g_ll, "fptrunc double "); } else { sb_append_str(g_ll, "fpext float "); }
+        sb_append_str(g_ll, r); sb_append_str(g_ll, " to "); sb_append_str(g_ll, st_to_ll(st)); sb_append_str(g_ll, "\n");
+        return r2;
+    }
     return r;
 }
 
@@ -1832,9 +1845,14 @@ pub fn ll_emit_builtin(cn: string, toks: []string) bool {
         var base2: string = str_slice(cn, 6, str_len(cn));
         var isf: bool = false;
         var L: i64 = str_len(base2);
+        // ⚠ 区分两种命名（修复 fmin_f/fmax_f/copysign_f 返回 0 的 bug）：
+        //   • std f64 包装函数 fmin_f/fmax_f/copysign_f 以 "_f" 结尾 → 去 "_f" 得 f64 内建基名
+        //     （fmin/fmax/copysign），走 double 变体 t_math_fmin 等（与 math.tc 声明 f64 一致）。
+        //   • 真实 f32 内建变体（sinf/sqrtf/fabsf/fminf/copysignf…）以 "f" 结尾（无下划线）→ float 变体。
+        //   旧逻辑把 "_f" 错当 f32 后缀（fmin_f→fminf）发出 float 调用，实参 double 喂 float → 返回 0。
         if (L >= 2 && str_at(base2, L - 2) == 95 && str_at(base2, L - 1) == 102) {
-            base2 = base.sb_cat2(str_slice(base2, 0, L - 2), "f");
-            isf = true;
+            base2 = str_slice(base2, 0, L - 2);
+            isf = false;
         } else if (L >= 1 && str_at(base2, L - 1) == 102) {
             isf = true;
         }
@@ -1855,22 +1873,32 @@ pub fn ll_emit_builtin(cn: string, toks: []string) bool {
             ll_call_ret("t_math_pow", "double", ["double", "double"], argv2, d);
             return true;
         }
+        // ⚠ 参数按「槽真实类型」加载，仅当 f32 调用且实参槽为 double 时补 fptrunc：
+        // 前端对 f32 实参存储类型不一致（f32 字面量常量存成 double 槽、fptrunc 结果存成 float 槽）。
+        // 直接按 ty(float) 加载 double 槽会从 8 字节读 4 字节低位垃圾（如 -3.5f32 读成 0.0）→ fabsf/fminf/... 返回 0；
+        // 直接按 double 加载 float 槽会多读 4 字节高位垃圾 → sqrtf/... 返回巨大/微小值。
+        // 故按槽真实类型加载（float 槽读 float、double 槽读 double），f32 调用遇 double 实参再 fptrunc 到 float。
         var fn2: string = base.sb_cat2("t_math_", base2);
         var argc: i64 = slice_len(toks) as i64 - 4;
         var argv2: []string = [];
         var argsts2: []string = [];
         var i: i64 = 0;
         while (i < argc) {
-            var av: string = ll_load(toks[4 + i], "double");
-            if (isf) {
+            // 按槽真实 alloca 宽度加载；f32 调用且实参槽为 double 时补 fptrunc：
+            // 前端对 f32 实参存储类型不一致（f32 字面量/表达式均存成 double 槽），
+            // 直接按 float 加载 double 槽会读 8 字节低位 4 字节垃圾（如 -3.5f32 读成 0.0）→ fabsf 返回 0。
+            // 故先按真实宽度加载为 double，再 fptrunc 到 float。float 槽（如 sqrtf 的 fptrunc 结果）则不转换。
+            var argnm: string = toks[4 + i];
+            var realst: string = ll_alloca_st(argnm);
+            var av: string = ll_load(argnm, ty);
+            if (realst == "double" && ty == "float") {
                 var fv: string = ll_tmp();
                 sb_append_str(g_ll, "  "); sb_append_str(g_ll, fv);
                 sb_append_str(g_ll, " = fptrunc double "); sb_append_str(g_ll, av);
                 sb_append_str(g_ll, " to float\n");
-                append(argv2, fv);
-            } else {
-                append(argv2, av);
+                av = fv;
             }
+            append(argv2, av);
             append(argsts2, ty);
             i = i + 1;
         }

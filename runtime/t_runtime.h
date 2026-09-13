@@ -79,6 +79,7 @@ void t_sb_append_i64(TSb* b, int64_t v);
 void t_sb_append_char(TSb* b, uint8_t c);
 TStr t_sb_to_str(TSb* b);          // 返回以 \0 结尾的 TStr（arena 分配）
 void t_sb_clear(TSb* b);
+void t_sb_free(TSb* b);   // TSb 由 arena 拥有，无法单独释放（no-op）
 
 // int_to_str(v: i64) -> string —— 整数转十进制字符串（arena 分配）
 TStr t_int_to_str(int64_t v);

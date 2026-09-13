@@ -74,6 +74,7 @@ void    tll_sb_append_u64(TSb* b, uint64_t v) { t_sb_append_u64(b, v); }
 void    tll_sb_append_i64(TSb* b, int64_t v)  { t_sb_append_i64(b, v); }
 void    tll_sb_to_str(TSb* b, TStr* out)    { *out = t_sb_to_str(b); }
 void    tll_sb_clear(TSb* b)                { t_sb_clear(b); }
+void    tll_sb_free(TSb* b)                 { t_sb_free(b); }
 void    tll_int_to_str(int64_t v, TStr* out) { *out = t_int_to_str(v); }
 
 // ── 格式化（Python 格式规范迷你语言子集）──
