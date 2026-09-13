@@ -343,6 +343,9 @@ pub var g_mod: TIRModule;
 pub var g_cur_func: TIRFunc;
 pub var g_cur_line: u64;
 pub var g_term: bool = false;       // 当前基本块是否已终止（ret/br 之后不再发射指令）
+pub var g_recording_mir: bool = false;  // mir 录制开关（仅 tmir 后端路径开启；TIR 发射期并行录制 pre-TIR MIR）
+pub var g_mir: TIRModule;                // 录制得到的 pre-TIR 线性 MIR（与 g_mod 平行，仅函数体由 tir_emit 录制）
+pub var g_mir_cur: TIRFunc;             // 当前函数的 MIR 录制缓冲
 
 pub var g_tmpc: i64;             // 临时 slot 计数（$tN）
 pub var g_lblc: i64;             // 基本块标签计数（@LN）
@@ -485,6 +488,7 @@ pub fn tir_block(label: string) void {
 pub fn tir_emit(inst: TIRInst) void {
     if (g_term) { return; }   // 终止符之后当前块不再发射（避免 ret 后出现死指令）
     append(g_cur_func.body, inst);
+    if (g_recording_mir) { append(g_mir_cur.body, inst); }
     // 终止符（ret / br / br_cond）之后当前块终止
     if (inst.op == TIR_OP_BR || inst.op == TIR_OP_BR_COND || inst.op == TIR_OP_RET || inst.op == TIR_OP_RET_VOID) { g_term = true; }
 }
@@ -1252,6 +1256,7 @@ pub fn tir_annotate_types(mod: string) void {
 
 pub fn lower_unit(mod: string, source: string) void {
     tir_reset();
+    if (g_recording_mir) { g_mir = TIRModule{ mod: mod, source: source, types: [], strings: [], funcs: [], globals: [] }; }
     g_mod.mod = mod;
     g_mod.source = source;
     tir_add_std_types();
@@ -1446,7 +1451,8 @@ pub fn lower_unit(mod: string, source: string) void {
                 }
 
                 tir_emit(TIRInst{ op: TIR_OP_RET_VOID, st: ST_NONE, dst: tir_op(""), args: tir_a0(), is_comment: false, line: g_cur_line, cmt: "" });
-                append(g_mod.funcs, g_cur_func);
+                if (g_recording_mir) { append(g_mir.funcs, g_mir_cur); }
+    append(g_mod.funcs, g_cur_func);
                 cc2 = kc2.next;
             }
         }
@@ -1678,6 +1684,7 @@ pub fn tir_lower_func(d: i64) void {
     var fp: []string = [];
     var fb: []TIRInst = [];
     g_cur_func = TIRFunc{ name: n.sa, ret_st: tir_st_of_td(tir_func_ret_td(d)), params: fp, body: fb, is_extern: false, is_kernel: false, is_main: tir_ann_has(n.la, "main") };
+    if (g_recording_mir) { g_mir_cur = TIRFunc{ name: g_cur_func.name, ret_st: g_cur_func.ret_st, params: g_cur_func.params, body: [], is_extern: g_cur_func.is_extern, is_kernel: g_cur_func.is_kernel, is_main: g_cur_func.is_main }; }
     g_cur_ret_td = tir_func_ret_td(d);
     var fln: []string = [];
     g_local_names = fln;

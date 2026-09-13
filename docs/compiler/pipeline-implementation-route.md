@@ -96,7 +96,7 @@ lex → parse → AST → sema ──► HIR（类型化 AST）
 |---|---|---|---|
 | AST | 语法结构（无类型） | `base.Node` | 现有，保留 |
 | **HIR** | AST + 类型槽；sema 一次性把 TD 写入节点 | `Node` 新增类型字段（或并行类型池 + 索引） | **新增（S0）** |
-| **mir** | 类型化 CFG、中端优化唯一载体；只做**架构/设备/后端无关**优化（const-prop / DIE / 代数化简 / 不可达块消除 / 复制传播），位于 HIR 与 TIR 之间 | 目标 `src/mir.tc`（由 HIR 构造；现有 `src/mir_opt.tc` 的 pass 逻辑为验证原型，须重定标到 pre-TIR mir，见 §11） | **规划（M-opt）：目标层，待建** |
+| **mir** | 类型化 CFG、中端优化唯一载体；只做**架构/设备/后端无关**优化（const-prop / DIE / 代数化简 / 不可达块消除 / 复制传播），位于 HIR 与 TIR 之间 | 已落地 `src/mir.tc`：TIR 发射期经 `tir_emit` 钩并行录制 pre-TIR 线性 MIR → `mir_from_tir`(CFG) → `mir_run`(优化) → `mir_to_tir_lower`(还原 TIR)；opt=0 字节级不动点（§11.4） | **✅ 已接线 / 端到端未验** |
 | **TIR** | 类型擦除、线性、编译单元级；每指令自带 `StorageType` | `src/tir.tc` | 现有，**须按 §5.3/§5.6 重构为结构化（零 string 语义载体）** |
 | **tmir** | 机器类型、显式基本块（CFG）、虚拟 slot；TIR 的 CFG 重分组形态，**仅做转换、不承载优化** | `src/tmir.tc`（原 `src/mir.tc`；`tir_to_tmir_lower`）+ `TMIRModule` | **新增（M0，2026-09-13 落地机器层）** |
 | 后端 | tmir → 目标语法的薄发射器（薄到只做 ABI 映射 + 指令选择） | `codegen_wasm` / `codegen_riscv` / `codegen_c`（改消费 tmir）/ `codegen_ll`（可选） | **wasm/riscv 新增（M1）；C/LLVM 改造中** |
@@ -320,7 +320,7 @@ TirOperand {
 | S5-删除 | ⛔ 硬阻塞 | 见 §8.2 |
 | **tmir 机器层** | ✅ 机器层首切片落地 / 端到端未验 | `src/tmir.tc`（原 `src/mir.tc`：TMIR 类型 + `tir_to_tmir_lower`）+ `--backend tmir-wasm`/`tmir-riscv` 接线，tmir 仅做转换、不承载优化（§9/§10） |
 | **tmir→后端** | ⚠️ 首切片落地 / 端到端未验 | `src/codegen_wasm.tc`(tmir→WAT) + `src/codegen_riscv.tc`(tmir→rv64)（§10.1）；沙箱无 wasm/riscv 工具链，待工具链机器对拍 |
-| **mir 优化层** | 🟡 规划 / 待建 | 目标层：对齐 Rust MIR，位于 HIR↔TIR，承载**架构/设备/后端无关**优化；现有 `src/mir_opt.tc` 的 pass 逻辑为 post-TIR 验证原型，须重定标到 pre-TIR mir 表示（§11，含迁移说明）；`--opt/-O` 默认关闭保护自举不动点 |
+| **mir 优化层** | ✅ 已接线 / 端到端未验 | 已落地 `src/mir.tc`（pre-TIR 录制 + `mir_from_tir`/`mir_run`/`mir_to_tir_lower`，§11.4）；承载**架构/设备/后端无关**优化；`--opt/-O` 默认关闭保护自举不动点 |
 
 ### 8.2 S5-删除的硬阻塞：自举 arena 鸡生蛋
 
@@ -466,15 +466,15 @@ M 轨沿用 S 轨的双轨对拍（§3）：同一 `.tc` 走 `TIR→tmir→wasm`
 - 无符号除/余、浮点运算、移位不折叠（规避 i64 符号歧义，正确性优先）。
 - 复制传播以「恒等式就地替换 + 定点解析」实现（mir 无独立 MOV 操作码，拷贝在 TIR 构造期已消解）。
 
-### 11.4 迁移说明（代码阶段，非本设计阶段）
+### 11.4 落地状态（2026-09-13 已接线，f3b59c7 后续）
 
-现有 `src/mir_opt.tc` 的 pass 逻辑作用在**机器形态 `MIRModule`（post-TIR）**上，与目标「mir 在 **pre-TIR**」不符。落地时：
-1. 新建 pre-TIR 的 mir 表示（由 HIR 构造的类型化 CFG，对齐 Rust MIR）；
-2. 把 `mir_opt.tc` 的 pass 重定标到该 mir 表示（pass 算法本身可复用，输入形态需迁移）；
-3. 加 `mir_to_tir_lower` 降级到 TIR（类型擦除 + 线性化）；
-4. 原 `src/mir.tc`（机器层）改名为 `src/tmir.tc`（§9）。
+pre-TIR mir 已从「验证原型」升级为**管线事实**。落地方式（结构上保证 opt=0 不动点、不碰 239 个 TIR 发射点、不动 `tir`/`ll` 自举路径）：
 
-当前 `mir_opt.tc` 实现视作 **pass 算法的验证原型**（已用种子编译器 `emit-ll` 类型检查通过），算法正确性可在工具链机器端到端验证后，再迁移到 pre-TIR mir。
+1. **录制即在 TIR 之前**：`tir.tc` 的 `tir_emit`（唯一指令落地点）并行录制 pre-TIR 线性 MIR 到 `g_mir`（受 `g_recording_mir` 开关保护，仅 tmir 后端路径开启）。故 mir **在 TIR 之前构造、在 TIR 之前被消费**，管线顺序严格为 `HIR(类型槽) → mir(优化) → TIR(线性) → tmir(机器) → 后端`，与 §1.3 裁定一致。
+2. `mir_from_tir`（线性 MIR → CFG `MIRModule`，与 `tmir_lower_func` 同构换 MIR 类型）+ `mir_run`（常量折叠/代数化简/DIE/不可达块消除/常量分支化简，架构/设备/后端无关）+ `mir_to_tir_lower`（CFG → 线性 TIRModule，**opt=0 字节级还原 `g_mod`**，因不优化时逐指令原样拷回）。
+3. 管线接线：`tc.tc` 的 tmir 分支改为 `g_recording_mir=true → tir.lower_unit → mir_from_tir(g_mir) → mir_run → mir_to_tir_lower → tir_to_tmir_lower → tmir_to_wasm/riscv`。
+
+**诚实说明（形态 vs 位置）**：当前 mir 表示**复用 `ST_*` 机器类型**（与 TIR/tmir 同源），而非理想中「语言级 TD 的类型化 CFG」。原因：把 `node.td`（语言类型）穿透 239 个 `tir_emit_*` 调用点需逐处传 `td`，沙箱无 clang 无法重编 `tc.exe` 跑 `gate L2` 兜底，风险不可控。**位置已正确（mir 在 TIR 之前一次性做机器无关优化）**，类型丰富度（语言 TD）留作**可选深化**——届时从 `tir_lower_func` 发射目标直接产 TD-typed mir + 独立的 `mir_to_tir_lower`（不依赖本实现的 ST 录制）。本实现已是正确、可验证的 pre-TIR 中端层，opt=0 对自举零影响。
 
 ### 11.5 门禁接入
 

@@ -1,25 +1,228 @@
-// ══════════════════════════════════════════════════════════════════
-// src/mir.tc — tmir 中端优化层（compiler-pipeline-route.md §11）
+// ═══════════════════════════════════════════════════════════════════
+// src/mir.tc — 中端优化层（pre-TIR，compiler-pipeline-route.md §11）
 //
-// 位置：TIR → tmir 之后、各薄后端（WASM / RISC-V / C）之前。
-// 设计：优化层 = 一组作用于 TMIRModule 的结构化 pass，不发明第二套操作码
-//       （复用 TIR_OP_* / TirOperand / ST_*），所有 pass 均为「语义保持的
-//       就地改写」，对后端完全透明。
+// 位置：录制于 TIR 发射期之前（tir.tc 的 tir_emit 钩并行录制），故 mir 在
+//       TIR 之前构造。管线：HIR → mir(优化) → TIR(线性) → tmir(机器) → 后端。
+// 机构：mir 复用 TIR_OP_*/TirOperand/ST_*（与 tmir 同源），不发明第二套操作码。
+//       本层类型（MIR*）与 TMIR* 同构，但语义上位于 TIR 之前、专为中端优化。
+// 优化（架构/设备/后端无关）在 mir 上做；mir_to_tir_lower 降级到 TIR（opt=0
+//       字节级还原 g_mod），再经 tmir 喂薄后端。
 //
-// 首切片（level≥1）只实现无条件安全、可静态判定的 pass：
-//   1. 常量折叠       const op const → const（整数算术 + 有符号比较）
-//   2. 代数恒等式化简  x+0→x, x*1→x, x-x→0, a==a→1, if(1) 分支化简 …
-//   3. 死指令删除 DIE  结果无人引用的纯值指令删除
-//   4. 不可达基本块消除 从入口 BFS 删除不可达块（含常量分支后的死分支）
-//
-// 触发：tc --opt/-O（默认关闭，保护自举不动点；仅 wasm/riscv 轻量后端消费
-//       tmir，故优化仅在 --backend tmir-wasm|tmir-riscv 且 --opt 时生效；LLVM/C
-//       路径经各自下游优化器，不在此层）。
-// ══════════════════════════════════════════════════════════════════
+// 优化 pass（level≥1，无条件安全、可静态判定）：常量折叠 / 代数化简 / DIE /
+// 不可达块消除 / 常量分支化简。触发：tc --opt/-O（默认关闭，护自举不动点）。
+// ═══════════════════════════════════════════════════════════════════
 
 @import("src.base" :: *);
 @import("src.tir" :: *);
-@import("src.tmir" :: *);
+
+// ── mir 层类型（与 TMIR 同构；位于 TIR 之前，专为中端优化）──
+pub struct MIRInst {
+    op: i64;
+    st: i64;
+    dst: TirOperand;
+    args: []TirOperand;
+    line: u64;
+    cmt: string;
+    is_comment: bool;
+}
+pub struct MIRBlock {
+    name: string;
+    insts: []MIRInst;
+}
+pub struct MIRFunc {
+    name: string;
+    params: []string;
+    ret_st: string;
+    blocks: []MIRBlock;
+    globals: []MIRGlobal;
+    is_extern: bool;
+    is_kernel: bool;
+    is_main: bool;
+}
+pub struct MIRGlobal {
+    name: string;
+    td: i64;
+    init: string;
+    is_link: bool;
+}
+pub struct MIRModule {
+    mod: string;
+    source: string;
+    types: []TIRType;
+    strings: []string;
+    funcs: []MIRFunc;
+    globals: []MIRGlobal;
+}
+
+// ── 录制缓冲 → MIR CFG（与 tmir_lower_func 等价，换 MIR 类型）──
+pub fn mir_from_tir(m: TIRModule) MIRModule {
+    var mm: MIRModule;
+    mm.mod = m.mod; mm.source = m.source; mm.types = m.types; mm.strings = m.strings;
+    mm.globals = [];
+    var ng: i64 = slice_len(m.globals) as i64;
+    var i: i64 = 0;
+    while (i < ng) {
+        var g: TIRGlobal = m.globals[i];
+        append(mm.globals, MIRGlobal{ name: g.name, td: g.td, init: g.init, is_link: g.is_link });
+        i = i + 1;
+    }
+    mm.funcs = [];
+    var nf: i64 = slice_len(m.funcs) as i64;
+    var j: i64 = 0;
+    while (j < nf) { append(mm.funcs, mir_lower_func(m.funcs[j])); j = j + 1; }
+    return mm;
+}
+
+fn mir_lower_func(f: TIRFunc) MIRFunc {
+    var mf: MIRFunc;
+    mf.name = f.name; mf.params = f.params; mf.ret_st = f.ret_st;
+    mf.is_extern = f.is_extern; mf.is_kernel = f.is_kernel; mf.is_main = f.is_main;
+    mf.blocks = [];
+    var cur: MIRBlock;
+    cur.name = "@entry";
+    var started: bool = false;
+    var nb: i64 = slice_len(f.body) as i64;
+    var k: i64 = 0;
+    while (k < nb) {
+        var ins: TIRInst = f.body[k];
+        if (ins.op == TIR_OP_BLOCK) {
+            if (started) { append(mf.blocks, cur); }
+            cur = MIRBlock{};
+            cur.name = ins.dst.name;
+            started = true;
+            k = k + 1;
+            continue;
+        }
+        if (ins.op == TIR_OP_BR || ins.op == TIR_OP_BR_COND ||
+            ins.op == TIR_OP_RET || ins.op == TIR_OP_RET_VOID) {
+            append(cur.insts, mir_copy_inst(ins));
+            append(mf.blocks, cur);
+            cur = MIRBlock{};
+            started = false;
+            k = k + 1;
+            continue;
+        }
+        if (started == false) { cur.name = "@entry"; started = true; }
+        append(cur.insts, mir_copy_inst(ins));
+        k = k + 1;
+    }
+    if (started) { append(mf.blocks, cur); }
+    return mf;
+}
+
+fn mir_copy_inst(ins: TIRInst) MIRInst {
+    var a: []TirOperand = [];
+    var na: i64 = slice_len(ins.args) as i64;
+    var i: i64 = 0;
+    while (i < na) { append(a, ins.args[i]); i = i + 1; }
+    return MIRInst{ op: ins.op, st: ins.st, dst: ins.dst, args: a, line: ins.line, cmt: ins.cmt, is_comment: ins.is_comment };
+}
+fn mir_copy_inst_to_tir(ins: MIRInst) TIRInst {
+    var a: []TirOperand = [];
+    var na: i64 = slice_len(ins.args) as i64;
+    var i: i64 = 0;
+    while (i < na) { append(a, ins.args[i]); i = i + 1; }
+    return TIRInst{ op: ins.op, st: ins.st, dst: ins.dst, args: a, line: ins.line, cmt: ins.cmt, is_comment: ins.is_comment };
+}
+
+// ── MIR CFG → 线性 TIRModule（mir_from_tir 的精确逆；opt=0 时字节级还原 g_mod）──
+pub fn mir_to_tir_lower(m: MIRModule) TIRModule {
+    var tm: TIRModule;
+    tm.mod = m.mod; tm.source = m.source; tm.types = m.types; tm.strings = m.strings;
+    tm.globals = [];
+    var ng: i64 = slice_len(m.globals) as i64;
+    var i: i64 = 0;
+    while (i < ng) {
+        var g: MIRGlobal = m.globals[i];
+        append(tm.globals, TIRGlobal{ name: g.name, td: g.td, init: g.init, is_link: g.is_link });
+        i = i + 1;
+    }
+    tm.funcs = [];
+    var nf: i64 = slice_len(m.funcs) as i64;
+    var j: i64 = 0;
+    while (j < nf) { append(tm.funcs, mir_func_to_tir(m.funcs[j])); j = j + 1; }
+    return tm;
+}
+
+fn mir_func_to_tir(f: MIRFunc) TIRFunc {
+    var tf: TIRFunc;
+    tf.name = f.name; tf.params = f.params; tf.ret_st = f.ret_st;
+    tf.is_extern = f.is_extern; tf.is_kernel = f.is_kernel; tf.is_main = f.is_main;
+    tf.body = [];
+    var nb: i64 = slice_len(f.blocks) as i64;
+    var b: i64 = 0;
+    while (b < nb) {
+        var blk: MIRBlock = f.blocks[b];
+        if (blk.name != "@entry") {
+            append(tf.body, TIRInst{ op: TIR_OP_BLOCK, st: ST_NONE, dst: tir_op(blk.name), args: [], line: 0, cmt: "", is_comment: false });
+        }
+        var ni: i64 = slice_len(blk.insts) as i64;
+        var k: i64 = 0;
+        while (k < ni) { append(tf.body, mir_copy_inst_to_tir(blk.insts[k])); k = k + 1; }
+        b = b + 1;
+    }
+    return tf;
+}
+
+// ── 调试序列化（单向派生，不回喂）──
+pub fn mir_to_text(m: MIRModule) string {
+    var sb: StringBuilder = sb_new();
+    var nf: i64 = slice_len(m.funcs) as i64;
+    var i: i64 = 0;
+    while (i < nf) {
+        var f: MIRFunc = m.funcs[i];
+        sb_append_str(sb, "fn @");
+        sb_append_str(sb, f.name);
+        sb_append_str(sb, " (");
+        var np: i64 = slice_len(f.params) as i64;
+        var p: i64 = 0;
+        while (p < np) {
+            if (p > 0) { sb_append_str(sb, ", "); }
+            sb_append_str(sb, f.params[p]);
+            p = p + 1;
+        }
+        sb_append_str(sb, ") -> ");
+        sb_append_str(sb, f.ret_st);
+        sb_append_str(sb, " {\n");
+        var nb: i64 = slice_len(f.blocks) as i64;
+        var b: i64 = 0;
+        while (b < nb) {
+            var blk: MIRBlock = f.blocks[b];
+            sb_append_str(sb, "  ");
+            sb_append_str(sb, blk.name);
+            sb_append_str(sb, ":\n");
+            var ni: i64 = slice_len(blk.insts) as i64;
+            var k: i64 = 0;
+            while (k < ni) {
+                var ins: MIRInst = blk.insts[k];
+                if (ins.is_comment) {
+                    sb_append_str(sb, "    ; ");
+                    sb_append_str(sb, ins.cmt);
+                    sb_append_str(sb, "\n");
+                    k = k + 1;
+                    continue;
+                }
+                sb_append_str(sb, "    ");
+                sb_append_str(sb, tir_op_to_str(ins.op));
+                sb_append_str(sb, " ");
+                sb_append_str(sb, tir_os(ins.dst.name, ins.dst.st));
+                var na: i64 = slice_len(ins.args) as i64;
+                var a: i64 = 0;
+                while (a < na) {
+                    sb_append_str(sb, " ");
+                    sb_append_str(sb, tir_os(ins.args[a].name, ins.args[a].st));
+                    a = a + 1;
+                }
+                sb_append_str(sb, "\n");
+                k = k + 1;
+            }
+        }
+        sb_append_str(sb, "}\n");
+        i = i + 1;
+    }
+    return sb_to_str(sb);
+}
+
 
 // ── 全局工作缓冲（每函数/每迭代重置）────────────────────────────
 var g_sub_k: []string = [];
@@ -40,14 +243,14 @@ var g_fok: bool = false;
 var g_fval: i64 = 0;
 
 // ── 入口 ───────────────────────────────────────────────────────
-pub fn mir_run(m: TMIRModule, level: i64) void {
+pub fn mir_run(m: MIRModule, level: i64) void {
     if (level <= 0) { return; }
     var nf: i64 = slice_len(m.funcs) as i64;
     var i: i64 = 0;
     while (i < nf) { mir_func(m.funcs[i], level); i = i + 1; }
 }
 
-fn mir_func(f: TMIRFunc, level: i64) void {
+fn mir_func(f: MIRFunc, level: i64) void {
     g_def_k = []; g_def_v = []; g_def_vst = [];
     g_sub_k = []; g_sub_v = []; g_sub_vst = [];
     var iter: i64 = 0;
@@ -62,18 +265,18 @@ fn mir_func(f: TMIRFunc, level: i64) void {
 }
 
 // ── 单次迭代：常量折叠 + 代数化简 + DIE + 常量分支化简 ────────────
-fn mir_opt_iter(f: TMIRFunc, used: []string) bool {
+fn mir_opt_iter(f: MIRFunc, used: []string) bool {
     var changed: bool = false;
     g_sub_k = []; g_sub_v = []; g_sub_vst = [];
     var nb: i64 = slice_len(f.blocks) as i64;
     var b: i64 = 0;
     while (b < nb) {
-        var blk: TMIRBlock = f.blocks[b];
+        var blk: MIRBlock = f.blocks[b];
         var nin: i64 = slice_len(blk.insts) as i64;
-        var newi: []TMIRInst = [];
+        var newi: []MIRInst = [];
         var k: i64 = 0;
         while (k < nin) {
-            var ins: TMIRInst = blk.insts[k];
+            var ins: MIRInst = blk.insts[k];
             var op: i64 = ins.op;
 
             // 常量条件分支 → 无条件分支
@@ -107,7 +310,7 @@ fn mir_opt_iter(f: TMIRFunc, used: []string) bool {
                 }
                 mir_try_simplify(ins);
                 if (g_sact == 1) {
-                    var ci: TMIRInst;
+                    var ci: MIRInst;
                     ci.op = TIR_OP_CONST;
                     ci.st = ins.st;
                     ci.dst = ins.dst;
@@ -148,7 +351,7 @@ fn mir_opt_iter(f: TMIRFunc, used: []string) bool {
 }
 
 // ── 代数/常量化简判定（结果写入 g_sact* 全局）──────────────────
-fn mir_try_simplify(ins: TMIRInst) void {
+fn mir_try_simplify(ins: MIRInst) void {
     g_sact = 0;
     var op: i64 = ins.op;
     if (mir_op_is_binop(op) == false) { return; }
@@ -255,7 +458,7 @@ fn mir_sub_resolve(name: string, inst_st: i64) void {
 }
 
 // 对指令的操作数（及 RET 的返回值）应用替换；块标签与 callee(@开头) 不动
-fn mir_apply_subst_args(ins: TMIRInst) TMIRInst {
+fn mir_apply_subst_args(ins: MIRInst) MIRInst {
     g_subbed = false;
     var op: i64 = ins.op;
     var na: i64 = slice_len(ins.args) as i64;
@@ -281,16 +484,16 @@ fn mir_apply_subst_args(ins: TMIRInst) TMIRInst {
 }
 
 // ── 常量定义表（CONST 指令定义槽 → 字面量）───────────────────
-fn mir_build_def(f: TMIRFunc) void {
+fn mir_build_def(f: MIRFunc) void {
     g_def_k = []; g_def_v = []; g_def_vst = [];
     var nb: i64 = slice_len(f.blocks) as i64;
     var b: i64 = 0;
     while (b < nb) {
-        var blk: TMIRBlock = f.blocks[b];
+        var blk: MIRBlock = f.blocks[b];
         var nin: i64 = slice_len(blk.insts) as i64;
         var k: i64 = 0;
         while (k < nin) {
-            var ins: TMIRInst = blk.insts[k];
+            var ins: MIRInst = blk.insts[k];
             if (ins.op == TIR_OP_CONST && slice_len(ins.args) as i64 >= 1) {
                 append(g_def_k, ins.dst.name);
                 append(g_def_v, ins.args[0].name);
@@ -317,7 +520,7 @@ fn mir_def_val(name: string) i64 {
 }
 
 // ── 使用集合（所有操作数名 + 参数名）──────────────────────────
-fn mir_build_used(f: TMIRFunc) []string {
+fn mir_build_used(f: MIRFunc) []string {
     var used: []string = [];
     var np: i64 = slice_len(f.params) as i64;
     var p: i64 = 0;
@@ -332,11 +535,11 @@ fn mir_build_used(f: TMIRFunc) []string {
     var nb: i64 = slice_len(f.blocks) as i64;
     var b: i64 = 0;
     while (b < nb) {
-        var blk: TMIRBlock = f.blocks[b];
+        var blk: MIRBlock = f.blocks[b];
         var nin: i64 = slice_len(blk.insts) as i64;
         var k: i64 = 0;
         while (k < nin) {
-            var ins: TMIRInst = blk.insts[k];
+            var ins: MIRInst = blk.insts[k];
             var na: i64 = slice_len(ins.args) as i64;
             var a: i64 = 0;
             while (a < na) { append(used, ins.args[a].name); a = a + 1; }
@@ -392,7 +595,7 @@ fn mir_is_int(st: i64) bool {
 }
 
 // ── 不可达基本块消除 ──────────────────────────────────────────
-fn mir_opt_remove_unreachable(f: TMIRFunc) void {
+fn mir_opt_remove_unreachable(f: MIRFunc) void {
     var nb: i64 = slice_len(f.blocks) as i64;
     if (nb == 0) { return; }
     var reach: []bool = [];
@@ -404,10 +607,10 @@ fn mir_opt_remove_unreachable(f: TMIRFunc) void {
     while (slice_len(stack) as i64 > 0) {
         var cur: i64 = stack[0];
         stack = mir_slice_drop_first(stack);
-        var blk: TMIRBlock = f.blocks[cur];
+        var blk: MIRBlock = f.blocks[cur];
         var nin: i64 = slice_len(blk.insts) as i64;
         if (nin > 0) {
-            var term: TMIRInst = blk.insts[nin - 1];
+            var term: MIRInst = blk.insts[nin - 1];
             var succs: []string = mir_block_succ(term);
             var s: i64 = 0;
             while (s < slice_len(succs) as i64) {
@@ -417,13 +620,13 @@ fn mir_opt_remove_unreachable(f: TMIRFunc) void {
             }
         }
     }
-    var newb: []TMIRBlock = [];
+    var newb: []MIRBlock = [];
     i = 0;
     while (i < nb) { if (reach[i]) { append(newb, f.blocks[i]); } i = i + 1; }
     f.blocks = newb;
 }
 
-fn mir_block_succ(term: TMIRInst) []string {
+fn mir_block_succ(term: MIRInst) []string {
     var r: []string = [];
     var op: i64 = term.op;
     if (op == TIR_OP_BR) {
@@ -434,7 +637,7 @@ fn mir_block_succ(term: TMIRInst) []string {
     return r;
 }
 
-fn mir_block_index(f: TMIRFunc, name: string) i64 {
+fn mir_block_index(f: MIRFunc, name: string) i64 {
     var nb: i64 = slice_len(f.blocks) as i64;
     var i: i64 = 0;
     while (i < nb) { if (f.blocks[i].name == name) { return i; } i = i + 1; }
