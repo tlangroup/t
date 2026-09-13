@@ -282,6 +282,43 @@ TirOperand {
 
 ---
 
+## 8. 执行进度与剩余阻塞（2026-09-13 更新）
+
+> 本节记录 v3 路线实际落地状态与 S5 收口的唯一剩余阻塞，作为「路径规划」的当前结论。
+
+### 8.1 切片完成状态
+
+| 切片 | 状态 | 证据 |
+|---|---|---|
+| S-1 | ✅ 已落地 | `tools/_diffpipe.mjs` 对拍框架 + gate warn 级接入 |
+| S0 | ✅ 已落地 | `Node` 类型槽 + TIR 结构化类型（`TIR_OP_*` i64 判别码，无文本 round-trip，满足 §5.3 判据 1–3） |
+| S1–S4 | ✅（经 emit-tir-ll 后端） | emit-tir-ll 后端对 69 个 example 双轨全绿 |
+| S5-切换 | ⚠️ 代码完成 / 判据未验 | `src/tc.tc` 默认 `backend="tir"`，`--backend ll` 保留回退；arena 改 16GB 预留+按需提交（commit `1d578f3`）。**切换判据（新轨编 `tc.tc` 且输出与旧轨逐字一致）尚未在工具链机器跑 `gate L2` 验证**（沙箱无 clang/VS/WinSDK，无法链接） |
+| S5-删除 | ⛔ 硬阻塞 | 见 §8.2 |
+
+### 8.2 S5-删除的硬阻塞：自举 arena 鸡生蛋
+
+`ll_td` / `ll_etd` / `expr_type_desc` / `desc_to_c` **全部为活代码**（caller 实测：
+`ll_td` / `ll_etd` 在 `codegen_ll.tc` 内被调用上百处；
+`expr_type_desc` 在 `codegen_c.tc` 内数十处 + `codegen_ll.tc:755/833/835` + `tir.tc:2420`；
+`desc_to_c` 在 `codegen_c.tc` 内数十处）。它们不是死代码，是旧双后端（C/LLVM）的类型推导主干。
+
+删除这 4 个函数 ≡ 删除 `codegen_ll` / `codegen_c` ≡ 删除 `--backend ll`。但**自举首建（stage0 = 当前 512MB arena 的旧 `tc.exe`）必须走 `--backend ll` 才能编译 `src/tc.tc`**：tir 降低完整 `tc.tc` 需 >512MB（旧 arena 报 `arena: out of memory`）。若删 ll，stage0 无可用后端编 `tc.tc` → 自举断链。
+
+**解锁路径（须工具链机器，严格按序）**：
+1. `node tools/build_runtime.mjs` —— 用新 16GB 预留 arena 的 `t_runtime.c` 重建 runtime lib；
+2. `./out/dbg/tc.exe build --backend ll src/tc.tc -o out/dbg/tc.exe` —— **首建显式走 ll**（旧 512MB arena 够用），产出带 16GB arena 的新 `tc.exe`（默认 tir）；
+3. `node tools/gate.mjs L2` —— 此后默认 tir 可自举 `tc.tc`，验证新轨输出与旧轨逐字一致；
+4. gate 全绿后，再删 `codegen_ll` / `codegen_c` + 上述 4 个重复类型推导函数 —— 此时 stage0 已是 16GB arena，首建可走 tir，删 ll 不再断链，S5 收益（单一类型真相源）兑现。
+
+### 8.3 日落研判（2026-09-13）
+
+- §7 的 09-30 日落线仍有效。S5-切换代码已完成，仅差步骤 3 的 gate 验证。
+- 若工具链机器 `gate L2` 通过 → S5 切换判据达成，剩余仅 S5-删除（受 §8.2 约束，待 stage0 升级 16GB arena 后做）。
+- 若 `gate L2` 因 tir 输出与 C 后端不符而失败 → 一行回退 `src/tc.tc:397` 改 `backend="ll"`，转回 `codegen_ll` 单点维护（§7 日落条款）。
+
+---
+
 ## 附录 A：v1/v2 实现偏离复盘（v3 立论依据）
 
 规模参照：项目 7/29 起 148 提交，TIR 相关 **25 提交全部集中在 9/5–9/8 共 4 天**。问题不是「投入不足」，而是「高密度投入但收敛慢」。
