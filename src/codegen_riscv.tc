@@ -1,0 +1,396 @@
+// ══════════════════════════════════════════════════════════════════
+// src/codegen_riscv.tc — MIR → RISC-V（rv64im）薄后端
+//
+// 职责：消费 MIRModule，发出 rv64 汇编（AT&T 风格的反向即 RISC-V 标准语法：
+// `op rd, rs1, rs2`）。这是「取代 LLVM 的轻量后端」之一——MIR 的 CFG 直接
+// 映射到 RISC-V 的标签 + 分支/跳转，无需 LLVM。
+//
+// 寄存器分配策略（薄后端，正确性优先）：把 MIR 的每个虚拟 slot（$name）溢出到
+// 栈帧 8 字节槽，所有运算走 t0/t1/t2 暂存 + load/store。调用参数经 a0–a7 传递，
+// 返回值在 a0。无全局寄存器分配（后续可插轻量线性扫描优化，本切片不依赖）。
+//
+// 覆盖：S1 标量子集（i32/i64/f64/bool、算术/比较/位/移位、load/store、
+// call/ret、br/br_cond）。S2+（struct/union/数组/字符串/全局）暂以 comment 兜底
+// （§5.5 临时占位，不保证不错编，待后续切片补齐）。
+//
+// 注意：本文件无法在沙箱内链接验证（无 riscv64 工具链）；须工具链机器用
+// `riscv64-linux-gnu-gcc -c out/dbg/<m>.s` 或 `clang --target=riscv64` 验证语法。
+// ══════════════════════════════════════════════════════════════════
+
+@import("src.base" :: *);
+@import("src.tir" :: *);
+@import("src.mir" :: *);
+
+// 栈槽名 → 偏移的并行数组（emit 期构建一次）。
+pub var g_slots: []string;
+pub var g_scratch: i64;   // 当前函数帧大小（字节）
+
+pub fn rv_is_slot(n: string) bool { return str_len(n) as i64 > 0 && n[0] == 36; }   // '$'
+pub fn rv_is_global(n: string) bool { return str_len(n) as i64 > 0 && n[0] == 64; } // '@'
+
+// 收集当前函数所有 slot 名，分配 8 字节栈槽（offset 从 8 起）。
+pub fn rv_collect_slots(f: MIRFunc) void {
+    g_slots = [];
+    // 参数槽：参数在 MIR 中即 $slot，须纳入帧（确保帧大小含参数），后续序言溢出 a0..a7
+    var nprm: i64 = slice_len(f.params) as i64;
+    var pri: i64 = 0;
+    while (pri < nprm) {
+        var pv: string = f.params[pri];
+        var pc: i64 = 0; var pnl: i64 = str_len(pv) as i64;
+        while (pc < pnl) { if (pv[pc] == 58) { break; } pc = pc + 1; }
+        rv_ensure_slot(str_slice(pv, 0, pc));
+        pri = pri + 1;
+    }
+    var nb: i64 = slice_len(f.blocks) as i64;
+    var b: i64 = 0;
+    while (b < nb) {
+        var blk: MIRBlock = f.blocks[b];
+        var ni: i64 = slice_len(blk.insts) as i64;
+        var k: i64 = 0;
+        while (k < ni) {
+            var ins: MIRInst = blk.insts[k];
+            if (rv_is_slot(ins.dst.name)) { rv_ensure_slot(ins.dst.name); }
+            var na: i64 = slice_len(ins.args) as i64;
+            var a: i64 = 0;
+            while (a < na) {
+                if (rv_is_slot(ins.args[a].name)) { rv_ensure_slot(ins.args[a].name); }
+                a = a + 1;
+            }
+            k = k + 1;
+        }
+        b = b + 1;
+    }
+    // 帧大小：槽数 * 8，再对齐 16 字节（RISC-V 调用约定 sp 16 字节对齐）。
+    var nslot: i64 = slice_len(g_slots) as i64;
+    g_scratch = (nslot + 1) * 8;
+    while (g_scratch % 16 != 0) { g_scratch = g_scratch + 8; }
+}
+
+pub fn rv_ensure_slot(n: string) void {
+    var i: i64 = 0;
+    var nslot: i64 = slice_len(g_slots) as i64;
+    while (i < nslot) {
+        if (g_slots[i] == n) { return; }
+        i = i + 1;
+    }
+    append(g_slots, n);
+}
+
+pub fn rv_slot_off(n: string) i64 {
+    var i: i64 = 0;
+    var nslot: i64 = slice_len(g_slots) as i64;
+    while (i < nslot) {
+        if (g_slots[i] == n) { return (i + 1) * 8; }
+        i = i + 1;
+    }
+    return 8;
+}
+
+// 标签清洗：@L0 → L0（RISC-V 标签可数字开头）。
+pub fn rv_lbl(n: string) string {
+    if (rv_is_global(n)) { return str_slice(n, 1, str_len(n) as i64); }
+    return n;
+}
+
+// ── 发射帮手 ───────────────────────────────────────────────────
+pub fn rv_ld(sb: StringBuilder, reg: string, slot: string, st: i64) void {
+    // 读 slot → reg
+    if (st == ST_F32) { sb_append_str(sb, "  flw "); sb_append_str(sb, reg); sb_append_str(sb, ", "); sb_append_str(sb, base.i2s(rv_slot_off(slot))); sb_append_str(sb, "(sp)\n"); return; }
+    if (st == ST_F64) { sb_append_str(sb, "  fld "); sb_append_str(sb, reg); sb_append_str(sb, ", "); sb_append_str(sb, base.i2s(rv_slot_off(slot))); sb_append_str(sb, "(sp)\n"); return; }
+    if (st == ST_I64 || st == ST_U64 || st == ST_PTR || st == ST_PTR_VOID) { sb_append_str(sb, "  ld "); }
+    else { sb_append_str(sb, "  lw "); }
+    sb_append_str(sb, reg); sb_append_str(sb, ", "); sb_append_str(sb, base.i2s(rv_slot_off(slot))); sb_append_str(sb, "(sp)\n");
+}
+
+pub fn rv_st(sb: StringBuilder, slot: string, reg: string, st: i64) void {
+    if (st == ST_F32) { sb_append_str(sb, "  fsw "); sb_append_str(sb, reg); sb_append_str(sb, ", "); sb_append_str(sb, base.i2s(rv_slot_off(slot))); sb_append_str(sb, "(sp)\n"); return; }
+    if (st == ST_F64) { sb_append_str(sb, "  fsd "); sb_append_str(sb, reg); sb_append_str(sb, ", "); sb_append_str(sb, base.i2s(rv_slot_off(slot))); sb_append_str(sb, "(sp)\n"); return; }
+    if (st == ST_I64 || st == ST_U64 || st == ST_PTR || st == ST_PTR_VOID) { sb_append_str(sb, "  sd "); }
+    else { sb_append_str(sb, "  sw "); }
+    sb_append_str(sb, reg); sb_append_str(sb, ", "); sb_append_str(sb, base.i2s(rv_slot_off(slot))); sb_append_str(sb, "(sp)\n");
+}
+
+// 把操作数载入 reg（slot→load，全局→预留 la，立即数→li）。返回是否为浮点。
+pub fn rv_load_operand(sb: StringBuilder, reg: string, op: TirOperand) void {
+    if (rv_is_global(op.name)) {
+        // 全局变量：la 取地址后 load（首切片仅支持 i64/i32 全局，其余 comment）
+        sb_append_str(sb, "  la t3, "); sb_append_str(sb, rv_lbl(op.name)); sb_append_str(sb, "\n");
+        if (op.st == ST_F64) { sb_append_str(sb, "  fld "); sb_append_str(sb, reg); sb_append_str(sb, ", 0(t3)\n"); }
+        else if (op.st == ST_F32) { sb_append_str(sb, "  flw "); sb_append_str(sb, reg); sb_append_str(sb, ", 0(t3)\n"); }
+        else if (op.st == ST_I64 || op.st == ST_U64 || op.st == ST_PTR) { sb_append_str(sb, "  ld "); sb_append_str(sb, reg); sb_append_str(sb, ", 0(t3)\n"); }
+        else { sb_append_str(sb, "  lw "); sb_append_str(sb, reg); sb_append_str(sb, ", 0(t3)\n"); }
+        return;
+    }
+    if (rv_is_slot(op.name)) { rv_ld(sb, reg, op.name, op.st); return; }
+    // 立即数
+    if (op.st == ST_F64 || op.st == ST_F32) {
+        sb_append_str(sb, "  fli.d "); sb_append_str(sb, reg); sb_append_str(sb, ", "); sb_append_str(sb, op.name); sb_append_str(sb, "\n");
+    } else {
+        sb_append_str(sb, "  li "); sb_append_str(sb, reg); sb_append_str(sb, ", "); sb_append_str(sb, op.name); sb_append_str(sb, "\n");
+    }
+}
+
+pub fn rv_width_suffix(st: i64) string {
+    // 64 位整数/指针用 64 位 op；32 位及窄类型用 w 后缀（rv64 addw 等）
+    if (st == ST_I64 || st == ST_U64 || st == ST_PTR || st == ST_PTR_VOID) { return ""; }
+    return "w";
+}
+
+// ── 主发射 ─────────────────────────────────────────────────────
+// 参数名提取（"$x: i32" → "$x"）
+pub fn rv_param_name(pv: string) string {
+    var col: i64 = 0; var n: i64 = str_len(pv) as i64;
+    while (col < n) { if (pv[col] == 58) { break; } col = col + 1; }
+    return str_slice(pv, 0, col);
+}
+pub fn rv_contains(hay: string, needle: string) bool {
+    var hl: i64 = str_len(hay) as i64; var nl: i64 = str_len(needle) as i64;
+    if (nl == 0) { return true; }
+    if (nl > hl) { return false; }
+    var i: i64 = 0;
+    while (i + nl <= hl) {
+        var j: i64 = 0; var ok: bool = true;
+        while (j < nl) { if (hay[i + j] != needle[j]) { ok = false; break; } j = j + 1; }
+        if (ok) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+pub fn rv_fareg(p: i64) string { return base.sb_cat2("fa", base.i2s(p)); }
+// 序言：把 a0..a7 / fa0..fa7 实参溢出到对应参数栈槽（参数在 MIR 即 $slot，统一经栈访问；S1 至多 8 个参数）
+pub fn rv_emit_prologue_params(sb: StringBuilder, f: MIRFunc) void {
+    var np: i64 = slice_len(f.params) as i64;
+    var p: i64 = 0;
+    while (p < np && p < 8) {
+        var pv: string = f.params[p];
+        var nm: string = rv_param_name(pv);
+        var off: i64 = rv_slot_off(nm);
+        var isf: bool = rv_contains(pv, "f32") || rv_contains(pv, "f64");
+        if (isf) {
+            if (rv_contains(pv, "f32")) { sb_append_str(sb, "  fsw "); } else { sb_append_str(sb, "  fsd "); }
+            sb_append_str(sb, rv_fareg(p)); sb_append_str(sb, ", "); sb_append_str(sb, base.i2s(off)); sb_append_str(sb, "(sp)\n");
+        } else {
+            var ar: string = rv_areg(10 + p);
+            if (rv_contains(pv, "i64") || rv_contains(pv, "u64") || rv_contains(pv, "ptr")) { sb_append_str(sb, "  sd "); } else { sb_append_str(sb, "  sw "); }
+            sb_append_str(sb, ar); sb_append_str(sb, ", "); sb_append_str(sb, base.i2s(off)); sb_append_str(sb, "(sp)\n");
+        }
+        p = p + 1;
+    }
+}
+
+pub fn mir_to_riscv(m: MIRModule) string {
+    var sb: StringBuilder = sb_new();
+    var nf: i64 = slice_len(m.funcs) as i64;
+    var i: i64 = 0;
+    while (i < nf) {
+        var f: MIRFunc = m.funcs[i];
+        if (f.is_extern) { i = i + 1; continue; }
+        rv_collect_slots(f);
+        sb_append_str(sb, "  .text\n");
+        sb_append_str(sb, "  .globl ");
+        sb_append_str(sb, f.name);
+        sb_append_str(sb, "\n");
+        sb_append_str(sb, f.name);
+        sb_append_str(sb, ":\n");
+        // 序言：分配帧
+        sb_append_str(sb, "  addi sp, sp, -");
+        sb_append_str(sb, base.i2s(g_scratch));
+        sb_append_str(sb, "\n");
+        rv_emit_prologue_params(sb, f);
+        var nb: i64 = slice_len(f.blocks) as i64;
+        var b: i64 = 0;
+        while (b < nb) {
+            var blk: MIRBlock = f.blocks[b];
+            sb_append_str(sb, rv_lbl(blk.name));
+            sb_append_str(sb, ":\n");
+            var ni: i64 = slice_len(blk.insts) as i64;
+            var k: i64 = 0;
+            while (k < ni) {
+                rv_emit_inst(sb, blk.insts[k]);
+                k = k + 1;
+            }
+            b = b + 1;
+        }
+        // 尾声：释放帧 + ret（每个函数至少一条 ret/ret_void 终止，这里兜底）
+        sb_append_str(sb, "  addi sp, sp, ");
+        sb_append_str(sb, base.i2s(g_scratch));
+        sb_append_str(sb, "\n");
+        sb_append_str(sb, "  ret\n");
+        i = i + 1;
+    }
+    return sb_to_str(sb);
+}
+
+pub fn rv_emit_inst(sb: StringBuilder, ins: MIRInst) void {
+    if (ins.is_comment) {
+        sb_append_str(sb, "  # "); sb_append_str(sb, ins.cmt); sb_append_str(sb, "\n");
+        return;
+    }
+    var op: i64 = ins.op;
+    // 终止 / 控制流
+    if (op == TIR_OP_RET_VOID) {
+        sb_append_str(sb, "  addi sp, sp, "); sb_append_str(sb, base.i2s(g_scratch)); sb_append_str(sb, "\n"); sb_append_str(sb, "  ret\n");
+        return;
+    }
+    if (op == TIR_OP_RET) {
+        if (rv_is_slot(ins.dst.name)) { rv_ld(sb, "a0", ins.dst.name, ins.dst.st); }
+        else if (rv_is_global(ins.dst.name)) { rv_load_operand(sb, "a0", ins.dst); }
+        else { rv_load_operand(sb, "a0", ins.dst); }
+        sb_append_str(sb, "  addi sp, sp, "); sb_append_str(sb, base.i2s(g_scratch)); sb_append_str(sb, "\n"); sb_append_str(sb, "  ret\n");
+        return;
+    }
+    if (op == TIR_OP_BR) {
+        sb_append_str(sb, "  j "); sb_append_str(sb, rv_lbl(ins.args[0].name)); sb_append_str(sb, "\n");
+        return;
+    }
+    if (op == TIR_OP_BR_COND) {
+        // args = [cond, thenL, elseL]
+        rv_load_operand(sb, "t0", ins.args[0]);
+        sb_append_str(sb, "  bnez t0, "); sb_append_str(sb, rv_lbl(ins.args[1].name)); sb_append_str(sb, "\n");
+        sb_append_str(sb, "  j "); sb_append_str(sb, rv_lbl(ins.args[2].name)); sb_append_str(sb, "\n");
+        return;
+    }
+    // load / store（slot 间拷贝）
+    if (op == TIR_OP_LOAD) {
+        rv_ld(sb, "t0", ins.args[0].name, ins.args[0].st);
+        rv_st(sb, ins.dst.name, "t0", ins.dst.st);
+        return;
+    }
+    if (op == TIR_OP_STORE) {
+        rv_load_operand(sb, "t0", ins.args[0]);
+        rv_st(sb, ins.dst.name, "t0", ins.dst.st);
+        return;
+    }
+    // call：args[0]=callee，args[1..]=实参 → a0..a7
+    if (op == TIR_OP_CALL) {
+        var na: i64 = slice_len(ins.args) as i64;
+        var a: i64 = 1;
+        var areg: i64 = 10; // a0
+        while (a < na && areg <= 17) {
+            var rg: string = rv_areg(areg);
+            rv_load_operand(sb, rg, ins.args[a]);
+            a = a + 1; areg = areg + 1;
+        }
+        sb_append_str(sb, "  call "); sb_append_str(sb, rv_lbl(ins.args[0].name)); sb_append_str(sb, "\n");
+        if (rv_is_slot(ins.dst.name)) { rv_st(sb, ins.dst.name, "a0", ins.dst.st); }
+        return;
+    }
+    if (op == TIR_OP_CALL_IND) {
+        rv_load_operand(sb, "t0", ins.args[0]); // fnptr
+        var na: i64 = slice_len(ins.args) as i64;
+        var a: i64 = 1;
+        var areg: i64 = 10;
+        while (a < na && areg <= 17) {
+            rv_load_operand(sb, rv_areg(areg), ins.args[a]);
+            a = a + 1; areg = areg + 1;
+        }
+        sb_append_str(sb, "  jalr t0\n");
+        if (rv_is_slot(ins.dst.name)) { rv_st(sb, ins.dst.name, "a0", ins.dst.st); }
+        return;
+    }
+    // const：立即数在 args[0]，按结果类型发 li（整）/fli（浮）
+    if (op == TIR_OP_CONST) {
+        if (ins.dst.st == ST_F64) { sb_append_str(sb, "  fli.d t0, "); sb_append_str(sb, ins.args[0].name); sb_append_str(sb, "\n"); }
+        else if (ins.dst.st == ST_F32) { sb_append_str(sb, "  fli.s t0, "); sb_append_str(sb, ins.args[0].name); sb_append_str(sb, "\n"); }
+        else { sb_append_str(sb, "  li t0, "); sb_append_str(sb, ins.args[0].name); sb_append_str(sb, "\n"); }
+        rv_st(sb, ins.dst.name, "t0", ins.dst.st);
+        return;
+    }
+    if (op == TIR_OP_CONST_STR) {
+        sb_append_str(sb, "  # const.str unsupported in riscv slice (S2)\n");
+        return;
+    }
+    // 一元
+    if (op == TIR_OP_NEG) { rv_load_operand(sb, "t0", ins.args[0]); sb_append_str(sb, "  neg t1, t0\n"); rv_st(sb, ins.dst.name, "t1", ins.dst.st); return; }
+    if (op == TIR_OP_NOT) { rv_load_operand(sb, "t0", ins.args[0]); sb_append_str(sb, "  not t1, t0\n"); rv_st(sb, ins.dst.name, "t1", ins.dst.st); return; }
+    if (op == TIR_OP_LNOT) { rv_load_operand(sb, "t0", ins.args[0]); sb_append_str(sb, "  seqz t1, t0\n"); rv_st(sb, ins.dst.name, "t1", ins.dst.st); return; }
+    // 转换
+    if (op == TIR_OP_ZEXT || op == TIR_OP_SEXT || op == TIR_OP_TRUNC) { rv_emit_conv(sb, ins); return; }
+    // 二元算术 / 比较 / 位 / 移位
+    rv_emit_binop(sb, ins);
+}
+
+pub fn rv_areg(r: i64) string {
+    if (r == 10) { return "a0"; } if (r == 11) { return "a1"; } if (r == 12) { return "a2"; }
+    if (r == 13) { return "a3"; } if (r == 14) { return "a4"; } if (r == 15) { return "a5"; }
+    if (r == 16) { return "a6"; } if (r == 17) { return "a7"; } return "a0";
+}
+
+pub fn rv_emit_conv(sb: StringBuilder, ins: MIRInst) void {
+    // 简化：i32↔i64 之间。zext: 源 32 → 目标 64 用 ld/lw 零扩展；sext: sext.w；trunc: addw 截断。
+    rv_load_operand(sb, "t0", ins.args[0]);
+    var d64: bool = (ins.dst.st == ST_I64 || ins.dst.st == ST_U64 || ins.dst.st == ST_PTR || ins.dst.st == ST_PTR_VOID);
+    var s64: bool = (ins.args[0].st == ST_I64 || ins.args[0].st == ST_U64 || ins.args[0].st == ST_PTR || ins.args[0].st == ST_PTR_VOID);
+    if (ins.op == TIR_OP_ZEXT) {
+        if (d64 && s64 == false) { sb_append_str(sb, "  addiw t1, t0, 0\n"); } // 零扩展到 64（lw 已零扩展，这里确保）
+        else { sb_append_str(sb, "  mv t1, t0\n"); }
+    } else if (ins.op == TIR_OP_SEXT) {
+        if (d64 && s64 == false) { sb_append_str(sb, "  sext.w t1, t0\n"); } else { sb_append_str(sb, "  mv t1, t0\n"); }
+    } else { // TRUNC
+        if (d64 == false && s64) { sb_append_str(sb, "  addw t1, t0, t0\n"); } else { sb_append_str(sb, "  mv t1, t0\n"); }
+    }
+    rv_st(sb, ins.dst.name, "t1", ins.dst.st);
+}
+
+pub fn rv_emit_binop(sb: StringBuilder, ins: MIRInst) void {
+    var op: i64 = ins.op;
+    // 浮点分支
+    if (ins.dst.st == ST_F32 || ins.dst.st == ST_F64 || ins.args[0].st == ST_F32 || ins.args[0].st == ST_F64) {
+        rv_emit_fbinop(sb, ins);
+        return;
+    }
+    // 整数：先加载两操作数（薄后端正确性优先，暂不做立即数直嵌优化）
+    rv_load_operand(sb, "t0", ins.args[0]);
+    if (slice_len(ins.args) as i64 >= 2) { rv_load_operand(sb, "t1", ins.args[1]); }
+    var w: string = rv_width_suffix(ins.dst.st);
+    // 逻辑运算无 w 变体（and/or/xor 在 rv64 即 64 位，按 32 位值运算时高 32 位无关）
+    if (op == TIR_OP_AND || op == TIR_OP_OR || op == TIR_OP_XOR) { w = ""; }
+    // 比较 → 32 位 0/1
+    if (op == TIR_OP_EQ) { sb_append_str(sb, "  xor t2, t0, t1\n  seqz t2, t2\n"); rv_st(sb, ins.dst.name, "t2", ins.dst.st); return; }
+    if (op == TIR_OP_NE) { sb_append_str(sb, "  xor t2, t0, t1\n  snez t2, t2\n"); rv_st(sb, ins.dst.name, "t2", ins.dst.st); return; }
+    if (op == TIR_OP_SLT) { sb_append_str(sb, "  slt"); sb_append_str(sb, w); sb_append_str(sb, " t2, t0, t1\n"); rv_st(sb, ins.dst.name, "t2", ins.dst.st); return; }
+    if (op == TIR_OP_SGT) { sb_append_str(sb, "  slt"); sb_append_str(sb, w); sb_append_str(sb, " t2, t1, t0\n"); rv_st(sb, ins.dst.name, "t2", ins.dst.st); return; }
+    if (op == TIR_OP_SLE) { sb_append_str(sb, "  slt"); sb_append_str(sb, w); sb_append_str(sb, " t2, t1, t0\n  seqz t2, t2\n"); rv_st(sb, ins.dst.name, "t2", ins.dst.st); return; }
+    if (op == TIR_OP_SGE) { sb_append_str(sb, "  slt"); sb_append_str(sb, w); sb_append_str(sb, " t2, t0, t1\n  seqz t2, t2\n"); rv_st(sb, ins.dst.name, "t2", ins.dst.st); return; }
+    if (op == TIR_OP_ULT) { sb_append_str(sb, "  sltu"); sb_append_str(sb, w); sb_append_str(sb, " t2, t0, t1\n"); rv_st(sb, ins.dst.name, "t2", ins.dst.st); return; }
+    if (op == TIR_OP_UGT) { sb_append_str(sb, "  sltu"); sb_append_str(sb, w); sb_append_str(sb, " t2, t1, t0\n"); rv_st(sb, ins.dst.name, "t2", ins.dst.st); return; }
+    if (op == TIR_OP_ULE) { sb_append_str(sb, "  sltu"); sb_append_str(sb, w); sb_append_str(sb, " t2, t1, t0\n  seqz t2, t2\n"); rv_st(sb, ins.dst.name, "t2", ins.dst.st); return; }
+    if (op == TIR_OP_UGE) { sb_append_str(sb, "  sltu"); sb_append_str(sb, w); sb_append_str(sb, " t2, t0, t1\n  seqz t2, t2\n"); rv_st(sb, ins.dst.name, "t2", ins.dst.st); return; }
+    // 算术 / 逻辑 / 移位
+    var mnem: string = "";
+    if (op == TIR_OP_ADD) { mnem = "add"; }
+    else if (op == TIR_OP_SUB) { mnem = "sub"; }
+    else if (op == TIR_OP_MUL) { mnem = "mul"; }
+    else if (op == TIR_OP_AND) { mnem = "and"; }
+    else if (op == TIR_OP_OR) { mnem = "or"; }
+    else if (op == TIR_OP_XOR) { mnem = "xor"; }
+    else if (op == TIR_OP_SHL) { mnem = "sll"; }
+    else if (op == TIR_OP_LSHR) { mnem = "srl"; }
+    else if (op == TIR_OP_ASHR) { mnem = "sra"; }
+    else if (op == TIR_OP_SDIV) { mnem = "div"; }
+    else if (op == TIR_OP_UDIV) { mnem = "divu"; }
+    else if (op == TIR_OP_SREM) { mnem = "rem"; }
+    else if (op == TIR_OP_UREM) { mnem = "remu"; }
+    else { sb_append_str(sb, "  # unsupported op "); sb_append_str(sb, base.i2s(op)); sb_append_str(sb, "\n"); return; }
+    sb_append_str(sb, "  "); sb_append_str(sb, mnem); sb_append_str(sb, w); sb_append_str(sb, " t2, t0, t1\n");
+    rv_st(sb, ins.dst.name, "t2", ins.dst.st);
+}
+
+pub fn rv_emit_fbinop(sb: StringBuilder, ins: MIRInst) void {
+    var op: i64 = ins.op;
+    var is_d: bool = (ins.dst.st == ST_F64);
+    var fsz: string = "s"; if (is_d) { fsz = "d"; }
+    rv_load_operand(sb, "ft0", ins.args[0]);
+    if (slice_len(ins.args) as i64 >= 2) { rv_load_operand(sb, "ft1", ins.args[1]); }
+    if (op == TIR_OP_ADD) { sb_append_str(sb, "  fadd."); sb_append_str(sb, fsz); sb_append_str(sb, " ft2, ft0, ft1\n"); rv_st(sb, ins.dst.name, "ft2", ins.dst.st); return; }
+    if (op == TIR_OP_SUB) { sb_append_str(sb, "  fsub."); sb_append_str(sb, fsz); sb_append_str(sb, " ft2, ft0, ft1\n"); rv_st(sb, ins.dst.name, "ft2", ins.dst.st); return; }
+    if (op == TIR_OP_MUL) { sb_append_str(sb, "  fmul."); sb_append_str(sb, fsz); sb_append_str(sb, " ft2, ft0, ft1\n"); rv_st(sb, ins.dst.name, "ft2", ins.dst.st); return; }
+    if (op == TIR_OP_SDIV || op == TIR_OP_UDIV) { sb_append_str(sb, "  fdiv."); sb_append_str(sb, fsz); sb_append_str(sb, " ft2, ft0, ft1\n"); rv_st(sb, ins.dst.name, "ft2", ins.dst.st); return; }
+    if (op == TIR_OP_EQ) { sb_append_str(sb, "  feq."); sb_append_str(sb, fsz); sb_append_str(sb, " t2, ft0, ft1\n"); rv_st(sb, ins.dst.name, "t2", ins.dst.st); return; }
+    if (op == TIR_OP_NE) { sb_append_str(sb, "  feq."); sb_append_str(sb, fsz); sb_append_str(sb, " t2, ft0, ft1\n  xori t2, t2, 1\n"); rv_st(sb, ins.dst.name, "t2", ins.dst.st); return; }
+    if (op == TIR_OP_SLT) { sb_append_str(sb, "  flt."); sb_append_str(sb, fsz); sb_append_str(sb, " t2, ft0, ft1\n"); rv_st(sb, ins.dst.name, "t2", ins.dst.st); return; }
+    if (op == TIR_OP_SLE) { sb_append_str(sb, "  fle."); sb_append_str(sb, fsz); sb_append_str(sb, " t2, ft0, ft1\n"); rv_st(sb, ins.dst.name, "t2", ins.dst.st); return; }
+    if (op == TIR_OP_SGT) { sb_append_str(sb, "  flt."); sb_append_str(sb, fsz); sb_append_str(sb, " t2, ft1, ft0\n"); rv_st(sb, ins.dst.name, "t2", ins.dst.st); return; }
+    if (op == TIR_OP_SGE) { sb_append_str(sb, "  fle."); sb_append_str(sb, fsz); sb_append_str(sb, " t2, ft1, ft0\n"); rv_st(sb, ins.dst.name, "t2", ins.dst.st); return; }
+    sb_append_str(sb, "  # unsupported float op "); sb_append_str(sb, base.i2s(op)); sb_append_str(sb, "\n");
+}

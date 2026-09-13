@@ -17,6 +17,9 @@
 @import("src.codegen_dev" :: *);
 @import("src.tir" :: *);
 @import("src.tir_to_ll" :: tir_to_ll_emit, g_has_main);
+@import("src.mir" :: tir_to_mir_lower, MIRModule);
+@import("src.codegen_wasm" :: mir_to_wasm);
+@import("src.codegen_riscv" :: mir_to_riscv);
 @import("src.test" :: *);
 @import("repl" :: *);
 
@@ -553,11 +556,26 @@ fn main() i32 @main {
 
         var mod2: string = codegen_ll.base_no_tc(src_file);
         var lltext: string = "";
+        var out_ext: string = ".ll";   // 输出文件扩展名（MIR 后端改为 .wat/.s）
+        var out_text: string = "";      // 实际写出内容（tir/ll 时为 lltext）
 
-        if (backend == "tir") {
+        if (backend == "mir-wasm") {
+            // MIR → WASM 薄后端（路线 §9）：sema → TIR → MIR → WAT，取代 LLVM 的轻量目标
+            tir.lower_unit(mod2, src_file);
+            var mm: MIRModule = tir_to_mir_lower(tir.g_mod);
+            out_text = mir_to_wasm(mm);
+            out_ext = ".wat";
+        } else if (backend == "mir-riscv") {
+            // MIR → RISC-V 薄后端（路线 §9）：sema → TIR → MIR → rv64 汇编
+            tir.lower_unit(mod2, src_file);
+            var mm: MIRModule = tir_to_mir_lower(tir.g_mod);
+            out_text = mir_to_riscv(mm);
+            out_ext = ".s";
+        } else if (backend == "tir") {
             // S5 新轨（--backend tir 时进入）：sema → TIR → LLVM，结构化翻译（无文本 round-trip，§5.3/§5.6 合规）
             tir.lower_unit(mod2, src_file);
             lltext = tir_to_ll_emit(tir.g_mod);
+            out_text = lltext;
         } else {
             // 旧轨 fallback（--backend ll）：codegen_ll 直发 LLVM
             codegen_ll.emit_llunit(mod2);
@@ -574,6 +592,7 @@ fn main() i32 @main {
                     base.i2s(blen), " x i8] c\"", lit, "\\00", "\", align 1", ""));
             }
             lltext = codegen_ll.ll_join();
+            out_text = lltext;
         }
 
         // 输出目录：--output 指定 exe/目录前缀；缺省按 --mode 落入 out/dbg|out/rls
@@ -587,12 +606,14 @@ fn main() i32 @main {
             }
         }
 
-        var llp: string = base.sb_cat2(out_p, ".ll");
+        var llp: string = base.sb_cat2(out_p, out_ext);
         codegen_ll.ensure_parent(llp);
-        file_write_all(llp, lltext);
+        file_write_all(llp, out_text);
         eprint(base.sb_cat3("Generated: ", codegen_ll.to_bs(llp), "\n"));
 
-        if (cmd == "emit-ll") {
+        // MIR 后端（wasm/riscv）：产出的 .wat/.s 需目标工具链（wat2wasm / riscv64 gcc）
+        // 才能链接运行；此处等价 emit-ll，仅写出 IR 即返回（链接留待工具链机器）。
+        if (cmd == "emit-ll" || backend == "mir-wasm" || backend == "mir-riscv") {
             return 0;
         }
 
@@ -603,6 +624,7 @@ fn main() i32 @main {
 
         // 无入口时提前报错：否则 lld-link 只会给出
         // "subsystem must be defined" 这类无从下手的链接期诊断。
+        // MIR 后端在 emit-ll 等价路径已返回，不会走到此处。
         if (backend == "tir") {
             if (tir_to_ll.g_has_main == false) {
                 eprint(base.sb_cat3("error: no entry point: ", codegen_ll.to_bs(src_file), " 缺少 @main 标注的函数（build/run 需要入口；只想产出 IR 请用 emit-ll）\n"));

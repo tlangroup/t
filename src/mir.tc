@@ -1,0 +1,255 @@
+// ══════════════════════════════════════════════════════════════════
+// src/mir.tc — MIR 机器中间层（compiler-pipeline-route.md §9）
+//
+// 位置：TIR 之后、各轻量后端（WASM / RISC-V / C）之前。取代 LLVM 作为
+// 「一套 MIR、多个薄后端」的通用中间层，使新增目标（wasm / riscv / …）只需
+// 写一个薄发射器，而非各自维护一份完整降级。
+//
+// 设计要点（对齐 §5.6 零 string 语义）：
+//   - MIR = TIR 的「显式 CFG + 机器类型」形态：复用 TIR 的操作码（TIR_OP_*）
+//     与操作数（TirOperand）与存储类型格（ST_*），不重新发明。
+//   - 区别仅在结构：把 TIR 的线性指令按基本块（MIRBlock）重分组，使每个
+//     后端成为薄发射器（遍历 MIRFunc.blocks，按 MIRInst.op 分支直译）。
+//   - MIR 操作数沿用 TIR 的 slot/全局/立即数命名（"$v3" / "@g" / "5"），
+//     后端据此映射到本目标寄存器/局部/栈槽；不做任何文本 round-trip。
+//   - mir_to_text() 仅供调试与快照，是 MIRModule 的单向派生（§5.6 判据 5）。
+// ══════════════════════════════════════════════════════════════════
+
+@import("src.base" :: *);
+@import("src.tir" :: *);
+
+// ── MIR 内存结构 ───────────────────────────────────────────────
+// 指令：复用 TIRInst 的全部字段语义（op/st/dst/args/line/cmt），仅类型改名以
+// 标明其处于「机器层」语义域（操作码已是机器 op，无高层构造）。
+pub struct MIRInst {
+    op: i64;            // 操作码整数判别（复用 TIR_OP_*）
+    st: i64;            // 存储类型（ST_* 编码）
+    dst: TirOperand;    // 目标操作数（slot / global）
+    args: []TirOperand; // 源操作数列表
+    line: u64;          // 源锚点行（诊断用）
+    cmt: string;        // 注释（is_comment 时有效）
+    is_comment: bool;   // true → 注释（不支持构造的临时兜底）
+}
+
+// 基本块：显式 CFG 节点。块以终止指令（br/br_cond/ret/ret_void）结束。
+pub struct MIRBlock {
+    name: string;       // 块标签（TIR 的 @LN，如 "@L0"）
+    insts: []MIRInst;   // 块内线性指令（不含跨块跳转的含义，跳转在终止指令 args）
+}
+
+pub struct MIRFunc {
+    name: string;       // @name（不含 @）
+    params: []string;   // "$p: ST" 文本列表（与 TIR 同构）
+    ret_st: string;     // 返回存储类型文本
+    blocks: []MIRBlock; // 基本块列表（顺序即发射顺序；入口块通常 index 0）
+    is_extern: bool;
+    is_main: bool;      // @main 入口标注
+}
+
+pub struct MIRGlobal {
+    name: string;       // 全局变量名（不含 @）
+    td: i64;            // 类型描述符
+    init: i64;          // 初始化表达式节点（-1 表示无）
+    is_link: i64;       // 0=本模块, 1/2=链接库
+}
+
+pub struct MIRModule {
+    mod: string;        // 来源模块名
+    source: string;     // 源文件路径
+    types: []TIRType;   // TT 类型表（复用 TIR 的 TT 表示）
+    strings: []string;  // 字符串表
+    globals: []MIRGlobal;
+    funcs: []MIRFunc;
+}
+
+pub var g_mir: MIRModule;
+
+// ── ST → 目标存储类映射帮手（供各后端复用）────────────────────
+// WASM 只有 i32/i64/f32/f64 四种数值类型；窄整数与指针一律提升到 i32（WASM32 地址）。
+pub fn mir_st_wasm(st: i64) string {
+    if (st == ST_I1 || st == ST_I8 || st == ST_U8 || st == ST_I16 || st == ST_U16 ||
+        st == ST_I32 || st == ST_U32 || st == ST_PTR || st == ST_PTR_VOID) { return "i32"; }
+    if (st == ST_I64 || st == ST_U64) { return "i64"; }
+    if (st == ST_F32) { return "f32"; }
+    if (st == ST_F64) { return "f64"; }
+    return "i32";
+}
+
+// RISC-V（rv64）：整数用 x 寄存器类，浮点用 f/d；ptr 在 rv64 为 64 位。
+// 返回 "w"(32 位整数) / "x"(64 位整数或指针) / "f"(f32) / "d"(f64)。
+pub fn mir_st_rv(st: i64) string {
+    if (st == ST_I64 || st == ST_U64 || st == ST_PTR || st == ST_PTR_VOID) { return "x"; }
+    if (st == ST_F32) { return "f"; }
+    if (st == ST_F64) { return "f"; }
+    return "w"; // ST_I1/I8/U8/I16/I32/U32 → 32 位
+}
+
+// C：直接映射到 <stdint.h> 类型（便携后端，无需 LLVM）。
+pub fn mir_st_c(st: i64) string {
+    if (st == ST_I1) { return "int32_t"; }
+    if (st == ST_I8) { return "int8_t"; }
+    if (st == ST_U8) { return "uint8_t"; }
+    if (st == ST_I16) { return "int16_t"; }
+    if (st == ST_U16) { return "uint16_t"; }
+    if (st == ST_I32) { return "int32_t"; }
+    if (st == ST_U32) { return "uint32_t"; }
+    if (st == ST_I64) { return "int64_t"; }
+    if (st == ST_U64) { return "uint64_t"; }
+    if (st == ST_F32) { return "float"; }
+    if (st == ST_F64) { return "double"; }
+    if (st == ST_PTR || st == ST_PTR_VOID) { return "void*"; }
+    return "int64_t";
+}
+
+// 操作数是否带符号（用于 CMP 选择 signed/unsigned 变体）。
+pub fn mir_st_signed(st: i64) bool {
+    if (st == ST_U8 || st == ST_U16 || st == ST_U32 || st == ST_U64 || st == ST_PTR || st == ST_PTR_VOID) { return false; }
+    return true;
+}
+
+// ── 指令构造帮手 ───────────────────────────────────────────────
+pub fn mir_a0() []TirOperand { var z: []TirOperand = []; return z; }
+pub fn mir_a1(n1: string) []TirOperand { var z: []TirOperand = []; append(z, tir_op(n1)); return z; }
+pub fn mir_a2(n1: string, n2: string) []TirOperand { var z: []TirOperand = []; append(z, tir_op(n1)); append(z, tir_op(n2)); return z; }
+pub fn mir_a3(n1: string, n2: string, n3: string) []TirOperand { var z: []TirOperand = []; append(z, tir_op(n1)); append(z, tir_op(n2)); append(z, tir_op(n3)); return z; }
+
+pub fn mir_copy_inst(ins: TIRInst) MIRInst {
+    var m: MIRInst;
+    m.op = ins.op;
+    m.st = ins.st;
+    m.dst = ins.dst;
+    m.line = ins.line;
+    m.cmt = ins.cmt;
+    m.is_comment = ins.is_comment;
+    var na: i64 = slice_len(ins.args) as i64;
+    var i: i64 = 0;
+    while (i < na) { append(m.args, ins.args[i]); i = i + 1; }
+    return m;
+}
+
+// ── TIR → MIR 降级（核心：线性指令按基本块重分组）──────────────
+// TIR 已是线性序列 + 显式块标签（TIR_OP_BLOCK，dst.name=标签）与终止指令
+// （br/br_cond/ret/ret_void）。MIR 仅把这些重新分组为 []MIRBlock，语义不变。
+pub fn tir_to_mir_lower(m: TIRModule) MIRModule {
+    var mm: MIRModule;
+    mm.mod = m.mod;
+    mm.source = m.source;
+    mm.types = m.types;
+    mm.strings = m.strings;
+    var ng: i64 = slice_len(m.globals) as i64;
+    var i: i64 = 0;
+    while (i < ng) {
+        var g: TIRGlobal = m.globals[i];
+        append(mm.globals, MIRGlobal{ name: g.name, td: g.td, init: g.init, is_link: g.is_link });
+        i = i + 1;
+    }
+    var nf: i64 = slice_len(m.funcs) as i64;
+    var j: i64 = 0;
+    while (j < nf) {
+        append(mm.funcs, mir_lower_func(m.funcs[j]));
+        j = j + 1;
+    }
+    return mm;
+}
+
+pub fn mir_lower_func(f: TIRFunc) MIRFunc {
+    var mf: MIRFunc;
+    mf.name = f.name;
+    mf.params = f.params;
+    mf.ret_st = f.ret_st;
+    mf.is_extern = f.is_extern;
+    mf.is_main = f.is_main;
+
+    var cur: MIRBlock;
+    cur.name = "@entry";
+    var started: bool = false;
+    var nb: i64 = slice_len(f.body) as i64;
+    var k: i64 = 0;
+    while (k < nb) {
+        var ins: TIRInst = f.body[k];
+        if (ins.op == TIR_OP_BLOCK) {
+            // 新基本块开始：先压入当前块（若有内容），再以块标签起新块。
+            if (started) { append(mf.blocks, cur); }
+            cur = MIRBlock{};
+            cur.name = ins.dst.name;
+            started = true;
+            k = k + 1;
+            continue;
+        }
+        if (ins.op == TIR_OP_BR || ins.op == TIR_OP_BR_COND ||
+            ins.op == TIR_OP_RET || ins.op == TIR_OP_RET_VOID) {
+            // 终止指令：结束当前块。
+            append(cur.insts, mir_copy_inst(ins));
+            append(mf.blocks, cur);
+            cur = MIRBlock{};
+            started = false;
+            k = k + 1;
+            continue;
+        }
+        // 普通指令：确保当前块已起名（首个块默认 @entry）。
+        if (started == false) { cur.name = "@entry"; started = true; }
+        append(cur.insts, mir_copy_inst(ins));
+        k = k + 1;
+    }
+    if (started) { append(mf.blocks, cur); }
+    return mf;
+}
+
+// ── 调试 / 快照：MIRModule → 文本（单向派生，禁止回喂任何层）──
+pub fn mir_to_text(m: MIRModule) string {
+    var sb: StringBuilder = sb_new();
+    var nf: i64 = slice_len(m.funcs) as i64;
+    var i: i64 = 0;
+    while (i < nf) {
+        var f: MIRFunc = m.funcs[i];
+        sb_append_str(sb, "fn @");
+        sb_append_str(sb, f.name);
+        sb_append_str(sb, " (");
+        var np: i64 = slice_len(f.params) as i64;
+        var p: i64 = 0;
+        while (p < np) {
+            if (p > 0) { sb_append_str(sb, ", "); }
+            sb_append_str(sb, f.params[p]);
+            p = p + 1;
+        }
+        sb_append_str(sb, ") -> ");
+        sb_append_str(sb, f.ret_st);
+        sb_append_str(sb, " {\n");
+        var nb: i64 = slice_len(f.blocks) as i64;
+        var b: i64 = 0;
+        while (b < nb) {
+            var blk: MIRBlock = f.blocks[b];
+            sb_append_str(sb, "  ");
+            sb_append_str(sb, blk.name);
+            sb_append_str(sb, ":\n");
+            var ni: i64 = slice_len(blk.insts) as i64;
+            var k: i64 = 0;
+            while (k < ni) {
+                var ins: MIRInst = blk.insts[k];
+                if (ins.is_comment) {
+                    sb_append_str(sb, "    ; ");
+                    sb_append_str(sb, ins.cmt);
+                    sb_append_str(sb, "\n");
+                    k = k + 1;
+                    continue;
+                }
+                sb_append_str(sb, "    ");
+                sb_append_str(sb, tir_op_to_str(ins.op));
+                sb_append_str(sb, " ");
+                sb_append_str(sb, tir_os(ins.dst.name, ins.dst.st));
+                var na: i64 = slice_len(ins.args) as i64;
+                var a: i64 = 0;
+                while (a < na) {
+                    sb_append_str(sb, " ");
+                    sb_append_str(sb, tir_os(ins.args[a].name, ins.args[a].st));
+                    a = a + 1;
+                }
+                sb_append_str(sb, "\n");
+                k = k + 1;
+            }
+        }
+        sb_append_str(sb, "}\n");
+        i = i + 1;
+    }
+    return sb_to_str(sb);
+}
