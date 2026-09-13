@@ -11192,6 +11192,71 @@ pub fn meta_eval_mbuiltin(e: i64) i64 {
         sb_cat3("未知的编译期内建 `@", n.sa, "`"), e);
 }
 
+// ═══════════════════════════════════════════════════════════════
+// `[_]T` 定长数组长度推断（Rust 风格占位）
+// ═══════════════════════════════════════════════════════════════
+// 解析侧把 `[_]T` 建成 array 节点且长度节点 nb = -1（见 parse.parse_type_inner）。
+// 本 pass 在 register_decl **之前**跑（register_decl 会急切 resolve_ti 形参/返回类型），
+// 遍历整张节点池，把声明类型里的 `[_]` 按初始化器回填成具体整数节点。
+// 无法回填的残留（struct 字段 / 形参 / 返回类型 / cast …）统一报 T-SEM-E215，
+// 并兜底写 0 —— 保证 alen 永不带着 -1 进入后端。
+pub fn ali_fix(tn: i64, init: i64, stmt: i64) void {
+    if (tn < 0) { return; }
+    var t: Node = base.nodes[tn];
+    if (t.kind != "array") { return; }
+    // 先递归元素类型，支持 `[2][_]T`（每行长度由初始化器的首元素字面量推断）。
+    var sub_init: i64 = -1;
+    if (init >= 0) {
+        var in0: Node = base.nodes[init];
+        if (in0.kind == "array_lit" && in0.la >= 0) {
+            var c0: Child = base.kids[in0.la];
+            sub_init = c0.val;
+        }
+    }
+    if (t.na >= 0 && sub_init >= 0) { ali_fix(t.na, sub_init, stmt); }
+    if (t.nb >= 0) { return; }
+    var cnt: i64 = -1;
+    if (init >= 0) {
+        var i2: Node = base.nodes[init];
+        if (i2.kind == "array_lit") { cnt = parse.list_count(i2.la); }
+    }
+    if (cnt < 0) {
+        parse.fc_err("T-SEM-E215",
+            "无法从初始化器推断 `[_]` 数组长度：初始化器必须是数组字面量（形如 `var a: [_]i64 = [1, 2, 3];`）",
+            stmt);
+        cnt = 0;
+    }
+    var tt: Node = base.nodes[tn];
+    tt.nb = base.mk_int(base.i2s(cnt), 10, -1);
+    slice_set(base.nodes, tn, tt);
+}
+
+pub fn lower_array_len_infer() void {
+    var total: i64 = slice_len(base.nodes) as i64;
+    var i: i64 = 0;
+    while (i < total) {
+        var n: Node = base.nodes[i];
+        if (n.kind == "var_decl" || n.kind == "GlobalVarDecl" || n.kind == "GlobalConstDecl") {
+            if (n.na >= 0 && n.nb >= 0) { ali_fix(n.na, n.nb, i); }
+        }
+        i = i + 1;
+    }
+    // 残留扫描：回填阶段没覆盖到的 `[_]`（无初始化器的位置）一律报错 + 兜底。
+    var j: i64 = 0;
+    while (j < total) {
+        var m: Node = base.nodes[j];
+        if (m.kind == "array" && m.nb < 0) {
+            parse.fc_err("T-SEM-E215",
+                "`[_]` 数组长度占位只能用在带初始化器的变量/常量声明中（形如 `var a: [_]i64 = [1, 2, 3];`）",
+                j);
+            var mm: Node = base.nodes[j];
+            mm.nb = base.mk_int("0", 10, -1);
+            slice_set(base.nodes, j, mm);
+        }
+        j = j + 1;
+    }
+}
+
 pub fn run_check() void {
     global_scope = scope_new(-1);
     cur_scope = global_scope;
@@ -11207,6 +11272,10 @@ pub fn run_check() void {
     // 否则同名多条 FuncDecl 会被 register 当成重复定义）。覆盖模块内联后的整张 decl_list。
     desugar_func_clauses();
     desugar_lambdas();
+
+    // `[_]T` 长度推断：必须在 register_decl 之前（register 急切解析类型），
+    // 且在模块内联/desugar 之后（此时全部声明与函数体节点均已入池）。
+    lower_array_len_infer();
 
     // 注册分三趟，因为 register_decl 对 FuncDecl **急切解析形参/返回类型**：
     //   A 纯类型声明（struct/enum/flag/flag_set/union/variant）—— 彼此无依赖，只登记名字；

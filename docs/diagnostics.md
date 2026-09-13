@@ -256,6 +256,7 @@ help: add `export` to `Bar` in src/foo/lib.tc, or rename the import
 | T-SEM-E209 | E | T_TAGID_DUP | tag 编号重复 |
 | T-SEM-E210 | E | T_TAGID_MIXED | tag 编号风格混用 |
 | T-SEM-E211 | E | T_VAR_NO_TYPE | 变量缺类型 |
+| T-SEM-E215 | E | T_ARRAY_LEN_UNINFERABLE | `[_]` 数组长度占位无法推断（只能用于带初始化器的变量/常量声明） |
 | T-SEM-W212 | W | W_OVERFLOW_LITERAL | 整数字面量溢出 |
 
 ### FST 300–312

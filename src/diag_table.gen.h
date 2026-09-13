@@ -165,8 +165,9 @@ static const DiagDef DIAG_DEFS[] = {
   { "T-VEC-E946", "error", "VEC", "T_TILE_OP_UNSUPPORTED", "TILE_OP_UNSUPPORTED", "operator does not support tile operands" },
   { "T-VEC-W927", "warning", "VEC", "T_VECTOR_WIDER_THAN_NATIVE", "VECTOR_WIDER_THAN_NATIVE", "vector is wider than the native SIMD register and will be split" },
   { "T-VEC-W947", "warning", "VEC", "T_TILE_WIDER_THAN_NATIVE", "TILE_WIDER_THAN_NATIVE", "hardware tile is wider than the native SIMD register and will fall back to scalar loops" },
+  { "T-SEM-E215", "error", "SEM", "T_ARRAY_LEN_UNINFERABLE", "ARRAY_LEN_UNINFERABLE", "array length placeholder `[_]` cannot be inferred here" },
 };
-#define DIAG_COUNT 153
+#define DIAG_COUNT 154
 
 /* legacy (old semantic name) -> machine code alias table */
 static const struct { const char* legacy; const char* code; } DIAG_LEGACY[] = {
@@ -313,8 +314,9 @@ static const struct { const char* legacy; const char* code; } DIAG_LEGACY[] = {
   { "T_TILE_OP_UNSUPPORTED", "T-VEC-E946" },
   { "T_VECTOR_WIDER_THAN_NATIVE", "T-VEC-W927" },
   { "T_TILE_WIDER_THAN_NATIVE", "T-VEC-W947" },
+  { "T_ARRAY_LEN_UNINFERABLE", "T-SEM-E215" },
 };
-#define DIAG_LEGACY_COUNT 143
+#define DIAG_LEGACY_COUNT 144
 
 const DiagDef* diag_find(const char* code);        /* exact machine-code lookup */
 const DiagDef* diag_find_any(const char* id);      /* machine code OR legacy name */
