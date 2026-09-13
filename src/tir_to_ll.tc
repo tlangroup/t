@@ -25,8 +25,7 @@ pub var g_pf_ret: string;
 pub var g_ll_declared: []string;       // 已 emit 过 declare 的外部函数名
 pub var g_ll_declbuf: StringBuilder;   // 外部 declare 缓冲（函数体扫描后追加到模块末尾）
 pub var g_opaque_emitted: []string;    // 已 emit 过 opaque 定义的运行时结构类型名（如 TSb）
-pub var g_ll_globals: []string;         // 模块级全局变量名（@ 已剥离）
-pub var g_ll_globalsts: []string;       // 对应的存储类型 ST（与 g_ll_globals 并行）
+// 模块级全局类型表已迁至 src.llname.tc（持久、跨函数不变，经 ll_add_global 填充，ll_reset_slots 回填进 g_ll_names）。
 pub var g_in_globals: bool = false;     // 当前是否处于 TIR globals: 段
 pub var g_ll_named_types: []string;     // 引用但未在 types: 段声明的命名类型（%Perm 等位标志/枚举，i64 底类型）
 pub var g_str_table: []string;          // TIR strings: 段内容（tir_esc 转义后的字面量，可直接用作 LLVM c"..." 内容）
@@ -71,6 +70,8 @@ pub fn ll_reset() void {
     g_opaque_emitted = [];
     g_ll_globals = [];
     g_ll_globalsts = [];
+    g_ll_global_keys = [];
+    g_ll_global_sts = [];
     g_in_globals = false;
     g_str_table = [];
     g_in_strings = false;
@@ -259,8 +260,7 @@ pub fn ll_register_global(name: string, st: string) void {
         if (g_ll_globals[i] == name) { return; }
         i = i + 1;
     }
-    append(g_ll_globals, name);
-    append(g_ll_globalsts, st_to_ll(st));
+    ll_add_global(name, st_to_ll(st));
 }
 
 // 分支标签：@Lx -> curfn.Lx（LLVM 标签是函数局域，需加函数前缀避免跨函数重名）
@@ -280,8 +280,11 @@ pub fn ll_ensure_slot(name: string, st: string) void {
 pub fn ll_load(tname: string, st: string) string {
     var dn: string = tname;   // ⚠ 飞地规避：同 ll_store，缓存避免 clobber
     // 字面量立即数（整数/浮点，如 0 / -1 / 1.5）：直接作为值返回，不可按临时量去 load，
-    // 否则会生成非法的 `load X, ptr 0`。
-    if (str_len(dn) >= 1 && dn[0] != 36 && dn[0] != 64) { return dn; }
+    // 否则会生成非法的 `load X, ptr 0`。裸全局名归一化为 @name 走下方 @ 分支（旧轨对裸全局名补 '@'）。
+    if (str_len(dn) >= 1 && dn[0] != 36 && dn[0] != 64) {
+        if (ll_is_global(dn)) { dn = "@" + dn; }
+        else { return dn; }
+    }
     // ⚠ 飞地规避：SLOT 分支被错编无法分配槽；此处（LOAD 分支读名正确）惰性分配局部槽（仅 $ 局部，@ 全局不处理）。
     if (str_len(dn) >= 1 && dn[0] == 36) { ll_ensure_slot(dn, st); }
     // 全局引用 @name（函数或全局变量）：全局符号在 LLVM 中恒为指针，作值操作数时必须 load 出其值。
@@ -293,9 +296,16 @@ pub fn ll_load(tname: string, st: string) string {
         if (ll_is_func(ll_mangle(gnm))) { return "@" + ll_mangle(gnm); }
         // ⚠ 优先用 globals 段已注册的真实全局类型：tir 侧 tir_expr_st 对向量全局会回退 i64，
         // 若直接以 i64 重注册会覆盖正确类型 → reduce/vlen 内建解析 N=0、逐元素运算类型错配。
+        var reqst: string = st;   // 调用方原始请求类型（gst 覆写 st 前先存住，供下方地址判定）
         var gst: string = ll_get_st("@" + gnm);
         if (ll_starts(gst, "vec<") || ll_starts(gst, "arr<") || ll_starts(gst, "%")) { st = gst; }
         ll_register_global(gnm, st);
+        // ⚠ 全局是值类型（struct/slice/i64…）但调用方按指针取（reqst 为 ptr<…>）→ 返回全局地址，不 load。
+        // 否则（全局本身是 ptr 变量，或调用方要值）才 load 出值。否则会把结构体值当 ptr 传入 → "expected ptr"。
+        // ⚠ 必须用 reqst（覆写前的请求类型）判定：gst 为 '%' 结构体时会把 st 覆写成值类型，导致丢失 ptr 信号。
+        if (gst != "" && ll_starts(gst, "ptr") == false && ll_starts(reqst, "ptr")) {
+            return "@" + ll_mangle(gnm);
+        }
         var r: string = ll_tmp();
         sb_append_str(g_ll, "  ");
         sb_append_str(g_ll, r);
@@ -319,19 +329,31 @@ pub fn ll_load(tname: string, st: string) string {
     sb_append_str(g_ll, ", ptr ");
     sb_append_str(g_ll, ll_llname_ptr(dn));
     sb_append_str(g_ll, "\n");
-    if (realst != st && (realst == "float" || realst == "double") && (st == "float" || st == "double")) {
-        var r2: string = ll_tmp();
-        sb_append_str(g_ll, "  "); sb_append_str(g_ll, r2);
-        sb_append_str(g_ll, " = ");
-        if (realst == "double") { sb_append_str(g_ll, "fptrunc double "); } else { sb_append_str(g_ll, "fpext float "); }
-        sb_append_str(g_ll, r); sb_append_str(g_ll, " to "); sb_append_str(g_ll, st_to_ll(st)); sb_append_str(g_ll, "\n");
-        return r2;
+    if (realst != st) {
+        // ⚠ 浮点互转（f32↔f64）。
+        if ((realst == "float" || realst == "double") && (st == "float" || st == "double")) {
+            var r2: string = ll_tmp();
+            sb_append_str(g_ll, "  "); sb_append_str(g_ll, r2);
+            sb_append_str(g_ll, " = ");
+            if (realst == "double") { sb_append_str(g_ll, "fptrunc double "); } else { sb_append_str(g_ll, "fpext float "); }
+            sb_append_str(g_ll, r); sb_append_str(g_ll, " to "); sb_append_str(g_ll, st_to_ll(st)); sb_append_str(g_ll, "\n");
+            return r2;
+        }
+        // ⚠ 整型按槽真实宽度加载后，对齐到请求类型 st（zext/sext/trunc）。否则窄量(如 i8 char)以
+        // 原始宽度传给期望 i64 的内建/函数（sb_append_char/tll_*）会 "defined with type 'i8' but expected 'i64'"。
+        if (ll_is_int(realst) && ll_is_int(st)) {
+            return ll_coerce_to(r, realst, st);
+        }
     }
     return r;
 }
 
 pub fn ll_store(tname: string, st: string, val: string) void {
     var dn: string = tname;   // ⚠ 飞地规避：tname 在错编模块内被寄存器复用（clobber），缓存一次保证 alloca 与 store 文本同名
+    // 裸全局名归一化为 @name（旧轨对裸全局名补 '@'），使其走下方 @ 分支（登记全局、不分配局部槽）。
+    if (str_len(dn) >= 1 && dn[0] != 36 && dn[0] != 64 && dn[0] != 37 && ll_is_global(dn)) {
+        dn = "@" + dn;
+    }
     if (str_len(dn) >= 1 && dn[0] == 64) {
         var gnm: string = str_slice(dn, 1, str_len(dn));
         if (ll_is_func(gnm) == false) { ll_register_global(gnm, st); }
@@ -347,6 +369,62 @@ pub fn ll_store(tname: string, st: string, val: string) void {
     sb_append_str(g_ll, ", ptr ");
     sb_append_str(g_ll, ll_llname_ptr(dn));
     sb_append_str(g_ll, "\n");
+}
+
+// 把已加载的值 v（实际类型 fromst）拓宽/截断到目标类型 tost，返回新临时量名。
+// 用于比较/算术等操作数类型对齐：ll_load 按槽真实宽度 realst 装载，可能 ≠ 指令 st
+// （如 i32 变量被 promote 进 i64 槽），直接 icmp st 会 "defined with type X but expected Y"。
+pub fn ll_int_bits(st: string) i64 {
+    if (st == "bool" || st == "u8" || st == "i8") { return 8; }
+    if (st == "u16" || st == "i16") { return 16; }
+    if (st == "u32" || st == "i32") { return 32; }
+    if (st == "u64" || st == "i64") { return 64; }
+    return 0;
+}
+
+pub fn ll_coerce_to(v: string, fromst: string, tost: string) string {
+    var ft: string = st_to_ll(fromst);
+    var tt: string = st_to_ll(tost);
+    if (ft == tt) { return v; }
+    // 浮点互转
+    if ((ft == "float" || ft == "double") && (tt == "float" || tt == "double")) {
+        var r: string = ll_tmp();
+        sb_append_str(g_ll, "  ");
+        sb_append_str(g_ll, r);
+        if (tt == "float") { sb_append_str(g_ll, " = fptrunc double "); sb_append_str(g_ll, v); sb_append_str(g_ll, " to float\n"); }
+        else { sb_append_str(g_ll, " = fpext float "); sb_append_str(g_ll, v); sb_append_str(g_ll, " to double\n"); }
+        return r;
+    }
+    // 整型按位宽截断/符号扩展/零扩展
+    var fb: i64 = ll_int_bits(fromst);
+    var tb: i64 = ll_int_bits(tost);
+    if (fb == 0 || tb == 0 || fb == tb) { return v; }
+    var r: string = ll_tmp();
+    sb_append_str(g_ll, "  ");
+    sb_append_str(g_ll, r);
+    if (fb > tb) {
+        sb_append_str(g_ll, " = trunc ");
+        sb_append_str(g_ll, ft);
+        sb_append_str(g_ll, " ");
+        sb_append_str(g_ll, v);
+        sb_append_str(g_ll, " to ");
+        sb_append_str(g_ll, tt);
+        sb_append_str(g_ll, "\n");
+    } else {
+        var op: string = "sext";
+        // ⚠ 拓宽按【源】类型有无符号选 sext/zext（此前误用目标类型，导致无符号窄量被错误 sext 成负数）。
+        if (ll_is_unsigned_st(fromst)) { op = "zext"; }
+        sb_append_str(g_ll, " = ");
+        sb_append_str(g_ll, op);
+        sb_append_str(g_ll, " ");
+        sb_append_str(g_ll, ft);
+        sb_append_str(g_ll, " ");
+        sb_append_str(g_ll, v);
+        sb_append_str(g_ll, " to ");
+        sb_append_str(g_ll, tt);
+        sb_append_str(g_ll, "\n");
+    }
+    return r;
 }
 
 pub fn ll_find(s: string, sub: string) i64 {
@@ -918,33 +996,28 @@ pub fn ll_lookup_ret(fname: string) string {
     return "";
 }
 
-// 每个函数翻译前 ll_emit_func 会清空 g_ll_names/g_ll_sts（局部槽表），
-// 这会把模块 setup 阶段注册的全局类型一并抹掉 → 函数体内 ll_get_st(@global) 返回 MISSING
-// （向量全局被当 i64 → reduce/vlen 解析 N=0、逐元素运算类型错配）。故每函数开始 re-register 全局类型。
-pub fn ll_reregister_globals() void {
-    var glines: []string = ll_split_lines(sb_to_str(tir.g_globals_section));
-    var gi: i64 = 0;
-    var gn: i64 = slice_len(glines) as i64;
-    while (gi < gn) {
-        var gt: []string = ll_tokens(glines[gi]);
-        var gm: i64 = slice_len(gt) as i64;
-        if (gm >= 2) {
-            var gnm: string = gt[0];
-            if (str_len(gnm) >= 1 && gnm[0] == 64) { gnm = str_slice(gnm, 1, str_len(gnm)); }
-            var gst: string = gt[1];
-            var ti: i64 = 2;
-            while (ti < gm) { gst = base.sb_cat3(gst, " ", gt[ti]); ti = ti + 1; }
-            ll_set_st("@" + gnm, gst);
-        }
-        gi = gi + 1;
-    }
+// 运行期内建名 → 链接符号解析：
+//   - 用户函数（本模块定义发射，在 g_func_names 中）→ 原名；
+//   - tll_* shim / llvm.* 内建 → 原名；
+//   - 其余 extern（t 运行库函数，库以 t_<name> 导出：t_args/t_eprint/t_exit/t_file_write_all…）
+//     → 补 t_ 前缀；sys_run 特例映射到 tll_system（与 print/eprint 同走 ptr 形参 shim）。
+// 此前新后端未做此映射，导致 eprint/args/sys_run/file_write_all/exit 以裸名发射 → 链接期
+// "undefined symbol"。对齐 codegen_c 的 t_ 前缀约定与 codegen_ll 的 tll_* shim 约定。
+pub fn ll_runtime_callee(fname: string) string {
+    if (ll_is_func(fname)) { return fname; }
+    if (ll_starts(fname, "tll_") || ll_starts(fname, "llvm.")) { return fname; }
+    if (ll_starts(fname, "t_")) { return fname; }
+    if (fname == "sys_run") { return "tll_system"; }
+    return "t_" + fname;
 }
+
+// 全局类型现已持久化（见 src.llname.tc 的 g_ll_global_keys/g_ll_global_sts 与 ll_add_global）：
+// pass-1 / ll_register_global 一次性登记，ll_reset_slots 直接回填进 g_ll_names，无需每函数重解析模块全局段。
 
 pub fn ll_emit_func(name: string, params: []string, ret: string) void {
     ll_reset_slots();   // ⚠ 飞地规避：槽状态在 llname.tc，经本函数重置（清 g_ll_names/g_ll_sts/g_ll_emitted/g_ll_curfn）
     ll_set_curfn(name); // 重置后再置当前函数前缀
     g_ll_tmpc = 0;
-    ll_reregister_globals();
     append(g_ll_func_rets, ret);
     // 聚合返回 ABI：>16B 结构经 sret 隐藏指针返回。
     // 关键：仅当「函数同时是闭包(env 首参)且返回结构」时才用显式 sret 槽——此时 sret 占 arg0、env 后移 arg1，
@@ -1043,19 +1116,34 @@ pub fn ll_fmt_int_arg(name: string, cn: string) string {
 }
 
 pub fn ll_emit_builtin(cn: string, toks: []string) bool {
+    // ⚠ callee 名经 ll_llname 后保留 '@' 前缀；builtin 匹配需裸名，先剥 '@'（调用方已剥，此处幂等兜底）。
+    if (str_len(cn) >= 1 && cn[0] == 64) { cn = str_slice(cn, 1, str_len(cn)); }
     // ⚠ d 归一成 LLVM 名（剥 `$` 前缀）：否则槽表注册 "$main.tN" 而下游 ll_get_st 用 "%main.tN"
     // 查不到 → 回退 i64 → reduce 等返回窄类型的向量内建结果被当 i64 读，高字节栈垃圾。
     var d: string = ll_llname(toks[2]);
-    if (cn == "println" || cn == "print") {
+    if (cn == "println" || cn == "print" || cn == "eprint") {
         var ap: string = ll_llname(toks[4]);
         var rt: string = "tll_println";
         if (cn == "print") { rt = "tll_print"; }
+        if (cn == "eprint") { rt = "tll_eprint"; }
         ll_maybe_declare(rt, "void", ["ptr"]);
         sb_append_str(g_ll, "  call void @");
         sb_append_str(g_ll, rt);
         sb_append_str(g_ll, "(ptr ");
         sb_append_str(g_ll, ap);
         sb_append_str(g_ll, ")\n");
+        return true;
+    }
+    if (cn == "sys_run") {
+        var ap: string = ll_llname(toks[4]);
+        ll_maybe_declare("tll_system", "i32", ["ptr"]);
+        var r: string = ll_tmp();
+        sb_append_str(g_ll, "  ");
+        sb_append_str(g_ll, r);
+        sb_append_str(g_ll, " = call i32 @tll_system(ptr ");
+        sb_append_str(g_ll, ap);
+        sb_append_str(g_ll, ")\n");
+        ll_ensure_slot(d, "i32"); ll_set_st(d, "i32"); ll_store(d, "i32", r);
         return true;
     }
     if (cn == "str_len") {
@@ -2805,7 +2893,12 @@ pub fn ll_emit_inst(inst: TIRInst) void {
         var callee: string = inst.args[0].name;
         var is_indirect: bool = (str_len(callee) >= 1 && callee[0] == 36);
         var fname: string = ll_llname(callee);
+        // ⚠ ll_llname 对 '@' 名保留 '@' 前缀返回（全局变量操作数需内联 '@'），但 callee 名需裸名匹配 builtin / 作 call 目标（call void @fn）。
+        if (str_len(fname) >= 1 && fname[0] == 64) { fname = str_slice(fname, 1, str_len(fname)); }
         if (ll_emit_builtin(fname, tir_call_to_toks(inst))) { return; }
+        // 运行库内建（t_args/t_exit/t_file_write_all…）以 t_<name> 导出，裸名发射 → 链接期 undefined symbol。
+        // 用户函数（ll_is_func 为真）/tll_* shim/llvm.* 内建保持不变；其余 extern 补 t_ 前缀（sys_run 已由其 builtin 分支处理）。
+        fname = ll_runtime_callee(fname);
         var argsb: StringBuilder = sb_new();
         var declargs: []string = [];
         var first: bool = true;
@@ -3578,7 +3671,7 @@ pub fn ll_emit_opaque_defs() void {
             }
             if (seen == false) {
                 var pat: string = base.sb_cat3("%", name, " = type");
-                if (ll_find(sb_to_str(g_ll), pat) < 0) {
+                if (ll_find(text, pat) < 0) {
                     sb_append_str(buf, "%");
                     sb_append_str(buf, name);
                     sb_append_str(buf, " = type opaque\n");
@@ -3669,9 +3762,7 @@ pub fn tir_to_ll_emit(module: TIRModule) string {
             var gst: string = gt[1];
             var ti: i64 = 2;
             while (ti < gm) { gst = base.sb_cat3(gst, " ", gt[ti]); ti = ti + 1; }
-            append(g_ll_globals, gnm);
-            append(g_ll_globalsts, gst);
-            ll_set_st("@" + gnm, gst);
+            ll_add_global(gnm, gst);
         }
         gi = gi + 1;
     }

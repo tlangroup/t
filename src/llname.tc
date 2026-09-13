@@ -11,9 +11,39 @@ pub var g_ll_names: []string;   // TIR 槽名($x) -> LLVM 类型(ST) 并行数�
 pub var g_ll_sts: []string;     // 与 g_ll_names 并行：槽的 ST
 pub var g_ll_emitted: []string; // 已发射 alloca 的槽名（去重用；与 g_ll_names 分离以对抗 ll_set_st 预注册未发射）
 pub var g_ll_curfn: string;     // 当前函数名前缀：LLVM 寄存器/标签是模块全局，按函数加前缀避免重名
+// 模块级全局类型持久表（跨函数不变，不受 ll_reset_slots 影响）。
+// g_ll_globals/g_ll_globalsts：发射用裸名表（@ 已剥离，emit 时再 ll_mangle）。
+// g_ll_global_keys/g_ll_global_sts：查询用已 mangle 键表，与上面并行；ll_reset_slots 直接回填进 g_ll_names/g_ll_sts。
+// ⚠ 旧实现每函数调 ll_reregister_globals 重解析整个模块全局段（F×模块段 = O(n²) arena），自举 tc（约 3.2 万全局）
+// 时撑爆 16GB；改为持久表后 O(1) 重置 + 每函数 O(G) 直接回填，彻底消除泄漏且 lookup 仍 O(局部)。
+pub var g_ll_globals: []string;
+pub var g_ll_globalsts: []string;
+pub var g_ll_global_keys: []string;
+pub var g_ll_global_sts: []string;
 
 pub fn ll_set_curfn(n: string) void { g_ll_curfn = n; }
-pub fn ll_reset_slots() void { g_ll_names = []; g_ll_sts = []; g_ll_emitted = []; }
+
+// 登记一个模块级全局（裸名）。同时写入发射表与查询键表（键做 ll_mangle，与 ll_get_st/ll_alloca_st 查询键一致）。
+pub fn ll_add_global(name: string, st: string) void {
+    append(g_ll_globals, name);
+    append(g_ll_globalsts, st);
+    // 键存 '@'+mangle：与 ll_llname 对裸全局名（及 @name）的输出一致，保证 ll_get_st/ll_alloca_st 查表命中。
+    var key: string = "@" + ll_mangle(name);
+    append(g_ll_global_keys, key);
+    append(g_ll_global_sts, st);
+}
+
+pub fn ll_reset_slots() void {
+    g_ll_names = []; g_ll_sts = []; g_ll_emitted = [];
+    // 重新挂回持久全局类型表（直接回填已知键，避免每函数重解析模块全局段 → O(n²) arena）
+    var gi: i64 = 0;
+    var gn: i64 = slice_len(g_ll_global_keys) as i64;
+    while (gi < gn) {
+        append(g_ll_names, g_ll_global_keys[gi]);
+        append(g_ll_sts, g_ll_global_sts[gi]);
+        gi = gi + 1;
+    }
+}
 
 // 最右一次子串出现位置（数组计数分隔符 " x " 须取最右，因元素类型本身可嵌套 arr<... x ...>）
 pub fn ll_rfind(s: string, sub: string) i64 {
@@ -123,6 +153,21 @@ pub fn st_to_ll(st: string) string {
     return st;
 }
 
+// 判断裸名是否为已知模块级全局（来自 pass-1 全局段与 ll_register_global 兜底登记）。
+// 用于让 ll_llname/ll_load/ll_store 对「TIR 中不带 '@' 前缀的跨模块全局引用」补 '@'，与旧轨 codegen_ll 一致。
+pub fn ll_is_global(name: string) bool {
+    var L: i64 = str_len(name);
+    if (L < 1) { return false; }
+    var c: i64 = str_at(name, 0);
+    if (c >= 48 && c <= 57) { return false; }   // 数字开头 = 字面量，快速跳过 (O(1))
+    if (c == 45) { return false; }               // '-' 负数字面量
+    if (c == 46) { return false; }               // '.' 浮点字面量
+    var n: i64 = slice_len(g_ll_globals) as i64;
+    var i: i64 = 0;
+    while (i < n) { if (g_ll_globals[i] == name) { return true; } i = i + 1; }
+    return false;
+}
+
 pub fn ll_llname(tname: string) string {
     // $x -> %curfn.x (值寄存器，按函数加前缀) ; @fn -> fn (全局函数名，去 @)
     if (str_len(tname) < 1) { return tname; }
@@ -136,7 +181,13 @@ pub fn ll_llname(tname: string) string {
         var s: string = str_slice(tname, 1, str_len(tname));
         return base.sb_cat3("%", g_ll_curfn, base.sb_cat2(".", ll_mangle(s)));
     }
-    if (tname[0] == 64) { return ll_mangle(str_slice(tname, 1, str_len(tname))); }                        // '@'
+    // ⚠ '@' 分支：全局名（函数或全局变量）一律保留 '@' 前缀返回。
+    //   - 全局变量作操作数须内联 '@'（ptr @g），否则成裸引用 → "expected value token"；
+    //   - 函数作 callee 时调用方会自己补 '@'（call void @fn），故下方调用方需先剥 '@' 得裸名匹配；
+    //   - 此前此处裸返回（ll_mangle 后无 '@'）导致 @全局变量操作数丢失 '@' → 自举 tc.ll 第 67 行裸 lex__decl_list 报错。
+    if (tname[0] == 64) { return "@" + ll_mangle(str_slice(tname, 1, str_len(tname))); }                    // '@'
+    // 裸全局名（TIR 跨模块全局引用可能不带 '@' 前缀）：按全局符号引用补 '@'，与旧轨 codegen_ll 一致。
+    if (ll_is_global(tname)) { return "@" + ll_mangle(tname); }
     return tname;
 }
 
