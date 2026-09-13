@@ -14,7 +14,7 @@
 ## 1. 诊断 IR 形态
 
 - 每条诊断 = 结构化记录：`{ code, severity, message, spans[], notes[], related[] }`，可序列化为 **SARIF** 或 T 自有 JSON。
-- `code` 沿用 `diag_table.gen.h` 的诊断码（`T-SEM-E*` / `T-MIR-E*` / `T-TIR-E*` …），覆盖全层，与 `tools/diag_defs.json` 单一真相源对齐。
+- `code` 沿用 `diag_table.gen.h` 的诊断码（`T-SEM-E*` / `T-mir-E*` / `T-TIR-E*` …），覆盖全层，与 `tools/diag_defs.json` 单一真相源对齐。
 - 机器可读：供 GitHub/CI 注解、LSP、LLM 辅助修复统一消费。
 
 ---
@@ -22,7 +22,7 @@
 ## 2. 跨层 span 贯通（核心机制）
 
 - CST 锚点（`ln/cl/tv`，见 `cst-design.md §2.3`）是 span 起点。
-- HIR 保留源锚（pre-sema 惰性诊断已可定位）；Sema / MIR / TIR 每级 lowering **携带 HIR 锚** → **TIR 级错误能回指源码 span**（见 `tir-design.md` 回指设计）。
+- HIR 保留源锚（pre-sema 惰性诊断已可定位）；Sema / mir / TIR 每级 lowering **携带 HIR 锚** → **TIR 级错误能回指源码 span**（见 `tir-design.md` 回指设计）。
 - 降级链：`src position → CST node → HIR instr → TIR slot`，每级记录原始 span；emitting 时沿链回溯到最精确源码位置。
 - WASM 组件隔离验证失败（见 `wasm-component-design.md §2`）也回指源码 span，使安全门禁报错可读。
 

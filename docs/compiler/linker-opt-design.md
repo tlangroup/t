@@ -37,7 +37,7 @@ TIR ──各后端──▶ 对象文件/bitcode ──▶ [本层] ──▶ �
 ## 5. IR 级 FDO 布局（G-11，T 特有补充）
 
 - 标准 BOLT 是 **post-link** 工具，需特殊工具链（重读二进制+重排）。
-- T 额外在 **TIR/MIR 级用 PGO 数据做基本块/函数布局**（G-11）：`tir-design.md §4.6` 已纳入。
+- T 额外在 **TIR/mir 级用 PGO 数据做基本块/函数布局**（G-11）：`tir-design.md §4.6` 已纳入。
 - 收益：拿 BOLT 大部分 icache/TLB 收益，**而无需 post-link 工具链**——更可移植（对标 BOLT 但内置于编译器）。
 - 二者关系：IR 级 FDO 是默认/可移植路径；BOLT 作为"极致布局"的可选补充。
 

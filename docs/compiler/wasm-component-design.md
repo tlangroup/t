@@ -40,13 +40,13 @@ Component Model 对 seesaw-erp 的价值（「核心不重编、业务以组件�
 
 ## 4. 落地（P1，与 G-3 同批）
 
-**W 阶段**（`backend-design.md §6`）：`tir→wasm` + Component Model / WIT + 本设计的隔离门禁。先于 ERP 插件化试点。建议与 G-9 诊断 IR（P1）同期，因隔离验证失败需精准回指源码 span（见 `diagnostic-ir-design.md §2`）。
+**W 阶段**（`backend-design.md §6`）：`tmir→wasm` + Component Model / WIT + 本设计的隔离门禁。先于 ERP 插件化试点。建议与 G-9 诊断 IR（P1）同期，因隔离验证失败需精准回指源码 span（见 `diagnostic-ir-design.md §2`）。
 
 ### 4.1 隔离门禁的 CI 实现（阻断）
 
 组件发布前在 CI 跑「构建 + 隔离验证」两段，任一不过则阻断（BP-2 交付门槛）：
 
-1. **构建段**：`tir→wasm` + `wasm-tools component new` 产出 component；失败即阻断。
+1. **构建段**：`tmir→wasm` + `wasm-tools component new` 产出 component；失败即阻断。
 2. **隔离验证段**（`wasm-component-verify` job，见 `ci-gate-design.md` G-CI-8）：
    - **ABI 闭环**：静态断言组件 import/export 仅白名单集合（Canonical ABI 校验拒绝未声明宿主调用）。
    - **内存边界**：以畸形输入 + wasm 运行时 trap 验证越界/未授权访问被拒；联动 CTFE fuzz 的隔离自检（§5.1.1）。

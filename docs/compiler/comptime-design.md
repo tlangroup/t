@@ -31,13 +31,14 @@
 lex → parse → CST
                 → AstGen → HIR (ZIR 槽位, untyped linear, 可缓存)
                 → sema + CTFE (解释 HIR: 名字解析 / 类型检查 / 单态化 / comptime 折叠)  ← CTFE 在此
-                → MIR (CFG+SSA, 中端优化)
-                → TIR (类型擦除后端桥)
+                → mir (CFG+SSA, 中端优化)
+                → TIR (类型擦除·线性)
+                 → tmir (机器桥, 喂薄后端)
                 → 后端 (LLVM / Cranelift / C / WASM / SPIR-V)
 ```
 
 - 新模块（目标）`src/comptime_fold.tc` 的求值逻辑迁入 Sema 的 HIR 解释器（`meta_eval_call` 重写为消费 HIR 指令）。
-- 入口 `comptime_fold_pass()` 语义保留：在 HIR 解释完成后、MIR 之前，对仍残留的可折 HIR 指令做一遍收尾折叠（护栏同 §5）。
+- 入口 `comptime_fold_pass()` 语义保留：在 HIR 解释完成后、mir 之前，对仍残留的可折 HIR 指令做一遍收尾折叠（护栏同 §5）。
 - **复用现有求值上下文**：`g_meta_steps` / `g_meta_err` / `g_meta_quiet` 预算与安静标志沿用。
 
 ## 3. 求值器 substrate：HIR 解释器 vs AST 树遍历
@@ -83,7 +84,7 @@ CTFE 在编译期执行用户提供的代码，是「编译期即攻击面」—
 
 ## 6. 双后端 & 不动点影响
 
-- 折叠产物是「已折为 HIR 常量指令」；C/LLVM/WASM/Cranelift/SPIR-V 后端照常从 TIR 发射，**comptime 逻辑零后端相关** → 天然守双（多）后端等价（`cself`）。
+- 折叠产物是「已折为 HIR 常量指令」；C/LLVM/WASM/Cranelift/SPIR-V 后端照常从 tmir 发射，**comptime 逻辑零后端相关** → 天然守双（多）后端等价（`cself`）。
 - 折叠是语义 no-op：四代统一应用同款折叠 → 四代 md5 不动点应仍成立，但 P6 须重跑 gate 复核。
 - **窄类型陷阱**：折叠出的 `u8`/`i32` 常量须保留 `cast` 指令（HIR 里是 `cast` 节点 / TIR 里是 `cast` 指令），否则后端误按 i64 发射（v0.1 §1.3 实证）。
 

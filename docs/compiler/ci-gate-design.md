@@ -58,8 +58,8 @@ bootstrap (L2, G-CI-1)
 
 ## 4. 与性能基线（D3-A vs D2）的衔接
 
-- `perf-baseline.md` 建立的单文件编译耗时基线是 MIR 层（D3-A）落地前后的回归参照。
-- MIR 阶段 PR 须复跑 `tools/bench_compile.mjs` 并比对中位 / p90；回归 > 阈值（由基线实证确定，初设 10%）即阻断 G-CI-10。
+- `perf-baseline.md` 建立的单文件编译耗时基线是 mir 层（D3-A）落地前后的回归参照。
+- mir 阶段 PR 须复跑 `tools/bench_compile.mjs` 并比对中位 / p90；回归 > 阈值（由基线实证确定，初设 10%）即阻断 G-CI-10。
 - 这是把「D3 工程性能」与「D2 IR 架构」的张力，转为可量化、可阻断的 CI 证据。
 
 ---

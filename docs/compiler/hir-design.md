@@ -27,7 +27,7 @@ CST ──AstGen──▶ HIR（未定型·线性·可序列化，= ZIR 槽位�
             sema + CTFE（解释 HIR：名字解析 / 类型检查 / 单态化 / comptime 折叠）
                   │
                   ▼
-              MIR（类型化 CFG+SSA，中端优化，= AIR 槽位）
+              mir（类型化 CFG+SSA，中端优化，= AIR 槽位）
                   │
                   ▼
               TIR（类型擦除的线性后端桥 IR，Zig 缺失的那一层）
@@ -36,8 +36,8 @@ CST ──AstGen──▶ HIR（未定型·线性·可序列化，= ZIR 槽位�
             后端（LLVM / Cranelift / C / WASM / SPIR-V）
 ```
 
-- **HIR 是唯一可按源文件内容哈希缓存到磁盘的层**。MIR/TIR 都携带跨文件信息（类型、单态实例），不可 per-file 缓存。
-- 对位：HIR ≈ Zig ZIR（pre-sema 未定型指令流）；MIR ≈ Zig AIR（typed）；TIR ≈ Zig 缺失的共享桥。
+- **HIR 是唯一可按源文件内容哈希缓存到磁盘的层**。mir/TIR 都携带跨文件信息（类型、单态实例），不可 per-file 缓存。
+- 对位：HIR ≈ Zig ZIR（pre-sema 未定型指令流）；mir ≈ Zig AIR（typed）；TIR ≈ Zig 缺失的共享桥。
 
 > **HIR 缓存（pre-type）与 `.tmi`（typed）必须分离**（详见 `compiler-pipeline-design.md §4.2b`）：
 > - **HIR 缓存**：键 = 源文件内容哈希；供**本模块** Sema 重入（改本文件才失效）——这是增量承重墙。
@@ -90,7 +90,7 @@ CST ──AstGen──▶ HIR（未定型·线性·可序列化，= ZIR 槽位�
 **type_expr 节点（全部「未解析」引用，Sema 才解析为 TD）**
 - `name_ref` / `generic_app(name_ref, [type_arg])` / `ptr(type_expr)` / `slice(type_expr)` / `array(type_expr, len)` / `fn_ptr(...)` / `option(type_expr)`
 
-> 关键：所有 `type_expr` 都是**未解析**引用，使 HIR 完全独立于类型系统 → 可缓存。解析发生在 Sema，产出 MIR。
+> 关键：所有 `type_expr` 都是**未解析**引用，使 HIR 完全独立于类型系统 → 可缓存。解析发生在 Sema，产出 mir。
 
 ---
 
@@ -99,13 +99,13 @@ CST ──AstGen──▶ HIR（未定型·线性·可序列化，= ZIR 槽位�
 当前 `sema.tc` 的 `meta_eval_call` / `comptime_fold_pass` **直接在 AST 树上求值**。采纳 A 后：
 
 1. **CTFE 改为解释 HIR 指令流**：comptime 求值器遍历 HIR body 而非 AST。
-2. **Sema 改为消费 HIR**：名字解析、类型检查、单态化都以 HIR 为输入，产出 MIR。
+2. **Sema 改为消费 HIR**：名字解析、类型检查、单态化都以 HIR 为输入，产出 mir。
 3. 重写是**孤立的风险线**，建议单列 Stage，与 TIR 落地解耦（不在同一个 gate 里捆）。
 
 **附带收益（采纳 A 才拿得到）**：
 - **Zig 式惰性诊断**：未实例化的泛型体内错误不报（Sema 只在实例化路径上解释 HIR）。
 - **真正的 per-file 缓存**：改一个文件只重算该文件 AstGen + 依赖闭包的 Sema 入口。
-- 平滑降级路径：HIR 与 TIR 同为线性，HIR→MIR→TIR 是「逐步加信息 / 逐步扁平」的单调过程。
+- 平滑降级路径：HIR 与 TIR 同为线性，HIR→mir→TIR→tmir 是「逐步加信息 / 逐步扁平」的单调过程。
 
 ---
 
@@ -127,7 +127,7 @@ CST ──AstGen──▶ HIR（未定型·线性·可序列化，= ZIR 槽位�
 - **A. AstGen + Driver/Query 层 + `.tmi` 三件套（P0）**：CST → HIR；`tc --emit-hir` 可 dump；**同期**立 Driver/Query/Scheduler（查询依赖图 + red-green 指纹 + work-stealing + 分片缓存，见 `compiler-pipeline-design.md §5.1`）与 `.tmi` 模块接口制品（§3.5 / `compiler-pipeline-design.md §4.2b`）。
 - **A'. CTFE 重写**：解释 HIR 指令流（与 TIR 落地解耦，单独 gate）。
 - **缓存**：HIR 以文件内容哈希进入 salsa / 磁盘缓存（分片），标准库预缓存；`.tmi` 以 API 指纹进入远程缓存（G-6）。
-- 本层不动任何后端；TIR（B–F 阶段）继续消费由 Sema 产出的 MIR。
+- 本层不动任何后端；TIR（B–F 阶段）继续消费由 Sema 产出的 mir。
 
 ---
 

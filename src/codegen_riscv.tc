@@ -1,11 +1,11 @@
 // ══════════════════════════════════════════════════════════════════
-// src/codegen_riscv.tc — MIR → RISC-V（rv64im）薄后端
+// src/codegen_riscv.tc — tmir → RISC-V（rv64im）薄后端
 //
-// 职责：消费 MIRModule，发出 rv64 汇编（AT&T 风格的反向即 RISC-V 标准语法：
-// `op rd, rs1, rs2`）。这是「取代 LLVM 的轻量后端」之一——MIR 的 CFG 直接
+// 职责：消费 TMIRModule，发出 rv64 汇编（AT&T 风格的反向即 RISC-V 标准语法：
+// `op rd, rs1, rs2`）。这是「取代 LLVM 的轻量后端」之一——tmir 的 CFG 直接
 // 映射到 RISC-V 的标签 + 分支/跳转，无需 LLVM。
 //
-// 寄存器分配策略（薄后端，正确性优先）：把 MIR 的每个虚拟 slot（$name）溢出到
+// 寄存器分配策略（薄后端，正确性优先）：把 tmir 的每个虚拟 slot（$name）溢出到
 // 栈帧 8 字节槽，所有运算走 t0/t1/t2 暂存 + load/store。调用参数经 a0–a7 传递，
 // 返回值在 a0。无全局寄存器分配（后续可插轻量线性扫描优化，本切片不依赖）。
 //
@@ -19,7 +19,7 @@
 
 @import("src.base" :: *);
 @import("src.tir" :: *);
-@import("src.mir" :: *);
+@import("src.tmir" :: *);
 
 // 栈槽名 → 偏移的并行数组（emit 期构建一次）。
 pub var g_slots: []string;
@@ -29,9 +29,9 @@ pub fn rv_is_slot(n: string) bool { return str_len(n) as i64 > 0 && n[0] == 36; 
 pub fn rv_is_global(n: string) bool { return str_len(n) as i64 > 0 && n[0] == 64; } // '@'
 
 // 收集当前函数所有 slot 名，分配 8 字节栈槽（offset 从 8 起）。
-pub fn rv_collect_slots(f: MIRFunc) void {
+pub fn rv_collect_slots(f: TMIRFunc) void {
     g_slots = [];
-    // 参数槽：参数在 MIR 中即 $slot，须纳入帧（确保帧大小含参数），后续序言溢出 a0..a7
+    // 参数槽：参数在 tmir 中即 $slot，须纳入帧（确保帧大小含参数），后续序言溢出 a0..a7
     var nprm: i64 = slice_len(f.params) as i64;
     var pri: i64 = 0;
     while (pri < nprm) {
@@ -44,11 +44,11 @@ pub fn rv_collect_slots(f: MIRFunc) void {
     var nb: i64 = slice_len(f.blocks) as i64;
     var b: i64 = 0;
     while (b < nb) {
-        var blk: MIRBlock = f.blocks[b];
+        var blk: TMIRBlock = f.blocks[b];
         var ni: i64 = slice_len(blk.insts) as i64;
         var k: i64 = 0;
         while (k < ni) {
-            var ins: MIRInst = blk.insts[k];
+            var ins: TMIRInst = blk.insts[k];
             if (rv_is_slot(ins.dst.name)) { rv_ensure_slot(ins.dst.name); }
             var na: i64 = slice_len(ins.args) as i64;
             var a: i64 = 0;
@@ -157,8 +157,8 @@ pub fn rv_contains(hay: string, needle: string) bool {
     return false;
 }
 pub fn rv_fareg(p: i64) string { return base.sb_cat2("fa", base.i2s(p)); }
-// 序言：把 a0..a7 / fa0..fa7 实参溢出到对应参数栈槽（参数在 MIR 即 $slot，统一经栈访问；S1 至多 8 个参数）
-pub fn rv_emit_prologue_params(sb: StringBuilder, f: MIRFunc) void {
+// 序言：把 a0..a7 / fa0..fa7 实参溢出到对应参数栈槽（参数在 tmir 即 $slot，统一经栈访问；S1 至多 8 个参数）
+pub fn rv_emit_prologue_params(sb: StringBuilder, f: TMIRFunc) void {
     var np: i64 = slice_len(f.params) as i64;
     var p: i64 = 0;
     while (p < np && p < 8) {
@@ -178,12 +178,12 @@ pub fn rv_emit_prologue_params(sb: StringBuilder, f: MIRFunc) void {
     }
 }
 
-pub fn mir_to_riscv(m: MIRModule) string {
+pub fn tmir_to_riscv(m: TMIRModule) string {
     var sb: StringBuilder = sb_new();
     var nf: i64 = slice_len(m.funcs) as i64;
     var i: i64 = 0;
     while (i < nf) {
-        var f: MIRFunc = m.funcs[i];
+        var f: TMIRFunc = m.funcs[i];
         if (f.is_extern) { i = i + 1; continue; }
         rv_collect_slots(f);
         sb_append_str(sb, "  .text\n");
@@ -200,7 +200,7 @@ pub fn mir_to_riscv(m: MIRModule) string {
         var nb: i64 = slice_len(f.blocks) as i64;
         var b: i64 = 0;
         while (b < nb) {
-            var blk: MIRBlock = f.blocks[b];
+            var blk: TMIRBlock = f.blocks[b];
             sb_append_str(sb, rv_lbl(blk.name));
             sb_append_str(sb, ":\n");
             var ni: i64 = slice_len(blk.insts) as i64;
@@ -221,7 +221,7 @@ pub fn mir_to_riscv(m: MIRModule) string {
     return sb_to_str(sb);
 }
 
-pub fn rv_emit_inst(sb: StringBuilder, ins: MIRInst) void {
+pub fn rv_emit_inst(sb: StringBuilder, ins: TMIRInst) void {
     if (ins.is_comment) {
         sb_append_str(sb, "  # "); sb_append_str(sb, ins.cmt); sb_append_str(sb, "\n");
         return;
@@ -316,7 +316,7 @@ pub fn rv_areg(r: i64) string {
     if (r == 16) { return "a6"; } if (r == 17) { return "a7"; } return "a0";
 }
 
-pub fn rv_emit_conv(sb: StringBuilder, ins: MIRInst) void {
+pub fn rv_emit_conv(sb: StringBuilder, ins: TMIRInst) void {
     // 简化：i32↔i64 之间。zext: 源 32 → 目标 64 用 ld/lw 零扩展；sext: sext.w；trunc: addw 截断。
     rv_load_operand(sb, "t0", ins.args[0]);
     var d64: bool = (ins.dst.st == ST_I64 || ins.dst.st == ST_U64 || ins.dst.st == ST_PTR || ins.dst.st == ST_PTR_VOID);
@@ -332,7 +332,7 @@ pub fn rv_emit_conv(sb: StringBuilder, ins: MIRInst) void {
     rv_st(sb, ins.dst.name, "t1", ins.dst.st);
 }
 
-pub fn rv_emit_binop(sb: StringBuilder, ins: MIRInst) void {
+pub fn rv_emit_binop(sb: StringBuilder, ins: TMIRInst) void {
     var op: i64 = ins.op;
     // 浮点分支
     if (ins.dst.st == ST_F32 || ins.dst.st == ST_F64 || ins.args[0].st == ST_F32 || ins.args[0].st == ST_F64) {
@@ -376,7 +376,7 @@ pub fn rv_emit_binop(sb: StringBuilder, ins: MIRInst) void {
     rv_st(sb, ins.dst.name, "t2", ins.dst.st);
 }
 
-pub fn rv_emit_fbinop(sb: StringBuilder, ins: MIRInst) void {
+pub fn rv_emit_fbinop(sb: StringBuilder, ins: TMIRInst) void {
     var op: i64 = ins.op;
     var is_d: bool = (ins.dst.st == ST_F64);
     var fsz: string = "s"; if (is_d) { fsz = "d"; }

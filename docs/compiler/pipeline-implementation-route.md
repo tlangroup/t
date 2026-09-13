@@ -35,7 +35,7 @@
 
 ### 1.1 用垂直切片，不用逐层做完
 
-IR 的形状由**下游需求倒逼**决定，不由上游推导：TIR 的 ST 体系取决于目标 ABI，MIR 的 SSA/CFG 取决于优化需求，HIR 的类型槽取决于 sema 查询需求。若自底向上逐层做完，设计 HIR 时后端尚未触碰，只能猜；到后端发现缺信息，则连锁回头改上面每一层。
+IR 的形状由**下游需求倒逼**决定，不由上游推导：TIR 的 ST 体系取决于目标 ABI，mir 的 SSA/CFG 取决于机器无关优化需求，HIR 的类型槽取决于 sema 查询需求。若自底向上逐层做完，设计 HIR 时后端尚未触碰，只能猜；到后端发现缺信息，则连锁回头改上面每一层。
 
 **垂直切片**：不按层推进，按**语言构造**推进。每个切片让一批构造**横贯所有层**并端到端可跑；每层能力同步增长，接口被真实需求倒逼，而非猜出来。
 
@@ -49,16 +49,22 @@ IR 的形状由**下游需求倒逼**决定，不由上游推导：TIR 的 ST �
 
 **真正的起点是「对拍框架 + AST 类型槽」**：前者提供判据，后者消除 `ll_etd` / `expr_type_desc` 存在的根因——`Node` 无类型字段，后端才不得不在发射期重新推导。
 
-### 1.3 加 MIR 机器中间层（取代 LLVM 的轻量多后端）★ 2026-09-13 裁定反转
+### 1.3 三层 IR：mir（优化）→ TIR（线性）→ tmir（机器）★ 2026-09-13 裁定
 
-> **本裁定反转此前「先建两层，不建 MIR」（v3 原 §1.3）的判断。** 原判断的出发点是「中端优化需求缺失 → MIR 空转」；但用户新增的硬性需求改变了立论前提：**需要一个位于 TIR 之后、各轻量后端（WASM / RISC-V / C）之前的机器中间层，作为取代 LLVM 的通用中间层**（原话：「TIR 之后加一个机器中间层，用于取代 llvm 的轻量各种后端的中间层，例如 wasm、riscv 等」）。
+> **本裁定反转 v3 原 §1.3「先建两层，不建 MIR」的判断**，并最终定型为三层 IR。三层分工如下（命名与管线位置见 §2）：
+>
+> - **`mir`（对齐 Rust 的 MIR）**：类型化、基于控制流图（CFG）的中端 IR，位于 **HIR 与 TIR 之间**。它是**中端优化的唯一载体**，只做**架构无关 / 设备无关 / 后端无关**的优化（const-prop、DIE、代数化简、不可达块消除、复制传播等）——即经典「机器无关优化」全集。由 HIR 构造，再降级为 TIR。
+> - **`tir`**：类型擦除、线性、编译单元级（现有，§5.3/§5.6 结构化重构）。
+> - **`tmir`（机器中间层）**：位于 **TIR 之后**，是显式 CFG + 机器类型（`ST_*`）形态，**作为「一套 IR、多个薄后端」的共用源**，取代 LLVM 成为 wasm / riscv / C 等轻量目标的发射源。**tmir 当前仅做转换（TIR→tmir 的结构重分组），不承载优化**——这是当下的设计定位，不是硬性约束（见 §9.5）。
+>
+> 三者复用 `TIR_OP_*` / `ST_*` / `TirOperand`，无第二套操作码宇宙。
 
-- **MIR 的动机是「后端可移植性」，不是「中端优化」**：一条 MIR，多个薄后端。新增目标（wasm / riscv / 后续 loongarch / arm64 …）只需写一个薄发射器，而非各自维护一份完整降级——这正是 v1/v2 失败的根因（平行翻译器越加越多，§附录 A-4）。
-- **MIR 复用 TIR 的操作码（TIR_OP_*）与存储类型格（ST_*）**，不重新发明：MIR = TIR 的「显式 CFG + 机器类型」形态。TIR→MIR 仅是把线性指令按基本块（`TIR_OP_BLOCK` / 终止指令）重分组，**语义零改动**（见 `src/mir.tc` 的 `tir_to_mir_lower`）。这把「层间接口」的成本压到最小，符合 §5.6 零 string 语义。
-- **MIR 不承载 LLVM 专属概念**：无 `ccc` 调用约定、无 `global` 元数据副作用；调用统一为 `call ret_st @callee (args)`，各后端映射到自身 ABI（WASM `call`、RISC-V `call`+`a0..a7`、C 函数调用）。
-- **与 S5 的关系**：S5 切换消费 TIR 仍成立；MIR 是 TIR 的下游消费者之一。原 S5「删 codegen_ll/codegen_c」的判定改为「删 codegen_ll，保留 codegen_c 改造为 MIR→C 便携后端」（见 §10）。
+- **tmir 的动机是「后端可移植性」，不是「中端优化」**：一条 tmir，多个薄后端。新增目标（wasm / riscv / 后续 loongarch / arm64 …）只需写一个薄发射器，而非各自维护一份完整降级——这正是 v1/v2 失败的根因（平行翻译器越加越多，§附录 A-4）。
+- **tmir 复用 TIR 的操作码与存储类型格**，不重新发明：tmir = TIR 的「显式 CFG + 机器类型」形态。TIR→tmir 仅是把线性指令按基本块重分组，**语义零改动**（见 `src/tmir.tc` 的 `tir_to_tmir_lower`）。
+- **mir（优化层）与 tmir（机器层）职责正交**：mir 在类型化形态上做一次机器无关优化，tmir 只把已优化的结果线性化、映射到机器存储类（`ST_*`）并发往后端。优化不在机器层重复（与 LLVM 模型一致：优化在 mid-IR，机器层只做线性化发射）。
+- **与 S5 的关系**：S5 切换消费 tmir 仍成立；tmir 是 TIR 的下游消费者之一。原 S5「删 codegen_ll/codegen_c」的判定改为「删 codegen_ll，保留 codegen_c 改造为 ttmir→C 便携后端」（见 §10）。
 
-由此推出：**管线变为 HIR → TIR → MIR → { WASM | RISC-V | C |（可选 LLVM）}**，MIR 是「一套中间层、多个薄后端」的分水岭。
+由此推出：**管线变为 HIR → mir → TIR → tmir → { WASM | RISC-V | C |（可选 LLVM）}**，tmir 是「一套中间层、多个薄后端」的分水岭，mir 是机器无关优化的唯一落点。
 
 ### 1.4 改造，不是重写
 
@@ -72,20 +78,30 @@ IR 的形状由**下游需求倒逼**决定，不由上游推导：TIR 的 ST �
 ## 2. 目标架构
 
 ```
-lex → parse → AST → sema ──► HIR（类型化 AST）──► TIR（类型擦除·线性）──► MIR（机器 IR·显式 CFG）──► { WASM | RISC-V | C |（可选 LLVM）}
-                      │            ↑ 类型槽由 sema 一次性填入        ↑ 降级只发生一次        ↑ 薄后端各自映射 ABI
-                      └─ 语义规则复用，不重写
+lex → parse → AST → sema ──► HIR（类型化 AST）
+                      │            ↑ 类型槽由 sema 一次性填入
+                      ▼
+                   mir（Rust-MIR·类型化 CFG·机器无关优化载体）
+                      ▼
+                   TIR（类型擦除·线性·编译单元级）
+                      ▼
+                  tmir（机器 IR·显式 CFG·ST_*）
+                      ▼
+        { WASM | RISC-V | C |（可选 LLVM）} 薄后端
+                      │
+                      └─ 语义规则复用，不重写；mir 仅做架构/设备/后端无关优化；tmir 仅做转换
 ```
 
 | 层 | 职责 | 载体 | 状态 |
 |---|---|---|---|
 | AST | 语法结构（无类型） | `base.Node` | 现有，保留 |
 | **HIR** | AST + 类型槽；sema 一次性把 TD 写入节点 | `Node` 新增类型字段（或并行类型池 + 索引） | **新增（S0）** |
+| **mir** | 类型化 CFG、中端优化唯一载体；只做**架构/设备/后端无关**优化（const-prop / DIE / 代数化简 / 不可达块消除 / 复制传播），位于 HIR 与 TIR 之间 | 目标 `src/mir.tc`（由 HIR 构造；现有 `src/mir_opt.tc` 的 pass 逻辑为验证原型，须重定标到 pre-TIR mir，见 §11） | **规划（M-opt）：目标层，待建** |
 | **TIR** | 类型擦除、线性、编译单元级；每指令自带 `StorageType` | `src/tir.tc` | 现有，**须按 §5.3/§5.6 重构为结构化（零 string 语义载体）** |
-| **MIR** | 机器类型、显式基本块（CFG）、虚拟 slot；TIR 的 CFG 重分组形态 | `src/mir.tc`（`tir_to_mir_lower`）+ `MIRModule` | **新增（M0，2026-09-13 落地）** |
-| 后端 | MIR → 目标语法的薄发射器（薄到只做 ABI 映射 + 指令选择） | `codegen_wasm` / `codegen_riscv` / `codegen_c`（改消费 MIR）/ `codegen_ll`（可选） | **wasm/riscv 新增（M1）；C/LLVM 改造中** |
+| **tmir** | 机器类型、显式基本块（CFG）、虚拟 slot；TIR 的 CFG 重分组形态，**仅做转换、不承载优化** | `src/tmir.tc`（原 `src/mir.tc`；`tir_to_tmir_lower`）+ `TMIRModule` | **新增（M0，2026-09-13 落地机器层）** |
+| 后端 | tmir → 目标语法的薄发射器（薄到只做 ABI 映射 + 指令选择） | `codegen_wasm` / `codegen_riscv` / `codegen_c`（改消费 tmir）/ `codegen_ll`（可选） | **wasm/riscv 新增（M1）；C/LLVM 改造中** |
 
-> **关键**：后端改的是**输入**（消费 TIR），不是在旁边新增第三个翻译器。v1/v2 正是在这一点上被做反（附录 A-4）。
+> **关键**：后端改的是**输入**（消费 tmir），不是在旁边新增第三个翻译器。v1/v2 正是在这一点上被做反（附录 A-4）。mir 与 tmir 复用 TIR 的 `TIR_OP_*` / `ST_*` / `TirOperand`，无第二套操作码宇宙。
 
 ---
 
@@ -120,7 +136,7 @@ lex → parse → AST → sema ──► HIR（类型化 AST）──► TIR（�
 | **S2** | 聚合：struct/enum/union/variant、字段访问、数组、切片、字符串 | 同上；**此片后 `tir_to_ll.tc` 须被结构化翻译器取代（直接消费 `TirModule` 字段、不解析文本）或下线** |
 | **S3** | 高级：闭包、泛型单态化、match、defer、T? | 同上 |
 | **S4** | std 库、模块系统、comptime / CTFE | 同上 |
-| **S5** | 新轨编译 `tc.tc` 且输出与旧轨逐字一致 | **切换**：`emit-ll` 改消费 TIR，删 `ll_etd` / `ll_td` / `expr_type_desc` / `desc_to_c` 的重复实现 |
+| **S5** | 新轨编译 `tc.tc` 且输出与旧轨逐字一致 | **切换**：`emit-ll` 改消费 tmir，删 `ll_etd` / `ll_td` / `expr_type_desc` / `desc_to_c` 的重复实现 |
 
 > **S5 是收益唯一兑现点**——前面所有切片都是成本，只有删掉重复实现才有回报。
 
@@ -302,9 +318,9 @@ TirOperand {
 | S1–S4 | ✅（经 emit-tir-ll 后端） | emit-tir-ll 后端对 69 个 example 双轨全绿 |
 | S5-切换 | ⚠️ 代码完成 / 判据未验 | `src/tc.tc` 默认 `backend="tir"`，`--backend ll` 保留回退；arena 改 16GB 预留+按需提交（commit `1d578f3`）。**切换判据（新轨编 `tc.tc` 且输出与旧轨逐字一致）尚未在工具链机器跑 `gate L2` 验证**（沙箱无 clang/VS/WinSDK，无法链接） |
 | S5-删除 | ⛔ 硬阻塞 | 见 §8.2 |
-| **M0** | ✅ 已落地 | `src/mir.tc` MIR 类型 + `tir_to_mir_lower` + `--backend mir-wasm`/`mir-riscv` 接线（§9/§10） |
-| **M1** | ⚠️ 首切片落地 / 端到端未验 | `src/codegen_wasm.tc`(MIR→WAT) + `src/codegen_riscv.tc`(MIR→rv64)（§10.1）；沙箱无 wasm/riscv 工具链，待工具链机器对拍 |
-| **M-opt** | ✅ 首切片落地 / 端到端未验 | `src/mir_opt.tc` 中端 pass（常量折叠+代数化简+DIE+不可达块消除）；`--opt/-O` 默认关闭保护自举不动点；沙箱无目标工具链，待工具链机器对拍（§11） |
+| **tmir 机器层** | ✅ 机器层首切片落地 / 端到端未验 | `src/tmir.tc`（原 `src/mir.tc`：TMIR 类型 + `tir_to_tmir_lower`）+ `--backend tmir-wasm`/`tmir-riscv` 接线，tmir 仅做转换、不承载优化（§9/§10） |
+| **tmir→后端** | ⚠️ 首切片落地 / 端到端未验 | `src/codegen_wasm.tc`(tmir→WAT) + `src/codegen_riscv.tc`(tmir→rv64)（§10.1）；沙箱无 wasm/riscv 工具链，待工具链机器对拍 |
+| **mir 优化层** | 🟡 规划 / 待建 | 目标层：对齐 Rust MIR，位于 HIR↔TIR，承载**架构/设备/后端无关**优化；现有 `src/mir_opt.tc` 的 pass 逻辑为 post-TIR 验证原型，须重定标到 pre-TIR mir 表示（§11，含迁移说明）；`--opt/-O` 默认关闭保护自举不动点 |
 
 ### 8.2 S5-删除的硬阻塞：自举 arena 鸡生蛋
 
@@ -326,97 +342,107 @@ TirOperand {
 - §7 的 09-30 日落线仍有效。S5-切换代码已完成，仅差步骤 3 的 gate 验证。
 - 若工具链机器 `gate L2` 通过 → S5 切换判据达成，剩余仅 S5-删除（受 §8.2 约束，待 stage0 升级 16GB arena 后做）。
 - 若 `gate L2` 因 tir 输出与 C 后端不符而失败 → 一行回退 `src/tc.tc:397` 改 `backend="ll"`，转回 `codegen_ll` 单点维护（§7 日落条款）。
-- **M 轨验证路径（独立于 S5）**：M0/M1 代码已落地，端到端须工具链机器执行——`wat2wasm out/dbg/<m>.wat` 验证 WASM 语法、或 `riscv64-linux-gnu-gcc -c out/dbg/<m>.s` 验证 RISC-V 汇编；随后以双轨对拍（§10.4）比对 `mir-wasm`/`mir-riscv` 与 `tir` 运行输出。沙箱无 clang/wasm/riscv 工具链，无法在此验证（与设计 §1.3 反转同期已知缺口）。
+- **M 轨验证路径（独立于 S5）**：M0/M1 代码已落地，端到端须工具链机器执行——`wat2wasm out/dbg/<m>.wat` 验证 WASM 语法、或 `riscv64-linux-gnu-gcc -c out/dbg/<m>.s` 验证 RISC-V 汇编；随后以双轨对拍（§10.4）比对 `tmir-wasm`/`tmir-riscv` 与 `tir` 运行输出。沙箱无 clang/wasm/riscv 工具链，无法在此验证（与设计 §1.3 反转同期已知缺口）。
 
 ---
 
-## 9. MIR 机器中间层设计（§1.3 裁定落地）
+## 9. tmir 机器中间层设计（§1.3 裁定落地）
 
-> MIR 是「一套中间层、多个薄后端」的分水岭。本节约等于 `hir-design.md` / `tir-design.md` 对 MIR 的补位——它此前在设计中是空位（附录 A 末段已指出 HIR/MIR/TMI 三层零文件）。
+> tmir 是「一套中间层、多个薄后端」的分水岭——**机器中间层**（TIR 之后），与「优化中间层 mir」（HIR 与 TIR 之间，§11）职责正交。本节约等于 `hir-design.md` / `tir-design.md` 对机器层的补位。
 
 ### 9.1 设计原则
 
-1. **复用 TIR 语义域，不重新发明**：MIR 的指令操作码直接复用 `TIR_OP_*`，存储类型复用 `ST_*`，操作数复用 `TirOperand`（`$slot` / `@global` / 立即数 + `st`）。MIR 不引入第二套 opcode/ST——避免 v1/v2「平行翻译器越加越多」的覆辙。
+1. **复用 TIR 语义域，不重新发明**：tmir 的指令操作码直接复用 `TIR_OP_*`，存储类型复用 `ST_*`，操作数复用 `TirOperand`（`$slot` / `@global` / 立即数 + `st`）。tmir 不引入第二套 opcode/ST——避免 v1/v2「平行翻译器越加越多」的覆辙。
 
-2. **MIR = TIR 的「显式 CFG + 机器类型」形态**：
+2. **tmir = TIR 的「显式 CFG + 机器类型」形态**：
    - TIR 是**线性**指令序列，块边界由 `TIR_OP_BLOCK`（dst=标签）与终止指令（`br`/`br_cond`/`ret`/`ret_void`）隐式标记；
-   - MIR 把线性序列按这些边界**重分组为 `[]MIRBlock`**，每个块含一组线性指令 + 一个终止指令。语义零改动（`tir_to_mir_lower` 是纯结构重排）。
-   - 机器类型：MIR 强制每指令带 `st`（TIR 已带），且只表达机器可直译的 op（无高层构造）。
+   - tmir 把线性序列按这些边界**重分组为 `[]TMIRBlock`**，每个块含一组线性指令 + 一个终止指令。语义零改动（`tir_to_tmir_lower` 是纯结构重排）。
+   - 机器类型：tmir 强制每指令带 `st`（TIR 已带），且只表达机器可直译的 op（无高层构造）。
 
-3. **虚拟 slot 模型（不绑物理寄存器）**：MIR 操作数沿用 TIR 的 `$slot`（帧槽），**不引入物理寄存器分配**。各后端把 `$slot` 映射到自身存储：
+3. **虚拟 slot 模型（不绑物理寄存器）**：tmir 操作数沿用 TIR 的 `$slot`（帧槽），**不引入物理寄存器分配**。各后端把 `$slot` 映射到自身存储：
    - WASM → `local`（按 `mir_st_wasm` 选 i32/i64/f32/f64）；
    - RISC-V → 栈帧 8 字节槽（`lw`/`ld`/`sw`/`sd`，调用参数经 `a0..a7`）；
    - C → 局部变量（`int32_t`/`int64_t`/…）。
-   寄存器分配（线性扫描 / 图着色）作为可选 pass 后续插，不阻塞首切片。
+   寄存器分配（线性扫描 / 图着色）作为可选 pass 后续插，不阻塞首切片（归 M3，属后端侧，非 tmir 层）。
 
-4. **零 string 语义（沿用 §5.6）**：MIR 的 `MIRInst`/`MIRBlock`/`MIRFunc` 全是结构体；`mir_to_text()` 仅供调试与快照，单向派生，禁止回喂。
+4. **零 string 语义（沿用 §5.6）**：tmir 的 `TMIRInst`/`TMIRBlock`/`TMIRFunc` 全是结构体；`tmir_to_text()` 仅供调试与快照，单向派生，禁止回喂。
 
-### 9.2 MIR 内存结构（`src/mir.tc`）
+5. **tmir 仅做转换，不承载优化**：tmir 的 `tir_to_tmir_lower` 是**纯结构重排**（语义零改动），不含任何优化 pass（常量折叠 / DIE / 代数化简等一律在更早的 mir 层，§11）。机器无关优化只发生一次、在类型化 mir 上，tmir 只负责把已优化结果线性化并发往后端。
+
+### 9.2 tmir 内存结构（`src/tmir.tc`，原 `src/mir.tc`）
 
 ```
-MIRInst  { op: i64; st: i64; dst: TirOperand; args: []TirOperand; line: u64; cmt: string; is_comment: bool }
-MIRBlock { name: string; insts: []MIRInst }            // 基本块；以终止指令结束
-MIRFunc  { name; params: []string; ret_st: string; blocks: []MIRBlock; is_extern; is_main }
-MIRGlobal{ name; td; init; is_link }
-MIRModule{ mod; source; types: []TIRType; strings: []string; globals: []MIRGlobal; funcs: []MIRFunc }
+TMIRInst  { op: i64; st: i64; dst: TirOperand; args: []TirOperand; line: u64; cmt: string; is_comment: bool }
+TMIRBlock { name: string; insts: []TMIRInst }            // 基本块；以终止指令结束
+TMIRFunc  { name; params: []string; ret_st: string; blocks: []TMIRBlock; is_extern; is_main }
+TMIRGlobal{ name; td; init; is_link }
+TMIRModule{ mod; source; types: []TIRType; strings: []string; globals: []TMIRGlobal; funcs: []TMIRFunc }
 ```
 
-ST → 目标存储类映射帮手（在 `mir.tc` 内，`mir_st_wasm` / `mir_st_rv` / `mir_st_c` / `mir_st_signed`）：
+ST → 目标存储类映射帮手（在 `tmir.tc` 内，`mir_st_wasm` / `mir_st_rv` / `mir_st_c` / `mir_st_signed`）：
 - WASM 只有 i32/i64/f32/f64；窄整数与指针一律提升到 i32（WASM32 地址）。
 - RISC-V（rv64）：i64/u64/ptr → x 寄存器（64 位），i32/u32/i8/i16 → 32 位（`addw` 等零/符号扩展），f32/f64 → f 寄存器。
 - C：直接映射 `<stdint.h>`（`int32_t`/`int64_t`/`void*`/…）。
 
-### 9.3 TIR → MIR 降级（`tir_to_mir_lower`）
+### 9.3 TIR → tmir 降级（`tir_to_tmir_lower`）
 
-纯结构重排：遍历 `TIRFunc.body`，遇 `TIR_OP_BLOCK` 起新块（块名=其 `dst.name`），遇终止指令结束当前块，普通指令 append 进当前块。无类型推导、无重写。复杂度 O(指令数)。
+纯结构重排：遍历 `TIRFunc.body`，遇 `TIR_OP_BLOCK` 起新块（块名=其 `dst.name`），遇终止指令结束当前块，普通指令 append 进当前块。无类型推导、无重写、无优化。复杂度 O(指令数)。
 
 ### 9.4 验收判据（对标 §5.3）
 
-- MIR 不引入任何 TIR 之外的 opcode/ST 语义；新架构若需新机器 op，先在 TIR 层以 `TIR_OP_*` 表达，MIR 直接继承。
-- `tir_to_mir_lower` 必须保持「逐指令语义等价」：同一 `tc.tc` 经 `tir→mir→wasm` 与 `tir→llvm` 运行输出须可端到端对拍（见 §10 门禁）。
+- tmir 不引入任何 TIR 之外的 opcode/ST 语义；新架构若需新机器 op，先在 TIR 层以 `TIR_OP_*` 表达，tmir 直接继承。
+- `tir_to_tmir_lower` 必须保持「逐指令语义等价」：同一 `tc.tc` 经 `TIR→tmir→wasm` 与 `tmir→llvm` 运行输出须可端到端对拍（见 §10 门禁）。
 
-## 10. MIR 后端计划（WASM / RISC-V / C）
+### 9.5 关于「tmir 不承载优化」的定位
 
-> 后端铁律（§6 纪律第 3 条延伸）：**后端只能消费 MIR，是薄发射器，不得在 MIR 之外新增平行翻译器**。MIR 是单一类型/指令真相源。
+「tmir 当前不承载优化」是**当下的设计定位（描述性）**，不是一条不可撤销的硬约束。优化之所以放在 mir（类型化、机器无关）而非 tmir，是因为：(a) 类型化形态上做机器无关优化信息最足、最不易出错；(b) 与 LLVM 模型一致（优化在 mid-IR，机器层只做线性化发射）；(c) 避免与后端自身优化器（clang -O2 / gcc）重复。
+
+若未来出现「只有机器层才方便做」的合法变换（例如某些架构特定的指令合并、或下游 ABI 约束驱动的等价改写），**可以**在 tmir 层补 pass——届时本条仅作为「默认不放、按需评估」的倾向，不构成禁令。不要在文档或实现里把它当成死规则死抠。
+
+## 10. tmir 后端计划（WASM / RISC-V / C）
+
+> 后端铁律（§6 纪律第 3 条延伸）：**后端只能消费 tmir，是薄发射器，不得在 tmir 之外新增平行翻译器**。tmir 是单一类型/指令真相源（架构/设备/后端无关优化已在上游 mir 层完成，见 §11）。
 
 ### 10.1 已落地（M0/M1，2026-09-13 首切片）
 
 | 后端 | 命令 | 载体 | 覆盖 | 状态 |
 |---|---|---|---|---|
-| **MIR→RISC-V** | `--backend mir-riscv` | `src/codegen_riscv.tc` | S1 标量（i32/i64/f64/bool、算术/比较/位/移位、load/store、call、br/br_cond）；CFG 直接映射 `beq/bne/j/ret`，虚拟 slot 溢出到栈帧 | **首切片落地**（沙箱无 riscv 工具链，待 `riscv64-linux-gnu-gcc -c` 验证） |
-| **MIR→WASM** | `--backend mir-wasm` | `src/codegen_wasm.tc` | S1 标量；对**可归约 CFG** 用支配树嵌套 `block`/`loop`+`br` 重建结构化控制流 | **首切片落地**（沙箱无 `wat2wasm`，待 `wat2wasm` 验证） |
+| **tmir→RISC-V** | `--backend tmir-riscv`（原 `mir-riscv`） | `src/codegen_riscv.tc` | S1 标量（i32/i64/f64/bool、算术/比较/位/移位、load/store、call、br/br_cond）；CFG 直接映射 `beq/bne/j/ret`，虚拟 slot 溢出到栈帧 | **首切片落地**（沙箱无 riscv 工具链，待 `riscv64-linux-gnu-gcc -c` 验证） |
+| **tmir→WASM** | `--backend tmir-wasm`（原 `mir-wasm`） | `src/codegen_wasm.tc` | S1 标量；对**可归约 CFG** 用支配树嵌套 `block`/`loop`+`br` 重建结构化控制流 | **首切片落地**（沙箱无 `wat2wasm`，待 `wat2wasm` 验证） |
 
-> MIR→WASM 的结构化控制流重建只对**可归约 CFG** 正确（S1 的 if/while/for 天然可归约）。`src/codegen_wasm.tc` 用迭代数据流求支配树 + Cooper-Harvey-Kennedy 求 `idom`，按支配树前序 DFS 发射，自然后继（支配后代）落入、其余目标 `br`。不可归约 CFG（如 computed goto）需后续补 `br_table`/栈式兜底。
+> tmir→WASM 的结构化控制流重建只对**可归约 CFG** 正确（S1 的 if/while/for 天然可归约）。`src/codegen_wasm.tc` 用迭代数据流求支配树 + Cooper-Harvey-Kennedy 求 `idom`，按支配树前序 DFS 发射，自然后继（支配后代）落入、其余目标 `br`。不可归约 CFG（如 computed goto）需后续补 `br_table`/栈式兜底。
 
 ### 10.2 待做（M2+ 切片）
 
 | 后端 | 载体 | 说明 |
 |---|---|---|
-| **MIR→C（便携后端）** | `codegen_c` 改造为消费 MIR | 取代 LLVM 的本地编译路径：MIR→C 后经宿主 `cc` 编译。覆盖度随 S2（struct/union/数组/字符串/全局）补齐 |
-| **MIR→LLVM（可选）** | `codegen_ll` 改消费 MIR | 保留为「需要 LLVM 优化/目标」的可选后端；S5 删 `codegen_ll` 改判为「MIR→LLVM 可选」，不再强制 |
-| **Global / 内存模型** | `codegen_wasm`/`codegen_riscv` 的 `.data`/内存段 | S1 标量切片暂以 `comment` 兜底全局/字符串（§5.5）；S2 起补齐 MIR 全局 → WASM `memory`/RISC-V `.data` |
-| **调度 / 寄存器分配** | 各后端可选 pass | 线性扫描把虚拟 slot 分配到物理寄存器，减少栈溢出（正确性不依赖，先正确后优化） |
+| **tmir→C（便携后端）** | `codegen_c` 改造为消费 tmir | 取代 LLVM 的本地编译路径：tmir→C 后经宿主 `cc` 编译。覆盖度随 S2（struct/union/数组/字符串/全局）补齐 |
+| **tmir→LLVM（可选）** | `codegen_ll` 改消费 tmir | 保留为「需要 LLVM 优化/目标」的可选后端；S5 删 `codegen_ll` 改判为「tmir→LLVM 可选」，不再强制 |
+| **Global / 内存模型** | `codegen_wasm`/`codegen_riscv` 的 `.data`/内存段 | S1 标量切片暂以 `comment` 兜底全局/字符串（§5.5）；S2 起补齐 tmir 全局 → WASM `memory`/RISC-V `.data` |
+| **调度 / 寄存器分配** | 各后端可选 pass | 线性扫描把虚拟 slot 分配到物理寄存器，减少栈溢出（正确性不依赖，先正确后优化；属后端侧，非 tmir 层） |
 
 ### 10.3 切片计划（M 轨，独立于 S 轨）
 
 | 切片 | 内容 | 完成判据 |
 |---|---|---|
-| **M0** | MIR 类型 + `tir_to_mir_lower` + `--backend mir-*` 接线 | `mir_to_text` 与 TIR 逐指令对应；`tc emit-mir` 类路径产出 `.wat`/`.s` |
-| **M1** | MIR→RISC-V + MIR→WASM（S1 标量子集） | 对 S1 example 子集，wasm/riscv 与 LLVM 后端运行输出对拍一致 |
-| **M2** | MIR→C 便携后端 + S2 聚合（struct/union/数组/字符串/全局） | 双轨对拍全绿；LLVM 转为可选 |
+| **M0** | tmir 类型 + `tir_to_tmir_lower` + `--backend tmir-*` 接线 | `tmir_to_text` 与 TIR 逐指令对应；`tc emit-tmir` 类路径产出 `.wat`/`.s` |
+| **M1** | tmir→RISC-V + tmir→WASM（S1 标量子集） | 对 S1 example 子集，wasm/riscv 与 LLVM 后端运行输出对拍一致 |
+| **M2** | ttmir→C 便携后端 + S2 聚合（struct/union/数组/字符串/全局） | 双轨对拍全绿；LLVM 转为可选 |
 | **M3** | 调度/寄存器分配 pass + 不可归约 CFG 兜底 | 性能与覆盖度达标 |
 
 ### 10.4 门禁接入
 
-M 轨沿用 S 轨的双轨对拍（§3）：同一 `.tc` 走 `tir→mir→wasm`（`--backend mir-wasm`）与 `tir→llvm`（`--backend tir`），比对运行输出。首切片（M1）先以 warn 级接入 `gate.mjs`（对齐 S-1 纪律），全绿后转 hard。
+M 轨沿用 S 轨的双轨对拍（§3）：同一 `.tc` 走 `TIR→tmir→wasm`（`--backend tmir-wasm`）与 `tmir→llvm`（`--backend tmir-llvm`），比对运行输出。首切片（M1）先以 warn 级接入 `gate.mjs`（对齐 S-1 纪律），全绿后转 hard。
 
-> **沙箱限制**：本沙箱无 `clang`/`VS2022`/`wat2wasm`/`riscv64` 工具链，M1 的端到端对拍须工具链机器执行（见 §8.3 验证路径）。代码改动（src/mir.tc / src/codegen_wasm.tc / src/codegen_riscv.tc / tc.tc 接线）已落地，仅差链接验证。
+> **沙箱限制**：本沙箱无 `clang`/`VS2022`/`wat2wasm`/`riscv64` 工具链，M1 的端到端对拍须工具链机器执行（见 §8.3 验证路径）。代码改动（src/tmir.tc / src/codegen_wasm.tc / src/codegen_riscv.tc / tc.tc 接线）已落地，仅差链接验证；CLI 标志 `mir-wasm`/`mir-riscv` 待代码阶段更名为 `tmir-wasm`/`tmir-riscv`。
 
-## 11. MIR 优化层（中端 pass，2026-09-13 首切片）
+## 11. mir 优化层（对齐 Rust MIR，HIR 与 TIR 之间，2026-09-13 设计）
 
-> 优化层 = 一组作用于 `MIRModule` 的结构化 pass，**不另造 IR**（MIR 已是显式 CFG + 机器类型，天然是中端优化载体）。所有 pass 均为「语义保持的就地改写」，对后端完全透明。
+> **定位**：mir 对齐 Rust 的 MIR——类型化、基于 CFG 的中端 IR，夹在 **HIR 与 TIR 之间**，是**优化的唯一载体**。mir 之上（HIR）保留类型与语义信息，mir 之下（TIR）类型擦除、机器无关优化只发生一次、在类型化形态上，降级到 TIR 后不再重复（与 LLVM 模型一致：优化在 mid-IR，机器层 tmir 只做线性化发射，§9.5）。
+>
+> **优化范围（铁则）**：mir 层只做 **架构无关 / 设备无关 / 后端无关** 的优化——即经典「机器无关优化」全集（const-prop、DIE、代数化简、不可达块消除、复制传播、CFG 简化等）。任何依赖目标 ABI、寄存器、指令集或设备（GPU/TPU/NPU）的变换**都不在此层**，归各自 tmir 后端或 Device 子系统。
 
-### 11.1 首切片（level≥1，无条件安全）
+### 11.1 首切片 pass（level≥1，无条件安全、机器无关）
 
 | Pass | 动作 | 示例 |
 |---|---|---|
@@ -426,23 +452,33 @@ M 轨沿用 S 轨的双轨对拍（§3）：同一 `.tc` 走 `tir→mir→wasm`�
 | 死指令删除 DIE | 结果无人引用的纯值指令删除 | 中间量不再使用即删 |
 | 不可达块消除 | 入口 BFS 删除不可达块（含死分支） | `if(1)` 后的 B 块移除 |
 
-实现：`src/mir_opt.tc`（全局替换表 + CONST 定义表 + 使用集，定点迭代至不动点）。MIR 复用 `TIR_OP_*`/`TirOperand`/`ST_*`，**无第二套操作码**。
+所有 pass 均为「语义保持的就地改写」，对下游 tmir / 后端完全透明。mir 复用 `TIR_OP_*`/`TirOperand`/`ST_*`，**无第二套操作码**。
 
 ### 11.2 触发与范围
 
 - 开关：`tc --opt`（或 `-O`）。**默认关闭**，保护自举不动点（`tc.tc` 自编译不经优化 → g2/g3/g4 不变）。
-- 范围：仅 `--backend mir-wasm`/`mir-riscv` 消费 MIR，故优化仅在这两个后端 + `--opt` 时生效；LLVM/C 路径经各自下游优化器（clang -O2 / gcc），不在此层（避免与 S5-删除重复）。
+- 范围：mir 优化作用于 **所有** 后端路径（它在 TIR 之前，tmir 与 LLVM/C 都消费优化后的结果），不限于某个后端——这正是「机器无关」的体现。LLVM/C 自身下游优化器（clang -O2 / gcc）仍独立工作，二者不冲突（mir 在更前、信息更足）。
+- 不做：架构/设备/后端相关优化（见 §11 铁则，归 tmir 后端或 Device 子系统）。
 
 ### 11.3 明确不做（留待 M2+）
 
-- 中端**不参与**类型感知优化（MIR 已类型擦除为 ST）；需要类型信息的优化留待 HIR/TIR 层（未来可选）。
-- 无 SSA 构造、无循环优化、无寄存器分配（归 M3）。本切片只对**局部可静态判定**的等价变换。
+- 无 SSA 构造、无循环优化、无寄存器分配（归 M3，属后端侧）。本切片只对**局部可静态判定**的等价变换。
 - 无符号除/余、浮点运算、移位不折叠（规避 i64 符号歧义，正确性优先）。
-- 复制传播以「恒等式就地替换 + 定点解析」实现（MIR 无独立 MOV 操作码，拷贝在 TIR 构造期已消解）。
+- 复制传播以「恒等式就地替换 + 定点解析」实现（mir 无独立 MOV 操作码，拷贝在 TIR 构造期已消解）。
 
-### 11.4 门禁接入
+### 11.4 迁移说明（代码阶段，非本设计阶段）
 
-随 M 轨双轨对拍（§10.4）：开 `--opt` 后 `mir-wasm`/`mir-riscv` 输出应与关闭 `--opt` **语义等价**（指令数更少）。工具链机器验证：对 S1 标量子集开/关 `--opt` 比对运行输出；再 `wat2wasm`/`riscv64-gcc` 编译确认合法。
+现有 `src/mir_opt.tc` 的 pass 逻辑作用在**机器形态 `MIRModule`（post-TIR）**上，与目标「mir 在 **pre-TIR**」不符。落地时：
+1. 新建 pre-TIR 的 mir 表示（由 HIR 构造的类型化 CFG，对齐 Rust MIR）；
+2. 把 `mir_opt.tc` 的 pass 重定标到该 mir 表示（pass 算法本身可复用，输入形态需迁移）；
+3. 加 `mir_to_tir_lower` 降级到 TIR（类型擦除 + 线性化）；
+4. 原 `src/mir.tc`（机器层）改名为 `src/tmir.tc`（§9）。
+
+当前 `mir_opt.tc` 实现视作 **pass 算法的验证原型**（已用种子编译器 `emit-ll` 类型检查通过），算法正确性可在工具链机器端到端验证后，再迁移到 pre-TIR mir。
+
+### 11.5 门禁接入
+
+随 M 轨双轨对拍（§10.4）：开 `--opt` 后各后端输出应与关闭 `--opt` **语义等价**（指令数更少）。工具链机器验证：对 S1 标量子集开/关 `--opt` 比对运行输出；再 `wat2wasm`/`riscv64-gcc` 编译确认合法。
 
 ## 附录 A：v1/v2 实现偏离复盘（v3 立论依据）
 
@@ -458,7 +494,7 @@ M 轨沿用 S 轨的双轨对拍（§3）：同一 `.tc` 走 `tir→mir→wasm`�
 
 **判定**：不是「TIR 不该做」（双后端重复是实证痛点，Bug1/Bug2 可证），而是**契约对、执行偏离 + 契约缺执行保障**。v3 用双轨对拍（§3）+ 硬性验收判据（§5.3）+ 纪律（§6）补上执行保障。
 
-**附带发现**：设计管线写作 `sema → MIR(类型化) → TIR`，但 `src/` 中 HIR / MIR / TMI **三层零文件**（`docs/compiler/` 23 篇 4067 行多为未落地草案）——实际从 AST 直接降级，即「类型当场擦掉→翻译器再猜回」。此缺口由 v3 §2 的类型槽补上；**应在 `tir-design.md` 中同步标注**。
+**附带发现**：设计管线写作 `sema → HIR → mir(类型化·优化) → TIR → tmir(机器) → 后端`，但 `src/` 中长期缺位（仅有 TIR 落地，HIR 类型槽刚立、mir/tmir 待建，`docs/compiler/` 多为未落地草案）——实际从 AST 直接降级，即「类型当场擦掉→翻译器再猜回」。此缺口由 v3 §2 的类型槽补上；**应在 `tir-design.md` 中同步标注**（mir 在 HIR↔TIR 之间、tmir 在 TIR 之后）。
 
 ---
 

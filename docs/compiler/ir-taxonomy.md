@@ -13,7 +13,7 @@ TIR 最初的需求描述是「**无类型的文件级线性中间表示**」。
 
 这三个定语，逐字就是 Zig ZIR 的定义。Zig 官方对 ZIR 的表述是：*an untyped, linear IR that represents program semantics independent of types*；由 `AstGen` 产出，**按源文件缓存到磁盘**，指令带引用计数以支持增量编译，内含**未解析**的声明与类型表达式。
 
-而 TIR 在 `tir-design.md` 里被放在了 **Sema/MIR 之后、后端之前** —— 也就是 Zig 里 **AIR** 的槽位。
+而 TIR 在 `tir-design.md` 里被放在了 **Sema/mir 之后、后端之前** —— 也就是 Zig 里 **AIR** 的槽位。
 
 所以：
 
@@ -45,9 +45,9 @@ TIR 最初的需求描述是「**无类型的文件级线性中间表示**」。
 | 词法 / 语法树 | AST | AST | AST | AST (`parse.tc`) | CST / AST |
 | **未定型·可序列化·可缓存指令流** | **ZIR**（`AstGen`） | 无对应（HIR 是类型化树；缓存靠 `rmeta`） | 无对应 | **✗ 空缺** | **HIR（= ZIR 槽位，已裁定 A）** |
 | 语义分析 / comptime / 单态化 | Sema（**解释 ZIR**） | 类型检查 + monomorphize | Sema / SILGen | `sema.tc`（直接在 AST 树上跑） | sema + CTFE（**解释 HIR**） |
-| **类型化·单态·CFG 化中层 IR**（中端优化在此） | **AIR**（typed, per-fn, 带 liveness） | **MIR**（typed CFG，中端 pass） | **SIL**（typed SSA，ARC/泛型特化） | ✗ 空缺 | **MIR** |
+| **类型化·单态·CFG 化中层 IR**（中端优化在此） | **AIR**（typed, per-fn, 带 liveness） | **mir**（typed CFG，中端 pass） | **SIL**（typed SSA，ARC/泛型特化） | ✗ 空缺 | **mir** |
 | **类型擦除的后端共享桥** | **✗ 空缺** | `rustc_codegen_ssa`（**trait 形式**，不物化） | IRGen（单后端，无桥压力） | ✗ 空缺 → 两后端各自从 AST 发射 | **TIR**（**物化 IR 形式**） |
-| 后端 | 各后端自有 MIR：`x86_64.Mir` / `aarch64.Mir` / `wasm.Mir` / `c.Mir` / LLVM | LLVM / Cranelift / GCC | LLVM | `codegen_c` / `codegen_ll` | LLVM / Cranelift / C / WASM / SPIR-V |
+| 后端 | 各后端自有 mir：`x86_64.Mir` / `aarch64.Mir` / `wasm.Mir` / `c.Mir` / LLVM | LLVM / Cranelift / GCC | LLVM | `codegen_c` / `codegen_ll` | LLVM / Cranelift / C / WASM / SPIR-V |
 
 **读表结论**：
 
@@ -59,7 +59,7 @@ TIR 最初的需求描述是「**无类型的文件级线性中间表示**」。
 
 ## 4. 为什么说 Zig 在「桥」这一行是空缺（证据）
 
-Zig 的 CodeGen 把 AIR 转成 **backend-specific MIR**：`codegen.AnyMir` 是 `aarch64.Mir` / `x86_64.Mir` / `wasm.Mir` / `c.Mir` 等的 union —— 注意这里的 "MIR" 是**各后端自己的机器 IR**，不是共享中层 IR。后果是每个后端把 AIR 的 lowering 重写一遍：
+Zig 的 CodeGen 把 AIR 转成 **backend-specific mir**：`codegen.AnyMir` 是 `aarch64.Mir` / `x86_64.Mir` / `wasm.Mir` / `c.Mir` 等的 union —— 注意这里的 "mir" 是**各后端自己的机器 IR**，不是共享中层 IR。后果是每个后端把 AIR 的 lowering 重写一遍：
 
 - `src/codegen/x86_64/CodeGen.zig` ≈ 10.4 MB 单文件（手写后端里最大的）
 - `src/codegen/llvm.zig` ≈ 580 KB
@@ -84,13 +84,13 @@ T 只有 **2** 个后端就已经漂移两次。管线设计要扩到 **5** 个�
 | | 做法 | 代价 | 收益 |
 |---|---|---|---|
 | **Zig** | 不建桥，每后端从 AIR 各自 lowering | 每后端一套 lowering（x86_64 后端 10.4 MB） | 手写后端有最大自由度 |
-| **Rust** | 建桥但**不物化**：`rustc_codegen_ssa` 提供 MIR 遍历骨架，后端实现 `BuilderMethods` / `BackendTypes` / `LayoutTypeMethods` 等 trait 填空 | 需要语言级 trait + 编译期单态化能力 | 官方数据：原 27,000 LOC 的 `rustc_codegen_llvm` 拆成 18,500 (LLVM) + 12,000 (SSA)，**复用约 10,000 LOC**，无性能/测试回归 |
+| **Rust** | 建桥但**不物化**：`rustc_codegen_ssa` 提供 mir 遍历骨架，后端实现 `BuilderMethods` / `BackendTypes` / `LayoutTypeMethods` 等 trait 填空 | 需要语言级 trait + 编译期单态化能力 | 官方数据：原 27,000 LOC 的 `rustc_codegen_llvm` 拆成 18,500 (LLVM) + 12,000 (SSA)，**复用约 10,000 LOC**，无性能/测试回归 |
 | **T（本设计）** | 建桥且**物化成数据**：TIR 是真实的 IR，可打印、可序列化、可 diff | 多一层数据结构与序列化 | 复用同 Rust；**外加**下面三条 |
 
 **T 为何选「物化」而非 Rust 的 trait 方案**：
 
 1. **语言能力**：Rust 方案依赖 `Bx: BuilderMethods` 的 trait + 编译期单态化。`t` 目前没有这套抽象能力（也不该为此先造一套 trait 系统）。
-2. **门禁收益（决定性）**：物化的 TIR 可以序列化成文本 → **可 diff → 可做单一 md5 快照**。于是 `gate L2` 的跨后端一致性从「靠两份文本恰好一致」变成「**同一份 TIR 输入喂所有后端**」的结构性必然。trait 方案拿不到这个：它没有可快照的中间产物。这直接把 `tools/ir_snapshot.mjs` 的双 `.ll`/`.c` md5 收敛为单一 `.tir` md5。
+2. **门禁收益（决定性）**：物化的 TIR 可以序列化成文本 → **可 diff → 可做单一 md5 快照**。于是 `gate L2` 的跨后端一致性从「靠两份文本恰好一致」变成「**同一份 tmir 输入喂所有后端**」的结构性必然。trait 方案拿不到这个：它没有可快照的中间产物。这直接把 `tools/ir_snapshot.mjs` 的双 `.ll`/`.c` md5 收敛为单一 `.tir` md5。
 3. **device 路径**：`ptr(ST, aspace)` 形态的 TIR 文本可以直接喂 `docs/compiler/device-design.md` 的 Device Dialect（`t-device-opt` 已跑通 `--device-to-nvvm`）。物化 IR 天然是跨进程/跨工具链的交换格式，trait 方案不是。
 
 ---
@@ -114,8 +114,9 @@ T 只有 **2** 个后端就已经漂移两次。管线设计要扩到 **5** 个�
 ```
 CST ──AstGen──▶ HIR（未定型·线性·可序列化，= T 的 ZIR 槽位）
                   → sema + CTFE（解释 HIR：名字解析/类型检查/单态化/comptime 折叠）
-                  → MIR（类型化 CFG+SSA，= AIR 槽位，中端优化在此）
-                  → TIR（类型擦除后端桥，Zig 无此层）
+                  → mir（类型化 CFG+SSA，= AIR 槽位，中端优化在此）
+                  → TIR（类型擦除·线性，Zig 无此层）
+                   → tmir（机器桥，喂薄后端）
                   → 后端（LLVM / Cranelift / C / WASM / SPIR-V）
 ```
 

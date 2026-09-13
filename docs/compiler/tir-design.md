@@ -3,7 +3,7 @@
 > 状态：草案 v0.1（设计阶段，尚未落地）
 > 作者：Buddy（基于 `src/*` 现状勘探 + `docs/compiler/device-design.md` 设计风格）
 > 关联：`docs/compiler/device-design.md`、`tools/ir_snapshot.mjs`、`tests/ir_baseline.json`、`src/codegen_c.tc`、`src/codegen_ll.tc`、`src/sema.tc`
-> **对位说明（必读）**：TIR 的三个定语（无类型 / 文件级 / 线性）逐字撞了 Zig **ZIR** 的定义，但两者位置相反、职责无关——ZIR 是**未定型**（sema 之前，类型还没算），TIR 是**已擦除**（sema/MIR 之后，类型算完丢掉）。TIR 真正对应的是 **Zig 缺失的那一层**（AIR 之后、各后端之前的共享桥）。完整对位表、命名裁定与由此暴露的反向缺口见 `docs/compiler/ir-taxonomy.md`。裁定后的精确表述为「**类型擦除的线性后端桥 IR**」。
+> **对位说明（必读）**：TIR 的三个定语（无类型 / 文件级 / 线性）逐字撞了 Zig **ZIR** 的定义，但两者位置相反、职责无关——ZIR 是**未定型**（sema 之前，类型还没算），TIR 是**已擦除**（sema/mir 之后，类型算完丢掉）。TIR 真正对应的是 **Zig 缺失的那一层**（AIR 之后、各后端之前的共享桥）。完整对位表、命名裁定与由此暴露的反向缺口见 `docs/compiler/ir-taxonomy.md`。裁定后的精确表述为「**类型擦除的线性后端桥 IR**」。
 
 ---
 
@@ -13,7 +13,7 @@
 
 ```
 lex → parse(含前端脱糖) → AstGen → HIR(未定型·线性·可序列化, =ZIR槽位)
-   → sema(类型检查+单态化+CTFE, 解释HIR) → MIR(类型化CFG+SSA) → comptime_fold → [codegen_c | codegen_ll]
+   → sema(类型检查+单态化+CTFE, 解释HIR) → mir(类型化CFG+SSA) → comptime_fold → TIR(类型擦除·线性) → tmir(机器桥) → [tmir→c | tmir→ll]
    （管线总览与 HIR=ZIR 槽位定义见 `docs/compiler/compiler-pipeline-design.md` §3/§4.2 与 `docs/compiler/hir-design.md`）
 ```
 
@@ -30,7 +30,7 @@ lex → parse(含前端脱糖) → AstGen → HIR(未定型·线性·可序列�
 
 **已付出的代价**：A1a `f-string !j` 双后端实现时，泛型 `!j` 在单态化实例中未解糖（Bug1）、LLVM `TStr+TStr` 被错 emit 为 `add i64`（Bug2），都是"同一语义在两端各实现一次、不一致"的典型。这类 bug 在 TIR 上只会出现**一次**，因为 lowering 写一遍。
 
-**TIR 的目标**：在 `comptime_fold` 之后、`emit_*` 之前插入一个**单一、无源类型、文件级、线性**的中间表示。所有"源语义 → 机器存储"的降级只发生一次；C 与 LLVM 两个后端退化为"TIR → 目标语法"的薄翻译器。
+**TIR 的目标**：在 `comptime_fold` 之后、`emit_*` 之前插入一个**单一、无源类型、文件级、线性**的中间表示。所有"源语义 → 机器存储"的降级只发生一次；C 与 LLVM 两个后端退化为"tmir → 目标语法"的薄翻译器。
 
 ---
 
@@ -64,7 +64,7 @@ TIR **不携带任何源语言类型**。源类型系统（泛型形参、可选
 
 ### 2.4 设计权衡：memory-first vs SSA-first（裁定与论证）
 
-TIR 的函数体可选用两种值模型。**裁定：memory-first**（每条值存于具名 `slot`，用 `load/store` 读写，不强制 SSA）；**SSA 归 MIR 层**（管线文档 §4.3，MIR 才是类型化 CFG+SSA 的中端优化层）。以下论证该裁定的来由与对后继节点的影响。
+TIR 的函数体可选用两种值模型。**裁定：memory-first**（每条值存于具名 `slot`，用 `load/store` 读写，不强制 SSA）；**SSA 归 mir 层**（管线文档 §4.3，mir 才是类型化 CFG+SSA 的中端优化层）。以下论证该裁定的来由与对后继节点的影响。
 
 #### 两种模型
 
@@ -75,7 +75,7 @@ TIR 的函数体可选用两种值模型。**裁定：memory-first**（每条值
 
 | 优 | 劣 |
 |---|---|
-| **风险最低**：与现状代码生成几乎 1:1 重皮，新增机制少 | TIR 自身**不能做值级优化**（GVN/CSE/SCCP）——但中端优化已在 MIR 跑过，TIR 不损失任何优化（见下） |
+| **风险最低**：与现状代码生成几乎 1:1 重皮，新增机制少 | TIR 自身**不能做值级优化**（GVN/CSE/SCCP）——但中端优化已在 mir 跑过，TIR 不损失任何优化（见下） |
 | **生成极简**：表达式结果写入 slot、读取即 load，无需支配树/φ 放置算法 | 指令数偏多（显式 load/store） |
 | **无 φ 构造**：循环/if 汇合直接写同一 slot，无支配边界计算 | 别名是隐式的，后端需保守（除非 TIR 带 `noalias`） |
 | **可变性/别名天然**：`var`、闭包引用捕获、原地更新直接映射 | — |
@@ -86,8 +86,8 @@ TIR 的函数体可选用两种值模型。**裁定：memory-first**（每条值
 
 | 优 | 劣（在 T 语境下为决定性劣势） |
 |---|---|
-| 若 TIR 是优化层，则 SSA 赋能 GVN/CSE/SCCP | **TIR 不是优化层**：MIR 已在其上游完成 SSA + 全部中端优化，TIR 再做 SSA 是**冗余工作、零收益** |
-| 紧凑、规范形式 | **C 后端无法发射 φ**：`tir→c` 必须把 SSA 重建回内存（"lower phi to selectors/goto" 问题）→ SSA-first 在 C 路径上**强制增加一个内存重建 pass**，而 memory-first 把这个成本推给 LLVM 的 mem2reg（免费、自动） |
+| 若 TIR 是优化层，则 SSA 赋能 GVN/CSE/SCCP | **TIR 不是优化层**：mir 已在其上游完成 SSA + 全部中端优化，TIR 再做 SSA 是**冗余工作、零收益** |
+| 紧凑、规范形式 | **C 后端无法发射 φ**：`tmir→c` 必须把 SSA 重建回内存（"lower phi to selectors/goto" 问题）→ SSA-first 在 C 路径上**强制增加一个内存重建 pass**，而 memory-first 把这个成本推给 LLVM 的 mem2reg（免费、自动） |
 | LLVM 后端可跳过 mem2reg（省约 1–2% codegen 时间） | **构造成本高**：生成器需算支配者、在汇合点放 φ、重命名变量，gate 回归面变大 |
 | 精确 use-def 链 | 可变性/别名别扭：`var`、引用捕获需 SSA 版本化（写 `v2`=复制），要么 IR 爆炸、要么对捕获变量仍回落内存 |
 
@@ -95,21 +95,21 @@ TIR 的函数体可选用两种值模型。**裁定：memory-first**（每条值
 
 | 后继节点 | memory-first | SSA-first |
 |---|---|---|
-| **`tir→c`** | slot → C 局部变量，直译 ✅ | 必须 lower φ → 要么重建 alloca/load/store（前功尽弃），要么用 computed-goto/临时技巧（脆弱、复杂 CFG 易碎）❌ **强制多一个 pass** |
-| **`tir→ll`（LLVM）** | `alloca/load/store` → LLVM 标准管线自动跑 mem2reg/SROA（免费）✅ 近乎零成本 | TIR SSA → LLVM SSA 直连、略省 mem2reg（微小收益）✅ |
-| **`tir→cranelift` / `tir→wasm`** | 这些后端内部是 SSA/内存混合，收内存操作自然（WASM 的 `local.get/set` 即内存式）✅ | 需各自处理 φ，等价重建成本 |
-| **`tir→spirv`（GPU）** | 与 `device-design.md` 的线性模型、`tir→device dialect` 同构；MLIR 多数 dialect 收内存式线性形式自然 ✅ | 需 MLIR 自有 SSA 重建（mlir 有 `mem2reg` pass，但多一层依赖） |
+| **`tmir→c`** | slot → C 局部变量，直译 ✅ | 必须 lower φ → 要么重建 alloca/load/store（前功尽弃），要么用 computed-goto/临时技巧（脆弱、复杂 CFG 易碎）❌ **强制多一个 pass** |
+| **`tmir→ll`（LLVM）** | `alloca/load/store` → LLVM 标准管线自动跑 mem2reg/SROA（免费）✅ 近乎零成本 | TIR SSA → LLVM SSA 直连、略省 mem2reg（微小收益）✅ |
+| **`tmir→cranelift` / `tmir→wasm`** | 这些后端内部是 SSA/内存混合，收内存操作自然（WASM 的 `local.get/set` 即内存式）✅ | 需各自处理 φ，等价重建成本 |
+| **`tmir→spirv`（GPU）** | 与 `device-design.md` 的线性模型、`tmir→device dialect` 同构；MLIR 多数 dialect 收内存式线性形式自然 ✅ | 需 MLIR 自有 SSA 重建（mlir 有 `mem2reg` pass，但多一层依赖） |
 | **链接全局优化（CGU/ThinLTO/PGO/BOLT）** | 在 LLVM IR / 对象文件层，下游于 TIR，两种模型无差 | 同左，无差 |
-| **TIR 级中端优化** | 仅当 TIR 是优化层才有意义（本项目不是） | 同左；MIR 已覆盖 |
+| **TIR 级中端优化** | 仅当 TIR 是优化层才有意义（本项目不是） | 同左；mir 已覆盖 |
 
 #### 净结论
 
-1. **TIR 是后端桥，不是优化层**——MIR 已在其上游完成 SSA + 全部中端优化，TIR 再做 SSA 冗余且零收益。这是否决 SSA-first 的**首要理由**。
+1. **tmir 是后端桥，不是优化层**——mir 已在其上游完成 SSA + 全部中端优化，TIR 再做 SSA 冗余且零收益。这是否决 SSA-first 的**首要理由**。
 2. **C 后端无法发射 φ**：SSA-first 在 C 路径上强制增加一个 φ-lower 回内存的 pass；memory-first 让 C 直译、把（免费的）mem2reg 成本推给 LLVM。
 3. **最低风险**：最贴近现有代码生成、无支配者/φ 机制、`.tir` 快照 diff 稳定。
-4. **混合路线（已纳入 Stage 5 可选）**：若未来 TIR 需要承载某些后端无关优化（如 `tir→*` 共享的 CSE），可在 memory-first 之上**选择性 SSA 化**（`phi` 指令已预留 §6），但**不作为 Phase 1 强制**。
+4. **混合路线（已纳入 Stage 5 可选）**：若未来 TIR 需要承载某些后端无关优化（如 `tmir→*` 共享的 CSE），可在 memory-first 之上**选择性 SSA 化**（`phi` 指令已预留 §6），但**不作为 Phase 1 强制**。
 
-> ⚠ SSA 化**不在 TIR 做**（裁定 3）：SSA 归 MIR 层，见 `docs/compiler/compiler-pipeline-design.md §4.3`。
+> ⚠ SSA 化**不在 TIR 做**（裁定 3）：SSA 归 mir 层，见 `docs/compiler/compiler-pipeline-design.md §4.3`。
 
 ---
 
@@ -117,10 +117,10 @@ TIR 的函数体可选用两种值模型。**裁定：memory-first**（每条值
 
 ```
 lex → parse → sema(+单态化+CTFE) → comptime_fold
-        → [codegen_tir]  →  TIR module (.tir 文本 + 内存结构)
-                                ├──→ [tir→c]    → .c/.h  → clang
-                                └──→ [tir→ll]   → .ll     → llc
-        （device kernel fn 经 [tir→device dialect] → MLIR，沿用 device-design.md）
+        → [codegen_tir]  →  TIR module (.tir 文本) → tmir module (.tmir 文本+内存结构)
+                                ├──→ [tmir→c]    → .c/.h  → clang
+                                └──→ [tmir→ll]   → .ll     → llc
+        （device kernel fn 经 [tmir→device dialect] → MLIR，沿用 device-design.md）
 ```
 
 - `codegen_tir`（新模块，建议 `src/tir.tc` + `src/tir_emit.mjs` 序列化）**取代**现有两份类型恢复 + 两份类型映射 + 两份 per-construct lowering。
@@ -267,7 +267,7 @@ ST ::=
 
 | # | 偏离 | LLVM 的做法 | TIR 的做法 | 为什么必须偏离 |
 |---|---|---|---|---|
-| 1 | **整数带符号性** | 符号性在**指令**上（`sdiv`/`udiv`、`sext`/`zext`），类型只有 `iN` | 类型上区分 `iN`/`uN` | C 后端必须发射 `int64_t` vs `uint64_t`。若类型不带符号性，`tir→c` 就得回头扫描指令来推导符号性——这正是 TIR 要消灭的"后端自行推导"。信息放在类型上，两个后端都只读不推。 |
+| 1 | **整数带符号性** | 符号性在**指令**上（`sdiv`/`udiv`、`sext`/`zext`），类型只有 `iN` | 类型上区分 `iN`/`uN` | C 后端必须发射 `int64_t` vs `uint64_t`。若类型不带符号性，`tmir→c` 就得回头扫描指令来推导符号性——这正是 TIR 要消灭的"后端自行推导"。信息放在类型上，两个后端都只读不推。 |
 | 2 | **指针带 pointee + aspace** | `ptr` 完全 opaque（LLVM 15+ 移除了 pointee） | `ptr<ST>` / `ptr<ST, as=N>` | C 后端必须发射 `T*`，需要 pointee；device 路径需要地址空间（`docs/compiler/device-design.md` 的 `pointer.as`）。TIR 保留全部信息，**LLVM 侧发射时丢弃 pointee 发 opaque `ptr`**、C 侧取 pointee 发 `T*`——各取所需，谁都不用推导。 |
 | 3 | **聚合具名引用而非内联展开** | 允许内联匿名 `{i8*, i64}` | 一律 `%TStr` 指向 TT 条目 | ① C 后端要发 `typedef struct` 的**名字**；② diff 友好：改一个字段只动 TT 一行，不会让所有使用点的文本全变——直接决定 `.tir` md5 快照的信噪比。 |
 
@@ -369,7 +369,7 @@ bitcast/inttoptr/ptrtoint      STdst STsrc $dst $src
 
 下表是"源 TD.cat → TIR ST / 构造"的**唯一真理源**，取代 `desc_to_c` 与 `ll_td`：
 
-| MIR `TD.cat` | TIR 表达 |
+| mir `TD.cat` | TIR 表达 |
 |---|---|
 | `scalar` i8..i64 / u8..u64 / f32 / f64 | 同名 ST |
 | `scalar` `bool` | `i8`（存储）；比较结果为 `i1`，存回需 `zext.i8`（见 §5.2） |
@@ -406,9 +406,9 @@ bitcast/inttoptr/ptrtoint      STdst STsrc $dst $src
 步骤：
 1. **建 TT**：遍历所有 `StructDecl/EnumDecl/UnionDecl/VariantDecl/FlagDecl`，解算字段偏移/大小/对齐，写入类型表。切片/字符串/闭包/optional 的标准 struct 也登记进 TT。
 2. **建符号表**：遍历 `lex.decl_list`，为每个函数生成签名（`ST` 形参 + `ST` 返回值）。跳过 `func_is_generic`（模板，已是具体实例才进 TIR）与 `kernel fn`（`bf`，走 device 路径）。
-3. **降级函数体**：对每个函数，按 MIR 求值序遍历其语句/基本块/SSA 值，把每个 SSA 值"翻译到目标 slot"：
-   - MIR 值 `v` + 目标 slot `$d` → 发射一串 TIR 指令，最终把 `v` 的值放进 `$d`（类型擦除：MIR 的源类型 → ST）。
-   - 控制流（`if/for/while/return/break/continue/var_decl/assign/block/defer`，已由 MIR 降级为 CFG 基本块 + 终止指令）→ 直接映射为 TIR 的 `block/br/br_cond/switch/ret`。
+3. **降级函数体**：对每个函数，按 mir 求值序遍历其语句/基本块/SSA 值，把每个 SSA 值"翻译到目标 slot"：
+   - mir 值 `v` + 目标 slot `$d` → 发射一串 TIR 指令，最终把 `v` 的值放进 `$d`（类型擦除：mir 的源类型 → ST）。
+   - 控制流（`if/for/while/return/break/continue/var_decl/assign/block/defer`，已由 mir 降级为 CFG 基本块 + 终止指令）→ 直接映射为 TIR 的 `block/br/br_cond/switch/ret`。
    - 子值先降级，结果 slot 作为父指令操作数。
 
 此 pass **一次性替代**了 `expr_type_desc`/`ll_etd`（类型恢复）与 `desc_to_c`/`ll_td`（类型→文本）以及全部 per-construct lowering。两个后端不再需要这些。
@@ -417,7 +417,7 @@ bitcast/inttoptr/ptrtoint      STdst STsrc $dst $src
 
 ## 9. 双后端变薄（TIR → 目标）
 
-### 9.1 C 后端（`emit_unit` 改写为消费 TIR）
+### 9.1 C 后端（`emit_unit` 改写为消费 tmir）
 - `slot ST $n` → C 局部变量 `desc_to_c(ST) n;`
 - `load/store` → C 赋值 `n = *p;` / `*p = v;`
 - `gep` → `.field` / `[idx]`（由 ST + TT 偏移决定）
@@ -425,7 +425,7 @@ bitcast/inttoptr/ptrtoint      STdst STsrc $dst $src
 - `block`/`br`/`br_cond` → C 标签 + `goto` / `if`
 - 仅保留极小的 `tir_tt_to_c`（ST→C 类型名），不再有完整 lowering。
 
-### 9.2 LLVM 后端（`emit_llunit` 改写为消费 TIR）
+### 9.2 LLVM 后端（`emit_llunit` 改写为消费 tmir）
 - `slot ST $n` → `alloca ST`
 - `load/store` → `load`/`store`
 - `gep` → `getelementptr inbounds`（由 ST + TT 偏移）
@@ -440,7 +440,7 @@ bitcast/inttoptr/ptrtoint      STdst STsrc $dst $src
 ## 10. 设备子系统衔接
 
 - `kernel fn` 在 TIR 中仍是带 `kernel` 标志的函数；其指针形参带 `aspace`（device 地址空间，见 `pointer.memspace`）。
-- `codegen_dev` 从"直接读 AST"改为"消费带 `aspace` 的 TIR"→ 发射 Device Dialect 文本（`docs/compiler/device-design.md` L4/L5 不变）。
+- `codegen_dev` 从"直接读 AST"改为"消费带 `aspace` 的 tmir"→ 发射 Device Dialect 文本（`docs/compiler/device-design.md` L4/L5 不变）。
 - TIR 的 `ptr<ST, as=N>` 完整保留地址空间信息，device 路径降级时直接读 `aspace`，无需再翻 AST 的 `memspace` 字段。
 
 ---
@@ -526,14 +526,14 @@ text --parse--> mem --emit_bin--> .tirb --parse_bin--> mem' --emit_text--> text'
 
 - **Stage 0**：新增 `src/tir.tc`（内存结构 + **文本**序列化）+ `emit-tir` 子命令。后端保持不变。
 - **Stage 1**：实现 `codegen_tir` 降级（**子集**：标量、调用、if/for/while、struct 字段、返回）。`emit-tir` 跑通；TIR 文本稳定、可读。门禁：TIR 文本 md5 稳定（不要求与旧 `.ll` 一致，是新增维度）。**optional 一律 `opt.boxed`（裁定 2）。**
-- **Stage 2**：实现 `tir→c` 薄后端，让 `emit-c` 改走 TIR。通过 `gate L2`。
-- **Stage 3**：实现 `tir→ll` 薄后端，让 `emit-ll` 改走 TIR。通过 `gate L2`。**此时双后端共享降级，Bug1/Bug2 类问题根除。**
+- **Stage 2**：实现 `tmir→c` 薄后端，让 `emit-c` 改走 TIR。通过 `gate L2`。
+- **Stage 3**：实现 `tmir→ll` 薄后端，让 `emit-ll` 改走 TIR。通过 `gate L2`。**此时双后端共享降级，Bug1/Bug2 类问题根除。**
 - **Stage 4**：删除重复的 `expr_type_desc`/`ll_etd`/`desc_to_c`/`ll_td`/per-construct 发射代码。TIR 成为唯一真相源。上线 `tir_snapshot` 门禁。
 - **Stage 4b**：二进制 `.tirb` 序列化器 + `tools/tir_roundtrip.mjs` round-trip 门禁上线（裁定 4）。此前所有阶段只用文本，二进制不影响任何既有判据。
 - **Stage 5+（独立 ABI 优化项）**：
   - `opt.tagged` 启用（`T?` 由装箱指针改为按值 `{i8, ST}`）——**独立 stage、独立基线重录**，不与上述任何阶段并行（裁定 2 的理由：一个 stage 只引入一条风险线）。
-  - TIR 层优化 pass（若 MIR 层未覆盖）；device 后端改由 TIR 驱动。
-  - ⚠ SSA 化**不在 TIR 做**（裁定 3）：SSA 归 MIR 层，见 `docs/compiler/compiler-pipeline-design.md §4.3`。
+  - TIR 层优化 pass（若 mir 层未覆盖）；device 后端改由 TIR 驱动。
+  - ⚠ SSA 化**不在 TIR 做**（裁定 3）：SSA 归 mir 层，见 `docs/compiler/compiler-pipeline-design.md §4.3`。
 
 每个 Stage 结束都以 `gate L2` 全绿为合并门槛，保证自举不动点不破。
 
@@ -557,10 +557,10 @@ text --parse--> mem --emit_bin--> .tirb --parse_bin--> mem' --emit_text--> text'
 |---|---|---|---|
 | 1 | **ST 命名风格** | **LLVM 记号为基 + 三处显式偏离**（整数带符号性 / 指针带 pointee+aspace / 聚合具名引用）。记号命名空间三分：`%`=类型、`$`=值 slot、`@`=符号 | §5、§5.1、§5.2、§4 |
 | 2 | **`T?` 的 ABI** | **Stage 1 严格沿用现状 `opt.boxed`（可空装箱指针）**；`{tag i8, payload ST}` 收进规格为 `opt.tagged`，**Stage 5+ 独立启用**。详见下方"裁定 2 的矛盾与解法" | §7、§15.2 |
-| 3 | **memory-first vs SSA** | **memory-first**；SSA 归 MIR 层（管线文档 G/H 阶段） | §2.4（完整权衡+后继节点影响）、§6、`compiler-pipeline-design.md §4.3` |
+| 3 | **memory-first vs SSA** | **memory-first**；SSA 归 mir 层（管线文档 G/H 阶段） | §2.4（完整权衡+后继节点影响）、§6、`compiler-pipeline-design.md §4.3` |
 | 4 | **序列化格式** | **双格式**：文本 `.tir` = 规范真相源（md5 快照只对它算）；二进制 `.tirb` = 速度格式（增量缓存 / device 内嵌 / 远端构建），带 **round-trip 逐字节门禁** | §12.1、§12.1b |
 | 5 | **模块边界** | **1:1 对应 `.tc` 源文件**；单态化实例按**定义点归属** + `linkonce_odr`。⚠ `.tc` 是**分区键**而非**可缓存单元**（缓存承重墙在 HIR 层） | §4.2、§4.2.1 |
-| 6 | 落地顺序 | 见 `docs/compiler/compiler-pipeline-design.md §9`（裁定 A 后：先立 HIR(=ZIR) → 再 TIR → 再 MIR 优化） | §13 |
+| 6 | 落地顺序 | 见 `docs/compiler/compiler-pipeline-design.md §9`（裁定 A 后：先立 HIR(=ZIR) → 再 mir 优化 → 再 TIR(线性) → 再 tmir(机器桥)） | §13 |
 
 ### 15.2 裁定 2 的矛盾与解法（重要）
 
@@ -609,7 +609,7 @@ func @add(i32 $a, i32 $b): i32 {
 }
 ```
 
-`tir→c`：
+`tmir→c`：
 ```c
 i32 add(i32 a, i32 b) {
   i32 v0;
@@ -618,7 +618,7 @@ i32 add(i32 a, i32 b) {
 }
 ```
 
-`tir→ll`：
+`tmir→ll`：
 ```llvm
 define i32 @add(i32 %a, i32 %b) {
   %v0 = alloca i32

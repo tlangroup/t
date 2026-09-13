@@ -5,11 +5,11 @@
 
 ## 0. 范围、定位与文档关系
 
-本文是 `docs/compiler/` 分层设计体系&#x7684;**「声明层」规格**，专门描述**用户声明的数据类型**在管线各层（CST → HIR → MIR → TIR → 后端）的形态与层间降级契约。
+本文是 `docs/compiler/` 分层设计体系&#x7684;**「声明层」规格**，专门描述**用户声明的数据类型**在管线各层（CST → HIR → mir → TIR → tmir → 后端）的形态与层间降级契约。
 
 - **1覆盖范围**：`struct`（积类型）、`enum`（整数枚举）、`variant`（带载荷标签和类型 / 代数数据类型 ADT）。关联类型一并说明：`union`（C 兼容联合体，**无 tag**）、`flag` / `flag_set`（位标志）。
-- **不覆盖**：标量 / 指针 / 切片 / 数组 / 字符串（各层通用文档）；闭包（见 `tir-design.md` 的 `%TClosure`）；函数类型（MIR/TIR 的 `func`）；泛型参数化本身（见 `tir-design.md` §4.2.1 单态化归属）。
-- **文档关系**：HIR 形态见 `hir-design.md`，MIR 形态见 `mir-design.md`，TIR 形态见 `tir-design.md` §4/§5/§7，后端发射见 `backend-design.md`。本文只定义「声明」在各层的**形态**与**层间契约**，不重复各层通用机制。
+- **不覆盖**：标量 / 指针 / 切片 / 数组 / 字符串（各层通用文档）；闭包（见 `tir-design.md` 的 `%TClosure`）；函数类型（mir/TIR 的 `func`）；泛型参数化本身（见 `tir-design.md` §4.2.1 单态化归属）。
+- **文档关系**：HIR 形态见 `hir-design.md`，mir 形态见 `mir-design.md`，TIR 形态见 `tir-design.md` §4/§5/§7，后端发射见 `backend-design.md`。本文只定义「声明」在各层的**形态**与**层间契约**，不重复各层通用机制。
 - **一致性声索**：本文是 struct/enum/variant/union 在 TIR 层 TT 表项的**唯一权威**。它会纠正 `tir-design.md` §7 中两处与现状实现不符的条目（见 §9）。
 
 ## 1. 源语法与语义直觉
@@ -75,7 +75,7 @@ flag_set PermSet : u8 { R; W; X }     // 动态长度位域集合
 
 | 声明         | sema 后的类型信息                                                  |
 | ---------- | ------------------------------------------------------------ |
-| `struct`   | `fields: [(name, TD, ann)]`；布局由 MIR 计算（§4）                   |
+| `struct`   | `fields: [(name, TD, ann)]`；布局由 mir 计算（§4）                   |
 | `enum`     | `underlying: scalar`，`members: [(name, value)]`              |
 | `variant`  | `cases: [(tag: u32, name, payload: [TD])]`，`recursive: bool` |
 | `union`    | `members: [(name, TD)]`，`max_size`                           |
@@ -100,7 +100,7 @@ flag_set PermSet : u8 { R; W; X }     // 动态长度位域集合
   decl.enum "Color" : named "u8" { member "Red" 0; member "Green" 1; member "Blue" 2; }
   ```
 
-## 4. MIR 形态（typed CFG+SSA，布局真相源）
+## 4. mir 形态（typed CFG+SSA，布局真相源）
 
 - 声明成为**带布局的类型**：字段偏移 / 对齐已按 `target_desc`（`target-desc-design.md`）的 ABI 规则算出。
 - `struct`：有序 `(offset, size, align, field_name, ST)`；`@bitpack` 走位域布局。
@@ -117,7 +117,7 @@ TT 表项（本文盖 `tir-design.md` §7）：
 
 | 源声明             | TIR 表达（canonical）                                               |
 | --------------- | --------------------------------------------------------------- |
-| `struct(Name)`  | `%Name` = `struct{ f0: ST, ... }`（字段按 MIR 偏移排序，已解算布局）           |
+| `struct(Name)`  | `%Name` = `struct{ f0: ST, ... }`（字段按 mir 偏移排序，已解算布局）           |
 | `enum(Name)`    | **底层标量 ST**（如 `u8`）；成员值进常量表（不在 TT 结构里）                          |
 | `union(Name)`   | `%uname` = `union{ f0: ST, ... }`（无 tag，最大成员共享存储）               |
 | `variant(Name)` | `%vname` = `struct{ tag: <tagST 默认 i32>, payload: <max-payload ST blob> }`（tag 默认 i32，`@repr(u8/u16)` 可缩小，见 §11 决策 4） |
@@ -131,9 +131,9 @@ TT 表项（本文盖 `tir-design.md` §7）：
 | 边                      | 动作                                                     |
 | ---------------------- | ------------------------------------------------------ |
 | CST → HIR              | 保留声明结构；类型字段转名字引用；注册声明符号                                |
-| HIR → MIR（sema + CTFE） | 解析名字 → TD；算布局（`target_desc`）；注册 variant 助手；递归检查        |
-| MIR → TIR              | 擦除源类型；ABI 事实落到 TT；字段 access → 偏移；match → `switch(tag)` |
-| TIR → 后端               | 每后端把 TT 翻译成目标语法（`backend-design.md` 的 `BackendTraits`） |
+| HIR → mir（sema + CTFE） | 解析名字 → TD；算布局（`target_desc`）；注册 variant 助手；递归检查        |
+| mir → TIR              | 擦除源类型；ABI 事实落到 TT；字段 access → 偏移；match → `switch(tag)` |
+| tmir → 后端               | 每后端把 TT 翻译成目标语法（`backend-design.md` 的 `BackendTraits`） |
 
 声明符号（struct/enum/variant 名、variant 助手名）在 TIR 阶段为 `@` 符号，归属规则见 `tir-design.md` §4.2.1（定义点归属 + `linkonce_odr`）。
 
@@ -166,7 +166,7 @@ TT 表项（本文盖 `tir-design.md` §7）：
 ## 8. match 降级（在这些类型上）
 
 - **enum**：scrutinee 是标量 → `switch` 整数；穷尽性由 sema 兜底（缺成员即报错）。
-- **variant**：`switch` on `_tag`；每个 case 体先 `extractvalue` / GEP 取 payload，再绑定模式变量（`Shape_as_Rect` 返回载荷 struct）。**穷尽性检查在 sema/MIR 补齐**（§11 决策 7）：`match` 必须覆盖所有 case 或缺省 `_`，新增 case 让旧 match 立即报错。
+- **variant**：`switch` on `_tag`；每个 case 体先 `extractvalue` / GEP 取 payload，再绑定模式变量（`Shape_as_Rect` 返回载荷 struct）。**穷尽性检查在 sema/mir 补齐**（§11 决策 7）：`match` 必须覆盖所有 case 或缺省 `_`，新增 case 让旧 match 立即报错。
 - **struct**：字段模式 = 逐字段 `extract` + 递归 match；顶层解构 `let Point{x, y} = p`。
 - **union**：C 兼容，无判别式；T 当前未提供 safe match（用户保证活跃成员）。
 
@@ -195,30 +195,30 @@ T 的 `enum` ≈ 各语言整数枚举；T 的 `variant` ≈ Rust / Swift 的带
 
 ## 11. 开放问题决策（已拍板，2026-09-04）
 
-1. **匿名 struct / enum（内联类型）** —— **进入 MIR + TIR，HIR 阶段以内联结构表达**。
+1. **匿名 struct / enum（内联类型）** —— **进入 mir + TIR，HIR 阶段以内联结构表达**。
    - 匿名 struct（类型位置：字段类型 / 返回值 / 局部变量类型）作为**结构类型**（structural，非名义），不分配具名 `@` 符号（避免污染命名空间、不进 `.tmi` 具名导出）。
-   - MIR 计算布局；TIR 用合成名 `%anon_<content-hash>`（结构等价 → 同一名，利于去重）。
+   - mir 计算布局；TIR 用合成名 `%anon_<content-hash>`（结构等价 → 同一名，利于去重）。
    - **否决匿名 enum**（C 式 `enum { A, B }` 提升成员为常量）：保持具名，穷尽性检查依赖具名成员；若需暴露成员用具名 enum + `pub const`。
    - HIR 阶段匿名结构以内联结构描述（字段名 + 类型名引用）表示，不分配具名符号。
 
 2. **泛型 struct / enum / variant（参数化）** —— **确认**：泛型声明在 TT 不占条目，只有单态化后的 concrete 实例占 `%Name_<键>` 条目。
    - mangled 名由 `instantiate_generic` 的键编码（见 `comptime-design.md` Phase E 的 `meta_val_key`）派生。
-   - HIR 阶段泛型声明是模板（具名、字段含类型参数名引用）；MIR 阶段每个实例独立算布局（类型参数已代入）；TIR 每个实例独立 `%Name_<键>`，归属定义点 + `linkonce_odr`（见 `tir-design.md` §4.2.1）。
+   - HIR 阶段泛型声明是模板（具名、字段含类型参数名引用）；mir 阶段每个实例独立算布局（类型参数已代入）；TIR 每个实例独立 `%Name_<键>`，归属定义点 + `linkonce_odr`（见 `tir-design.md` §4.2.1）。
 
 3. **enum 是否支持 payload** —— **否决**。enum 保持 C-like 整数枚举（零成本、C 互操作、匹配为整型 `switch`）；带载荷的和类型统一用 `variant`。已隐含于 §1.2。
 
-4. **variant tag 宽度** —— **默认 i32**（`uint32_t` / LLVM `i32`，通用性 + C 互操作 + 防溢出）；提供 `@repr(u8)` / `@repr(u16)` 属性用于 ≤255 / ≤65535 cases 的紧凑布局。**TIR 记录实际 tag ST（非硬编码 i32）**，MIR 按 `@repr` 算 tag 宽度。已同步精修 §4 / §5 / §9。
+4. **variant tag 宽度** —— **默认 i32**（`uint32_t` / LLVM `i32`，通用性 + C 互操作 + 防溢出）；提供 `@repr(u8)` / `@repr(u16)` 属性用于 ≤255 / ≤65535 cases 的紧凑布局。**TIR 记录实际 tag ST（非硬编码 i32）**，mir 按 `@repr` 算 tag 宽度。已同步精修 §4 / §5 / §9。
 
-5. **递归 variant 经 ptr** —— **要求用户显式写 `*T`**（当前语义锁定）。不隐式 `Box`/`Rc` 间接：t 无 GC / 所有权系统，隐式堆分配违反宪法第 3 条（全行为显式）与第 8 条（零未定义行为 / 无隐式内存分配）。MIR 确认经 ptr 间接；TIR 载荷 ST 为 `ptr<ST>`。
+5. **递归 variant 经 ptr** —— **要求用户显式写 `*T`**（当前语义锁定）。不隐式 `Box`/`Rc` 间接：t 无 GC / 所有权系统，隐式堆分配违反宪法第 3 条（全行为显式）与第 8 条（零未定义行为 / 无隐式内存分配）。mir 确认经 ptr 间接；TIR 载荷 ST 为 `ptr<ST>`。
 
-6. **struct 字段重排** —— **默认保持声明序**（确定性 + C 互操作 + 与 `#[repr(C)]` 心智一致）。提供 `@layout(reorder)` 属性启用 MIR 字段重排（减小 size，仅当类型不逃逸到 FFI）；`@bitpack` 已是显式位域。reorder 属 opt-in 优化 pass（见 `mir-design.md` G3）。
+6. **struct 字段重排** —— **默认保持声明序**（确定性 + C 互操作 + 与 `#[repr(C)]` 心智一致）。提供 `@layout(reorder)` 属性启用 mir 字段重排（减小 size，仅当类型不逃逸到 FFI）；`@bitpack` 已是显式位域。reorder 属 opt-in 优化 pass（见 `mir-design.md` G3）。
 
-7. **variant match 穷尽性检查** —— **补齐**（已落实于 §8）。在 sema / MIR 阶段对 `variant` 的 `match` 做穷尽性分析：必须覆盖所有 case 或缺省 `_`，新增 case 让旧 match 立即报错。variant 是真正的**和类型**，穷尽性是其核心价值（Rust 式）。
+7. **variant match 穷尽性检查** —— **补齐**（已落实于 §8）。在 sema / mir 阶段对 `variant` 的 `match` 做穷尽性分析：必须覆盖所有 case 或缺省 `_`，新增 case 让旧 match 立即报错。variant 是真正的**和类型**，穷尽性是其核心价值（Rust 式）。
 
 8. **空 struct / 单 case variant 的 ABI** —— **统一规则**：
    - **空 struct `struct {}`**：默认 **1 字节占位**（与 C++ / 多数 C ABI 一致，避 LLVM `alloca 0` 坑、数组退化）；`@repr(C_zero)` / `@repr(transparent)` 可选 0 字节。TIR size 默认 1。
    - **单 case variant（无载荷）**：大小 = **tag ST 宽度**（默认 i32 = 4B），无 payload blob，仍保留 tag 字段（与多 case 一致，匹配统一走 `switch(tag)`）。
    - **单 case 带载荷 variant**：tag + payload。
-   - TIR 记录 MIR 算出的实际 size（非固定值）。
+   - TIR 记录 mir 算出的实际 size（非固定值）。
 
 > 注：原 §11 标题编号「11」与所列条目数（8）不一致，本文已按实际 8 项拍板并修正标题。

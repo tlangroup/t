@@ -31,9 +31,9 @@
 
 ## 1. 现有设计已做对的部分（先肯定）
 
-1. **多级 IR 职责单一**：HIR(=ZIR 承重墙) / MIR(优化) / TIR(桥) 各管一段，方向正确。
+1. **多级 IR 职责单一**：HIR(=ZIR 承重墙) / mir(优化) / TIR(线性) / tmir(桥) 各管一段，方向正确。
 2. **物化 TIR 而非 trait**（比 Rust 更狠一步）：换来单一 `.tir` md5 快照 + device 路径复用。这是比 `rustc_codegen_ssa` 更进一步的决策，站得住。
-3. **memory-first 论证扎实**：C 后端无法发 φ 这一条是决定性论据，且 SSA 归 MIR 的分工最优。
+3. **memory-first 论证扎实**：C 后端无法发 φ 这一条是决定性论据，且 SSA 归 mir 的分工最优。
 4. **拆快照键解决单态化实例污染**（§4.2.1）：把"函数区(文件局部)"与"实例区(全局)"拆成两个 md5，是 smart 的隔离手法。
 5. **双序列化 + round-trip 门禁**（§12.1b）：把"两套序列化器语义一致"变成机械判据——正是 TIR 要消灭的那类漂移在序列化层的防御。
 6. **多后端按 profile 选**（Cranelift debug / LLVM release）：与 Rust/Zig 的 2020+ 结论一致。
@@ -52,7 +52,7 @@
 **2020+ 事实**：Rust 2024 的并行前端（+30~50%）根基是 **query 系统**——thread-safe/sharded 缓存、每线程独立分配池、单线程降级 RefCell（1–3% 开销）；其增量架构是 `Fingerprint` + `DefPathHash` + **red-green 算法** + `cache_on_disk_if`。rustc 的"改一行只重编受影响函数"是这套机制的结果，不是单独实现的。
 
 **T 缺的三件事**：
-1. **查询依赖图**：什么查询依赖什么（parse → HIR → Sema → MIR → TIR → codegen）。
+1. **查询依赖图**：什么查询依赖什么（parse → HIR → Sema → mir → TIR → tmir → codegen）。
 2. **变更影响计算**：red-green 式指纹比对，决定哪些查询失效、哪些可复用。
 3. **work-stealing 调度器 + 分片缓存**：把查询映射到线程，缓存分片避免跨线程争用（Rust 实测 8→16 线程反而下降，正是缓存争用所致）。
 
@@ -90,7 +90,7 @@
 
 **现状缺口**：`compiler-pipeline-design.md §4.5 / §7` 把 WASM 标为 `wasm32-wasip1`（core module 层），未触及 Component Model。
 
-**提案**：WASM 目标升级为 **Component Model + WIT emission**——生成 `.wit` 接口定义 + 用 `wasm-tools component new` 产出 component；Canonical ABI 由 TIR→WASM 后端自动生成。这是**有业务相关性、低风险高收益**的具体优化（TIR 已是线性桥，加一层 WIT 发射器即可）。
+**提案**：WASM 目标升级为 **Component Model + WIT emission**——生成 `.wit` 接口定义 + 用 `wasm-tools component new` 产出 component；Canonical ABI 由 tmir→WASM 后端自动生成。这是**有业务相关性、低风险高收益**的具体优化（TIR 已是线性桥，加一层 WIT 发射器即可）。
 
 **落地位置**：`compiler-pipeline-design.md §4.5` WASM 行改写为"Component Model + WIT"；§7 目标矩阵 `wasm32-wasip1` → `wasm32-wasip1`(legacy) + `component`(新)；K 阶段加"WIT 发射器"。
 
@@ -132,15 +132,15 @@
 
 ---
 
-### G-7 中：borrow / 所有权应设计为"可选 MIR 验证 pass"，而非强制类型系统
+### G-7 中：borrow / 所有权应设计为"可选 mir 验证 pass"，而非强制类型系统
 
-**现状**：§11.2 把 borrow 检查框为"MIR 承担 NLL，工作量陡增，建议先透传"——隐含"要么全有要么全无"。
+**现状**：§11.2 把 borrow 检查框为"mir 承担 NLL，工作量陡增，建议先透传"——隐含"要么全有要么全无"。
 
 **2020+ 事实**：Odin / Jai / Lobster / Austral / Cone 把所有权/borrow 当**可选、分离**的验证/检查，不强制进核心类型系统。
 
-**提案**：重框为 **可选 MIR pass**（类强化 lint/verify 层），可开关，**不改 ABI、不阻塞 bootstrap**。把"要安全"与"要能自举"解耦——需要安全时开 pass，不需要时关。这直接降 §11.2 的风险评级。
+**提案**：重框为 **可选 mir pass**（类强化 lint/verify 层），可开关，**不改 ABI、不阻塞 bootstrap**。把"要安全"与"要能自举"解耦——需要安全时开 pass，不需要时关。这直接降 §11.2 的风险评级。
 
-**落地位置**：§11.2 改写为"可选 borrow-verify pass（MIR 层，可开关）"；G 阶段注明"MIR 可挂可选 verify pass"。
+**落地位置**：§11.2 改写为"可选 borrow-verify pass（mir 层，可开关）"；G 阶段注明"mir 可挂可选 verify pass"。
 
 ---
 
@@ -172,7 +172,7 @@
 
 **现状**：TT 管类型 ABI，但没有 CPU 特征/指令可用性矩阵。
 
-**提案**：新增 **`target_desc`**（类 LLVM target triple + feature attrs / Bazel platform constraints），声明 CPU 特征（AVX2/AVX-512/NEON）、OS ABI 变体、data layout。供 **MIR 的 autovectorizer** 与多后端知道可用指令。
+**提案**：新增 **`target_desc`**（类 LLVM target triple + feature attrs / Bazel platform constraints），声明 CPU 特征（AVX2/AVX-512/NEON）、OS ABI 变体、data layout。供 **mir 的 autovectorizer** 与多后端知道可用指令。
 
 **落地位置**：§4.3 后加「`target_desc`」；§4 类型/ABI 区补一行。
 
@@ -180,7 +180,7 @@
 
 ### G-11 打磨：IR 级 FDO 布局（比 BOLT 更便宜）
 
-**提案**：在 TIR/MIR 级用 PGO 数据做**基本块/函数布局**（IR-level FDO layout），拿 BOLT 大部分 icache/TLB 收益，不需 post-link 工具链。作为 BOLT 的更可移植替代/补充。
+**提案**：在 TIR/mir 级用 PGO 数据做**基本块/函数布局**（IR-level FDO layout），拿 BOLT 大部分 icache/TLB 收益，不需 post-link 工具链。作为 BOLT 的更可移植替代/补充。
 
 **落地位置**：§4.6 BOLT 项旁加"IR 级 FDO 布局"。
 
@@ -219,15 +219,20 @@
         └──────────┬───────────┘
                      │  ── 产出 .tmi（typed 模块接口，键=API 指纹）★G-2
                      ▼
-        ┌───────── MIR ─────────┐   中层 IR (CFG + SSA)
+        ┌───────── mir ─────────┐   中层 IR (CFG + SSA)
         │ 显式控制流·drop/所有权 │   中端优化: 内联/常量传播/DCE/
         │ （可选 borrow-verify  │   循环变换/自动向量化/多面体
         │   pass，可开关）★G-7  │   autovectorizer 读 target_desc ★G-10
         └──────────┬───────────┘
                      ▼
-        ┌───────── TIR ─────────┐   类型擦除·线性后端桥 IR ★
+        ┌───────── TIR ─────────┐   类型擦除·线性 IR（mir 与 tmir 之间）
         │ ABI事实集中(TT表)·     │   IR 级 FDO 布局 ★G-11
         │ 存储类型格 ST·slot模型 │
+        └──────────┬───────────┘
+                     ▼
+        ┌───────── tmir ─────────┐   机器中间层：显式 CFG + 机器类型 ST_*
+        │ 仅做转换（TIR→tmir 结构重分组）│   桥接所有薄后端（★本层不承载优化）
+        │ 虚拟 slot·无 φ·无优化    │
         └─────┬──────┬──────┬───┘
         ┌──────┘      │      └───────────────┐
         ▼            ▼                      ▼
@@ -462,7 +467,7 @@
 
 **5.** 开发维护成本：新增语言特性的改动范围可控，测试负担可控
 
-**6. 安全机制可解耦性：** 可选 borrow/所有权 verify pass（MIR 层、可开关、不改 ABI、不阻塞 bootstrap；要安全时开、自举时关，对应 G-7）
+**6. 安全机制可解耦性：** 可选 borrow/所有权 verify pass（mir 层、可开关、不改 ABI、不阻塞 bootstrap；要安全时开、自举时关，对应 G-7）
 
 ***
 
@@ -472,7 +477,7 @@
 
 **1.** conformance suite 的组织与规范对应关系（每条用例可追溯至语言规则条目）
 
-**2.** 各层 lowering 语义等价验证手段（HIR→MIR→TIR→后端的等价性测试/证明）
+**2.** 各层 lowering 语义等价验证手段（HIR→mir→TIR→tmir→后端的等价性测试/证明）
 
 **3.** 差分测试 / 随机 fuzzing 投入与多后端互证（同一输入在不同后端输出行为一致）
 
@@ -521,8 +526,8 @@
 | 维度 | 审查结论（证据） | 主要缺口 | 对应 G-x | 严重度 |
 |---|---|---|---|---|
 | **D1 语言语义** | comptime/CTFE 语义由 `comptime-design.md` 统一（B 式弥漫折叠 + HIR 解释）；TIR 单 lowering 根除 Bug1/Bug2（双后端不一致已结构性消除，D7-2）。`reference.md` 已把 `meta` 统一为 `KwMeta` 保留字、`comptime` 为唯一编译期关键字 | ① 反射能力（D1-7/G-14）规格未预留入口；② panic/unwind 在 TIR 后端的降级模型未定义（D1-6） | G-14（地平线） | 低 |
-| **D2 IR 架构** | HIR/MIR/TIR 三层职责单一、论证扎实；round-trip 双序列化门禁已建模（D2-7）。**最大缺口**：父文档 `compiler-pipeline-design.md` 缺子文档声称的 6 个锚点（§4.2b/§4.3b/§5.1/§5.2/§5.4/§11.2），层间契约不齐 | 父文档悬空引用（子文档"落实 §X"但父文档无该节）；INDEX.md 变更日志却声称已落编——文档治理失真 | G-1/G-2/G-10 | **高（契约断裂）** |
-| **D3 工程性能** | 增量/并行机制完整（HIR 缓存 + `.tmi` + Driver/Query + red-green）；多后端按 profile 选。ML autotuning 搜索空间/缓存已设计 | ① 增量产物正确性未绑定验证门禁（D3-B ↔ D7-8）；② 新增 MIR 层单次编译开销无原型量化（D3-A）；③ ML 决策未纳入 hermetic key（D3-D1） | G-1/G-8 | 中 |
+| **D2 IR 架构** | HIR/mir/TIR 三层职责单一、论证扎实；round-trip 双序列化门禁已建模（D2-7）。**最大缺口**：父文档 `compiler-pipeline-design.md` 缺子文档声称的 6 个锚点（§4.2b/§4.3b/§5.1/§5.2/§5.4/§11.2），层间契约不齐 | 父文档悬空引用（子文档"落实 §X"但父文档无该节）；INDEX.md 变更日志却声称已落编——文档治理失真 | G-1/G-2/G-10 | **高（契约断裂）** |
+| **D3 工程性能** | 增量/并行机制完整（HIR 缓存 + `.tmi` + Driver/Query + red-green）；多后端按 profile 选。ML autotuning 搜索空间/缓存已设计 | ① 增量产物正确性未绑定验证门禁（D3-B ↔ D7-8）；② 新增 mir 层单次编译开销无原型量化（D3-A）；③ ML 决策未纳入 hermetic key（D3-D1） | G-1/G-8 | 中 |
 | **D4 适配与兼容** | 多后端/多目标矩阵清晰；`.tmi` API 指纹稳定性已定义 | ① WASM Component Model 仅 bullet，无 WIT 发射细则 + **无沙箱隔离属性**（D4-3 ↔ D7-10）；② 文本 `.tmi` 格式版本/兼容策略缺失（D4-8 ↔ D8-5） | G-3/G-5/G-10 | 中 |
 | **D5 工具与体验** | 持久会话/JIT（G-4）、TIR/HIR dump 自观测、REPL 已规划 | ① 诊断 IR(SARIF) 跨层 span 贯通设计 **已落编 `diagnostic-ir-design.md`**（D5-1⊕D7），提至 P1；剩余为 CI/SARIF 导出实现与 LSP 集成 | G-9 | 低（设计已闭环，待实现） |
 | **D6 安全与可维护** | 可选 borrow-verify pass（G-7）解耦安全与自举；CTFE 预算护栏（`T_META_BUDGET`）存在 | ① 恶意输入/深嵌套 OOM 无 fuzz 投入与硬上限（D6-1）；② CTFE 沙箱主机资源上限未显式（D6-2） | G-7 | 低中 |
@@ -543,7 +548,7 @@
 
 ### 8.1 三处维度张力（不处理会互相拖累）
 
-1. **D3-A（单次编译性能）vs D2（新增 MIR 层）**：MIR 比当前"双后端直接从 AST 发射"多一层 IR pass，单次编译有回归风险。设计已用"M 阶段透传 → M' 阶段再优化"的分期化解，但**缺原型量化证据**——须在 M 阶段落地前先测"HIR→MIR→TIR→后端"vs"当前双后端"的单次编译耗时基线。
+1. **D3-A（单次编译性能）vs D2（新增 mir 层）**：mir 比当前"双后端直接从 AST 发射"多一层 IR pass，单次编译有回归风险。设计已用"M 阶段透传 → M' 阶段再优化"的分期化解，但**缺原型量化证据**——须在 M 阶段落地前先测"HIR→mir→TIR→tmir→后端"vs"当前双后端"的单次编译耗时基线。
 2. **D3-B（增量机制）vs D7-8（增量正确性）**：最危险张力。增量机制若不被正确性门禁钉死，就是误编译源。→ 见 BP-1。
 3. **D8（远程缓存/供应链）vs D7-8/D3-D**：缓存命中、远端分发的前提是"等价且可信"。等价由 D7-8 保证，可信由 D8-4/8-6 保证；二者缺一则缓存从"加速"变"投毒"。→ 见 BP-1/BP-3。
 
@@ -551,7 +556,7 @@
 
 - **D2(HIR=ZIR) + D1-7(G-14) + D3-B(per-file 缓存)**：HIR 未定型使 per-file 缓存与 comptime 解释编译器自身 IR 同时成立——增量、反射、惰性诊断三赢，是设计最漂亮的协同。
 - **D7-2/D7-5（TIR 单 lowering + round-trip）**：把"双后端一致"从文本巧合升级为结构性必然，一次性消除 Bug1/Bug2 类漂移——D2 物化 TIR 决策的直接正确性回报。
-- **D6-6(G-7) + D2(MIR 层)**：可选 borrow-verify pass 放在 MIR、可开关、不改 ABI、不阻塞自举——把"要安全"与"要能自举"解耦，是 D6 可维护性的范本。
+- **D6-6(G-7) + D2(mir 层)**：可选 borrow-verify pass 放在 mir、可开关、不改 ABI、不阻塞自举——把"要安全"与"要能自举"解耦，是 D6 可维护性的范本。
 
 ### 8.3 最佳结合点（综合裁定，本回合核心结论）
 
@@ -560,7 +565,7 @@
 - **BP-1（P0 交付门槛）· 增量正确性门禁是增量机制的交付门槛** = D3-B ⊕ D7-8 ⊕ D8-4 ⊕ D6
   G-1/G-2 只有在其增量产物被证明**位等价**于 clean 产物时才算优化。落实：red-green 失效完备性测试 + `clean≡incremental` 等价门禁（纳入 CI 阻断）。这把"增量性能"（D3）、"杜绝误编译"（D7）、"远程缓存可信"（D8）、"长期可维护"（D6）钉成一条铁链。→ 已写入 `driver-query-design.md §9`。
 - **BP-2（P1 同一交付包）· WASM Component = 接口发射 + 沙箱隔离验证** = D4-3 ⊕ D7-10 ⊕ D8
-  Component Model 对 ERP 的价值仅在"产物无法逃逸沙箱"时成立。故 `tir→wasm` 不能只产 `.wit`+`.wasm`，须同日定义并验证**沙箱隔离属性**（vWasm 式：仅经声明 ABI 交互、无非法访存）。把"对外兼容"（D4）、"安全边界保持"（D7-10）、"插件供应链信任"（D8）打包交付。→ 已写入 `backend-design.md §3` 并指向独立文档 `wasm-component-design.md`。
+  Component Model 对 ERP 的价值仅在"产物无法逃逸沙箱"时成立。故 `tmir→wasm` 不能只产 `.wit`+`.wasm`，须同日定义并验证**沙箱隔离属性**（vWasm 式：仅经声明 ABI 交互、无非法访存）。把"对外兼容"（D4）、"安全边界保持"（D7-10）、"插件供应链信任"（D8）打包交付。→ 已写入 `backend-design.md §3` 并指向独立文档 `wasm-component-design.md`。
 - **BP-3（P2/P3 三位一体）· learned 优化 = 可复现 + 可审计 + 可回退** = D3-D ⊕ D7-9 ⊕ D8
   任何 ML 决策（GPU autotuning / MLGO）不得 ship，除非：① 模型身份进 hermetic key（D3-D1，保确定性）；② 过正确性回归门禁且可自动回退（D7-9，防误编译）；③ 缓存条目带签名/校验（D8-4/8-6，防投毒）。→ 已写入 `device-design.md §5.1` 治理约束(1)(2)(3)。
 
@@ -595,18 +600,18 @@
 | `supply-chain-design.md` | §7.1 | 新增「CI 供应链门禁」：SBOM/审计/签名/缓存信任分级门禁（D8-1~D8-5） | D8、BP-1/2/3 信任侧 |
 | `ci-gate-design.md` | 全文 | 新建：BP-1/2/3 三向绑定落到 CI 阻断层的门禁矩阵 G-CI-1~G-CI-10 + DAG 执行序 + hermetic action cache + 门禁脚本接口契约 | 跨维度综合落地、BP 实体化 |
 | `.github/workflows/ci.yml` | 全文 | 新建：真实 GitHub Actions 工作流实现上述门禁（bootstrap/ir-roundtrip/incrementality/ctfe-fuzz/diagnose/supply-chain/wasm-component-verify/perf-baseline）；gate.mjs + ir_snapshot.mjs 直跑，其余为接口契约 | 跨维度综合落地、BP 实体化 |
-| `perf-baseline.md` | 全文 | 新建：性能基线方法学 + 实测（前端+sema 中位 13ms / codegen 中位 116ms）+ MIR 落地 G-CI-10 对比接入 | D3-A vs D2 张力证据 |
+| `perf-baseline.md` | 全文 | 新建：性能基线方法学 + 实测（前端+sema 中位 13ms / codegen 中位 116ms）+ mir 落地 G-CI-10 对比接入 | D3-A vs D2 张力证据 |
 | `tools/bench_compile.mjs` | 全文 | 新建：编译性能基准脚本（仅驱动 `tc` 计时，不碰实现） | D3-A 量化工具 |
 
 ### 9.2 留待后续回合（未落编，列入待办）
 
 > 上轮 §9.2 第 1/2/3 项（`wasm-component-design.md` / D8 供应链专项 / 诊断 IR）**本回合已落编**，见 §9.1。以下为仍待推进项：
 
-1. ~~**单次编译性能基线（原型量化）**~~ **已完成（见 §9.1 `perf-baseline.md` / `tools/bench_compile.mjs`）**：实测当前管线「前端+sema 中位 13ms / codegen 中位 116ms」，MIR 落地前后 G-CI-10 阻断阈值 10%，D3-A vs D2 张力转为可量化证据。
+1. ~~**单次编译性能基线（原型量化）**~~ **已完成（见 §9.1 `perf-baseline.md` / `tools/bench_compile.mjs`）**：实测当前管线「前端+sema 中位 13ms / codegen 中位 116ms」，mir 落地前后 G-CI-10 阻断阈值 10%，D3-A vs D2 张力转为可量化证据。
 2. **CTFE fuzz 门禁实现（D6-1/D7-3）**：`comptime-design.md §5.1.1` 已定义 fuzz 门禁规格与 CI 接入，但 `tools/ctfe_fuzz.mjs` 语料生成 + CI 熔断为实现项（接口契约见 `ci-gate-design.md §5`）。
 3. **文档治理闭环（D2 修复根因）**：本回合已通过 `docs/INDEX.md` 变更日志 + 真实落盘复核缓解「父文档不落盘」失真（与 `reference.md` overlay 同源）；仍建议建立「变更日志 ↔ 磁盘真实小节」的自动校验脚本，避免声称已落编而实际悬空复发。
 4. **D8 / G-3 / G-9 门禁脚本实现（CI 接入已完成，实现待排）**：本回合已完成「CI 接入」设计/配置层——四文档 CI 门禁小节 + `ci-gate-design.md` + `.github/workflows/ci.yml`（见 §9.1）；剩余 SBOM 生成、签名流水线、缓存信任校验、WASM 隔离验证、SARIF 导出等**门禁脚本实现**为后续回合，接口契约见 `ci-gate-design.md §5`。
 
 ---
 
-> **本回合（续 7 · 两个同时都做）闭环状态**：用户要求「实现与 CI 接入」与「性能基线量化」两条线同时推进，均已交付。① **CI 接入**：四文档补齐 CI 门禁小节（`comptime §5.1.1` / `wasm-component §4.1` / `diagnostic-ir §5.1` / `supply-chain §7.1`）+ 新建 `ci-gate-design.md`（门禁矩阵 G-CI-1~G-CI-10）+ 真实 `.github/workflows/ci.yml`（GitHub Actions 工作流），把 BP-1/2/3 三向绑定落到 CI 阻断层。② **性能基线**：新建 `tools/bench_compile.mjs` + `perf-baseline.md`，实测前端+sema 中位 13ms / codegen 中位 116ms，MIR 落地前后 G-CI-10 阻断阈值 10%。§9.1 新增 9 处落编、§9.2 第 1 项（性能基线）已完成、第 4 项（CI 接入）已完成、门禁脚本实现与 CTFE fuzz 实现列为后续待办。全部为设计/配置/测量，未触碰编译器实现（沿用「不要编码」裁定）。
+> **本回合（续 7 · 两个同时都做）闭环状态**：用户要求「实现与 CI 接入」与「性能基线量化」两条线同时推进，均已交付。① **CI 接入**：四文档补齐 CI 门禁小节（`comptime §5.1.1` / `wasm-component §4.1` / `diagnostic-ir §5.1` / `supply-chain §7.1`）+ 新建 `ci-gate-design.md`（门禁矩阵 G-CI-1~G-CI-10）+ 真实 `.github/workflows/ci.yml`（GitHub Actions 工作流），把 BP-1/2/3 三向绑定落到 CI 阻断层。② **性能基线**：新建 `tools/bench_compile.mjs` + `perf-baseline.md`，实测前端+sema 中位 13ms / codegen 中位 116ms，mir 落地前后 G-CI-10 阻断阈值 10%。§9.1 新增 9 处落编、§9.2 第 1 项（性能基线）已完成、第 4 项（CI 接入）已完成、门禁脚本实现与 CTFE fuzz 实现列为后续待办。全部为设计/配置/测量，未触碰编译器实现（沿用「不要编码」裁定）。
