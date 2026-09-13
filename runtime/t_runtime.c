@@ -15,6 +15,7 @@
 #include <io.h>
 #include <fcntl.h>
 #include <intrin.h>
+#include <windows.h>
 #endif
 
 // 全局 arena：编译器单 arena 策略，由 t_runtime_set_arena 在 main 入口注入。
@@ -57,16 +58,28 @@ void* t_opt_unwrap(const void* p) {
 // ── Arena 分配器 ───────────────────────────────────────────────
 struct TArena {
     uint8_t* base;
-    size_t   size;
-    size_t   used;
+    size_t   size;       // 预留虚拟空间容量
+    size_t   used;       // 已分配（含对齐）字节数
+    size_t   committed;  // 已提交物理页的字节数（仅 Windows 预留模式使用）
 };
 
 TArena* t_arena_new(void) {
     TArena* a = (TArena*)malloc(sizeof(TArena));
     if (!a) t_fatal("arena: malloc failed");
-    a->size = 512 * 1024 * 1024; // 512 MB：自举编译 12k+ 行（含 XID 表）需要更大 arena
+#ifdef _WIN32
+    // 预留大虚拟空间（不占物理内存），tir 降低超大模块（如完整 tc.tc）时按需提交。
+    // 单一连续虚拟区域保证 a->base + a->used 指针语义与旧 malloc 实现一致。
+    a->size = (size_t)16 * 1024 * 1024 * 1024; // 16 GB 虚拟预留（仅占地址空间，无物理成本）
+    a->base = (uint8_t*)VirtualAlloc(NULL, a->size, MEM_RESERVE, PAGE_READWRITE);
+    if (!a->base) t_fatal("arena: virtual reserve failed");
+    a->committed = 0;
+#else
+    // POSIX 等：保持原单一 malloc 预提交行为（自举在 Windows 上完成）
+    a->size = 512 * 1024 * 1024;
     a->base = (uint8_t*)malloc(a->size);
     if (!a->base) t_fatal("arena: base malloc failed");
+    a->committed = a->size;
+#endif
     a->used = 0;
     return a;
 }
@@ -75,13 +88,29 @@ void* t_arena_alloc(TArena* a, size_t size) {
     // 16 字节对齐
     size_t aligned = (size + 15) & ~(size_t)15;
     if (a->used + aligned > a->size) t_fatal("arena: out of memory");
+#ifdef _WIN32
+    // 按需提交：仅把真正用到的区间从预留转为物理页（64KB 分配粒度对齐）
+    if (a->used + aligned > a->committed) {
+        size_t need = (a->used + aligned) - a->committed;
+        size_t gran = (size_t)64 * 1024;
+        size_t commit = (need + gran - 1) & ~(gran - 1);
+        void* r = VirtualAlloc(a->base + a->committed, commit, MEM_COMMIT, PAGE_READWRITE);
+        if (!r) t_fatal("arena: commit failed");
+        a->committed += commit;
+    }
+#endif
     void* p = a->base + a->used;
     a->used += aligned;
     return p;
 }
 
 void t_arena_free_all(TArena* a) {
-    if (a) { a->used = 0; } // 进程退出时 OS 回收 base
+    if (a) {
+        a->used = 0;
+#ifdef _WIN32
+        a->committed = 0; // 物理页留待进程退出由 OS 回收；下次分配从预留基址重新提交
+#endif
+    }
 }
 
 // ── 通用堆分配（闭包 env / TClosure record）──
