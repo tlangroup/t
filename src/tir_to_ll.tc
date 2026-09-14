@@ -214,12 +214,16 @@ pub fn ll_flush_clo_thunks() void {
         if (is_sret) {
             sb_append_str(g_clo_constbuf, "define void ");
             sb_append_str(g_clo_constbuf, thunk);
-            sb_append_str(g_clo_constbuf, "(ptr %__sret, ptr %__env");
+            sb_append_str(g_clo_constbuf, "(ptr sret(");
+            sb_append_str(g_clo_constbuf, st_to_ll(retst));
+            sb_append_str(g_clo_constbuf, ") %__sret, ptr %__env");
             if (str_len(argstr) > 0) { sb_append_str(g_clo_constbuf, ", "); sb_append_str(g_clo_constbuf, argstr); }
             sb_append_str(g_clo_constbuf, ") {\n");
             sb_append_str(g_clo_constbuf, "  call void ");
             sb_append_str(g_clo_constbuf, sym);
-            sb_append_str(g_clo_constbuf, "(ptr %__sret");
+            sb_append_str(g_clo_constbuf, "(ptr sret(");
+            sb_append_str(g_clo_constbuf, st_to_ll(retst));
+            sb_append_str(g_clo_constbuf, ") %__sret, ptr %__env");
             if (str_len(argstr) > 0) { sb_append_str(g_clo_constbuf, ", "); sb_append_str(g_clo_constbuf, argstr); }
             sb_append_str(g_clo_constbuf, ")\n");
             sb_append_str(g_clo_constbuf, "  ret void\n}\n");
@@ -763,14 +767,16 @@ pub fn ll_maybe_declare(fname: string, retst: string, argsts: []string) void {
     }
     append(g_ll_declared, fname);
     var sb: StringBuilder = sb_new();
+    var sret_ret: bool = ll_needs_sret(retst);
     sb_append_str(sb, "declare ");
-    sb_append_str(sb, st_to_ll(retst));
+    if (sret_ret) { sb_append_str(sb, "void"); } else { sb_append_str(sb, st_to_ll(retst)); }
     sb_append_str(sb, " @");
     sb_append_str(sb, fname);
     sb_append_str(sb, "(");
+    var first: bool = true;
+    if (sret_ret) { sb_append_str(sb, "ptr sret("); sb_append_str(sb, st_to_ll(retst)); sb_append_str(sb, ")"); first = false; }
     var k: i64 = 0;
     var am: i64 = slice_len(argsts) as i64;
-    var first: bool = true;
     while (k < am) {
         if (first == false) { sb_append_str(sb, ", "); }
         sb_append_str(sb, st_to_ll(argsts[k]));
@@ -1028,7 +1034,7 @@ pub fn ll_emit_func(name: string, params: []string, ret: string) void {
     var m: i64 = slice_len(params) as i64;
     var is_env_first: bool = (m >= 2 && params[0] == "$__env" && params[1] == "ptr<void>");
     var is_sret: bool = ll_needs_sret(ret);
-    var use_sret: bool = (is_sret && is_env_first);   // 仅闭包返回结构才显式 sret
+    var use_sret: bool = is_sret;   // 所有聚合返回（>16B 结构）一律显式 sret（ptr sret 首参），与 C runtime/clang ABI 逐字一致
     if (use_sret) { g_cur_sret = base.sb_cat3("%", name, ".sret"); } else { g_cur_sret = ""; }
     var sig: StringBuilder = sb_new();
     sb_append_str(sig, "define ");
@@ -1045,8 +1051,10 @@ pub fn ll_emit_func(name: string, params: []string, ret: string) void {
     sb_append_str(sig, "(");
     var first: bool = true;
     if (use_sret) {
-        // 显式返回槽：调用方把结果槽地址作为首参传入（避免依赖 LLVM 隐式 sret 与 env 在 arg0 冲突）。
-        sb_append_str(sig, "ptr ");
+        // 显式返回槽：调用方把结果槽地址作为首参传入（sret 属性，与 C runtime/clang ABI 一致）。
+        sb_append_str(sig, "ptr sret(");
+        sb_append_str(sig, st_to_ll(ret));
+        sb_append_str(sig, ") ");
         sb_append_str(sig, g_cur_sret);
         first = false;
     }
@@ -2994,7 +3002,9 @@ pub fn ll_emit_inst(inst: TIRInst) void {
             ll_ensure_slot(d, st);
             ll_set_st(d, st);
             var nbargs2: StringBuilder = sb_new();
-            sb_append_str(nbargs2, "ptr ");
+            sb_append_str(nbargs2, "ptr sret(");
+            sb_append_str(nbargs2, st_to_ll(st));
+            sb_append_str(nbargs2, ") ");
             sb_append_str(nbargs2, ll_llname(d));
             sb_append_str(nbargs2, ", ptr null");
             if (nargs > 0) { sb_append_str(nbargs2, ", "); sb_append_str(nbargs2, sb_to_str(argsb)); }
@@ -3002,6 +3012,25 @@ pub fn ll_emit_inst(inst: TIRInst) void {
             sb_append_str(g_ll, fname);
             sb_append_str(g_ll, "(");
             sb_append_str(g_ll, sb_to_str(nbargs2));
+            sb_append_str(g_ll, ")\n");
+            return;
+        }
+        // 非闭包聚合返回（slice 返回函数 append/csv_parse/slice_pop_str/...）：LLVM 走隐式 sret 隐藏指针。
+        // 函数声明为 `define %TSlice @fn(...)`、返回 `ret %TSlice %v`；调用必须把 dst 槽地址作为隐藏 sret 首参传入，
+        // 且调用结果(%r)==sret 指针==dst 槽（callee 已把结构写入该槽），故不得再 ll_store（否则把指针当结构覆盖 → 崩溃）。
+        if (ll_needs_sret(st) && callee_has_env == false) {
+            // 外部/普通聚合返回函数走显式 sret 约定（与声明/定义/运行时 ABI 一致）：
+            // callee 为 `define void @f(ptr sret %f.sret, ...)`，调用把 dst 槽地址作为首个
+            // sret 实参传入；callee 把结构写入该槽，结果即槽内结构（无需 ll_store）。
+            ll_ensure_slot(d, st);
+            ll_set_st(d, st);
+            sb_append_str(g_ll, "  call void @");
+            sb_append_str(g_ll, fname);
+            sb_append_str(g_ll, "(ptr sret(");
+            sb_append_str(g_ll, st_to_ll(st));
+            sb_append_str(g_ll, ") ");
+            sb_append_str(g_ll, ll_llname(d));
+            if (nargs > 0) { sb_append_str(g_ll, ", "); sb_append_str(g_ll, sb_to_str(argsb)); }
             sb_append_str(g_ll, ")\n");
             return;
         }
@@ -3075,7 +3104,9 @@ pub fn ll_emit_inst(inst: TIRInst) void {
             // sret 聚合返回：dst 槽即 sret 指针（首参），env 次之，用户实参再次之
             ll_ensure_slot(d, st);
             ll_set_st(d, st);
-            sb_append_str(argsb, "ptr ");
+            sb_append_str(argsb, "ptr sret(");
+            sb_append_str(argsb, st_to_ll(st));
+            sb_append_str(argsb, ") ");
             sb_append_str(argsb, ll_llname(d));
             sb_append_str(argsb, ", ptr ");
             sb_append_str(argsb, env);
