@@ -1155,8 +1155,17 @@ pub fn tir_make_closure_value(fnref: string, envref: string) string {
     return heap;
 }
 
+// 具名结构体「字段 ST 表」：供 tir_sizeof 计算结构体真实字节尺寸。
+// ⚠ 此前 tir_sizeof 对任意 %Struct 一律兜底返 8 → 空切片字面量 `var zt: []TIRType = []`
+//   的 elem_size 被填成 8（应为 32）→ 后续 append 每元素只拷 8 字节、步长 8 →
+//   读元素时 name.len 读到「下一个元素的 name.ptr」（地址量级）→ memcpy 长度爆炸 →
+//   越界读穿 rdata 直抵 arena 预留区 → ACCESS_VIOLATION（emit-ll 自举崩溃）。
+pub var g_ssz_name: []string;      // "%tir__TIRType" 形态的 TIR 结构体类型名
+pub var g_ssz_fields: [][]string;  // 与上一表并行：各字段的 TIR ST 列表
+var g_ssz_depth: i64 = 0;          // 递归守卫（自引用结构体）
 pub fn tir_add_struct_tt(name: string, field_head: i64) void {
     var sb: StringBuilder = sb_new();
+    var fsts: []string = [];
     var c: i64 = field_head;
     var first: bool = true;
     while (c >= 0) {
@@ -1167,6 +1176,7 @@ pub fn tir_add_struct_tt(name: string, field_head: i64) void {
             var ft: i64 = sema.resolve_type_desc(f.na);
             if (ft >= 0) { fst = tir_st_of_td(ft); }
         }
+        append(fsts, fst);
         if (first == false) { sb_append_str(sb, ", "); }
         sb_append_str(sb, base.sb_cat2(f.sa, ": "));
         sb_append_str(sb, fst);
@@ -1174,6 +1184,8 @@ pub fn tir_add_struct_tt(name: string, field_head: i64) void {
         c = k.next;
     }
     append(g_mod.types, TIRType{ name: base.sb_cat2("%", name), body: sb_to_str(sb) });
+    append(g_ssz_name, base.sb_cat2("%", name));
+    append(g_ssz_fields, fsts);
 }
 
 pub fn tir_add_union_tt(name: string) void {
@@ -3561,11 +3573,27 @@ pub fn tir_flush_defer() void {
     g_tir_defer = z;
 }
 
+var g_membase_st: string = "";   // tir_member_addr 写回的「基底表达式权威类型」，供 tir_member_read 取字段 ST（嵌套 member 必须，避免 tir_expr_st 对 m.i 误判为 i64）
+// 嵌套 member 的基底类型解析（纯字符串路径，不依赖 TD 索引，避免 TD 越界回退 i64 导致字段索引错位）：
+// m.i.b → 基底 m.i 的类型 = tir_field_st(typeof(m), "i") = "%Inner"；再用 "%Inner" 查字段索引。
+pub fn tir_member_base_st(e: i64) string {
+    var n: Node = base.nodes[e];
+    if (n.kind == "member") {
+        var bst: string = tir_member_base_st(n.na);
+        if (str_len(bst) > 0 && bst[0] == '%') {
+            var sname: string = str_slice(bst, 1, str_len(bst));
+            return tir_field_st(sname, n.sa);
+        }
+        return "i64";
+    }
+    return tir_expr_st(e);
+}
 // ══════════════════════════════════════════════════════════════════
 // 字段地址（ptr<ST>）：用于 member 读/写
 pub fn tir_member_addr(mnode: Node) string {
-    var base_st: string = tir_expr_st(mnode.na);
     var base_slotr: TirEmitRes = tir_emit_expr(mnode.na); var base_slot: string = base_slotr.name;
+    var base_st: string = tir_member_base_st(mnode.na);   // 嵌套 member 权威基底类型（字符串路径，绕开 TD 越界回退 i64）
+    g_membase_st = base_st;
     var addr: string = tir_tmp();
     tir_emit(TIRInst{ op: TIR_OP_ADDR_OF, st: tir_st_from_str(base_st), dst: tir_op(addr), args: tir_a1(base_slot), is_comment: false, line: g_cur_line, cmt: "" });
     var sname: string = tir_strip_pct(base_st);
@@ -3638,8 +3666,8 @@ pub fn tir_member_read(e: i64) TirEmitRes {
             return TirEmitRes{ name: d2, st: tir_st_from_str(tir_expr_st(e)) };
         }
     }
-    var base_st: string = tir_expr_st(mnode.na);
     var faddr: string = tir_member_addr(mnode);
+    var base_st: string = g_membase_st;   // 用 tir_member_addr 写回的权威基底类型（嵌套 member 正确）
     var sname: string = tir_strip_pct(base_st);
     var fldst: string = tir_field_st(sname, mnode.sa);
     var ld: string = tir_tmp();
@@ -3659,6 +3687,27 @@ pub fn tir_sizeof(st: string) i64 {
     if (st == "i8" || st == "u8" || st == "bool") { return 1; }
     if (st == "%TStr") { return 16; }
     if (st == "%TSlice") { return 32; }
+    // 具名结构体：按字段 ST 求和 + 8 字节收尾对齐（字段均为 8 字节对齐的 t 布局）。
+    // 若兜底 8，则 []Struct 的 elem_size 恒为 8 → append 步长错 → 读元素错位 → 段错误。
+    if (str_len(st) >= 1 && st[0] == 37) {
+        var i: i64 = 0;
+        var n: i64 = slice_len(g_ssz_name) as i64;
+        while (i < n) {
+            if (g_ssz_name[i] == st) {
+                if (g_ssz_depth >= 4) { return 8; }
+                g_ssz_depth = g_ssz_depth + 1;
+                var tot: i64 = 0;
+                var fs: []string = g_ssz_fields[i];
+                var j: i64 = 0;
+                var m: i64 = slice_len(fs) as i64;
+                while (j < m) { tot = tot + tir_sizeof(fs[j]); j = j + 1; }
+                g_ssz_depth = g_ssz_depth - 1;
+                if (tot <= 8) { return tot; }
+                return tir_round8(tot);
+            }
+            i = i + 1;
+        }
+    }
     return 8;
 }
 

@@ -40,6 +40,7 @@ pub var g_clo_constbuf: StringBuilder;    // 闭包常量全局声明缓冲（�
 pub var g_clo_thunk_req: []string;         // 待生成 thunk 的普通函数名（模块末尾统一生成，确保被包装函数已 emit、ret 已知）
 pub var g_cur_sret: string = "";          // 当前函数若以 sret 返回聚合（>16B struct），记录 sret 槽名；否则空串
 pub var g_ll_struct_fieldtys: [][]string; // 用户聚合类型名 → 字段存储类型列表（并行 g_ll_struct_types），供 sizeof 计算
+pub var g_memcpy_declared: bool = false;
 pub var g_ll_valptr: []string;   // 槽名集合：内容为「值字节指针(val_ptr，如 tll_map_val_ptr 返回值)」。
                                   // load 此类槽须解引用（load ptr, ptr (load ptr, ptr %x)）取回真正的值；
                                   // 普通 ptr 槽（如 map_new 句柄）load 只取槽中值本身，两者均属 ptr 类型故需显式标记区分。
@@ -87,6 +88,7 @@ pub fn ll_reset() void {
     g_ll_struct_fieldtys = [];
     g_ll_valptr = [];
     g_ll_addrslot = [];
+    g_memcpy_declared = false;
 }
 
 // @name 是否为已声明的函数（避免把函数名误当作全局变量声明）
@@ -204,8 +206,14 @@ pub fn ll_flush_clo_thunks() void {
         var first: bool = true;
         while (pi < pn) {
             if (first == false) { sb_append_str(argsb, ", "); }
-            sb_append_str(argsb, st_to_ll(params[pi]));
-            sb_append_str(argsb, " %__p");
+            if (ll_needs_byval(params[pi])) {
+                sb_append_str(argsb, "ptr byval(");
+                sb_append_str(argsb, st_to_ll(params[pi]));
+                sb_append_str(argsb, ") %__p");
+            } else {
+                sb_append_str(argsb, st_to_ll(params[pi]));
+                sb_append_str(argsb, " %__p");
+            }
             sb_append_i64(argsb, pi);
             first = false;
             pi = pi + 1;
@@ -307,7 +315,13 @@ pub fn ll_load(tname: string, st: string) string {
         // ⚠ 全局是值类型（struct/slice/i64…）但调用方按指针取（reqst 为 ptr<…>）→ 返回全局地址，不 load。
         // 否则（全局本身是 ptr 变量，或调用方要值）才 load 出值。否则会把结构体值当 ptr 传入 → "expected ptr"。
         // ⚠ 必须用 reqst（覆写前的请求类型）判定：gst 为 '%' 结构体时会把 st 覆写成值类型，导致丢失 ptr 信号。
-        if (gst != "" && ll_starts(gst, "ptr") == false && ll_starts(reqst, "ptr")) {
+        // ⚠ 句柄型全局（StringBuilder 等：类型串以 '*' 结尾，如 %TSb*）本身就是指针值，
+        // 即便调用方按 ptr 取也必须 load 出句柄本身，不可返回槽位地址：
+        // 返回 &slot 会让 shim 把「槽位」当 TSb 结构体读，b->arena 落到槽位相邻字节（常为 0）
+        // → t_arena_alloc(NULL) → ACCESS_VIOLATION READ @0x10。
+        var gst_is_ptr: bool = ll_starts(gst, "ptr");
+        if (str_len(gst) >= 1 && str_slice(gst, str_len(gst) - 1, str_len(gst)) == "*") { gst_is_ptr = true; }
+        if (gst != "" && gst_is_ptr == false && ll_starts(reqst, "ptr")) {
             return "@" + ll_mangle(gnm);
         }
         var r: string = ll_tmp();
@@ -534,6 +548,32 @@ pub fn ll_needs_sret(st: string) bool {
     if (st == "void" || str_len(st) == 0) { return false; }
     if (ll_starts(st, "%") || ll_starts(st, "[")) { return ll_sizeof_st(st) > 16; }
     return false;
+}
+
+// 按值传参的 byval 阈值：与 sret 同理，聚合按 Win64 寄存器预算判定。
+// 参数有 4 个整数寄存器(RCX/RDX/R8/R9)，故 ≤32B 聚合(如 %TSlice=32B)可直接按值传(占满 4 寄存器)；
+// >32B(如 %tir__TIRModule)超出寄存器预算，须走 byval 隐藏指针——否则被当成寄存器值解包 → 字段被指针覆盖崩溃。
+// 返回/参数分别用 >16(2 寄存器对) / >32(4 寄存器)，与 Win64 ABI 寄存器数一致。
+pub fn ll_needs_byval(st: string) bool {
+    if (str_len(st) == 0) { return false; }
+    if (ll_starts(st, "%") || ll_starts(st, "[") || ll_starts(st, "arr<") || ll_starts(st, "vec<")) {
+        return ll_sizeof_st(st) > 32;
+    }
+    return false;
+}
+
+// call 实参 IR：>32B 聚合走 byval(传槽地址)；其余按值 load。
+pub fn ll_call_arg_ir(a: string, pst: string, v: string) string {
+    if (ll_needs_byval(pst)) {
+        return base.sb_cat5("ptr byval(", st_to_ll(pst), ")", " ", ll_llname(a));
+    }
+    return base.sb_cat3(st_to_ll(pst), " ", v);
+}
+
+// declare 用的形参类型串：>32B 聚合补 byval 属性（st_to_ll 对未知串原样透传 → 合法 IR "ptr byval(%T)"）。
+pub fn ll_declarg_ty(pst: string) string {
+    if (ll_needs_byval(pst)) { return base.sb_cat3("ptr byval(", st_to_ll(pst), ")"); }
+    return pst;
 }
 
 // LLVM 标量整数类型判定（st_to_ll 结果）。用于 bitcast 在 i64↔ptr 时改发 inttoptr/ptrtoint
@@ -1064,8 +1104,14 @@ pub fn ll_emit_func(name: string, params: []string, ret: string) void {
         var pname: string = params[i];
         var pst: string = params[i + 1];
         if (first == false) { sb_append_str(sig, ", "); }
-        sb_append_str(sig, st_to_ll(pst));
-        sb_append_str(sig, " ");
+        if (ll_needs_byval(pst)) {
+            sb_append_str(sig, "ptr byval(");
+            sb_append_str(sig, st_to_ll(pst));
+            sb_append_str(sig, ") ");
+        } else {
+            sb_append_str(sig, st_to_ll(pst));
+            sb_append_str(sig, " ");
+        }
         sb_append_str(sig, ll_llname(pname));
         sb_append_str(sig, ".in");
         first = false;
@@ -1080,13 +1126,28 @@ pub fn ll_emit_func(name: string, params: []string, ret: string) void {
         var pst: string = params[i + 1];
         ll_ensure_slot(pname, pst);
         ll_set_st(pname, pst);
-        sb_append_str(g_ll, "  store ");
-        sb_append_str(g_ll, st_to_ll(pst));
-        sb_append_str(g_ll, " ");
-        sb_append_str(g_ll, ll_llname(pname));
-        sb_append_str(g_ll, ".in, ptr ");
-        sb_append_str(g_ll, ll_llname(pname));
-        sb_append_str(g_ll, "\n");
+        if (ll_needs_byval(pst)) {
+            // byval：%x.in 是调用方副本指针；拷贝进本地 slot %x（下游按 alloca 取字段，无需改动）。
+            if (g_memcpy_declared == false) {
+                g_memcpy_declared = true;
+                sb_append_str(g_ll_declbuf, "declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)\n");
+            }
+            sb_append_str(g_ll, "  call void @llvm.memcpy.p0.p0.i64(ptr ");
+            sb_append_str(g_ll, ll_llname(pname));
+            sb_append_str(g_ll, ", ptr ");
+            sb_append_str(g_ll, ll_llname(pname));
+            sb_append_str(g_ll, ".in, i64 ");
+            sb_append_str(g_ll, base.i2s(ll_sizeof_st(pst)));
+            sb_append_str(g_ll, ", i1 false)\n");
+        } else {
+            sb_append_str(g_ll, "  store ");
+            sb_append_str(g_ll, st_to_ll(pst));
+            sb_append_str(g_ll, " ");
+            sb_append_str(g_ll, ll_llname(pname));
+            sb_append_str(g_ll, ".in, ptr ");
+            sb_append_str(g_ll, ll_llname(pname));
+            sb_append_str(g_ll, "\n");
+        }
         i = i + 2;
     }
 }
@@ -1154,6 +1215,26 @@ pub fn ll_emit_builtin(cn: string, toks: []string) bool {
         ll_ensure_slot(d, "i32"); ll_set_st(d, "i32"); ll_store(d, "i32", r);
         return true;
     }
+    if (cn == "file_write_all") {
+        // ⚠ 必须走 tll_ shim：native t_file_write_all 的签名是 (const char*, TStr)，
+        // 而 TIR 传来的实参是两个 %TStr。若按 ll_runtime_callee 的 t_ 前缀直发
+        // `call i8 @t_file_write_all(%TStr, %TStr)`，Win64 下 path 取到第一个 TStr 的 ptr（碰巧可用），
+        // content 却被解释成 {第一个TStr.len, 第二个TStr.ptr} → content.ptr 变成路径长度
+        // （如 21=0x15）→ fwrite 从 0x15 读 → ACCESS_VIOLATION READ。改走 tll_file_write_all(ptr, ptr)。
+        var fp: string = ll_llname(toks[4]);
+        var fc: string = ll_llname(toks[5]);
+        ll_maybe_declare("tll_file_write_all", "i32", ["ptr", "ptr"]);
+        var rw: string = ll_tmp();
+        sb_append_str(g_ll, "  ");
+        sb_append_str(g_ll, rw);
+        sb_append_str(g_ll, " = call i32 @tll_file_write_all(ptr ");
+        sb_append_str(g_ll, fp);
+        sb_append_str(g_ll, ", ptr ");
+        sb_append_str(g_ll, fc);
+        sb_append_str(g_ll, ")\n");
+        ll_ensure_slot(d, "i32"); ll_set_st(d, "i32"); ll_store(d, "i32", rw);
+        return true;
+    }
     if (cn == "str_len") {
         var ap: string = ll_llname(toks[4]);
         ll_maybe_declare("tll_str_len", "i64", ["ptr"]);
@@ -1206,6 +1287,33 @@ pub fn ll_emit_builtin(cn: string, toks: []string) bool {
         sb_append_str(g_ll, ap);
         sb_append_str(g_ll, ")\n");
         ll_ensure_slot(d, "i64"); ll_set_st(d, "i64"); ll_store(d, "i64", r);
+        return true;
+    }
+    if (cn == "slice_set") {
+        // ⚠ 必须走 tll_slice_set(ptr, i64, ptr)：切片按指针传、元素按指针传。
+        // 若按值传 %TSlice(32B)/%base__Node(巨结构)，Win64 调用约定错配——
+        // 调用方把 32B 结构按寄存器拆分传入，被调 C 函数 t_slice_set 按隐藏指针
+        // (rcx=栈上副本地址) 解读 → s 被当成「指向结构的指针」解引用 →
+        // 读到字符串字面量地址、len=4 → 越界 panic（init_anndefs 自举门禁炸点）。
+        // 与 append/slice_len 一致：切片与元素均按 ptr 传（tll_slice_set 内部 *s 写入）。
+        var slicest: string = ll_get_st(toks[4]);
+        var sliceptr: string;
+        if (ll_starts(slicest, "ptr<") || slicest == "ptr") {
+            sliceptr = ll_load(toks[4], slicest);
+        } else {
+            sliceptr = ll_llname(toks[4]);
+        }
+        var iv: string = ll_load(toks[5], "i64");
+        var elemptr: string = ll_map_argptr(toks[6], ll_get_st(toks[6]));
+        ll_maybe_declare("tll_slice_set", "void", ["ptr", "i64", "ptr"]);
+        sb_append_str(g_ll, "  call void @tll_slice_set(ptr ");
+        sb_append_str(g_ll, sliceptr);
+        sb_append_str(g_ll, ", i64 ");
+        sb_append_str(g_ll, iv);
+        sb_append_str(g_ll, ", ptr ");
+        sb_append_str(g_ll, elemptr);
+        sb_append_str(g_ll, ")\n");
+        ll_ensure_slot(d, "i64"); ll_set_st(d, "i64"); ll_store(d, "i64", "0");
         return true;
     }
     if (cn == "sb_new") {
@@ -2907,6 +3015,7 @@ pub fn ll_emit_inst(inst: TIRInst) void {
         // 运行库内建（t_args/t_exit/t_file_write_all…）以 t_<name> 导出，裸名发射 → 链接期 undefined symbol。
         // 用户函数（ll_is_func 为真）/tll_* shim/llvm.* 内建保持不变；其余 extern 补 t_ 前缀（sys_run 已由其 builtin 分支处理）。
         fname = ll_runtime_callee(fname);
+        var callee_params: []string = ll_lookup_params(fname);
         var argsb: StringBuilder = sb_new();
         var declargs: []string = [];
         var first: bool = true;
@@ -2924,10 +3033,36 @@ pub fn ll_emit_inst(inst: TIRInst) void {
                     sb_append_str(argsb, clo);
                     append(declargs, "ptr<void>");
                 } else {
-                    if (first == false) { sb_append_str(argsb, ", "); }
-                    sb_append_str(argsb, "ptr ");
-                    sb_append_str(argsb, ll_load(a, "ptr<void>"));
-                    append(declargs, "ptr<void>");
+                    // 非函数全局实参：tll_ shim 一律按指针传地址；其余按全局存储类型判定：
+                    // 聚合(slice/struct/arr/vec)按值 load（callee 是值形参，LLVM 自动 by-ref）；
+                    // 标量/指针变量按地址传（与旧行为一致）。
+                    if (ll_starts(fname, "tll_")) {
+                        if (first == false) { sb_append_str(argsb, ", "); }
+                        sb_append_str(argsb, "ptr ");
+                        sb_append_str(argsb, ll_load(a, "ptr<void>"));
+                        append(declargs, "ptr<void>");
+                    } else {
+                        // 非函数、非 tll_ shim 的全局实参：按全局真实存储类型取「值」传，对齐通用路径 3006-3034。
+                        // ⚠ 不再剥离 ptr<：指针全局(@g: ptr<X>)须按「指针值」传（load ptr, ptr @g 出的 ptr），
+                        //    否则剥离成内部类型会传错值/类型错配。聚合(%/arr</vec<)按值 load；标量/指针按值 load。
+                        var gst0: string = ll_get_st(a);
+                        var vst: string = gst0;
+                        var is_agg: bool = (ll_starts(vst, "%") || ll_starts(vst, "arr<") || ll_starts(vst, "vec<"));
+                        if (first == false) { sb_append_str(argsb, ", "); }
+                        if (is_agg) {
+                            var v: string = ll_load(a, vst);
+                            sb_append_str(argsb, ll_call_arg_ir(a, vst, v));
+                            append(declargs, ll_declarg_ty(vst));
+                        } else {
+                            // BUG A 修复：标量/指针全局实参须按「值」传，不能按「地址」传。
+                            // 旧代码 ll_load(a,"ptr<void>") 会命中 ll_load 的地址返回分支
+                            // （reqst 为 ptr → 返回 @g 地址），导致 cur_t()→tk_t(pos) 把 @lex__pos 的地址当 i64 索引 → t_slice_at 越界。
+                            // 现改为 ll_load(a, vst) 取真值（i64 load 出的值 / ptr load 出的指针值），与通用路径一致。
+                            var v: string = ll_load(a, vst);
+                            sb_append_str(argsb, ll_call_arg_ir(a, vst, v));
+                            append(declargs, ll_declarg_ty(vst));
+                        }
+                    }
                 }
                 first = false;
                 nargs = nargs + 1;
@@ -2945,12 +3080,49 @@ pub fn ll_emit_inst(inst: TIRInst) void {
                 ki = ki + 1;
                 continue;
             }
-            var v: string = ll_load(a, ast);
+            // 全局聚合(slice/struct/arr/vec)变量作实参：LLVM 对聚合参数自动 by-ref，
+            // 调方必须传「值」（load 出 %TSlice 等）；若直接传全局地址 ptr @g，callee 会把
+            // 8 字节指针当整个结构解引用 → 读垃圾崩溃。仅当被调形参确为 ptr<聚合> 时才传地址。
+            // 用 tir_callee_param_td 取被调形参类型（与 emit 顺序无关，读 TIR 声明）；
+            // 取不到则默认按值 load（覆盖 slice 按值传递这一最常见情形）。
+            var pst: string = ast;
+            var v: string;
+            var a_is_global: bool = (str_len(a) >= 1 && a[0] == 64) || ll_is_global(a);
+            if (a_is_global) {
+                var gst0: string = ll_get_st(a);
+                var vst: string = gst0;
+                if (ll_starts(vst, "ptr<")) { vst = str_slice(vst, 4, str_len(vst) - 1); }
+                var is_agg: bool = (ll_starts(vst, "%") || ll_starts(vst, "arr<") || ll_starts(vst, "vec<"));
+                if (is_agg) {
+                    var cnm: string = callee;
+                    if (str_len(cnm) >= 1 && cnm[0] == 64) { cnm = str_slice(cnm, 1, str_len(cnm)); }
+                    var ptd: i64 = tir_callee_param_td(cnm, ki - 1);
+                    var callee_wants_ptr: bool = false;
+                    if (ptd >= 0) {
+                        var cpst2: string = tir_st_to_str(ptd);
+                        // TIR 把 slice/struct 值形参编码为 ptr<%TSlice>/ptr<%TStr>/ptr<%X>，
+                        // LL 发射时归一化为 %TSlice 等值形参（by-ref）；只有 ptr<标量/指针>
+                        // （即非 ptr<%…>）才是真正的指针形参（如 ptr<i64>/ptr<void>）。
+                        if (ll_starts(cpst2, "ptr<") && ll_starts(cpst2, "ptr<%") == false) {
+                            callee_wants_ptr = true;
+                        }
+                    }
+                    if (callee_wants_ptr) {
+                        v = ll_llname(a);            // 传全局地址
+                        pst = tir_st_to_str(ptd);
+                    } else {
+                        v = ll_load(a, vst);         // 按值 load 出结构
+                        pst = vst;
+                    }
+                } else {
+                    v = ll_load(a, ast);
+                }
+            } else {
+                v = ll_load(a, ast);
+            }
             if (first == false) { sb_append_str(argsb, ", "); }
-            sb_append_str(argsb, st_to_ll(ast));
-            sb_append_str(argsb, " ");
-            sb_append_str(argsb, v);
-            append(declargs, ast);
+            sb_append_str(argsb, ll_call_arg_ir(a, pst, v));
+            append(declargs, ll_declarg_ty(pst));
             first = false;
             nargs = nargs + 1;
             ki = ki + 1;
@@ -2986,7 +3158,6 @@ pub fn ll_emit_inst(inst: TIRInst) void {
         // 闭包(env 首参)函数才需要传 env；普通函数无 env 形参（与旧轨 codegen_ll 逐字一致，
         // 旧轨仅对 n.sb 非空的合成闭包函数前置 ptr %__env）。此前误用 ll_is_func（对所有已定义函数为真）
         // 给普通函数调用也塞 ptr null env，导致签名多一个实参、ABI 错乱。
-        var callee_params: []string = ll_lookup_params(fname);
         var callee_has_env: bool = (slice_len(callee_params) >= 2 && callee_params[0] == "$__env" && callee_params[1] == "ptr<void>");
         if (callee_has_env) {
             var nbargs: StringBuilder = sb_new();
@@ -3134,9 +3305,7 @@ pub fn ll_emit_inst(inst: TIRInst) void {
             var ast: string = ll_get_st(a);
             var v: string = ll_load(a, ast);
             sb_append_str(argsb, ", ");
-            sb_append_str(argsb, st_to_ll(ast));
-            sb_append_str(argsb, " ");
-            sb_append_str(argsb, v);
+            sb_append_str(argsb, ll_call_arg_ir(a, ast, v));
             ki = ki + 1;
         }
         if (ll_needs_sret(st)) {
@@ -3292,7 +3461,14 @@ pub fn ll_emit_inst(inst: TIRInst) void {
         var b1: string = ll_tmp();
         sb_append_str(g_ll, "  ");
         sb_append_str(g_ll, b1);
-        sb_append_str(g_ll, " = icmp ne i32 ");
+        sb_append_str(g_ll, " = icmp ");
+        // ⚠ tll_str_eq 返回 1 表示相等：`==` 取 ne 0，`!=` 取 eq 0。
+        //    二者共用本分支，此前恒写 ne 0 → 字符串 `!=` 被静默编译成 `==`
+        //    （自举期 parse_unit 的 `while (lex.cur_t() != "Eof")` 因此永假，
+        //     整个 decl_list/nodes 为 0，LLVM 自托管 emit-ll 只产出空模块）。
+        if (o == TIR_OP_NE) { sb_append_str(g_ll, "eq"); }
+        else { sb_append_str(g_ll, "ne"); }
+        sb_append_str(g_ll, " i32 ");
         sb_append_str(g_ll, r);
         sb_append_str(g_ll, ", 0\n");
         ll_ensure_slot(d, "i1");
@@ -3631,9 +3807,10 @@ pub fn ll_trim(s: string) string {
 
 pub fn ll_emit_type_line(line: string) void {
     var eq: i64 = ll_find(line, " = struct {");
+    if (eq < 0) { eq = ll_find(line, " = type {"); }
     if (eq < 0) { return; }
     var name: string = ll_trim(str_slice(line, 0, eq));
-    // 记录已在 types: 段声明为 struct 的命名类型，供 ll_register_named_type 跳过（避免误判为 i64 标量）。
+    // 记录已在 types: 段声明为 struct/type 的命名类型(兼容 "= struct {" 旧式与 "= type {" 新式)，供 ll_register_named_type 跳过（避免误判为 i64 标量）。
     var sn: i64 = slice_len(g_ll_struct_types) as i64;
     var si: i64 = 0;
     var sseen: bool = false;
@@ -3703,9 +3880,19 @@ pub fn ll_emit_opaque_defs() void {
             if (seen == false) {
                 var pat: string = base.sb_cat3("%", name, " = type");
                 if (ll_find(text, pat) < 0) {
+                    // 已知按值使用的运行期结构必须给具体布局：%TSb 由 sb_new 返回、作全局 g_ll，
+                    // 若 emit 为 type opaque，按值返回/取址会 ABI 错乱 → 崩溃。其余 %T* 仅作 ptr 用，维持 opaque。
+                    var lay: string = "";
+                    if (name == "TSb") { lay = "{ ptr, i64, i64, ptr }"; }
                     sb_append_str(buf, "%");
                     sb_append_str(buf, name);
-                    sb_append_str(buf, " = type opaque\n");
+                    if (str_len(lay) > 0) {
+                        sb_append_str(buf, " = type ");
+                        sb_append_str(buf, lay);
+                        sb_append_str(buf, "\n");
+                    } else {
+                        sb_append_str(buf, " = type opaque\n");
+                    }
                     append(g_opaque_emitted, name);
                 }
             }
@@ -3996,3 +4183,4 @@ pub fn ll_emit_main_wrapper() void {
     }
     sb_append_str(g_ll, "}\n");
 }
+
