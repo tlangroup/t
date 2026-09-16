@@ -68,11 +68,17 @@ function run(cmd, args, opts = {}) {
 }
 
 function compileC(outDir, exeName) {
+    // 关键修复：自举种子（tc1/tc2/tc3）默认继承 Windows 1MB 栈，
+    // 而编译器自身超大源在 sema 的「类型推断/解析」环（infer_expr → resolve_ti →
+    // ti_equal → infer_expr）会做数千层深递归，在 1MB 下 STATUS_STACK_OVERFLOW(127)。
+    // C 后端产品被 clang -O2 编译时 TCO 能折叠尾递归不溢出，但 cl /Od 不 TCO ⇒ 必须
+    // 显式放大栈。与 tc.tc:683（build 产物）/ gate.mjs:287（cself 产品）的 /STACK 一致。
     run(msvc.cl, [
         "/nologo", "/std:c11", "/utf-8", "/Od",
         `/I${RUNTIME}`, `/I${outDir}`,
         join(outDir, "tc.c"), join(RUNTIME, "t_runtime.c"),
         `/Fo${outDir}\\`, `/Fe${join(outDir, exeName)}`,
+        "/link", "/STACK:268435456", "/LARGEADDRESSAWARE",
     ], { env: msvc.env });
     return join(outDir, exeName);
 }
