@@ -503,8 +503,12 @@ pub fn ll_is_struct_type(st: string) bool {
     return false;
 }
 
-// 聚合返回 ABI：Windows x64 上 >16 字节的结构体必须经 sret 隐藏指针返回（参数表 arg0 让位给 sret），
-// ≤16 字节（如 %TStr/%TClosure）按 Win64 约定在 RAX:RDX 寄存器对返回，无需 sret。
+// 聚合返回 ABI（Win64 / Microsoft x64 calling convention）：
+// ≤8B 结构在 RAX 单寄存器返回；>8B 且 ≤16B 的结构（16B 的 %TStr/%TClosure）在 RAX:RDX 寄存器对返回；
+// >16B 的结构（32B 的 %TSlice、更大的 %tir__TIRModule 等）必须经由 sret 隐藏指针返回（首参让位给 sret 槽地址）。
+// 阈值取 >16 与 MSVC/clang 编译 C runtime 的 ABI 逐字一致：t_str_slice / t_file_read_all 等返回 %TStr 的
+// 运行时函数按 RAX:RDX 返回（非 sret），编译器若误用 sret 会把返回值错位 → TStr.len 读到垃圾 → arena 2^47 OOM。
+// ⚠ 此前误改为 >8，把 16B %TStr/%TClosure 也强行 sret，与 C runtime 的 RAX:RDX 返回约定冲突，致自举 OOM。
 // 旧轨（codegen_ll）对聚合返回函数不加 env 形参，sret 隐式占用 arg0 因此工作；
 // 新轨统一前置 `ptr %__env.in` 会与 sret 隐式指针在 arg0 冲突 → 必须显式 sret 并把 env 后移。
 pub fn ll_sizeof_st(st: string) i64 {
@@ -546,14 +550,17 @@ pub fn ll_sizeof_st(st: string) i64 {
 
 pub fn ll_needs_sret(st: string) bool {
     if (st == "void" || str_len(st) == 0) { return false; }
+    // Win64：>16 字节聚合必须 sret 返回（≤16B 的 %TStr/%TClosure 在 RAX:RDX 返回，无需 sret）。
     if (ll_starts(st, "%") || ll_starts(st, "[")) { return ll_sizeof_st(st) > 16; }
     return false;
 }
 
-// 按值传参的 byval 阈值：与 sret 同理，聚合按 Win64 寄存器预算判定。
-// 参数有 4 个整数寄存器(RCX/RDX/R8/R9)，故 ≤32B 聚合(如 %TSlice=32B)可直接按值传(占满 4 寄存器)；
-// >32B(如 %tir__TIRModule)超出寄存器预算，须走 byval 隐藏指针——否则被当成寄存器值解包 → 字段被指针覆盖崩溃。
-// 返回/参数分别用 >16(2 寄存器对) / >32(4 寄存器)，与 Win64 ABI 寄存器数一致。
+// 按值传参的 byval 阈值（Win64 / Microsoft x64 calling convention）：Win64 有 4 个整数寄存器
+// (RCX/RDX/R8/R9)，一个 8B 对齐的结构体每 8B 占一个寄存器。≤32B 聚合（%TSlice=32B）正好填满
+// 4 个寄存器、按值传；>32B（%tir__TIRModule）超出寄存器预算，必须走 byval 隐藏指针——否则被当成
+// 寄存器值解包 → 字段被指针覆盖崩溃。阈值取 >32 与 MSVC/clang 编译 C runtime 的 ABI 逐字一致。
+// ⚠ 此前误改为 >8，把 16B %TStr/%TClosure 也强行 byval，与 C runtime 的「≤16B 按值传(RAX:RDX)」
+// 约定冲突，致自举 OOM（read_file 返回的 %TStr 被按指针误读 → 2^47）。
 pub fn ll_needs_byval(st: string) bool {
     if (str_len(st) == 0) { return false; }
     if (ll_starts(st, "%") || ll_starts(st, "[") || ll_starts(st, "arr<") || ll_starts(st, "vec<")) {
@@ -562,7 +569,7 @@ pub fn ll_needs_byval(st: string) bool {
     return false;
 }
 
-// call 实参 IR：>32B 聚合走 byval(传槽地址)；其余按值 load。
+// call 实参 IR：>8B 聚合走 byval(传槽地址)；其余按值 load。
 pub fn ll_call_arg_ir(a: string, pst: string, v: string) string {
     if (ll_needs_byval(pst)) {
         return base.sb_cat5("ptr byval(", st_to_ll(pst), ")", " ", ll_llname(a));
@@ -570,7 +577,7 @@ pub fn ll_call_arg_ir(a: string, pst: string, v: string) string {
     return base.sb_cat3(st_to_ll(pst), " ", v);
 }
 
-// declare 用的形参类型串：>32B 聚合补 byval 属性（st_to_ll 对未知串原样透传 → 合法 IR "ptr byval(%T)"）。
+// declare 用的形参类型串：>8B 聚合补 byval 属性（st_to_ll 对未知串原样透传 → 合法 IR "ptr byval(%T)"）。
 pub fn ll_declarg_ty(pst: string) string {
     if (ll_needs_byval(pst)) { return base.sb_cat3("ptr byval(", st_to_ll(pst), ")"); }
     return pst;
@@ -1065,16 +1072,15 @@ pub fn ll_emit_func(name: string, params: []string, ret: string) void {
     ll_set_curfn(name); // 重置后再置当前函数前缀
     g_ll_tmpc = 0;
     append(g_ll_func_rets, ret);
-    // 聚合返回 ABI：>16B 结构经 sret 隐藏指针返回。
-    // 关键：仅当「函数同时是闭包(env 首参)且返回结构」时才用显式 sret 槽——此时 sret 占 arg0、env 后移 arg1，
-    // 不冲突。普通函数（无 env）一律不加 env、交给 LLVM 自动 sret（与旧轨 codegen_ll 行为逐字一致，旧轨即为
-    // `define %TSlice @t.first3()` 由 LLVM 在 arg0 自动插入 sret 隐藏指针）。
-    // ⚠ 此前错误：对所有非闭包函数无条件前置 `ptr %__env.in`，导致该 env 占位 arg0 与 LLVM 自动 sret
-    // 隐藏指针冲突 → 返回 %TSlice 的函数签名 ABI 错乱、运行期崩溃。
+    // 聚合返回 ABI（Win64）：>8B 结构一律经显式 sret 隐藏指针返回（ptr sret(...) 首参），
+    // 与 declare / call / 运行时 C ABI 逐字一致。无论是否闭包（env 首参），返回槽都用同一套 sret 机制；
+    // 闭包时 sret 占 arg0、env 占 arg1，普通函数 sret 占 arg0、无 env，二者不冲突。
+    // ⚠ 此前错误：对所有非闭包函数无条件前置 `ptr %__env.in`，导致该 env 占位 arg0 与 sret
+    // 隐藏指针冲突 → 返回 %TSlice 的函数签名 ABI 错乱、运行期崩溃；且阈值误用 >16 让 16B 结构按值返回在 -O0 miscompile。
     var m: i64 = slice_len(params) as i64;
     var is_env_first: bool = (m >= 2 && params[0] == "$__env" && params[1] == "ptr<void>");
     var is_sret: bool = ll_needs_sret(ret);
-    var use_sret: bool = is_sret;   // 所有聚合返回（>16B 结构）一律显式 sret（ptr sret 首参），与 C runtime/clang ABI 逐字一致
+    var use_sret: bool = is_sret;   // 所有聚合返回（>8B 结构）一律显式 sret（ptr sret 首参），与 C runtime/clang Win64 ABI 逐字一致
     if (use_sret) { g_cur_sret = base.sb_cat3("%", name, ".sret"); } else { g_cur_sret = ""; }
     var sig: StringBuilder = sb_new();
     sb_append_str(sig, "define ");
@@ -2842,7 +2848,12 @@ pub fn ll_emit_inst(inst: TIRInst) void {
             gtypename = ll_ptr_inner(pst);
             pv = ll_load(p, pst);
         } else {
-            gtypename = st_to_ll(st);
+            // ⚠ 基址 p 是结构体「值」（非 ptr< 指针）：GEP 基类型必须是「父结构体类型」，
+            // 绝不能是字段类型 st_to_ll(st)。若用字段类型当基（如 getelementptr %TStr, ... i32 K），
+            // 偏移会按字段类型宽度计算（K*sizeof(字段)），对含嵌套聚合(16B %TStr/%TSlice)的结构体，
+            // 后续字段偏移全错位 → 读写到错误字节 → TStr.len 读到指针值 → arena 2^47 OOM。
+            // 指针情形已由上层 ll_ptr_inner 取父类型；值情形直接取 pst（即父结构体名）。
+            gtypename = pst;
             pv = ll_llname(p);
         }
         var r: string = ll_tmp();
@@ -4150,14 +4161,14 @@ pub fn ll_emit_main_wrapper() void {
     sb_append_str(g_ll, "  call void @t_runtime_init(i32 %argc, ptr %argv)\n");
     sb_append_str(g_ll, "  %a = call ptr @t_arena_new()\n");
     sb_append_str(g_ll, "  call void @t_runtime_set_arena(ptr %a)\n");
-    sb_append_str(g_ll, "  call void @t.__ginit(ptr null)\n");
+    sb_append_str(g_ll, "  call void @t.__ginit()\n");
     // wrapper 必须按入口函数真实返回类型调用 @t.<main>，否则与 define 的返回类型不匹配
     // （如 fn main() i64 → define i64 @t.main，但此前硬编码 call i32 触发 LLVM 未定义行为/崩溃）。
     // @main 自身恒返回 i32（进程退出码），故在此把真实返回值收敛到 i32。
     if (g_main_ret == "void") {
         sb_append_str(g_ll, "  call void @t.");
         sb_append_str(g_ll, g_main_fn);
-        sb_append_str(g_ll, "(ptr null)\n");
+        sb_append_str(g_ll, "()\n");
         sb_append_str(g_ll, "  call void @t_runtime_done()\n");
         sb_append_str(g_ll, "  ret i32 0\n");
     } else {
@@ -4166,7 +4177,7 @@ pub fn ll_emit_main_wrapper() void {
         sb_append_str(g_ll, rt_ll);
         sb_append_str(g_ll, " @t.");
         sb_append_str(g_ll, g_main_fn);
-        sb_append_str(g_ll, "(ptr null)\n");
+        sb_append_str(g_ll, "()\n");
         sb_append_str(g_ll, "  call void @t_runtime_done()\n");
         // 整数类返回类型 → trunc 到 i32；i32 本身无需 trunc（LLVM 禁止 trunc 到同类型，否则
         // 生成非法 `trunc i32 %r to i32` → clang -c 失败，连带一大批 fn main() i32 示例整体挂掉）。
