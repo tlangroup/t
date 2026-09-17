@@ -2867,6 +2867,36 @@ pub fn ll_emit_inst(inst: TIRInst) void {
             dstst = base.sb_cat3("ptr<", st, ">");
         }
         if (str_len(x) >= 1 && x[0] == 64) { ll_register_global(str_slice(x, 1, str_len(x)), ll_ptr_inner(st)); }
+        // ⚠ 源已是「地址」时禁止物化副本：切片元素访问（TIR_OP_SLICE_AT / STR_AT）与已发射
+        // 的 alloca 槽，其登记类型本就是 ptr/ptr<…>。若按下方 st（值类型，如 %P）去 ensure，
+        // 会先把元素值 load 出来、物化成临时副本再取址 —— 于是 `s[i].f = v` 只改了副本，
+        // 且没有 slice_set 写回 → 写入静默丢失。这是 LLVM 后端编译编译器自身失败的
+        // 根因：`nodes[d].bc = true` 从不生效 → 跨模块 pub 判定恒假 → src/tc.tc 报
+        // 17956 条 T-MOD-E558。判据见 examples/_slicefield.tc（写入失效返回 1）。
+        var xst0: string = ll_get_st(x);
+        // ⚠ 只在「取聚合字段」时直传指针（st 为 `%` 结构体/TStr/TSlice）。
+        // 无条件放行会误伤 map：map 句柄槽登记类型也是 ptr，对其取址期望的是
+        // 「句柄变量的地址」，直传会退化成句柄值本身 → map_put 参数错
+        // （map_advanced / map_assign 回归）。
+        if ((ll_starts(xst0, "ptr<") || xst0 == "ptr") && ll_starts(st, "%")) {
+            ll_ensure_slot(d, dstst);
+            ll_set_st(d, dstst);
+            // ⚠ 不能直接把 ll_load(...) 的返回值拼进 store：它返回的是「已发射指令的
+            // 文本 + 寄存器名」（多行），嵌进 store 会产出畸形 IR（`store ptr   %x = load ...`）。
+            // 这里手写 load：先取出 x 槽里的指针值，再存给 d。
+            var pv0: string = ll_tmp();
+            sb_append_str(g_ll, "  ");
+            sb_append_str(g_ll, pv0);
+            sb_append_str(g_ll, " = load ptr, ptr ");
+            sb_append_str(g_ll, ll_llname(x));
+            sb_append_str(g_ll, "\n");
+            sb_append_str(g_ll, "  store ptr ");
+            sb_append_str(g_ll, pv0);
+            sb_append_str(g_ll, ", ptr ");
+            sb_append_str(g_ll, ll_llname(d));
+            sb_append_str(g_ll, "\n");
+            return;
+        }
         // ⚠ 飞地规避 + SLOT no-op 后：被取地址的局部槽（如固定数组 var b:[5]i64，仅经 &b[i] 引用）
         // 不会经 store/load 惰性分配，必须在此显式 ensure，否则其 tll_alloc 堆分配永不发射 → undefined。
         if (str_len(x) >= 1 && x[0] == 36) { ll_ensure_slot(x, st); }
