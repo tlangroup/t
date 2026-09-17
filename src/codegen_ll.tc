@@ -4090,6 +4090,17 @@ pub fn ll_local_decl(name: string, td: i64, init_e: i64) void {
         llfa(base.sb_cat4("  ", vn, " = alloca ", ty));
     }
     var t0: TD = sema.tds[td];
+    // ── 零初始化兜底 ────────────────────────────────────────────────
+    // t 语义保证 `var x: T;`（无初始化式）初值为全 0。此前 LLVM 后端只发
+    // alloca 不 store 0，局部变量读到的是栈上垃圾；C 后端发 `T x = {0}` 故一直正确。
+    // 这是「LLVM 后端产物编译编译器自身即行为错乱」的根因：sema 的各类计数器 /
+    // 标志位读出脏值 —— -O0 下表现为循环上界失控 → 深递归爆栈（exit 127），
+    // -O1/-O2 下优化器把 UB 常量化 → 空诊断 + exit 1 早退。
+    // 位置：alloca 之后、各类型初始化分支之前；后续初始化（含 slice_new /
+    // map_new / 数组逐元素 store）会覆盖它，故有初值的变量语义不变。
+    if (str_len(ty) > 0 && t0.cat != "array") {
+        llfb(base.sb_cat6("  store ", ty, " ", ll_zero(ty), ", ptr ", vn));
+    }
     // 定长数组：先整体零初始化，再按 GEP 逐元素 store
     if (t0.cat == "array") {
         llfb(base.sb_cat6("  store ", ty, " ", ll_zero(ty), ", ptr ", vn));

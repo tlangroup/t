@@ -165,7 +165,17 @@ const steps = [
         },
     },
     {
+        id: "irverify", lv: 0, name: "IR 静态审计 (调用签名 / 括号平衡)",
+        run: async () => {
+            const r = await node("ir_verify.mjs", join(ROOT, "out", "dbg", "g1.ll"));
+            const nerr = (r.out.match(/^\s+ERROR /gm) || []).length;
+            const nwarn = (r.out.match(/^\s+WARN  /gm) || []).length;
+            return { ok: r.code === 0, note: nerr + " 处非法 IR, " + nwarn + " 处类型不符(仅告警)" };
+        },
+    },
+    {
         id: "snapshot", lv: 0, name: "产物快照比对 (ll + c 双后端)",
+
         run: async () => {
             const r = await node("ir_snapshot.mjs", "--compiler", `${G1}.exe`);
             ctx.irClean = r.code === 0;
@@ -248,10 +258,10 @@ const steps = [
         // 不随 irClean 跳过：对拍基线必须随每次提交累积，否则退化为一次性数字。
         id: "diffpipe", lv: 1, name: "双轨对拍 (旧轨 LLVM vs 新轨 TIR, warn)",
         run: async () => {
-            const r = await node("_diffpipe.mjs", "--mode", "dbg", "--jobs", "4");
+            const r = await node("_diffpipe.mjs", "--mode", "dbg", "--jobs", "4", "--strict");
             const lines = r.out.split("\n").filter((l) => l.startsWith("_diffpipe:"));
             const summary = lines.length ? lines[lines.length - 1].replace(/^_diffpipe:\s*/, "") : lastLine(r.out, 2);
-            return { ok: true, warn: true, note: summary };
+            return { ok: r.code === 0, note: summary };
         },
     },
     {

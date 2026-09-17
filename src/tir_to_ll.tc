@@ -288,6 +288,34 @@ pub fn ll_ensure_slot(name: string, st: string) void {
     sb_append_str(g_ll, ll_emit_alloca(name, st));
 }
 
+// 取切片/字符串基底的「结构地址」(ptr <inner>)，供 tll_slice_at / tll_str_at 使用。
+//   - 局部切片变量：base 即 alloca 地址 → 直接可用；
+//   - 全局切片：@g 即全局地址 → 直接可用；
+//   - member 字段读取 / call 返回值：base 是「值」(inner 值寄存器)，须 alloca+store 物化地址，
+//     否则把值当 ptr 传入 → tll_slice_at 解引用读垃圾 len/cap → 越界 panic。
+// inner 为聚合类型名（%TSlice / %TStr 等）。
+pub fn ll_slice_base_addr(base: string, inner: string) string {
+    if (str_len(base) >= 1 && base[0] == 64) { return ll_llname_ptr(base); }   // 全局变量 → 地址
+    if (ll_is_emitted(base)) { return ll_llname_ptr(base); }                  // 已 emit 的 alloca → 地址
+    // base 是「值」(member 读取 / call 返回值) → 物化地址：alloca inner + store 值
+    var baslot: string = ll_tmp();
+    ll_ensure_slot(baslot, inner);
+    ll_set_st(baslot, inner);
+    sb_append_str(g_ll, "  ");
+    sb_append_str(g_ll, baslot);
+    sb_append_str(g_ll, " = alloca ");
+    sb_append_str(g_ll, inner);
+    sb_append_str(g_ll, "\n");
+    sb_append_str(g_ll, "  store ");
+    sb_append_str(g_ll, inner);
+    sb_append_str(g_ll, " ");
+    sb_append_str(g_ll, ll_llname_ptr(base));
+    sb_append_str(g_ll, ", ptr ");
+    sb_append_str(g_ll, baslot);
+    sb_append_str(g_ll, "\n");
+    return baslot;
+}
+
 // 取 $x 承载值的 LLVM 寄存器（load 出 alloca）
 pub fn ll_load(tname: string, st: string) string {
     var dn: string = tname;   // ⚠ 飞地规避：同 ll_store，缓存避免 clobber
@@ -2565,6 +2593,17 @@ pub fn ll_emit_inst(inst: TIRInst) void {
         var dst: string = inst.dst.name;
         var src: string = inst.args[0].name;
         var sgst: string = ll_get_st(src);
+        // 目标为聚合（%TStr / %st.Pt / %TSlice …）的 bitcast：语义是「值搬运」，不是
+        // 「取地址」。此前与标量同路：要么把值槽的地址当结果（`ret %TStr <ptr>`），要么把
+        // %Pt 槽按回落的 i64 load 再 inttoptr（`ret %Pt <ptr>`）—— clang -c 均报错。
+        // ⚠ 源的登记类型不可靠（match 结果槽 __mres 常被登记成 i64），故一律按目标类型取值。
+        if (ll_starts(dstst0, "%") && ll_starts(sgst, "arr<") == false && ll_starts(sgst, "vec<") == false && ll_starts(sgst, "ptr") == false && sgst != "ptr") {
+            var bv: string = ll_load(src, dstst0);
+            ll_ensure_slot(dst, dstst0);
+            ll_set_st(dst, dstst0);
+            ll_store(dst, dstst0, bv);
+            return;
+        }
         var src_is_ptr: bool = ll_starts(sgst, "ptr<") || sgst == "ptr" ||
                                 ll_starts(sgst, "arr<") || ll_starts(sgst, "vec<");
         var dstst_eff: string = dstst0;
@@ -2581,6 +2620,11 @@ pub fn ll_emit_inst(inst: TIRInst) void {
             srcv = ll_load(src, sgst);
         } else if (ll_starts(sgst, "arr<") || ll_starts(sgst, "vec<")) {
             srcv = ll_llname_ptr(src);
+        } else if (ll_starts(sgst, "%")) {
+            // 聚合（%TSlice / %TStr / 结构体）：值由 alloca 承载，转换源应是它的「地址」。
+            // 此前与标量同路、把 % 类型谎报成 i64 → 发出非法 `inttoptr i64 %agg to ptr`
+            // （clang -c 直接报错，波及 agent_* / atom / clause / cli / match / slice_literal_arg）。
+            srcv = ll_slice_base_addr(src, st_to_ll(sgst));
         } else {
             var sgll: string = st_to_ll(sgst);
             if (ll_starts(sgll, "%")) { sgll = "i64"; }
@@ -2588,7 +2632,7 @@ pub fn ll_emit_inst(inst: TIRInst) void {
         }
         var t: string = ll_tmp();
         var srcLlTy: string;
-        if (sgst == "ptr" || ll_starts(sgst, "ptr<") || ll_starts(sgst, "arr<") || ll_starts(sgst, "vec<")) {
+        if (sgst == "ptr" || ll_starts(sgst, "ptr<") || ll_starts(sgst, "arr<") || ll_starts(sgst, "vec<") || ll_starts(sgst, "%")) {
             srcLlTy = "ptr";
         } else {
             srcLlTy = st_to_ll(sgst);
@@ -3633,7 +3677,7 @@ pub fn ll_emit_inst(inst: TIRInst) void {
         sb_append_str(g_ll, "  ");
         sb_append_str(g_ll, r);
         sb_append_str(g_ll, " = call ptr @tll_slice_at(ptr ");
-        sb_append_str(g_ll, ll_llname_ptr(base));
+        sb_append_str(g_ll, ll_slice_base_addr(base, "%TSlice"));
         sb_append_str(g_ll, ", i64 ");
         sb_append_str(g_ll, iv);
         sb_append_str(g_ll, ")\n");
@@ -3665,7 +3709,7 @@ pub fn ll_emit_inst(inst: TIRInst) void {
         sb_append_str(g_ll, "  ");
         sb_append_str(g_ll, r);
         sb_append_str(g_ll, " = call i64 @tll_str_at(ptr ");
-        sb_append_str(g_ll, ll_llname_ptr(base));
+        sb_append_str(g_ll, ll_slice_base_addr(base, "%TStr"));
         sb_append_str(g_ll, ", i64 ");
         sb_append_str(g_ll, iv);
         sb_append_str(g_ll, ")\n");

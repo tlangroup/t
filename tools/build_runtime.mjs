@@ -25,8 +25,18 @@ function findClang() {
 const clang = findClang();
 if (!clang) { console.error("build_runtime: clang not found"); process.exit(2); }
 const clangDir = dirname(clang);
-const ar = join(clangDir, "llvm-ar.exe");
-if (!existsSync(ar)) { console.error("build_runtime: llvm-ar not found"); process.exit(2); }
+// 坑：findClang() 可能命中 PATH 上的裸 "clang"，此时 dirname 为 "."，
+// join(".", "llvm-ar.exe") 恒不存在 → 误报 "llvm-ar not found"（dbg 版
+// t_runtime.lib 因此长期未被构建，diffpipe 新轨 69 例全部 link 失败）。
+// 必须依次回落：clang 同目录 → PATH。
+function resolveAr(dir) {
+  for (const c of [join(dir, "llvm-ar.exe"), join(dir, "llvm-ar"), "llvm-ar.exe", "llvm-ar"]) {
+    try { execFileSync(c, ["--version"], { stdio: "pipe" }); return c; } catch {}
+  }
+  return null;
+}
+const ar = resolveAr(clangDir);
+if (!ar) { console.error("build_runtime: llvm-ar not found"); process.exit(2); }
 
 const modes = [
   { name: "dbg", opt: "-O0" },

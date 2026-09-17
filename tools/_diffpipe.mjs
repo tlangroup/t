@@ -69,6 +69,12 @@ function findClang() {
 }
 const CLANG = findClang();
 const RTLIB = join(ROOT, "out", mode, "deps", "t_runtime.lib");
+// 缺库不能静默：否则每个用例都只表现为 "link failed"，69 例全红却看不出是同一个
+// 基础设施原因（曾因此误判为「TIR 新轨 0/69 全错」）。显式致命退出并给出修复命令。
+if (!existsSync(RTLIB)) {
+    console.error(`_diffpipe: FATAL 运行时静态库缺失: ${RTLIB}\n_diffpipe: 先执行 node tools/build_runtime.mjs 再重跑`);
+    process.exit(2);
+}
 const OLD = join(ROOT, "out", mode, "diffpipe", "old");
 const NEW = join(ROOT, "out", mode, "diffpipe", "new");
 mkdirSync(OLD, { recursive: true });

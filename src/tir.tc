@@ -493,6 +493,143 @@ pub fn tir_emit(inst: TIRInst) void {
     if (inst.op == TIR_OP_BR || inst.op == TIR_OP_BR_COND || inst.op == TIR_OP_RET || inst.op == TIR_OP_RET_VOID) { g_term = true; }
 }
 
+// ── T0：TIR 发射期校验器（TIR-VERIFY）─────────────────────────────────
+// 动机：后端静默错编（结构体槽位错位 / 空操作数 / 未登记具名类型）在「发射那一刻」
+// 是完全可见的，却要等到运行时 arena OOM 或 exit 127 才以无位置信号浮现。
+// 本校验器在「TIR 发射完成后、翻译为 LLVM 之前」做低成本结构自检，把静默错编
+// 变成带函数名与行号的显式错误。
+// 开关：环境变量 T_TIR_VERIFY=1（仅报告）|=fail（有错即 exit 3）。未设置 → 零开销。
+
+pub var g_tir_verify_on: bool = false;
+pub var g_tir_verify_errs: i64 = 0;
+
+pub fn tir_verify_init() void {
+    var v: string = getenv("T_TIR_VERIFY");
+    if (str_len(v) > 0) { g_tir_verify_on = true; }
+    g_tir_verify_errs = 0;
+}
+
+pub fn tir_verify_report(code: string, msg: string) void {
+    if (g_tir_verify_on == false) { return; }
+    g_tir_verify_errs = g_tir_verify_errs + 1;
+    eprint(base.sb_cat4("TIR-VERIFY ", code, ": ", base.sb_cat2(msg, "\n")));
+}
+
+// sname（不含 % ）是否为已声明结构体；返回声明字段数，-1 = sema 未登记。
+pub fn tir_verify_field_count(sname: string) i64 {
+    var fh: i64 = sema.find_struct_fields(sname);
+    if (fh < 0) { return -1; }
+    var c: i64 = 0;
+    var cur: i64 = fh;
+    while (cur >= 0) {
+        var k: Child = base.kids[cur];
+        c = c + 1;
+        cur = k.next;
+    }
+    return c;
+}
+
+pub fn tir_verify_has_field(fh: i64, fname: string) bool {
+    var c: i64 = fh;
+    while (c >= 0) {
+        var k: Child = base.kids[c];
+        var ff: Node = base.nodes[k.val];
+        if (ff.sa == fname) { return true; }
+        c = k.next;
+    }
+    return false;
+}
+
+// tname（含 % ）是否已登记于 g_mod.types（内建 %TStr/%TSlice/%TClosure 等在此）。
+pub fn tir_verify_in_types(tname: string) bool {
+    var i: i64 = 0;
+    var n: i64 = slice_len(g_mod.types) as i64;
+    while (i < n) {
+        var ty: TIRType = g_mod.types[i];
+        if (ty.name == tname) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+pub fn tir_verify_inst(fname: string, inst: TIRInst) void {
+    if (g_tir_verify_on == false) { return; }
+    if (inst.is_comment) { return; }
+    var na: i64 = slice_len(inst.args) as i64;
+    var tn: string = tir_st_to_str(inst.st);
+    // V001/V002：具名结构体构造的槽位契约（后端按 "i32 <arg_index>" 落槽）
+    if (inst.op == TIR_OP_STRUCT_NEW) {
+        if (str_len(tn) > 1) {
+            if (tn[0] == 37) {
+                var sname: string = str_slice(tn, 1, str_len(tn) as i64);
+                var fc: i64 = tir_verify_field_count(sname);
+                if (fc < 0) {
+                    if (tir_verify_in_types(tn) == false) {
+                        tir_verify_report("V002", base.sb_cat3(base.sb_cat2(fname, ": "), "未知具名类型 ", tn));
+                    }
+                } else {
+                    if (na > fc) {
+                        tir_verify_report("V001", base.sb_cat3(base.sb_cat4(fname, ": ", tn, " 实参 "), base.i2s(na), base.sb_cat2(" > 声明字段 ", base.i2s(fc))));
+                    }
+                    var c5: i64 = sema.find_struct_fields(sname);
+                    var i5: i64 = 0;
+                    while (c5 >= 0) {
+                        var k5: Child = base.kids[c5];
+                        if (i5 < na) {
+                            var f5: Node = base.nodes[k5.val];
+                            var fst5: string = tir_st_of_td(sema.resolve_type_desc(f5.na));
+                            var ast5: string = tir_st_to_str(inst.args[i5].st);
+                            if (str_len(fst5) > 1) {
+                                if (str_len(ast5) > 1) {
+                                    if (fst5[0] == 37) {
+                                        if (ast5[0] == 37) {
+                                            if (fst5 != ast5) {
+                                                tir_verify_report("V005", base.sb_cat4(fname, ": ", tn, base.sb_cat4(" 字段#", base.i2s(i5 + 1), " 期望 ", base.sb_cat3(fst5, " 实参 ", ast5))));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        i5 = i5 + 1;
+                        c5 = k5.next;
+                    }
+                }
+            }
+        }
+    }
+    // V003：空操作数 → 直接产出非法 IR
+    var k: i64 = 0;
+    while (k < na) {
+        var a: TirOperand = inst.args[k];
+        if (str_len(a.name) == 0) {
+            tir_verify_report("V003", base.sb_cat3(base.sb_cat2(fname, ": 空操作数 arg#"), base.i2s(k), base.sb_cat3(" (line ", base.i2s(inst.line as i64), ")")));
+        }
+        k = k + 1;
+    }
+}
+
+pub fn tir_verify_module() i64 {
+    if (g_tir_verify_on == false) { return 0; }
+    var fi: i64 = 0;
+    var nf: i64 = slice_len(g_mod.funcs) as i64;
+    while (fi < nf) {
+        var f: TIRFunc = g_mod.funcs[fi];
+        var bi: i64 = 0;
+        var nb: i64 = slice_len(f.body) as i64;
+        while (bi < nb) {
+            tir_verify_inst(f.name, f.body[bi]);
+            bi = bi + 1;
+        }
+        fi = fi + 1;
+    }
+    eprint(base.sb_cat3("TIR-VERIFY: ", base.i2s(g_tir_verify_errs), " error(s)\n"));
+    if (g_tir_verify_errs > 0) {
+        if (getenv("T_TIR_VERIFY") == "fail") { exit(3); }
+    }
+    return g_tir_verify_errs;
+}
+
 pub fn tir_emit_ret_void() TIRInst {
     var __a: []TirOperand = [];
     return TIRInst{ op: TIR_OP_RET_VOID, st: ST_NONE, dst: tir_op(""), args: __a, is_comment: false, line: g_cur_line, cmt: "" };
@@ -1268,6 +1405,7 @@ pub fn tir_annotate_types(mod: string) void {
 
 pub fn lower_unit(mod: string, source: string) void {
     tir_reset();
+    tir_verify_init();
     if (g_recording_mir) { g_mir = TIRModule{ mod: mod, source: source, types: [], strings: [], funcs: [], globals: [] }; }
     g_mod.mod = mod;
     g_mod.source = source;
@@ -3423,33 +3561,79 @@ pub fn tir_cast_slot(src: string, src_stc: i64, dst_st: string) string {
 pub fn tir_emit_struct_lit(e: i64) TirEmitRes {
     var n: Node = base.nodes[e];
     // 目标存储类型：具名结构体字面量名在 n.sa（与 codegen_c.tc:789 / ll_etd struct_lit 分支对齐，
-    // 类型名即 TT 条目名）；匿名（n.sa 空）退回 meta 推断（tir-design.md §7 named → %Name）。
+    // 类型名即 TT 条目名）；匿名（n.sa 空）退回 meta 推断（tir-design.md §7 named -> %Name）。
     var target_st: string = "i64";
     if (str_len(n.sa) > 0) { target_st = base.sb_cat2("%", n.sa); }
     else { target_st = tir_expr_st(e); }
     var d: string = tir_tmp();
     var __sl_args: []TirOperand = [];
     var fc: i64 = n.la;
+    // ⚠ 具名字面量：TIR_OP_STRUCT_NEW 的后端以 "i32 0, i32 <arg_index>" GEP 把实参按
+    // **声明槽位**落槽，故 __sl_args 必须是声明序。字面量书写序可能与声明序不同
+    // （如 TIRFunc{name,ret_st,params,body} vs 声明 name,params,ret_st,body），
+    // 直接按书写序 append 会让 params/ret_st 互换 -> 切片 len 读垃圾 -> arena OOM。
+    // 故先按书写序收集 (字段名 -> 值槽名)，再沿声明字段链表顺序归位。
+    var fnames: []string = [];
+    var fvals: []string = [];
+    var fvalsts: []i64 = [];
     while (fc >= 0) {
         var k: Child = base.kids[fc];
         // 字段以 FV（field-value）节点存储：na = 字段值表达式（见 base.mk_FV）；
         // 直接 emit FV 节点会落到 unsupported 兜底，故必须解包到其 .na 值子节点。
         var fv: Node = base.nodes[k.val];
         var fs: string;
+        var fst: i64 = 0;
         if (str_len(n.sa) > 0 && base.nodes[fv.na].kind == "map_lit") {
             // ⚠ map 字面量作具名结构体字段值：tir_emit_expr 落到 map_lit 分支时 force_td=-1，
-            // tir_expr_td 不可靠 → untyped 兜底返回 0 指针。显式用字段类型 TD 构造。
+            // tir_expr_td 不可靠 -> untyped 兜底返回 0 指针。显式用字段类型 TD 构造。
             var ftd: i64 = tir_field_td(n.sa, fv.sa);
             if (ftd >= 0 && sema.tds[ftd].cat == "map") {
-                var fsrm: TirEmitRes = tir_emit_map_lit(fv.na, ftd); fs = fsrm.name;
+                var fsrm: TirEmitRes = tir_emit_map_lit(fv.na, ftd); fs = fsrm.name; fst = fsrm.st;
             } else {
-                var fsr2: TirEmitRes = tir_emit_expr(fv.na); fs = fsr2.name;
+                var fsr2: TirEmitRes = tir_emit_expr(fv.na); fs = fsr2.name; fst = fsr2.st;
             }
         } else {
-            var fsr: TirEmitRes = tir_emit_expr(fv.na); fs = fsr.name;
+            var fsr: TirEmitRes = tir_emit_expr(fv.na); fs = fsr.name; fst = fsr.st;
         }
-        append(__sl_args, tir_op(fs));
+        append(fnames, fv.sa);
+        append(fvals, fs);
+        append(fvalsts, fst);
         fc = k.next;
+    }
+    var fh: i64 = -1;
+    if (str_len(n.sa) > 0) { fh = sema.find_struct_fields(n.sa); }
+    if (fh >= 0) {
+        // 按声明顺序归位；未提供值的字段直接跳过（槽位保持 zeroinitializer，
+        // 避免发射空操作数 -> 非法 IR）。
+        var c: i64 = fh;
+        var matched: i64 = 0;
+        while (c >= 0) {
+            var kk: Child = base.kids[c];
+            var ff: Node = base.nodes[kk.val];
+            var vv: string = "";
+            var vst: i64 = 0;
+            var j: i64 = 0;
+            while (j < slice_len(fnames) as i64) {
+                if (fnames[j] == ff.sa) { vv = fvals[j]; vst = fvalsts[j]; matched = matched + 1; }
+                j = j + 1;
+            }
+            if (str_len(vv) > 0) { append(__sl_args, tir_op_st(vv, vst)); }
+            c = kk.next;
+        }
+        // V004：具名字面量写入了非声明字段 —— 位置落槽后端会把它静默错位。
+        if (matched < slice_len(fnames) as i64) {
+            var q: i64 = 0;
+            while (q < slice_len(fnames) as i64) {
+                if (tir_verify_has_field(fh, fnames[q]) == false) {
+                    tir_verify_report("V004", base.sb_cat2(base.sb_cat2(n.sa, " 具名字面量含非声明字段: "), fnames[q]));
+                }
+                q = q + 1;
+            }
+        }
+    } else {
+        // 匿名字面量 / 查不到声明：退回书写序（原行为）
+        var j2: i64 = 0;
+        while (j2 < slice_len(fvals) as i64) { append(__sl_args, tir_op(fvals[j2])); j2 = j2 + 1; }
     }
     tir_emit(TIRInst{ op: TIR_OP_STRUCT_NEW, st: tir_st_from_str(target_st), dst: tir_op(d), args: __sl_args, is_comment: false, line: g_cur_line, cmt: "" });
     return TirEmitRes{ name: d, st: tir_st_from_str(target_st) };

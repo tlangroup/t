@@ -223,6 +223,17 @@ pub fn ll_alloca_st(dn: string) string {
     return "";
 }
 
+// 返回槽 name 是否已被发射为 alloca（即 name 是「地址」而非「值寄存器」）。
+// 用于切片/字符串下标时区分局部切片变量(地址，可直接传给 tll_slice_at)与
+// member 字段读取 / call 返回值(值寄存器，须 alloca+store 物化地址)。
+pub fn ll_is_emitted(name: string) bool {
+    name = ll_llname(name);
+    var n: i64 = slice_len(g_ll_emitted) as i64;
+    var i: i64 = 0;
+    while (i < n) { if (g_ll_emitted[i] == name) { return true; } i = i + 1; }
+    return false;
+}
+
 pub fn ll_set_st(name: string, st: string) void {
     name = ll_llname(name);
     var n: i64 = slice_len(g_ll_names) as i64;
@@ -269,6 +280,12 @@ pub fn ll_emit_alloca(tname: string, st: string) string {
         sb_append_str(sb, " = call ptr @tll_alloc(i64 ");
         sb_append_str(sb, tname);
         sb_append_str(sb, ".bytes)\n");
+        // tll_alloc = 裸 malloc，不清零；`var y: [N]T;` 的元素必须显式置零。
+        sb_append_str(sb, "  store ");
+        sb_append_str(sb, llt);
+        sb_append_str(sb, " zeroinitializer, ptr ");
+        sb_append_str(sb, tname);
+        sb_append_str(sb, "\n");
         var r: string = sb_to_str(sb);
         sb_free(sb);
         return r;
@@ -281,7 +298,13 @@ pub fn ll_emit_alloca(tname: string, st: string) string {
     // ⚠ 聚合槽零初始化：所有 `%` 命名聚合类型（slice/string/结构体/Map/闭包）的无初始化器局部
     // alloca 后若不置零，其内含的指针字段（slice 的 data/len/cap、Map 句柄、闭包 env、结构体里的
     // slice 字段）会被读成垃圾 → t_slice_append / t_str_* / map_* 撑爆 arena 或越界。
-    if (ll_starts(st, "%")) {
+    // ⚠ 局部槽零初始化：所有类型（聚合 `%TSlice`/`%TStr`/结构体/Map/闭包 **以及标量**）
+    // 的无初始化器局部 alloca 后都必须置零。此前只对 `%` 开头的聚合置零，标量
+    // `var x: i64;` 读到的是栈上垃圾 —— 这是「LLVM 后端产物编译编译器自身即行为错乱」
+    // 的根因：sema 的各类计数器 / 标志位读出脏值 → -O0 下循环上界失控 → 深递归爆栈
+    // （exit 127），-O1/-O2 下优化器把 UB 常量化 → 空诊断 + exit 1 早退。
+    // C 后端发 `T x = {0};` 故始终正确，差异只体现在 LLVM 后端上。
+    if (str_len(st) > 0) {
         sb_append_str(sb, "  store ");
         sb_append_str(sb, st_to_ll(st));
         sb_append_str(sb, " zeroinitializer, ptr ");
