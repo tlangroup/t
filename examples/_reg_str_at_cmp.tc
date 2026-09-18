@@ -1,0 +1,53 @@
+// 回归：标量整数栈槽尺寸 —— 两个 str_at 结果互比必须可用。
+//
+// 事故回放：t 的「寄存器」宽度是 i64，运行期内建 tll_str_at 亦返回 i64；
+// 但栈槽曾按声明类型（u8/i8/i1）分配成 1 字节，于是「i64 写进 1 字节槽」
+// 写穿相邻槽，load i64 读回邻居脏数据。症状极具迷惑性：
+//   - 单个 str_at(s, i) 打印出来是**对的**
+//   - 但 str_at(s, i) == str_at(t, j) 恒为假、!= 恒为真
+//   → ll_find 恒 -1 → 类型定义区整段不发射 → `%TStr = type opaque`
+//     + `alloca arr<%TStr x 0>` 畸形类型 → 自举二代 clang 报
+//     "Cannot allocate unsized type"。
+// 修复：ll_ensure_slot 对标量整数一律按 i64 分配。
+fn j1(s: string, sub: string) i64 {
+    var n: i64 = str_len(s);
+    var m: i64 = str_len(sub);
+    var i: i64 = 0;
+    var tot: i64 = 0;
+    while (i + m <= n) {
+        var j: i64 = 0;
+        var bad: i64 = 0;
+        while (j < m) { if (str_at(s, i + j) != str_at(sub, j)) { bad = 1; } j = j + 1; }
+        tot = tot + bad;
+        i = i + 1;
+    }
+    return tot;
+}
+
+fn j4(s: string, sub: string) i64 {
+    var n: i64 = str_len(s);
+    var m: i64 = str_len(sub);
+    var i: i64 = 0;
+    var tot: i64 = 0;
+    while (i + m <= n) {
+        var j: i64 = 0;
+        var good: i64 = 0;
+        while (j < m) { if (str_at(s, i + j) == str_at(sub, j)) { good = good + 1; } j = j + 1; }
+        if (good == m) { tot = tot + 1000; }
+        i = i + 1;
+    }
+    return tot;
+}
+
+@main
+fn main() i64 {
+    var s: string = "%TStr = struct { f0: ptr<i8>, f1: i64 }";
+    var sub: string = " = struct {";
+    var a: i64 = j1(s, sub);   // 29 个窗口中 28 个不匹配
+    var b: i64 = j4(s, sub);   // 恰好 1 个窗口全匹配
+    println("mismatch_windows=" + int_to_str(a) + " full_matches=" + int_to_str(b));
+    if (a == 28) {
+        if (b == 1000) { return 0; }
+    }
+    return 1;
+}

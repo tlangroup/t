@@ -285,7 +285,17 @@ pub fn ll_label(name: string) string {
 // ⚠ ll_mangle / ll_ensure_slot 已迁至 src.llname.tc（飞地规避小模块）。本 wrapper 把小模块返回的
 // alloca 文本追加进 g_ll（IR 缓冲留在本模块，避免跨模块写 g_ll）。
 pub fn ll_ensure_slot(name: string, st: string) void {
-    sb_append_str(g_ll, ll_emit_alloca(name, st));
+    // ⚠ 标量整数槽一律按 i64 分配。t 的「寄存器」宽度是 i64，运行期内建
+    // （tll_str_at / tll_slice_at 等）也返回 i64；若槽按声明的 u8 / i1 / i32
+    // 分配成 1~4 字节，就会发生「i64 值写进 1 字节槽」→ 写穿相邻栈槽，
+    // 之后 load i64 读到邻居脏数据。实测症状：两个 str_at 结果互比恒不等
+    // （`==` 永假 / `!=` 永真）→ ll_find 恒 -1 → 类型定义区整段不发射、
+    // 类型退化成 `%TStr = type opaque` + `alloca arr<%TStr x 0>`。
+    // 注意：alloca 在序言按名排序发射，早于 STR_AT 处的 i64 请求，
+    // 故只能在分配处统一加宽，不能在 STR_AT 处补救。
+    var ast: string = st;
+    if (ast == "i1" || ast == "bool" || ast == "i8" || ast == "u8" || ast == "i16" || ast == "u16" || ast == "i32" || ast == "u32") { ast = "i64"; }
+    sb_append_str(g_ll, ll_emit_alloca(name, ast));
 }
 
 // 取切片/字符串基底的「结构地址」(ptr <inner>)，供 tll_slice_at / tll_str_at 使用。
@@ -3205,37 +3215,59 @@ pub fn ll_emit_inst(inst: TIRInst) void {
             } else {
                 v = ll_load(a, ast);
             }
-            // T0-2 暴露的非法 IR：i64 实参传给 i8/u8/bool 形参（如 is_digit(c: u8) 收到
-            // tll_str_at 的 i64 返回值）。release 版 LLVM 不跑 verifier，但 -O2 会按 UB
-            // 处理 → 自举产物行为错乱（实测 g1 走错发射路径、类型定义表为空、发射
-            // 出 arr<%TStr x 0> 这类畸形类型）。此处按被调形参声明类型做整数宽度适配。
+            // T0-2 暴露的非法 IR 族：实参整数宽度与形参声明不符。两类实形态：
+            //   ① tll_str_at 返回 i64 传给 u8 形参（is_digit / hex_val / utf8_w0 / ...）
+            //   ② icmp 的 i1 结果（bool 值）传给 i8 / i32 / i64 形参
+            // release 版 LLVM 不跑 verifier：-O0 静默通过、-O2 按 UB 处理，于是自举产物
+            // 行为错乱（实测：类型定义区整段消失、alloca arr<%TStr x 0>）。
+            // 此处按位宽双向适配：宽→窄 trunc，窄→宽 zext/sext。
+            // ⚠ 刻意不用辅助函数：全由 `if (形参==字面量) { return 字面量; }` 构成的函数体
+            //   会被解析器当作 match 子句组（T-FUN-E814），故就地展开。
             var fit_i: i64 = ki - 1;
             if (fit_i < slice_len(callee_params) as i64) {
                 var fit_decl: string = callee_params[fit_i];
-                var fit_narrow: bool = (fit_decl == "u8" || fit_decl == "i8" || fit_decl == "bool" || fit_decl == "i1");
-                var fit_wide: bool = (pst == "i64" || pst == "u64");
-                if (fit_narrow) {
-                    if (fit_wide) {
-                        var fit_tmp: string = ll_tmp();
-                        sb_append_str(g_ll, "  ");
-                        sb_append_str(g_ll, fit_tmp);
-                        sb_append_str(g_ll, " = trunc i64 ");
-                        sb_append_str(g_ll, v);
-                        sb_append_str(g_ll, " to i8\n");
-                        v = fit_tmp;
-                        pst = "i8";
-                    } else {
-                        // 同一类问题的另一半：bool 实参（icmp 结果 i1）传给 i8 形参
-                        // （t 的 bool 在签名里归一化为 i8），须 zext 而非 trunc。
-                        if (pst == "i1") {
-                            var fit_tmpb: string = ll_tmp();
+                var fit_dw: i64 = 0;
+                var fit_aw: i64 = 0;
+                if (fit_decl == "i1") { fit_dw = 1; }
+                if (fit_decl == "bool" || fit_decl == "i8" || fit_decl == "u8") { fit_dw = 8; }
+                if (fit_decl == "i16" || fit_decl == "u16") { fit_dw = 16; }
+                if (fit_decl == "i32" || fit_decl == "u32") { fit_dw = 32; }
+                if (fit_decl == "i64" || fit_decl == "u64") { fit_dw = 64; }
+                if (pst == "i1") { fit_aw = 1; }
+                if (pst == "bool" || pst == "i8" || pst == "u8") { fit_aw = 8; }
+                if (pst == "i16" || pst == "u16") { fit_aw = 16; }
+                if (pst == "i32" || pst == "u32") { fit_aw = 32; }
+                if (pst == "i64" || pst == "u64") { fit_aw = 64; }
+                if (fit_dw > 0) {
+                    if (fit_aw > 0) {
+                        if (fit_aw != fit_dw) {
+                            var fit_to: string = "i64";
+                            if (fit_dw == 1) { fit_to = "i1"; }
+                            if (fit_dw == 8) { fit_to = "i8"; }
+                            if (fit_dw == 16) { fit_to = "i16"; }
+                            if (fit_dw == 32) { fit_to = "i32"; }
+                            var fit_t: string = ll_tmp();
+                            var fit_op: string = "zext";
+                            if (fit_aw > fit_dw) {
+                                fit_op = "trunc";
+                            } else {
+                                if (fit_aw > 1) {
+                                    if (ll_starts(pst, "u") == false) { fit_op = "sext"; }
+                                }
+                            }
                             sb_append_str(g_ll, "  ");
-                            sb_append_str(g_ll, fit_tmpb);
-                            sb_append_str(g_ll, " = zext i1 ");
+                            sb_append_str(g_ll, fit_t);
+                            sb_append_str(g_ll, " = ");
+                            sb_append_str(g_ll, fit_op);
+                            sb_append_str(g_ll, " ");
+                            sb_append_str(g_ll, pst);
+                            sb_append_str(g_ll, " ");
                             sb_append_str(g_ll, v);
-                            sb_append_str(g_ll, " to i8\n");
-                            v = fit_tmpb;
-                            pst = "i8";
+                            sb_append_str(g_ll, " to ");
+                            sb_append_str(g_ll, fit_to);
+                            sb_append_str(g_ll, "\n");
+                            v = fit_t;
+                            pst = fit_to;
                         }
                     }
                 }

@@ -108,6 +108,11 @@ function run(cmd, args) {
 }
 const node = (script, ...args) => run(NODE, [join("tools", script), ...args]);
 const tc = (exe, ...args) => run(exe, args);
+// T0：真 LLVM IR verifier。本环境没有 opt / llvm-as，但 LLVM-C.dll 导出 LLVMVerifyModule
+// 与 LLVMParseIRInContext，可由 ctypes 直接调用（tools/llvm_verify.py —— 零构建、不需要
+// LLVM 头文件）。它比 clang 更严：实测 clang 会放过 `call i8 @f(i64 42)` 这类实参类型不符。
+const PY = process.env.PY || "python";
+const py = (script, ...args) => run(PY, [join("tools", script), ...args]);
 
 function md5(p) {
     return createHash("md5").update(readFileSync(p)).digest("hex");
@@ -182,6 +187,25 @@ const steps = [
             const nerr = (r.out.match(/^\s+ERROR /gm) || []).length;
             const nwarn = (r.out.match(/^\s+WARN  /gm) || []).length;
             return { ok: r.code === 0 && nwarn === 0, note: nerr + " 处非法 IR, " + nwarn + " 处类型不符" };
+        },
+    },
+    {
+        id: "llvmverify", lv: 0, name: "LLVM IR verifier (LLVMVerifyModule)",
+        run: async () => {
+            // 与 irverify 互补而非替代：ir_verify 是文本层三方签名审计，专抓「实参类型
+            // 与形参签名不符」；LLVMVerifyModule 抓结构性非法（未定义类型 / unsized
+            // alloca / ret 类型不符等）。实测两者的覆盖并不重叠：
+            //   - `call i8 @f(i64 42)`：ir_verify 抓到，LLVMVerifyModule 放过
+            //   - `%X = type opaque` + `alloca %X`：LLVMVerifyModule 抓到，clang 也抓到
+            // boot23 的 `_g2dbg.ll:25 alloca %base__Node: Cannot allocate unsized type`
+            // 正属后者 —— 有了这一步，它会在发射当期失败，而不是十分钟后在自举二代崩。
+            const r = await py("llvm_verify.py", join(ROOT, "out", "dbg", "g1.ll"));
+            if (r.code === 2) return { ok: true, warn: true, note: "SKIP（本机无 LLVM-C.dll）" };
+            if (r.code !== 0) {
+                const first = (r.out.split("\n").find((l) => /error:/.test(l)) || "").trim();
+                return { ok: false, note: first || "LLVM verifier 报告非法 IR" };
+            }
+            return { ok: true, note: lastLine(r.out, 1) };
         },
     },
     {
