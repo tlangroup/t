@@ -3205,6 +3205,41 @@ pub fn ll_emit_inst(inst: TIRInst) void {
             } else {
                 v = ll_load(a, ast);
             }
+            // T0-2 暴露的非法 IR：i64 实参传给 i8/u8/bool 形参（如 is_digit(c: u8) 收到
+            // tll_str_at 的 i64 返回值）。release 版 LLVM 不跑 verifier，但 -O2 会按 UB
+            // 处理 → 自举产物行为错乱（实测 g1 走错发射路径、类型定义表为空、发射
+            // 出 arr<%TStr x 0> 这类畸形类型）。此处按被调形参声明类型做整数宽度适配。
+            var fit_i: i64 = ki - 1;
+            if (fit_i < slice_len(callee_params) as i64) {
+                var fit_decl: string = callee_params[fit_i];
+                var fit_narrow: bool = (fit_decl == "u8" || fit_decl == "i8" || fit_decl == "bool" || fit_decl == "i1");
+                var fit_wide: bool = (pst == "i64" || pst == "u64");
+                if (fit_narrow) {
+                    if (fit_wide) {
+                        var fit_tmp: string = ll_tmp();
+                        sb_append_str(g_ll, "  ");
+                        sb_append_str(g_ll, fit_tmp);
+                        sb_append_str(g_ll, " = trunc i64 ");
+                        sb_append_str(g_ll, v);
+                        sb_append_str(g_ll, " to i8\n");
+                        v = fit_tmp;
+                        pst = "i8";
+                    } else {
+                        // 同一类问题的另一半：bool 实参（icmp 结果 i1）传给 i8 形参
+                        // （t 的 bool 在签名里归一化为 i8），须 zext 而非 trunc。
+                        if (pst == "i1") {
+                            var fit_tmpb: string = ll_tmp();
+                            sb_append_str(g_ll, "  ");
+                            sb_append_str(g_ll, fit_tmpb);
+                            sb_append_str(g_ll, " = zext i1 ");
+                            sb_append_str(g_ll, v);
+                            sb_append_str(g_ll, " to i8\n");
+                            v = fit_tmpb;
+                            pst = "i8";
+                        }
+                    }
+                }
+            }
             if (first == false) { sb_append_str(argsb, ", "); }
             sb_append_str(argsb, ll_call_arg_ir(a, pst, v));
             append(declargs, ll_declarg_ty(pst));
