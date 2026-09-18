@@ -56,6 +56,14 @@ const LV = Number(level[1]);
 // 在里程碑上多花十几秒换「全部结论都由实跑得出」也是划算的。
 if (LV === 2) full = true;
 
+// T0：TIR 发射期校验器在门禁与自举路径上默认开启，且有错即 exit 3。
+// 动机：结构体槽位错位一类的后端静默错编，在「发射那一刻」是完全可见的，
+// 却要等到运行时 arena OOM / exit 127 才以无位置信号浮现（phase-1 的代价）。
+// 校验器早已实现，但默认关闭、门禁从未开启 —— 等于不存在。
+// tc 子进程（boot1/boot23/boot4/cself）继承 process.env，故此处一处设置全局生效。
+// 显式设 T_TIR_VERIFY=0 可临时关闭（调试发射器本身时用）。
+if (process.env.T_TIR_VERIFY === undefined) process.env.T_TIR_VERIFY = "fail";
+
 const BASE_TC = join(ROOT, "out", "dbg", "tc.exe");
 if (!existsSync(BASE_TC)) {
     console.error("gate: out/dbg/tc.exe 不存在，先跑一次 bootstrap");
@@ -167,10 +175,13 @@ const steps = [
     {
         id: "irverify", lv: 0, name: "IR 静态审计 (调用签名 / 括号平衡)",
         run: async () => {
-            const r = await node("ir_verify.mjs", join(ROOT, "out", "dbg", "g1.ll"));
+            // --strict：实参/签名类型不符同样计入失败。release 版 LLVM 不跑 verifier，
+            // 这类问题在 -O0 静默通过、在 -O1/-O2 被优化器按 UB 处理（7eecbae 即属此类），
+            // 症状是「-O0 对、-O2 错」，定位成本极高。文本层审计是环境无 opt/llvm-as 时的替代。
+            const r = await node("ir_verify.mjs", "--strict", join(ROOT, "out", "dbg", "g1.ll"));
             const nerr = (r.out.match(/^\s+ERROR /gm) || []).length;
             const nwarn = (r.out.match(/^\s+WARN  /gm) || []).length;
-            return { ok: r.code === 0, note: nerr + " 处非法 IR, " + nwarn + " 处类型不符(仅告警)" };
+            return { ok: r.code === 0 && nwarn === 0, note: nerr + " 处非法 IR, " + nwarn + " 处类型不符" };
         },
     },
     {
@@ -180,10 +191,13 @@ const steps = [
             const r = await node("ir_snapshot.mjs", "--compiler", `${G1}.exe`);
             ctx.irClean = r.code === 0;
             if (r.code !== 0) {
-                // 快照有差异不等于错误：可能是本次改动的预期效果。
-                // 此处不判失败，只记录，并让后续运行类门禁强制全跑。
+                // T0：基线已改由 C 后端 oracle 录制（`node tools/ir_snapshot.mjs --update
+                // --compiler <C 后端产物>`）。oracle 不经过 LLVM 后端，是「当前源码应当
+                // 发射什么」的可信答案。于是 g1（LLVM 自举产物）与之不符 = LLVM 后端发射
+                // 偏差，属真回归，不再是「可能是本次改动的预期效果」。此前此处为软失败
+                // （warn），静默错编因此得以一路溜到 conformance / arena OOM 才现形。
                 const diffs = r.out.split("\n").filter((l) => /^\s+(DIFF|NEW|GONE)/.test(l)).length;
-                return { ok: true, warn: true, note: `${diffs} 处差异 → 运行类门禁将全量执行` };
+                return { ok: false, note: `${diffs} 处与 C-oracle 基线不符 ⇒ LLVM 后端发射偏差` };
             }
             return { ok: true, note: lastLine(r.out.split("⇒")[0], 1) };
         },
@@ -254,9 +268,10 @@ const steps = [
     },
     {
         // v3 S-1 安全机制：双轨对拍基线，冻结新管线退化。
-        // warn 级 —— 永不直接阻断门禁；任何不一致只记录，待切片推进逐步收敛。
+        // T0：由 warn 提升为硬失败 —— 双轨不一致即新管线退化的直接证据，
+        // 「只记录不阻断」会让退化无限累积，直到某天以 OOM 形式爆发。
         // 不随 irClean 跳过：对拍基线必须随每次提交累积，否则退化为一次性数字。
-        id: "diffpipe", lv: 1, name: "双轨对拍 (旧轨 LLVM vs 新轨 TIR, warn)",
+        id: "diffpipe", lv: 1, name: "双轨对拍 (旧轨 LLVM vs 新轨 TIR)",
         run: async () => {
             const r = await node("_diffpipe.mjs", "--mode", "dbg", "--jobs", "4", "--strict");
             const lines = r.out.split("\n").filter((l) => l.startsWith("_diffpipe:"));
@@ -294,7 +309,7 @@ const steps = [
                 // C 后端 -O0 自举产物递归处理编译器自身超大源时会超出 1MB 默认 Windows 栈；
                 // LLVM 后端同档 -O0 不溢出（代码生成更省栈），故此处仅给验证用二进制放大栈即可，
                 // 不改变任何发射产物（IR 与 LLVM 后端逐字节相同，已验证）。
-                "-Wl,/STACK:268435456",
+                "-Wl,/STACK:4294967296",
             ]);
             if (cc.code !== 0) return { ok: false, note: `clang 构建失败: ${lastLine(cc.out, 3)}` };
             // ① 跨后端等价：C 产物与 LLVM 产物对同一份源必须发射逐字节相同的 IR。
@@ -397,7 +412,9 @@ if (failed === 0 && LV === 2) {
     console.log(`    cp out/dbg/g4.exe out/dbg/tc.exe && cp ${GR}.exe out/rls/tc.exe`);
 }
 if (nWarn > 0) {
-    console.log(`\n  ⚠ 产物快照存在差异。若为本次改动的预期效果，重录基线：`);
-    console.log(`    node tools/ir_snapshot.mjs --compiler out/dbg/g1.exe --update`);
+    // 基线必须由 C 后端 oracle 录制：g1 是 LLVM 自举产物，用它录基线等于
+    // 「用待测实现定义正确答案」，会把任何 LLVM 后端偏差固化进基线。
+    console.log(`\n  ⚠ 产物快照存在差异。确认本次改动确实改变了发射语义后，用 C 后端 oracle 重录：`);
+    console.log(`    node tools/ir_snapshot.mjs --compiler out/dbg/tc.exe --update`);
 }
 process.exit(failed === 0 ? 0 : 1);
