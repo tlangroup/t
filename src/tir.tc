@@ -3336,7 +3336,27 @@ pub fn tir_emit_call(e: i64) TirEmitRes {
         var a1: i64 = base.kids[n.la].next;
         if (a1 >= 0) { vn = base.kids[a1].val; }
         var vs: string = "";
-        if (vn >= 0) { vs = tir_emit_expr(vn).name; }      // 待追加元素值（翻译器转指针）
+        // 元素次参的期望类型 = 首参切片的元素类型。否则 `append(s, [])` 这类空字面量
+        // 无从推断元素宽度 ⇒ elem_size 兜底成 8（V006）：元素是 %TStr(16) 时按 8 字节步长
+        // 寻址 ⇒ 读到邻字段。契约：聚合的元素宽度必须由类型导出。
+        if (vn >= 0) {
+            var vnk: Node = base.nodes[vn];
+            var etdv: i64 = -1;
+            if (a0n >= 0) {
+                var atdv: i64 = tir_expr_td(a0n);
+                if (atdv >= 0 && atdv < slice_len(sema.tds) as i64) {
+                    if (sema.tds[atdv].cat == "slice") { etdv = sema.tds[atdv].elem; }
+                }
+            }
+            var usedv: bool = false;
+            if (etdv >= 0 && etdv < slice_len(sema.tds) as i64 && vnk.kind == "array_lit") {
+                var ecatv: string = sema.tds[etdv].cat;
+                if (ecatv == "slice" || ecatv == "array" || ecatv == "vector" || ecatv == "tile") {
+                    var __era1: TirEmitRes = tir_emit_array_lit(vn, etdv); vs = __era1.name; usedv = true;
+                }
+            }
+            if (usedv == false) { vs = tir_emit_expr(vn).name; }      // 待追加元素值（翻译器转指针）
+        }
         tir_emit(tir_e_call(retst, d, "@append", tir_cargs2(sl, vs)));
         return TirEmitRes{ name: d, st: tir_st_from_str(retst) };
     }
@@ -3719,7 +3739,21 @@ pub fn tir_emit_struct_lit(e: i64) TirEmitRes {
         var fv: Node = base.nodes[k.val];
         var fs: string;
         var fst: i64 = 0;
-        if (str_len(n.sa) > 0 && base.nodes[fv.na].kind == "map_lit") {
+        if (str_len(n.sa) > 0 && base.nodes[fv.na].kind == "array_lit") {
+            // 字段值是切片/数组字面量（含 `types: []` 这类空字面量）：用**字段声明类型**作
+            // 期望类型下发。否则空字面量无从推断元素宽度 ⇒ elem_size 兜底成 8（V006）。
+            var fatd: i64 = tir_field_td(n.sa, fv.sa);
+            var faus: bool = false;
+            if (fatd >= 0 && fatd < slice_len(sema.tds) as i64) {
+                var facat: string = sema.tds[fatd].cat;
+                if (facat == "slice" || facat == "array" || facat == "vector" || facat == "tile") {
+                    var __era2: TirEmitRes = tir_emit_array_lit(fv.na, fatd); fs = __era2.name; fst = __era2.st; faus = true;
+                }
+            }
+            if (faus == false) {
+                var fsr5: TirEmitRes = tir_emit_expr(fv.na); fs = fsr5.name; fst = fsr5.st;
+            }
+        } else if (str_len(n.sa) > 0 && base.nodes[fv.na].kind == "map_lit") {
             // ⚠ map 字面量作具名结构体字段值：tir_emit_expr 落到 map_lit 分支时 force_td=-1，
             // tir_expr_td 不可靠 -> untyped 兜底返回 0 指针。显式用字段类型 TD 构造。
             var ftd: i64 = tir_field_td(n.sa, fv.sa);
@@ -3800,6 +3834,19 @@ pub fn tir_emit_array_lit(e: i64, force_td: i64) TirEmitRes {
         elem_st = tir_st_of_td(t.elem);
     } else if (N > 0) {
         elem_st = tir_expr_st(elems[0]);
+    } else if (N == 0) {
+        // V006（T1「聚合写入语义」第一刀）：空字面量 + 无期望类型 ⇒ 元素宽度只能兜底成 i64。
+        // 「兜底」不是语义，是静默错编：elem_size 写成 8 而元素实为 %TStr(16) 时，
+        // t_slice_at / t_slice_append 按 data+idx*elem_size 寻址 ⇒ %TStr.len 读到邻字段
+        // （打印空行或内存残片，不崩溃）。自举二代 arena OOM 正由此而起
+        // （ll_parse_func: `g_pf_params = []` 后 append 形参名）。
+        // 契约：聚合的元素宽度必须由**类型**导出；推导不出就显式报告，不许猜。
+        tir_verify_report("V006", base.sb_cat2(
+            base.sb_cat2("空切片字面量元素类型不可推断（无期望类型、且无元素可推）⇒ elem_size 退化为 8 —— line ",
+                base.i2s(g_cur_line as i64)),
+            "；请给它一个期望类型上下文（赋值目标 / 形参 / 返回值）"));
+        elem_st = "i64";
+    } else {
     }
     if (cat == "array" || cat == "vector") {
         // 向量字面量 `[a,b,c,d]`（期望类型为 @Vector(N,T)）与定长数组同构：

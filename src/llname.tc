@@ -190,7 +190,16 @@ pub fn ll_llname(tname: string) string {
     //   - 全局变量作操作数须内联 '@'（ptr @g），否则成裸引用 → "expected value token"；
     //   - 函数作 callee 时调用方会自己补 '@'（call void @fn），故下方调用方需先剥 '@' 得裸名匹配；
     //   - 此前此处裸返回（ll_mangle 后无 '@'）导致 @全局变量操作数丢失 '@' → 自举 tc.ll 第 67 行裸 lex__decl_list 报错。
-    if (tname[0] == 64) { return "@" + ll_mangle(str_slice(tname, 1, str_len(tname))); }                    // '@'
+    // ⚠ 全局引用同样要剥 TIR 类型后缀 `.sN`：tir_os 会给操作数名附 ".s<ST码>"，
+    //   而 ll_register_global 登记全局时已剥过 ⇒ 不剥的话引用会写成 @g.s9 而定义是 @g
+    //   ⇒ "use of undefined value" —— 只有带 st 的全局引用路径才触发，故时隐时现。
+    //   实测：自举二代 g1 编译 src/tc.tc 时 `load i64, ptr @tir__g_cur_line.s9` 撞此错，
+    //   clang 报 1 error ⇒ g2 构建失败 ⇒ 自举不动点/四代/run_examples/rls/tote 连带全红。
+    //   已带 '%' 的分支（上方）仍禁止剥：%main.s2 的 ".s2" 是用户槽名，剥了会压成函数名。
+    if (tname[0] == 64) {
+        var gname: string = ll_strip_suf(str_slice(tname, 1, str_len(tname)));
+        return "@" + ll_mangle(gname);
+    }                    // '@'
     // 裸全局名（TIR 跨模块全局引用可能不带 '@' 前缀）：按全局符号引用补 '@'，与旧轨 codegen_ll 一致。
     if (ll_is_global(tname)) { return "@" + ll_mangle(tname); }
     return tname;
@@ -199,7 +208,10 @@ pub fn ll_llname(tname: string) string {
 // 指针目的地（store/load 的 ptr 操作数、addr_of 目标）用此变体：@name 全局引用保留 '@' 前缀。
 pub fn ll_llname_ptr(tname: string) string {
     if (str_len(tname) >= 1 && tname[0] == 64) {
-        return "@" + ll_mangle(str_slice(tname, 1, str_len(tname)));
+        // 与 ll_llname 的 '@' 分支同坑：必须剥 TIR 类型后缀 `.sN`，否则 load/store 的
+        // ptr 操作数写成 @g.s9 而定义是 @g ⇒ "use of undefined value"。
+        var pn: string = ll_strip_suf(str_slice(tname, 1, str_len(tname)));
+        return "@" + ll_mangle(pn);
     }
     return ll_llname(tname);
 }
