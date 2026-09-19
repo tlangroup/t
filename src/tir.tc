@@ -355,6 +355,11 @@ pub var g_local_names: []string; // 与下面两个并行：局部名 → slot /
 pub var g_local_slots: []string;
 pub var g_local_sts: []string;
 pub var g_local_tds: []i64;      // emit 期唯一可靠的局部类型来源（符号表在 emit 期无效）
+pub var g_local_depths: []i64;   // 与上面并行：该局部声明处的块嵌套深度（0 = 函数体）
+pub var g_blk_depth: i64;        // 当前块嵌套深度。TIR 把全函数局部铺平，必须显式管理块作用域：
+                                 // C 后端靠 C 自身 {} 块作用域天然正确；TIR 若不做深度过滤，
+                                 // if/while 块内声明的同名局部会在块结束后继续遮蔽外层，
+                                 // 静默取到零初始化的内层槽（自举误编译根因之一）。
 
 // (FS-2b) g_tir_last_st 侧信道已移除：各值发射器返回 TirEmitRes{name, st} 显式携带真实发射类型。
 
@@ -401,6 +406,9 @@ pub fn tir_reset() void {
     g_local_sts = zlt;
     var zld: []i64 = [];
     g_local_tds = zld;
+    var zldp: []i64 = [];
+    g_local_depths = zldp;
+    g_blk_depth = 0;
     var zlh: []string = [];
     g_loop_head = zlh;
     var zle: []string = [];
@@ -1144,10 +1152,19 @@ pub fn tir_find_local_idx(name: string) i64 {
     var n: i64 = slice_len(g_local_names) as i64;
     var i: i64 = n - 1;
     while (i >= 0) {
-        if (g_local_names[i] == name) { return i; }
+        if (g_local_names[i] == name && i < slice_len(g_local_depths) as i64 && g_local_depths[i] <= g_blk_depth) { return i; }
         i = i - 1;
     }
     return -1;
+}
+
+// 块作用域进出：见 g_blk_depth 注释。TIR 无 {} 结构，须显式维护嵌套深度。
+pub fn tir_blk_push() void {
+    g_blk_depth = g_blk_depth + 1;
+}
+
+pub fn tir_blk_pop() void {
+    if (g_blk_depth > 0) { g_blk_depth = g_blk_depth - 1; }
 }
 
 // 判定 name 是否为模块内某个函数（含泛型/库函数）的名字。
@@ -1204,6 +1221,7 @@ pub fn tir_new_named_slot(td: i64, st: string, name: string) string {
     append(g_local_slots, slot);
     append(g_local_sts, st);
     append(g_local_tds, td);
+    append(g_local_depths, g_blk_depth);
     // ⚠ 飞地规避：把槽名同时放进 args[0]（字符串常量）。译器 TIR_OP_SLOT 改从 inst.args[0].name
     // 读取（inst.dst.name 在巨型模块 tir_to_ll.tc 的 SLOT 分支被种子错编成函数名 "main"，
     // 而 inst.args[0].name 在该分支读取正确，见 generics_demo/fid_read_demo/map_iter）。
@@ -1788,6 +1806,21 @@ pub fn tir_emit_ginit() void {
                     var ts: string = tir_tmp();
                     tir_emit(tir_emit_const_typed("f64", ts, initn.sa));
                     tir_emit(tir_emit_store(ts, base.sb_cat2("@", nm)));
+                } else if (initn.kind == "bool") {
+                    // ⚠ 布尔全局此前未覆盖：@g 只剩 zeroinitializer（恒 false）。
+                    // 编译器自身的 `pub var g_comptime_full: bool = true;` 正是此类，LLVM 自托管下
+                    // 被读成 false → comptime_fold_pass 直接 return → 全量编译期折叠整段失效
+                    // （`-1` 不再是常量、IR 多出 neg 指令）→ 两代 emit-ll 对不上、无自举不动点。
+                    var brr: TirEmitRes = tir_emit_expr(nb); var bslot: string = brr.name;
+                    tir_emit(tir_emit_store(bslot, base.sb_cat2("@", nm)));
+                } else if (initn.kind == "string") {
+                    // 字符串全局（非 Sym）：经字面量发射器物化成 %TStr 槽再 store。
+                    var srr: TirEmitRes = tir_emit_expr(nb); var sslot: string = srr.name;
+                    tir_emit(tir_emit_store(sslot, base.sb_cat2("@", nm)));
+                } else if (initn.kind == "unary") {
+                    // 负数字面量（折叠关闭时 `-1` 仍是 unary）：按表达式发射再 store。
+                    var urr: TirEmitRes = tir_emit_expr(nb); var uslot: string = urr.name;
+                    tir_emit(tir_emit_store(uslot, base.sb_cat2("@", nm)));
                 }
             }
         }
@@ -1853,6 +1886,9 @@ pub fn tir_lower_func(d: i64) void {
     g_local_sts = flt;
     var fld: []i64 = [];
     g_local_tds = fld;
+    var fldp: []i64 = [];
+    g_local_depths = fldp;
+    g_blk_depth = 0;
     g_slotc = 0;
     g_term = false;
     var zlh: []string = [];
@@ -1874,6 +1910,7 @@ pub fn tir_lower_func(d: i64) void {
         append(g_local_slots, envslot);
         append(g_local_sts, envst);
         append(g_local_tds, -1);
+        append(g_local_depths, 0);
         tir_emit(tir_emit_slot(envst, envslot));
     }
     var c: i64 = n.lb;
@@ -1887,6 +1924,7 @@ pub fn tir_lower_func(d: i64) void {
         append(g_local_slots, pslot);
         append(g_local_sts, pst);
         append(g_local_tds, sema.resolve_type_desc(p.na));
+        append(g_local_depths, 0);
         tir_emit(tir_emit_slot(pst, pslot));
         c = k.next;
     }
@@ -1996,12 +2034,14 @@ pub fn tir_emit_stmt(sid: i64) void {
     if (kd == "while") { tir_emit_while(n); return; }
     if (kd == "for_each") { tir_emit_for_each(n); return; }
     if (kd == "block") {
+        tir_blk_push();
         var c: i64 = n.la;
         while (c >= 0) {
             var k: Child = base.kids[c];
             tir_emit_stmt(k.val);
             c = k.next;
         }
+        tir_blk_pop();
         return;
     }
     if (kd == "comptime_block") {
@@ -2092,19 +2132,23 @@ pub fn tir_emit_if(n: Node) void {
     if (has_else) { elseL = tir_lbl("if.f"); }
     tir_emit(tir_emit_br_cond(cond, thenL, elseL));
     tir_block(thenL);
+    tir_blk_push();
     var tb: i64 = n.la;
     while (tb >= 0) {
         tir_emit_stmt(base.kids[tb].val);
         tb = base.kids[tb].next;
     }
+    tir_blk_pop();
     tir_emit(tir_emit_br(endL));
     if (has_else) {
         tir_block(elseL);
+        tir_blk_push();
         var eb: i64 = n.lb;
         while (eb >= 0) {
             tir_emit_stmt(base.kids[eb].val);
             eb = base.kids[eb].next;
         }
+        tir_blk_pop();
         tir_emit(tir_emit_br(endL));
     }
     tir_block(endL);
@@ -2125,12 +2169,14 @@ pub fn tir_emit_for(n: Node) void {
         tir_emit(tir_emit_br(bodyL));
     }
     tir_block(bodyL);
+    tir_blk_push();
     var bc: i64 = n.la;
     while (bc >= 0) {
         tir_emit_stmt(base.kids[bc].val);
         bc = base.kids[bc].next;
     }
     if (n.nc >= 0) { tir_emit_stmt(n.nc); }     // 增量（通常 assignment）
+    tir_blk_pop();
     tir_emit(tir_emit_br(headL));
     tir_block(endL);
     tir_loop_pop();
@@ -2146,11 +2192,13 @@ pub fn tir_emit_while(n: Node) void {
     var condr: TirEmitRes = tir_emit_expr(n.na); var cond: string = condr.name;
     tir_emit(tir_emit_br_cond(cond, bodyL, endL));
     tir_block(bodyL);
+    tir_blk_push();
     var bc: i64 = n.la;
     while (bc >= 0) {
         tir_emit_stmt(base.kids[bc].val);
         bc = base.kids[bc].next;
     }
+    tir_blk_pop();
     tir_emit(tir_emit_br(headL));
     tir_block(endL);
     tir_loop_pop();
@@ -2177,6 +2225,7 @@ pub fn tir_emit_for_each(n: Node) void {
         }
     }
     if (coll_td < 0) { tir_cmt("unsupported for_each: untyped collection"); return; }
+    tir_blk_push();
     var ct: TD = sema.tds[coll_td];
     var etd: i64 = -1;
     var is_arr: bool = false;
@@ -2249,10 +2298,12 @@ pub fn tir_emit_for_each(n: Node) void {
         tir_emit(tir_emit_store(cidx3, idx));
         tir_emit(tir_emit_br(headL));
         tir_block(endL);
+        tir_blk_pop();
         tir_loop_pop();
         return;
     } else {
         tir_cmt(base.sb_cat3("unsupported for_each collection: ", ct.cat, ""));
+        tir_blk_pop();
         return;
     }
     var elem_st: string = tir_st_of_td(etd);
@@ -2324,6 +2375,7 @@ pub fn tir_emit_for_each(n: Node) void {
     tir_emit(TIRInst{ op: TIR_OP_STORE, st: ST_NONE, dst: tir_op(idx), args: tir_a1(cidx3), is_comment: false, line: g_cur_line, cmt: "" });
     tir_emit(TIRInst{ op: TIR_OP_BR, st: ST_NONE, dst: tir_op(""), args: tir_a1(headL), is_comment: false, line: g_cur_line, cmt: "" });
     tir_block(endL);
+    tir_blk_pop();
     tir_loop_pop();
 }
 
@@ -4360,6 +4412,7 @@ pub fn tir_emit_match(n: Node, as_stmt: bool, est: i64) TirEmitRes {
         var arm: Node = base.nodes[armIds[i]];
         var armL: string = armLabels[i];
         tir_block(armL);
+        tir_blk_push();
         // conpat 载荷提取：把 scrutinee 各字段 load 进预声明 slot（仅本臂命中时执行）
         if (arm.na >= 0 && base.nodes[arm.na].kind == "conpat") {
             var cp3: Node = base.nodes[arm.na];
@@ -4415,6 +4468,7 @@ pub fn tir_emit_match(n: Node, as_stmt: bool, est: i64) TirEmitRes {
             var bvr: TirEmitRes = tir_emit_expr(arm.nc); var bv: string = bvr.name;
             if (res != "") { tir_emit(TIRInst{ op: TIR_OP_STORE, st: ST_NONE, dst: tir_op(res), args: tir_a1(bv), is_comment: false, line: g_cur_line, cmt: "" }); }
         }
+        tir_blk_pop();
         g_term = false;   // 臂内可能有 return/break；强制补上收尾 br
         tir_emit(TIRInst{ op: TIR_OP_BR, st: ST_NONE, dst: tir_op(""), args: tir_a1(endL), is_comment: false, line: g_cur_line, cmt: "" });
         i = i + 1;

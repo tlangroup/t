@@ -221,6 +221,12 @@ const steps = [
                 // 偏差，属真回归，不再是「可能是本次改动的预期效果」。此前此处为软失败
                 // （warn），静默错编因此得以一路溜到 conformance / arena OOM 才现形。
                 const diffs = r.out.split("\n").filter((l) => /^\s+(DIFF|NEW|GONE)/.test(l)).length;
+                // diffs==0 却 rc!=0 ⇒ 不是「发射偏差」，而是快照自身执行失败（某目标发射期
+                // 被 TIR verifier 中止 / emit-c 报错 / 编译器中途崩溃）。必须透传尾部输出，
+                // 否则门禁只报「0 处不符」误导定位（2026-09-19 实测：真实 ERROR 被报成 0 处）。
+                if (diffs === 0) {
+                    return { ok: false, note: lastLine(r.out, 3) };
+                }
                 return { ok: false, note: `${diffs} 处与 C-oracle 基线不符 ⇒ LLVM 后端发射偏差` };
             }
             return { ok: true, note: lastLine(r.out.split("⇒")[0], 1) };

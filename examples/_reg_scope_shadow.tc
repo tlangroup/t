@@ -1,0 +1,28 @@
+// 回归：块作用域 —— if/while/for 块内声明的同名局部，不得在块结束后继续遮蔽外层。
+//
+// 事故回放：TIR 路径把函数内所有局部铺平成一张表（C 后端靠 C 自身的 {} 块作用域天然正确），
+// 且 tir_find_local_idx 从后往前找（取最内层）。缺了块深度过滤时，
+// `if (cond) { var st: string = ...; }` 块结束后，外层同名 `st` 仍被解析到内层槽，
+// 而内层槽从未被赋值（零初始化空串）→ 静默取到 ""。
+// 编译器自身 tir_to_ll.tc 的 ll_emit_inst 恰是这个形状：GEP_IDX 分支里的 `var st`
+// 在块结束后继续遮蔽入口的 `var st`，致其后通用二元运算 st_to_ll(st) 得空串 →
+// 发射 `add  %a, %b`（缺类型）→ 自举二代 clang 报错。
+// 修复：tir.tc 新增 g_local_depths / g_blk_depth，块进出显式 push/pop，查找按深度过滤。
+@main
+fn main() i64 {
+    var s: string = "A";
+    if (s == "Q") { var s: string = "B"; }
+    var t: string = "C";
+    var i: i64 = 0;
+    while (i < 1) { var t: string = "D"; i = i + 1; }
+    var u: string = "E";
+    var k: i64 = 0;
+    for (k = 0; k < 1; k = k + 1) { var u: string = "F"; }
+    var ok: i64 = 0;
+    if (s == "A") { ok = ok + 1; }
+    if (t == "C") { ok = ok + 1; }
+    if (u == "E") { ok = ok + 1; }
+    println("s=" + s + " t=" + t + " u=" + u + " ok=" + int_to_str(ok));
+    if (ok == 3) { return 0; }
+    return 1;
+}
