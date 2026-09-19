@@ -38,7 +38,7 @@
 //    确定性），良性噪声消失，只放量级 emit/后端真改动。重录命令：
 //      node tools/ir_snapshot.mjs --update --compiler out/dbg/g1.exe
 
-import { execFile, spawn } from "node:child_process";
+import { execFile, execFileSync, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import {
     readFileSync, writeFileSync, readdirSync, existsSync, mkdirSync,
@@ -126,6 +126,46 @@ for (const s of ["src/tc.tc", "src/tote.tc"]) {
 function md5File(p) {
     return createHash("md5").update(readFileSync(p)).digest("hex");
 }
+
+// ── 基线溯源（T2：hermetic）─────────────────────────────────────
+// 基线必须能回答「它是谁录的、在什么源码上录的」。否则出现 DIFF 时无法区分
+//   (a) 本次改动合法地改变了发射产物，与
+//   (b) 基线是别的源码 / 别的编译器录的，本就不可比。
+// 这正是「agent 报已修、树里没有」那类非 hermetic 代价的来源：结论只能靠
+// git diff 和门禁输出复核，不能靠报告。故把溯源写进 _meta，并在比对时
+// 显式提示漂移（仅提示，不改变判定——源码每天都在变，漂移本身不是失败）。
+function gitHead() {
+    try {
+        return execFileSync("git", ["rev-parse", "HEAD"], { cwd: ROOT, windowsHide: true })
+            .toString().trim();
+    } catch { return "unknown"; }
+}
+function dirHash(dir, exts) {
+    const h = createHash("sha256");
+    let files = [];
+    try {
+        files = readdirSync(join(ROOT, dir))
+            .filter((f) => exts.some((e) => f.endsWith(e)))
+            .sort();
+    } catch { return "unknown"; }
+    if (files.length === 0) return "unknown";
+    for (const f of files) {
+        h.update(f);
+        try { h.update(readFileSync(join(ROOT, dir, f))); } catch { /* 忽略不可读 */ }
+    }
+    return h.digest("hex").slice(0, 16);
+}
+function provenance() {
+    const rel = compiler.replace(ROOT + "\\", "").replace(ROOT + "/", "");
+    return {
+        compiler: rel,
+        compilerMd5: existsSync(compiler) ? md5File(compiler) : "missing",
+        gitHead: gitHead(),
+        srcHash: dirHash("src", [".tc"]),
+        runtimeHash: dirHash("runtime", [".c", ".h"]),
+    };
+}
+
 
 // ── 结构体名规范化（跨编译器稳定）──────────────────────────────────
 // 不同宿主编译器对「同布局」结构体可能赋予不同名字（命名依赖 map 遍历序），
@@ -331,6 +371,8 @@ if (update) {
             backends: backends.join(","),
             targets: targets.length,
             entries: curKeys.length,
+            // 溯源：录制者编译器指纹 + 录制时提交 + 源码/运行时指纹
+            provenance: provenance(),
         },
         ...sorted,
     };
@@ -373,6 +415,21 @@ console.log(
     `targets=${targets.length} entries=${curKeys.length} ` +
     `backends=${backends.join(",")} jobs=${jobs} (${elapsed}s)\n`
 );
+
+
+// 溯源漂移提示：基线是别的源码/编译器录的 ⇒ 差异可能合法，别当成后端 bug 查
+const provNow = provenance();
+const provOld = (base._meta && base._meta.provenance) || {};
+const driftKeys = ["gitHead", "srcHash", "runtimeHash", "compilerMd5"]
+    .filter((k) => provOld[k] && provOld[k] !== "unknown" && provOld[k] !== provNow[k]);
+if (driftKeys.length > 0) {
+    console.log("  ⚠ 基线溯源漂移: " + driftKeys.join(", "));
+    console.log("      基线录于 " + ((base._meta || {}).updated || "?")
+        + " @ " + (provOld.gitHead || "?") + " src=" + (provOld.srcHash || "?"));
+    console.log("      本次      " + provNow.gitHead
+        + " src=" + provNow.srcHash + " runtime=" + provNow.runtimeHash);
+    console.log("      → DIFF 可能合法来自源码变更；确认后用 --update 重录基线。");
+}
 
 for (const d of diffs) {
     console.log(`  DIFF   ${d.k}`);

@@ -72,13 +72,16 @@ if (!existsSync(BASE_TC)) {
 
 // ── 执行辅助 ─────────────────────────────────────────────────────
 // 单步硬超时（毫秒）。最慢的一步是 run_examples 双后端（约 45s），留足余量。
+// 单步硬超时（毫秒）。默认 8 分钟对绝大多数步骤足够；个别步骤（产物快照比对：--jobs 1
+// 串行发射 95 目标 × ll/c/h/dev）实测约 10 分钟，用调用处传入的 timeoutMs 单独放宽，
+// 而不是把全局默认值抬上去、连带削弱其它步骤的卡死保护。
 const STEP_TIMEOUT_MS = Number(process.env.GATE_STEP_TIMEOUT_MS || 8 * 60 * 1000);
 // 'exit' 之后再等 stdio 关闭的宽限期。子进程可能 spawn 了继承管道的孙进程
 // （clang / lld），孙进程若不退出，'close' 永远不来 —— 只等 'close' 会让整个
 // 门禁静默挂起（实测卡死 9 分钟无输出）。故以 'exit' 为准、'close' 仅用于收尾。
 const DRAIN_MS = 3000;
 
-function run(cmd, args) {
+function run(cmd, args, timeoutMs) {
     return new Promise((res) => {
         const p = spawn(cmd, args, { cwd: ROOT, windowsHide: true });
         let out = "";
@@ -91,10 +94,11 @@ function run(cmd, args) {
             clearTimeout(hardTimer);
             res({ code, out: extra ? out + extra : out });
         };
+        const limit = Number(timeoutMs) > 0 ? Number(timeoutMs) : STEP_TIMEOUT_MS;
         const hardTimer = setTimeout(() => {
             try { p.kill("SIGKILL"); } catch { /* 已退出 */ }
-            finish(-1, `\n[gate] 步骤超时 ${STEP_TIMEOUT_MS / 1000}s，已强制终止\n`);
-        }, STEP_TIMEOUT_MS);
+            finish(-1, `\n[gate] 步骤超时 ${limit / 1000}s，已强制终止\n`);
+        }, limit);
 
         p.stdout.on("data", (d) => { out += d; });
         p.stderr.on("data", (d) => { out += d; });
@@ -106,7 +110,14 @@ function run(cmd, args) {
         p.on("error", (e) => finish(-1, String(e)));
     });
 }
-const node = (script, ...args) => run(NODE, [join("tools", script), ...args]);
+// 末尾可传 { timeoutMs } 覆盖单步超时（产物快照步需要，见 snapshot 步骤注释）。
+const node = (script, ...args) => {
+    let ms = 0;
+    if (args.length && typeof args[args.length - 1] === "object" && args[args.length - 1] !== null) {
+        ms = Number(args.pop().timeoutMs) || 0;
+    }
+    return run(NODE, [join("tools", script), ...args], ms);
+};
 const tc = (exe, ...args) => run(exe, args);
 // T0：真 LLVM IR verifier。本环境没有 opt / llvm-as，但 LLVM-C.dll 导出 LLVMVerifyModule
 // 与 LLVMParseIRInContext，可由 ctypes 直接调用（tools/llvm_verify.py —— 零构建、不需要
@@ -212,7 +223,10 @@ const steps = [
         id: "snapshot", lv: 0, name: "产物快照比对 (ll + c 双后端)",
 
         run: async () => {
-            const r = await node("ir_snapshot.mjs", "--compiler", `${G1}.exe`, "--jobs", "1");
+// ⚠ --jobs 1 是为消除并行抖动（同一目标重复发射可能取到不同临时名），代价是串行慢：
+//   95 目标 × ll/c/h/dev 实测约 10 分钟，远超 8 分钟默认单步超时 → 曾稳定假红（超时被
+//   当成「快照有差异」上报）。此处单独放宽到 25 分钟；不放并行度，那会动摇快照的确定性前提。
+const r = await node("ir_snapshot.mjs", "--compiler", `${G1}.exe`, "--jobs", "1", { timeoutMs: 25 * 60 * 1000 });
             ctx.irClean = r.code === 0;
             if (r.code !== 0) {
                 // T0（修订·2026-09-19）：基线由 LLVM 自举产物 g1 录制
@@ -391,10 +405,17 @@ const steps = [
     {
         id: "tote", lv: 2, name: "tote 构建冒烟",
         run: async () => {
+            // ⚠ note 必须带退出码：g4 崩溃（0xC0000005 / 139）时输出尾部停在
+            //   "TIR-VERIFY: 0 error(s)"，只看最后几行会被读成「0 错误却判红」——
+            //   这是门禁步骤自身的显示缺陷，曾掩盖了「g4 其实是旧产物、构建时崩溃」。
+            //   退出码是唯一能区分「崩溃」与「编译错误」的信号，故一律带上。
+            if (existsSync(join(ROOT, `${G4}.exe`)) === false) {
+                return { ok: false, note: "g4.exe 缺失：前置自举步骤未产出，本步无从判定" };
+            }
             const b = await tc(`${G4}.exe`, "build", "src/tote.tc", "--output", join("out", "dbg", "gtote"));
-            if (b.code !== 0) return { ok: false, note: lastLine(b.out, 3) };
+            if (b.code !== 0) return { ok: false, note: `build 退出码 ${b.code} | ${lastLine(b.out, 3)}` };
             const h = await tc(join(ROOT, "out", "dbg", "gtote.exe"), "--help");
-            return { ok: h.code === 0, note: "构建 + --help 正常" };
+            return { ok: h.code === 0, note: h.code === 0 ? "构建 + --help 正常" : `--help 退出码 ${h.code}` };
         },
     },
 ];
