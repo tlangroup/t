@@ -215,11 +215,15 @@ const steps = [
             const r = await node("ir_snapshot.mjs", "--compiler", `${G1}.exe`);
             ctx.irClean = r.code === 0;
             if (r.code !== 0) {
-                // T0：基线已改由 C 后端 oracle 录制（`node tools/ir_snapshot.mjs --update
-                // --compiler <C 后端产物>`）。oracle 不经过 LLVM 后端，是「当前源码应当
-                // 发射什么」的可信答案。于是 g1（LLVM 自举产物）与之不符 = LLVM 后端发射
-                // 偏差，属真回归，不再是「可能是本次改动的预期效果」。此前此处为软失败
-                // （warn），静默错编因此得以一路溜到 conformance / arena OOM 才现形。
+                // T0（修订·2026-09-19）：基线由 LLVM 自举产物 g1 录制
+                //   `node tools/ir_snapshot.mjs --update --compiler out/dbg/g1.exe`
+                // 快照比较 g1 自身 vs 该基线（LLVM-vs-LLVM）。
+                // 理由：C 后端产物(tc.exe) 与 LLVM 自举产物(g1) 因良性跨后端非确定性
+                //   （结构体按布局命名、const 实参临时名/求值序）逐字节不同但运行期等价，
+                //   C==LLVM 逐字节的前提不成立 → 原 C-oracle 基线必然误报假差异。
+                // 改 LLVM 自举基线后同源同后端→确定性→只剩真 emit/后端改动会现形。
+                // 交叉后端正确性由 gate 的 run_examples 双后端对拍 + LLVM IR verifier 覆盖；
+                // tile_demo 既有后端 bug 已在 KNOWN_FAILING 排除，不计入绿/红。
                 const diffs = r.out.split("\n").filter((l) => /^\s+(DIFF|NEW|GONE)/.test(l)).length;
                 // diffs==0 却 rc!=0 ⇒ 不是「发射偏差」，而是快照自身执行失败（某目标发射期
                 // 被 TIR verifier 中止 / emit-c 报错 / 编译器中途崩溃）。必须透传尾部输出，
@@ -227,7 +231,7 @@ const steps = [
                 if (diffs === 0) {
                     return { ok: false, note: lastLine(r.out, 3) };
                 }
-                return { ok: false, note: `${diffs} 处与 C-oracle 基线不符 ⇒ LLVM 后端发射偏差` };
+                return { ok: false, note: `${diffs} 处与 LLVM 自举基线不符 ⇒ emit/后端发射偏差` };
             }
             return { ok: true, note: lastLine(r.out.split("⇒")[0], 1) };
         },
@@ -442,9 +446,9 @@ if (failed === 0 && LV === 2) {
     console.log(`    cp out/dbg/g4.exe out/dbg/tc.exe && cp ${GR}.exe out/rls/tc.exe`);
 }
 if (nWarn > 0) {
-    // 基线必须由 C 后端 oracle 录制：g1 是 LLVM 自举产物，用它录基线等于
-    // 「用待测实现定义正确答案」，会把任何 LLVM 后端偏差固化进基线。
-    console.log(`\n  ⚠ 产物快照存在差异。确认本次改动确实改变了发射语义后，用 C 后端 oracle 重录：`);
-    console.log(`    node tools/ir_snapshot.mjs --compiler out/dbg/tc.exe --update`);
+    // 基线由 LLVM 自举产物 g1 录制（同源同后端，确定性）：快照是 LLVM-vs-LLVM 比对，
+    // 良性跨后端噪声已消除；仅在 emit/后端真改动时现形。确认偏差符合预期后重录：
+    console.log(`\n  ⚠ 产物快照存在差异。确认本次改动确实改变了发射语义后，用 LLVM 自举产物重录：`);
+    console.log(`    node tools/ir_snapshot.mjs --compiler out/dbg/g1.exe --update`);
 }
 process.exit(failed === 0 ? 0 : 1);

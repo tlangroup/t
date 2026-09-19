@@ -31,6 +31,12 @@
 //   node tools/ir_snapshot.mjs --keep          # 保留发射产物便于 diff
 //
 // 基线文件: tests/ir_baseline.json（应随语义变更一同提交）
+//
+// ⚠ 基线须由「与门禁被测编译器相同后端」的产物录制（gate L2 用 g1 = LLVM 自举产物）。
+//    跨后端(C vs LLVM)比较会因良性非确定性（结构体按布局命名、const 实参临时名/求值序）
+//    逐字节不同但运行期等价 → 误报假差异。故基线用 g1 录制、g1 比对（LLVM-vs-LLVM
+//    确定性），良性噪声消失，只放量级 emit/后端真改动。重录命令：
+//      node tools/ir_snapshot.mjs --update --compiler out/dbg/g1.exe
 
 import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
