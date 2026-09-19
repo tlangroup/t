@@ -2405,18 +2405,32 @@ pub fn tir_emit_for_each(n: Node) void {
     tir_loop_pop();
 }
 
+// 取赋值 LHS 的期望 TD：局部符号表 → 全局/成员 → LHS 表达式自身类型推导。
+// ⚠ 此前只查局部符号表（`tir_find_local_idx`），LHS 是**全局变量**时返回 -1 ⇒
+//   空切片字面量 `g = []` 的元素类型退化成默认 i64 ⇒ %TSlice.elem_size = 8 而非 16
+//   ⇒ t_slice_append / t_slice_at 按 8 字节步长寻址，%TStr 的 len 字段读到邻字节
+//   （症状：println 输出空行或内存残片；编译器自举二代 arena OOM 的真因）。
+//   C 后端发 `t_slice_new(sizeof(T))` 恒正确，故只有双后端 differential 能暴露。
+pub fn tir_lhs_td(na: i64) i64 {
+    var lhn: Node = base.nodes[na];
+    if (lhn.kind == "ident") {
+        var idx: i64 = tir_find_local_idx(lhn.sa);
+        if (idx >= 0) { return g_local_tds[idx]; }
+    }
+    if (lhn.kind == "index") {
+        var btd: i64 = tir_expr_td(lhn.na);
+        if (btd >= 0 && sema.tds[btd].cat == "map") { return sema.tds[btd].val; }
+    }
+    return tir_expr_td(na);
+}
+
 pub fn tir_emit_assign(n: Node, est: i64) TirEmitRes {
     var op: string = n.sa;
     if (op == "=") {
         var rhs: string;
         if (base.nodes[n.nb].kind == "array_lit") {
-            // 期望类型来自 LHS（ident 局部 TD / 其余退化）；使固定数组字面量落到 arr< 而非 slice
-            var lhstd: i64 = -1;
-            var lhn: Node = base.nodes[n.na];
-            if (lhn.kind == "ident") {
-                var idx: i64 = tir_find_local_idx(lhn.sa);
-                if (idx >= 0) { lhstd = g_local_tds[idx]; }
-            }
+            // 期望类型来自 LHS（局部 TD / 全局 TD / LHS 表达式类型）；使固定数组字面量落到 arr< 而非 slice
+            var lhstd: i64 = tir_lhs_td(n.na);
             var __er3: TirEmitRes = tir_emit_array_lit(n.nb, lhstd); rhs = __er3.name;
         } else if (base.nodes[n.nb].kind == "map_lit") {
             var lhstd: i64 = -1;

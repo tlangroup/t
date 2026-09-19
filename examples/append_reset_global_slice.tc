@@ -1,0 +1,24 @@
+// 回归用例：全局切片置空后 append（LLVM 后端 elem_size 退化的经典形态）
+//
+// 曾经的双后端分歧：
+//   - LLVM：空切片字面量 `[]` 的元素类型推断不出，退化成默认 i64 ⇒
+//     %TSlice.elem_size = 8 而非 sizeof(%TStr) = 16 ⇒
+//     t_slice_append / t_slice_at 按 8 字节步长寻址 ⇒ %TStr.len 读到邻字节，
+//     println 输出空行或内存残片。
+//   - C：全局切片 + 数组字面量初始化器在文件作用域发成聚合初始化式
+//     `TSlice g = {TSTR_LIT("z")};` ⇒ clang: initializing 'void *' with 'TStr'。
+//
+// 同一个根因的两端表现：字面量自身推断不出元素类型，而上下文期望类型没传下去。
+// 修法见 src/tir.tc 的 tir_lhs_td（LLVM 轨）与 src/codegen_c.tc 的 emit_global_var（C 轨）。
+//
+// 影响面远大于本例：编译器自身 ll_parse_func 里 `g_pf_params = []` 后 append 形参名
+// 正好命中此路径 ⇒ 自举二代（LLVM 后端编出的编译器）一遇带形参的函数就错乱 ⇒
+// g2 编译 src/tc.tc 时 arena OOM，自举不动点 / 四代不动点 / rls 快速通道全线失败。
+pub var g: []string = ["z"];
+
+fn main() i64 @main {
+    g = [];
+    append(g, "R");
+    println(g[0]);
+    return 0;
+}
