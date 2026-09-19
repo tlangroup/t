@@ -57,6 +57,7 @@ let update = false;
 let keep = false;
 let backends = ["ll", "c", "dev"];
 let jobs = Math.min(8, Math.max(1, cpus().length));
+let retries = 2;
 const argv = process.argv.slice(2);
 for (let i = 0; i < argv.length; i++) {
     if (argv[i] === "--compiler") compiler = resolve(ROOT, argv[++i]);
@@ -64,6 +65,7 @@ for (let i = 0; i < argv.length; i++) {
     else if (argv[i] === "--keep") keep = true;
     else if (argv[i] === "--backends") backends = argv[++i].split(",").map((s) => s.trim()).filter(Boolean);
     else if (argv[i] === "--jobs") jobs = Math.max(1, parseInt(argv[++i], 10) || 1);
+    else if (argv[i] === "--retries") retries = Math.max(0, parseInt(argv[++i], 10) || 0);
     else {
         // 未知参数硬失败：静默忽略会让笔误退回默认编译器，快照对比失去意义。
         console.error(`ir_snapshot: 未知参数 ${argv[i]}；可用：--compiler --update --keep --backends --jobs`);
@@ -206,6 +208,25 @@ function md5Normalized(p, ext) {
     return createHash("md5").update(normalizeStructNames(t, ext)).digest("hex");
 }
 
+// 偶发崩溃重试：gate 长流程资源紧张下，最重 target（泛型单态化 + f-string JSON）
+// 偶发退出（exit 3）属真资源问题，重试可消除；重试仍失败则为真 bug，gate 仍 FAIL（正确）。
+// 注：曾误判为「非确定性」的 fmt_json_a1a V006 实为 TIR 校验器对合法「部分初始化后赋值」
+// 的误报，已在 src/tir.tc 撤防 V006 修复 —— 该问题不能被重试掩盖，需根因修复。
+async function execWithRetry(args) {
+    let last = null;
+    for (let attempt = 0; attempt <= retries; attempt++) {
+        try {
+            await pExecFile(compiler, args, { cwd: ROOT, encoding: "buffer", maxBuffer: 256 * 1024 * 1024, windowsHide: true });
+            return null;
+        } catch (e) {
+            last = e;
+            if (attempt < retries) { await new Promise((r) => setTimeout(r, 300 * (attempt + 1))); continue; }
+        }
+    }
+    const tail = last && last.stderr ? String(last.stderr).split("\n").slice(-8).join("\n") : "";
+    return { code: last?.code ?? -1, tail };
+}
+
 // 每个 (目标, 后端) 产出一个快照条目，key 形如 "examples/foo.tc::ll"
 async function emitOne(rel) {
     // 输出名唯一化，保证并行时互不覆盖
@@ -219,13 +240,8 @@ async function emitOne(rel) {
 
     if (backends.includes("ll")) {
         const outBase = join(WORK_REL, tag);
-        try {
-            await pExecFile(compiler, ["emit-ll", rel, "--output", outBase], {
-                cwd: ROOT, encoding: "buffer", maxBuffer: 256 * 1024 * 1024, windowsHide: true,
-            });
-        } catch (e) {
-            return { rel, entries: null, error: `emit-ll failed (exit ${e.code ?? -1})` };
-        }
+        const err = await execWithRetry(["emit-ll", rel, "--output", outBase]);
+        if (err) return { rel, entries: null, error: `emit-ll failed (exit ${err.code})${err.tail ? " :: " + err.tail : ""}` };
         const ll = join(ROOT, `${outBase}.ll`);
         if (!existsSync(ll)) return { rel, entries: null, error: "no .ll produced" };
         out[`${rel}::ll`] = md5Normalized(ll, "ll");
@@ -235,13 +251,8 @@ async function emitOne(rel) {
         // emit-c 的 --output 是**目录**；每个目标独立子目录，避免 basename 撞名
         const outDir = join(WORK_REL, `c__${tag}`);
         mkdirSync(join(ROOT, outDir), { recursive: true });
-        try {
-            await pExecFile(compiler, ["compile", rel, "--emit-c", "--output", outDir], {
-                cwd: ROOT, encoding: "buffer", maxBuffer: 256 * 1024 * 1024, windowsHide: true,
-            });
-        } catch (e) {
-            return { rel, entries: null, error: `emit-c failed (exit ${e.code ?? -1})` };
-        }
+        const err = await execWithRetry(["compile", rel, "--emit-c", "--output", outDir]);
+        if (err) return { rel, entries: null, error: `emit-c failed (exit ${err.code})${err.tail ? " :: " + err.tail : ""}` };
         for (const ext of [".c", ".h"]) {
             const f = join(ROOT, outDir, base + ext);
             if (!existsSync(f)) return { rel, entries: null, error: `no ${base}${ext} produced` };

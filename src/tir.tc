@@ -142,6 +142,7 @@ pub const TIR_OP_SDIV: i64 = 58;
 pub const TIR_OP_UDIV: i64 = 59;
 pub const TIR_OP_SREM: i64 = 60;
 pub const TIR_OP_UREM: i64 = 61;
+pub const TIR_OP_TYPEINFO: i64 = 62;   // type_info(T)：编译期合成 @__ti_<T> 全局常量引用（TIR 轨反射支持）
 pub const TIR_OP_AND: i64 = 38;
 pub const TIR_OP_OR: i64 = 39;
 pub const TIR_OP_XOR: i64 = 40;
@@ -258,6 +259,7 @@ pub fn tir_op_to_str(o: i64) string {
     if (o == TIR_OP_STRUCT_NEW) { return "struct_new"; }
     if (o == TIR_OP_CALL) { return "call"; }
     if (o == TIR_OP_CALL_IND) { return "call_ind"; }
+    if (o == TIR_OP_TYPEINFO) { return "typeinfo"; }
     if (o == TIR_OP_BR) { return "br"; }
     if (o == TIR_OP_BR_COND) { return "br_cond"; }
     if (o == TIR_OP_BLOCK) { return "block"; }
@@ -579,15 +581,13 @@ pub fn tir_verify_inst(fname: string, inst: TIRInst) void {
                     if (na > fc) {
                         tir_verify_report("V001", base.sb_cat3(base.sb_cat4(fname, ": ", tn, " 实参 "), base.i2s(na), base.sb_cat2(" > 声明字段 ", base.i2s(fc))));
                     }
-                    // V006：部分初始化（给了若干个、而非全部）。
-                    // Struct{} 空壳（na == 0）是合法的零初始化写法 —— mir/tmir 的
-                    // MIRBlock{} / TMIRBlock{} 即如此，字段随后逐个赋值。但「给了
-                    // 一部分」在位置契约下必然让后续字段落槽错位，正是 phase-1 的形态。
-                    if (na > 0) {
-                        if (na < fc) {
-                            tir_verify_report("V006", base.sb_cat3(base.sb_cat4(fname, ": ", tn, " 实参 "), base.i2s(na), base.sb_cat2(" < 声明字段 ", base.i2s(fc))));
-                        }
-                    }
+                    // V006（已撤防）：部分初始化 na < fc。
+                    // 历史上 phase-1 后端把书写序实参直接落槽，na < fc 会让缺失字段后的
+                    // 字段错位 → arena OOM。但当前 TIR 发射器 tir_emit_struct_lit 已按
+                    // 声明序归位、缺失字段留 zeroinitializer（tir.tc:3667-3683），故
+                    // 「先给若干字段、剩余随后逐字段赋值」是合法写法
+                    // （examples/fmt_json_a1a.tc 的 Shape 即如此），不应判错。
+                    // 过参情形仍由上方 V001 (na > fc) 拦截。
                     var c5: i64 = sema.find_struct_fields(sname);
                     var i5: i64 = 0;
                     while (c5 >= 0) {
@@ -856,6 +856,10 @@ pub fn tir_scalar_st(name: string) string {
     if (name == "bool") { return "i8"; }     // 存储型 i8（tir-design.md §5.2）
     if (name == "atom" || name == "fid") { return "u64"; }
     if (name == "char") { return "i8"; }
+    // 任意位宽整数 > 64（u128 / i128 及更宽）：LLVM 原生 i<N>，与 C 的 _BitInt(N) 逐位一致。
+    // 缺此分支会回落到 i64，造成 128 位值被截断（awi_demo：b=2^128-1 丢高 64 位 → 地址垃圾）。
+    var ab: i64 = base.awi_bits(name);
+    if (ab > 64) { return base.sb_cat3("i", base.i2s(ab), ""); }
     return "i64";
 }
 
@@ -1030,6 +1034,14 @@ pub fn tir_expr_td(e: i64) i64 {
     // 注意：此处 base.nodes[e].kind 为单层成员访问，且本函数无 TirEmitRes 局部，
     // 旧轨 emit-ll 不会触发 str_eq 槽位冲突 / null 指针访问。
     if (n0.kind == "atom") { return tir_atom_td(); }
+    // 结构体字面量：类型即其命名类型 n0.sa（如 Pt{...} → Pt TD）。
+    // 此前无此分支 → 落到下方 meta_type_of_expr，经 .td 缓存（line 1033）易取到脏标量 TD，
+    // 使 match 返回结构体时 __mres 槽退化为 i64 → 槽宽不足 / IR 类型不匹配
+    //（match_return_struct：store %Pt … ptr %__mres(alloca i64) + load i64 误编）。
+    if (n0.kind == "struct_lit") {
+        var sl_td: i64 = t_td_of_named(n0.sa);
+        if (sl_td >= 0) { return sl_td; }
+    }
     // v3 §5.3：优先读 HIR 类型槽（sema 一次性填入），避免每次重推导 + 影子表反推。
     // ⚠ 缓存值须做越界检查：node.td 可能取自更大 sema.tds 上下文的残留索引，直接返回会毒化下游 sema.tds[td] 索引。
     var cached_td: i64 = base.nodes[e].td;
@@ -2018,9 +2030,17 @@ pub fn tir_emit_stmt(sid: i64) void {
                 var clo: string = tir_make_closure_value(base.sb_cat2("@", base.nodes[n.nb].sa), "");
                 tir_emit(TIRInst{ op: TIR_OP_STORE, st: ST_NONE, dst: tir_op(slot), args: tir_a1(clo), is_comment: false, line: g_cur_line, cmt: "" });
             } else {
-                var initr: TirEmitRes = tir_emit_expr(n.nb); var init: string = initr.name;
-                if (st == "%TSlice") { init = tir_maybe_array_to_slice(init, n.nb); }
-                tir_emit(TIRInst{ op: TIR_OP_STORE, st: ST_NONE, dst: tir_op(slot), args: tir_a1(init), is_comment: false, line: g_cur_line, cmt: "" });
+                if (base.nodes[n.nb].kind == "int" && base.awi_bits(st) > 64) {
+                    // AWI：整数字面量直接以目标 i<N> 槽类型全精度发射（规避 tir_emit_expr 把字面量
+                    // 降级成 i64 → 高位截断，如 u128 2^128-1 / i128 -1 经 ll_norm_imm 溢出成 2^64-1）。
+                    var daw: string = tir_tmp();
+                    tir_emit(TIRInst{ op: TIR_OP_CONST, st: tir_st_from_str(st), dst: tir_op(daw), args: tir_a1(base.nodes[n.nb].sa), is_comment: false, line: g_cur_line, cmt: "" });
+                    tir_emit(TIRInst{ op: TIR_OP_STORE, st: ST_NONE, dst: tir_op(slot), args: tir_a1(daw), is_comment: false, line: g_cur_line, cmt: "" });
+                } else {
+                    var initr: TirEmitRes = tir_emit_expr(n.nb); var init: string = initr.name;
+                    if (st == "%TSlice") { init = tir_maybe_array_to_slice(init, n.nb); }
+                    tir_emit(TIRInst{ op: TIR_OP_STORE, st: ST_NONE, dst: tir_op(slot), args: tir_a1(init), is_comment: false, line: g_cur_line, cmt: "" });
+                }
             }
         }
         return;
@@ -2158,8 +2178,11 @@ pub fn tir_emit_for(n: Node) void {
     if (n.na >= 0) { tir_emit_stmt(n.na); }    // 初始化（通常 var_decl）
     var headL: string = tir_lbl("for.h");
     var bodyL: string = tir_lbl("for.b");
+    var contL: string = tir_lbl("for.c");   // continue 目标 = 增量块（不跳过增量）
     var endL: string = tir_lbl("for.e");
-    tir_loop_push(headL, endL);
+    // ⚠ for 循环的 continue 必须跳到「增量块」而非「条件头」：否则遇 continue 时增量被跳过，
+    //   导致死循环（LLVM 后端字面发射会触发该 bug；C 后端因原生 for(;cond;incr) 语义掩掉）。
+    tir_loop_push(contL, endL);
     tir_emit(tir_emit_br(headL));
     tir_block(headL);
     if (n.nb >= 0) {
@@ -2175,8 +2198,10 @@ pub fn tir_emit_for(n: Node) void {
         tir_emit_stmt(base.kids[bc].val);
         bc = base.kids[bc].next;
     }
-    if (n.nc >= 0) { tir_emit_stmt(n.nc); }     // 增量（通常 assignment）
     tir_blk_pop();
+    tir_emit(tir_emit_br(contL));   // body 末尾跳增量块（continue 也跳此）
+    tir_block(contL);
+    if (n.nc >= 0) { tir_emit_stmt(n.nc); }     // 增量（通常 assignment）
     tir_emit(tir_emit_br(headL));
     tir_block(endL);
     tir_loop_pop();
@@ -2253,7 +2278,7 @@ pub fn tir_emit_for_each(n: Node) void {
         var bodyL: string = tir_lbl("fe.b");
         var stepL: string = tir_lbl("fe.s");
         var endL: string = tir_lbl("fe.e");
-        tir_loop_push(headL, endL);
+        tir_loop_push(stepL, endL);   // ⚠ continue 必须跳 stepL（增量块），否则跳过 idx++
         tir_emit(tir_emit_br(headL));
         tir_block(headL);
         var cidx: string = tir_tmp();
@@ -2331,7 +2356,7 @@ pub fn tir_emit_for_each(n: Node) void {
     var bodyL: string = tir_lbl("fe.b");
     var stepL: string = tir_lbl("fe.s");
     var endL: string = tir_lbl("fe.e");
-    tir_loop_push(headL, endL);
+    tir_loop_push(stepL, endL);   // ⚠ continue 必须跳 stepL（增量块），否则跳过 idx++
     tir_emit(TIRInst{ op: TIR_OP_BR, st: ST_NONE, dst: tir_op(""), args: tir_a1(headL), is_comment: false, line: g_cur_line, cmt: "" });
     tir_block(headL);
     var cidx: string = tir_tmp();
@@ -2414,6 +2439,17 @@ pub fn tir_emit_assign(n: Node, est: i64) TirEmitRes {
                 // Sym 类型 = 字符串字面量：自动 intern（LHS 存 id，而非字符串本身）。
                 // 否则会把 %TStr 字面量塞进 i32/i16 槽 → sym_str 拿到垃圾 id → 输出空串。
                 var lhstd: i64 = g_local_tds[idx];
+                // AWI：整数字面量必须以目标 i<N> 槽类型全精度发射，否则被降级成 i64 → 高位截断
+                // （如 u128 2^128-1 / i128 -1 经 ll_norm_imm 溢出成 2^64-1）。字面量值存于 n.sa 文本，
+                // sema 对字面量恒标 i64，故在此按 LHS 槽实际宽度重发射常量。
+                if (base.nodes[n.nb].kind == "int") {
+                    var lhst: string = g_local_sts[idx];
+                    if (base.awi_bits(lhst) > 64) {
+                        var daw: string = tir_tmp();
+                        tir_emit(TIRInst{ op: TIR_OP_CONST, st: tir_st_from_str(lhst), dst: tir_op(daw), args: tir_a1(base.nodes[n.nb].sa), is_comment: false, line: g_cur_line, cmt: "" });
+                        rhs = daw;
+                    }
+                }
                 if (lhstd >= 0 && sema.tds[lhstd].cat == "sym" && base.nodes[n.nb].kind == "string") {
                     var tagid: i64 = slice_len(g_mod.strings) as i64;
                     append(g_mod.strings, sema.tds[lhstd].name);
@@ -2603,6 +2639,12 @@ pub fn tir_emit_expr(e: i64) TirEmitRes {
     // 新轨此前无此分支，< 被当普通小于比较发射 → fid 序列化整段失效。
     if (kd == "serialize") { return tir_emit_serialize(n); }
     if (kd == "deserialize") { return tir_emit_deserialize(n); }
+    if (kd == "typeinfo") {
+        // type_info(T)：编译期反射，降级为 TIR_OP_TYPEINFO（由 tir_to_ll 发射 @__ti_<T> 全局常量引用）。
+        var d: string = tir_tmp();
+        tir_emit(TIRInst{ op: TIR_OP_TYPEINFO, st: ST_PTR_VOID, dst: tir_op(d), args: tir_a1(n.sa), is_comment: false, line: g_cur_line, cmt: "" });
+        return TirEmitRes{ name: d, st: ST_PTR_VOID };
+    }
     // 兜底：不支持的表达式 → 零 slot，绝不崩溃
     tir_cmt(base.sb_cat3("unsupported expr: ", kd, ""));
     var z: string = tir_tmp();
@@ -2769,19 +2811,37 @@ pub fn tir_emit_deserialize(n: Node) TirEmitRes {
     var dsgnv: i64 = 0;
     if (base.ll_signed(sn)) { dsgnv = 1; }
     tir_emit(tir_e_call("i64", iv, "@tll_deser_int", tir_cargs3(fslot, tir_const_i32(base.ll_bits(sn)), tir_const_i32(dsgnv))));
+    // ⚠ 无符号窄量（u8/u16/u32）：deser 返回 i64，TRUNC 到窄位宽后位模式正确，
+    // 但赋给加宽成 i64 的槽位时需 zext（而非 sext），否则 200 被误当作有符号 -56。
+    // 故无符号分支在 TRUNC 后补一枚 ZEXT i⟨窄⟩→i64，直接返回 i64，让赋值 i64→i64 槽免误转。
     if (sn == "i8" || sn == "u8") {
         var d: string = tir_tmp();
         tir_emit(TIRInst{ op: TIR_OP_TRUNC, st: tir_st_from_str("i8"), dst: tir_op(d), args: tir_a1(iv), is_comment: false, line: g_cur_line, cmt: "" });
+        if (base.ll_signed(sn) == false) {
+            var d2: string = tir_tmp();
+            tir_emit(TIRInst{ op: TIR_OP_ZEXT, st: tir_st_from_str("i64"), dst: tir_op(d2), args: tir_a1(d), is_comment: false, line: g_cur_line, cmt: "" });
+            return TirEmitRes{ name: d2, st: ST_I64 };
+        }
         return TirEmitRes{ name: d, st: ST_I8 };
     }
     if (sn == "i16" || sn == "u16") {
         var d: string = tir_tmp();
         tir_emit(TIRInst{ op: TIR_OP_TRUNC, st: tir_st_from_str("i16"), dst: tir_op(d), args: tir_a1(iv), is_comment: false, line: g_cur_line, cmt: "" });
+        if (base.ll_signed(sn) == false) {
+            var d2: string = tir_tmp();
+            tir_emit(TIRInst{ op: TIR_OP_ZEXT, st: tir_st_from_str("i64"), dst: tir_op(d2), args: tir_a1(d), is_comment: false, line: g_cur_line, cmt: "" });
+            return TirEmitRes{ name: d2, st: ST_I64 };
+        }
         return TirEmitRes{ name: d, st: tir_st_from_str("i16") };
     }
     if (sn == "i32" || sn == "u32") {
         var d: string = tir_tmp();
         tir_emit(TIRInst{ op: TIR_OP_TRUNC, st: tir_st_from_str("i32"), dst: tir_op(d), args: tir_a1(iv), is_comment: false, line: g_cur_line, cmt: "" });
+        if (base.ll_signed(sn) == false) {
+            var d2: string = tir_tmp();
+            tir_emit(TIRInst{ op: TIR_OP_ZEXT, st: tir_st_from_str("i64"), dst: tir_op(d2), args: tir_a1(d), is_comment: false, line: g_cur_line, cmt: "" });
+            return TirEmitRes{ name: d2, st: ST_I64 };
+        }
         return TirEmitRes{ name: d, st: ST_I32 };
     }
     return TirEmitRes{ name: iv, st: ST_I64 };
@@ -3830,6 +3890,19 @@ pub fn tir_member_base_st(e: i64) string {
             return tir_field_st(sname, n.sa);
         }
         return "i64";
+    }
+    if (n.kind == "index") {
+        // ⚠ 切片/数组/向量下标作 member 基底：`s[i].field` 的基底类型 = 元素类型。
+        // 优先用 tir_emit_index_addr 已算好的权威元素类型 g_idx_elem_st（与 slice_at 同源，
+        // 绕开索引节点 .td 缓存被污染成 i64 的陷阱 → 否则字段 GEP 落在 field0，写入错位置
+        // / 篡改侦测失效）。退化路径再退回 base_td→elem_st / tir_expr_st。
+        if (str_len(g_idx_elem_st) > 0 && g_idx_elem_st[0] == '%') { return g_idx_elem_st; }
+        var btd: i64 = tir_expr_td(n.na);
+        if (btd >= 0) {
+            var est: string = tir_elem_st(btd);
+            if (str_len(est) > 0 && est[0] == '%') { return est; }
+        }
+        return tir_expr_st(e);
     }
     return tir_expr_st(e);
 }

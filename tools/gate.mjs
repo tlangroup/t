@@ -212,7 +212,7 @@ const steps = [
         id: "snapshot", lv: 0, name: "产物快照比对 (ll + c 双后端)",
 
         run: async () => {
-            const r = await node("ir_snapshot.mjs", "--compiler", `${G1}.exe`);
+            const r = await node("ir_snapshot.mjs", "--compiler", `${G1}.exe`, "--jobs", "1");
             ctx.irClean = r.code === 0;
             if (r.code !== 0) {
                 // T0（修订·2026-09-19）：基线由 LLVM 自举产物 g1 录制

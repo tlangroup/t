@@ -41,7 +41,7 @@ void       tll_fi_name(TFieldInfo* fi, TStr* out)     { *out = t_fi_name(fi); }
 int64_t    tll_fi_offset(TFieldInfo* fi)              { return t_fi_offset(fi); }
 void       tll_fi_type_name(TFieldInfo* fi, TStr* out){ *out = t_fi_type_name(fi); }
 int64_t    tll_fi_type_size(TFieldInfo* fi)           { return t_fi_type_size(fi); }
-int8_t     tll_fi_is_ptr(TFieldInfo* fi)              { return t_fi_is_ptr(fi); }
+int64_t    tll_fi_is_ptr(TFieldInfo* fi)              { return (int64_t)t_fi_is_ptr(fi); }
 int64_t    tll_fi_tag(TFieldInfo* fi)                { return t_fi_tag(fi); }
 int64_t tll_str_len(TStr* s)                { return t_str_len(*s); }
 int64_t tll_str_at(TStr* s, int64_t i)      { return (int64_t)t_str_byte_at(*s, i); }

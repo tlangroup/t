@@ -13,6 +13,12 @@
 @import("src.base" :: *);
 @import("src.tir" :: *);   // 结构化入口消费 TIRModule / tir.g_globals_section（tir.tc 不反向导入本模块，无环）
 @import("src.llname" :: *);  // ⚠ 飞地规避：命名/槽分配子系统抽到小模块（种子对小模块 100% 正确编译）
+// type_info 反射：TIR 轨此前无 typeinfo 处理（仅 direct HIR→LLVM 路径 codegen_ll.emit_type_info_ll 有），
+// 导致 tc build 编出的程序里 @__ti_<T> 全局永不发射、type_info(T) 返回 null → 段错误。
+// 此处自包含发射 @__ti_<T> 全局常量（与 codegen_ll 同布局），复用 sema/lex 的字段元数据。
+@import("src.sema" :: resolve_type_desc, td_readable);
+@import("src.lex" :: decl_list);
+@import("src.codegen_c" :: is_ref_type);
 
 pub var g_ll: StringBuilder;
 pub var g_ll_tmpc: i64;
@@ -45,6 +51,17 @@ pub var g_ll_valptr: []string;   // 槽名集合：内容为「值字节指针(v
                                   // load 此类槽须解引用（load ptr, ptr (load ptr, ptr %x)）取回真正的值；
                                   // 普通 ptr 槽（如 map_new 句柄）load 只取槽中值本身，两者均属 ptr 类型故需显式标记区分。
 pub var g_ll_addrslot: []string;  // 槽名集合：GEP 结果（struct/closure 字段地址，l-value）。
+pub var g_ll_clofnslot: []string; // 槽名集合：`getelementptr %TClosure, ..., 0, 0` 的结果（闭包 field0 = code 槽）。
+                                  // ⚠ 该槽只能存**裸函数指针**(@fn.__clo_thunk)，不能存闭包全局(@.tirll_clo_fn)：
+                                  // call_ind 解包时把 field0 当 code 直接 call；若 field0 存的是 %TClosure 全局地址，
+                                  // 控制流会跳进数据段 → 段错误（2026-09-19 回归：closure_demo/func_type_demo/
+                                  // lambda_demo/closure_struct_demo/pipeline_demo 5 例 LLVM 后端空输出）。
+                                  // 而 fn 类型的**变量/结构体字段**槽存的是 ptr %TClosure（闭包值），二者 st 同为
+                                  // ptr<void> / ptr<ptr<void>>，无法按类型区分 → 只能按 GEP 基类型记录来源。
+// ── type_info 反射（TIR 轨 @__ti_<T> 全局常量缓冲）──────────────────
+pub var g_ti_defs: StringBuilder;     // @__ti_<T> / @__ti_<T>_f / 字段名/类型名字符串常量，模块末尾拼入 g_ll
+pub var g_ti_done: []string;         // 已发射 @__ti_<T> 的 struct 名（去重，避免重复定义）
+pub var g_ti_strc: i64;              // type_info 专属字符串常量计数（前缀 .tis，避免与 @.tirll_tstr / @.sN 撞号）
                                   // 写此类槽须「解引用写穿」：store v, ptr *dst（dst 槽内容是字段地址）；
                                   // 指针变量槽不是地址槽，store 直接把值拷进槽（store v, ptr dst）。
                                   // ⚠ 区分根因：TIR_OP_STORE 写 GEP 字段时 dst 是临时量(持有地址)，
@@ -398,7 +415,16 @@ pub fn ll_load(tname: string, st: string) string {
         // ⚠ 整型按槽真实宽度加载后，对齐到请求类型 st（zext/sext/trunc）。否则窄量(如 i8 char)以
         // 原始宽度传给期望 i64 的内建/函数（sb_append_char/tll_*）会 "defined with type 'i8' but expected 'i64'"。
         if (ll_is_int(realst) && ll_is_int(st)) {
-            return ll_coerce_to(r, realst, st);
+            // ⚠ 按【声明类型】而非槽位分配类型选 sext/zext：u8/u16/u32 的值槽可能保留窄类型
+            //   （i8/i16/i32），而变量最终槽被 ll_ensure_slot 加宽为 i64；若按 i8 决策会把无符号
+            //   窄量错误 sext 成负数（fid_read: c:u8=200 → -56）。仅当声明类型确为无符号窄量且位宽
+            //   与槽位一致时改用 zext，其余保持原行为。
+            var fromst: string = realst;
+            var declst: string = ll_get_st(dn);
+            if (declst == "u8" || declst == "u16" || declst == "u32") {
+                if (ll_int_bits(declst) == ll_int_bits(realst)) { fromst = declst; }
+            }
+            return ll_coerce_to(r, fromst, st);
         }
     }
     return r;
@@ -435,6 +461,10 @@ pub fn ll_int_bits(st: string) i64 {
     if (st == "u16" || st == "i16") { return 16; }
     if (st == "u32" || st == "i32") { return 32; }
     if (st == "u64" || st == "i64") { return 64; }
+    // 任意位宽整数（AWI）：i<N> / u<N> 的位宽由 base.awi_bits 解析（如 i128/u128 → 128）。
+    // ⚠ 此前此处 return 0 使 ll_coerce_to 对 AWI 早退、跳过宽度对齐 → "defined with type 'i64' but expected 'i128'"。
+    var ab: i64 = base.awi_bits(st);
+    if (ab > 0) { return ab; }
     return 0;
 }
 
@@ -481,6 +511,18 @@ pub fn ll_coerce_to(v: string, fromst: string, tost: string) string {
         sb_append_str(g_ll, "\n");
     }
     return r;
+}
+
+// 按操作数真实类型(ast)装载并强制对齐到运算类型(tst)。用于二元/比较运算：LLVM 要求两操作数
+// 类型一致，但整数字面量(如 `a + 1` 中的 1)在 TIR 中以默认 i64 发射，运算类型为 i128 时
+// 必须 sext/zext 对齐，否则 "defined with type 'i64' but expected 'i128'"。
+// ⚠ 仅对数值类型对齐；非数值(指针/聚合)保持原行为（ll_load(name, tst)）。
+pub fn ll_load_coerce(name: string, ast: string, tst: string) string {
+    if (str_len(ast) > 0 && (ll_is_int(ast) || ll_is_float(ast)) && st_to_ll(ast) != st_to_ll(tst)) {
+        var v: string = ll_load(name, ast);
+        return ll_coerce_to(v, ast, tst);
+    }
+    return ll_load(name, tst);
 }
 
 pub fn ll_find(s: string, sub: string) i64 {
@@ -736,9 +778,13 @@ pub fn ll_is_int(st: string) bool {
 
 // 是否为标量类型（整数/浮点/布尔）。聚合/指针/命名类型返回 false。
 pub fn ll_is_scalar_st(st: string) bool {
-    return st == "bool" || st == "i1" || st == "i8" || st == "i16" ||
-           st == "i32" || st == "i64" || st == "u8" || st == "u16" ||
-           st == "u32" || st == "u64" || st == "f32" || st == "f64";
+    if (st == "bool" || st == "i1" || st == "i8" || st == "i16" ||
+        st == "i32" || st == "i64" || st == "u8" || st == "u16" ||
+        st == "u32" || st == "u64" || st == "f32" || st == "f64") { return true; }
+    // 任意位宽整数（AWI）：i<N>/u<N>（N>64，如 i128/u128）也是标量，须被 STORE 宽度换算门禁识别，
+    // 否则 `store i128 ..., ptr %x` 被当成非标量跳过 → 高位丢失。
+    if ((ll_starts(st, "i") || ll_starts(st, "u")) && base.awi_bits(st) > 64) { return true; }
+    return false;
 }
 
 pub fn ll_is_float(st: string) bool {
@@ -752,7 +798,10 @@ pub fn ll_is_float(st: string) bool {
 
 // 无符号整型（用于拓宽时选 zext 而非 sext）。
 pub fn ll_is_unsigned_st(st: string) bool {
-    return st == "bool" || st == "u8" || st == "u16" || st == "u32" || st == "u64";
+    if (st == "bool" || st == "u8" || st == "u16" || st == "u32" || st == "u64") { return true; }
+    // 任意位宽无符号整数 u<N>（如 u128）：拓宽时须 zext 而非 sext。
+    if (ll_starts(st, "u")) { var ab: i64 = base.awi_bits(st); if (ab > 0) { return true; } }
+    return false;
 }
 
 // 八进制整数字面量 -> 十进制（LLVM IR 不支持 0o755，但支持 0x.. 与十进制）
@@ -830,10 +879,68 @@ pub fn ll_norm_imm(imm: string, st: string) string {    if (ll_starts(st, "f")) 
         if (ll_imm_is_int(imm)) { return base.sb_cat2(imm, ".0"); }
         return imm;
     }
+    // 任意位宽整数（AWI）：LLVM IR 仅接受十进制整数字面量（`0x…` 会被当成十六进制浮点、`0b/0o` 非法），
+    // 故把 hex/bin/oct 经任意精度转换（base 1e9 大整数）成十进制，避免 ll_hex/oct/bin_to_dec 用 i64 累积溢出。
+    if (base.awi_bits(st) > 64) { return ll_awi_imm_to_dec(imm); }
     if (ll_starts(imm, "0b") || ll_starts(imm, "0B")) { return ll_bin_to_dec(imm); }
     if (ll_starts(imm, "0o") || ll_starts(imm, "0O")) { return ll_oct_to_dec(imm); }
     if (ll_starts(imm, "0x") || ll_starts(imm, "0X")) { return ll_hex_to_dec(imm); }
     return imm;
+}
+
+// 任意位宽整数字面量（hex/bin/oct）转十进制：i64 累积会溢出，须 base-1e9 任意精度。
+// 输入可为 0x/0X/0b/0B/0o/0O 前缀或纯十进制；可带前导 '-'。返回十进制字符串。
+pub fn ll_awi_imm_to_dec(imm: string) string {
+    if (str_len(imm) > 0 && str_at(imm, 0) == 45) {
+        return base.sb_cat2("-", ll_awi_imm_to_dec(str_slice(imm, 1, str_len(imm))));
+    }
+    var radix: i64 = 10;
+    var s: string = imm;
+    if (ll_starts(imm, "0x") || ll_starts(imm, "0X")) { radix = 16; s = str_slice(imm, 2, str_len(imm)); }
+    else if (ll_starts(imm, "0b") || ll_starts(imm, "0B")) { radix = 2; s = str_slice(imm, 2, str_len(imm)); }
+    else if (ll_starts(imm, "0o") || ll_starts(imm, "0O")) { radix = 8; s = str_slice(imm, 2, str_len(imm)); }
+    else { return imm; }   // 已是十进制
+    // 1) 任意精度累加到 base-1e9 大整数：big = big*radix + digit
+    var limbs: []i64 = [];
+    var n: i64 = str_len(s);
+    var i: i64 = 0;
+    while (i < n) {
+        var c: i64 = str_at(s, i);
+        var d: i64;
+        if (c >= 48 && c <= 57) { d = c - 48; }
+        else if (c >= 65 && c <= 70) { d = c - 55; }
+        else if (c >= 97 && c <= 102) { d = c - 87; }
+        else { d = 0; }
+        var carry: i64 = d;
+        var j: i64 = 0;
+        while (j < slice_len(limbs) as i64) {
+            var v: i64 = limbs[j] * radix + carry;
+            limbs[j] = v % 1000000000;
+            carry = v / 1000000000;
+            j = j + 1;
+        }
+        if (carry > 0) { append(limbs, carry); }
+        i = i + 1;
+    }
+    if (slice_len(limbs) as i64 == 0) { return "0"; }
+    // 2) 大整数 ÷10 取余逐位生成十进制（从低位向前拼）
+    var out: string = "";
+    var alive: bool = true;
+    while (alive) {
+        var rem: i64 = 0;
+        var z: i64 = slice_len(limbs) as i64 - 1;
+        while (z >= 0) {
+            var val: i64 = rem * 1000000000 + limbs[z];
+            limbs[z] = val / 10;
+            rem = val % 10;
+            z = z - 1;
+        }
+        out = base.sb_cat2(base.i2s(rem), out);
+        alive = false;
+        var q: i64 = 0;
+        while (q < slice_len(limbs) as i64) { if (limbs[q] != 0) { alive = true; } q = q + 1; }
+    }
+    return out;
 }
 
 // 为模块内未定义的被调函数 emit declare（可被多次调用，仅首见时声明一次）
@@ -1472,12 +1579,18 @@ pub fn ll_emit_builtin(cn: string, toks: []string) bool {
         var tlln: string = base.sb_cat2("tll_", cn);
         ll_maybe_declare(tlln, "i64", ["ptr"]);
         var r: string = ll_tmp();
+        // ⚠ ti/fi 实参是指针类型（TTypeInfo* / TFieldInfo*），槽内存的是句柄本身，
+        //   必须 load 出值传给 shim；直接传槽地址(ptr*)会被当成 TTypeInfo* 解引用 → 读到的是
+        //   「指针的字节」而非「@__ti_<T> 的内容」。与 emit-ll 的 emit_lle 自动 load 对齐。
+        //   ll_load 会立即把 load 指令 append 到 g_ll，故须先取好寄存器名，再拼 call 行
+        //   （否则 load 会插进 call 行中间 → IR 非法；见 tll_deser_str 处注释）。
+        var tv: string = ll_load(toks[4], "ptr");
         sb_append_str(g_ll, "  ");
         sb_append_str(g_ll, r);
         sb_append_str(g_ll, " = call i64 @");
         sb_append_str(g_ll, tlln);
         sb_append_str(g_ll, "(ptr ");
-        sb_append_str(g_ll, ll_llname_ptr(toks[4]));
+        sb_append_str(g_ll, tv);
         sb_append_str(g_ll, ")\n");
         ll_ensure_slot(d, "i64"); ll_set_st(d, "i64"); ll_store(d, "i64", r);
         return true;
@@ -2016,7 +2129,8 @@ pub fn ll_emit_builtin(cn: string, toks: []string) bool {
     if (cn == "ti_name" || cn == "fi_name" || cn == "fi_type_name") {
         var fn2: string = base.sb_cat2("tll_", cn);
         ll_ensure_slot(d, "%TStr"); ll_set_st(d, "%TStr");
-        ll_call_void(fn2, ["ptr", "ptr"], [ll_llname(toks[4]), ll_llname(d)]);
+        // ti/fi 实参是指针类型，槽内存的是句柄本身，须 load 出值（见 ti_size 处注释）。
+        ll_call_void(fn2, ["ptr", "ptr"], [ll_load(toks[4], "ptr"), ll_llname(d)]);
         return true;
     }
     // ── tll_deser_str：void + 显式 sret（out 末位 ptr 实参）──
@@ -2037,13 +2151,15 @@ pub fn ll_emit_builtin(cn: string, toks: []string) bool {
     }
     // ── ti_field：ti, i → TFieldInfo* (ptr) ──
     if (cn == "ti_field") {
+        // ti 实参是指针类型，须 load 出值（见 ti_size 处注释）。
         ll_call_ret("tll_ti_field", "ptr", ["ptr", "i64"],
-                    [ll_llname(toks[4]), ll_load(toks[5], "i64")], d);
+                    [ll_load(toks[4], "ptr"), ll_load(toks[5], "i64")], d);
         return true;
     }
     // ── fi_tag：fi → i64 ──
     if (cn == "fi_tag") {
-        ll_call_ret("tll_fi_tag", "i64", ["ptr"], [ll_llname(toks[4])], d);
+        // fi 实参是指针类型，须 load 出值（见 ti_size 处注释）。
+        ll_call_ret("tll_fi_tag", "i64", ["ptr"], [ll_load(toks[4], "ptr")], d);
         return true;
     }
     // ── sb_append_fmt_*：void，忽略 i64 返回 ──
@@ -2587,6 +2703,16 @@ pub fn ll_emit_inst(inst: TIRInst) void {
         ll_store(d, "ptr", "null");
         return;
     }
+    if (op == TIR_OP_TYPEINFO) {
+        // type_info(T)：合成 @__ti_<T> 全局常量并将其指针存入结果槽（值即 ptr @__ti_<T>）。
+        var d: string = inst.dst.name;
+        var tname: string = inst.args[0].name;
+        var gref: string = ll_emit_ti_global(tname);
+        ll_ensure_slot(d, "ptr");
+        ll_set_st(d, "ptr");
+        ll_store(d, "ptr", gref);
+        return;
+    }
     if (op == TIR_OP_CONST || op == TIR_OP_CONST_STR || op == TIR_OP_CONST_PTR_NULL) {
         var st: string;
         var d: string = inst.dst.name;
@@ -2687,14 +2813,36 @@ pub fn ll_emit_inst(inst: TIRInst) void {
         var dstst: string = ll_get_st(dst);
         if (str_len(src) >= 1 && src[0] == 64 && ll_is_func(ll_mangle(str_slice(src, 1, str_len(src))))) {
             var mref: string = ll_mangle(str_slice(src, 1, str_len(src)));
-            // field0 必须存 code（@fn 或 @fn.__clo_thunk），不能存 %TClosure 全局（否则双重包裹 → 段错误）
-            var fptr: string = ll_closure_code(mref);
-            var p: string = ll_load(dst, dstst);
-            sb_append_str(g_ll, "  store ptr ");
-            sb_append_str(g_ll, fptr);
-            sb_append_str(g_ll, ", ptr ");
-            sb_append_str(g_ll, p);
-            sb_append_str(g_ll, "\n");
+            // 两种「函数值」槽，语义互斥，st 相同故只能按来源（GEP 基类型）区分：
+            //  (a) %TClosure.field0（闭包构造）→ 必须存**裸 code** @fn.__clo_thunk；
+            //      call_ind 解包时直接 call field0，存闭包全局会跳进数据段 → 段错误。
+            //  (b) fn 类型的变量 / 结构体字段 → 必须存**闭包值** ptr %TClosure（@.tirll_clo_fn）；
+            //      call_ind 先 load 该值再 GEP 解包，存裸 code 会把函数机器码当前 8 字节当
+            //      field0 指针 → GEP 出垃圾 → 段错误（colony_wave / func_type 类崩溃根因）。
+            var is_clofn: bool = false;
+            var si: i64 = 0;
+            var sn: i64 = slice_len(g_ll_clofnslot) as i64;
+            while (si < sn) {
+                if (g_ll_clofnslot[si] == dst) { is_clofn = true; }
+                si = si + 1;
+            }
+            var fptr: string;
+            if (is_clofn) { fptr = ll_closure_code(mref); } else { fptr = ll_emit_closure_const(mref, ""); }
+            if (is_clofn || ll_is_addrslot(dst)) {
+                // 地址槽（%TClosure.field0 / fn 类型的结构体字段）：dst 槽内容=字段地址 → 解引用写穿
+                var p: string = ll_load(dst, dstst);
+                sb_append_str(g_ll, "  store ptr ");
+                sb_append_str(g_ll, fptr);
+                sb_append_str(g_ll, ", ptr ");
+                sb_append_str(g_ll, p);
+                sb_append_str(g_ll, "\n");
+            } else {
+                // 值槽（fn 类型的**变量**，槽内容即 ptr %TClosure）：直接写槽，**禁止**解引用。
+                // 若误按地址槽写穿（`f = sub` → `*f = clo`），闭包指针会被塞进 f 所指 TClosure 的
+                // 首 8 字节（= field0/code），下一次 call_ind 把它当 code 调用 → 段错误
+                // （func_type_demo / lambda_demo 第二行崩溃的根因，2026-09-19）。
+                ll_store(dst, dstst, fptr);
+            }
             return;
         }
         if (ll_starts(dstst, "ptr<")) {
@@ -2940,6 +3088,11 @@ pub fn ll_emit_inst(inst: TIRInst) void {
             gtypename = pst;
             pv = ll_llname(p);
         }
+        if (slice_len(inst.args) as i64 >= 2) {
+            if (gtypename == "%TClosure" && inst.args[1].name == "0") {
+                append(g_ll_clofnslot, g);
+            }
+        }
         var r: string = ll_tmp();
         var operands: string = "";
         var ki: i64 = 1;
@@ -2972,7 +3125,19 @@ pub fn ll_emit_inst(inst: TIRInst) void {
         sb_append_str(g_ll, gtypename);
         sb_append_str(g_ll, ", ptr ");
         sb_append_str(g_ll, pv);
-        if (ll_starts(gtypename, "[")) { sb_append_str(g_ll, ", i32 0"); }
+        // ⚠ 解引用首索引 `i32 0` 的归属（GEP 首索引 = 穿过 ptr 选中被指聚合，第二索引才是字段/元素）：
+        //   - 指针基（pst 以 `ptr<` 开头）：前端在索引首位已给出解引用 0（如 ptr<%Struct> 的 [0,field]），
+        //     仅当基类型是数组（[N x T]）时仍需补；结构体基若再补会重复 0 → 索引层数错位（见 _slicefield）。
+        //   - 值基（聚合直接落 alloca，else 分支）：前端只给字段/元素下标（如 s.len → [1]），必须补解引用 0，
+        //     否则 `base.field_k` 被算成 `ptr + k*sizeof(Struct)` → 读写越界崩溃（见 array_range）。
+        //     field 0 因偏移恰为 0 而「偶然正确」，长期掩盖该 bug。
+        var add_deref0: bool = false;
+        if (ll_starts(pst, "ptr<")) {
+            add_deref0 = ll_starts(gtypename, "[");
+        } else {
+            add_deref0 = ll_starts(gtypename, "%") || ll_starts(gtypename, "[");
+        }
+        if (add_deref0) { sb_append_str(g_ll, ", i32 0"); }
         sb_append_str(g_ll, operands);
         sb_append_str(g_ll, "\n");
         if (ll_starts(st, "ptr") && (kn - 1) == 1 && ll_starts(pst, "%")) {
@@ -3633,8 +3798,8 @@ pub fn ll_emit_inst(inst: TIRInst) void {
         var d: string = inst.dst.name;
         var a: string = inst.args[0].name;
         var b: string = inst.args[1].name;
-        var da: string = ll_load(a, st);
-        var db: string = ll_load(b, st);
+        var da: string = ll_load_coerce(a, tir_st_to_str(inst.args[0].st), st);
+        var db: string = ll_load_coerce(b, tir_st_to_str(inst.args[1].st), st);
         var r: string = ll_tmp();
         sb_append_str(g_ll, "  ");
         sb_append_str(g_ll, r);
@@ -3898,8 +4063,8 @@ pub fn ll_emit_inst(inst: TIRInst) void {
         }
         return;
     }
-    var da: string = ll_load(a, st);
-    var db: string = ll_load(b, st);
+    var da: string = ll_load_coerce(a, tir_st_to_str(inst.args[0].st), st);
+    var db: string = ll_load_coerce(b, tir_st_to_str(inst.args[1].st), st);
     var r: string = ll_tmp();
     sb_append_str(g_ll, "  ");
     sb_append_str(g_ll, r);
@@ -4102,6 +4267,9 @@ pub fn ll_emit_string_globals() void {
 // 产出 .ll 与 tir_to_ll_translate(tir_to_text()) 逐字节一致（对拍基线不变）。
 pub fn tir_to_ll_emit(module: TIRModule) string {
     ll_reset();
+    g_ti_defs = sb_new();
+    g_ti_done = [];
+    g_ti_strc = 0;
     // 第 1 遍：TT 类型 + 字符串表 + 全局 + 函数签名
     var ti: i64 = 0;
     var tn: i64 = slice_len(module.types) as i64;
@@ -4111,6 +4279,9 @@ pub fn tir_to_ll_emit(module: TIRModule) string {
         ll_emit_type_line(base.sb_cat3(t.name, " = struct { ", base.sb_cat2(t.body, " }")));
         ti = ti + 1;
     }
+    // type_info 反射所需的运行时类型（TIR 轨此前缺，导致 @__ti_<T> 引用未定义类型）。与 runtime/t_runtime.h 布局一致。
+    ll_emit_type_line("%TTypeInfo = struct { %TStr, i64, i64, i64, %TSlice }");
+    ll_emit_type_line("%TFieldInfo = struct { %TStr, i64, %TStr, i64, i8, i64 }");
     // 字符串表（module.strings 已是原始内容，无需 esc/unesc，等价于 translate 解析 strings: 段）
     var si: i64 = 0;
     var sn: i64 = slice_len(module.strings) as i64;
@@ -4225,6 +4396,8 @@ pub fn tir_to_ll_emit(module: TIRModule) string {
     ll_emit_string_globals();
     ll_flush_clo_thunks();
     sb_append_str(g_ll, sb_to_str(g_clo_constbuf));
+    // type_info 反射全局常量（@__ti_<T> / @__ti_<T>_f / 字段名·类型名字符串字面量）拼入模块作用域
+    sb_append_str(g_ll, sb_to_str(g_ti_defs));
     ll_emit_opaque_defs();
     ll_emit_main_wrapper();
     return sb_to_str(g_ll);
@@ -4270,6 +4443,138 @@ pub fn ll_emit_atom_table() void {
     sb_append_str(g_ll, "@t_atom_count = global i64 ");
     sb_append_i64(g_ll, cnt + 1);
     sb_append_str(g_ll, "\n");
+}
+
+// ── type_info 反射：@__ti_<T> 全局常量合成（TIR 轨，与 codegen_ll.emit_type_info_ll 布局一致）──
+// 关键差异：TIR 轨结构体命名为 %<T>（无 direct 路径的 st. 前缀），故 sty = "%" + tname，
+// 对齐 tir.tc tir_add_struct_tt 的命名；其余字段元数据取自 lex.decl_list 的 StructDecl（同 ll_build_reg）。
+
+pub fn ll_emit_ti_strlit(s: string) string {
+    // 发射 @.tis<N> ([N x i8]) + @.tits<N> (%TStr) 对，返回内联 %TStr 值字符串。
+    // 使用 .tis 前缀，避免与 tir_to_ll 的 @.tirll_tstr 及 codegen_ll 的 @.s 撞号。
+    var idx: i64 = g_ti_strc;
+    g_ti_strc = g_ti_strc + 1;
+    var L: i64 = str_len(s) as i64;
+    var sn: string = base.sb_cat2("@.tis", base.i2s(idx));
+    var tn: string = base.sb_cat2("@.tits", base.i2s(idx));
+    if (L == 0) {
+        sb_append_str(g_ti_defs, sn);
+        sb_append_str(g_ti_defs, " = private unnamed_addr constant [1 x i8] zeroinitializer\n");
+    } else {
+        sb_append_str(g_ti_defs, sn);
+        sb_append_str(g_ti_defs, " = private unnamed_addr constant [");
+        sb_append_i64(g_ti_defs, L);
+        sb_append_str(g_ti_defs, " x i8] c\"");
+        sb_append_str(g_ti_defs, tir_esc(s));
+        sb_append_str(g_ti_defs, "\"\n");
+    }
+    sb_append_str(g_ti_defs, tn);
+    sb_append_str(g_ti_defs, " = constant %TStr { ptr ");
+    sb_append_str(g_ti_defs, sn);
+    sb_append_str(g_ti_defs, ", i64 ");
+    sb_append_i64(g_ti_defs, L);
+    sb_append_str(g_ti_defs, " }\n");
+    return base.sb_cat5("%TStr { ptr ", sn, ", i64 ", base.i2s(L), " }");
+}
+
+// 编译期 sizeof(TY) 的合法 IR 表达式：用 [1 x TY] 数组 + 单索引 GEP 跳过一整个元素，
+// 得到该类型的大小。注意：必须是 `i32 1`（跳过整个 TY），不能用 `i32 0, i32 1`
+//（那是取「结构体第 1 个字段的偏移」，不是类型大小）。与 direct 路径 codegen_ll.ll_sizeof
+// 的 `getelementptr (TY, ptr null, i32 1)` 语义一致。
+pub fn ll_sizeof_const(ty: string) string {
+    return base.sb_cat3("ptrtoint (ptr getelementptr ([1 x ", ty, "], ptr null, i32 1) to i64)");
+}
+
+pub fn ll_emit_ti_global(tname: string) string {
+    var gref: string = base.sb_cat2("@__ti_", tname);
+    // 去重：同一 struct 只合成一次全局
+    var di: i64 = 0; var dn: i64 = slice_len(g_ti_done) as i64;
+    while (di < dn) { if (g_ti_done[di] == tname) { return gref; } di = di + 1; }
+    append(g_ti_done, tname);
+    var sty: string = base.sb_cat2("%", tname);
+    // 收集结构体字段（对齐 ll_build_reg：lex.decl_list → StructDecl → 子节点 f.sa/f.na/f.ib）
+    var fnames: []string; var fidx: []i64; var ftds: []i64; var ftags: []i64;
+    var n: i64 = slice_len(decl_list) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        var d: i64 = decl_list[i];
+        var dn2: Node = base.nodes[d];
+        if (dn2.kind == "StructDecl" && dn2.sa == tname) {
+            var fi: i64 = 0;
+            var c: i64 = dn2.lb;
+            while (c >= 0) {
+                var k: Child = base.kids[c];
+                var f: Node = base.nodes[k.val];
+                if (f.ia < 0) {
+                    append(fnames, f.sa);
+                    append(fidx, fi);
+                    append(ftds, sema.resolve_type_desc(f.na));
+                    append(ftags, f.ib);
+                    fi = fi + 1;
+                }
+                c = k.next;
+            }
+        }
+        i = i + 1;
+    }
+    var nf: i64 = slice_len(fnames) as i64;
+    // 字段数组全局 @__ti_<T>_f
+    var fsb: StringBuilder = sb_new();
+    sb_append_str(fsb, gref);
+    sb_append_str(fsb, "_f = constant [");
+    sb_append_i64(fsb, nf);
+    sb_append_str(fsb, " x %TFieldInfo] [");
+    var j: i64 = 0;
+    while (j < nf) {
+        if (j > 0) { sb_append_str(fsb, ", "); }
+        var fns: string = ll_emit_ti_strlit(fnames[j]);
+        var tns: string = ll_emit_ti_strlit(sema.td_readable(ftds[j]));
+        var isp: i64 = 0;
+        if (is_ref_type(ftds[j])) { isp = 1; }
+        var fst: string = tir_st_of_td(ftds[j]);
+        sb_append_str(fsb, "%TFieldInfo { ");
+        sb_append_str(fsb, fns);
+        sb_append_str(fsb, ", i64 ptrtoint (ptr getelementptr (");
+        sb_append_str(fsb, sty);
+        sb_append_str(fsb, ", ptr null, i32 0, i32 ");
+        sb_append_i64(fsb, fidx[j]);
+        sb_append_str(fsb, ") to i64), ");
+        sb_append_str(fsb, tns);
+        sb_append_str(fsb, ", i64 ");
+        sb_append_str(fsb, ll_sizeof_const(fst));
+        sb_append_str(fsb, ", ");
+        sb_append_str(fsb, "i8 ");
+        sb_append_i64(fsb, isp);
+        sb_append_str(fsb, ", i64 ");
+        sb_append_i64(fsb, ftags[j]);
+        sb_append_str(fsb, " }");
+        j = j + 1;
+    }
+    sb_append_str(fsb, "]");
+    sb_append_str(g_ti_defs, sb_to_str(fsb));
+    sb_append_str(g_ti_defs, "\n");
+    // %TTypeInfo 全局 @__ti_<T>
+    var tnm: string = ll_emit_ti_strlit(tname);
+    var tsb: StringBuilder = sb_new();
+    sb_append_str(tsb, gref);
+    sb_append_str(tsb, " = constant %TTypeInfo { ");
+    sb_append_str(tsb, tnm);
+    sb_append_str(tsb, ", i64 ");
+    sb_append_str(tsb, ll_sizeof_const(sty));
+    sb_append_str(tsb, ", i64 0, i64 ");
+    sb_append_i64(tsb, nf);
+    sb_append_str(tsb, ", %TSlice { ptr ");
+    sb_append_str(tsb, gref);
+    sb_append_str(tsb, "_f, i64 ");
+    sb_append_i64(tsb, nf);
+    sb_append_str(tsb, ", i64 ");
+    sb_append_i64(tsb, nf);
+    sb_append_str(tsb, ", i64 ");
+    sb_append_str(tsb, ll_sizeof_const("%TFieldInfo"));
+    sb_append_str(tsb, " } }");
+    sb_append_str(g_ti_defs, sb_to_str(tsb));
+    sb_append_str(g_ti_defs, "\n");
+    return gref;
 }
 
 // 主入口：消费 tir.tir_to_text() 文本，产出 .ll 文本（保留以兼容旧调用/对照）
