@@ -1772,6 +1772,39 @@ pub fn c_bitint_suffix(n: Node) string {
     return "";
 }
 
+// ── C 后端「聚合构造」单一入口（T1 cut3：双后端收口到 struct_new 契约）──────
+// 与 LLVM 后端 TIR_OP_STRUCT_NEW / tir_emit_struct_new 共用同一契约：
+//   命名结构体字面量 → by-value 复合字面量 `(T){.f=v, ...}`（对齐 LLVM 非变体
+//   struct_new 的 by-value 语义）；变体走 `<V>_from_<C>` 构造器返回 `void*`
+//   （对齐 LLVM 变体 struct_new 的 `ptr<%V>` 指针语义）。
+// 此前 C 后端把这段内联在 emit_expr 的 struct_lit 分支里，与 LLVM 的 struct_new
+// 各写各的，易漂移；本函数把它收口为唯一命名入口，双后端仅「印刷语法」不同
+// （C 复合字面量 vs LLVM alloca+GEP），契约（构造语义/值类别）一致。
+// ⚠ 发射文本与原内联分支逐字节相同（行为保持），仅做路由收口。
+pub fn c_emit_struct_new(tname: string, la: i64) string {
+    var sb: StringBuilder = sb_new();
+    sb_append_char(sb, 40);
+    sb_append_str(sb, tname);
+    sb_append_str(sb, "){");
+    var c: i64 = la;
+    var first: bool = true;
+    while (c >= 0) {
+        var k: Child = base.kids[c];
+        var fv: Node = base.nodes[k.val];
+        if (!first) {
+            sb_append_str(sb, ", ");
+        }
+        sb_append_char(sb, 46);
+        sb_append_str(sb, fv.sa);
+        sb_append_str(sb, " = ");
+        sb_append_str(sb, emit_expr(fv.na));
+        first = false;
+        c = k.next;
+    }
+    sb_append_char(sb, 125);
+    return sb_to_str(sb);
+}
+
 pub fn emit_expr(e: i64) string {
     if (e < 0) {
         return "";
@@ -2764,27 +2797,8 @@ pub fn emit_expr(e: i64) string {
         return sb_to_str(sb3);
     }
     if (n.kind == "struct_lit") {
-        var sb4: StringBuilder = sb_new();
-        sb_append_char(sb4, 40);
-        sb_append_str(sb4, n.sa);
-        sb_append_str(sb4, "){");
-        var c4: i64 = n.la;
-        var first4: bool = true;
-        while (c4 >= 0) {
-            var k4: Child = base.kids[c4];
-            var fv: Node = base.nodes[k4.val];
-            if (!first4) {
-                sb_append_str(sb4, ", ");
-            }
-            sb_append_char(sb4, 46);
-            sb_append_str(sb4, fv.sa);
-            sb_append_str(sb4, " = ");
-            sb_append_str(sb4, emit_expr(fv.na));
-            first4 = false;
-            c4 = k4.next;
-        }
-        sb_append_char(sb4, 125);
-        return sb_to_str(sb4);
+        // T1 cut3：C 后端聚合构造收口到 c_emit_struct_new（与 LLVM struct_new 同一契约）。
+        return c_emit_struct_new(n.sa, n.la);
     }
     if (n.kind == "cast") {
         var ftd: i64 = expr_type_desc(n.na);
