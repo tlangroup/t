@@ -2044,6 +2044,16 @@ pub fn tir_emit_stmt(sid: i64) void {
                 }
             }
         }
+        // 无初始化器的切片声明：必须在**声明点**显式建空表（带正确 elem_size）。
+        // TIR 轨此前只在入口 alloca + zeroinitializer 一次 —— 声明在循环体内时，
+        // 上一轮 append 出来的缓冲/长度会被带进下一轮（C 后端在声明点发
+        // `TSlice x = t_slice_new(sizeof(T))`，每轮都是新表，LLVM 轨不是）⇒ 双后端分叉。
+        // 实测后果：编译器自身 emit_struct_families_ordered 的依赖缓冲 depbuf 跨轮累积，
+        // 跨模块结构体拓扑排序退化成 decl_list 顺序 ⇒ agent_npc_mind 的 C 产物
+        // `unknown type 'physics__Velocity'`（LLVM 后端静默错编编译器自身的 C 后端）。
+        if (n.nb < 0 && st == "%TSlice") {
+            tir_emit_slice_default(slot, t);
+        }
         return;
     }
     if (kd == "expr") {
@@ -3597,6 +3607,31 @@ pub fn tir_maybe_array_to_slice(src: string, srce: i64) string {
     tir_emit(TIRInst{ op: TIR_OP_CONST, st: tir_st_from_str("i64"), dst: tir_op(ez), args: tir_a1(base.i2s(tir_sizeof(tir_st_of_td(sema.tds[std].elem)))), is_comment: false, line: g_cur_line, cmt: "" });
     tir_emit(TIRInst{ op: TIR_OP_CALL, st: tir_st_from_str("%TSlice"), dst: tir_op(d), args: tir_a4("@slice_from_raw", src, nl, ez), is_comment: false, line: g_cur_line, cmt: "" });
     return d;
+}
+
+// 无初始化器的切片声明 → 显式空表（elem_size 由声明类型导出，不许兜底 8）。
+// 与 C 后端 `TSlice x = t_slice_new(sizeof(T))` 同构：{ptr=null, len=0, cap=0, elem_size}。
+// 走 @slice_from_raw(null, 0, esz) 复用既有的「切片返回值经 out 参数」翻译路径
+// （tir_to_ll 的 tll_slice_from_raw 分支），不新增 opcode。
+pub fn tir_emit_slice_default(slot: string, td: i64) void {
+    var esz: i64 = 8;
+    if (td >= 0 && td < slice_len(sema.tds) as i64) {
+        if (sema.tds[td].cat == "slice") {
+            var etd: i64 = sema.tds[td].elem;
+            if (etd >= 0 && etd < slice_len(sema.tds) as i64) {
+                esz = tir_sizeof(tir_st_of_td(etd));
+            }
+        }
+    }
+    var nul: string = tir_tmp();
+    tir_emit(TIRInst{ op: TIR_OP_CONST_PTR_NULL, st: tir_st_from_str("ptr<void>"), dst: tir_op(nul), args: tir_a0(), is_comment: false, line: g_cur_line, cmt: "" });
+    var nl: string = tir_tmp();
+    tir_emit(TIRInst{ op: TIR_OP_CONST, st: tir_st_from_str("i64"), dst: tir_op(nl), args: tir_a1("0"), is_comment: false, line: g_cur_line, cmt: "" });
+    var ez: string = tir_tmp();
+    tir_emit(TIRInst{ op: TIR_OP_CONST, st: tir_st_from_str("i64"), dst: tir_op(ez), args: tir_a1(base.i2s(esz)), is_comment: false, line: g_cur_line, cmt: "" });
+    var d: string = tir_tmp();
+    tir_emit(TIRInst{ op: TIR_OP_CALL, st: tir_st_from_str("%TSlice"), dst: tir_op(d), args: tir_a4("@slice_from_raw", nul, nl, ez), is_comment: false, line: g_cur_line, cmt: "" });
+    tir_emit(TIRInst{ op: TIR_OP_STORE, st: ST_NONE, dst: tir_op(slot), args: tir_a1(d), is_comment: false, line: g_cur_line, cmt: "" });
 }
 
 pub fn tir_emit_cast(n: Node, est: i64) TirEmitRes {
