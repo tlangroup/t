@@ -3,7 +3,7 @@
 //
 // 依赖：base（字符串/切片/文件/子进程）、parse（tokenize / parse_unit）、
 //       sema（decl_list / ann_find / run_check / emit 系列）、
-//       codegen_ll（emit_llunit / ll_join / ll_has_main）。
+//       tir（lower_unit / tir_verify_module）/ tir_to_ll（tir_to_ll_emit / g_has_main）。
 //
 // 实现要点：**单遍 parse + token 追加**。tokenize() 是 append 语义（不清空
 // toks），parse_unit() 遇 Eof 即停。因此：
@@ -24,7 +24,9 @@
 @import("src.parse" :: *);
 @import("src.sema" :: *);
 @import("src.codegen_c" :: *);
-@import("src.codegen_ll" :: *);
+@import("src.tir" :: *);
+@import("src.tir_to_ll" :: tir_to_ll_emit, g_has_main);
+@import("src.comptime_fold" :: *);
 
 // 收集到的测试（平行数组；顺序 = decl_list 顺序 = 源码书写顺序）
 pub var tt_fn: []string;      // 合成函数名 __test_<k>
@@ -200,7 +202,7 @@ pub fn run_test_cmd(argv: []string) i32 {
         eprint("usage: tc test <file.tc> [--filter <substr>] [--tag <name>] [--mode dbg|rls] [--no-run]\n");
         return 2;
     }
-    if (codegen_ll.valid_mode(mode) == false) {
+    if (base.valid_mode(mode) == false) {
         eprint(base.sb_cat3("error: unknown --mode `", mode, "` (expected dbg|rls)\n"));
         return 2;
     }
@@ -262,7 +264,7 @@ pub fn run_test_cmd(argv: []string) i32 {
     }
     var sel: i64 = slice_len(tt_fn) as i64;
     if (total == 0) {
-        eprint(base.sb_cat3("error: ", codegen_ll.to_bs(src_file), " 中没有任何测试（`test \"名字\" { ... }`）\n"));
+        eprint(base.sb_cat3("error: ", base.to_bs(src_file), " 中没有任何测试（`test \"名字\" { ... }`）\n"));
         return 1;
     }
     if (sel == 0) {
@@ -285,13 +287,15 @@ pub fn run_test_cmd(argv: []string) i32 {
     }
 
     // ── ⑦ emit → link → run ──────────────────────────────────
-    var mod2: string = codegen_ll.base_no_tc(src_file);
-    codegen_ll.emit_llunit(mod2);
+    var mod2: string = base.base_no_tc(src_file);
+    tir.lower_unit(mod2, src_file);
+    tir.tir_verify_module();
+    var lltext: string = tir_to_ll_emit(tir.g_mod);
     var out_p: string = base.sb_cat4("out/", mode, "/tests/", mod2);
     var llp: string = base.sb_cat2(out_p, ".ll");
-    codegen_ll.ensure_parent(llp);
-    file_write_all(llp, codegen_ll.ll_join());
-    if (codegen_ll.ll_has_main == false) {
+    base.ensure_parent(llp);
+    file_write_all(llp, lltext);
+    if (tir_to_ll.g_has_main == false) {
         eprint("error: internal: 合成的测试入口未产生 @main\n");
         return 1;
     }
@@ -338,8 +342,8 @@ pub fn run_test_cmd(argv: []string) i32 {
         return 1;
     }
     if (no_run) {
-        print(base.sb_cat3("Built: ", codegen_ll.to_bs(exep), "\n"));
+        print(base.sb_cat3("Built: ", base.to_bs(exep), "\n"));
         return 0;
     }
-    return sys_run(base.sb_cat3("\"", codegen_ll.to_bs(exep), "\""));
+    return sys_run(base.sb_cat3("\"", base.to_bs(exep), "\""));
 }

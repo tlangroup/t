@@ -4652,3 +4652,74 @@ pub fn ll_emit_main_wrapper() void {
     sb_append_str(g_ll, "}\n");
 }
 
+// ── 预编译外部库为 .tlib（Phase2 真·独立编译+链接）：把当前已 emit 的 <out>.ll
+// 经 clang -c 编为 .o，再用 llvm-ar 打成归档 <out>.tlib（重命名的 .a），并写出
+// <out>.exports.json 接口块。库符号已按规范别名重整（json__version），与下游
+// import(json) 的重整结果一致，故导入方只需外链该归档 + 发 declare。
+// 原 codegen_ll.build_tlib，迁至 TIR 后端（T2「TIR 唯一 IR」：.tlib 不再依赖 legacy）。
+pub fn build_tlib(out_p: string, lib_alias: string, clang_p: string) i32 {
+    var lib_ext: string = ".tlib";
+    var lib_cflags: string = "-O2";
+    if (lex.g_lib_debug) {
+        lib_ext = ".tlibd";
+        lib_cflags = "-O0 -gcodeview";
+    }
+    var llp: string = base.sb_cat2(out_p, ".ll");
+    var op: string = base.sb_cat2(out_p, ".o");
+    var arp: string = base.sb_cat2(out_p, lib_ext);
+    var ar_p: string = "llvm-ar";
+    if (clang_p == "C:/Program Files/LLVM/bin/clang.exe") {
+        ar_p = "C:/Program Files/LLVM/bin/llvm-ar.exe";
+    }
+    var csb: StringBuilder = sb_new();
+    sb_append_str(csb, "\"");
+    sb_append_str(csb, clang_p);
+    sb_append_str(csb, base.sb_cat2("\" -c ", lib_cflags));
+    sb_append_str(csb, " -o \"");
+    sb_append_str(csb, op);
+    sb_append_str(csb, "\" \"");
+    sb_append_str(csb, llp);
+    sb_append_str(csb, "\"");
+    var rc: i32 = sys_run(sb_to_str(csb));
+    if (rc != 0) {
+        eprint("clang -c (lib) failed\n");
+        return 1;
+    }
+    var asb: StringBuilder = sb_new();
+    sb_append_str(asb, "\"");
+    sb_append_str(asb, ar_p);
+    sb_append_str(asb, "\" rcs \"");
+    sb_append_str(asb, arp);
+    sb_append_str(asb, "\" \"");
+    sb_append_str(asb, op);
+    sb_append_str(asb, "\"");
+    var arc: i32 = sys_run(sb_to_str(asb));
+    if (arc != 0) {
+        eprint("llvm-ar (lib) failed\n");
+        return 1;
+    }
+    var exp: StringBuilder = sb_new();
+    sb_append_str(exp, "[\n");
+    var first: bool = true;
+    var n: i64 = slice_len(lex.decl_list) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        var d: i64 = lex.decl_list[i];
+        if (base.g_node_mod[d] == lib_alias && base.nodes[d].bc && sema.is_top_decl_kind(base.nodes[d].kind)) {
+            if (first == false) { sb_append_str(exp, ",\n"); }
+            first = false;
+            sb_append_str(exp, "  {\"name\": \"");
+            sb_append_str(exp, base.nodes[d].sa);
+            sb_append_str(exp, "\", \"kind\": \"");
+            sb_append_str(exp, base.nodes[d].kind);
+            sb_append_str(exp, "\"}");
+        }
+        i = i + 1;
+    }
+    sb_append_str(exp, "\n]\n");
+    file_write_all(base.sb_cat2(out_p, base.sb_cat2(lib_ext, ".exports.json")), sb_to_str(exp));
+    sys_run(base.sb_cat3("cmd /c del \"", op, "\" >nul 2>nul"));
+    print(base.sb_cat3("Built library: ", base.to_bs(arp), "\n"));
+    return 0;
+}
+

@@ -2,7 +2,7 @@
 // src/tc.tc — 驱动层 / 入口：命令行分发与 main()
 //
 // 编译器本体已按编译步骤拆分为多模块，本文件仅做 import 汇总与 CLI 派发：
-//   base → lex → parse → sema → codegen_c → codegen_ll
+//   base → lex → parse → sema → codegen_c → tir → tir_to_ll
 // 测试运行器与 REPL 各自独立成模块（src/test.tc / lib/repl.tc），
 // 本文件只 import 它们并派发 `tc test` / REPL 子命令。
 // ══════════════════════════════════════════════════════════════════
@@ -13,10 +13,9 @@
 @import("src.sema" :: *);
 @import("src.comptime_fold" :: *);
 @import("src.codegen_c" :: *);
-@import("src.codegen_ll" :: *);
 @import("src.codegen_dev" :: *);
 @import("src.tir" :: *);
-@import("src.tir_to_ll" :: tir_to_ll_emit, g_has_main);
+@import("src.tir_to_ll" :: tir_to_ll_emit, g_has_main, build_tlib);
 @import("src.tmir" :: tir_to_tmir_lower, TMIRModule);
 @import("src.codegen_wasm" :: tmir_to_wasm);
 @import("src.codegen_riscv" :: tmir_to_riscv);
@@ -39,6 +38,33 @@ pub fn module_has_kernels() bool {
     return false;
 }
 
+pub fn print_help() void {
+    print("tc — 静态类型数据驱动语言(t)编译器\n");
+    print("用法:\n");
+    print("  tc <lex|check|compile|emit-ll|build|run|test> <file.tc> [选项]\n");
+    print("  tc --help | -h | help            显示本帮助并退出 0\n\n");
+    print("子命令:\n");
+    print("  lex       词法分析，输出 token 流(JSON)\n");
+    print("  check     类型/语义检查，输出诊断(JSON)\n");
+    print("  compile   产出 C 源码(.c/.h)\n");
+    print("  emit-ll   产出 LLVM IR(.ll)\n");
+    print("  build     编译并链接为可执行文件(.exe)\n");
+    print("  run       build 后立即运行，透传子进程退出码\n");
+    print("  test      收集 `test \"名字\" {}` 并运行，汇总 passed/failed/skipped\n\n");
+    print("选项:\n");
+    print("  --example <name>   编译 examples/<name>.tc\n");
+    print("  --filter <substr>  test: 只跑显示名含该子串的用例\n");
+    print("  --tag <name>       test: 只跑带 @tag(<name>) 的用例\n");
+    print("  --no-run           test: 只编译不执行\n");
+    print("  --mode <dbg|rls>   调试/发布(默认 dbg)\n");
+    print("  --output <path>    指定输出路径前缀\n");
+    print("  --clang <path>     指定 clang 路径\n");
+    print("  --runtime <dir>    指定运行时目录(默认 runtime/)\n");
+    print("  --debug-libs       链接调试态库 .tlibd（缺少则回退 .tlib）\n");
+    print("  --debug            build --lib 时产出调试态归档 .tlibd\n");
+    print("  --emit-deps        check 时打印模块依赖图(JSON)后退出\n\n");
+    print("退出码: 0=成功, 1=编译/运行错误, 2=命令行用法错误\n");
+}
 fn main() i32 @main {
     var argv: []string = args();
     lex.init_keywords();
@@ -50,13 +76,13 @@ fn main() i32 @main {
     var han: i64 = slice_len(argv) as i64;
     while (hai < han) {
         if (argv[hai] == "--help" || argv[hai] == "-h") {
-            codegen_ll.print_help();
+            print_help();
             return 0;
         }
         hai = hai + 1;
     }
     if (han >= 2 && argv[1] == "help") {
-        codegen_ll.print_help();
+        print_help();
         return 0;
     }
     // `tc test` 少于 3 个参数时会被下面的通用门槛吞掉，给出的用法串又不含 test，
@@ -70,7 +96,7 @@ fn main() i32 @main {
         // 注意：`tc help` / `tc --help` / `tc test` 已在上方特判（返回 0 或用法串），
         // 故走到这里且参数不足时，只有「纯 tc 无子命令」一种情况 → REPL。
         if (slice_len(argv) < 2) {
-            return repl.run_repl(codegen_ll.to_bs(argv[0]));
+            return repl.run_repl(base.to_bs(argv[0]));
         }
         eprint("usage: tc <lex|check|compile|emit-ll|build|run|test> <file.tc> [--example <name>] [--mode dbg|rls] [--output <path>] [--clang <path>] [--runtime <dir>]\n");
         return 2;
@@ -79,7 +105,7 @@ fn main() i32 @main {
     var file: string = argv[2];
 
     if (cmd == "lex") {
-        return codegen_ll.run_lex(file);
+        return lex.run_lex(file);
     }
 
     if (cmd == "check") {
@@ -161,7 +187,7 @@ fn main() i32 @main {
             if (argv[ai] == "--trace-comptime") { sema.g_meta_trace = true; ai = ai + 1; continue; }
             ai = ai + 1;
         }
-        if (codegen_ll.valid_mode(mode) == false) {
+        if (base.valid_mode(mode) == false) {
             eprint(base.sb_cat3("error: unknown --mode `", mode, "` (expected dbg|rls)\n"));
             return 2;
         }
@@ -183,7 +209,7 @@ fn main() i32 @main {
             return 1;
         }
 
-        var mod: string = codegen_ll.base_no_tc(file);
+        var mod: string = base.base_no_tc(file);
         codegen_c.emit_unit(mod);
 
         if (has_out == false) {
@@ -193,10 +219,10 @@ fn main() i32 @main {
 
         var hp: string = base.sb_cat4(out_dir, "/", mod, ".h");
         var cp: string = base.sb_cat4(out_dir, "/", mod, ".c");
-        codegen_ll.ensure_parent(hp);
+        base.ensure_parent(hp);
         file_write_all(hp, codegen_c.h_join());
         file_write_all(cp, codegen_c.s_join());
-        print(base.sb_cat6("Generated: ", codegen_ll.to_bs(hp), ", ", codegen_ll.to_bs(cp), "\n", ""));
+        print(base.sb_cat6("Generated: ", base.to_bs(hp), ", ", base.to_bs(cp), "\n", ""));
         return 0;
     }
 
@@ -220,7 +246,7 @@ fn main() i32 @main {
             ai3 = ai3 + 1;
         }
         if (has_outp == false) {
-            var mod3: string = codegen_ll.base_no_tc(file);
+            var mod3: string = base.base_no_tc(file);
             out_p = base.sb_cat4("out/dbg/", mod3, "", ".mlir");
         }
         base.g_file = base.rel_path(file);
@@ -235,9 +261,9 @@ fn main() i32 @main {
             return 1;
         }
         var mlir: string = codegen_dev.emit_device_module();
-        codegen_ll.ensure_parent(out_p);
+        base.ensure_parent(out_p);
         file_write_all(out_p, mlir);
-        print(base.sb_cat3("Generated device dialect: ", codegen_ll.to_bs(out_p), "\n"));
+        print(base.sb_cat3("Generated device dialect: ", base.to_bs(out_p), "\n"));
         return 0;
     }
 
@@ -274,7 +300,7 @@ fn main() i32 @main {
             if (has_src == false) { src_file = argv[ai2]; has_src = true; }
             ai2 = ai2 + 1;
         }
-        if (codegen_ll.valid_mode(mode) == false) {
+        if (base.valid_mode(mode) == false) {
             eprint(base.sb_cat3("error: unknown --mode `", mode, "` (expected dbg|rls)\n"));
             return 2;
         }
@@ -288,7 +314,7 @@ fn main() i32 @main {
             src_file = base.sb_cat3("examples/", ex_name, ".tc");
             has_src = true;
             if (has_outp == false) {
-                var exdir: string = codegen_ll.to_bs(base.sb_cat3("out/", mode, "/examples"));
+                var exdir: string = base.to_bs(base.sb_cat3("out/", mode, "/examples"));
                 sys_run(base.sb_cat5("cmd /c if not exist \"", exdir, "\" mkdir \"", exdir, "\""));
                 out_p = base.sb_cat4("out/", mode, "/examples/", ex_name);
                 has_outp = true;
@@ -312,13 +338,13 @@ fn main() i32 @main {
         sema.flag_pass();
         sema.ann_pass();
         if (sema.has_errors()) { base.emit_diags(); return 1; }
-        var mod2: string = codegen_ll.base_no_tc(src_file);
+        var mod2: string = base.base_no_tc(src_file);
         tir.lower_unit(mod2, src_file);
         if (has_outp == false) { out_p = base.sb_cat4("out/", mode, "/", mod2); }
         var tirp: string = base.sb_cat2(out_p, ".tir");
-        codegen_ll.ensure_parent(tirp);
+        base.ensure_parent(tirp);
         file_write_all(tirp, tir.tir_to_text());
-        eprint(base.sb_cat3("Generated: ", codegen_ll.to_bs(tirp), "\n"));
+        eprint(base.sb_cat3("Generated: ", base.to_bs(tirp), "\n"));
         return 0;
     }
 
@@ -350,7 +376,7 @@ fn main() i32 @main {
             if (has_src == false) { src_file = argv[ai2]; has_src = true; }
             ai2 = ai2 + 1;
         }
-        if (codegen_ll.valid_mode(mode) == false) {
+        if (base.valid_mode(mode) == false) {
             eprint(base.sb_cat3("error: unknown --mode `", mode, "` (expected dbg|rls)\n"));
             return 2;
         }
@@ -382,15 +408,15 @@ fn main() i32 @main {
         sema.flag_pass();
         sema.ann_pass();
         if (sema.has_errors()) { base.emit_diags(); return 1; }
-        var mod2: string = codegen_ll.base_no_tc(src_file);
+        var mod2: string = base.base_no_tc(src_file);
         tir.lower_unit(mod2, src_file);
         if (has_outp == false) { out_p = base.sb_cat4("out/", mode, "/tirll_", mod2); }
         var llp: string = base.sb_cat2(out_p, ".tir.ll");
-        codegen_ll.ensure_parent(llp);
+        base.ensure_parent(llp);
         tir.tir_verify_module();
         var lltext: string = tir_to_ll_emit(tir.g_mod);
         file_write_all(llp, lltext);
-        eprint(base.sb_cat3("Generated: ", codegen_ll.to_bs(llp), "\n"));
+        eprint(base.sb_cat3("Generated: ", base.to_bs(llp), "\n"));
         return 0;
     }
 
@@ -400,7 +426,7 @@ fn main() i32 @main {
         var rt_dir: string = "runtime";
         var clang_p: string = "clang";
         var backend: string = "tir";   // S5 收口
-        var opt_level: i64 = 0;   // 中端优化等级（--opt/-O）；默认 0=关闭保护自举不动点：默认新轨 TIR→LLVM 结构化翻译（§5.3/§5.6 合规）；--backend ll 回退旧轨 codegen_ll（arena 已改为预留+按需提交，tir 降低完整 tc.tc 不再 OOM）
+        var opt_level: i64 = 0;   // 中端优化等级（--opt/-O）；默认 0=关闭，保护自举不动点；新轨 TIR→LLVM 结构化翻译（§5.3/§5.6 合规）
         var mode: string = "dbg";
         var src_file: string = "";
         var has_src: bool = false;
@@ -441,9 +467,7 @@ fn main() i32 @main {
                 }
             }
             // T2「TIR 唯一 IR」：主编译路径（build/emit-ll/run）统一走新轨 TIR→LLVM，
-            // 不再提供 --backend ll 回退旧轨 codegen_ll。旧轨仅剩 build --lib (.tlib) 库归档
-            // 一座孤岛（tir 新轨暂不支持库归档，见 codegen_ll.build_tlib）；后续把 .tlib 也
-            // 迁到 tir_to_ll 后即可彻底删除 codegen_ll。
+            // 旧轨 codegen_ll 已彻底删除（.tlib 库归档亦迁至 tir_to_ll.build_tlib）
             if (argv[ai2] == "--opt" || argv[ai2] == "-O") {
                 opt_level = 1;
                 ai2 = ai2 + 1;
@@ -493,8 +517,7 @@ fn main() i32 @main {
             }
             ai2 = ai2 + 1;
         }
-        if (is_lib) { backend = "ll"; }   // 库预编译（.tlib）为 codegen_ll 专属能力，tir 新轨暂不支持，强制回退旧轨
-        if (codegen_ll.valid_mode(mode) == false) {
+        if (base.valid_mode(mode) == false) {
             eprint(base.sb_cat3("error: unknown --mode `", mode, "` (expected dbg|rls)\n"));
             return 2;
         }
@@ -511,7 +534,7 @@ fn main() i32 @main {
             src_file = base.sb_cat3("examples/", ex_name, ".tc");
             has_src = true;
             if (has_outp == false) {
-                var exdir: string = codegen_ll.to_bs(base.sb_cat3("out/", mode, "/examples"));
+                var exdir: string = base.to_bs(base.sb_cat3("out/", mode, "/examples"));
                 sys_run(base.sb_cat5("cmd /c if not exist \"", exdir, "\" mkdir \"", exdir, "\""));
                 out_p = base.sb_cat4("out/", mode, "/examples/", ex_name);
                 has_outp = true;
@@ -541,7 +564,7 @@ fn main() i32 @main {
         if (is_lib) {
             // 预编译库：以规范别名（源文件名 stem）作为名字重整命名空间，
             // 使产出的 .tlib 归档符号（json__version）与下游 import(json) 的重整结果一致。
-            lib_alias = codegen_ll.base_no_tc(src_file);
+            lib_alias = base.base_no_tc(src_file);
             base.g_cur_mod = lib_alias;
             lex.g_lib_emit = true;       // 跳过进程级全局发射（t.__ginit / atom 表），避免链接冲突
         }
@@ -561,7 +584,7 @@ fn main() i32 @main {
             sema.print_warn_summary();
         }
 
-        var mod2: string = codegen_ll.base_no_tc(src_file);
+        var mod2: string = base.base_no_tc(src_file);
         var lltext: string = "";
         var out_ext: string = ".ll";   // 输出文件扩展名（tmir 后端改为 .wat/.s）
         var out_text: string = "";      // 实际写出内容（tir/ll 时为 lltext）
@@ -601,24 +624,6 @@ fn main() i32 @main {
             tir.tir_verify_module();
             lltext = tir_to_ll_emit(tir.g_mod);
             out_text = lltext;
-        } else {
-            // 旧轨孤岛：仅 build --lib (.tlib) 库归档走 legacy codegen_ll（tir 新轨暂不支持）。
-            // 普通 build/emit-ll/run 已统一新轨 TIR→LLVM，无此分支。
-            codegen_ll.emit_llunit(mod2);
-
-            // Device 子系统 M3：若本模块含 `kernel fn`，把 Device Dialect 文本作为
-            // @__t_devmod_blob 全局常量注入 host LLVM 模块，供 tll_gpu_launch 读取
-            // （docs/compiler/device-design.md §6）。tc.tc 自身无 kernel → 此分支不触发，
-            // 自举不动点 / IR 基线零漂移。
-            if (module_has_kernels()) {
-                var blob: string = codegen_dev.emit_device_module();
-                var lit: string = codegen_ll.esc_ll(blob);     // 正确 LLVM 转义（\22/\5C/\0A 十六进制）
-                var blen: i64 = (str_len(blob) as i64) + 1;   // +1：末尾 null 终结符（供运行时 strlen）
-                codegen_ll.llpg(base.sb_cat7("@__t_devmod_blob = private constant [",
-                    base.i2s(blen), " x i8] c\"", lit, "\\00", "\", align 1", ""));
-            }
-            lltext = codegen_ll.ll_join();
-            out_text = lltext;
         }
 
         // 输出目录：--output 指定 exe/目录前缀；缺省按 --mode 落入 out/dbg|out/rls
@@ -633,9 +638,9 @@ fn main() i32 @main {
         }
 
         var llp: string = base.sb_cat2(out_p, out_ext);
-        codegen_ll.ensure_parent(llp);
+        base.ensure_parent(llp);
         file_write_all(llp, out_text);
-        eprint(base.sb_cat3("Generated: ", codegen_ll.to_bs(llp), "\n"));
+        eprint(base.sb_cat3("Generated: ", base.to_bs(llp), "\n"));
 
         // tmir 后端（wasm/riscv）：产出的 .wat/.s 需目标工具链（wat2wasm / riscv64 gcc）
         // 才能链接运行；此处等价 emit-ll，仅写出 IR 即返回（链接留待工具链机器）。
@@ -645,7 +650,7 @@ fn main() i32 @main {
 
         // 库预编译（build --lib）：emit-ll 后直接产出 .tlib（归档 + 接口块），不链 exe、不要求 main
         if (is_lib) {
-            return codegen_ll.build_tlib(out_p, lib_alias, clang_p);
+            return tir_to_ll.build_tlib(out_p, lib_alias, clang_p);
         }
 
         // 无入口时提前报错：否则 lld-link 只会给出
@@ -653,12 +658,7 @@ fn main() i32 @main {
         // tmir 后端在 emit-ll 等价路径已返回，不会走到此处。
         if (backend == "tir") {
             if (tir_to_ll.g_has_main == false) {
-                eprint(base.sb_cat3("error: no entry point: ", codegen_ll.to_bs(src_file), " 缺少 @main 标注的函数（build/run 需要入口；只想产出 IR 请用 emit-ll）\n"));
-                return 1;
-            }
-        } else {
-            if (codegen_ll.ll_has_main == false) {
-                eprint(base.sb_cat3("error: no entry point: ", codegen_ll.to_bs(src_file), " 缺少 @main 标注的函数（build/run 需要入口；只想产出 IR 请用 emit-ll）\n"));
+                eprint(base.sb_cat3("error: no entry point: ", base.to_bs(src_file), " 缺少 @main 标注的函数（build/run 需要入口；只想产出 IR 请用 emit-ll）\n"));
                 return 1;
             }
         }
@@ -710,11 +710,11 @@ fn main() i32 @main {
             eprint("clang link failed\n");
             return 1;
         }
-        eprint(base.sb_cat3("Built: ", codegen_ll.to_bs(exep), "\n"));
+        eprint(base.sb_cat3("Built: ", base.to_bs(exep), "\n"));
 
         // run：构建成功后立即执行，透传子进程退出码（cargo run 语义）
         if (cmd == "run") {
-            var run_cmd: string = base.sb_cat3("\"", codegen_ll.to_bs(exep), "\"");
+            var run_cmd: string = base.sb_cat3("\"", base.to_bs(exep), "\"");
             var rrc: i32 = sys_run(run_cmd);
             return rrc;
         }

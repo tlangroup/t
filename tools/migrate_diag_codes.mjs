@@ -3,7 +3,7 @@
 // 将 src/*.tc 中诊断码字面量从旧语义名迁移为新机器码（双标识归一化的配套步骤）。
 // 映射来自 tools/diag_defs.json（legacy -> code）。
 // 特例：T_TYPE_MISMATCH 按文件分区 ——
-//   codegen_c.tc / codegen_ll.tc  -> T-CDE-E910（codegen 期 type_info）
+//   codegen_c.tc -> T-CDE-E910（codegen 期 type_info）
 //   其余文件                    -> T-SEM-E202（语义期）
 // base.tc 的 >>> GEN:diagnostics <<< 块内的 g_dlegacy 数据是映射表本身，禁止改动，故跳过。
 
@@ -25,10 +25,10 @@ for (const d of raw.defs) {
 delete map['T_TYPE_MISMATCH'];
 
 const FILES = [
-  'lex.tc', 'parse.tc', 'sema.tc', 'codegen_c.tc', 'codegen_ll.tc',
+  'lex.tc', 'parse.tc', 'sema.tc', 'codegen_c.tc',
   'base.tc', 'test.tc', '../lib/repl.tc', 'tc.tc',
 ];
-const CODEGEN_FILES = new Set(['codegen_c.tc', 'codegen_ll.tc']);
+const CODEGEN_FILES = new Set(['codegen_c.tc']);
 
 const MARKER_RE = /\/\/ >>> GEN:diagnostics[\s\S]*?\/\/ <<< GEN:diagnostics <<</m;
 
