@@ -22,6 +22,31 @@
 @import("src.tir" :: *);
 @import("src.tmir" :: *);
 
+// 名字归一化：TIR 操作数名可能带 `.s<ST码>` 类型后缀（tir_os 附加）。
+// WASM 端必须剥掉才能与 slot 声明（param/local）对齐，否则同一变量被当成两个槽。
+pub fn w_strip_suf(n: string) string {
+    var L: i64 = str_len(n) as i64;
+    var i: i64 = L - 1;
+    while (i >= 1) {
+        if (n[i] == 115 && n[i - 1] == 46) {
+            var suf: string = str_slice(n, i + 1, L);
+            var okd: bool = str_len(suf) > 0;
+            var j: i64 = 0;
+            while (j < str_len(suf) as i64) { if (suf[j] < 48 || suf[j] > 57) { okd = false; } j = j + 1; }
+            if (okd) { return str_slice(n, 0, i - 1); }
+        }
+        i = i - 1;
+    }
+    return n;
+}
+
+// 调用目标名：剥类型后缀与 '@' 前缀（WASM 以 $ 名引用函数）。
+pub fn w_fn_name(n: string) string {
+    var s: string = w_strip_suf(n);
+    if (str_len(s) as i64 > 0 && s[0] == 64) { return str_slice(s, 1, str_len(s) as i64); }
+    return s;
+}
+
 // 本地字符串帮手（编译器 stdlib 无 str_find）：返回 needle 首现下标，未找到 -1。
 pub fn w_find_col(s: string, needle: string) i64 {
     var L: i64 = str_len(s) as i64;
@@ -46,12 +71,18 @@ pub var g_wdom: [][]i64;      // dom[b] = 支配 b 的块索引集合
 pub var g_widom: []i64;       // idom[b]
 pub var g_wloop: []bool;      // 是否为循环头
 pub var g_wchild: [][]i64;    // 支配树子节点
+pub var g_wsucc: [][]i64;     // 后继（自然循环判定用）
+pub var g_wchin: [][]i64;     // 支配树子节点中「位于 b 循环体内」者（非循环头时全归入此）
+pub var g_wchout: [][]i64;    // 支配树子节点中「位于 b 循环体之后」者（仅循环头非空）
 
 pub fn w_lbl(idx: i64) string { return base.sb_cat2("B", base.i2s(idx)); }
+pub fn w_xlbl(idx: i64) string { return base.sb_cat2("X", base.i2s(idx)); }  // 循环出口 wrapper
+pub fn w_wlbl(idx: i64) string { return base.sb_cat2("W", base.i2s(idx)); }  // 子块 wrapper
 pub fn w_bname_to_idx(n: string) i64 {
+    var nn: string = w_strip_suf(n);
     var i: i64 = 0;
     while (i < g_wn) {
-        if (g_wf.blocks[i].name == n) { return i; }
+        if (w_strip_suf(g_wf.blocks[i].name) == nn) { return i; }
         i = i + 1;
     }
     return 0;
@@ -63,6 +94,25 @@ pub fn w_in_dom(x: i64, y: i64) bool {
     var n: i64 = slice_len(g_wdom[x]) as i64;
     while (s < n) { if (g_wdom[x][s] == y) { return true; } s = s + 1; }
     return false;
+}
+
+// 可达性：a 能否沿后继边走到 b（自然循环判定）
+pub fn w_reach_dfs(cur: i64, to: i64, vis: []bool) bool {
+    if (cur == to) { return true; }
+    vis[cur] = true;
+    var i: i64 = 0;
+    while (i < slice_len(g_wsucc[cur]) as i64) {
+        var nx: i64 = g_wsucc[cur][i];
+        if (vis[nx] == false) { if (w_reach_dfs(nx, to, vis)) { return true; } }
+        i = i + 1;
+    }
+    return false;
+}
+pub fn w_can_reach(a: i64, b: i64) bool {
+    var vis: []bool = [];
+    var i: i64 = 0;
+    while (i < g_wn) { append(vis, false); i = i + 1; }
+    return w_reach_dfs(a, b, vis);
 }
 
 pub fn w_set_eq(a: []i64, b: []i64) bool {
@@ -92,10 +142,20 @@ pub fn w_intersect(a: []i64, b: []i64) []i64 {
 }
 
 pub fn w_intersect_idom(a: i64, b: i64) i64 {
-    var x: i64 = a; var y: i64 = b;
+    var x: i64 = a;
+    var y: i64 = b;
     while (x != y) {
-        while (g_wrponum[x] < g_wrponum[y]) { x = g_widom[x]; }
-        while (g_wrponum[y] < g_wrponum[x]) { y = g_widom[y]; }
+        var px: i64 = x;
+        var py: i64 = y;
+        // ⚠ 比较方向：g_wrponum 是**逆后序**序号，入口最小（0）。
+        //   必须让「序号大」的一方沿 idom 往上爬。原写法方向相反：爬到入口后
+        //   idom(入口)==入口，x 永远不动 ⇒ 死循环（表现为退出码 127 栈溢出）。
+        if (g_wrponum[x] > g_wrponum[y]) {
+            if (g_widom[x] != x) { x = g_widom[x]; }
+        } else {
+            if (g_widom[y] != y) { y = g_widom[y]; }
+        }
+        if (x == px && y == py) { return x; }   // 已无法再上爬（至少一方是入口）
     }
     return x;
 }
@@ -106,6 +166,7 @@ pub fn w_build_cfg(f: TMIRFunc) void {
     g_wn = slice_len(f.blocks) as i64;
     // 重置模块级 CFG 表（tmir_to_wasm 可能多函数连续调用，避免跨函数累积）
     g_wpreds = []; g_wdom = []; g_wloop = []; g_wchild = []; g_wrpo = []; g_wrponum = []; g_widom = [];
+    g_wsucc = []; g_wchin = []; g_wchout = [];
     // preds
     var i: i64 = 0;
     while (i < g_wn) {
@@ -113,6 +174,9 @@ pub fn w_build_cfg(f: TMIRFunc) void {
         append(g_wdom, []);
         append(g_wloop, false);
         append(g_wchild, []);
+        append(g_wsucc, []);
+        append(g_wchin, []);
+        append(g_wchout, []);
         i = i + 1;
     }
     i = 0;
@@ -209,10 +273,36 @@ pub fn w_build_cfg(f: TMIRFunc) void {
         var q2: i64 = 0;
         while (q2 < nb) {
             var pr2: i64 = g_wpreds[pi2][q2];
-            if (w_in_dom(pi2, pr2)) { g_wloop[pr2] = true; } // pr2 支配 pi2 → 回边 → pr2 是循环头
+            // 回边判据：边 pr2 → pi2 是回边 ⟺ pi2 支配 pr2（目标支配源）。
+            // 原写法 w_in_dom(pi2, pr2) 方向反了：前向树边也被判成回边，exit 块会被误当循环头。
+            if (w_in_dom(pr2, pi2)) { g_wloop[pi2] = true; }
             q2 = q2 + 1;
         }
         pi2 = pi2 + 1;
+    }
+    // 后继表
+    i = 0;
+    while (i < g_wn) {
+        var ti: TMIRInst = f.blocks[i].insts[slice_len(f.blocks[i].insts) as i64 - 1];
+        if (ti.op == TIR_OP_BR) { append(g_wsucc[i], w_bname_to_idx(ti.args[0].name)); }
+        else if (ti.op == TIR_OP_BR_COND) {
+            append(g_wsucc[i], w_bname_to_idx(ti.args[1].name));
+            append(g_wsucc[i], w_bname_to_idx(ti.args[2].name));
+        }
+        i = i + 1;
+    }
+    // 支配子节点分类：循环头 b 的子节点中「能回到 b」的在循环体内，其余在循环体之后。
+    i = 0;
+    while (i < g_wn) {
+        var c2: i64 = 0;
+        while (c2 < slice_len(g_wchild[i]) as i64) {
+            var ch2: i64 = g_wchild[i][c2];
+            var inside: bool = true;
+            if (g_wloop[i]) { inside = w_can_reach(ch2, i); }
+            if (inside) { append(g_wchin[i], ch2); } else { append(g_wchout[i], ch2); }
+            c2 = c2 + 1;
+        }
+        i = i + 1;
     }
 }
 
@@ -258,6 +348,7 @@ pub fn tmir_to_wasm(m: TMIRModule) string {
 
 pub fn w_emit_func(sb: StringBuilder, f: TMIRFunc) void {
     sb_append_str(sb, "  (func $"); sb_append_str(sb, f.name);
+    sb_append_str(sb, " (export \""); sb_append_str(sb, w_fn_name(f.name)); sb_append_str(sb, "\")");
     // params
     var np: i64 = slice_len(f.params) as i64;
     var p: i64 = 0;
@@ -267,7 +358,7 @@ pub fn w_emit_func(sb: StringBuilder, f: TMIRFunc) void {
         var col: i64 = w_find_col(pv, ":");
         var pname: string = str_slice(pv, 0, col);
         var pst: i64 = w_st_from_str(str_slice(pv, col + 1, str_len(pv) as i64));
-        sb_append_str(sb, " (param $"); sb_append_str(sb, pname); sb_append_str(sb, " "); sb_append_str(sb, tmir_st_wasm(pst)); sb_append_str(sb, ")");
+        sb_append_str(sb, " (param $"); sb_append_str(sb, w_strip_suf(pname)); sb_append_str(sb, " "); sb_append_str(sb, tmir_st_wasm(pst)); sb_append_str(sb, ")");
         p = p + 1;
     }
     if (f.ret_st != "" && f.ret_st != "void") {
@@ -290,6 +381,13 @@ pub fn w_emit_func(sb: StringBuilder, f: TMIRFunc) void {
     }
     // 按支配树前序发射（入口块 index 0）
     w_emit_dom(sb, 0);
+    // 兜底终结：WASM 校验器在每个 block/loop 的 `end` 之后会重置「不可达」状态，
+    // 所以即便所有真实路径都以 return 结束，函数体末尾仍被视为可达且栈为空，
+    // 非 void 函数会报 "type mismatch: expected <T> but nothing on stack"。
+    // 补一条 unreachable 终结（栈多态下合法），且能让「真漏 return」在运行时炸出来。
+    if (f.ret_st != "" && f.ret_st != "void") {
+        sb_append_str(sb, "    unreachable\n");
+    }
     sb_append_str(sb, "  )\n");
 }
 
@@ -302,10 +400,10 @@ pub fn w_collect_slots(f: TMIRFunc) []string {
         var k: i64 = 0;
         while (k < ni) {
             var ins: TMIRInst = f.blocks[b].insts[k];
-            if (str_len(ins.dst.name) as i64 > 0 && ins.dst.name[0] == 36) { w_add_unique(r, ins.dst.name); }
+            if (str_len(ins.dst.name) as i64 > 0 && ins.dst.name[0] == 36) { r = w_add_slot(r, w_strip_suf(ins.dst.name)); }
             var na: i64 = slice_len(ins.args) as i64;
             var a: i64 = 0;
-            while (a < na) { if (str_len(ins.args[a].name) as i64 > 0 && ins.args[a].name[0] == 36) { w_add_unique(r, ins.args[a].name); } a = a + 1; }
+            while (a < na) { if (str_len(ins.args[a].name) as i64 > 0 && ins.args[a].name[0] == 36) { r = w_add_slot(r, w_strip_suf(ins.args[a].name)); } a = a + 1; }
             k = k + 1;
         }
         b = b + 1;
@@ -313,13 +411,78 @@ pub fn w_collect_slots(f: TMIRFunc) []string {
     return r;
 }
 
-pub fn w_add_unique(sl: []string, n: string) void {
+// ⚠ t 的 slice 是值语义：函数内 append 形参不影响调用者（曾使 local 声明全丢）。
+// 故构造新 slice 返回，调用方必须 `r = w_add_slot(r, n)` 接收。
+pub fn w_add_slot(sl: []string, n: string) []string {
     var i: i64 = 0; var nn: i64 = slice_len(sl) as i64;
-    while (i < nn) { if (sl[i] == n) { return; } i = i + 1; }
-    append(sl, n);
+    while (i < nn) { if (sl[i] == n) { return sl; } i = i + 1; }
+    var out: []string = [];
+    var j: i64 = 0;
+    while (j < nn) { append(out, sl[j]); j = j + 1; }
+    append(out, n);
+    return out;
 }
 
-// 估计某 slot 的 ST：扫描其作为 dst 的指令 st（粗略；S1 单一定宽）
+// ── 类型来源 ───────────────────────────────────────────────
+// ⚠ 关键事实（实测）：TIR 的 `TirInst.dst.st` **恒为 0（ST_NONE），从不设置**。
+//   真正的类型只有两个来源：① 指令自身的 `ins.st`；② 操作数被引用时的 `arg.st`
+//   （以及名字后缀 `.s<st>`，如 `$r.s11`）。因此后端一律不得依赖 `dst.st`。
+pub fn w_is_cmp_op(op: i64) bool {
+    if (op == TIR_OP_EQ || op == TIR_OP_NE) { return true; }
+    if (op == TIR_OP_SLT || op == TIR_OP_SGT || op == TIR_OP_SLE || op == TIR_OP_SGE) { return true; }
+    if (op == TIR_OP_ULT || op == TIR_OP_UGT || op == TIR_OP_ULE || op == TIR_OP_UGE) { return true; }
+    return false;
+}
+// 操作数类型（算术/比较的参与类型）
+pub fn w_val_st(ins: TMIRInst) i64 {
+    if (ins.st != ST_NONE) { return ins.st; }
+    if (ins.dst.st != ST_NONE) { return ins.dst.st; }
+    return ST_I32;
+}
+// 结果类型（写入 dst slot 的类型）。WASM 的比较/逻辑结果恒为 i32。
+pub fn w_res_st(ins: TMIRInst) i64 {
+    if (w_is_cmp_op(ins.op)) { return ST_I32; }
+    if (ins.op == TIR_OP_NOT || ins.op == TIR_OP_LNOT) { return ST_I32; }
+    return w_val_st(ins);
+}
+// 第 i 个操作数的类型：优先 arg.st，其次回落到该 slot 的声明类型。
+pub fn w_arg_st(ins: TMIRInst, i: i64) i64 {
+    if (i < 0 || i >= slice_len(ins.args) as i64) { return w_val_st(ins); }
+    var a: TirOperand = ins.args[i];
+    if (a.st != ST_NONE) { return a.st; }
+    if (str_len(a.name) as i64 > 0 && a.name[0] == 36) { return w_slot_st(w_strip_suf(a.name), g_wf); }
+    return w_val_st(ins);
+}
+
+pub fn w_is_int_st(st: i64) bool {
+    if (st == ST_F32 || st == ST_F64) { return false; }
+    return true;
+}
+// 操作数的类型（slot 取语义类型，立即数取自带 st）
+pub fn w_operand_st(op: TirOperand) i64 {
+    if (str_len(op.name) as i64 > 0 && op.name[0] == 36) { return w_slot_st(w_strip_suf(op.name), g_wf); }
+    return op.st;
+}
+// 按期望类型发射操作数；整数宽度不符时插入 wrap/extend。
+// TIR 的整数临时槽按 i64 宽存储，而运算语义宽度可能是 i32 ⇒ 边界必须适配。
+pub fn w_emit_operand(sb: StringBuilder, op: TirOperand, want: i64) void {
+    if (str_len(op.name) as i64 > 0 && op.name[0] == 36) {
+        var have: i64 = w_slot_st(w_strip_suf(op.name), g_wf);
+        if (w_is_int_st(have) && w_is_int_st(want)) {
+            var h64: bool = (have == ST_I64 || have == ST_U64);
+            var w64: bool = (want == ST_I64 || want == ST_U64);
+            if (w64 && h64 == false) { sb_append_str(sb, "(i64.extend_i32_s "); w_emit_val_st(sb, op, want); sb_append_str(sb, ")"); return; }
+            if (w64 == false && h64) { sb_append_str(sb, "(i32.wrap_i64 "); w_emit_val_st(sb, op, want); sb_append_str(sb, ")"); return; }
+        }
+    }
+    w_emit_val_st(sb, op, want);
+}
+
+// 估计某 slot 的语义 ST：① 作为操作数被引用时的 arg.st（最贴近语义）
+// → ② 定义它的指令的结果类型 → 兜底 i32。
+// ⚠ 不能用 TIR_OP_SLOT 的 ins.st：那是**存储宽度**（整数临时槽一律 i64，见项目笔记坑 7），
+//   拿来声明 local 会把 i32 常量槽抬成 i64，进而 i32 变量赋值处报
+//   "type mismatch: expected i32, found i64"。
 pub fn w_slot_st(n: string, f: TMIRFunc) i64 {
     var nb: i64 = slice_len(f.blocks) as i64;
     var b: i64 = 0;
@@ -328,7 +491,27 @@ pub fn w_slot_st(n: string, f: TMIRFunc) i64 {
         var k: i64 = 0;
         while (k < ni) {
             var ins: TMIRInst = f.blocks[b].insts[k];
-            if (ins.dst.name == n && ins.st != 0) { return ins.st; }
+            var na: i64 = slice_len(ins.args) as i64;
+            var a: i64 = 0;
+            while (a < na) {
+                if (w_strip_suf(ins.args[a].name) == n && ins.args[a].st != ST_NONE) { return ins.args[a].st; }
+                a = a + 1;
+            }
+            k = k + 1;
+        }
+        b = b + 1;
+    }
+    b = 0;
+    while (b < nb) {
+        var ni: i64 = slice_len(f.blocks[b].insts) as i64;
+        var k: i64 = 0;
+        while (k < ni) {
+            var ins: TMIRInst = f.blocks[b].insts[k];
+            if (ins.op == TIR_OP_SLOT || ins.op == TIR_OP_CONST_STR) { k = k + 1; continue; }
+            // 整数 CONST 的 ins.st 是「临时槽存储宽」（一律 i64），不是语义宽 ⇒ 不可信；
+            // 浮点 CONST 的 ins.st 即真实类型 ⇒ 可信。
+            if (ins.op == TIR_OP_CONST && ins.st != ST_F32 && ins.st != ST_F64) { k = k + 1; continue; }
+            if (w_strip_suf(ins.dst.name) == n && ins.st != ST_NONE) { return w_res_st(ins); }
             k = k + 1;
         }
         b = b + 1;
@@ -346,32 +529,101 @@ pub fn w_st_from_str(s: string) i64 {
 }
 
 // 支配树前序 DFS 发射
-pub fn w_emit_dom(sb: StringBuilder, b: i64) void {
-    var need_wrap: bool = (b != 0) && (g_wloop[b] || slice_len(g_wpreds[b]) as i64 >= 2 || slice_len(g_wpreds[b]) as i64 >= 1);
-    if (b == 0) { need_wrap = false; }
-    else { need_wrap = (g_wloop[b] || slice_len(g_wpreds[b]) as i64 >= 1); } // 非入口且是被跳转目标 → 需 wrapper
-    if (need_wrap) {
-        if (g_wloop[b]) { sb_append_str(sb, "    (loop $"); } else { sb_append_str(sb, "    (block $"); }
-        sb_append_str(sb, w_lbl(b)); sb_append_str(sb, "\n");
+// 跳转目标 → WASM 标签（与 w_emit_dom 的 wrapper 嵌套一一对应）。
+// 前提：块按支配树前序发射，每个支配子节点 c 套一层 wrapper `(block $Wc)`，逆序打开
+// ⇒ 子 0 在最内层、子 k 在其外层；`br` 是**跳出** block 而非跳入，于是
+//   跳到子 k == 跳出子 k-1 的 wrapper。
+// 通用做法：自 b 沿 idom 上溯，找最近的祖先 p（含 b 自身）使 t 为 p 的支配子节点；
+//   ① t 在 p 的**循环内**子表 chin 中：i==0 顺序落入，否则 br $W<chin[i-1]>；
+//   ② t 在 p 的**循环外**子表 chout 中：k==0 表示要从循环里跳出去 ⇒ br $X<p>，
+//      否则 br $W<chout[k-1]>。
+//   ③ t==b 是回边 ⇒ br 自身 loop；找不到且 t 是祖先 loop ⇒ br $Bt；其余兜底顺序落入。
+pub fn w_br_lbl(b: i64, t: i64) string {
+    if (t == b) { return w_lbl(b); }
+    // 回边：t 是支配 b 的循环头 ⇒ 必须 br 到该 loop 顶部。
+    // 不能靠「上溯找祖先子节点」处理——t 会作为入口块的子节点被找到并返回「顺序落入」，
+    // 而落入是走到循环后继，不是回到循环头（曾致 while 只跑一轮）。
+    if (g_wloop[t] && w_in_dom(b, t)) { return w_lbl(t); }
+    var p: i64 = b;
+    var guard: i64 = 0;
+    while (guard <= g_wn) {
+        var chin: []i64 = g_wchin[p];
+        var chout: []i64 = g_wchout[p];
+        var ncin: i64 = slice_len(chin) as i64;
+        var i: i64 = 0;
+        while (i < ncin) {
+            if (chin[i] == t) {
+                if (i == 0) { return ""; }
+                return w_wlbl(chin[i - 1]);
+            }
+            i = i + 1;
+        }
+        var k2: i64 = 0;
+        while (k2 < slice_len(chout) as i64) {
+            if (chout[k2] == t) {
+                if (k2 == 0) { return w_xlbl(p); }
+                return w_wlbl(chout[k2 - 1]);
+            }
+            k2 = k2 + 1;
+        }
+        if (p == 0) { break; }
+        var ip: i64 = g_widom[p];
+        if (ip < 0 || ip == p) { break; }
+        p = ip;
+        guard = guard + 1;
     }
-    // 发射块内指令（除终止指令）
+    if (g_wloop[t]) { return w_lbl(t); }   // 兜底：祖先循环头的回边
+    return "";                             // 兜底：顺序落入（不可归约 / 未覆盖情形）
+}
+
+// 结构化控制流发射（支配树递归）。
+// 布局：
+//   循环头 b：(block $Xb (loop $b <in-wrappers> <b 指令> <in 子块…>)) <out-wrappers> <out 子块…>
+//   非循环头：<wrappers> <b 指令> <子块…>（逐块关闭）
+// ⚠ 循环内子块（in）的 wrapper 必须开在 (loop $b) **之内**、循环外子块（out）的 wrapper 开在
+//   (block $Xb) **之外**。若把循环后继也包进 loop，「跳出循环」的 br 会连后继一起跳过
+//   （曾致 main 直接落到函数尾 unreachable）。
+pub fn w_emit_dom(sb: StringBuilder, b: i64) void {
+    var isloop: bool = (g_wloop[b] && b != 0);
+    var chin: []i64 = g_wchin[b];
+    var ncin: i64 = slice_len(chin) as i64;
+    var chout: []i64 = g_wchout[b];
+    var ncout: i64 = slice_len(chout) as i64;
+    if (isloop) {
+        sb_append_str(sb, "    (block $"); sb_append_str(sb, w_xlbl(b)); sb_append_str(sb, "\n");
+        sb_append_str(sb, "    (loop $"); sb_append_str(sb, w_lbl(b)); sb_append_str(sb, "\n");
+    }
+    var i: i64 = ncin - 1;
+    while (i >= 0) {
+        sb_append_str(sb, "    (block $"); sb_append_str(sb, w_wlbl(chin[i])); sb_append_str(sb, "\n");
+        i = i - 1;
+    }
     var blk: TMIRBlock = g_wf.blocks[b];
     var ni: i64 = slice_len(blk.insts) as i64;
     var k: i64 = 0;
-    while (k < ni - 1) { w_emit_inst(sb, blk.insts[k]); k = k + 1; }
-    // 终止指令
-    if (ni > 0) {
-        var term: TMIRInst = blk.insts[ni - 1];
-        w_emit_term(sb, b, term);
+    while (k + 1 < ni) { w_emit_inst(sb, blk.insts[k]); k = k + 1; }
+    if (ni > 0) { w_emit_term(sb, b, blk.insts[ni - 1]); }
+    var j: i64 = 0;
+    while (j < ncin) {
+        w_emit_dom(sb, chin[j]);
+        sb_append_str(sb, "    )\n");
+        j = j + 1;
     }
-    // 子节点（natural successor 排前）
-    var nat: i64 = w_natural_succ(b);
-    var ch: []i64 = g_wchild[b];
-    // 先 natural，再其余
-    if (nat >= 0) { w_emit_dom(sb, nat); }
-    var ci: i64 = 0; var nc: i64 = slice_len(ch) as i64;
-    while (ci < nc) { if (ch[ci] != nat) { w_emit_dom(sb, ch[ci]); } ci = ci + 1; }
-    if (need_wrap) { sb_append_str(sb, "    )\n"); }
+    if (isloop) {
+        sb_append_str(sb, "    )\n");   // close (loop $b)
+        sb_append_str(sb, "    )\n");   // close (block $Xb)
+    }
+    i = ncout - 1;
+    while (i >= 0) {
+        sb_append_str(sb, "    (block $"); sb_append_str(sb, w_wlbl(chout[i])); sb_append_str(sb, "\n");
+        i = i - 1;
+    }
+    j = 0;
+    while (j < ncout) {
+        w_emit_dom(sb, chout[j]);
+        sb_append_str(sb, "    )\n");
+        j = j + 1;
+    }
 }
 
 // 自然后继（支配后代）：br→[L]；br_cond→[T,E] 中 in_dom 且非循环头者
@@ -398,86 +650,118 @@ pub fn w_natural_succ(b: i64) i64 {
 pub fn w_emit_term(sb: StringBuilder, b: i64, term: TMIRInst) void {
     if (term.op == TIR_OP_RET_VOID) { sb_append_str(sb, "    return\n"); return; }
     if (term.op == TIR_OP_RET) {
-        sb_append_str(sb, "    return "); w_emit_val(sb, term.dst); sb_append_str(sb, "\n"); return;
+        // 返回类型适配：TIR 的 ret 操作数可能是更窄的整型（如字面量 i32 当 i64 返回）。
+        var frs: i64 = w_st_from_str(g_wf.ret_st);
+        sb_append_str(sb, "    (return ");
+        w_emit_operand(sb, term.dst, frs);
+        sb_append_str(sb, ")\n"); return;
     }
     if (term.op == TIR_OP_BR) {
         var L: i64 = w_bname_to_idx(term.args[0].name);
-        if ((w_in_dom(b, L) && g_wloop[L] == false) == false) {
-            sb_append_str(sb, "    br $"); sb_append_str(sb, w_lbl(L)); sb_append_str(sb, "\n");
-        }
+        var lb: string = w_br_lbl(b, L);
+        if (str_len(lb) > 0) { sb_append_str(sb, "    br $"); sb_append_str(sb, lb); sb_append_str(sb, "\n"); }
         return;
     }
     if (term.op == TIR_OP_BR_COND) {
         var T: i64 = w_bname_to_idx(term.args[1].name);
         var E: i64 = w_bname_to_idx(term.args[2].name);
-        var natT: bool = (w_in_dom(b, T) && g_wloop[T] == false);
-        var natE: bool = (w_in_dom(b, E) && g_wloop[E] == false);
-        sb_append_str(sb, "    if "); w_emit_val(sb, term.args[0]); sb_append_str(sb, "\n");
+        var lt: string = w_br_lbl(b, T);
+        var le: string = w_br_lbl(b, E);
+        // 折叠式 if 必须整体加括号：(if (cond) (then ...) (else ...))；
+        // 混用「折叠条件 + 裸 then/else + )」会被 wat2wasm 判为未知记号。
+        sb_append_str(sb, "    (if "); w_emit_val(sb, term.args[0]); sb_append_str(sb, "\n");
         sb_append_str(sb, "      (then");
-        if (natT == false) { sb_append_str(sb, " (br $"); sb_append_str(sb, w_lbl(T)); sb_append_str(sb, ")"); }
+        if (str_len(lt) > 0) { sb_append_str(sb, " (br $"); sb_append_str(sb, lt); sb_append_str(sb, ")"); }
         sb_append_str(sb, ")\n");
         sb_append_str(sb, "      (else");
-        if (natE == false) { sb_append_str(sb, " (br $"); sb_append_str(sb, w_lbl(E)); sb_append_str(sb, ")"); }
-        sb_append_str(sb, ")\n");
-        sb_append_str(sb, "    )\n");
+        if (str_len(le) > 0) { sb_append_str(sb, " (br $"); sb_append_str(sb, le); sb_append_str(sb, ")"); }
+        sb_append_str(sb, "))\n");
         return;
     }
     sb_append_str(sb, "    ;; unsupported term\n");
 }
 
-// 操作数 → WAT 值表达式
-pub fn w_emit_val(sb: StringBuilder, op: TirOperand) void {
+// 操作数 → WAT 值表达式。want 为期望类型：立即数常不带 st（实测多为 0），由调用方给出。
+pub fn w_emit_val_st(sb: StringBuilder, op: TirOperand, want: i64) void {
     if (str_len(op.name) as i64 > 0 && op.name[0] == 64) { // '@' 全局
         sb_append_str(sb, "(global.get $"); sb_append_str(sb, op.name); sb_append_str(sb, ")");
         return;
     }
     if (str_len(op.name) as i64 > 0 && op.name[0] == 36) { // '$' slot
-        sb_append_str(sb, "(local.get $"); sb_append_str(sb, op.name); sb_append_str(sb, ")");
+        sb_append_str(sb, "(local.get $"); sb_append_str(sb, w_strip_suf(op.name)); sb_append_str(sb, ")");
         return;
     }
     // 立即数
-    var wt: string = tmir_st_wasm(op.st);
+    var wt: string = tmir_st_wasm(want);
+    if (op.st != ST_NONE) { wt = tmir_st_wasm(op.st); }
     sb_append_str(sb, "("); sb_append_str(sb, wt); sb_append_str(sb, ".const "); sb_append_str(sb, op.name); sb_append_str(sb, ")");
 }
+pub fn w_emit_val(sb: StringBuilder, op: TirOperand) void { w_emit_val_st(sb, op, ST_I32); }
 
 pub fn w_emit_inst(sb: StringBuilder, ins: TMIRInst) void {
     if (ins.is_comment) { sb_append_str(sb, "    ;; "); sb_append_str(sb, ins.cmt); sb_append_str(sb, "\n"); return; }
     var op: i64 = ins.op;
+    // TIR_OP_SLOT 是帧槽声明：WASM 的 local 已由 w_collect_slots 统一声明，此处无需发射。
+    if (op == TIR_OP_SLOT) { return; }
     // load / store（slot 间拷贝）
-    if (op == TIR_OP_LOAD) { sb_append_str(sb, "    local.set $"); sb_append_str(sb, ins.dst.name); sb_append_str(sb, " "); w_emit_val(sb, ins.args[0]); sb_append_str(sb, "\n"); return; }
-    if (op == TIR_OP_STORE) { sb_append_str(sb, "    local.set $"); sb_append_str(sb, ins.dst.name); sb_append_str(sb, " "); w_emit_val(sb, ins.args[0]); sb_append_str(sb, "\n"); return; }
-    if (op == TIR_OP_CONST) { sb_append_str(sb, "    local.set $"); sb_append_str(sb, ins.dst.name); sb_append_str(sb, " ("); sb_append_str(sb, tmir_st_wasm(ins.dst.st)); sb_append_str(sb, ".const "); sb_append_str(sb, ins.args[0].name); sb_append_str(sb, ")\n"); return; }
+    if (op == TIR_OP_LOAD) { var wl: i64 = w_slot_st(w_strip_suf(ins.dst.name), g_wf); sb_append_str(sb, "    (local.set $"); sb_append_str(sb, w_strip_suf(ins.dst.name)); sb_append_str(sb, " "); w_emit_operand(sb, ins.args[0], wl); sb_append_str(sb, ")\n"); return; }
+    if (op == TIR_OP_STORE) { var ws: i64 = w_slot_st(w_strip_suf(ins.dst.name), g_wf); sb_append_str(sb, "    (local.set $"); sb_append_str(sb, w_strip_suf(ins.dst.name)); sb_append_str(sb, " "); w_emit_operand(sb, ins.args[0], ws); sb_append_str(sb, ")\n"); return; }
+    if (op == TIR_OP_CONST) { sb_append_str(sb, "    (local.set $"); sb_append_str(sb, w_strip_suf(ins.dst.name)); sb_append_str(sb, " ("); sb_append_str(sb, tmir_st_wasm(w_slot_st(w_strip_suf(ins.dst.name), g_wf))); sb_append_str(sb, ".const "); sb_append_str(sb, ins.args[0].name); sb_append_str(sb, "))\n"); return; }
     if (op == TIR_OP_CONST_STR) { sb_append_str(sb, "    ;; const.str unsupported (S2)\n"); return; }
     // call
     if (op == TIR_OP_CALL) {
-        sb_append_str(sb, "    local.set $"); sb_append_str(sb, ins.dst.name); sb_append_str(sb, " (call $");
-        sb_append_str(sb, ins.args[0].name); sb_append_str(sb, "");
+        sb_append_str(sb, "    (local.set $"); sb_append_str(sb, w_strip_suf(ins.dst.name)); sb_append_str(sb, " (call $");
+        sb_append_str(sb, w_fn_name(ins.args[0].name)); sb_append_str(sb, "");
         var na: i64 = slice_len(ins.args) as i64;
         var a: i64 = 1;
         while (a < na) { sb_append_str(sb, " "); w_emit_val(sb, ins.args[a]); a = a + 1; }
-        sb_append_str(sb, ")\n");
+        sb_append_str(sb, "))\n");
         return;
     }
     // 一元
     if (op == TIR_OP_NEG) { w_set_binop(sb, ins, "sub", "0", "0"); return; }
-    if (op == TIR_OP_NOT) { sb_append_str(sb, "    local.set $"); sb_append_str(sb, ins.dst.name); sb_append_str(sb, " (i32.xor "); w_emit_val(sb, ins.args[0]); sb_append_str(sb, " (i32.const -1))\n"); return; }
-    if (op == TIR_OP_LNOT) { sb_append_str(sb, "    local.set $"); sb_append_str(sb, ins.dst.name); sb_append_str(sb, " (i32.eqz "); w_emit_val(sb, ins.args[0]); sb_append_str(sb, ")\n"); return; }
+    if (op == TIR_OP_NOT) { sb_append_str(sb, "    (local.set $"); sb_append_str(sb, w_strip_suf(ins.dst.name)); sb_append_str(sb, " (i32.xor "); w_emit_operand(sb, ins.args[0], ST_I32); sb_append_str(sb, " (i32.const -1)))\n"); return; }
+    if (op == TIR_OP_LNOT) { sb_append_str(sb, "    (local.set $"); sb_append_str(sb, w_strip_suf(ins.dst.name)); sb_append_str(sb, " (i32.eqz "); w_emit_operand(sb, ins.args[0], ST_I32); sb_append_str(sb, "))\n"); return; }
     // 转换
     if (op == TIR_OP_ZEXT || op == TIR_OP_SEXT || op == TIR_OP_TRUNC) {
-        sb_append_str(sb, "    local.set $"); sb_append_str(sb, ins.dst.name); sb_append_str(sb, " "); w_emit_val(sb, ins.args[0]); sb_append_str(sb, "\n"); return;
+        sb_append_str(sb, "    (local.set $"); sb_append_str(sb, w_strip_suf(ins.dst.name)); sb_append_str(sb, " ");
+        var d64: bool = (w_res_st(ins) == ST_I64 || w_res_st(ins) == ST_U64 || w_res_st(ins) == ST_PTR || w_res_st(ins) == ST_PTR_VOID);
+        var s64: bool = (w_arg_st(ins, 0) == ST_I64 || w_arg_st(ins, 0) == ST_U64 || w_arg_st(ins, 0) == ST_PTR || w_arg_st(ins, 0) == ST_PTR_VOID);
+        if (d64 && s64 == false) {
+            if (op == TIR_OP_ZEXT) { sb_append_str(sb, "(i64.extend_i32_u "); } else { sb_append_str(sb, "(i64.extend_i32_s "); }
+            w_emit_operand(sb, ins.args[0], w_arg_st(ins, 0)); sb_append_str(sb, "))\n"); return;
+        }
+        if (d64 == false && s64) { sb_append_str(sb, "(i32.wrap_i64 "); w_emit_operand(sb, ins.args[0], w_arg_st(ins, 0)); sb_append_str(sb, "))\n"); return; }
+        w_emit_operand(sb, ins.args[0], w_res_st(ins)); sb_append_str(sb, ")\n"); return;
+    }
+    // 浮点 ↔ 整数 / 浮点 ↔ 浮点
+    if (op == TIR_OP_FPTOSI || op == TIR_OP_FPTOUI || op == TIR_OP_SITOFP || op == TIR_OP_UITOFP || op == TIR_OP_FPEXT || op == TIR_OP_FPTRUNC) {
+        var dt: string = tmir_st_wasm(w_res_st(ins));
+        var ss: string = tmir_st_wasm(w_arg_st(ins, 0));
+        var mn: string = "";
+        if (op == TIR_OP_FPTOSI) { mn = base.sb_cat3(dt, ".trunc_", base.sb_cat2(ss, "_s")); }
+        else if (op == TIR_OP_FPTOUI) { mn = base.sb_cat3(dt, ".trunc_", base.sb_cat2(ss, "_u")); }
+        else if (op == TIR_OP_SITOFP) { mn = base.sb_cat3(dt, ".convert_", base.sb_cat2(ss, "_s")); }
+        else if (op == TIR_OP_UITOFP) { mn = base.sb_cat3(dt, ".convert_", base.sb_cat2(ss, "_u")); }
+        else if (op == TIR_OP_FPEXT) { mn = "f64.promote_f32"; }
+        else { mn = "f32.demote_f64"; }
+        sb_append_str(sb, "    (local.set $"); sb_append_str(sb, w_strip_suf(ins.dst.name)); sb_append_str(sb, " (");
+        sb_append_str(sb, mn); sb_append_str(sb, " "); w_emit_operand(sb, ins.args[0], w_arg_st(ins, 0)); sb_append_str(sb, "))\n");
+        return;
     }
     // 二元
-    if (ins.dst.st == ST_F32 || ins.dst.st == ST_F64) { w_emit_fbinop(sb, ins); return; }
-    var mnem: string = w_int_mnem(op, ins.dst.st);
+    if (w_val_st(ins) == ST_F32 || w_val_st(ins) == ST_F64) { w_emit_fbinop(sb, ins); return; }
+    var mnem: string = w_int_mnem(op, w_val_st(ins));
     if (mnem == "") { sb_append_str(sb, "    ;; unsupported op "); sb_append_str(sb, base.i2s(op)); sb_append_str(sb, "\n"); return; }
-    sb_append_str(sb, "    local.set $"); sb_append_str(sb, ins.dst.name); sb_append_str(sb, " (");
-    sb_append_str(sb, mnem); sb_append_str(sb, " "); w_emit_val(sb, ins.args[0]); sb_append_str(sb, " "); w_emit_val(sb, ins.args[1]); sb_append_str(sb, ")\n");
+    sb_append_str(sb, "    (local.set $"); sb_append_str(sb, w_strip_suf(ins.dst.name)); sb_append_str(sb, " (");
+    var wa: i64 = w_val_st(ins);
+    sb_append_str(sb, mnem); sb_append_str(sb, " "); w_emit_operand(sb, ins.args[0], wa); sb_append_str(sb, " "); w_emit_operand(sb, ins.args[1], wa); sb_append_str(sb, "))\n");
 }
 
 // 用 sub 实现 neg（t 无 neg 一元 op 直接映射到 wasm）：a - 0
 pub fn w_set_binop(sb: StringBuilder, ins: TMIRInst, mnem: string, filler: string, filler2: string) void {
-    sb_append_str(sb, "    local.set $"); sb_append_str(sb, ins.dst.name); sb_append_str(sb, " (");
-    sb_append_str(sb, mnem); sb_append_str(sb, " "); w_emit_val(sb, ins.args[0]); sb_append_str(sb, " ("); sb_append_str(sb, tmir_st_wasm(ins.dst.st)); sb_append_str(sb, ".const 0))\n");
+    sb_append_str(sb, "    (local.set $"); sb_append_str(sb, w_strip_suf(ins.dst.name)); sb_append_str(sb, " (");
+    sb_append_str(sb, mnem); sb_append_str(sb, " "); w_emit_operand(sb, ins.args[0], w_val_st(ins)); sb_append_str(sb, " ("); sb_append_str(sb, tmir_st_wasm(w_val_st(ins))); sb_append_str(sb, ".const 0)))\n");
 }
 
 pub fn w_int_mnem(op: i64, st: i64) string {
@@ -510,7 +794,7 @@ pub fn w_int_mnem(op: i64, st: i64) string {
 
 pub fn w_emit_fbinop(sb: StringBuilder, ins: TMIRInst) void {
     var op: i64 = ins.op;
-    var fsz: string = "f32"; if (ins.dst.st == ST_F64) { fsz = "f64"; }
+    var fsz: string = "f32"; if (w_val_st(ins) == ST_F64) { fsz = "f64"; }
     var mnem: string = "";
     if (op == TIR_OP_ADD) { mnem = "add"; } else if (op == TIR_OP_SUB) { mnem = "sub"; }
     else if (op == TIR_OP_MUL) { mnem = "mul"; } else if (op == TIR_OP_SDIV || op == TIR_OP_UDIV) { mnem = "div"; }
@@ -518,6 +802,7 @@ pub fn w_emit_fbinop(sb: StringBuilder, ins: TMIRInst) void {
     else if (op == TIR_OP_SLT) { mnem = "lt"; } else if (op == TIR_OP_SLE) { mnem = "le"; }
     else if (op == TIR_OP_SGT) { mnem = "gt"; } else if (op == TIR_OP_SGE) { mnem = "ge"; }
     if (mnem == "") { sb_append_str(sb, "    ;; unsupported float op "); sb_append_str(sb, base.i2s(op)); sb_append_str(sb, "\n"); return; }
-    sb_append_str(sb, "    local.set $"); sb_append_str(sb, ins.dst.name); sb_append_str(sb, " (");
-    sb_append_str(sb, fsz); sb_append_str(sb, "."); sb_append_str(sb, mnem); sb_append_str(sb, " "); w_emit_val(sb, ins.args[0]); sb_append_str(sb, " "); w_emit_val(sb, ins.args[1]); sb_append_str(sb, ")\n");
+    sb_append_str(sb, "    (local.set $"); sb_append_str(sb, w_strip_suf(ins.dst.name)); sb_append_str(sb, " (");
+    var wf: i64 = w_val_st(ins);
+    sb_append_str(sb, fsz); sb_append_str(sb, "."); sb_append_str(sb, mnem); sb_append_str(sb, " "); w_emit_operand(sb, ins.args[0], wf); sb_append_str(sb, " "); w_emit_operand(sb, ins.args[1], wf); sb_append_str(sb, "))\n");
 }

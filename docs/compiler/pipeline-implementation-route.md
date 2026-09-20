@@ -318,9 +318,9 @@ TirOperand {
 | S1–S4 | ✅（经 emit-tir-ll 后端） | emit-tir-ll 后端对 69 个 example 双轨全绿 |
 | S5-切换 | ⚠️ 代码完成 / 判据未验 | `src/tc.tc` 默认 `backend="tir"`，`--backend ll` 保留回退；arena 改 16GB 预留+按需提交（commit `1d578f3`）。**切换判据（新轨编 `tc.tc` 且输出与旧轨逐字一致）尚未在工具链机器跑 `gate L2` 验证**（沙箱无 clang/VS/WinSDK，无法链接） |
 | S5-删除 | ⛔ 硬阻塞 | 见 §8.2 |
-| **tmir 机器层** | ✅ 机器层首切片落地 / 端到端未验 | `src/tmir.tc`（原 `src/mir.tc`：TMIR 类型 + `tir_to_tmir_lower`）+ `--backend tmir-wasm`/`tmir-riscv` 接线，tmir 仅做转换、不承载优化（§9/§10） |
-| **tmir→后端** | ⚠️ 首切片落地 / 端到端未验 | `src/codegen_wasm.tc`(tmir→WAT) + `src/codegen_riscv.tc`(tmir→rv64)（§10.1）；沙箱无 wasm/riscv 工具链，待工具链机器对拍 |
-| **mir 优化层** | ✅ 已接线 / 端到端未验 | 已落地 `src/mir.tc`（pre-TIR 录制 + `mir_from_tir`/`mir_run`/`mir_to_tir_lower`，§11.4）；承载**架构/设备/后端无关**优化；`--opt/-O` 默认关闭保护自举不动点 |
+| **tmir 机器层** | ✅ 机器层首切片落地 / 端到端已验 | `src/tmir.tc`（原 `src/mir.tc`：TMIR 类型 + `tir_to_tmir_lower`）+ `--backend tmir-wasm`/`tmir-riscv` 接线，tmir 仅做转换、不承载优化（§9/§10）；M1 三轨对拍 12/12 全绿 |
+| **tmir→后端** | ✅ 首切片落地 / **端到端已验（M1 判据达成）** | `src/codegen_wasm.tc`(tmir→WAT) + `src/codegen_riscv.tc`(tmir→rv64)（§10.1）；`tools/m1_difftest.py` 对 `tests/m1/` 的 S1 标量子集做 tir/wasm/riscv 三轨对拍，12/12 全绿（wasm 用 wasmtime 实跑取 main 返回值，riscv 用 `clang -target riscv64-linux-gnu -c` 汇编校验） |
+| **mir 优化层** | ✅ 已接线 / 端到端已验（opt=0 与 opt=1 均 12/12） | 已落地 `src/mir.tc`（pre-TIR 录制 + `mir_from_tir`/`mir_run`/`mir_to_tir_lower`，§11.4）；承载**架构/设备/后端无关**优化；`--opt/-O` 默认关闭保护自举不动点。⚠ 落地期修复：`tir_emit` 只对 kernel 分支录过 `g_mir.funcs`，普通函数未录 ⇒ `g_mir` 恒为空，已补齐三处 `append(g_mir.funcs, g_mir_cur)` |
 
 ### 8.2 S5-删除的硬阻塞：自举 arena 鸡生蛋
 
@@ -342,7 +342,11 @@ TirOperand {
 - §7 的 09-30 日落线仍有效。S5-切换代码已完成，仅差步骤 3 的 gate 验证。
 - 若工具链机器 `gate L2` 通过 → S5 切换判据达成，剩余仅 S5-删除（受 §8.2 约束，待 stage0 升级 16GB arena 后做）。
 - 若 `gate L2` 因 tir 输出与 C 后端不符而失败 → 一行回退 `src/tc.tc:397` 改 `backend="ll"`，转回 `codegen_ll` 单点维护（§7 日落条款）。
-- **M 轨验证路径（独立于 S5）**：M0/M1 代码已落地，端到端须工具链机器执行——`wat2wasm out/dbg/<m>.wat` 验证 WASM 语法、或 `riscv64-linux-gnu-gcc -c out/dbg/<m>.s` 验证 RISC-V 汇编；随后以双轨对拍（§10.4）比对 `tmir-wasm`/`tmir-riscv` 与 `tir` 运行输出。沙箱无 clang/wasm/riscv 工具链，无法在此验证（与设计 §1.3 反转同期已知缺口）。
+- **M 轨验证路径（独立于 S5）**：✅ **2026-09-21 已完成**。本机工具链齐备（clang 含 riscv64 target、`pip install wasmtime`），新增 `tools/m1_difftest.py` + `tests/m1/`（12 个 S1 标量用例）做三轨对拍：
+  - WASM：`tc emit-ll --backend tmir-wasm` → `.wat` → wasmtime 实例化调导出 `main()`，取返回值；
+  - RISC-V：`tc emit-ll --backend tmir-riscv` → `.s` → `clang -target riscv64-linux-gnu -c` 汇编校验（本机无 rv64 模拟器，不做运行对拍）；
+  - LLVM：`tc build`（默认 `--backend tir`）→ exe → 进程退出码即 `main` 返回值。
+  `--opt 0` 与 `--opt 1` 各 12/12 全绿 ⇒ **M1 判据（§10.3）达成**，mir 优化层同时得到端到端验证。
 
 ---
 
@@ -407,8 +411,8 @@ ST → 目标存储类映射帮手（在 `tmir.tc` 内，`mir_st_wasm` / `mir_st
 
 | 后端 | 命令 | 载体 | 覆盖 | 状态 |
 |---|---|---|---|---|
-| **tmir→RISC-V** | `--backend tmir-riscv`（原 `mir-riscv`） | `src/codegen_riscv.tc` | S1 标量（i32/i64/f64/bool、算术/比较/位/移位、load/store、call、br/br_cond）；CFG 直接映射 `beq/bne/j/ret`，虚拟 slot 溢出到栈帧 | **首切片落地**（沙箱无 riscv 工具链，待 `riscv64-linux-gnu-gcc -c` 验证） |
-| **tmir→WASM** | `--backend tmir-wasm`（原 `mir-wasm`） | `src/codegen_wasm.tc` | S1 标量；对**可归约 CFG** 用支配树嵌套 `block`/`loop`+`br` 重建结构化控制流 | **首切片落地**（沙箱无 `wat2wasm`，待 `wat2wasm` 验证） |
+| **tmir→RISC-V** | `--backend tmir-riscv`（原 `mir-riscv`） | `src/codegen_riscv.tc` | S1 标量（i32/i64/f64/bool、算术/比较/位/移位、load/store、call、br/br_cond）；CFG 直接映射 `beq/bne/j/ret`，虚拟 slot 溢出到栈帧 | ✅ **已验**：`clang -target riscv64-linux-gnu -c` 对 S1 子集全部汇编通过（浮点字面量走 `.rodata` 常量池 + `la`+`fld`/`flw`） |
+| **tmir→WASM** | `--backend tmir-wasm`（原 `mir-wasm`） | `src/codegen_wasm.tc` | S1 标量；对**可归约 CFG** 用支配树嵌套 `block`/`loop`+`br` 重建结构化控制流 | ✅ **已验**：wasmtime 实跑，S1 子集 `main()` 返回值与 LLVM 轨逐一对拍一致 |
 
 > tmir→WASM 的结构化控制流重建只对**可归约 CFG** 正确（S1 的 if/while/for 天然可归约）。`src/codegen_wasm.tc` 用迭代数据流求支配树 + Cooper-Harvey-Kennedy 求 `idom`，按支配树前序 DFS 发射，自然后继（支配后代）落入、其余目标 `br`。不可归约 CFG（如 computed goto）需后续补 `br_table`/栈式兜底。
 
@@ -434,7 +438,12 @@ ST → 目标存储类映射帮手（在 `tmir.tc` 内，`mir_st_wasm` / `mir_st
 
 M 轨沿用 S 轨的双轨对拍（§3）：同一 `.tc` 走 `TIR→tmir→wasm`（`--backend tmir-wasm`）与 `tmir→llvm`（`--backend tmir-llvm`），比对运行输出。首切片（M1）先以 warn 级接入 `gate.mjs`（对齐 S-1 纪律），全绿后转 hard。
 
-> **沙箱限制**：本沙箱无 `clang`/`VS2022`/`wat2wasm`/`riscv64` 工具链，M1 的端到端对拍须工具链机器执行（见 §8.3 验证路径）。代码改动（src/tmir.tc / src/codegen_wasm.tc / src/codegen_riscv.tc / tc.tc 接线）已落地，仅差链接验证；CLI 标志 `mir-wasm`/`mir-riscv` 待代码阶段更名为 `tmir-wasm`/`tmir-riscv`。
+> ~~**沙箱限制**：本沙箱无 `clang`/`VS2022`/`wat2wasm`/`riscv64` 工具链，M1 的端到端对拍须工具链机器执行~~
+> **2026-09-21 已解除**：本机 clang（含 riscv64 target）与 wasmtime 齐备，M1 对拍已本地跑通。
+
+**对拍入口（M1）**：`python tools/m1_difftest.py [--tc out/dbg/tc.exe] [--opt 0|1] [--dir tests/m1]`
+（wasmtime 装在 `C:/Python312`，故须用 `C:/Python312/python.exe`；默认 `python` 是 3.13，找不到 wasmtime）。
+判据：llvm 退出码 == wasm `main()` 返回值，且 riscv `.s` 汇编通过。首切片先按 warn 级使用，M2 后再考虑接进 `gate.mjs` 转 hard。
 
 ## 11. mir 优化层（对齐 Rust MIR，HIR 与 TIR 之间，2026-09-13 设计）
 
