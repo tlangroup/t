@@ -46,6 +46,7 @@ import {
 import { join, resolve, basename } from "node:path";
 import { createHash } from "node:crypto";
 import { cpus } from "node:os";
+import { findClang, clangVersion, nodeVersion, osInfo } from "./toolchain.mjs";
 
 const pExecFile = promisify(execFile);
 const ROOT = resolve(new URL("..", import.meta.url).pathname.replace(/^\/([A-Za-z]):/, "$1:"));
@@ -157,12 +158,19 @@ function dirHash(dir, exts) {
 }
 function provenance() {
     const rel = compiler.replace(ROOT + "\\", "").replace(ROOT + "/", "");
+    const c = findClang();
     return {
         compiler: rel,
         compilerMd5: existsSync(compiler) ? md5File(compiler) : "missing",
         gitHead: gitHead(),
         srcHash: dirHash("src", [".tc"]),
         runtimeHash: dirHash("runtime", [".c", ".h"]),
+        // hermetic 溯源：记录工具链身份 + 版本，使「clang 版本变化」可审计
+        // （此前仅在文件头注释里声明「不覆盖 clang 版本变化」，现可被查证）。
+        // 注意：clang/node 版本不参与 DIFF 判定（_meta 已被比对排除），仅作报告。
+        clang: { path: c.path, via: c.via, version: clangVersion(c.path) },
+        node: nodeVersion(),
+        os: osInfo(),
     };
 }
 
@@ -172,9 +180,12 @@ function provenance() {
 // 但布局相同 ⇒ 运行时行为相同，属良性发散。快照比对按"布局签名"分配规范名，
 // 使同布局不同名的类型归并；只放过命名发散，不放过真实布局差异。
 //
-// 已知失败用例：既有 LLVM 后端 bug（tile_demo 的 Tile 元素被错当成 i64 当 ptr 存），
-// 单独立项跟踪，不计入快照绿/红判定。修好该后端 bug 后从名单移除。
-const KNOWN_FAILING = new Set(["tile_demo"]);
+// 已知失败用例名单（与 _diffpipe.mjs / run_examples.mjs 的 KNOWN_FAILING 保持一致）：
+// 后端 bug 修好后从名单移除，恢复快照覆盖。
+// tile_demo 的 Tile 元素错当成 i64 当 ptr 存的后端 bug 已修复
+// （src/tir_to_ll.tc 瓦片 binop 聚合类型探测从 inst.st 回退到 inst.args[0].st），
+// 已从名单移除，恢复快照覆盖。
+const KNOWN_FAILING = new Set();
 
 function collectStructDefsLLVM(text) {
     const defs = {};
@@ -366,7 +377,8 @@ if (update) {
     const payload = {
         _meta: {
             note: "编译产物逐目标 md5 基线（key = <源文件>::<ll|c|h>）。"
-                + "全同 ⇒ 两后端 clang 输入不变 ⇒ 语义零影响，可跳过运行类门禁。",
+                + "全同 ⇒ 两后端 clang 输入不变 ⇒ 语义零影响，可跳过运行类门禁。"
+                + "provenance 记录录制者编译器指纹 + 源码/运行时指纹 + 工具链(clang/node/os) 身份。",
             updated: new Date().toISOString().slice(0, 19).replace("T", " "),
             backends: backends.join(","),
             targets: targets.length,

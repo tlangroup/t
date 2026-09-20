@@ -8,35 +8,23 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync } from "node:fs";
 import { join, resolve, dirname } from "node:path";
+import { findClang, clangVersion, resolveAr } from "./toolchain.mjs";
 
 const ROOT = resolve(".");
 
-function findClang() {
-  const candidates = ["clang", "C:\\Program Files\\LLVM\\bin\\clang.exe"];
-  for (const c of candidates) {
-    try {
-      execFileSync(c, ["--version"], { stdio: "pipe" });
-      return c;
-    } catch {}
-  }
-  return null;
-}
-
-const clang = findClang();
-if (!clang) { console.error("build_runtime: clang not found"); process.exit(2); }
-const clangDir = dirname(clang);
-// 坑：findClang() 可能命中 PATH 上的裸 "clang"，此时 dirname 为 "."，
-// join(".", "llvm-ar.exe") 恒不存在 → 误报 "llvm-ar not found"（dbg 版
-// t_runtime.lib 因此长期未被构建，diffpipe 新轨 69 例全部 link 失败）。
-// 必须依次回落：clang 同目录 → PATH。
-function resolveAr(dir) {
-  for (const c of [join(dir, "llvm-ar.exe"), join(dir, "llvm-ar"), "llvm-ar.exe", "llvm-ar"]) {
-    try { execFileSync(c, ["--version"], { stdio: "pipe" }); return c; } catch {}
-  }
-  return null;
-}
+// 工具链发现收口到 toolchain.mjs（与 gate / tc.exe 同一规则）。
+const clangResolved = findClang();
+const clang = clangResolved.path;
+const clangDir = clangResolved.via === "path" ? "." : dirname(clang);
+if (clangVersion(clang) === "unknown") { console.error("build_runtime: clang not found"); process.exit(2); }
+// 回落规则（clang 同目录 → PATH）已由 toolchain.resolveAr 统一处理；
+// 旧实现在此因 dirname(".") 拼出不存在路径而误报 llvm-ar，现已消除。
 const ar = resolveAr(clangDir);
-if (!ar) { console.error("build_runtime: llvm-ar not found"); process.exit(2); }
+if (ar === "ar") {
+    // 最后回落裸 "ar"：验证确实可用，否则明确报错（而非带着无效 ar 继续）
+    try { execFileSync(ar, ["--version"], { stdio: "pipe", windowsHide: true }); }
+    catch { console.error("build_runtime: ar not found (llvm-ar / llvm-lib / ar 均不可用)"); process.exit(2); }
+}
 
 const modes = [
   { name: "dbg", opt: "-O0" },

@@ -358,6 +358,7 @@ fn main() i32 @main {
         var has_src: bool = false;
         var ex_name: string = "";
         var is_example: bool = false;
+        var emit_link_deps: bool = false;   // 仅输出 emit 后解析到的外部链接库（.tlib），供 diffpipe 手动 link 复用
         var ai2: i64 = 2;
         var an2: i64 = slice_len(argv) as i64;
         while (ai2 < an2) {
@@ -372,6 +373,10 @@ fn main() i32 @main {
             if (argv[ai2] == "--example") {
                 if (ai2 + 1 < an2) { ex_name = argv[ai2 + 1]; is_example = true; }
                 ai2 = ai2 + 2; continue;
+            }
+            if (argv[ai2] == "--link-deps") {
+                emit_link_deps = true;
+                ai2 = ai2 + 1; continue;
             }
             if (has_src == false) { src_file = argv[ai2]; has_src = true; }
             ai2 = ai2 + 1;
@@ -414,9 +419,19 @@ fn main() i32 @main {
         var llp: string = base.sb_cat2(out_p, ".tir.ll");
         base.ensure_parent(llp);
         tir.tir_verify_module();
-        var lltext: string = tir_to_ll_emit(tir.g_mod);
+        var lltext: string = tir_to_ll__tir_to_ll_emit(tir.g_mod);
         file_write_all(llp, lltext);
         eprint(base.sb_cat3("Generated: ", base.to_bs(llp), "\n"));
+        // --link-deps：把解析到的外部链接库（.tlib 归档）逐行打到 stdout，
+        // 供 diffpipe 新轨手动 clang link 时一并并入（与 tc build 的 g_ext_link 一致）。
+        if (emit_link_deps) {
+            var nlk: i64 = slice_len(lex.g_ext_link) as i64;
+            var elk: i64 = 0;
+            while (elk < nlk) {
+                print(lex.g_ext_link[elk]); print("\n");
+                elk = elk + 1;
+            }
+        }
         return 0;
     }
 
@@ -549,9 +564,17 @@ fn main() i32 @main {
         // ⚠ 严禁用 sys_run("cmd /c if exist <绝对路径>") 探测：绝对路径触发 arena OOM
         //   （见 sema.tc:12383 同款问题），会污染 arena 致后续 anndefs append 段错误（build 必崩）。
         //   改用稳健的 file_exists 内建（C fopen 直查 / LLVM @tll_file_exists）。
-        if (clang_p == "clang") {
-            if (file_exists("C:/Program Files/LLVM/bin/clang.exe")) {
-                clang_p = "C:/Program Files/LLVM/bin/clang.exe";
+        // hermetic：允许用 TC_CLANG 环境变量显式指定 clang，使「门禁解析一次、
+        // 全链路继承」成为现实（gate 解析出 clang 后注入 TC_CLANG，所有 tc 子进程
+        // 用同一份 clang 链接，避免隐式依赖 PATH / 硬编码路径漂移）。
+        var tc_clang: string = getenv("TC_CLANG");
+        if (tc_clang != "") {
+            clang_p = tc_clang;
+        } else {
+            if (clang_p == "clang") {
+                if (file_exists("C:/Program Files/LLVM/bin/clang.exe")) {
+                    clang_p = "C:/Program Files/LLVM/bin/clang.exe";
+                }
             }
         }
 
@@ -592,37 +615,37 @@ fn main() i32 @main {
         if (backend == "tmir-wasm") {
             // 路线 §11：sema → mir(pre-TIR 优化) → TIR → tmir → WAT
             // 开启录制：tir.lower_unit 在 TIR 发射期并行录制 pre-TIR 线性 MIR 到 g_mir
-            g_recording_mir = true;
+            tir__g_recording_mir = true;
             tir.lower_unit(mod2, src_file);
-            g_recording_mir = false;
-            g_mir.globals = g_mod.globals;   // 非函数部分录制期不含，从 g_mod 取（优化不影响 globals）
-            g_mir.types = g_mod.types;
-            g_mir.strings = g_mod.strings;
-            var mir_mod: MIRModule = mir_from_tir(g_mir);
-            mir_run(mir_mod, opt_level);          // 架构/设备/后端无关优化；opt=0 恒等
-            var tm: TIRModule = mir_to_tir_lower(mir_mod);   // CFG→线性 TIR，opt=0 字节级还原 g_mod
-            var mm: TMIRModule = tir_to_tmir_lower(tm);
-            out_text = tmir_to_wasm(mm);
+            tir__g_recording_mir = false;
+            tir__g_mir.globals = tir__g_mod.globals;   // 非函数部分录制期不含，从 g_mod 取（优化不影响 globals）
+            tir__g_mir.types = tir__g_mod.types;
+            tir__g_mir.strings = tir__g_mod.strings;
+            var mir_mod: MIRModule = mir__mir_from_tir(tir__g_mir);
+            mir__mir_run(mir_mod, opt_level);          // 架构/设备/后端无关优化；opt=0 恒等
+            var tm: TIRModule = mir__mir_to_tir_lower(mir_mod);   // CFG→线性 TIR，opt=0 字节级还原 g_mod
+            var mm: TMIRModule = tmir__tir_to_tmir_lower(tm);
+            out_text = codegen_wasm__tmir_to_wasm(mm);
             out_ext = ".wat";
         } else if (backend == "tmir-riscv") {
             // 路线 §11：sema → mir(pre-TIR 优化) → TIR → tmir → rv64 汇编
-            g_recording_mir = true;
+            tir__g_recording_mir = true;
             tir.lower_unit(mod2, src_file);
-            g_recording_mir = false;
-            g_mir.globals = g_mod.globals;
-            g_mir.types = g_mod.types;
-            g_mir.strings = g_mod.strings;
-            var mir_mod: MIRModule = mir_from_tir(g_mir);
-            mir_run(mir_mod, opt_level);
-            var tm: TIRModule = mir_to_tir_lower(mir_mod);
-            var mm: TMIRModule = tir_to_tmir_lower(tm);
-            out_text = tmir_to_riscv(mm);
+            tir__g_recording_mir = false;
+            tir__g_mir.globals = tir__g_mod.globals;
+            tir__g_mir.types = tir__g_mod.types;
+            tir__g_mir.strings = tir__g_mod.strings;
+            var mir_mod: MIRModule = mir__mir_from_tir(tir__g_mir);
+            mir__mir_run(mir_mod, opt_level);
+            var tm: TIRModule = mir__mir_to_tir_lower(mir_mod);
+            var mm: TMIRModule = tmir__tir_to_tmir_lower(tm);
+            out_text = codegen_riscv__tmir_to_riscv(mm);
             out_ext = ".s";
         } else if (backend == "tir") {
             // S5 新轨（--backend tir 时进入）：sema → TIR → LLVM，结构化翻译（无文本 round-trip，§5.3/§5.6 合规）
             tir.lower_unit(mod2, src_file);
             tir.tir_verify_module();
-            lltext = tir_to_ll_emit(tir.g_mod);
+            lltext = tir_to_ll__tir_to_ll_emit(tir.g_mod);
             out_text = lltext;
         }
 

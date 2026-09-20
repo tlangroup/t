@@ -28,6 +28,7 @@ import { readFileSync, existsSync, copyFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { ensureMsvcEnv } from "./msvc_env.mjs";
+import { findClang, clangVersion, toolchainReport, TC_CLANG_ENV } from "./toolchain.mjs";
 
 const ROOT = resolve(new URL("..", import.meta.url).pathname.replace(/^\/([A-Za-z]):/, "$1:"));
 const NODE = process.execPath;
@@ -128,14 +129,14 @@ const py = (script, ...args) => run(PY, [join("tools", script), ...args]);
 function md5(p) {
     return createHash("md5").update(readFileSync(p)).digest("hex");
 }
-function findClang() {
-    for (const p of [
-        "C:\\Program Files\\LLVM\\bin\\clang.exe",
-        "C:\\Program Files (x86)\\LLVM\\bin\\clang.exe",
-    ]) if (existsSync(p)) return p;
-    return "clang";
+// 工具链发现收口到 toolchain.mjs（单一事实来源）。解析结果注入 process.env.TC_CLANG，
+// 使本门禁 spawn 的所有 tc 子进程（build / run_examples / difftest / _diffpipe …）
+// 继承同一 clang —— 「门禁用的 clang」与「编译器链接用的 clang」强一致（hermetic）。
+const clangResolved = findClang();
+const CLANG = clangResolved.path;
+if (clangResolved.via === "env" || clangResolved.via === "fixed") {
+    process.env[TC_CLANG_ENV] = CLANG;
 }
-const CLANG = findClang();
 function lastLine(s, n = 1) {
     const ls = s.trimEnd().split("\n").filter((l) => l.trim());
     return ls.slice(-n).join(" / ").trim();
@@ -151,6 +152,34 @@ const G4 = join("out", "dbg", "g4");
 const GR = join("out", "rls", "gr");   // rls 编译器
 
 const steps = [
+    {
+        id: "toolchain", lv: 0, name: "工具链断言 (clang / node / python / MSVC)",
+        run: async () => {
+            // hermetic：门禁对外部工具链的依赖从「隐式回退 PATH」改为「显式发现 + 断言」。
+            // 缺 clang 在此直接失败（而非深层 cself 步报含糊的 "clang link failed"）；
+            // 仅靠 PATH 裸 clang 时告警（跨机器不确定）但允许继续（真实环境通常有固定安装）。
+            const envClang = process.env[TC_CLANG_ENV];
+            if (envClang && !existsSync(envClang)) {
+                return { ok: false, note: `TC_CLANG=${envClang} 不存在（环境变量指向无效 clang）` };
+            }
+            const c = findClang();
+            const v = clangVersion(c.path);
+            // 让所有子进程继承本次解析到的 clang（固定结果，避免各步各自解析漂移）
+            process.env[TC_CLANG_ENV] = c.path;
+            if (v === "unknown") {
+                if (c.via === "path") return { ok: false, note: "PATH 上找不到 clang —— C 后端链接不可用" };
+                return { ok: false, note: `${c.path} 不可执行` };
+            }
+            const rep = toolchainReport();
+            const pyTag = rep.python.version === "unknown"
+                ? "python 缺失（llvm_verify 步将 SKIP，仅该步降级）"
+                : `python ${rep.python.version}`;
+            const clangTag = c.via === "path"
+                ? `clang(PATH) ${v} —— 非固定路径，跨机器不确定`
+                : `${c.path} ${v}`;
+            return { ok: true, warn: c.via === "path", note: `${clangTag} | node ${rep.node.version} | ${pyTag} | ${rep.os}` };
+        },
+    },
     {
         id: "diagdef", lv: 0, name: "诊断注册表不变量 (gen_diag --check)",
         run: async () => {
@@ -237,7 +266,8 @@ const r = await node("ir_snapshot.mjs", "--compiler", `${G1}.exe`, "--jobs", "1"
                 //   C==LLVM 逐字节的前提不成立 → 原 C-oracle 基线必然误报假差异。
                 // 改 LLVM 自举基线后同源同后端→确定性→只剩真 emit/后端改动会现形。
                 // 交叉后端正确性由 gate 的 run_examples 双后端对拍 + LLVM IR verifier 覆盖；
-                // tile_demo 既有后端 bug 已在 KNOWN_FAILING 排除，不计入绿/红。
+                // tile_demo 既有后端 bug（Tile 元素错当成 i64 当 ptr 存）已修复并从 KNOWN_FAILING
+                // 移除，恢复快照 / 双轨对拍 / 示例门禁覆盖。
                 const diffs = r.out.split("\n").filter((l) => /^\s+(DIFF|NEW|GONE)/.test(l)).length;
                 // diffs==0 却 rc!=0 ⇒ 不是「发射偏差」，而是快照自身执行失败（某目标发射期
                 // 被 TIR verifier 中止 / emit-c 报错 / 编译器中途崩溃）。必须透传尾部输出，

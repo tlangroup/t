@@ -130,9 +130,12 @@ async function runPool(items, limit, worker) {
 }
 
 // ── 收集用例 ─────────────────────────────────────────────────────
-// 已知失败用例：既有 LLVM 后端 bug（tile_demo 的 Tile 元素被错当成 i64 当 ptr 存），
-// 单独立项跟踪，不计入门禁绿/红判定。修好该后端 bug 后从名单移除。
-const KNOWN_FAILING = new Set(["tile_demo"]);
+// 已知失败用例名单（与 _diffpipe.mjs / ir_snapshot.mjs 的 KNOWN_FAILING 保持一致）：
+// 后端 bug 修好后从名单移除，恢复示例门禁双后端对拍覆盖。
+// tile_demo 的 Tile 元素错当成 i64 当 ptr 存的后端 bug 已修复
+// （src/tir_to_ll.tc 瓦片 binop 聚合类型探测从 inst.st 回退到 inst.args[0].st），
+// 已从名单移除。
+const KNOWN_FAILING = new Set();
 let names = readdirSync(EX)
     .filter((f) => f.endsWith(".expected.txt"))
     .map((f) => f.slice(0, -".expected.txt".length))

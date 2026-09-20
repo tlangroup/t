@@ -63,10 +63,12 @@ if (!compiler) compiler = join(ROOT, "out", mode === "rls" ? "rls" : "dbg", "tc.
 compiler = resolve(ROOT, compiler);
 if (!existsSync(compiler)) { console.error(`_diffpipe: compiler not found: ${compiler}`); process.exit(2); }
 
-// 已知失败用例：既有 LLVM 后端 bug（tile_demo 的 Tile 元素被错当成 i64 当 ptr 存），
-// 与 ir_snapshot.mjs 的 KNOWN_FAILING 保持一致——单独立项跟踪，不计入双轨对拍绿/红判定。
-// 两轨都无法编译该示例时无法提供差分信号，排除而非误报为「不一致」。修好该后端 bug 后从名单移除。
-const KNOWN_FAILING = new Set(["tile_demo"]);
+// 已知失败用例名单（与 ir_snapshot.mjs / run_examples.mjs 的 KNOWN_FAILING 保持一致）：
+// 后端 bug 修好后从名单移除，恢复双轨对拍 / 快照 / 示例门禁覆盖。
+// tile_demo 的 Tile 元素错当成 i64 当 ptr 存的后端 bug 已修复
+// （src/tir_to_ll.tc 瓦片 binop 聚合类型探测从 inst.st 回退到 inst.args[0].st），
+// 已从名单移除，恢复双轨对拍覆盖。
+const KNOWN_FAILING = new Set();
 
 function findClang() {
   for (const c of ["C:\\Program Files\\LLVM\\bin\\clang.exe", "C:\\Program Files (x86)\\LLVM\\bin\\clang.exe", "clang"]) if (existsSync(c)) return c;
@@ -139,19 +141,22 @@ async function runCase(name) {
     }
   }
 
-  // ② 新轨（待测）：tc emit-tir-ll → .tir.ll → clang -c → link t_runtime.lib → .exe → run
+  // ② 新轨（待测）：tc emit-tir-ll → .tir.ll → clang -c → link t_runtime.lib(+导入 .tlib) → .exe → run
   const nb = join(NEW, name);
   const ll = `${nb}.tir.ll`;
   const obj = `${nb}.o`;
   const exe = `${nb}.exe`;
-  const e = await sh(compiler, ["emit-tir-ll", src, "--mode", mode, "--output", nb]);
+  const e = await sh(compiler, ["emit-tir-ll", src, "--mode", mode, "--output", nb, "--link-deps"]);
+  // 从 stdout 解析编译器解析到的外部链接库（.tlib/.tlibd），与 tc build 的 g_ext_link 一致并入链接。
+  const linkDeps = norm(e.out).split("\n").map((s) => s.trim())
+    .filter((s) => s.endsWith(".tlib") || s.endsWith(".tlibd"));
   if (!e.ok) {
     problems.push(`emit-tir-ll failed (exit ${e.code}): ${tailErr(e.err)}`);
   } else {
     const c = await sh(CLANG, ["-c", COPT, "-o", obj, ll]);
     if (!c.ok) { problems.push(`clang -c failed (exit ${c.code}): ${tailErr(c.err)}`); }
     else {
-      const l = await sh(CLANG, ["-o", exe, obj, RTLIB, "-Wl,-subsystem:console"]);
+      const l = await sh(CLANG, ["-o", exe, obj, ...linkDeps, RTLIB, "-Wl,-subsystem:console"]);
       if (!l.ok) {
         const undefs = norm(l.err).split("\n").filter((s) => s.includes("undefined symbol:")).map((s) => s.replace(/.*undefined symbol: /, "").trim());
         problems.push(`link failed (exit ${l.code}): ${undefs.slice(0, 6).join(", ")}${undefs.length > 6 ? ` (+${undefs.length - 6} more)` : ""}`);

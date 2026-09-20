@@ -18,12 +18,14 @@
 // 此处自包含发射 @__ti_<T> 全局常量（与 codegen_ll 同布局），复用 sema/lex 的字段元数据。
 @import("src.sema" :: resolve_type_desc, td_readable);
 @import("src.lex" :: decl_list);
-@import("src.codegen_c" :: is_ref_type);
+@import("src.codegen_c" :: is_ref_type, math_is_mbuiltin_c);
 
 pub var g_ll: StringBuilder;
 pub var g_ll_tmpc: i64;
 pub var g_func_names: []string;       // 函数名 -> 参数 ST 列表（供 call 用）
 pub var g_func_paramsts: [][]string;
+pub var g_ll_extern_funcs: []string;   // 导入库的 external 函数名：登记于 g_func_names 但本模块不 emit 函数体，
+                                        // 须由链接期 .tlib 归档提供；emit call 时必须补 declare（否则 LLVM verifier 报 undefined value）。
 pub var g_ll_func_rets: []string;     // 兼容保留
 pub var g_pf_name: string;            // ll_parse_func 结果（t 不支持多返回值，用全局传递）
 pub var g_pf_params: []string;
@@ -79,6 +81,7 @@ pub fn ll_reset() void {
     ll_reset_slots();   // ⚠ 飞地规避：槽状态(g_ll_names/g_ll_sts/g_ll_emitted/g_ll_curfn)在 llname.tc，经本函数重置
     g_func_names = [];
     g_func_paramsts = [];
+    g_ll_extern_funcs = [];
     g_ll_func_rets = [];
     g_pf_name = "";
     g_pf_params = [];
@@ -948,12 +951,23 @@ pub fn ll_awi_imm_to_dec(imm: string) string {
     return out;
 }
 
+// 判断函数是否为「导入库 external」函数（登记于 g_func_names 但本模块不 emit 函数体，
+// 函数体由链接期 .tlib 归档提供）。此类函数必须 emit declare 才能被合法 call。
+pub fn ll_is_extern_func(name: string) bool {
+    var n: i64 = slice_len(g_ll_extern_funcs) as i64;
+    var i: i64 = 0;
+    while (i < n) { if (g_ll_extern_funcs[i] == name) { return true; } i = i + 1; }
+    return false;
+}
+
 // 为模块内未定义的被调函数 emit declare（可被多次调用，仅首见时声明一次）
 pub fn ll_maybe_declare(fname: string, retst: string, argsts: []string) void {
     var i: i64 = 0;
     var n: i64 = slice_len(g_func_names) as i64;
     while (i < n) {
-        if (g_func_names[i] == fname) { return; }   // 本模块已定义
+        // 本模块已定义的函数跳过；但 external（导入库）函数虽登记于 g_func_names，
+        // 其体由 .tlib 提供，必须补 declare（否则 call 既无 define 又无 declare → verifier 报 undefined value）。
+        if (g_func_names[i] == fname && ll_is_extern_func(fname) == false) { return; }
         i = i + 1;
     }
     var j: i64 = 0;
@@ -2209,6 +2223,43 @@ pub fn ll_emit_builtin(cn: string, toks: []string) bool {
         ll_ensure_slot(d, "i64"); ll_set_st(d, "i64"); ll_store(d, "i64", "0");
         return true;
     }
+    // ── @math builtins（fabs/sqrt/sin/.../f32 变体/谓词） → t_math_<name> ──
+    // 与 C 后端 emit_math_call（t_math_<cn>）及下方 math__ 块同构。此前 @fabs 等裸名内建
+    // 落入 ll_runtime_callee 通用路径被加 t_ 前缀 → t_fabs，而 runtime 仅定义 t_math_fabs（无 t_fabs）
+    // → 链接 undefined；且返回类型被误判 i64。此处显式拦截，发 t_math_<cn> 并据尾缀定 double/float/i32。
+    // 整数辅助（abs/gcd/...）与 pow_i 不在此列（math_is_mbuiltin_c 已排除），走普通函数调用。
+    if (ll_starts(cn, "math__") == false && math_is_mbuiltin_c(cn)) {
+        var ty: string = "double";
+        // 谓词类（isnan/isinf/isfinite/isnormal/signbit）返回 i32，而非浮点。
+        if (cn == "signbit" || cn == "isnan" || cn == "isinf" || cn == "isfinite" || cn == "isnormal") {
+            ty = "i32";
+        } else {
+            var Lm: i64 = str_len(cn);
+            if (Lm >= 1 && str_at(cn, Lm - 1) == 102) { ty = "float"; }   // 裸 f 后缀 = f32 变体
+        }
+        var fn2: string = base.sb_cat2("t_math_", cn);
+        var argc2: i64 = slice_len(toks) as i64 - 4;
+        var argv2: []string = [];
+        var argsts2: []string = [];
+        var mi: i64 = 0;
+        while (mi < argc2) {
+            var argnm2: string = toks[4 + mi];
+            var realst2: string = ll_alloca_st(argnm2);
+            var av2: string = ll_load(argnm2, ty);
+            if (realst2 == "double" && ty == "float") {
+                var fv2: string = ll_tmp();
+                sb_append_str(g_ll, "  "); sb_append_str(g_ll, fv2);
+                sb_append_str(g_ll, " = fptrunc double "); sb_append_str(g_ll, av2);
+                sb_append_str(g_ll, " to float\n");
+                av2 = fv2;
+            }
+            append(argv2, av2);
+            append(argsts2, ty);
+            mi = mi + 1;
+        }
+        ll_call_ret(fn2, ty, argsts2, argv2, d);
+        return true;
+    }
     // ── math__*：裸名 → t_math_<base>（f32 变体名以 f 结尾或 _f）──
     if (ll_starts(cn, "math__")) {
         var base2: string = str_slice(cn, 6, str_len(cn));
@@ -2225,23 +2276,15 @@ pub fn ll_emit_builtin(cn: string, toks: []string) bool {
         } else if (L >= 1 && str_at(base2, L - 1) == 102) {
             isf = true;
         }
+        // ⚠ 仅对「真正的浮点 libm 内建名」拦截并改写 t_math_<base>；
+        // math 模块里的整数辅助函数（abs/sign/gcd/min/max/clamp/div_floor/div_ceil/
+        // mod_e/ilog2/pow2_i/is_pow2/next_multiple_of/lerp_i）与 pow_i 都是真实函数，
+        // 必须走普通函数调用，否则会被误写成 t_math_abs(double) 等导致类型错乱 / 链接失败。
+        if (math_is_mbuiltin_c(base2) == false) {
+            return false;
+        }
         var ty: string = "double";
         if (isf) { ty = "float"; }
-        if (base2 == "pow_i") {
-            var a0: string = ll_load(toks[4], "double");
-            var a1i: string = ll_load(toks[5], "i64");
-            var a1: string = ll_tmp();
-            sb_append_str(g_ll, "  "); sb_append_str(g_ll, a1);
-            sb_append_str(g_ll, " = sitofp i64 "); sb_append_str(g_ll, a1i);
-            sb_append_str(g_ll, " to double\n");
-            // ⚠ 用 append 构造 argv：本语言内联数组字面量 [a0, a1]（含变量 string）只会拷贝首元素，
-            // 导致 argv[1] 为空（math__pow_i 第二实参丢失）。改用 append 逐个追加可正确保留两者。
-            var argv2: []string = [];
-            append(argv2, a0);
-            append(argv2, a1);
-            ll_call_ret("t_math_pow", "double", ["double", "double"], argv2, d);
-            return true;
-        }
         // ⚠ 参数按「槽真实类型」加载，仅当 f32 调用且实参槽为 double 时补 fptrunc：
         // 前端对 f32 实参存储类型不一致（f32 字面量常量存成 double 槽、fptrunc 结果存成 float 槽）。
         // 直接按 ty(float) 加载 double 槽会从 8 字节读 4 字节低位垃圾（如 -3.5f32 读成 0.0）→ fabsf/fminf/... 返回 0；
@@ -2475,7 +2518,8 @@ pub fn ll_emit_builtin(cn: string, toks: []string) bool {
                 // 这里 inner = "arr<i32 x 3"，末尾 ">" 已切），需再剥一层 "arr<" 才得元素 i32。
                 // 漏剥会让 elem = "arr<i32" → st_to_ll 兜底成 "ptr" ⇒ `store ptr %v, ptr %gep`
                 // （元素被当指针存，clang: defined with type 'i64' but expected 'ptr'），
-                // 即 tile_demo 长期 known-failing 的根因（2026-09-20）。
+                // 这是 tile_demo 早期瓦片元素发射错位的一个根因，已于 2026-09-20 修复
+                // （同时修复 inst.st 为空时从 inst.args[0].st 回退聚合类型）。
                 elem = str_slice(inner, 4, p1);
                 cols = ll_atoi(str_slice(inner, p1 + 3, str_len(inner)));
             }
@@ -3997,6 +4041,8 @@ pub fn ll_emit_inst(inst: TIRInst) void {
     // 与旧轨 codegen_ll tile binop 分支对齐（值级输出一致即可；IR 不必逐字相同）。
     // binop 的 inst.st 常为 ptr（瓦片以指针存储），或操作数槽注册为 ptr<arr<arr<...>>；
     // 归一化为值聚合类型 arr<arr<elem x cols> x rows> 后再走瓦片分支。
+    // ⚠ 实测 tile `a + b` 的 inst.st 为空串，真实聚合类型落在 inst.args[0].st
+    //   （如 "arr<arr<i32 x 3> x 2>"），故 st 探测全部 miss 时必须从参数槽类型回退。
     var tst: string = "";
     if (ll_starts(st, "ptr<arr<arr<")) { tst = str_slice(st, 4, str_len(st) - 1); }
     else if (ll_starts(st, "arr<arr<")) { tst = st; }
@@ -4004,6 +4050,17 @@ pub fn ll_emit_inst(inst: TIRInst) void {
         var areg: string = ll_get_st(ll_llname(a));
         if (ll_starts(areg, "ptr<arr<arr<")) { tst = str_slice(areg, 4, str_len(areg) - 1); }
         else if (ll_starts(areg, "arr<arr<")) { tst = areg; }
+    }
+    if (str_len(tst) == 0) {
+        // 回退：从操作数槽的注册/声明类型推导聚合类型。
+        var a0st: string = tir_st_to_str(inst.args[0].st);
+        if (ll_starts(a0st, "arr<arr<")) { tst = a0st; }
+        else if (ll_starts(a0st, "ptr<arr<arr<")) { tst = str_slice(a0st, 4, str_len(a0st) - 1); }
+        else {
+            var areg: string = ll_get_st(ll_llname(a));
+            if (ll_starts(areg, "ptr<arr<arr<")) { tst = str_slice(areg, 4, str_len(areg) - 1); }
+            else if (ll_starts(areg, "arr<arr<")) { tst = areg; }
+        }
     }
     if (str_len(tst) > 0) {
         var elem: string = "i32";
@@ -4267,9 +4324,12 @@ pub fn ll_emit_string_globals() void {
         sb_append_str(g_ll, " }\n");
         i = i + 1;
     }
-    sb_append_str(g_ll, "@__dbg_stcount = global i64 ");
-    sb_append_i64(g_ll, n);
-    sb_append_str(g_ll, "\n");
+    // 调试计数器全局：仅在入口模块（非链接库预编译）发射，避免与 .tlib 成员重复符号。
+    if (lex.g_lib_emit == false) {
+        sb_append_str(g_ll, "@__dbg_stcount = global i64 ");
+        sb_append_i64(g_ll, n);
+        sb_append_str(g_ll, "\n");
+    }
 }
 
 // 结构化入口（§5.6）：直接消费 TIRModule，不再经 tir_to_text() 文本 round-trip。
@@ -4353,6 +4413,7 @@ pub fn tir_to_ll_emit(module: TIRModule) string {
         var ps: []string = []; var pi3: i64 = 0; var plen3: i64 = slice_len(g_pf_params) as i64;
         while (pi3 < plen3) { append(ps, g_pf_params[pi3 + 1]); pi3 = pi3 + 2; }
         append(g_func_names, g_pf_name); append(g_func_paramsts, ps);
+        if (f.is_extern) { append(g_ll_extern_funcs, g_pf_name); }   // 导入库函数：本模块不 emit 函数体，须 declare + 链接 .tlib
         fi = fi + 1;
     }
     // 命名类型声明（%Perm 等位标志/枚举，i64 底类型）置于函数之前
