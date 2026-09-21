@@ -1,15 +1,30 @@
 // ═══════════════════════════════════════════════════════════════════
-// src/mir.tc — 中端优化层（pre-TIR，compiler-pipeline-route.md §11）
+// src/mir.tc — 中端优化层（CFG 形态的 TIR 往返层，compiler-pipeline-design.md §4.3 务实落地）
 //
-// 位置：录制于 TIR 发射期之前（tir.tc 的 tir_emit 钩并行录制），故 mir 在
-//       TIR 之前构造。管线：HIR → mir(优化) → TIR(线性) → tmir(机器) → 后端。
-// 机构：mir 复用 TIR_OP_*/TirOperand/ST_*（与 tmir 同源），不发明第二套操作码。
-//       本层类型（MIR*）与 TMIR* 同构，但语义上位于 TIR 之前、专为中端优化。
-// 优化（架构/设备/后端无关）在 mir 上做；mir_to_tir_lower 降级到 TIR（opt=0
-//       字节级还原 g_mod），再经 tmir 喂薄后端。
+// 实际管线（与 compiler-pipeline-route.md §11 一致，tc.tc 接线为权威）：
+//   sema + 单态化 + CTFE
+//     → tir.lower_unit 同时产出：
+//         (a) 线性 TIR（g_mod）—— 主 IR，喂 LLVM 后端（tir_to_ll，绕过 mir/tmir）
+//         (b) 并行录制的 CFG 形态 MIR 缓冲（g_mir，本层输入；见 tir.tc:348）
+//     → mir_from_tir(g_mir)        收为 MIRModule（显式基本块 CFG）
+//     → mir_run(level)             中端优化（opt<=0 恒等，字节级还原；opt>=1 开 pass）
+//     → mir_to_tir_lower           还原为线性 TIR
+//     → tir_to_tmir_lower          重分组为 tmir
+//     → {wasm|riscv|c} 薄后端（tmir_to_*）
 //
+// ⚠ 与设计 §4.3「HIR → mir → TIR（mir 在 TIR 之上、产出 TIR）」的偏差（务实取舍，非回退）：
+//   1. HIR 尚未落地（设计 §9 阶段 A，P0 未排期），故 TIR 由前端直接产出
+//      （tir.lower_unit），mir 改为「与 TIR 并行录制的 CFG 往返层」，不独立产出 TIR。
+//      旧注释「mir 在 TIR 之前构造 / HIR → mir → TIR」不实，以此段为准。
+//   2. LLVM 主后端（codegen_ll / tir_to_ll）直接消费 TIR，绕过 mir 与 tmir
+//      （设计 §9 H'「tmir 为唯一后端桥」待后续阶段落地）。
+//   3. 故 mir 优化当前仅惠及 tmir 系后端（wasm/riscv/c）；LLVM 不受益
+//      （设计 G3「中端优化一次、全后端受益」的 LLVM 部分待 H' 阶段补齐）。
+//
+// 结构：mir 复用 TIR_OP_*/TirOperand/ST_*（与 tmir 同源），不发明第二套操作码；
+//       MIR* 类型与 TMIR* 同构，但语义上位于 TIR 之后、专为中端优化 + 喂 tmir。
 // 优化 pass（level≥1，无条件安全、可静态判定）：常量折叠 / 代数化简 / DIE /
-// 不可达块消除 / 常量分支化简。触发：tc --opt/-O（默认关闭，护自举不动点）。
+//       不可达块消除 / 常量分支化简。触发：tc --opt/-O（opt=0 默认关闭，护自举不动点）。
 // ═══════════════════════════════════════════════════════════════════
 
 @import("src.base" :: *);
