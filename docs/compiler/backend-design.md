@@ -11,7 +11,7 @@ TIR 是**后端无关**的（G1）。每个后端只实现一组 `BackendTraits`
 tmir 模块 ──▶ 通用遍历机（遍历指令/基本块）──▶ 调用 BackendTraits 钩子
                                                     │
                        ┌────────────────────────────┼───────────────────┐
-                  tmir→c           tmir→ll          tmir→cranelift      tmir→wasm      tmir→spirv(device)
+                  tmir→c           TIR→ll(LLVM直消费) tmir→cranelift      tmir→wasm      tmir→spirv(device)
                   (C 文本)        (.ll)            (机器码/对象)       (.wasm+.wit)  (GPU dialect)
 ```
 
@@ -24,7 +24,7 @@ tmir 模块 ──▶ 通用遍历机（遍历指令/基本块）──▶ 调�
 | 后端 | 触发 | 职责 | 状态 |
 |---|---|---|---|
 | **tmir→c** | 便携/自举/无 LLVM | tmir slot→C 局部变量(`mem2reg` 推给 C 编译器)；`ST→C 类型`(`int64_t`/`uint64_t`/`T*`)；`ptr<ST>` 取 pointee | 重写(原 codegen_c) |
-| **tmir→ll** | release/native | tmir→LLVM IR；`alloca/load/store`→LLVM 自动 `mem2reg`；`ST` 映射(`iN/uN/f32`/`ptr`)；`ptr<ST,as>` opaque 丢弃 aspace | 重写(原 codegen_ll) |
+| **TIR→ll（LLVM 直消费 TIR）** | release/native | TIR→LLVM IR（自管 LLVM IR/MIR，不经 tmir）；`alloca/load/store`→LLVM 自动 `mem2reg`；`ST` 映射(`iN/uN/f32`/`ptr`)；`ptr<ST,as>` opaque 丢弃 aspace | 保留 codegen_ll 直消费 TIR |
 | **tmir→cranelift** | profile=dev | tmir→Cranelift IR→机器码/对象；codegen 约 **10× 快于 LLVM**(Rust 实测 ~20% 省代码生成时间) | 新增 |
 | **tmir→wasm** | Web/沙箱/插件 | tmir→LLVM wasm **或** 独立发射；生成 `.wasm` + `.wit`(Component Model, G-3) | 新增 |
 | **tmir→spirv** | GPU | `kernel fn`→tmir→Device Dialect→SPIR-V/NVVM/ROCDL(见 `device-design.md`) | 沿用 device 路径 |
@@ -45,13 +45,13 @@ tmir 模块 ──▶ 通用遍历机（遍历指令/基本块）──▶ 调�
 
 ## 5. 与 TIR 的契约
 
-- 后端**只消费 tmir**：不遍历 AST、不推类型、不做中端优化（那些在 mir/HIR）。
+- **tmir 系便携后端**只消费 tmir：不遍历 AST、不推类型、不做中端优化（那些在 mir/HIR）。**LLVM 例外**——release 主后端直消费 TIR（既有 `codegen_ll`，自管 LLVM IR/MIR），不经 tmir。
 - 后端**只读 `ST` 与 TT**（ABI 事实已集中）；布局细节来自 `target_desc`（见 `target-desc-design.md`）。
 - 后端**不引入 φ**（TIR 已 memory-first，φ 在 mir 展开，见 `tir-design.md §2.4`）。
 
 ## 6. 落地（对应 `compiler-pipeline-design.md §9`）
 
-- **B–F 阶段**：`tmir→c`/`tmir→ll` 先重写为薄翻译器（tmir 落地）；通过 `gate L2`（双后端共享降级 ⇒ Bug1/Bug2 根除）。
+- **B–F 阶段**：`tmir→c` 重写为薄翻译器（tmir 落地）；`emit-ll` 直消费 TIR（codegen_ll，自管 LLVM IR/MIR，不经 tmir）。通过 `gate L2`（双后端共享 TIR 单一真相源 ⇒ Bug1/Bug2 根除）。
 - **C 阶段(新增)**：`tmir→cranelift`（profile=dev 默认）。
 - **W 阶段(新增)**：`tmir→wasm` + Component Model/WIT。
 - **device 路径**：沿用 `device-design.md`（tmir→Device Dialect）。

@@ -23,7 +23,7 @@
 
 | 编号 | 目标 | 说明 |
 |---|---|---|
-| **G1** | 后端无关 | 所有后端（C / LLVM / Cranelift / WASM / GPU）从 **同一份 tmir**（TIR 降级得到）lowering，杜绝双后端漂移（根治 Bug1/Bug2 类问题） |
+| **G1** | 后端无关 | 每个后端有唯一 IR 真相源，杜绝双后端漂移（根治 Bug1/Bug2 类问题）：C / WASM / RISC-V / Cranelift / GPU **消费 tmir**（TIR 降级得到）lowering；**LLVM 例外**——release 主后端直接消费 **TIR**，自管其机器表示（LLVM IR / MIR / 寄存器分配），不经由 tmir。tmir 是「一套 IR、多个便携薄后端」的桥，不是 LLVM 的机器层 |
 | **G2** | 多级 IR、职责单一 | HIR(语义) / mir(优化+所有权) / TIR(类型擦除·线性) / tmir(机器桥) 各管一段，互不越界 |
 | **G3** | 中端优化后端无关 | 内联/常量传播/DCE/循环变换/自动向量化在 mir 做一遍，所有后端受益 |
 | **G4** | 增量编译 | 基于查询（query）的依赖图 + 内容寻址缓存，改一行只重编受影响函数 |
@@ -86,15 +86,15 @@
                  └──────────┬───────────┘
                             ▼
                  ┌───────── tmir ─────────┐   机器中间层：显式 CFG + 机器类型 ST_*
-                 │ 仅做转换（TIR'+ARR+'tmir 结构重分组）│   桥接所有薄后端（★本层不承载优化）
+                 │ 仅做转换（TIR'+ARR+'tmir 结构重分组）│   桥接便携薄后端(非LLVM)（★本层不承载优化）
                  │ 虚拟 slot·无 φ·无优化    │
                  └─────┬──────┬──────┬───┘
         ┌──────────────┘      │      └───────────────┐
         ▼                     ▼                      ▼
   ┌──────────┐        ┌──────────────┐       ┌──────────────┐
   │ LLVM     │        │ Cranelift    │       │ C (clang)    │   ← 按 profile 选
-  │ (release │        │ (debug 快)   │       │ (便携/自举)  │
-  │  优化)   │        │ ~10x codegen │       │              │
+  │ 直消费   │        │ (debug 快)   │       │ (便携/自举)  │
+  │ TIR①     │        │ ~10x codegen │       │              │
   └────┬─────┘        └──────┬───────┘       └──────┬───────┘
        │                     │                      │
        │            ┌────────┴────────┐             │
@@ -112,6 +112,8 @@
                            ▼
                        可执行/库/对象
 
+> ① **LLVM 不消费 tmir**：release 主后端直接消费 **TIR**，自管机器表示（LLVM IR → MIR → 寄存器分配），走既有 `codegen_ll`。tmir 仅桥接便携薄后端（wasm/riscv/C/Cranelift/GPU）；LLVM 有自己的机器层，不经 tmir 中转。
+
   ╔════════════════ 横切系统（贯穿全管线）════════════════╗
   ║ 增量/查询(salsa) · 并行(rayon式) · 内容寻址缓存(sccache) ║
   ║ 确定性构建 · 富诊断/机器可读 · 自观测profiling · MLGO  ║
@@ -124,8 +126,8 @@
 2. **HIR**（= ZIR 槽位：未定型·线性·可序列化）—→ 产出 **`.tmi` 模块接口制品 ★G-2**
 3. **mir**（中层 IR：CFG + SSA + 中端优化；可选 borrow-verify pass ★G-7；读 `target_desc` ★G-10）
 4. **TIR**（类型擦除·文件级·线性 IR——mir 与 tmir 之间；IR 级 FDO 布局 ★G-11）
-4.5 **tmir**（机器中间层：显式 CFG + 机器类型 `ST_*`；TIR 之后、仅做转换（结构重分组）、不承载优化；桥接所有薄后端）
-5. **后端层**：消费 **tmir**（薄发射器 tmir'+ARR+'c / tmir'+ARR+'ll / tmir'+ARR+'wasm / tmir'+ARR+'spirv）；LLVM / Cranelift / C / WASM / SPIR-V
+4.5 **tmir**（机器中间层：显式 CFG + 机器类型 `ST_*`；TIR 之后、仅做转换（结构重分组）、不承载优化；**桥接便携薄后端**（wasm/riscv/C/Cranelift/GPU）；**LLVM 不在此层**——release 主后端直消费 TIR）
+5. **后端层**：**便携薄后端消费 tmir**（薄发射器 tmir'+ARR'+c / tmir'+ARR'+wasm / tmir'+ARR'+riscv / tmir'+ARR'+spirv）；**LLVM 例外**——直消费 TIR（既有 `codegen_ll`，自管 LLVM IR/MIR，不经 tmir）。Cranelift/WASM/SPIR-V 走 tmir；native release 走 TIR
 6. **链接与全局优化**：CGU · ThinLTO · PGO · BOLT · 跨模块摘要缓存(增量 LTO) ★G-5
 7. **持久会话 / JIT（REPL·Notebook）★G-4**：消费 HIR 缓存 + `.tmi`，增量编译输入
 8. **远程内容寻址缓存（hermetic action cache）★G-6/G-12**：CI/分布式构建共享
@@ -142,6 +144,8 @@
 ### 4.2 HIR —— ZIR 槽位（未定型 · 线性 · 可序列化）
 
 > **采纳 A（2026-09-04）**：HIR 重定义为 Zig 的 **ZIR 槽位**——未定型 · 线性 · 可序列化，位于 Sema **之前**。权威规格见 `docs/compiler/hir-design.md`（含四大性质、指令集草图、与 Sema/CTFE 接口）。本节仅保留与总管线相关的要点，避免与 hir-design.md 重复。
+
+> **实现状态（与管线对齐）**：HIR 是**设计的**前端 IR 锚点（增量编译承重墙 + 惰性诊断 + CTFE 解释对象），位于 mir/TIR/tmir 之上。截至 M0–M2 收口，**HIR 尚未落地**——当前发货管线为 `sema → TIR → {mir→tmir→便携后端}`，LLVM 直消费 TIR（见 §4.5 / 管线图①），前端在 sema 内把 AST 直接降到 TIR（类型当场擦除）。这与 v3 §2「类型槽」设计不冲突：类型槽是 HIR 的**前瞻补位**，待 HIR（阶段 A）落地后并入其缓存/重入体系。HIR 在管线中的**位置**不变（永远是顶层前端 IR），只是**接线**推迟，不构成层级偏离。
 
 - **性质**：未定型（源类型注解为未解析名字引用）、线性（扁平指令数组）、可序列化（文本+二进制双格式）。
 - **来源**：CST 经 AstGen（宏/agent 展开、脱糖、名字解析的**未解析**形式）生成；**不做类型推断**（那是 Sema 的事）。
@@ -187,7 +191,7 @@
 - **承接**（详 `docs/compiler/tir-design.md`；跨语言对位与命名裁定详 `docs/compiler/ir-taxonomy.md`）：mir 经"类型擦除 + ABI 事实集中（TT 类型表）+ 线性化（slot 模型）"降级为 TIR。
 - **对位**：TIR 不是 Zig 的 ZIR（那是 sema **之前**的未定型指令流），而是 **Zig 缺失的那一层**——AIR 之后、tmir 之前的共享桥（tmir 为各后端之前的机器桥）。Zig 让每个后端各自把 AIR 降到自家 mir（`src/codegen/x86_64/CodeGen.zig` ≈10.4 MB、`llvm.zig` ≈580 KB、`c.zig` 另一套），对手写机器码后端是合理取舍；但 T 的后端都只是**文本 IR 发射器**（不做寄存器分配/指令选择），重写一遍拿不到自由度、只拿到漂移。Rust 用 `rustc_codegen_ssa` + `BuilderMethods` trait 解了同一问题（官方数据复用约 10,000 LOC）；T 选择**物化成数据**而非 trait，额外换来单一 `.tir` md5 快照与 device 路径复用。理由详 `ir-taxonomy.md §4`/§5。
 - **本质**：**无源类型、文件级、线性**——每个值只带存储类型 `ST`（定宽整数/浮点/指针/聚合/函数指针/void），ABI 事实（String=`{ptr,len}` 等）集中在 TT。
-- **为什么必须存在**：让 **C 与 LLVM 都从 tmir（TIR 降级得到）lowering，而非各自从 AST 发射**。当前两个后端各写一遍类型恢复(`expr_type_desc`/`ll_etd`)、类型映射(`desc_to_c`/`ll_td`)与每构造 lowering，是双后端漂移（Bug1/Bug2）的根源；TIR 把这一切收敛为**单一真相源**，双后端退化为"tmir → 目标语法"的薄翻译器（§5.5）。
+- **为什么必须存在**：让所有后端有**单一类型真相源**，而非各自从 AST 重新推导类型。C / WASM / RISC-V 经 **tmir（TIR 降级得到）** lowering 到目标语法，成为薄翻译器（§5.5）；**LLVM 直消费 TIR**（自管 LLVM IR/MIR，见 §4.5 与管线图①）——它有独立机器层，不经 tmir 中转。双后端漂移（Bug1/Bug2）根源是 C 与 LLVM 各写一遍类型恢复(`expr_type_desc`/`ll_etd`)、类型映射(`desc_to_c`/`ll_td`)；TIR 把类型语义收敛为单一真相源，release/便携后端都只从它派生，不再各自猜回。
 - **文件级**：一个 TIR 模块 = 一个 `.tc` 编译单元；是快照/对拍/门禁的基本单位（取代按 `.ll`/`.c` 文本 md5）。⚠ `.tc` 是**分区键**而非**独立可缓存单元**——TIR 在全程序单态化之后，缓存承重墙在 HIR(=ZIR) 层（`tir-design.md §4.2`）。
 
 > **TIR 规格已全部拍板（2026-09-04，详 `docs/compiler/tir-design.md §15`）**：
@@ -200,13 +204,13 @@
 ### 4.5 后端层（多目标 codegen，按 profile 选择）
 | 后端 | 用途 | 选型策略 | 状态 |
 |---|---|---|---|
-| **LLVM** | release / 极致优化 | 默认 release；最佳代码质量 | 主后端（沿用现有 `codegen_ll`） |
+| **LLVM** | release / 极致优化 | 默认 release；最佳代码质量；**直消费 TIR**（自管 LLVM IR/MIR，不经 tmir） | 主后端（沿用现有 `codegen_ll`） |
 | **Cranelift** | debug / 快编 | profile=dev 时启用；codegen 约 **10× 快于 LLVM**（Rust 实测 ~20% 省代码生成时间） | 新增（tmir→Cranelift） |
 | **C** | 便携 / 自举 / 无 LLVM 环境 | 嵌入/教学/自举引导 | 沿用（重写为 tmir→C） |
 | **WASM / Component Model** | Web / 沙箱便携 / **多语言插件·ERP 扩展** | `wasm32-wasip1`(legacy) + `component`(新，★G-3)；生成 `.wit` + `wasm-tools component new` | 新增（tmir→wasm，经 LLVM wasm 或独立；Component Model 由 WIT 发射器覆盖，沙箱隔离验证见 `wasm-component-design.md` BP-2） |
 | **SPIR-V / NVVM / ROCDL** | GPU 计算 | `kernel fn` 走 tmir→Device Dialect（见 `docs/compiler/device-design.md`） | 沿用 device 路径 |
 
-- **后端无关抽象层（对标 `rustc_codegen_ssa`）**：定义 `BackendTraits`（布局/`ST→目标类型`/链接/debuginfo），各后端实现 traits，复用整条 tmir 遍历机。这保证"加一个新后端只写 traits，不碰 tmir 语义"。
+- **后端无关抽象层（对标 `rustc_codegen_ssa`）**：定义 `BackendTraits`（布局/`ST→目标类型`/链接/debuginfo），**tmir 系后端**实现 traits、复用整条 tmir 遍历机（保证"加一个新便携后端只写 traits，不碰 tmir 语义"）；**LLVM 例外**——release 路径直消费 TIR，由既有 `codegen_ll` 自管到 LLVM IR 的 lowering，不参与 tmir 遍历机（其 `BackendTraits` 落在 LLVM 侧）。
 
 ### 4.6 链接与全局优化（CGU · ThinLTO · PGO · BOLT）
 - **CGU（Codegen Unit）划分**：按模块/函数图切分，供并行 codegen 与增量。
@@ -303,10 +307,10 @@ PGO 之上预留 ML 决策接口（内联/regalloc，LLVM MLGO 范式）；GPU �
 
 - **A. AstGen + Driver/Query 层 + `.tmi` 三件套（P0，★G-1/★G-2）**：CST → HIR（ZIR 槽位，未定型·线性·可序列化）；**同期**立 Driver/Query/Scheduler 层（§5.1 查询依赖图 + red-green 指纹 + work-stealing + 分片缓存）与 `.tmi` 模块接口制品（§4.2b）。`hir-design.md` 为 HIR 规格。不动后端、不动 TIR。⚠ 三件套必须同期立——HIR 缓存（pre-type）确立了，但缺查询层则增量只是缓存命中、缺 `.tmi` 则下游仍重 type-check；二者与 A 同属"立增量承重墙"的一件事。
 - **A'. CTFE 重写（选项 A 核心成本，与 TIR 解耦）**：`meta_eval_call` / `comptime_fold_pass` 从 AST 树求值改为**解释 HIR 指令流**；Sema 改为消费 HIR。单独 gate，作为回退 B 的隔离线。
-- **B–F. TIR（沿用 Stage0-5）**：建 `src/tir.tc` + `emit-tir`；先子集降级；再 `tmir→c`、`tmir→ll` 薄后端；删除重复 lowering；上线 `tir_snapshot` 门禁。
+- **B–F. TIR（沿用 Stage0-5）**：建 `src/tir.tc` + `emit-tir`；先子集降级；再 `tmir→c` 薄后端（便携）；`emit-ll` 直消费 TIR（自管 LLVM IR/MIR，不经 tmir）；删除重复 lowering；上线 `tir_snapshot` 门禁。
 - **G. mir 抽取**：在 TIR 之前插入 mir（CFG+SSA+显式 drop），先把"控制流扁平化/常量折叠"从后端提到 mir（哪怕初始 mir 仅做透传降级，也为优化留接口）。
 - **H. mir 中端优化**：内联 + 常量传播 + DCE + CSE（后端无关，验证双后端一致收益）。
-- **H'. tmir 机器层**：TIR→tmir 结构重分组（仅转换，不承载优化）；薄后端由消费 TIR 改为消费 tmir（tmir→c/ll/wasm/spirv），tmir 成为唯一后端桥（见 `pipeline-implementation-route.md §9`）。
+- **H'. tmir 机器层**：TIR→tmir 结构重分组（仅转换，不承载优化）；**便携薄后端由消费 TIR 改为消费 tmir**（tmir→c/wasm/riscv/spirv），tmir 成为「一套 IR、多个便携薄后端」的桥（见 `pipeline-implementation-route.md §9`）。**LLVM 不在此列**——release 主后端直消费 TIR、自管 LLVM IR/MIR（见 §4.5），其机器层由 LLVM 自身提供；tmir 只服务于无自有机器层的轻量目标，不替代 LLVM 的机器表示。
 - **I. 后端抽象层 + Cranelift**：抽 `BackendTraits`，加 `tmir→cranelift`（debug 快编路径）。
 - **J. 链接全局优化**：CGU 划分 + ThinLTO + PGO 接入。
 - **K. WASM / SPIR-V**：扩展目标矩阵；GPU 经 tmir→Device Dialect。
@@ -355,7 +359,7 @@ fn add(a: i32, b: i32) -> i32 { return a + b; }
 - **TIR**：`slot i32 %v0; add.i32 %v0 %a %b; ret.i32 %v0`（无类型，仅 ST）
 - **tmir**：`TMIRBlock bb0 { insts: [add.i32 $v0 $a $b]; ret.i32 $v0 }`（TIR 结构重分组为显式 CFG+ST，仅转换）
 - **tmir→c**：`i32 v0 = a + b; return v0;`
-- **tmir→ll**：`%v0 = alloca i32; %t = add i32 %a,%b; store; load; ret`
+- **LLVM（直消费 TIR，不经 tmir）**：`%v0 = alloca i32; %t = add i32 %a,%b; store; load; ret`（TIR→LLVM IR，自管后续 MIR / 寄存器分配）
 - **tmir→cranelift**：等价；debug 构建 codegen 快 ~10×。
 
 ---

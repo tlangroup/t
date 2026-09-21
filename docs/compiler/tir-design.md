@@ -13,7 +13,7 @@
 
 ```
 lex → parse(含前端脱糖) → AstGen → HIR(未定型·线性·可序列化, =ZIR槽位)
-   → sema(类型检查+单态化+CTFE, 解释HIR) → mir(类型化CFG+SSA) → comptime_fold → TIR(类型擦除·线性) → tmir(机器桥) → [tmir→c | tmir→ll]
+   → sema(类型检查+单态化+CTFE, 解释HIR) → mir(类型化CFG+SSA) → comptime_fold → TIR(类型擦除·线性) → tmir(便携机器桥) → [tmir→c | TIR→ll(LLVM直消费TIR)]
    （管线总览与 HIR=ZIR 槽位定义见 `docs/compiler/compiler-pipeline-design.md` §3/§4.2 与 `docs/compiler/hir-design.md`）
 ```
 
@@ -96,7 +96,7 @@ TIR 的函数体可选用两种值模型。**裁定：memory-first**（每条值
 | 后继节点 | memory-first | SSA-first |
 |---|---|---|
 | **`tmir→c`** | slot → C 局部变量，直译 ✅ | 必须 lower φ → 要么重建 alloca/load/store（前功尽弃），要么用 computed-goto/临时技巧（脆弱、复杂 CFG 易碎）❌ **强制多一个 pass** |
-| **`tmir→ll`（LLVM）** | `alloca/load/store` → LLVM 标准管线自动跑 mem2reg/SROA（免费）✅ 近乎零成本 | TIR SSA → LLVM SSA 直连、略省 mem2reg（微小收益）✅ |
+| **TIR→ll（LLVM 直消费 TIR）** | TIR→LLVM IR（自管 LLVM IR/MIR，不经 tmir）；`alloca/load/store`→LLVM 标准管线自动跑 mem2reg/SROA（免费）✅ 近乎零成本 | TIR SSA → LLVM SSA 直连、略省 mem2reg（微小收益）✅ |
 | **`tmir→cranelift` / `tmir→wasm`** | 这些后端内部是 SSA/内存混合，收内存操作自然（WASM 的 `local.get/set` 即内存式）✅ | 需各自处理 φ，等价重建成本 |
 | **`tmir→spirv`（GPU）** | 与 `device-design.md` 的线性模型、`tmir→device dialect` 同构；MLIR 多数 dialect 收内存式线性形式自然 ✅ | 需 MLIR 自有 SSA 重建（mlir 有 `mem2reg` pass，但多一层依赖） |
 | **链接全局优化（CGU/ThinLTO/PGO/BOLT）** | 在 LLVM IR / 对象文件层，下游于 TIR，两种模型无差 | 同左，无差 |
@@ -119,7 +119,7 @@ TIR 的函数体可选用两种值模型。**裁定：memory-first**（每条值
 lex → parse → sema(+单态化+CTFE) → comptime_fold
         → [codegen_tir]  →  TIR module (.tir 文本) → tmir module (.tmir 文本+内存结构)
                                 ├──→ [tmir→c]    → .c/.h  → clang
-                                └──→ [tmir→ll]   → .ll     → llc
+                                └──→ [TIR→ll]   → .ll     → llc（LLVM 直消费 TIR）
         （device kernel fn 经 [tmir→device dialect] → MLIR，沿用 device-design.md）
 ```
 
@@ -425,7 +425,7 @@ bitcast/inttoptr/ptrtoint      STdst STsrc $dst $src
 - `block`/`br`/`br_cond` → C 标签 + `goto` / `if`
 - 仅保留极小的 `tir_tt_to_c`（ST→C 类型名），不再有完整 lowering。
 
-### 9.2 LLVM 后端（`emit_llunit` 改写为消费 tmir）
+### 9.2 LLVM 后端（`emit_llunit` 直消费 TIR，不经 tmir）
 - `slot ST $n` → `alloca ST`
 - `load/store` → `load`/`store`
 - `gep` → `getelementptr inbounds`（由 ST + TT 偏移）
@@ -527,7 +527,7 @@ text --parse--> mem --emit_bin--> .tirb --parse_bin--> mem' --emit_text--> text'
 - **Stage 0**：新增 `src/tir.tc`（内存结构 + **文本**序列化）+ `emit-tir` 子命令。后端保持不变。
 - **Stage 1**：实现 `codegen_tir` 降级（**子集**：标量、调用、if/for/while、struct 字段、返回）。`emit-tir` 跑通；TIR 文本稳定、可读。门禁：TIR 文本 md5 稳定（不要求与旧 `.ll` 一致，是新增维度）。**optional 一律 `opt.boxed`（裁定 2）。**
 - **Stage 2**：实现 `tmir→c` 薄后端，让 `emit-c` 改走 TIR。通过 `gate L2`。
-- **Stage 3**：实现 `tmir→ll` 薄后端，让 `emit-ll` 改走 TIR。通过 `gate L2`。**此时双后端共享降级，Bug1/Bug2 类问题根除。**
+- **Stage 3**：`emit-ll` 直消费 TIR（自管 LLVM IR/MIR，不经 tmir）。通过 `gate L2`。**双后端共享 TIR 单一真相源，Bug1/Bug2 类问题根除。**
 - **Stage 4**：删除重复的 `expr_type_desc`/`ll_etd`/`desc_to_c`/`ll_td`/per-construct 发射代码。TIR 成为唯一真相源。上线 `tir_snapshot` 门禁。
 - **Stage 4b**：二进制 `.tirb` 序列化器 + `tools/tir_roundtrip.mjs` round-trip 门禁上线（裁定 4）。此前所有阶段只用文本，二进制不影响任何既有判据。
 - **Stage 5+（独立 ABI 优化项）**：
@@ -618,7 +618,7 @@ i32 add(i32 a, i32 b) {
 }
 ```
 
-`tmir→ll`：
+`TIR→ll`（LLVM 直消费 TIR，不经 tmir）：
 ```llvm
 define i32 @add(i32 %a, i32 %b) {
   %v0 = alloca i32
