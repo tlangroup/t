@@ -2153,6 +2153,18 @@ pub fn ll_emit_builtin(cn: string, toks: []string) bool {
         ll_call_void(fn2, ["ptr", "ptr"], [ll_llname(toks[4]), ll_llname(d)]);
         return true;
     }
+    // ── read_line：无参 → TStr out ──
+    // ⚠ 必须走 tll_read_line 末位 out 指针 shim，不能直接 call %TStr @t_read_line()：
+    // clang 在 Win64 把 16B %TStr 聚合返回编译为 sret 隐藏指针（void @t_read_line(ptr sret)），
+    // 而编译器若按 RAX:RDX 按值返回发射 `call %TStr @t_read_line()`，调用方读到错位寄存器
+    // → TStr.len 取到垃圾（常为 2^47）→ t_arena_alloc 触发 "arena: out of memory"。
+    // file_read_all/path_resolve/getenv 同理已走 tll_ 末位 out 指针 shim，read_line 此前漏配，
+    // 致 REPL（lib/repl.tc 调 read_line）在 LLVM 后端（含 out/dbg/tc.exe 自身）必 OOM。
+    if (cn == "read_line") {
+        ll_ensure_slot(d, "%TStr"); ll_set_st(d, "%TStr");
+        ll_call_void("tll_read_line", ["ptr"], [ll_llname(d)]);
+        return true;
+    }
     // ── fid_format：f, a_text, a_json, a_raw, a_pb → i64 ──
     if (cn == "fid_format") {
         // a_text/a_json/a_raw/a_pb 均为可选实参：前端常省略，原代码无条件读 toks[5..8] 会越界 panic。

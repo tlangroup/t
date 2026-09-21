@@ -358,6 +358,17 @@ const r = await node("ir_snapshot.mjs", "--compiler", `${G1}.exe`, "--jobs", "1"
         },
     },
     {
+        id: "repl", lv: 1, name: "REPL 冒烟 (read_line 不触发 arena OOM)",
+        // 轻量回归护栏：曾经 REPL 输入 `let a=3` 即报 arena OOM（read_line 内建漏配
+        // sret 兼容的 tll_read_line 末位 out 指针 shim，16B %TStr 按值发射与 sret ABI 错位）。
+        // 用最朴素的单行输入（算术 / let 声明 / 字符串拼接 / :quit）确认 read_line 不再 OOM、
+        // 表达式能求值、退出码为 0。详见 tools/repl_test.mjs。
+        run: async () => {
+            const r = await node("repl_test.mjs", "--compiler", BASE_TC);
+            return { ok: r.code === 0, note: lastLine(r.out, 3) };
+        },
+    },
+    {
         id: "boot4", lv: 2, name: "自举四代不动点 (g2 == g3 == g4)",
         run: async () => {
             const r4 = await tc(`${G3}.exe`, "build", "src/tc.tc", "--output", G4);
