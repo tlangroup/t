@@ -53,6 +53,9 @@ pub var g_ll_valptr: []string;   // 槽名集合：内容为「值字节指针(v
                                   // load 此类槽须解引用（load ptr, ptr (load ptr, ptr %x)）取回真正的值；
                                   // 普通 ptr 槽（如 map_new 句柄）load 只取槽中值本身，两者均属 ptr 类型故需显式标记区分。
 pub var g_ll_addrslot: []string;  // 槽名集合：GEP 结果（struct/closure 字段地址，l-value）。
+pub var g_ll_addrst: []string;    // 与 g_ll_addrslot 平行：该地址槽的「被指类型」（字段/元素 st）。
+                                  // ⚠ 解引用写穿时 store 的类型必须取这里，不能取源值类型 —— 否则
+                                  // i32 字段被按 i64 写（8 字节写穿踩坏相邻字段）。
 pub var g_ll_clofnslot: []string; // 槽名集合：`getelementptr %TClosure, ..., 0, 0` 的结果（闭包 field0 = code 槽）。
                                   // ⚠ 该槽只能存**裸函数指针**(@fn.__clo_thunk)，不能存闭包全局(@.tirll_clo_fn)：
                                   // call_ind 解包时把 field0 当 code 直接 call；若 field0 存的是 %TClosure 全局地址，
@@ -108,6 +111,7 @@ pub fn ll_reset() void {
     g_ll_struct_fieldtys = [];
     g_ll_valptr = [];
     g_ll_addrslot = [];
+    g_ll_addrst = [];
     g_memcpy_declared = false;
 }
 
@@ -145,12 +149,58 @@ pub fn ll_is_valptr(name: string) bool {
 }
 // 标记/查询某槽是否为「GEP 地址槽（l-value）」：store 该槽须解引用写穿（store v, ptr *dst），
 // 而非把值拷进槽本身。指针变量槽不是地址槽（store 直接拷进槽）。详见 g_ll_addrslot 注释。
-pub fn ll_mark_addrslot(name: string) void {
+pub fn ll_mark_addrslot(name: string, st: string) void {
     name = ll_strip_suf(name);
     var n: i64 = slice_len(g_ll_addrslot) as i64;
     var i: i64 = 0;
-    while (i < n) { if (g_ll_addrslot[i] == name) { return; } i = i + 1; }
+    while (i < n) {
+        if (g_ll_addrslot[i] == name) { g_ll_addrst[i] = st; return; }
+        i = i + 1;
+    }
     append(g_ll_addrslot, name);
+    append(g_ll_addrst, st);
+}
+// 取地址槽的「被指类型」（字段/元素 st）；非地址槽返回 ""。
+pub fn ll_addrst_of(name: string) string {
+    name = ll_strip_suf(name);
+    var n: i64 = slice_len(g_ll_addrslot) as i64;
+    var i: i64 = 0;
+    while (i < n) { if (g_ll_addrslot[i] == name) { return g_ll_addrst[i]; } i = i + 1; }
+    return "";
+}
+// 把标量值 v（当前类型 vst）换算为目标标量类型 want，返回换算后的值名（无需换算则原样返回）。
+// ⚠ 仅做宽度换算：整型↔浮点不在此自动转换（须由 TIR 显式 cast 指令完成）。
+pub fn ll_coerce_scalar(v: string, vst: string, want: string) string {
+    if (want == "" || vst == want) { return v; }
+    if (ll_is_scalar_st(vst) == false || ll_is_scalar_st(want) == false) { return v; }
+    if (ll_bits(vst) == ll_bits(want)) { return v; }
+    var opcode: string = "";
+    if (ll_is_float(want) && ll_is_float(vst)) {
+        if (ll_bits(vst) > ll_bits(want)) { opcode = "fptrunc"; } else { opcode = "fpext"; }
+    } else if (ll_is_float(want) == false && ll_is_float(vst) == false) {
+        opcode = "trunc";
+        if (vst == "i1" && ll_is_int(want)) {
+            // ⚠ ll_bits("i1") 兜底返回 64，会误判「源比目标宽」→ 错发 trunc i1 to i8（非法）。
+            // i1→任意整型一律 zext（bool 0/1 → 0/1）；sext 会把 1 扩成 -1。
+            opcode = "zext";
+        } else if (ll_bits(vst) < ll_bits(want)) {
+            if (ll_is_unsigned_st(vst)) { opcode = "zext"; } else { opcode = "sext"; }
+        }
+    }
+    if (opcode == "") { return v; }
+    var conv: string = ll_tmp();
+    sb_append_str(g_ll, "  ");
+    sb_append_str(g_ll, conv);
+    sb_append_str(g_ll, " = ");
+    sb_append_str(g_ll, opcode);
+    sb_append_str(g_ll, " ");
+    sb_append_str(g_ll, st_to_ll(vst));
+    sb_append_str(g_ll, " ");
+    sb_append_str(g_ll, v);
+    sb_append_str(g_ll, " to ");
+    sb_append_str(g_ll, st_to_ll(want));
+    sb_append_str(g_ll, "\n");
+    return conv;
 }
 pub fn ll_is_addrslot(name: string) bool {
     name = ll_strip_suf(name);
@@ -2909,8 +2959,20 @@ pub fn ll_emit_inst(inst: TIRInst) void {
                 // 旧逻辑在 src 也为指针时误把值拷进临时量(覆盖地址)→字段永不写入→闭包捕获读到垃圾。
                 var p: string = ll_load(dst, dstst);
                 var v: string = ll_load(src, srcst);
+                // ⚠ 解引用写穿的存储类型必须取「字段/元素类型」(ptr<inner> 的 inner)，
+                // 不能取源值类型。TIR 的整数临时量一律按 i64 宽存储，若直接 store i64 到
+                // i32 字段会 8 字节写穿、踩坏相邻字段（tests/m2/b01：P2{i32,i32} 的
+                // p.x=3 把 p.y 清零，随后地址计算越界段错误）。i64 字段（b04）因宽度
+                // 恰好相同而「偶然正确」——编译器自身结构体字段几乎全 i64，故该 bug
+                // 长期不可见。聚合字段(非标量 inner)不参与换算，保持原语义。
+                var want: string = ll_ptr_inner(dstst);
+                var wst: string = srcst;
+                if (ll_is_scalar_st(srcst) && ll_is_scalar_st(want)) {
+                    v = ll_coerce_scalar(v, srcst, want);
+                    wst = want;
+                }
                 sb_append_str(g_ll, "  store ");
-                sb_append_str(g_ll, st_to_ll(srcst));
+                sb_append_str(g_ll, st_to_ll(wst));
                 sb_append_str(g_ll, " ");
                 sb_append_str(g_ll, v);
                 sb_append_str(g_ll, ", ptr ");
@@ -3208,7 +3270,7 @@ pub fn ll_emit_inst(inst: TIRInst) void {
             ll_store(g, st, lv);
             return;
         }
-        ll_mark_addrslot(g);   // GEP 结果是字段/元素地址(l-value)；store 该槽须解引用写穿
+        ll_mark_addrslot(g, st);   // GEP 结果是字段/元素地址(l-value)；store 该槽须解引用写穿
         ll_store(g, base.sb_cat3("ptr<", st, ">"), r);
         return;
     }
