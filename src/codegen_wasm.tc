@@ -75,6 +75,235 @@ pub var g_wsucc: [][]i64;     // 后继（自然循环判定用）
 pub var g_wchin: [][]i64;     // 支配树子节点中「位于 b 循环体内」者（非循环头时全归入此）
 pub var g_wchout: [][]i64;    // 支配树子节点中「位于 b 循环体之后」者（仅循环头非空）
 
+// ── S2 聚合内存 ABI ──────────────────────────────────────────
+// WASM 的 local 只能装标量；struct/数组等聚合必须落在线性内存里，用 i32 地址引用。
+// - 聚合基槽（被 addr_of 取址的 struct/数组变量）：静态分配一段内存，local 存其 i32 基址。
+// - addr_of：把基址拷到目标 local（仍是 i32 地址），并记录基类型（%Struct / [N]T）。
+// - gep：dst = 基址 + 字节偏移（按基类型布局 + 字段对齐从 args[2] 索引算出），dst 是「带元素类型的地址」。
+// - load/store 的源/目标是地址槽时，走 `*.load`/`*.store` 内存指令（宽度取元素类型）。
+pub var g_w_base_name: []string;   // 聚合基槽名
+pub var g_w_base_off: []i64;       // 对应静态内存基址（i32 常量）
+pub var g_w_addr_name: []string;   // 地址槽名（gep/addr_of 结果）
+pub var g_w_addr_st: []i64;        // 地址槽的元素 ST（load/store 宽度）
+pub var g_w_addr_base_name: []string;  // 地址槽名（gep 基 / addr_of 结果的基）
+pub var g_w_addr_base_ty: []string;    // 对应聚合基类型字符串（"%Struct" / "[N]T"）
+pub var g_w_addr_slot_name: []string;  // 地址槽名（local 声明类型为 i32：WASM 线性内存地址）
+pub var g_w_mem_top: i64;          // 静态内存分配游标（模块级，避免跨函数冲突）
+pub var g_w_mod: TMIRModule;       // 当前模块（供 w_find_type_body 查类型表）
+
+pub fn w_base_find(n: string) i64 {
+    var i: i64 = 0;
+    while (i < slice_len(g_w_base_name) as i64) { if (g_w_base_name[i] == n) { return g_w_base_off[i]; } i = i + 1; }
+    return -1;
+}
+pub fn w_addr_find(n: string) i64 {
+    var i: i64 = 0;
+    while (i < slice_len(g_w_addr_name) as i64) { if (g_w_addr_name[i] == n) { return g_w_addr_st[i]; } i = i + 1; }
+    return ST_NONE;
+}
+pub fn w_addr_mark(n: string, st: i64) void {
+    var i: i64 = 0;
+    while (i < slice_len(g_w_addr_name) as i64) { if (g_w_addr_name[i] == n) { g_w_addr_st[i] = st; return; } i = i + 1; }
+    append(g_w_addr_name, n); append(g_w_addr_st, st);
+}
+// 是否为「地址槽」（gep/addr_of/gep_idx 结果）：其 local 声明类型为 i32（WASM 内存地址），
+// 与「元素类型」（g_w_addr_st，决定 load/store 宽度）解耦——后者在指令发射期才标记。
+pub fn w_is_addr_slot(n: string) bool {
+    var i: i64 = 0;
+    while (i < slice_len(g_w_addr_slot_name) as i64) { if (g_w_addr_slot_name[i] == n) { return true; } i = i + 1; }
+    return false;
+}
+pub fn w_addr_base_mark(n: string, ty: string) void {
+    var i: i64 = 0;
+    while (i < slice_len(g_w_addr_base_name) as i64) { if (g_w_addr_base_name[i] == n) { g_w_addr_base_ty[i] = ty; return; } i = i + 1; }
+    append(g_w_addr_base_name, n); append(g_w_addr_base_ty, ty);
+}
+// 字符串前缀判断（替代未导入的 ll_starts）
+pub fn w_starts(s: string, pre: string) bool {
+    if (str_len(s) as i64 < str_len(pre) as i64) { return false; }
+    var i: i64 = 0;
+    while (i < str_len(pre) as i64) { if (s[i] != pre[i]) { return false; } i = i + 1; }
+    return true;
+}
+// load/store 宽度 → WASM 内存指令后缀（"i32"/"i64"/"f32"/"f64"）
+pub fn w_mem_suffix(st: i64) string {
+    if (st == ST_I64 || st == ST_U64) { return "i64"; }
+    if (st == ST_F32) { return "f32"; }
+    if (st == ST_F64) { return "f64"; }
+    return "i32";
+}
+
+// ── S2 GEP 偏移计算（按聚合基类型布局 + 字段对齐）──
+// 类型字符串 → 尺寸 / 自然对齐（WASM32：ptr 4 字节；i64/f64 8 字节；其余取其宽）
+pub fn w_tstr_align(ts: string) i64 {
+    if (ts == "i8" || ts == "u8") { return 1; }
+    if (ts == "i16" || ts == "u16") { return 2; }
+    if (ts == "i32" || ts == "u32") { return 4; }
+    if (ts == "i64" || ts == "u64") { return 8; }
+    if (ts == "f32") { return 4; }
+    if (ts == "f64") { return 8; }
+    if (ts == "ptr" || ts == "ptr<void>" || w_starts(ts, "ptr<")) { return 4; }
+    if (w_starts(ts, "%")) { return w_struct_align(ts); }
+    if (w_starts(ts, "[") || w_is_arr(ts)) { return w_tstr_align(w_array_elem(ts)); }
+    return 4;
+}
+pub fn w_tstr_size(ts: string) i64 {
+    if (ts == "i8" || ts == "u8") { return 1; }
+    if (ts == "i16" || ts == "u16") { return 2; }
+    if (ts == "i32" || ts == "u32") { return 4; }
+    if (ts == "i64" || ts == "u64") { return 8; }
+    if (ts == "f32") { return 4; }
+    if (ts == "f64") { return 8; }
+    if (ts == "ptr" || ts == "ptr<void>" || w_starts(ts, "ptr<")) { return 4; }
+    if (w_starts(ts, "%")) { return w_struct_size(ts); }
+    if (w_starts(ts, "[")) { return w_array_nelems(ts) * w_tstr_size(w_array_elem(ts)); }
+    return 4;
+}
+pub fn w_align_up(off: i64, a: i64) i64 {
+    if (a <= 1) { return off; }
+    var m: i64 = a - 1;
+    var r: i64 = off + m;
+    r = r - (r % a);
+    return r;
+}
+// 查 TT 类型表取结构体 body（"f0: T0, f1: T1"）；未命中返回 ""
+pub fn w_find_type_body(name: string) string {
+    var i: i64 = 0;
+    while (i < slice_len(g_w_mod.types) as i64) {
+        if (g_w_mod.types[i].name == name) { return g_w_mod.types[i].body; }
+        i = i + 1;
+    }
+    return "";
+}
+pub fn w_struct_align(name: string) i64 {
+    var body: string = w_find_type_body(name);
+    if (body == "") { return 8; }
+    var maxa: i64 = 1;
+    var i: i64 = 0;
+    while (true) {
+        var ft: string = w_field_type_at(body, i);
+        if (ft == "") { break; }
+        var a: i64 = w_tstr_align(ft);
+        if (a > maxa) { maxa = a; }
+        i = i + 1;
+    }
+    return maxa;
+}
+pub fn w_struct_size(name: string) i64 {
+    var body: string = w_find_type_body(name);
+    if (body == "") { return 0; }
+    var off: i64 = 0; var i: i64 = 0;
+    while (true) {
+        var ft: string = w_field_type_at(body, i);
+        if (ft == "") { break; }
+        off = w_align_up(off, w_tstr_align(ft));
+        off = off + w_tstr_size(ft);
+        i = i + 1;
+    }
+    off = w_align_up(off, w_struct_align(name));
+    return off;
+}
+// 取第 idx 个字段的类型：body 形如 "x: i32, y: i32"（字段名: 类型，逗号分隔）。
+pub fn w_field_type_at(body: string, idx: i64) string {
+    var flds: []string = w_split_comma(body);
+    if (idx < 0 || idx >= slice_len(flds) as i64) { return ""; }
+    var f: string = flds[idx];
+    var ci: i64 = w_find_col(f, ":");  // 跳过 "name: " 前缀
+    if (ci < 0) { return w_strip_ws(f); }
+    return w_strip_ws(str_slice(f, ci + 1, str_len(f) as i64));
+}
+// 按顶层逗号切分（尖括号 <...> 内不切分，兼容 ptr<i32> 等）
+pub fn w_split_comma(s: string) []string {
+    var r: []string = [];
+    var cur: string = "";
+    var depth: i64 = 0;
+    var i: i64 = 0;
+    while (i < str_len(s) as i64) {
+        var c: i64 = s[i];
+        if (c == 60) { depth = depth + 1; }       // '<'
+        else if (c == 62) { depth = depth - 1; }  // '>'
+        if (c == 44 && depth == 0) { append(r, cur); cur = ""; }  // ','
+        else { cur = base.sb_cat2(cur, str_slice(s, i, i + 1)); }
+        i = i + 1;
+    }
+    append(r, cur);
+    return r;
+}
+// 去首尾空白
+pub fn w_strip_ws(s: string) string {
+    var L: i64 = str_len(s) as i64;
+    var a: i64 = 0;
+    while (a < L && (s[a] == 32 || s[a] == 9)) { a = a + 1; }
+    var b: i64 = L;
+    while (b > a && (s[b - 1] == 32 || s[b - 1] == 9)) { b = b - 1; }
+    return str_slice(s, a, b);
+}
+// 数组类型：实际格式 "arr<T x N>"（亦兼容旧 "[N]T"）
+pub fn w_is_arr(ts: string) bool { return w_starts(ts, "arr<"); }
+pub fn w_array_elem(ts: string) string {
+    if (w_is_arr(ts)) {
+        var s: i64 = 4;  // 跳过 "arr<"
+        var e: i64 = str_len(ts) as i64 - 1;  // 去尾 '>'
+        var body: string = str_slice(ts, s, e);  // "T x N"
+        var xi: i64 = w_find_col(body, " x ");
+        if (xi < 0) { return "i32"; }
+        return str_slice(body, 0, xi);
+    }
+    // [N]T
+    var e: i64 = str_len(ts) as i64 - 1;  // 去尾 ']'
+    var i: i64 = 1;  // 跳过首 '['
+    while (i < str_len(ts) as i64 && ts[i] != 93) { i = i + 1; }  // 93 = ']'
+    var inner: string = str_slice(ts, 1, i);
+    var j: i64 = 0;
+    while (j < str_len(inner) as i64 && inner[j] != 93) { j = j + 1; }
+    return str_slice(inner, j + 1, str_len(inner) as i64);
+}
+pub fn w_array_nelems(ts: string) i64 {
+    if (w_is_arr(ts)) {
+        var s: i64 = 4;
+        var e: i64 = str_len(ts) as i64 - 1;
+        var body: string = str_slice(ts, s, e);  // "T x N"
+        var xi: i64 = w_find_col(body, " x ");
+        if (xi < 0) { return 0; }
+        return tir_atoi(str_slice(body, xi + 3, str_len(body) as i64));
+    }
+    var i: i64 = 1;
+    while (i < str_len(ts) as i64 && ts[i] != 93) { i = i + 1; }
+    return tir_atoi(str_slice(ts, 1, i));
+}
+// GEP 字节偏移：基类型 ty 的第 idx 个字段/元素（含对齐）
+pub fn w_gep_offset(ty: string, idx: i64) i64 {
+    if (w_starts(ty, "[") || w_is_arr(ty)) { return idx * w_tstr_size(w_array_elem(ty)); }
+    if (w_starts(ty, "%") == false) { return idx * w_tstr_size(ty); }
+    var body: string = w_find_type_body(ty);
+    if (body == "") { return idx * 8; }
+    var off: i64 = 0; var i: i64 = 0;
+    while (i < idx) {
+        var ft: string = w_field_type_at(body, i);
+        if (ft == "") { break; }
+        off = w_align_up(off, w_tstr_align(ft));
+        off = off + w_tstr_size(ft);
+        i = i + 1;
+    }
+    var fidx_t: string = w_field_type_at(body, idx);
+    off = w_align_up(off, w_tstr_align(fidx_t));
+    return off;
+}
+pub fn w_addr_base_find(n: string) string {
+    var i: i64 = 0;
+    while (i < slice_len(g_w_addr_base_name) as i64) { if (g_w_addr_base_name[i] == n) { return g_w_addr_base_ty[i]; } i = i + 1; }
+    return "";
+}
+// 查模块全局变量的存储类型（ST 码）；未命中兜底 i32。
+pub fn w_global_st(n: string) i64 {
+    var i: i64 = 0;
+    while (i < slice_len(g_w_mod.globals) as i64) {
+        if (g_w_mod.globals[i].name == n) { return g_w_mod.globals[i].td; }
+        i = i + 1;
+    }
+    return ST_I32;
+}
+
 pub fn w_lbl(idx: i64) string { return base.sb_cat2("B", base.i2s(idx)); }
 pub fn w_xlbl(idx: i64) string { return base.sb_cat2("X", base.i2s(idx)); }  // 循环出口 wrapper
 pub fn w_wlbl(idx: i64) string { return base.sb_cat2("W", base.i2s(idx)); }  // 子块 wrapper
@@ -322,16 +551,24 @@ pub fn w_dfs_post(b: i64, visited: []bool) void {
 
 // ── 主发射 ─────────────────────────────────────────────────────
 pub fn tmir_to_wasm(m: TMIRModule) string {
+    g_w_mod = m;
     var sb: StringBuilder = sb_new();
     sb_append_str(sb, "(module\n");
-    // 全局（S1：仅声明 i32 可变全局占位）
+    // 聚合内存（S2：struct/数组落在线性内存，基址由聚合基槽 local 持有）。
+    sb_append_str(sb, "  (memory 1)\n");
+    // 全局（可变全局，初值 0；真正初值由 @t.__ginit 在 main 入口写入）
     var ng: i64 = slice_len(m.globals) as i64;
     var gi: i64 = 0;
     while (gi < ng) {
+        var gt: string = tmir_st_wasm(m.globals[gi].td);
         sb_append_str(sb, "  (global $"); sb_append_str(sb, m.globals[gi].name);
-        sb_append_str(sb, " (mut i32) (i32.const 0))\n");
+        sb_append_str(sb, " (mut "); sb_append_str(sb, gt); sb_append_str(sb, ") (");
+        sb_append_str(sb, gt); sb_append_str(sb, ".const 0))\n");
         gi = gi + 1;
     }
+    // 重置聚合内存 ABI 状态（模块级）
+    g_w_base_name = []; g_w_base_off = []; g_w_addr_name = []; g_w_addr_st = [];
+    g_w_addr_base_name = []; g_w_addr_base_ty = []; g_w_addr_slot_name = []; g_w_mem_top = 1024;
     var nf: i64 = slice_len(m.funcs) as i64;
     var i: i64 = 0;
     while (i < nf) {
@@ -348,7 +585,10 @@ pub fn tmir_to_wasm(m: TMIRModule) string {
 
 pub fn w_emit_func(sb: StringBuilder, f: TMIRFunc) void {
     sb_append_str(sb, "  (func $"); sb_append_str(sb, f.name);
-    sb_append_str(sb, " (export \""); sb_append_str(sb, w_fn_name(f.name)); sb_append_str(sb, "\")");
+    // 仅入口函数导出为 "main"；其余函数（helper / @t.__ginit）仅供模块内调用。
+    if (f.is_main || f.name == "main" || f.name == "@main") {
+        sb_append_str(sb, " (export \""); sb_append_str(sb, w_fn_name(f.name)); sb_append_str(sb, "\")");
+    }
     // params
     var np: i64 = slice_len(f.params) as i64;
     var p: i64 = 0;
@@ -366,6 +606,26 @@ pub fn w_emit_func(sb: StringBuilder, f: TMIRFunc) void {
         sb_append_str(sb, " (result "); sb_append_str(sb, tmir_st_wasm(rst)); sb_append_str(sb, ")");
     }
     sb_append_str(sb, "\n");
+    // 预扫描：标记地址槽（gep/addr_of/gep_idx 结果）的 local 为 i32（WASM 内存地址）。
+    // 必须在声明 local 之前做——指令发射期才标记的 g_w_addr_st（元素类型）此刻尚未填充。
+    {
+        var pbi: i64 = 0;
+        while (pbi < slice_len(f.blocks) as i64) {
+            var pni: i64 = slice_len(f.blocks[pbi].insts) as i64;
+            var pk: i64 = 0;
+            while (pk < pni) {
+                var pins: TMIRInst = f.blocks[pbi].insts[pk];
+                if (pins.op == TIR_OP_GEP || pins.op == TIR_OP_ADDR_OF || pins.op == TIR_OP_GEP_IDX) {
+                    var dn: string = w_strip_suf(pins.dst.name);
+                    var found: bool = false; var fi: i64 = 0;
+                    while (fi < slice_len(g_w_addr_slot_name) as i64) { if (g_w_addr_slot_name[fi] == dn) { found = true; } fi = fi + 1; }
+                    if (found == false) { append(g_w_addr_slot_name, dn); }
+                }
+                pk = pk + 1;
+            }
+            pbi = pbi + 1;
+        }
+    }
     // locals（非 param 的 slot）
     var slots: []string = w_collect_slots(f);
     var ns: i64 = slice_len(slots) as i64;
@@ -378,6 +638,49 @@ pub fn w_emit_func(sb: StringBuilder, f: TMIRFunc) void {
             sb_append_str(sb, "    (local $"); sb_append_str(sb, nm); sb_append_str(sb, " "); sb_append_str(sb, tmir_st_wasm(w_slot_st(nm, f))); sb_append_str(sb, ")\n");
         }
         s = s + 1;
+    }
+    // ── S2 聚合基槽：收集本函数内被 addr_of 取址的 struct/数组变量，分配静态内存基址 ──
+    var agg: []string = [];
+    var nb2: i64 = slice_len(f.blocks) as i64;
+    var b2: i64 = 0;
+    while (b2 < nb2) {
+        var ni2: i64 = slice_len(f.blocks[b2].insts) as i64;
+        var k2: i64 = 0;
+        while (k2 < ni2) {
+            var ins2: TMIRInst = f.blocks[b2].insts[k2];
+            if (ins2.op == TIR_OP_ADDR_OF && str_len(ins2.args[0].name) as i64 > 0 && ins2.args[0].name[0] == 36) {
+                var bn: string = w_strip_suf(ins2.args[0].name);
+                var found2: bool = false; var q2: i64 = 0;
+                while (q2 < slice_len(agg) as i64) { if (agg[q2] == bn) { found2 = true; } q2 = q2 + 1; }
+                if (found2 == false) {
+                    // 分配 1024 字节槽（容纳任意中小 struct/数组；GEP 偏移均 < 此值，互不串扰）
+                    append(g_w_base_name, bn); append(g_w_base_off, g_w_mem_top); g_w_mem_top = g_w_mem_top + 1024;
+                    append(agg, bn);
+                }
+            }
+            k2 = k2 + 1;
+        }
+        b2 = b2 + 1;
+    }
+    // 聚合基槽 local 初始化为静态内存基址（i32）
+    var na2: i64 = slice_len(agg) as i64;
+    var a2: i64 = 0;
+    while (a2 < na2) {
+        sb_append_str(sb, "    (local.set $"); sb_append_str(sb, agg[a2]);
+        sb_append_str(sb, " (i32.const "); sb_append_str(sb, base.i2s(w_base_find(agg[a2])));
+        sb_append_str(sb, "))\n");
+        a2 = a2 + 1;
+    }
+    // 入口函数：主体前调用模块级全局初始化函数（@t.__ginit 等，写全局初值）。
+    if (f.is_main || f.name == "main" || f.name == "@main") {
+        var gi3: i64 = 0;
+        while (gi3 < slice_len(g_w_mod.funcs) as i64) {
+            var fnm: string = g_w_mod.funcs[gi3].name;
+            if (w_starts(fnm, "t.__g")) {
+                sb_append_str(sb, "    (call $"); sb_append_str(sb, fnm); sb_append_str(sb, ")\n");
+            }
+            gi3 = gi3 + 1;
+        }
     }
     // 按支配树前序发射（入口块 index 0）
     w_emit_dom(sb, 0);
@@ -484,6 +787,7 @@ pub fn w_emit_operand(sb: StringBuilder, op: TirOperand, want: i64) void {
 //   拿来声明 local 会把 i32 常量槽抬成 i64，进而 i32 变量赋值处报
 //   "type mismatch: expected i32, found i64"。
 pub fn w_slot_st(n: string, f: TMIRFunc) i64 {
+    if (w_is_addr_slot(n)) { return ST_I32; }  // 地址槽：聚合基址/字段偏移均为 i32（WASM 线性内存地址）
     var nb: i64 = slice_len(f.blocks) as i64;
     var b: i64 = 0;
     while (b < nb) {
@@ -684,7 +988,7 @@ pub fn w_emit_term(sb: StringBuilder, b: i64, term: TMIRInst) void {
 // 操作数 → WAT 值表达式。want 为期望类型：立即数常不带 st（实测多为 0），由调用方给出。
 pub fn w_emit_val_st(sb: StringBuilder, op: TirOperand, want: i64) void {
     if (str_len(op.name) as i64 > 0 && op.name[0] == 64) { // '@' 全局
-        sb_append_str(sb, "(global.get $"); sb_append_str(sb, op.name); sb_append_str(sb, ")");
+        sb_append_str(sb, "(global.get $"); sb_append_str(sb, w_fn_name(op.name)); sb_append_str(sb, ")");
         return;
     }
     if (str_len(op.name) as i64 > 0 && op.name[0] == 36) { // '$' slot
@@ -703,9 +1007,80 @@ pub fn w_emit_inst(sb: StringBuilder, ins: TMIRInst) void {
     var op: i64 = ins.op;
     // TIR_OP_SLOT 是帧槽声明：WASM 的 local 已由 w_collect_slots 统一声明，此处无需发射。
     if (op == TIR_OP_SLOT) { return; }
-    // load / store（slot 间拷贝）
-    if (op == TIR_OP_LOAD) { var wl: i64 = w_slot_st(w_strip_suf(ins.dst.name), g_wf); sb_append_str(sb, "    (local.set $"); sb_append_str(sb, w_strip_suf(ins.dst.name)); sb_append_str(sb, " "); w_emit_operand(sb, ins.args[0], wl); sb_append_str(sb, ")\n"); return; }
-    if (op == TIR_OP_STORE) { var ws: i64 = w_slot_st(w_strip_suf(ins.dst.name), g_wf); sb_append_str(sb, "    (local.set $"); sb_append_str(sb, w_strip_suf(ins.dst.name)); sb_append_str(sb, " "); w_emit_operand(sb, ins.args[0], ws); sb_append_str(sb, ")\n"); return; }
+    // ── S2 取址 / GEP：聚合基址 + 字段偏移 ──
+    if (op == TIR_OP_ADDR_OF) {
+        var dstn: string = w_strip_suf(ins.dst.name);
+        var basen: string = w_strip_suf(ins.args[0].name);
+        // 聚合基槽 local 已持有静态内存基址（i32），直接拷给 dst（dst 也是 i32 地址）。
+        // 记录 dst 的基类型（%Struct / [N]T），供后续 gep 据索引算字节偏移。
+        sb_append_str(sb, "    (local.set $"); sb_append_str(sb, dstn);
+        sb_append_str(sb, " (local.get $"); sb_append_str(sb, basen); sb_append_str(sb, "))\n");
+        w_addr_base_mark(dstn, tir_st_to_str(ins.st));
+        return;
+    }
+    if (op == TIR_OP_GEP) {
+        var dstn: string = w_strip_suf(ins.dst.name);
+        var basen: string = w_strip_suf(ins.args[0].name);
+        var bty: string = w_addr_base_find(basen);   // 基聚合类型（"%Struct"/"[N]T"）
+        var idx: i64 = tir_atoi(ins.args[2].name);  // 字段/元素索引（非字节偏移！）
+        var off: i64 = w_gep_offset(bty, idx);
+        sb_append_str(sb, "    (local.set $"); sb_append_str(sb, dstn);
+        sb_append_str(sb, " (i32.add (local.get $"); sb_append_str(sb, basen);
+        sb_append_str(sb, ") (i32.const "); sb_append_str(sb, base.i2s(off)); sb_append_str(sb, ")))\n");
+        w_addr_mark(dstn, ins.st);  // 记录元素类型（load/store 宽度）
+        return;
+    }
+    // GEP_IDX：运行时节点的数组下标（a[i]）。偏移 = idx * 元素宽，须运行时乘。
+    if (op == TIR_OP_GEP_IDX) {
+        var dstn: string = w_strip_suf(ins.dst.name);
+        var basen: string = w_strip_suf(ins.args[0].name);
+        var bty: string = w_addr_base_find(basen);   // 基数组类型 "arr<T x N>"
+        var elem: string = w_array_elem(bty);
+        var esz: i64 = w_tstr_size(elem);
+        sb_append_str(sb, "    (local.set $"); sb_append_str(sb, dstn);
+        sb_append_str(sb, " (i32.add (local.get $"); sb_append_str(sb, basen);
+        sb_append_str(sb, ") (i32.mul (i32.const "); sb_append_str(sb, base.i2s(esz));
+        sb_append_str(sb, ") (local.get $"); sb_append_str(sb, w_strip_suf(ins.args[1].name));
+        sb_append_str(sb, "))))\n");
+        w_addr_mark(dstn, ins.st);  // 记录元素类型（load/store 宽度）
+        return;
+    }
+    // load / store：目标是地址槽 → 内存指令；否则 slot 间拷贝
+    if (op == TIR_OP_LOAD) {
+        var dstn: string = w_strip_suf(ins.dst.name);
+        var srcn: string = w_strip_suf(ins.args[0].name);
+        var ast: i64 = w_addr_find(srcn);
+        if (ast != ST_NONE) {
+            sb_append_str(sb, "    (local.set $"); sb_append_str(sb, dstn);
+            sb_append_str(sb, " ("); sb_append_str(sb, w_mem_suffix(ast)); sb_append_str(sb, ".load (local.get $");
+            sb_append_str(sb, srcn); sb_append_str(sb, ")))\n");
+            return;
+        }
+        var wl: i64 = w_slot_st(dstn, g_wf);
+        sb_append_str(sb, "    (local.set $"); sb_append_str(sb, dstn); sb_append_str(sb, " ");
+        w_emit_operand(sb, ins.args[0], wl); sb_append_str(sb, ")\n"); return;
+    }
+    if (op == TIR_OP_STORE) {
+        var dname: string = ins.dst.name;
+        if (str_len(dname) as i64 > 0 && dname[0] == 64) {  // 全局变量写（store @g ...）
+            var gname: string = w_fn_name(dname);  // 剥 '@'
+            var vst: i64 = w_global_st(gname);
+            sb_append_str(sb, "    (global.set $"); sb_append_str(sb, gname);
+            sb_append_str(sb, " "); w_emit_operand(sb, ins.args[0], vst); sb_append_str(sb, ")\n");
+            return;
+        }
+        var dstn: string = w_strip_suf(dname);
+        var ast: i64 = w_addr_find(dstn);
+        if (ast != ST_NONE) {
+            sb_append_str(sb, "    ("); sb_append_str(sb, w_mem_suffix(ast));
+            sb_append_str(sb, ".store (local.get $"); sb_append_str(sb, dstn); sb_append_str(sb, ") ");
+            w_emit_operand(sb, ins.args[0], ast); sb_append_str(sb, ")\n");
+            return;
+        }
+        var ws: i64 = w_slot_st(dstn, g_wf);
+        sb_append_str(sb, "    (local.set $"); sb_append_str(sb, dstn); sb_append_str(sb, " ");
+        w_emit_operand(sb, ins.args[0], ws); sb_append_str(sb, ")\n"); return;
+    }
     if (op == TIR_OP_CONST) { sb_append_str(sb, "    (local.set $"); sb_append_str(sb, w_strip_suf(ins.dst.name)); sb_append_str(sb, " ("); sb_append_str(sb, tmir_st_wasm(w_slot_st(w_strip_suf(ins.dst.name), g_wf))); sb_append_str(sb, ".const "); sb_append_str(sb, ins.args[0].name); sb_append_str(sb, "))\n"); return; }
     if (op == TIR_OP_CONST_STR) { sb_append_str(sb, "    ;; const.str unsupported (S2)\n"); return; }
     // call
@@ -726,7 +1101,10 @@ pub fn w_emit_inst(sb: StringBuilder, ins: TMIRInst) void {
     if (op == TIR_OP_ZEXT || op == TIR_OP_SEXT || op == TIR_OP_TRUNC) {
         sb_append_str(sb, "    (local.set $"); sb_append_str(sb, w_strip_suf(ins.dst.name)); sb_append_str(sb, " ");
         var d64: bool = (w_res_st(ins) == ST_I64 || w_res_st(ins) == ST_U64 || w_res_st(ins) == ST_PTR || w_res_st(ins) == ST_PTR_VOID);
-        var s64: bool = (w_arg_st(ins, 0) == ST_I64 || w_arg_st(ins, 0) == ST_U64 || w_arg_st(ins, 0) == ST_PTR || w_arg_st(ins, 0) == ST_PTR_VOID);
+        // 源宽度：全局操作数用全局声明类型（@g2count.s4 的 a.st 可能是 i64 误标），其余用 w_arg_st。
+        var sst: i64 = w_arg_st(ins, 0);
+        if (str_len(ins.args[0].name) as i64 > 0 && ins.args[0].name[0] == 64) { sst = w_global_st(w_fn_name(ins.args[0].name)); }
+        var s64: bool = (sst == ST_I64 || sst == ST_U64 || sst == ST_PTR || sst == ST_PTR_VOID);
         if (d64 && s64 == false) {
             if (op == TIR_OP_ZEXT) { sb_append_str(sb, "(i64.extend_i32_u "); } else { sb_append_str(sb, "(i64.extend_i32_s "); }
             w_emit_operand(sb, ins.args[0], w_arg_st(ins, 0)); sb_append_str(sb, "))\n"); return;

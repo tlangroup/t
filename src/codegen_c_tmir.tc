@@ -1,0 +1,863 @@
+// ══════════════════════════════════════════════════════════════════
+// src/codegen_c_tmir.tc — tmir → C（.c 文本）便携后端
+//
+// 职责：消费 TMIRModule，发出可移植 C 源码（仅依赖 stdint/string/stdio），
+// 无需 LLVM。与 codegen_wasm.tc / codegen_riscv.tc 同构（均消费 TMIRModule），
+// 但 C 后端利用 C 的 goto+label 直接翻译 CFG——无需 WASM 那样的结构化控制流重建，
+// 实现大幅简化且对任意可归约/不可归约 CFG 都正确。
+//
+// 聚合内存模型（struct/数组）：本地字节缓冲 `unsigned char <slot>_buf[SIZE]`，
+//   地址槽为 `unsigned char*`，GEP 做字节偏移，load/store 走 memcpy（规避严格别名 UB）。
+//   与 WASM 的线性内存思路一致，仅把「模块级 g_mem」换成「每聚合独立缓冲」。
+//
+// 覆盖：S1 标量（i32/i64/f64/bool、算术/比较/位/移位/load/store/call/ret/br/br_cond）
+//   + S2 聚合（struct/union/数组/字符串/全局内存）。M2 判据「tmir→C 便携后端 + S2 聚合」。
+// ══════════════════════════════════════════════════════════════════
+
+@import("src.base" :: *);
+@import("src.tir" :: *);
+@import("src.tmir" :: *);
+
+// ── 名字归一化 ───────────────────────────────────────────────
+// 剥类型后缀（tir_os 附加的 `.s<ST码>`）+ 前导 sigil（$ slot / @ global）；
+// 与 wasm w_strip_suf 同逻辑，但 C 标识符不允许 `$`/`@`，故一并剥除。
+pub fn c_strip_suf(n: string) string {
+    var L: i64 = str_len(n) as i64;
+    if (L > 0 && (n[0] == 36 || n[0] == 64)) { n = str_slice(n, 1, L); L = L - 1; }
+    var i: i64 = L - 1;
+    while (i >= 1) {
+        if (n[i] == 115 && n[i - 1] == 46) {
+            var suf: string = str_slice(n, i + 1, L);
+            var okd: bool = str_len(suf) > 0;
+            var j: i64 = 0;
+            while (j < str_len(suf) as i64) { if (suf[j] < 48 || suf[j] > 57) { okd = false; } j = j + 1; }
+            if (okd) { return str_slice(n, 0, i - 1); }
+        }
+        i = i - 1;
+    }
+    return n;
+}
+
+// 函数名：剥 '@' 前缀与类型后缀；把 '.' 重整为 '_'（C 标识符不允许 '.'，如 t.__ginit → t__ginit）。
+pub fn c_fn_name(n: string) string {
+    var s: string = c_strip_suf(n);
+    if (str_len(s) as i64 > 0 && s[0] == 64) { s = str_slice(s, 1, str_len(s) as i64); }
+    var out: string = "";
+    var i: i64 = 0;
+    while (i < str_len(s) as i64) {
+        if (s[i] == 46) { out = base.sb_cat2(out, "_"); }   // '.'
+        else { out = base.sb_cat2(out, str_slice(s, i, i + 1)); }
+        i = i + 1;
+    }
+    return out;
+}
+
+// 块标签：剥 '@' 后加 "L" 前缀（"@entry" → "Lentry"，"@L0" → "LL0"，"@Lwhile.h0" → "LLwhile_h0"）。
+// 注意：tmir 块名可含 '.'（子块如 .h0/.b1/.e2），C 标识符不允许 '.'，须重整为 '_'。
+pub fn c_block_label(nm: string) string {
+    var s: string = c_strip_suf(nm);
+    if (str_len(s) as i64 > 0 && s[0] == 64) { s = str_slice(s, 1, str_len(s) as i64); }
+    var out: string = "";
+    var i: i64 = 0;
+    while (i < str_len(s) as i64) {
+        if (s[i] == 46) { out = base.sb_cat2(out, "_"); }
+        else { out = base.sb_cat2(out, str_slice(s, i, i + 1)); }
+        i = i + 1;
+    }
+    return base.sb_cat2("L", out);
+}
+
+// ── 类型 / 布局辅助（后端无关，与 wasm 同逻辑，c_ 前缀避免跨文件符号冲突）──
+pub fn c_starts(s: string, pre: string) bool {
+    if (str_len(s) as i64 < str_len(pre) as i64) { return false; }
+    var i: i64 = 0;
+    while (i < str_len(pre) as i64) { if (s[i] != pre[i]) { return false; } i = i + 1; }
+    return true;
+}
+pub fn c_align_up(off: i64, a: i64) i64 {
+    if (a <= 1) { return off; }
+    var m: i64 = a - 1;
+    var r: i64 = off + m;
+    r = r - (r % a);
+    return r;
+}
+pub fn c_tstr_align(ts: string) i64 {
+    if (ts == "i8" || ts == "u8") { return 1; }
+    if (ts == "i16" || ts == "u16") { return 2; }
+    if (ts == "i32" || ts == "u32") { return 4; }
+    if (ts == "i64" || ts == "u64") { return 8; }
+    if (ts == "f32") { return 4; }
+    if (ts == "f64") { return 8; }
+    if (ts == "ptr" || ts == "ptr<void>" || c_starts(ts, "ptr<")) { return 8; }
+    if (c_starts(ts, "%")) { return c_struct_align(ts); }
+    if (c_starts(ts, "[")) { return c_tstr_align(c_array_elem(ts)); }
+    return 8;
+}
+pub fn c_tstr_size(ts: string) i64 {
+    if (ts == "i8" || ts == "u8") { return 1; }
+    if (ts == "i16" || ts == "u16") { return 2; }
+    if (ts == "i32" || ts == "u32") { return 4; }
+    if (ts == "i64" || ts == "u64") { return 8; }
+    if (ts == "f32") { return 4; }
+    if (ts == "f64") { return 8; }
+    if (ts == "ptr" || ts == "ptr<void>" || c_starts(ts, "ptr<")) { return 8; }
+    if (c_starts(ts, "%")) { return c_struct_size(ts); }
+    if (c_starts(ts, "[")) { return c_array_nelems(ts) * c_tstr_size(c_array_elem(ts)); }
+    return 8;
+}
+pub fn c_find_type_body(name: string) string {
+    var i: i64 = 0;
+    while (i < slice_len(g_c_mod.types) as i64) {
+        if (g_c_mod.types[i].name == name) { return g_c_mod.types[i].body; }
+        i = i + 1;
+    }
+    return "";
+}
+pub fn c_struct_align(name: string) i64 {
+    var body: string = c_find_type_body(name);
+    if (body == "") { return 8; }
+    var maxa: i64 = 1;
+    var i: i64 = 0;
+    while (true) {
+        var ft: string = c_field_type_at(body, i);
+        if (ft == "") { break; }
+        var a: i64 = c_tstr_align(ft);
+        if (a > maxa) { maxa = a; }
+        i = i + 1;
+    }
+    return maxa;
+}
+pub fn c_struct_size(name: string) i64 {
+    var body: string = c_find_type_body(name);
+    if (body == "") { return 0; }
+    var off: i64 = 0; var i: i64 = 0;
+    while (true) {
+        var ft: string = c_field_type_at(body, i);
+        if (ft == "") { break; }
+        off = c_align_up(off, c_tstr_align(ft));
+        off = off + c_tstr_size(ft);
+        i = i + 1;
+    }
+    off = c_align_up(off, c_struct_align(name));
+    return off;
+}
+pub fn c_field_type_at(body: string, idx: i64) string {
+    var flds: []string = c_split_comma(body);
+    if (idx < 0 || idx >= slice_len(flds) as i64) { return ""; }
+    var f: string = flds[idx];
+    var ci: i64 = c_find_col(f, ":");
+    if (ci < 0) { return c_strip_ws(f); }
+    return c_strip_ws(str_slice(f, ci + 1, str_len(f) as i64));
+}
+pub fn c_split_comma(s: string) []string {
+    var r: []string = [];
+    var cur: string = "";
+    var depth: i64 = 0;
+    var i: i64 = 0;
+    while (i < str_len(s) as i64) {
+        var c: i64 = s[i];
+        if (c == 60) { depth = depth + 1; }
+        else if (c == 62) { depth = depth - 1; }
+        if (c == 44 && depth == 0) { append(r, cur); cur = ""; }
+        else { cur = base.sb_cat2(cur, str_slice(s, i, i + 1)); }
+        i = i + 1;
+    }
+    append(r, cur);
+    return r;
+}
+pub fn c_find_col(s: string, needle: string) i64 {
+    var L: i64 = str_len(s) as i64;
+    var nL: i64 = str_len(needle) as i64;
+    var i: i64 = 0;
+    while (i + nL <= L) {
+        var j: i64 = 0; var ok: bool = true;
+        while (j < nL) { if (s[i + j] != needle[j]) { ok = false; break; } j = j + 1; }
+        if (ok) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+pub fn c_strip_ws(s: string) string {
+    var L: i64 = str_len(s) as i64;
+    var a: i64 = 0;
+    while (a < L && (s[a] == 32 || s[a] == 9)) { a = a + 1; }
+    var b: i64 = L;
+    while (b > a && (s[b - 1] == 32 || s[b - 1] == 9)) { b = b - 1; }
+    return str_slice(s, a, b);
+}
+pub fn c_is_arr(ts: string) bool { return c_starts(ts, "arr<"); }
+pub fn c_array_elem(ts: string) string {
+    if (c_is_arr(ts)) {
+        var s: i64 = 4;
+        var e: i64 = str_len(ts) as i64 - 1;
+        var body: string = str_slice(ts, s, e);
+        var xi: i64 = c_find_col(body, " x ");
+        if (xi < 0) { return "i32"; }
+        return str_slice(body, 0, xi);
+    }
+    var e: i64 = str_len(ts) as i64 - 1;
+    var i: i64 = 1;
+    while (i < str_len(ts) as i64 && ts[i] != 93) { i = i + 1; }
+    var inner: string = str_slice(ts, 1, i);
+    var j: i64 = 0;
+    while (j < str_len(inner) as i64 && inner[j] != 93) { j = j + 1; }
+    return str_slice(inner, j + 1, str_len(inner) as i64);
+}
+pub fn c_array_nelems(ts: string) i64 {
+    if (c_is_arr(ts)) {
+        var s: i64 = 4;
+        var e: i64 = str_len(ts) as i64 - 1;
+        var body: string = str_slice(ts, s, e);
+        var xi: i64 = c_find_col(body, " x ");
+        if (xi < 0) { return 0; }
+        return tir_atoi(str_slice(body, xi + 3, str_len(body) as i64));
+    }
+    var i: i64 = 1;
+    while (i < str_len(ts) as i64 && ts[i] != 93) { i = i + 1; }
+    return tir_atoi(str_slice(ts, 1, i));
+}
+pub fn c_gep_offset(ty: string, idx: i64) i64 {
+    if (c_starts(ty, "[") || c_is_arr(ty)) { return idx * c_tstr_size(c_array_elem(ty)); }
+    if (c_starts(ty, "%") == false) { return idx * c_tstr_size(ty); }
+    var body: string = c_find_type_body(ty);
+    if (body == "") { return idx * 8; }
+    var off: i64 = 0; var i: i64 = 0;
+    while (i < idx) {
+        var ft: string = c_field_type_at(body, i);
+        if (ft == "") { break; }
+        off = c_align_up(off, c_tstr_align(ft));
+        off = off + c_tstr_size(ft);
+        i = i + 1;
+    }
+    var fidx_t: string = c_field_type_at(body, idx);
+    off = c_align_up(off, c_tstr_align(fidx_t));
+    return off;
+}
+
+// ── 模块级 CFG / 聚合状态 ────────────────────────────────────
+pub var g_c_mod: TMIRModule;
+pub var g_cf: TMIRFunc;
+pub var g_c_addr_slot_name: []string;   // 地址槽名（unsigned char* 指针声明）
+pub var g_c_addr_name: []string;        // 地址槽名（load/store 元素类型表）
+pub var g_c_addr_st: []i64;             // 地址槽元素 ST（load/store 宽度）
+pub var g_c_addr_base_name: []string;   // 地址槽名
+pub var g_c_addr_base_ty: []string;     // 对应聚合基类型（"%Struct"/"arr<...>"）
+pub var g_c_agg_base_name: []string;    // 聚合基槽名（本地缓冲拥有者）
+pub var g_c_agg_base_size: []i64;       // 缓冲尺寸（字节）
+pub var g_c_tmpc: i64;                  // load/store 临时变量计数器
+
+pub fn c_addr_mark(n: string, st: i64) void {
+    var i: i64 = 0;
+    while (i < slice_len(g_c_addr_name) as i64) { if (g_c_addr_name[i] == n) { g_c_addr_st[i] = st; return; } i = i + 1; }
+    append(g_c_addr_name, n); append(g_c_addr_st, st);
+}
+
+pub fn c_is_addr_slot(n: string) bool {
+    var i: i64 = 0;
+    while (i < slice_len(g_c_addr_slot_name) as i64) { if (g_c_addr_slot_name[i] == n) { return true; } i = i + 1; }
+    return false;
+}
+pub fn c_is_agg_base(n: string) bool {
+    var i: i64 = 0;
+    while (i < slice_len(g_c_agg_base_name) as i64) { if (g_c_agg_base_name[i] == n) { return true; } i = i + 1; }
+    return false;
+}
+pub fn c_addr_base_mark(n: string, ty: string) void {
+    var i: i64 = 0;
+    while (i < slice_len(g_c_addr_base_name) as i64) { if (g_c_addr_base_name[i] == n) { g_c_addr_base_ty[i] = ty; return; } i = i + 1; }
+    append(g_c_addr_base_name, n); append(g_c_addr_base_ty, ty);
+}
+pub fn c_addr_base_find(n: string) string {
+    var i: i64 = 0;
+    while (i < slice_len(g_c_addr_base_name) as i64) { if (g_c_addr_base_name[i] == n) { return g_c_addr_base_ty[i]; } i = i + 1; }
+    return "";
+}
+pub fn c_global_st(n: string) i64 {
+    var i: i64 = 0;
+    while (i < slice_len(g_c_mod.globals) as i64) {
+        if (g_c_mod.globals[i].name == n) { return g_c_mod.globals[i].td; }
+        i = i + 1;
+    }
+    return ST_I32;
+}
+pub fn c_global_is_agg(n: string) bool {
+    var st: i64 = c_global_st(n);
+    return st >= ST_NAMED_BASE;
+}
+
+// ── 类型来源（与 wasm 同语义；dst.st 恒为 0，类型取自变量/定义指令）──
+pub fn c_is_cmp_op(op: i64) bool {
+    if (op == TIR_OP_EQ || op == TIR_OP_NE) { return true; }
+    if (op == TIR_OP_SLT || op == TIR_OP_SGT || op == TIR_OP_SLE || op == TIR_OP_SGE) { return true; }
+    if (op == TIR_OP_ULT || op == TIR_OP_UGT || op == TIR_OP_ULE || op == TIR_OP_UGE) { return true; }
+    return false;
+}
+pub fn c_val_st(ins: TMIRInst) i64 {
+    if (ins.st != ST_NONE) { return ins.st; }
+    if (ins.dst.st != ST_NONE) { return ins.dst.st; }
+    return ST_I32;
+}
+pub fn c_res_st(ins: TMIRInst) i64 {
+    if (c_is_cmp_op(ins.op)) { return ST_I32; }
+    if (ins.op == TIR_OP_NOT || ins.op == TIR_OP_LNOT) { return ST_I32; }
+    return c_val_st(ins);
+}
+pub fn c_arg_st(ins: TMIRInst, i: i64) i64 {
+    if (i < 0 || i >= slice_len(ins.args) as i64) { return c_val_st(ins); }
+    var a: TirOperand = ins.args[i];
+    if (a.st != ST_NONE) { return a.st; }
+    if (str_len(a.name) as i64 > 0 && a.name[0] == 36) { return c_slot_st(c_strip_suf(a.name), g_cf); }
+    return c_val_st(ins);
+}
+// 操作数语义 ST（slot 取声明类型，立即数取自带 st）。
+pub fn c_operand_st(op: TirOperand) i64 {
+    if (str_len(op.name) as i64 > 0 && op.name[0] == 36) { return c_slot_st(c_strip_suf(op.name), g_cf); }
+    return op.st;
+}
+pub fn c_st_bits(st: i64) i64 {
+    if (st == ST_I8 || st == ST_U8) { return 8; }
+    if (st == ST_I16 || st == ST_U16) { return 16; }
+    if (st == ST_I32 || st == ST_U32 || st == ST_F32) { return 32; }
+    if (st == ST_I64 || st == ST_U64 || st == ST_F64) { return 64; }
+    if (st == ST_PTR || st == ST_PTR_VOID) { return 64; }
+    return 64;
+}
+// 宽窄转换的 C 整数类型（signed=true→有符号）。
+pub fn c_int_cast(st: i64, is_signed: bool) string {
+    var bits: i64 = c_st_bits(st);
+    if (is_signed) { if (bits == 64) { return "int64_t"; } return "int32_t"; }
+    if (bits == 64) { return "uint64_t"; }
+    return "uint32_t";
+}
+
+// 估计某 slot 的语义 ST（扫描被引用处的 arg.st → 定义指令结果类型 → 兜底 i32）。
+// 同 wasm w_slot_st。
+pub fn c_slot_st(n: string, f: TMIRFunc) i64 {
+    var nb: i64 = slice_len(f.blocks) as i64;
+    var b: i64 = 0;
+    while (b < nb) {
+        var ni: i64 = slice_len(f.blocks[b].insts) as i64;
+        var k: i64 = 0;
+        while (k < ni) {
+            var ins: TMIRInst = f.blocks[b].insts[k];
+            var na: i64 = slice_len(ins.args) as i64;
+            var a: i64 = 0;
+            while (a < na) {
+                if (c_strip_suf(ins.args[a].name) == n && ins.args[a].st != ST_NONE) { return ins.args[a].st; }
+                a = a + 1;
+            }
+            k = k + 1;
+        }
+        b = b + 1;
+    }
+    b = 0;
+    while (b < nb) {
+        var ni: i64 = slice_len(f.blocks[b].insts) as i64;
+        var k: i64 = 0;
+        while (k < ni) {
+            var ins: TMIRInst = f.blocks[b].insts[k];
+            if (ins.op == TIR_OP_SLOT || ins.op == TIR_OP_CONST_STR) { k = k + 1; continue; }
+            if (ins.op == TIR_OP_CONST && ins.st != ST_F32 && ins.st != ST_F64) { k = k + 1; continue; }
+            if (c_strip_suf(ins.dst.name) == n && ins.st != ST_NONE) { return c_res_st(ins); }
+            k = k + 1;
+        }
+        b = b + 1;
+    }
+    return ST_I32;
+}
+
+// ── 操作数发射（rvalue 表达式）──
+pub fn c_emit_val(sb: StringBuilder, op: TirOperand) void {
+    if (str_len(op.name) as i64 > 0 && op.name[0] == 64) {   // '@' 全局
+        sb_append_str(sb, c_strip_suf(op.name));   // 全局名（剥 '@' 与 .s<N> 后缀，如 @g2count.s4 → g2count）
+        return;
+    }
+    if (str_len(op.name) as i64 > 0 && op.name[0] == 36) {   // '$' slot
+        sb_append_str(sb, c_strip_suf(op.name));
+        return;
+    }
+    // 立即数
+    sb_append_str(sb, op.name);
+}
+
+// ── 主发射 ─────────────────────────────────────────────────────
+pub fn tmir_to_c(m: TMIRModule) string {
+    g_c_mod = m;
+    var sb: StringBuilder = sb_new();
+    sb_append_str(sb, "#include <stdint.h>\n#include <string.h>\n#include <stdio.h>\n\n");
+    // 全局
+    var ng: i64 = slice_len(m.globals) as i64;
+    var gi: i64 = 0;
+    while (gi < ng) {
+        var g: TMIRGlobal = m.globals[gi];
+        if (g.td >= ST_NAMED_BASE) {
+            var sz: i64 = c_tstr_size(tir_st_to_str(g.td));
+            sb_append_str(sb, "static unsigned char "); sb_append_str(sb, g.name); sb_append_str(sb, "_buf[");
+            sb_append_str(sb, base.i2s(sz)); sb_append_str(sb, "] = {0};\n");
+            sb_append_str(sb, "static unsigned char* "); sb_append_str(sb, g.name); sb_append_str(sb, " = ");
+            sb_append_str(sb, g.name); sb_append_str(sb, "_buf;\n");
+        } else {
+            sb_append_str(sb, "static "); sb_append_str(sb, tmir_st_c(g.td)); sb_append_str(sb, " ");
+            sb_append_str(sb, g.name); sb_append_str(sb, " = 0;\n");
+        }
+        gi = gi + 1;
+    }
+    if (ng > 0) { sb_append_str(sb, "\n"); }
+    // 前向声明：CFG 跨函数调用顺序任意，C 要求被调用函数先声明（如 main 调 __ginit）。
+    {
+        var nfd: i64 = slice_len(m.funcs) as i64;
+        var fdi: i64 = 0;
+        while (fdi < nfd) {
+            var ff: TMIRFunc = m.funcs[fdi];
+            if (slice_len(ff.blocks) as i64 == 0) { fdi = fdi + 1; continue; }
+            var fismain: bool = (ff.is_main || ff.name == "main" || ff.name == "@main");
+            var ffname: string = c_fn_name(ff.name);
+        var fret: string = "int";
+        if (fismain == false) {
+            if (ff.ret_st == "void") { fret = "void"; }
+            else if (ff.ret_st != "") { fret = tmir_st_c(tir_st_from_str(ff.ret_st)); }
+        }
+            if (fismain) { sb_append_str(sb, fret); } else { sb_append_str(sb, "static "); sb_append_str(sb, fret); }
+            sb_append_str(sb, " "); sb_append_str(sb, ffname); sb_append_str(sb, "(");
+            var fp: i64 = 0;
+            while (fp < slice_len(ff.params) as i64) {
+                var fpv: string = ff.params[fp];
+                var fcol: i64 = c_find_col(fpv, ":");
+                var fpname: string = c_strip_suf(str_slice(fpv, 0, fcol));
+                var fpst: i64 = c_slot_st(fpname, ff);
+                if (fp > 0) { sb_append_str(sb, ", "); }
+                sb_append_str(sb, tmir_st_c(fpst)); sb_append_str(sb, " "); sb_append_str(sb, fpname);
+                fp = fp + 1;
+            }
+            sb_append_str(sb, ");\n");
+            fdi = fdi + 1;
+        }
+        sb_append_str(sb, "\n");
+    }
+    // 函数
+    var nf: i64 = slice_len(m.funcs) as i64;
+    var i: i64 = 0;
+    while (i < nf) {
+        var f: TMIRFunc = m.funcs[i];
+        if (f.is_extern) { i = i + 1; continue; }
+        if (slice_len(f.blocks) as i64 == 0) { i = i + 1; continue; }
+        c_emit_func(sb, f);
+        i = i + 1;
+    }
+    return sb_to_str(sb);
+}
+
+pub fn c_emit_func(sb: StringBuilder, f: TMIRFunc) void {
+    g_cf = f;
+    g_c_addr_slot_name = []; g_c_addr_name = []; g_c_addr_st = []; g_c_addr_base_name = []; g_c_addr_base_ty = [];
+    g_c_agg_base_name = []; g_c_agg_base_size = []; g_c_tmpc = 0;
+    // 预扫描：地址槽（gep/addr_of/gep_idx 的 dst）+ 聚合基槽（addr_of 的 args[0]）
+    {
+        var pbi: i64 = 0;
+        while (pbi < slice_len(f.blocks) as i64) {
+            var pni: i64 = slice_len(f.blocks[pbi].insts) as i64;
+            var pk: i64 = 0;
+            while (pk < pni) {
+                var pins: TMIRInst = f.blocks[pbi].insts[pk];
+                if (pins.op == TIR_OP_GEP || pins.op == TIR_OP_ADDR_OF || pins.op == TIR_OP_GEP_IDX) {
+                    var dn: string = c_strip_suf(pins.dst.name);
+                    if (c_is_addr_slot(dn) == false) { append(g_c_addr_slot_name, dn); }
+                }
+                if (pins.op == TIR_OP_ADDR_OF && str_len(pins.args[0].name) as i64 > 0 && pins.args[0].name[0] == 36) {
+                    var bn: string = c_strip_suf(pins.args[0].name);
+                    if (c_is_agg_base(bn) == false) {
+                        append(g_c_agg_base_name, bn);
+                        append(g_c_agg_base_size, c_tstr_size(tir_st_to_str(pins.st)));
+                    }
+                }
+                pk = pk + 1;
+            }
+            pbi = pbi + 1;
+        }
+    }
+    var ismain: bool = (f.is_main || f.name == "main" || f.name == "@main");
+    var fname: string = c_fn_name(f.name);
+    var retctype: string = "int";
+    if (ismain == false) {
+        if (f.ret_st == "void") { retctype = "void"; }
+        else if (f.ret_st != "") { retctype = tmir_st_c(tir_st_from_str(f.ret_st)); }
+    }
+    if (ismain) { sb_append_str(sb, retctype); } else { sb_append_str(sb, "static "); sb_append_str(sb, retctype); }
+    sb_append_str(sb, " "); sb_append_str(sb, fname); sb_append_str(sb, "(");
+    // 参数
+    var np: i64 = slice_len(f.params) as i64;
+    var p: i64 = 0;
+    while (p < np) {
+        var pv: string = f.params[p];
+        var col: i64 = c_find_col(pv, ":");
+        var pname: string = c_strip_suf(str_slice(pv, 0, col));
+        var pst: i64 = c_slot_st(pname, f);   // 参数即 slot，用与标量槽一致的存储类型（tmir 整数临时槽按 i64 宽），避免与 c_collect_scalars 重复声明/类型冲突
+        if (p > 0) { sb_append_str(sb, ", "); }
+        sb_append_str(sb, tmir_st_c(pst)); sb_append_str(sb, " "); sb_append_str(sb, pname);
+        p = p + 1;
+    }
+    sb_append_str(sb, ") {\n");
+    // 标量局部
+    var scalars: []string = c_collect_scalars(f);
+    var ns: i64 = slice_len(scalars) as i64;
+    var s: i64 = 0;
+    while (s < ns) {
+        var nm: string = scalars[s];
+        sb_append_str(sb, "  "); sb_append_str(sb, tmir_st_c(c_slot_st(nm, f))); sb_append_str(sb, " ");
+        sb_append_str(sb, nm); sb_append_str(sb, " = 0;\n");
+        s = s + 1;
+    }
+    // 聚合基缓冲
+    var na: i64 = slice_len(g_c_agg_base_name) as i64;
+    var a: i64 = 0;
+    while (a < na) {
+        sb_append_str(sb, "  unsigned char "); sb_append_str(sb, g_c_agg_base_name[a]); sb_append_str(sb, "_buf[");
+        sb_append_str(sb, base.i2s(g_c_agg_base_size[a])); sb_append_str(sb, "] = {0};\n");
+        a = a + 1;
+    }
+    // 地址槽（指针）
+    var nas: i64 = slice_len(g_c_addr_slot_name) as i64;
+    var x: i64 = 0;
+    while (x < nas) {
+        sb_append_str(sb, "  unsigned char* "); sb_append_str(sb, g_c_addr_slot_name[x]); sb_append_str(sb, " = (unsigned char*)0;\n");
+        x = x + 1;
+    }
+    // 入口函数：调用模块级全局初始化（t.__ginit 等）
+    if (ismain) {
+        var gi2: i64 = 0;
+        while (gi2 < slice_len(g_c_mod.funcs) as i64) {
+            var fnm: string = g_c_mod.funcs[gi2].name;
+            if (c_starts(fnm, "t.__g")) { sb_append_str(sb, "  "); sb_append_str(sb, c_fn_name(fnm)); sb_append_str(sb, "();\n"); }
+            gi2 = gi2 + 1;
+        }
+    }
+    // 基本块（CFG → label + goto 直译）
+    var nb: i64 = slice_len(f.blocks) as i64;
+    var b: i64 = 0;
+    while (b < nb) {
+        var blk: TMIRBlock = f.blocks[b];
+        sb_append_str(sb, "  "); sb_append_str(sb, c_block_label(blk.name)); sb_append_str(sb, ":\n");
+        var ni: i64 = slice_len(blk.insts) as i64;
+        var k: i64 = 0;
+        while (k + 1 < ni) { c_emit_inst(sb, blk.insts[k]); k = k + 1; }
+        if (ni > 0) { c_emit_term(sb, blk.insts[ni - 1]); }
+        else { sb_append_str(sb, "    ;\n"); }
+        b = b + 1;
+    }
+    sb_append_str(sb, "}\n\n");
+}
+
+pub fn c_collect_scalars(f: TMIRFunc) []string {
+    var r: []string = [];
+    var nb: i64 = slice_len(f.blocks) as i64;
+    var b: i64 = 0;
+    while (b < nb) {
+        var ni: i64 = slice_len(f.blocks[b].insts) as i64;
+        var k: i64 = 0;
+        while (k < ni) {
+            var ins: TMIRInst = f.blocks[b].insts[k];
+            if (str_len(ins.dst.name) as i64 > 0 && ins.dst.name[0] == 36) { var dn2: string = c_strip_suf(ins.dst.name); if (c_is_param(f, dn2) == false) { r = c_add_scalar(r, dn2); } }
+            var na: i64 = slice_len(ins.args) as i64;
+            var a: i64 = 0;
+            while (a < na) { if (str_len(ins.args[a].name) as i64 > 0 && ins.args[a].name[0] == 36) { var an2: string = c_strip_suf(ins.args[a].name); if (c_is_param(f, an2) == false) { r = c_add_scalar(r, an2); } } a = a + 1; }
+            k = k + 1;
+        }
+        b = b + 1;
+    }
+    return r;
+}
+// 加 slot 到标量列表：跳过地址槽（unsigned char*）与聚合基槽（缓冲拥有者），二者单独声明。
+pub fn c_add_scalar(sl: []string, n: string) []string {
+    if (c_is_addr_slot(n)) { return sl; }
+    if (c_is_agg_base(n)) { return sl; }
+    return c_add_slot(sl, n);
+}
+pub fn c_add_slot(sl: []string, n: string) []string {
+    var i: i64 = 0; var nn: i64 = slice_len(sl) as i64;
+    while (i < nn) { if (sl[i] == n) { return sl; } i = i + 1; }
+    var out: []string = [];
+    var j: i64 = 0;
+    while (j < nn) { append(out, sl[j]); j = j + 1; }
+    append(out, n);
+    return out;
+}
+// 参数名判定：参数在 tmir 中即 slot，已在签名中声明，c_collect_scalars 须跳过以免重复声明。
+pub fn c_is_param(f: TMIRFunc, n: string) bool {
+    var i: i64 = 0;
+    while (i < slice_len(f.params) as i64) {
+        var pv: string = f.params[i];
+        var col: i64 = c_find_col(pv, ":");
+        if (c_strip_suf(str_slice(pv, 0, col)) == n) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+// ── 终止指令 ─────────────────────────────────────────────────
+pub fn c_emit_term(sb: StringBuilder, term: TMIRInst) void {
+    if (term.op == TIR_OP_RET_VOID) { sb_append_str(sb, "  return;\n"); return; }
+    if (term.op == TIR_OP_RET) {
+        sb_append_str(sb, "  return (");
+        c_emit_val(sb, term.dst);
+        sb_append_str(sb, ");\n");
+        return;
+    }
+    if (term.op == TIR_OP_BR) {
+        sb_append_str(sb, "  goto "); sb_append_str(sb, c_block_label(term.args[0].name)); sb_append_str(sb, ";\n");
+        return;
+    }
+    if (term.op == TIR_OP_BR_COND) {
+        sb_append_str(sb, "  if (");
+        c_emit_val(sb, term.args[0]);
+        sb_append_str(sb, ") goto "); sb_append_str(sb, c_block_label(term.args[1].name));
+        sb_append_str(sb, "; else goto "); sb_append_str(sb, c_block_label(term.args[2].name)); sb_append_str(sb, ";\n");
+        return;
+    }
+    sb_append_str(sb, "  /* unsupported term */\n");
+}
+
+// ── 普通指令 ─────────────────────────────────────────────────
+pub fn c_emit_inst(sb: StringBuilder, ins: TMIRInst) void {
+    if (ins.is_comment) { sb_append_str(sb, "  /* "); sb_append_str(sb, ins.cmt); sb_append_str(sb, " */\n"); return; }
+    var op: i64 = ins.op;
+    if (op == TIR_OP_SLOT) { return; }
+    if (op == TIR_OP_ADDR_OF) {
+        var dstn: string = c_strip_suf(ins.dst.name);
+        // 基：slot → <slot>_buf；global → <g>_buf
+        var basebuf: string = "";
+        if (str_len(ins.args[0].name) as i64 > 0 && ins.args[0].name[0] == 64) {
+            basebuf = c_strip_suf(ins.args[0].name);
+        } else {
+            basebuf = base.sb_cat2(c_strip_suf(ins.args[0].name), "_buf");
+        }
+        sb_append_str(sb, "  "); sb_append_str(sb, dstn); sb_append_str(sb, " = "); sb_append_str(sb, basebuf); sb_append_str(sb, ";\n");
+        c_addr_base_mark(dstn, tir_st_to_str(ins.st));
+        return;
+    }
+    if (op == TIR_OP_GEP) {
+        var dstn: string = c_strip_suf(ins.dst.name);
+        var basen: string = c_strip_suf(ins.args[0].name);
+        var bty: string = c_addr_base_find(basen);
+        var idx: i64 = tir_atoi(ins.args[2].name);
+        var off: i64 = c_gep_offset(bty, idx);
+        sb_append_str(sb, "  "); sb_append_str(sb, dstn); sb_append_str(sb, " = "); sb_append_str(sb, basen);
+        sb_append_str(sb, " + "); sb_append_str(sb, base.i2s(off)); sb_append_str(sb, ";\n");
+        c_addr_mark(dstn, ins.st);
+        return;
+    }
+    if (op == TIR_OP_GEP_IDX) {
+        var dstn: string = c_strip_suf(ins.dst.name);
+        var basen: string = c_strip_suf(ins.args[0].name);
+        var bty: string = c_addr_base_find(basen);
+        var elem: string = c_array_elem(bty);
+        var esz: i64 = c_tstr_size(elem);
+        sb_append_str(sb, "  "); sb_append_str(sb, dstn); sb_append_str(sb, " = "); sb_append_str(sb, basen);
+        sb_append_str(sb, " + ("); c_emit_val(sb, ins.args[1]); sb_append_str(sb, " * "); sb_append_str(sb, base.i2s(esz)); sb_append_str(sb, ");\n");
+        c_addr_mark(dstn, ins.st);
+        return;
+    }
+    if (op == TIR_OP_LOAD) {
+        var dstn: string = c_strip_suf(ins.dst.name);
+        var srcn: string = c_strip_suf(ins.args[0].name);
+        // 全局聚合（地址为 @g 指向 _buf）：从 _buf memcpy
+        if (str_len(ins.args[0].name) as i64 > 0 && ins.args[0].name[0] == 64 && c_global_is_agg(c_strip_suf(ins.args[0].name))) {
+            var gnm: string = c_strip_suf(ins.args[0].name);
+            var est: i64 = c_global_st(gnm);
+            sb_append_str(sb, "  { "); sb_append_str(sb, tmir_st_c(est)); sb_append_str(sb, " _cld"); sb_append_str(sb, base.i2s(g_c_tmpc)); sb_append_str(sb, "; memcpy(&_cld");
+            sb_append_str(sb, base.i2s(g_c_tmpc)); sb_append_str(sb, ", (void*)("); sb_append_str(sb, gnm); sb_append_str(sb, "_buf), sizeof(_cld"); sb_append_str(sb, base.i2s(g_c_tmpc)); sb_append_str(sb, ")); ");
+            sb_append_str(sb, dstn); sb_append_str(sb, " = _cld"); sb_append_str(sb, base.i2s(g_c_tmpc)); sb_append_str(sb, "; }\n");
+            g_c_tmpc = g_c_tmpc + 1;
+            return;
+        }
+        // 地址槽（struct/数组字段）→ memcpy 出缓冲
+        var ast: i64 = c_addr_st_of(srcn);
+        if (ast != ST_NONE) {
+            sb_append_str(sb, "  { "); sb_append_str(sb, tmir_st_c(ast)); sb_append_str(sb, " _cld"); sb_append_str(sb, base.i2s(g_c_tmpc)); sb_append_str(sb, "; memcpy(&_cld");
+            sb_append_str(sb, base.i2s(g_c_tmpc)); sb_append_str(sb, ", (void*)("); sb_append_str(sb, srcn); sb_append_str(sb, "), sizeof(_cld"); sb_append_str(sb, base.i2s(g_c_tmpc)); sb_append_str(sb, ")); ");
+            sb_append_str(sb, dstn); sb_append_str(sb, " = _cld"); sb_append_str(sb, base.i2s(g_c_tmpc)); sb_append_str(sb, "; }\n");
+            g_c_tmpc = g_c_tmpc + 1;
+            return;
+        }
+        // 标量 slot 间拷贝
+        sb_append_str(sb, "  "); sb_append_str(sb, dstn); sb_append_str(sb, " = ");
+        c_emit_val(sb, ins.args[0]); sb_append_str(sb, ";\n");
+        return;
+    }
+    if (op == TIR_OP_STORE) {
+        var dname: string = ins.dst.name;
+        if (str_len(dname) as i64 > 0 && dname[0] == 64) {   // 全局
+            var gname: string = c_strip_suf(dname);
+            if (c_global_is_agg(gname)) {
+                var est: i64 = c_global_st(gname);
+                sb_append_str(sb, "  { "); sb_append_str(sb, tmir_st_c(est)); sb_append_str(sb, " _cst"); sb_append_str(sb, base.i2s(g_c_tmpc)); sb_append_str(sb, " = ");
+                c_emit_val(sb, ins.args[0]); sb_append_str(sb, "; memcpy((void*)("); sb_append_str(sb, gname); sb_append_str(sb, "_buf), &_cst"); sb_append_str(sb, base.i2s(g_c_tmpc)); sb_append_str(sb, "), sizeof(_cst"); sb_append_str(sb, base.i2s(g_c_tmpc)); sb_append_str(sb, ")); }\n");
+                g_c_tmpc = g_c_tmpc + 1;
+                return;
+            }
+            var vst: i64 = c_global_st(gname);
+            sb_append_str(sb, "  "); sb_append_str(sb, gname); sb_append_str(sb, " = (");
+            sb_append_str(sb, tmir_st_c(vst)); sb_append_str(sb, ")(");
+            c_emit_val(sb, ins.args[0]); sb_append_str(sb, ");\n");
+            return;
+        }
+        var dstn: string = c_strip_suf(dname);
+        var ast: i64 = c_addr_st_of(dstn);
+        if (ast != ST_NONE) {
+            sb_append_str(sb, "  { "); sb_append_str(sb, tmir_st_c(ast)); sb_append_str(sb, " _cst"); sb_append_str(sb, base.i2s(g_c_tmpc)); sb_append_str(sb, " = ");
+            c_emit_val(sb, ins.args[0]); sb_append_str(sb, "; memcpy((void*)("); sb_append_str(sb, dstn); sb_append_str(sb, "), &_cst"); sb_append_str(sb, base.i2s(g_c_tmpc)); sb_append_str(sb, ", sizeof(_cst"); sb_append_str(sb, base.i2s(g_c_tmpc)); sb_append_str(sb, ")); }\n");
+            g_c_tmpc = g_c_tmpc + 1;
+            return;
+        }
+        sb_append_str(sb, "  "); sb_append_str(sb, dstn); sb_append_str(sb, " = ");
+        c_emit_val(sb, ins.args[0]); sb_append_str(sb, ";\n");
+        return;
+    }
+    if (op == TIR_OP_CONST) {
+        var dstn: string = c_strip_suf(ins.dst.name);
+        sb_append_str(sb, "  "); sb_append_str(sb, dstn); sb_append_str(sb, " = (");
+        sb_append_str(sb, tmir_st_c(c_slot_st(dstn, g_cf))); sb_append_str(sb, ")(");
+        sb_append_str(sb, ins.args[0].name); sb_append_str(sb, ");\n");
+        return;
+    }
+    if (op == TIR_OP_CONST_STR) { sb_append_str(sb, "  /* const.str unsupported (S2) */\n"); return; }
+    if (op == TIR_OP_BITCAST) {
+        var dstn: string = c_strip_suf(ins.dst.name);
+        sb_append_str(sb, "  "); sb_append_str(sb, dstn); sb_append_str(sb, " = (");
+        sb_append_str(sb, tmir_st_c(c_slot_st(dstn, g_cf))); sb_append_str(sb, ")(");
+        c_emit_val(sb, ins.args[0]); sb_append_str(sb, ");\n");
+        return;
+    }
+    if (op == TIR_OP_CALL) {
+        var dstn: string = c_strip_suf(ins.dst.name);
+        sb_append_str(sb, "  "); sb_append_str(sb, dstn); sb_append_str(sb, " = "); sb_append_str(sb, c_fn_name(ins.args[0].name)); sb_append_str(sb, "(");
+        var na: i64 = slice_len(ins.args) as i64;
+        var a: i64 = 1;
+        while (a < na) { if (a > 1) { sb_append_str(sb, ", "); } c_emit_val(sb, ins.args[a]); a = a + 1; }
+        sb_append_str(sb, ");\n");
+        return;
+    }
+    if (op == TIR_OP_NEG) {
+        var dstn: string = c_strip_suf(ins.dst.name);
+        sb_append_str(sb, "  "); sb_append_str(sb, dstn); sb_append_str(sb, " = -(");
+        c_emit_val(sb, ins.args[0]); sb_append_str(sb, ");\n");
+        return;
+    }
+    if (op == TIR_OP_NOT) {
+        var dstn: string = c_strip_suf(ins.dst.name);
+        sb_append_str(sb, "  "); sb_append_str(sb, dstn); sb_append_str(sb, " = ~(");
+        c_emit_val(sb, ins.args[0]); sb_append_str(sb, ");\n");
+        return;
+    }
+    if (op == TIR_OP_LNOT) {
+        var dstn: string = c_strip_suf(ins.dst.name);
+        sb_append_str(sb, "  "); sb_append_str(sb, dstn); sb_append_str(sb, " = ((");
+        c_emit_val(sb, ins.args[0]); sb_append_str(sb, ") == 0 ? 1 : 0);\n");
+        return;
+    }
+    if (op == TIR_OP_ZEXT || op == TIR_OP_SEXT || op == TIR_OP_TRUNC) {
+        var dstn: string = c_strip_suf(ins.dst.name);
+        var dstst: i64 = c_slot_st(dstn, g_cf);
+        var srcst: i64 = c_arg_st(ins, 0);
+        var db: i64 = c_st_bits(dstst);
+        var sb2: i64 = c_st_bits(srcst);
+        sb_append_str(sb, "  "); sb_append_str(sb, dstn); sb_append_str(sb, " = (");
+        if (db > sb2) {
+            if (op == TIR_OP_ZEXT) {
+                sb_append_str(sb, c_int_cast(dstst, false)); sb_append_str(sb, ")("); sb_append_str(sb, c_int_cast(srcst, false)); sb_append_str(sb, ")(");
+            } else {
+                sb_append_str(sb, c_int_cast(dstst, true)); sb_append_str(sb, ")(");
+            }
+        } else if (db < sb2) {
+            sb_append_str(sb, c_int_cast(dstst, true)); sb_append_str(sb, ")(");
+        } else {
+            sb_append_str(sb, tmir_st_c(dstst)); sb_append_str(sb, ")(");
+        }
+        c_emit_val(sb, ins.args[0]); sb_append_str(sb, ");\n");
+        return;
+    }
+    if (op == TIR_OP_FPTOSI || op == TIR_OP_FPTOUI || op == TIR_OP_SITOFP || op == TIR_OP_UITOFP || op == TIR_OP_FPEXT || op == TIR_OP_FPTRUNC) {
+        var dstn: string = c_strip_suf(ins.dst.name);
+        var dt: string = tmir_st_c(c_slot_st(dstn, g_cf));
+        var st2: string = "";
+        if (op == TIR_OP_FPTOSI || op == TIR_OP_SITOFP) { st2 = c_int_cast(c_arg_st(ins, 0), true); }
+        else if (op == TIR_OP_FPTOUI || op == TIR_OP_UITOFP) { st2 = c_int_cast(c_arg_st(ins, 0), false); }
+        else { st2 = tmir_st_c(c_arg_st(ins, 0)); }
+        sb_append_str(sb, "  "); sb_append_str(sb, dstn); sb_append_str(sb, " = ("); sb_append_str(sb, dt); sb_append_str(sb, ")("); sb_append_str(sb, st2); sb_append_str(sb, ")(");
+        c_emit_val(sb, ins.args[0]); sb_append_str(sb, ");\n");
+        return;
+    }
+    // 比较
+    if (c_is_cmp_op(op)) {
+        var dstn: string = c_strip_suf(ins.dst.name);
+        var is_signed: bool = (op == TIR_OP_EQ || op == TIR_OP_NE || op == TIR_OP_SLT || op == TIR_OP_SGT || op == TIR_OP_SLE || op == TIR_OP_SGE);
+        var mnem: string = "";
+        if (op == TIR_OP_EQ) { mnem = "=="; } else if (op == TIR_OP_NE) { mnem = "!="; }
+        else if (op == TIR_OP_SLT || op == TIR_OP_ULT) { mnem = "<"; }
+        else if (op == TIR_OP_SGT || op == TIR_OP_UGT) { mnem = ">"; }
+        else if (op == TIR_OP_SLE || op == TIR_OP_ULE) { mnem = "<="; }
+        else { mnem = ">="; }
+        sb_append_str(sb, "  "); sb_append_str(sb, dstn); sb_append_str(sb, " = (");
+        sb_append_str(sb, c_int_cast(c_arg_st(ins, 0), is_signed)); sb_append_str(sb, ")(");
+        c_emit_val(sb, ins.args[0]); sb_append_str(sb, ") "); sb_append_str(sb, mnem); sb_append_str(sb, " (");
+        sb_append_str(sb, c_int_cast(c_arg_st(ins, 1), is_signed)); sb_append_str(sb, ")(");
+        c_emit_val(sb, ins.args[1]); sb_append_str(sb, ");\n");
+        return;
+    }
+    // 浮点 / 整数 二元
+    var mnem: string = c_binop_mnem(op);
+    if (mnem == "") { sb_append_str(sb, "  /* unsupported op "); sb_append_str(sb, base.i2s(op)); sb_append_str(sb, " */\n"); return; }
+    var dstn: string = c_strip_suf(ins.dst.name);
+    var isfloat: bool = (c_val_st(ins) == ST_F32 || c_val_st(ins) == ST_F64);
+    sb_append_str(sb, "  "); sb_append_str(sb, dstn); sb_append_str(sb, " = ("); sb_append_str(sb, tmir_st_c(c_slot_st(dstn, g_cf))); sb_append_str(sb, ")(");
+    if (op == TIR_OP_SHL) {
+        c_emit_val(sb, ins.args[0]); sb_append_str(sb, " "); sb_append_str(sb, mnem); sb_append_str(sb, " "); c_emit_val(sb, ins.args[1]); sb_append_str(sb, ");\n");
+        return;
+    }
+    if (op == TIR_OP_LSHR || op == TIR_OP_ASHR) {
+        var cast: string = "";
+        if (op == TIR_OP_LSHR) { cast = c_int_cast(c_arg_st(ins, 0), false); } else { cast = c_int_cast(c_arg_st(ins, 0), true); }
+        sb_append_str(sb, "("); sb_append_str(sb, cast); sb_append_str(sb, ")("); c_emit_val(sb, ins.args[0]); sb_append_str(sb, ") "); sb_append_str(sb, mnem); sb_append_str(sb, " "); c_emit_val(sb, ins.args[1]); sb_append_str(sb, ");\n");
+        return;
+    }
+    if (op == TIR_OP_UDIV || op == TIR_OP_UREM) {
+        sb_append_str(sb, "("); sb_append_str(sb, c_int_cast(c_arg_st(ins, 0), false)); sb_append_str(sb, ")("); c_emit_val(sb, ins.args[0]); sb_append_str(sb, ") "); sb_append_str(sb, mnem); sb_append_str(sb, " "); sb_append_str(sb, "("); sb_append_str(sb, c_int_cast(c_arg_st(ins, 1), false)); sb_append_str(sb, ")("); c_emit_val(sb, ins.args[1]); sb_append_str(sb, "));\n");
+        return;
+    }
+    if (op == TIR_OP_SDIV || op == TIR_OP_SREM) {
+        sb_append_str(sb, "("); sb_append_str(sb, c_int_cast(c_arg_st(ins, 0), true)); sb_append_str(sb, ")("); c_emit_val(sb, ins.args[0]); sb_append_str(sb, ") "); sb_append_str(sb, mnem); sb_append_str(sb, " "); sb_append_str(sb, "("); sb_append_str(sb, c_int_cast(c_arg_st(ins, 1), true)); sb_append_str(sb, ")("); c_emit_val(sb, ins.args[1]); sb_append_str(sb, "));\n");
+        return;
+    }
+    if (isfloat) {
+        c_emit_val(sb, ins.args[0]); sb_append_str(sb, " "); sb_append_str(sb, mnem); sb_append_str(sb, " "); c_emit_val(sb, ins.args[1]); sb_append_str(sb, ");\n");
+        return;
+    }
+    // 默认整数算术（ADD/SUB/MUL/AND/OR/XOR）
+    c_emit_val(sb, ins.args[0]); sb_append_str(sb, " "); sb_append_str(sb, mnem); sb_append_str(sb, " "); c_emit_val(sb, ins.args[1]); sb_append_str(sb, ");\n");
+}
+
+// load/store 查地址槽元素类型
+pub fn c_addr_st_of(n: string) i64 {
+    var i: i64 = 0;
+    while (i < slice_len(g_c_addr_name) as i64) { if (g_c_addr_name[i] == n) { return g_c_addr_st[i]; } i = i + 1; }
+    return ST_NONE;
+}
+
+pub fn c_binop_mnem(op: i64) string {
+    if (op == TIR_OP_ADD) { return "+"; }
+    if (op == TIR_OP_SUB) { return "-"; }
+    if (op == TIR_OP_MUL) { return "*"; }
+    if (op == TIR_OP_AND) { return "&"; }
+    if (op == TIR_OP_OR) { return "|"; }
+    if (op == TIR_OP_XOR) { return "^"; }
+    if (op == TIR_OP_SHL) { return "<<"; }
+    if (op == TIR_OP_LSHR || op == TIR_OP_ASHR) { return ">>"; }
+    if (op == TIR_OP_SDIV || op == TIR_OP_UDIV) { return "/"; }
+    if (op == TIR_OP_SREM || op == TIR_OP_UREM) { return "%"; }
+    if (op == TIR_OP_EQ) { return "=="; }
+    if (op == TIR_OP_NE) { return "!="; }
+    if (op == TIR_OP_SLT || op == TIR_OP_ULT) { return "<"; }
+    if (op == TIR_OP_SGT || op == TIR_OP_UGT) { return ">"; }
+    if (op == TIR_OP_SLE || op == TIR_OP_ULE) { return "<="; }
+    if (op == TIR_OP_SGE || op == TIR_OP_UGE) { return ">="; }
+    return "";
+}

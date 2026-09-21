@@ -420,7 +420,7 @@ ST → 目标存储类映射帮手（在 `tmir.tc` 内，`mir_st_wasm` / `mir_st
 
 | 后端 | 载体 | 说明 |
 |---|---|---|
-| **tmir→C（便携后端）** | `codegen_c` 改造为消费 tmir | 取代 LLVM 的本地编译路径：tmir→C 后经宿主 `cc` 编译。覆盖度随 S2（struct/union/数组/字符串/全局）补齐 |
+| **tmir→C（便携后端）** ✅ | 新增 `src/codegen_c_tmir.tc`（`tmir_to_c`），`--backend tmir-c` 走 `tir.lower → tmir → tmir_to_c` 产出 `.c`，经宿主 `clang` 直编（**不链 runtime**）。**未改造 `codegen_c`**——其 `emit_unit` 仍是自举链 `compile --emit-c` 的依赖，故独立成模块。S1 标量 + S2 聚合（struct/union/数组/字符串/全局）已覆盖；聚合走「本地字节缓冲 `unsigned char*_buf` + GEP 字节偏移 + `memcpy` 规避严格别名 UB」模型 |
 | **tmir→LLVM（可选）** | `codegen_ll` 改消费 tmir | 保留为「需要 LLVM 优化/目标」的可选后端；S5 删 `codegen_ll` 改判为「tmir→LLVM 可选」，不再强制 |
 | **Global / 内存模型** | `codegen_wasm`/`codegen_riscv` 的 `.data`/内存段 | S1 标量切片暂以 `comment` 兜底全局/字符串（§5.5）；S2 起补齐 tmir 全局 → WASM `memory`/RISC-V `.data` |
 | **调度 / 寄存器分配** | 各后端可选 pass | 线性扫描把虚拟 slot 分配到物理寄存器，减少栈溢出（正确性不依赖，先正确后优化；属后端侧，非 tmir 层） |
@@ -431,7 +431,7 @@ ST → 目标存储类映射帮手（在 `tmir.tc` 内，`mir_st_wasm` / `mir_st
 |---|---|---|
 | **M0** | tmir 类型 + `tir_to_tmir_lower` + `--backend tmir-*` 接线 | `tmir_to_text` 与 TIR 逐指令对应；`tc emit-tmir` 类路径产出 `.wat`/`.s` |
 | **M1** | tmir→RISC-V + tmir→WASM（S1 标量子集） | 对 S1 example 子集，wasm/riscv 与 LLVM 后端运行输出对拍一致 |
-| **M2** | ttmir→C 便携后端 + S2 聚合（struct/union/数组/字符串/全局） | 双轨对拍全绿；LLVM 转为可选 |
+| **M2** | ttmir→C 便携后端 + S2 聚合（struct/union/数组/字符串/全局） | ✅ **已完成**：`tests/m1`（12 例 S1 标量）四轨对拍 LLVM==wasm==riscv==C 全绿（`--opt 0/1` 各 12/12）；`tests/m2`（b01–b04，S2 聚合：结构体字段/i64 字段/定长数组/全局变量）LLVM==C 全绿。tmir→C 便携后端落地，LLVM 转为可选 |
 | **M3** | 调度/寄存器分配 pass + 不可归约 CFG 兜底 | 性能与覆盖度达标 |
 
 ### 10.4 门禁接入
@@ -441,9 +441,10 @@ M 轨沿用 S 轨的双轨对拍（§3）：同一 `.tc` 走 `TIR→tmir→wasm`
 > ~~**沙箱限制**：本沙箱无 `clang`/`VS2022`/`wat2wasm`/`riscv64` 工具链，M1 的端到端对拍须工具链机器执行~~
 > **2026-09-21 已解除**：本机 clang（含 riscv64 target）与 wasmtime 齐备，M1 对拍已本地跑通。
 
-**对拍入口（M1）**：`python tools/m1_difftest.py [--tc out/dbg/tc.exe] [--opt 0|1] [--dir tests/m1]`
-（wasmtime 装在 `C:/Python312`，故须用 `C:/Python312/python.exe`；默认 `python` 是 3.13，找不到 wasmtime）。
-判据：llvm 退出码 == wasm `main()` 返回值，且 riscv `.s` 汇编通过。首切片先按 warn 级使用，M2 后再考虑接进 `gate.mjs` 转 hard。
+**对拍入口（M1/M2）**：`python tools/m1_difftest.py [--tc out/dbg/tc.exe] [--opt 0|1] [--dir tests/m1]`
+四轨对拍：LLVM（`tc build` 默认 tir 后端，取退出码）/ WASM（`--backend tmir-wasm` 产 `.wat`，wasmtime 跑 `main`）/ RISC-V（`--backend tmir-riscv` 产 `.s`，`clang -target riscv64-linux-gnu -c` 汇编校验）/ **C（`--backend tmir-c` 产 `.c`，`clang` 直编取退出码）**。
+判据：llvm 退出码 == wasm `main()` 返回值 == C 退出码，且 riscv `.s` 汇编通过。`wasmtime` 不可用时该轨自动 SKIP（非判红）。首切片先按 warn 级使用，接进 `gate.mjs` 转 hard 待定。
+> 注：`wasmtime` 装在 `C:/Python312`，故须用 `C:/Python312/python.exe`；默认 `python`（3.13）找不到 wasmtime 模块。
 
 ## 11. mir 优化层（对齐 Rust MIR，HIR 与 TIR 之间，2026-09-13 设计）
 

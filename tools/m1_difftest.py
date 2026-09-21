@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""M1 三轨对拍：tir(LLVM) / tmir-wasm / tmir-riscv 对 S1 标量子集。
+"""M1 四轨对拍：tir(LLVM) / tmir-wasm / tmir-riscv / tmir-c 对 S1 标量子集。
 
-判据（docs/compiler/pipeline-implementation-route.md §10.3 M1）：
-    「对 S1 example 子集，wasm/riscv 与 LLVM 后端运行输出对拍一致」
+判据（docs/compiler/pipeline-implementation-route.md §10.3 M1 / §10.2 M2）：
+    「对 S1 example 子集，wasm/riscv/C 与 LLVM 后端运行输出对拍一致」
 
 - LLVM 轨：tc build（默认 --backend tir）产出 exe，运行取进程退出码（t 的 main 返回值）。
 - WASM 轨：tc emit-ll --backend tmir-wasm 产出 .wat，wasmtime 实例化后调用导出 main。
 - RV    轨：tc emit-ll --backend tmir-riscv 产出 .s，clang -target riscv64-linux-gnu -c 汇编校验。
+- C     轨：tc build --backend tmir-c 产出 .c，clang 直编（不链 runtime）后运行取退出码。
 
 用法：
     python tools/m1_difftest.py [--tc out/dbg/tc.exe] [--opt 0|1] [--dir tests/m1]
@@ -28,11 +29,11 @@ def run(cmd, cwd=ROOT):
 
 
 def wasm_run(wat_path):
-    """返回 (ok, value_or_error)。"""
+    """返回 (ok, value_or_error)。ok 三态：True=成功取到值；False=wasmtime 可用但运行失败；None=wasmtime 不可用（环境缺模块，本机跳过而非判红）。"""
     try:
         import wasmtime
     except Exception as ex:
-        return False, 'wasmtime 不可用: %s' % ex
+        return None, 'wasmtime 不可用（环境缺模块，跳过）: %s' % ex
     try:
         eng = wasmtime.Engine()
         mod = wasmtime.Module(eng, open(wat_path, encoding='utf-8').read())
@@ -62,8 +63,8 @@ def main():
         return 1
 
     fails = 0
-    print('%-22s %10s %10s %8s  %s' % ('test', 'llvm', 'wasm', 'riscv', 'verdict'))
-    print('-' * 78)
+    print('%-22s %8s %8s %8s %8s  %s' % ('test', 'llvm', 'wasm', 'riscv', 'c', 'verdict'))
+    print('-' * 80)
     for f in files:
         name = os.path.splitext(os.path.basename(f))[0]
         rel = os.path.relpath(f, ROOT).replace('\\', '/')
@@ -110,16 +111,46 @@ def main():
                 fails += 1
                 print('   [riscv]', se2.strip()[:200])
 
-        if not ok_w:
-            print('%-22s %10s %10s %8s  WASM-RUN-FAIL' % (name, v_ll, '-', v_rv))
+        # ── C 轨 (tmir-c) ──
+        c_exe = os.path.join(outdir, name + '_c.exe')
+        rc, so, se = run([args.tc, 'build', rel, '--output',
+                          os.path.join(args.outdir, name + '_c'),
+                          '--backend', 'tmir-c', '--opt', args.opt])
+        if rc != 0 or not os.path.exists(c_exe):
+            v_c = 'BUILD-FAIL'
+            c_ok = False
+            fails += 1
+            print('   [c]', (se or so).strip()[:200])
+        else:
+            p = subprocess.run([c_exe], cwd=ROOT, capture_output=True)
+            v_c = p.returncode
+            c_ok = True
+
+        if ok_w is False:
+            print('%-22s %8s %8s %8s %8s  WASM-RUN-FAIL' % (name, v_ll, v_w, v_rv, v_c))
             print('   ', v_w[:300])
             fails += 1
             continue
-        if v_ll != v_w:
-            print('%-22s %10s %10s %8s  MISMATCH' % (name, v_ll, v_w, v_rv))
+        if v_rv != 'OK':
+            print('%-22s %8s %8s %8s %8s  RISCV-FAIL' % (name, v_ll, v_w, v_rv, v_c))
             fails += 1
             continue
-        print('%-22s %10s %10s %8s  ok' % (name, v_ll, v_w, v_rv))
+        # 值对拍：llvm == wasm == c（riscv 仅校验可汇编；wasmtime 不可用时跳过 wasm 比对）
+        bad = None
+        if ok_w is True and v_ll != v_w:
+            bad = 'MISMATCH llvm/wasm'
+        elif c_ok and v_ll != v_c:
+            bad = 'MISMATCH llvm/c'
+        if bad is not None:
+            print('%-22s %8s %8s %8s %8s  %s' % (name, v_ll, v_w, v_rv, v_c, bad))
+            fails += 1
+            continue
+        if not c_ok:
+            print('%-22s %8s %8s %8s %8s  C-FAIL' % (name, v_ll, v_w, v_rv, v_c))
+            fails += 1
+            continue
+        wtag = v_w if ok_w is True else 'skip'
+        print('%-22s %8s %8s %8s %8s  ok' % (name, v_ll, wtag, v_rv, v_c))
 
     print('-' * 78)
     print('FAILS:', fails)

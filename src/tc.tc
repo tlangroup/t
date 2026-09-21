@@ -19,6 +19,7 @@
 @import("src.tmir" :: tir_to_tmir_lower, TMIRModule);
 @import("src.codegen_wasm" :: tmir_to_wasm);
 @import("src.codegen_riscv" :: tmir_to_riscv);
+@import("src.codegen_c_tmir" :: tmir_to_c);
 @import("src.mir" :: *);
 @import("src.test" :: *);
 @import("repl" :: *);
@@ -505,12 +506,12 @@ fn main() i32 @main {
             // 避免调用方以为在跑机器层、实际拿到 LLVM 产物（T2 期间 tmir 即因此不可达）。
             if (argv[ai2] == "--backend") {
                 if (ai2 + 1 < an2) {
-                    if (argv[ai2 + 1] == "tir" || argv[ai2 + 1] == "tmir-wasm" || argv[ai2 + 1] == "tmir-riscv") {
+                    if (argv[ai2 + 1] == "tir" || argv[ai2 + 1] == "tmir-wasm" || argv[ai2 + 1] == "tmir-riscv" || argv[ai2 + 1] == "tmir-c") {
                         backend = argv[ai2 + 1];
                         ai2 = ai2 + 2;
                         continue;
                     }
-                    eprint(base.sb_cat3("error: unknown --backend `", argv[ai2 + 1], "` (expected tir|tmir-wasm|tmir-riscv; legacy ll retired)\n"));
+                    eprint(base.sb_cat3("error: unknown --backend `", argv[ai2 + 1], "` (expected tir|tmir-wasm|tmir-riscv|tmir-c; legacy ll retired)\n"));
                     return 2;
                 }
             }
@@ -664,6 +665,20 @@ fn main() i32 @main {
             tir.tir_verify_module();
             lltext = tir_to_ll__tir_to_ll_emit(tir.g_mod);
             out_text = lltext;
+        } else if (backend == "tmir-c") {
+            // M2：tmir → C 便携后端（无需 LLVM）。sema → mir → TIR → tmir → .c。
+            tir__tir_set_recording_mir(true);
+            tir.lower_unit(mod2, src_file);
+            tir__tir_set_recording_mir(false);
+            tir__g_mir.globals = tir__g_mod.globals;
+            tir__g_mir.types = tir__g_mod.types;
+            tir__g_mir.strings = tir__g_mod.strings;
+            var mir_mod: MIRModule = mir__mir_from_tir(tir__g_mir);
+            mir__mir_run(mir_mod, opt_level);
+            var tm: TIRModule = mir__mir_to_tir_lower(mir_mod);
+            var mm: TMIRModule = tmir__tir_to_tmir_lower(tm);
+            out_text = codegen_c_tmir__tmir_to_c(mm);
+            out_ext = ".c";
         }
 
         // 输出目录：--output 指定 exe/目录前缀；缺省按 --mode 落入 out/dbg|out/rls
@@ -721,20 +736,23 @@ fn main() i32 @main {
         sb_append_str(csb2, "\" -Wl,-subsystem:console -Xlinker /STACK:4294967296,134217728 \"");
         sb_append_str(csb2, llp);
         sb_append_str(csb2, "\" ");
-        if (use_lib) {
-            sb_append_str(csb2, "\"");
-            sb_append_str(csb2, deps_lib);
-            sb_append_str(csb2, "\"");
-        } else {
-            sb_append_str(csb2, "\"");
-            sb_append_str(csb2, rt_dir);
-            sb_append_str(csb2, "/t_runtime.c\" \"");
-            sb_append_str(csb2, rt_dir);
-            sb_append_str(csb2, "/t_shim_ll.c\" \"");
-            sb_append_str(csb2, rt_dir);
-            sb_append_str(csb2, "/t_runtime_gpu.c\" -I \"");
-            sb_append_str(csb2, rt_dir);
-            sb_append_str(csb2, "\"");
+        // tmir-c 便携后端：纯 S1/S2 测试产物为独立 .c（无 runtime 依赖），不链 runtime。
+        if (backend != "tmir-c") {
+            if (use_lib) {
+                sb_append_str(csb2, "\"");
+                sb_append_str(csb2, deps_lib);
+                sb_append_str(csb2, "\"");
+            } else {
+                sb_append_str(csb2, "\"");
+                sb_append_str(csb2, rt_dir);
+                sb_append_str(csb2, "/t_runtime.c\" \"");
+                sb_append_str(csb2, rt_dir);
+                sb_append_str(csb2, "/t_shim_ll.c\" \"");
+                sb_append_str(csb2, rt_dir);
+                sb_append_str(csb2, "/t_runtime_gpu.c\" -I \"");
+                sb_append_str(csb2, rt_dir);
+                sb_append_str(csb2, "\"");
+            }
         }
         // 链接模式外部库：把命中的 .tlib 归档（重命名的 .a）一并交给链接器
         var elk: i64 = 0;
