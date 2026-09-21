@@ -3,12 +3,19 @@
 //
 // 内容：类型检查器（TypeInfo 池）、comptime/meta 泛型单态化、CTFE 求值器、
 //       编译期内建，以及供两个后端消费的 TypeDesc（TD）池。
-// 依赖：base, lex, parse。
+// 依赖：base, lex, parse, hir。
+//
+// Stage B（HIR 消费）：sema 的**遍历与分派**一律以 HIR 指令为输入 ——
+// 顶层声明工作集取自 hir.g_hir.decls，函数体/语句走 HIR BLOCK 指令流，
+// 表达式经 HIR inst 进入。语义规则体仍作用于 CST 节点（每条 HIR 指令携带
+// 源节点 id `nd`，经 hir_inst_node 回桥），因为脱糖（format / 管道 / 区间）
+// 与后端都还在 CST 上工作。无 HIR 的节点（脱糖合成）回落 CST 路径。
 // ══════════════════════════════════════════════════════════════════
 
 @import("src.base" :: *);
 @import("src.lex" :: *);
 @import("src.parse" :: *);
+@import("src.hir" :: *);
 
 // ── TypeDesc 池（复刻 TypeDesc interface）──────────────────────
 // 类型描述库由语义分析阶段产出（构建 TD 索引），供两个代码生成后端消费，
@@ -4103,6 +4110,9 @@ pub fn lower_pipe(e: i64) i64 {
     // 用 paren 而非直接搬运字段：paren 是既有的透传节点，四处（expr_type_desc /
     // ll_etd / emit_expr / emit_lle）都已支持，无需给后端新增分支。
     var on: Node = base.nodes[e];
+    // 就地改写 kind ⇒ 该节点的 HIR 指令（PIPE 等）即失效：断开映射，
+    // 后续分派回落 CST kind，避免按**改写前**的语义标签再走一遍。
+    hir.hir_invalidate(e);
     // `|>` 逐元素 + void lambda 降级出的 for-each 循环是语句，不能作为表达式用
     // paren 包裹（那样会走 emit_expr 路径 → 报 unsupported expr）。这里单独把它
     // 包成一个 block 语句块发射。其余情况照旧退化成透传 paren。
@@ -4372,6 +4382,7 @@ pub fn materialize_range(e: i64) i64 {
     // 就地退化成透传 paren（与管道降解同一手法）：paren 在四处 emit/etd 都已支持，
     // 且重复 infer 天然幂等（第二次走的是 paren 分支）。
     var on: Node = base.nodes[e];
+    hir.hir_invalidate(e);
     on.kind = "paren";
     on.na = cl;
     on.nb = -1;
@@ -4439,6 +4450,7 @@ pub fn lower_range_index(e: i64) i64 {
     var cl: i64 = base.mk_call(base.mk_ident(fname, -1), ah, -1);
     rng_anchor(cl, e);
     var on: Node = base.nodes[e];
+    hir.hir_invalidate(e);
     on.kind = "paren";
     on.na = cl;
     on.nb = -1;
@@ -4470,6 +4482,7 @@ pub fn lower_in_range(e: i64) i64 {
     var test: i64 = base.mk_range_test(n.na, n.na, n.nb);
     rng_anchor(test, e);
     var on: Node = base.nodes[e];
+    hir.hir_invalidate(e);
     on.kind = "paren";
     on.sa = "";
     on.na = test;
@@ -4515,6 +4528,7 @@ pub fn lower_for_range(s: i64) void {
     if (head < 0) { head = tail; }
 
     var on: Node = base.nodes[s];
+    hir.hir_invalidate(s);
     on.kind = "block";
     on.sa = "";
     on.sb = "";
@@ -4574,6 +4588,7 @@ pub fn lower_for_array(s: i64) void {
     tail = base.list_push(head, tail, lendcl); if (head < 0) { head = tail; }
     tail = base.list_push(head, tail, floop);
     var on: Node = base.nodes[s];
+    hir.hir_invalidate(s);
     on.kind = "block";
     on.sa = "";
     on.sb = "";
@@ -4814,14 +4829,32 @@ pub fn sema_idecl_infer_idents(m: i64) void {
     }
 }
 
+// Stage B：sema 的表达式**分派键**取自 HIR 指令（op → 语义标签），
+// 不再直接读 `node.kind`。三类节点回落 CST kind：
+//   ① 无 HIR 指令（脱糖合成）；② RAW（AstGen 未建模）；③ 委托指令
+//      （paren/expr 的 inst 属于内层子节点，`nd != e` 时不可用）。
+pub fn hir_tag(e: i64) string {
+    var ei: i64 = hir.hir_of_node(e);
+    if (ei >= 0) {
+        var en: i64 = hir.hir_inst_node(ei);
+        if (en == e) {
+            var t: string = hir.hir_tag_of_op(hir.hir_op_of(ei));
+            if (t != "") { return t; }
+        }
+    }
+    var nn: Node = base.nodes[e];
+    return nn.kind;
+}
+
 pub fn infer_expr(e: i64) i64 {
     var n: Node = base.nodes[e];
-    if (is_pipe_kind(n.kind) == true) {
+    var k: string = hir_tag(e);
+    if (is_pipe_kind(k) == true) {
         return lower_pipe(e);
     }
     // 区间走到「取值」这一步，说明它不在 for / 索引 / match / in 这四个已降解的
     // 上下文里 —— 那就只剩物化一条路（`(0..10) |> f`、`var xs: []i64 = 1..5;`）。
-    if (n.kind == "range") {
+    if (k == "range") {
         return materialize_range(e);
     }
     // `x as T`：类型由目标类型定死，GEN:type_infer2 的生成规则因此写成「直接
@@ -4830,14 +4863,14 @@ pub fn infer_expr(e: i64) i64 {
     // 后端照发代码（静默错编，与 T-SEM-E201/E208 同一类）。range 落地后更致命：
     // `str_len(s[0..5]) as i64` 里的区间下标不被降解，后端当单元素索引发 str_at。
     // 生成区不能手改，故在此前置补一条：先推操作数，再按目标类型收口。
-    if (n.kind == "cast") {
+    if (k == "cast") {
         if (n.na >= 0) { infer_expr(n.na); }
         return resolve_ti(n.nb);
     }
     // M-meta Phase D：编译期内建走到 check 说明它没被折掉 —— 一律是错。
     // `@compile_error` 本就只许活在编译期上下文；`@type_*` 折不掉意味着类型实参
     // 在编译期不可解析。两者都不该、也无法降级为运行期代码（第 8 条）。
-    if (n.kind == "mbuiltin") {
+    if (k == "mbuiltin") {
         if (n.sa == "compile_error") {
             // 语义同 Zig 的 @compileError：**只要被分析到就触发**。CTFE 执行到会触发，
             // 走到 check（说明这段代码真的会被编译）同样触发。死分支已由 mb_prune_if
@@ -5058,7 +5091,7 @@ pub fn infer_expr(e: i64) i64 {
         }
         return ti_mk("Unknown");
     }
-    if (n.kind == "int") {
+    if (k == "int") {
         // 带位宽后缀的字面量：类型由后缀直接定死，不再按量级猜。
         // 这正是 `-255i32` 能得到 -255（而裸 `-255` 因 255 被猜成 u8 而得到 1）
         // 的原因，见 reference.md §2.4。
@@ -5078,46 +5111,46 @@ pub fn infer_expr(e: i64) i64 {
         return ti_scalar("u64");
     }
     // Erlang 式原子字面量：类型 = 64 位标量 "atom"，值 = 编译期 intern 的稳定 i64 id
-    if (n.kind == "atom") {
+    if (k == "atom") {
         n.ia = atom_intern(n.sa);
         slice_set(base.nodes, e, n);
         return ti_scalar("atom");
     }
     // 内建文件描述符常量（M51）：stdin/stdout/stderr → 64 位标量 "fid"
-    if (n.kind == "fidconst") {
+    if (k == "fidconst") {
         return ti_scalar("fid");
     }
     // 序列化操作符（M51）：`f < v` 的值即目标 fid 本身，故左结合可链式
-    if (n.kind == "serialize") {
+    if (k == "serialize") {
         infer_expr(n.na);
         infer_expr(n.nb);
         return ti_scalar("fid");
     }
     // 反序列化操作符（M52 读路径）：`f > Type` 的值是裸 Type；右操作数是类型表达式，不调 infer_expr
-    if (n.kind == "deserialize") {
+    if (k == "deserialize") {
         infer_expr(n.na);
         return ti_from_td(deser_type_of(n.nb));
     }
 // >>> GEN:type_infer1 (generated by tools/totter.tc from out/ebnf.json -- DO NOT EDIT) >>>
-    if (n.kind == "float") {
+    if (k == "float") {
         return ti_scalar("f64");
     }
-    if (n.kind == "string") {
+    if (k == "string") {
         return ti_mk("String");
     }
-    if (n.kind == "bool") {
+    if (k == "bool") {
         return ti_scalar("bool");
     }
-    if (n.kind == "null") {
+    if (k == "null") {
         return ti_mk("Unknown");
     }
     // `?` none 字面量：与 `null` 同一手法——顶层 Unknown，由赋值/返回的目标 ?T 反推。
     // （不可用 Optional(Unknown)：统一器只处理顶层 Unknown，嵌套的 Unknown 不会与目标反推。）
-    if (n.kind == "opt_none") {
+    if (k == "opt_none") {
         return ti_mk("Unknown");
     }
     // 取址 `&x`：操作数须为可寻址 lvalue，结果类型为 pointer(pointee)。
-    if (n.kind == "amp") {
+    if (k == "amp") {
         var opti: i64 = infer_expr(n.na);
         if (expr_is_lvalue(n.na) == false) {
             parse.fc_err("T-SEM-E760",
@@ -5128,7 +5161,7 @@ pub fn infer_expr(e: i64) i64 {
         return ti_elem_of("Pointer", opti);
     }
     // 解引用 `*r`：操作数须为引用/指针类型，结果类型为其指向的元素类型。
-    if (n.kind == "deref") {
+    if (k == "deref") {
         var opti: i64 = infer_expr(n.na);
         if (tip_kind(opti) != "Pointer") {
             parse.fc_err("T-SEM-E761",
@@ -5141,11 +5174,11 @@ pub fn infer_expr(e: i64) i64 {
         return det;
     }
 // <<< GEN:type_infer1 <<<
-    if (n.kind == "typeinfo") {
+    if (k == "typeinfo") {
         return ti_mk("TypeInfo");
     }
     // 闭包构造点（M48）：值类型 = 合成函数的函数类型（env 首参对用户不可见）
-    if (n.kind == "closure_make") {
+    if (k == "closure_make") {
         var cmi: i64 = sym_lookup(global_scope, n.sa);
         if (cmi >= 0) {
             var cms: Sym = syms[cmi];
@@ -5158,7 +5191,7 @@ pub fn infer_expr(e: i64) i64 {
         }
         return ti_mk("Unknown");
     }
-    if (n.kind == "ident") {
+    if (k == "ident") {
         var si: i64 = sym_lookup(cur_scope, n.sa);
         if (si >= 0) {
             var s: Sym = syms[si];
@@ -5198,7 +5231,7 @@ pub fn infer_expr(e: i64) i64 {
         return ti_mk("Unknown");
     }
     // match 表达式（L-15）：分支结果类型统一 + when 守卫布尔显式 + 穷尽性
-    if (n.kind == "match") {
+    if (k == "match") {
         var m_scr: i64 = infer_expr(n.na);
         var m_res: i64 = -1;
         var m_irref: bool = false;
@@ -5399,7 +5432,7 @@ pub fn infer_expr(e: i64) i64 {
         }
         return m_res;
     }
-    if (n.kind == "binary") {
+    if (k == "binary") {
         var op: string = n.sa;
         // 成员测试 `x in lo..hi`：右操作数是区间，整体降解成比较合取
         if (op == "in") {
@@ -5414,6 +5447,7 @@ pub fn infer_expr(e: i64) i64 {
             var rt: i64 = infer_expr(n.nb);
             check_serializable(n.nb, rt);
             n.kind = "serialize";
+            hir.hir_invalidate(e);
             slice_set(base.nodes, e, n);
             return ti_scalar("fid");
         }
@@ -5435,6 +5469,7 @@ pub fn infer_expr(e: i64) i64 {
                 return ti_mk("Unknown");
             }
             n.kind = "deserialize";
+            hir.hir_invalidate(e);
             slice_set(base.nodes, e, n);
             return ti_from_td(rtd);          // Option B：结果类型为裸 T，EOF 由 fid_eof 探针表达
         }
@@ -5594,14 +5629,14 @@ pub fn infer_expr(e: i64) i64 {
         }
         return rt;
     }
-    if (n.kind == "unary") {
+    if (k == "unary") {
         var ot: i64 = infer_expr(n.na);
         if (n.sa == "!") {
             return ti_scalar("bool");
         }
         return ot;
     }
-    if (n.kind == "assign") {
+    if (k == "assign") {
         var atl: i64 = infer_expr(n.na);
         var saved_ve0: i64 = g_vec_expect;
         var saved_te0: i64 = g_tile_expect;
@@ -5651,7 +5686,7 @@ pub fn infer_expr(e: i64) i64 {
         }
         return atl;
     }
-    if (n.kind == "call") {
+    if (k == "call") {
         // 实参不走通用遍历，嵌套其中的 format 只能在这里补扫（详见 fmt_scan_subtree）
         if (parse.g_has_format) { fmt_scan_list(n.la, e); }
         var cn: Node = base.nodes[n.na];
@@ -6052,7 +6087,7 @@ pub fn infer_expr(e: i64) i64 {
         }
         return ti_mk("Unknown");
     }
-    if (n.kind == "member") {
+    if (k == "member") {
         // 前导点成员引用 `.a`：无接收者（na<0），依上下文解析。
         if (n.lb == 1 && n.na < 0) {
             var msa: string = n.sa;
@@ -6109,6 +6144,7 @@ pub fn infer_expr(e: i64) i64 {
             if (mi < 0) { mi = sym_lookup(global_scope, msa); }
             if (mi >= 0) {
                 n.kind = "ident";
+                hir.hir_invalidate(e);
                 n.sa = syms[mi].name;
                 n.na = -1;
                 n.lb = 0;
@@ -6131,12 +6167,12 @@ pub fn infer_expr(e: i64) i64 {
                     if (sd.kind == "StructDecl") {
                         var c: i64 = sd.lb;
                         while (c >= 0) {
-                            var k: Child = base.kids[c];
-                            var f: Node = base.nodes[k.val];
+                            var kc: Child = base.kids[c];
+                            var f: Node = base.nodes[kc.val];
                             if (f.sa == n.sa) {
                                 return resolve_ti(f.na);
                             }
-                            c = k.next;
+                            c = kc.next;
                         }
                         // 字段表里没有该名字：此前静默退化为 Unknown（与 Unknown 的
                         // 全兼容 can_cast 叠加后 → 编译期零诊断、后端产出读 0 的垃圾值，
@@ -6166,7 +6202,7 @@ pub fn infer_expr(e: i64) i64 {
         }
         return ti_mk("Unknown");
     }
-    if (n.kind == "index") {
+    if (k == "index") {
         // 区间下标 `s[a..b]` 与整数下标是两种东西：前者出子串/子切片，后者出元素
         if (is_range_node(n.nb)) {
             return lower_range_index(e);
@@ -6195,7 +6231,7 @@ pub fn infer_expr(e: i64) i64 {
         }
         return ti_mk("Unknown");
     }
-    if (n.kind == "array_lit") {
+    if (k == "array_lit") {
         // 向量字面量构造：`[a,b,c,d]` 在父节点注入的期望类型为 @Vector(N,T) 时，
         // 直接按向量构造（校验 lane 数 + 每元素可转 lane 类型），并把向量 TD 标记到
         // 节点 ib，供 codegen 发射成硬件向量字面量。
@@ -6323,7 +6359,7 @@ pub fn infer_expr(e: i64) i64 {
         // 空数组字面量：元素类型未知，配合 can_cast 可赋给任意 []T / [N]T。
         return ti_elem_of("Array", ti_mk("Unknown"));
     }
-    if (n.kind == "map_lit") {
+    if (k == "map_lit") {
         if (n.la >= 0) {
             var k3: Child = base.kids[n.la];
             var en: Node = base.nodes[k3.val];
@@ -6355,7 +6391,7 @@ pub fn infer_expr(e: i64) i64 {
     }
 // >>> GEN:type_infer2 (generated by tools/totter.tc from out/ebnf.json -- DO NOT EDIT) >>>
     // 匿名结构体字面量（sa==""）：合成具名 struct 类型后再走既有命名 struct 路径
-    if (n.kind == "struct_lit") {
+    if (k == "struct_lit") {
         // 前导点 `.{...}`：省略类型名，类型由上下文（g_lead_expect）提供的具名结构体推断。
         // 接受 Struct 与 Named 两种 TI 种类——具名结构体注解经 resolve_ti 可能落为 Named，
         // 故统一按「期望类型名解析到 StructDecl」判定，避免漏判。
@@ -6457,13 +6493,13 @@ pub fn infer_expr(e: i64) i64 {
         }
         return ti_named("Struct", n.sa);
     }
-    if (n.kind == "cast") {
+    if (k == "cast") {
         return resolve_ti(n.nb);
     }
-    if (n.kind == "paren") {
+    if (k == "paren") {
         return infer_expr(n.na);
     }
-    if (n.kind == "comptime") {
+    if (k == "comptime") {
         return infer_expr(n.na);
     }
 // <<< GEN:type_infer2 <<<
@@ -6503,9 +6539,386 @@ pub fn stmt_returns(s: i64) bool {
     return false;
 }
 
-// ── 语句检查 checkStmt（复刻 checker.ts:345）──────────────────
+// ═══ Stage B：语句检查的 HIR 分派层 ═════════════════════════════
+// check_stmt 是 sema 唯一的语句入口：节点有对应 HIR 指令 → 走 HIR 指令流
+// （递归一律经 hir_arg，不再读 kids 链）；没有（脱糖合成的块）→ 回落 CST 树。
+// 两条路径共用下面这一组 cs_* 语义动作，行为不因入口而分叉。
+
+// 子表达式推断入口：一律先经 HIR 指令（inst → 源节点），无 HIR 时以 fb 兜底。
+pub fn infer_expr_hir(inst: i64, fb: i64) i64 {
+    if (inst >= 0) {
+        var e2: i64 = hir.hir_inst_node(inst);
+        if (e2 >= 0) { return infer_expr(e2); }
+    }
+    if (fb >= 0) { return infer_expr(fb); }
+    return ti_mk("Unknown");
+}
 
 pub fn check_stmt(s: i64) void {
+    var si: i64 = hir.hir_of_node(s);
+    if (si >= 0) { check_stmt_hir(si); return; }
+    check_stmt_cst(s);
+}
+
+// HIR BLOCK 指令内的语句序列（递归）
+pub fn cs_stmts_hir(bi: i64) void {
+    if (bi < 0) { return; }
+    var cnt: i64 = hir.hir_arg_count(bi);
+    var i: i64 = 0;
+    while (i < cnt) {
+        var st: i64 = hir.hir_arg(bi, i);
+        if (st >= 0) { check_stmt_hir(st); }
+        i = i + 1;
+    }
+}
+
+// 块作用域 + HIR 语句序列
+pub fn cs_block_inst(bi: i64) void {
+    var prev4: i64 = cur_scope;
+    cur_scope = scope_new(prev4);
+    cs_stmts_hir(bi);
+    cur_scope = prev4;
+}
+
+// 已被脱糖就地改写成 block 的语句（无 HIR 指令）：走 CST kids 链
+pub fn cs_block_node(s: i64) void {
+    var prev: i64 = cur_scope;
+    cur_scope = scope_new(prev);
+    var c: i64 = base.nodes[s].la;
+    while (c >= 0) {
+        var k: Child = base.kids[c];
+        check_stmt(k.val);
+        c = k.next;
+    }
+    cur_scope = prev;
+}
+
+// 局部变量声明（var/const/let 统一路径）
+pub fn cs_var_decl(s: i64, init_i: i64) void {
+    var n: Node = base.nodes[s];
+    var vt: i64 = -1;
+    // 管道许可上下文之一：初始化器（reference.md §3.15.6）
+    if (n.nb >= 0) { pipe_mark(n.nb); }
+    if (n.na >= 0) {
+        vt = resolve_ti(n.na);
+    } else if (n.nb >= 0) {
+        var inf_ti: i64 = infer_expr_hir(init_i, n.nb);
+        if (inf_ti >= 0 && tip_kind(inf_ti) != "Unknown") {
+            vt = inf_ti;
+            var tn2: i64 = mk_type_node_from_ti(inf_ti);
+            n.na = tn2;
+            slice_set(base.nodes, s, n);
+        }
+    }
+    if (vt < 0) {
+        parse.fc_err("T-SEM-E211",
+            base.sb_cat3("局部变量 `", n.sa,
+                "` 必须带类型标注或提供可推断类型的初始化器"), s);
+        return;
+    }
+    if (n.nb >= 0) {
+        var saved_ve2: i64 = g_vec_expect;
+        var saved_te2: i64 = g_tile_expect;
+        var saved_le2: i64 = g_lead_expect;
+        if (ti_is_vector(vt)) { g_vec_expect = vt; g_tile_expect = -1; }
+        else if (ti_is_tile(vt)) { g_tile_expect = vt; g_vec_expect = -1; }
+        else { g_vec_expect = -1; g_tile_expect = -1; }
+        g_lead_expect = vt;
+        var it: i64 = infer_expr_hir(init_i, n.nb);
+        g_vec_expect = saved_ve2;
+        g_tile_expect = saved_te2;
+        g_lead_expect = saved_le2;
+        intlit_overflow_warn(n.nb, vt);
+        if (tip_kind(it) != "Unknown" && ti_equal(it, vt) == false) {
+            var vk: string = tip_kind(vt);
+            var int_to_fe: bool = (vk == "Flag" || vk == "Enum") && is_int_ti(it);
+            var str_to_sym: bool = vk == "Sym" && tip_kind(it) == "String";
+            if (int_to_fe == false && str_to_sym == false && can_cast(it, vt) == false) {
+                err_type_mismatch(n.nb, vt, it);
+            }
+        }
+    }
+    sym_define(cur_scope, n.sa, "var", vt, s);
+    if (base.g_const_decl_has(s)) { check_const_ref(s); }
+}
+
+// if 语句
+pub fn cs_if(s: i64, cond_i: i64, then_i: i64, else_i: i64) void {
+    var n: Node = base.nodes[s];
+    var ct: i64 = infer_expr_hir(cond_i, n.na);
+    if (is_cond_bool(ct) == false) {
+        var di: i64 = base.diag_new("T-SEM-E204", "error",
+            base.sb_cat2("if condition must be bool or explicit comparison, got ", ti_str(ct)),
+            "", 1, 1, 1, 5);
+        var fx: i64 = base.fix_one("add explicit comparison", "", 1, 1, 1, 1, "(expr != 0)");
+        base.diag_set_fs(di, fx);
+    }
+    var prev: i64 = cur_scope;
+    cur_scope = scope_new(prev);
+    cs_stmts_hir(then_i);
+    if (else_i >= 0) {
+        cur_scope = scope_new(prev);
+        cs_stmts_hir(else_i);
+    }
+    cur_scope = prev;
+}
+
+// while / C 式 for 共用：init/upd 为 -1 即 while
+pub fn cs_loop(s: i64, init_i: i64, cond_i: i64, upd_i: i64, body_i: i64) void {
+    // 循环头与循环体共用一层作用域。C 式 for 的初始化变量必须**先**入作用域，
+    // 条件与步进才解析得到它。
+    var prev2: i64 = cur_scope;
+    cur_scope = scope_new(prev2);
+    if (init_i >= 0) { check_stmt_hir(init_i); }
+    if (cond_i >= 0) {
+        var ct2: i64 = infer_expr_hir(cond_i, hir.hir_inst_node(cond_i));
+        if (is_cond_bool(ct2) == false) {
+            base.diag_new("T-SEM-E204", "error",
+                base.sb_cat2("loop condition must be bool, got ", ti_str(ct2)),
+                "", 1, 1, 1, 5);
+        }
+    }
+    cs_stmts_hir(body_i);
+    // 步进语句（C 式 for）一并检查
+    if (upd_i >= 0) { check_stmt_hir(upd_i); }
+    cur_scope = prev2;
+}
+
+// for-in 迭代
+pub fn cs_forin(s: i64, iter_i: i64, body_i: i64) void {
+    var n: Node = base.nodes[s];
+    // 已被 lower_for_range / lower_for_array 就地改写为 block
+    if (base.nodes[s].kind == "block") { cs_block_node(s); return; }
+    if (is_range_node(n.na)) {
+        lower_for_range(s);
+        if (base.nodes[s].kind == "block") { cs_block_node(s); }
+        return;
+    }
+    var itt: i64 = infer_expr_hir(iter_i, n.na);
+    if (tip_kind(itt) == "Array") {
+        lower_for_array(s);
+        if (base.nodes[s].kind == "block") { cs_block_node(s); }
+        return;
+    }
+    var prev3: i64 = cur_scope;
+    cur_scope = scope_new(prev3);
+    var et: i64 = -1;
+    var itk: string = tip_kind(itt);
+    if (itk == "Slice" || itk == "Array") {
+        var t4: TI = tis[itt];
+        et = t4.elem;
+    } else {
+    if (itk == "Map") {
+        var t5: TI = tis[itt];
+        et = t5.key;
+    } else {
+        et = ti_mk("Unknown");
+    }}
+    sym_define(cur_scope, n.sa, "var", et, -1);
+    // 双变量形式 `for (k, v in m)`：第二个变量绑定值类型
+    if (str_len(n.sb) > 0) {
+        var vt5: i64 = ti_mk("Unknown");
+        if (itk == "Map") {
+            var t6: TI = tis[itt];
+            vt5 = t6.val;
+        } else {
+            base.diag_new("T-SEM-E202", "error",
+                "for (k, v in x): 双变量迭代仅支持 map",
+                parse.n_file(n.na), parse.n_line(n.na), parse.n_col(n.na), parse.n_line(n.na), parse.n_col(n.na) + 5);
+        }
+        sym_define(cur_scope, n.sb, "var", vt5, -1);
+    }
+    cs_stmts_hir(body_i);
+    cur_scope = prev3;
+}
+
+// return 语句
+pub fn cs_return(s: i64, val_i: i64) void {
+    var n: Node = base.nodes[s];
+    if (n.na >= 0) {
+        // 管道许可上下文之三：return 值
+        pipe_mark(n.na);
+        var saved_ve3: i64 = g_vec_expect;
+        var saved_te3: i64 = g_tile_expect;
+        var saved_le3: i64 = g_lead_expect;
+        if (ti_is_vector(cur_ret)) { g_vec_expect = cur_ret; g_tile_expect = -1; }
+        else if (ti_is_tile(cur_ret)) { g_tile_expect = cur_ret; g_vec_expect = -1; }
+        else { g_vec_expect = -1; g_tile_expect = -1; }
+        g_lead_expect = cur_ret;
+        var rt: i64 = infer_expr_hir(val_i, n.na);
+        g_vec_expect = saved_ve3;
+        g_tile_expect = saved_te3;
+        g_lead_expect = saved_le3;
+        // 逃逸分析（T-SEM-E764）：返回对局部变量/参数的引用 → 悬垂指针
+        if (expr_has_local_addr(n.na)) {
+            parse.fc_err("T-SEM-E764",
+                "返回对局部变量/参数的引用会产生悬垂指针（dangling）：该引用随函数返回而失效",
+                n.na);
+        }
+        intlit_overflow_warn(n.na, cur_ret);
+        if (tip_kind(rt) != "Unknown" && ti_equal(rt, cur_ret) == false) {
+            if (can_cast(rt, cur_ret) == false) {
+                err_type_mismatch(n.na, cur_ret, rt);
+            }
+        }
+        // 同 call 路径，return 值处的 Array→Slice / 空数组字面量→Slice 构造
+        if (tip_kind(cur_ret) == "Slice" && ti_equal(cur_ret, rt) == false && can_cast(rt, cur_ret)) {
+            var rak: string = base.nodes[n.na].kind;
+            if (rak == "array_lit" || tip_kind(rt) == "Array") {
+                n.na = base.mk_cast(n.na, ti_to_td_base(cur_ret), -1);
+                slice_set(base.nodes, s, n);
+            }
+        }
+    }
+}
+
+// 赋值语句（含复合赋值 `*r = v` 的只读引用写入检查）
+pub fn cs_assignment(s: i64, ai: i64) void {
+    var n: Node = base.nodes[s];
+    var lhs_i: i64 = hir.hir_arg(ai, 0);
+    var rhs_i: i64 = hir.hir_arg(ai, 1);
+    var tt: i64 = infer_expr_hir(lhs_i, n.na);
+    if (base.nodes[n.na].kind == "deref") {
+        var dop: i64 = base.nodes[n.na].na;
+        if (dop >= 0 && base.nodes[dop].kind == "ident") {
+            var dsi: i64 = sym_lookup(cur_scope, base.nodes[dop].sa);
+            if (dsi < 0) { dsi = sym_lookup(global_scope, base.nodes[dop].sa); }
+            if (dsi >= 0) {
+                var ddecl: i64 = syms[dsi].decl;
+                if (ddecl >= 0 && base.nodes[ddecl].kind == "var_decl" && base.nodes[ddecl].ba == true) {
+                    parse.fc_err("T-SEM-E762",
+                        base.sb_cat3("不能透过只读引用 `", base.nodes[dop].sa,
+                            "` 写入：它由 `let`/`const` 声明（只读），要用可变引用请改用 `var` 声明"),
+                        n.na);
+                }
+            }
+        }
+    }
+    // 管道许可上下文之二：赋值右侧
+    pipe_mark(n.nb);
+    var saved_ve1: i64 = g_vec_expect;
+    var saved_te1: i64 = g_tile_expect;
+    var saved_le1: i64 = g_lead_expect;
+    if (ti_is_vector(tt)) { g_vec_expect = tt; g_tile_expect = -1; }
+    else if (ti_is_tile(tt)) { g_tile_expect = tt; g_vec_expect = -1; }
+    else { g_vec_expect = -1; g_tile_expect = -1; }
+    g_lead_expect = tt;
+    var vt2: i64 = infer_expr_hir(rhs_i, n.nb);
+    g_vec_expect = saved_ve1;
+    g_tile_expect = saved_te1;
+    g_lead_expect = saved_le1;
+    intlit_overflow_warn(n.nb, tt);
+    if (tip_kind(tt) != "Unknown" && tip_kind(vt2) != "Unknown" && ti_equal(tt, vt2) == false) {
+        var str_to_sym2: bool = tip_kind(tt) == "Sym" && tip_kind(vt2) == "String";
+        if (str_to_sym2 == false && can_cast(vt2, tt) == false) {
+            err_type_mismatch(n.nb, tt, vt2);
+        }
+        if (tip_kind(tt) == "Slice" && ti_equal(tt, vt2) == false && can_cast(vt2, tt)) {
+            var aak: string = base.nodes[n.nb].kind;
+            if (aak == "array_lit" || tip_kind(vt2) == "Array") {
+                n.nb = base.mk_cast(n.nb, ti_to_td_base(tt), -1);
+                slice_set(base.nodes, s, n);
+            }
+        }
+    }
+}
+
+// 表达式语句
+pub fn cs_expr_stmt(s: i64, ei: i64) void {
+    var n: Node = base.nodes[s];
+    // 管道许可上下文之四：表达式语句（穿过赋值链移到最内层右值）
+    var pe: i64 = pipe_mark(n.na);
+    var discarded: bool = true;
+    var go2: bool = true;
+    while (go2 == true) {
+        go2 = false;
+        if (pe >= 0) {
+            if (base.nodes[pe].kind == "assign") {
+                pe = pipe_mark(base.nodes[pe].nb);
+                discarded = false;
+                go2 = true;
+            }
+        }
+    }
+    var was_pipe: bool = false;
+    if (pe >= 0) { was_pipe = is_pipe_kind(base.nodes[pe].kind); }
+    var et: i64 = infer_expr_hir(ei, n.na);
+    // 管道 `|>` 逐元素 + void lambda 降级：lower_pipe 把管道根就地改写成 block
+    if (base.nodes[n.na].kind == "block") {
+        var blk: Node = base.nodes[n.na];
+        hir.hir_invalidate(s);
+        n.kind = "block";
+        n.sa = "";
+        n.sb = "";
+        n.na = -1;
+        n.nb = -1;
+        n.la = blk.la;
+        slice_set(base.nodes, s, n);
+        cs_block_node(s);
+        return;
+    }
+    if (discarded == false) { was_pipe = false; }
+    if (was_pipe == true) {
+        if (tip_kind(et) != "Void" && tip_kind(et) != "Unknown") {
+            pipe_warn("T-PIP-W868",
+                base.sb_cat3("管道结果类型为 `", ti_str(et),
+                    "` 但被丢弃：请接收结果，或让末级函数返回 void"), n.na);
+        }
+    }
+}
+
+// 语句指令分派（HIR 驱动）
+pub fn check_stmt_hir(si: i64) void {
+    var op: i64 = hir.hir_op_of(si);
+    // BLOCK 可能由语句列表头合成（无源节点），须先于节点解析处理
+    if (op == hir.HIR_OP_BLOCK) { cs_block_inst(si); return; }
+    var s: i64 = hir.hir_inst_node(si);
+    if (s < 0) { return; }
+    var n: Node = base.nodes[s];
+    if (op == hir.HIR_OP_CAPTURE) {
+        if (n.na >= 0) { sym_define(cur_scope, n.sa, "var", resolve_ti(n.na), -1); }
+        return;
+    }
+    if (op == hir.HIR_OP_LOCAL_DECL) { cs_var_decl(s, hir.hir_arg(si, 0)); return; }
+    if (op == hir.HIR_OP_IF) { cs_if(s, hir.hir_arg(si, 0), hir.hir_arg(si, 1), hir.hir_arg(si, 2)); return; }
+    if (op == hir.HIR_OP_LOOP) { cs_loop(s, -1, hir.hir_arg(si, 0), -1, hir.hir_arg(si, 1)); return; }
+    if (op == hir.HIR_OP_FOR) { cs_loop(s, hir.hir_arg(si, 0), hir.hir_arg(si, 1), hir.hir_arg(si, 2), hir.hir_arg(si, 3)); return; }
+    if (op == hir.HIR_OP_FORIN) { cs_forin(s, hir.hir_arg(si, 0), hir.hir_arg(si, 1)); return; }
+    if (op == hir.HIR_OP_RETURN) { cs_return(s, hir.hir_arg(si, 0)); return; }
+    if (op == hir.HIR_OP_ASSIGN) {
+        // 只有复合赋值（`+=` 等，kind=="assignment"）是语句；普通赋值表达式
+        // 在语句位置无动作（与原 check_stmt 行为一致）
+        if (n.kind == "assignment") { cs_assignment(s, si); }
+        return;
+    }
+    if (op == hir.HIR_OP_EXPR_STMT) { cs_expr_stmt(s, hir.hir_arg(si, 0)); return; }
+    if (op == hir.HIR_OP_DEFER) {
+        var prevd: i64 = cur_scope;
+        cur_scope = scope_new(prevd);
+        cs_stmts_hir(hir.hir_arg(si, 0));
+        cur_scope = prevd;
+        return;
+    }
+    if (op == hir.HIR_OP_COMPTIME) {
+        if (n.kind == "comptime_block") {
+            var prevc: i64 = cur_scope;
+            cur_scope = scope_new(prevc);
+            cs_stmts_hir(hir.hir_arg(si, 0));
+            cur_scope = prevc;
+        }
+        return;
+    }
+    if (op == hir.HIR_OP_BREAK) { return; }
+    if (op == hir.HIR_OP_CONTINUE) { return; }
+    if (op == hir.HIR_OP_RAW) { check_stmt_cst(s); return; }
+    // 其余指令（FIELD_SET / INDEX_SET / CALL / …）在语句层无动作：
+    // 它们只作为表达式出现在 EXPR_STMT 之下，由 infer 侧处理。
+}
+
+// ── 语句检查（CST 回落路径；复刻 checker.ts:345）────────────────
+// 仅用于「没有 HIR 指令的节点」（脱糖合成 / 就地改写后的块）。
+
+pub fn check_stmt_cst(s: i64) void {
     var n: Node = base.nodes[s];
     // 闭包体首的捕获变量重建（M48）：类型来自捕获点的原始声明，直接定义同名局部
     if (n.kind == "closure_capture") {
@@ -6806,6 +7219,7 @@ pub fn check_stmt(s: i64) void {
         // 检查（注册循环变量、递归 body），再交由后端 emit_stmt 的 block 分支发射。
         if (base.nodes[n.na].kind == "block") {
             var blk: Node = base.nodes[n.na];
+            hir.hir_invalidate(s);
             n.kind = "block";
             n.sa = "";
             n.sb = "";
@@ -6848,7 +7262,17 @@ pub fn check_stmt(s: i64) void {
 
 // ── 声明检查（复刻 checker.ts:178-341）────────────────────────
 
+// CST 入口（泛型实例克隆体等没有 HIR 指令的声明）
 pub fn check_func_decl(d: i64) void {
+    check_func_decl_ex(d, -1);
+}
+
+// HIR 入口：形参取 PARAM_DECL 指令、函数体取末位 BLOCK 指令
+pub fn check_func_decl_hir(di: i64) void {
+    check_func_decl_ex(hir.hir_inst_node(di), di);
+}
+
+pub fn check_func_decl_ex(d: i64, di: i64) void {
     var n: Node = base.nodes[d];
     if (n.lc == -2) {
         return;
@@ -6865,20 +7289,42 @@ pub fn check_func_decl(d: i64) void {
     var prev_lam: bool = lex.g_in_lambda;
     lex.g_in_lambda = n.sc == "__lambda__";
 
-    var c: i64 = n.lb;
-    while (c >= 0) {
-        var k: Child = base.kids[c];
-        var p: Node = base.nodes[k.val];
-        sym_define(cur_scope, p.sa, "var", resolve_ti(p.na), -1);
-        // T-SEM-E214：简写闭包 `|v|` 参数类型若到检查期仍无上下文回填 → 报错（绝不默认 any）
-        if (p.na >= 0 && tip_kind(resolve_ti(p.na)) == "Infer") {
-            parse.fc_err("T-SEM-E214",
-                base.sb_cat5("匿名函数参数 `", p.sa,
-                    "` 的类型无法推断：请标注目标类型（如 `var g: fn(T)U = |name| ...`），或显式写出 `|",
-                    p.sa, ": Type|`"),
-                d);
+    if (di >= 0) {
+        // HIR 路径：FN_DECL 的 args = [PARAM_DECL..., body]
+        var pc: i64 = hir.hir_arg_count(di);
+        var pi: i64 = 0;
+        while (pi < pc - 1) {
+            var p_inst: i64 = hir.hir_arg(di, pi);
+            var pid2: i64 = hir.hir_inst_node(p_inst);
+            if (pid2 >= 0) {
+                var pn: Node = base.nodes[pid2];
+                sym_define(cur_scope, pn.sa, "var", resolve_ti(pn.na), -1);
+                // T-SEM-E214：简写闭包 `|v|` 参数类型若到检查期仍无上下文回填 → 报错（绝不默认 any）
+                if (pn.na >= 0 && tip_kind(resolve_ti(pn.na)) == "Infer") {
+                    parse.fc_err("T-SEM-E214",
+                        base.sb_cat5("匿名函数参数 `", pn.sa,
+                            "` 的类型无法推断：请标注目标类型（如 `var g: fn(T)U = |name| ...`），或显式写出 `|",
+                            pn.sa, ": Type|`"),
+                        d);
+                }
+            }
+            pi = pi + 1;
         }
-        c = k.next;
+    } else {
+        var c: i64 = n.lb;
+        while (c >= 0) {
+            var k: Child = base.kids[c];
+            var p: Node = base.nodes[k.val];
+            sym_define(cur_scope, p.sa, "var", resolve_ti(p.na), -1);
+            if (p.na >= 0 && tip_kind(resolve_ti(p.na)) == "Infer") {
+                parse.fc_err("T-SEM-E214",
+                    base.sb_cat5("匿名函数参数 `", p.sa,
+                        "` 的类型无法推断：请标注目标类型（如 `var g: fn(T)U = |name| ...`），或显式写出 `|",
+                        p.sa, ": Type|`"),
+                    d);
+            }
+            c = k.next;
+        }
     }
 
     var prev_ret: i64 = cur_ret;
@@ -6889,11 +7335,16 @@ pub fn check_func_decl(d: i64) void {
         cur_ret = infer_lambda_ret_from_decl(d);
     }
 
-    var c2: i64 = n.lc;
-    while (c2 >= 0) {
-        var k2: Child = base.kids[c2];
-        check_stmt(k2.val);
-        c2 = k2.next;
+    if (di >= 0) {
+        var bi: i64 = hir.hir_arg(di, hir.hir_arg_count(di) - 1);
+        if (bi >= 0) { check_stmt_hir(bi); }
+    } else {
+        var c2: i64 = n.lc;
+        while (c2 >= 0) {
+            var k2: Child = base.kids[c2];
+            check_stmt(k2.val);
+            c2 = k2.next;
+        }
     }
 
     if (tip_kind(cur_ret) != "Void") {
@@ -7140,58 +7591,111 @@ pub fn check_decl(d: i64) void {
         return;
     }
     if (n.kind == "GlobalVarDecl") {
-        if (n.nb >= 0) {
-            // 模块级全局的向量字面量构造：`var g: @Vector(4,i32) = [1,2,3,4];`
-            // 与局部 var_decl 同一机制，注入期望类型后由 array_lit 分支升格。
-            var saved_ve6: i64 = g_vec_expect;
-            var saved_te6: i64 = g_tile_expect;
-            var gvt0: i64 = resolve_ti(n.na);
-            if (ti_is_vector(gvt0)) { g_vec_expect = gvt0; g_tile_expect = -1; }
-            else if (ti_is_tile(gvt0)) { g_tile_expect = gvt0; g_vec_expect = -1; }
-            else { g_vec_expect = -1; g_tile_expect = -1; }
-            var it: i64 = infer_expr(n.nb);
-            g_vec_expect = saved_ve6;
-            g_tile_expect = saved_te6;
-            var vt: i64 = resolve_ti(n.na);
-            if (tip_kind(it) != "Unknown" && ti_equal(it, vt) == false) {
-                // Sym 全局变量允许由字符串赋值（自动 intern → id）
-                var gss: bool = tip_kind(vt) == "Sym" && tip_kind(it) == "String";
-                if (gss == false && can_cast(it, vt) == false) {
-                    err_type_mismatch(n.nb, vt, it);
-                }
-            }
-        }
+        check_global_var_decl(d);
         return;
     }
     if (n.kind == "GlobalConstDecl") {
-        if (n.nb >= 0) {
-            // 模块级 const 的向量字面量构造（同 GlobalVarDecl）
-            var saved_ve7: i64 = g_vec_expect;
-            var saved_te7: i64 = g_tile_expect;
-            if (n.na >= 0) {
-                var gct0: i64 = resolve_ti(n.na);
-                if (ti_is_vector(gct0)) { g_vec_expect = gct0; g_tile_expect = -1; }
-                else if (ti_is_tile(gct0)) { g_tile_expect = gct0; g_vec_expect = -1; }
-                else { g_vec_expect = -1; g_tile_expect = -1; }
-            }
-            var it2: i64 = infer_expr(n.nb);
-            g_vec_expect = saved_ve7;
-            g_tile_expect = saved_te7;
-            if (n.na >= 0) {
-                var ct: i64 = resolve_ti(n.na);
-                if (tip_kind(it2) != "Unknown" && ti_equal(it2, ct) == false) {
-                    if (can_cast(it2, ct) == false) {
-                        err_type_mismatch(n.nb, ct, it2);
-                    }
-                }
-            }
-            // const 引用静态常量规则（仅对 const 声明生效；let 不受限）
-            if (base.g_const_decl_has(d)) { check_const_ref(d); }
-        }
+        check_global_const_decl(d);
         return;
     }
     // 注：ImportModDecl 节点已在 resolve_modules（run_check 入口）内联解析时
     // 被整体移除，故此处不会再遇到；若残留（理论上不会）将由下方通用分支兜底。
+}
+
+// 模块级全局变量（HIR 消费路径与 CST 路径共用）
+pub fn check_global_var_decl(d: i64) void {
+    var n: Node = base.nodes[d];
+    if (n.nb >= 0) {
+        // 模块级全局的向量字面量构造：`var g: @Vector(4,i32) = [1,2,3,4];`
+        // 与局部 var_decl 同一机制，注入期望类型后由 array_lit 分支升格。
+        var saved_ve6: i64 = g_vec_expect;
+        var saved_te6: i64 = g_tile_expect;
+        var gvt0: i64 = resolve_ti(n.na);
+        if (ti_is_vector(gvt0)) { g_vec_expect = gvt0; g_tile_expect = -1; }
+        else if (ti_is_tile(gvt0)) { g_tile_expect = gvt0; g_vec_expect = -1; }
+        else { g_vec_expect = -1; g_tile_expect = -1; }
+        var it: i64 = infer_expr(n.nb);
+        g_vec_expect = saved_ve6;
+        g_tile_expect = saved_te6;
+        var vt: i64 = resolve_ti(n.na);
+        if (tip_kind(it) != "Unknown" && ti_equal(it, vt) == false) {
+            // Sym 全局变量允许由字符串赋值（自动 intern → id）
+            var gss: bool = tip_kind(vt) == "Sym" && tip_kind(it) == "String";
+            if (gss == false && can_cast(it, vt) == false) {
+                err_type_mismatch(n.nb, vt, it);
+            }
+        }
+    }
+}
+
+// 模块级全局常量（HIR 消费路径与 CST 路径共用）
+pub fn check_global_const_decl(d: i64) void {
+    var n: Node = base.nodes[d];
+    if (n.nb >= 0) {
+        // 模块级 const 的向量字面量构造（同 GlobalVarDecl）
+        var saved_ve7: i64 = g_vec_expect;
+        var saved_te7: i64 = g_tile_expect;
+        if (n.na >= 0) {
+            var gct0: i64 = resolve_ti(n.na);
+            if (ti_is_vector(gct0)) { g_vec_expect = gct0; g_tile_expect = -1; }
+            else if (ti_is_tile(gct0)) { g_tile_expect = gct0; g_vec_expect = -1; }
+            else { g_vec_expect = -1; g_tile_expect = -1; }
+        }
+        var it2: i64 = infer_expr(n.nb);
+        g_vec_expect = saved_ve7;
+        g_tile_expect = saved_te7;
+        if (n.na >= 0) {
+            var ct: i64 = resolve_ti(n.na);
+            if (tip_kind(it2) != "Unknown" && ti_equal(it2, ct) == false) {
+                if (can_cast(it2, ct) == false) {
+                    err_type_mismatch(n.nb, ct, it2);
+                }
+            }
+        }
+        // const 引用静态常量规则（仅对 const 声明生效；let 不受限）
+        if (base.g_const_decl_has(d)) { check_const_ref(d); }
+    }
+}
+
+// ── Stage B：按 HIR 指令分派的声明检查 ──────────────────────────
+// 入口是 HIR decl 指令（而非 CST 节点 kind）：decl 工作集、检查顺序全部由
+// g_hir.decls 决定；语义动作仍落到源节点（hir_inst_node）。
+pub fn check_decl_hir(di: i64) void {
+    var d: i64 = hir.hir_inst_node(di);
+    if (d < 0) { return; }
+    var op: i64 = hir.hir_op_of(di);
+    if (op == hir.HIR_OP_RAW) { check_decl(d); return; }
+    if (op == hir.HIR_OP_FN_DECL) {
+        var n: Node = base.nodes[d];
+        // Device 入口 `kernel fn`：设备体不在 host 阶段做类型检查。
+        if (n.bf == true) { return; }
+        if (func_is_generic(d)) { return; }
+        check_func_decl_hir(di);
+        return;
+    }
+    if (op == hir.HIR_OP_STRUCT_DECL) { check_struct_decl(d); return; }
+    if (op == hir.HIR_OP_ENUM_DECL) { check_enum_decl(d); return; }
+    if (op == hir.HIR_OP_FLAG_DECL) { check_flag_decl(d); return; }
+    if (op == hir.HIR_OP_FLAGSET_DECL) { check_flag_decl(d); return; }
+    if (op == hir.HIR_OP_GLOBAL_DECL) {
+        var k: string = base.nodes[d].kind;
+        if (k == "GlobalVarDecl") { check_global_var_decl(d); return; }
+        if (k == "GlobalConstDecl") { check_global_const_decl(d); return; }
+        return;
+    }
+    // 其余（import / module / type_alias / union / variant / const_decl）：
+    // 与 check_decl 的兜底一致 —— 声明期无动作。
+}
+
+// HIR decl 指令是否属于「纯类型声明」第一趟（彼此无依赖，可先登记名字）。
+pub fn hir_decl_is_type_op(op: i64) bool {
+    if (op == hir.HIR_OP_STRUCT_DECL) { return true; }
+    if (op == hir.HIR_OP_ENUM_DECL) { return true; }
+    if (op == hir.HIR_OP_FLAG_DECL) { return true; }
+    if (op == hir.HIR_OP_FLAGSET_DECL) { return true; }
+    if (op == hir.HIR_OP_UNION_DECL) { return true; }
+    if (op == hir.HIR_OP_VARIANT_DECL) { return true; }
+    return false;
 }
 
 // ── §7.2 CTFE 导入脱糖（M27）──────────────────────────────────
@@ -10466,6 +10970,10 @@ pub fn meta_fold_expr(e: i64) void {
     g_meta_err = false;
     var v: i64 = meta_eval(e);
     if (v < 0) { return; }
+    // 就地整节点改写（kind 也会变：comptime 表达式折叠成字面量）⇒ 该节点的 HIR
+    // 指令（COMPTIME 等）即失效，必须断开映射，否则后续 infer 会按**折叠前**的
+    // 语义标签分派（实测：`int -> comptime` → 读 n.na = -1 → 越界崩溃）。
+    hir.hir_invalidate(e);
     var src: Node = base__nodes[v];
     var dst: Node = base__nodes[e];
     dst.kind = src.kind;
@@ -10930,6 +11438,8 @@ pub fn mb_fold(e: i64) i64 {
 pub fn mb_fold_inplace(e: i64) void {
     var v: i64 = mb_fold(e);
     if (v < 0) { return; }
+    // 同 meta_fold_expr：就地改写 kind ⇒ 原 HIR 指令（MBUILTIN 等）失效。
+    hir.hir_invalidate(e);
     var src: Node = base__nodes[v];
     var dst: Node = base__nodes[e];
     dst.kind = src.kind;
@@ -11283,22 +11793,40 @@ pub fn run_check() void {
     // 一趟按声明序注册会让「函数形参类型晚于函数声明」的前向引用误报 T_UNKNOWN_TYPE；
     // import 更是必然踩中 —— load_module_file 把模块声明**追加**在 decl_list 末尾，
     // 入口文件里 `f fn(m: mod.T)` 永远先于 mod 的 StructDecl 被注册。
-    var n: i64 = slice_len(lex__decl_list) as i64;
+    // ── Stage B：AstGen 重建（脱糖 / 名字重整之后）─────────────────
+    // parse 期那一份 HIR 是缓存制品（键 = 源哈希）；sema 消费的必须是**脱糖后**
+    // 的树 —— 模块内联会追加声明、子句合并会改写节点、名字重整会改 sa。
+    // 重建代价 = 一次 AstGen，换来 sema 全程只认 HIR。
+    hir.hir_build(hir.g_last_src);
+
+    // 注册三趟（趟次语义不变），工作集与分类全部取自 HIR decl 指令。
+    var n: i64 = slice_len(hir.g_hir.decls) as i64;
     var i: i64 = 0;
     while (i < n) {
-        if (is_type_decl_node(lex__decl_list[i])) { register_decl(lex__decl_list[i]); }
+        var dai: i64 = hir.g_hir.decls[i];
+        if (hir_decl_is_type_op(hir.hir_op_of(dai))) {
+            var d0: i64 = hir.hir_inst_node(dai);
+            if (d0 >= 0) { register_decl(d0); }
+        }
         i = i + 1;
     }
     var ia: i64 = 0;
     while (ia < n) {
-        if (base__nodes[lex__decl_list[ia]].kind == "TypeAliasDecl") { register_decl(lex__decl_list[ia]); }
+        var d1i: i64 = hir.g_hir.decls[ia];
+        if (hir.hir_op_of(d1i) == hir.HIR_OP_TYPE_ALIAS_DECL) {
+            var d1: i64 = hir.hir_inst_node(d1i);
+            if (d1 >= 0) { register_decl(d1); }
+        }
         ia = ia + 1;
     }
     var ib: i64 = 0;
     while (ib < n) {
-        var dcl: i64 = lex__decl_list[ib];
-        if (is_type_decl_node(dcl) == false) {
-            if (base__nodes[dcl].kind != "TypeAliasDecl") { register_decl(dcl); }
+        var d2i: i64 = hir.g_hir.decls[ib];
+        if (hir_decl_is_type_op(hir.hir_op_of(d2i)) == false) {
+            if (hir.hir_op_of(d2i) != hir.HIR_OP_TYPE_ALIAS_DECL) {
+                var d2: i64 = hir.hir_inst_node(d2i);
+                if (d2 >= 0) { register_decl(d2); }
+            }
         }
         ib = ib + 1;
     }
@@ -11311,20 +11839,40 @@ pub fn run_check() void {
     // 必须在 check_decl 之前：折叠后 checker 看到的是普通字面量，
     // 双后端也因此无需为 meta 单独发射（见 docs/compiler/meta_design.md §9 Phase B）。
     meta_pass();
-    // desugar 可能追加合成的 __import_N 函数，重新取长度以便一并检查
-    var n2: i64 = slice_len(lex__decl_list) as i64;
+    // ⚠ 再重建一次 HIR：mb_pass / meta_pass 会**改结构**（编译期块执行完即清空语句表、
+    // `meta <expr>` 就地折叠成字面量）。注册期那一份指令流已与当前 CST 脱节 ——
+    // 照它走会把「已被删除的语句」重新检查一遍（实测：`comptime {}` 里的
+    // `@str_from_bytes` 被判 T-MTA-E605，因为它本该随块一起消失）。
+    hir.hir_build(hir.g_last_src);
+    // 检查循环：走 HIR decl 指令流。检查期会合成新声明（__fmt_N / __pipe_N /
+    // __import_N），故每次走到队尾就同步一次 AstGen，让循环自然覆盖（不动点）。
     var j: i64 = 0;
-    while (j < n2) {
-        check_decl(lex__decl_list[j]);
+    var rounds: i64 = 0;
+    while (j < slice_len(hir.g_hir.decls) as i64) {
+        var dji: i64 = hir.g_hir.decls[j];
+        var dj: i64 = hir.hir_inst_node(dji);
+        if (dj >= 0) {
+            if (g_pipe_bad == true) {
+                if (pipe_decl_has(dj)) { j = j + 1; continue; }
+            }
+            check_decl_hir(dji);
+        }
         j = j + 1;
+        if (j >= slice_len(hir.g_hir.decls) as i64) {
+            if (rounds >= 64) { break; }
+            var addn: i64 = hir.hir_sync();
+            rounds = rounds + 1;
+            if (addn == 0) { break; }
+        }
     }
-    // 管道降解在 check 期追加的 __pipe_N：上面的长度已冻结，故单独补检。
-    // 只补检管道合成函数（而非整段新增尾巴），避免波及 __fmt_N 等既有合成路径的行为。
+    // 管道降解在 check 期追加的 __pipe_N：多数已被上面的同步拾走，这里只兜底
+    // 「仍无 HIR 指令」的残留（g_pipe_bad 时主诊断已报，不级联二手噪声）。
     var jp: i64 = 0;
     var npd: i64 = slice_len(g_pipe_decls) as i64;
-    if (g_pipe_bad == true) { npd = 0; }   // 已有主诊断，别再级联二手噪声
+    if (g_pipe_bad == true) { npd = 0; }
     while (jp < npd) {
-        check_decl(g_pipe_decls[jp]);
+        var pd: i64 = g_pipe_decls[jp];
+        if (hir.hir_of_node(pd) < 0) { check_decl(pd); }
         jp = jp + 1;
     }
     // P0-2 / P0-3：实例体的补齐检查已落在 instantiate_generic 内部（克隆+代换后即重跑
@@ -11332,6 +11880,17 @@ pub fn run_check() void {
     // 嵌套泛型再单态化与 format/!j 脱糖一并完成，且落在主检查循环/代码生成预处理之前，
     // 脱糖结果直接进入同一趟发射视图。主循环之后不再需要 fixpoint。
     scan_fid_format_atoms();
+}
+
+// g_pipe_decls 是否含该声明（HIR 检查循环用它跳过「管道已报错」的二手噪声）
+pub fn pipe_decl_has(d: i64) bool {
+    var i: i64 = 0;
+    var n: i64 = slice_len(g_pipe_decls) as i64;
+    while (i < n) {
+        if (g_pipe_decls[i] == d) { return true; }
+        i = i + 1;
+    }
+    return false;
 }
 
 // 标记「作为 call callee 的 member 节点」：`p.clone()`（@derive 生成的方法调用写法）、

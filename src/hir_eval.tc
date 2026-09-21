@@ -497,6 +497,16 @@ pub fn hv_step(idx: i64) EvRet {
         var rc: EvRet = hv_eval_block(idx);
         return rc;
     }
+    // 表达式语句：语句层的赋值/调用都裹在它下面（Stage B 新增 op）。
+    // ⚠ 不转发会让 `while (i <= n) { i = i + 1; }` 的更新语句整条被丢弃 ⇒
+    //   循环变量永不推进 ⇒ arena 被无限累积的 HIR 值撑爆（实测 basic.tc OOM）。
+    if (op == hir.HIR_OP_EXPR_STMT) {
+        if (slice_len(inst.args) as i64 >= 1) {
+            var rc2: EvRet = hv_step(inst.args[0]);
+            return rc2;
+        }
+        return res;
+    }
     // 二元/一元
     if (op == hir.HIR_OP_BINOP) {
         hv_ensure(inst.args[0]);
@@ -617,9 +627,15 @@ pub fn hv_step(idx: i64) EvRet {
         }
         return res;
     }
-    // loop（while / for_each / C-for）
+    // loop（while）/ for-in（for_each）/ C-for
     if (op == hir.HIR_OP_LOOP) {
         return hv_eval_loop(inst);
+    }
+    if (op == hir.HIR_OP_FORIN) {
+        return hv_eval_loop(inst);
+    }
+    if (op == hir.HIR_OP_FOR) {
+        return hv_eval_for(inst);
     }
     // return / break / continue
     if (op == hir.HIR_OP_RETURN) {
@@ -695,6 +711,25 @@ pub fn hv_eval_loop(inst: HirInst) EvRet {
         if (brc.sig == 1) { return brc; }
         if (brc.sig == 2) { break; }
         if (brc.sig == 3) { /* continue */ }
+    }
+    return res;
+}
+
+// C 式 for：args=[init(-1), cond(-1), upd(-1), body]（固定 4 槽位）
+pub fn hv_eval_for(inst: HirInst) EvRet {
+    var res: EvRet;
+    res.sig = 0; res.val = -1;
+    if (inst.args[0] >= 0) { hv_step(inst.args[0]); }
+    while (true) {
+        if (inst.args[1] >= 0) {
+            hv_ensure(inst.args[1]);
+            var cv: i64 = g_slots[inst.args[1]];
+            if (cv < 0 || g_hv[cv].kind != HV_BOOL || g_hv[cv].b == false) { break; }
+        }
+        var brc: EvRet = hv_eval_block(inst.args[3]);
+        if (brc.sig == 1) { return brc; }
+        if (brc.sig == 2) { break; }
+        if (inst.args[2] >= 0) { hv_step(inst.args[2]); }
     }
     return res;
 }

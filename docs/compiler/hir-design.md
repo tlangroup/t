@@ -1,6 +1,9 @@
 # HIR —— t 语言「未定型 · 线性 · 可序列化」IR（ZIR 槽位）
 
-> 状态：草案 v0.1（设计阶段，尚未落地）
+> 状态：v0.3 —— **Stage A（AstGen）+ Stage B（sema 消费 HIR）已落地**
+>   - Stage A：CST → HIR（未定型·线性·可序列化），`tc emit-hir` 可 dump，二进制往返一致。
+>   - Stage B：sema 的**遍历与分派**全部改以 HIR 为输入（见 §5.1）；RAW 逃生舱归零，
+>     由 `tools/hir_test.mjs` 的覆盖扫描在门禁里守住。
 > 作者：Buddy（编译管线设计专家视角）
 > 关联：`docs/compiler/ir-taxonomy.md §6`（采纳选项 A 的裁定依据）、`docs/compiler/compiler-pipeline-design.md §4.2`、`docs/compiler/tir-design.md`
 > 命名裁定：本设计里 **HIR = Zig 的 ZIR 槽位**——由 AstGen 产出、位于 Sema **之前**。沿用缩写 HIR，但语义已重新定义为「未定型 · 线性 · 可序列化」，**不是**传统的 High-level typed IR。完整对位见 `ir-taxonomy.md`。
@@ -96,11 +99,46 @@ CST ──AstGen──▶ HIR（未定型·线性·可序列化，= ZIR 槽位�
 
 ## 5. 与 Sema / CTFE 的接口（选项 A 的核心成本）
 
-当前 `sema.tc` 的 `meta_eval_call` / `comptime_fold_pass` **直接在 AST 树上求值**。采纳 A 后：
+CTFE 已改为解释 HIR 指令流（`src/hir_eval.tc`，Stage A'）。Sema 消费 HIR 见 §5.1。
 
-1. **CTFE 改为解释 HIR 指令流**：comptime 求值器遍历 HIR body 而非 AST。
-2. **Sema 改为消费 HIR**：名字解析、类型检查、单态化都以 HIR 为输入，产出 mir。
-3. 重写是**孤立的风险线**，建议单列 Stage，与 TIR 落地解耦（不在同一个 gate 里捆）。
+### 5.1 Stage B：sema 消费 HIR（已落地）
+
+契约：**HIR 决定「走哪、走几条边」，CST 承载语义动作**。每条 HIR 指令带源节点 id
+（`HirInst.nd`），sema 经 `hir_inst_node` 回桥到节点做变更与诊断 —— 因为 format /
+管道 / 区间的脱糖与全部后端仍在 CST 上工作。
+
+| 层 | 入口 | 输入 |
+|---|---|---|
+| 顶层声明工作集 | `run_check` 三趟注册 + 检查循环 | `hir.g_hir.decls`（= `lex.decl_list` 的 HIR 视图） |
+| 声明分派 | `check_decl_hir(di)` | decl 指令 op（FN_DECL / STRUCT_DECL / …） |
+| 函数体 | `check_func_decl_hir(di)` | FN_DECL args = `[PARAM_DECL…, body BLOCK]` |
+| 语句 | `check_stmt_hir(si)` | BLOCK/IF/LOOP/FOR/FORIN/RETURN/LOCAL_DECL/EXPR_STMT… |
+| 表达式入口 | `infer_expr_hir(inst, fb)` | 子表达式一律经 HIR 指令进入 |
+| 表达式分派键 | `hir_tag(e)` | HIR op → 语义标签（`hir_tag_of_op`） |
+
+**AstGen 的时机**：parse 期那一份是缓存制品（键 = 源哈希）。sema 消费的必须是
+**脱糖后**的树（模块内联追加声明、子句合并改写节点、名字重整改 `sa`），故 `run_check`
+在 `lower_array_len_infer()` 之后**重建**一次；检查期合成的声明（`__fmt_N` /
+`__pipe_N` / `__import_N`）由 `hir_sync()` 在检查循环队尾增量补降（不动点）。
+
+**失效规则**：sema 就地把节点改写成 `paren` / `block` / `serialize` / `ident` 时，
+该节点的 HIR 指令反映的是**改写前**的语法意图 —— 必须 `hir_invalidate(n)` 断开映射，
+让后续分派回落 CST kind（管道/区间的重复 infer 正是靠这个幂等收口的）。
+
+**回落边界（Stage B-2，未做）**：`infer_expr` 的分支体仍读 `n.na / n.nb / n.la`
+等节点字段；表达式内部的下降边尚未逐条搬进 HIR。
+
+**⚠ 两个必须同步的面（实测踩坑）**：
+
+1. **`mb_pass()` / `meta_pass()` 之后必须再 `hir_build()` 一次**。这两个 pass 会改 CST
+   结构：`comptime { }` 块执行完即清空语句表（`meta_run_block` 里 `la = -1`）、
+   `meta <expr>` 就地折叠成字面量。注册期那一份指令流会与当前 CST 脱节，照它走等于
+   把**已被删除的语句重新检查一遍**（实测：`tests/conformance/pass/p40_meta_builtin_ok.tc`
+   里 `comptime {}` 内的 `@str_from_bytes` 被判 T-MTA-E605）。
+2. **新增 op 必须同步 `src/hir_eval.tc`（CTFE 解释器）**。Stage B 新增的
+   `HIR_OP_EXPR_STMT` 若在解释器里没有分支，会落到「未实现 ⇒ 置空」：语句层的赋值
+   整条被丢弃 ⇒ `while (i <= n) { i = i + 1; }` 永不推进 ⇒ arena 被无限累积的编译期
+   值撑爆（`arena: out of memory`），症状是 CTFE 测试挂掉而非报错。
 
 **附带收益（采纳 A 才拿得到）**：
 - **Zig 式惰性诊断**：未实例化的泛型体内错误不报（Sema 只在实例化路径上解释 HIR）。
