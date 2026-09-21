@@ -333,6 +333,17 @@ const r = await node("ir_snapshot.mjs", "--compiler", `${G1}.exe`, "--jobs", "1"
         },
     },
     {
+        // HIR（ZIR 槽位）AstGen 护栏：emit-hir 对任意源（含编译器自身 src/tc.tc）
+        // 不崩溃、产出非空、无未识别 op，且二进制 hir_to_bin/hir_from_bin 往返一致。
+        // 跑在 g1（刚自举出的含新 HIR 的编译器）上，验证自举产物内 HIR 通路。
+        id: "hir", lv: 1, name: "HIR AstGen 验证 (emit-hir + 二进制往返)",
+        run: async () => {
+            const r = await node("hir_test.mjs", "--compiler", `${G1}.exe`);
+            if (r.code !== 0) return { ok: false, note: lastLine(r.out, 6) };
+            return { ok: true, note: lastLine(r.out, 2) };
+        },
+    },
+    {
         id: "diffgen", lv: 1, name: "difftest 代际对拍 (g2 ↔ g3)",
         run: async () => {
             if (ctx.irClean && !full) {

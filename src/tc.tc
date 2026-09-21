@@ -10,6 +10,7 @@
 @import("src.base" :: *);
 @import("src.lex" :: *);
 @import("src.parse" :: *);
+@import("src.hir" :: *);
 @import("src.sema" :: *);
 @import("src.comptime_fold" :: *);
 @import("src.codegen_c" :: *);
@@ -109,6 +110,64 @@ fn main() i32 @main {
         return lex.run_lex(file);
     }
 
+    if (cmd == "emit-hir") {
+        // HIR（ZIR 槽位）：AstGen 在 sema **之前** 产出未定型·线性·可序列化 IR。
+        // 见 docs/compiler/hir-design.md。emit-hir 不跑语义检查（pre-type）。
+        var out_p: string = "";
+        var has_outp: bool = false;
+        var src_file: string = "";
+        var has_src: bool = false;
+        var as_bin: bool = false;
+        var from_bin: bool = false;
+        var ai2: i64 = 2;
+        var an2: i64 = slice_len(argv) as i64;
+        while (ai2 < an2) {
+            if (argv[ai2] == "--output") {
+                if (ai2 + 1 < an2) { out_p = argv[ai2 + 1]; has_outp = true; }
+                ai2 = ai2 + 2; continue;
+            }
+            if (argv[ai2] == "--bin") { as_bin = true; ai2 = ai2 + 1; continue; }
+            if (argv[ai2] == "--from-bin") { from_bin = true; ai2 = ai2 + 1; continue; }
+            if (argv[ai2] == "--example") {
+                if (ai2 + 1 < an2) { src_file = base.sb_cat3("examples/", argv[ai2 + 1], ".tc"); has_src = true; }
+                ai2 = ai2 + 2; continue;
+            }
+            if (has_src == false) { src_file = argv[ai2]; has_src = true; }
+            ai2 = ai2 + 1;
+        }
+        if (has_src == false) {
+            eprint("usage: tc emit-hir <file.tc> | --example <name> [--output <path>] [--bin] [--from-bin <file.hirbin>]\n");
+            return 2;
+        }
+        // --from-bin：读取二进制 HIR 并还原为文本（验证 hir_to_bin/hir_from_bin 往返一致性）
+        if (from_bin) {
+            var bin: string = file_read_all(src_file);
+            var m2: HirModule = hir.hir_from_bin(bin);
+            print(hir.hir_to_text(m2));
+            return 0;
+        }
+        base.g_file = base.rel_path(src_file);
+        var src: string = file_read_all(src_file);
+        lex.tokenize(src);
+        if (sema.has_errors()) { base.emit_diags(); return 1; }
+        lex.pos = 0;
+        sema.init_anndefs();
+        parse.parse_unit();
+        var m: HirModule = hir.hir_build(src);
+        if (as_bin) {
+            if (has_outp == false) {
+                eprint("error: --bin 需配合 --output <path>\n");
+                return 2;
+            }
+            file_write_all(out_p, hir.hir_to_bin(m));
+            return 0;
+        }
+        var txt: string = hir.hir_to_text(m);
+        if (has_outp) { file_write_all(out_p, txt); }
+        else { print(txt); }
+        return 0;
+    }
+
     if (cmd == "check") {
         // 解析中性开关：--emit-deps（输出依赖图）、--debug-libs（优先 .tlibd）、--debug、
         // --lib-dir（调用方如 tote 注入的库搜索目录）
@@ -141,6 +200,9 @@ fn main() i32 @main {
         lex.pos = 0;
         sema.init_anndefs();
         parse.parse_unit();
+        // HIR（ZIR 槽位）AstGen：pre-sema 真实跑一次，存 g_hir 供增量缓存锚点消费。
+        // Stage A 仅产出生存（不崩溃 + 可序列化），sema 仍吃 CST，未消费 g_hir。
+        hir.hir_run(src);
         sema.run_check();
         sema.run_device_check();
         comptime_fold.comptime_fold_pass();

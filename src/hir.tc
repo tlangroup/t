@@ -1,0 +1,769 @@
+// ═════════════════════════════════════════════════════════════
+// src/hir.tc — HIR（ZIR 槽位）：未定型 · 线性 · 可序列化
+//
+// 由 AstGen 在 sema **之前** 从 CST 降级产出（docs/compiler/hir-design.md）：
+//   - 未定型（pre-type）：type_expr 只存「未解析名字引用」文本，绝不存 TD。
+//   - 线性（linear）：每个函数体 = 扁平指令数组；表达式降级到显式临时槽。
+//   - 可序列化（serializable）：hir_to_text（diff 友好）+ hir_to_bin（缓存）。
+//     缓存键 = 源内容哈希（含编译器版本戳），见 hir_hash。
+//
+// 依赖：base 仅（读 base.nodes / base.kids）。无反向引用，DAG 安全。
+//
+// 逃生舱：任何未被显式降级的节点种类 → HIR_OP_RAW（dst = CST 节点 id，sa = kind），
+// 保证 AstGen 对任意源程序都不崩溃；语义下游（sema，后续阶段）可经 node_to_hir 反查原节点。
+// ═════════════════════════════════════════════════════════════
+
+// ── 操作码（与 tir.tc 的 TIR_OP_* 同范式：pub const i64）────────
+pub const HIR_OP_INVALID: i64 = 0;
+pub const HIR_OP_LIT_INT: i64 = 1;
+pub const HIR_OP_LIT_FLOAT: i64 = 2;
+pub const HIR_OP_LIT_STR: i64 = 3;
+pub const HIR_OP_LIT_BOOL: i64 = 4;
+pub const HIR_OP_LIT_NULL: i64 = 5;
+pub const HIR_OP_LOCAL_DECL: i64 = 6;   // sa=名字, ty=未解析类型, args[0]=初始化 inst(-1=无)
+pub const HIR_OP_LOCAL_REF: i64 = 7;    // sa=名字
+pub const HIR_OP_PARAM_REF: i64 = 8;    // sa=名字
+pub const HIR_OP_CALL: i64 = 9;         // sa=被调名(未解析), args=实参 inst
+pub const HIR_OP_METHOD_CALL: i64 = 10; // sa=方法名, args[0]=接收者 inst, args[1..]=实参
+pub const HIR_OP_BINOP: i64 = 11;       // sa=运算符, args=[l, r]
+pub const HIR_OP_UNOP: i64 = 12;        // sa=运算符, args=[x]
+pub const HIR_OP_FIELD_REF: i64 = 13;   // sa=字段名, args[0]=基 inst
+pub const HIR_OP_FIELD_SET: i64 = 14;   // sa=字段名, args=[base, val]
+pub const HIR_OP_INDEX_REF: i64 = 15;   // args=[base, idx]
+pub const HIR_OP_INDEX_SET: i64 = 16;   // args=[base, idx, val]
+pub const HIR_OP_CONSTRUCT: i64 = 17;   // ty=类型 expr, sa=字段名 csv, args=值 inst
+pub const HIR_OP_IF: i64 = 18;          // args=[cond, then_blk, else_blk(-1=无)]
+pub const HIR_OP_BLOCK: i64 = 19;       // args=本块内 inst
+pub const HIR_OP_LOOP: i64 = 20;        // args=[cond(-1=无限), body_blk]（init/update 见 lowered 序列）
+pub const HIR_OP_RETURN: i64 = 21;      // args[0]=值 inst(-1=void)
+pub const HIR_OP_BREAK: i64 = 22;
+pub const HIR_OP_CONTINUE: i64 = 23;
+pub const HIR_OP_CAST: i64 = 24;        // ty=目标类型, args[0]=值 inst
+pub const HIR_OP_RAW: i64 = 25;         // 逃生舱：dst=CST 节点 id, sa=kind
+// decl 级
+pub const HIR_OP_FN_DECL: i64 = 26;     // sa=名字, ty=返回类型 expr, args=[参数 decl..., body_blk]
+pub const HIR_OP_STRUCT_DECL: i64 = 27; // sa=名字, args=字段 decl
+pub const HIR_OP_ENUM_DECL: i64 = 28;   // sa=名字, args=变体 decl
+pub const HIR_OP_UNION_DECL: i64 = 29;  // sa=名字, args=字段 decl
+pub const HIR_OP_CONST_DECL: i64 = 30;  // sa=名字, ty, args[0]=初始化 inst
+pub const HIR_OP_GLOBAL_DECL: i64 = 31; // sa=名字, ty, args[0]=初始化 inst, ba=isExtern
+pub const HIR_OP_IMPORT_DECL: i64 = 32; // sa=路径/模块名, sb=别名
+pub const HIR_OP_TYPE_ALIAS_DECL: i64 = 33; // sa=名字, ty
+pub const HIR_OP_FLAG_DECL: i64 = 34;
+pub const HIR_OP_FLAGSET_DECL: i64 = 35;
+pub const HIR_OP_VARIANT_DECL: i64 = 36; // sa=名字, ia=tag
+pub const HIR_OP_PARAM_DECL: i64 = 37;  // sa=名字, ty
+pub const HIR_OP_FIELD_DECL: i64 = 38;  // sa=名字, ty
+pub const HIR_OP_MODULE_DECL: i64 = 39; // sa=属性串
+pub const HIR_OP_CLOSURE_MAKE: i64 = 40; // sa=合成名, args=捕获 inst
+pub const HIR_OP_LAMBDA: i64 = 41;      // args=[参数 decl..., body_blk]
+pub const HIR_OP_ASSIGN: i64 = 42;      // sa=目标变量名, args=[目标 ref, 值]（普通变量赋值）
+
+// ── 数据结构 ─────────────────────────────────────────────────
+pub struct HirInst {
+    op: i64;
+    dst: i64;       // 结果临时槽（-1=无）；HIR_RAW 时 = CST 节点 id
+    args: []i64;    // 操作数 inst 索引（-1 = null/空）
+    sa: string;     // 名字/运算符/被调名/字段名/未解析类型文本等
+    ty: string;     // 未解析类型 expr 文本（pre-type；空 = N/A）
+    ba: bool;       // 通用布尔位（GLOBAL_DECL 的 isExtern 等）
+    line: u64;
+}
+
+pub struct HirModule {
+    insts: []HirInst;
+    decls: []i64;        // 顶层 decl inst 索引（顺序保留）
+    src_hash: string;    // 缓存键 = 源内容哈希（含编译器版本戳）
+    file: string;
+    node_to_hir: []i64;  // CST 节点 id → HIR inst 索引（-1 = 未映射），sema 桥
+}
+
+pub var g_hir: HirModule;
+pub var g_hir_next: i64;        // 临时槽计数器
+pub const HIR_VERSION: string = "hir-v1";
+
+pub fn hir_reset() void {
+    g_hir.insts = [];
+    g_hir.decls = [];
+    g_hir.src_hash = "";
+    g_hir.file = "";
+    g_hir.node_to_hir = [];
+    var n: i64 = slice_len(base.nodes) as i64;
+    var i: i64 = 0;
+    while (i < n) { append(g_hir.node_to_hir, -1); i = i + 1; }
+    g_hir_next = 0;
+}
+
+pub fn hir_emit(op: i64, dst: i64, args: []i64, sa: string, ty: string, line: u64) i64 {
+    var inst: HirInst;
+    inst.op = op;
+    inst.dst = dst;
+    inst.args = args;
+    inst.sa = sa;
+    inst.ty = ty;
+    inst.line = line;
+    append(g_hir.insts, inst);
+    return (slice_len(g_hir.insts) as i64) - 1;
+}
+
+pub fn hir_slot() i64 {
+    var s: i64 = g_hir_next;
+    g_hir_next = g_hir_next + 1;
+    return s;
+}
+
+// 子节点列表（Child 池）展开为 val 索引数组
+pub fn hir_list(head: i64) []i64 {
+    var out: []i64 = [];
+    var c: i64 = head;
+    while (c >= 0) {
+        var kc: base.Child = base.kids[c];
+        append(out, kc.val);
+        c = kc.next;
+    }
+    return out;
+}
+
+// 未解析类型 expr 文本（pre-type：只保留语法意图，不解析名字）
+pub fn hir_type_text(tn: i64) string {
+    if (tn < 0) { return ""; }
+    var n: base.Node = base.nodes[tn];
+    var k: string = n.kind;
+    if (k == "scalar" || k == "ident" || k == "named" || k == "atom") { return n.sa; }
+    if (k == "sym") { return base.sb_cat2("@", n.sa); }
+    if (k == "pointer") { return base.sb_cat3("ptr<", hir_type_text(n.na), ">"); }
+    if (k == "slice") { return base.sb_cat3("[]", hir_type_text(n.na), ""); }
+    if (k == "array") { return base.sb_cat3(base.sb_cat2("[", n.sa), "]", hir_type_text(n.na)); }
+    if (k == "optional") { return base.sb_cat2("?", hir_type_text(n.na)); }
+    if (k == "amp") { return base.sb_cat2("&", hir_type_text(n.na)); }
+    if (k == "func_type") {
+        var ps: []i64 = hir_list(n.la);
+        var s: string = "fn(";
+        var i: i64 = 0;
+        while (i < slice_len(ps) as i64) {
+            if (i > 0) { s = base.sb_cat2(s, ","); }
+            s = base.sb_cat2(s, hir_type_text(base.nodes[ps[i]].na));
+            i = i + 1;
+        }
+        return base.sb_cat3(s, ")", hir_type_text(n.na));
+    }
+    if (k == "member") { return base.sb_cat3(hir_type_text(n.na), ".", n.sa); }
+    if (n.sa != "") { return n.sa; }
+    return "<type>";
+}
+
+// ── 顶层入口 ─────────────────────────────────────────────────
+pub fn hir_is_decl(k: string) bool {
+    if (k == "FuncDecl") { return true; }
+    if (k == "StructDecl") { return true; }
+    if (k == "EnumDecl") { return true; }
+    if (k == "UnionDecl") { return true; }
+    if (k == "GlobalConstDecl") { return true; }
+    if (k == "GlobalVarDecl") { return true; }
+    if (k == "TypeAliasDecl") { return true; }
+    if (k == "ImportDecl") { return true; }
+    if (k == "ImportModDecl") { return true; }
+    if (k == "ModuleDecl") { return true; }
+    if (k == "FlagDecl") { return true; }
+    if (k == "FlagSetDecl") { return true; }
+    if (k == "VariantDecl") { return true; }
+    return false;
+}
+
+// AstGen：parse 之后、sema 之前调用。src = 当前文件内容（算缓存键）。
+pub fn hir_build(src: string) HirModule {
+    hir_reset();
+    g_hir.src_hash = hir_hash(src);
+    g_hir.file = base.g_file;
+    var n: i64 = slice_len(base.nodes) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        var nd: base.Node = base.nodes[i];
+        if (hir_is_decl(nd.kind) && g_hir.node_to_hir[i] < 0) {
+            var idx: i64 = hir_lower_decl(i);
+            if (idx >= 0) { append(g_hir.decls, idx); }
+        }
+        i = i + 1;
+    }
+    return g_hir;
+}
+
+// 管线真实产物：parse 后跑一次，存 g_hir（后续阶段/缓存消费）。
+pub fn hir_run(src: string) i64 {
+    hir_build(src);
+    return 0;
+}
+
+// ── decl 降级 ────────────────────────────────────────────────
+pub fn hir_lower_decl(d: i64) i64 {
+    if (d < 0) { return -1; }
+    if (g_hir.node_to_hir[d] >= 0) { return g_hir.node_to_hir[d]; }
+    var n: base.Node = base.nodes[d];
+    var k: string = n.kind;
+    var idx: i64 = -1;
+    if (k == "FuncDecl") {
+        idx = hir_lower_funcdecl(d);
+    } else if (k == "StructDecl") {
+        var fields: []i64 = hir_list(n.lb);
+        var fargs: []i64 = [];
+        var fi: i64 = 0;
+        while (fi < slice_len(fields) as i64) {
+            var vn: base.Node = base.nodes[fields[fi]];
+            var fd: i64 = hir_emit(HIR_OP_FIELD_DECL, -1, [], vn.sa, hir_type_text(vn.na), vn.ln);
+            append(fargs, fd);
+            fi = fi + 1;
+        }
+        idx = hir_emit(HIR_OP_STRUCT_DECL, -1, fargs, n.sa, "", n.ln);
+    } else if (k == "EnumDecl") {
+        var vs: []i64 = hir_list(n.lb);
+        var vargs: []i64 = [];
+        var vi: i64 = 0;
+        while (vi < slice_len(vs) as i64) {
+            var vcn: base.Node = base.nodes[vs[vi]];
+            var vd: i64 = hir_emit(HIR_OP_VARIANT_DECL, -1, [], vcn.sa, "", vcn.ln);
+            append(vargs, vd);
+            vi = vi + 1;
+        }
+        idx = hir_emit(HIR_OP_ENUM_DECL, -1, vargs, n.sa, "", n.ln);
+    } else if (k == "UnionDecl") {
+        var fields: []i64 = hir_list(n.lb);
+        var fargs: []i64 = [];
+        var fi: i64 = 0;
+        while (fi < slice_len(fields) as i64) {
+            var vn: base.Node = base.nodes[fields[fi]];
+            var fd: i64 = hir_emit(HIR_OP_FIELD_DECL, -1, [], vn.sa, hir_type_text(vn.na), vn.ln);
+            append(fargs, fd);
+            fi = fi + 1;
+        }
+        idx = hir_emit(HIR_OP_UNION_DECL, -1, fargs, n.sa, "", n.ln);
+    } else if (k == "GlobalConstDecl" || k == "GlobalVarDecl") {
+        var init: i64 = -1;
+        if (n.nb >= 0) { init = hir_lower_expr(n.nb); }
+        idx = hir_emit(HIR_OP_GLOBAL_DECL, -1, [init], n.sa, hir_type_text(n.na), n.ln);
+        if (idx >= 0) { var ii: i64 = slice_len(g_hir.insts) as i64 - 1; g_hir.insts[ii].ba = n.bb; }
+    } else if (k == "TypeAliasDecl") {
+        idx = hir_emit(HIR_OP_TYPE_ALIAS_DECL, -1, [], n.sa, hir_type_text(n.na), n.ln);
+    } else if (k == "ImportDecl") {
+        idx = hir_emit(HIR_OP_IMPORT_DECL, -1, [], n.sb, n.sc, n.ln);
+    } else if (k == "ImportModDecl") {
+        idx = hir_emit(HIR_OP_IMPORT_DECL, -1, [], n.sb, n.sc, n.ln);
+    } else if (k == "ModuleDecl") {
+        idx = hir_emit(HIR_OP_MODULE_DECL, -1, [], n.sa, "", n.ln);
+    } else if (k == "FlagDecl") {
+        idx = hir_emit(HIR_OP_FLAG_DECL, -1, [], n.sa, "", n.ln);
+    } else if (k == "FlagSetDecl") {
+        idx = hir_emit(HIR_OP_FLAGSET_DECL, -1, [], n.sa, "", n.ln);
+    } else if (k == "VariantDecl") {
+        idx = hir_emit(HIR_OP_VARIANT_DECL, -1, [], n.sa, "", n.ln);
+    } else {
+        idx = hir_emit(HIR_OP_RAW, d, [], n.kind, "", n.ln);
+    }
+    if (idx >= 0) { g_hir.node_to_hir[d] = idx; }
+    return idx;
+}
+
+pub fn hir_lower_funcdecl(d: i64) i64 {
+    var n: base.Node = base.nodes[d];
+    var params: []i64 = hir_list(n.lb);
+    var pargs: []i64 = [];
+    var pi: i64 = 0;
+    while (pi < slice_len(params) as i64) {
+        var pn: base.Node = base.nodes[params[pi]];
+        var pd: i64 = hir_emit(HIR_OP_PARAM_DECL, -1, [], pn.sa, hir_type_text(pn.na), pn.ln);
+        append(pargs, pd);
+        pi = pi + 1;
+    }
+    // n.lc 是语句子列表头（kids 池索引），不是单节点；用 stmt_list 降级为 BLOCK。
+    var body: i64 = -1;
+    if (n.lc >= 0) { body = hir_lower_stmt_list(n.lc); }
+    var all: []i64 = pargs;
+    append(all, body);
+    var idx: i64 = hir_emit(HIR_OP_FN_DECL, -1, all, n.sa, hir_type_text(n.na), n.ln);
+    g_hir.node_to_hir[d] = idx;
+    return idx;
+}
+
+// ── 语句降级 ────────────────────────────────────────────────
+pub fn hir_lower_stmt_list(head: i64) i64 {
+    var ss: []i64 = hir_list(head);
+    var args: []i64 = [];
+    var i: i64 = 0;
+    while (i < slice_len(ss) as i64) {
+        var st: i64 = hir_lower_stmt(ss[i]);
+        if (st >= 0) { append(args, st); }
+        i = i + 1;
+    }
+    return hir_emit(HIR_OP_BLOCK, -1, args, "", "", 0);
+}
+
+pub fn hir_lower_stmt(n: i64) i64 {
+    if (n < 0) { return -1; }
+    var nd: base.Node = base.nodes[n];
+    var k: string = nd.kind;
+    if (k == "block") {
+        var ss: []i64 = hir_list(nd.la);
+        var args: []i64 = [];
+        var i: i64 = 0;
+        while (i < slice_len(ss) as i64) {
+            var st: i64 = hir_lower_stmt(ss[i]);
+            if (st >= 0) { append(args, st); }
+            i = i + 1;
+        }
+        return hir_emit(HIR_OP_BLOCK, -1, args, "", "", nd.ln);
+    }
+    if (k == "expr") { return hir_lower_expr(nd.na); }
+    if (k == "var_decl") {
+        var init: i64 = -1;
+        if (nd.nb >= 0) { init = hir_lower_expr(nd.nb); }
+        return hir_emit(HIR_OP_LOCAL_DECL, -1, [init], nd.sa, hir_type_text(nd.na), nd.ln);
+    }
+    if (k == "assign" || k == "assignment") {
+        return hir_lower_assign(n);
+    }
+    if (k == "return") {
+        var v: i64 = -1;
+        if (nd.na >= 0) { v = hir_lower_expr(nd.na); }
+        return hir_emit(HIR_OP_RETURN, -1, [v], "", "", nd.ln);
+    }
+    if (k == "if") {
+        var cond: i64 = hir_lower_expr(nd.na);
+        // then/else 分支是语句子列表头（kids 池索引），不是单节点
+        var then_b: i64 = -1;
+        if (nd.la >= 0) { then_b = hir_lower_stmt_list(nd.la); }
+        var else_b: i64 = -1;
+        if (nd.lb >= 0) { else_b = hir_lower_stmt_list(nd.lb); }
+        return hir_emit(HIR_OP_IF, -1, [cond, then_b, else_b], "", "", nd.ln);
+    }
+    if (k == "for") {
+        var init_i: i64 = -1;
+        if (nd.na >= 0) { init_i = hir_lower_stmt(nd.na); }
+        var cond_i: i64 = -1;
+        if (nd.nb >= 0) { cond_i = hir_lower_expr(nd.nb); }
+        var upd_i: i64 = -1;
+        if (nd.nc >= 0) { upd_i = hir_lower_expr(nd.nc); }
+        var body: i64 = hir_lower_stmt_list(nd.la);
+        var args: []i64 = [cond_i, body];
+        if (init_i >= 0) { append(args, init_i); }
+        if (upd_i >= 0) { append(args, upd_i); }
+        return hir_emit(HIR_OP_LOOP, -1, args, "", "", nd.ln);
+    }
+    if (k == "while") {
+        var cond_i: i64 = -1;
+        if (nd.na >= 0) { cond_i = hir_lower_expr(nd.na); }
+        var body: i64 = hir_lower_stmt_list(nd.la);
+        return hir_emit(HIR_OP_LOOP, -1, [cond_i, body], "", "", nd.ln);
+    }
+    if (k == "for_each") {
+        var iter_i: i64 = -1;
+        if (nd.na >= 0) { iter_i = hir_lower_expr(nd.na); }
+        var body: i64 = hir_lower_stmt_list(nd.la);
+        return hir_emit(HIR_OP_LOOP, -1, [iter_i, body], nd.sa, "", nd.ln);
+    }
+    if (k == "break") { return hir_emit(HIR_OP_BREAK, -1, [], "", "", nd.ln); }
+    if (k == "continue") { return hir_emit(HIR_OP_CONTINUE, -1, [], "", "", nd.ln); }
+    if (k == "defer") { return hir_emit(HIR_OP_RAW, n, hir_list(nd.la), "defer", "", nd.ln); }
+    if (k == "comptime") { return hir_emit(HIR_OP_RAW, n, [nd.na], "comptime", "", nd.ln); }
+    if (k == "comptime_block") { return hir_emit(HIR_OP_RAW, n, hir_list(nd.la), "comptime_block", "", nd.ln); }
+    // 其余语句种类：逃生舱
+    return hir_emit(HIR_OP_RAW, n, [], nd.kind, "", nd.ln);
+}
+
+// ── 表达式降级（返回产生值的 inst 索引）──────────────────────
+pub fn hir_lower_expr(n: i64) i64 {
+    if (n < 0) { return -1; }
+    var nd: base.Node = base.nodes[n];
+    var k: string = nd.kind;
+    var slot: i64 = hir_slot();
+    var idx: i64 = -1;
+    if (k == "int") {
+        idx = hir_emit(HIR_OP_LIT_INT, slot, [], nd.sa, "", nd.ln);
+    } else if (k == "float") {
+        idx = hir_emit(HIR_OP_LIT_FLOAT, slot, [], nd.sa, "", nd.ln);
+    } else if (k == "string") {
+        idx = hir_emit(HIR_OP_LIT_STR, slot, [], nd.sa, "", nd.ln);
+    } else if (k == "bool") {
+        var s: string = "false";
+        if (nd.ba) { s = "true"; }
+        idx = hir_emit(HIR_OP_LIT_BOOL, slot, [], s, "", nd.ln);
+    } else if (k == "null") {
+        idx = hir_emit(HIR_OP_LIT_NULL, slot, [], "", "", nd.ln);
+    } else if (k == "ident") {
+        idx = hir_emit(HIR_OP_LOCAL_REF, slot, [], nd.sa, "", nd.ln);
+    } else if (k == "binary") {
+        var l: i64 = hir_lower_expr(nd.na);
+        var r: i64 = hir_lower_expr(nd.nb);
+        idx = hir_emit(HIR_OP_BINOP, slot, [l, r], nd.sa, "", nd.ln);
+    } else if (k == "unary") {
+        var x: i64 = hir_lower_expr(nd.na);
+        idx = hir_emit(HIR_OP_UNOP, slot, [x], nd.sa, "", nd.ln);
+    } else if (k == "call") {
+        var callee: string = hir_callee_name(nd.na);
+        var args: []i64 = [];
+        var alist: []i64 = hir_list(nd.la);
+        var i: i64 = 0;
+        while (i < slice_len(alist) as i64) {
+            var ai: i64 = hir_lower_expr(alist[i]);
+            if (ai >= 0) { append(args, ai); }
+            i = i + 1;
+        }
+        idx = hir_emit(HIR_OP_CALL, slot, args, callee, "", nd.ln);
+    } else if (k == "member") {
+        var b: i64 = hir_lower_expr(nd.na);
+        var fname: string = "";
+        if (nd.nb >= 0) { fname = base.nodes[nd.nb].sa; }
+        idx = hir_emit(HIR_OP_FIELD_REF, slot, [b], fname, "", nd.ln);
+    } else if (k == "index") {
+        var b: i64 = hir_lower_expr(nd.na);
+        var ix: i64 = hir_lower_expr(nd.nb);
+        idx = hir_emit(HIR_OP_INDEX_REF, slot, [b, ix], "", "", nd.ln);
+    } else if (k == "struct_lit") {
+        idx = hir_lower_struct_lit(n, slot);
+    } else if (k == "cast") {
+        var v: i64 = hir_lower_expr(nd.na);
+        idx = hir_emit(HIR_OP_CAST, slot, [v], "", hir_type_text(nd.nb), nd.ln);
+    } else if (k == "paren" || k == "expr") {
+        idx = hir_lower_expr(nd.na);
+    } else if (k == "closure_make") {
+        var caps: []i64 = hir_list(nd.la);
+        var cargs: []i64 = [];
+        var ci: i64 = 0;
+        while (ci < slice_len(caps) as i64) {
+            var cexp: i64 = hir_lower_expr(caps[ci]);
+            if (cexp >= 0) { append(cargs, cexp); }
+            ci = ci + 1;
+        }
+        idx = hir_emit(HIR_OP_CLOSURE_MAKE, slot, cargs, nd.sa, "", nd.ln);
+    } else if (k == "lambda") {
+        var params: []i64 = hir_list(nd.lb);
+        var pargs: []i64 = [];
+        var pi: i64 = 0;
+        while (pi < slice_len(params) as i64) {
+            var pn: base.Node = base.nodes[params[pi]];
+            var pd: i64 = hir_emit(HIR_OP_PARAM_DECL, -1, [], pn.sa, hir_type_text(pn.na), pn.ln);
+            append(pargs, pd);
+            pi = pi + 1;
+        }
+        var body: i64 = -1;
+        if (nd.lc >= 0) { body = hir_lower_stmt(nd.lc); }
+        var all: []i64 = pargs;
+        append(all, body);
+        idx = hir_emit(HIR_OP_LAMBDA, slot, all, nd.sa, hir_type_text(nd.na), nd.ln);
+    } else if (k == "match") {
+        var scr: i64 = hir_lower_expr(nd.na);
+        idx = hir_emit(HIR_OP_RAW, n, [scr], "match", "", nd.ln);
+    } else if (k == "assign" || k == "assignment") {
+        idx = hir_lower_assign(n);
+    } else {
+        // 未覆盖表达式（range/slice/optional/pointer/array/array_lit/map_lit/list/vector/
+        // flag/flag_set/amp/deref/named/vval/sym/atom/scalar/F/FV/number/typeinfo 等）：逃生舱
+        idx = hir_emit(HIR_OP_RAW, n, [], nd.kind, "", nd.ln);
+    }
+    if (idx >= 0) { g_hir.node_to_hir[n] = idx; }
+    return idx;
+}
+
+// 赋值降级（stmt 与 expr 上下文共用）：字段/索引赋值 → *_SET；普通变量赋值 → 一级 ASSIGN。
+// sa 保留目标变量名（或字段名），便于后续 Sema 重写消费。（ZIR 式 HIR·Stage A）
+pub fn hir_lower_assign(n: i64) i64 {
+    var nd: base.Node = base.nodes[n];
+    var l: i64 = hir_lower_expr(nd.na);
+    var r: i64 = hir_lower_expr(nd.nb);
+    var ln: base.Node = base.nodes[nd.na];
+    if (ln.kind == "member") {
+        var base_i: i64 = hir_lower_expr(ln.na);
+        return hir_emit(HIR_OP_FIELD_SET, -1, [base_i, r], ln.sa, "", nd.ln);
+    }
+    if (ln.kind == "index") {
+        var base_i: i64 = hir_lower_expr(ln.na);
+        var idx_i: i64 = hir_lower_expr(ln.nb);
+        return hir_emit(HIR_OP_INDEX_SET, -1, [base_i, idx_i, r], "", "", nd.ln);
+    }
+    return hir_emit(HIR_OP_ASSIGN, -1, [l, r], ln.sa, "", nd.ln);
+}
+
+pub fn hir_callee_name(callee: i64) string {
+    if (callee < 0) { return "<expr>"; }
+    var cn: base.Node = base.nodes[callee];
+    if (cn.kind == "ident") { return cn.sa; }
+    if (cn.kind == "member") { return cn.sa; }
+    if (cn.kind == "sym") { return base.sb_cat2("@", cn.sa); }
+    return "<expr>";
+}
+
+pub fn hir_lower_struct_lit(n: i64, slot: i64) i64 {
+    var nd: base.Node = base.nodes[n];
+    var fields: []i64 = hir_list(nd.la);
+    var names: []string = [];
+    var args: []i64 = [];
+    var i: i64 = 0;
+    while (i < slice_len(fields) as i64) {
+        var f: base.Node = base.nodes[fields[i]];
+        var fname: string = "";
+        var fval: i64 = -1;
+        if (f.kind == "named") {
+            fname = f.sa;
+            if (f.na >= 0) { fval = hir_lower_expr(f.na); }
+        } else if (f.kind == "assignment") {
+            if (f.na >= 0) { fname = base.nodes[f.na].sa; }
+            if (f.nb >= 0) { fval = hir_lower_expr(f.nb); }
+        } else if (f.kind == "P") {
+            fname = f.sa;
+            if (f.na >= 0) { fval = hir_lower_expr(f.na); }
+        } else if (f.kind == "FV") {
+            fname = f.sa;
+            if (f.na >= 0) { fval = hir_lower_expr(f.na); }
+        } else {
+            // 未知字段形态：整字段逃生舱（值）
+            fval = hir_emit(HIR_OP_RAW, fields[i], [], f.kind, "", f.ln);
+        }
+        append(names, fname);
+        append(args, fval);
+        i = i + 1;
+    }
+    var csv: string = "";
+    var j: i64 = 0;
+    while (j < slice_len(names) as i64) {
+        if (j > 0) { csv = base.sb_cat2(csv, ","); }
+        csv = base.sb_cat2(csv, names[j]);
+        j = j + 1;
+    }
+    return hir_emit(HIR_OP_CONSTRUCT, slot, args, nd.sa, csv, nd.ln);
+}
+
+// ── 序列化：文本（diff 友好）─────────────────────────────────
+pub fn hir_op_name(op: i64) string {
+    if (op == HIR_OP_LIT_INT) { return "lit_int"; }
+    if (op == HIR_OP_LIT_FLOAT) { return "lit_float"; }
+    if (op == HIR_OP_LIT_STR) { return "lit_str"; }
+    if (op == HIR_OP_LIT_BOOL) { return "lit_bool"; }
+    if (op == HIR_OP_LIT_NULL) { return "lit_null"; }
+    if (op == HIR_OP_LOCAL_DECL) { return "local_decl"; }
+    if (op == HIR_OP_LOCAL_REF) { return "local_ref"; }
+    if (op == HIR_OP_PARAM_REF) { return "param_ref"; }
+    if (op == HIR_OP_CALL) { return "call"; }
+    if (op == HIR_OP_METHOD_CALL) { return "method_call"; }
+    if (op == HIR_OP_BINOP) { return "binop"; }
+    if (op == HIR_OP_UNOP) { return "unop"; }
+    if (op == HIR_OP_FIELD_REF) { return "field_ref"; }
+    if (op == HIR_OP_FIELD_SET) { return "field_set"; }
+    if (op == HIR_OP_INDEX_REF) { return "index_ref"; }
+    if (op == HIR_OP_INDEX_SET) { return "index_set"; }
+    if (op == HIR_OP_ASSIGN) { return "assign"; }
+    if (op == HIR_OP_CONSTRUCT) { return "construct"; }
+    if (op == HIR_OP_IF) { return "if"; }
+    if (op == HIR_OP_BLOCK) { return "block"; }
+    if (op == HIR_OP_LOOP) { return "loop"; }
+    if (op == HIR_OP_RETURN) { return "return"; }
+    if (op == HIR_OP_BREAK) { return "break"; }
+    if (op == HIR_OP_CONTINUE) { return "continue"; }
+    if (op == HIR_OP_CAST) { return "cast"; }
+    if (op == HIR_OP_RAW) { return "raw"; }
+    if (op == HIR_OP_FN_DECL) { return "fn_decl"; }
+    if (op == HIR_OP_STRUCT_DECL) { return "struct_decl"; }
+    if (op == HIR_OP_ENUM_DECL) { return "enum_decl"; }
+    if (op == HIR_OP_UNION_DECL) { return "union_decl"; }
+    if (op == HIR_OP_CONST_DECL) { return "const_decl"; }
+    if (op == HIR_OP_GLOBAL_DECL) { return "global_decl"; }
+    if (op == HIR_OP_IMPORT_DECL) { return "import_decl"; }
+    if (op == HIR_OP_TYPE_ALIAS_DECL) { return "type_alias_decl"; }
+    if (op == HIR_OP_FLAG_DECL) { return "flag_decl"; }
+    if (op == HIR_OP_FLAGSET_DECL) { return "flagset_decl"; }
+    if (op == HIR_OP_VARIANT_DECL) { return "variant_decl"; }
+    if (op == HIR_OP_PARAM_DECL) { return "param_decl"; }
+    if (op == HIR_OP_FIELD_DECL) { return "field_decl"; }
+    if (op == HIR_OP_MODULE_DECL) { return "module_decl"; }
+    if (op == HIR_OP_CLOSURE_MAKE) { return "closure_make"; }
+    if (op == HIR_OP_LAMBDA) { return "lambda"; }
+    return "invalid";
+}
+
+pub fn hir_args_str(args: []i64) string {
+    var s: string = "[";
+    var i: i64 = 0;
+    while (i < slice_len(args) as i64) {
+        if (i > 0) { s = base.sb_cat2(s, " "); }
+        var v: i64 = args[i];
+        if (v < 0) { s = base.sb_cat2(s, "_"); }
+        else { s = base.sb_cat2(s, base.i2s(v)); }
+        i = i + 1;
+    }
+    return base.sb_cat2(s, "]");
+}
+
+pub fn hir_to_text(m: HirModule) string {
+    var out: string = "";
+    out = base.sb_cat3(out, "; HIR ", HIR_VERSION);
+    out = base.sb_cat3(out, "  src=", m.file);
+    out = base.sb_cat3(out, "  hash=", m.src_hash);
+    out = base.sb_cat2(out, "\n");
+    out = base.sb_cat4(out, "; decls(", base.i2s(slice_len(m.decls) as i64), "): ");
+    var di: i64 = 0;
+    while (di < slice_len(m.decls) as i64) {
+        if (di > 0) { out = base.sb_cat2(out, " "); }
+        out = base.sb_cat2(out, base.i2s(m.decls[di]));
+        di = di + 1;
+    }
+    out = base.sb_cat2(out, "\n");
+    var i: i64 = 0;
+    while (i < slice_len(m.insts) as i64) {
+        var inst: HirInst = m.insts[i];
+        var line: string = base.sb_cat2(base.i2s(i), ":");
+        line = base.sb_cat2(line, hir_op_name(inst.op));
+        if (inst.dst >= 0) { line = base.sb_cat3(line, " dst=%", base.i2s(inst.dst)); }
+        if (inst.sa != "") { line = base.sb_cat3(line, " name=", inst.sa); }
+        if (inst.ty != "") { line = base.sb_cat3(line, " ty=", inst.ty); }
+        line = base.sb_cat3(line, " args=", hir_args_str(inst.args));
+        if (inst.line > 0) { line = base.sb_cat3(line, " @", base.i2s(inst.line as i64)); }
+        out = base.sb_cat2(out, line);
+        out = base.sb_cat2(out, "\n");
+        i = i + 1;
+    }
+    return out;
+}
+
+// ── 序列化：二进制（缓存；长度前缀，确定性）──────────────────
+// 字节缓冲用 string（而非 []u8）：LLVM 后端对 []u8 的 getelementptr 取尺寸会误发
+// 非法类型令牌 `u8`，而 string 底层为 i8，索引/解码均合法。
+// 写：StringBuilder 累积；读：全局游标 g_hir_buf(string) + g_hir_cur。
+
+// 把 v 的 8 个低位字节追加到 StringBuilder
+pub fn hir_put_u64(sb: StringBuilder, v: i64) void {
+    var x: i64 = v;
+    var i: i64 = 0;
+    while (i < 8) {
+        var b: i64 = x & 255;
+        sb_append_char(sb, b);
+        x = x >> 8;
+        i = i + 1;
+    }
+}
+
+pub fn hir_put_str(sb: StringBuilder, s: string) void {
+    var len: i64 = str_len(s) as i64;
+    hir_put_u64(sb, len);
+    var i: i64 = 0;
+    while (i < len) {
+        var c: i64 = s[i] as i64;
+        if (c < 0) { c = c + 256; }
+        sb_append_char(sb, c);
+        i = i + 1;
+    }
+}
+
+pub fn hir_put_i64s(sb: StringBuilder, arr: []i64) void {
+    hir_put_u64(sb, slice_len(arr) as i64);
+    var i: i64 = 0;
+    while (i < slice_len(arr) as i64) {
+        hir_put_u64(sb, arr[i]);
+        i = i + 1;
+    }
+}
+
+pub fn hir_to_bin(m: HirModule) string {
+    var sb: StringBuilder = sb_new();
+    // magic "HIR1"
+    sb_append_char(sb, 72);
+    sb_append_char(sb, 73);
+    sb_append_char(sb, 82);
+    sb_append_char(sb, 49);
+    hir_put_str(sb, m.src_hash);
+    hir_put_str(sb, m.file);
+    hir_put_i64s(sb, m.decls);
+    hir_put_u64(sb, slice_len(m.insts) as i64);
+    var i: i64 = 0;
+    while (i < slice_len(m.insts) as i64) {
+        var inst: HirInst = m.insts[i];
+        hir_put_u64(sb, inst.op);
+        hir_put_u64(sb, inst.dst);
+        hir_put_i64s(sb, inst.args);
+        hir_put_str(sb, inst.sa);
+        hir_put_str(sb, inst.ty);
+        hir_put_u64(sb, inst.line as i64);
+        i = i + 1;
+    }
+    return sb_to_str(sb);
+}
+
+// 二进制解码用全局游标（t 结构体按值传递，局部游标 pos 不会回写调用方）
+pub var g_hir_buf: string = "";
+pub var g_hir_cur: i64 = 0;
+
+pub fn hir_get_u64() i64 {
+    var v: i64 = 0;
+    var i: i64 = 0;
+    while (i < 8) {
+        var b: i64 = g_hir_buf[g_hir_cur] as i64;
+        if (b < 0) { b = b + 256; }   // string 元素为 i8，高位字节需还原为 0..255
+        v = v | (b << (8 * i));
+        g_hir_cur = g_hir_cur + 1;
+        i = i + 1;
+    }
+    return v;
+}
+
+pub fn hir_get_str() string {
+    var len: i64 = hir_get_u64();
+    var sb: StringBuilder = sb_new();
+    var i: i64 = 0;
+    while (i < len) {
+        var c: i64 = g_hir_buf[g_hir_cur] as i64;
+        if (c < 0) { c = c + 256; }
+        sb_append_char(sb, c);
+        g_hir_cur = g_hir_cur + 1;
+        i = i + 1;
+    }
+    return sb_to_str(sb);
+}
+
+pub fn hir_get_i64s() []i64 {
+    var n: i64 = hir_get_u64();
+    var out: []i64 = [];
+    var i: i64 = 0;
+    while (i < n) { append(out, hir_get_u64()); i = i + 1; }
+    return out;
+}
+
+pub fn hir_from_bin(buf: string) HirModule {
+    g_hir_buf = buf;
+    g_hir_cur = 4; // skip "HIR1" magic
+    var m: HirModule;
+    m.src_hash = hir_get_str();
+    m.file = hir_get_str();
+    m.decls = hir_get_i64s();
+    var ninst: i64 = hir_get_u64();
+    var i: i64 = 0;
+    while (i < ninst) {
+        var inst: HirInst;
+        inst.op = hir_get_u64();
+        inst.dst = hir_get_u64();
+        inst.args = hir_get_i64s();
+        inst.sa = hir_get_str();
+        inst.ty = hir_get_str();
+        inst.line = hir_get_u64() as u64;
+        append(m.insts, inst);
+        i = i + 1;
+    }
+    return m;
+}
+
+// ── 缓存键：源内容 FNV-1a + 编译器版本戳 ─────────────────────
+pub fn hir_hash(src: string) string {
+    var h: i64 = 0xcbf29ce484222325; // FNV offset basis
+    var n: i64 = str_len(src) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        h = h ^ (src[i] as i64);
+        h = h * 1099511628211;
+        i = i + 1;
+    }
+    // 混入版本戳：改动编译器/格式即失效缓存
+    var vs: string = HIR_VERSION;
+    var vn: i64 = str_len(vs) as i64;
+    var j: i64 = 0;
+    while (j < vn) {
+        h = h ^ (vs[j] as i64);
+        h = h * 1099511628211;
+        j = j + 1;
+    }
+    return base.i2s(h);
+}
