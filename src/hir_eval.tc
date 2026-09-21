@@ -1,0 +1,862 @@
+// ═══════════════════════════════════════════════════════════
+// src/hir_eval.tc — Stage A'：CTFE 重写为「解释 HIR 指令流」
+//
+// 设计依据：docs/compiler/hir-design.md §5/§7（A' = CTFE 重写，与 TIR 落地解耦，
+// 单独 gate）。本模块**不依赖 sema**（自带值模型），只消费 hir.hir_build 产出的
+// HirModule 指令流，逐 inst 求值，产出编译期值。
+//
+// 值模型：HirVal 存于全局池 g_hv（用池索引互引，避免递归 struct 类型）。
+// 环境 g_env：名字 → 池索引（扁平，调用帧 save/restore 支持递归与跨 const 引用）。
+//
+// 覆盖：int/f64/bool/str/null/struct/array、binop/unop（语义对齐 sema.meta_eval）、
+//   if/loop/return/break/continue、field_set/index_set、call（递归 + 少量纯内建）、cast。
+//
+// 局限（Stage A' 首切片，明确记录）：① 仅求值「编译期可定」的子语言；命中 HIR_OP_RAW
+//   逃生舱的节点会登记 g_hv_err 但 ASTGen 已保证不崩溃；② 函数调用不区分 comptime/runtime
+//   （由调用方保证只在编译期上下文调用纯函数）。
+// ═══════════════════════════════════════════════════════════
+
+@import("src.base" :: *);
+@import("src.hir" :: *);
+
+// ── 值模型 ─────────────────────────────────────────────────
+pub const HV_INT: i64 = 1;
+pub const HV_F64: i64 = 2;
+pub const HV_BOOL: i64 = 3;
+pub const HV_STR: i64 = 4;
+pub const HV_NULL: i64 = 5;
+pub const HV_STRUCT: i64 = 6;   // s=类型名; field_names/field_vals 并行
+pub const HV_ARRAY: i64 = 7;    // items = 池索引列表
+pub const HV_FN: i64 = 8;       // fn_ref = FN_DECL inst 索引
+
+pub struct HirVal {
+    kind: i64;
+    i: i64;       // HV_INT 载荷
+    f: f64;       // HV_F64 载荷
+    b: bool;      // HV_BOOL 载荷
+    s: string;    // HV_STR 载荷 / HV_STRUCT 类型名
+    field_names: []string;
+    field_vals: []i64;   // 池索引（与 field_names 平行）
+    items: []i64;        // 池索引（数组元素）
+    fn_ref: i64;         // HV_FN: FN_DECL inst 索引
+}
+
+pub var g_hv: []HirVal;
+
+pub fn hv_box(v: HirVal) i64 {
+    append(g_hv, v);
+    return (slice_len(g_hv) as i64) - 1;
+}
+
+pub fn hv_int(v: i64) i64 {
+    var x: HirVal;
+    x.kind = HV_INT; x.i = v;
+    return hv_box(x);
+}
+pub fn hv_f64(v: f64) i64 {
+    var x: HirVal;
+    x.kind = HV_F64; x.f = v;
+    return hv_box(x);
+}
+pub fn hv_bool(v: bool) i64 {
+    var x: HirVal;
+    x.kind = HV_BOOL; x.b = v;
+    return hv_box(x);
+}
+pub fn hv_str(v: string) i64 {
+    var x: HirVal;
+    x.kind = HV_STR; x.s = v;
+    return hv_box(x);
+}
+pub fn hv_null() i64 {
+    var x: HirVal;
+    x.kind = HV_NULL;
+    return hv_box(x);
+}
+pub fn hv_struct(name: string) i64 {
+    var x: HirVal;
+    x.kind = HV_STRUCT; x.s = name;
+    return hv_box(x);
+}
+
+// ── 环境（名字 → 池索引）──────────────────────────────────
+pub var g_env_names: []string;
+pub var g_env_vals: []i64;
+
+pub fn env_set(name: string, val: i64) void {
+    // 作用域语义：总是压入新绑定（shadow），而非原地改写外层帧的同名绑定。
+    // 这样函数返回时 env_trunc(saved_base) 能恢复外层值（递归/嵌套调用正确）。
+    append(g_env_names, name);
+    append(g_env_vals, val);
+}
+pub fn env_get(name: string) i64 {
+    var i: i64 = slice_len(g_env_names) as i64 - 1;
+    while (i >= 0) {
+        if (g_env_names[i] == name) { return g_env_vals[i]; }
+        i = i - 1;
+    }
+    return -1;
+}
+pub fn env_trunc(n: i64) void {
+    var nn: []string = [];
+    var nv: []i64 = [];
+    var i: i64 = 0;
+    while (i < n) {
+        append(nn, g_env_names[i]);
+        append(nv, g_env_vals[i]);
+        i = i + 1;
+    }
+    g_env_names = nn;
+    g_env_vals = nv;
+}
+
+// ── 错误 ───────────────────────────────────────────────────
+pub var g_hv_err: bool = false;
+pub var g_hv_errmsg: string = "";
+pub fn hv_fail(msg: string) i64 {
+    g_hv_err = true;
+    g_hv_errmsg = msg;
+    return -1;
+}
+
+// ── 解析/格式化辅助 ────────────────────────────────────────
+pub fn hv_parse_i64(s: string) i64 {
+    var n: i64 = str_len(s) as i64;
+    if (n == 0) { return 0; }
+    var neg: bool = false;
+    var p: i64 = 0;
+    if (s[0] == '-') { neg = true; p = 1; }
+    var v: i64 = 0;
+    while (p < n) {
+        var c: i64 = s[p] as i64;
+        if (c >= 48 && c <= 57) {
+            v = v * 10 + (c - 48);
+        }
+        p = p + 1;
+    }
+    if (neg) { v = 0 - v; }
+    return v;
+}
+pub fn hv_parse_f64(s: string) f64 {
+    var n: i64 = str_len(s) as i64;
+    if (n == 0) { return 0.0; }
+    var neg: bool = false;
+    var p: i64 = 0;
+    if (s[0] == '-') { neg = true; p = 1; }
+    var intv: f64 = 0.0;
+    var frac: f64 = 0.0;
+    var fracdiv: f64 = 1.0;
+    var in_frac: bool = false;
+    var exp: i64 = 0;
+    var in_exp: bool = false;
+    var exp_neg: bool = false;
+    while (p < n) {
+        var c: i64 = s[p] as i64;
+        if (c == 46) { in_frac = true; }       // '.'
+        else if (c == 101 || c == 69) { in_exp = true; }  // e/E
+        else if (c == 45) { if (in_exp) { exp_neg = true; } }  // '-' in exponent
+        else if (c >= 48 && c <= 57) {
+            var d: f64 = (c - 48) as f64;
+            if (in_exp) { exp = exp * 10 + (c - 48); }
+            else if (in_frac) { fracdiv = fracdiv * 10.0; frac = frac * 10.0 + d; }
+            else { intv = intv * 10.0 + d; }
+        }
+        p = p + 1;
+    }
+    var r: f64 = intv + (frac / fracdiv);
+    if (exp_neg == false) {
+        var e: i64 = 0;
+        while (e < exp) { r = r * 10.0; e = e + 1; }
+    } else {
+        var e: i64 = 0;
+        while (e < exp) { r = r / 10.0; e = e + 1; }
+    }
+    if (neg) { r = 0.0 - r; }
+    return r;
+}
+pub fn hv_f64_to_str(f: f64) string {
+    if (f < 0.0) { return base.sb_cat2("-", hv_f64_to_str(0.0 - f)); }
+    var i: i64 = f as i64;
+    var fr: f64 = f - (i as f64);
+    var sb: StringBuilder = sb_new();
+    sb_append_str(sb, base.i2s(i));
+    if (fr > 0.0000001) {
+        sb_append_char(sb, 46);  // '.'
+        var frac: i64 = (fr * 1000000.0) as i64;
+        var s: string = base.i2s(frac);
+        var z: i64 = 6 - str_len(s) as i64;
+        var k: i64 = 0;
+        while (k < z) { sb_append_char(sb, 48); k = k + 1; }  // '0'
+        // 去尾随 0
+        var e: i64 = str_len(s) as i64 - 1;
+        while (e > 0 && s[e] == '0') { e = e - 1; }
+        var j: i64 = 0;
+        while (j <= e) { sb_append_char(sb, s[j] as i64); j = j + 1; }
+    } else {
+        // 整数值的 f64 仍显式带小数点，区分 3 与 3.0（例如 `3 as f64`）
+        sb_append_char(sb, 46);  // '.'
+        sb_append_char(sb, 48);  // '0'
+    }
+    return sb_to_str(sb);
+}
+
+// ── 值 → 文本（调试/校验输出）──────────────────────────────
+pub fn hv_field_idx(v: HirVal, name: string) i64 {
+    var i: i64 = 0;
+    while (i < slice_len(v.field_names) as i64) {
+        if (v.field_names[i] == name) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+pub fn hv_to_str(idx: i64) string {
+    if (idx < 0) { return "<none>"; }
+    var v: HirVal = g_hv[idx];
+    if (v.kind == HV_INT) { return base.i2s(v.i); }
+    if (v.kind == HV_F64) { return hv_f64_to_str(v.f); }
+    if (v.kind == HV_BOOL) {
+        if (v.b) { return "true"; }
+        return "false";
+    }
+    if (v.kind == HV_STR) { return base.sb_cat3("\"", v.s, "\""); }
+    if (v.kind == HV_NULL) { return "null"; }
+    if (v.kind == HV_STRUCT) {
+        var sb: StringBuilder = sb_new();
+        sb_append_char(sb, 123);  // '{'
+        var i: i64 = 0;
+        while (i < slice_len(v.field_names) as i64) {
+            if (i > 0) { sb_append_char(sb, 44); sb_append_char(sb, 32); }  // ', '
+            sb_append_str(sb, v.field_names[i]);
+            sb_append_char(sb, 61);  // '='
+            sb_append_str(sb, hv_to_str(v.field_vals[i]));
+            i = i + 1;
+        }
+        sb_append_char(sb, 125);  // '}'
+        return sb_to_str(sb);
+    }
+    if (v.kind == HV_ARRAY) {
+        var sb: StringBuilder = sb_new();
+        sb_append_char(sb, 91);  // '['
+        var i: i64 = 0;
+        while (i < slice_len(v.items) as i64) {
+            if (i > 0) { sb_append_char(sb, 44); sb_append_char(sb, 32); }  // ', '
+            sb_append_str(sb, hv_to_str(v.items[i]));
+            i = i + 1;
+        }
+        sb_append_char(sb, 93);  // ']'
+        return sb_to_str(sb);
+    }
+    if (v.kind == HV_FN) { return base.sb_cat2("<fn ", g_hir.insts[v.fn_ref].sa); }
+    return "<val>";
+}
+
+// 修改池内 struct/array 字段（原地回写）
+pub fn hv_set_field(idx: i64, name: string, val: i64) void {
+    var v: HirVal = g_hv[idx];
+    var fi: i64 = hv_field_idx(v, name);
+    if (fi >= 0) { v.field_vals[fi] = val; }
+    else {
+        append(v.field_names, name);
+        append(v.field_vals, val);
+    }
+    g_hv[idx] = v;
+}
+pub fn hv_set_index(idx: i64, ix: i64, val: i64) void {
+    var v: HirVal = g_hv[idx];
+    // 确保 items 足够长
+    var n: i64 = slice_len(v.items) as i64;
+    while (n <= ix) { append(v.items, -1); n = n + 1; }
+    v.items[ix] = val;
+    g_hv[idx] = v;
+}
+
+// ── 求值主循环 ─────────────────────────────────────────────
+pub var g_slots: []i64;   // inst 索引 → 池索引（-1 = 无）
+
+pub fn hv_new_slots() []i64 {
+    var n: i64 = slice_len(g_hir.insts) as i64;
+    var a: []i64 = [];
+    var i: i64 = 0;
+    while (i < n) { append(a, -1); i = i + 1; }
+    return a;
+}
+// 递归确保某操作数 inst 已求值（g_slots[a]<0 表示未求值；池索引 >=0 均为合法值）。
+// 由于 HIR 指令按依赖序 emit（操作数先于消费指令），递归无环，且 hv_step 幂等。
+//
+// ⚠ 关键：env 是可变的（LOCAL_REF/PARAM_REF 读的是当前 env 池值，而池值会被后续
+//   赋值原地改写；循环里 s = s + x 的 binop 若被缓存就会复用陈旧结果）。因此凡「读
+//   env 或纯运算」的 inst 每次都必须重算；只有 CALL（给定参数即纯）与 LIT_* 可安全缓存。
+//   控制流/decl 类 inst 永不在此重跑（它们只由 hv_eval_block / 控制流路径求值一次）。
+pub fn hv_ensure(a: i64) void {
+    if (a < 0) { return; }
+    var op: i64 = g_hir.insts[a].op;
+    if (op == hir.HIR_OP_LOCAL_REF || op == hir.HIR_OP_PARAM_REF
+        || op == hir.HIR_OP_FIELD_REF || op == hir.HIR_OP_INDEX_REF
+        || op == hir.HIR_OP_BINOP || op == hir.HIR_OP_UNOP || op == hir.HIR_OP_CAST) {
+        hv_step(a);
+        return;
+    }
+    if (g_slots[a] < 0) { hv_step(a); }
+}
+
+pub struct EvRet {
+    sig: i64;   // 0 ok / 1 return / 2 break / 3 continue
+    val: i64;   // 池索引
+}
+
+// 求值一个 block（inst 索引，其 args 为子 inst 列表）
+pub fn hv_eval_block(blk: i64) EvRet {
+    var res: EvRet;
+    if (blk < 0) { res.sig = 0; res.val = -1; return res; }
+    var args: []i64 = g_hir.insts[blk].args;
+    var n: i64 = slice_len(args) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        var rc: EvRet = hv_step(args[i]);
+        if (rc.sig != 0) { return rc; }
+        i = i + 1;
+    }
+    res.sig = 0; res.val = -1;
+    return res;
+}
+
+// ── 二元 / 一元运算（语义对齐 sema.meta_eval）──────────────
+pub fn hv_binop(op: string, l: i64, r: i64) i64 {
+    if (l < 0 || r < 0) { return hv_fail("binop 操作数未求值"); }
+    var lv: HirVal = g_hv[l];
+    var rv: HirVal = g_hv[r];
+    // 短路
+    if (op == "&&" || op == "||") {
+        if (lv.kind != HV_BOOL || rv.kind != HV_BOOL) { return hv_fail("&&/|| 操作数须为 bool"); }
+        if (op == "&&") { return hv_bool(lv.b && rv.b); }
+        return hv_bool(lv.b || rv.b);
+    }
+    // 字符串
+    if (lv.kind == HV_STR && rv.kind == HV_STR) {
+        if (op == "==") { return hv_bool(lv.s == rv.s); }
+        if (op == "!=") { return hv_bool(lv.s != rv.s); }
+        if (op == "+") { return hv_str(base.sb_cat2(lv.s, rv.s)); }
+        return hv_fail("字符串不支持算子 " + op);
+    }
+    // 浮点
+    if (lv.kind == HV_F64 || rv.kind == HV_F64) {
+        var fa: f64 = hv_as_f64(l);
+        var fb: f64 = hv_as_f64(r);
+        if (op == "+") { return hv_f64(fa + fb); }
+        if (op == "-") { return hv_f64(fa - fb); }
+        if (op == "*") { return hv_f64(fa * fb); }
+        if (op == "/") {
+            if (fb == 0.0) { return hv_fail("浮点除零"); }
+            return hv_f64(fa / fb);
+        }
+        if (op == "==") { return hv_bool(fa == fb); }
+        if (op == "!=") { return hv_bool(fa != fb); }
+        if (op == "<") { return hv_bool(fa < fb); }
+        if (op == "<=") { return hv_bool(fa <= fb); }
+        if (op == ">") { return hv_bool(fa > fb); }
+        if (op == ">=") { return hv_bool(fa >= fb); }
+        return hv_fail("浮点不支持算子 " + op);
+    }
+    // 整数
+    if (lv.kind == HV_INT && rv.kind == HV_INT) {
+        var a: i64 = lv.i;
+        var b: i64 = rv.i;
+        if (op == "+") { return hv_int(a + b); }
+        if (op == "-") { return hv_int(a - b); }
+        if (op == "*") { return hv_int(a * b); }
+        if (op == "/") {
+            if (b == 0) { return hv_fail("除零"); }
+            return hv_int(a / b);
+        }
+        if (op == "%") {
+            if (b == 0) { return hv_fail("取模除零"); }
+            return hv_int(a % b);
+        }
+        if (op == "&") { return hv_int(a & b); }
+        if (op == "|") { return hv_int(a | b); }
+        if (op == "^") { return hv_int(a ^ b); }
+        if (op == "<<") { return hv_int(a << b); }
+        if (op == ">>") { return hv_int(a >> b); }
+        if (op == "==") { return hv_bool(a == b); }
+        if (op == "!=") { return hv_bool(a != b); }
+        if (op == "<") { return hv_bool(a < b); }
+        if (op == "<=") { return hv_bool(a <= b); }
+        if (op == ">") { return hv_bool(a > b); }
+        if (op == ">=") { return hv_bool(a >= b); }
+        return hv_fail("整数不支持算子 " + op);
+    }
+    // bool 比较
+    if (lv.kind == HV_BOOL && rv.kind == HV_BOOL) {
+        if (op == "==") { return hv_bool(lv.b == rv.b); }
+        if (op == "!=") { return hv_bool(lv.b != rv.b); }
+        return hv_fail("bool 不支持算子 " + op);
+    }
+    return hv_fail("binop 操作数类型不一致");
+}
+pub fn hv_as_f64(idx: i64) f64 {
+    var v: HirVal = g_hv[idx];
+    if (v.kind == HV_F64) { return v.f; }
+    if (v.kind == HV_INT) { return v.i as f64; }
+    if (v.kind == HV_BOOL) {
+        if (v.b) { return 1.0; }
+        return 0.0;
+    }
+    return 0.0;
+}
+pub fn hv_unop(op: string, x: i64) i64 {
+    if (x < 0) { return hv_fail("unop 操作数未求值"); }
+    var v: HirVal = g_hv[x];
+    if (op == "+") {
+        if (v.kind == HV_F64) { return x; }
+        if (v.kind == HV_INT) { return x; }
+        return hv_fail("一元 + 操作数须为 int/float");
+    }
+    if (op == "-") {
+        if (v.kind == HV_F64) { return hv_f64(0.0 - v.f); }
+        if (v.kind == HV_INT) { return hv_int(0 - v.i); }
+        return hv_fail("一元 - 操作数须为 int/float");
+    }
+    if (op == "~") {
+        if (v.kind != HV_INT) { return hv_fail("一元 ~ 操作数须为 int"); }
+        return hv_int(0 - v.i - 1);
+    }
+    if (op == "!") {
+        if (v.kind != HV_BOOL) { return hv_fail("一元 ! 操作数须为 bool"); }
+        return hv_bool(v.b == false);
+    }
+    return hv_fail("不支持一元算子 " + op);
+}
+
+// 类型转换（cast）
+pub fn hv_cast(tname: string, x: i64) i64 {
+    if (x < 0) { return hv_fail("cast 操作数未求值"); }
+    var v: HirVal = g_hv[x];
+    if (tname == "f64" || tname == "f32") {
+        return hv_f64(hv_as_f64(x));
+    }
+    if (tname == "bool") {
+        if (v.kind != HV_BOOL) { return hv_fail("cast 到 bool 须为 bool"); }
+        return x;
+    }
+    // 整数目标
+    if (v.kind == HV_INT) { return x; }
+    if (v.kind == HV_BOOL) {
+        if (v.b) { return hv_int(1); }
+        return hv_int(0);
+    }
+    if (v.kind == HV_F64) { return hv_int(v.f as i64); }
+    return hv_fail("cast 不支持目标类型 " + tname);
+}
+
+// 纯内建（对齐 sema：i2s/int_to_str/str_len/print/eprint）
+pub fn hv_call_builtin(name: string, args: []i64) i64 {
+    if (name == "i2s" || name == "int_to_str") {
+        if (slice_len(args) as i64 >= 1) { return hv_str(base.i2s(g_hv[args[0]].i)); }
+        return hv_fail("i2s 缺参数");
+    }
+    if (name == "str_len") {
+        if (slice_len(args) as i64 >= 1) { return hv_int(str_len(g_hv[args[0]].s) as i64); }
+        return hv_fail("str_len 缺参数");
+    }
+    if (name == "print" || name == "eprint") {
+        // 编译期日志写 stderr（对齐 sema：编译期 print 同义 eprint）
+        var i: i64 = 0;
+        while (i < slice_len(args) as i64) {
+            eprint(hv_to_str(args[i]));
+            i = i + 1;
+        }
+        return hv_null();
+    }
+    return hv_fail("未知编译期内建 " + name);
+}
+
+// ── 单 inst 求值 ────────────────────────────────────────────
+pub fn hv_step(idx: i64) EvRet {
+    var res: EvRet;
+    res.sig = 0; res.val = -1;
+    if (idx < 0) { return res; }
+    var inst: HirInst = g_hir.insts[idx];
+    var op: i64 = inst.op;
+    // 字面量
+    if (op == hir.HIR_OP_LIT_INT) { g_slots[idx] = hv_int(hv_parse_i64(inst.sa)); return res; }
+    if (op == hir.HIR_OP_LIT_FLOAT) { g_slots[idx] = hv_f64(hv_parse_f64(inst.sa)); return res; }
+    if (op == hir.HIR_OP_LIT_STR) { g_slots[idx] = hv_str(inst.sa); return res; }
+    if (op == hir.HIR_OP_LIT_BOOL) {
+        if (inst.sa == "true") { g_slots[idx] = hv_bool(true); }
+        else { g_slots[idx] = hv_bool(false); }
+        return res;
+    }
+    if (op == hir.HIR_OP_LIT_NULL) { g_slots[idx] = hv_null(); return res; }
+    // 引用
+    if (op == hir.HIR_OP_LOCAL_REF || op == hir.HIR_OP_PARAM_REF) {
+        g_slots[idx] = env_get(inst.sa);
+        return res;
+    }
+    // 块
+    if (op == hir.HIR_OP_BLOCK) {
+        var rc: EvRet = hv_eval_block(idx);
+        return rc;
+    }
+    // 二元/一元
+    if (op == hir.HIR_OP_BINOP) {
+        hv_ensure(inst.args[0]);
+        hv_ensure(inst.args[1]);
+        g_slots[idx] = hv_binop(inst.sa, g_slots[inst.args[0]], g_slots[inst.args[1]]);
+        return res;
+    }
+    if (op == hir.HIR_OP_UNOP) {
+        hv_ensure(inst.args[0]);
+        g_slots[idx] = hv_unop(inst.sa, g_slots[inst.args[0]]);
+        return res;
+    }
+    // 局部声明 / 赋值
+    if (op == hir.HIR_OP_LOCAL_DECL) {
+        var vv: i64 = -1;
+        if (slice_len(inst.args) as i64 >= 1 && inst.args[0] >= 0) { hv_ensure(inst.args[0]); vv = g_slots[inst.args[0]]; }
+        env_set(inst.sa, vv);
+        g_slots[idx] = vv;
+        return res;
+    }
+    if (op == hir.HIR_OP_ASSIGN) {
+        var rv: i64 = -1;
+        if (slice_len(inst.args) as i64 >= 2 && inst.args[1] >= 0) { hv_ensure(inst.args[1]); rv = g_slots[inst.args[1]]; }
+        env_set(inst.sa, rv);
+        g_slots[idx] = rv;
+        return res;
+    }
+    // 字段/索引设置（原地回写池）
+    if (op == hir.HIR_OP_FIELD_SET) {
+        hv_ensure(inst.args[0]);
+        hv_ensure(inst.args[1]);
+        var bv: i64 = g_slots[inst.args[0]];
+        var val: i64 = g_slots[inst.args[1]];
+        if (bv >= 0) { hv_set_field(bv, inst.sa, val); }
+        g_slots[idx] = val;
+        return res;
+    }
+    if (op == hir.HIR_OP_INDEX_SET) {
+        hv_ensure(inst.args[0]);
+        hv_ensure(inst.args[1]);
+        hv_ensure(inst.args[2]);
+        var bv: i64 = g_slots[inst.args[0]];
+        var ixv: i64 = g_slots[inst.args[1]];
+        var val: i64 = g_slots[inst.args[2]];
+        if (bv >= 0 && ixv >= 0) { hv_set_index(bv, g_hv[ixv].i, val); }
+        g_slots[idx] = val;
+        return res;
+    }
+    // 构造（struct）
+    if (op == hir.HIR_OP_ARRAY) {
+        var av: i64 = hv_struct("");  // 复用 HirVal，标记 HV_ARRAY
+        g_hv[av].kind = HV_ARRAY;
+        var i: i64 = 0;
+        while (i < slice_len(inst.args) as i64) {
+            var ev: i64 = -1;
+            if (inst.args[i] >= 0) { hv_ensure(inst.args[i]); ev = g_slots[inst.args[i]]; }
+            append(g_hv[av].items, ev);
+            i = i + 1;
+        }
+        g_slots[idx] = av;
+        return res;
+    }
+    if (op == hir.HIR_OP_CONSTRUCT) {
+        // HIR 约定：CONSTRUCT 的 sa = 类型名，ty = 字段名 csv（见 hir.tc:34 / :549）
+        var st: i64 = hv_struct(inst.sa);
+        var names_csv: []string = hv_split_csv(inst.ty);
+        var i: i64 = 0;
+        while (i < slice_len(names_csv) as i64) {
+            var fv: i64 = -1;
+            if (i < slice_len(inst.args) as i64 && inst.args[i] >= 0) { hv_ensure(inst.args[i]); fv = g_slots[inst.args[i]]; }
+            append(g_hv[st].field_names, names_csv[i]);
+            append(g_hv[st].field_vals, fv);
+            i = i + 1;
+        }
+        g_slots[idx] = st;
+        return res;
+    }
+    // 字段/索引读取
+    if (op == hir.HIR_OP_FIELD_REF) {
+        hv_ensure(inst.args[0]);
+        var bv: i64 = g_slots[inst.args[0]];
+        if (bv >= 0) {
+            var v: HirVal = g_hv[bv];
+            var fi: i64 = hv_field_idx(v, inst.sa);
+            if (fi >= 0) { g_slots[idx] = v.field_vals[fi]; return res; }
+        }
+        g_slots[idx] = -1;
+        return res;
+    }
+    if (op == hir.HIR_OP_INDEX_REF) {
+        hv_ensure(inst.args[0]);
+        hv_ensure(inst.args[1]);
+        var bv: i64 = g_slots[inst.args[0]];
+        var ixv: i64 = g_slots[inst.args[1]];
+        if (bv >= 0 && ixv >= 0) {
+            var v: HirVal = g_hv[bv];
+            var ix: i64 = g_hv[ixv].i;
+            if (ix >= 0 && ix < slice_len(v.items) as i64) { g_slots[idx] = v.items[ix]; return res; }
+        }
+        g_slots[idx] = -1;
+        return res;
+    }
+    // 类型转换
+    if (op == hir.HIR_OP_CAST) {
+        hv_ensure(inst.args[0]);
+        g_slots[idx] = hv_cast(inst.ty, g_slots[inst.args[0]]);
+        return res;
+    }
+    // if
+    if (op == hir.HIR_OP_IF) {
+        hv_ensure(inst.args[0]);
+        var cv: i64 = g_slots[inst.args[0]];
+        if (cv >= 0 && g_hv[cv].kind == HV_BOOL && g_hv[cv].b) {
+            return hv_eval_block(inst.args[1]);
+        }
+        if (slice_len(inst.args) as i64 >= 3 && inst.args[2] >= 0) {
+            return hv_eval_block(inst.args[2]);
+        }
+        return res;
+    }
+    // loop（while / for_each / C-for）
+    if (op == hir.HIR_OP_LOOP) {
+        return hv_eval_loop(inst);
+    }
+    // return / break / continue
+    if (op == hir.HIR_OP_RETURN) {
+        if (slice_len(inst.args) as i64 >= 1 && inst.args[0] >= 0) { hv_ensure(inst.args[0]); res.val = g_slots[inst.args[0]]; }
+        else { res.val = -1; }
+        res.sig = 1;
+        return res;
+    }
+    if (op == hir.HIR_OP_BREAK) { res.sig = 2; return res; }
+    if (op == hir.HIR_OP_CONTINUE) { res.sig = 3; return res; }
+    // call（函数 / 内建）
+    if (op == hir.HIR_OP_CALL) {
+        g_slots[idx] = hv_eval_call(inst);
+        return res;
+    }
+    // 逃生舱：未覆盖节点
+    if (op == hir.HIR_OP_RAW || op == hir.HIR_OP_INVALID) {
+        hv_fail("HIR_OP_RAW 节点不可编译期求值: " + inst.sa);
+        g_slots[idx] = -1;
+        return res;
+    }
+    // 其余 decl 级 / 未实现：置空
+    g_slots[idx] = -1;
+    return res;
+}
+
+// for/while/for_each 循环
+pub fn hv_eval_loop(inst: HirInst) EvRet {
+    var res: EvRet;
+    res.sig = 0; res.val = -1;
+    var nargs: i64 = slice_len(inst.args) as i64;
+    // C-for: args=[cond, body, init, upd]（4 个，sa 空）
+    if (nargs >= 4) {
+        // init 已在调用前 emit 为独立 inst（已在 slots）；这里只跑 cond/body/upd
+        while (true) {
+            hv_ensure(inst.args[0]);
+            var cv: i64 = g_slots[inst.args[0]];
+            if (cv < 0 || g_hv[cv].kind != HV_BOOL || g_hv[cv].b == false) { break; }
+            var brc: EvRet = hv_eval_block(inst.args[1]);
+            if (brc.sig == 1) { return brc; }       // return 透传
+            if (brc.sig == 2) { break; }            // break
+            if (brc.sig == 3) { /* continue: 跑 upd */ }
+            if (inst.args[3] >= 0) { hv_step(inst.args[3]); }  // upd
+        }
+        return res;
+    }
+    // for_each: sa=循环变量名, args=[iterable, body]
+    if (inst.sa != "") {
+        hv_ensure(inst.args[0]);
+        var itv: i64 = g_slots[inst.args[0]];
+        if (itv >= 0) {
+            var v: HirVal = g_hv[itv];
+            var elems: []i64 = [];
+            if (v.kind == HV_ARRAY) { elems = v.items; }
+            var i: i64 = 0;
+            while (i < slice_len(elems) as i64) {
+                env_set(inst.sa, elems[i]);
+                var brc: EvRet = hv_eval_block(inst.args[1]);
+                if (brc.sig == 1) { return brc; }
+                if (brc.sig == 2) { break; }
+                if (brc.sig == 3) { /* continue */ }
+                i = i + 1;
+            }
+        }
+        return res;
+    }
+    // while: args=[cond, body]
+    while (true) {
+        hv_ensure(inst.args[0]);
+        var cv: i64 = g_slots[inst.args[0]];
+        if (cv < 0 || g_hv[cv].kind != HV_BOOL || g_hv[cv].b == false) { break; }
+        var brc: EvRet = hv_eval_block(inst.args[1]);
+        if (brc.sig == 1) { return brc; }
+        if (brc.sig == 2) { break; }
+        if (brc.sig == 3) { /* continue */ }
+    }
+    return res;
+}
+
+// 函数调用（含递归 + 内建）
+pub fn hv_eval_call(inst: HirInst) i64 {
+    var name: string = inst.sa;
+    // 内建优先
+    if (name == "i2s" || name == "int_to_str" || name == "str_len" || name == "print" || name == "eprint") {
+        var av: []i64 = [];
+        var i: i64 = 0;
+        while (i < slice_len(inst.args) as i64) {
+            if (inst.args[i] >= 0) { hv_ensure(inst.args[i]); }
+            append(av, g_slots[inst.args[i]]);
+            i = i + 1;
+        }
+        return hv_call_builtin(name, av);
+    }
+    // 用户函数（在 g_fns 注册）
+    var fidx: i64 = hv_fn_lookup(name);
+    if (fidx < 0) {
+        return hv_fail("调用未注册的编译期函数: " + name);
+    }
+    // 收集参数值
+    var argvals: []i64 = [];
+    var i: i64 = 0;
+    while (i < slice_len(inst.args) as i64) {
+        if (inst.args[i] >= 0) { hv_ensure(inst.args[i]); }
+        append(argvals, g_slots[inst.args[i]]);
+        i = i + 1;
+    }
+    // FN_DECL args = [param_decls..., body_blk]
+    var fnargs: []i64 = g_hir.insts[fidx].args;
+    var nfn: i64 = slice_len(fnargs) as i64;
+    var body: i64 = fnargs[nfn - 1];
+    // 保存调用帧
+    var saved_slots: []i64 = g_slots;
+    g_slots = hv_new_slots();
+    var saved_base: i64 = slice_len(g_env_names) as i64;
+    var pi: i64 = 0;
+    while (pi < nfn - 1) {
+        var pd: i64 = fnargs[pi];
+        var pname: string = g_hir.insts[pd].sa;
+        var pv: i64 = -1;
+        if (pi < slice_len(argvals) as i64) { pv = argvals[pi]; }
+        env_set(pname, pv);
+        pi = pi + 1;
+    }
+    var rc: EvRet = hv_eval_block(body);
+    // 恢复调用帧
+    env_trunc(saved_base);
+    g_slots = saved_slots;
+    if (rc.sig == 1) {
+        return rc.val;
+    }
+    return -1;
+}
+
+// ── 顶层驱动 ────────────────────────────────────────────────
+pub var g_fns: []string;   // 函数名
+pub var g_fn_idx: []i64;   // FN_DECL inst 索引
+pub fn hv_fn_lookup(name: string) i64 {
+    var i: i64 = 0;
+    while (i < slice_len(g_fns) as i64) {
+        if (g_fns[i] == name) { return g_fn_idx[i]; }
+        i = i + 1;
+    }
+    return -1;
+}
+pub fn hv_split_csv(s: string) []string {
+    var out: []string = [];
+    if (s == "") { return out; }
+    var cur: StringBuilder = sb_new();
+    var i: i64 = 0;
+    var n: i64 = str_len(s) as i64;
+    while (i < n) {
+        var c: i64 = s[i] as i64;
+        if (c == 44) {  // ','
+            append(out, sb_to_str(cur));
+            cur = sb_new();
+        } else {
+            sb_append_char(cur, c);
+        }
+        i = i + 1;
+    }
+    append(out, sb_to_str(cur));
+    return out;
+}
+
+// 重置状态并预扫描函数表
+pub fn hv_prepare(m: HirModule) void {
+    g_hv = [];
+    g_env_names = [];
+    g_env_vals = [];
+    g_fns = [];
+    g_fn_idx = [];
+    g_hv_err = false;
+    g_hv_errmsg = "";
+    var i: i64 = 0;
+    while (i < slice_len(m.decls) as i64) {
+        var d: i64 = m.decls[i];
+        var op: i64 = g_hir.insts[d].op;
+        if (op == hir.HIR_OP_FN_DECL) {
+            append(g_fns, g_hir.insts[d].sa);
+            append(g_fn_idx, d);
+        }
+        i = i + 1;
+    }
+}
+
+// 求值单个顶层 const 声明，返回 `name = value` 文本（失败则附错误）
+pub fn hv_eval_const(decl: i64) string {
+    var dinst: HirInst = g_hir.insts[decl];
+    var name: string = dinst.sa;
+    var init: i64 = -1;
+    if (slice_len(dinst.args) as i64 >= 1) { init = dinst.args[0]; }
+    hv_prepare_slots_local();
+    var rc: EvRet = hv_step(init);
+    if (g_hv_err) {
+        return base.sb_cat3(name, " = <error: ", g_hv_errmsg);
+    }
+    var val: i64 = g_slots[init];
+    if (val < 0) { val = rc.val; }
+    env_set(name, val);  // 让后续 const 可引用
+    return base.sb_cat3(name, " = ", hv_to_str(val));
+}
+
+pub fn hv_prepare_slots_local() void {
+    g_slots = hv_new_slots();
+}
+
+// 求值模块内所有顶层 const，返回文本（每行一个）
+pub fn hv_eval_module(m: HirModule) string {
+    hv_prepare(m);
+    var out: StringBuilder = sb_new();
+    var i: i64 = 0;
+    var hv_any: bool = false;
+    while (i < slice_len(m.decls) as i64) {
+        var d: i64 = m.decls[i];
+        if (g_hir.insts[d].op == hir.HIR_OP_GLOBAL_DECL || g_hir.insts[d].op == hir.HIR_OP_CONST_DECL) {
+            if (hv_any) { sb_append_char(out, 10); }  // '\n'
+            sb_append_str(out, hv_eval_const(d));
+            hv_any = true;
+        }
+        i = i + 1;
+    }
+    if (hv_any == false) {
+        sb_append_str(out, "; 无顶层 const（尝试给文件加 `const X = ...`）");
+    }
+    return sb_to_str(out);
+}
+
+// 按名字求值单个 const
+pub fn hv_eval_const_named(m: HirModule, name: string) string {
+    hv_prepare(m);
+    var i: i64 = 0;
+    while (i < slice_len(m.decls) as i64) {
+        var d: i64 = m.decls[i];
+        if ((g_hir.insts[d].op == hir.HIR_OP_GLOBAL_DECL || g_hir.insts[d].op == hir.HIR_OP_CONST_DECL) && g_hir.insts[d].sa == name) {
+            return hv_eval_const(d);
+        }
+        i = i + 1;
+    }
+    return base.sb_cat2("; 未找到 const: ", name);
+}

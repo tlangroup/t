@@ -344,6 +344,18 @@ const r = await node("ir_snapshot.mjs", "--compiler", `${G1}.exe`, "--jobs", "1"
         },
     },
     {
+        // HIR 解释器（CTFE · Stage A'）护栏：comptime-eval 解释 HIR 指令流，
+        // 与文档预期逐项对齐（basic.tc 全量顶层 const + fact.tc 与真实后端双轨对拍）。
+        // 这是 Stage A' 的核心交付；自举产物 g1 内必须含正确解释器，否则本步 fail。
+        // 不随 irClean 跳过：新解释器是独立改动面，每次提交都须重验。
+        id: "hireval", lv: 1, name: "HIR 解释器验证 (comptime-eval CTFE)",
+        run: async () => {
+            const r = await node("hir_eval_test.mjs", "--compiler", `${G1}.exe`);
+            if (r.code !== 0) return { ok: false, note: lastLine(r.out, 6) };
+            return { ok: true, note: lastLine(r.out, 2) };
+        },
+    },
+    {
         id: "diffgen", lv: 1, name: "difftest 代际对拍 (g2 ↔ g3)",
         run: async () => {
             if (ctx.irClean && !full) {

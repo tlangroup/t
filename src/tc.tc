@@ -11,6 +11,7 @@
 @import("src.lex" :: *);
 @import("src.parse" :: *);
 @import("src.hir" :: *);
+@import("src.hir_eval" :: *);
 @import("src.sema" :: *);
 @import("src.comptime_fold" :: *);
 @import("src.codegen_c" :: *);
@@ -165,6 +166,58 @@ fn main() i32 @main {
         var txt: string = hir.hir_to_text(m);
         if (has_outp) { file_write_all(out_p, txt); }
         else { print(txt); }
+        return 0;
+    }
+
+    if (cmd == "comptime-eval") {
+        // Stage A'：CTFE 重写 —— 解释 HIR 指令流（见 docs/compiler/hir-design.md §5/§7）。
+        // 不求类型、不跑 sema，直接对顶层 const 初始化式做编译期求值并打印结果。
+        var src_file: string = "";
+        var has_src: bool = false;
+        var name_filter: string = "";
+        var has_name: bool = false;
+        var out_p: string = "";
+        var has_outp: bool = false;
+        var ai3: i64 = 2;
+        var an3: i64 = slice_len(argv) as i64;
+        while (ai3 < an3) {
+            if (argv[ai3] == "--output") {
+                if (ai3 + 1 < an3) { out_p = argv[ai3 + 1]; has_outp = true; }
+                ai3 = ai3 + 2; continue;
+            }
+            if (argv[ai3] == "--name") {
+                if (ai3 + 1 < an3) { name_filter = argv[ai3 + 1]; has_name = true; }
+                ai3 = ai3 + 2; continue;
+            }
+            if (argv[ai3] == "--example") {
+                if (ai3 + 1 < an3) { src_file = base.sb_cat3("examples/", argv[ai3 + 1], ".tc"); has_src = true; }
+                ai3 = ai3 + 2; continue;
+            }
+            if (has_src == false) { src_file = argv[ai3]; has_src = true; }
+            ai3 = ai3 + 1;
+        }
+        if (has_src == false) {
+            eprint("usage: tc comptime-eval <file.tc> | --example <name> [--name <const>] [--output <path>]\n");
+            return 2;
+        }
+        base.g_file = base.rel_path(src_file);
+        var src: string = file_read_all(src_file);
+        lex.tokenize(src);
+        if (sema.has_errors()) { base.emit_diags(); return 1; }
+        lex.pos = 0;
+        sema.init_anndefs();
+        parse.parse_unit();
+        hir.hir_run(src);
+        var m: HirModule = hir.g_hir;
+        var out_s: string = "";
+        if (has_name) {
+            out_s = hir_eval.hv_eval_const_named(m, name_filter);
+        } else {
+            out_s = hir_eval.hv_eval_module(m);
+        }
+        if (has_outp) { file_write_all(out_p, out_s); }
+        else { print(out_s); }
+        if (hir_eval.g_hv_err) { return 1; }
         return 0;
     }
 
