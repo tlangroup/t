@@ -4846,9 +4846,113 @@ pub fn hir_tag(e: i64) string {
     return nn.kind;
 }
 
+// ── Stage B-2：表达式「下降边」也取自 HIR ─────────────────────
+// Stage B 只把入口与分派键搬进 HIR，分支体里仍读 `n.na / n.nb / base.kids[...]`
+// 找子节点；这里改为向 HIR 指令要操作数：
+//   `ie_sub(ei, k, fb)`   —— 取 HIR 第 k 个操作数（positional）；
+//   `ie_sub_in(ei, fb)`   —— 在 HIR 操作数表里查找该子节点（列表型子节点用）。
+//
+// ⚠ 安全网：**只有 HIR 操作数指向的正是 CST 那个子节点时才走 HIR**，否则回落 CST。
+//   sema 就地改写过子节点（或该边根本没被 AstGen 建模）时，HIR 反映的是改写前的
+//   结构 —— 硬走 HIR 会把「旧子节点」再推一遍，那是**静默错编**，远比回落危险。
+//   回落次数由 g_hir_edge_cst 计；它收敛到 0 之后，CST 读法即可整体删掉。
+pub var g_hir_edge_hir: i64 = 0;
+pub var g_hir_edge_cst: i64 = 0;
+pub var g_hir_edge_noinst: i64 = 0;    // 回落原因①：该节点没有 HIR 指令（sema 期合成 / 已失效）
+pub var g_hir_edge_mis: i64 = 0;       // 回落原因②：有指令，但操作数不是这个 CST 子节点
+
+// 取节点 e 自己的 HIR 指令。委托指令（paren / expr 的 inst 属于内层子节点，
+// `nd != e`）对本节点没有操作数语义，一律当作「无指令」处理。
+pub fn ie_inst(e: i64) i64 {
+    if (e < 0) { return -1; }
+    var ei: i64 = hir.hir_of_node(e);
+    if (ei < 0) { return -1; }
+    if (hir.hir_inst_node(ei) != e) { return -1; }
+    return ei;
+}
+
+// 回落原因②的诊断：`T_HIR_EDGE_TRACE=1` 时打印「父 op / 子 kind」，
+// 用来分辨是 AstGen 漏建模，还是 sema 就地改写导致两边本就不同。
+pub fn ie_mis(ei: i64, fb: i64) void {
+    g_hir_edge_mis = g_hir_edge_mis + 1;
+    if (str_len(getenv("T_HIR_EDGE_TRACE")) > 0) {
+        eprint("HIR-EDGE-MIS parent_op=" + base.i2s(hir.hir_op_of(ei))
+            + " child_kind=" + base.nodes[fb].kind);
+    }
+}
+
+pub fn ie_sub(ei: i64, k: i64, fb: i64) i64 {
+    if (fb < 0) { return ti_mk("Unknown"); }
+    if (ei < 0) { g_hir_edge_noinst = g_hir_edge_noinst + 1; }
+    else {
+        if (hir.hir_inst_node(hir.hir_arg(ei, k)) == fb) {
+            g_hir_edge_hir = g_hir_edge_hir + 1;
+            return infer_expr(fb);
+        }
+        ie_mis(ei, fb);
+    }
+    g_hir_edge_cst = g_hir_edge_cst + 1;
+    return infer_expr(fb);
+}
+
+pub fn ie_sub_v(ei: i64, k: i64, fb: i64) void {
+    if (fb < 0) { return; }
+    if (ei < 0) { g_hir_edge_noinst = g_hir_edge_noinst + 1; }
+    else {
+        if (hir.hir_inst_node(hir.hir_arg(ei, k)) == fb) {
+            g_hir_edge_hir = g_hir_edge_hir + 1;
+            infer_expr(fb);
+            return;
+        }
+        ie_mis(ei, fb);
+    }
+    g_hir_edge_cst = g_hir_edge_cst + 1;
+    infer_expr(fb);
+}
+
+pub fn ie_sub_in(ei: i64, fb: i64) i64 {
+    if (fb < 0) { return ti_mk("Unknown"); }
+    if (ei < 0) { g_hir_edge_noinst = g_hir_edge_noinst + 1; }
+    else {
+        var i2: i64 = 0;
+        var na2: i64 = hir.hir_arg_count(ei);
+        while (i2 < na2) {
+            if (hir.hir_inst_node(hir.hir_arg(ei, i2)) == fb) {
+                g_hir_edge_hir = g_hir_edge_hir + 1;
+                return infer_expr(fb);
+            }
+            i2 = i2 + 1;
+        }
+        ie_mis(ei, fb);
+    }
+    g_hir_edge_cst = g_hir_edge_cst + 1;
+    return infer_expr(fb);
+}
+
+pub fn ie_sub_in_v(ei: i64, fb: i64) void {
+    if (fb < 0) { return; }
+    if (ei < 0) { g_hir_edge_noinst = g_hir_edge_noinst + 1; }
+    else {
+        var i3: i64 = 0;
+        var na3: i64 = hir.hir_arg_count(ei);
+        while (i3 < na3) {
+            if (hir.hir_inst_node(hir.hir_arg(ei, i3)) == fb) {
+                g_hir_edge_hir = g_hir_edge_hir + 1;
+                infer_expr(fb);
+                return;
+            }
+            i3 = i3 + 1;
+        }
+        ie_mis(ei, fb);
+    }
+    g_hir_edge_cst = g_hir_edge_cst + 1;
+    infer_expr(fb);
+}
+
 pub fn infer_expr(e: i64) i64 {
     var n: Node = base.nodes[e];
     var k: string = hir_tag(e);
+    var ei: i64 = ie_inst(e);
     if (is_pipe_kind(k) == true) {
         return lower_pipe(e);
     }
@@ -4864,7 +4968,7 @@ pub fn infer_expr(e: i64) i64 {
     // `str_len(s[0..5]) as i64` 里的区间下标不被降解，后端当单元素索引发 str_at。
     // 生成区不能手改，故在此前置补一条：先推操作数，再按目标类型收口。
     if (k == "cast") {
-        if (n.na >= 0) { infer_expr(n.na); }
+        if (n.na >= 0) { ie_sub_v(ei, 0, n.na); }
         return resolve_ti(n.nb);
     }
     // M-meta Phase D：编译期内建走到 check 说明它没被折掉 —— 一律是错。
@@ -4899,7 +5003,7 @@ pub fn infer_expr(e: i64) i64 {
             // @sin 等数学内建：编译期可折叠常量（见 meta_eval_math），运行期回落 libm / fdlibm
             //（见各后端 ll_call / emit_expr）。此处给实参加类型检查，避免把字符串当浮点发射。
             var mc: i64 = n.la;
-            while (mc >= 0) { infer_expr(base.kids[mc].val); mc = base.kids[mc].next; }
+            while (mc >= 0) { ie_sub_in_v(ei, base.kids[mc].val); mc = base.kids[mc].next; }
             if (str_slice(n.sa, str_len(n.sa) - 1, str_len(n.sa)) == "f") { return ti_scalar("f32"); }
             return ti_scalar("f64");
         } else if (test_mbuiltin(n.sa)) {
@@ -4908,18 +5012,18 @@ pub fn infer_expr(e: i64) i64 {
             if (n.sa == "panic") {
                 var tp_pc: i64 = n.la;
                 if (tp_pc < 0) { parse.fc_err("T-SEM-E206", "@panic 需要 1 个字符串实参", e); return ti_mk("Void"); }
-                var tp_t: i64 = infer_expr(base.kids[tp_pc].val);
+                var tp_t: i64 = ie_sub_in(ei, base.kids[tp_pc].val);
                 if (tip_kind(tp_t) != "String") { parse.fc_err("T-SEM-E207", "@panic 的实参必须是 string", e); return ti_mk("Void"); }
                 return ti_mk("Void");
             }
             if (n.sa == "assert") {
                 var tp_ac: i64 = n.la;
                 if (tp_ac < 0) { parse.fc_err("T-SEM-E206", "@assert 需要 2 个实参（条件, 消息）", e); return ti_mk("Void"); }
-                var tp_cond: i64 = infer_expr(base.kids[tp_ac].val);
+                var tp_cond: i64 = ie_sub_in(ei, base.kids[tp_ac].val);
                 if (tip_kind(tp_cond) != "Scalar" || tip_name(tp_cond) != "bool") { parse.fc_err("T-SEM-E207", "@assert 的第一个实参必须是 bool 条件", e); return ti_mk("Void"); }
                 var tp_msg: i64 = base.kids[tp_ac].next;
                 if (tp_msg < 0) { parse.fc_err("T-SEM-E206", "@assert 缺少消息实参", e); return ti_mk("Void"); }
-                var tp_mt: i64 = infer_expr(base.kids[tp_msg].val);
+                var tp_mt: i64 = ie_sub_in(ei, base.kids[tp_msg].val);
                 if (tip_kind(tp_mt) != "String") { parse.fc_err("T-SEM-E207", "@assert 的第二个实参必须是 string", e); return ti_mk("Void"); }
                 return ti_mk("Void");
             }
@@ -4935,9 +5039,9 @@ pub fn infer_expr(e: i64) i64 {
                 tp_cur = base.kids[tp_cur].next;
             }
             if (tp_n != 3) { parse.fc_err("T-SEM-E206", "@assert_eq 需要 3 个实参（期望, 实际, 消息）", e); return ti_mk("Void"); }
-            var tp_ta: i64 = infer_expr(tp_a);
-            var tp_tb: i64 = infer_expr(tp_b);
-            var tp_tm: i64 = infer_expr(tp_m);
+            var tp_ta: i64 = ie_sub_in(ei, tp_a);
+            var tp_tb: i64 = ie_sub_in(ei, tp_b);
+            var tp_tm: i64 = ie_sub_in(ei, tp_m);
             if (tip_kind(tp_tm) != "String") { parse.fc_err("T-SEM-E207", "@assert_eq 的第三个实参必须是 string", e); return ti_mk("Void"); }
             var tp_ak: string = tip_kind(tp_ta);
             var tp_an: string = tip_name(tp_ta);
@@ -4997,14 +5101,14 @@ pub fn infer_expr(e: i64) i64 {
             if (n.sa == "vlen") {
                 var c: i64 = n.la;
                 if (c < 0) { parse.fc_err("T-VEC-E926", "`@vlen` 需要 1 个向量实参", e); return ti_mk("Unknown"); }
-                var ati: i64 = infer_expr(base.kids[c].val);
+                var ati: i64 = ie_sub_in(ei, base.kids[c].val);
                 if (ti_is_vector(ati) == false) { parse.fc_err("T-VEC-E926", "`@vlen` 的实参必须是向量", e); return ti_mk("Unknown"); }
                 return ti_scalar("i64");
             }
             if (n.sa == "reduce_add" || n.sa == "reduce_max" || n.sa == "reduce_min") {
                 var c: i64 = n.la;
                 if (c < 0) { parse.fc_err("T-VEC-E926", base.sb_cat2("`", n.sa), e); return ti_mk("Unknown"); }
-                var ati: i64 = infer_expr(base.kids[c].val);
+                var ati: i64 = ie_sub_in(ei, base.kids[c].val);
                 if (ti_is_vector(ati) == false) { parse.fc_err("T-VEC-E926", base.sb_cat3("`", n.sa, "` 的实参必须是向量"), e); return ti_mk("Unknown"); }
                 return tis[ati].elem;
             }
@@ -5020,7 +5124,7 @@ pub fn infer_expr(e: i64) i64 {
                     c2 = base.kids[c2].next;
                 }
                 if (cnt != 3) { parse.fc_err("T-VEC-E926", "`@tsplat` 需要 3 个实参（标量, 行数, 列数）", e); return ti_mk("Unknown"); }
-                var sti: i64 = infer_expr(a0);
+                var sti: i64 = ie_sub_in(ei, a0);
                 if (tip_kind(sti) != "Scalar") { parse.fc_err("T-VEC-E921", "`@tsplat` 的第一实参必须是标量", e); return ti_mk("Unknown"); }
                 var rows: i64 = -1; var mrows: i64 = meta_eval(a1);
                 if (mrows >= 0) { var mvn: Node = base.nodes[mrows]; if (mvn.kind == "int" || mvn.kind == "bool") { rows = mv_get_int(mrows); } }
@@ -5039,7 +5143,7 @@ pub fn infer_expr(e: i64) i64 {
             if (n.sa == "treduce_sum" || n.sa == "treduce_mul" || n.sa == "treduce_min" || n.sa == "treduce_max") {
                 var c: i64 = n.la;
                 if (c < 0) { parse.fc_err("T-VEC-E926", base.sb_cat2("`", n.sa), e); return ti_mk("Unknown"); }
-                var ati: i64 = infer_expr(base.kids[c].val);
+                var ati: i64 = ie_sub_in(ei, base.kids[c].val);
                 if (ti_is_tile(ati) == false) { parse.fc_err("T-VEC-E926", base.sb_cat3("`", n.sa, "` 的实参必须是瓦片"), e); return ti_mk("Unknown"); }
                 var rowti: i64 = tis[ati].elem;
                 if (rowti < 0) { return ti_mk("Unknown"); }
@@ -5048,7 +5152,7 @@ pub fn infer_expr(e: i64) i64 {
             if (n.sa == "tile_rows" || n.sa == "tile_cols" || n.sa == "tile_flavor") {
                 var c: i64 = n.la;
                 if (c < 0) { parse.fc_err("T-VEC-E926", base.sb_cat2("`", n.sa), e); return ti_mk("Unknown"); }
-                var ati: i64 = infer_expr(base.kids[c].val);
+                var ati: i64 = ie_sub_in(ei, base.kids[c].val);
                 if (ti_is_tile(ati) == false) { parse.fc_err("T-VEC-E926", base.sb_cat3("`", n.sa, "` 的实参必须是瓦片类型或瓦片值"), e); return ti_mk("Unknown"); }
                 // 把行/列/flavor 回填到节点（ia=行, ib=列, lc=flavor）供后端发射编译期常量。
                 // 注意：绝不可写 n.la —— 对 mbuiltin 节点 la 是「首个实参子节点」的链指针，
@@ -5070,7 +5174,7 @@ pub fn infer_expr(e: i64) i64 {
                 c2 = base.kids[c2].next;
             }
             if (cnt != 2) { parse.fc_err("T-VEC-E926", "`@splat` 需要 2 个实参（标量, lane 数）", e); return ti_mk("Unknown"); }
-            var sti: i64 = infer_expr(a0);
+            var sti: i64 = ie_sub_in(ei, a0);
             if (tip_kind(sti) != "Scalar") { parse.fc_err("T-VEC-E921", "`@splat` 的第一实参必须是标量", e); return ti_mk("Unknown"); }
             var len: i64 = -1;
             var mlen: i64 = meta_eval(a1);
@@ -5122,13 +5226,13 @@ pub fn infer_expr(e: i64) i64 {
     }
     // 序列化操作符（M51）：`f < v` 的值即目标 fid 本身，故左结合可链式
     if (k == "serialize") {
-        infer_expr(n.na);
-        infer_expr(n.nb);
+        ie_sub_in_v(ei, n.na);
+        ie_sub_in_v(ei, n.nb);
         return ti_scalar("fid");
     }
     // 反序列化操作符（M52 读路径）：`f > Type` 的值是裸 Type；右操作数是类型表达式，不调 infer_expr
     if (k == "deserialize") {
-        infer_expr(n.na);
+        ie_sub_in_v(ei, n.na);
         return ti_from_td(deser_type_of(n.nb));
     }
 // >>> GEN:type_infer1 (generated by tools/totter.tc from out/ebnf.json -- DO NOT EDIT) >>>
@@ -5151,7 +5255,7 @@ pub fn infer_expr(e: i64) i64 {
     }
     // 取址 `&x`：操作数须为可寻址 lvalue，结果类型为 pointer(pointee)。
     if (k == "amp") {
-        var opti: i64 = infer_expr(n.na);
+        var opti: i64 = ie_sub(ei, 0, n.na);
         if (expr_is_lvalue(n.na) == false) {
             parse.fc_err("T-SEM-E760",
                 "取址 `&x` 的操作数必须是可寻址的左值（变量 / 结构体字段 / 下标），不能对临时值取址",
@@ -5162,7 +5266,7 @@ pub fn infer_expr(e: i64) i64 {
     }
     // 解引用 `*r`：操作数须为引用/指针类型，结果类型为其指向的元素类型。
     if (k == "deref") {
-        var opti: i64 = infer_expr(n.na);
+        var opti: i64 = ie_sub(ei, 0, n.na);
         if (tip_kind(opti) != "Pointer") {
             parse.fc_err("T-SEM-E761",
                 base.sb_cat3("解引用 `*r` 的操作数必须是引用/指针类型，但得到 `", ti_str(opti), "`"),
@@ -5232,7 +5336,7 @@ pub fn infer_expr(e: i64) i64 {
     }
     // match 表达式（L-15）：分支结果类型统一 + when 守卫布尔显式 + 穷尽性
     if (k == "match") {
-        var m_scr: i64 = infer_expr(n.na);
+        var m_scr: i64 = ie_sub(ei, 0, n.na);
         var m_res: i64 = -1;
         var m_irref: bool = false;
         var m_rep: bool = n.bb == false;   // 诊断只报一次（infer_expr 可能被重入）
@@ -5330,7 +5434,7 @@ pub fn infer_expr(e: i64) i64 {
                 if (is_range_node(m_an.na)) {
                     var m_rp: Node = base.nodes[m_an.na];
                     if (m_rp.na >= 0) {
-                        var m_rlo: i64 = infer_expr(m_rp.na);
+                        var m_rlo: i64 = ie_sub_in(ie_inst(m_an.na), m_rp.na);
                         if (m_rep && tip_kind(m_rlo) != "Unknown" && tip_kind(m_scr) != "Unknown") {
                             if (ti_equal(m_rlo, m_scr) == false && can_cast(m_rlo, m_scr) == false) {
                                 err_type_mismatch(m_rp.na, m_scr, m_rlo);
@@ -5338,7 +5442,7 @@ pub fn infer_expr(e: i64) i64 {
                         }
                     }
                     if (m_rp.nb >= 0) {
-                        var m_rhi: i64 = infer_expr(m_rp.nb);
+                        var m_rhi: i64 = ie_sub_in(ie_inst(m_an.na), m_rp.nb);
                         if (m_rep && tip_kind(m_rhi) != "Unknown" && tip_kind(m_scr) != "Unknown") {
                             if (ti_equal(m_rhi, m_scr) == false && can_cast(m_rhi, m_scr) == false) {
                                 err_type_mismatch(m_rp.nb, m_scr, m_rhi);
@@ -5358,7 +5462,7 @@ pub fn infer_expr(e: i64) i64 {
                     if (tip_kind(m_scr) == "Enum" || tip_kind(m_scr) == "Union") {
                         g_lead_expect = m_scr;
                     }
-                    var m_pt: i64 = infer_expr(m_an.na);
+                    var m_pt: i64 = ie_sub_in(ie_inst(m_k.val), m_an.na);
                     g_lead_expect = m_sav_exp;
                     if (m_rep && tip_kind(m_pt) != "Unknown" && tip_kind(m_scr) != "Unknown") {
                         if (ti_equal(m_pt, m_scr) == false && can_cast(m_pt, m_scr) == false) {
@@ -5368,7 +5472,7 @@ pub fn infer_expr(e: i64) i64 {
                 }
             }
             if (m_an.nb >= 0) {
-                var m_gt: i64 = infer_expr(m_an.nb);
+                var m_gt: i64 = ie_sub_in(ie_inst(m_k.val), m_an.nb);
                 if (m_rep && is_cond_bool(m_gt) == false) {
                     var m_gl: i64 = parse.n_line(m_an.nb);
                     var m_gc: i64 = parse.n_col(m_an.nb);
@@ -5377,7 +5481,7 @@ pub fn infer_expr(e: i64) i64 {
                         parse.n_file(m_an.nb), m_gl, m_gc, m_gl, m_gc + 4);
                 }
             }
-            var m_bt: i64 = infer_expr(m_an.nc);
+            var m_bt: i64 = ie_sub_in(ie_inst(m_k.val), m_an.nc);
             cur_scope = m_prev;
             if (m_res < 0) {
                 m_res = m_bt;
@@ -5441,10 +5545,10 @@ pub fn infer_expr(e: i64) i64 {
         // ── 序列化/反序列化操作符脱糖（M51 `<` 写；M52 读路径 `>` 读）────────
         // 语义由**左操作数静态类型**唯一判定：fid ⇒ 序列化/反序列化，否则 ⇒ 普通比较。
         // fid 无序，故 `<`/`>` 作比较时不存在二义（L-04）；`>` 作反序列化时右操作数是「类型」而非值。
-        var lt: i64 = infer_expr(n.na);
+        var lt: i64 = ie_sub(ei, 0, n.na);
         var lfid: bool = tip_kind(lt) == "Scalar" && tip_name(lt) == "fid";
         if (lfid && op == "<") {
-            var rt: i64 = infer_expr(n.nb);
+            var rt: i64 = ie_sub(ei, 1, n.nb);
             check_serializable(n.nb, rt);
             n.kind = "serialize";
             hir.hir_invalidate(e);
@@ -5482,7 +5586,7 @@ pub fn infer_expr(e: i64) i64 {
             return ti_mk("Unknown");
         }
         // 其余：正常推断右操作数，再按既有规则处理比较/有序错误
-        var rt: i64 = infer_expr(n.nb);
+        var rt: i64 = ie_sub(ei, 1, n.nb);
         var rfid: bool = tip_kind(rt) == "Scalar" && tip_name(rt) == "fid";
         if (lfid || rfid) {
             if (op == "<" || op == ">" || op == "<=" || op == ">=") {
@@ -5630,14 +5734,14 @@ pub fn infer_expr(e: i64) i64 {
         return rt;
     }
     if (k == "unary") {
-        var ot: i64 = infer_expr(n.na);
+        var ot: i64 = ie_sub(ei, 0, n.na);
         if (n.sa == "!") {
             return ti_scalar("bool");
         }
         return ot;
     }
     if (k == "assign") {
-        var atl: i64 = infer_expr(n.na);
+        var atl: i64 = ie_sub(ei, 0, n.na);
         var saved_ve0: i64 = g_vec_expect;
         var saved_te0: i64 = g_tile_expect;
         var saved_le0: i64 = g_lead_expect;
@@ -5646,7 +5750,7 @@ pub fn infer_expr(e: i64) i64 {
         else { g_vec_expect = -1; g_tile_expect = -1; }
         // 前导点 `.{...}` 右侧：按 LHS 类型注入上下文（与 var_decl/return/assignment 一致）
         g_lead_expect = atl;
-        var atr: i64 = infer_expr(n.nb);
+        var atr: i64 = ie_sub(ei, 1, n.nb);
         g_vec_expect = saved_ve0;
         g_tile_expect = saved_te0;
         g_lead_expect = saved_le0;
@@ -5715,7 +5819,7 @@ pub fn infer_expr(e: i64) i64 {
                 slice_set(base.nodes, e, mfa_n);
                 return desugar_format_call(e);
             }
-            var mfa_rt: i64 = infer_expr(mfa_recv);
+            var mfa_rt: i64 = ie_sub_in(ei, mfa_recv);
             if (tip_kind(mfa_rt) == "String") {
                 parse.fc_err("T-FST-E304",
                     "`.format(...)` 的接收者必须是字符串**字面量**（编译期解析，运行期无模板引擎）；变量模板请改用 StringBuilder 逐段拼接",
@@ -5818,10 +5922,10 @@ pub fn infer_expr(e: i64) i64 {
             // 它是区间索引降解出来的内部内建，也允许直接写。
             if (fname == "slice_sub" && n.la >= 0) {
                 var ssn: i64 = base.kids[n.la].val;
-                var sst: i64 = infer_expr(ssn);
+                var sst: i64 = ie_sub_in(ei, ssn);
                 var ssc: i64 = base.kids[n.la].next;
                 while (ssc >= 0) {
-                    infer_expr(base.kids[ssc].val);
+                    ie_sub_in_v(ei, base.kids[ssc].val);
                     ssc = base.kids[ssc].next;
                 }
                 if (tip_kind(sst) == "Slice") {
@@ -5834,7 +5938,7 @@ pub fn infer_expr(e: i64) i64 {
             // map_get(m, k) 的返回类型 = 映射的 V（需从首个实参的 map 类型反查）
             if (fname == "map_get" && n.la >= 0) {
                 var mgn: i64 = base.kids[n.la].val;
-                var mgt: i64 = infer_expr(mgn);
+                var mgt: i64 = ie_sub_in(ei, mgn);
                 if (tip_kind(mgt) == "Map") {
                     var mgti: TI = tis[mgt];
                     if (mgti.val >= 0) {
@@ -5846,7 +5950,7 @@ pub fn infer_expr(e: i64) i64 {
             // 可选类型内建：some(x)→Optional(实参类型)；unwrap(x)→Optional 元素类型；is_some/is_none(x)→bool。
             if ((fname == "some" || fname == "unwrap" || fname == "is_some" || fname == "is_none") && n.la >= 0) {
                 var oan: i64 = call_arg_node(e, 0);
-                var oat: i64 = infer_expr(oan);
+                var oat: i64 = ie_sub_in(ei, oan);
                 if (fname == "some") {
                     // 实参是**元素值**（非可选），结果为 Optional(该实参类型)。
                     return ti_elem_of("Optional", oat);
@@ -5870,7 +5974,7 @@ pub fn infer_expr(e: i64) i64 {
             if (fname == "print" || fname == "println" || fname == "eprint") {
                 if (n.la >= 0) {
                     var pan: i64 = base.kids[n.la].val;
-                    var pat: i64 = infer_expr(pan);
+                    var pat: i64 = ie_sub_in(ei, pan);
                     if (tip_kind(pat) != "String" && tip_kind(pat) != "Unknown") {
                         base.diag_new("T-SEM-E202", "error",
                             base.sb_cat3(fname, " 的实参必须是字符串（String）；标量请先用 int_to_str / to_string / StringBuilder 拼接。当前收到: ", ti_str(pat)),
@@ -5892,7 +5996,7 @@ pub fn infer_expr(e: i64) i64 {
             if (fname == "fid_error") {
                 if (n.la >= 0) {
                     var fean: i64 = base.kids[n.la].val;
-                    var feat: i64 = infer_expr(fean);
+                    var feat: i64 = ie_sub_in(ei, fean);
                     var feok: bool = (tip_kind(feat) == "Scalar" && tip_name(feat) == "fid") || tip_kind(feat) == "Unknown";
                     if (!feok) {
                         base.diag_new("T-FID-E659", "error",
@@ -5905,7 +6009,7 @@ pub fn infer_expr(e: i64) i64 {
             if (fname == "fid_eof") {
                 if (n.la >= 0) {
                     var feon: i64 = base.kids[n.la].val;
-                    var feot: i64 = infer_expr(feon);
+                    var feot: i64 = ie_sub_in(ei, feon);
                     var feook: bool = (tip_kind(feot) == "Scalar" && tip_name(feot) == "fid") || tip_kind(feot) == "Unknown";
                     if (!feook) {
                         base.diag_new("T-FID-E660", "error",
@@ -5919,7 +6023,7 @@ pub fn infer_expr(e: i64) i64 {
             if (fname == "fseek" || fname == "ftell") {
                 if (n.la >= 0) {
                     var skn: i64 = base.kids[n.la].val;
-                    var skt: i64 = infer_expr(skn);
+                    var skt: i64 = ie_sub_in(ei, skn);
                     var skok: bool = (tip_kind(skt) == "Scalar" && tip_name(skt) == "fid") || tip_kind(skt) == "Unknown";
                     if (!skok) {
                         base.diag_new("T-FID-E661", "error",
@@ -5930,7 +6034,7 @@ pub fn infer_expr(e: i64) i64 {
                 if (fname == "fseek") {
                     var skon: i64 = call_arg_node(e, 1);
                     if (skon >= 0) {
-                        var skot: i64 = infer_expr(skon);
+                        var skot: i64 = ie_sub_in(ei, skon);
                         var skoname: string = tip_name(skot);
                         var skoint: bool = tip_kind(skot) == "Scalar" && skoname != "fid" && skoname != "atom"
                             && skoname != "bool" && skoname != "f32" && skoname != "f64";
@@ -5950,7 +6054,7 @@ pub fn infer_expr(e: i64) i64 {
                     if (ftnode.kind == "string") {
                         check_time_spec(ftnode.sa, ftn);
                     } else {
-                        var ftt: i64 = infer_expr(ftn);
+                        var ftt: i64 = ie_sub_in(ei, ftn);
                         if (tip_kind(ftt) != "String" && tip_kind(ftt) != "Unknown") {
                             base.diag_new("T-TIM-E702", "error",
                                 base.sb_cat3(fname, " 的第 1 个实参（格式串）必须是字符串；当前收到: ", ti_str(ftt)),
@@ -5960,7 +6064,7 @@ pub fn infer_expr(e: i64) i64 {
                 }
                 var ftmn: i64 = call_arg_node(e, 1);
                 if (ftmn >= 0) {
-                    var ftmt: i64 = infer_expr(ftmn);
+                    var ftmt: i64 = ie_sub_in(ei, ftmn);
                     var ftmname: string = tip_name(ftmt);
                     var ftmint: bool = tip_kind(ftmt) == "Scalar" && ftmname != "fid" && ftmname != "atom"
                         && ftmname != "bool" && ftmname != "f32" && ftmname != "f64";
@@ -5977,7 +6081,7 @@ pub fn infer_expr(e: i64) i64 {
                         parse.fc_err("T-SEM-E206",
                             "format_time_tz(spec, t, tz_minutes) 需要 3 个实参：格式串、微秒 epoch、时区偏移分钟数（东为正，如东八区 480）", e);
                     } else {
-                        var tzt: i64 = infer_expr(tzn);
+                        var tzt: i64 = ie_sub_in(ei, tzn);
                         var tzname: string = tip_name(tzt);
                         var tzint: bool = tip_kind(tzt) == "Scalar" && tzname != "fid" && tzname != "atom"
                             && tzname != "bool" && tzname != "f32" && tzname != "f64";
@@ -6001,7 +6105,7 @@ pub fn infer_expr(e: i64) i64 {
                     if (ptnode.kind == "string") {
                         check_time_parse_spec(ptnode.sa, ptn);
                     } else {
-                        var ptt2: i64 = infer_expr(ptn);
+                        var ptt2: i64 = ie_sub_in(ei, ptn);
                         if (tip_kind(ptt2) != "String" && tip_kind(ptt2) != "Unknown") {
                             base.diag_new("T-TIM-E702", "error",
                                 base.sb_cat3(fname, " 的第 1 个实参（格式串）必须是字符串；当前收到: ", ti_str(ptt2)),
@@ -6013,7 +6117,7 @@ pub fn infer_expr(e: i64) i64 {
                         parse.fc_err("T-SEM-E206",
                             base.sb_cat3(fname, "(spec, s) 缺少第 2 个实参（待解析字符串）", ""), e);
                     } else {
-                        var pst: i64 = infer_expr(psn);
+                        var pst: i64 = ie_sub_in(ei, psn);
                         if (tip_kind(pst) != "String" && tip_kind(pst) != "Unknown") {
                             base.diag_new("T-TIM-E703", "error",
                                 base.sb_cat3(fname, " 的第 2 个实参（待解析文本）必须是字符串；当前收到: ", ti_str(pst)),
@@ -6036,7 +6140,7 @@ pub fn infer_expr(e: i64) i64 {
                     if (fsn.kind == "string") {
                         check_fmt_spec(fsn.sa, fspecn);
                     } else {
-                        var fst: i64 = infer_expr(fspecn);
+                        var fst: i64 = ie_sub_in(ei, fspecn);
                         if (tip_kind(fst) != "String" && tip_kind(fst) != "Unknown") {
                             base.diag_new("T-FST-E312", "error",
                                 base.sb_cat3(fname, " 的第 1 个实参（格式串 spec）必须是字符串；当前收到: ", ti_str(fst)),
@@ -6057,7 +6161,7 @@ pub fn infer_expr(e: i64) i64 {
                 if (ge0 < 0) {
                     parse.fc_err("T-SEM-E206", "getenv(name) 需要 1 个实参：环境变量名（字符串）；未设置返回错误，请传入形如 \"PATH\" 的名称", e);
                 } else {
-                    var get0: i64 = infer_expr(ge0);
+                    var get0: i64 = ie_sub_in(ei, ge0);
                     if (tip_kind(get0) != "String" && tip_kind(get0) != "Unknown") {
                         base.diag_new("T-SEM-E207", "error",
                             base.sb_cat2("getenv 的第 1 个实参（环境变量名）必须是字符串；当前收到: ", ti_str(get0)),
@@ -6073,14 +6177,14 @@ pub fn infer_expr(e: i64) i64 {
             var bsc: i64 = n.la;
             while (bsc >= 0) {
                 var bsk: Child = base.kids[bsc];
-                infer_expr(bsk.val);
+                ie_sub_in_v(ei, bsk.val);
                 bsc = bsk.next;
             }
             return builtin_ret(fname);
         }
         // callee 是任意表达式（结构体字段 / 数组元素 / 调用结果…）：若其类型是函数类型，
         // 与 ident 路径同样校验实参并返回签名的返回类型。
-        var xcti: i64 = infer_expr(n.na);
+        var xcti: i64 = ie_sub_in(ei, n.na);
         if (tip_kind(xcti) == "Func") {
             check_indirect_call(e, xcti);
             return tif_ret[xcti];
@@ -6156,7 +6260,7 @@ pub fn infer_expr(e: i64) i64 {
                     "（self / 期望类型 / 当前模块均无可匹配项）"), e);
             return ti_mk("Unknown");
         }
-        var obt: i64 = infer_expr(n.na);
+        var obt: i64 = ie_sub(ei, 0, n.na);
         var obk: string = tip_kind(obt);
         if (obk == "Struct" || obk == "Named") {
             var si3: i64 = sym_lookup(global_scope, tip_name(obt));
@@ -6210,8 +6314,8 @@ pub fn infer_expr(e: i64) i64 {
         // 下标操作数 n.nb（如 argv[ai] 中的 ai）也必须经 infer_expr 解析：
         // 否则其标识符不会走中心识别路径、不会调用 idecl_set，导致后端 shadowing
         // 反查不到声明节点、发射未唯一化的原名，与声明（已唯一化）不一致。
-        if (n.nb >= 0) { infer_expr(n.nb); }
-        var obt2: i64 = infer_expr(n.na);
+        if (n.nb >= 0) { ie_sub_v(ei, 1, n.nb); }
+        var obt2: i64 = ie_sub(ei, 0, n.na);
         var obk2: string = tip_kind(obt2);
         if (obk2 == "Array" || obk2 == "Slice") {
             var t2: TI = tis[obt2];
@@ -6255,7 +6359,7 @@ pub fn infer_expr(e: i64) i64 {
                 // 不能被外层期望误判成同一向量类型。
                 var saved_ve5: i64 = g_vec_expect;
                 g_vec_expect = -1;
-                var cet: i64 = infer_expr(ckv.val);
+                var cet: i64 = ie_sub_in(ei, ckv.val);
                 g_vec_expect = saved_ve5;
                 if (tip_kind(cet) != "Unknown" && ti_equal(cet, velem) == false && can_cast(cet, velem) == false) {
                     parse.fc_err("T-VEC-E924",
@@ -6324,7 +6428,7 @@ pub fn infer_expr(e: i64) i64 {
                     var cchild: Child = base.kids[ck2];
                     var saved_te5: i64 = g_tile_expect;
                     g_tile_expect = -1;
-                    var cet: i64 = infer_expr(cchild.val);
+                    var cet: i64 = ie_sub_in(ei, cchild.val);
                     g_tile_expect = saved_te5;
                     if (tip_kind(cet) != "Unknown" && ti_equal(cet, tele) == false && can_cast(cet, tele) == false) {
                         parse.fc_err("T-VEC-E945",
@@ -6344,7 +6448,7 @@ pub fn infer_expr(e: i64) i64 {
         var cnt: i64 = parse.list_count(n.la);
         if (cnt > 0) {
             var k2: Child = base.kids[n.la];
-            var et: i64 = infer_expr(k2.val);
+            var et: i64 = ie_sub_in(ei, k2.val);
             // 数组字面量的整型元素按「默认 int」提升为 i64（与多数语言一致，
             // 避免 [1,2,3] 被推成 []u8）；其余类型（bool/f64/struct…）保持不变。
             if (tip_kind(et) == "Scalar" && is_int_name(tip_name(et)) && tip_name(et) != "i64" && tip_name(et) != "i32") {
@@ -6363,8 +6467,8 @@ pub fn infer_expr(e: i64) i64 {
         if (n.la >= 0) {
             var k3: Child = base.kids[n.la];
             var en: Node = base.nodes[k3.val];
-            var kt: i64 = infer_expr(en.na);
-            var vt: i64 = infer_expr(en.nb);
+            var kt: i64 = ie_sub_in(ie_inst(k3.val), en.na);
+            var vt: i64 = ie_sub_in(ie_inst(k3.val), en.nb);
             // 与数组字面量同规则：整型键/值按「默认 int」提升为 i64，
             // 避免 [1: 2] 被推成 map[u8]u8。
             if (tip_kind(kt) == "Scalar" && is_int_name(tip_name(kt)) && tip_name(kt) != "i64" && tip_name(kt) != "i32") {
@@ -6469,7 +6573,7 @@ pub fn infer_expr(e: i64) i64 {
                     if (fti >= 0) {
                         var saved_le: i64 = g_lead_expect;
                         g_lead_expect = fti;
-                        infer_expr(fvna);
+                        ie_sub_in_v(ei, fvna);
                         g_lead_expect = saved_le;
                     }
                 }
@@ -6497,10 +6601,10 @@ pub fn infer_expr(e: i64) i64 {
         return resolve_ti(n.nb);
     }
     if (k == "paren") {
-        return infer_expr(n.na);
+        return ie_sub(ei, 0, n.na);
     }
     if (k == "comptime") {
-        return infer_expr(n.na);
+        return ie_sub(ei, 0, n.na);
     }
 // <<< GEN:type_infer2 <<<
     return ti_mk("Unknown");
@@ -11880,6 +11984,14 @@ pub fn run_check() void {
     // 嵌套泛型再单态化与 format/!j 脱糖一并完成，且落在主检查循环/代码生成预处理之前，
     // 脱糖结果直接进入同一趟发射视图。主循环之后不再需要 fixpoint。
     scan_fid_format_atoms();
+    // Stage B-2 观测：`T_HIR_EDGE_STATS=1` 时打印表达式下降边的来源统计。
+    // 回落 CST 的次数收敛到 0，就意味着 sema 在表达式层已完全不需要读节点槽位。
+    if (str_len(getenv("T_HIR_EDGE_STATS")) > 0) {
+        eprint("HIR 下降边: 经 HIR " + base.i2s(g_hir_edge_hir)
+            + " 次 / 回落 CST " + base.i2s(g_hir_edge_cst)
+            + " 次（无指令 " + base.i2s(g_hir_edge_noinst)
+            + " / 操作数不符 " + base.i2s(g_hir_edge_mis) + "）");
+    }
 }
 
 // g_pipe_decls 是否含该声明（HIR 检查循环用它跳过「管道已报错」的二手噪声）

@@ -125,8 +125,21 @@ CTFE 已改为解释 HIR 指令流（`src/hir_eval.tc`，Stage A'）。Sema 消�
 该节点的 HIR 指令反映的是**改写前**的语法意图 —— 必须 `hir_invalidate(n)` 断开映射，
 让后续分派回落 CST kind（管道/区间的重复 infer 正是靠这个幂等收口的）。
 
-**回落边界（Stage B-2，未做）**：`infer_expr` 的分支体仍读 `n.na / n.nb / n.la`
-等节点字段；表达式内部的下降边尚未逐条搬进 HIR。
+### Stage B-2（已落地）：表达式下降边也取自 HIR
+
+`infer_expr` 里 64 处子节点下降改走 `ie_sub(ei, k, fb)`（位置式取第 k 个操作数）/
+`ie_sub_in(ei, fb)`（成员式：在操作数表里找该子节点），先向 HIR 指令要操作数。
+
+⚠ **安全网**：只有 HIR 操作数指向的正是那个 CST 子节点时才走 HIR，否则回落 CST。
+sema 就地改写过子节点时，HIR 反映的是**改写前**的结构 —— 硬走就是静默错编，
+远比回落危险。回落次数由 `g_hir_edge_cst` 计（`T_HIR_EDGE_STATS=1` 打印）。
+
+实测（`tc check src/tc.tc`）：**98% 的下降边经 HIR**（85513 / 87182），回落 1669 =
+「无指令」316 + 「操作数不符」1353。前者是 sema 期合成的子树（泛型实例克隆 /
+format 脱糖产物），本来就没有 HIR；后者是 HIR **结构性不表达**的三类节点：
+`paren` 透明省略（AstGen 直接委托到内层节点）、`FIELD_SET` / `INDEX_SET` 的赋值目标
+被合成（只留 base + 字段名 / base + idx + val）、`call` 的 callee 只存名字。
+这几类 sema 只能读 CST，属设计取舍而非 AstGen 缺陷；`T_HIR_EDGE_TRACE=1` 可逐条打印。
 
 **⚠ 两个必须同步的面（实测踩坑）**：
 
