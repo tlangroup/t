@@ -145,7 +145,7 @@
 
 > **采纳 A（2026-09-04）**：HIR 重定义为 Zig 的 **ZIR 槽位**——未定型 · 线性 · 可序列化，位于 Sema **之前**。权威规格见 `docs/compiler/hir-design.md`（含四大性质、指令集草图、与 Sema/CTFE 接口）。本节仅保留与总管线相关的要点，避免与 hir-design.md 重复。
 
-> **实现状态（与管线对齐）**：HIR 是**设计的**前端 IR 锚点（增量编译承重墙 + 惰性诊断 + CTFE 解释对象），位于 mir/TIR/tmir 之上。截至 M0–M2 收口，**HIR 尚未落地**——当前发货管线为 `sema → TIR → {mir→tmir→便携后端}`，LLVM 直消费 TIR（见 §4.5 / 管线图①），前端在 sema 内把 AST 直接降到 TIR（类型当场擦除）。这与 v3 §2「类型槽」设计不冲突：类型槽是 HIR 的**前瞻补位**，待 HIR（阶段 A）落地后并入其缓存/重入体系。HIR 在管线中的**位置**不变（永远是顶层前端 IR），只是**接线**推迟，不构成层级偏离。
+> **实现状态（与管线对齐，2026-09-22 更正）**：HIR 是前端 IR 锚点（增量编译承重墙 + 惰性诊断 + CTFE 解释对象），位于 mir/TIR/tmir 之上。**HIR 已落地（2026-09-21 起，提交 855349d / 633545d）**：`emit-hir` 产真实 HIR + 二进制往返一致；`check` 管线经 AstGen 生成 HIR；**Stage B 全量 sema 已改为消费 HIR 指令流**（RAW 逃生舱 300→0，`infer_expr` 98% 下降边经 HIR），CTFE 经 `src/hir_eval.tc` 解释 HIR。当前发货管线为 `Lex/Parse →(AstGen) HIR → Sema(消费 HIR) → TIR → {mir→tmir→便携后端}`，LLVM 直消费 TIR（见 §4.5 / 管线图①）；类型在 Sema 消费 HIR 时推断、TIR 阶段擦除。这与 v3 §2「类型槽」设计不冲突：类型槽是 HIR 的**前瞻补位**，HIR 落地后已并入其缓存/重入体系。HIR 在管线中的**位置**不变（永远是顶层前端 IR）。（旧版「HIR 尚未落地 / 发货管线 sema→TIR」已于本次扫描更正——该陈述已过时。）
 
 - **性质**：未定型（源类型注解为未解析名字引用）、线性（扁平指令数组）、可序列化（文本+二进制双格式）。
 - **来源**：CST 经 AstGen（宏/agent 展开、脱糖、名字解析的**未解析**形式）生成；**不做类型推断**（那是 Sema 的事）。
@@ -298,7 +298,7 @@ PGO 之上预留 ML 决策接口（内联/regalloc，LLVM MLGO 范式）；GPU �
 ## 8. 与现有 `gate L2` 自举不动点的兼容（G11）
 
 - 新管线插入 **HIR/mir/TIR/tmir** 后，`tc.tc` 自身不含泛型使用/kernel，故 `g2==g3==g4` 不动点不受影响（`device-design.md` 已确认同类结论）。
-- **IR 漂移归零铁律沿用**：改前端后先同步 `tc.exe`，再重录 **TIR 基线**（`tools/tir_snapshot.mjs --update`），判不动点只比 `.tir` md5，非 `.exe` md5。
+- **IR 漂移归零铁律沿用**：改前端后先同步 `tc.exe`，再重录 **TIR 基线**（`tools/tir_snapshot.mjs --update`）。⚠ **现状（2026-09-22 扫描）**：`gate.mjs` 的自举不动点（`boot23`/`boot4`）实际以 **`.ll` md5** 为 oracle（见 `tools/gate.mjs` 与记忆「致命坑 5」），`tests/tir_baseline.json`（`.tir` 发射稳定性）由 `tir_snapshot.mjs` **并行护卫**；设计目标「以 `.tir` 为唯一不动点 oracle」尚待收口，当前 `.ll` md5 仍为实际判据。判不动点只比产物 md5、非 `.exe` md5 的原则不变。
 - 现有 `.ll`/`.c` 文本 md5 作为端到端安全网保留。
 
 ---
@@ -317,6 +317,33 @@ PGO 之上预留 ML 决策接口（内联/regalloc，LLVM MLGO 范式）；GPU �
 - **L. MLGO / 确定性 / 增量缓存**：PGO 反馈 + ML 决策接口；内容寻址缓存 + 确定性构建。
 
 每 Stage 结束以 `gate L2` 全绿 + TIR 基线稳定为合并门槛。
+
+### 9.1 实现状态总表（2026-09-22 扫描，对照实际仓库）
+
+> 本表为对 `docs/compiler/compiler-pipeline-design.md` 的查缺补漏：以 `src/*.tc`、`tools/*.mjs|*.py`、各 `docs/compiler/*.md` 的实际存在与接线为准，标注「设计 vs 落地」是否相符，并判定文档正确性。
+
+| 设计项（编号） | 文档主张 | 实际状态（扫描） | 判定 |
+|---|---|---|---|
+| **HIR（ZIR 槽位）** §4.2 | 草案称「尚未落地，发货管线 sema→TIR」 | **已落地**：`src/hir.tc`、`emit-hir` 真实产出 + 二进制往返一致；Stage B 全量 sema 消费 HIR（`src/sema.tc` `infer_expr_hir` 等）；CTFE 经 `src/hir_eval.tc` | ⚠ **文档过时（已更正 §4.2）**——文档该陈述错误，实际已落地 |
+| **TIR** §4.4 | mir 与 tmir 之间，类型擦除线性 IR；LLVM 直消费、便携后端经 tmir | 一致：`src/tir.tc` + `src/tir_to_ll.tc`（LLVM 直消费）；`src/tmir.tc` 由 TIR 降 | ✅ 相符 |
+| **tmir** §4.4/4.5 | 机器桥，便携薄后端消费 | 一致：`codegen_wasm.tc`(16×tmir) / `codegen_riscv.tc`(7×) / `codegen_c_tmir.tc`(24×) 均消费 tmir；LLVM 不消费 | ✅ 相符 |
+| **LLVM 后端** §4.5① | 直消费 TIR，不经 tmir | 一致：`tc build/emit-ll/run` 走 `tir_to_ll`，绕过 mir/tmir（`src/tc.tc:607`） | ✅ 相符 |
+| **C 后端（tmir→C）** G1 | 单一真相源 tmir→C，删除重复 lowering | ⚠ **两套 C 后端并存**：① `src/codegen_c.tc`（直接 TIR→C，绕过 tmir）被 `tc compile --emit-c` 调用，且 gate.mjs:414「C 后端自举」/ir_snapshot.mjs:305/bootstrap.mjs:89/difftest.mjs:124/run_examples.mjs:183 全用它；② `src/codegen_c_tmir.tc`（tmir→C）仅 `tests/m1` 的 `tc build --backend tmir-c` 用 | ❌ **不符（G1 漂移根未除）**——两套对同一源码可漂，正是 Bug1/Bug2 类；建议把生产路径统一迁到 `tmir-c` 后删 `codegen_c.tc` 直接路径 |
+| **mir** §4.3 / Stage G-H | TIR 前插 mir（CFG+SSA+中端优化，opt=0 恒等） | 已落：`src/mir.tc`（`mir_from_tir`/`mir_run`/`mir_to_tir_lower`），主路径 wasm/riscv/c 经 `mir_run(opt=0 恒等) → tir_to_tmir_lower`；LLVM 旁路 | ✅ 相符（初版透传，符合 §10 风险策略） |
+| **`.tmi`（★G-2）** §4.2b / Stage A | P0 三件套之一，typed 接口制品 | ❌ 未实现：无 `emit-tmi` 子命令、无 `.tmi` 产物（`grep "\.tmi"` 仅在设计文档与后端注释出现，非发射逻辑） | ⚠ 文档标 P0 但未落地（设计层决策 `tmi-design.md §3` 已定，实现待办） |
+| **Driver/Query/Scheduler（★G-1）** §5.1 / Stage A | P0 三件套之一，查询依赖图 + red-green + work-stealing | ❌ 未实现：仅有 `docs/compiler/driver-query-design.md` 设计，无对应引擎代码 | ⚠ 文档标 P0 但未落地 |
+| **Cranelift** Stage I | debug 快编后端 | ❌ 未实现（无 `codegen_cranelift.tc`） | ✅ 符合路线图（后续 Stage） |
+| **WASM Component Model / SPIR-V / NVVM** Stage K | 多目标 | 部分：wasm/riscv/device 发射器已落（v3 M 轨，`tests/m1` 三轨对拍 12/12 全绿）；Component Model/PGO/BOLT 未做 | ✅ 部分落地、其余符合路线图 |
+| **PGO / ThinLTO / BOLT / MLGO / 增量缓存 / 确定性 hermetic** Stage J/L | 全局优化 + 缓存 | ❌ 未实现 | ✅ 符合路线图（后续 Stage） |
+| **自举不动点 g2==g3==g4** G11 | 新管线不破不动点 | 一致：gate L2 22/22 通过，四代 `.ll` md5 全同 | ✅ 相符 |
+| **不动点 oracle** §8 | 「判不动点只比 `.tir` md5」 | ⚠ 实际 gate 比 `.ll` md5（见 §8 注）；`.tir` 基线并行护卫 | ⚠ **文档措辞超前于实现（已加注 §8）** |
+| **被引子文档/工具完整性** | 引用 hir/tir/device/tmi/target-desc/driver-query/persistent-session/ir-taxonomy/mir/pipeline-*/wasm-component/supply-chain/comptime/meta_design + gate/ir_snapshot/tir_snapshot/hir_test/llvm_verify/m1_difftest | 全部存在，无缺失引用 | ✅ 相符 |
+
+**扫描结论**：
+1. 文档整体是**正确且自洽的路线图**，除 HIR 状态与不动点 oracle 两处措辞外，层级/后端接线主张与实现一致；所有被引设计文档与工具均齐备，无断链。
+2. **两处文档错误/超前（已更正）**：① §4.2「HIR 尚未落地」→ 已落地；② §8「只比 .tir md5」→ 实际以 .ll 为 oracle（.tir 并行护卫）。
+3. **一处真实设计-实现偏离（需收口）**：G1「C 后端单一真相源」未达成——`codegen_c.tc`（直接 TIR→C）仍在生产路径（gate/ir_snapshot/bootstrap/run_examples/difftest 的 `compile --emit-c`），与 `codegen_c_tmir.tc`（tmir→C）并存，是双后端漂移的残留温床。建议优先将其统一到 tmir→C 并删除旧直接路径，否则 G1 的「根治 Bug1/Bug2」只在 LLVM↔tmir-C 之间成立、在旧 `compile` 路径上不成立。
+4. **P0 未落地**：`.tmi` 与 Driver/Query 仅设计未实现，与文档 Stage A 路线图一致（非偏差），但因其标 ★G-1/★G-2，建议立项追踪。
 
 ---
 
