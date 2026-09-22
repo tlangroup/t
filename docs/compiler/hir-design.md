@@ -95,6 +95,8 @@ CST ──AstGen──▶ HIR（未定型·线性·可序列化，= ZIR 槽位�
 
 > 关键：所有 `type_expr` 都是**未解析**引用，使 HIR 完全独立于类型系统 → 可缓存。解析发生在 Sema，产出 mir。
 
+> **实现现状（2026-09-22）**：当前 HIR 尚未落地结构化的 `type_expr` 节点树（`name_ref`/`generic_app`/`ptr`/`slice`/`array`/`fn_ptr`/`option` 各自为独立 op）。务实做法——类型标注经 `hir_type_text()` 压成**未解析名字文本**存入 `ty` 字段（或 `HIR_OP_TYPE_REF.sa`），Sema 仍经 `HirInst.nd` 回桥 CST 节点做真实解析（见 `src/sema.tc` Stage B 契约）。故 HIR 文本层已做到「类型=未解析引用」（可缓存），但还**不是完全脱离 CST 的自包含制品**——这是 `type_expr 未解析引用` 设计项待全量落地的剩余部分，应与模块系统重设计 / 泛型类型应用（`generic_app`）同期做。已知坑：`hir_type_text` 原先漏覆盖 `vector`/`tile` 两种 SIMD 类型位 kind，会把 `@Vector(4,i64)`/`@Tile(...)` 的 `ty` 压成 `<type>`（类型名丢失）；已补 `vector`/`tile` 分支，使其忠实重建源码文本（commit 见 git log）。
+
 ---
 
 ## 5. 与 Sema / CTFE 的接口（选项 A 的核心成本）
