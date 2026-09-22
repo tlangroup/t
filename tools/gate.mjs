@@ -328,7 +328,13 @@ const r = await node("ir_snapshot.mjs", "--compiler", `${G1}.exe`, "--jobs", "1"
                 return { ok: true, skip: true, note: "产物快照全同 ⇒ 运行结果必然一致" };
             }
             // 用已达不动点的那代（g3），而非 g1
-            const r = await node("run_examples.mjs", "--compiler", `${G3}.exe`, "--jobs", "1");
+            // ⚠ 单步超时必须单独放宽：本步用 --jobs 1 串行跑 71 个用例 × 双后端
+            // （LLVM build + C compile/clang/run），实测约 8.1 分钟，已顶破 8 分钟全局
+            // STEP_TIMEOUT_MS（2026-09-23 新增第 71 个用例后首次撞上，症状是恰好 480.0s
+            // 被杀、但手跑同命令 71/71 全绿 —— 是超时不是失败，极易误判为回归）。
+            // 与 snapshot 步同一做法：调用处传 timeoutMs，不抬高全局默认值。
+            const r = await node("run_examples.mjs", "--compiler", `${G3}.exe`, "--jobs", "1",
+                { timeoutMs: 20 * 60 * 1000 });
             return { ok: r.code === 0, note: lastLine(r.out) };
         },
     },

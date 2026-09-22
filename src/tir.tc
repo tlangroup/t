@@ -886,6 +886,26 @@ pub fn t_td_is_variant(td: i64) bool {
     }
     return false;
 }
+// 判断 TD 是否为枚举类型。⚠ 与 t_td_is_variant 同构：引擎对「用户具名类型」一律登记
+// cat=="named"（cat=="enum" 只出现在极少数字面 TD 上），故仅判 cat=="enum" 恒为假——
+// 这正是「enum scrutinee 的 match 恒命中首臂」的根因：模式条件返回空串 → 整条条件链被跳过
+// → 入口变成 `br label <首臂>`。必须按 named TD 的 name 回查 decl_list 的 EnumDecl。
+pub fn t_td_is_enum(td: i64) bool {
+    if (td < 0) { return false; }
+    if (td >= slice_len(sema.tds) as i64) { return false; }
+    var t: TD = sema.tds[td];
+    if (t.cat == "enum") { return true; }
+    if (t.cat != "named") { return false; }
+    if (t.name == "") { return false; }
+    var n: i64 = slice_len(lex.decl_list) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        var d: i64 = lex.decl_list[i];
+        if (base.nodes[d].kind == "EnumDecl" && base.nodes[d].sa == t.name) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
 // 按变体名查找 VariantDecl 节点索引（emit 期 lex.decl_list 可靠，无需 sym 表）。
 pub fn t_variant_decl_of_name(vname: string) i64 {
     if (vname == "") { return -1; }
@@ -3704,8 +3724,9 @@ var cft: i64 = tir_expr_td(n.na);
     // 而不是 emit 引用未声明 %Color 的 `bitcast`。
     // ⚠ TD-vs-TI：tir_expr_td 返回 TD 索引，tir_emit_cast 此处需用 TD 字段判定枚举，
     // 绝不可把 TD 索引喂给 sema.tip_kind（读 tis[]，会越界 panic）。
+    // ⚠ 枚举 TD 的 cat 是 "named"，用 cat=="enum" 判定永远不生效；必须走 t_td_is_enum 回查 EnumDecl。
     var cast_src_td: i64 = tir_expr_td(n.na);
-    if (cast_src_td >= 0 && cast_src_td < slice_len(sema.tds) as i64 && sema.tds[cast_src_td].cat == "enum") { inner_st = "i64"; }
+    if (t_td_is_enum(cast_src_td)) { inner_st = "i64"; }
     var target_st: string = tir_st_of_td(sema.resolve_type_desc(n.nb));
     if (inner_st == target_st) { return TirEmitRes{ name: inner, st: est }; }
     var d: string = tir_tmp();
@@ -4382,11 +4403,15 @@ pub fn tir_match_pattern_cond(arm: Node, scr: string, scr_base: string, scr_st: 
         // ⚠ TD-vs-TI：scr_td 是 TD 索引（tir_expr_td 返回），必须用 TD 字段判定枚举，
         // 不可喂给 sema.tip_kind/tip_name/enum_has_case（读 tis[] 或期望 TI 索引，会越界 panic）。
         // enum_const_lookup 取枚举名（字符串）即可，无需 TI 索引。
-        if (scr_td >= 0 && scr_td < slice_len(sema.tds) as i64 && sema.tds[scr_td].cat == "enum") {
+        // ⚠ 枚举 TD 的 cat 是 "named"（不是 "enum"），必须走 t_td_is_enum 回查 EnumDecl。
+        if (t_td_is_enum(scr_td)) {
             var ename: string = sema.tds[scr_td].name;
             var cn: i64 = sema.enum_const_lookup(ename, cname);
             if (cn >= 0) {
-                var val: i64 = base.nodes[cn].ia;
+                // ⚠ enum_const_lookup 返回的是一个 int 节点，其 ia 字段是**进制**（恒为 10），
+                // 真正的成员值在 sa 文本里。直接读 .ia 会让所有枚举成员模式都拿到常量 10
+                // → 三臂条件全都 `== 10` → 永不命中。取值写法须与 tir.tc:4135 一致。
+                var val: i64 = sema.js_parse_int(base.nodes[cn].sa, base.nodes[cn].ia);
                 var pv: string = tir_tmp();
                 tir_emit(TIRInst{ op: TIR_OP_CONST, st: tir_st_from_str(scr_st), dst: tir_op(pv), args: tir_a1(base.i2s(val)), is_comment: false, line: g_cur_line, cmt: "" });
                 var cond: string = tir_tmp();

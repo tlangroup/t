@@ -7,6 +7,8 @@
 > **记号**：符合 `docs/reference.md` §1 Notation（`ProductionName: Syntax`；`|` 选择、`( )` 分组、`*`/`+` 重复、`?` 可选、字面量 `"..."`）。
 >
 > **本稿与实现的关系**：本次修订（2026-08-02）以**实测行为为准**逐条校订了 EBNF 与示例 —— 此前草稿中若干产生式和示例在真实编译器上无法通过。所有 §3 示例均已实际编译运行验证。
+> **语法基线复核（2026-09-23）**：其间语言发生过**语法迁移**，本稿原先使用的**并置式声明**（`FuncName fn(...) -> Ret`、`Color enum`）已被移除。本次已按现行编译器（`out/dbg/tc.exe`）重新实跑校订全部示例，详见 §7.6。
+> ✅ **该缺陷已于同日修复**（LLVM 发射侧四处根因，见 §6.2），并新增 `examples/enum_match_dispatch.tc` 运行期用例补上门禁缺口；§3 的 ②③ 示例现已恢复「已验证」状态。
 
 ---
 
@@ -30,9 +32,11 @@ MatchPat:
 CaseName: (EnumName ".")? UpperIdent
 
 // —— 函数子句模式匹配 ——
-// 声明头与 reference.md §3.1 并置式完全一致；差别仅在参数位允许模式。
 // 注意：子句守卫写在**参数括号内**，紧跟该参数模式，而非括号之后。
-FuncDecl: FuncName "fn" "(" (ParamPattern ("," ParamPattern)*)? ")" "->" Type FuncAnns? Block
+// ⚠ 现行语法（2026-09-23 实测）：并置式 `FuncName fn(...) -> Type` 已**移除**
+//   （现报 T-PAR-E102），唯一合法形式为 `"fn" FuncName "(" ... ")" Type Block`
+//   —— 即 `fn` 前置、返回类型前**无** `->`。
+FuncDecl: "fn" FuncName "(" (ParamPattern ("," ParamPattern)*)? ")" Type FuncAnns? Block
 
 ParamPattern:
     | Ident ":" Type      // 普通参数，与 reference.md §3.1 的 name:type 完全等价
@@ -43,7 +47,8 @@ ParamPattern:
 
 - 新增词法记号：`KwMatch`（`match`）、`KwWhen`（`when`）、`"=>"`（臂映射箭头）。
 - **`Newline` 不是终结符**：本语言词法不产生换行记号，臂的边界由 `=>` 表达式的自然结束确定。旧稿的 `(Newline | ",")` 是错误记法，已改为 `","?`。
-- **守卫位置**：`match` 臂的守卫在 `MatchPat` 与 `=>` 之间（`n when n > 0 => ...`）；函数子句的守卫在**参数括号内**（`classify fn(n when n > 0) -> string`）。这是两处不同的位置，勿混。
+- **守卫位置**：`match` 臂的守卫在 `MatchPat` 与 `=>` 之间（`n when n > 0 => ...`）；函数子句的守卫在**参数括号内**（`fn classify(n when n > 0) string`）。这是两处不同的位置，勿混。
+- **子句体 / 臂体必须是单一表达式（2026-09-23 实测）**：子句体要脱糖为 match 臂，故只能是一条表达式；写成多条语句（如 `if (c) { return A; } else { return B; }`）报 **`T-FUN-E814`**。t 当前**既无 `if` 表达式、也无 Block 表达式** —— `return if (c) A else B;` 与 arm 写 `_ => { ...; return v; }` 均报 **`T-PAR-E101`**。故多步逻辑须提取为辅助函数，或改用 `when` 守卫 + 兜底臂。
 
 ---
 
@@ -66,11 +71,12 @@ ParamPattern:
 
 ## 3. Examples
 
-> 以下代码均已在 `out/dbg/tc.exe` 上实际编译运行通过。
+> 以下代码均已以**现行语法**在 `out/dbg/tc.exe` 上实际编译运行通过（2026-09-23 复核，含 enum 示例 —— 运行期分派缺陷已于同日修复，见 §6.2）。
+> ⚠ `unreachable` **不是** t 的内建，兜底一律写 `return 0 - 1;`。
 
 ```t
 // ── ① 字面量模式 + 绑定 + 守卫 + 通配 ────────────────────────
-sign_of fn(x: i64) -> string {
+fn sign_of(x: i64) string {
     return match (x) {
         0 => "zero"
         n when n > 0 => "positive"   // n 绑定，守卫过滤
@@ -78,14 +84,15 @@ sign_of fn(x: i64) -> string {
     };
 }
 
-// ── ② enum 分发：裸 CaseName，全覆盖故无需 `_` ───────────────
-Color enum : u8 {
+// ── ② enum 分发：三种等价写法，全覆盖故无需 `_` ───────────────
+// 三种写法均编译通过且运行分派正确（2026-09-23 修复后复核）
+enum Color : u8 {
     Red,
     Green,
     Blue,
 }
 
-name_of fn(c: Color) -> string {
+fn name_of(c: Color) string {          // 裸 CaseName
     return match (c) {
         Red => "red"
         Green => "green"
@@ -93,8 +100,7 @@ name_of fn(c: Color) -> string {
     };
 }
 
-// 限定写法等价
-name_of2 fn(c: Color) -> string {
+fn name_of2(c: Color) string {         // 限定写法
     return match (c) {
         Color.Red => "red"
         Color.Green => "green"
@@ -102,8 +108,16 @@ name_of2 fn(c: Color) -> string {
     };
 }
 
+fn name_of3(c: Color) string {         // 前导点写法
+    return match (c) {
+        .Red => "red"
+        .Green => "green"
+        .Blue => "blue"
+    };
+}
+
 // ── ③ 大小写混用：CaseName 分发 + 小写绑定兜底 ───────────────
-is_warm fn(c: Color) -> bool {
+fn is_warm(c: Color) bool {
     return match (c) {
         Red => true
         other => false
@@ -111,7 +125,7 @@ is_warm fn(c: Color) -> bool {
 }
 
 // ── ④ 字符串模式 ─────────────────────────────────────────────
-lang_of fn(code: string) -> string {
+fn lang_of(code: string) string {
     return match (code) {
         "zh" => "Chinese"
         "en" => "English"
@@ -119,21 +133,22 @@ lang_of fn(code: string) -> string {
     };
 }
 
-// ── ⑤ 函数子句：守卫在括号内，体是完整 Block ─────────────────
-classify fn(0)            -> string { return "zero"; }
-classify fn(n when n > 0) -> string { return "positive"; }
-classify fn(_)            -> string { return "negative"; }
+// ── ⑤ 函数子句：守卫在括号内，体须单一表达式 ─────────────────
+fn classify(0) string { return "zero"; }
+fn classify(n when n > 0) string { return "positive"; }
+fn classify(_) string { return "negative"; }
 
 // ── ⑥ 多参子句：首位走 match，其余位折叠进守卫 ───────────────
-pick fn(1, k: i64) -> i64 { return k * 10; }
-pick fn(2, k)      -> i64 { return k * 100; }
-pick fn(m, k)      -> i64 { return m + k; }
+fn pick(1, k: i64) i64 { return k * 10; }
+fn pick(2, k) i64 { return k * 100; }
+fn pick(m, k) i64 { return m + k; }
 
 // ── ⑦ 子句递归 ───────────────────────────────────────────────
-fib fn(0)            -> i64 { return 0; }
-fib fn(1)            -> i64 { return 1; }
-fib fn(n when n > 1) -> i64 { return fib(n - 1) + fib(n - 2); }
-fib fn(_)            -> i64 { return 0 - 1; }
+// ⚠ `when` 臂不计入穷尽性，故必须有 `_` 兜底，否则报 T-MAT-E742
+fn fib(0) i64 { return 0; }
+fn fib(1) i64 { return 1; }
+fn fib(n when n > 1) i64 { return fib(n - 1) + fib(n - 2); }
+fn fib(_) i64 { return 0 - 1; }
 ```
 
 ---
@@ -144,7 +159,7 @@ fib fn(_)            -> i64 { return 0 - 1; }
 |---|---|---|---|
 | `switch` | 标量 / 整数 / 枚举值 | 值相等分发 | 🚫 **已废弃并移除**（2026-08-01 从 `reference.md` 删除词法记号 / 产生式 / 节点定义） |
 | `match`（表达式） | 标量 / 字符串 / `enum` | 相等 + CaseName 分发 + 绑定 + `when` 守卫 + 穷尽性 | ✅ 已实装 |
-| 函数子句 `FuncName fn(...)` | 参数列表（模式 + `when`） | 声明级多子句分发（**纯语法糖**，lowering 脱糖为 match） | ✅ 已实装 |
+| 函数子句 `fn FuncName(...)` | 参数列表（模式 + `when`） | 声明级多子句分发（**纯语法糖**，lowering 脱糖为 match） | ✅ 已实装 |
 
 `switch` 移除后，表达式级值分发仅余 `match` 一种写法。函数子句虽在源码层是另一种写法，但经用户裁定（§7.1）定义为 **`match` 的语法糖**，AST lowering 阶段强制脱糖，语义真源唯一，L-04 满足。
 
@@ -171,6 +186,7 @@ fib fn(_)            -> i64 { return 0 - 1; }
 - **A1 覆盖分析**：`enum_all_cases_covered` / `enum_missing_cases` 遍历 `EnumDecl` 成员链，逐个查是否有无守卫的 member 臂覆盖。
 - **锚点**：所有合成节点（match / arm / scrutinee / C2 改写的 member）均承接原节点 `ln`/`cl`/`tv`，故诊断能报出原始文件行列。
 - **惰性验证**：`src/tc.tc` 自身不使用子句语法与 enum match，脱糖前后其自编译 IR 逐字节相同 —— 该通道对既有代码完全惰性。
+- ⚠ **原运行期覆盖缺口（2026-09-23 已补）**：上述门禁只保证「编译通过」+「**整数 / 字符串** scrutinee 的运行正确」。复核时发现 **enum scrutinee 的分派在运行期恒命中首臂**（§6.2）——`run_examples` 全仓无 enum 分派用例，conformance 的 `p21/p22` 只校验编译期行为，故该路径**完全未被门禁覆盖**。缺陷已修复，并新增 `examples/enum_match_dispatch.tc`（+ 期望输出）把该路径纳入双后端运行期对拍。
 
 ---
 
@@ -188,6 +204,54 @@ fib fn(_)            -> i64 { return 0 - 1; }
 - **`variant` 解构模式** `CaseName(a, b)`：前向依赖 —— `variant` 值构造尚未实现，v1 不含。EBNF 中暂不列出该产生式，待 variant 落地后另起草稿增补。
 - **非 enum scrutinee 的大写裸标识符**：当前仅在 scrutinee 为 `enum` 时做 CaseName 解析；标量 / 字符串 scrutinee 下的大写裸名仍按绑定处理（不报错）。待 variant 落地时统一收紧。
 - **臂不可达检测**：`_` 或绑定臂之后的臂当前不报 unreachable 告警。
+- **arm 体多语句**：依赖「Block / if 表达式化」这一当前不存在的语言能力（现 arm 体只能是单一表达式，见 §7.6）。
+
+> 上述增量扩展统一登记在 `docs/syntax/drafts/match_extensions.md`（S1–S14：按难易分级的实现步骤与实现记录），本稿不重复展开。
+
+---
+
+### 6.2 已修运行期缺陷：enum scrutinee 恒命中首臂
+
+> 2026-09-23 语法基线复核时由**实跑**发现；同日定位四处根因并修复，见下方记录。
+
+**现象**：**enum scrutinee 的模式分派恒命中首臂** —— 与传入哪个成员无关，返回值永远是第一条 arm 的值。
+
+**最小复现**：
+
+```t
+enum Expl : u8 { R = 1, G = 2, B = 3, }
+
+fn pick(c: Expl) string {
+    return match (c) {
+        .R => "r"
+        .G => "g"
+        .B => "b"
+    };
+}
+// 修复前：pick(Expl.R) / pick(Expl.G) / pick(Expl.B) 三者均返回 "r"
+// 修复后：分别返回 "r" / "g" / "b"
+```
+
+**关键定性**：缺陷**只存在于 TIR→LLVM 轨**（`build` / `run` / `emit-ll` 的唯一主路径，旧轨 `codegen_ll` 已删除）；`tc compile` 的 C 后端产物从一开始就是**正确**的（`_tms1 == NoB_C` + `#define NoB_C 2`，手工 clang 编译运行输出全对）。故这是单后端错编，**不是**语义/前端问题。
+
+**四处根因（均在 LLVM 发射侧，逐个剔除后逐层暴露下一层）**：
+
+| # | 位置 | 根因 | 症状 |
+|---|---|---|---|
+| ① | `tir.tc` `tir_match_pattern_cond` | 引擎给**用户具名类型**一律登记 `cat=="named"`，而此处判 `tds[scr_td].cat == "enum"` → 恒假 → 条件返回空串 → **整条条件链被跳过**，函数入口退化成 `br label <首臂>` | 恒命中首臂 |
+| ② | `tir.tc` 同函数 | `sema.enum_const_lookup` 返回的是 int **节点**，值在 `sa`（文本）、`ia` 存的是**进制**（恒为 10）；直接 `nodes[cn].ia` 取值 → 所有成员模式都拿到常量 `10` | 全部臂永假（①修好后才可见） |
+| ③ | `tir_to_ll.tc` `ll_register_named_type` | 「`%T` 前缀 ⇒ 运行期结构」启发式把 `Two` / `TokKind` 这类**名字以大写 T 起头的用户类型**一并排除 → 不 emit `%Two = type i64` → 被 `ll_emit_opaque_defs` 兜底成 `type opaque` | clang: *invalid type for function argument* |
+| ④ | `tir_to_ll.tc` `tir_to_ll_emit` 第 1 遍 | 具名类型登记原先只扫「返回值 + 形参」，**仅作局部变量的枚举**（`var lv: Level`）拿不到类型定义 | clang: *Cannot allocate unsized type* |
+
+另修一处同类死代码：`tir_emit_cast` 里的 enum→i64 判定同样因写 `cat == "enum"` 而从未生效，导致 `c as i32` 发出多余的 `bitcast i64→i64` 而非正确的 `trunc`（`examples/enum_constval.tc` 的 IR 因此从 445 行降到 365 行，运行输出不变）。
+
+**统一判据**：`cat=="enum"` 在 t 的 TypeDef 上基本不成立，除 `t_td_is_variant` 那样「named + 回查 `lex.decl_list` 的 EnumDecl」外无可靠判定。已新增 `tir.t_td_is_enum(td)` 与 `tir_to_ll.ll_is_user_named_type(name)` 两个 helper，与既有 `t_td_is_variant` / `t_variant_decl_of_name` 同构。
+
+**为何门禁未拦住**：`run_examples` 全仓**无任何 enum 分派用例**（唯一的 `examples/enum_constval.tc` 只测成员常量值）；conformance 的 `p21_match_enum_exhaustive` / `p22_match_case_dispatch` 只校验**编译期**行为（是否报错），不校验运行期落臂。典型的「双后端 differential 全绿也有洞」。
+
+**已补守卫生 gate**：新增 `examples/enum_match_dispatch.tc`（+ `.expected.txt`）作为常规门禁用例，覆盖四种根因 + 三种语法形态（裸 `Case` / `Color.Red` / `.Red`）+ 有无 backing + 自动编号/显式值 + 局部与内联 scrutinee + 绑定兜底臂 + `as i32` 窄化。已用修复**前**的编译器验证该用例确实失败（返回首臂 / 链接报错），确保它不是空跑。
+
+**验证**（2026-09-23）：`run_examples` 71/71（双后端）、`conformance` 274/274、`hir_test` RAW=0、`hir_eval_test` 全绿、IR 基线已由 g1 重录（97 targets / 294 entries）。
 
 ---
 
@@ -199,9 +263,10 @@ fib fn(_)            -> i64 { return 0 - 1; }
 
 ### 7.2 函数子句声明形式 vs 函数声明（2026-08-01）
 
-**裁定：声明头对齐 + 参数位泛化**。`FuncDecl` 声明头与 `reference.md` §3.1 完全一致（并置式 `FuncName fn(...) -> Ret`、禁止重载）；参数位统一为 `ParamPattern`，其首选项 `Ident ":" Type` 与普通参数等价。故「普通函数声明」与「模式匹配子句」是**同一产生式的两种用法**，不存在第二种声明语法，L-04 满足。游离的 `ParamPatternList` 产生式已删除。
+**裁定：声明头对齐 + 参数位泛化**。`FuncDecl` 声明头与普通函数声明完全一致（禁止重载）；参数位统一为 `ParamPattern`，其首选项 `Ident ":" Type` 与普通参数等价。故「普通函数声明」与「模式匹配子句」是**同一产生式的两种用法**，不存在第二种声明语法，L-04 满足。游离的 `ParamPatternList` 产生式已删除。
 
-> **记号迁移注记**：该裁定作出时 `::` 绑定算子尚存、声明关键字为 `func`。其后 `::` 移除、`func` 更名 `fn`，声明形态统一为并置式。结论不受影响，记号已同步。
+> **记法勘误（2026-09-23）**：本裁定原以「并置式 `FuncName fn(...) -> Ret`」记述，那是当时的形态；其后语法**再次迁移为 `fn FuncName(...) Ret { }`**（返回类型前无 `->`），并置式报 `T-PAR-E102` 移除。本稿 §1 EBNF 与 §3 示例已按现行形态改定。
+> **结论不受影响** —— 本裁定的要点是「同一产生式两种用法」，与声明头采用哪种记号无关；声明头随语言统一演进即可。
 
 ### 7.3 穷尽性判据：是否强制 `_`（A1，2026-08-02）
 
@@ -227,10 +292,35 @@ fib fn(_)            -> i64 { return 0 - 1; }
 
 **理由**：函数子句既已脱糖为 `match`，其穷尽性由 `T_MATCH_NONEXHAUSTIVE` 在**编译期**统一保证 —— 编译期已证穷尽，就不存在「无子句匹配」的运行期状态，`T_FUNC_NO_CLAUSE` 无从触发；`T_FUNC_NO_IRREFUTABLE` 亦被穷尽性检查完全覆盖。保留两个永不触发的诊断码违反 L-04 唯一语义（同一约束两套码）。
 
+### 7.6 语法基线：文档一律以现行编译器实测为准（2026-09-23）
+
+**争点**：本稿 §1 EBNF 与 §3 示例自 2026-08-02 起沿用**并置式声明**（`FuncName fn(...) -> Ret`、`Color enum : u8`）。语言其后发生过语法迁移，这些写法今日已全部非法 —— 照抄示例必然失败，而文档仍赫然写着「所有 §3 示例均已实际编译运行验证」，形成误导。
+
+**裁定：以现行编译器（`out/dbg/tc.exe`）实测行为为准全面勘误本稿，并把「示例必须实跑」固化为硬约束。**
+
+**理由**：错写的根因是把「当时验证过」当作永久有效，而语法会迁移。更关键的是 —— **编译通过不等于示例正确**：本次实跑意外暴露出 §6.2 的 enum 分派缺陷（三种语法形态都编译通过、却恒定返回首臂），这正是「只 `check` 不 `run`」发现不了的一类问题。故裁定本稿 §3 的示例准入为三重：**① 编译通过 ② 运行通过 ③ 输出符合预期**；任一条不满足，必须在文中显式标注失效范围，不得笼统称「已验证」。
+
+实测基线（本稿据此校订）：
+
+| 项 | 结论 |
+|---|---|
+| 函数声明唯一形式 | `fn FuncName(params) Ret { }`（返回类型前**无** `->`） |
+| 并置式 `FuncName fn(...) -> Ret` | 已移除 → `T-PAR-E102` |
+| enum 声明 | `enum Color : u8 { ... }`（`Color enum : u8` 已移除 → `T-PAR-E102`） |
+| 子句体 / 臂体 | 必须是单一表达式 → 多语句报 `T-FUN-E814` |
+| `if` 表达式 / Block 表达式 | **均不存在** → `T-PAR-E101` |
+| `unreachable` | 非 t 内建，不存在；兜底惯例 `return 0 - 1;` |
+| `when` 臂是否计入穷尽性 | 否；缺兜底 → `T-MAT-E742` |
+
+> ⚠ 同类语法漂移亦存在于 `docs/reference.md` L2897 / L2108（仍记作 `Ident "fn" ...` 并置式），需另行勘误，本次未改。
+
 ---
 
 ## 8. 采纳状态
 
 本草稿据 L-15 第5条维持 **DRAFT**，**待用户下达「规则采纳」指令**后并入 `docs/reference.md`（§3.3 / §3.4 / §3.5），并同步标记本草稿失效。
 
-四项法律判据 L-02 / L-03 / L-04 / L-14 现均为 ✅；§7 五项设计裁定全部已决；§6.1 三项待办均为增量能力，不构成采纳阻塞。
+- 四项法律判据 L-02 / L-03 / L-04 / L-14：**✅ 均已满足**。
+- §7 **六项**设计裁定全部已决（7.1–7.5 语义层，7.6 语法基线层）。
+- §6.1 **四项**待办均为增量能力，不构成采纳阻塞。
+- ✅ **§6.2 的 enum 分派缺陷已于 2026-09-23 修复**：它本属 LLVM 发射侧的实现缺陷（四处根因），不影响本规则的合法性（语法与静态语义原本就判定正确）。修复后 §3 的 ②③ 示例已可运行且输出正确，并入 `reference.md` 的示例准入三重条件（编译 / 运行 / 输出）全部满足。

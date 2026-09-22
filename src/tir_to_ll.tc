@@ -739,18 +739,49 @@ pub fn ll_is_variant(tyname: string) bool {
 }
 
 
-pub fn ll_register_named_type(st: string) void {
-    // 仅处理命名类型（%X，非运行期结构 %T*）；且须排除 types: 段已声明为 struct 的用户聚合
-    // （%Node 等）——那些已是正确 struct 定义，不可再被盖成 `type i64`。
-    if (ll_starts(st, "%") && ll_starts(st, "%T") == false && ll_is_struct_type(st) == false) {
-        var n: i64 = slice_len(g_ll_named_types) as i64;
-        var i: i64 = 0;
-        var seen: bool = false;
-        while (i < n) {
-            if (g_ll_named_types[i] == st) { seen = true; break; }
-            i = i + 1;
+// 「用户是否真的声明了这个具名类型？」——纠正「%T 前缀 ⇒ 运行期结构」的旧启发式。
+// 旧写法把任何 %T*** 一律当成 %TStr/%TSlice 一族运行期结构跳过登记，于是用户写的
+// `enum Two : u8` / `struct Token` 等（名字以大写 T 起头）永远不会 emit `%Two = type i64`，
+// 最后被 ll_emit_opaque_defs 兜底成 `%Two = type opaque` —— 该类型一旦作形参，
+// clang 就报 "invalid type for function argument"（%NoB 这种非 T 起头的同名代码却正常）。
+// 判定口径与 tir.t_td_is_variant / t_td_is_enum 一致：回查 decl_list 的用户类型声明。
+pub fn ll_is_user_named_type(fname: string) bool {
+    if (fname == "") { return false; }
+    var n: i64 = slice_len(decl_list) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        var d: i64 = decl_list[i];
+        var kd: string = base.nodes[d].kind;
+        if (kd == "StructDecl" || kd == "EnumDecl" || kd == "VariantDecl"
+                || kd == "UnionDecl" || kd == "FlagDecl" || kd == "FlagSetDecl") {
+            if (base.nodes[d].sa == fname) { return true; }
         }
-        if (seen == false) { append(g_ll_named_types, st); }
+        i = i + 1;
+    }
+    return false;
+}
+
+pub fn ll_register_named_type(st: string) void {
+    // 仅处理命名类型（%X）；且须排除 types: 段已声明为 struct 的用户聚合
+    // （%Node 等）——那些已是正确 struct 定义，不可再被盖成 `type i64`。
+    // ⚠ 不可再用 `ll_starts(st,"%T")==false` 排除运行期结构：那会连带排除掉「名字以 T 起头的
+    // 用户类型」。改为：%T 起头时，只有当它确实不是用户声明的类型才按运行期结构跳过。
+    if (ll_starts(st, "%") && ll_is_struct_type(st) == false) {
+        var rskip: bool = false;
+        if (ll_starts(st, "%T")) {
+            var uname: string = str_slice(st, 1, str_len(st));
+            if (ll_is_user_named_type(uname) == false) { rskip = true; }
+        }
+        if (rskip == false) {
+            var n: i64 = slice_len(g_ll_named_types) as i64;
+            var i: i64 = 0;
+            var seen: bool = false;
+            while (i < n) {
+                if (g_ll_named_types[i] == st) { seen = true; break; }
+                i = i + 1;
+            }
+            if (seen == false) { append(g_ll_named_types, st); }
+        }
     }
 }
 
@@ -4470,6 +4501,20 @@ pub fn tir_to_ll_emit(module: TIRModule) string {
         ll_register_named_type(g_pf_ret);
         var pi2: i64 = 0; var plen2: i64 = slice_len(g_pf_params) as i64;
         while (pi2 < plen2) { ll_register_named_type(g_pf_params[pi2 + 1]); pi2 = pi2 + 2; }
+        // ⚠ 函数体内的局部槽类型同样参与命名类型登记。此前只登记「返回值 + 形参」，
+        // 于是从未出现在函数签名里的具名类型（典型：`var c: Col = Col.B;` 这种仅作局部变量的
+        // 枚举）拿不到 `%Col = type i64` 定义，而 ll_emit_opaque_defs 又只兜底 %T* 运行时结构，
+        // 结果 IR 里 `%main.c = alloca %Col` 引用一个从未定义的类型 → clang 报
+        // "Cannot allocate unsized type"（sized 类型 %NoB 之所以正常，只是因为同一个枚举
+        // 还碰巧出现在某个形参位上）。
+        var ntp_i: i64 = 0; var ntp_n: i64 = slice_len(f.body) as i64;
+        while (ntp_i < ntp_n) {
+            var ntp_in: TIRInst = f.body[ntp_i];
+            if (ntp_in.is_comment == false && str_len(ntp_in.dst.name) >= 1 && ntp_in.dst.name[0] == 36) {
+                ll_register_named_type(tir_st_to_str(ntp_in.st));
+            }
+            ntp_i = ntp_i + 1;
+        }
         var ps: []string = []; var pi3: i64 = 0; var plen3: i64 = slice_len(g_pf_params) as i64;
         while (pi3 < plen3) { append(ps, g_pf_params[pi3 + 1]); pi3 = pi3 + 2; }
         append(g_func_names, g_pf_name); append(g_func_paramsts, ps);

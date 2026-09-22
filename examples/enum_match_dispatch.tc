@@ -1,0 +1,139 @@
+// enum_match_dispatch.tc — enum scrutinee 的 match 分派回归用例
+//
+// 背景：`tc run` / `tc build` / `tc emit-ll` 走 TIR→LLVM 轨，此前对 enum 分派
+// **恒命中首臂**：name_of(Color.Blue) 会返回 "red"。三处独立根因叠加：
+//   ① enum 类型的 TypeDef 的 cat 是 "named" 而非 "enum"，模式条件里
+//      `tds[scr_td].cat == "enum"` 恒假 → 条件返回空串 → 整条条件链被跳过，
+//      函数入口退化成 `br label <首臂>`，其余臂成死基本块。
+//   ② sema.enum_const_lookup 返回的是 int 节点，真正的值在 `sa`（文本），
+//      `ia` 存的是**进制**（恒为 10）。直接 `nodes[cn].ia` 取值会让所有成员
+//      模式都拿到常量 10 → 三臂条件全是 `== 10` → 永不命中。
+//   ③ 名字以大写 T 起头的用户类型（Two / TokKind / Table …）被 `%T*` 启发式
+//      误判为运行期结构，既不登记也不 emit `%TokKind = type i64`，最终被
+//      ll_emit_opaque_defs 兜底成 `type opaque` → 作形参时 clang 报
+//      "invalid type for function argument"。
+//   ④ 具名类型登记原先只看「返回值 + 形参」，仅作局部变量的枚举（`var lv: Level`）
+//      永远拿不到 `%Level = type i64` → clang 报 "Cannot allocate unsized type"。
+//
+// 本用例覆盖：自动编号 / 显式赋值 / 有无 backing / 局部变量与内联常量 scrutinee /
+// 裸 CaseName、`Enum.Case` 限定、`.Case` 前导点三种写法 / 绑定兜底臂 / `as i64` 取值。
+// 期望输出见 examples/enum_match_dispatch.expected.txt。
+
+enum Color : u8 {
+    Red,
+    Green,
+    Blue,
+}
+
+enum Size {
+    Small,
+    Medium,
+    Large,
+}
+
+// 名字以大写 T 起头 + 显式非 10 的值：同时覆盖根因 ②③
+// （若仍误读 ia，所有臂会比较 == 10，本个例将全部落空）。
+enum TokKind : u8 {
+    Word = 5,
+    Num = 7,
+}
+
+// ⑦ 只出现在局部变量的枚举（从不作形参 / 返回值）：此前它的 `%Level` 既不在签名
+//    上被登记、又不被 ll_emit_opaque_defs 兜底（只认 %T* 运行期结构），IR 里
+//    `alloca %Level` 引用从未定义的类型 → clang: "Cannot allocate unsized type"。
+enum Level : u8 {
+    Low = 1,
+    High = 9,
+}
+
+// ① 裸 CaseName（由 sema C2 改写成 Color.Red）
+fn name_bare(c: Color) string {
+    return match (c) {
+        Red => "red"
+        Green => "green"
+        Blue => "blue"
+    };
+}
+
+// ② 限定写法 Enum.Case
+fn name_qual(c: Color) string {
+    return match (c) {
+        Color.Red => "red"
+        Color.Green => "green"
+        Color.Blue => "blue"
+    };
+}
+
+// ③ 前导点写法 .Case
+fn name_dot(c: Color) string {
+    return match (c) {
+        .Red => "red"
+        .Green => "green"
+        .Blue => "blue"
+    };
+}
+
+// ④ 无 backing 枚举 + 顺序调换（前三+b后二排序，确保不是“按声明序命中”）
+fn rank(s: Size) i64 {
+    return match (s) {
+        Large => 3
+        Medium => 2
+        Small => 1
+    };
+}
+
+// ⑤ 绑定兜底臂：非首成员必须精确命中，兜底臂只在其余情况触发
+fn first_or_other(s: Size) string {
+    return match (s) {
+        Small => "first"
+        other => "other"
+    };
+}
+
+// ⑥ 显式值 + T 起头类型
+fn kind_name(k: TokKind) string {
+    return match (k) {
+        .Word => "word"
+        .Num => "num"
+    };
+}
+
+@main
+fn main() i64 {
+    // 局部变量 scrutinee
+    var c: Color = Color.Blue;
+    var s: Size = Size.Medium;
+
+    println(name_bare(c));
+    println(name_qual(c));
+    println(name_dot(c));
+    // 内联成员常量 scrutinee
+    println(name_dot(Color.Green));
+    println(name_bare(Color.Red));
+
+    println(int_to_str(rank(s)));
+    println(int_to_str(rank(Size.Small)));
+    println(int_to_str(rank(Size.Large)));
+
+    println(first_or_other(Size.Small));
+    println(first_or_other(Size.Large));
+
+    println(kind_name(TokKind.Word));
+    println(kind_name(TokKind.Num));
+
+    // 枚举值 → i64 取值（枚举在 TIR 中被擦除为整数）
+    println(int_to_str(Color.Red as i64));
+    println(int_to_str(Color.Green as i64));
+    println(int_to_str(Color.Blue as i64));
+    println(int_to_str(c as i64));
+    println(int_to_str(TokKind.Num as i64));
+
+    // 枚举 → 窄整型（`as i32` 走 trunc，不是 bitcast）
+    var narrow: i32 = c as i32;
+    println(int_to_str(narrow as i64));
+
+    // 仅作局部变量的枚举
+    var lv: Level = Level.High;
+    println(int_to_str(lv as i64));
+    return 0;
+}
