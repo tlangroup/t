@@ -1916,27 +1916,13 @@ pub fn ll_emit_builtin(cn: string, toks: []string) bool {
     // ⚠ 零初始化的 slice（FIX 5 已置 zeroinitializer）elem_size==0，runtime 首 append 时
     // 按传入 elem_size 自动定型。若用 t_slice_append（自元数据推断）则 elem_size 恒 0 →
     // memcpy 0 字节 → 元素全垃圾（maputil_demo 曾输出 "2010044703744..."）。
-    // 元素大小由「待追加值」的 LLVM 类型推导：getelementptr <est>, ptr null, i32 1 → ptrtoint to i64。
+    // 元素大小 esz 由前端从「切片声明元素类型」显式传入（第三实参，与 @slice_from_raw 同构），
+    // 翻译器直接用、不再从「待追加值槽存储型」反推（窄整数已加宽成 i64 ⇒ []u8 的 elem_size
+    // 退化成 8 导致步长错；槽保留 u8 还会误发非法类型令牌 `u8`）。根治 hir.tc 字节缓冲被迫用 string 的 bug。
     if (cn == "append") {
-        var est: string = ll_get_st(toks[5]);          // 元素 LLVM 类型（%TStr/i64/ptr…）
-        // ⚠ 聚合元素在 TIR 中常按「指针」承载（槽 ST=ptr<%TStr>），但其真实元素是 %TStr 本身；
-        // 若直接拿 ptr<%TStr> 算 sizeof → 得 8（指针宽）而非 16（结构体宽），t_slice_append_sized
-        // 据此只拷 8 字节 → 字符串/结构体内容残缺（maputil_demo / pipeline_demo / list_demo 等）。
-        // 解引用取真元素类型：ptr<%TStr>→%TStr(16)，标量 i64/真 ptr 不受影响。
-        if (ll_starts(est, "ptr<")) { est = ll_ptr_inner(est); }
-        var esz: string = ll_tmp();                    // 临时名承载 sizeof(元素)
+        var eszst: string = ll_get_st(toks[6]);          // 元素字节宽（i64，前端从元素类型导出）
+        var esz: string = ll_load(toks[6], eszst);
         ll_maybe_declare("t_slice_append_sized", "void", ["ptr", "ptr", "i64"]);
-        // 计算 sizeof(元素)
-        sb_append_str(g_ll, "  ");
-        sb_append_str(g_ll, esz);
-        sb_append_str(g_ll, ".gep = getelementptr ");
-        sb_append_str(g_ll, est);
-        sb_append_str(g_ll, ", ptr null, i32 1\n");
-        sb_append_str(g_ll, "  ");
-        sb_append_str(g_ll, esz);
-        sb_append_str(g_ll, " = ptrtoint ptr ");
-        sb_append_str(g_ll, esz);
-        sb_append_str(g_ll, ".gep to i64\n");
         // 调用 t_slice_append_sized(slice_ptr, elem_ptr, elem_size)
         // ⚠ 元素次参 tir.tc 按值发射，须用 ll_map_argptr 转指针（含字面量/右值，对齐旧轨
         //   emit-ll 的 `alloca elem; store v; → ptr` 模式；直接 ll_llname 当 ptr 会类型错配/段错误）。

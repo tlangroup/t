@@ -3370,19 +3370,25 @@ pub fn tir_emit_call(e: i64) TirEmitRes {
         var vn: i64 = -1;
         var a1: i64 = base.kids[n.la].next;
         if (a1 >= 0) { vn = base.kids[a1].val; }
+        // 元素类型 = 首参切片的元素 TD（append 要求值类型 == 元素类型）。
+        // 用声明元素类型导出的字节宽作为 elem_size 传给翻译器；绝不可从「待追加值槽的存储型」
+        // 反推——窄整数在 TIR 整数临时槽按 i64 加宽 ⇒ []u8 的 elem_size 退化成 8，append 按
+        // 8 字节步长寻址，每个字节被填进 8 字节槽、相邻元素读到 0/越界（hir.tc 字节缓冲曾因此
+        // 被迫用 string 而非 []u8）；若槽保留 u8 还会误发非法类型令牌 `u8`。与 C 后端 sizeof(ElemT) 同构。
+        var etdv: i64 = -1;
+        if (a0n >= 0) {
+            var atdv: i64 = tir_expr_td(a0n);
+            if (atdv >= 0 && atdv < slice_len(sema.tds) as i64) {
+                if (sema.tds[atdv].cat == "slice") { etdv = sema.tds[atdv].elem; }
+            }
+        }
+        var esz: i64 = 8;   // 兜底（元素类型不可推断时，如 append(s, []) 空字面量）
+        if (etdv >= 0 && etdv < slice_len(sema.tds) as i64) {
+            esz = tir_sizeof(tir_st_of_td(etdv));
+        }
         var vs: string = "";
-        // 元素次参的期望类型 = 首参切片的元素类型。否则 `append(s, [])` 这类空字面量
-        // 无从推断元素宽度 ⇒ elem_size 兜底成 8（V006）：元素是 %TStr(16) 时按 8 字节步长
-        // 寻址 ⇒ 读到邻字段。契约：聚合的元素宽度必须由类型导出。
         if (vn >= 0) {
             var vnk: Node = base.nodes[vn];
-            var etdv: i64 = -1;
-            if (a0n >= 0) {
-                var atdv: i64 = tir_expr_td(a0n);
-                if (atdv >= 0 && atdv < slice_len(sema.tds) as i64) {
-                    if (sema.tds[atdv].cat == "slice") { etdv = sema.tds[atdv].elem; }
-                }
-            }
             var usedv: bool = false;
             if (etdv >= 0 && etdv < slice_len(sema.tds) as i64 && vnk.kind == "array_lit") {
                 var ecatv: string = sema.tds[etdv].cat;
@@ -3392,7 +3398,10 @@ pub fn tir_emit_call(e: i64) TirEmitRes {
             }
             if (usedv == false) { vs = tir_emit_expr(vn).name; }      // 待追加元素值（翻译器转指针）
         }
-        tir_emit(tir_e_call(retst, d, "@append", tir_cargs2(sl, vs)));
+        // 元素尺寸作为第三实参显式传递（与 @slice_from_raw 的 esz 同构），翻译器直接用、不再自推。
+        var ez: string = tir_tmp();
+        tir_emit(TIRInst{ op: TIR_OP_CONST, st: tir_st_from_str("i64"), dst: tir_op(ez), args: tir_a1(base.i2s(esz)), is_comment: false, line: g_cur_line, cmt: "" });
+        tir_emit(tir_e_call(retst, d, "@append", tir_cargs3(sl, vs, ez)));
         return TirEmitRes{ name: d, st: tir_st_from_str(retst) };
     }
     // ── @splat(s, N)：返回 @Vector(N, T) ────────────────────────────────
