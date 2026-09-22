@@ -112,18 +112,52 @@ pub fn idecl_get(idn: i64) i64 {
 }
 
 // 后端：同函数内重名局部变量唯一化命名（shadowing 支持）。
-// g_seen 记录本函数已声明的局部名（key = 函数名 + "::" + 变量名）；g_local_decls
-// 记录被唯一化的声明节点 id，供标识符发射时反查。
+//
+// 设计（扁平 g_seen + 帧边界哨兵，append-only，绝不 slice_sub 全局切片）：
+//   g_seen       扁平 []string，按发射顺序记录所有 name-key（func::name）与帧哨兵。
+//               flat append 与原扁平实现同构、经长期验证安全（全局切片头就地更新）。
+//   G_SEEN_FRAME 帧边界哨兵串（含 @，绝不可能等于任何 "func::name" 真 key）。
+//               g_seen_push 进块时 append 一枚；g_seen_pop 为**空操作**（不截断，
+//               见下方 -O2 红线说明）—— 帧隔离完全靠「反向搜索遇哨兵即停」。
+//   g_seen_has   **只搜索当前（最深的）那一帧**：从末尾反向扫描，遇到哨兵即停（返回
+//               false），否则命中 key 才算 true。
+//
+// 正确性：C 的块作用域天然隔离「兄弟块」与「嵌套块」里的同名局部，二者都无需 mangle；
+// 真正会撞名的是「同一 C 作用域内重复声明」，而 sema 已禁止同作用域重声明。
+// 故 g_seen_has 在当前帧内永远搜不到重复 key（当前帧内名字本就唯一）→ mangle 恒为一致的
+// 空操作，声明端与引用端（经 idecl 反查 + g_local_has）永远自洽。这从根上消除了此前
+// 扁平 g_seen 把独立块内同名局部误 mangle（声明 name__<sid> 而引用端仍 name）的 bug。
+//
+// ⚠ -O2 红线（踩过两次）：
+//   ① 曾用 [][]string 作用域栈，g_seen_add 对「切片元素索引」g_seen[n-1] 做 append 在 t 里
+//     是按值拷贝、非可变左值；-O2 编译后端自身时在帧内 realloc 路径误编译 → 0xC0000005。
+//   ② 曾用扁平 + g_seen_marks（[]i64 存每帧起始下标），g_seen_pop 用
+//     `g_seen_marks = slice_sub(g_seen_marks, 0, m-1)` 把全局切片**重赋值成自身的子视图**
+//     （自别名）→ -O2 优化器对自别名全局切片生成错误代码 → 0xC0000005。
+//   现改为 append-only + 哨兵 + 空操作 pop，**彻底规避任何对全局切片的 slice_sub/元素级写**，
+//   所有写都是已验证安全的 flat append；g_seen_has 反向扫描成本 = 当前块嵌套深度（遇哨兵即停）。
 pub var g_seen: []string;
 pub var g_local_decls: []i64;
+pub const G_SEEN_FRAME: string = "@frame@";
+pub fn g_seen_push() void {
+    append(g_seen, G_SEEN_FRAME);
+}
+pub fn g_seen_pop() void {
+    // 空操作：不截断 g_seen（截断需 slice_sub 全局切片 → 自别名 -O2 误编译）。
+    // 帧隔离由 g_seen_has 反向扫描遇哨兵即停保证；g_seen 只增不减（单次编译内规模有界）。
+}
 pub fn g_seen_has(key: string) bool {
     var n: i64 = slice_len(g_seen) as i64;
     var i: i64 = n - 1;
     while (i >= 0) {
+        if (g_seen[i] == G_SEEN_FRAME) { return false; } // 越过当前帧边界
         if (g_seen[i] == key) { return true; }
         i = i - 1;
     }
     return false;
+}
+pub fn g_seen_add(key: string) void {
+    append(g_seen, key);
 }
 pub fn g_local_has(dcl: i64) bool {
     var n: i64 = slice_len(g_local_decls) as i64;

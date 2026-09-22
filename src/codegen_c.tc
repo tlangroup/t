@@ -3015,6 +3015,7 @@ pub fn emit_stmt(sid: i64, indent: i64) void {
     }
     // comptime_block：无 CTFE，退化为运行期内联块（避免被静默丢弃）
     if (n.kind == "comptime_block") {
+        base.g_seen_push();
         spush(base.sb_cat2(pad, "{"));
         var cb: i64 = n.la;
         while (cb >= 0) {
@@ -3023,6 +3024,7 @@ pub fn emit_stmt(sid: i64, indent: i64) void {
             cb = ckb.next;
         }
         spush(base.sb_cat2(pad, "}"));
+        base.g_seen_pop();
         return;
     }
 
@@ -3042,6 +3044,10 @@ pub fn emit_stmt(sid: i64, indent: i64) void {
     if (n.kind == "var_decl") {
         // 同函数内重名局部变量（shadowing）：与 LLVM 后端同机制。
         // conpat 载荷绑定（match 构造器解构出的 x）身处各臂独立代码块，不做唯一化重整。
+        // g_seen 为 append-only 扁平表 + 帧哨兵（进块 push 一枚哨兵 / 出块 pop 为空操作）：
+        // 同名局部只有落在「同一帧」（真正同块重名）才唯一化 mangle；落在独立块
+        // （C 块作用域天然隔离）则不 mangle —— 引用端经 idecl 反查同名声明，两端自洽，
+        // 根治此前扁平 g_seen 把独立块内同名局部误 mangle（声明 name__<sid> 而引用端仍 name）的 bug。
         if (em_in_fn) {
             var cname: string = n.sa;
             var lkey: string = base.sb_cat3(em_cur_fn, "::", n.sa);
@@ -3049,7 +3055,7 @@ pub fn emit_stmt(sid: i64, indent: i64) void {
                 cname = base.sb_cat3(n.sa, "__", base.i2s(sid));
                 append(base.g_local_decls, sid);
             }
-            append(base.g_seen, lkey);
+            base.g_seen_add(lkey);
             n.sa = cname;
         }
         if (n.na >= 0) {
@@ -3185,6 +3191,7 @@ pub fn emit_stmt(sid: i64, indent: i64) void {
             var mfat: string = "t_map_key_int_at";
             if (sema.tds[it.key].cat == "string") { mfat = "t_map_key_str_at"; }
             var mfit: string = emit_expr(n.na);
+            base.g_seen_push();
             spush(base.sb_cat4(pad, "for (int64_t _fe_i = 0; _fe_i < t_map_count(", mfit, "); _fe_i = _fe_i + 1) {"));
             spush(base.sb_cat6(base.sb_cat2(pad, "    "), mfkc, " ", n.sa, base.sb_cat6(" = ", mfat, "(", mfit, ", _fe_i);", ""), ""));
             // 双变量形式 `for (k, v in m)`：v 由插入序下标直接取值
@@ -3199,6 +3206,7 @@ pub fn emit_stmt(sid: i64, indent: i64) void {
                 mfb = mfbk.next;
             }
             spush(base.sb_cat2(pad, "}"));
+            base.g_seen_pop();
             return;
         }
         var fe_elem_td: i64 = -1;
@@ -3206,6 +3214,7 @@ pub fn emit_stmt(sid: i64, indent: i64) void {
             fe_elem_td = it.elem;
         }
         var iter: string = emit_expr(n.na);
+        base.g_seen_push();
         spush(base.sb_cat6(pad, "for (int64_t _fe_i = 0; _fe_i < t_slice_len(", iter, "); _fe_i = _fe_i + 1) {", "", ""));
         spush(base.sb_cat6(base.sb_cat2(pad, "    "), c_decl_of(fe_elem_td, n.sa), " = *((", c_ptr_to(fe_elem_td), base.sb_cat4(")t_slice_at(", iter, ", _fe_i));", ""), ""));
         var b: i64 = n.la;
@@ -3215,9 +3224,11 @@ pub fn emit_stmt(sid: i64, indent: i64) void {
             b = bk.next;
         }
         spush(base.sb_cat2(pad, "}"));
+        base.g_seen_pop();
         return;
     }
     if (n.kind == "if") {
+        base.g_seen_push();
         spush(base.sb_cat4(pad, "if (", emit_expr(n.na), ") {"));
         var tb: i64 = n.la;
         while (tb >= 0) {
@@ -3226,7 +3237,9 @@ pub fn emit_stmt(sid: i64, indent: i64) void {
             tb = tk.next;
         }
         if (n.lb > -2) {
+            base.g_seen_pop();
             spush(base.sb_cat2(pad, "} else {"));
+            base.g_seen_push();
             var eb: i64 = n.lb;
             while (eb >= 0) {
                 var ek: Child = base.kids[eb];
@@ -3235,9 +3248,11 @@ pub fn emit_stmt(sid: i64, indent: i64) void {
             }
         }
         spush(base.sb_cat2(pad, "}"));
+        base.g_seen_pop();
         return;
     }
     if (n.kind == "while") {
+        base.g_seen_push();
         spush(base.sb_cat4(pad, "while (", emit_expr(n.na), ") {"));
         var wb: i64 = n.la;
         while (wb >= 0) {
@@ -3246,6 +3261,7 @@ pub fn emit_stmt(sid: i64, indent: i64) void {
             wb = wk.next;
         }
         spush(base.sb_cat2(pad, "}"));
+        base.g_seen_pop();
         return;
     }
     if (n.kind == "for") {
@@ -3276,6 +3292,7 @@ pub fn emit_stmt(sid: i64, indent: i64) void {
             upd = emit_expr(n.nc);
         }
         sappend_last(base.sb_cat6("; ", cnd, "; ", upd, ") {", ""));
+        base.g_seen_push();
         var fb: i64 = n.la;
         while (fb >= 0) {
             var fk: Child = base.kids[fb];
@@ -3283,6 +3300,7 @@ pub fn emit_stmt(sid: i64, indent: i64) void {
             fb = fk.next;
         }
         spush(base.sb_cat2(pad, "}"));
+        base.g_seen_pop();
         return;
     }
     if (n.kind == "return") {
@@ -3291,6 +3309,7 @@ pub fn emit_stmt(sid: i64, indent: i64) void {
         while (di >= 0) {
             var dnode: Node = base.nodes[g_defer[di]];
             var dpad: string = mk_pad(indent);
+            base.g_seen_push();
             spush(base.sb_cat2(dpad, "{"));
             var dbb: i64 = dnode.la;
             while (dbb >= 0) {
@@ -3299,6 +3318,7 @@ pub fn emit_stmt(sid: i64, indent: i64) void {
                 dbb = dbk.next;
             }
             spush(base.sb_cat2(dpad, "}"));
+            base.g_seen_pop();
             di = di - 1;
         }
         g_defer_n = 0;
@@ -3328,6 +3348,7 @@ pub fn emit_stmt(sid: i64, indent: i64) void {
         return;
     }
     if (n.kind == "block") {
+        base.g_seen_push();
         spush(base.sb_cat2(pad, "{"));
         var bb: i64 = n.la;
         while (bb >= 0) {
@@ -3336,6 +3357,7 @@ pub fn emit_stmt(sid: i64, indent: i64) void {
             bb = bk2.next;
         }
         spush(base.sb_cat2(pad, "}"));
+        base.g_seen_pop();
         return;
     }
     // 其余未识别节点：不输出（fallthrough）
@@ -4231,6 +4253,7 @@ pub fn emit_func_decl(d: i64) void {
     em_in_fn = true;
     em_cur_ret = sema.resolve_type_desc(n.na);
     g_defer_n = 0;   // 每个函数独立延迟栈
+    base.g_seen_push();   // 函数体作用域栈底帧：隔离不同函数、承接块级嵌套帧
     spush(base.sb_cat2(sig, " {"));
     if (n.lc > -2) {
         var b: i64 = n.lc;
@@ -4245,6 +4268,7 @@ pub fn emit_func_decl(d: i64) void {
         var di: i64 = g_defer_n - 1;
         while (di >= 0) {
             var dnode: Node = base.nodes[g_defer[di]];
+            base.g_seen_push();
             spush("    {");
             var dbb: i64 = dnode.la;
             while (dbb >= 0) {
@@ -4253,11 +4277,13 @@ pub fn emit_func_decl(d: i64) void {
                 dbb = dbk.next;
             }
             spush("    }");
+            base.g_seen_pop();
             di = di - 1;
         }
         g_defer_n = 0;
     }
     spush("}");
+    base.g_seen_pop();   // 弹出函数体作用域栈底帧
     em_in_fn = false;
     em_cur_fn = "";
     em_cur_ret = -1;
