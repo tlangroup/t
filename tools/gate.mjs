@@ -403,6 +403,20 @@ const r = await node("ir_snapshot.mjs", "--compiler", `${G1}.exe`, "--jobs", "1"
         },
     },
     {
+        // G3 中端优化守卫：MIR 安全 pass（opt=1）与内联 pass（opt=2）必须经四轨
+        // 双后端 differential 验证（LLVM/tmir-wasm/tmir-riscv/tmir-c 对 S1 子集值对拍一致）。
+        // 这是 G3「优化不改变语义」的硬证据，也是双后端漂移在 mir 层的补位守卫。
+        // 不随 irClean 跳过：MIR 优化与 IR 快照正交（快照为 opt=0），须每次提交独立重验。
+        id: "miropt", lv: 2, name: "MIR 中端优化 differential (opt=1 安全 pass + opt=2 内联, m1 四轨)",
+        run: async () => {
+            const r1 = await py("m1_difftest.py", "--opt", "1", "--tc", `${G4}.exe`);
+            if (r1.code !== 0) return { ok: false, note: `MIR opt=1 对拍失败: ${lastLine(r1.out, 5)}` };
+            const r2 = await py("m1_difftest.py", "--opt", "2", "--tc", `${G4}.exe`);
+            if (r2.code !== 0) return { ok: false, note: `MIR opt=2 内联对拍失败: ${lastLine(r2.out, 5)}` };
+            return { ok: true, note: `opt=1/2 四轨全绿 (${lastLine(r1.out, 1)})` };
+        },
+    },
+    {
         id: "cself", lv: 2, name: "C 后端自举 (tc.c → clang → conformance)",
         run: async () => {
             // 盲区补丁：C 后端长期只在示例上验证过，从未拿它编译过编译器自身。

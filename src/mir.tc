@@ -257,17 +257,244 @@ var g_sother_st: i64 = 0;
 var g_fok: bool = false;
 var g_fval: i64 = 0;
 
+// ── G3 内联 pass（opt>=2 触发；纯新增，不影响 opt=0/1 安全 pass 轨）──
+// 策略：仅内联「小且非递归」的叶子/链函数，约束代码膨胀与无限递归。
+// 形参经 `$` 基名映射到实参操作数；所有被调方 `$` 局部基名统一改名避免与调用方冲突；
+// 块名 `@...` 改到调用方命名空间；多返回点统一改写为 `store <结果槽> <retval>; br <续延>`。
+var g_inline_uid: i64 = 0;
+var MIR_INLINE_LIMIT: i64 = 60;
+
+fn mir_base(name: string) string {
+    var n: i64 = str_len(name) as i64;
+    var i: i64 = 0;
+    while (i < n) { if (name[i] == 46) { return str_slice(name, 0, i); } i = i + 1; }
+    return name;
+}
+fn mir_suffix(name: string) string {
+    var n: i64 = str_len(name) as i64;
+    var i: i64 = 0;
+    while (i < n) { if (name[i] == 46) { return str_slice(name, i, n); } i = i + 1; }
+    return "";
+}
+fn mir_arr_has(k: []string, s: string) bool {
+    var n: i64 = slice_len(k) as i64;
+    var i: i64 = 0;
+    while (i < n) { if (k[i] == s) { return true; } i = i + 1; }
+    return false;
+}
+fn mir_arr_get(k: []string, v: []string, s: string) string {
+    var n: i64 = slice_len(k) as i64;
+    var i: i64 = 0;
+    while (i < n) { if (k[i] == s) { return v[i]; } i = i + 1; }
+    return "";
+}
+fn mir_arr_get_op(k: []string, v: []TirOperand, s: string) TirOperand {
+    var n: i64 = slice_len(k) as i64;
+    var i: i64 = 0;
+    while (i < n) { if (k[i] == s) { return v[i]; } i = i + 1; }
+    return TirOperand{ name: "", st: 0 };
+}
+fn mir_find_func(mod: MIRModule, name: string) i64 {
+    var n: i64 = slice_len(mod.funcs) as i64;
+    var i: i64 = 0;
+    while (i < n) { if (mod.funcs[i].name == name) { return i; } i = i + 1; }
+    return -1;
+}
+fn mir_func_insts(cf: MIRFunc) i64 {
+    var tot: i64 = 0;
+    var nb: i64 = slice_len(cf.blocks) as i64;
+    var b: i64 = 0;
+    while (b < nb) { tot = tot + (slice_len(cf.blocks[b].insts) as i64); b = b + 1; }
+    return tot;
+}
+fn mir_ren(op: TirOperand, rk: []string, rv: []string, pk: []string, pv: []TirOperand, bk: []string, bv: []string) TirOperand {
+    var nm: string = op.name;
+    if (mir_arr_has(bk, nm)) { return TirOperand{ name: mir_arr_get(bk, bv, nm), st: op.st }; }
+    var base: string = mir_base(nm);
+    var suf: string = mir_suffix(nm);
+    if (mir_arr_has(pk, base)) { return mir_arr_get_op(pk, pv, base); }
+    if (mir_arr_has(rk, base)) { return TirOperand{ name: mir_arr_get(rk, rv, base) + suf, st: op.st }; }
+    return op;
+}
+// 在调用方 f 的第 bi 块、第 ki 条指令处内联 callins（被调为 mod.funcs[cf_idx]）。
+fn mir_do_inline(f: MIRFunc, bi: i64, ki: i64, callins: MIRInst, cf_idx: i64, mod: MIRModule) void {
+    var cf: MIRFunc = mod.funcs[cf_idx];
+    var uid: i64 = g_inline_uid; g_inline_uid = g_inline_uid + 1;
+    var rk: []string = []; var rv: []string = [];          // 被调方 $ 基名 → 新鲜基名
+    var pk: []string = []; var pv: []TirOperand = [];        // 形参基名 → 实参操作数
+    var bk: []string = []; var bv: []string = [];           // 被调方块名 → 新鲜块名
+    // 形参表
+    var np: i64 = slice_len(cf.params) as i64;
+    var p: i64 = 0;
+    while (p < np) {
+        var pb: string = mir_base(cf.params[p]);
+        append(pk, pb);
+        append(pv, callins.args[p + 1]);
+        p = p + 1;
+    }
+    // 收集被调方所有 $ 基名（def + use）→ 新鲜名
+    var cnb: i64 = slice_len(cf.blocks) as i64;
+    var cb: i64 = 0;
+    while (cb < cnb) {
+        var cblk: MIRBlock = cf.blocks[cb];
+        var cni: i64 = slice_len(cblk.insts) as i64;
+        var ci: i64 = 0;
+        while (ci < cni) {
+            var x: MIRInst = cblk.insts[ci];
+            if (str_len(x.dst.name) as i64 > 0 && x.dst.name[0] == 36) {
+                var db: string = mir_base(x.dst.name);
+                if (mir_arr_has(rk, db) == false) { append(rk, db); append(rv, sb_cat4("$__inl_", base.i2s(uid), "_", db)); }
+            }
+            var na: i64 = slice_len(x.args) as i64;
+            var a: i64 = 0;
+            while (a < na) {
+                var anm: string = x.args[a].name;
+                if (str_len(anm) as i64 > 0 && anm[0] == 36) {
+                    var ab: string = mir_base(anm);
+                    if (mir_arr_has(rk, ab) == false) { append(rk, ab); append(rv, sb_cat4("$__inl_", base.i2s(uid), "_", ab)); }
+                }
+                a = a + 1;
+            }
+            ci = ci + 1;
+        }
+        cb = cb + 1;
+    }
+    // 块名映射（首块=entry）
+    cb = 0;
+    while (cb < cnb) {
+        append(bk, cf.blocks[cb].name);
+        if (cb == 0) { append(bv, sb_cat3("@__inl_", base.i2s(uid), "_entry")); }
+        else { append(bv, sb_cat4("@__inl_", base.i2s(uid), "_b", base.i2s(cb))); }
+        cb = cb + 1;
+    }
+    var entryName: string = bv[0];
+    var contName: string = sb_cat3("@__cont_", base.i2s(uid), "");
+    var calleedst: string = callins.dst.name;
+    var callst: i64 = callins.st;
+    var B: MIRBlock = f.blocks[bi];
+    // newB 指令 = [结果槽 decl?] + 前缀 + br entry
+    var newB_insts: []MIRInst = [];
+    if (str_len(calleedst) as i64 > 0) {
+        var sl_args: []TirOperand = [];
+        append(sl_args, TirOperand{ name: calleedst, st: callst });
+        append(newB_insts, MIRInst{ op: TIR_OP_SLOT, st: callst, dst: TirOperand{ name: calleedst, st: callst }, args: sl_args, line: callins.line, cmt: "", is_comment: false });
+    }
+    var ki2: i64 = 0;
+    while (ki2 < ki) { append(newB_insts, B.insts[ki2]); ki2 = ki2 + 1; }
+    var br_args: []TirOperand = [];
+    append(br_args, TirOperand{ name: entryName, st: 0 });
+    append(newB_insts, MIRInst{ op: TIR_OP_BR, st: ST_NONE, dst: TirOperand{ name: "", st: 0 }, args: br_args, line: callins.line, cmt: "", is_comment: false });
+    var newB: MIRBlock = MIRBlock{ name: B.name, insts: newB_insts };
+    // 克隆被调方块（RET→store+br / RET_VOID→br；跳过形参 SLOT decl）
+    var cloned: []MIRBlock = [];
+    cb = 0;
+    while (cb < cnb) {
+        var cblk = cf.blocks[cb];
+        var cni = slice_len(cblk.insts) as i64;
+        var cnew: []MIRInst = [];
+        var ci = 0;
+        while (ci < cni) {
+            var x = cblk.insts[ci];
+            if (x.op == TIR_OP_SLOT) {
+                var db = mir_base(x.dst.name);
+                if (mir_arr_has(pk, db)) { ci = ci + 1; continue; }
+            }
+            if (x.op == TIR_OP_RET) {
+                if (str_len(calleedst) as i64 > 0) {
+                    var val: TirOperand = mir_ren(x.dst, rk, rv, pk, pv, bk, bv);
+                    var st_args: []TirOperand = [];
+                    append(st_args, val);
+                    append(cnew, MIRInst{ op: TIR_OP_STORE, st: ST_NONE, dst: TirOperand{ name: calleedst, st: callst }, args: st_args, line: x.line, cmt: "", is_comment: false });
+                }
+                var rb_args: []TirOperand = [];
+                append(rb_args, TirOperand{ name: contName, st: 0 });
+                append(cnew, MIRInst{ op: TIR_OP_BR, st: ST_NONE, dst: TirOperand{ name: "", st: 0 }, args: rb_args, line: x.line, cmt: "", is_comment: false });
+                ci = ci + 1; continue;
+            }
+            if (x.op == TIR_OP_RET_VOID) {
+                var rv_args: []TirOperand = [];
+                append(rv_args, TirOperand{ name: contName, st: 0 });
+                append(cnew, MIRInst{ op: TIR_OP_BR, st: ST_NONE, dst: TirOperand{ name: "", st: 0 }, args: rv_args, line: x.line, cmt: "", is_comment: false });
+                ci = ci + 1; continue;
+            }
+            var nd: TirOperand = mir_ren(x.dst, rk, rv, pk, pv, bk, bv);
+            var nargs: []TirOperand = [];
+            var a = 0;
+            while (a < slice_len(x.args) as i64) { append(nargs, mir_ren(x.args[a], rk, rv, pk, pv, bk, bv)); a = a + 1; }
+            append(cnew, MIRInst{ op: x.op, st: x.st, dst: nd, args: nargs, line: x.line, cmt: x.cmt, is_comment: x.is_comment });
+            ci = ci + 1;
+        }
+        append(cloned, MIRBlock{ name: bv[cb], insts: cnew });
+        cb = cb + 1;
+    }
+    // 续延块 C = 调用点之后的后缀指令
+    var suffix: []MIRInst = [];
+    var si: i64 = ki + 1;
+    while (si < slice_len(B.insts) as i64) { append(suffix, B.insts[si]); si = si + 1; }
+    var C: MIRBlock = MIRBlock{ name: contName, insts: suffix };
+    // 重组 f.blocks： [0..bi-1] + newB + cloned + C + [bi+1..]
+    var newblocks: []MIRBlock = [];
+    var bi2: i64 = 0;
+    while (bi2 < bi) { append(newblocks, f.blocks[bi2]); bi2 = bi2 + 1; }
+    append(newblocks, newB);
+    var cl: i64 = 0;
+    while (cl < slice_len(cloned) as i64) { append(newblocks, cloned[cl]); cl = cl + 1; }
+    append(newblocks, C);
+    var af: i64 = bi + 1;
+    while (af < slice_len(f.blocks) as i64) { append(newblocks, f.blocks[af]); af = af + 1; }
+    f.blocks = newblocks;
+}
+// 找到第一个可内联调用点并内联；返回是否发生改动（供外层循环重复处理嵌套内联）。
+fn mir_inline(f: MIRFunc, mod: MIRModule) bool {
+    var nb: i64 = slice_len(f.blocks) as i64;
+    var b: i64 = 0;
+    while (b < nb) {
+        var blk: MIRBlock = f.blocks[b];
+        var nin: i64 = slice_len(blk.insts) as i64;
+        var k: i64 = 0;
+        while (k < nin) {
+            var ins: MIRInst = blk.insts[k];
+            if (ins.op == TIR_OP_CALL && slice_len(ins.args) as i64 >= 1) {
+                var callee: string = ins.args[0].name;
+                if (str_len(callee) as i64 > 0 && callee[0] == 64) {
+                    var cidx: i64 = mir_find_func(mod, callee);
+                    if (cidx >= 0) {
+                        var cf: MIRFunc = mod.funcs[cidx];
+                        if (cf.is_extern == false && cf.name != f.name && mir_func_insts(cf) <= MIR_INLINE_LIMIT) {
+                            mir_do_inline(f, b, k, ins, cidx, mod);
+                            return true;
+                        }
+                    }
+                }
+            }
+            k = k + 1;
+        }
+        b = b + 1;
+    }
+    return false;
+}
+
 // ── 入口 ───────────────────────────────────────────────────────
 pub fn mir_run(m: MIRModule, level: i64) void {
     if (level <= 0) { return; }
     var nf: i64 = slice_len(m.funcs) as i64;
     var i: i64 = 0;
-    while (i < nf) { mir_func(m.funcs[i], level); i = i + 1; }
+    while (i < nf) { mir_func(m.funcs[i], m, level); i = i + 1; }
 }
 
-fn mir_func(f: MIRFunc, level: i64) void {
+fn mir_func(f: MIRFunc, mod: MIRModule, level: i64) void {
     g_def_k = []; g_def_v = []; g_def_vst = [];
     g_sub_k = []; g_sub_v = []; g_sub_vst = [];
+    // G3 内联 pass：opt>=2 时在安全 pass 之前展开「小且非递归」调用，
+    // 受 MIR_INLINE_LIMIT 与外层 16 次迭代上限约束，防代码膨胀/互递归无限展开。
+    if (level >= 2) {
+        var ig: i64 = 0;
+        while (ig < 16) {
+            var did: bool = mir_inline(f, mod);
+            if (did == false) { break; }
+            ig = ig + 1;
+        }
+    }
     var iter: i64 = 0;
     while (iter < 48) {
         mir_build_def(f);
