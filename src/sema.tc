@@ -5306,7 +5306,15 @@ pub fn infer_expr(e: i64) i64 {
             if (s.kind == "func" && g_infer_ti >= 0 && tif_ret[s.ti] == g_infer_ti) {
                 infer_lambda_ret_from_decl(s.decl);
             }
-            return s.ti;
+            var rt: i64 = s.ti;
+            // 无类型标注的全局变量：符号类型在 register 阶段固化为 Unknown，检查期
+            // 已从 RHS 推断并回填 decl 节点的类型字段（n.na）。此处回退取真实类型，
+            // 使后续引用能解析到正确类型（修复全局无标注 var 返回 Unknown）。
+            if (tip_kind(rt) == "Unknown" && s.decl >= 0) {
+                var dn: Node = base.nodes[s.decl];
+                if (dn.na >= 0) { rt = resolve_ti(dn.na); }
+            }
+            return rt;
         }
         if (n.sa == "true" || n.sa == "false") {
             return ti_scalar("bool");
@@ -7721,8 +7729,38 @@ pub fn check_global_var_decl(d: i64) void {
         var it: i64 = infer_expr(n.nb);
         g_vec_expect = saved_ve6;
         g_tile_expect = saved_te6;
-        var vt: i64 = resolve_ti(n.na);
-        if (tip_kind(it) != "Unknown" && ti_equal(it, vt) == false) {
+        // 无类型标注的全局变量：decl 类型节点是 void/Unknown 占位（parse 阶段预填 void，
+        // 并非 -1），从 RHS 推断类型并回填类型节点（与局部 var 对称）。register 阶段把
+        // 符号 s.ti 固化为 void 占位，故后续引用需回退到 resolve_ti(decl.na) 取得真实类型。
+        var vt: i64 = -1;
+        var decl_ti: i64 = -1;
+        if (n.na >= 0) { decl_ti = resolve_ti(n.na); }
+        if (n.na < 0 || tip_kind(decl_ti) == "Void" || tip_kind(decl_ti) == "Unknown") {
+            // 无标注：用 RHS 推断类型回填（若 RHS 也无类型则保持 void 占位，不误报）
+            if (tip_kind(it) != "Unknown") {
+                vt = it;
+                var tn2: i64 = mk_type_node_from_ti(it);
+                n.na = tn2;
+                slice_set(base.nodes, d, n);
+            } else {
+                vt = decl_ti;
+            }
+        } else {
+            vt = decl_ti; // 有标注：用声明的类型
+        }
+        // 同步符号表：register 阶段把未标注全局 var 的 s.ti 固化为 void 占位，
+        // 此处回填真实类型，使后续引用（含 `b = a + 1`）与代码生成都拿到正确类型。
+        if (vt >= 0 && tip_kind(vt) != "Unknown" && tip_kind(vt) != "Void") {
+            var si3: i64 = sym_lookup(global_scope, n.sa);
+            if (si3 >= 0) {
+                var s3: Sym = syms[si3];
+                if (s3.ti != vt) {
+                    s3.ti = vt;
+                    syms[si3] = s3;
+                }
+            }
+        }
+        if (tip_kind(it) != "Unknown" && tip_kind(vt) != "Unknown" && ti_equal(it, vt) == false) {
             // Sym 全局变量允许由字符串赋值（自动 intern → id）
             var gss: bool = tip_kind(vt) == "Sym" && tip_kind(it) == "String";
             if (gss == false && can_cast(it, vt) == false) {
