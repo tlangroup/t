@@ -163,7 +163,7 @@
 
 - **定位**：HIR 缓存（pre-type，键=源内容）解决"本模块 Sema 重入"；`.tmi`（typed，键=**API 指纹**）解决"下游依赖跳过对本模块的 type-check"。二者是**两个独立的增量粒度**，必须分离（详见 §4.2 张力说明与 `hir-design.md §3`）。
 - **内容**：本模块导出符号的完整类型签名、泛型定义、comptime 常量值、类型别名解析结果、API 指纹、依赖 `.tmi` 指纹清单。
-- **失效键**：`hash(导出签名 + 泛型定义 + comptime 常量 + 依赖指纹)`；改实现不改签名 ⇒ 指纹不变 ⇒ 下游零重编（声明级失效，见 `tmi-design.md §3`）。
+- **失效键**：`hash(导出签名 + 泛型定义 + comptime 常量 + 依赖指纹)`；**范围含 `pub` 导出 + same-package `path` 可见符号（决策 (A)，见 `tmi-design.md §3.1`）**；改实现不改签名 ⇒ 指纹不变 ⇒ 下游零重编（声明级失效，见 `tmi-design.md §3`）。
 - **与 TIR 拆快照键的关系**：`.tmi` 描述接口、TIR `foo.tir`/`foo.tir.inst` 描述实现产物，二者独立（见 `tir-design.md §4.2.1` / `tmi-design.md §5`）。
 - **消费方**：普通编译（第一消费者）+ 持久会话/REPL（第二消费者，见 `persistent-session-design.md`）。
 
