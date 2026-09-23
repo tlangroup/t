@@ -2619,6 +2619,47 @@ pub fn enum_all_cases_covered(e: i64, scr: i64) bool {
     return covered;
 }
 
+// 无守卫臂是否以布尔字面量模式（true / false）覆盖了 want。
+// 与 match_covers_case 同构：带守卫的臂不算覆盖（守卫可能为假，控制流仍会漏出）。
+// 差别只在模式形态——enum 成员是 `kind=="member"` + sa 存名，bool 字面量是 `kind=="bool"` + ba 存值。
+pub fn match_covers_bool(e: i64, want: bool) bool {
+    var mn: Node = base.nodes[e];
+    var mc: i64 = mn.la;
+    while (mc >= 0) {
+        var mk: Child = base.kids[mc];
+        var arm: Node = base.nodes[mk.val];
+        if (arm.nb < 0 && arm.na >= 0) {
+            var pat: Node = base.nodes[arm.na];
+            if (pat.kind == "bool" && pat.ba == want) {
+                return true;
+            }
+        }
+        mc = mk.next;
+    }
+    return false;
+}
+
+// scrutinee 类型若是 bool，判断 match 是否同时覆盖了 true 与 false —— 二者即 bool 值域全集，
+// 此时不必再要求 `_` 兜底。
+// 修复前：穷尽性只认 member 模式（enum / variant），bool 被当成「无 member 模式的普通标量」，
+// 一律退回「需要 `_`」的旧判据 ⇒ 对 `match (c) { true => A, false => B }` 是**假阴性**
+// （本就穷尽却报 T-MAT-E742）。该形态正是值 `if` 的脱糖目标形态，故此修复是 P1 的前置。
+pub fn bool_all_cases_covered(e: i64, scr: i64) bool {
+    if (tip_kind(scr) != "Scalar") {
+        return false;
+    }
+    if (tip_name(scr) != "bool") {
+        return false;
+    }
+    if (match_covers_bool(e, true) == false) {
+        return false;
+    }
+    if (match_covers_bool(e, false) == false) {
+        return false;
+    }
+    return true;
+}
+
 // 未被覆盖的 enum 成员，形如 `Color.Green, Color.Blue`；非 enum 或已全覆盖时返回空串。
 // 供 T_MATCH_NONEXHAUSTIVE 指名道姓地报缺口，而不是只说「加个 `_`」。
 pub fn enum_missing_cases(e: i64, scr: i64) string {
@@ -5811,6 +5852,10 @@ pub fn infer_expr(e: i64) i64 {
         }
         // enum scrutinee 的全 case 覆盖同样构成穷尽，此时 `_` 不再必需。
         if (m_irref == false && enum_all_cases_covered(e, m_scr)) {
+            m_irref = true;
+        }
+        // bool 值域全集 = {true, false}：两臂齐备即穷尽，无需 `_` 兜底。
+        if (m_irref == false && bool_all_cases_covered(e, m_scr)) {
             m_irref = true;
         }
         // ADT：variant 的全 case 覆盖同理（A1 推广到 variant）。
