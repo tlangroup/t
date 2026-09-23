@@ -86,6 +86,7 @@ pub const HIR_OP_FORIN: i64 = 61;       // sa=迭代变量, ty=第二变量(双�
 pub const HIR_OP_CAPTURE: i64 = 62;     // 闭包体首的捕获变量重建：sa=名字, ty=类型
 pub const HIR_OP_EXPR_STMT: i64 = 63;   // 表达式语句：args=[expr]（与「表达式作为值」区分）
 pub const HIR_OP_CONPAT: i64 = 64;      // match 构造器模式：sa=构造器名, ty=限定名, args=子模式
+pub const HIR_OP_SLICE_PAT: i64 = 65;   // match 切片/数组模式：args=[rest_pos, count, 元素模式...]（rest 元素不入 args）
 
 // ── 数据结构 ─────────────────────────────────────────────────
 pub struct HirInst {
@@ -686,6 +687,25 @@ pub fn hir_lower_expr(n: i64) i64 {
         // 「类型即值」位置（comptime 类型实参 / @type_* 的实参 / 泛型实参）：
         // 只留未解析类型文本，解析交给 sema。
         idx = hir_emit(HIR_OP_TYPE_REF, slot, n, [], hir_type_text(n), "", nd.ln);
+    } else if (k == "slice_pat") {
+        // 切片/数组模式 [a,b,..,last]/[]/[x]/[..]：args=[rest_pos, count, 元素模式...]
+        // （`rest` 元素不入 args，由 rest_pos+count 还原位置）。各元素模式递归降级，
+        // 绑定 ident/字面量/conpat 均为合法 HIR op，不会掉回 RAW 逃生舱（S6）。
+        var sp_rest: i64 = nd.na;
+        var sp_count: i64 = nd.nb;
+        var sp_args: []i64 = [];
+        append(sp_args, hir_emit(HIR_OP_LIT_INT, hir_slot(), -1, [], base.i2s(sp_rest), "", nd.ln));
+        append(sp_args, hir_emit(HIR_OP_LIT_INT, hir_slot(), -1, [], base.i2s(sp_count), "", nd.ln));
+        var sp_e: i64 = nd.la;
+        while (sp_e >= 0) {
+            var sp_en: base.Node = base.nodes[base.kids[sp_e].val];
+            if (sp_en.kind != "rest") {
+                var sp_el: i64 = hir_lower_any(base.kids[sp_e].val);
+                if (sp_el >= 0) { append(sp_args, sp_el); }
+            }
+            sp_e = base.kids[sp_e].next;
+        }
+        idx = hir_emit(HIR_OP_SLICE_PAT, slot, n, sp_args, "", "", nd.ln);
     } else {
         // 未覆盖表达式：逃生舱
         idx = hir_emit(HIR_OP_RAW, n, n, [], nd.kind, "", nd.ln);
@@ -897,6 +917,7 @@ pub fn hir_op_name(op: i64) string {
     if (op == HIR_OP_CAPTURE) { return "capture"; }
     if (op == HIR_OP_EXPR_STMT) { return "expr_stmt"; }
     if (op == HIR_OP_CONPAT) { return "conpat"; }
+    if (op == HIR_OP_SLICE_PAT) { return "slice_pat"; }
     return "invalid";
 }
 

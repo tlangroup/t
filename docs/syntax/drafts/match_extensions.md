@@ -250,8 +250,8 @@
 | S2 | 范围 `..=`/`..` | 易 | 已实现（本轮前已落地） | 无（lex 已确认 `..` token） | `lex.tc` / `parse.tc` / `sema.tc` / `codegen_c.tc`+`codegen_ll.tc`（RangePat） | `tests/conformance/pass/p48_range_ok.tc`；双后端 |
 | S3 | `@` 绑定 | 易 | 设计就绪 | 无 | `parse.tc` / `sema.tc`(AsPat 作用域+C2) / 双后端 | conformance `pass/p_as`；双后端 |
 | S4 | 臂不可达 | 易 | 设计就绪 | 无 | `sema.tc`（纯遍历） | conformance `fail/f_unreach`（`@allow` 关闭） |
-| S5 | 大写裸标识符收敛 | 易 | 设计就绪 | 随 S9 收紧为 error | `sema.tc`（C2 框架） | conformance `fail/f_upper_bind` |
-| S6 | 切片/数组模式 | 中 | 设计就绪 | 无 | `parse.tc` / `sema.tc`(arity) / `codegen_c.tc`+`codegen_ll.tc`(SlicePat) | conformance `pass/p_slice` `fail/f_slice_arity`；双后端 |
+| S5 | 大写裸标识符收敛 | 易 | 已实现（2026-09-23） | 已收紧为硬错 `T-MAT-E740`（与 C2 同级别） | `src/sema.tc`（C2 框架；`~5474` 裸大写名非合法 case → `diag_new("T-MAT-E740")`） | 实跑验证：大写裸名非合法 case 报 `T-MAT-E740`（UNKNOWN_CASE） |
+| S6 | 切片/数组模式 | 中 | 已实现（2026-09-23） | 无 | `src/parse.tc`(parse_slice_pat) / `src/sema.tc`(validate_slice_pat + `[..]` 穷尽性) / `src/codegen_c.tc`+`src/tir.tc`(SlicePat) | conformance `pass/p_slice_pat` `fail/f_slice_arity`；双后端 `examples/match_slice.tc` |
 | S7 | map 模式 | 中 | 设计就绪 | 待 map 字面量语法定稿 | `parse.tc` / `sema.tc` / 双后端(复用 map_get) | conformance `pass/p_map`；双后端 |
 | S8 | Block/if 表达式化 | **难（前置）** | 设计就绪（初版误判为易，已实测纠偏） | 无 | `lex.tc` / `parse.tc` / `sema.tc` / 双后端（语言级新增） | conformance `pass/p_block_expr` `fail/f_block_type`；双后端 |
 | S9 | **variant 解构** | 难 | 设计就绪 | **variant 值构造落地**（decl_variant §5 缺口） | `parse.tc` / `sema.tc`(成员归属+位置绑定) / `codegen_c.tc`+`codegen_ll.tc`(is/as+绑定) / `hir_eval.tc`(若含 S14) | conformance `pass/p_variant` `fail/f_variant_*`；双后端；自举 md5 |
@@ -286,24 +286,30 @@
 1. **`..` token 冲突**（S2/S6）：t 既有 `..` 是否用于切片/区间？需在 `lex.tc` 确认 `..=`/`..` 与既有用法的歧义消解规则。
 2. **map 字面量语法**（S7）：`map_lit` 实际写法未确认，`MapPat` 的 `{}` 必须与 struct 字面量/`{}` 块区分——需先定 map 构造语法。
 3. **`{}` 三义消歧**（S7/S10/S11）：map 模式 / tuple 模式 / struct 字段模式三者都用 `{}`，必须靠 scrutinee 类型在 sema 阶段分流，裁定优先级（struct 名显式 > tuple 元素数 > map 键类型）。
-4. **S5 收紧强度**：非 enum 大写裸标识符当前仅 lint，是否随 S9 一并升级为硬错 `T_MATCH_UPPER_BIND`（建议：是，与 C2 同级别）。
+4. **S5 收紧强度（已决，2026-09-23）**：非 enum 大写裸标识符已**升级为硬错 `T-MAT-E740`**（与 C2 同级别），不再静默当作绑定；未另立 `T_MATCH_UPPER_BIND` 码，复用既有 `T-MAT-E740`(UNKNOWN_CASE) 语义，enum 场景给出「unknown case」专用文案。
 
 ---
 
-### 3.5 实现记录（S1–S4，2026-09-23 落地）
+### 3.5 实现记录（S1–S6，2026-09-23 落地）
 
-S1/S2/S3/S4 已脱离「设计就绪」状态，进入实装 + 门禁覆盖。
+S1/S2/S3/S4/S5/S6 已脱离「设计就绪」状态，进入实装 + 门禁覆盖。
 
 | 编号 | 现状 | 触及文件（实装落点） | 门禁/验证 |
 |---|---|---|---|
 | S1 | 已实现 | `src/parse.tc`（`parse_match_arm` 的 `"BitOr"` 循环）/ `src/sema.tc`（OrPat 展开为共享同一臂体 AST 的 N 个内部候选，穷尽性按备选并集计） | `examples/match_ext.tc`（双后端）、`tests/conformance/pass/p_or_pat.tc` |
-| S2 | 已实现（本轮前已落地） | `src/parse.tc` / `src/sema.tc` / `src/tir.tc`（RangePat 降级为比较链） | `tests/conformance/pass/p48_range_ok.tc`、本稿 §0.4 |
+| S2 | 已实现（本轮前已落地） | `src/parse.tc` / `src/sema.tc` / `src/tir.tc`（RangePat 降级为比较链） | `tests/conformance/pass/p48_range_ok.tc`、本稿 §0.4；`..` 全通配臂算穷尽 |
 | S3 | 已实现 | `src/parse.tc`（AsPat `Ident @` 检测）/ `src/sema.tc`（绑定槽 + variant 载荷槽预声明）/ `src/tir.tc`（`g_expect_st` 注入函数返回 ST，修复 `__mres` 槽宽） | `examples/match_ext.tc`、`tests/conformance/pass/p_as_pat.tc`、`tests/conformance/pass/p_as_variant_pat.tc` |
 | S4 | 已实现 | `src/sema.tc`（不可反驳臂后置 `m_dead`，后续臂发 `T-MAT-W744` 警告，不拦截编译） | `tests/conformance/fail/f_unreach_arm.tc` |
+| S5 | 已实现 | `src/sema.tc`（C2 框架：裸大写名非 `enum`/`variant` 合法 case → `diag_new("T-MAT-E740")`；`enum` 场景给 unknown-case 文案） | 实跑验证：大写裸名非合法 case 报 `T-MAT-E740` |
+| S6 | 已实现 | `src/parse.tc`(parse_slice_pat) / `src/sema.tc`(validate_slice_pat + `[..]` 穷尽性) / `src/codegen_c.tc`+`src/tir.tc`(SlicePat) | `examples/match_slice.tc`（双后端）、`tests/conformance/pass/p_slice_pat.tc`、`tests/conformance/fail/f_slice_arity.tc` |
 
 **S3 触发的根因修复（值得记一笔）**：`match` 作为 `return` 值时，`infer_expr` 不把结果类型写回 `match_node.td`，而 `meta_eval_match` 对运行期 scrutinee 直接返回 `-1`；于是 `tir_emit_match` 退而用 `ST_NONE → i64` 作为 `__mres` 结果槽宽。当 match 返回 `string`/`struct` 时，链接期报 `defined with type 'i64' but expected '%TStr'`。`match_node.td` 方案不可行——t 的 TD 表 0 号是 `string`，`tir_expr_td` 的 `cached_td > 0` 缓存判据把 0 当作「未设置」而漏判。最终解法是 `return` 处理器在发射返回表达式前把函数返回 ST 写入全局 `g_expect_st`，`tir_emit_expr` 取 `est` 时优先消费该值并立即清零——既不污染子表达式、也不依赖 TD 索引。
 
 **as-模式 variant 载荷绑定坑**：`c @ Circle(r)` 同时有绑定名 `sa="c"` 与子模式 `conpat`；原 conpat 载荷槽预声明写在 `else if (arm.sa != "")` 分支里，被 `sa != ""` 短路跳过，导致 `r` 的本地槽缺失、body 提取 `tir_find_local_idx("r")` 返回 -1 而静默不写 → `r` 恒为 0。改为与绑定名分支**独立**的 `if`（非 `else if`）即修复，并补 `tests/conformance/pass/p_as_variant_pat.tc` 锁定该场景。
+
+**S6 两处根因（值得记一笔）**：
+1. **parse_postfix 防贪婪漏 `LBracket`**：match 臂 body 解析时，`parse_postfix` 原有的防贪婪收手只处理前导 `.X`（`.X =>` 是下一臂模式，非 body 字段），漏掉了 `[...]`。于是 `[] => "zero" [x] => "one"` 这类「上一臂 body 后紧跟切片模式臂」会被贪成上一臂 body 的下标访问，下一臂的 `=>` 被孤立 → `T-PAR-E101 unexpected token in expression: =>`。修复为在 match-body 上下文对 `LBracket` 也做 `lbracket_is_next_arm_pattern()` 探测（扫描到配平 `]` 后紧跟 `=>`/`when` 即判定为下一臂切片模式，提前 `break`），与 `dot_is_next_arm_pattern` 完全同构。
+2. **`validate_slice_pat` 越界 + cat/kind 混用**：切片模式在**推断期**校验，彼时 `sema.tds` 尚未填充，直接下标 `sema.tds[scr]` 会 `index_out_of_bounds`；须改用推断期可用的 `tis` 表（`tip_kind`/`tis[].elem`）。同时切片判定用 `tis[].kind == "Slice"`（大写），不是 `sema.tds[].cat == "slice"`（小写）——混用会误拒合法 `[]T` 切片。穷尽性方面：切片长度无有限穷尽集，故新增「`[..]` 全通配（仅 rest、无其它元素、无守卫）等价于 `_`」判定（`m_an.ba=true` + `m_irref`/`m_dead`），令后续臂触发 S4 `T-MAT-W744`；缺 `[..]`/`_` 收尾报 `T-MAT-E742`。
 
 ---
 

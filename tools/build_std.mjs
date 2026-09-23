@@ -9,7 +9,7 @@
 // 用法：
 //   node tools/build_std.mjs                # 用 out/dbg/tc.exe
 //   node tools/build_std.mjs --tc <path>    # 指定编译器（gate 传入 BASE_TC）
-import { spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { join, dirname } from "node:path";
 import { existsSync, rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -41,24 +41,38 @@ for (const mod of MODULES) {
   }
 }
 
+// 用异步 spawn（与 gate.mjs 主流程一致）—— 同步 spawnSync 在本沙箱会因
+// Windows  opportunistic lock（Defender 扫描 freshly-built .exe）返回 EBUSY，
+// 导致 boot_std 步误报失败；异步 spawn 走 libuv 不同代码路径，可正常拉起。
 function buildOne(mod, debug) {
-  const src = join(ROOT, "lib", "std", `${mod}.tc`);
-  // --output 为前缀（不带扩展名）；build --lib 会写出 <prefix>.tlib / <prefix>.ll。
-  const outp = join(OUT_DIR, mod);
-  const cargs = ["build", "--lib", src, "--output", outp];
-  if (debug) cargs.push("--debug");
-  const r = spawnSync(TC, cargs, { cwd: ROOT, encoding: "utf8" });
-  const ok = r.status === 0;
-  const out = (r.stdout || "") + (r.stderr || "");
-  console.log(`[build_std] ${mod}${debug ? " (debug .tlibd)" : " (.tlib)"}: ${ok ? "OK" : "FAIL"}`);
-  if (!ok) console.log(out);
-  return ok;
+  return new Promise((resolve) => {
+    const src = join(ROOT, "lib", "std", `${mod}.tc`);
+    // --output 为前缀（不带扩展名）；build --lib 会写出 <prefix>.tlib / <prefix>.ll。
+    const outp = join(OUT_DIR, mod);
+    const cargs = ["build", "--lib", src, "--output", outp];
+    if (debug) cargs.push("--debug");
+    const p = spawn(TC, cargs, { cwd: ROOT, windowsHide: true });
+    let out = "";
+    p.stdout.on("data", (d) => (out += d));
+    p.stderr.on("data", (d) => (out += d));
+    p.on("error", (e) => {
+      console.log(`[build_std] ${mod}${debug ? " (debug .tlibd)" : " (.tlib)"}: FAIL`);
+      console.log(String(e));
+      resolve(false);
+    });
+    p.on("exit", (code) => {
+      const ok = code === 0;
+      console.log(`[build_std] ${mod}${debug ? " (debug .tlibd)" : " (.tlib)"}: ${ok ? "OK" : "FAIL"}`);
+      if (!ok) console.log(out);
+      resolve(ok);
+    });
+  });
 }
 
 let allOk = true;
 for (const mod of MODULES) {
-  allOk = buildOne(mod, false) && allOk; // 发布态 .tlib
-  allOk = buildOne(mod, true) && allOk;  // 调试态 .tlibd
+  allOk = (await buildOne(mod, false)) && allOk; // 发布态 .tlib
+  allOk = (await buildOne(mod, true)) && allOk;  // 调试态 .tlibd
 }
 console.log(allOk ? "[build_std] 全部就绪 ✅" : "[build_std] 存在失败 ❌");
 process.exit(allOk ? 0 : 1);

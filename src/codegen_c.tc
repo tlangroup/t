@@ -1347,6 +1347,23 @@ pub fn match_conpat_binds_register(e: i64) void {
         var mr_an: Node = base.nodes[mr_k.val];
         if (mr_an.na >= 0) {
             conpat_binds_register_one(mr_an.na);
+            // S6 切片元素绑定预登记：与 conpat 载荷绑定同机制，避免首臂体引用绑定时
+            // 结果类型退化成 unknown（L-09：绝不静默错编）。
+            if (base.nodes[mr_an.na].kind == "slice_pat") {
+                var sb_scr: i64 = base.nodes[e].na;
+                var sb_scr_td: i64 = -1;
+                if (sb_scr >= 0) { sb_scr_td = expr_type_desc(sb_scr); }
+                var sb_elem: i64 = -1;
+                if (sb_scr_td >= 0 && sema.tds[sb_scr_td].cat == "slice") { sb_elem = sema.tds[sb_scr_td].elem; }
+                var sb_e: i64 = base.nodes[mr_an.na].la;
+                while (sb_e >= 0) {
+                    var sb_en: Node = base.nodes[base.kids[sb_e].val];
+                    if (sb_en.kind == "ident" && sb_en.sa != "_") {
+                        fs_set(em_cur_fn, sb_en.sa, sb_elem);
+                    }
+                    sb_e = base.kids[sb_e].next;
+                }
+            }
         }
         mr_c = mr_k.next;
     }
@@ -1474,6 +1491,63 @@ pub fn match_chain_from(c: i64, rname: string, sname: string) i64 {
                 }
                 slp = base.kids[slp].next;
             }
+        } else if (base.nodes[mc_an.na].kind == "slice_pat") {
+            // 切片模式 [a, b, .., last] / [] / [x]（S6）：
+            // 条件 = 长度判别（len == count 无 rest | len >= count-1 有 rest）
+            //        AND 各字面量元素的等值比较；绑定元素在 body 前置声明为局部变量。
+            var sp_pat: i64 = mc_an.na;
+            var sp_rest: i64 = base.nodes[sp_pat].na;   // rest 位置（-1 无）
+            var sp_count: i64 = base.nodes[sp_pat].nb;  // 元素总数（含 rest 占位）
+            var sp_scr_td: i64 = expr_type_desc(base.mk_ident(sname, -1));
+            var sp_elem: i64 = -1;
+            if (sp_scr_td >= 0 && sema.tds[sp_scr_td].cat == "slice") { sp_elem = sema.tds[sp_scr_td].elem; }
+            var sp_len_call: i64 = base.mk_call(base.mk_ident("t_slice_len", -1), base.list_push(-1, -1, base.mk_ident(sname, -1)), -1);
+            if (sp_rest < 0) {
+                mc_cond = base.mk_binary("==", sp_len_call, base.mk_int(base.i2s(sp_count), -1, -1), -1);
+            } else {
+                mc_cond = base.mk_binary(">=", sp_len_call, base.mk_int(base.i2s(sp_count - 1), -1, -1), -1);
+            }
+            var sp_pre: i64 = -1;
+            var sp_pre_tail: i64 = -1;
+            var sp_e: i64 = base.nodes[sp_pat].la;
+            var sp_pos: i64 = 0;
+            while (sp_e >= 0) {
+                var sp_en: Node = base.nodes[base.kids[sp_e].val];
+                var sp_idxn: i64;
+                if (sp_rest < 0 || sp_pos < sp_rest) {
+                    sp_idxn = base.mk_int(base.i2s(sp_pos), -1, -1);
+                } else {
+                    sp_idxn = base.mk_binary("-", sp_len_call, base.mk_int(base.i2s(sp_count - sp_pos), -1, -1), -1);
+                }
+                var sp_acc: i64 = base.mk_index(base.mk_ident(sname, -1), sp_idxn, -1);
+                if (sp_en.kind == "ident" && sp_en.sa != "_") {
+                    // 元素绑定：声明为真实局部变量（与 conpat 载荷绑定同机制，不进 mb 栈）。
+                    var sp_vd: i64 = base.mk_var_decl(sp_en.sa, false, c_td_to_tnode(sp_elem), sp_acc, -1);
+                    append(base.g_conpat_binds, sp_vd);
+                    fs_set(em_cur_fn, sp_en.sa, sp_elem);
+                    sp_pre_tail = base.list_push(sp_pre, sp_pre_tail, sp_vd);
+                    if (sp_pre < 0) { sp_pre = sp_pre_tail; }
+                } else if (sp_en.kind != "rest") {
+                    // 字面量元素：等值比较（字符串走 t_str_eq，expr_type_desc 不解析 index 节点）
+                    if (sp_elem >= 0 && sema.tds[sp_elem].cat == "string") {
+                        var sp_arg_head: i64 = base.list_push(-1, -1, sp_acc);
+                        var sp_arg_tail: i64 = base.list_push(sp_arg_head, sp_arg_head, base.kids[sp_e].val);
+                        var sp_eq: i64 = base.mk_call(base.mk_ident("t_str_eq", -1), sp_arg_head, -1);
+                        mc_cond = base.mk_binary("&&", mc_cond, sp_eq, -1);
+                    } else {
+                        var sp_eq: i64 = base.mk_binary("==", sp_acc, base.kids[sp_e].val, -1);
+                        mc_cond = base.mk_binary("&&", mc_cond, sp_eq, -1);
+                    }
+                }
+                sp_pos = sp_pos + 1;
+                sp_e = base.kids[sp_e].next;
+            }
+            if (sp_pre >= 0) {
+                var sp_ptk: Child = base.kids[sp_pre_tail];
+                sp_ptk.next = mc_body;
+                slice_set(base.kids, sp_pre_tail, sp_ptk);
+                mc_body = sp_pre;
+            }
         } else {
             mc_cond = base.mk_binary("==", base.mk_ident(sname, -1), mc_an.na, -1);
         }
@@ -1533,6 +1607,19 @@ pub fn c_elem_ctype(slice_expr: i64) string {
         }
     }
     return "int64_t";
+}
+
+// TD → 类型描述节点（供 mk_var_decl 的 na）。切片元素绑定在 C 后端声明为
+// 真实局部变量，类型须由此构造（var_decl 发射走 resolve_type_desc(na)）。
+pub fn c_td_to_tnode(td: i64) i64 {
+    if (td < 0) { return base.mk_named("i64", -1); }
+    var t: TD = sema.tds[td];
+    if (t.cat == "scalar") { return base.mk_scalar(t.name, -1); }
+    if (t.cat == "string") { return base.mk_scalar("string", -1); }
+    if (t.cat == "slice") { return base.mk_slice(c_td_to_tnode(t.elem), -1); }
+    if (t.cat == "named") { return base.mk_named(t.name, -1); }
+    if (str_len(t.name) > 0) { return base.mk_named(t.name, -1); }
+    return base.mk_named("i64", -1);
 }
 
 // ── fid 打开方式 / 格式的编译期编码（M51，双后端共用）─────────

@@ -209,15 +209,17 @@ fn fib(_) i64 { return 0 - 1; }
 
 > 上述增量扩展统一登记在 `docs/syntax/drafts/match_extensions.md`（S1–S14：按难易分级的实现步骤与实现记录），本稿不重复展开。
 
-### 6.1.1 跨语言调研扩展 S1/S2/S3 已实装（2026-09-23）
+### 6.1.1 跨语言调研扩展 S1/S2/S3/S5/S6 已实装（2026-09-23）
 
-跨语言调研（`match_extensions.md`）暴露的 **S1 或模式 `|`**、**S2 范围模式 `..=`/`..`**、**S3 `@` 绑定 `x @ pat`** 均已落地，与既有 match 节点零新增语义、双后端复用既有比较 / member 路径：
+跨语言调研（`match_extensions.md`）暴露的 **S1 或模式 `|`**、**S2 范围模式 `..=`/`..`**、**S3 `@` 绑定 `x @ pat`**、**S5 大写裸标识符收敛**、**S6 切片/数组模式** 均已落地，与既有 match 节点零新增语义、双后端复用既有比较 / member / slice 路径：
 
-- S2 范围模式早已实装，`tests/conformance/pass/p48_range_ok.tc` 已覆盖（`1..5` / `5..=9` / `10..` 在 match 臂降级为比较链）。
+- S2 范围模式早已实装，`tests/conformance/pass/p48_range_ok.tc` 已覆盖（`1..5` / `5..=9` / `10..` 在 match 臂降级为比较链）；`..` 全通配臂（两端都省）算穷尽（令 `_` 不再必需）。
 - S1 或模式、S3 `@` 绑定本次补齐：parse 侧 `parse_match_arm` 支持 `|` 多候选与 `Ident @` 子模式；sema 侧把 `OrPat` 展开为共享臂体的 N 个内部候选、把 `AsPat` 预声明绑定槽（含 variant 载荷槽）。
 - **关键修复（S3 触发）**：返回 `string`/`struct` 的 `match`（如 `@` 绑定臂返回字符串）曾因运行期 scrutinee 无法从 sema 反推结果类型，导致 `__mres` 结果槽退化为 `i64` 宽 → 链接期 `defined with type 'i64' but expected '%TStr'`。根因是 `return` 发射未携带函数返回类型；修复为 `tir_emit_expr` 经全局 `g_expect_st` 读取 `return` 处理器注入的函数返回 ST（详见 `match_extensions.md` §3.5）。
-- 双后端运行期门禁：`examples/match_ext.tc`（输出 `match_ext ok`，LLVM/C 交叉对拍）；conformance `tests/conformance/pass/{p_or_pat,p_as_pat,p_as_variant_pat}.tc`；S4 告警 `tests/conformance/fail/f_unreach_arm.tc`。
-- S4 见上方 §6.1 第三条。S5（非 enum 大写裸标识符收敛）、S9（variant 解构）仍为 `match_extensions.md` 中的待办 / 前向依赖。
+- **S5 大写裸标识符收敛**：模式位置的裸大写标识符若不是 scrutinee 所属 `enum`/`variant` 的合法 case，一律硬报错 `T-MAT-E740`（「starts with an uppercase letter, so it is read as a case name, not a binding」），不再静默当作绑定名；`enum` 场景给出「unknown case」专用诊断。与 C2 改写（大写 ⇒ `Enum.Case` member 模式）共用同一错误码。
+- **S6 切片/数组模式**：`[a, b]` / `[]` / `[first, .., last]` / `[a, ..]` / `[.., last]` / `[..]` 六形态均支持，类型检查（`validate_slice_pat`，走 `tis`/`tip_kind` 而非未填充的 `sema.tds`）、穷尽性（`[..]` 全通配收尾算穷尽，等价于 `_`）、双后端发射（C 与 LLVM/TIR 的长度判别 + 中缀 rest 索引 + 元素绑定提取）全部落地。切片长度无有限穷尽集，故必须以 `[..]`/`_` 收尾，否则报 `T-MAT-E742`。
+- 双后端运行期门禁：`examples/match_ext.tc`（S1/S2/S3，输出 `match_ext ok`）与 `examples/match_slice.tc`（S6，输出 `match_slice ok`，LLVM/C 交叉对拍全绿）；conformance `tests/conformance/pass/{p_or_pat,p_as_pat,p_as_variant_pat,p_slice_pat}.tc`、S4 告警 `tests/conformance/fail/f_unreach_arm.tc`、S6 穷尽性 `tests/conformance/fail/f_slice_arity.tc`。
+- S4 见上方 §6.1 第三条。S9（variant 解构）仍为 `match_extensions.md` 中的前向依赖。
 
 ---
 
@@ -333,5 +335,5 @@ fn pick(c: Expl) string {
 
 - 四项法律判据 L-02 / L-03 / L-04 / L-14：**✅ 均已满足**。
 - §7 **六项**设计裁定全部已决（7.1–7.5 语义层，7.6 语法基线层）。
-- §6.1 待办中 **S4 已实装**（T-MAT-W744 不可达臂警告）；跨语言调研扩展 **S1/S2/S3 已实装**（见 §6.1.1）。其余（variant 解构 S9 / 非 enum 大写裸标识符 S5 / arm 多语句）仍为增量能力，不构成采纳阻塞。
+- §6.1 待办中 **S4 已实装**（T-MAT-W744 不可达臂警告）；跨语言调研扩展 **S1/S2/S3/S5/S6 已实装**（见 §6.1.1）。其余（variant 解构 S9 / arm 多语句）仍为增量能力，不构成采纳阻塞。
 - ✅ **§6.2 的 enum 分派缺陷已于 2026-09-23 修复**：它本属 LLVM 发射侧的实现缺陷（四处根因），不影响本规则的合法性（语法与静态语义原本就判定正确）。修复后 §3 的 ②③ 示例已可运行且输出正确，并入 `reference.md` 的示例准入三重条件（编译 / 运行 / 输出）全部满足。

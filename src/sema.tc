@@ -4177,6 +4177,65 @@ pub fn is_range_node(e: i64) bool {
     return base.nodes[e].kind == "range";
 }
 
+pub fn is_slice_pat(e: i64) bool {
+    if (e < 0) { return false; }
+    return base.nodes[e].kind == "slice_pat";
+}
+
+// 切片模式校验（S6）：scr 必须是 []T 切片；逐元素检查绑定/字面量类型；
+// 变体构造器（conpat）暂不支持作切片元素。切片模式永不穷尽，故不置 m_irref。
+pub fn validate_slice_pat(pat: i64, scr: i64, rep: bool) void {
+    if (scr < 0) { return; }
+    // ⚠ scr 是 TI（tis 表）索引，不是 sema.tds 索引：sema.tds 在推断期尚未填充，
+    // 直接下标会越界 panic（index_out_of_bounds）。切片判定与元素类型一律走 tis，
+    // 与 match 循环其余分支（tip_kind / ti_equal / can_cast）保持一致。
+    if (tip_kind(scr) != "Slice") {
+        if (rep) {
+            var l: i64 = parse.n_line(pat);
+            var c: i64 = parse.n_col(pat);
+            base.diag_new("T-MAT-E750", "error",
+                base.sb_cat3("slice pattern requires a `[]T` slice scrutinee, got ", ti_str(scr), ""),
+                parse.n_file(pat), l, c, l, c + 1);
+        }
+        return;
+    }
+    var elem: i64 = -1;
+    if (scr >= 0 && scr < (slice_len(tis) as i64)) { elem = tis[scr].elem; }
+    var ele: i64 = base.nodes[pat].la;
+    var pos: i64 = 0;
+    while (ele >= 0) {
+        var en: Node = base.nodes[base.kids[ele].val];
+        if (en.kind == "rest") {
+            // 占位，无类型约束
+        } else if (en.kind == "ident") {
+            if (en.sa != "_") {
+                // 元素绑定名：在本臂子作用域声明（与整臂绑定 sa 同处理）
+                sym_define(cur_scope, en.sa, "var", elem, -1);
+            }
+        } else if (en.kind == "conpat") {
+            if (rep) {
+                var l: i64 = parse.n_line(base.kids[ele].val);
+                var c: i64 = parse.n_col(base.kids[ele].val);
+                base.diag_new("T-MAT-E750", "error",
+                    "variant constructor patterns are not supported as slice elements yet",
+                    parse.n_file(base.kids[ele].val), l, c, l, c + 1);
+            }
+        } else {
+            // 字面量元素：与切片元素类型比对
+            var et: i64 = infer_expr(base.kids[ele].val);
+            if (rep && ti_equal(et, elem) == false && can_cast(et, elem) == false && tip_kind(et) != "Unknown") {
+                var l: i64 = parse.n_line(base.kids[ele].val);
+                var c: i64 = parse.n_col(base.kids[ele].val);
+                base.diag_new("T-MAT-E750", "error",
+                    base.sb_cat4("slice element literal type ", ti_str(et), " does not match slice element type ", ti_str(elem)),
+                    parse.n_file(base.kids[ele].val), l, c, l, c + 4);
+            }
+        }
+        pos = pos + 1;
+        ele = base.kids[ele].next;
+    }
+}
+
 pub fn rng_lit(v: i64) i64 {
     return base.mk_int(base.i2s(v), v, -1);
 }
@@ -5444,12 +5503,25 @@ pub fn infer_expr(e: i64) i64 {
                 // 载荷绑定直接 define 进去（仅本臂可见，遮蔽外层同名）。
                 conpat_check(m_an.na, m_scr, m_rep);
             } else if (m_an.na >= 0) {
-                // 范围模式（`1..5` / `1..=5` / `1..` / `..5`）**不能**整体 infer——
+                // 切片模式（S6）：children 由 validate_slice_pat 校验 + 声明元素绑定，
+                // 本身不整体 infer（与 range 同处理，避免被当成普通表达式求值）。
+                if (is_slice_pat(m_an.na)) {
+                    validate_slice_pat(m_an.na, m_scr, m_rep);
+                    // `[..]` 全通配（仅 rest、无其它元素、无守卫）等价于 `_`：必然命中，
+                    // 算穷尽（令 m_irref=true）且令后续臂不可达（m_dead=true，触发 S4 W744）。
+                    // 切片长度无有限穷尽集，故只有 `[..]`/`_` 能收尾；精确长度臂组合不行。
+                    var sp_n: Node = base.nodes[m_an.na];
+                    if (m_an.nb < 0 && sp_n.na >= 0 && sp_n.nb == 1) {
+                        m_an.ba = true;
+                        slice_set(base.nodes, m_k.val, m_an);
+                        m_irref = true;
+                        m_dead = true;
+                    }
+                } else if (is_range_node(m_an.na)) {
                 // infer_expr 见到 range 会走 materialize_range，把它物化成 []i64：
                 // 既误报「[]i64 vs i64」类型不符，又把节点退化成 paren，
                 // 让 codegen 的 match_chain_from 认不出 `kind == "range"`。
                 // 这里只逐端点校验类型，range 节点原样留给后端合成比较链。
-                if (is_range_node(m_an.na)) {
                     var m_rp: Node = base.nodes[m_an.na];
                     if (m_rp.na >= 0) {
                         var m_rlo: i64 = ie_sub_in(ie_inst(m_an.na), m_rp.na);
@@ -5468,9 +5540,12 @@ pub fn infer_expr(e: i64) i64 {
                         }
                     }
                     // `..` 全通配等价于 `_`：两端都省的范围臂必然命中，算穷尽。
+                    // 直接置 m_irref/m_dead（不可走 line 5581 的 `m_an.na<0` 分支，range 节点 na>=0）。
                     if (m_rp.na < 0 && m_rp.nb < 0) {
                         m_an.ba = true;
                         slice_set(base.nodes, m_k.val, m_an);
+                        m_irref = true;
+                        m_dead = true;
                     }
                 } else {
                     // 前导点变体臂 `.Red`：模式是 leading-dot member（na<0, lb==1），
