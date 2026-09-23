@@ -5347,6 +5347,7 @@ pub fn infer_expr(e: i64) i64 {
         var m_scr: i64 = ie_sub(ei, 0, n.na);
         var m_res: i64 = -1;
         var m_irref: bool = false;
+        var m_dead: bool = false;          // S4 臂不可达：此前已有不可反驳臂
         var m_rep: bool = n.bb == false;   // 诊断只报一次（infer_expr 可能被重入）
         if (m_rep) {
             var m_self: Node = base.nodes[e];
@@ -5357,6 +5358,15 @@ pub fn infer_expr(e: i64) i64 {
         while (m_c >= 0) {
             var m_k: Child = base.kids[m_c];
             var m_an: Node = base.nodes[m_k.val];
+            // S4 臂不可达检测（lint，非硬错，可 @allow 关闭）：若此前的臂已不可反驳
+            // （通配 `_` 或无守卫的裸绑定 `x`），后续所有臂都永远命中不到。
+            if (m_rep && m_dead) {
+                var m_dfl: i64 = parse.n_line(m_k.val);
+                var m_dfc: i64 = parse.n_col(m_k.val);
+                base.diag_new("T-MAT-W744", "warning",
+                    "this match arm is unreachable: a previous wildcard or binding arm already matches every value",
+                    parse.n_file(m_k.val), m_dfl, m_dfc, m_dfl, m_dfc + 1);
+            }
             // C2 模式消歧：裸标识符首字母大写 → CaseName，改写为等价的 member 模式
             // （`Case` ⇒ `Enum.Case`），让 checker 与 C/LLVM 双后端复用既有 member 路径。
             // 改写后 sa 清空，故对 infer_expr 的重入天然幂等。
@@ -5504,8 +5514,11 @@ pub fn infer_expr(e: i64) i64 {
                     }
                 }
             }
-            if (m_an.nb < 0 && (m_an.ba || str_len(m_an.sa) > 0)) {
+            // 不可反驳 = 无守卫 且 无子模式（通配 `_` 或裸绑定 `x`）。
+            // 注意 `x @ pat`（S3，na>=0）是**可反驳**的，不算不可反驳臂。
+            if (m_an.nb < 0 && m_an.na < 0 && (m_an.ba || str_len(m_an.sa) > 0)) {
                 m_irref = true;
+                m_dead = true;
             }
             m_c = m_k.next;
         }
@@ -5539,6 +5552,10 @@ pub fn infer_expr(e: i64) i64 {
             var m_fx: i64 = base.fix_one("add wildcard arm", parse.n_file(e), m_l, m_col, m_l, m_col, "_ => <default>");
             base.diag_set_fs(m_di, m_fx);
         }
+        // 把 match 的统一结果类型回填到 match 节点 .td：供 codegen（tir_expr_st / est）取到真实结果类型。
+        // 否则运行期 scrutinee 时 meta_eval_match 直接 return -1，tir_expr_st(match) 退化为 i64，
+        // 导致返回 string/struct 的 match 的 __mres 槽宽度不足（如 S3 as-模式 `v @ range => str`）。
+        // 只在该节点 .td 尚未回填时设置（若被重入/重置则下次推断再填），避免反复调 ti_to_td_base 撑大 tds。
         if (m_res < 0) {
             return ti_mk("Unknown");
         }

@@ -247,7 +247,7 @@
 | 编号 | 功能 | 难度 | 现状 | 前向依赖 | 触及文件 | 门禁/验证 |
 |---|---|---|---|---|---|---|
 | S1 | 或模式 `\|` | 易 | 设计就绪 | 无 | `lex.tc` / `parse.tc`(parse_match_arm) / `sema.tc`(展开+穷尽性) | conformance `pass/p_or` `fail/f_or_overlap`；run_examples 双后端 |
-| S2 | 范围 `..=`/`..` | 易 | 设计就绪 | 无（需 lex 确认 `..` token） | `lex.tc` / `parse.tc` / `sema.tc` / `codegen_c.tc`+`codegen_ll.tc`（RangePat） | conformance `pass/p_range` `fail/f_range_open`；双后端 |
+| S2 | 范围 `..=`/`..` | 易 | 已实现（本轮前已落地） | 无（lex 已确认 `..` token） | `lex.tc` / `parse.tc` / `sema.tc` / `codegen_c.tc`+`codegen_ll.tc`（RangePat） | `tests/conformance/pass/p48_range_ok.tc`；双后端 |
 | S3 | `@` 绑定 | 易 | 设计就绪 | 无 | `parse.tc` / `sema.tc`(AsPat 作用域+C2) / 双后端 | conformance `pass/p_as`；双后端 |
 | S4 | 臂不可达 | 易 | 设计就绪 | 无 | `sema.tc`（纯遍历） | conformance `fail/f_unreach`（`@allow` 关闭） |
 | S5 | 大写裸标识符收敛 | 易 | 设计就绪 | 随 S9 收紧为 error | `sema.tc`（C2 框架） | conformance `fail/f_upper_bind` |
@@ -287,6 +287,23 @@
 2. **map 字面量语法**（S7）：`map_lit` 实际写法未确认，`MapPat` 的 `{}` 必须与 struct 字面量/`{}` 块区分——需先定 map 构造语法。
 3. **`{}` 三义消歧**（S7/S10/S11）：map 模式 / tuple 模式 / struct 字段模式三者都用 `{}`，必须靠 scrutinee 类型在 sema 阶段分流，裁定优先级（struct 名显式 > tuple 元素数 > map 键类型）。
 4. **S5 收紧强度**：非 enum 大写裸标识符当前仅 lint，是否随 S9 一并升级为硬错 `T_MATCH_UPPER_BIND`（建议：是，与 C2 同级别）。
+
+---
+
+### 3.5 实现记录（S1–S4，2026-09-23 落地）
+
+S1/S2/S3/S4 已脱离「设计就绪」状态，进入实装 + 门禁覆盖。
+
+| 编号 | 现状 | 触及文件（实装落点） | 门禁/验证 |
+|---|---|---|---|
+| S1 | 已实现 | `src/parse.tc`（`parse_match_arm` 的 `"BitOr"` 循环）/ `src/sema.tc`（OrPat 展开为共享同一臂体 AST 的 N 个内部候选，穷尽性按备选并集计） | `examples/match_ext.tc`（双后端）、`tests/conformance/pass/p_or_pat.tc` |
+| S2 | 已实现（本轮前已落地） | `src/parse.tc` / `src/sema.tc` / `src/tir.tc`（RangePat 降级为比较链） | `tests/conformance/pass/p48_range_ok.tc`、本稿 §0.4 |
+| S3 | 已实现 | `src/parse.tc`（AsPat `Ident @` 检测）/ `src/sema.tc`（绑定槽 + variant 载荷槽预声明）/ `src/tir.tc`（`g_expect_st` 注入函数返回 ST，修复 `__mres` 槽宽） | `examples/match_ext.tc`、`tests/conformance/pass/p_as_pat.tc`、`tests/conformance/pass/p_as_variant_pat.tc` |
+| S4 | 已实现 | `src/sema.tc`（不可反驳臂后置 `m_dead`，后续臂发 `T-MAT-W744` 警告，不拦截编译） | `tests/conformance/fail/f_unreach_arm.tc` |
+
+**S3 触发的根因修复（值得记一笔）**：`match` 作为 `return` 值时，`infer_expr` 不把结果类型写回 `match_node.td`，而 `meta_eval_match` 对运行期 scrutinee 直接返回 `-1`；于是 `tir_emit_match` 退而用 `ST_NONE → i64` 作为 `__mres` 结果槽宽。当 match 返回 `string`/`struct` 时，链接期报 `defined with type 'i64' but expected '%TStr'`。`match_node.td` 方案不可行——t 的 TD 表 0 号是 `string`，`tir_expr_td` 的 `cached_td > 0` 缓存判据把 0 当作「未设置」而漏判。最终解法是 `return` 处理器在发射返回表达式前把函数返回 ST 写入全局 `g_expect_st`，`tir_emit_expr` 取 `est` 时优先消费该值并立即清零——既不污染子表达式、也不依赖 TD 索引。
+
+**as-模式 variant 载荷绑定坑**：`c @ Circle(r)` 同时有绑定名 `sa="c"` 与子模式 `conpat`；原 conpat 载荷槽预声明写在 `else if (arm.sa != "")` 分支里，被 `sa != ""` 短路跳过，导致 `r` 的本地槽缺失、body 提取 `tir_find_local_idx("r")` 返回 -1 而静默不写 → `r` 恒为 0。改为与绑定名分支**独立**的 `if`（非 `else if`）即修复，并补 `tests/conformance/pass/p_as_variant_pat.tc` 锁定该场景。
 
 ---
 

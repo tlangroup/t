@@ -379,6 +379,11 @@ pub var g_tir_defer: []i64;          // 延迟语句节点栈（defer → LIFO�
 pub var g_tir_func_names: []string;   // 模块内函数名 → FuncDecl 节点（call 实参定长数组降级用）
 pub var g_tir_func_decls: []i64;
 pub var g_cur_ret_td: i64 = -1;       // 当前函数返回类型 TD（return 字面量定长数组降级用）
+// 调用方已知的目标类型 ST 码（由 return/var_decl/assignment 等上下文注入）。tir_emit_expr
+// 取 est 时优先用它，解决「运行期 scrutinee 的 match 无法从 sema 反推结果类型（meta_eval_match
+// 直接 -1）导致返回 string/struct 的 match 的 __mres 槽宽度不足（as-模式 v @ range => str 等）」。
+// 仅作用于顶层表达式一次：读取后立即清零，避免污染子表达式的真实类型。
+pub var g_expect_st: i64 = ST_NONE;
 
 // ── 模块级全局变量（Stage 4 降级目标，解锁 func_type/lambda/map 全局等示例）──
 pub var g_globals_section: StringBuilder;   // 缓冲 `globals:` 段文本（@name ST 每行）
@@ -2143,6 +2148,7 @@ pub fn tir_emit_stmt(sid: i64) void {
             // 故此处显式用函数返回类型 TD 构造（与 array_lit 返回降级同构）。
             var __er1m: TirEmitRes = tir_emit_map_lit(n.na, g_cur_ret_td); s = __er1m.name;
         } else {
+            g_expect_st = tir_st_from_str(g_cur_func.ret_st);
             var __er2: TirEmitRes = tir_emit_expr(n.na); s = __er2.name;
             // 返回值按函数返回类型对齐（修复 i64 字面量/表达式直接 ret 给 i32 函数 →
             // LLVM `ret i32 <i64 值>` 类型错配：翻译器按槽真实宽度 load（i64）却 ret i32）。
@@ -2636,7 +2642,11 @@ pub fn tir_emit_expr(e: i64) TirEmitRes {
     g_cur_line = base.nodes[e].ln;
     var n: Node = base.nodes[e];
     var kd: string = n.kind;
-    var est: i64 = tir_st_from_str(tir_expr_st(e));   // 默认取 sema 推断类型；具体发射器（如 binary）会覆盖为真实发射类型
+    // est 优先取调用方注入的预期类型（g_expect_st）：解决 match 等无法从 sema 反推结果类型、
+    // 退回 i64 导致 __mres 槽宽度不足的问题。读取后即清零，子表达式改用自身推断类型。
+    var est: i64 = ST_NONE;
+    if (g_expect_st != ST_NONE) { est = g_expect_st; g_expect_st = ST_NONE; }
+    if (est == ST_NONE) { est = tir_st_from_str(tir_expr_st(e)); }
 
     if (kd == "assign" || kd == "assignment") { return tir_emit_assign(n, est); }
     if (kd == "match") { return tir_emit_match(n, false, est); }
@@ -4396,6 +4406,39 @@ pub fn tir_match_pattern_cond(arm: Node, scr: string, scr_base: string, scr_st: 
         tir_emit(TIRInst{ op: TIR_OP_NE, st: tir_st_from_str("i32"), dst: tir_op(cond), args: tir_a2(cmp, "0"), is_comment: false, line: g_cur_line, cmt: "" });
         return cond;
     }
+    // ── 范围模式（1..=5 / 6.. / ..5）：LLVM 轨此前漏发此分支（C 轨 match_chain_from
+    // 早有 mk_range_test），导致 range 臂条件返回 "" → 整臂被降级为终极端、永不命中，
+    // 落到首臂或兜底。此处镜像 C 轨语义合成区间成员测试。
+    if (p.kind == "range") {
+        var rcond: string = "";
+        if (p.na >= 0) {
+            var lov: TirEmitRes = tir_emit_expr(p.na);
+            var loc: string = tir_tmp();
+            tir_emit(TIRInst{ op: TIR_OP_SGE, st: tir_st_from_str(scr_st), dst: tir_op(loc), args: tir_a2(scr, lov.name), is_comment: false, line: g_cur_line, cmt: "" });
+            rcond = loc;
+        }
+        if (p.nb >= 0) {
+            var hiv: TirEmitRes = tir_emit_expr(p.nb);
+            var hic: string = tir_tmp();
+            if (p.ba == true) {
+                tir_emit(TIRInst{ op: TIR_OP_SLE, st: tir_st_from_str(scr_st), dst: tir_op(hic), args: tir_a2(scr, hiv.name), is_comment: false, line: g_cur_line, cmt: "" });
+            } else {
+                tir_emit(TIRInst{ op: TIR_OP_SLT, st: tir_st_from_str(scr_st), dst: tir_op(hic), args: tir_a2(scr, hiv.name), is_comment: false, line: g_cur_line, cmt: "" });
+            }
+            if (rcond == "") { rcond = hic; }
+            else {
+                var comb: string = tir_tmp();
+                // 比较结果恒为 i1（tir_to_ll 比较分支硬编码 i1），故内部 AND 也用 i1，
+                // 与 br_cond 同型；外部 when 守卫的 AND（tir_emit_match:4618，st=i8）会按需 zext 合并。
+                tir_emit(TIRInst{ op: TIR_OP_AND, st: tir_st_from_str("i1"), dst: tir_op(comb), args: tir_a2(rcond, hic), is_comment: false, line: g_cur_line, cmt: "" });
+                rcond = comb;
+            }
+        }
+        // 两端全省（..）的 range 臂已在 sema 置 ba=true 等价 `_`，不会走到这里；
+        // 保险起见仍为恒真，避免条件链塌陷。
+        if (rcond == "") { rcond = "1"; }
+        return rcond;
+    }
     // ── 枚举 / 变体构造器模式（ident 或 Enum.Case / Variant.Case 的 member）──
     var cname: string = p.sa;
     if (p.kind == "member") { cname = p.sa; }
@@ -4569,15 +4612,21 @@ pub fn tir_emit_match(n: Node, as_stmt: bool, est: i64) TirEmitRes {
     var i: i64 = 0;
     while (i < nArm) {
         var arm: Node = base.nodes[armIds[i]];
-        if (arm.na < 0 && arm.sa != "") {
+        // 预声明绑定名 slot：裸绑定 `x`（na<0）与 as-模式 `x @ pat`（S3，na>=0）都要把
+        // 整体被匹配值绑到 x，故只按 sa 判定，不要求 na<0。
+        if (arm.sa != "") {
             // 同绑定名跨多臂只建一个 slot（避免 $x / $x__0 重复死槽）；已声明则复用
             var bidx: i64 = tir_find_local_idx(arm.sa);
             if (bidx < 0) {
                 var bs: string = tir_new_named_slot(scr_td, scr_st, arm.sa);
                 tir_emit(TIRInst{ op: TIR_OP_STORE, st: ST_NONE, dst: tir_op(bs), args: tir_a1(scr), is_comment: false, line: g_cur_line, cmt: "" });
             }
-        } else if (arm.na >= 0 && base.nodes[arm.na].kind == "conpat") {
-            // conpat 载荷绑定：预声明 slot（类型取绑定 .na），提取在 body 块内进行
+        }
+        // conpat 载荷绑定：预声明 slot（类型取绑定 .na），提取在 body 块内进行。
+        // 注意：与上方 `arm.sa != ""` 分支是**独立**的 if（非 else if）——as-模式 `c @ Circle(r)`
+        // 同时有绑定名 sa="c" 与子模式 conpat，二者都要预声明（否则载荷 r 的 slot 缺失、
+        // body 提取 TirEmit 找不到本地槽而不写，r 恒为 0）。
+        if (arm.na >= 0 && base.nodes[arm.na].kind == "conpat") {
             var cp2: Node = base.nodes[arm.na];
             var bk2: i64 = cp2.la;
             while (bk2 >= 0) {

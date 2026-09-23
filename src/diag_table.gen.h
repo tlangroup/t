@@ -72,6 +72,7 @@ static const DiagDef DIAG_DEFS[] = {
   { "T-MAT-E741", "error", "MAT", "T_MATCH_ARM_TYPE", "ARM_TYPE", "match arm type mismatch" },
   { "T-MAT-E742", "error", "MAT", "T_MATCH_NONEXHAUSTIVE", "NONEXHAUSTIVE", "match is not exhaustive" },
   { "T-MAT-E743", "error", "MAT", "T_MATCH_PATTERN_ARITY", "PATTERN_ARITY", "match constructor pattern arity mismatch" },
+  { "T-MAT-W744", "warning", "MAT", "T_MATCH_ARM_UNREACHABLE", "ARM_UNREACHABLE", "match arm is unreachable" },
   { "T-MOD-E550", "error", "MOD", "T_IMPORT_NOT_FOUND", "IMPORT_NOT_FOUND", "import target not found" },
   { "T-MOD-E551", "error", "MOD", "T_IMPORT_CYCLE", "IMPORT_CYCLE", "cyclic import detected" },
   { "T-MOD-E552", "error", "MOD", "T_IMPORT_IO", "IMPORT_IO", "import I/O failure" },
@@ -144,6 +145,7 @@ static const DiagDef DIAG_DEFS[] = {
   { "T-SEM-E211", "error", "SEM", "T_VAR_NO_TYPE", "VAR_NO_TYPE", "variable has no type" },
   { "T-SEM-E213", "error", "SEM", "T_VARIANT_RECURSIVE_VALUE", "VARIANT_RECURSIVE_VALUE", "variant case payload references its own type by value" },
   { "T-SEM-E214", "error", "SEM", "T_LAMBDA_PARAM_UNINFERABLE", "LAMBDA_PARAM_UNINFERABLE", "lambda parameter type cannot be inferred" },
+  { "T-SEM-E215", "error", "SEM", "T_ARRAY_LEN_UNINFERABLE", "ARRAY_LEN_UNINFERABLE", "array length placeholder `[_]` cannot be inferred here" },
   { "T-SEM-W212", "warning", "SEM", "W_OVERFLOW_LITERAL", "OVERFLOW_LITERAL", "integer literal overflow" },
   { "T-TIM-E700", "error", "TIM", "T_TIME_BAD_SPEC", "BAD_SPEC", "invalid time format specifier" },
   { "T-TIM-E701", "error", "TIM", "T_TIME_PARSE_UNSUPPORTED", "PARSE_UNSUPPORTED", "time parsing unsupported" },
@@ -165,9 +167,8 @@ static const DiagDef DIAG_DEFS[] = {
   { "T-VEC-E946", "error", "VEC", "T_TILE_OP_UNSUPPORTED", "TILE_OP_UNSUPPORTED", "operator does not support tile operands" },
   { "T-VEC-W927", "warning", "VEC", "T_VECTOR_WIDER_THAN_NATIVE", "VECTOR_WIDER_THAN_NATIVE", "vector is wider than the native SIMD register and will be split" },
   { "T-VEC-W947", "warning", "VEC", "T_TILE_WIDER_THAN_NATIVE", "TILE_WIDER_THAN_NATIVE", "hardware tile is wider than the native SIMD register and will fall back to scalar loops" },
-  { "T-SEM-E215", "error", "SEM", "T_ARRAY_LEN_UNINFERABLE", "ARRAY_LEN_UNINFERABLE", "array length placeholder `[_]` cannot be inferred here" },
 };
-#define DIAG_COUNT 154
+#define DIAG_COUNT 155
 
 /* legacy (old semantic name) -> machine code alias table */
 static const struct { const char* legacy; const char* code; } DIAG_LEGACY[] = {
@@ -221,6 +222,7 @@ static const struct { const char* legacy; const char* code; } DIAG_LEGACY[] = {
   { "T_MATCH_ARM_TYPE", "T-MAT-E741" },
   { "T_MATCH_NONEXHAUSTIVE", "T-MAT-E742" },
   { "T_MATCH_PATTERN_ARITY", "T-MAT-E743" },
+  { "T_MATCH_ARM_UNREACHABLE", "T-MAT-W744" },
   { "T_IMPORT_NOT_FOUND", "T-MOD-E550" },
   { "T_IMPORT_CYCLE", "T-MOD-E551" },
   { "T_IMPORT_IO", "T-MOD-E552" },
@@ -293,6 +295,7 @@ static const struct { const char* legacy; const char* code; } DIAG_LEGACY[] = {
   { "T_VAR_NO_TYPE", "T-SEM-E211" },
   { "T_VARIANT_RECURSIVE_VALUE", "T-SEM-E213" },
   { "T_LAMBDA_PARAM_UNINFERABLE", "T-SEM-E214" },
+  { "T_ARRAY_LEN_UNINFERABLE", "T-SEM-E215" },
   { "W_OVERFLOW_LITERAL", "T-SEM-W212" },
   { "T_TIME_BAD_SPEC", "T-TIM-E700" },
   { "T_TIME_PARSE_UNSUPPORTED", "T-TIM-E701" },
@@ -314,9 +317,8 @@ static const struct { const char* legacy; const char* code; } DIAG_LEGACY[] = {
   { "T_TILE_OP_UNSUPPORTED", "T-VEC-E946" },
   { "T_VECTOR_WIDER_THAN_NATIVE", "T-VEC-W927" },
   { "T_TILE_WIDER_THAN_NATIVE", "T-VEC-W947" },
-  { "T_ARRAY_LEN_UNINFERABLE", "T-SEM-E215" },
 };
-#define DIAG_LEGACY_COUNT 144
+#define DIAG_LEGACY_COUNT 145
 
 const DiagDef* diag_find(const char* code);        /* exact machine-code lookup */
 const DiagDef* diag_find_any(const char* id);      /* machine code OR legacy name */

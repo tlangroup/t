@@ -3535,25 +3535,76 @@ pub fn parse_statement() i64 {
 //   裸 Ident       → 绑定被匹配值到该名字（不可反驳），可带 `when` 守卫
 //   其它表达式     → 与被匹配值做 `==` 等值匹配（整数 / 字符串 / bool / Enum 成员）
 // arm 之间的分隔符 `,` 可选（词法层不产生 Newline token，故以 `}` 收尾判定）。
+// match 模式原子（不含二元 `|`）：通配 / 构造器 / 区间 / 字面量 / 枚举或变体 case 名 / 值引用。
+// 用于 S1 或模式：每个 `|` 切分出的备选都用一个原子解析，故 `|` 不会被当成按位或吞掉。
+pub fn parse_match_alt_atom() i64 {
+    if (lex.cur_t() == "_") {
+        lex.advance_i();
+        return -1;
+    }
+    if (pat_is_conpat()) {
+        return parse_conpat();
+    }
+    if (lex.cur_t() == "DotDot" || lex.cur_t() == "DotDotEq" ||
+        (lex.cur_t() == "Integer" && (lex.peek_t(1) == "DotDot" || lex.peek_t(1) == "DotDotEq"))) {
+        return parse_range();
+    }
+    // 模式原子停在 `|`/`||`（按位或 / 逻辑或）之下：否则 `1 | 2 | 3` 会被 parse_bitor
+    // 整体吞成一个按位或表达式，或模式脱糖的 `|` 切分就失效了。parse_bitxor 在
+    // parse_bitor 之下一层，天然在 `|` 处停手。
+    return parse_bitxor();
+}
+
+// @ 子模式（S3 as-模式）：单模式原子，不允许再嵌套 or。
+pub fn parse_match_subpat() i64 {
+    return parse_match_alt_atom();
+}
+
+// match 臂解析（支持 S1 或模式 `|` 与 S3 as-模式 `x @ pat`）。
+// 或模式脱糖为多个并列臂（共用守卫与体），返回这一组臂的链表头。
 pub fn parse_match_arm() i64 {
     var am_ti: i64 = lex.pos;
-    var am_isw: bool = false;
-    var am_bind: string = "";
-    var am_pat: i64 = -1;
-    if (lex.cur_t() == "Identifier" && lex.cur_v() == "_") {
+    var am_sa: []string;
+    var am_pat: []i64;
+    var f_sa: string = "";
+    var f_pat: i64 = -1;
+    if (lex.cur_t() == "Identifier" && lex.peek_t(1) == "At") {
+        // S3 as-模式：x @ pat（整体值绑定到 x，并测试 pat）
+        f_sa = lex.cur_v();
         lex.advance_i();
-        am_isw = true;
+        lex.advance_i();
+        f_pat = parse_match_subpat();
+    } else if (lex.cur_t() == "_") {
+        lex.advance_i();
+        f_sa = "";
+        f_pat = -1;
+    } else if (lex.cur_t() == "Identifier" && (lex.peek_t(1) == "FatArrow" || lex.peek_t(1) == "KwWhen")) {
+        f_sa = lex.cur_v();
+        lex.advance_i();
+        f_pat = -1;
     } else {
-        var am_nt: string = lex.peek_t(1);
-        if (lex.cur_t() == "Identifier" && (am_nt == "FatArrow" || am_nt == "KwWhen")) {
-            am_bind = lex.cur_v();
+        f_pat = parse_match_alt_atom();
+        f_sa = "";
+    }
+    append(am_sa, f_sa);
+    append(am_pat, f_pat);
+    // S1 或模式：仅当首备选非绑定（f_pat >= 0）时才进入 or 组；
+    // 绑定模式（通配 / 裸绑定 / @）本身不可参与或（避免引入歧义绑定）。
+    // 分隔符是 `|`（BitOr）；逻辑或 `||`（Or）不是模式分隔符。
+    while (f_pat >= 0 && lex.cur_t() == "BitOr") {
+        lex.advance_i();
+        var a_sa: string = "";
+        var a_pat: i64 = -1;
+        if (lex.cur_t() == "_") {
             lex.advance_i();
-        } else if (pat_is_conpat()) {
-            // ADT：variant 构造器解构模式 `Circle(r)` / `Shape.Rect(w, h)`
-            am_pat = parse_conpat();
+            a_sa = "";
+            a_pat = -1;
         } else {
-            am_pat = parse_expr();
+            a_pat = parse_match_alt_atom();
+            a_sa = "";
         }
+        append(am_sa, a_sa);
+        append(am_pat, a_pat);
     }
     var am_guard: i64 = -1;
     if (lex.cur_t() == "KwWhen") {
@@ -3568,7 +3619,20 @@ pub fn parse_match_arm() i64 {
     if (lex.cur_t() == "Comma") {
         lex.advance_i();
     }
-    return base.mk_arm(am_bind, am_isw, am_pat, am_guard, am_body, am_ti);
+    // 脱糖：每个备选生成一个独立 arm，链接成组，返回组头
+    var am_gh: i64 = -1;
+    var am_gt: i64 = -1;
+    var am_i: i64 = 0;
+    while (am_i < (slice_len(am_sa) as i64)) {
+        var a_sa2: string = am_sa[am_i];
+        var a_pat2: i64 = am_pat[am_i];
+        var a_isw: bool = (a_pat2 < 0 && a_sa2 == "");
+        var arm: i64 = base.mk_arm(a_sa2, a_isw, a_pat2, am_guard, am_body, am_ti);
+        am_gt = base.list_push(am_gh, am_gt, arm);
+        if (am_gh < 0) { am_gh = am_gt; }
+        am_i = am_i + 1;
+    }
+    return am_gh;
 }
 
 pub fn parse_match_expr() i64 {
@@ -3582,10 +3646,12 @@ pub fn parse_match_expr() i64 {
     while (lex.cur_t() != "RBrace" && lex.cur_t() != "Eof") {
         var mx_a: i64 = parse_match_arm();
         if (mx_a >= 0) {
-            mx_tail = base.list_push(mx_head, mx_tail, mx_a);
             if (mx_head < 0) {
-                mx_head = mx_tail;
+                mx_head = mx_a;
+            } else {
+                base.list_link(mx_tail, mx_a);
             }
+            mx_tail = base.list_last(mx_a);
         }
     }
     expect_tok("RBrace");
