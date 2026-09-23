@@ -463,6 +463,89 @@ xs |> sum_i32;                   // ⇔ sum_i32(xs)（整体应用）
 
 ---
 
+### 2.9 Everything is value（一切皆值）（#10）
+
+> ⏳ **状态：设计中（proposed）**。本提案把「一切皆表达式、一切皆值」作为 T 的语法统一目标写入设计文档：循环作为表达式的取值补全由 `else` 完成子句承担；`void` 移除、过渡期作 `unit` 别名；并形式化 `unit` 在 T 中「既是类型也是值」、以及 `Never` 底类型在补齐中的单位元角色。完整白皮书见 `docs/everything-is-value-t.md`（含五分钟速览、补齐阶梯与矩阵、循环取值三规则、与 Zig 0.16 对照、速查表、术语表、易错点）。本文仅登记其 **§1 合规矩阵 + 三样落点**，不重复白皮书正文。
+
+**事实基础（依据 `docs/reference.md` §3.3）**：当前 `IfStatement` / `WhileStatement` / `ForStatement` / `Block` 全是 **Statement**（`Block: "{" Statement* "}"`）；`match` 已是表达式；`unit`/`()` 与 `@` 转换原语、`break`/`continue`/`return`/`panic` 跳转均已存在。故「一切皆表达式」是**文法级提升**，非小改。
+
+**提案拆包（P1–P5）**
+
+| 编号 | 主张 | 与现状差异 |
+|---|---|---|
+| P1 | `if`/`while`/`for`/`Block` 从语句提升为表达式（值位置可产出值） | 现状四者皆 Statement |
+| P2 | 分支/循环类型「补齐」（widen-only lub）：各候选求最小上界、只许加宽 | 现状 `match` 要求分支类型**一致**（无 lub） |
+| P3 | 循环 `else` 完成子句（无值路径供值） | 现状循环无 `else` |
+| P4 | `Never` 底类型 + 跳转原语（`break`/`continue`/`return`/`panic`）归 `Never`，确立其补齐单位元角色 | `unit`/`()` 与跳转已存在，本文为形式化/命名澄清 |
+| P5 | `void` 移除、`unit` 作其过渡别名；`unit` 既是类型也是值 | `unit`/`()` 已存在；本文移除 `void` 概念、明确别名 |
+
+> P4/P5 是既有特性的形式化与命名澄清，运行期零增量；真正改变语法与代码生成的是 **P1 + P2 + P3**。
+
+**desugar 姿势（落点要求 1）——只允许 A**：不新增求值原语，全部脱糖为既有节点。
+
+- **值 `if`**：`var x: T = if (c) { A } else { B };` → 直接 lowering 为「条件分支 + 结果槽赋值」（复用 `"assign"` 节点）；与既有 `match` 表达式同构。
+- **值 `for`/`while`（含 `else` 与 `break v`）**：desugar 为「累加器 + 已交付标志」，纯复用 `var`/`if`/`for`：
+  ```
+  var __r: T;                       // T = 交付类型与 else 类型的 lub
+  var __delivered: bool = false;
+  for (x in arr) {
+      if (<本轮交付>) { __r = <尾表达式值>; __delivered = true; }   // 尾表达式非 unit 即交付
+  }
+  if (!__delivered) { __r = <else 值>; }   // else 完成子句
+  // break v 脱糖为：__r = v; __delivered = true; break;
+  var r: T = __r;
+  ```
+- **`unit`/`()`、`@` 转换原语、`Never` 跳转**：全部复用既有，无新节点。
+
+**姿势 B（判违规，绝不采用）**：为「表达式化循环」另立运行期迭代器 / 惰性流 / 新 ABI 求值原语 → 撞 L1-③ 极简 runtime，直接 ❌。
+
+**双后端发射草图 + 一致性论证（落点要求 2）**：例 `var r: T = for (x in arr) { if (p(x)) { x*2 } else { () } } else { 0 };`（T = i32）。
+
+- **C 后端**（已 desugar）：`int64_t __r; int64_t __d = 0; for (int64_t _i=0; _i<t_slice_len(arr); _i=_i+1){ int64_t x=arr[_i]; if (p(x)){ __r=x*2; __d=1; } } if (!__d){ __r=0; } int64_t r=__r;` —— 走 `emit_expr` 的 `"assign"` 分支写回 `__r`。
+- **LLVM 后端**（同一 desugar AST）：`%r=alloca i64; %d=alloca i1; store i1 false, i1* %d; loop: %x=..., br %body; body: %cond=call p(%x); br i1 %cond, label %deliv, label %next; deliv: store i64 %mul, i64* %r; store i1 true, i1* %d; br label %next; after-loop: %dd=load i1, %d; br i1 %dd, label %done, label %elseb; elseb: store i64 0, i64* %r; br label %done; done: %rv=load i64, %r; store i64 %rv, i64* %r_slot`。
+
+**一致性论证（关键）**：① **desugar 在前、分后端在后**——两后端 never 见「表达式化循环」原始语法，只见同一份归一化 `var`/`if`/`for`/`assign` AST，lowering 语义输入完全相同；② **「最后一次成功交付」不是 phi**——朴素 phi 只能取变量终值，取不到「最后一次非 `unit` 的值」，本姿势用显式累加器 `__r` + 标志 `__d` 表达，逻辑在 desugar 期定型，两后端只是各译一遍顺序控制流 → 可证明逐字节语义一致；③ **`else` 必要性在 sema 锁定**——值位置且无 `Never` 出口时若不能静态证明「必然交付」则强制要求 `else`，两后端拿到的已是「要么有 `else` 兜底、要么是 `Never`」的完备 AST，不存在分叉；④ 守门落 `tools/gate.mjs` 的 `catn_check` + `conformance`（双后端对拍）+ `ir_verify`。
+
+**依赖标注（落点要求 3）**
+
+| 依赖项 | 现状 | 是否阻塞 |
+|---|---|---|
+| `match` 表达式 machinery（值 `if` 同构复用） | ✅ 已实装 | 否 |
+| `var`/`if`/`for` 语句 + `"assign"` 节点 + `shadow_check` | ✅ 已实装 | 否（须确保表达式化后仍走这些节点） |
+| `unit`/`()` 字面量 | ✅ 已实装 | 否 |
+| `@` 转换原语族（补齐显式出口） | ✅ 已实装 | 否 |
+| `Never` / 底类型（跳转归 `Never`） | ⚠️ 须形式化落地（P4） | 软阻塞（P4 即本提案一部分） |
+| **分支/循环 widen-only lub（补齐）类型推导** | ❌ 当前 `match` 要求分支类型一致、无 lub 能力 | **硬阻塞**：P2 须先实现 lub 推导 |
+| `reference.md` §3.3 文法重写（Statement→Expression） | ❌ 未做 | 软阻塞（spec 同步） |
+
+**合规矩阵（按 §1.4 模板）**
+
+| 检查项 | 判定 | 理由 / 落点 |
+|---|---|---|
+| L1-① 静态类型 | ✅ | 分支/循环补齐与穷尽性检查把错挡在编译期；`unit` 落非 `unit` 值位置、`else` 缺失均在 sema 报错，强化 fail-fast |
+| L1-② ECS·数据驱动 | 🟡 | 表达式化是控制流中立的语法统一，与数据驱动 mild 错位但非硬冲突 |
+| L1-③ 轻量 runtime | ✅ | 全部 desugar 为既有节点，0 新增 runtime 原语、无 GC、无隐式分配 |
+| L1-④ 确定性/性能 | ✅ | 纯前端变换，确定可复现；值用 SSA/寄存器表达，无惰性流 |
+| L1-⑤ fail-fast | ✅ | 类型不完备（缺 `else`、值位置落 `unit`）编译期即报 |
+| L2 `shadow_check` | ⚠️ | 表达式化后体内绑定仍须过同名不同型守卫；循环 `else` 结果槽 `__r` 须纳入（达标线） |
+| L2 `"assign"` 节点 | ⚠️ | 结果槽写回、`break v` 必须走 `"assign"` 分支，不得误用 `"assignment"`（达标线） |
+| L2 双后端逐字节一致 | ⚠️→**核心风险** | 循环「最后一次成功交付」是动态语义，不能朴素 phi；须 desugar 成「累加器 + 标志」再分后端 → 由构造保证一致；朴素 phi 属姿势 B 误编译。**唯一真风险点** |
+| L2 `sb_catN`/`TypeInfo`/line-col | ✅ | 不新增内建、不改 ABI、不改诊断定位 |
+| L3 spec §2.3 | 🟡 | 改的是核心 `Expression`/`Statement` 文法（§3.3 大片重写），属既有约定内演进、非平行新机制（姿势 A 合规） |
+| L3 命名/CLI 契约 | ✅ | 不引入新保留字冲突（`else`/`for`/`while` 已存在）、不改 CLI |
+| L4 类型层 | ✅ 接纳 | T 静态类型强于动态；补齐让类型更强 |
+| L4 运行层 | ✅ 0 成本 | desugar，无运行期增量 |
+| L4 哲学层 | 🟡 | 「一切皆表达式」是语法统一哲学，与宪法「显式/fail-fast/数据驱动」不冲突但改变语言观感；建议在宪法层留备注 |
+| L4 范围层 | ✅ | 无网络/分布式越界 |
+
+**总判定：⚠️ 部分违反 ~ ✅ 不违反**（守铁律 + 姿势 A 时合规）。唯一真风险是 **L2 双后端 lowering 一致性**，且仅在「循环动态取值（`else` + `break v` + 最后一次成功交付）」一处；采用「先 desugar 成累加器 + 标志、再分后端」即由构造保证一致，`catn_check`/`conformance` 可守。
+
+**子项拆分（落地顺序）**：① 先实现 **P2 的 lub 推导**（最小可独立验证、不依赖表达式化）；② 再做 **P1 表达式化 + P3 循环 `else`**（依赖 ① 与既有 `match`/`var`/`if`/`for`）；③ 最后 **P4 形式化 `Never`**、**P5 移除 `void`**（纯命名/别名，零风险）。①② 任一不过 `catn_check`/`conformance` 则整体退回。
+
+**开放风险与门禁落点**：① 循环动态取值 lowering 正确性是头号风险，禁止按迭代 phi，门禁新增 examples（空容器/中途 `break`/末轮交付/永不交付+`else`）双后端对拍；② `else` 就近绑定的悬空歧义（循环体末恰为缺 `else` 的 `if` 时归 `if`），门禁嵌套 `if/for`+`else` 语法歧义用例；③ `reference.md` §3.3 须把 If/While/For/Block 从 `Statement` 移到 `Expression` 并保留「语句位置」（`;` 结尾）兼容，门禁 `reference.md` 与 `tc` 实机对照；④ 建议 `docs/constitution.md` 留「表达式化是语法统一、不改显式/fail-fast 哲学」备注。
+
+---
+
 ## 3. 依赖链
 
 - **#2 tuple → #4 match**：第 4 类匹配（元组解构）依赖 tuple 类型先落地。
@@ -473,12 +556,13 @@ xs |> sum_i32;                   // ⇔ sum_i32(xs)（整体应用）
 - **#7 = Erlang 式通信提案的合规化版本**：重运行时外置到通信库，语言核心只留语法检查 + 抽象接口，从而消解早前的范围层违规定性。
 - **#8 链式计算/管道运算符 → 迭代机制 + FuncType/lambda（均已实装）**：仅依赖既有能力，自身 0 运行成本（贪心循环 desugar）。
 - **#8 ↔ #7 / #6 / #4 / #2**：管道可作通信库消息流（#7）、协程异步流（#6）的承载；stage 内复用 match（#4）/tuple（#2）。
+- **#10 Everything is value → #4 match / 既有 `var`·`if`·`for` / `@` 原语 / `unit`·`()`**：P1 值 `if` 同构复用 #4 match 表达式 machinery；P2 lub 补齐、P3 循环 `else` 的 desugar 全落既有 `var`/`if`/`for`/`"assign"`/`shadow_check`；P4 `Never`、P5 `unit` 别名均复用既有能力。唯一硬前提是 **P2 的 lub 类型推导**当前缺失（#4 match 仍要求分支类型一致）。
 
 ---
 
 ## 4. 备注
 
-- 本文档仅记录设计讨论与结论，所有语言特性提案（#2–#9）均未实现、未进入 `src/`（`#9 cell` 块为 notebook 单元作用域，经 `docs/notebook.md` §13.8 裁定引入，tc 未接入）。
+- 本文档仅记录设计讨论与结论，所有语言特性提案（#2–#10）均未实现、未进入 `src/`（`#9 cell` 块为 notebook 单元作用域，经 `docs/notebook.md` §13.8 裁定引入，tc 未接入；`#10 Everything is value` 为语法统一目标设计，详见 `docs/everything-is-value-t.md`，落地顺序见 §2.9）。
 - **例外（已落地但待审查）**：§2.7 登记的是 REPL 依赖的 `tc` 诊断能力（R2 人类可读诊断 flag、R3 相对工程根路径），其代码已随 REPL 工作落入 `src/`，但**未经本设计文档批准**——按 `docs/repl.md` 红线，须在本节审查通过（R2 的 flag 命名冲突抉择方案 A / B）后才算 ratified；在此之前属「临时实现」。
 - 自举（bootstrap）状态：**已暂停**——相关设计理由不以「为了自举」为论据。
 - 相关审查类待办（非设计提案）：返回值错误处理审计（`sys_run` 的 `rc` 检查、退出码 0/1/2 归类一致性）单列跟踪，不在本文档范围内。

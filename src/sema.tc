@@ -741,6 +741,210 @@ pub fn can_cast(fi: i64, ti2: i64) bool {
     return false;
 }
 
+// ── P2（everything-is-value 补齐）：对称 widen-only 最小上界 ──────────
+// 与书写顺序无关；只许加宽，禁止窄化或跨「无公共类型」的提升。
+// 返回唯一最小上界 TI 索引；候选间无公共可表示类型（如 i16+u16、bool+int）→ -2（报错哨兵）；
+// 候选全为 Unknown/Never（被跳过）→ -1。
+
+// 整数类型名是否无符号（'u' 前缀；rune 等有符号不在内）
+fn int_is_uns(name: string) bool {
+    return name[0] == 117;   // 'u' == 117
+}
+
+// 整数类型名的位宽（任意位宽 i<N>/u<N> 走 awi_bits，标准宽度走 get_bw 兜底）
+fn int_bits(name: string) i64 {
+    var b: i64 = base.awi_bits(name);
+    if (b <= 0) {
+        b = get_bw(name);
+    }
+    return b;
+}
+
+// 整数 (a_uns, a_bits) 的范围是否包含 (b_uns, b_bits) 的全部值
+fn int_contains(au: bool, ab: i64, bu: bool, bb: i64) bool {
+    if (au) {
+        if (bu) {
+            return ab >= bb;        // 无符号 ⊇ 无符号：位宽够
+        }
+        return false;               // 无符号不能含负数
+    }
+    // a 有符号
+    if (bu) {
+        return bb <= ab - 1;        // 有符号 ⊇ 无符号：无符号上界 2^bb-1 <= 有符号上界 2^(ab-1)-1
+    }
+    return ab >= bb;                // 有符号 ⊇ 有符号：位宽够
+}
+
+// 浮点有效尾数位数（含隐式位）：f16=11, f32=24, f64=53
+fn float_mant(name: string) i64 {
+    if (name == "f16") {
+        return 11;
+    }
+    if (name == "f32") {
+        return 24;
+    }
+    return 53;                      // f64
+}
+
+// 整数能否被某浮点（有效尾数 fm）精确表示
+fn int_exact_in_float(name: string, fm: i64) bool {
+    var iu: bool = int_is_uns(name);
+    var ib: i64 = int_bits(name);
+    if (iu) {
+        return ib <= fm;            // 无符号：2^ib-1 <= 2^fm  ⇔ ib <= fm
+    }
+    return ib <= fm + 1;            // 有符号：2^(ib-1)-1 <= 2^fm  ⇔ ib-1 <= fm
+}
+
+// 一组整数求唯一最小上界；不可比（多极大 / 无极大）→ -2
+fn lub_ints(ints: []i64) i64 {
+    var best: i64 = -1;
+    var k: i64 = 0;
+    while (k < slice_len(ints)) {
+        var a: i64 = ints[k];
+        var au: bool = int_is_uns(tip_name(a));
+        var ab: i64 = int_bits(tip_name(a));
+        var contains_all: bool = true;
+        var j: i64 = 0;
+        while (j < slice_len(ints)) {
+            if (j == k) {
+                j = j + 1;
+                continue;
+            }
+            var bu: bool = int_is_uns(tip_name(ints[j]));
+            var bb: i64 = int_bits(tip_name(ints[j]));
+            if (int_contains(au, ab, bu, bb) == false) {
+                contains_all = false;
+                break;
+            }
+            j = j + 1;
+        }
+        if (contains_all) {
+            if (best >= 0 && ti_equal(a, best) == false) {
+                return -2;           // 两个不同极大 → 不可比
+            }
+            best = a;
+        }
+        k = k + 1;
+    }
+    return best;
+}
+
+// 对称 widen-only 最小上界（P2 主入口）。ts = 若干分支类型 TI 索引。
+pub fn widen_only_lub(ts: []i64) i64 {
+    var cs: []i64 = [];
+    var k: i64 = 0;
+    while (k < slice_len(ts)) {
+        var t: i64 = ts[k];
+        if (t >= 0 && tip_kind(t) != "Never") {
+            append(cs, t);
+        }
+        k = k + 1;
+    }
+    if (slice_len(cs) == 0) {
+        return -1;
+    }
+    if (slice_len(cs) == 1) {
+        return cs[0];
+    }
+    var ints: []i64 = [];
+    var floats: []i64 = [];
+    var saw_bool: bool = false;
+    var saw_str: bool = false;
+    var saw_other: bool = false;
+    k = 0;
+    while (k < slice_len(cs)) {
+        var t: i64 = cs[k];
+        if (tip_kind(t) == "Scalar") {
+            var nm: string = tip_name(t);
+            if (is_int_name(nm)) {
+                append(ints, t);
+            } else if (is_float_name(nm)) {
+                append(floats, t);
+            } else if (nm == "bool") {
+                saw_bool = true;
+                saw_other = true;
+            } else {
+                saw_str = true;
+                saw_other = true;
+            }
+        } else {
+            saw_other = true;
+        }
+        k = k + 1;
+    }
+    // bool / str 与数值混用 → 不可比
+    if (saw_bool && (slice_len(ints) > 0 || slice_len(floats) > 0)) {
+        return -2;
+    }
+    if (saw_str && (slice_len(ints) > 0 || slice_len(floats) > 0 || saw_bool)) {
+        return -2;
+    }
+    // 数值与 String / 非标量混用 → 不可比（String 的 kind 是 "String" 非 "Scalar"，归 saw_other）
+    if (saw_other && (slice_len(ints) > 0 || slice_len(floats) > 0)) {
+        return -2;
+    }
+    // 纯数值（整型 ± 浮点）
+    if (slice_len(ints) > 0 || slice_len(floats) > 0) {
+        var f_mant: i64 = -1;
+        var f_ti: i64 = -1;
+        var ki: i64 = 0;
+        while (ki < slice_len(floats)) {
+            var fm: i64 = float_mant(tip_name(floats[ki]));
+            if (fm > f_mant) {
+                f_mant = fm;
+                f_ti = floats[ki];
+            }
+            ki = ki + 1;
+        }
+        var int_lub: i64 = -1;
+        if (slice_len(ints) > 0) {
+            int_lub = lub_ints(ints);
+            if (int_lub < 0) {
+                return -2;
+            }
+        }
+        if (f_ti < 0) {
+            return int_lub;
+        }
+        if (int_lub >= 0 && int_exact_in_float(tip_name(int_lub), f_mant) == false) {
+            return -2;
+        }
+        return f_ti;
+    }
+    // 纯 bool
+    if (saw_bool) {
+        var kk: i64 = 0;
+        while (kk < slice_len(cs)) {
+            if (tip_kind(cs[kk]) != "Scalar" || tip_name(cs[kk]) != "bool") {
+                return -2;
+            }
+            kk = kk + 1;
+        }
+        return cs[0];
+    }
+    // 纯 str
+    if (saw_str) {
+        var kk: i64 = 0;
+        while (kk < slice_len(cs)) {
+            if (tip_kind(cs[kk]) != "String") {
+                return -2;
+            }
+            kk = kk + 1;
+        }
+        return cs[0];
+    }
+    // 非标量（struct/enum/slice/pointer/optional/array/map/func/vector）：须全同类型
+    var kk: i64 = 0;
+    while (kk < slice_len(cs)) {
+        if (ti_equal(cs[kk], cs[0]) == false) {
+            return -2;
+        }
+        kk = kk + 1;
+    }
+    return cs[0];
+}
+
 // 2^bits 的无符号幂（bits ≤ 64；bits == 64 时按 u64 回绕为 0，正好对应 u64 上界 2^64-1）。
 pub fn u64_pow2(bits: i64) u64 {
     var r: u64 = 1;
@@ -5580,12 +5784,20 @@ pub fn infer_expr(e: i64) i64 {
                 m_res = m_bt;
             } else {
                 if (m_rep && tip_kind(m_bt) != "Unknown" && tip_kind(m_res) != "Unknown") {
-                    if (ti_equal(m_bt, m_res) == false && can_cast(m_bt, m_res) == false) {
+                    // P2（everything-is-value 补齐）：对称 widen-only lub，取代方向性 can_cast。
+                    // 与书写顺序无关；无公共可表示类型（如 i16+u16、bool+int）→ T-MAT-E741。
+                    var m_pair: []i64 = [];
+                    append(m_pair, m_res);
+                    append(m_pair, m_bt);
+                    var m_lub: i64 = widen_only_lub(m_pair);
+                    if (m_lub < 0) {
                         var m_bl: i64 = parse.n_line(m_an.nc);
                         var m_bc: i64 = parse.n_col(m_an.nc);
                         base.diag_new("T-MAT-E741", "error",
                             base.sb_cat4("match arms have different types: ", ti_str(m_res), " vs ", ti_str(m_bt)),
                             parse.n_file(m_an.nc), m_bl, m_bc, m_bl, m_bc + 4);
+                    } else {
+                        m_res = m_lub;
                     }
                 }
             }
