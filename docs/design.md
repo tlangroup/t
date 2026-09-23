@@ -544,12 +544,13 @@ xs |> sum_i32;                   // ⇔ sum_i32(xs)（整体应用）
 
 **落地进度（实跑记录）**：
 - **P2 已落地**（`044ead0`）：`src/sema.tc` 新增对称 widen-only `lub`（`widen_only_lub` + `int_contains`/`float_mant`/`int_exact_in_float`/`lub_ints`），`match` 分支检查由方向性 `can_cast` 换成 widen-only 最小上界；不可比组合（i16+u16、bool+int、u25+f32）→ `T-MAT-E741`。gate L2 23/23 全绿。
-- **P1 Stage 0 已落地**：**值 `if` 在解析期脱糖为 `match (c) { true => T, false => E }`**（`parse.tc: parse_value_if()`），借道既有 match 的 `__mres` 结果槽，**tir / tir_to_ll / codegen_c / hir 零改动** —— 正是 §2.9 姿势 A 的直接兑现。当前限制：分支体须为单一表达式（Block 取值未做）、缺 `else` / `else if` 链明确报错不静默降级。
+- **P1 Stage 0 已落地**：**值 `if` 在解析期脱糖为 `match (c) { true => T, false => E }`**（`parse.tc: parse_value_if()`），借道既有 match 的 `__mres` 结果槽，**tir / tir_to_ll / codegen_c / hir 零改动** —— 正是 §2.9 姿势 A 的直接兑现。
+- **P1 Stage 1a 已落地**：**值位置的块** `{ e; }` 在解析期直接脱糖为该表达式本身（`parse.tc: parse_block_expr()`），同样零后端改动。由此解锁：① `{ e; }` 可出现在任意值位置（含 match 臂）；② 值 `if` 的 else 分支变成任意表达式 ⇒ **`else if` 链自然成立**（递归脱糖为嵌套 match）。
 - **P1 的两个前置 bug 已修**（均由值 `if` 暴露，非新特性自身缺陷）：
   1. **bool 穷尽性假阴性**：`match(c){true=>..,false=>..}` 已穷尽却报 `T-MAT-E742` —— 穷尽性谓词只有 enum/variant 版，`match_covers_case` 只认 `kind=="member"`；bool 字面量是 `kind=="bool"`+`ba`。补 `match_covers_bool` + `bool_all_cases_covered`（带守卫臂不算覆盖）接入判定链。
   2. **i1 槽不参与宽度对齐**（仅坏 TIR→LLVM 轨，C 后端一直正确）：`ll_int_bits("i1")` 落到 `base.awi_bits` 因 `1 < awi_min_bits()` 返回 -1 ⇒ 位宽 0 ⇒ `ll_coerce_to` 早退跳过对齐 ⇒ i1 值原样喂给 `icmp eq i64`，clang 报 `defined with type 'i1' but expected 'i64'`。修：`ll_int_bits` 显式 `i1→1`，且 **bool 拓宽必须 zext**（`sext i1 1` = -1 会把 true 变 -1）。
-- **P1 剩余（未做）**：Block-as-expression（Stage 1，值 `if` 多语句分支与 `while`/`for` 取值的共同前提）、`while`/`for` 取值 + **P3 循环 `else`**（累加器 `__r` + 标志 `__delivered`、`break v` 脱糖、悬空 `else` 消歧）。
-- **T 语法事实（影响后续设计）**：块内表达式语句**必须有 `;`**（`{ 1 }` 非法、`{ 1; }` 才解析）。
+- **P1 剩余（未做）**：**多语句值块** `{ s1; ...; sn; e; }`（Stage 1b）—— 它是 `while`/`for` 取值与 **P3 循环 `else`** 的共同前提。阻塞点不在 LLVM 轨（值 = 尾随表达式的临时槽，很好办），而在 **C 轨**：`emit_stmt` 返回 void、只把文本推进全局 `slines`，`emit_expr` 却必须**返回**字符串；要取到语句文本就得截断全局切片，而「全局切片 `slice_pop` / 自别名 `slice_sub`」正是已记录的 -O2 自编译 UB。⇒ 须先给 C 后端补一套**捕获式发射缓冲**（spush 重定向 + 可恢复），再做 1b。
+- **T 语法事实（影响后续设计）**：块内表达式语句**必须有 `;`**（`{ 1 }` 非法、`{ 1; }` 才解析）；`parse_block()` 自己吞 `{` / `}`（调用方勿重复 advance）。
 
 **开放风险与门禁落点**：① 循环动态取值 lowering 正确性是头号风险，禁止按迭代 phi，门禁新增 examples（空容器/中途 `break`/末轮交付/永不交付+`else`）双后端对拍；② `else` 就近绑定的悬空歧义（循环体末恰为缺 `else` 的 `if` 时归 `if`），门禁嵌套 `if/for`+`else` 语法歧义用例；③ `reference.md` §3.3 须把 If/While/For/Block 从 `Statement` 移到 `Expression` 并保留「语句位置」（`;` 结尾）兼容，门禁 `reference.md` 与 `tc` 实机对照；④ 建议 `docs/constitution.md` 留「表达式化是语法统一、不改显式/fail-fast 哲学」备注。
 

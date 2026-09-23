@@ -939,6 +939,26 @@ pub fn parse_comptime_stmt() i64 {
     return id3;
 }
 
+// P1 Stage 1a（everything-is-value）：**值位置的块** `{ e; }` —— 解析期直接脱糖为该表达式本身。
+//
+// 为什么只做「单一表达式」这一种形态：多语句值块 `{ s1; ...; sn; e; }` 需要后端真正的结果槽。
+// LLVM 轨好办（值 = 尾随表达式的临时槽），但 **C 轨不行** —— `emit_stmt` 返回 void、
+// 只把文本推进全局 `slines`，而 `emit_expr` 必须**返回**字符串；要拿到语句文本就得截断全局
+// 切片，而「全局切片 slice_pop / 自别名 slice_sub」正是已记录的 -O2 自编译 UB（见笔记第 14 条）。
+// 故多语句值块留待后端补「捕获式发射缓冲」后再做，当前按 fail-fast 明确报错、绝不静默降级。
+//
+// 即便如此，本形态已解锁两件事：① `{ e; }` 可出现在任意值位置（含 match 臂、值 if 分支）；
+// ② 值 if 的 else 分支因此可以是任意表达式 —— **`else if` 链自然成立**（见 parse_value_if）。
+pub fn parse_block_expr() i64 {
+    var tl: i64 = lex.pos;           // 记块起点行号；`{`/`}` 由 parse_block 自己吞
+    var body: i64 = parse_block();
+    var e: i64 = block_single_expr(body);
+    if (e < 0) {
+        parse_fatal("值位置的块当前只支持单一表达式（如 `{ 1; }`）；多语句值块须后端结果槽，待后续 Stage");
+    }
+    return e;
+}
+
 pub fn parse_block_stmt() i64 {
     var tl: i64 = lex.pos;
     var body3: i64 = parse_block();
@@ -3496,6 +3516,8 @@ pub fn parse_if_stmt() i64 {
 // 可让值 if 落地而**后端零改动** —— 正是设计 §2.9 姿势 A「desugar 在前、分后端在后」。
 // 前置：bool 穷尽性修复（true+false 两臂齐备即穷尽），否则会误报 T-MAT-E742。
 // 限制：分支体须为**单一表达式**（Block 尚不是表达式，多语句分支待 P1 Stage 1 的 Block 取值）。
+// 块语句链表的**末条**语句；当且仅当它是 `expr` 语句时返回其节点 id，否则 -1。
+
 fn block_single_expr(head: i64) i64 {
     if (head < 0) {
         return -1;
@@ -3516,19 +3538,20 @@ pub fn parse_value_if() i64 {
     expect_tok("LParen");
     var cond: i64 = parse_expr();
     expect_tok("RParen");
-    var then_head: i64 = parse_block();
-    var then_e: i64 = block_single_expr(then_head);
+    var then_e: i64 = parse_block_expr();
     var else_e: i64 = -1;
     if (lex.cur_t() == "KwElse") {
         lex.advance_i();
         if (lex.cur_t() == "KwIf") {
-            parse_fatal("value-position `if`: `else if` chains are not supported yet (nested-match desugar pending)");
+            // `else if` 链：else 分支本身又是一个值 if，递归脱糖成嵌套 match。
+            // 之所以成立，正因为值块脱糖后分支位是**任意表达式**而非语句块。
+            else_e = parse_value_if();
+        } else {
+            else_e = parse_block_expr();
         }
-        var eh2: i64 = parse_block();
-        else_e = block_single_expr(eh2);
     }
-    if (then_e < 0 || else_e < 0) {
-        parse_fatal("value-position `if` requires an `else` branch and both branches to be a single expression (block-as-expression is P1 Stage 1, pending)");
+    if (else_e < 0) {
+        parse_fatal("值位置的 `if` 必须有 `else` 分支（无值路径供值属 P3/P5，当前不支持）");
     }
     var t_arm: i64 = base.mk_arm("", false, base.mk_bool(true, ti), -1, then_e, ti);
     var f_arm: i64 = base.mk_arm("", false, base.mk_bool(false, ti), -1, else_e, ti);
@@ -3804,6 +3827,11 @@ pub fn parse_primary() i64 {
     // 语句位置的 `if` 走 parse_statement → parse_if_stmt，不受影响。
     if (t == "KwIf") {
         return parse_value_if();
+    }
+    // P1 Stage 1：值位置的块 `{ s1; ...; sn; e; }` —— 见 parse_block_expr。
+    // 语句位置的块走 parse_statement → parse_block_stmt，不受影响。
+    if (t == "LBrace") {
+        return parse_block_expr();
     }
     if (t == "KwMatch") {
         return parse_match_expr();
