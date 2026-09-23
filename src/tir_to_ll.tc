@@ -515,6 +515,11 @@ pub fn ll_store(tname: string, st: string, val: string) void {
 // 用于比较/算术等操作数类型对齐：ll_load 按槽真实宽度 realst 装载，可能 ≠ 指令 st
 // （如 i32 变量被 promote 进 i64 槽），直接 icmp st 会 "defined with type X but expected Y"。
 pub fn ll_int_bits(st: string) i64 {
+    // ⚠ i1 必须显式给出位宽 1：base.awi_bits("i1") 因 1 < awi_min_bits() 返回 -1，
+    // 若落到 0 ⇒ ll_coerce_to 走 `fb == 0` 早退、跳过宽度对齐 ⇒ i1 槽（比较结果）被原样
+    // 喂给期望 i64 的指令，clang 报 "defined with type 'i1' but expected 'i64'"
+    //（复现：match (n > 0) { true => .., false => .. }，即值 if 的脱糖形态）。
+    if (st == "i1") { return 1; }
     if (st == "bool" || st == "u8" || st == "i8") { return 8; }
     if (st == "u16" || st == "i16") { return 16; }
     if (st == "u32" || st == "i32") { return 32; }
@@ -558,6 +563,9 @@ pub fn ll_coerce_to(v: string, fromst: string, tost: string) string {
         var op: string = "sext";
         // ⚠ 拓宽按【源】类型有无符号选 sext/zext（此前误用目标类型，导致无符号窄量被错误 sext 成负数）。
         if (ll_is_unsigned_st(fromst)) { op = "zext"; }
+        // ⚠ i1 是布尔（值域 {0,1}），拓宽必须 zext：sext i1 1 → -1，会把 true 变成 -1
+        // （match (n>0) 等值比较时 -1 != 1 ⇒ 分派恒不命中）。
+        if (fromst == "i1") { op = "zext"; }
         sb_append_str(g_ll, " = ");
         sb_append_str(g_ll, op);
         sb_append_str(g_ll, " ");

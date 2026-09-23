@@ -3491,6 +3491,58 @@ pub fn parse_if_stmt() i64 {
     return id;
 }
 
+// P1（everything-is-value）：值位置的 `if` 脱糖为 `match (c) { true => THEN, false => ELSE }`。
+// 动机：match 已是表达式且自带结果槽（__mres），而 if/Block 仍是 Statement；借道 match
+// 可让值 if 落地而**后端零改动** —— 正是设计 §2.9 姿势 A「desugar 在前、分后端在后」。
+// 前置：bool 穷尽性修复（true+false 两臂齐备即穷尽），否则会误报 T-MAT-E742。
+// 限制：分支体须为**单一表达式**（Block 尚不是表达式，多语句分支待 P1 Stage 1 的 Block 取值）。
+fn block_single_expr(head: i64) i64 {
+    if (head < 0) {
+        return -1;
+    }
+    var k: Child = base.kids[head];
+    if (k.next >= 0) {
+        return -1;
+    }
+    var s: Node = base.nodes[k.val];
+    if (s.kind != "expr") {
+        return -1;
+    }
+    return s.na;
+}
+
+pub fn parse_value_if() i64 {
+    var ti: i64 = lex.advance_i();
+    expect_tok("LParen");
+    var cond: i64 = parse_expr();
+    expect_tok("RParen");
+    var then_head: i64 = parse_block();
+    var then_e: i64 = block_single_expr(then_head);
+    var else_e: i64 = -1;
+    if (lex.cur_t() == "KwElse") {
+        lex.advance_i();
+        if (lex.cur_t() == "KwIf") {
+            parse_fatal("value-position `if`: `else if` chains are not supported yet (nested-match desugar pending)");
+        }
+        var eh2: i64 = parse_block();
+        else_e = block_single_expr(eh2);
+    }
+    if (then_e < 0 || else_e < 0) {
+        parse_fatal("value-position `if` requires an `else` branch and both branches to be a single expression (block-as-expression is P1 Stage 1, pending)");
+    }
+    var t_arm: i64 = base.mk_arm("", false, base.mk_bool(true, ti), -1, then_e, ti);
+    var f_arm: i64 = base.mk_arm("", false, base.mk_bool(false, ti), -1, else_e, ti);
+    // 注意：mk_match 的 la 是 kids（Child）链表下标，不是节点 id —— 必须走 list_push。
+    var head: i64 = -1;
+    var tail: i64 = -1;
+    tail = base.list_push(head, tail, t_arm);
+    if (head < 0) { head = tail; }
+    tail = base.list_push(head, tail, f_arm);
+    if (head < 0) { head = tail; }
+    var m: i64 = base.mk_match(cond, head, ti);
+    return m;
+}
+
 pub fn parse_return_stmt() i64 {
     var ti: i64 = lex.advance_i();
     var val: i64 = -1;
@@ -3747,6 +3799,11 @@ pub fn parse_primary() i64 {
     // 中缀位的 `|` 仍是按位或 BitOr（由 or 级处理），不会走到这里。
     if (t == "BitOr") {
         return parse_bar_lambda();
+    }
+    // P1：值位置的 `if` —— 脱糖为 `match (c) { true => THEN, false => ELSE }`（见 parse_value_if）。
+    // 语句位置的 `if` 走 parse_statement → parse_if_stmt，不受影响。
+    if (t == "KwIf") {
+        return parse_value_if();
     }
     if (t == "KwMatch") {
         return parse_match_expr();
