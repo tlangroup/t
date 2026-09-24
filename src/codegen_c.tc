@@ -691,6 +691,7 @@ pub fn expr_type_desc(e: i64) i64 {
     if (n.kind == "int") { return sema.td_named_mk("scalar", "i64"); }
     if (n.kind == "float") { return sema.td_named_mk("scalar", "f64"); }
     if (n.kind == "bool") { return sema.td_named_mk("scalar", "bool"); }
+    if (n.kind == "unit_lit") { return sema.td_mk("void"); }   // P5：unit 字面量类型即 unit（void 别名）
 // <<< GEN:td_expr1 <<<
     // 编译期内建 @sin / @sinf 等（运行时未折叠的情形）：数学内建返回 f64，f 后缀返回 f32
     if (n.kind == "mbuiltin" && sema.math_mbuiltin(n.sa)) {
@@ -1952,6 +1953,11 @@ pub fn emit_expr(e: i64) string {
         return "";
     }
     var n: Node = base.nodes[e];
+
+    // P5：unit 字面量 `()` —— 无值，作 void 表达式占位（GNU 语句表达式尾 / 独立 expr 语句均可）。
+    if (n.kind == "unit_lit") {
+        return "(void)0";
+    }
 
     // P1 Stage 1b：多语句值块 `{ s1; ...; sn; e; }` —— C 无块表达式，用 GNU
     // **语句表达式** `({ ...; e; })` 同构表达（值与尾随表达式同，块内 var 不外泄）。
@@ -3216,6 +3222,18 @@ pub fn emit_stmt(sid: i64, indent: i64) void {
         return;
     }
     if (n.kind == "var_decl") {
+        // P5：unit/void 局部变量无存储意义（C 不允许 `void x;`）。直接丢弃声明；
+        // 若有初始化器，仅保留其副作用（如 `var _: unit = f();`）。否则（绝大多数情况
+        // 为 `var x: unit = ();`）整个声明连同初始化器一并丢弃。
+        if (n.na >= 0) {
+            var tdv: i64 = sema.resolve_type_desc(n.na);
+            if (tdv >= 0 && sema.tds[tdv].cat == "void") {
+                if (n.nb >= 0) {
+                    spush(base.sb_cat4(pad, "(void)(", emit_expr(n.nb), ");"));
+                }
+                return;
+            }
+        }
         // 同函数内重名局部变量（shadowing）：与 LLVM 后端同机制。
         // conpat 载荷绑定（match 构造器解构出的 x）身处各臂独立代码块，不做唯一化重整。
         // g_seen 为 append-only 扁平表 + 帧哨兵（进块 push 一枚哨兵 / 出块 pop 为空操作）：

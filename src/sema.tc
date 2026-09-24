@@ -5274,8 +5274,30 @@ pub fn infer_block_expr(e: i64) i64 {
         t = infer_expr(base.nodes[last].na);
     }
     cur_scope = prev;
-    if (t < 0) { return ti_mk("Unknown"); }
+    if (t < 0) {
+        // P4：末条语句为终止性语句（return / break / continue / @panic）⇒ 块类型为 Never。
+        // 这让 `var r = if (c) { @panic("x"); } else { 2; }` 之外、裸块版本的推断同样正确
+        // （块永不「正常落到末尾」，类型即 Never，与 widen_only_lub 的单位元语义一致）。
+        if (last >= 0 && stmt_terminates(last)) {
+            return ti_mk("Never");
+        }
+        return ti_mk("Unknown");
+    }
     return t;
+}
+
+// P4 辅助：末条语句是否为「终止性」——执行到它函数/循环/程序即不可正常落到块末尾。
+fn stmt_terminates(s: i64) bool {
+    if (s < 0) { return false; }
+    var k: string = base.nodes[s].kind;
+    if (k == "return" || k == "break" || k == "continue") { return true; }
+    if (k == "expr") {
+        var inner: i64 = base.nodes[s].na;
+        if (inner >= 0 && base.nodes[inner].kind == "call" && base.nodes[inner].sa == "panic") {
+            return true;
+        }
+    }
+    return false;
 }
 
 // ── P3（循环 else / 值循环）：sema 层脱糖 ──
@@ -5453,7 +5475,7 @@ pub fn desugar_value_loop(L: i64) i64 {
         if (g_vl_break_vals[i] >= 0) { has_break_v = true; }
         i = i + 1;
     }
-    if (has_break_v && !has_else) {
+    if (has_break_v && !has_else && !vl_body_always_delivers(L)) {
         parse.fc_err("T-SEM-E280", "带值 break 必须配合循环 `else` 子句提供「无中断路径」的值（否则无中断时循环无值可产）", L);
     }
     // 值循环里普通 break（无值）无意义：无中断路径下 __loop_r 未赋值
@@ -5549,6 +5571,66 @@ pub fn desugar_value_loop(L: i64) i64 {
     return T;
 }
 
+// P4：值循环体是否「恒交付」—— 循环不可能「无中断完成」（即不靠 break 也能走到循环尾 /
+// 条件变 false 退出），故省略 else 时循环值仍有确定来源。
+// 判定（保守、可证明安全）：
+//   - for / for_each：容器可能为空 ⇒ 体一次都不执行 ⇒ 循环可无中断完成 ⇒ 必须 else。
+//   - while：仅当条件静态恒为 true（字面 `true`）且体不落到末尾（末条为 break/return/@panic）
+//     时，循环不可能「条件为假」退出 ⇒ 恒交付、可省 else；否则（条件可能变 false）存在无中断
+//     完成路径 ⇒ 必须 else。
+// 注：空容器导致体一次都不执行 ⇒ 循环仍可无中断完成，此时省略 else 属程序员不变量
+// （与 Zig 式 for/else 同语义）；门禁用例一律用非空容器保证运行期安全。
+fn vl_body_always_delivers(L: i64) bool {
+    var n: Node = base.nodes[L];
+    var kind: string = n.kind;
+    if (kind == "for" || kind == "for_each") { return false; }
+    if (kind == "while") {
+        var cond: i64 = n.na;
+        if (cond >= 0 && base.nodes[cond].kind == "bool" && base.nodes[cond].ba) {
+            return !block_list_can_fall_through(n.la);
+        }
+        return false;
+    }
+    return false;
+}
+
+// 语句链表（块体 / if 分支体）是否可能「正常落到末尾」（不被 return/break/@panic 截断）。
+fn block_list_can_fall_through(head: i64) bool {
+    if (head < 0) { return true; }
+    var c: i64 = head;
+    var last_s: i64 = -1;
+    while (c >= 0) { last_s = base.kids[c].val; c = base.kids[c].next; }
+    if (last_s < 0) { return true; }
+    return stmt_can_fall_through(last_s);
+}
+
+// 单条语句是否可能正常落到其后的位置。
+fn stmt_can_fall_through(s: i64) bool {
+    if (s < 0) { return true; }
+    var k: string = base.nodes[s].kind;
+    if (k == "return" || k == "break") { return false; }       // 退出函数 / 带值退出循环（不落到末尾）
+    if (k == "continue") { return true; }                       // 重启发迭代，循环仍可能正常结束（非恒交付）
+    if (k == "expr") {
+        var inner: i64 = base.nodes[s].na;
+        if (inner >= 0 && base.nodes[inner].kind == "call" && base.nodes[inner].sa == "panic") {
+            return false;                                       // @panic 终止程序
+        }
+        return true;
+    }
+    if (k == "var_decl" || k == "assign") { return true; }
+    if (k == "block") { return block_list_can_fall_through(base.nodes[s].la); }
+    if (k == "if") {
+        var then_f: bool = block_list_can_fall_through(base.nodes[s].la);
+        var else_f: bool = true;
+        if (base.nodes[s].lb >= 0) { else_f = block_list_can_fall_through(base.nodes[s].lb); }
+        // lb == -2 表示无 else 分支 ⇒ 缺失分支必然落到末尾
+        return then_f || else_f;
+    }
+    // while/for/for_each：保守判定可落到末尾（不要求体恒终止）
+    if (k == "while" || k == "for" || k == "for_each") { return true; }
+    return true;
+}
+
 pub fn infer_expr(e: i64) i64 {
     var n: Node = base.nodes[e];
     var k: string = hir_tag(e);
@@ -5556,6 +5638,10 @@ pub fn infer_expr(e: i64) i64 {
     // P1 Stage 1b：多语句值块在表达式位置出现（含值 if 的多语句分支、match 的多语句臂）。
     if (base.nodes[e].kind == "block_expr") {
         return infer_block_expr(e);
+    }
+    // P5：`()` 是 unit 字面量，类型即 unit（void 别名）。
+    if (n.kind == "unit_lit") {
+        return ti_mk("Void");
     }
     // P3：值循环（带 `else` 完成子句或含 `break v`）出现在表达式位置 → 脱糖为值块。
     // 脱糖恒定产出 block_expr（不透明容器），双后端零改动由构造保证一致；改写后
@@ -5634,7 +5720,8 @@ pub fn infer_expr(e: i64) i64 {
                 if (tp_pc < 0) { parse.fc_err("T-SEM-E206", "@panic 需要 1 个字符串实参", e); return ti_mk("Void"); }
                 var tp_t: i64 = ie_sub_in(ei, base.kids[tp_pc].val);
                 if (tip_kind(tp_t) != "String") { parse.fc_err("T-SEM-E207", "@panic 的实参必须是 string", e); return ti_mk("Void"); }
-                return ti_mk("Void");
+                // P4：@panic 归 Never（底类型）—— 作补齐单位元，恒有交付路径时循环可省 else。
+                return ti_mk("Never");
             }
             if (n.sa == "assert") {
                 var tp_ac: i64 = n.la;
@@ -12349,6 +12436,7 @@ pub fn meta_type_of_expr(e: i64) i64 {
     if (n.kind == "float") { return base__mk_scalar("f64", -1); }
     if (n.kind == "string") { return base__mk_scalar("string", -1); }
     if (n.kind == "bool") { return base__mk_scalar("bool", -1); }
+    if (n.kind == "unit_lit") { return base__mk_scalar("void", -1); }
     if (n.kind == "cast") { return n.nb; }                      // cast 目标类型节点
     if (n.kind == "ident") {
         var si: i64 = sym_lookup(cur_scope, n.sa);

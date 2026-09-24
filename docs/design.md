@@ -465,7 +465,7 @@ xs |> sum_i32;                   // ⇔ sum_i32(xs)（整体应用）
 
 ### 2.9 Everything is value（一切皆值）（#10）
 
-> ⏳ **状态：设计中（proposed）**。本提案把「一切皆表达式、一切皆值」作为 T 的语法统一目标写入设计文档：循环作为表达式的取值补全由 `else` 完成子句承担；`void` 移除、过渡期作 `unit` 别名；并形式化 `unit` 在 T 中「既是类型也是值」、以及 `Never` 底类型在补齐中的单位元角色。完整白皮书见 `docs/everything-is-value-t.md`（含五分钟速览、补齐阶梯与矩阵、循环取值三规则、与 Zig 0.16 对照、速查表、术语表、易错点）。本文仅登记其 **§1 合规矩阵 + 三样落点**，不重复白皮书正文。
+> ✅ **状态：已落地（P1–P5 全部实现，2026-09-24）**。本提案把「一切皆表达式、一切皆值」作为 T 的语法统一目标写入设计文档：循环作为表达式的取值补全由 `else` 完成子句承担；`void` 移除、过渡期作 `unit` 别名；并形式化 `unit` 在 T 中「既是类型也是值」、以及 `Never` 底类型在补齐中的单位元角色。完整白皮书见 `docs/everything-is-value-t.md`（含五分钟速览、补齐阶梯与矩阵、循环取值三规则、与 Zig 0.16 对照、速查表、术语表、易错点）。本文仅登记其 **§1 合规矩阵 + 三样落点**，不重复白皮书正文。P1/P2/P3 见下方「落地进度」；P4/P5 见文末补充记录。
 
 **事实基础（依据 `docs/reference.md` §3.3）**：当前 `IfStatement` / `WhileStatement` / `ForStatement` / `Block` 全是 **Statement**（`Block: "{" Statement* "}"`）；`match` 已是表达式；`unit`/`()` 与 `@` 转换原语、`break`/`continue`/`return`/`panic` 跳转均已存在。故「一切皆表达式」是**文法级提升**，非小改。
 
@@ -514,7 +514,7 @@ xs |> sum_i32;                   // ⇔ sum_i32(xs)（整体应用）
 | `var`/`if`/`for` 语句 + `"assign"` 节点 + `shadow_check` | ✅ 已实装 | 否（须确保表达式化后仍走这些节点） |
 | `unit`/`()` 字面量 | ✅ 已实装 | 否 |
 | `@` 转换原语族（补齐显式出口） | ✅ 已实装 | 否 |
-| `Never` / 底类型（跳转归 `Never`） | ⚠️ 须形式化落地（P4） | 软阻塞（P4 即本提案一部分） |
+| `Never` / 底类型（跳转归 `Never`） | ✅ 已落地（P4） | 否 |
 | **分支/循环 widen-only lub（补齐）类型推导** | ❌ 当前 `match` 要求分支类型一致、无 lub 能力 | **硬阻塞**：P2 须先实现 lub 推导 |
 | `reference.md` §3.3 文法重写（Statement→Expression） | ❌ 未做 | 软阻塞（spec 同步） |
 
@@ -554,7 +554,7 @@ xs |> sum_i32;                   // ⇔ sum_i32(xs)（整体应用）
   2. **LLVM 轨**：`tir_emit_expr` 的 `block_expr` 分支 —— `tir_blk_push/pop` 维护块深度，块内语句照常发射，值取尾随表达式的临时槽。⚠ 中间的 expr 语句（如 `f();`）**必须照常发射**，只有末条走取值路径，否则整条语句被丢弃 = 静默错编。
   3. **类型推断**：`sema.infer_block_expr`（新作用域 + 尾随表达式类型）；`codegen_c.expr_type_desc` 与 `tir.tir_expr_td` 各补 `block_expr` 分支（值 = 尾随表达式的 TD）。缺任一支都会让「首臂/首分支体为值块」时结果槽退化 `void*` / i64（L-09 同类）。另：`expr_type_desc` 的 `block_expr` 分支须**自登记块内 var** 进 `em_cur_fn`（`fs_set`）—— `collect_local_types` 只遍历语句链，match 臂 / var 初始化器这些**表达式**位置里的块它遍历不到（与 conpat 载荷绑定同一类坑）。
 - **P1 剩余（现已随 P3 一并落地）**：`while` / `for` 在表达式位置取值 + **P3 循环 `else`** 完成子句 —— 见下条 P3 已落地记录。悬空 `else` 消歧（循环体末恰为缺 `else` 的 `if` 时归 `if`）由解析期 `parse_block()` 收口，已含于 P3 实现。
-- **P3 已落地**（2026-09-24，HEAD 待提交）：循环 `else` 完成子句 + 值循环（带值 `break v`）。**纯 sema 层脱糖，双后端（C / LLVM）零改动**，正是 §2.9 姿势 A 的直接兑现。
+- **P3 已落地**（2026-09-24，已提交 `421dcd6`）：循环 `else` 完成子句 + 值循环（带值 `break v`）。**纯 sema 层脱糖，双后端（C / LLVM）零改动**，正是 §2.9 姿势 A 的直接兑现。
   - **脱糖姿势**：在表达式位置的循环、或含 `break v` 的循环，原地改写为多语句值块 `block_expr`：
     ```
     { var __loop_delivered_<L>: bool = false; var __loop_r_<L>: T;
@@ -566,6 +566,19 @@ xs |> sum_i32;                   // ⇔ sum_i32(xs)（整体应用）
   - **HIR `HIR_OP_BLOCK` 不透明容器**：`hir.tc: hir_lower_expr` 对 `while`/`for`/`for_each` 增不透明 `HIR_OP_BLOCK` 分支（同 `block_expr` 模式：不递归 lower 子节点、不建 `node_to_hir` 映射，让 sema 走 CST 路径），归零 RAW 逃生舱（`hir_test` 扫描 `min_while.tc`+`p3_loop_value.tc` 全 0）。
   - **诊断码**（均注册于 `tools/diag_defs.json` 并重生成 `src/diag_table.gen.h`）：`T-SEM-E280`（带值 break 需配合循环 `else`）、`T-SEM-E281`（值循环 break 必须带值）、`T-SEM-E282`（表达式位置循环必须是值循环）。
   - **QA**：conformance 新增 `p63_value_loop`（PASS）+ `f145`/`f146`/`f147`（FAIL 三类错误）；`examples/min_while.tc`、`examples/p3_loop_value.tc`（含嵌套值循环 `r5==12`）双后端对拍；gate L1 **15 passed / 0 failed / 2 skipped**（snapshot/boot23/hir/double-track/conform 全 PASS；examples 与 difftest 因 snapshot 干净 SKIP 属正常）。IR 基线 `tests/ir_baseline.json` 已重录（新增 example 6 条 + 编译器自身 IR 漂移）。
+- **P4 已落地**（2026-09-24，随 P3 之后提交）：`Never` 底类型 + 跳转原语归 `Never`，确立补齐单位元角色。
+  - **`Never` 产生点**：① `meta_type_of_expr` 的 `@panic(...)` 分支返回值由 `Void` 改为 `Never`；② `infer_block_expr` 末条语句为终止性语句（`return`/`break`/`continue`/`@panic`）时块类型返回 `Never`（辅助 `stmt_terminates`）。
+  - **lub 单位元已就绪**：`widen_only_lub`（sema.tc:839 `if (t >= 0 && tip_kind(t) != "Never")`）本就跳过 `Never` ⇒ `lub(T, Never) = T` 天然成立；P4 之前缺的只是「谁产生 `Never`」，本步补齐。故 `var v: i64 = if (c) { 1; } else { @panic("x"); };` 之类值位置 if 的 `Never` 臂被 lub 跳过、整体类型仍由 `i64` 决定。
+  - **值循环可省 `else` 的形式化条件**：`desugar_value_loop` 由「`has_break_v && !has_else` 即报 `T-SEM-E280`」放宽为「`has_break_v && !has_else && !vl_body_always_delivers(L)`」才报。`vl_body_always_delivers(L)` 为**保守可证明安全**判定：`for`/`for_each` 因容器可能为空（体可一次不执行）一律判「不恒交付」⇒ 必须 else；`while` 仅当条件为字面 `true` 且体末条为 `break`/`return`/`@panic`（不落到末尾）时才判「恒交付」⇒ 可省 else，否则条件可能变 false ⇒ 循环存在无中断完成路径 ⇒ 必须 else。原 P3 的 `f145`（`while(true){break 1;}` 期望 E280）因此变为合法，已将其循环条件改为 `while(x>0)` 保留为 E280 负例。
+  - 双后端零改动（脱糖到既有节点；`Never` 只存在于类型层，运行期无实体）。
+- **P5 已落地**（2026-09-24，随 P4 之后提交）：`void` 移除、`unit` 作其过渡别名；`unit` 既是类型也是值（`()` 空元组字面量）。
+  - **`unit` 关键字**：`lex` 新增 `KwUnit`；`parse_type_inner` 的 `unit` → `base.mk_scalar("void", -1)`（与 `void` 同一底层 TD，**零后端改动**）；类型关键字列表（`parse_primary` 降级表 / `is_type_kw`）追加 `KwUnit`。
+  - **`()` 字面量**：`parse_prim_paren` 空括号 → `unit_lit` 节点；块末无尾随表达式时 `parse_block_expr` 自动补 `()`（不再 fail-fast 报错）；多语句值块尾随 `()`、值位置落 `unit` 均合法。
+  - **`unit` 既作类型也作值**：`sema.infer_expr` / `meta_type_of_expr` 的 `unit_lit` → `void` TD；`codegen_c.emit_expr` 的 `unit_lit` → `(void)0`；`tir_emit_expr` 的 `unit_lit` → 占位常量（返回占位 slot）；`return ()` → `RET_VOID`。
+  - **⚠ C 后端 `void` 变量陷阱**：`void x;` 在 C 非法 ⇒ `codegen_c`/`tir` 的 `var_decl` 分支对 void/unit 局部变量**降级丢弃**（不发射声明；初始化器仍求值保副作用）。`var x: unit = ();` 即被整体丢弃，`()` 无存储意义。
+  - **`hir`**：`hir_lower_expr` 为 `unit_lit` 显式加一条分支，返回无槽位的 `HIR_OP_BLOCK`（与 `block_expr`/`while` 同款：不递归 lower、不建 `node_to_hir` 映射，让 sema 走 CST），RAW 逃生舱计数 0（`hir_test` 扫描全量 examples 含 `p5_unit.tc` 全 0）。⚠ 初版曾误判「默认返回 -1 即 RAW=0」，实测 `unit_lit` 会落 `HIR_OP_RAW` 逃生舱（p5_unit.tc 4 处 RAW）→ 门禁 `hir` 步 FAIL，须显式分支。
+  - **运行期零增量**：unit/void 在内存里不占值槽（C 端降级丢弃、LLVM 端占位常量），`Never` 同理只存在于类型层。
+  - **QA**：`examples/p4_never_loop.tc`(+`.expected.txt` 输出 `1`/`7`)、`examples/p5_unit.tc`(+`.expected.txt` 输出 `42`) 双后端对拍一致；conformance 新增 `p_never_else_omitted`(PASS)/`p_never_panic_branch`(PASS)/`p_unit_alias`(PASS)/`f_value_loop_else_required`(`T-SEM-E280`)/`f_value_loop_expr_no_value`(`T-SEM-E282`)。**未新增诊断码**（P4 复用既有 `T-SEM-E280`/`T-SEM-E282`，E 码 sev 均为 `error`）。
 - **T 语法事实（影响后续设计）**：块内表达式语句**必须有 `;`**（`{ 1 }` 非法、`{ 1; }` 才解析）；`parse_block()` 自己吞 `{` / `}`（调用方勿重复 advance）。
 
 **开放风险与门禁落点**：① 循环动态取值 lowering 正确性是头号风险，禁止按迭代 phi，门禁新增 examples（空容器/中途 `break`/末轮交付/永不交付+`else`）双后端对拍；② `else` 就近绑定的悬空歧义（循环体末恰为缺 `else` 的 `if` 时归 `if`），门禁嵌套 `if/for`+`else` 语法歧义用例；③ `reference.md` §3.3 须把 If/While/For/Block 从 `Statement` 移到 `Expression` 并保留「语句位置」（`;` 结尾）兼容，门禁 `reference.md` 与 `tc` 实机对照；④ 建议 `docs/constitution.md` 留「表达式化是语法统一、不改显式/fail-fast 哲学」备注。
@@ -588,7 +601,7 @@ xs |> sum_i32;                   // ⇔ sum_i32(xs)（整体应用）
 
 ## 4. 备注
 
-- 本文档仅记录设计讨论与结论，所有语言特性提案（#2–#10）均未实现、未进入 `src/`（`#9 cell` 块为 notebook 单元作用域，经 `docs/notebook.md` §13.8 裁定引入，tc 未接入；`#10 Everything is value` 为语法统一目标设计，详见 `docs/everything-is-value-t.md`，落地顺序见 §2.9）。
+- 本文档仅记录设计讨论与结论；除 **#10 Everything is value 的 P1–P5 已全部实现**（见 §2.9 落地进度，代码已进入 `src/` 并经 gate L2 自举不动点 + 双后端验证）外，其余语言特性提案（#2–#9）均未实现、未进入 `src/`（`#9 cell` 块为 notebook 单元作用域，经 `docs/notebook.md` §13.8 裁定引入，tc 未接入；`#10` 详见 `docs/everything-is-value-t.md`，落地顺序见 §2.9）。
 - **例外（已落地但待审查）**：§2.7 登记的是 REPL 依赖的 `tc` 诊断能力（R2 人类可读诊断 flag、R3 相对工程根路径），其代码已随 REPL 工作落入 `src/`，但**未经本设计文档批准**——按 `docs/repl.md` 红线，须在本节审查通过（R2 的 flag 命名冲突抉择方案 A / B）后才算 ratified；在此之前属「临时实现」。
 - 自举（bootstrap）状态：**已暂停**——相关设计理由不以「为了自举」为论据。
 - 相关审查类待办（非设计提案）：返回值错误处理审计（`sys_run` 的 `rc` 检查、退出码 0/1/2 归类一致性）单列跟踪，不在本文档范围内。

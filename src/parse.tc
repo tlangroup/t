@@ -299,6 +299,11 @@ pub fn parse_type_inner() i64 {
         lex.advance_i();
         return base.mk_scalar("void", -1);
     }
+    if (t == "KwUnit") {
+        lex.advance_i();
+        // P5：unit 是 void 的过渡别名（同一底层类型，零后端改动）。void 概念保留作兼容。
+        return base.mk_scalar("void", -1);
+    }
     if (t == "KwString") {
         lex.advance_i();
         return base.mk_scalar("string", -1);
@@ -795,6 +800,13 @@ pub fn parse_prim_ident(ti: i64) i64 {
 }
 
 pub fn parse_prim_paren(ti: i64) i64 {
+    // P5：空括号 `()` 是 unit 字面量（值位置的无值占位）。
+    if (lex.cur_t() == "RParen") {
+        lex.advance_i();
+        var u: i64 = base.node_new("unit_lit");
+        base.node_at(u, ti);
+        return u;
+    }
     var inner: i64 = parse_expr();
     expect_tok("RParen");
     var id: i64 = base.mk_paren(inner, ti);
@@ -984,7 +996,23 @@ pub fn parse_block_expr() i64 {
     var body: i64 = parse_block();
     var last: i64 = block_trailing_expr(body);
     if (last < 0) {
-        parse_fatal("值位置的块必须以表达式语句结尾（如 `{ 1; }`）；无尾随表达式的块取值待 P5（unit）");
+        // P5：无尾随表达式的值块 ⇒ 自动补 `()`（unit 字面量），块类型为 unit。
+        // 例如 `{ var x: i64 = 1; }` 自动成为 `{ var x: i64 = 1; (); }`，类型 unit，
+        // 值块表达式位置照样合法（对应「无值」语义），不静默降级为错误。
+        var u: i64 = base.node_new("unit_lit");
+        base.node_at(u, lex.pos);
+        var ue: i64 = base.mk_expr(u, -1);
+        if (body < 0) {
+            body = base.list_push(-1, -1, ue);
+        } else {
+            var lc: i64 = body;
+            while (base.kids[lc].next >= 0) { lc = base.kids[lc].next; }
+            base.list_push(body, lc, ue);
+        }
+        last = block_trailing_expr(body);
+    }
+    if (last < 0) {
+        parse_fatal("值位置的块必须以表达式语句结尾（如 `{ 1; }`）");
     }
     if (block_is_single(body)) {
         return base.nodes[last].na;  // ① 快路径：脱糖为表达式本身
@@ -3940,7 +3968,7 @@ pub fn parse_primary() i64 {
     // 但允许它们作为 comptime 类型模板参数的实参出现在调用位置
     // （如 `id(string, "hi")`）。降为 ident 节点，由 instantiate_generic 解析为类型；
     // 若被误当作值使用，check 期会报「未知标识符」，语义正确。
-    if (t == "KwString" || t == "KwStringBuilder" || t == "KwVoid" || t == "KwMap") {
+    if (t == "KwString" || t == "KwStringBuilder" || t == "KwVoid" || t == "KwMap" || t == "KwUnit") {
         var ti_Kw: i64 = lex.advance_i();
         return base.mk_ident(lex.tk_v(ti_Kw), ti_Kw);
     }
@@ -4146,7 +4174,7 @@ pub fn parse_shift() i64 {
 // 因此在 `>` 之后遇到它们，只可能是反序列化 `fid > Type` 的类型操作数。
 pub fn tok_type_only(t: string) bool {
     if (t == "KwString" || t == "KwStringBuilder") { return true; }
-    return t == "KwVoid" || t == "KwMap";
+    return t == "KwVoid" || t == "KwMap" || t == "KwUnit";
 }
 
 pub fn parse_cmp() i64 {

@@ -1091,6 +1091,8 @@ pub fn tir_expr_td(e: i64) i64 {
             if (be_td >= 0) { return be_td; }
         }
     }
+    // P5：() 空元组字面量 = unit 值，类型即 void TD（与 codegen_c 的 expr_type_desc 同构）。
+    if (n0.kind == "unit_lit") { return sema.td_mk("void"); }
     // v3 §5.3：优先读 HIR 类型槽（sema 一次性填入），避免每次重推导 + 影子表反推。
     // ⚠ 缓存值须做越界检查：node.td 可能取自更大 sema.tds 上下文的残留索引，直接返回会毒化下游 sema.tds[td] 索引。
     var cached_td: i64 = base.nodes[e].td;
@@ -2049,6 +2051,11 @@ pub fn tir_emit_stmt(sid: i64) void {
         var st: string = "i64";
         var t: i64 = -1;
         if (n.na >= 0) { t = sema.resolve_type_desc(n.na); if (t >= 0) { st = tir_st_of_td(t); } }
+        // P5：unit/void 局部变量降级丢弃（C 中 `void x;` 非法）；初始化器仍求值以保副作用。
+        if (t >= 0 && sema.tds[t].cat == "void") {
+            if (n.nb >= 0) { tir_emit_expr(n.nb); }
+            return;
+        }
         var slot: string = tir_new_named_slot(t, st, n.sa);
         // map 类型变量声明：无初始化器时按 canonical 同构自动建空表（tll_map_new），
         // 否则后续 map_set/map_get/map_del 会解引用未初始化的句柄槽 → 运行时段错误。
@@ -2157,6 +2164,8 @@ pub fn tir_emit_stmt(sid: i64) void {
         tir_flush_defer();
         if (n.na >= 0) {
             var rk: Node = base.nodes[n.na];
+            // P5：return () 在 void 函数中 = RET_VOID（unit 无载荷，发射占位值无意义）。
+            if (rk.kind == "unit_lit") { tir_emit(tir_emit_ret_void()); return; }
             var s: string;
         if (rk.kind == "array_lit" && g_cur_ret_td >= 0 && sema.tds[g_cur_ret_td].cat == "array") {
             var __er1: TirEmitRes = tir_emit_array_lit(n.na, g_cur_ret_td); s = __er1.name;
@@ -2660,6 +2669,13 @@ pub fn tir_emit_expr(e: i64) TirEmitRes {
     g_cur_line = base.nodes[e].ln;
     var n: Node = base.nodes[e];
     var kd: string = n.kind;
+    // P5：() 空元组字面量 = unit 值，无语义载荷。发射为占位常量（与 C 后端 (void)0 同效），
+    //     返回占位 slot 供下游（如尾随表达式）消费；unit-typed 变量声明在 var_decl 分支已降级丢弃。
+    if (kd == "unit_lit") {
+        var z: string = tir_tmp();
+        tir_emit(TIRInst{ op: TIR_OP_CONST, st: tir_st_from_str("i64"), dst: tir_op(z), args: tir_a1("0"), is_comment: false, line: g_cur_line, cmt: "" });
+        return TirEmitRes{ name: z, st: tir_st_from_str("i64") };
+    }
     // est 优先取调用方注入的预期类型（g_expect_st）：解决 match 等无法从 sema 反推结果类型、
     // 退回 i64 导致 __mres 槽宽度不足的问题。读取后即清零，子表达式改用自身推断类型。
     var est: i64 = ST_NONE;
