@@ -1,0 +1,59 @@
+// P1 Stage 1b（everything-is-value）：**多语句值块** `{ s1; ...; sn; e; }`
+// 编译器：t  @ 自举；后端：C + LLVM 双后端语义一致
+//
+// 块值 = **尾随表达式**的值；块内语句在新作用域，块内 var 不外泄到外层。
+// 两条后端路径：
+//   C     → GNU 语句表达式 `({ ...; e; })`（语句文本经 codegen_c 的捕获式发射缓冲
+//           g_cap / g_cap_on 取得 —— emit_stmt 返回 void、只 spush，故需开关拦截）
+//   LLVM  → 块内语句照常发射，值取尾随表达式的临时槽
+//
+// 覆盖点：① 多语句值块作 return 值；② **中间的 expr 语句必须照常发射**（副作用可见 ——
+//          若被丢弃就是"不崩溃的静默错编"）；③ 作 var 初值；④ 作 match 臂；
+//          ⑤ 作值 if 的分支；⑥ 块内 var 与外层同名（遮蔽，验作用域不外泄）。
+// 注：单表达式块 `{ e; }` 走 Stage 1a 快路径（解析期直接脱糖为 `e`），见 p1_value_if.tc。
+
+fn side(n: i64) i64 {
+    println(int_to_str(n));
+    return n;
+}
+
+fn calc(n: i64) i64 {
+    return {
+        var t: i64 = n * 2;
+        side(t);      // ② 中间 expr 语句：必须执行（打印 20），不能被丢
+        t + 1;
+    };
+}
+
+fn shadow() i64 {
+    var v: i64 = 100;
+    var r: i64 = {
+        var v: i64 = 5;      // ⑥ 遮蔽外层 v
+        v * 3;
+    };
+    return v + r;            // 100 + 15 = 115（外层 v 未被块内改写）
+}
+
+fn arms(c: bool) i32 {
+    return match (c) {
+        true => { var x: i32 = 3; x * 4; },
+        false => { var y: i32 = 5; y * 6; },
+    };
+}
+
+fn vif(n: i64) i32 {
+    return if (n > 0) { var p: i32 = 1; p + 10; } else { var q: i32 = 2; q + 20; };
+}
+
+@main
+fn main() i64 {
+    println(int_to_str(calc(10)));      // 20（side 的副作用）→ 21
+    var y: i64 = { var a: i64 = 5; a * 3; };
+    println(int_to_str(y));             // 15
+    println(int_to_str(shadow()));      // 115
+    println(int_to_str(arms(true)));    // 12
+    println(int_to_str(arms(false)));   // 30
+    println(int_to_str(vif(1)));        // 11
+    println(int_to_str(vif(0 - 1)));    // 22
+    return 0;
+}

@@ -1076,6 +1076,21 @@ pub fn tir_expr_td(e: i64) i64 {
         var sl_td: i64 = t_td_of_named(n0.sa);
         if (sl_td >= 0) { return sl_td; }
     }
+    // P1 Stage 1b：多语句值块的 TD = **尾随表达式**的 TD（与 codegen_c 的
+    // expr_type_desc 同构）。缺这一支会落到 meta_type_of_expr，值块返回非 i64
+    // 时可能拿到脏标量 TD → __mres / _tmrN 槽宽退化（笔记第 20 条同类问题）。
+    if (n0.kind == "block_expr") {
+        var be_c3: i64 = n0.la;
+        var be_lv3: i64 = -1;
+        while (be_c3 >= 0) {
+            be_lv3 = base.kids[be_c3].val;
+            be_c3 = base.kids[be_c3].next;
+        }
+        if (be_lv3 >= 0 && base.nodes[be_lv3].kind == "expr") {
+            var be_td: i64 = tir_expr_td(base.nodes[be_lv3].na);
+            if (be_td >= 0) { return be_td; }
+        }
+    }
     // v3 §5.3：优先读 HIR 类型槽（sema 一次性填入），避免每次重推导 + 影子表反推。
     // ⚠ 缓存值须做越界检查：node.td 可能取自更大 sema.tds 上下文的残留索引，直接返回会毒化下游 sema.tds[td] 索引。
     var cached_td: i64 = base.nodes[e].td;
@@ -2653,6 +2668,29 @@ pub fn tir_emit_expr(e: i64) TirEmitRes {
 
     if (kd == "assign" || kd == "assignment") { return tir_emit_assign(n, est); }
     if (kd == "match") { return tir_emit_match(n, false, est); }
+    // P1 Stage 1b：多语句值块 `{ s1; ...; sn; e; }` —— 值即**尾随表达式**的槽。
+    // 块内语句在新作用域发射（tir_blk_push/pop 维护 g_blk_depth，使块内局部随块结束退出）；
+    // 尾随表达式的临时槽位于函数栈上，块退出后仍可读（tir 槽不随块回收）。
+    // ⚠ 中间的 expr 语句（如 `f();`）必须照常发射，只有**末条**才走取值路径 ——
+    //    否则语句被整条丢弃（静默错编，与"不崩溃的错编最难查"同类）。
+    if (kd == "block_expr") {
+        tir_blk_push();
+        var be_r: TirEmitRes = TirEmitRes{ name: tir_tmp(), st: est };
+        var be_c: i64 = n.la;
+        while (be_c >= 0) {
+            var be_k: Child = base.kids[be_c];
+            var be_s: i64 = be_k.val;
+            if (be_k.next < 0 && base.nodes[be_s].kind == "expr") {
+                if (est != ST_NONE) { g_expect_st = est; }   // 传预期类型，保结果槽宽度
+                be_r = tir_emit_expr(base.nodes[be_s].na);
+            } else {
+                tir_emit_stmt(be_s);
+            }
+            be_c = be_k.next;
+        }
+        tir_blk_pop();
+        return be_r;
+    }
     if (kd == "int") {
         var st: string = tir_expr_st(e);
         var d: string = tir_tmp();

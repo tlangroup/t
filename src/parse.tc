@@ -939,24 +939,53 @@ pub fn parse_comptime_stmt() i64 {
     return id3;
 }
 
-// P1 Stage 1a（everything-is-value）：**值位置的块** `{ e; }` —— 解析期直接脱糖为该表达式本身。
+// 块语句链表的**末条**语句；当且仅当它是 `expr` 语句时返回其节点 id，否则 -1。
+// 值块的取值就是这条尾随表达式的值。
+fn block_trailing_expr(head: i64) i64 {
+    if (head < 0) {
+        return -1;
+    }
+    var last: i64 = -1;
+    var c: i64 = head;
+    while (c >= 0) {
+        last = base.kids[c].val;
+        c = base.kids[c].next;
+    }
+    if (last < 0) { return -1; }
+    if (base.nodes[last].kind != "expr") { return -1; }
+    return last;
+}
+
+// 值块是否只有一个语句（Stage 1a 快路径：可脱糖为该表达式本身，后端零改动）。
+fn block_is_single(head: i64) bool {
+    if (head < 0) { return false; }
+    var k: Child = base.kids[head];
+    if (k.next >= 0) { return false; }
+    return true;
+}
+
+// P1 Stage 1a/1b（everything-is-value）：**值位置的块** `{ s1; ...; sn; e; }`。
 //
-// 为什么只做「单一表达式」这一种形态：多语句值块 `{ s1; ...; sn; e; }` 需要后端真正的结果槽。
-// LLVM 轨好办（值 = 尾随表达式的临时槽），但 **C 轨不行** —— `emit_stmt` 返回 void、
-// 只把文本推进全局 `slines`，而 `emit_expr` 必须**返回**字符串；要拿到语句文本就得截断全局
-// 切片，而「全局切片 slice_pop / 自别名 slice_sub」正是已记录的 -O2 自编译 UB（见笔记第 14 条）。
-// 故多语句值块留待后端补「捕获式发射缓冲」后再做，当前按 fail-fast 明确报错、绝不静默降级。
+// 两条路径：
+// ① 单表达式块 `{ e; }` —— 解析期直接脱糖为 `e` 本身（Stage 1a）。后端零改动，零风险。
+// ② 多语句块 `{ s1; ...; sn; e; }` —— 构造 `block_expr` 节点（Stage 1b）。后端需真实结果槽：
+//    LLVM 轨取尾随表达式的临时槽；C 轨用 GNU 语句表达式 `({ ...; e; })`，文本经
+//    codegen_c 的捕获式发射缓冲（g_cap / g_cap_on）取得 —— 不可截断全局 slines，
+//    那是已记录的 -O2 自编译 UB（笔记第 14 条）。
 //
-// 即便如此，本形态已解锁两件事：① `{ e; }` 可出现在任意值位置（含 match 臂、值 if 分支）；
-// ② 值 if 的 else 分支因此可以是任意表达式 —— **`else if` 链自然成立**（见 parse_value_if）。
+// 硬约束：块必须以**表达式语句**结尾（T 语句一律带 `;`）。无尾随表达式的块取值
+// 属 P5（void → unit），当前按 fail-fast 报 T-PAR-E101，绝不静默降级。
 pub fn parse_block_expr() i64 {
     var tl: i64 = lex.pos;           // 记块起点行号；`{`/`}` 由 parse_block 自己吞
     var body: i64 = parse_block();
-    var e: i64 = block_single_expr(body);
-    if (e < 0) {
-        parse_fatal("值位置的块当前只支持单一表达式（如 `{ 1; }`）；多语句值块须后端结果槽，待后续 Stage");
+    var last: i64 = block_trailing_expr(body);
+    if (last < 0) {
+        parse_fatal("值位置的块必须以表达式语句结尾（如 `{ 1; }`）；无尾随表达式的块取值待 P5（unit）");
     }
-    return e;
+    if (block_is_single(body)) {
+        return base.nodes[last].na;  // ① 快路径：脱糖为表达式本身
+    }
+    return base.mk_block_expr(body, tl);   // ② 多语句值块
 }
 
 pub fn parse_block_stmt() i64 {

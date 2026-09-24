@@ -549,7 +549,11 @@ xs |> sum_i32;                   // ⇔ sum_i32(xs)（整体应用）
 - **P1 的两个前置 bug 已修**（均由值 `if` 暴露，非新特性自身缺陷）：
   1. **bool 穷尽性假阴性**：`match(c){true=>..,false=>..}` 已穷尽却报 `T-MAT-E742` —— 穷尽性谓词只有 enum/variant 版，`match_covers_case` 只认 `kind=="member"`；bool 字面量是 `kind=="bool"`+`ba`。补 `match_covers_bool` + `bool_all_cases_covered`（带守卫臂不算覆盖）接入判定链。
   2. **i1 槽不参与宽度对齐**（仅坏 TIR→LLVM 轨，C 后端一直正确）：`ll_int_bits("i1")` 落到 `base.awi_bits` 因 `1 < awi_min_bits()` 返回 -1 ⇒ 位宽 0 ⇒ `ll_coerce_to` 早退跳过对齐 ⇒ i1 值原样喂给 `icmp eq i64`，clang 报 `defined with type 'i1' but expected 'i64'`。修：`ll_int_bits` 显式 `i1→1`，且 **bool 拓宽必须 zext**（`sext i1 1` = -1 会把 true 变 -1）。
-- **P1 剩余（未做）**：**多语句值块** `{ s1; ...; sn; e; }`（Stage 1b）—— 它是 `while`/`for` 取值与 **P3 循环 `else`** 的共同前提。阻塞点不在 LLVM 轨（值 = 尾随表达式的临时槽，很好办），而在 **C 轨**：`emit_stmt` 返回 void、只把文本推进全局 `slines`，`emit_expr` 却必须**返回**字符串；要取到语句文本就得截断全局切片，而「全局切片 `slice_pop` / 自别名 `slice_sub`」正是已记录的 -O2 自编译 UB。⇒ 须先给 C 后端补一套**捕获式发射缓冲**（spush 重定向 + 可恢复），再做 1b。
+- **P1 Stage 1b 已落地**：**多语句值块** `{ s1; ...; sn; e; }`（`base.mk_block_expr` → kind `"block_expr"`，块值 = 尾随表达式的值，块内 var 在新作用域不外泄）。单表达式块 `{ e; }` 仍走 1a 快路径（脱糖为 `e`），只有多语句才建节点。三后端改动：
+  1. **C 轨阻塞点已解除** —— 给 `codegen_c` 加**捕获式发射缓冲**：`g_cap` / `g_cap_on` 两个全局，`spush` / `sappend_last` 在 `g_cap_on` 时改写进 `g_cap` 字符串；`emit_expr` 用局部变量保存/恢复，块内语句文本得以取得。**全程不截断全局切片**（那是 -O2 自编译 UB），只做字符串累积。C 侧用 GNU 语句表达式 `({ ...; e; })` 同构表达（工具链固定 clang，可用）。
+  2. **LLVM 轨**：`tir_emit_expr` 的 `block_expr` 分支 —— `tir_blk_push/pop` 维护块深度，块内语句照常发射，值取尾随表达式的临时槽。⚠ 中间的 expr 语句（如 `f();`）**必须照常发射**，只有末条走取值路径，否则整条语句被丢弃 = 静默错编。
+  3. **类型推断**：`sema.infer_block_expr`（新作用域 + 尾随表达式类型）；`codegen_c.expr_type_desc` 与 `tir.tir_expr_td` 各补 `block_expr` 分支（值 = 尾随表达式的 TD）。缺任一支都会让「首臂/首分支体为值块」时结果槽退化 `void*` / i64（L-09 同类）。另：`expr_type_desc` 的 `block_expr` 分支须**自登记块内 var** 进 `em_cur_fn`（`fs_set`）—— `collect_local_types` 只遍历语句链，match 臂 / var 初始化器这些**表达式**位置里的块它遍历不到（与 conpat 载荷绑定同一类坑）。
+- **P1 剩余（未做）**：`while` / `for` 取值 + **P3 循环 `else`**（累加器 `__r` + 已交付标志 `__delivered`、`break v` 脱糖为 `__r = v; __delivered = true; break;`、悬空 `else` 消歧）。Stage 1b 是它的共同前提，现已具备。
 - **T 语法事实（影响后续设计）**：块内表达式语句**必须有 `;`**（`{ 1 }` 非法、`{ 1; }` 才解析）；`parse_block()` 自己吞 `{` / `}`（调用方勿重复 advance）。
 
 **开放风险与门禁落点**：① 循环动态取值 lowering 正确性是头号风险，禁止按迭代 phi，门禁新增 examples（空容器/中途 `break`/末轮交付/永不交付+`else`）双后端对拍；② `else` 就近绑定的悬空歧义（循环体末恰为缺 `else` 的 `if` 时归 `if`），门禁嵌套 `if/for`+`else` 语法歧义用例；③ `reference.md` §3.3 须把 If/While/For/Block 从 `Statement` 移到 `Expression` 并保留「语句位置」（`;` 结尾）兼容，门禁 `reference.md` 与 `tc` 实机对照；④ 建议 `docs/constitution.md` 留「表达式化是语法统一、不改显式/fail-fast 哲学」备注。

@@ -27,11 +27,24 @@ pub var g_spush_to_ginit: bool = false;
 pub var ti_lines: []string;
 pub var ti_done: []string;
 
+// ── P1 Stage 1b：捕获式发射缓冲 ──────────────────────────────
+// 值块 `{ s1; ...; sn; e; }` 在 C 里用 GNU 语句表达式 `({ ...; e; })` 表达，
+// 但 emit_stmt 返回 **void**（只经 spush 写 slines），而 emit_expr 必须**返回**字符串。
+// 故加「捕获开关」：g_cap_on 为 true 时 spush / sappend_last 改写进 g_cap 字符串。
+// ⚠ 绝不截断全局切片取文本 —— 笔记第 14 条：t 全局切片在 -O2 下 slice_pop /
+//    自别名 slice_sub 会触发自编译 UB。这里只做字符串累积 + 局部变量保存/恢复。
+pub var g_cap: string = "";
+pub var g_cap_on: bool = false;
+
 pub fn hpush(s: string) void {
     append(hlines, s);
 }
 
 pub fn spush(s: string) void {
+    if (g_cap_on) {
+        g_cap = base.sb_cat2(g_cap, s);
+        return;
+    }
     if (g_spush_to_ginit) {
         append(glines, s);
         return;
@@ -41,6 +54,11 @@ pub fn spush(s: string) void {
 
 // 向最后一行追加文本（ForStmt 拼接用）
 pub fn sappend_last(s: string) void {
+    if (g_cap_on) {
+        // 捕获模式下所有行都汇进同一个 g_cap 字符串，故"追加到最后一行" == 追加到缓冲尾。
+        g_cap = base.sb_cat2(g_cap, s);
+        return;
+    }
     var n: i64 = slice_len(slines) as i64;
     var last: string = slines[n - 1];
     var joined: string = base.sb_cat2(last, s);
@@ -786,6 +804,35 @@ pub fn expr_type_desc(e: i64) i64 {
     if (n.kind == "typeinfo") {
         return sema.td_named_mk("typeinfo", n.sa);
     }
+    // P1 Stage 1b：多语句值块的类型 = **尾随表达式**的类型。
+    // 缺这一支会让「首臂/首分支体为值块」时 mq_rtd 退化 unknown，进而把 match 结果
+    // 临时量 _tmrN 声明成 void*（与 struct_lit 那支同源的问题，见 L-09）。
+    if (n.kind == "block_expr") {
+        // 先把块内 var 登记进函数作用域类型表：尾随表达式若引用块内 var（如
+        // `{ var x: i32 = 3; x * 4; }`），不登记就在 em_cur_fn 里查不到 → unknown → void*。
+        // 自登记而非依赖 collect_local_types：后者只看语句链，match 臂 / var 初始化器
+        // 这类**表达式**位置里的块它遍历不到（与 conpat 载荷绑定同一类坑）。
+        var be_vc: i64 = n.la;
+        while (be_vc >= 0) {
+            var be_vn: Node = base.nodes[base.kids[be_vc].val];
+            if (be_vn.kind == "var_decl" && be_vn.na >= 0) {
+                if (str_len(em_cur_fn) > 0) {
+                    fs_set(em_cur_fn, be_vn.sa, sema.resolve_type_desc(be_vn.na));
+                }
+            }
+            be_vc = base.kids[be_vc].next;
+        }
+        var be_c2: i64 = n.la;
+        var be_lv: i64 = -1;
+        while (be_c2 >= 0) {
+            be_lv = base.kids[be_c2].val;
+            be_c2 = base.kids[be_c2].next;
+        }
+        if (be_lv >= 0 && base.nodes[be_lv].kind == "expr") {
+            return expr_type_desc(base.nodes[be_lv].na);
+        }
+        return sema.td_mk("unknown");
+    }
     // 结构体字面量：类型名在 n.sa（与 LLVM 后端 ll_etd 的 struct_lit 分支对齐）。
     // 缺这一支会让 match 首臂体为结构体字面量时 mq_rtd 退化为 unknown，
     // 进而把 match 结果临时量 _tmrN 声明成 void*（见 examples/match_return_struct.tc）。
@@ -1051,6 +1098,14 @@ pub fn collect_local_types(head: i64) void {
             }
         }
         if (n.kind == "while" || n.kind == "block") {
+            collect_local_types(n.la);
+        }
+        // P1 Stage 1b：多语句值块内的 var 同样须登记。否则块内 var 参与尾随表达式时
+        // （如 `{ var x: i32 = 3; x * 4; }`），expr_type_desc 在 em_cur_fn 里查不到
+        // 该名字 → 退化 unknown → match 结果槽 _tmrN 被声明成 void*。
+        // 与上面 conpat 载荷绑定的坑同源：collect_local_types 只看语句链，
+        // 看不到嵌套在**表达式**里的声明。
+        if (n.kind == "block_expr") {
             collect_local_types(n.la);
         }
         if (n.kind == "for") {
@@ -1897,6 +1952,38 @@ pub fn emit_expr(e: i64) string {
         return "";
     }
     var n: Node = base.nodes[e];
+
+    // P1 Stage 1b：多语句值块 `{ s1; ...; sn; e; }` —— C 无块表达式，用 GNU
+    // **语句表达式** `({ ...; e; })` 同构表达（值与尾随表达式同，块内 var 不外泄）。
+    // 语句文本经捕获式发射缓冲（g_cap / g_cap_on）取得：emit_stmt 返回 void、只 spush，
+    // 开启捕获后 spush/sappend_last 改写进 g_cap。GNU 扩展，C 后端工具链固定 clang，可用。
+    // ⚠ 中间的 expr 语句（如 `f();`）必须照常发射，只有**末条**走取值路径。
+    if (n.kind == "block_expr") {
+        var cap_prev: string = g_cap;
+        var on_prev: bool = g_cap_on;
+        // ⚠ 变量名不可叫 `sb`：emit_expr 后续分支已有 `StringBuilder sb`，
+        //    shadow_check 会报「变量 sb 有 2 种类型」（门禁 static 步）。
+        var blk_sb: string = "({";
+        var be_c: i64 = n.la;
+        while (be_c >= 0) {
+            var be_k: Child = base.kids[be_c];
+            var be_s: i64 = be_k.val;
+            if (be_k.next < 0 && base.nodes[be_s].kind == "expr") {
+                blk_sb = base.sb_cat3(blk_sb, emit_expr(base.nodes[be_s].na), ";");
+            } else {
+                g_cap = "";
+                g_cap_on = true;
+                emit_stmt(be_s, 0);
+                g_cap_on = false;
+                blk_sb = base.sb_cat2(blk_sb, g_cap);
+            }
+            be_c = be_k.next;
+        }
+        blk_sb = base.sb_cat2(blk_sb, "})");
+        g_cap = cap_prev;
+        g_cap_on = on_prev;
+        return blk_sb;
+    }
 
     if (n.kind == "int") {
         var r: i64 = n.ia;

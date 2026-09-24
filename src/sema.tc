@@ -5253,10 +5253,39 @@ pub fn ie_sub_in_v(ei: i64, fb: i64) void {
     infer_expr(fb);
 }
 
+// P1 Stage 1b（everything-is-value）：**多语句值块** `{ s1; ...; sn; e; }` 的类型
+// = 尾随表达式 `e` 的类型。
+// 块内语句在**新作用域**检查（与语句块 cs_block_node 同构），故块内 var 不外泄到外层。
+// 取值由后端发射：tir 取尾随表达式的槽；codegen_c 走 GNU 语句表达式 `({ ...; e; })`。
+pub fn infer_block_expr(e: i64) i64 {
+    var n: Node = base.nodes[e];
+    var prev: i64 = cur_scope;
+    cur_scope = scope_new(prev);
+    var c: i64 = n.la;
+    var last: i64 = -1;
+    while (c >= 0) {
+        var k: Child = base.kids[c];
+        last = k.val;
+        check_stmt(k.val);
+        c = k.next;
+    }
+    var t: i64 = -1;
+    if (last >= 0 && base.nodes[last].kind == "expr") {
+        t = infer_expr(base.nodes[last].na);
+    }
+    cur_scope = prev;
+    if (t < 0) { return ti_mk("Unknown"); }
+    return t;
+}
+
 pub fn infer_expr(e: i64) i64 {
     var n: Node = base.nodes[e];
     var k: string = hir_tag(e);
     var ei: i64 = ie_inst(e);
+    // P1 Stage 1b：多语句值块在表达式位置出现（含值 if 的多语句分支、match 的多语句臂）。
+    if (base.nodes[e].kind == "block_expr") {
+        return infer_block_expr(e);
+    }
     if (is_pipe_kind(k) == true) {
         return lower_pipe(e);
     }
