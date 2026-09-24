@@ -380,6 +380,47 @@ pub fn parse_type_inner() i64 {
         var idn: i64 = base.mk_named(name, -1);
         return idn;
     }
+    // 匿名元组类型 `.{T1, T2, ...}`：合成具名 struct（位置字段 `_0`/`_1`/...），
+    // 规范名由元素类型推导，保证同构元组类型共享同一 struct 声明。
+    if (t == "Dot" && lex.peek_t(1) == "LBrace") {
+        lex.advance_i();                          // Dot
+        expect_tok("LBrace");
+        var elems: []i64 = [];
+        while (lex.cur_t() != "RBrace" && lex.cur_t() != "Eof") {
+            var et: i64 = parse_type();
+            append(elems, et);
+            if (lex.cur_t() == "Comma") {
+                lex.advance_i();
+            } else {
+                break;
+            }
+        }
+        expect_tok("RBrace");
+        var sname: string = synth_tuple_type_name(elems);
+        if (tuple_struct_exists(sname) == false) {
+            var fh: i64 = -1;
+            var fht: i64 = -1;
+            var idx: i64 = 0;
+            while (idx < slice_len(elems) as i64) {
+                var fid: i64 = base.node_new("F");
+                var fnn: Node = base.nodes[fid];
+                fnn.sa = base.sb_cat2("_", base.i2s(idx));
+                fnn.na = elems[idx];
+                fnn.ib = -1;
+                fnn.la = -1;
+                fnn.nb = -1;
+                slice_set(base.nodes, fid, fnn);
+                fht = base.list_push(fh, fht, fid);
+                if (fh < 0) {
+                    fh = fht;
+                }
+                idx = idx + 1;
+            }
+            var sd: i64 = base.mk_StructDecl(sname, "", "", false, false, -1, fh, -1);
+            append(lex.decl_list, sd);
+        }
+        return base.mk_named(sname, -1);
+    }
         parse_fatal("expected type");
         return -1;
     }
@@ -505,6 +546,12 @@ pub fn mk_un(op: string, operand: i64, ti: i64) i64 {
 }
 
 pub fn parse_post_member(e: i64, ti: i64) i64 {
+    // 元组索引 `.0`/`.1`/...：Dot 已被调用方消费，当前 token 为整数 → 字段名 `_N`。
+    if (lex.cur_t() == "Integer") {
+        var dn: string = lex.tk_v(lex.advance_i());
+        var id: i64 = base.mk_member(base.sb_cat2("_", dn), e, ti);
+        return id;
+    }
     var member: string = expect_tok("Identifier");
     var id: i64 = base.mk_member(member, e, ti);
     return id;
@@ -592,16 +639,128 @@ pub fn looks_like_struct_lit() bool {
     if (lex.peek_t(1) == "Identifier" && lex.peek_t(2) == "Colon") {
         return true;
     }
+    // 新增：`.x = ...` 形式的具名字面量字段（`Point{ .x = 10 }`）也视为结构体字面量。
+    if (lex.peek_t(1) == "Dot" && lex.peek_t(2) == "Identifier" && lex.peek_t(3) == "Assign") {
+        return true;
+    }
     return false;
+}
+
+// ── 元组（tuple）辅助 ───────────────────────────────────────────
+// 元组 = 带位置字段（自动命名 `_0`/`_1`/...）的具名结构体。匿名元组类型 `.{T1,T2}` 与
+// 匿名元组字面量 `.{e1,e2}` 都合成一个 StructDecl 并据此命名，保证同构元组共享同一类型。
+
+// 已合成的元组 StructDecl 是否存在（按名字扫描 decl_list，注册期前亦可见）。
+pub fn tuple_struct_exists(sname: string) bool {
+    var i: i64 = 0;
+    while (i < slice_len(lex.decl_list) as i64) {
+        var d: Node = base.nodes[lex.decl_list[i]];
+        if (d.kind == "StructDecl" && d.sa == sname) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// 从「类型节点」列表推导匿名元组类型的规范名（须与 sema 侧 ti_mangle 永远一致）。
+pub fn type_node_mangle(tn: i64) string {
+    var n: Node = base.nodes[tn];
+    var k: string = n.kind;
+    if (k == "scalar") {
+        return n.sa;
+    }
+    if (k == "named") {
+        if (n.sb != "" && n.sb != "?") {
+            return base.sb_cat3(n.sb, ".", n.sa);
+        }
+        return n.sa;
+    }
+    if (k == "slice") {
+        return base.sb_cat2("Sl_", type_node_mangle(n.na));
+    }
+    if (k == "pointer") {
+        return base.sb_cat2("Pt_", type_node_mangle(n.na));
+    }
+    if (k == "array") {
+        var len: string = "?";
+        if (n.nb >= 0) {
+            len = base.i2s(n.nb);
+        }
+        return base.sb_cat3("Ar_", len, type_node_mangle(n.na));
+    }
+    if (k == "optional") {
+        return base.sb_cat2("Op_", type_node_mangle(n.na));
+    }
+    if (k == "map") {
+        return base.sb_cat4("Map_", type_node_mangle(n.na), "_", type_node_mangle(n.nb));
+    }
+    return base.sb_cat2(k, "_");
+}
+
+pub fn synth_tuple_type_name(elems: []i64) string {
+    var sb: StringBuilder = sb_new();
+    sb_append_str(sb, "_Tup_");
+    var i: i64 = 0;
+    while (i < slice_len(elems) as i64) {
+        sb_append_str(sb, type_node_mangle(elems[i]));
+        i = i + 1;
+    }
+    return sb_to_str(sb);
 }
 
 pub fn parse_struct_lit(type_name: string, ti: i64) i64 {
     lex.advance_i();
     var head: i64 = -1;
     var tail: i64 = -1;
+    // 前导点（省略类型名）且首个元素不是具名字段（`x:` 或 `.x =`）→ 匿名元组字面量：
+    // 元素按位置存入 `_0`/`_1`/...，标记 lc=1，由 sema 据元素类型合成具名 struct。
+    var is_tuple: bool = false;
+    if (type_name == "" && lex.cur_t() != "RBrace" && lex.cur_t() != "Eof") {
+        var ft0: string = lex.cur_t();
+        if (ft0 == "Identifier" && lex.peek_t(1) == "Colon") {
+            is_tuple = false;
+        } else if (ft0 == "Dot" && lex.peek_t(1) == "Identifier" && lex.peek_t(2) == "Assign") {
+            is_tuple = false;
+        } else {
+            is_tuple = true;
+        }
+    }
+    if (is_tuple) {
+        var idx: i64 = 0;
+        while (lex.cur_t() != "RBrace" && lex.cur_t() != "Eof") {
+            var val: i64 = parse_expr();
+            var fname: string = base.sb_cat2("_", base.i2s(idx));
+            var fid: i64 = base.mk_FV(fname, val, -1);
+            tail = base.list_push(head, tail, fid);
+            if (head < 0) {
+                head = tail;
+            }
+            idx = idx + 1;
+            if (lex.cur_t() == "Comma") {
+                lex.advance_i();
+            } else {
+                break;
+            }
+        }
+        expect_tok("RBrace");
+        var id: i64 = base.mk_struct_lit("", head, ti);
+        var nl: Node = base.nodes[id];
+        nl.lc = 1;   // 元组字面量标记（struct_lit 其他路径 lc 恒为 0/未用）
+        slice_set(base.nodes, id, nl);
+        return id;
+    }
+    // 具名字段：接受旧式 `x: v` 与新式 `.x = v`（两者并存以保自举不动点）。
     while (lex.cur_t() != "RBrace" && lex.cur_t() != "Eof") {
-        var fname: string = expect_tok("Identifier");
-        expect_tok("Colon");
+        var fname: string;
+        if (lex.cur_t() == "Dot" && lex.peek_t(1) == "Identifier" && lex.peek_t(2) == "Assign") {
+            lex.advance_i();                       // 消费 Dot
+            fname = expect_tok("Identifier");
+            expect_tok("Assign");
+        } else {
+            fname = expect_tok("Identifier");
+            expect_tok("Colon");
+        }
         var val: i64 = parse_expr();
         var fid: i64 = base.mk_FV(fname, val, -1);
         tail = base.list_push(head, tail, fid);
@@ -4392,9 +4551,10 @@ pub fn parse_struct_decl(name: string, anns: i64, layout: string) i64 {
     expect_tok("LBrace");
     var r_sfield: i64 = -1;
     var r_sfield_t: i64 = -1;
+    var r_idx: i64 = 0;   // 位置字段元组（struct T { T1, T2 }）的自动字段名计数 `_0`/`_1`/...
     lex.g_method_head = -1;
     lex.g_method_tail = -1;
-    while ((lex.cur_t() == "Identifier" || lex.cur_t() == "KwFunc") && lex.cur_t() != "Eof") {
+    while (lex.cur_t() != "RBrace" && lex.cur_t() != "Eof") {
         if (lex.cur_t() == "KwFunc") {
             // 新文法：`fn mname(params) Ret {...}`（关键字领头，LL(1) 友好）
             lex.advance_i();   // 消费 `fn`
@@ -4404,15 +4564,35 @@ pub fn parse_struct_decl(name: string, anns: i64, layout: string) i64 {
                 lex.g_method_tail = base.list_push(lex.g_method_head, lex.g_method_tail, mfd);
                 if (lex.g_method_head < 0) { lex.g_method_head = lex.g_method_tail; }
             }
-        } else if (lex.peek_t(1) == "KwFunc") {
+        } else if (lex.cur_t() == "Identifier" && lex.peek_t(1) == "KwFunc") {
             // 方言统一（Stage 2）：`mname fn(...)` 结构体方法旧文法已废弃，统一为 `fn mname(...)`。
             // 转换器已把整树结构体方法迁到 `fn mname`，此处直接报迁移错误而非误当成字段解析。
             var mname: string = expect_tok("Identifier");
             parse_fatal_at("T-PAR-E102", base.sb_cat6("method `", mname, " fn(...)` removed; use `fn ", mname, "(...)` (struct ", base.sb_cat2(name, ")")), lex.pos);
-        } else {
+        } else if (lex.cur_t() == "Identifier" && lex.peek_t(1) == "Colon") {
+            // 具名字段：`name: Type;`（沿用既有 parse_sfield）
             var __it: i64 = parse_sfield();
             r_sfield_t = base.list_push(r_sfield, r_sfield_t, __it);
             if (r_sfield < 0) { r_sfield = r_sfield_t; }
+        } else {
+            // 位置字段元组语法：`struct T { T1, T2, ... }` —— 字段自动命名 `_0`/`_1`/...。
+            // 任意「类型起始 token」（标识符类型、类型关键字 string/void/map/unit、
+            // `[` 切片/数组、`.` 元组类型、`*` 指针、`?` 可选等）都按位置字段处理，
+            // 字段类型节点（na）由 sema 期 resolve_ti 解析为真实类型（与匿名元组类型 `.{T1,T2}` 同源）。
+            var ft: i64 = parse_type();
+            var fnm: string = base.sb_cat2("_", base.i2s(r_idx));
+            r_idx = r_idx + 1;
+            var fid: i64 = base.node_new("F");
+            var fnode: Node = base.nodes[fid];
+            fnode.sa = fnm;
+            fnode.na = ft;       // 字段类型节点（sema 期通过 resolve_ti 解析为真实类型）
+            fnode.ib = -1;
+            fnode.la = -1;
+            fnode.nb = -1;
+            slice_set(base.nodes, fid, fnode);
+            r_sfield_t = base.list_push(r_sfield, r_sfield_t, fid);
+            if (r_sfield < 0) { r_sfield = r_sfield_t; }
+            if (lex.cur_t() == "Comma") { lex.advance_i(); }
         }
     }
     expect_tok("RBrace");
