@@ -147,6 +147,9 @@ static const DiagDef DIAG_DEFS[] = {
   { "T-SEM-E213", "error", "SEM", "T_VARIANT_RECURSIVE_VALUE", "VARIANT_RECURSIVE_VALUE", "variant case payload references its own type by value" },
   { "T-SEM-E214", "error", "SEM", "T_LAMBDA_PARAM_UNINFERABLE", "LAMBDA_PARAM_UNINFERABLE", "lambda parameter type cannot be inferred" },
   { "T-SEM-E215", "error", "SEM", "T_ARRAY_LEN_UNINFERABLE", "ARRAY_LEN_UNINFERABLE", "array length placeholder `[_]` cannot be inferred here" },
+  { "T-SEM-E280", "error", "SEM", "T_VALUE_LOOP_BREAK_NEEDS_ELSE", "VALUE_LOOP_BREAK_NEEDS_ELSE", "value-loop `break <expr>` requires a matching loop `else` clause to supply the no-break value" },
+  { "T-SEM-E281", "error", "SEM", "T_VALUE_LOOP_PLAIN_BREAK", "VALUE_LOOP_PLAIN_BREAK", "plain `break` (without value) is not allowed in a value loop; use `break <expr>`" },
+  { "T-SEM-E282", "error", "SEM", "T_NON_VALUE_LOOP_IN_EXPR", "NON_VALUE_LOOP_IN_EXPR", "a loop used as an expression must be a value loop (with `else` clause or `break <value>` in body)" },
   { "T-SEM-W212", "warning", "SEM", "W_OVERFLOW_LITERAL", "OVERFLOW_LITERAL", "integer literal overflow" },
   { "T-TIM-E700", "error", "TIM", "T_TIME_BAD_SPEC", "BAD_SPEC", "invalid time format specifier" },
   { "T-TIM-E701", "error", "TIM", "T_TIME_PARSE_UNSUPPORTED", "PARSE_UNSUPPORTED", "time parsing unsupported" },
@@ -169,7 +172,7 @@ static const DiagDef DIAG_DEFS[] = {
   { "T-VEC-W927", "warning", "VEC", "T_VECTOR_WIDER_THAN_NATIVE", "VECTOR_WIDER_THAN_NATIVE", "vector is wider than the native SIMD register and will be split" },
   { "T-VEC-W947", "warning", "VEC", "T_TILE_WIDER_THAN_NATIVE", "TILE_WIDER_THAN_NATIVE", "hardware tile is wider than the native SIMD register and will fall back to scalar loops" },
 };
-#define DIAG_COUNT 156
+#define DIAG_COUNT 159
 
 /* legacy (old semantic name) -> machine code alias table */
 static const struct { const char* legacy; const char* code; } DIAG_LEGACY[] = {
@@ -298,6 +301,9 @@ static const struct { const char* legacy; const char* code; } DIAG_LEGACY[] = {
   { "T_VARIANT_RECURSIVE_VALUE", "T-SEM-E213" },
   { "T_LAMBDA_PARAM_UNINFERABLE", "T-SEM-E214" },
   { "T_ARRAY_LEN_UNINFERABLE", "T-SEM-E215" },
+  { "T_VALUE_LOOP_BREAK_NEEDS_ELSE", "T-SEM-E280" },
+  { "T_VALUE_LOOP_PLAIN_BREAK", "T-SEM-E281" },
+  { "T_NON_VALUE_LOOP_IN_EXPR", "T-SEM-E282" },
   { "W_OVERFLOW_LITERAL", "T-SEM-W212" },
   { "T_TIME_BAD_SPEC", "T-TIM-E700" },
   { "T_TIME_PARSE_UNSUPPORTED", "T-TIM-E701" },
@@ -320,7 +326,7 @@ static const struct { const char* legacy; const char* code; } DIAG_LEGACY[] = {
   { "T_VECTOR_WIDER_THAN_NATIVE", "T-VEC-W927" },
   { "T_TILE_WIDER_THAN_NATIVE", "T-VEC-W947" },
 };
-#define DIAG_LEGACY_COUNT 146
+#define DIAG_LEGACY_COUNT 149
 
 const DiagDef* diag_find(const char* code);        /* exact machine-code lookup */
 const DiagDef* diag_find_any(const char* id);      /* machine code OR legacy name */

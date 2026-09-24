@@ -906,8 +906,12 @@ pub fn parse_expr_or_assign_stmt() i64 {
 
 pub fn parse_break_stmt() i64 {
     var tb: i64 = lex.advance_i();
+    var val: i64 = -1;
+    if (lex.cur_t() != "Semicolon") {
+        val = parse_expr();
+    }
     expect_tok("Semicolon");
-    var idb: i64 = base.mk_break(tb);
+    var idb: i64 = base.mk_break(val, tb);
     return idb;
 }
 
@@ -3479,7 +3483,14 @@ pub fn parse_for_stmt() i64 {
         var iterable: i64 = parse_expr();
         expect_tok("RParen");
         var body: i64 = parse_block();
-        var id: i64 = base.mk_for_each(vname, vname2, iterable, body, ti);
+        var else_e: i64 = -1;
+        if (lex.cur_t() == "KwElse") {
+            lex.advance_i();
+            // 与 if/while 的 else 同构：存**语句链表头**（kids 池下标），不是表达式节点。
+            // 否则 lam_find / hir_list / 各 AST walker 把节点 id 当 kids 池下标 → t_slice_at 越界。
+            else_e = parse_block();
+        }
+        var id: i64 = base.mk_for_each(vname, vname2, iterable, body, else_e, ti);
         return id;
     }
     var init: i64 = -1;
@@ -3514,7 +3525,14 @@ pub fn parse_for_stmt() i64 {
     }
     expect_tok("RParen");
     var body2: i64 = parse_block();
-    var id2: i64 = base.mk_for(init, cond, upd, body2, ti);
+    var else_e: i64 = -1;
+    if (lex.cur_t() == "KwElse") {
+        lex.advance_i();
+        // 与 if/while 的 else 同构：存**语句链表头**（kids 池下标），不是表达式节点。
+        // 否则 lam_find / hir_list / 各 AST walker 把节点 id 当 kids 池下标 → t_slice_at 越界。
+        else_e = parse_block();
+    }
+    var id2: i64 = base.mk_for(init, cond, upd, body2, else_e, ti);
     return id2;
 }
 
@@ -3612,7 +3630,14 @@ pub fn parse_while_stmt() i64 {
     var cond: i64 = parse_expr();
     expect_tok("RParen");
     var body: i64 = parse_block();
-    var id: i64 = base.mk_while(cond, body, ti);
+    var else_e: i64 = -1;
+    if (lex.cur_t() == "KwElse") {
+        lex.advance_i();
+        // 与 if 的 else 同构：存**语句链表头**（kids 池下标），不是表达式节点。
+        // 否则 lam_find / hir_list / 各 AST walker 把节点 id 当 kids 池下标 → t_slice_at 越界。
+        else_e = parse_block();
+    }
+    var id: i64 = base.mk_while(cond, body, else_e, ti);
     return id;
 }
 
@@ -3856,6 +3881,15 @@ pub fn parse_primary() i64 {
     // 语句位置的 `if` 走 parse_statement → parse_if_stmt，不受影响。
     if (t == "KwIf") {
         return parse_value_if();
+    }
+    // P3：值位置的循环（while/for/for_each）—— 带 `else` 完成子句或体含 `break <值>` 即值循环，
+    // 由 sema 的 desugar_value_loop 脱糖为 block_expr（见 infer_expr 钩子）。复用既有
+    // parse_while_stmt / parse_for_stmt（已含可选 else 解析）；语句位置走 parse_statement 不受影响。
+    if (t == "KwWhile") {
+        return parse_while_stmt();
+    }
+    if (t == "KwFor") {
+        return parse_for_stmt();
     }
     // P1 Stage 1：值位置的块 `{ s1; ...; sn; e; }` —— 见 parse_block_expr。
     // 语句位置的块走 parse_statement → parse_block_stmt，不受影响。

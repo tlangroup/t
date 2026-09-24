@@ -553,7 +553,19 @@ xs |> sum_i32;                   // ⇔ sum_i32(xs)（整体应用）
   1. **C 轨阻塞点已解除** —— 给 `codegen_c` 加**捕获式发射缓冲**：`g_cap` / `g_cap_on` 两个全局，`spush` / `sappend_last` 在 `g_cap_on` 时改写进 `g_cap` 字符串；`emit_expr` 用局部变量保存/恢复，块内语句文本得以取得。**全程不截断全局切片**（那是 -O2 自编译 UB），只做字符串累积。C 侧用 GNU 语句表达式 `({ ...; e; })` 同构表达（工具链固定 clang，可用）。
   2. **LLVM 轨**：`tir_emit_expr` 的 `block_expr` 分支 —— `tir_blk_push/pop` 维护块深度，块内语句照常发射，值取尾随表达式的临时槽。⚠ 中间的 expr 语句（如 `f();`）**必须照常发射**，只有末条走取值路径，否则整条语句被丢弃 = 静默错编。
   3. **类型推断**：`sema.infer_block_expr`（新作用域 + 尾随表达式类型）；`codegen_c.expr_type_desc` 与 `tir.tir_expr_td` 各补 `block_expr` 分支（值 = 尾随表达式的 TD）。缺任一支都会让「首臂/首分支体为值块」时结果槽退化 `void*` / i64（L-09 同类）。另：`expr_type_desc` 的 `block_expr` 分支须**自登记块内 var** 进 `em_cur_fn`（`fs_set`）—— `collect_local_types` 只遍历语句链，match 臂 / var 初始化器这些**表达式**位置里的块它遍历不到（与 conpat 载荷绑定同一类坑）。
-- **P1 剩余（未做）**：`while` / `for` 取值 + **P3 循环 `else`**（累加器 `__r` + 已交付标志 `__delivered`、`break v` 脱糖为 `__r = v; __delivered = true; break;`、悬空 `else` 消歧）。Stage 1b 是它的共同前提，现已具备。
+- **P1 剩余（现已随 P3 一并落地）**：`while` / `for` 在表达式位置取值 + **P3 循环 `else`** 完成子句 —— 见下条 P3 已落地记录。悬空 `else` 消歧（循环体末恰为缺 `else` 的 `if` 时归 `if`）由解析期 `parse_block()` 收口，已含于 P3 实现。
+- **P3 已落地**（2026-09-24，HEAD 待提交）：循环 `else` 完成子句 + 值循环（带值 `break v`）。**纯 sema 层脱糖，双后端（C / LLVM）零改动**，正是 §2.9 姿势 A 的直接兑现。
+  - **脱糖姿势**：在表达式位置的循环、或含 `break v` 的循环，原地改写为多语句值块 `block_expr`：
+    ```
+    { var __loop_delivered_<L>: bool = false; var __loop_r_<L>: T;
+      <循环体(去 else；break v 改写为 { __loop_r_<L> = v; __loop_delivered_<L> = true; break; })>;
+      if (!__loop_delivered_<L>) { __loop_r_<L> = <else 值>; }; __loop_r_<L> }
+    ```
+    其中 `<L>` = 循环节点 id，保证**每个值循环的名字全局唯一**。
+  - **⚠ LLVM 扁平名表陷阱（核心教训）**：LLVM 后端对每个函数维护 `name→alloca` 扁平映射，重名变量会 manglify（`__loop_r` → `__loop_r__1`）。若外层与内层值循环复用同名 `__loop_r`/`__loop_delivered`，内层重新声明改写符号映射，导致**外层后发射的 `break` 误解析到内层变量**（实测嵌套值循环 `r5=-1`，应为 12）。C 后端靠词法块作用域天然隔离故不报错，掩盖该 bug。⇒ 脱糖产物**绝不能依赖重名变量被词法作用域隔离**，必须按节点 id 生成唯一名。
+  - **HIR `HIR_OP_BLOCK` 不透明容器**：`hir.tc: hir_lower_expr` 对 `while`/`for`/`for_each` 增不透明 `HIR_OP_BLOCK` 分支（同 `block_expr` 模式：不递归 lower 子节点、不建 `node_to_hir` 映射，让 sema 走 CST 路径），归零 RAW 逃生舱（`hir_test` 扫描 `min_while.tc`+`p3_loop_value.tc` 全 0）。
+  - **诊断码**（均注册于 `tools/diag_defs.json` 并重生成 `src/diag_table.gen.h`）：`T-SEM-E280`（带值 break 需配合循环 `else`）、`T-SEM-E281`（值循环 break 必须带值）、`T-SEM-E282`（表达式位置循环必须是值循环）。
+  - **QA**：conformance 新增 `p63_value_loop`（PASS）+ `f145`/`f146`/`f147`（FAIL 三类错误）；`examples/min_while.tc`、`examples/p3_loop_value.tc`（含嵌套值循环 `r5==12`）双后端对拍；gate L1 **15 passed / 0 failed / 2 skipped**（snapshot/boot23/hir/double-track/conform 全 PASS；examples 与 difftest 因 snapshot 干净 SKIP 属正常）。IR 基线 `tests/ir_baseline.json` 已重录（新增 example 6 条 + 编译器自身 IR 漂移）。
 - **T 语法事实（影响后续设计）**：块内表达式语句**必须有 `;`**（`{ 1 }` 非法、`{ 1; }` 才解析）；`parse_block()` 自己吞 `{` / `}`（调用方勿重复 advance）。
 
 **开放风险与门禁落点**：① 循环动态取值 lowering 正确性是头号风险，禁止按迭代 phi，门禁新增 examples（空容器/中途 `break`/末轮交付/永不交付+`else`）双后端对拍；② `else` 就近绑定的悬空歧义（循环体末恰为缺 `else` 的 `if` 时归 `if`），门禁嵌套 `if/for`+`else` 语法歧义用例；③ `reference.md` §3.3 须把 If/While/For/Block 从 `Statement` 移到 `Expression` 并保留「语句位置」（`;` 结尾）兼容，门禁 `reference.md` 与 `tc` 实机对照；④ 建议 `docs/constitution.md` 留「表达式化是语法统一、不改显式/fail-fast 哲学」备注。
