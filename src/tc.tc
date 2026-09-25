@@ -41,6 +41,36 @@ pub fn module_has_kernels() bool {
     return false;
 }
 
+// ── 多文件编译单元（R2 基础）────────────────────────────────
+// 接受多个源文件作为同一个编译单元：按序读取并拼接为一份源码，tokenize 后统一
+// parse_unit 填入同一 lex.decl_list。所有文件共享入口命名空间（不做模块名字重整），
+// 因此跨文件 `extend overload fn` 与同文件一致——desugar_func_clauses 按名合并时
+// 自然把不同文件的同名子句并入同一组。单文件时 files 仅含一个元素，与原单文件路径
+// 逐字节一致（分隔符仅插在文件「之间」，末文件不追加换行）。
+// 注意：仅拼源码、不切 g_file 溯源——诊断 file 统一指向首个文件（多文件项目可改进，
+// 但不影响编译产物与门禁；门禁始终单文件）。
+pub fn tc_load_src(files: []string) string {
+    var combined: StringBuilder = sb_new();
+    var nf: i64 = slice_len(files) as i64;
+    var k: i64 = 0;
+    while (k < nf) {
+        // 仅在文件「之间」插入换行分隔符，防止跨文件 token 粘连；
+        // 末文件尾部不追加换行——保持与旧单文件路径逐字节一致，否则未终结
+        // 字符串位于 EOF 时会被多出的换行误判为「串内裸换行」(T-LEX-E003
+        // 而非预期的 T-LEX-E000，见 f93_lex_unterminated_string.tc)。
+        if (k > 0) { sb_append_str(combined, "\n"); }
+        sb_append_str(combined, file_read_all(files[k]));
+        k = k + 1;
+    }
+    var src: string = sb_to_str(combined);
+    base.g_file = base.rel_path(files[0]);
+    lex.tokenize(src);
+    hir.g_last_src = src;
+    lex.pos = 0;
+    sema.init_anndefs();
+    return src;
+}
+
 pub fn print_help() void {
     print("tc — 静态类型数据驱动语言(t)编译器\n");
     print("用法:\n");
@@ -118,6 +148,7 @@ fn main() i32 @main {
         var has_outp: bool = false;
         var src_file: string = "";
         var has_src: bool = false;
+        var files: []string;
         var as_bin: bool = false;
         var from_bin: bool = false;
         var ai2: i64 = 2;
@@ -175,6 +206,7 @@ fn main() i32 @main {
         // 不求类型、不跑 sema，直接对顶层 const 初始化式做编译期求值并打印结果。
         var src_file: string = "";
         var has_src: bool = false;
+        var files: []string;
         var name_filter: string = "";
         var has_name: bool = false;
         var out_p: string = "";
@@ -231,6 +263,7 @@ fn main() i32 @main {
         var ai: i64 = 2;
         var an: i64 = slice_len(argv) as i64;
         var found_file: string = "";
+        var files: []string;
         while (ai < an) {
             if (argv[ai] == "--emit-deps") { lex.g_emit_deps = true; ai = ai + 1; continue; }
             if (argv[ai] == "--debug-libs") { lex.g_debug_libs = true; ai = ai + 1; continue; }
@@ -243,18 +276,17 @@ fn main() i32 @main {
             }
             if (argv[ai] == "--json") { base.g_diag_fmt = "json"; ai = ai + 1; continue; }
             if (argv[ai] == "--trace-comptime") { sema.g_meta_trace = true; ai = ai + 1; continue; }
+            // R2 多文件：首个非 flag 即入口文件，其后所有位置参数并入同一编译单元
             if (found_file == "") { found_file = argv[ai]; }
+            append(files, argv[ai]);
             ai = ai + 1;
         }
         base.g_file = base.rel_path(found_file);
-        var src: string = file_read_all(found_file);
-        lex.tokenize(src);
+        var src: string = tc_load_src(files);
         hir.g_last_src = src;
         // 阶段闸门：词法错误会让 token 流失去结构（未终结串、坏数字…），
         // 继续 parse 只会撞上无关的 `parse error` 硬中断并盖掉真正的病因。
         if (sema.has_errors()) { base.emit_diags(); return 1; }
-        lex.pos = 0;
-        sema.init_anndefs();
         parse.parse_unit();
         // HIR（ZIR 槽位）AstGen：pre-sema 真实跑一次，存 g_hir 供增量缓存锚点消费。
         // Stage A 仅产出生存（不崩溃 + 可序列化），sema 仍吃 CST，未消费 g_hir。
@@ -283,6 +315,9 @@ fn main() i32 @main {
         var mode: string = "dbg";
         var ai: i64 = 3;
         var an: i64 = slice_len(argv) as i64;
+        var src_file: string = "";
+        var has_src: bool = false;
+        var files: []string;
         while (ai < an) {
             if (argv[ai] == "--mode") {
                 if (ai + 1 < an) {
@@ -304,6 +339,11 @@ fn main() i32 @main {
             }
             if (argv[ai] == "--json") { base.g_diag_fmt = "json"; ai = ai + 1; continue; }
             if (argv[ai] == "--trace-comptime") { sema.g_meta_trace = true; ai = ai + 1; continue; }
+            // R2 多文件：非 flag 位置参数并入同一编译单元
+            if (str_len(argv[ai]) as i64 >= 2 && str_slice(argv[ai], 0, 2) != "--") {
+                append(files, argv[ai]);
+                if (has_src == false) { src_file = argv[ai]; has_src = true; }
+            }
             ai = ai + 1;
         }
         if (base.valid_mode(mode) == false) {
@@ -311,13 +351,11 @@ fn main() i32 @main {
             return 2;
         }
 
+        // R2 多文件：确保入口文件在编译单元内（单文件时 argv[2] 即唯一源）
+        if (slice_len(files) as i64 == 0) { append(files, file); }
         base.g_file = base.rel_path(file);
-        var src2: string = file_read_all(file);
-        lex.tokenize(src2);
-        hir.g_last_src = src2;
+        var src2: string = tc_load_src(files);
         if (sema.has_errors()) { base.emit_diags(); return 1; }
-        lex.pos = 0;
-        sema.init_anndefs();
         parse.parse_unit();
         sema.run_check();
         comptime_fold.comptime_fold_pass();
@@ -396,6 +434,7 @@ fn main() i32 @main {
         var mode: string = "dbg";
         var src_file: string = "";
         var has_src: bool = false;
+        var files: []string;
         var ex_name: string = "";
         var is_example: bool = false;
         var ai2: i64 = 2;
@@ -478,6 +517,7 @@ fn main() i32 @main {
         var mode: string = "dbg";
         var src_file: string = "";
         var has_src: bool = false;
+        var files: []string;
         var ex_name: string = "";
         var is_example: bool = false;
         var emit_link_deps: bool = false;   // 仅输出 emit 后解析到的外部链接库（.tlib），供 diffpipe 手动 link 复用
@@ -568,6 +608,7 @@ fn main() i32 @main {
         var mode: string = "dbg";
         var src_file: string = "";
         var has_src: bool = false;
+        var files: []string;
         var ex_name: string = "";
         var is_example: bool = false;
         var is_lib: bool = false;        // build --lib：预编译外部库为 .tlib（归档 + 接口块）
@@ -690,11 +731,12 @@ fn main() i32 @main {
                     continue;
                 }
             }
-            // 位置参数：第一个非 flag 即源文件
+            // 位置参数：第一个非 flag 即源文件；其后所有位置参数并入同一编译单元（R2 多文件）
             if (has_src == false) {
                 src_file = argv[ai2];
                 has_src = true;
             }
+            append(files, argv[ai2]);
             ai2 = ai2 + 1;
         }
         if (base.valid_mode(mode) == false) {
@@ -724,6 +766,8 @@ fn main() i32 @main {
             eprint("usage: tc build|run <file.tc> | --example <name>\n");
             return 2;
         }
+        // R2 多文件：--example 模式未走位置参数收集，此处补入唯一的源文件
+        if (slice_len(files) as i64 == 0) { append(files, src_file); }
 
         // 缺省 clang：PATH 上没有时探测标准安装路径。
         // ⚠ 严禁用 sys_run("cmd /c if exist <绝对路径>") 探测：绝对路径触发 arena OOM
@@ -744,12 +788,8 @@ fn main() i32 @main {
         }
 
         base.g_file = base.rel_path(src_file);
-        var src3: string = file_read_all(src_file);
-        lex.tokenize(src3);
-        hir.g_last_src = src3;
+        var src3: string = tc_load_src(files);
         if (sema.has_errors()) { base.emit_diags(); return 1; }
-        lex.pos = 0;
-        sema.init_anndefs();
         if (is_lib) {
             // 预编译库：以规范别名（源文件名 stem）作为名字重整命名空间，
             // 使产出的 .tlib 归档符号（json__version）与下游 import(json) 的重整结果一致。

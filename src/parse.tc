@@ -2992,6 +2992,139 @@ pub var g_fc_d: [64]i64;      // 组内各子句的 FuncDecl 节点
 pub var g_fc_i: [64]i64;      // 各子句在 decl_list 中的下标
 pub var g_fc_n: i64 = 0;
 
+// ── R3 类型组（类别格分派）全局表 ──────────────────────────────────
+// desugar_func_clauses 把类型组脱糖为内部函数 __name__cK + 入口包装 name(ia==3)；
+// 本表供 sema 在调用点按实参静态类型选最具体子句（静态分派，不依赖运行期类型标签）。
+// 扁平存储：g_ovl_tg_cat / g_ovl_tg_func 按「组0全子句, 组1全子句, ...」顺序拼接。
+pub var g_ovl_tg_names: []string;   // 各组入口名（name）
+pub var g_ovl_tg_cat: []string;     // 各子句声明类别名（与 func 平行）
+pub var g_ovl_tg_func: []string;    // 各子句内部函数名（__name__cK）
+pub var g_ovl_tg_n: []i64;          // 各组子句数
+
+pub fn ovl_find_group(name: string) i64 {
+    var n: i64 = slice_len(g_ovl_tg_names) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        if (g_ovl_tg_names[i] == name) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+pub fn ovl_group_base(gi: i64) i64 {
+    var b: i64 = 0;
+    var i: i64 = 0;
+    while (i < gi) { b = b + g_ovl_tg_n[i]; i = i + 1; }
+    return b;
+}
+
+pub fn ovl_group_count(gi: i64) i64 { return g_ovl_tg_n[gi]; }
+
+pub fn ovl_group_cat_at(gi: i64, ci: i64) string {
+    return g_ovl_tg_cat[ovl_group_base(gi) + ci];
+}
+pub fn ovl_group_func_at(gi: i64, ci: i64) string {
+    return g_ovl_tg_func[ovl_group_base(gi) + ci];
+}
+
+// 子句首参的声明类别名（解析期字符串，无需 TD）：
+//   标量类型节点 → 其名（i64）；具名/类别节点 → 其名（anykind / Point）。
+pub fn fc_param_catname(p0: i64) string {
+    if (p0 < 0) { return ""; }
+    var pn: Node = base.nodes[p0];
+    var tn: i64 = pn.na;
+    if (tn < 0) { return ""; }
+    var tnn: Node = base.nodes[tn];
+    if (tnn.kind == "scalar") { return tnn.sa; }
+    if (tnn.kind == "named") { return tnn.sa; }
+    if (tnn.kind == "void") { return "void"; }
+    return tnn.sa;
+}
+
+// ── R3 类别格（静态分派）辅助 ──────────────────────────────────
+// 类别模板节点 id：Concrete 子句 = -1；类别子句 = 其 FuncDecl 节点 id
+// （desugar 期降级为 ClauseDead，调用点按需克隆单态化）。
+pub var g_ovl_tg_tmpl: []i64;
+
+pub fn ovl_tmpl_at(gi: i64, ci: i64) i64 {
+    return g_ovl_tg_tmpl[ovl_group_base(gi) + ci];
+}
+
+pub fn ovl_is_category(c: string) bool {
+    if (c == "anykind") { return true; }
+    if (c == "scalarkind") { return true; }
+    if (c == "integralkind") { return true; }
+    if (c == "floatkind") { return true; }
+    if (c == "namedkind") { return true; }
+    return false;
+}
+
+pub fn ovl_is_integral(a: string) bool {
+    if (a == "i8" || a == "i16" || a == "i32" || a == "i64") { return true; }
+    if (a == "u8" || a == "u16" || a == "u32" || a == "u64") { return true; }
+    return false;
+}
+
+pub fn ovl_is_float(a: string) bool {
+    if (a == "f16" || a == "f32" || a == "f64") { return true; }
+    return false;
+}
+
+// 子句声明类别 C 对静态实参类型 A 的「具体程度」(specificity)。
+//   < 0 表示不覆盖；-1 = 具体类型精确匹配（最具体）；>=0 = 类别匹配，值越小越具体。
+// ⚠ 直接展开类别格，不借助「函数返回 []string」的中间表 —— t 当前对「函数返回数组字面量」
+//   的切片不做逃逸提升，跨帧读回 p[i] 会得到悬空内存（实测 integralkind 子句恒判 -2）。
+pub fn ovl_specificity(a: string, c: string) i64 {
+    if (ovl_is_category(c) == false) {
+        if (a == c) { return -1; }
+        return -2;
+    }
+    if (c == "anykind") { return 2; }
+    if (c == "scalarkind") {
+        if (ovl_is_integral(a) || ovl_is_float(a) || a == "string" || a == "bytes" || is_scalar_name(a)) { return 1; }
+        return -2;
+    }
+    if (c == "integralkind") {
+        if (ovl_is_integral(a)) { return 0; }
+        return -2;
+    }
+    if (c == "floatkind") {
+        if (ovl_is_float(a)) { return 0; }
+        return -2;
+    }
+    if (c == "namedkind") {
+        // 具名类型（非标量、非 string/bytes）：struct / enum / flag / variant / typealias 等。
+        if (ovl_is_integral(a) == false && ovl_is_float(a) == false
+            && a != "string" && a != "bytes" && is_scalar_name(a) == false) {
+            return 0;
+        }
+        return -2;
+    }
+    return -2;
+}
+
+// 子句是否纯裸绑定（无模式、无守卫、所有形参均无模式/守卫）→ 归为类型组分派。
+pub fn fc_clause_is_bare(cd: i64) bool {
+    var cn: Node = base.nodes[cd];
+    var pl: i64 = cn.lb;
+    while (pl >= 0) {
+        var pp: i64 = base.kids[pl].val;
+        var ppn: Node = base.nodes[pp];
+        if (ppn.nb >= 0 || ppn.nc >= 0) { return false; }
+        pl = base.kids[pl].next;
+    }
+    return true;
+}
+
+pub fn fc_group_is_type() bool {
+    var i: i64 = 0;
+    while (i < g_fc_n) {
+        if (fc_clause_is_bare(g_fc_d[i]) == false) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
 // 子句诊断（脱糖发生在 parse 之后、check 之前，g_file 此时已就绪）
 pub fn fc_err(code: string, msg: string, d: i64) void {
     var l: i64 = n_line(d);
@@ -3216,8 +3349,12 @@ pub fn fc_merge() void {
             var p0: i64 = fc_list_nth(cn.lb, 0);
             var p0n: Node = base.nodes[p0];
             var is_wild: bool = p0n.ba;
-            // pass 0 仅具体臂；pass 1 仅通配臂
-            if ((pass == 0 && is_wild) || (pass == 1 && is_wild == false)) { c = c + 1; continue; }
+            // 兜底臂 = 无守卫且无模式（裸绑定 name 与通配 _ 两种写法都算），必须晚于所有
+            // 具体/守卫臂，否则会遮蔽后续子句（见 examples/overload_cross_a.tc：classify 的
+            // "default" 子句须排在 when 守卫子句之后）。
+            var is_catch_all: bool = (p0n.nc < 0 && p0n.nb < 0);
+            // pass 0 仅非兜底臂（具体/守卫）；pass 1 仅兜底臂
+            if ((pass == 0 && is_catch_all) || (pass == 1 && is_catch_all == false)) { c = c + 1; continue; }
             var be: i64 = fc_body_expr(cd);
             if (be < 0) {
                 fc_err("T-FUN-E814",
@@ -3268,6 +3405,149 @@ pub fn fc_merge() void {
     slice_set(lex.decl_list, g_fc_i[0], merged);
 }
 
+// 类型组脱糖（R3 类别格静态分派）：每个子句变成独立真实函数 __name__cK，
+// 调用点按首实参静态类型选最具体子句改写（见 sema.ovl_dispatch_call）。
+//   · 具体类型子句：__name__cK 直接登记为普通 FuncDecl（参数类型即声明类型，ABI 正确）。
+//   · 类别子句（anykind / scalarkind / integralkind / floatkind / namedkind）：
+//     首参声明类型不是真实类型，无法登记；降级为 ClauseDead 保留节点，调用点按需
+//     单态化（克隆 + 把类别名替换为具体类型，见 sema.ovl_instantiate）。
+// 另生成一个入口包装 name（调用最具体的具体子句 __name__c<entry>），保证 name 作为
+// 符号可解析（被当作一等函数值 / 反射引用时走到此包装）。
+pub fn fc_merge_type() void {
+    var base_name: string = base.nodes[g_fc_d[0]].sa;
+    var m: i64 = g_fc_n;
+    // 1. 各子句声明类别 + 是否类别 + 首参类型是否齐全
+    var cats: []string;
+    var is_cat: []bool;
+    var k: i64 = 0;
+    while (k < m) {
+        var cd: i64 = g_fc_d[k];
+        var cn: Node = base.nodes[cd];
+        var p0: i64 = fc_list_nth(cn.lb, 0);
+        if (p0 < 0) {
+            fc_err("T-OVL-E981", base.sb_cat3("type-group '", base_name, "': 首参数缺失"), cd);
+            return;
+        }
+        var cname: string = fc_param_catname(p0);
+        if (str_len(cname) == 0) {
+            fc_err("T-OVL-E981",
+                base.sb_cat3("type-group '", base_name,
+                    "': 每个子句首参数须带显式类型标注（如 `v: i64`），以便静态分派"), cd);
+            return;
+        }
+        append(cats, cname);
+        append(is_cat, ovl_is_category(cname));
+        k = k + 1;
+    }
+    // 1b. 单条「具体类型」子句 = 本就是普通函数，无需类别格分派：直接还原为普通
+    // FuncDecl（原名 + ia==0），不登记 g_ovl_tg、不生成入口包装。这样调用走常规
+    // 语义（含字面量 u8→i64 等隐式拓宽），否则静态分派会因实参静态类型（如 7→u8）
+    // 与声明类型（i64）不精确匹配而误报 T-OVL-E903（见 p_overload_values.tc 的 kind）。
+    // 单条「类别」子句不在此豁免（类别不是真实类型，必须走单态化分派）。
+    if (m == 1 && is_cat[0] == false) {
+        var cd0: i64 = g_fc_d[0];
+        var c0: Node = base.nodes[cd0];
+        c0.sa = base_name;
+        c0.ia = 0;
+        slice_set(base.nodes, cd0, c0);
+        return;
+    }
+    // 2. 入口 = 首个具体类型子句（静态分派需要具体入口；纯类别组需运行期类型标签，本期未实现）
+    var entry: i64 = -1;
+    var k2: i64 = 0;
+    while (k2 < m) {
+        if (is_cat[k2] == false) { entry = k2; }
+        k2 = k2 + 1;
+    }
+    if (entry < 0) {
+        fc_err("T-OVL-E982",
+            base.sb_cat3("type-group '", base_name,
+                "' 至少需要一个具体类型子句（纯类别子句需运行期类型标签，见 overload.md §2.8，本期未实现）"),
+            g_fc_d[0]);
+        return;
+    }
+    // 3. 元数一致性
+    var arity: i64 = list_count(base.nodes[g_fc_d[0]].lb);
+    var ka: i64 = 1;
+    while (ka < m) {
+        if (list_count(base.nodes[g_fc_d[ka]].lb) != arity) {
+            fc_err("T-FUN-E811",
+                base.sb_cat3("type-group '", base_name, "': all clauses must have the same arity"), g_fc_d[ka]);
+            return;
+        }
+        ka = ka + 1;
+    }
+    // 4. 返回类型一致性
+    var kr: i64 = 1;
+    while (kr < m) {
+        if (fc_type_key(base.nodes[g_fc_d[kr]].na) != fc_type_key(base.nodes[g_fc_d[0]].na)) {
+            fc_err("T-FUN-E813",
+                base.sb_cat3("type-group '", base_name, "': all clauses must declare the same return type"), g_fc_d[kr]);
+            return;
+        }
+        kr = kr + 1;
+    }
+    // 5. 登记组 + 重命名子句 + 类别模板降级
+    var gi: i64 = slice_len(g_ovl_tg_names) as i64;
+    append(g_ovl_tg_names, base_name);
+    append(g_ovl_tg_n, m);
+    var k3: i64 = 0;
+    while (k3 < m) {
+        var cd2: i64 = g_fc_d[k3];
+        var cn2: Node = base.nodes[cd2];
+        var newname: string = base.sb_cat3("__", base_name, base.sb_cat2("__c", base.i2s(k3)));
+        cn2.sa = newname;
+        cn2.ia = 0;
+        slice_set(base.nodes, cd2, cn2);
+        append(g_ovl_tg_func, newname);
+        append(g_ovl_tg_cat, cats[k3]);
+        if (is_cat[k3]) {
+            // 类别子句：保留首参/体供调用点按需单态化；降级为 ClauseDead 使其对
+            // register / 双后端发射的所有 `kind == "FuncDecl"` 分派不可见（不新增死代码路径）。
+            cn2.kind = "ClauseDead";
+            slice_set(base.nodes, cd2, cn2);
+            append(g_ovl_tg_tmpl, cd2);
+        } else {
+            append(g_ovl_tg_tmpl, -1);
+        }
+        k3 = k3 + 1;
+    }
+    // 6. 入口包装 name：调用最具体的具体子句 __name__c<entry>。
+    var ed: i64 = g_fc_d[entry];
+    var en: Node = base.nodes[ed];
+    var entry_name: string = base.sb_cat3("__", base_name, base.sb_cat2("__c", base.i2s(entry)));
+    var wh: i64 = -1;
+    var wt: i64 = -1;
+    var pl: i64 = en.lb;
+    while (pl >= 0) {
+        var pp: i64 = base.kids[pl].val;
+        var ppn: Node = base.nodes[pp];
+        var np: i64 = base.mk_P(ppn.sa, ppn.na, -1, -1);
+        wt = base.list_push(wh, wt, np);
+        if (wh < 0) { wh = wt; }
+        pl = base.kids[pl].next;
+    }
+    var ah: i64 = -1;
+    var at: i64 = -1;
+    var pl2: i64 = wh;
+    while (pl2 >= 0) {
+        var pp2: i64 = base.kids[pl2].val;
+        var ppn2: Node = base.nodes[pp2];
+        var argid: i64 = base.mk_ident(ppn2.sa, -1);
+        at = base.list_push(ah, at, argid);
+        if (ah < 0) { ah = at; }
+        pl2 = base.kids[pl2].next;
+    }
+    var callnode: i64 = base.mk_call(base.mk_ident(entry_name, -1), ah, -1);
+    var retnode: i64 = base.mk_return(callnode, -1);
+    var body: i64 = base.list_push(-1, -1, retnode);
+    var wrapper: i64 = base.mk_FuncDecl(base_name, false, false, en.na, -1, wh, body, -1);
+    var wn: Node = base.nodes[wrapper];
+    wn.ln = en.ln; wn.cl = en.cl; wn.tv = en.tv;
+    slice_set(base.nodes, wrapper, wn);
+    append(lex.decl_list, wrapper);
+}
+
 pub fn desugar_func_clauses() void {
     // overload（Route 1）：`extend overload` 必须引用本文件内已存在的
     // `overload fn` 组（ia==1），否则报 T-OVL-E980。跨文件合并见 Route 2。
@@ -3298,6 +3578,10 @@ pub fn desugar_func_clauses() void {
     while (i < n) {
         var d: i64 = lex.decl_list[i];
         var dn: Node = base.nodes[d];
+        // 分组守卫：仅「裸子句式」函数（ba==false）参与子句组合并；普通函数
+        // （ba==true，如 `fn main() i64 { ... }`）与脱糖产物一律跳过。类型组判定
+        // （fc_merge_type）额外要求 ia∈{1,2}（overload / extend overload），否则普通
+        // `fn` 裸子句组（即使全裸带类型）会误入 R3 类别格分派（见 T-OVL-E981）。
         if (dn.kind == "FuncDecl" && dn.ba == false) {
             g_fc_n = 0;
             g_fc_d[0] = d;
@@ -3316,19 +3600,28 @@ pub fn desugar_func_clauses() void {
                 }
                 j = j + 1;
             }
-            // 组内多于一条 → 必为子句组；单条但含模式参数 → 亦按子句组脱糖
-            // （便于 match 的穷尽性检查统一兜底，无需第二套诊断）
-            var need: bool = g_fc_n > 1;
-            if (need == false) {
-                var pc: i64 = dn.lb;
-                while (pc >= 0) {
-                    var pk: Child = base.kids[pc];
-                    if (pp_is_pattern(pk.val)) { need = true; }
-                    pc = pk.next;
+            // 类型组（全部子句纯裸绑定、首参带显式类型）→ R3 类别格静态分派。
+            // 值/结构组（含模式或守卫子句）→ 既有 match 脱糖（fc_merge）。
+            // ⚠ 类型组判定要求 ia∈{1,2}：普通 `fn` 裸子句组（ia==0）即使全裸带类型，
+            // 仍按值/模式组走 fc_merge，不进入 R3 类别格（避免误把 plain fn 当类型分派）。
+            var is_type: bool = fc_group_is_type() && (dn.ia == 1 || dn.ia == 2);
+            if (is_type) {
+                fc_merge_type();
+            } else {
+                // 组内多于一条 → 必为子句组；单条但含模式参数 → 亦按子句组脱糖
+                // （便于 match 的穷尽性检查统一兜底，无需第二套诊断）
+                var need: bool = g_fc_n > 1;
+                if (need == false) {
+                    var pc: i64 = dn.lb;
+                    while (pc >= 0) {
+                        var pk: Child = base.kids[pc];
+                        if (pp_is_pattern(pk.val)) { need = true; }
+                        pc = pk.next;
+                    }
                 }
-            }
-            if (need) {
-                fc_merge();
+                if (need) {
+                    fc_merge();
+                }
             }
         }
         i = i + 1;

@@ -561,10 +561,17 @@ overload 特性的实现按以下路线分期落地。每期独立验收、不�
 - 让 `@import` 把被引入文件中同名 overload 子句并入同一编译单元的脱糖组（需改 import 作用域与 `desugar_func_clauses` 跨来源文件分组；当前 CLI 单文件编译单元，见 `src/tc.tc` argv 门槛）。
 - `T-OVL-E901` 的「本文件内」约束放宽到「可见域内」；前置声明 / 根节点绑定在跨文件场景的归属待定。
 
-**Route 3 — 类别格分派（§2.7）** ⬜
-- 前置条件：先在类型系统建立 `anykind` / `scalarkind` / `integralkind` / `floatkind` … 类别树。当前 t 类型系统**无此类别**（§2.8 注已说明元组实现为合成具名 struct `_Tup_*`，无独立 `tuplekind` / `structkind` 运行时类别），故本路线被实现前提卡住。
-- 实现 `overload root(v: <类别>);` 前置声明 + 类型子句编译期按具体程度排序（判定规则一至四）+ 不可判定歧义诊断（`T-OVL-E902` 预留）。
-- 值 / 结构组与类别组按 §5.4 分层：外层类别子句、内层值 / 结构子句，两层各自独立排序。
+**Route 3 — 类别格分派（§2.7）** ✅
+- **落地方式：静态类型分派（编译期按实参静态类型选最具体子句，不引入运行期类型标签）**。类别格在解析期 / 语义期以字符串名实现：`anykind ⊃ scalarkind ⊃ {integralkind, floatkind}`，`namedkind` 覆盖 struct / enum / flag / variant / typealias 等具名类型；`string` / `bytes` 归入 `scalarkind`（overload.md §2.8）。
+- 具体程度（`parse.ovl_specificity`）：`-1`=具体类型精确匹配（最具体）；`0`=类别直接子（`integralkind`/`floatkind`/`namedkind`）；`1`=`scalarkind`；`2`=`anykind`；`<0`=不覆盖。调用点（`sema.ovl_dispatch_call`）取 `spec` 最小且唯一者，存在并列则报 `T-OVL-E903` 歧义，全部不覆盖报 `T-OVL-E901`/对应错误。
+- 类型组脱糖（`parse.fc_merge_type`）：每个子句降级为内部真实函数 `__name__cK`（`ia==0`），类别子句（`anykind` 等）保留为 `ClauseDead` 模板，调用点经 `sema.ovl_instantiate` 克隆 + 类型替换单态化；另生成入口包装 `name` 调用首个具体子句。组信息登记于扁平表 `g_ovl_tg_{names,cat,func,n,tmpl}`，供 `ovl_find_group` / `ovl_group_*_at` 查询。
+- 分组守卫：`desugar_func_clauses` 仅对裸子句式函数（`FuncDecl.ba==false`）分组；**类型组判定额外要求 `ia∈{1,2}`（`overload` / `extend overload`）**，普通 `fn` 裸子句组即使全裸带类型仍走值 / 结构组 `fc_merge`，不误入类别格（避免 `T-OVL-E981`）。
+- 验证基准：**双后端一致**（`examples/overload_type.tc` 经 LLVM + C 后端对拍，输出 `i64/f64/bool/integral/scalar`）；conformance `tests/conformance/pass/p_overload_type.tc` 通过；失败用例 `f_overload_type_nomatch.tc`（`T-OVL-E903` 歧义）、`f_overload_type_purecat.tc`（`T-OVL-E982` 纯类别组需具体入口）覆盖诊断边界。
+
+**Route 2 — 跨文件 `extend overload`** 🔧
+- 多文件编译单元（`src.tc.tc` `@import` + `tc_load_src` 按序拼接源码、统一 `parse_unit` 填入同一 `lex.decl_list`）已落地；跨文件同名 `overload fn` / `extend overload fn` 子句由 `desugar_func_clauses` 按名并入同一脱糖组（与同文件一致）。
+- `T-OVL-E980`（`extend overload` 须引用可见域内已存在的 `overload fn` 组）已落地；验证见 `examples/overload_cross_a.tc` + `examples/overload_cross_b.tc`（双文件协作，双后端）。
+- 前置声明 / 根节点绑定在跨文件场景的归属细节待 `decl_import` 规则法（L-15）补全，当前不影响编译产物与门禁。
 
 **明确不做**：真正函数重载（多个函数实体）。规范 §5.1 明确 overload 声明组脱糖后仅产生单一函数实体，本路线不偏离。
 

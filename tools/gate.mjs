@@ -380,7 +380,11 @@ const r = await node("ir_snapshot.mjs", "--compiler", `${G1}.exe`, "--jobs", "1"
         // 不随 irClean 跳过：对拍基线必须随每次提交累积，否则退化为一次性数字。
         id: "diffpipe", lv: 1, name: "双轨对拍 (旧轨 LLVM vs 新轨 TIR)",
         run: async () => {
-            const r = await node("_diffpipe.mjs", "--mode", "dbg", "--jobs", "4", "--strict");
+            // 用本次待验证的编译器 g3（boot23 步已自举，含本期 R3 类别格语法），
+            // 而非冻结的种子 tc.exe —— 种子 predate overload fn 语法，无法编译本期新增的
+            // overload_type / overload_catchall 等示例，会误报双轨不一致。
+            if (existsSync(`${G3}.exe`) === false) return { ok: false, note: "g3.exe 缺失：前置自举步骤未产出" };
+            const r = await node("_diffpipe.mjs", "--mode", "dbg", "--jobs", "4", "--strict", "--compiler", `${G3}.exe`);
             const lines = r.out.split("\n").filter((l) => l.startsWith("_diffpipe:"));
             const summary = lines.length ? lines[lines.length - 1].replace(/^_diffpipe:\s*/, "") : lastLine(r.out, 2);
             return { ok: r.code === 0, note: summary };

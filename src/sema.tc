@@ -2077,6 +2077,122 @@ pub fn instantiate_generic(tmpl: i64, e: i64) i64 {
     return inst;
 }
 
+// ── R3 类型组分派（类别格静态分派）──────────────────────────────
+// 调用点按首实参静态类型在类型组里选最具体覆盖子句：具体类型精确匹配（specificity -1）
+// > 类别（按 ovl_path_of_name 路径长度，integralkind > scalarkind > anykind 等）。
+// 类别子句按需单态化（克隆 + 把类别名替换为具体类型），与 comptime 泛型单态化同构。
+pub fn ovl_arg_typename(ti: i64) string {
+    // 把 t 的内部 TI kind 归一为类别格用的「类型名」：
+    //   Scalar  → 其名（i64 / u8 / f64 / bool …）
+    //   String  → "string"（TI 的 name 字段为空，须显式映射；见 sema.tc:5863 string 是独立 kind）
+    //   Bytes   → "bytes"
+    //   Named   → 其名（struct / enum）
+    // 其余（Slice / Map / Func / Unknown …）→ "" 表示无法静态分派。
+    var k: string = tip_kind(ti);
+    if (k == "Scalar") { return tip_name(ti); }
+    if (k == "String") { return "string"; }
+    if (k == "Bytes") { return "bytes"; }
+    if (k == "Named") { return tip_name(ti); }
+    return "";
+}
+
+pub fn ovl_dispatch_call(e: i64, gi: i64) i64 {
+    var n: Node = base.nodes[e];
+    var arg0: i64 = -1;
+    if (n.la >= 0) { arg0 = base.kids[n.la].val; }
+    if (arg0 < 0) {
+        parse.fc_err("T-OVL-E903",
+            base.sb_cat3("type-group '", parse.g_ovl_tg_names[gi], "' 至少需要一个实参用于静态分派"), e);
+        return ti_mk("Unknown");
+    }
+    var ei: i64 = ie_inst(e);
+    var at0: i64 = ie_sub_in(ei, arg0);
+    var a: string = ovl_arg_typename(at0);
+    var m: i64 = parse.ovl_group_count(gi);
+    var best: i64 = -1;
+    var bestspec: i64 = 1000000000;
+    var ambiguous: bool = false;
+    var k: i64 = 0;
+    while (k < m) {
+        var c: string = parse.ovl_group_cat_at(gi, k);
+        var spec: i64 = parse.ovl_specificity(a, c);
+        // spec == -2：不覆盖；spec == -1：具体类型精确匹配（最具体）；spec >= 0：类别匹配（值越小越具体）。
+        // ⚠ 旧实现只接受 spec >= 0，把最具体的精确匹配（-1）也误判为「不覆盖」→ 全部子句漏选 → E903。
+        if (spec == -2) { k = k + 1; continue; }
+        if (spec < bestspec) { bestspec = spec; best = k; ambiguous = false; }
+        else if (spec == bestspec) { ambiguous = true; }
+        k = k + 1;
+    }
+    if (best < 0) {
+        parse.fc_err("T-OVL-E903",
+            base.sb_cat5("type-group '", parse.g_ovl_tg_names[gi],
+                "': 没有子句覆盖静态类型 '", a, "'"), e);
+        return ti_mk("Unknown");
+    }
+    if (ambiguous) {
+        parse.fc_err("T-OVL-E902",
+            base.sb_cat3("type-group '", parse.g_ovl_tg_names[gi],
+                "': 多个子句同样匹配（静态分派歧义）"), e);
+        return ti_mk("Unknown");
+    }
+    var target: string = parse.ovl_group_func_at(gi, best);
+    var tmpl: i64 = parse.ovl_tmpl_at(gi, best);
+    if (tmpl >= 0) {
+        target = ovl_instantiate(gi, best, a);
+        if (str_len(target) == 0) { return ti_mk("Unknown"); }
+    }
+    var cn: Node = base.nodes[n.na];
+    cn.sa = target;
+    slice_set(base.nodes, n.na, cn);
+    return infer_expr(e);
+}
+
+pub fn ovl_instantiate(gi: i64, best: i64, a: string) string {
+    var tmplname: string = parse.ovl_group_func_at(gi, best);
+    var iname: string = sanitize_sym(base.sb_cat3(tmplname, "__", a));
+    var si: i64 = sym_lookup(global_scope, iname);
+    if (si >= 0) {
+        return iname;
+    }
+    var tmpl: i64 = parse.ovl_tmpl_at(gi, best);
+    var catname: string = parse.ovl_group_cat_at(gi, best);
+    var tnode: i64 = type_node_from_ident(a);
+    var inst: i64 = clone_node(tmpl);
+    var inn: Node = base.nodes[inst];
+    inn.sa = iname;
+    inn.kind = "FuncDecl";
+    inn.ia = 0;
+    inn.na = subst_type_in_node(inn.na, catname, tnode);
+    var pp: i64 = inn.lb;
+    while (pp >= 0) {
+        var ppn: Node = base.nodes[base.kids[pp].val];
+        ppn.na = subst_type_in_node(ppn.na, catname, tnode);
+        slice_set(base.nodes, base.kids[pp].val, ppn);
+        pp = base.kids[pp].next;
+    }
+    inn.lc = subst_type_in_kids(inn.lc, catname, tnode);
+    inn.lc = subst_type_ident_kids(inn.lc, catname, tnode);
+    slice_set(base.nodes, inst, inn);
+    append(lex.decl_list, inst);
+    register_decl(inst);
+    var sq: bool = g_meta_quiet;
+    var st2: i64 = g_menv_top;
+    var sb2: i64 = g_menv_base;
+    g_meta_quiet = false;
+    g_meta_err = false;
+    g_menv_top = g_menv_nglobal;
+    g_menv_base = g_menv_nglobal;
+    if (g_meta_steps < 200000) { g_meta_steps = 200000; }
+    mb_walk_list(base.nodes[inst].lc);
+    meta_walk_list(base.nodes[inst].lc);
+    g_meta_quiet = sq;
+    g_meta_err = false;
+    g_menv_top = st2;
+    g_menv_base = sb2;
+    if (base.nodes[inst].lc != -2) { check_func_decl(inst); }
+    return iname;
+}
+
 // ── P0-2 + P0-3：实例体补齐检查的落点 ──────────────────────────
 // 实例体的补齐检查（嵌套泛型再单态化 + 体内 format/!j 脱糖）落在 `instantiate_generic`
 // 末尾：克隆+代换后即重跑 check_func_decl（见该函数末尾注释）。理由是该步处于主检查循环
@@ -6594,6 +6710,14 @@ pub fn infer_expr(e: i64) i64 {
         // 实参不走通用遍历，嵌套其中的 format 只能在这里补扫（详见 fmt_scan_subtree）
         if (parse.g_has_format) { fmt_scan_list(n.la, e); }
         var cn: Node = base.nodes[n.na];
+        // R3 类别格静态分派：若 callee 是类型组入口，按首实参静态类型选最具体子句改写 callee。
+        // 改写后目标名（`__name__cK` 或单态实例名）不在类型组表里，重入 infer_expr 不会再分派，自然收敛。
+        if (cn.kind == "ident") {
+            var gi0: i64 = parse.ovl_find_group(cn.sa);
+            if (gi0 >= 0) {
+                return ovl_dispatch_call(e, gi0);
+            }
+        }
         // 方法式 `"tmpl".format(a, b)`（M57）：与函数式 `format("tmpl", a, b)` 完全同义。
         // 实现取「归一化」而非「另起一套」——就地把 receiver 挪成第 0 个实参、callee 换成
         // 裸 `format`，随后交给同一个 desugar_format_call。两种写法因此共享同一份模板文法、
