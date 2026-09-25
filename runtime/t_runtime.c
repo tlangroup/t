@@ -1230,6 +1230,23 @@ TSlice t_slice_from_raw(void* ptr, int64_t len, int64_t elem_size) {
     return s;
 }
 
+// 切片合并 `++`（§15.6）：分配足以容纳 a.len+b.len 个元素的新缓冲，按元素大小逐段拷贝，
+// 返回新 TSlice（len=cap=总和）。与 t_slice_new 同构、arena 分配。
+TSlice t_slice_concat(TSlice a, TSlice b) {
+    if (g_arena == NULL) t_fatal("t_slice_concat: arena not initialized");
+    int64_t total = a.len + b.len;
+    int64_t esz = a.elem_size;
+    TSlice r = t_slice_new(esz);
+    if (total > 0) {
+        r.ptr = t_arena_alloc(g_arena, (size_t)(total * esz));
+        r.cap = total;
+        if (a.len > 0) memcpy(r.ptr, a.ptr, (size_t)(a.len * esz));
+        if (b.len > 0) memcpy((uint8_t*)r.ptr + a.len * esz, b.ptr, (size_t)(b.len * esz));
+    }
+    r.len = total;
+    return r;
+}
+
 void t_runtime_set_arena(TArena* a) { g_arena = a; }
 TArena* t_arena_current(void) { return g_arena; }
 
