@@ -2265,6 +2265,28 @@ pub fn emit_expr(e: i64) string {
             if (lcat == "slice" && rcat == "slice") {
                 return base.sb_cat5("t_slice_concat(", emit_expr(n.na), ", ", emit_expr(n.nb), ")");
             }
+            // 定长数组 [N]T ++ [M]T ⇒ [N+M]T：结果在 arena 上分配（与切片合并同源），
+            // 以字节数传参（sizeof(T)*N），避免元素尺寸在 C 侧反推（§15.6）。
+            if (lcat == "array" && rcat == "array") {
+                var aec2: string = desc_to_c(sema.tds[clt].elem);
+                var sbac: StringBuilder = sb_new();
+                sb_append_str(sbac, "((");
+                sb_append_str(sbac, aec2);
+                sb_append_str(sbac, "*)t_array_concat(");
+                sb_append_str(sbac, emit_expr(n.na));
+                sb_append_str(sbac, ", sizeof(");
+                sb_append_str(sbac, aec2);
+                sb_append_str(sbac, ") * ");
+                sb_append_str(sbac, base.i2s(sema.tds[clt].alen));
+                sb_append_str(sbac, ", ");
+                sb_append_str(sbac, emit_expr(n.nb));
+                sb_append_str(sbac, ", sizeof(");
+                sb_append_str(sbac, aec2);
+                sb_append_str(sbac, ") * ");
+                sb_append_str(sbac, base.i2s(sema.tds[crt].alen));
+                sb_append_str(sbac, "))");
+                return sb_to_str(sbac);
+            }
             // 兜底（不应到达，sema 已拦截类型不匹配）：以 bitstr 路径保编译通过。
             return base.sb_cat5("t_bitstr_concat(", emit_expr(n.na), ", ", emit_expr(n.nb), ")");
         }
@@ -3399,6 +3421,12 @@ pub fn emit_stmt(sid: i64, indent: i64) void {
             // 缓冲再让指针指向它，否则 `var a: [8]i64;` 之后 a[0]=x 会写野指针。
             if (t.cat == "array" && t.alen > 0) {
                 var aecy: string = desc_to_c(t.elem);
+                // `var c: [N+M]T = a ++ b;`：右端已是 arena 分配的 T*，不是花括号聚合初值，
+                // 不能再走 `T c_abuf[N+M] = <ptr>;`（C 不允许用指针初始化数组）⇒ 直接以指针形态声明。
+                if (n.nb >= 0 && base.nodes[n.nb].kind == "binary" && base.nodes[n.nb].sa == "Concat") {
+                    spush(base.sb_cat6(pad, aecy, "* ", n.sa, " = ", base.sb_cat2(emit_expr(n.nb), ";")));
+                    return;
+                }
                 var abuf: string = base.sb_cat2(n.sa, "_abuf");
                 var adim: string = base.sb_cat3("[", base.i2s(t.alen), "]");
                 if (n.nb < 0) {

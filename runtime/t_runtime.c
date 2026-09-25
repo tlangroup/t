@@ -1247,6 +1247,19 @@ TSlice t_slice_concat(TSlice a, TSlice b) {
     return r;
 }
 
+// 定长数组合并 `[N]T ++ [M]T ⇒ [N+M]T`（§15.6）。
+// 以「字节数」而非元素个数传参：元素尺寸由调用方（C 后端 sizeof(T)*N、LLVM 后端
+// GEP-null-1）精确给出，避免运行时反推元素布局（结构体元素尤其不可反推）。
+void* t_array_concat(void* a, int64_t abytes, void* b, int64_t bbytes) {
+    if (g_arena == NULL) t_fatal("t_array_concat: arena not initialized");
+    int64_t total = abytes + bbytes;
+    if (total <= 0) { return NULL; }
+    void* out = t_arena_alloc(g_arena, (size_t)total);
+    if (abytes > 0 && a != NULL) memcpy(out, a, (size_t)abytes);
+    if (bbytes > 0 && b != NULL) memcpy((uint8_t*)out + abytes, b, (size_t)bbytes);
+    return out;
+}
+
 void t_runtime_set_arena(TArena* a) { g_arena = a; }
 TArena* t_arena_current(void) { return g_arena; }
 

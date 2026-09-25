@@ -139,6 +139,7 @@ typedef struct { void* ptr; int64_t len; int64_t cap; int64_t elem_size; } TSlic
 TSlice t_slice_new(int64_t elem_size);
 TSlice t_slice_from_raw(void* ptr, int64_t len, int64_t elem_size); // 定长数组 → 切片零拷贝视图
 TSlice t_slice_concat(TSlice a, TSlice b);                       // 切片合并（arena 分配，复制两份缓冲）
+void*   t_array_concat(void* a, int64_t abytes, void* b, int64_t bbytes); // 定长数组合并（arena 分配，按字节复制两份缓冲）
 void   t_slice_append(TSlice* s, const void* elem);
 void   t_slice_append_sized(TSlice* s, const void* elem, int64_t elem_size);
 void*  t_slice_at(TSlice s, int64_t i);        // 越界 → panic + JSON 诊断；返回元素地址

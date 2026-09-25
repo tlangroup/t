@@ -118,6 +118,12 @@ int64_t tll_slice_len(TSlice* s)                             { return t_slice_le
 void    tll_slice_sub(TSlice* s, int64_t a, int64_t b, TSlice* out) { *out = t_slice_sub(*s, a, b); }
 // 切片合并 `++`（§15.6）：聚合入参/返回一律走指针，out 排末位（与 tll_str_concat 同构）。
 void    tll_slice_concat(TSlice* a, TSlice* b, TSlice* out) { *out = t_slice_concat(*a, *b); }
+// 定长数组合并 `++`（§15.6）：out 由调用方 alloca（[N+M x T]），按字节数复制两段。
+// ⚠ 不复用 t_array_concat（它 arena 分配新缓冲）—— LLVM 侧 dst 槽已有存储，直接写入即可。
+void    tll_array_concat(void* a, int64_t abytes, void* b, int64_t bbytes, void* out) {
+    if (abytes > 0 && a != NULL) memcpy(out, a, (size_t)abytes);
+    if (bbytes > 0 && b != NULL) memcpy((uint8_t*)out + abytes, b, (size_t)bbytes);
+}
 // 定长数组 → 切片零拷贝视图（聚合返回走指针，out 排末位）
 void    tll_slice_from_raw(void* ptr, int64_t len, int64_t elem_size, TSlice* out) { *out = t_slice_from_raw(ptr, len, elem_size); }
 

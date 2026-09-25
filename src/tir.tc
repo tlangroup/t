@@ -1095,6 +1095,25 @@ pub fn tir_expr_td(e: i64) i64 {
     }
     // P5：() 空元组字面量 = unit 值，类型即 void TD（与 codegen_c 的 expr_type_desc 同构）。
     if (n0.kind == "unit_lit") { return sema.td_mk("void"); }
+    // `++` 集合合并（§15.6）：结果类型 **不能**沿用「二元运算取左操作数类型」的常规推导。
+    // 定长数组 [N]T ++ [M]T ⇒ [N+M]T，与左右操作数都不同。取左型会让结果槽按 [N x T] 分配
+    // 却被写入 N+M 个元素（写穿邻槽），且下游只拷回前 N 个（实测拼接结果 `10 20 30 0 0`）。
+    // String/Slice/BitStr 合并后类型与左操作数一致，无需特判。
+    // ⚠ 必须放在下方 node.td 缓存早返回之前：缓存里可能已残留「左操作数」的错误 TD。
+    if (n0.kind == "binary" && n0.sa == "Concat") {
+        var arrcat_ltd: i64 = tir_expr_td(n0.na);
+        var arrcat_rtd: i64 = tir_expr_td(n0.nb);
+        if (arrcat_ltd >= 0 && arrcat_rtd >= 0 &&
+            arrcat_ltd < slice_len(sema.tds) as i64 && arrcat_rtd < slice_len(sema.tds) as i64) {
+            if (sema.tds[arrcat_ltd].cat == "array" && sema.tds[arrcat_rtd].cat == "array") {
+                var arrcat_ot: i64 = sema.td_elem_mk("array", sema.tds[arrcat_ltd].elem);
+                var arrcat_td: TD = sema.tds[arrcat_ot];
+                arrcat_td.alen = sema.tds[arrcat_ltd].alen + sema.tds[arrcat_rtd].alen;
+                slice_set(sema.tds, arrcat_ot, arrcat_td);
+                return arrcat_ot;
+            }
+        }
+    }
     // v3 §5.3：优先读 HIR 类型槽（sema 一次性填入），避免每次重推导 + 影子表反推。
     // ⚠ 缓存值须做越界检查：node.td 可能取自更大 sema.tds 上下文的残留索引，直接返回会毒化下游 sema.tds[td] 索引。
     var cached_td: i64 = base.nodes[e].td;
@@ -3123,6 +3142,20 @@ pub fn tir_emit_binary(n: Node, e: i64) TirEmitRes {
         rsr = tir_emit_expr(n.nb);
     }
     var rs: string = rsr.name;
+    // `++` 定长数组合并（§15.6）：结果存储型必须是 [N+M x T]，绝不能沿用左操作数的 [N x T]
+    //（上方 `if (ost == "i64") { ost = tir_expr_st(n.na) }` 回落正是取左型）。否则结果槽只
+    // 分配 N 个元素却被写入 N+M 个 → 写穿邻槽，且下游按 [N x T] 拷回，实测拼接结果尾部
+    // 恒为 0（`10 20 30 0 0`）。
+    // ⚠ 只改结果型 ost，不动 ostc —— ostc 是「操作数」型，用于给入参加标记，改了会污染实参。
+    if (op == "Concat" && ltd >= 0 && rtd >= 0 &&
+        ltd < slice_len(sema.tds) as i64 && rtd < slice_len(sema.tds) as i64 &&
+        sema.tds[ltd].cat == "array" && sema.tds[rtd].cat == "array") {
+        var ccat_td3: i64 = sema.td_elem_mk("array", sema.tds[ltd].elem);
+        var ccat_t3: TD = sema.tds[ccat_td3];
+        ccat_t3.alen = sema.tds[ltd].alen + sema.tds[rtd].alen;
+        slice_set(sema.tds, ccat_td3, ccat_t3);
+        ost = tir_st_of_td(ccat_td3);
+    }
     var opc: string = tir_binop(n.sa, ost);
     var d: string = tir_tmp();
     var __bin_args: []TirOperand = [];

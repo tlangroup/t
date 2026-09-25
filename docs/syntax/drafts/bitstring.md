@@ -178,7 +178,8 @@
 ### 15.6 设计决策补充（19:20）：`++` 合并符推广到所有集合类型
 - **决策**：`++` 作为**所有集合类型的合并操作符**（Slice/Array/String/bitstr/Map 合并），与数值 `+`（仅标量加法）彻底解耦。先随 bitstr 落地 `bitstr ++ bitstr`，再逐步推广到其余集合类型。
 - **依据**：Erlang/Elixir 传统——`++` 表列表/二进制拼接，`+` 仅数值；避免「`+` 既加数字又拼字符串」的语义混淆（§11.4 值语义一致性延伸）。
-- **推广顺序**：bitstr(本期) → String → Slice（**已落地，双后端**) → Array → Map(merge)。每推广一类须在 sema 加 `++` 分派分支 + 双后端发射 + conformance。
+- **推广顺序**：bitstr(本期) → String → Slice（**已落地，双后端**) → Array（**已落地，双后端**) → Map(merge)。每推广一类须在 sema 加 `++` 分派分支 + 双后端发射 + conformance。
+- **定长数组合并的长度算术**：`[N]T ++ [M]T ⇒ [N+M]T`（元素类型须一致，否则 `T-BIT-E515`）。⚠ **结果类型是新增的第三种类型**，既不沿用左型也不沿用右型——而 t 的二元运算结果类型推导默认「取左操作数类型」（`codegen_c.expr_type_desc` binary 分支、`tir.tc` `tir_emit_binary` 的 `ost` 回落 `tir_expr_st(n.na)`）。故数组 `++` 必须在两处显式覆盖结果类型，否则结果槽按 `[N x T]` 分配却被写入 `N+M` 个元素（写穿邻槽），且下游只拷回前 N 个（实测拼接结果尾部恒为 0：`10 20 30 0 0`）。现已于 `tir.tc` 的 `tir_expr_td` 与 `tir_emit_binary` 两处加 `Concat` 特判。
 - **兼容处置**：若 t 现有 `+` 曾用于字符串/切片拼接，需改为 `++` 并在迁移期保留诊断（如 `T-OP-W...` 提示「用 ++ 拼接集合」）；纯数值 `+` 不变。
 - **`++` 与自增冲突**：核查 lexer 是否已用 `++` 作自增（C 风格）；若已占用，bitstr/集合合并的 `++` 与之在语法位置（中缀 vs 前缀/后缀）可共存，否则需改自增为 `+=` 或 `+= 1`。见 §15.7 核查。
 
@@ -188,17 +189,17 @@
 - **词法**：`lex.tc` 新增两字符 token `PlusPlus`（`++`，与 `+=` 字符对不冲突）。
 - **语法**：`parse.tc` 新增 `parse_concat`（`++` 中缀层级，介于 range 与 in 之间）；`parse_primary`/`parse_match_alt_atom` 在 primary 位置把 `<<` 当作位串字面量起点（`ShiftLeft` 在 primary 位置 = 位串字面量，左移需左操作数，无冲突）；新增 `parse_bitstr_lit(pat)` 解析 `<<v:W, ... | v/bitstr, ...>>`。
 - **类型**：`sema.tc` 新增 TI kind `BitStr` 与 TD cat `bitstr` 全链路（`resolve_ti`/`resolve_type_desc` 的 `named`/`ident` 分支、`ti_from_td`、`ti_to_td_base`、`ti_to_type_node`、`mk_type_node_from_ti`、`ti_equal`、`td_readable`、`desc_to_c`）；`base.tc` 新增节点 `bitstr`/`bitstr_seg`/`bitstr_pat` 与构造子。
-- **`++` 分派（§15.6 推广）**：`sema.tc` `Concat` 运算支持 `BitStr`/`String`/`Slice` 三类（切片按 `ti_equal` 比元素类型，不一致 → `T-BIT-E515`）；Array/Map 合并为后续增量。
+- **`++` 分派（§15.6 推广）**：`sema.tc` `Concat` 运算支持 `BitStr`/`String`/`Slice`/`Array` 四类（切片与数组均按 `ti_equal` 比元素类型，不一致 → `T-BIT-E515`；数组结果长度 = 两侧 `alen` 之和）；Map 合并为后续增量。
 - **位串字面量推断**：总位宽 = 各定长段 `Width` 之和；非整数字面量位宽 → `T-BIT-E511`；多于一个 `/bitstr` 尾段 → `T-BIT-E516`。
-- **C 后端发射**：`codegen_c.tc` 位串字面量 → `t_bitstr_new` + 逐段 `t_bitstr_append_val`（MSB-first 位打包）；`++` 按操作数类型分派 `t_str_concat`/`t_bitstr_concat`/`t_slice_concat`；`for (x in bs)` 逐字节遍历（`x: u8`，游标 `bs.ptr[_fe_i]`，计数 `ceil(bit_len/8)`）。
-- **LLVM 后端发射**：`tir.tc` 新增 `TIR_OP_CONCAT(=63)`；`opmap.tc` 的 `tir_binop`/`tir_op_from_str` 双向映射；`tir_to_ll.tc` 按 st 分派 `tll_str_concat`/`tll_slice_concat`（sret 末位 out，与既有 `tll_str_concat` 同构）；`t_shim_ll.c` 新增 `tll_slice_concat`。**BitStr 在 LLVM 仍为既有缺口**（位串字面量尚未在 LLVM 实现，`++` 对 bitstr 在 LLVM 静默 no-op，与改动前一致）。
-- **运行时**：`t_runtime.c/.h` 新增 `TBitStr{ptr,bit_len,cap}` 与 `t_bitstr_*` 系列，以及 `t_slice_concat`（arena 分配，复制两份缓冲）；`t_shim_ll.c` 新增 `tll_slice_concat`。
+- **C 后端发射**：`codegen_c.tc` 位串字面量 → `t_bitstr_new` + 逐段 `t_bitstr_append_val`（MSB-first 位打包）；`++` 按操作数类型分派 `t_str_concat`/`t_bitstr_concat`/`t_slice_concat`/`t_array_concat`（数组以**字节数**传参 `sizeof(T)*N`，结果 arena 分配；`var c: [N+M]T = a ++ b;` 须直接以指针形态声明，不能走 `T c_abuf[N+M] = <ptr>;` —— C 不允许用指针初始化数组）；`for (x in bs)` 逐字节遍历（`x: u8`，游标 `bs.ptr[_fe_i]`，计数 `ceil(bit_len/8)`）。
+- **LLVM 后端发射**：`tir.tc` 新增 `TIR_OP_CONCAT(=63)`；`opmap.tc` 的 `tir_binop`/`tir_op_from_str` 双向映射；`tir_to_ll.tc` 按 st 分派 `tll_str_concat`/`tll_slice_concat`/`tll_array_concat`（数组 out 排末位，写入调用方 alloca 的 `[N+M x T]`，不另分配）；两侧字节数用 `getelementptr <arrTy>, ptr null, i32 1 → ptrtoint` 惯用法精确求得（对任意元素类型成立，含嵌套聚合 —— 不用 `ll_sizeof_st`，它对未登记的聚合元素会兜底返回 8）；`t_shim_ll.c` 新增 `tll_slice_concat`/`tll_array_concat`。**BitStr 在 LLVM 仍为既有缺口**（位串字面量尚未在 LLVM 实现，`++` 对 bitstr 在 LLVM 静默 no-op，与改动前一致）。
+- **运行时**：`t_runtime.c/.h` 新增 `TBitStr{ptr,bit_len,cap}` 与 `t_bitstr_*` 系列，以及 `t_slice_concat` / `t_array_concat`（arena 分配，复制两份缓冲；数组版按字节数传参，不反推元素布局）；`t_shim_ll.c` 新增 `tll_slice_concat`/`tll_array_concat`。
 
 ### 16.2 验证
 - **自举不动点**：`g_bit`(seed→src) → `g2` → `g3` → `g4`，三代为 `src/tc.tc` 的 emit-ll md5 完全一致，确认改动不破坏自托管。
 - **端到端（C 后端）**：`examples/bitstr_demo.tc` 经 `compile --emit-c` + clang 链接运行，输出 `byte=184`（6-bit 合并 `101110` = 0xB8），返回字节计数 1。
-- **端到端（双后端 `++` 推广）**：`examples/concat_demo.tc`（`String ++` 与 `Slice ++`）经 C 与 LLVM 两后端运行，输出一致（`Hello, World!` + `1..5`），已补 `.expected.txt` 纳入 gate 双后端对拍。
-- **前端 conformance**：bitstr 4 例（`p_bitstr_basic` / `f_bitstr_width` E511 / `f_bitstr_tworest` E516 / `f_bitstr_concat_type` E515）+ `++` 推广 2 例（`p_concat_basic` / `f_concat_slice_elem` E515），均按预期通过 `--check`。
+- **端到端（双后端 `++` 推广）**：`examples/concat_demo.tc`（`String ++`、`Slice ++`、**Array `++`**）经 C 与 LLVM 两后端运行，输出一致（`Hello, World!` + `1..5` + `10..50`），已补 `.expected.txt` 纳入 gate 双后端对拍。
+- **前端 conformance**：bitstr 4 例（`p_bitstr_basic` / `f_bitstr_width` E511 / `f_bitstr_tworest` E516 / `f_bitstr_concat_type` E515）+ `++` 推广 3 例（`p_concat_basic` / `p_concat_array` / `f_concat_slice_elem` E515），均按预期通过 `--check`。
 - **IR 基线**：改前端后已用 `ir_snapshot.mjs --update --compiler g4.exe` 重录（112 targets / 339 entries）。
 - **`++` 冲突核查（§15.6）**：全量扫描 `src/`、`examples/`、`lib/`、`tests/conformance` 既无 `a++`/`++a` 自增用法，确认 `++` 中缀引入无二义（见 §15.7）。
 
@@ -206,6 +207,6 @@
 - **LLVM 后端**：`codegen_ll.tc` 的 `bitstr` 字面量 / `Concat` / `for_each` 发射（当前 `build` 默认走 LLVM，`examples/bitstr_demo.tc` 刻意未配 `.expected.txt` 不参与双后端对拍，待 LLVM 补齐后补配）。
 - **位串模式匹配**：`bitstr_pat` 当前占位 `(*(TBitStr*)0)`；`§6` 的 match 解糖（段内 ident 绑定 + 运行时位解包）未实现。
 - **`.len`/`.bit_len` 成员**：位串逻辑位长访问（当前 demo 借 `for (x in c)` 计数绕开）。
-- **`++` 推广**：String / Slice / Array / Map 合并（§15.6 推广顺序），每类需 sema 分派 + 双后端发射 + conformance。
+- **`++` 推广**：仅剩 **Map 合并**（§15.6 推广顺序最后一类）：需 sema 加 `++` 分派分支 + 双后端发射 + conformance。String / Slice / Array 三类均已落地（双后端）。
 - **BinarySerde 交互**：`@derive(BinarySerde)` 与 bitstr 的衔接（§14.2 列为 deferred gap）。
 
