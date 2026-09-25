@@ -517,14 +517,69 @@ pub fn parse_range() i64 {
 // 成员测试级：`x in <range>` → bool。右操作数当前只接受区间字面量，
 // 由 sema 就地降解为 `(x >= lo && x <= hi)`，两个后端永远看不到 `in`。
 // 与 `for (x in xs)` 零冲突：for 头部在调用 parse_expr **之前**已自行吃掉 `in`。
-pub fn parse_in() i64 {
+// 集合合并级 `++`（§15.6）：bitstr/Slice/String/... 合并，与数值 `+` 解耦。
+// 夹在 in 级与 range 级之间（塔只向下扩展，不重排）；`++` 优先级低于 `+`/`<<`。
+pub fn parse_concat() i64 {
     var left: i64 = parse_range();
+    while (lex.cur_t() == "PlusPlus") {
+        var ti: i64 = lex.advance_i();
+        var right: i64 = parse_range();
+        left = base.mk_binary("Concat", left, right, ti);
+    }
+    return left;
+}
+
+pub fn parse_in() i64 {
+    var left: i64 = parse_concat();
     while (lex.cur_t() == "KwIn") {
         var ti: i64 = lex.advance_i();
         var right: i64 = parse_range();
         left = base.mk_binary("in", left, right, ti);
     }
     return left;
+}
+
+// 位串字面量 / 模式：`<<val:W, val/bitstr, ...>>`。
+// pat=false → 表达式位（kind "bitstr"）；pat=true → match 模式位（kind "bitstr_pat"，段内 ident 即绑定）。
+// 段：val[:Width][/big|/little] 或 val/bitstr（变长尾段，须为最后一段）。
+pub fn parse_bitstr_lit(pat: bool) i64 {
+    var ti0: i64 = lex.advance_i();   // 吃掉 ShiftLeft
+    var h: i64 = -1;
+    var t: i64 = -1;
+    if (lex.cur_t() != "ShiftRight") {
+        while (true) {
+            var val: i64 = parse_primary();
+            var width: i64 = -1;
+            var endian: string = "";
+            var rest: bool = false;
+            if (lex.cur_t() == "Colon") {
+                lex.advance_i();
+                width = parse_primary();
+            }
+            if (lex.cur_t() == "Slash") {
+                lex.advance_i();
+                if (lex.cur_t() != "Identifier") {
+                    parse_fatal_at("T-BIT-E513", "位串段 `/` 后须为 bitstr/big/little 说明符", lex.pos);
+                }
+                var spi: i64 = lex.advance_i();
+                var sp: string = lex.tk_v(spi);
+                if (sp == "bitstr") { rest = true; }
+                else if (sp == "big" || sp == "little") { endian = sp; }
+                else { parse_fatal_at("T-BIT-E513", base.sb_cat3("未知位串说明符 `", sp, "`"), spi); }
+            }
+            var seg: i64 = base.mk_bitstr_seg(val, width, endian, rest, -1);
+            t = base.list_push(h, t, seg);
+            if (h < 0) { h = t; }
+            if (lex.cur_t() == "Comma") { lex.advance_i(); continue; }
+            break;
+        }
+    }
+    if (lex.cur_t() != "ShiftRight") {
+        parse_fatal_at("T-BIT-E514", "位串字面量须以 `>>` 闭合", ti0);
+    }
+    lex.advance_i();
+    if (pat) { return base.mk_bitstr_pat(h, -1); }
+    return base.mk_bitstr(h, -1);
 }
 
 pub fn parse_assign_expr() i64 {
@@ -4309,6 +4364,10 @@ pub fn parse_match_alt_atom() i64 {
         lex.advance_i();
         return -1;
     }
+    // 位串模式 `<<seg:W, rest/bitstr>>`：模式起始位的 `<<`（左移不在模式文法里）。
+    if (lex.cur_t() == "ShiftLeft") {
+        return parse_bitstr_lit(true);
+    }
     if (lex.cur_t() == "LBracket") {
         return parse_slice_pat();
     }
@@ -4486,6 +4545,11 @@ pub fn parse_primary() i64 {
     }
     if (t == "KwMatch") {
         return parse_match_expr();
+    }
+    // Erlang 式位串字面量 `<<seg:W, ...>>`：表达式起始位的 `<<` 此前未使用
+    // （左移 `<<` 在更高优先级塔层、必有左操作数，不会走到 primary）。pat=true 用于 match 模式。
+    if (t == "ShiftLeft") {
+        return parse_bitstr_lit(false);
     }
     if (t == "Integer") {
         var ti_Integer: i64 = lex.advance_i();

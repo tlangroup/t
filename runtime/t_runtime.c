@@ -149,6 +149,56 @@ TStr t_str_concat(TStr a, TStr b) {
     TStr r; r.ptr = buf; r.len = n; return r;
 }
 
+// ── 位串 bitstr（§15）─────────────────────────────────────────
+TBitStr t_bitstr_new(int64_t bit_len) {
+    // 创建**空**容器：分配足以容纳 bit_len 位的字节，初始 bit_len=0。
+    // 语义调用方（字面量用 t_bitstr_append_val 逐段填充；t_bitstr_concat 显式写 bit_len）
+    // 都从 0 开始累积，避免「new 已填 + append 再叠」造成的越界（§15）。
+    int64_t bytes = (bit_len + 7) / 8;
+    uint8_t* buf = (uint8_t*)t_arena_alloc(t_arena_current(), (size_t)bytes);
+    if (bytes > 0) { memset(buf, 0, (size_t)bytes); }
+    TBitStr r; r.ptr = buf; r.bit_len = 0; r.cap = bytes; return r;
+}
+
+TBitStr t_bitstr_concat(TBitStr a, TBitStr b) {
+    int64_t total = a.bit_len + b.bit_len;
+    TBitStr r = t_bitstr_new(total);
+    for (int64_t i = 0; i < a.bit_len; i++) {
+        int bit = (a.ptr[i / 8] >> (7 - (i % 8))) & 1;
+        if (bit) { r.ptr[i / 8] |= (uint8_t)(1 << (7 - (i % 8))); }
+    }
+    for (int64_t i = 0; i < b.bit_len; i++) {
+        int64_t dst = a.bit_len + i;
+        int bit = (b.ptr[i / 8] >> (7 - (i % 8))) & 1;
+        if (bit) { r.ptr[dst / 8] |= (uint8_t)(1 << (7 - (dst % 8))); }
+    }
+    r.bit_len = total;
+    return r;
+}
+
+void t_bitstr_append_val(TBitStr* dst, uint64_t val, int64_t bits, int little) {
+    int64_t cur = dst->bit_len;
+    for (int64_t i = 0; i < bits; i++) {
+        int64_t srcbit = little ? i : (bits - 1 - i);
+        int bit = (int)((val >> srcbit) & 1);
+        int64_t pos = cur + i;
+        if (bit) { dst->ptr[pos / 8] |= (uint8_t)(1 << (7 - (pos % 8))); }
+        else { dst->ptr[pos / 8] &= (uint8_t)~(1 << (7 - (pos % 8))); }
+    }
+    dst->bit_len = cur + bits;
+}
+
+void t_bitstr_append_bitstr(TBitStr* dst, TBitStr src) {
+    for (int64_t i = 0; i < src.bit_len; i++) {
+        int bit = (src.ptr[i / 8] >> (7 - (i % 8))) & 1;
+        int64_t pos = dst->bit_len + i;
+        if (bit) { dst->ptr[pos / 8] |= (uint8_t)(1 << (7 - (pos % 8))); }
+    }
+    dst->bit_len += src.bit_len;
+}
+
+int64_t t_bitstr_bitlen(TBitStr s) { return s.bit_len; }
+
 uint8_t t_str_byte_at(TStr s, int64_t i) {
     if (i < 0 || i >= s.len) t_panic_bounds(i, s.len, "t_str_byte_at");
     return s.ptr[i];

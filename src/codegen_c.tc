@@ -449,6 +449,8 @@ pub fn emit_ctype(tn: i64) string {
         // 因为运行时 t_ti_*/t_fi_* 接收 TTypeInfo*/TFieldInfo*。
         if (n.sa == "TypeInfo") { return "TTypeInfo*"; }
         if (n.sa == "FieldInfo") { return "TFieldInfo*"; }
+        // 位串基元类型 `bitstr`：值级 (ptr u8, bit_len, cap) ⇒ C 侧 TBitStr（§15）。
+        if (n.sa == "bitstr") { return "TBitStr"; }
         return n.sa;
     }
     if (n.kind == "array") {
@@ -593,6 +595,7 @@ pub fn desc_to_c(td: i64) string {
     if (t.cat == "typeinfo") { return "TTypeInfo*"; }
     if (t.cat == "fieldinfo") { return "TFieldInfo*"; }
     if (t.cat == "slice") { return "TSlice"; }
+    if (t.cat == "bitstr") { return "TBitStr"; }
     if (t.cat == "array") { return c_ptr_to(t.elem); }
     if (t.cat == "map") { return "TMap*"; }
     if (t.cat == "pointer") {
@@ -1125,6 +1128,9 @@ pub fn collect_local_types(head: i64) void {
             var itd: TD = sema.tds[it];
             if (itd.cat == "slice" && itd.elem >= 0) {
                 fs_set(em_cur_fn, n.sa, itd.elem);
+            }
+            if (itd.cat == "bitstr") {
+                fs_set(em_cur_fn, n.sa, sema.ti_scalar("u8"));
             }
             if (itd.cat == "map" && itd.key >= 0) {
                 fs_set(em_cur_fn, n.sa, itd.key);
@@ -2078,6 +2084,51 @@ pub fn emit_expr(e: i64) string {
     if (n.kind == "string") {
         return base.sb_cat3("TSTR_LIT(\"", esc_c(n.sa), "\")");
     }
+    // 位串字面量 `<<seg:W, ...>>`（§15）：构造 TBitStr 并逐段写位。
+    // 固定段 → t_bitstr_append_val；变长尾段 /bitstr → t_bitstr_concat。
+    if (n.kind == "bitstr") {
+        var sb: StringBuilder = sb_new();
+        var fixed_bits: i64 = 0;
+        var has_rest: bool = false;
+        var c: i64 = n.la;
+        while (c >= 0) {
+            var seg: Node = base.nodes[base.kids[c].val];
+            if (seg.ba) { has_rest = true; }
+            else { var wn: Node = base.nodes[seg.nb]; fixed_bits = fixed_bits + parse_int_len(wn.sa, wn.ia); }
+            c = base.kids[c].next;
+        }
+        var fixed_bytes: i64 = (fixed_bits + 7) / 8;
+        sb_append_str(sb, "({ TBitStr _bs = t_bitstr_new(");
+        sb_append_i64(sb, fixed_bits);
+        sb_append_str(sb, "); ");
+        c = n.la;
+        while (c >= 0) {
+            var seg: Node = base.nodes[base.kids[c].val];
+            if (seg.ba) {
+                sb_append_str(sb, "_bs = t_bitstr_concat(_bs, ");
+                sb_append_str(sb, emit_expr(seg.na));
+                sb_append_str(sb, "); ");
+            } else {
+                var little: i64 = 0;
+                if (seg.sa == "little") { little = 1; }
+                sb_append_str(sb, "t_bitstr_append_val(&_bs, (uint64_t)(");
+                sb_append_str(sb, emit_expr(seg.na));
+                sb_append_str(sb, "), ");
+                var wn: Node = base.nodes[seg.nb];
+                sb_append_i64(sb, parse_int_len(wn.sa, wn.ia));
+                sb_append_str(sb, ", ");
+                sb_append_i64(sb, little);
+                sb_append_str(sb, "); ");
+            }
+            c = base.kids[c].next;
+        }
+        sb_append_str(sb, "_bs; })");
+        return sb_to_str(sb);
+    }
+    if (n.kind == "bitstr_pat") {
+        // TODO（§6 match 解糖）：占位，bitstr 模式匹配为后续增量；此处不应被发射。
+        return "(*(TBitStr*)0)";
+    }
     if (n.kind == "typeinfo") {
         return emit_type_info_c(n.sa);
     }
@@ -2198,6 +2249,10 @@ pub fn emit_expr(e: i64) string {
             if (lt >= 0 && rt >= 0 && sema.tds[lt].cat == "string" && sema.tds[rt].cat == "string") {
                 return base.sb_cat5("t_str_concat(", emit_expr(n.na), ", ", emit_expr(n.nb), ")");
             }
+        }
+        // 集合合并 `++`（§15.6）：bitstr 合并降级为 t_bitstr_concat。
+        if (op == "Concat") {
+            return base.sb_cat5("t_bitstr_concat(", emit_expr(n.na), ", ", emit_expr(n.nb), ")");
         }
         // 瓦片逐元素算术：扁平 T* 缓冲上用 GCC 语句表达式嵌套循环，逐元素 a[i][j] OP b[i][j]。
         if (op == "+" || op == "-" || op == "*" || op == "/" || op == "%"
@@ -3404,6 +3459,22 @@ pub fn emit_stmt(sid: i64, indent: i64) void {
         var fe_elem_td: i64 = -1;
         if (it.cat == "slice" && it.elem >= 0) {
             fe_elem_td = it.elem;
+        }
+        // bitstr 字节迭代：元素 u8，游标走 TBitStr.ptr[_fe_i]，计数 = ceil(bit_len/8)。
+        if (it.cat == "bitstr") {
+            var iterb: string = emit_expr(n.na);
+            base.g_seen_push();
+            spush(base.sb_cat6(pad, "for (int64_t _fe_i = 0; _fe_i < ((t_bitstr_bitlen(", iterb, ") + 7) / 8); _fe_i = _fe_i + 1) {", "", ""));
+            spush(base.sb_cat6(base.sb_cat2(pad, "    "), "uint8_t ", n.sa, " = ", iterb, ".ptr[_fe_i];"));
+            var b2: i64 = n.la;
+            while (b2 >= 0) {
+                var bk2: Child = base.kids[b2];
+                emit_stmt(bk2.val, indent + 2);
+                b2 = bk2.next;
+            }
+            spush(base.sb_cat2(pad, "}"));
+            base.g_seen_pop();
+            return;
         }
         var iter: string = emit_expr(n.na);
         base.g_seen_push();

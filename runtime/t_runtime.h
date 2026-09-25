@@ -146,6 +146,15 @@ int64_t t_slice_len(TSlice s);
 void*  t_slice_ptr(TSlice s);                  // 底层数组首地址（供 memset/序列化）
 TSlice t_slice_sub(TSlice s, int64_t a, int64_t b); // s[a..b] 子切片视图；越界 → panic
 
+// ── 位串 bitstr（§15）：任意位宽位序列；binary 为字节对齐特例 ──
+// 与 TSlice 同构（ptr/len/cap），但长度单位是 bit 而非 byte；尾部字节未用位填 0。
+typedef struct { uint8_t* ptr; int64_t bit_len; int64_t cap; } TBitStr;
+TBitStr t_bitstr_new(int64_t bit_len);                       // arena 分配 ceil(bit_len/8) 字节，清零
+TBitStr t_bitstr_concat(TBitStr a, TBitStr b);               // 位级拼接（a.bit_len + b.bit_len）
+void    t_bitstr_append_val(TBitStr* dst, uint64_t val, int64_t bits, int little); // 写 bits 低位到 dst 游标
+void    t_bitstr_append_bitstr(TBitStr* dst, TBitStr src);  // 追加整个 src（位级）
+int64_t t_bitstr_bitlen(TBitStr s);                          // 返回 s.bit_len
+
 // ── map[K]V：开放寻址，K 限定 string / 整数 ───────────────────
 // key_kind: 0 = TStr, 1 = int64
 typedef struct TMap TMap;
