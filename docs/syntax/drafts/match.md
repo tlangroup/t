@@ -25,9 +25,20 @@ Guard: "when" Expr
 
 MatchPat:
     | Literal        // 字面量相等匹配（整数 / 字符串）
+    | StructLitPat   // struct / 元组字面量模式（见下）
     | CaseName       // enum 成员：裸写 `Red` 或限定写 `Color.Red`，两者等价
     | Ident          // 绑定：匹配任意值并绑定到该名字（首字母必须小写，见 §2 C2）
     | "_"            // 通配占位：匹配任意值，不绑定变量
+
+// struct / 元组字面量模式：按字段逐一比较是否等于给定字面量
+// 类型名可省（前导点），匿名元组走位置元素形态
+StructLitPat:
+      TypeName? "{" FieldPatInit ("," FieldPatInit)* "}"   // 具名字段
+    | "." "{" PatternExpr ("," PatternExpr)* "}"           // 匿名元组（位置式）
+FieldPatInit:
+      "." ident "=" PatternExpr     // `.x = 0`
+    | ident ":" PatternExpr         // `x: 0`（旧式）
+PatternExpr: Literal                // ⚠ 现仅支持字面量常量，**不是绑定**
 
 CaseName: (EnumName ".")? UpperIdent
 
@@ -66,6 +77,11 @@ ParamPattern:
 - **结果类型统一（L-03 静态类型）**：各臂表达式须推断为同一类型 `R`，`MatchExpr` 整体即 `R`；不一致报 `T_MATCH_ARM_TYPE`。
 - **函数子句分发语义（纯语法糖）**：多个同名同元数的 `FuncDecl` 构成子句组。调用时**从左到右**匹配各子句参数模式，首个「全部模式匹配且守卫为真」的子句被选中。编译器在 AST lowering 阶段**强制**把整组脱糖为单一 `FuncDecl`，其体即 `return match (__p0) { ... };` —— `match` 是唯一语义真源，函数子句不引入独立语义。子句组声明头与 `reference.md` §3.1 并置式一致，禁止重载。
 - **绑定作用域（L-02 显式）**：模式绑定仅在其臂 / 子句作用域内可见，遮蔽同名外部变量，`match` 结束后外层不受影响，无隐式生命周期。
+- **struct / 元组字面量模式的语义（2026-09-25 实测）**：
+  - 语义是**按字段逐一相等比较**：`Pt{ .x = 0, .y = 0 }` ≡ 「`p.x == 0 && p.y == 0`」；`.{1i64, "a"}` ≡ 「`t._0 == 1i64 && t._1 == "a"`」。省字段即少一道比较（`Pt{ .x = 0 }` 只比 `x`）。
+  - **不引入绑定**：字段后的小写标识符**不是**绑定名。`Pt{ x: a, y: b }` 不绑定 `a`/`b`（这与 Rust/Swift 的解构直觉相反），在臂体内引用报 `T-SEM-E201`。
+  - ⚠ **不做充分静态校验**：未知字段名（`Pt{ zz: 0 }`）与未定义标识符（`Pt{ x: zzz, y: 0 }`）在 struct 字面量模式里**均不报诊断**（`tc check` 通过）。C 后端会把它们原样发射，导致 clang 阶段才报 C 的未定义符号。故拼写错误编译期不可见。
+  - ⚠ **LLVM 后端运行期错编（KI-002，open）**：比较条件被整体丢弃 → **首臂恒命中**；C 后端正确。详见 §6.3。
 
 ---
 
@@ -158,7 +174,7 @@ fn fib(_) i64 { return 0 - 1; }
 | 构造 | 操作数类型 | 能力 | 状态 |
 |---|---|---|---|
 | `switch` | 标量 / 整数 / 枚举值 | 值相等分发 | 🚫 **已废弃并移除**（2026-08-01 从 `reference.md` 删除词法记号 / 产生式 / 节点定义） |
-| `match`（表达式） | 标量 / 字符串 / `enum` | 相等 + CaseName 分发 + 绑定 + `when` 守卫 + 穷尽性 | ✅ 已实装 |
+| `match`（表达式） | 标量 / 字符串 / `enum` / `struct` / 元组 | 相等 + CaseName 分发 + 绑定 + `when` 守卫 + 穷尽性；struct/元组走**字面量模式**按字段逐一相等比较（不绑定，LLVM 轨有缺陷见 §6.3） | ✅ 已实装 |
 | 函数子句 `fn FuncName(...)` | 参数列表（模式 + `when`） | 声明级多子句分发（**纯语法糖**，lowering 脱糖为 match） | ✅ 已实装 |
 
 `switch` 移除后，表达式级值分发仅余 `match` 一种写法。函数子句虽在源码层是另一种写法，但经用户裁定（§7.1）定义为 **`match` 的语法糖**，AST lowering 阶段强制脱糖，语义真源唯一，L-04 满足。
@@ -265,6 +281,81 @@ fn pick(c: Expl) string {
 **已补守卫生 gate**：新增 `examples/enum_match_dispatch.tc`（+ `.expected.txt`）作为常规门禁用例，覆盖四种根因 + 三种语法形态（裸 `Case` / `Color.Red` / `.Red`）+ 有无 backing + 自动编号/显式值 + 局部与内联 scrutinee + 绑定兜底臂 + `as i32` 窄化。已用修复**前**的编译器验证该用例确实失败（返回首臂 / 链接报错），确保它不是空跑。
 
 **验证**（2026-09-23）：`run_examples` 71/71（双后端）、`conformance` 274/274、`hir_test` RAW=0、`hir_eval_test` 全绿、IR 基线已由 g1 重录（97 targets / 294 entries）。
+
+---
+
+### 6.3 未修运行期缺陷（KI-002 open）：struct / 元组字面量模式在 LLVM 轨恒命中首臂
+
+> 🐞 **状态：open（2026-09-25 复确认）**。`docs/code-style-guide.md` 与 `docs/compiler/known-issues.md` 曾记载 KI-002 已于 `fb6eeaf` 修复；2026-09-25 的双后端对拍显示该结论**在 LLVM 轨上不成立**，故重新置为 open。
+>
+> **归属说明（重要）**：已用 **`2a3c4b6^`（= `0b212ac`，元组特性的上一个提交）源码独立重建编译器**交叉复验，得到同样错误结果 ⇒ **不是 2026-09-25 元组 / `.x=` 特性引入的**。回归窗口为 `fb6eeaf..0b212ac` 之间的约 123 个提交（`fb6eeaf` 时期的源码在当前方言下已无法编译——旧源码触 `T-SEM-E201`，故无法用现役编译器重建该时间点产物来复核当年的「已修复」结论是否是误判）。精确 culprit 待按此窗口二分。
+
+**现象**：struct / 匿名元组**字面量模式**的判别条件在 **LLVM 后端被整体丢弃**，第一条 arm 无条件命中；**C 后端语义正确**（逐字段相等比较）。
+
+**最小复现**：
+
+```t
+struct Pt { x: i64; y: i64; }
+fn at_origin(p: Pt) i64 {
+    return match (p) { Pt{ x: 0, y: 0 } => 1, _ => 0 };
+}
+// at_origin(Pt{ x: 1, y: 2 })  —— 期望 0
+//   LLVM 轨（tc run）                     : 1   ✗
+//   C 轨（tc compile --emit-c + clang）   : 0   ✓
+```
+
+仓库内既有复现用例：`tests/known-issues/KI-002_struct_literal_pat.tc`（期望输出 `0`，`tc run` 实测 `1`；同一份源码走 C 轨输出 `0`）。
+
+**实测矩阵（2026-09-25，基准 `2a3c4b6`）**：
+
+| 用例 | scrutinee | 模式 | LLVM | C 轨 | 判定 |
+|---|---|---|---|---|---|
+| `x1` | `Pt{ .x = 1, .y = 2 }` | `Pt{ x: 0, y: 0 }` | 命中首臂 | 不匹配 | LLVM ✗ |
+| `x3` | `.{1i64, 2i64}` | `.{1i64, 9i64}`（次元素不同） | 命中首臂 | 不匹配 | LLVM ✗ |
+| `x4` | `Pt{ .x = 1, .y = 2 }` | `Pt{ .x = 1, .y = 2 }` | 命中 | 命中 | 双轨一致 ✓ |
+| `v1` | `.{1i64, "a"}` | `.{1i64, "a"}` | 命中 | 命中 | 双轨一致 ✓ |
+
+⇒ 只在「应当**不**匹配」的分叉上暴露；全匹配场景侥幸正确，故极易被漏测。
+
+**根因定位（LLVM IR 证据）**：`tc emit-ll` 的产物里 `at_origin` **不含任何 `icmp` / 条件分支** —— 函数入口直接 `br label %at_origin.Lm.b1`，第二块（`_` 兜底臂）**无任何前驱**，是死块：
+
+```llvm
+define i64 @at_origin(%Pt %at_origin.p.in) {
+  %at_origin._ = alloca %Pt
+  store %Pt %at_origin.p.in, ptr %at_origin.p
+  %at_origin.llt0 = load %Pt, ptr %at_origin.p
+  store %Pt %at_origin.llt0, ptr %at_origin._
+  br label %at_origin.Lm.b1          ; ← 无条件跳首臂，全程无 icmp
+at_origin.Lm.b1:
+  store i64 1, ptr %at_origin.t0     ; ← arm 1
+  br label %at_origin.Lm.e0
+at_origin.Lm.b2:                     ; ← 无前驱，死代码（arm `_`）
+  store i64 0, ptr %at_origin.t1
+```
+
+对照同一份源码的 C 后端产物（`codegen_c`）是**正确**的逐字段比较：
+
+```c
+Pt _tms1 = p;
+if (((_tms1.x == 0) && (_tms1.y == 0))) { _tmr1 = 1; } else { _tmr1 = 0; }
+```
+
+⇒ 缺陷只在 **LLVM / TIR 轨**；推测与 §6.2 根因 ① 同族（`tir_match_pattern_cond` 对 struct_lit 模式返回空条件串 ⇒ dispatch 退化为无条件跳转，未走 `named` 回查分支）。
+
+**为何门禁未拦住**：与 §6.2 同构 —— ① `tests/known-issues/` **不被 conformance / difftest / run_examples 自动扫描**（设计如此，仅手动跑）；② `examples/` 全仓无「struct/元组字面量模式 + 运行期判别」用例，既有 struct 示例一律用字段访问；③ `conformance` 只校验编译期行为。故该路径运行期**零覆盖**，错编长期不可见。
+
+**用户侧规避（必须）**：不要用 struct / 元组字面量模式做运行期判别，改写为显式比较：
+
+```t
+fn at_origin(p: Pt) i64 {
+    if ((p.x == 0) && (p.y == 0)) { return 1; }
+    return 0;
+}
+```
+
+另一处相关静默（同一路径）：struct **字面量**（含模式位）里的**未知字段名不报诊断** —— `Pt{ zz: 0 }` 与 `Pt{ x: zzz, y: 0 }` 均 `tc check` 通过；后者在 C 轨会一路发射到 clang 才报 C 的未定义符号。字段名拼写需人工核对。
+
+**修复验收待办**：① LLVM 轨补发 struct_lit / 元组模式的逐字段比较（使其 IR 出现对应 `icmp` 与条件 `br`）；② 字面量模式补「未知字段名 + 未定义标识符」的 sema 诊断；③ 新增 `examples/` 常规门禁用例，覆盖 struct/元组字面量模式的**双后端运行期对拍**（建成前先用修复前的编译器确认用例会失败，避免空跑）。
 
 ---
 

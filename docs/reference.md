@@ -436,6 +436,13 @@ sfield : Ident ":" ( Integer | type ) anns ";"
     la = @anns
 }
 
+// ⚠ 2026-09-25 元组扩展（**手写**，非本表驱动）：`struct_decl` 的成员循环已手写扩展出
+// **位置字段元组**形态 `struct Pair { i64, string }`（§3.21）——此类成员不再经由 `sfield`
+// 构造，而是解析 `@type` 后按序自动命名 `_0`/`_1`/… 并直接入成员链表；故本表中
+// `sfield*`（具名字段 / 位宽字段）已**不是** `parse_struct_decl` 成员形态的完整描述。
+// 因 totter 数据优先生成管线已废弃、`GEN:parser_rules`（`src/parse.tc`）转为**冻结快照 +
+// 手写维护**，此处保留原规则作历史溯源，以 `src/parse.tc` 实际实现与 §3.21 为准。
+
 // ── 表达式二进制优先级塔（fold=bin：左结合二元运算折叠）──
 // 形状：base ( (op | op | ...) base )*  →  while (op) { left = mk_bin(op, left, parse_base(), ti); }
 // 运算符字面量即 mk_bin 的 op 串（"&&"→"&&"、"<<"→"<<"），token kind 由 gen_ebnf 的 OPKIND 映射。
@@ -876,27 +883,41 @@ ModuleItem:
     | ImportDecl        // ⚠ spec-only（代码模块导入，语法经 L-15 采纳，实现待排期）
 
 FuncDecl:
-    FuncName "fn" "(" (Param ("," Param)*)? ")" ("->")? Type FuncAnns? Block
+    "fn" FuncName "(" (Param ("," Param)*)? ")" Type FuncAnns? Block
 
 FuncName: IDENTIFIER
 Param:    ParamName ":" Type
 ```
 
-- 函数用**并置形式** `Name fn(...) Ret { ... }` 声明（spec §1.3：参数类型后置、禁止重载、禁止隐式返回、所有分支显式 `return`）。返回类型**紧跟参数表、无 `->` 记号**（规范唯一写法）。旧代码使用的 `Name fn(...) -> Ret { ... }` 箭头形式**已于编译器移除、不再被接受**，统一改用无箭头并置式 `Name fn(...) Ret { ... }`。
+- 函数用**关键字领头**形式 `fn name(...) Ret { ... }` 声明（spec §1.3：参数类型后置、禁止重载、禁止隐式返回、所有分支显式 `return`）。返回类型**紧跟参数表、无 `->` 记号**（规范唯一写法）。旧并列式 `Name fn(...) Ret { ... }` 已于编译器**移除**，报 `T-PAR-E102`（message 形如 `function declarations must use the fn name(...) form`）；更早的 `Name fn(...) -> Ret { ... }` 箭头形式亦早已不被接受。struct 声明与方法同律见 §3.1 结构体段。
 - ✅ tote：已支持 `fn` 声明、`@main` 入口、`@test` 等注解；`enum` 常数枚举（编译期常量赋值）已实装（见 §3.18）；`union` 标记但未实装。
 
 ```ebnf
 StructDecl:
-    StructName "struct" StructAnns? "{" (StructField ";")* "}"
+    "struct" StructName Layout? StructAnns? "{" (StructMember)* "}"
 
-StructField:
+Layout:
+    "#" ("soa" | "aos")          // 缺省 default（AOS）
+
+StructMember:
+      NamedField                 // name ":" Type … ";"   —— 具名字段
+    | PositionalField            // Type ("," Type)*      —— 位置字段（元组结构体，见 §3.21）
+    | StructMethod               // "fn" MethodName … Block（见 §3.1.1.2）
+
+NamedField:
     FieldName ":" Type (Annotation)* ( "@" IntLiteral )? ( "=" Expression )? (Annotation)*
+
+PositionalField:
+    Type ("," PositionalField)*   // 自动命名 `_0`/`_1`/…，以 `,` 分隔，不带 `;`
 
 StructAnns:
     "@derive" "(" DeriveCap ("," DeriveCap)* ")"
 ```
 
-- 字段以 `;` 结尾；字段可挂 `@doc` / `@export` / `@binary_offset(N)` / `@binary_skip` 等注解。
+- **声明语序唯一**：`struct Name { … }`（关键字领头）。旧 name-first 写法 `Name struct { … }` 已删除，报 `T-PAR-E102`（message：`type declarations must use the struct Name form`）。`enum` 同律（见 §3.18）。
+- **具名字段**以 `;` 结尾；字段可挂 `@doc` / `@export` / `@binary_offset(N)` / `@binary_skip` 等注解，以及 tagID `@ N` 与默认值 `= expr`（见 §3.1.1.1）。
+- **位置字段**用于元组结构体，以 `,` 分隔且**不写 `;`**（写了报 `T-PAR-E101`）：`struct Pair { i64, string }`。字段名自动分配 `_0`/`_1`/…，可用 `p._0` 或序号 `p.0` 访问。语义详见 §3.21。
+- 具名字段与位置字段**可混写**，但位置字段计数只统计位置字段（`struct Mix { x: i64; string }` 的 `string` 是 `_0` 而非 `_1`），容易误读——**不推荐混写**，优先「全具名」或「全位置」。混写时位置字段后须跟 `,` 再接具名字段（`struct Mix { string, y: i64; }`）。
 - ⚠ spec-only：`@derive` 全能力（当前 tc 的 `@derive` 处理函数体为空壳/带已知 bug，见 `src/tc.tc` `process_derive`）。
 
 #### 3.1.1.1 字段 tagID（`@ N`）与默认值（`= expr`） ✅ tote（M-tagID）
@@ -907,12 +928,12 @@ StructAnns:
 - **默认值 `= expr`**：给字段一个默认表达式；构造 struct 字面量时若省略该字段，则由编译器在检查期合成该默认值填充（双后端自动受益）。`expr` 类型须可转型为该字段类型，否则报 `T_TYPE_MISMATCH`。
 
 ```t
-Point struct {
+struct Point {
     x: i64 @ 1;
     y: i64 @ 2 = 42;     // 显式 tagID + 默认值
     z: i64 @ 3;
 }
-Auto struct {             // 全自动：无 @N → tagID 按声明序 1,2,3 隐式分配
+struct Auto {             // 全自动：无 @N → tagID 按声明序 1,2,3 隐式分配
     a: i64;
     b: i64 = 7;           // 仅默认值，无 tagID
     c: i64;
@@ -968,12 +989,11 @@ VariantCase:
 struct 体内除字段外还可直接书写**方法声明**，语法与顶层 `FuncDecl` 完全一致。方法在**解析期**被脱糖为顶层自由函数，`struct` 本身仍是**纯数据**（字段表不变、内存布局不变、后端零改动）。
 
 ```ebnf
-StructDecl:
-    StructName "struct" StructAnns? "{" (StructField ";" | StructMethod)* "}"
-
 StructMethod:
-    MethodName "fn" "(" (Param ("," Param)*)? ")" ("->")? Type FuncAnns? Block
+    "fn" MethodName "(" (Param ("," Param)*)? ")" Type FuncAnns? Block
 ```
+
+- **方法亦为关键字领头**（与顶层 `fn` 一致）：`fn mname(...) Ret { ... }`。旧 `Name fn(...)` 写法已删除，报 `T-PAR-E102`（message 形如 `method len fn(...) removed; use fn len(...)`）。返回类型并置、无 `->` 记号。
 
 脱糖规则（两条，无例外）：
 
@@ -981,22 +1001,22 @@ StructMethod:
 2. **类型 `Self`** 在方法签名（形参类型、返回类型）与函数体（局部变量类型标注、struct 字面量名）中全部改写为宿主 struct 名。
 
 ```t
-List struct {
+struct List {
     items: []i64;
 
-    new  fn()    Self                    { var l: Self; return l; }
-    push fn(self: Self, v: i64)    Self  { append(self.items, v); return self; }
-    len  fn(self: Self)    i64           { return slice_len(self.items); }
+    fn new()                   Self  { var l: Self; return l; }
+    fn push(self: Self, v: i64) Self { append(self.items, v); return self; }
+    fn len(self: Self)          i64  { return slice_len(self.items); }
 }
 ```
 
 ⇓ 等价于
 
 ```t
-List struct { items: []i64; }
-list_new  fn()    List                   { var l: List; return l; }
-list_push fn(self: List, v: i64)    List { append(self.items, v); return self; }
-list_len  fn(self: List)    i64          { return slice_len(self.items); }
+struct List { items: []i64; }
+fn list_new()                    List { var l: List; return l; }
+fn list_push(self: List, v: i64) List { append(self.items, v); return self; }
+fn list_len(self: List)          i64  { return slice_len(self.items); }
 ```
 
 约束与说明：
@@ -1004,7 +1024,7 @@ list_len  fn(self: List)    i64          { return slice_len(self.items); }
 - **没有 receiver 调用语法**。调用一律走自由函数：`list_push(l, 10)`，不是 `l.push(10)`。语法糖只作用于**声明侧**，`.` 仍然只表示字段访问 / 模块限定访问。
 - **`self` 不是关键字**，只是形参名的惯例；第一个形参写什么名字、是否存在，编译器都不关心。因此**无 `self` 形参的「静态方法」**（如 `new`）同样合法，脱糖结果一致。
 - 字段与方法可**任意交错**书写；方法不进字段表，`type_info` / `@derive` / 二进制布局均不受影响。
-- 方法**继承宿主 struct 的 `export` 标记**：`export List struct { ... }` 的所有方法都是模块导出符号，跨模块以 `list.list_push(...)` 访问（重整为 `list__list_push`）。
+- 方法**继承宿主 struct 的 `export` 标记**：`export`d struct（`pub struct List { ... }` 配合 `@module(pub)`）的所有方法都是模块导出符号，跨模块以 `list.list_push(...)` 访问（重整为 `list__list_push`）。
 - 脱糖后的自由函数与手写的同名顶层函数**完全等价**，因此**不得重名**（否则触发重复定义诊断）；同理，方法之间不构成「函数子句组」——名字已按 `struct_方法` 唯一化。
 - 实现位置：`src/tc.tc` 的 `parse_struct_decl` / `parse_method_decl` / `desugar_self_node` / `flush_struct_methods`（解析期合成真实 `FuncDecl` 节点并按「宿主 struct 在前、方法在后」的顺序并入 `decl_list`）。
 - 参考实现：`examples/lib/list.tc`（切片列表 `List`，10 个方法）+ `examples/list_demo.tc`；conformance `p36_struct_method_ok`。
@@ -1152,8 +1172,12 @@ UnaryExpr: ("!" | "-" | "~") UnaryExpr | PostfixExpr
 
 // 后缀（左结合，可堆叠）；`as` 仅在后缀循环结束后出现一次
 PostfixExpr:
-    PrimaryExpr (("." ident) | ("[" Expr "]") | ("(" Args? ")"))*
+    PrimaryExpr (MemberAccess | IndexAccess | Call)*
     ("as" Type)?
+
+MemberAccess: "." ( ident | integer )     // `p.x` 具名字段；`t.0` 元组位置字段（`0` → `_0`，见 §3.21）
+IndexAccess:  "[" Expr "]"
+Call:         "(" Args? ")"
 
 Args: Expr ("," Expr)*
 
@@ -1168,6 +1192,7 @@ PrimaryExpr:
     | IdentExpr
     | TypeInfoExpr
     | StructLit
+    | TupleLit                // ✅ tc 匿名元组字面量 `.{e1, e2}`（见 §3.21）
     | ArrayLit
     | MapLit
     | FuncLit                 // ✅ tote 匿名函数字面量（M46）
@@ -1195,7 +1220,14 @@ BoolLit:  "true" | "false"
 NullLit:  "null"
 IdentExpr: ident
 TypeInfoExpr: "type_info" "(" ident ")"      // 编译期类型信息内建
-StructLit: ident "{" (ident ":" Expr ("," ident ":" Expr)*)? "}"
+StructLit: TypeName? "{" FieldInit ("," FieldInit)* "}"
+TypeName:  ident | "."                 // "." 前导点：省略类型名，类型由上下文推断
+FieldInit:
+      "." ident "=" Expr               // `.x = v`（字段名带前导点、`=` 关联）
+    | ident ":" Expr                   // `x: v`（旧式 `:` 关联，为保自举不动点仍接受）
+
+TupleLit: "." "{" Expr ("," Expr)* ","? "}"   // `.{e1, e2}` 位置元素，无字段名（见 §3.21）
+
 ArrayLit:  "[" (Expr ("," Expr)*)? "]"
 MapLit:    "[" (Expr ":" Expr ("," Expr ":" Expr)*)? "]"   // 当首元素后跟 ":"
 FuncLit:   "fn" "(" ParamList? ")" ("->")? Type Block         // 匿名函数；静态类型即同签名 FuncType
@@ -1205,7 +1237,7 @@ FuncLit:   "fn" "(" ParamList? ")" ("->")? Type Block         // 匿名函数；
 - **全行为显式（L-02）**：`as` 为唯一显式类型转换（仅一次、不可 `e as T1 as T2`）；无隐式类型转换 / 隐式布尔 / 隐式内存分配；复合字面量（数组 `[...]` / map `[k:v]` / 结构体 `T{...}`）显式构造。
 - **静态类型安全（L-03）**：每个 `Expr` 的静态类型由 checker 推算；元素 / 字段 / 下标 / `type_info` 静态校验；`MapLit` 与 `ArrayLit` 共用 `[ ]`，由首元素后是否跟 `:`` 向前看消歧（无二义）。
 - **唯一写法（L-04 ✅）**：调用 `f(x)`、转换 `e as T`、下标 `e[i]`、成员 `e.f`、结构体 `T{...}`、数组 `[...]`、map `[k:v]`、匿名函数 `fn(...) T {...}` 均仅一种标准写法，无 `->` 记号。函数返回类型一律并置（`fn(...) T`），编译器已于 2026-08-20 移除对 `fn(...) -> T` 箭头的解析，规范彻底收敛为唯一写法（见 §3.1 声明形式）。
-- **匿名函数字面量 `FuncLit`** ✅ tote（M46）：与函数**声明**靠「`fn` 前有无名字」区分——声明位先吃名字（`Name fn(...)`），表达式位裸 `fn` 即字面量，无二义。返回类型紧跟参数表（与声明一致，无 `->` 记号）：`fn(...) Ret`（L-02 全行为显式）。语义与限制见 §3.5。
+- **匿名函数字面量 `FuncLit`** ✅ tote（M46）：声明走关键字领头 `fn Name(...)`（见 §3.1），表达式位为 `fn(...) Ret Block`；二者由 `fn` 之后**有无名字**（以及首次出现的句法位置）区分，无二义。返回类型紧跟参数表（与声明一致，无 `->` 记号）：`fn(...) Ret`（L-02 全行为显式）。语义与限制见 §3.5。
 - `>>>` 注意：比较/移位序列中 `>>` 不得被词法拆成两个 `>`。
 - **调用实参校验（L-03 静态类型安全，2026-08-05 收紧）**：函数调用（含后缀 `f(x)` 直接调用具名函数，以及经函数类型变量间接调用）**统一校验实参**——元数不符报 `T_CALL_ARITY`，逐位类型不符且不可 `can_cast` 报 `T_TYPE_MISMATCH`。此前**直接调用具名函数完全不校验实参**：少传的形参在函数体内读到未初始化的栈槽；若该形参是 `string`/`[]T` 的 `len` 字段，会拿到随机天文数字，导致循环把 512MB arena 瞬间耗尽（`arena: out of memory`），且报错离真正错误点极远（曾因 `tote` 的 `str_concat3(hd, "/.tote/libs")` 少传一参排查数小时）。校验实现见 `src/tc.tc` 的 `check_call_args`（直接/间接调用共用），variant 合成助手因无签名记录走 `tif_pstart<0` 守卫放行。conformance 用例 `tests/conformance/fail/f57_call_arity_direct` / `f58_call_arg_type`。
 
@@ -1225,6 +1257,7 @@ Type:
     | NamedType
     | SymType                           // ✅ tote 字符串驻留符号 Sym32("tag")/Sym16("tag")
     | FuncType                          // ✅ tote 函数类型（一等值 / 函数指针语义）
+    | TupleType                         // ✅ tc 匿名元组类型 `.{T1, T2}`（见 §3.21）
 
 Scalar: "u8" | "u16" | "u32" | "u64"
       | "i8" | "i16" | "i32" | "i64"
@@ -1240,6 +1273,7 @@ NamedType: Ident                      // 结构体/枚举/flag/variant/别名名
 SymType: "Sym" ("32"|"16") "(" StringLiteral ")"
 FuncType: "fn" "(" TypeList? ")" ("->")? Type   // ✅ tote 函数类型（函数指针语义：仅顶层具名函数可绑定）
 TypeList: Type ("," Type)*
+TupleType: "." "{" Type ("," Type)* "}"         // ✅ tc 匿名元组类型；见 §3.21
 ```
 
 - ✅ tote：标量固定位宽 + `string`/`StringBuilder` + `[]T` 切片 + `[N]T` 定长数组 + `map[K]V` 哈希映射 + `fn(...) Ret` 函数类型（返回类型并置、无 `->` 记号）均实装（函数类型 v1 为函数指针语义：仅顶层具名函数可被绑定到函数类型变量 / 参数 / 返回值 / 结构体字段 / 全局变量；支持间接调用，诊断 T_CALL_ARITY / T_NOT_CALLABLE / T_TYPE_MISMATCH）。
@@ -2876,6 +2910,116 @@ Flavor   : "hardware" | "simulate"
 
 ---
 
+### 3.21 元组（Tuple）✅ tc（2026-09-25）
+
+> 元组 = **位置字段结构体**。语义上元组**不是独立的类型种类**：它就是一个普通 `struct`，只是字段没有用户可见的名字，而由编译器按位置自动命名为 `_0` / `_1` / …。因此**布局 / `type_info` / 三个代码生成轨**（`codegen_c` 的 C 发射、`codegen_ll` 的 LLVM 发射、TIR→LLVM 轨）全部零改动即可复用 struct 通路。实现位置：`src/parse.tc`（`.{T…}` 类型、`.{e…}` 字面量、位置字段、`t.N` 成员访问）+ `src/sema.tc` 的 `tuple_lit_type_name`（据元素 TI 合成/复用 struct）。
+
+#### 3.21.1 三种写法
+
+| 形态 | 语法 | 说明 |
+|---|---|---|
+| 匿名元组**类型** | `.{T1, T2}` | 可用于变量标注、形参类型、返回类型 |
+| 匿名元组**字面量** | `.{e1, e2}` | 按位置构造；元素类型逐个推断后合成具名 struct |
+| 具名元组**结构体** | `struct Pair { i64, string }` | 显式具名的元组类型，字段自动命名 `_0`/`_1`（见 §3.1 的 `PositionalField`） |
+
+```ebnf
+TupleType:  "." "{" Type ("," Type)* "}"
+TupleLit:   "." "{" Expr ("," Expr)* "}"
+TupleField: Type ("," Type)*                  // struct 体内的位置字段，"，" 分隔、不带 ";"
+MemberAccess: "." ( ident | integer )         // `t.1` ≡ `t._1`（整数字面量 → 字段 `_N`）
+```
+
+前导点 `.` 是**统一的省略记号**（与 §3.1 结构体字面量省类型名、`enum` 成员 `.Red`、`variant` 构造器 `.Circle(x)` 同源）： `.{ … }` 读作「此处省略类型名」。
+
+#### 3.21.2 匿名元组的类型身份（合成名）
+
+- 匿名元组**没有作者可见的名字**：编译器据元素类型合成一个具名 `StructDecl`，名字按元素类型 mangling 得到 `_Tup_<元素1><元素2>…`，例如 `.{i64, string}` → `_Tup_i64string`（mangling 规则见 `src/parse.tc` 的 `type_node_mangle` / `synth_tuple_type_name`，必须与 `src/sema.tc` 侧保持一致）。
+- **同构即同类型**：元素类型按序相同的两个匿名元组共享同一 struct 名，故可互相赋值、作同一形参/返回类型。
+- 该合成名只作为内部类型身份，**不建议手写引用**；需要稳定的公开类型请声明具名元组结构体。
+
+#### 3.21.3 与具名元组 struct 互不隐式转换
+
+具名元组结构体与同构匿名元组是两个**互不相干的类型**，不做结构化互转：
+
+```t
+struct Pair { i64, string }
+fn take(p: Pair) i64 { return p._0; }
+
+var u = .{5i64, "w"};
+take(u);   // ✗ T-SEM-E202：type mismatch: expected Pair but got _Tup_i64string
+```
+
+需要互操作时显式构造目标类型：`take(Pair{ ._0 = 5, ._1 = "w" })`。
+
+#### 3.21.4 元素访问
+
+- 位置访问 `t.0` / `t.1`（后缀 `.` + 整数字面量，`N` → 字段 `_N`）；具名访问 `t._0` 等价可用，二者都走既有 `member` 通路。
+- 对已解析到具体 `StructDecl` 的对象，访问不存在字段报 `T_UNKNOWN_FIELD`（见 §3.5）。
+- ⚠ **注意**：结构体**字面量**里写出目标类型不存在的字段当前**不报错**，该字段被静默丢弃（既有行为，`Pt{ .zz = 2 }` 与 `Pt{ zz: 2 }` 均如此）——拼写错误不会在编译期暴露，请留意。
+
+#### 3.21.5 元素个数与类型推断
+
+- 元素至少 1 个，单元素元组合法：`var one = .{1i64};`
+- 元素类型**各自独立推断**（不做「取首元素统一提升」，与数组/ map 字面量不同）。因此落在整数字面量上时按 §2.4 的**量级默认**取宽：`v ≤ 255` 取 `u8`，故 `.{1, 2}` 是 `_Tup_u8u8` 而非 `_Tup_i64i64`。需要 `i64` 宽度时显式写后缀：`1i64`。
+- 由于不做元素提升，`.{i64, string}` 与 `.{u8, string}` 是两个不同的元组类型。
+
+#### 3.21.6 未支持 / 受限形态
+
+| 写法 | 诊断 | 说明 |
+|---|---|---|
+| `Pt{ 1, 2 }`（具名类型的位置式字面量） | `T-PAR-E101` | 位置式字面量只对匿名 `.{…}` 成立；具名类型必须写字段名（`Pt{ .x = 1, .y = 2 }` 或 `Pt{ x: 1, y: 2 }`） |
+| `.{i64, .{i64, string}}`（嵌套匿名元组类型） | `T-PAR-E101` | 类型文法不接受嵌套前导点元组类型；需嵌套请用具名 tuple struct |
+| `.{1i64, .{2i64, 3i64}}`（嵌套元组字面量） | `T-PAR-E101` | 元素位不接受前导点复合字面量；可先赋局部变量再组装 |
+| `struct Pair { i64, string; }`（位置字段尾随 `;`） | `T-PAR-E101` | 位置字段一律 `,` 分隔且不带 `;` |
+| struct 体内位置字段与具名字段混写 | 允许（不推荐） | 位置字段计数**只数位置字段**：`struct Mix { x: i64; string }` 的 `string` 是 `_0` 而非 `_1` |
+
+#### 3.21.7 结构体字面量的两种字段关联式
+
+`.x=` 形式与本轮引入的元组同为新增项：具名字段既可用旧式 `:` 关联，也可用带前导点的 `=` 关联。二者**当前都合法且等价**（`:` 形式保留是为了维持自举不动点）：
+
+```t
+struct Pt { x: i64; y: i64; }
+var a: Pt = Pt{ .x = 3, .y = 4 };   // ✅ 推荐写法
+var b: Pt = Pt{ x: 3, y: 4 };       // ✅ 仍接受（旧式）
+```
+
+⚠ 与既有「匿名+具名混合」禁令的关系：被禁止的是 **`.{ x = 0 }`**（省类型名但字段**不带前导点**却用 `=` 关联）；新增的 `.{ .x = 0 }` 字段带前导点，不属于该禁令。
+
+#### 3.21.8 示例（双后端 + 双轨均已门禁覆盖）
+
+```t
+struct Pt { x: i64; y: i64; }
+struct Pair { i64, string }
+
+fn add_tup(a: .{i64, string}, b: .{i64, string}) .{i64, string} {
+    return .{a.0 + b.0, a.1 + b.1};
+}
+
+fn main() i32 @main {
+    var a: Pt = Pt{ .x = 3, .y = 4 };          // 具名 struct 的 `.x=` 字面量
+    println(f"a.x={a.x} a.y={a.y}");
+
+    var t = .{1i64, "hi", true};               // 匿名三元组字面量
+    println(f"t.0={t.0} t.1={t.1} t.2={t.2}");
+
+    var u: .{i64, string} = .{7i64, "yo"};     // 匿名元组类型标注
+    println(f"u.0={u.0} u.1={u.1}");
+
+    var p: Pair = Pair{ ._0 = 9, ._1 = "z" };  // 具名元组 struct
+    println(f"p._0={p._0} p._1={p._1}");
+
+    var s = add_tup(.{1i64, "hi"}, u);         // 元组作形参 / 返回值
+    println(f"s.0={s.0} s.1={s.1}");
+
+    var ok: i64 = a.x + a.y + t.0 + u.0 + p._0 + s.0;
+    return (ok as i32);
+}
+```
+
+运行期守卫：`examples/tuple_demo.tc` + `examples/tuple_demo.expected.txt`（期望输出 5 行，退出码 `32`）；LLVM 轨、C 轨（`tc compile --emit-c`）、TIR 轨三轨输出逐字节一致。
+
+---
+
 ## 4. Program entry（程序入口） ✅ tote
 
 ```ebnf
@@ -2894,8 +3038,13 @@ TranslationUnit : ModuleItem*
 ModuleItem      : FuncDecl | StructDecl | EnumDecl | FlagDecl | VariantDecl
                 | TestDecl | SuiteDecl
                 | GlobalVarDecl | ConstDecl | InnerAttribute
-FuncDecl        : Ident "fn" "(" Params? ")" Type Anns? Block
-StructDecl      : Ident "struct" Anns? "{" Field* "}"
+FuncDecl        : "fn" Ident "(" Params? ")" Type Anns? Block
+StructDecl      : "struct" Ident Layout? Anns? "{" StructMember* "}"
+StructMember    : NamedField ";" | PositionalField ("," PositionalField)* | StructMethod
+NamedField      : Ident ":" Type Anns? ("@" Int)? ("=" Expression)?
+PositionalField : Type                          // 元组位置字段，自动命名 `_0`/`_1`/…（见 §3.21）
+StructMethod    : "fn" Ident "(" Params? ")" Type Anns? Block   // 脱糖为 `<struct>_<method>` 顶层函数
+Layout          : "#" ("soa" | "aos")
 FlagDecl        : Ident "flag" "[" IntType "]" "{" Slot* "}"
 VariantDecl     : Ident "variant" "{" Case* "}"
 EnumDecl        : Ident "enum" (":" IntType)? EnumAnns? "{" EnumMember ("," EnumMember)* ","? "}"
@@ -2909,7 +3058,11 @@ Statement       : VarDecl | ConstDecl | Assign | If | While | Return | ExprStmt 
 ExpectStmt      : "expect" "(" Expression ("," String)? ")" ";"
 Expression      : Literal | Ident | Call | FieldAccess | Unary | Binary | Pipeline | "(" Expression ")"
 Pipeline        : Expression (("|->" | "|>?" | "|>") Expression)*   // L0 最低级，左结合
-Type            : Scalar | "[]" Type | "[" N "]" Type | NamedType
+StructLit        : (Ident | ".")? "{" FieldInit ("," FieldInit)* "}"
+FieldInit        : "." Ident "=" Expr | Ident ":" Expr     // 两种字段关联式并存（见 §3.21.7）
+TupleLit         : "." "{" Expr ("," Expr)* "}"            // 匿名元组字面量（见 §3.21）
+Type             : Scalar | "[]" Type | "[" N "]" Type | NamedType
+                 | "." "{" Type ("," Type)* "}"            // 匿名元组类型（见 §3.21）
 Annotation      : "@" Ident ("(" ArgList? ")")?
 ```
 
@@ -2934,6 +3087,8 @@ Annotation      : "@" Ident ("(" ArgList? ")")?
 | §3.14 | 测试声明 `test "名" / suite "名" {}` + `expect` + `tc test` 运行器 | ✅ 已实现（2026-08-08；旧 `@test` 系列转弃用别名） |
 | §3.15 | 管道算子 `\|->` / `\|>?` / `\|>`（贪心融合脱糖，双后端零改动） | ✅ 已实现（2026-08-10；sema 降解 + 9 条 `PIP` 诊断） |
 | §2.4 | 字面量全量（`_` 分隔符 / `0o` / `1e9` / 位宽后缀 / `'A'` / `\xHH` / `\u{}` / `r"..."` / `"""..."""` / `inf` / `nan`） | ✅ 已实现（2026-08-10；`T-LEX-E000..E008` 九码 + 词法阶段闸门） |
+| §3.1 | struct / struct 方法**关键字领头**形式（`struct Name` / `fn mname`）；旧并列式 `Name struct` / `mname fn` 与函数 `Name fn` 已删除（报 `T-PAR-E102`） | ✅ 已实现（方言统一：关键字领头；2026-09-25 文档同步） |
+| §3.21 | 元组：匿名元组类型 `.{T1,T2}` / 字面量 `.{e1,e2}` / 具名位置字段 struct / `.N` 位置访问 / struct 字面量 `.x=` 关联式 | ✅ 已实现（2026-09-25；LLVM + C + TIR 三轨一致，`gate L2` 全绿，示例 `examples/tuple_demo.tc`） |
 
 > 设计哲学落地：**语法根本源为 `docs/reference.md`**（内含 `ebnf` 产生式块），经 `tools/gen_ebnf.mjs` 生成 `out/ebnf.json`，再由 `src/totter.tc`（已放弃）数据驱动生成 `gen/tc.tc`（冻结快照，见 `src/tc.tc` `kw_lookup` 等标记区间）。⚠ totter 已放弃，此「数据优先」生成管线为历史设计；`src/tc.tc` 现手写维护，`GEN:` 区间为冻结快照。
 

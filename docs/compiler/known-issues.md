@@ -16,7 +16,7 @@
 | ID | 标题 | 类别 | 构建版本 | 状态 | 严重度 | 复现用例 | 期望 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | **KI-001** | variant 直接字面量 `Circle(5)` LLVM 代码生成缺陷 | codegen（variant） | 2026-09-03 | **closed** | 高 | `tests/known-issues/KI-001_variant_anon_literal.tc` | `tc run` 输出 `5` |
-| **KI-002** | struct 字面量模式 `Pt{ x: 0, y: 0 }` 在 match 中的 LLVM 代码生成缺陷 | codegen（match 解构） | 2026-09-03 | **closed** | 高 | `tests/known-issues/KI-002_struct_literal_pat.tc` | `tc run` 输出 `0` |
+- **KI-002**：struct / 元组字面量模式 `Pt{ x: 0, y: 0 }` / `.{1i64, "a"}` 在 LLVM 轨条件被丢弃 → **恒命中首臂**（静默错编；C 轨正确） | codegen（LLVM 轨 match 解构） | 2026-09-03 登记，`fb6eeaf` 误记已修 | ⚠ **reopen**（2026-09-25 复确认；非 `2a3c4b6` 元组引入） | 高 | `tests/known-issues/KI-002_struct_literal_pat.tc` | `tc run` 输出 `0`（现为 `1`；C 轨已是 `0`） |
 
 ## 2. KI-001 · variant 直接字面量（匿名字段字面量）代码生成缺陷
 
@@ -52,11 +52,21 @@
   ```
 - **修复方向**：LLVM 后端对 match 字面量/绑定模式解构出的 struct 字段绑定，发射 `load` 取字段值后再参与比较/绑定（与字段访问 `p.x` 复用同一取址路径）；同时评估是否一并放开绑定模式 `Pt{ x: a, y: b }` 的 sema 支持。
 - **验收标准**：`tc run tests/known-issues/KI-002_struct_literal_pat.tc` 退出 0、无 LLVM IR 报错、stdout 含 `0`。
-- **✅ 已修复（2026-09-05 02:19 构建，提交 `fb6eeaf`）**：`out/dbg/tc.exe run tests/known-issues/KI-002_struct_literal_pat.tc` → 退出 0、无 IR 报错、stdout 输出 `0`。struct 字面量模式 `Pt{ x: 0, y: 0 }` 与具名 match 解构现已双后端通过。复现用例保留为回归测试。状态 → `closed`。
+- **⚠ 状态回退为 open（2026-09-25 复确认）**：曾经记录的「`fb6eeaf` 已修复」结论在 LLVM 轨上**不成立**。
+
+### 3.1 KI-002 复证实录（2026-09-25，基准 `out/dbg/tc.exe` · `2a3c4b6`）
+
+- **现象（已变）**：不再是 IR 类型错配导致的链接/校验失败，而是**静默错编** —— struct / 元组字面量模式的判别条件在 **LLVM 轨被整体丢弃**，第一条 arm **恒命中**；**C 轨（`tc compile --emit-c` + clang）语义正确**（逐字段相等比较）。复跑 `tests/known-issues/KI-002_struct_literal_pat.tc`：期望 `0`，LLVM 轨实测 **`1`**，C 轨实测 **`0`**。
+- **IR 证据**：`tc emit-ll` 产物中 `at_origin` **不含任何 `icmp`**，入口直接 `br label %at_origin.Lm.b1`，第二块（`_` 兜底臂）**无前驱**为死块 —— dispatch 退化为无条件跳转。对照 C 产物是正确的 `if (((_tms1.x == 0) && (_tms1.y == 0))) {…} else {…}`。
+- **归属（已交叉复验）**：用 **`2a3c4b6^`（`0b212ac`，元组特性的上一个提交）源码独立重建编译器**跑同一用例，输出同为 `1` ⇒ **与 2026-09-25 的元组 / `.x=` 特性无关**。回归窗口为 `fb6eeaf..0b212ac`（约 123 个提交）；该时期源码在当前方言下无法被重建（旧源码触 `T-SEM-E201`），故当年「已修复」是否为误判、以及精确 culprit，需按此窗口二分。
+- **实测矩阵**（详见 `docs/syntax/drafts/match.md` §6.3）：仅在「应当不匹配」的分叉上暴露（`Pt{ x: 0, y: 0 }` vs `Pt{ .x = 1, .y = 2 }`；元组同 `.{1i64, 9i64}` vs `.{1i64, 2i64}`），全匹配场景侥幸正确，故极易漏测。
+- **相关静默（同路径）**：struct 字面量里的**未知字段名 / 未定义标识符不发诊断** —— `Pt{ zz: 0 }`、`Pt{ x: zzz, y: 0 }` 均 `tc check` 通过；后者在 C 轨会一路发射到 clang 才报 C 未定义符号。建议与 KI-002 一并修（sema 侧补校验）。
+- **为何门禁未拦住**：`tests/known-issues/` 不被 conformance / difftest / run_examples 自动扫描（本文件 §0 约定），`examples/` 全仓无「struct/元组字面量模式 + 运行期判别」用例 ⇒ 该路径运行期零覆盖。
+- **待办**：① 修复 LLVM 轨 struct_lit 模式的逐字段比较发射；② 补 sema 诊断（未知字段 / 未定义标识符）；③ **把该用例挪进 `examples/` 常规门禁**（建成前须用修复前的编译器确认会失败，避免空跑）；④ 必要时二分定位 `fb6eeaf..0b212ac` 的 culprit。
 
 ## 4. 修复排期建议
 
-- **优先级**：KI-001 / KI-002 均 **已修复**（2026-09-05 `fb6eeaf` 构建，高优先 blocker 已闭环，见 §2/§3 验收记录）。复现用例保留于 `tests/known-issues/` 作回归测试。
+- **优先级**：KI-001 **closed**（`fb6eeaf` 构建，`KI-001_variant_anon_literal.tc` `tc run` 输出 `5`）；**KI-002 ⚠ reopen** —— 2026-09-25 双后端对拍确认 LLVM 轨仍错编（详见 §3.1）。二者均为高优先：KI-002 属**静默错编**（不报错、结果错），比链接失败更危险，建议排到 KI-001 之前。复现用例保留于 `tests/known-issues/`，并建议同步进 `examples/` 常规门禁。
 - **前置（修复时已完成）**：修复落在「双后端一致」约束内——C 后端（`codegen_c`）须同步验证；`tc run` 验收即双后端一致证据。后续若改动相关 codegen 路径，复跑 `node tools/gate.mjs L2` 保自举不动点，并视情况将两用例纳入 `tests/variant_smoke` 自动回归。
 - **关联待办（非本次范围）**：struct match 绑定模式 `Pt{ x: a, y: b }` 的 sema 支持（当前 `T-SEM-E201`）仍开放，建议单独排期评估放开。
 

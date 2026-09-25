@@ -3,6 +3,11 @@
 > 依据：`src/tc.tc` `parse_type`（L4819–L4878）+ `docs/reference.md` §3.5 / §2.10。<br>
 > **状态：已并入 reference.md（失效）** —— 经 L-15 起草工作流于 2026-08-01 规则采纳（四法 L-04/L-02/L-03/L-14 评审 ✅/⚠️ 通过），原草稿仅作历史追溯，不再据以执行。权威载体：`docs/reference.md` §3.x。
 
+> ⚠️ **权威指引（2026-09-25 补）**：本草稿为 2026-08-01 冻结快照，下列写法已过期，请以 `docs/reference.md` §3.5 / §3.21 为准：
+> - **元组类型（新增）**：`.{ T1, T2, … }` —— 匿名类型，合成具名 struct 名 `_Tup_<mangled>`；**同构即同类型**（元素类型逐一相同才等价）。
+> - **具名元组（位置字段结构体）**：`struct Pair { i64, string }` 即字段为 `_0:i64`/`_1:string` 的具名结构体；其类型与匿名 `.{i64,string}` 不隐式互转（报 `T-SEM-E202`）。
+> - 元组字面量 `.{ e1, e2 }` 见 `expr_literal.md` 权威指引；元组补齐（lub）语义见 `docs/everything-is-value-t.md`。
+
 ## 1. EBNF（§1 Notation）
 
 ```ebnf

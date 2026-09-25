@@ -3,6 +3,12 @@
 > 依据：`src/tc.tc` `parse_struct_decl`（L6071，GEN 生成）+ `docs/reference.md` §2.8 `struct_decl` / §3.1。<br>
 > **状态：已并入 reference.md（失效）** —— 经 L-15 起草工作流于 2026-08-01 规则采纳（四法 L-04/L-02/L-03/L-14 评审 ✅/⚠️ 通过），原草稿仅作历史追溯，不再据以执行。权威载体：`docs/reference.md` §3.x。
 
+> ⚠️ **权威指引（2026-09-25 补）**：本草稿为 2026-08-01 冻结快照，下列写法已过期，请以 `docs/reference.md` 为准：
+> - 声明改为**关键字前置** `struct StructName { … }`（旧式 `Ident "struct" { … }` 已移除，报 `T-PAR-E102`）。
+> - 成员支持**位置字段（元组形态）**：`struct Pair { i64, string }` 自动命名为 `_0`/`_1`；命名与位置字段可混用。
+> - 当前权威章节：`docs/reference.md` **§3.1 StructDecl / §3.21 元组（Tuple）**。
+> - 字面量 `.x =` 形式与 `x:` 形式并存（见 `expr_literal.md` 权威指引）。
+
 ## 1. EBNF（§1 Notation）
 
 ```ebnf
