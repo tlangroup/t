@@ -546,6 +546,30 @@ Rust 编译期决策树实现：检查枚举判别式，匹配足够密集时常
 
 ---
 
+## 7. 落地路线（Route）
+
+overload 特性的实现按以下路线分期落地。每期独立验收、不破坏既有语义；已完成期在标题标注 ✅，进行中为 🔧，未开始为 ⬜。贯穿约束：struct / 元组字面量模式 overload 受 KI-002 影响（LLVM 后端运行期错编），**验证仅以 C 后端（`tc compile --emit-c` + clang）为基准**，除非显式标注「双后端」。
+
+**Route 1 — 单文件值/结构模式 overload** 🔧
+- 新增保留关键字 `overload` 与 `extend`（当前为保留关键字；待 L-15 语法规则法可降级为上下文关键词，以复用既有的 `when` 关键字处理惯例）。
+- `overload fn name(...)` 与 `extend overload fn name(...)` 解析为函数子句（`FuncDecl`，以 `ia` 槽标记 1 / 2），声明组**复用既有 `desugar_func_clauses`** 脱糖为单一函数 + `match` 臂（与 `examples/clause_demo.tc` 同构，语义真源唯一）。
+- 约束：`extend overload` 必须引用本文件内已存在的 `overload fn` 组，否则报 `T-OVL-E901`；跨文件合并见 Route 2。值/结构组按 §2.5 顺序敏感性与不可达子句沿用 `match` 既有 `T-MAT-W744` 警告。
+- 验证基准：值 / 标量 / 字符串 / `when` 守卫模式 overload **双后端一致**；struct / 元组字面量模式 overload **仅 C 后端**。
+- 交付：`examples/overload_demo.tc`（+`.expected.txt`）、`examples/overload_struct_pat.tc`（C 后端）、conformance pass / fail 用例。
+
+**Route 2 — 跨文件 `extend overload`** ⬜
+- 让 `@import` 把被引入文件中同名 overload 子句并入同一编译单元的脱糖组（需改 import 作用域与 `desugar_func_clauses` 跨来源文件分组；当前 CLI 单文件编译单元，见 `src/tc.tc` argv 门槛）。
+- `T-OVL-E901` 的「本文件内」约束放宽到「可见域内」；前置声明 / 根节点绑定在跨文件场景的归属待定。
+
+**Route 3 — 类别格分派（§2.7）** ⬜
+- 前置条件：先在类型系统建立 `anykind` / `scalarkind` / `integralkind` / `floatkind` … 类别树。当前 t 类型系统**无此类别**（§2.8 注已说明元组实现为合成具名 struct `_Tup_*`，无独立 `tuplekind` / `structkind` 运行时类别），故本路线被实现前提卡住。
+- 实现 `overload root(v: <类别>);` 前置声明 + 类型子句编译期按具体程度排序（判定规则一至四）+ 不可判定歧义诊断（`T-OVL-E902` 预留）。
+- 值 / 结构组与类别组按 §5.4 分层：外层类别子句、内层值 / 结构子句，两层各自独立排序。
+
+**明确不做**：真正函数重载（多个函数实体）。规范 §5.1 明确 overload 声明组脱糖后仅产生单一函数实体，本路线不偏离。
+
+---
+
 ## 附录 A　非规范性说明
 
 本附录收录不属于规范性要求的内容，用于记录评估过程、适用性判断与编者核对状态，供实现者与审阅者参考。附录内所载的评分、比较与判断均为编者判断，不构成实证结论，亦不引据任何文献；与正文的规范性条款不一致时，以正文为准。

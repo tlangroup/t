@@ -1920,7 +1920,14 @@ pub fn parse_func_decl(name: string, anns: i64, is_comptime: bool, is_kernel: bo
                 ptn = parse_type();
             } else {
                 if (lex.cur_t() == "Identifier") {
-                    pname = expect_tok("Identifier");
+                    // 结构字面量模式：`Ident { ... }` —— 含前导点形式 `Point{.x=0}` 与
+                    // 旧式 `Point{ x: 0 }`；按模式表达式解析（与 match 臂同构），存入 plit(=nb)。
+                    // 否则为裸绑定形参名。
+                    if (lex.peek_t(1) == "LBrace") {
+                        plit = parse_expr();
+                    } else {
+                        pname = expect_tok("Identifier");
+                    }
                 } else {
                     plit = parse_expr();
                 }
@@ -2699,6 +2706,72 @@ pub fn parse_declaration() i64 {
         parse_fatal_at("T-PAR-E102", "`import(X)` was removed; write `@import(\"X\")` instead", lex.pos);
     }
 
+    // ── overload 上下文关键词（Route 1）──
+    // `overload fn name(...)` 声明一组同名函数子句；`extend overload fn name(...)`
+    // 向本文件内已存在的 overload 组追加子句。二者解析为函数子句（FuncDecl），
+    // 以节点 `ia` 槽标记（1=overload 声明 / 2=extend 追加），声明组复用既有
+    // `desugar_func_clauses` 按名脱糖为单一函数 + match 臂。跨文件合并见 Route 2。
+    if (lex.cur_t() == "KwOverload") {
+        lex.advance_i();   // 吃掉 `overload`
+        if (lex.cur_t() != "KwFunc") {
+            parse_fatal_at("T-PAR-E102", "expected 'fn' after 'overload'", lex.pos);
+        }
+        lex.advance_i();   // 吃掉 `fn`
+        if (lex.cur_t() != "Identifier") {
+            parse_fatal("expected function name after 'overload fn'");
+        }
+        var fni: i64 = lex.advance_i();
+        var fname: string = lex.tk_v(fni);
+        lex.g_agent_anchor = fni;
+        lex.g_struct_exported = is_export;
+        base.validate_decl_name(fname, fni);
+        var fd: i64 = parse_func_decl(fname, anns, is_comptime, is_kernel);
+        if (fd >= 0) {
+            var fdn: Node = base.nodes[fd];
+            fdn.ia = 1;
+            slice_set(base.nodes, fd, fdn);
+            base.node_at(fd, fni);
+            if (is_export) { base.nodes[fd].bc = true; }
+            if (ann_find(anns, "c_export") >= 0) {
+                base.nodes[fd].be = true;
+                base.nodes[fd].se = fname;
+            }
+        }
+        return fd;
+    }
+    if (lex.cur_t() == "KwExtend") {
+        lex.advance_i();   // 吃掉 `extend`
+        if (lex.cur_t() != "KwOverload") {
+            parse_fatal_at("T-PAR-E102", "expected 'overload' after 'extend'", lex.pos);
+        }
+        lex.advance_i();   // 吃掉 `overload`
+        if (lex.cur_t() != "KwFunc") {
+            parse_fatal_at("T-PAR-E102", "expected 'fn' after 'extend overload'", lex.pos);
+        }
+        lex.advance_i();   // 吃掉 `fn`
+        if (lex.cur_t() != "Identifier") {
+            parse_fatal("expected function name after 'extend overload fn'");
+        }
+        var fni: i64 = lex.advance_i();
+        var fname: string = lex.tk_v(fni);
+        lex.g_agent_anchor = fni;
+        lex.g_struct_exported = is_export;
+        base.validate_decl_name(fname, fni);
+        var fd: i64 = parse_func_decl(fname, anns, is_comptime, is_kernel);
+        if (fd >= 0) {
+            var fdn: Node = base.nodes[fd];
+            fdn.ia = 2;
+            slice_set(base.nodes, fd, fdn);
+            base.node_at(fd, fni);
+            if (is_export) { base.nodes[fd].bc = true; }
+            if (ann_find(anns, "c_export") >= 0) {
+                base.nodes[fd].be = true;
+                base.nodes[fd].se = fname;
+            }
+        }
+        return fd;
+    }
+
     // LL(1) 具名函数文法（兼容桥接）：`fn name(params) ret { body }`。
     // 旧 `name fn(...)` 并置式仍保留兼容（下方名字先行路径），二者由首个 token 消歧、不冲突。
     if (lex.cur_t() == "KwFunc") {
@@ -3129,39 +3202,47 @@ pub fn fc_merge() void {
         k = k + 1;
     }
 
-    // 逐子句 → match arm
+    // 逐子句 → match arm。两遍扫描：pass 0 具体臂、pass 1 通配（_）臂，
+    // 保证「兜底晚于所有具体子句」（§2.4 / §3.3），并使 extend overload 追加的
+    // 具体臂能先于通配生效（同文件 extend 在源码上位于通配之后也正确）。
     var ah: i64 = -1;
     var at: i64 = -1;
-    var c: i64 = 0;
-    while (c < g_fc_n) {
-        var cd: i64 = g_fc_d[c];
-        var cn: Node = base.nodes[cd];
-        var be: i64 = fc_body_expr(cd);
-        if (be < 0) {
-            fc_err("T-FUN-E814",
-                base.sb_cat3("function clause group '", g0.sa,
-                    "': clause body must be a single expression (it becomes a match arm)"),
-                cd);
-            return;
+    var pass: i64 = 0;
+    while (pass < 2) {
+        var c: i64 = 0;
+        while (c < g_fc_n) {
+            var cd: i64 = g_fc_d[c];
+            var cn: Node = base.nodes[cd];
+            var p0: i64 = fc_list_nth(cn.lb, 0);
+            var p0n: Node = base.nodes[p0];
+            var is_wild: bool = p0n.ba;
+            // pass 0 仅具体臂；pass 1 仅通配臂
+            if ((pass == 0 && is_wild) || (pass == 1 && is_wild == false)) { c = c + 1; continue; }
+            var be: i64 = fc_body_expr(cd);
+            if (be < 0) {
+                fc_err("T-FUN-E814",
+                    base.sb_cat3("function clause group '", g0.sa,
+                        "': clause body must be a single expression (it becomes a match arm)"),
+                    cd);
+                return;
+            }
+            var a_bind: string = "";
+            var a_pat: i64 = p0n.nb;
+            if (is_wild == false && a_pat < 0) { a_bind = p0n.sa; }
+            var a_guard: i64 = p0n.nc;
+            a_guard = fc_fold_guard(a_guard, cd, arity, ph);
+            // arm 承接本子句的锚点：诊断（不可达 / 类型不符）指回原始子句而非合成节点
+            var armid: i64 = base.mk_arm(a_bind, is_wild, a_pat, a_guard, be, -1);
+            var armn: Node = base.nodes[armid];
+            armn.ln = cn.ln;
+            armn.cl = cn.cl;
+            armn.tv = cn.tv;
+            slice_set(base.nodes, armid, armn);
+            at = base.list_push(ah, at, armid);
+            if (ah < 0) { ah = at; }
+            c = c + 1;
         }
-        var p0: i64 = fc_list_nth(cn.lb, 0);
-        var p0n: Node = base.nodes[p0];
-        var a_bind: string = "";
-        var a_wild: bool = p0n.ba;
-        var a_pat: i64 = p0n.nb;
-        if (a_wild == false && a_pat < 0) { a_bind = p0n.sa; }
-        var a_guard: i64 = p0n.nc;
-        a_guard = fc_fold_guard(a_guard, cd, arity, ph);
-        // arm 承接本子句的锚点：诊断（不可达 / 类型不符）指回原始子句而非合成节点
-        var armid: i64 = base.mk_arm(a_bind, a_wild, a_pat, a_guard, be, -1);
-        var armn: Node = base.nodes[armid];
-        armn.ln = cn.ln;
-        armn.cl = cn.cl;
-        armn.tv = cn.tv;
-        slice_set(base.nodes, armid, armn);
-        at = base.list_push(ah, at, armid);
-        if (ah < 0) { ah = at; }
-        c = c + 1;
+        pass = pass + 1;
     }
 
     // 合成 match 承接首子句锚点：T_MATCH_NONEXHAUSTIVE 才能报出文件与行列
@@ -3188,7 +3269,31 @@ pub fn fc_merge() void {
 }
 
 pub fn desugar_func_clauses() void {
+    // overload（Route 1）：`extend overload` 必须引用本文件内已存在的
+    // `overload fn` 组（ia==1），否则报 T-OVL-E980。跨文件合并见 Route 2。
     var n: i64 = slice_len(lex.decl_list) as i64;
+    var k: i64 = 0;
+    while (k < n) {
+        var ek: i64 = lex.decl_list[k];
+        var ekn: Node = base.nodes[ek];
+        if (ekn.kind == "FuncDecl" && ekn.ia == 2) {
+            var found: bool = false;
+            var m: i64 = 0;
+            while (m < n) {
+                var mk: i64 = lex.decl_list[m];
+                var mkn: Node = base.nodes[mk];
+                if (mkn.kind == "FuncDecl" && mkn.ia == 1 && mkn.sa == ekn.sa) { found = true; }
+                m = m + 1;
+            }
+            if (found == false) {
+                fc_err("T-OVL-E980",
+                    base.sb_cat4("extend overload '", ekn.sa,
+                        "' has no matching 'overload fn ", base.sb_cat2(ekn.sa, "' group in this file")),
+                    ek);
+            }
+        }
+        k = k + 1;
+    }
     var i: i64 = 0;
     while (i < n) {
         var d: i64 = lex.decl_list[i];
