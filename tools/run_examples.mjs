@@ -185,10 +185,15 @@ async function runCase(name) {
         problems.push(`c emit failed (exit ${c.code})`);
     } else {
         const cexe = join(cdir, `${name}.exe`);
+        // ⚠ 运行时不再以源码形式参与编译：t_runtime.c 现在依赖 vendored 第三方库
+        // （mimalloc / fdlibm / imath / ryu），逐个编进来既不现实也让命令行失控。
+        // 统一链接预编译的 out/<mode>/deps/t_runtime.lib（与 LLVM 后端同一份产物），
+        // 既保证两后端用**同一份**运行时，也让 C 后端编译快得多。
         const cc = await sh(CLANG, [
             COPT, "-o", cexe,
-            join(cdir, `${name}.c`), join(RUNTIME, "t_runtime.c"),
+            join(cdir, `${name}.c`),
             "-I", RUNTIME, "-I", cdir, "-Wl,-subsystem:console",
+            join(ROOT, "out", mode, "deps", "t_runtime.lib"),
         ]);
         if (!cc.ok) {
             problems.push(`c link failed (exit ${cc.code}): ${tailErr(cc.err)}`);

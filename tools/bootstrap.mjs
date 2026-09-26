@@ -2,9 +2,9 @@
 // bootstrap.mjs — M10 三轮自编译不动点验证 (bootstrap.md)
 //
 // 轮次:
-//   gen0: tc0 (TypeScript)      compile src/tc.tc → C_a; cl → tc1.exe
-//   gen1: tc1.exe                compile src/tc.tc → C_b; cl → tc2.exe
-//   gen2: tc2.exe                compile src/tc.tc → C_c; cl → tc3.exe
+//   gen0: tc0 (TypeScript)      compile src/tc.tc → C_a; clang+预编译 t_runtime.lib → tc1.exe
+//   gen1: tc1.exe                compile src/tc.tc → C_b; clang+预编译 t_runtime.lib → tc2.exe
+//   gen2: tc2.exe                compile src/tc.tc → C_c; clang+预编译 t_runtime.lib → tc3.exe
 // 判定: C_a ≡ C_b ≡ C_c (逐字节)。成立 ⇒ 自举不动点 (Stage 2)。
 //
 // 用法: node tools/bootstrap.mjs
@@ -12,56 +12,22 @@
 import { execFileSync } from "node:child_process";
 import { readFileSync, mkdirSync, existsSync, readdirSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { findClang } from "./toolchain.mjs";
+import { ensureMsvcEnv } from "./msvc_env.mjs";
 
 const ROOT = resolve(new URL("..", import.meta.url).pathname.replace(/^\/([A-Za-z]):/, "$1:"));
 const SRC = join(ROOT, "src", "tc.tc");
 const RUNTIME = join(ROOT, "runtime");
 
-// ── 定位 MSVC (同 tc0/index.ts findMsvc 逻辑简化版) ──────────────
-function findMsvc() {
-    const vsRoots = [
-        "C:\\Program Files\\Microsoft Visual Studio\\2022",
-        "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022",
-    ];
-    for (const vsRoot of vsRoots) {
-        if (!existsSync(vsRoot)) continue;
-        for (const edition of readdirSync(vsRoot)) {
-            const msvcDir = join(vsRoot, edition, "VC", "Tools", "MSVC");
-            if (!existsSync(msvcDir)) continue;
-            const vers = readdirSync(msvcDir).sort().reverse();
-            for (const v of vers) {
-                const cl = join(msvcDir, v, "bin", "Hostx64", "x64", "cl.exe");
-                if (!existsSync(cl)) continue;
-                const kitsInc = "C:\\Program Files (x86)\\Windows Kits\\10\\Include";
-                const kitsLib = "C:\\Program Files (x86)\\Windows Kits\\10\\Lib";
-                if (!existsSync(kitsInc)) continue;
-                const sdk = readdirSync(kitsInc).sort().reverse()[0];
-                const msvcHome = join(msvcDir, v);
-                return {
-                    cl,
-                    env: {
-                        ...process.env,
-                        INCLUDE: [
-                            join(msvcHome, "include"),
-                            join(kitsInc, sdk, "ucrt"),
-                            join(kitsInc, sdk, "um"),
-                            join(kitsInc, sdk, "shared"),
-                        ].join(";"),
-                        LIB: [
-                            join(msvcHome, "lib", "x64"),
-                            join(kitsLib, sdk, "ucrt", "x64"),
-                            join(kitsLib, sdk, "um", "x64"),
-                        ].join(";"),
-                    },
-                };
-            }
-        }
-    }
-    return null;
-}
-
-const msvc = findMsvc();
-if (!msvc) { console.error("bootstrap: MSVC (cl.exe) not found"); process.exit(2); }
+// ── C 后端编译/链接 ──────────────────────────────────────────────
+// ⚠ 2026-09-26 改：runtime 不再以源码形式参与编译。t_runtime.c 现在依赖 4 个
+//   vendored 第三方库（mimalloc / fdlibm / imath / Ryu），单独编译它既缺
+//   -I mimalloc/include 也缺那 100 个 .obj。统一改为「clang 编 tc.c + 链接预编译的
+//   out/<mode>/deps/t_runtime.lib」（tools/build_runtime.mjs 产物），与
+//   run_examples.mjs / gate.mjs 的 cself 步一致。MSVC cl 不再是必需工具链。
+const { path: CLANG } = findClang();
+ensureMsvcEnv();   // 注入 LIB/INCLUDE，使 clang 能找到系统头与导入库
+const RUNTIME_LIB = join(ROOT, "out", "dbg", "deps", "t_runtime.lib");
 
 function run(cmd, args, opts = {}) {
     return execFileSync(cmd, args, { cwd: ROOT, stdio: ["pipe", "pipe", "pipe"], ...opts });
@@ -71,15 +37,16 @@ function compileC(outDir, exeName) {
     // 关键修复：自举种子（tc1/tc2/tc3）默认继承 Windows 1MB 栈，
     // 而编译器自身超大源在 sema 的「类型推断/解析」环（infer_expr → resolve_ti →
     // ti_equal → infer_expr）会做数千层深递归，在 1MB 下 STATUS_STACK_OVERFLOW(127)。
-    // C 后端产品被 clang -O2 编译时 TCO 能折叠尾递归不溢出，但 cl /Od 不 TCO ⇒ 必须
+    // C 后端产品被 clang -O2 编译时 TCO 能折叠尾递归不溢出，但 -O0 不 TCO ⇒ 必须
     // 显式放大栈。与 tc.tc:683（build 产物）/ gate.mjs:287（cself 产品）的 /STACK 一致。
-    run(msvc.cl, [
-        "/nologo", "/std:c11", "/utf-8", "/Od",
-        `/I${RUNTIME}`, `/I${outDir}`,
-        join(outDir, "tc.c"), join(RUNTIME, "t_runtime.c"),
-        `/Fo${outDir}\\`, `/Fe${join(outDir, exeName)}`,
-        "/link", "/STACK:268435456", "/LARGEADDRESSAWARE",
-    ], { env: msvc.env });
+    run(CLANG, [
+        "-std=c11", "-O0",
+        `-I${RUNTIME}`, `-I${outDir}`,
+        join(outDir, "tc.c"),
+        RUNTIME_LIB,
+        "-o", join(outDir, exeName),
+        "-Wl,-subsystem:console", "-Wl,/STACK:268435456", "-Wl,/LARGEADDRESSAWARE",
+    ]);
     return join(outDir, exeName);
 }
 

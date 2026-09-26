@@ -293,7 +293,9 @@ void*   t_opt_unwrap(const void* p);
 
 
 // ── 数学内建运行时包装（t_math_*；对应 @sin / sin 等编译期内建）──
-// 仅在此处经由 t_runtime.c 间接 include <math.h>；生成的用户 .c 不会引入 libc 数学名。
+// 实现侧：t_runtime.c 已移除 <math.h>，全部走 vendored **fdlibm**（符号改名为 tfd_*），
+// f32 变体一律「双精度计算后再窄化」。生成的用户 .c 只看到 t_math_*，不引入 libc 数学名。
+// 详见 runtime/VENDORED.md 与 runtime/fdlibm/README.md。
 // f64 名 = t_math_<base>，f32 名 = t_math_<base>f；2 元函数 arity=2。
 double t_math_sin(double);
 float  t_math_sinf(float);
@@ -350,7 +352,7 @@ float  t_math_hypotf(float, float);
 double t_math_cbrt(double);
 float  t_math_cbrtf(float);
 
-// ── 扩展数学内建（推荐补充集）── 与上文 54 个遵循同一包装约定（间接 include <math.h>，用户 .c 不引入 libc 数学名）
+// ── 扩展数学内建（推荐补充集）── 与上文 54 个遵循同一包装约定（fdlibm 实现，用户 .c 不引入 libc 数学名）
 // 双目浮点→浮点：copysign / nextafter / remainder / fmin / fmax / fdim（各带 f32 变体）
 double t_math_copysign(double, double);
 float  t_math_copysignf(float, float);

@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <mimalloc.h>
 #include "t_runtime_gpu.h"
 
 #ifndef HAVE_CUDA
@@ -147,7 +148,7 @@ static int gpu_emu_run(const char* blob, const char* name,
                         char m[16]; const char* ap = strchr(rhs, '(');
                         if (ap) { const char* mp = strchr(ap, '%'); if (mp) { ssa_scan(mp, m);
                             Ssa* sm = ssa_get(m); int cnt = sm ? sm->i : 0;
-                            if (!g_shared) g_shared = malloc((size_t)cnt * 4);
+                            if (!g_shared) g_shared = mi_malloc((size_t)cnt * 4);
                             Ssa* s = ssa_set(dstnm, 3); if (s) s->p = g_shared; } }
                     } else if (strstr(rhs, "llvm.getelementptr")) {
                         char b[16], i[16]; const char* bp = strchr(rhs, '%');
@@ -195,16 +196,16 @@ static int gpu_emu_run(const char* blob, const char* name,
             p = (nl < pend) ? nl + 1 : pend;
         }
     }
-    if (g_shared) { free(g_shared); g_shared = NULL; }
+    if (g_shared) { mi_free(g_shared); g_shared = NULL; }
     return 0;
 }
 
 int64_t tll_gpu_alloc(int64_t bytes) {
-    void* p = malloc((size_t)(bytes > 0 ? bytes : 1));
+    void* p = mi_malloc((size_t)(bytes > 0 ? bytes : 1));
     return (int64_t)(intptr_t)p;
 }
 
-void tll_gpu_free(int64_t p) { if (p) free((void*)(intptr_t)p); }
+void tll_gpu_free(int64_t p) { if (p) mi_free((void*)(intptr_t)p); }
 
 void tll_gpu_h2d(int64_t dst, int64_t src, int64_t bytes) {
     memcpy((void*)(intptr_t)dst, (void*)(intptr_t)src, (size_t)bytes);
