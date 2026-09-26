@@ -3113,8 +3113,11 @@ pub fn struct_lit_pat_check(pat: i64, scr: i64, rep: bool) void {
     var pn: Node = base.nodes[pat];
     var sname: string = pn.sa;
     if (sname == "" && scr >= 0) {
-        var std: i64 = resolve_ti(scr);
-        if (std >= 0) { sname = sema.tds[std].name; }
+        // 匿名元组 / 匿名结构模式：scrutinee 是 TI（TD 索引），直接取类型名
+        // （含匿名元组合成结构名）。⚠ 切勿用 resolve_ti(scr) —— resolve_ti 把入参当
+        // 节点 id 解析，scr 是 TI 索引会越界 panic（t_slice_at OOB）。同文件 line 3120
+        // 的 tip_name(scr) 即此语义。
+        sname = tip_name(scr);
     }
     // 模式结构名须与被匹配值类型一致（无名元组由 scrutinee 反查，此处 sname=="" 已被填上）
     if (pn.sa != "" && scr >= 0 && tip_name(scr) != sname) {
@@ -3133,21 +3136,33 @@ pub fn struct_lit_pat_check(pat: i64, scr: i64, rep: bool) void {
         return;
     }
     var fvp: i64 = pn.la;
+    var pos_idx: i64 = 0;   // 位置式（sa==""）字段按列表下标映射到结构第 i 个字段
     while (fvp >= 0) {
         var fv: Node = base.nodes[base.kids[fvp].val];
         var fname: string = fv.sa;
+        // 位置式（如 `.{a, b}` / `Name{a, b}`）：按列表下标取结构第 pos_idx 个字段名。
+        var eff_name: string = fname;
+        if (fname == "") {
+            eff_name = sema.struct_field_name_at(sname, pos_idx);
+            pos_idx = pos_idx + 1;
+        }
         // 取字段声明类型节点（同时校验字段存在）
         var ftnode: i64 = -1;
         var fc: i64 = fh;
         while (fc >= 0) {
             var ffn: Node = base.nodes[base.kids[fc].val];
-            if (ffn.sa == fname) { ftnode = ffn.na; break; }
+            if (ffn.sa == eff_name) { ftnode = ffn.na; break; }
             fc = base.kids[fc].next;
         }
         if (ftnode < 0) {
             if (rep) {
-                parse.fc_err("T-MAT-E741",
-                    base.sb_cat3("struct `", sname, base.sb_cat3("` 没有字段 `", fname, "`")), pat);
+                if (fname == "") {
+                    parse.fc_err("T-MAT-E741",
+                        base.sb_cat5("struct `", sname, "` 没有第 ", base.i2s(pos_idx - 1), " 个字段（位置式模式越界）"), pat);
+                } else {
+                    parse.fc_err("T-MAT-E741",
+                        base.sb_cat3("struct `", sname, base.sb_cat3("` 没有字段 `", fname, "`")), pat);
+                }
             }
             fvp = base.kids[fvp].next;
             continue;
@@ -9009,6 +9024,20 @@ pub fn find_struct_fields(sname: string) i64 {
     var dn: Node = base.nodes[s.decl];
     if (dn.kind != "StructDecl") { return -1; }
     return dn.lb;
+}
+
+// 取 struct 第 idx 个字段名（0-based）；越界返回 ""。供位置式模式 `.{a,b}` 按列表下标解构（#4 §8.2）。
+pub fn struct_field_name_at(sname: string, idx: i64) string {
+    var fh: i64 = sema.find_struct_fields(sname);
+    if (fh < 0) { return ""; }
+    var c: i64 = fh;
+    var i: i64 = 0;
+    while (c >= 0) {
+        if (i == idx) { return base.nodes[base.kids[c].val].sa; }
+        i = i + 1;
+        c = base.kids[c].next;
+    }
+    return "";
 }
 
 // 从字段链表收集 (字段名, 标量类型名) 对。结果写入全局 imp_fnames/imp_ftypes。
