@@ -628,6 +628,9 @@ pub var g_has_format: bool;
 // match 臂 body 解析期间置位：阻止 body 的 postfix `.` 贪婪吞掉下一个臂的 `.X =>` 模式
 //（`.X` 看起来像 `obj.field`）。详见 parse_postfix 的防贪婪判断。
 pub var g_in_match_body: bool;
+// 模式位标记：parse_struct_lit 据其判定 `.{a,b}` / `Name{a,b}` 是否为位置式模式
+// （元素按列表下标绑定到结构第 i 个字段）。仅在 match 模式解析期间为真。
+pub var g_in_match_pat: bool;
 
 pub fn parse_post_call(e: i64, ti: i64) i64 {
     var ce: Node = base.nodes[e];
@@ -768,6 +771,35 @@ pub fn parse_struct_lit(type_name: string, ti: i64) i64 {
     lex.advance_i();
     var head: i64 = -1;
     var tail: i64 = -1;
+    // 位置式模式（match 模式位，g_in_match_pat）：`.{a, b}` / `Name{a, b}` —— 元素按列表
+    // 下标绑定到结构第 i 个字段；元素为绑定标识符 / 字面量 / `_` 通配（#4 §8.2）。
+    // 与具名字段形式（`x:` / `.x =`）互斥：非具名字段形式即视为位置式。
+    var positional: bool = false;
+    if (g_in_match_pat) {
+        var c0: string = lex.cur_t();
+        var named_form: bool = (c0 == "Identifier" && lex.peek_t(1) == "Colon") ||
+                               (c0 == "Dot" && lex.peek_t(1) == "Identifier" && lex.peek_t(2) == "Assign");
+        if (named_form == false) { positional = true; }
+    }
+    if (positional) {
+        while (lex.cur_t() != "RBrace" && lex.cur_t() != "Eof") {
+            var val: i64 = -1;
+            if (lex.cur_t() == "_") {            // 通配 `_`：占位、不绑定
+                lex.advance_i();
+                val = base.mk_ident("_", -1);
+            } else {
+                val = parse_expr();              // 绑定标识符（ident 节点）→ sema 据字段类型绑定；字面量→比对
+            }
+            var fid: i64 = base.mk_FV("", val, -1);
+            tail = base.list_push(head, tail, fid);
+            if (head < 0) { head = tail; }
+            if (lex.cur_t() == "Comma") { lex.advance_i(); } else { break; }
+        }
+        expect_tok("RBrace");
+        // ⚠ ia 保持默认（非 1）：位置式是模式不是元组构造，sema 据 scrutinee 类型解构，
+        // 不可触发 value 路径的「据元素类型合成 struct」逻辑（parse.tc:7618）。
+        return base.mk_struct_lit(type_name, head, ti);
+    }
     // 前导点（省略类型名）且首个元素不是具名字段（`x:` 或 `.x =`）→ 匿名元组字面量：
     // 元素按位置存入 `_0`/`_1`/...，标记 ia=1，由 sema 据元素类型合成具名 struct。
     var is_tuple: bool = false;
@@ -4378,6 +4410,18 @@ pub fn parse_match_alt_atom() i64 {
         (lex.cur_t() == "Integer" && (lex.peek_t(1) == "DotDot" || lex.peek_t(1) == "DotDotEq"))) {
         return parse_range();
     }
+    // 匿名元组位置式模式 `.{a, b}`（#4 §8.2）：模式位识别前导点 + `{`。
+    if (lex.cur_t() == "Dot" && lex.peek_t(1) == "LBrace") {
+        lex.advance_i();                       // 消费 Dot
+        return parse_struct_lit("", -1);       // 自 `{` 起解析（位置式，sa 留空）
+    }
+    // 具名类型位置式 / 具名字段模式 `Name{ a, b }` / `Name{ x: a }`（#4 §8.2）。
+    // 与 conpat（`Name(...)`）区分：`{` 而非 `(`。非 conpat 才走 struct_lit 模式。
+    if (lex.cur_t() == "Identifier" && lex.peek_t(1) == "LBrace" && pat_is_conpat() == false) {
+        var nm: string = lex.cur_v();
+        lex.advance_i();                       // 消费 ident
+        return parse_struct_lit(nm, -1);       // 自 `{` 起解析
+    }
     // 模式原子停在 `|`/`||`（按位或 / 逻辑或）之下：否则 `1 | 2 | 3` 会被 parse_bitor
     // 整体吞成一个按位或表达式，或模式脱糖的 `|` 切分就失效了。parse_bitxor 在
     // parse_bitor 之下一层，天然在 `|` 处停手。
@@ -4386,7 +4430,11 @@ pub fn parse_match_alt_atom() i64 {
 
 // @ 子模式（S3 as-模式）：单模式原子，不允许再嵌套 or。
 pub fn parse_match_subpat() i64 {
-    return parse_match_alt_atom();
+    var sav: bool = g_in_match_pat;
+    g_in_match_pat = true;
+    var r: i64 = parse_match_alt_atom();
+    g_in_match_pat = sav;
+    return r;
 }
 
 // match 臂解析（支持 S1 或模式 `|` 与 S3 as-模式 `x @ pat`）。
@@ -4412,7 +4460,7 @@ pub fn parse_match_arm() i64 {
         lex.advance_i();
         f_pat = -1;
     } else {
-        f_pat = parse_match_alt_atom();
+        f_pat = parse_match_subpat();
         f_sa = "";
     }
     append(am_sa, f_sa);
@@ -4429,7 +4477,7 @@ pub fn parse_match_arm() i64 {
             a_sa = "";
             a_pat = -1;
         } else {
-            a_pat = parse_match_alt_atom();
+            a_pat = parse_match_subpat();
             a_sa = "";
         }
         append(am_sa, a_sa);

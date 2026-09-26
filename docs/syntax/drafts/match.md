@@ -77,10 +77,10 @@ ParamPattern:
 - **结果类型统一（L-03 静态类型）**：各臂表达式须推断为同一类型 `R`，`MatchExpr` 整体即 `R`；不一致报 `T_MATCH_ARM_TYPE`。
 - **函数子句分发语义（纯语法糖）**：多个同名同元数的 `FuncDecl` 构成子句组。调用时**从左到右**匹配各子句参数模式，首个「全部模式匹配且守卫为真」的子句被选中。编译器在 AST lowering 阶段**强制**把整组脱糖为单一 `FuncDecl`，其体即 `return match (__p0) { ... };` —— `match` 是唯一语义真源，函数子句不引入独立语义。子句组声明头与 `reference.md` §3.1 并置式一致，禁止重载。
 - **绑定作用域（L-02 显式）**：模式绑定仅在其臂 / 子句作用域内可见，遮蔽同名外部变量，`match` 结束后外层不受影响，无隐式生命周期。
-- **struct / 元组字面量模式的语义（2026-09-25 实测）**：
+- **struct / 元组字面量模式的语义（2026-09-25 实测，2026-09-26 解构绑定已落地）**：
   - 语义是**按字段逐一相等比较**：`Pt{ .x = 0, .y = 0 }` ≡ 「`p.x == 0 && p.y == 0`」；`.{1i64, "a"}` ≡ 「`t._0 == 1i64 && t._1 == "a"`」。省字段即少一道比较（`Pt{ .x = 0 }` 只比 `x`）。
-  - **不引入绑定**：字段后的小写标识符**不是**绑定名。`Pt{ x: a, y: b }` 不绑定 `a`/`b`（这与 Rust/Swift 的解构直觉相反），在臂体内引用报 `T-SEM-E201`。
-  - ⚠ **不做充分静态校验**：未知字段名（`Pt{ zz: 0 }`）与未定义标识符（`Pt{ x: zzz, y: 0 }`）在 struct 字面量模式里**均不报诊断**（`tc check` 通过）。C 后端会把它们原样发射，导致 clang 阶段才报 C 的未定义符号。故拼写错误编译期不可见。
+  - **字段名解构绑定（2026-09-26 已落地）**：字段值位置若是**小写标识符**即视作绑定名（按字段把该字段解构绑定到臂内局部）。`Pt{ x: a, y: 0 }` 把 `a` 绑定为 `p.x`；`Pt{ x: a, y: b }` 双绑定；`Pair{ a: m, b: n }` 同理。这与 Rust/Swift 解构直觉一致，且与「小写 = 绑定名」（C2 裁定）同一套约定；绑定名作用域限本臂（L-02）。
+  - ⚠ **静态校验（2026-09-26 部分补齐）**：字段名不存在现报错 `T-MAT-E741`（`struct_lit_pat_check` 经 `find_struct_fields` 回查）；字面量字段类型不匹配也报错（经 `ti_equal`/`can_cast`）。仅「绑定名拼写错」（如 `Pt{ x: zzz }` 中 `zzz` 是合法新绑定）仍静默接受，列为后续增量。
   - ⚠ **LLVM 后端运行期错编（KI-002，open）**：比较条件被整体丢弃 → **首臂恒命中**；C 后端正确。详见 §6.3。
 
 ---
@@ -342,6 +342,8 @@ if (((_tms1.x == 0) && (_tms1.y == 0))) { _tmr1 = 1; } else { _tmr1 = 0; }
 
 ⇒ 缺陷只在 **LLVM / TIR 轨**；推测与 §6.2 根因 ① 同族（`tir_match_pattern_cond` 对 struct_lit 模式返回空条件串 ⇒ dispatch 退化为无条件跳转，未走 `named` 回查分支）。
 
+**✅ 已修复 + 解构绑定已落地（2026-09-26，元组特性 #2）**：`src/tir.tc` 的 `tir_match_pattern_cond` 增补 `struct_lit` 分支，逐字段 `icmp` + `AND` 合成非空条件链（复用 `tir_member_addr` 的 `ADDR_OF`+`GEP`+`LOAD` 配方；`ADDR_OF` 的 `st` 须 `ptr<%Pt>` 带 `%`，否则 GEP 基类型非法），并跳过 ident 绑定字段。`src/sema.tc` 新增 `struct_lit_pat_check`：校验字段存在（不存在报 `T-MAT-E741`）、字面量字段类型匹配（否则 `ti_equal`/`can_cast` 报错），并把 ident 字段 `sym_define` 为臂内局部（解构绑定）。`src/codegen_c.tc` `match_chain_from` 与 `src/tir.tc` `tir_emit_match` 的 `struct_lit` 分支按字段偏移提取绑定（与 conpat/slice_pat 同构）。修复后 `tc run`（LLVM 轨）输出 `0`；`examples/tuple_match_demo.tc` 与新增 `examples/tuple_destructure_demo.tc` 均经 `run_examples` 双后端逐字节一致 PASS。仍待补：匿名元组位置式 `.{a,b}` 解析支持（#4 增量）。
+
 **为何门禁未拦住**：与 §6.2 同构 —— ① `tests/known-issues/` **不被 conformance / difftest / run_examples 自动扫描**（设计如此，仅手动跑）；② `examples/` 全仓无「struct/元组字面量模式 + 运行期判别」用例，既有 struct 示例一律用字段访问；③ `conformance` 只校验编译期行为。故该路径运行期**零覆盖**，错编长期不可见。
 
 **用户侧规避（必须）**：不要用 struct / 元组字面量模式做运行期判别，改写为显式比较：
@@ -356,6 +358,8 @@ fn at_origin(p: Pt) i64 {
 另一处相关静默（同一路径）：struct **字面量**（含模式位）里的**未知字段名不报诊断** —— `Pt{ zz: 0 }` 与 `Pt{ x: zzz, y: 0 }` 均 `tc check` 通过；后者在 C 轨会一路发射到 clang 才报 C 的未定义符号。字段名拼写需人工核对。
 
 **修复验收待办**：① LLVM 轨补发 struct_lit / 元组模式的逐字段比较（使其 IR 出现对应 `icmp` 与条件 `br`）；② 字面量模式补「未知字段名 + 未定义标识符」的 sema 诊断；③ 新增 `examples/` 常规门禁用例，覆盖 struct/元组字面量模式的**双后端运行期对拍**（建成前先用修复前的编译器确认用例会失败，避免空跑）。
+
+> 状态更新（2026-09-26）：① 与 ③ 已完成；解构绑定（② 的「字段名解构」部分）已随元组特性 #2 一并落地（`struct_lit_pat_check` 校验字段名存在 + 字面量类型，ident 字段绑定为臂内局部）；仅「绑定名拼写错静默接受」与匿名元组 `.{a,b}` 位置式语法仍待增量。
 
 ---
 

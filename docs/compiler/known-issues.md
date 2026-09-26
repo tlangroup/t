@@ -16,7 +16,7 @@
 | ID | 标题 | 类别 | 构建版本 | 状态 | 严重度 | 复现用例 | 期望 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | **KI-001** | variant 直接字面量 `Circle(5)` LLVM 代码生成缺陷 | codegen（variant） | 2026-09-03 | **closed** | 高 | `tests/known-issues/KI-001_variant_anon_literal.tc` | `tc run` 输出 `5` |
-- **KI-002**：struct / 元组字面量模式 `Pt{ x: 0, y: 0 }` / `.{1i64, "a"}` 在 LLVM 轨条件被丢弃 → **恒命中首臂**（静默错编；C 轨正确） | codegen（LLVM 轨 match 解构） | 2026-09-03 登记，`fb6eeaf` 误记已修 | ⚠ **reopen**（2026-09-25 复确认；非 `2a3c4b6` 元组引入） | 高 | `tests/known-issues/KI-002_struct_literal_pat.tc` | `tc run` 输出 `0`（现为 `1`；C 轨已是 `0`） |
+- **KI-002**：struct / 元组字面量模式 `Pt{ x: 0, y: 0 }` / `.{1i64, "a"}` 在 LLVM 轨条件被丢弃 → **恒命中首臂**（静默错编；C 轨正确） | codegen（LLVM 轨 match 解构） | 2026-09-03 登记，`fb6eeaf` 误记已修 | ✅ **closed**（2026-09-26 元组特性一并修复） | 高 | `tests/known-issues/KI-002_struct_literal_pat.tc` | `tc run` 输出 `0`（C 轨 `0`，LLVM 轨原 `1` → 修复后 `0`） |
 
 ## 2. KI-001 · variant 直接字面量（匿名字段字面量）代码生成缺陷
 
@@ -63,6 +63,16 @@
 - **相关静默（同路径）**：struct 字面量里的**未知字段名 / 未定义标识符不发诊断** —— `Pt{ zz: 0 }`、`Pt{ x: zzz, y: 0 }` 均 `tc check` 通过；后者在 C 轨会一路发射到 clang 才报 C 未定义符号。建议与 KI-002 一并修（sema 侧补校验）。
 - **为何门禁未拦住**：`tests/known-issues/` 不被 conformance / difftest / run_examples 自动扫描（本文件 §0 约定），`examples/` 全仓无「struct/元组字面量模式 + 运行期判别」用例 ⇒ 该路径运行期零覆盖。
 - **待办**：① 修复 LLVM 轨 struct_lit 模式的逐字段比较发射；② 补 sema 诊断（未知字段 / 未定义标识符）；③ **把该用例挪进 `examples/` 常规门禁**（建成前须用修复前的编译器确认会失败，避免空跑）；④ 必要时二分定位 `fb6eeaf..0b212ac` 的 culprit。
+
+### 3.2 ✅ KI-002 已修复（2026-09-26，元组特性 #2 一并落地，提交 wb）
+
+- **根因（确定）**：`tir_match_pattern_cond` 对 `struct_lit` 模式**无分支** → 返回空条件串 → dispatch 退化为无条件跳转恒命中首臂（§3.1 的「IR 证据」正是此根因，而非早先假设的 load/icmp 类型错配）。
+- **修复**：`src/tir.tc` 的 `tir_match_pattern_cond` 增补 `struct_lit` 分支，复用 `tir_member_addr` 同款配方（`ADDR_OF` 结构值 → `GEP` 前导 `0` + 字段下标 → `LOAD`）逐字段 `icmp eq` + `AND` 合成非空条件链，对齐 C 后端 `match_chain_from` 的 struct_lit 比较发射。
+  - ⚠ **关键坑**：`ADDR_OF` 的 `st` 必须 `ptr<%Pt>`（带 `%`），否则 `ll_ptr_inner` 退化成无 `%` 的 `Pt` → GEP 基类型非法 → LLVM `error: expected type`。命名结构（`sa` 非空）与匿名元组（由 `scr_td` 名反查合成结构名）均覆盖。
+- **验收（双后端一致）**：
+  - `tests/known-issues/KI-002_struct_literal_pat.tc`：`tc run`（LLVM 轨）退出 0、无 IR 报错、stdout = `0`（修复前 `1`）。
+  - 新增 `examples/tuple_match_demo.tc`（+ `.expected.txt`）：含命名结构模式 `Pt{ x: 0, y: 0 }`、具名元组合成结构 `_0/_1` 模式 `IntPair{ ._0 = 0, ._1 = 0 }`、部分字段模式、多臂 + 兜底 `_`，经 `node tools/run_examples.mjs` **双后端逐字节一致 PASS**。
+- **待办 ②（sema 诊断：未知字段 / 未定义标识符）仍未做**，属 §14.2 解构绑定特性的独立子项，本轮未一并补；③ 已通过新增 `examples/tuple_match_demo.tc` 达成「挪进常规门禁运行期覆盖」。
 
 ## 4. 修复排期建议
 
