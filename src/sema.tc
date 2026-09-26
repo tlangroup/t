@@ -3102,6 +3102,76 @@ pub fn conpat_check(pat: i64, scr: i64, rep: bool) void {
     }
 }
 
+// ── struct / 具名元组 字面量模式解构绑定（KI-002 + 解构绑定 §8.2）──
+// 命名字段形式 `Pt{ x: a, y: b }` / `IntPair{ ._0 = a, ._1 = b }`（均解析为 struct_lit 节点）。
+//   · ident 值字段 = 绑定（声明为本臂子作用域局部，类型取字段声明类型；`_ ` 仅占位）
+//   · 字面量值字段 = 与字段类型比对（等值匹配语义，沿用既有）
+//   · 模式结构名须与被匹配值类型一致；未知字段名 / 非 struct 类型 → 诊断
+// 仅处理模式位（match 臂 m_an.na）；表达式位的 struct_lit 构造照常走 infer。
+// 条件生成（字面量比较）与绑定提取（ident）分别在 tir / codegen_c 的 match 发射期完成。
+pub fn struct_lit_pat_check(pat: i64, scr: i64, rep: bool) void {
+    var pn: Node = base.nodes[pat];
+    var sname: string = pn.sa;
+    if (sname == "" && scr >= 0) {
+        var std: i64 = resolve_ti(scr);
+        if (std >= 0) { sname = sema.tds[std].name; }
+    }
+    // 模式结构名须与被匹配值类型一致（无名元组由 scrutinee 反查，此处 sname=="" 已被填上）
+    if (pn.sa != "" && scr >= 0 && tip_name(scr) != sname) {
+        if (rep) {
+            parse.fc_err("T-MAT-E741",
+                base.sb_cat5("字面量模式类型 `", sname, "` 与被匹配值类型 `", tip_name(scr), "` 不符"), pat);
+        }
+        return;
+    }
+    var fh: i64 = sema.find_struct_fields(sname);
+    if (fh < 0) {
+        if (rep) {
+            parse.fc_err("T-MAT-E741",
+                base.sb_cat3("字面量模式类型 `", sname, "` 不是 struct / 元组，无法做字段解构"), pat);
+        }
+        return;
+    }
+    var fvp: i64 = pn.la;
+    while (fvp >= 0) {
+        var fv: Node = base.nodes[base.kids[fvp].val];
+        var fname: string = fv.sa;
+        // 取字段声明类型节点（同时校验字段存在）
+        var ftnode: i64 = -1;
+        var fc: i64 = fh;
+        while (fc >= 0) {
+            var ffn: Node = base.nodes[base.kids[fc].val];
+            if (ffn.sa == fname) { ftnode = ffn.na; break; }
+            fc = base.kids[fc].next;
+        }
+        if (ftnode < 0) {
+            if (rep) {
+                parse.fc_err("T-MAT-E741",
+                    base.sb_cat3("struct `", sname, base.sb_cat3("` 没有字段 `", fname, "`")), pat);
+            }
+            fvp = base.kids[fvp].next;
+            continue;
+        }
+        var fti: i64 = resolve_ti(ftnode);
+        var fval: i64 = fv.na;
+        if (fval >= 0 && base.nodes[fval].kind == "ident") {
+            // 绑定：声明为本臂子作用域局部（仅本臂可见，遮蔽外层同名）
+            if (base.nodes[fval].sa != "_") {
+                sym_define(cur_scope, base.nodes[fval].sa, "var", fti, -1);
+            }
+        } else if (fval >= 0) {
+            // 字面量：与字段类型比对（等值匹配语义）
+            var lt: i64 = infer_expr(fval);
+            if (rep && tip_kind(lt) != "Unknown" && tip_kind(fti) != "Unknown") {
+                if (ti_equal(lt, fti) == false && can_cast(lt, fti) == false) {
+                    err_type_mismatch(fval, fti, lt);
+                }
+            }
+        }
+        fvp = base.kids[fvp].next;
+    }
+}
+
 // ── 文件描述符内建的编译期校验（M51）──────────────────────────
 
 pub fn fid_atom_allowed(sel: string) string {
@@ -6341,6 +6411,11 @@ pub fn infer_expr(e: i64) i64 {
                 // ADT：variant 构造器解构。此刻 cur_scope 已是本臂子作用域，
                 // 载荷绑定直接 define 进去（仅本臂可见，遮蔽外层同名）。
                 conpat_check(m_an.na, m_scr, m_rep);
+            } else if (m_an.na >= 0 && base.nodes[m_an.na].kind == "struct_lit") {
+                // struct / 具名元组 字面量模式：逐字段类型校验 + ident 绑定（§8.2）。
+                // 须先于下方「前导点变体」else 分支，避免被当成表达式整体 infer 而把
+                // 绑定标识符误判为未定义（T-SEM-E201）。
+                struct_lit_pat_check(m_an.na, m_scr, m_rep);
             } else if (m_an.na >= 0) {
                 // 切片模式（S6）：children 由 validate_slice_pat 校验 + 声明元素绑定，
                 // 本身不整体 infer（与 range 同处理，避免被当成普通表达式求值）。

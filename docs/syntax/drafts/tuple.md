@@ -84,14 +84,17 @@ TupleBind       ::= "var" TupleLitPat "=" Expr              // 直接解构绑�
 - **根因（match.md §6.3）**：`tir_match_pattern_cond` 对 struct_lit 模式返回空条件串 → dispatch 退化为无条件跳转，未走 `named` 回查分支。与 enum scrutinee 首臂 bug（match.md §6.2 根因 ①）同族。
 - **修复方向**：在 `tir_match_pattern_cond` / `tir_to_ll` 的 struct_lit 模式分支，按 struct 字段偏移逐个提取 + 相等比较，生成非空的 `icmp` 条件链（对齐 C 后端 `struct_lit` 比较发射）。
 
-### 8.2 解构绑定模式（`.{a,b}` / `Pair{a,b}`）—— 未实现
+### 8.2 解构绑定模式（字段名 `.{a,b}` 同构 / `Pt{ x: a }` / `Pair{ a: m }`）—— ✅ 已实现（2026-09-26，提交 wb）
 
-- **现状**：`match (t) { .{a,b} => ... }` 解析期即报 `T-PAR-E101`（`.{` 在模式位未被识别为模式）；`Pair{ a, b }` 报「期待 FatArrow，实际读到 {」（conpat 只认 `Name(args)` 不认 `Name{...}`）。
-- **设计（#2/#4 第 4 类）**：`do_msg({add,A,B}) => A+B` —— 按位置字段把元组解构成绑定 `A`/`B`。
-  - **解析**：`parse_match_alt_atom` / `parse_struct_lit` 在模式位（`pat=true`）识别 `.{...}`（元素为 `Ident` 绑定或嵌套模式）与 `Name{ a, b }`（位置/字段名绑定），生成 `struct_pat` 节点（沿用 `conpat`/`slice_pat` 的「模式节点」范式）。
-  - **sema**：`conpat_check` 增加 struct/tuple 分支——校验 scrutinee 类型是该 struct（或同构元组），按字段声明绑定（作用域限臂内），复用 `f_pat`/`a_bind` 既有绑定槽机制（match.md §7.2、S3 as-模式槽机制）。
-  - **发射**：`match` 发射期对每个绑定字段，按 struct 字段偏移 `gep` 提取并存入绑定变量（C：取成员地址/值；LLVM：提取 + alloca 绑定）。
-- **范围边界**：仅做**位置字段绑定**（`.{a,b}` 与 `Pair{a,b}` 位置式）；具名字段 `Pt{ x: a, y: b }` 的「字段名→绑定」映射留作 #4 扩展（match.md §2 已明示「`Pt{ x: a }` 不绑定 a」为当前语义，解构绑定是增量，须另行裁定字段名语义）。
+- **现状（修复前）**：`match (t) { .{a,b} => ... }` 解析期即报 `T-PAR-E101`（`.{` 在模式位未被识别为模式）；`Pt{ x: a, y: b }` 中的 ident 被当成表达式整体 infer，报 `T-SEM-E201`（UNDEFINED_IDENT）。
+- **设计（#2/#4 第 4 类）**：`do_msg({add,A,B}) => A+B` —— 把结构/元组按字段解构成绑定。
+  - **解析**：`Pt{ x: a }` / `Pair{ a: m }` 等「字段名 = ident」形式沿用既有 `struct_lit` 模式节点（解析器本就产出 `struct_lit`，无需新节点）；匿名元组位置式 `.{a,b}` 仍待解析器支持（见 §8.2 范围边界）。
+  - **sema**：新增 `struct_lit_pat_check`（`src/sema.tc`，在 `conpat_check` 之后于 `match` 臂语义循环的分发分支调用）——校验 scrutinee 类型与该 struct/同构元组一致、字段存在（不存在报 `T-MAT-E741`）、字面量字段类型匹配（否则 `ti_equal`/`can_cast` 报错）；**ident 字段经 `sym_define` 绑定为臂内局部**（作用域限臂，可遮蔽外层同名）。须先于「前导点变体」else 分支，避免 ident 被误判为未定义。
+  - **发射（双后端）**：
+    - C：`match_chain_from` 的 `struct_lit` 分支——ident 字段跳过比较链，改为在 body 前置 `mk_var_decl` 绑定（`auto a = sname.x;`，复用 `g_conpat_binds` 机制，与 slice_pat 同构）；纯绑定臂（无字面量字段）`mc_cond` 保持 `-1` → 该臂无条件命中。
+    - LLVM：`tir_emit_match` 在 entry 预声明绑定名 slot（mirror conpat/slice_pat）；body 块内 ADDR_OF 结构值 → GEP 字段偏移 → LOAD → STORE；`tir_match_pattern_cond` 的 `struct_lit` 分支跳过 ident 字段（仅字面量进 `icmp`+`AND` 链）。
+- **范围边界**：本轮回**字段名解构**（任意 struct / 具名元组的 `Name{ f: ident }` 形式，如 `Pt{ x: a, y: 0 }`、`Pair{ a: m, b: n }`）已双后端落地；匿名元组**位置式** `.{a,b}` 语法仍待解析器支持（当前 `.{...}` 在模式位报 `T-PAR-E101`），列为 #4 增量。
+- **验证**：`examples/tuple_destructure_demo.tc`（+ `.expected.txt`）经 `run_examples` 双后端逐字节一致 PASS；`tests/conformance/pass/p_tuple_destructure.tc` `tc check` 接受（`EXPECT: pass`）。
 
 ## 9. 门禁与测试
 
@@ -144,9 +147,10 @@ TupleBind       ::= "var" TupleLitPat "=" Expr              // 直接解构绑�
 - **处置**：本特性落地时一并修复（§8.1 修复方向），使元组字面量模式双后端一致。**修复须双后端对拍验证**，避免「C 改对、LLVM 仍错」的静默不一致。
 
 ### 14.2 解构绑定模式
-- **事实**：当前 `match` 模式位不识别 `.{...}` / `Name{...}` 为模式（`T-PAR-E101`），仅支持字面量常量比较（match.md §2：「`Pt{ x: a }` 不绑定 a」）。
-- **决策**：本特性补「位置字段解构绑定」（`.{a,b}` / `Pair{a,b}`），实现 `do_msg({add,A,B}) => A+B`（design.md §2.3 第 4 类）。复用 `conpat_check` 的 struct 分支 + `f_pat`/`a_bind` 绑定槽 + `match` 发射的字段提取。
-- **影响**：`parse_match_alt_atom` 增加 struct_pat 识别；`conpat_check` 增加 struct/tuple 解构分支；`match` 发射（C/LLVM）增加字段提取绑定。
+- **事实（修复前）**：`match` 模式位的 `.{...}` 在解析期报 `T-PAR-E101`；`Pt{ x: a }` 中的 ident 被 sema 误判为未定义（`T-SEM-E201`）。
+- **决策（已落地，2026-09-26 提交 wb）**：补「字段名解构绑定」——任意 struct / 具名元组的 `Name{ f: ident }` 模式（如 `Pt{ x: a, y: 0 }`、`Pair{ a: m, b: n }`）把 ident 字段绑定为臂内局部，实现 `do_msg({add,A,B}) => A+B`（design.md §2.3 第 4 类）。复用 `struct_lit_pat_check`（`conpat_check` 之后独立分支）+ `match` 发射的字段提取（C/LLVM 双后端，与 conpat/slice_pat 同构）。
+- **影响**：`struct_lit_pat_check` 增加 struct/tuple 解构分支（src/sema.tc）；`match_chain_from`（C）与 `tir_emit_match`（LLVM）的 `struct_lit` 分支增加字段提取绑定；无新 AST 节点（沿用既有 `struct_lit`）。
+- **未含**：匿名元组位置式 `.{a,b}` 仍待解析器支持（见 §8.2 范围边界）。
 
 ## 15. 实现计划（Phase 2 PLAN）
 
@@ -199,6 +203,9 @@ TupleBind       ::= "var" TupleLitPat "=" Expr              // 直接解构绑�
   `examples/tuple_match_demo.tc`（+ `.expected.txt`）经 `run_examples` 双后端逐字节一致 PASS
   （命名结构模式 + 具名元组合成结构 `_0/_1` 模式 + 部分字段模式全覆盖）。
   ⚠ 关键坑：ADDR_OF 的 st 必须 `ptr<%Pt>`（带 `%`），否则 GEP 基类型退化成无 `%` 的 `Pt` → LLVM "expected type" 报错。
-- **待补（本文目标）**：
-  - 解构绑定模式 `.{a,b}` / `Pair{a,b}`（§8.2 / §14.2）。
-  - conformance `p_tuple_destructure` / `p_tuple_litpat`（§9，litpat 已通过 example 固化）。
+- **✅ 解构绑定已落地（2026-09-26，提交 wb）**：struct / 具名元组字面量模式中的 ident 字段绑定为臂内局部（字段名解构 `Pt{ x: a, y: 0 }` / `Pair{ a: m, b: n }`），C + LLVM 双后端按字段偏移提取一致。
+  验证：`examples/tuple_destructure_demo.tc`（+ `.expected.txt`）双后端逐字节 PASS；`tests/conformance/pass/p_tuple_destructure.tc` `EXPECT: pass`。
+  实现点：`src/sema.tc` 新增 `struct_lit_pat_check`；`src/codegen_c.tc` `match_chain_from` 的 `struct_lit` 分支（绑定提取 + 比较链拆分）；`src/tir.tc` `tir_match_pattern_cond` 跳过 ident 字段 + `tir_emit_match` entry 预声明 slot 与 body 字段提取。
+  ⚠ 仍待补：匿名元组位置式 `.{a,b}` 语法（解析器未识别模式位 `.{`）。
+- **✅ conformance `p_tuple_litpat` 已固化**（见 KI-002 条，`tests/conformance/pass/p_tuple_litpat.tc` `EXPECT: pass`）。
+- **待补（增量）**：匿名元组位置式 `.{a,b}` 解析与解构（parser 增量，#4 范畴）。
