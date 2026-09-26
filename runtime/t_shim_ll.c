@@ -191,3 +191,35 @@ void    tll_path_resolve(TStr* path, TStr* out)      { *out = t_path_resolve(t_c
 void    tll_args(TSlice* out)                        { *out = t_args(); }
 void    tll_exit(int32_t code)                       { t_exit(code); }
 int32_t tll_system(TStr* cmd)                        { return t_system(*cmd); }
+
+// ── 位串 bitstr（§15）─────────────────────────────────────────
+// 与 TStr 同策略：聚合按指针传，out 排在末位；用内联实现规避 24 字节 TBitStr 的 sret ABI 歧义。
+void tll_bitstr_new(TBitStr* out, int64_t bit_len) {
+    int64_t bytes = (bit_len + 7) / 8;
+    uint8_t* buf = (uint8_t*)t_arena_alloc(t_arena_current(), (size_t)bytes);
+    if (bytes > 0) { memset(buf, 0, (size_t)bytes); }
+    out->ptr = buf; out->bit_len = 0; out->cap = bytes;
+}
+void tll_bitstr_append_val(TBitStr* dst, uint64_t val, int64_t bits, int little) {
+    t_bitstr_append_val(dst, val, bits, little);
+}
+void tll_bitstr_concat(TBitStr* out, TBitStr* a, TBitStr* b) {
+    int64_t total = a->bit_len + b->bit_len;
+    int64_t bytes = (total + 7) / 8;
+    uint8_t* buf = (uint8_t*)t_arena_alloc(t_arena_current(), (size_t)bytes);
+    if (bytes > 0) { memset(buf, 0, (size_t)bytes); }
+    TBitStr r; r.ptr = buf; r.bit_len = 0; r.cap = bytes;
+    // 复制 a 的位（读 *a 发生在写 *out 之前，out==a 重叠安全）
+    for (int64_t i = 0; i < a->bit_len; i++) {
+        int bit = (a->ptr[i / 8] >> (7 - (i % 8))) & 1;
+        if (bit) { r.ptr[i / 8] |= (uint8_t)(1 << (7 - (i % 8))); }
+    }
+    // 复制 b 的位
+    for (int64_t i = 0; i < b->bit_len; i++) {
+        int64_t dsti = a->bit_len + i;
+        int bit = (b->ptr[i / 8] >> (7 - (i % 8))) & 1;
+        if (bit) { r.ptr[dsti / 8] |= (uint8_t)(1 << (7 - (dsti % 8))); }
+    }
+    r.bit_len = total;
+    *out = r;
+}

@@ -985,6 +985,7 @@ pub fn tir_st_of_td(td: i64) string {
         return base.sb_cat5("arr<", rowst, " x ", base.i2s(rows), ">");
     }
     if (t.cat == "map") { return "ptr<void>"; }
+    if (t.cat == "bitstr") { return "%TBitStr"; }   // 位串（§15）：与 TStr/TSlice 同构，LLVM 侧为聚合 {ptr,i64,i64}
     if (t.cat == "optional") { return base.sb_cat3("ptr<", tir_st_of_td(t.elem), ">"); }  // Stage 1 opt.boxed
     if (t.cat == "sym") {
         if (t.alen == 16) { return "u16"; }
@@ -1321,6 +1322,7 @@ pub fn tir_add_std_types() void {
     append(g_mod.types, TIRType{ name: "%TStr", body: "f0: ptr<i8>, f1: i64" });
     append(g_mod.types, TIRType{ name: "%TSlice", body: "f0: ptr<void>, f1: i64, f2: i64, f3: i64" });
     append(g_mod.types, TIRType{ name: "%TClosure", body: "f0: ptr<void>, f1: ptr<void>" });
+    append(g_mod.types, TIRType{ name: "%TBitStr", body: "f0: ptr<i8>, f1: i64, f2: i64" });
 }
 
 // 字段 ST：尽力从字段类型节点解析（非标量退化为 i64；TT 可读性为主，顺序才关键）
@@ -2436,6 +2438,74 @@ pub fn tir_emit_for_each(n: Node) void {
         tir_blk_pop();
         tir_loop_pop();
         return;
+    } else if (ct.cat == "bitstr") {
+        // 字节遍历：nbytes = ceil(bit_len/8)，元素 u8 从 %TBitStr.f0 ptr[i] 读（与 C 后端 codegen_c.tc:3511 对齐）
+        var etd: i64 = sema.td_named_mk("scalar", "u8");
+        var elem_st: string = "u8";   // ⚠ 必须是 u8：int_to_str(x) 经 ll_load→zext 才能与 C 端 uint8_t 零扩展一致（否则 -72 vs 184）
+        var iterr: TirEmitRes = tir_emit_expr(n.na); var iter: string = iterr.name;
+        // 循环变量 x：u8 槽
+        var lv: string = tir_new_named_slot(etd, elem_st, n.sa);
+        // bit_len = iter.f1
+        var bladdr: string = tir_tmp();
+        tir_emit(TIRInst{ op: TIR_OP_GEP, st: tir_st_from_str("i64"), dst: tir_op(bladdr), args: tir_a2(iter, "1"), is_comment: false, line: g_cur_line, cmt: "" });
+        var blen: string = tir_tmp();
+        tir_emit(TIRInst{ op: TIR_OP_LOAD, st: tir_st_from_str("i64"), dst: tir_op(blen), args: tir_a1(bladdr), is_comment: false, line: g_cur_line, cmt: "" });
+        // nbytes = (bit_len + 7) / 8
+        var bl7: string = tir_tmp();
+        tir_emit(tir_emit_binop(TIR_OP_ADD, "i64", bl7, blen, "7"));
+        var len: string = tir_tmp();
+        tir_emit(tir_emit_binop(TIR_OP_UDIV, "i64", len, bl7, "8"));
+        // idx = 0
+        var idx: string = tir_new_named_slot(-1, "i64", "__fe_idx");
+        var z: string = tir_tmp();
+        tir_emit(tir_emit_const_typed("i64", z, "0"));
+        tir_emit(tir_emit_store(z, idx));
+        // 循环骨架
+        var headL: string = tir_lbl("fe.h");
+        var bodyL: string = tir_lbl("fe.b");
+        var stepL: string = tir_lbl("fe.s");
+        var endL: string = tir_lbl("fe.e");
+        tir_loop_push(stepL, endL);   // ⚠ continue 必须跳 stepL（增量块），否则跳过 idx++
+        tir_emit(tir_emit_br(headL));
+        tir_block(headL);
+        var cidx: string = tir_tmp();
+        tir_emit(tir_emit_load("i64", cidx, idx));
+        var ccmp: string = tir_tmp();
+        tir_emit(tir_emit_binop(TIR_OP_SLT, "i64", ccmp, cidx, len));
+        tir_emit(tir_emit_br_cond(ccmp, bodyL, endL));
+        tir_block(bodyL);
+        // 元素地址：buffer ptr = iter.f0 (ptr<i8>)
+        var vaddr: string = tir_tmp();
+        tir_emit(TIRInst{ op: TIR_OP_GEP, st: tir_st_from_str("ptr<i8>"), dst: tir_op(vaddr), args: tir_a2(iter, "0"), is_comment: false, line: g_cur_line, cmt: "" });
+        var vptr: string = tir_tmp();
+        tir_emit(TIRInst{ op: TIR_OP_LOAD, st: tir_st_from_str("ptr<i8>"), dst: tir_op(vptr), args: tir_a1(vaddr), is_comment: false, line: g_cur_line, cmt: "" });
+        var eptr: string = tir_tmp();
+        tir_emit(TIRInst{ op: TIR_OP_GEP_IDX, st: tir_st_from_str("i8"), dst: tir_op(eptr), args: tir_a2(vptr, cidx), is_comment: false, line: g_cur_line, cmt: "" });
+        var ev: string = tir_tmp();
+        tir_emit(TIRInst{ op: TIR_OP_LOAD, st: tir_st_from_str("i8"), dst: tir_op(ev), args: tir_a1(eptr), is_comment: false, line: g_cur_line, cmt: "" });
+        // ⚠ 字节元素必须【零扩展】进标量栈槽（恒 i64，见 ll_ensure_slot 加宽）：直接 store i8 会被 sign-extend 成负数
+        // （0xB8→-72），而 C 端 uint8_t 零扩展为 184。先 zext i8→i64 再存，确保与 C 后端一致。
+        var evi64: string = tir_tmp();
+        tir_emit(TIRInst{ op: TIR_OP_ZEXT, st: tir_st_from_str("i64"), dst: tir_op(evi64), args: tir_a1(ev), is_comment: false, line: g_cur_line, cmt: "" });
+        tir_emit(TIRInst{ op: TIR_OP_STORE, st: ST_NONE, dst: tir_op(lv), args: tir_a1(evi64), is_comment: false, line: g_cur_line, cmt: "" });
+        // 循环体
+        var bc: i64 = n.la;
+        while (bc >= 0) {
+            tir_emit_stmt(base.kids[bc].val);
+            bc = base.kids[bc].next;
+        }
+        tir_emit(tir_emit_br(stepL));
+        tir_block(stepL);
+        var cidx2: string = tir_tmp();
+        tir_emit(tir_emit_load("i64", cidx2, idx));
+        var cidx3: string = tir_tmp();
+        tir_emit(tir_emit_binop(TIR_OP_ADD, "i64", cidx3, cidx2, "1"));
+        tir_emit(tir_emit_store(cidx3, idx));
+        tir_emit(tir_emit_br(headL));
+        tir_block(endL);
+        tir_blk_pop();
+        tir_loop_pop();
+        return;
     } else {
         tir_cmt(base.sb_cat3("unsupported for_each collection: ", ct.cat, ""));
         tir_blk_pop();
@@ -2746,6 +2816,42 @@ pub fn tir_emit_expr(e: i64) TirEmitRes {
         var d: string = tir_tmp();
         tir_emit(TIRInst{ op: TIR_OP_CONST_STR, st: ST_NONE, dst: tir_op(d), args: tir_a1(base.i2s(id)), is_comment: false, line: g_cur_line, cmt: "" });
         return TirEmitRes{ name: d, st: est };
+    }
+    // 位串字面量 `<<seg:W, ...>>`（§15）：在 TIR 轨构造 TBitStr 并逐段写位，
+    // 与 C 后端 codegen_c.emit 同构（t_bitstr_new + t_bitstr_append_val / tll_bitstr_concat）。
+    // 复用 %TStr 的 ptr-out(sret) 策略：局部槽 = alloca %TBitStr，tll_ 函数以 ptr 传参。
+    if (kd == "bitstr") {
+        var bs: string = tir_new_named_slot(-1, "%TBitStr", "bs");
+        // 固定段总位宽（容量提示；变长段运行时由 append/concat 累积 bit_len）
+        var fixed_bits: i64 = 0;
+        var bc0: i64 = n.la;
+        while (bc0 >= 0) {
+            var seg0: Node = base.nodes[base.kids[bc0].val];
+            if (seg0.ba == false) {
+                var wn0: Node = base.nodes[seg0.nb];
+                fixed_bits = fixed_bits + sema.parse_int_len(wn0.sa, wn0.ia);
+            }
+            bc0 = base.kids[bc0].next;
+        }
+        tir_emit(TIRInst{ op: TIR_OP_CALL, st: tir_st_from_str("void"), dst: tir_op(""), args: tir_a3("@tll_bitstr_new", bs, base.i2s(fixed_bits)), is_comment: false, line: g_cur_line, cmt: "" });
+        var bci: i64 = n.la;
+        while (bci >= 0) {
+            var seg: Node = base.nodes[base.kids[bci].val];
+            if (seg.ba) {
+                // 变长尾段：递归发射段表达式（bitstr 值），再 tll_bitstr_concat(bs, bs, segv)
+                var segr: TirEmitRes = tir_emit_expr(seg.na);
+                tir_emit(TIRInst{ op: TIR_OP_CALL, st: tir_st_from_str("void"), dst: tir_op(""), args: tir_a4("@tll_bitstr_concat", bs, bs, segr.name), is_comment: false, line: g_cur_line, cmt: "" });
+            } else {
+                var valr: TirEmitRes = tir_emit_expr(seg.na);
+                var wn: Node = base.nodes[seg.nb];
+                var bits: i64 = sema.parse_int_len(wn.sa, wn.ia);
+                var little: i64 = 0;
+                if (seg.sa == "little") { little = 1; }
+                tir_emit(TIRInst{ op: TIR_OP_CALL, st: tir_st_from_str("void"), dst: tir_op(""), args: tir_a5("@tll_bitstr_append_val", bs, valr.name, base.i2s(bits), base.i2s(little)), is_comment: false, line: g_cur_line, cmt: "" });
+            }
+            bci = base.kids[bci].next;
+        }
+        return TirEmitRes{ name: bs, st: tir_st_from_str("%TBitStr") };
     }
     if (kd == "bool") {
         var d: string = tir_tmp();
