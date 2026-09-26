@@ -156,6 +156,8 @@ TBitStr t_bitstr_concat(TBitStr a, TBitStr b);               // 位级拼接（a
 void    t_bitstr_append_val(TBitStr* dst, uint64_t val, int64_t bits, int little); // 写 bits 低位到 dst 游标
 void    t_bitstr_append_bitstr(TBitStr* dst, TBitStr src);  // 追加整个 src（位级）
 int64_t t_bitstr_bitlen(TBitStr s);                          // 返回 s.bit_len
+uint64_t t_bitstr_extract(TBitStr s, int64_t bit_off, int64_t bits, int little); // 提取 [bit_off,bit_off+bits) 为 u64（与 t_bitstr_append_val 打包互逆）
+TBitStr t_bitstr_sub(TBitStr s, int64_t bit_off);            // 返回 [bit_off, bit_len) 的字节对齐副本视图（match /bitstr 段）
 
 // ── map[K]V：开放寻址，K 限定 string / 整数 ───────────────────
 // key_kind: 0 = TStr, 1 = int64

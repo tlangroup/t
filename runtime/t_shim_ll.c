@@ -223,3 +223,10 @@ void tll_bitstr_concat(TBitStr* out, TBitStr* a, TBitStr* b) {
     r.bit_len = total;
     *out = r;
 }
+uint64_t tll_bitstr_extract(TBitStr* s, int64_t bit_off, int64_t bits, int little) {
+    return t_bitstr_extract(*s, bit_off, bits, little);
+}
+void tll_bitstr_sub(TBitStr* out, TBitStr* s, int64_t bit_off) {
+    *out = t_bitstr_sub(*s, bit_off);
+}
+

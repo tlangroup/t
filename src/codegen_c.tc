@@ -1610,6 +1610,58 @@ pub fn match_chain_from(c: i64, rname: string, sname: string) i64 {
                 slice_set(base.kids, sp_pre_tail, sp_ptk);
                 mc_body = sp_pre;
             }
+        } else if (base.nodes[mc_an.na].kind == "bitstr_pat") {
+            // 位串模式解构（§6）：段内 ident 绑定 + 运行时位解包；恒匹配（无判别条件）
+            var bp_pat: i64 = mc_an.na;
+            var bp_pre: i64 = -1;
+            var bp_pre_tail: i64 = -1;
+            var bp_off: i64 = 0;
+            var bp_seg: i64 = base.nodes[bp_pat].la;
+            while (bp_seg >= 0) {
+                var bp_sn: Node = base.nodes[base.kids[bp_seg].val];
+                if (bp_sn.na >= 0 && base.nodes[bp_sn.na].kind == "ident" && base.nodes[bp_sn.na].sa != "_") {
+                    var bp_name: string = base.nodes[bp_sn.na].sa;
+                    var bp_init: i64;
+                    var bp_td: i64;
+                    var bp_tnode: i64 = -1;
+                    if (bp_sn.ba) {
+                        bp_td = sema.td_mk("bitstr");
+                        bp_tnode = base.mk_named("bitstr", -1);
+                        var bp_ahead: i64 = base.list_push(-1, -1, base.mk_ident(sname, -1));
+                        var bp_atail: i64 = base.list_push(bp_ahead, bp_ahead, base.mk_int(base.i2s(bp_off), -1, -1));
+                        bp_init = base.mk_call(base.mk_ident("t_bitstr_sub", -1), bp_ahead, -1);
+                    } else {
+                        bp_td = sema.td_named_mk("scalar", "i64");
+                        bp_tnode = base.mk_scalar("i64", -1);
+                        var bp_wn: Node = base.nodes[bp_sn.nb];
+                        var bp_bits: i64 = parse_int_len(bp_wn.sa, bp_wn.ia);
+                        var bp_little: i64 = 0;
+                        if (bp_sn.sa == "little") { bp_little = 1; }
+                        var bp_ahead: i64 = base.list_push(-1, -1, base.mk_ident(sname, -1));
+                        var bp_atail: i64 = base.list_push(bp_ahead, bp_ahead, base.mk_int(base.i2s(bp_off), -1, -1));
+                        bp_atail = base.list_push(bp_atail, bp_atail, base.mk_int(base.i2s(bp_bits), -1, -1));
+                        bp_atail = base.list_push(bp_atail, bp_atail, base.mk_int(base.i2s(bp_little), -1, -1));
+                        bp_init = base.mk_call(base.mk_ident("t_bitstr_extract", -1), bp_ahead, -1);
+                    }
+                    var bp_vd: i64 = base.mk_var_decl(bp_name, false, bp_tnode, bp_init, -1);
+                    append(base.g_conpat_binds, bp_vd);
+                    fs_set(em_cur_fn, bp_name, bp_td);
+                    bp_pre_tail = base.list_push(bp_pre, bp_pre_tail, bp_vd);
+                    if (bp_pre < 0) { bp_pre = bp_pre_tail; }
+                }
+                if (bp_sn.ba == false) {
+                    var bp_wn2: Node = base.nodes[bp_sn.nb];
+                    if (bp_wn2.kind == "int") { bp_off = bp_off + parse_int_len(bp_wn2.sa, bp_wn2.ia); }
+                }
+                bp_seg = base.kids[bp_seg].next;
+            }
+            // 恒匹配：mc_cond 保持 -1（不覆盖）
+            if (bp_pre >= 0) {
+                var bp_ptk: Child = base.kids[bp_pre_tail];
+                bp_ptk.next = mc_body;
+                slice_set(base.kids, bp_pre_tail, bp_ptk);
+                mc_body = bp_pre;
+            }
         } else {
             mc_cond = base.mk_binary("==", base.mk_ident(sname, -1), mc_an.na, -1);
         }
@@ -2208,6 +2260,17 @@ pub fn emit_expr(e: i64) string {
         var mq_rn: string = base.sb_cat2("_tmr", base.i2s(mq_no));
         var mq_sn: string = base.sb_cat2("_tms", base.i2s(mq_no));
         var mq_std: i64 = expr_type_desc(n.na);
+        // 位串模式匹配臂：scrutinee 为 <<...>> 字面量时，expr_type_desc 退化为其它类型
+        // （desc_to_c 会落成 void*），破坏后续 GNU 语句表达式。强制映射为 TBitStr。
+        var mq_arm: i64 = n.la;
+        while (mq_arm >= 0) {
+            var mq_armn: Node = base.nodes[base.kids[mq_arm].val];
+            if (mq_armn.na >= 0 && base.nodes[mq_armn.na].kind == "bitstr_pat") {
+                mq_std = sema.td_mk("bitstr");
+                break;
+            }
+            mq_arm = base.kids[mq_arm].next;
+        }
         fs_set(em_cur_fn, mq_sn, mq_std);
         var mq_sv: string = emit_expr(n.na);
         var mq_pushed: i64 = match_bind_push(e, mq_no);

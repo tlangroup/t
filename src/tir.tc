@@ -4769,6 +4769,10 @@ pub fn tir_match_pattern_cond(arm: Node, scr: string, scr_base: string, scr_st: 
         }
         return "";
     }
+    // ── 位串模式（bitstr_pat）：绑定不判别，恒匹配；段内 ident 在 body 提取（§6）──
+    if (p.kind == "bitstr_pat") {
+        return "";
+    }
     return "";
 }
 
@@ -4913,6 +4917,29 @@ pub fn tir_emit_match(n: Node, as_stmt: bool, est: i64) TirEmitRes {
                 sp_e2 = base.kids[sp_e2].next;
             }
         }
+        // 位串模式：预声明段内绑定名 slot（定长段 → i64，/bitstr 尾段 → %TBitStr）
+        if (arm.na >= 0 && base.nodes[arm.na].kind == "bitstr_pat") {
+            var bsp2: Node = base.nodes[arm.na];
+            var bseg3: i64 = bsp2.la;
+            while (bseg3 >= 0) {
+                var bsn3: Node = base.nodes[base.kids[bseg3].val];
+                if (bsn3.na >= 0 && base.nodes[bsn3.na].kind == "ident" && base.nodes[bsn3.na].sa != "_") {
+                    var bbn3: Node = base.nodes[bsn3.na];
+                    var bidx3: i64 = tir_find_local_idx(bbn3.sa);
+                    if (bidx3 < 0) {
+                        if (bsn3.ba) {
+                            // /bitstr 尾段绑定：类型必须是 bitstr（不能用 scrutinee 的 scr_td，
+                            // 内联 <<...>> 字面量 scr_td 退化为 -1/未知类型，会导致下游 for-each
+                            // 走 unsupported 分支、迭代 0 次）。与 C 后端 match_chain_from 同语义。
+                            tir_new_named_slot(sema.td_mk("bitstr"), "%TBitStr", bbn3.sa);
+                        } else {
+                            tir_new_named_slot(-1, "i64", bbn3.sa);
+                        }
+                    }
+                }
+                bseg3 = base.kids[bseg3].next;
+            }
+        }
         i = i + 1;
     }
     var armLabels: []string = [];
@@ -5040,6 +5067,41 @@ pub fn tir_emit_match(n: Node, as_stmt: bool, est: i64) TirEmitRes {
                 }
                 pos2 = pos2 + 1;
                 sp_e3 = base.kids[sp_e3].next;
+            }
+        }
+        // 位串模式解构（§6）：按累计位偏移提取段 → 绑定 slot（与 C 后端 match_chain_from 同语义）
+        if (arm.na >= 0 && base.nodes[arm.na].kind == "bitstr_pat") {
+            var bsp: Node = base.nodes[arm.na];
+            var boff: i64 = 0;
+            var bseg2: i64 = bsp.la;
+            while (bseg2 >= 0) {
+                var bsn2: Node = base.nodes[base.kids[bseg2].val];
+                if (bsn2.na >= 0 && base.nodes[bsn2.na].kind == "ident" && base.nodes[bsn2.na].sa != "_") {
+                    var bbn2: Node = base.nodes[bsn2.na];
+                    var bidx: i64 = tir_find_local_idx(bbn2.sa);
+                    if (bidx >= 0) {
+                        var bslot: string = g_local_slots[bidx];
+                        if (bsn2.ba) {
+                            // /bitstr 尾段：tll_bitstr_sub(out, scr, off) → %TBitStr
+                            tir_emit(TIRInst{ op: TIR_OP_CALL, st: tir_st_from_str("void"), dst: tir_op(""), args: tir_a4("@tll_bitstr_sub", bslot, scr, base.i2s(boff)), is_comment: false, line: g_cur_line, cmt: "" });
+                        } else {
+                            // 定长段 v:W：tll_bitstr_extract(scr, off, W, little) → i64
+                            var bwn2: Node = base.nodes[bsn2.nb];
+                            var bbits: i64 = sema.parse_int_len(bwn2.sa, bwn2.ia);
+                            var blittle: i64 = 0;
+                            if (bsn2.sa == "little") { blittle = 1; }
+                            var bext: string = tir_tmp();
+                            tir_emit(TIRInst{ op: TIR_OP_CALL, st: tir_st_from_str("i64"), dst: tir_op(bext), args: tir_a5("@tll_bitstr_extract", scr, base.i2s(boff), base.i2s(bbits), base.i2s(blittle)), is_comment: false, line: g_cur_line, cmt: "" });
+                            tir_emit(TIRInst{ op: TIR_OP_STORE, st: ST_NONE, dst: tir_op(bslot), args: tir_a1(bext), is_comment: false, line: g_cur_line, cmt: "" });
+                        }
+                    }
+                }
+                // 累计位偏移：定长段占 W 位（绑定或字面量皆然）；rest 段为末尾，不累计
+                if (bsn2.ba == false) {
+                    var bwn3: Node = base.nodes[bsn2.nb];
+                    if (bwn3.kind == "int") { boff = boff + sema.parse_int_len(bwn3.sa, bwn3.ia); }
+                }
+                bseg2 = base.kids[bseg2].next;
             }
         }
         if (as_stmt) {

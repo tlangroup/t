@@ -199,6 +199,30 @@ void t_bitstr_append_bitstr(TBitStr* dst, TBitStr src) {
 
 int64_t t_bitstr_bitlen(TBitStr s) { return s.bit_len; }
 
+uint64_t t_bitstr_extract(TBitStr s, int64_t bit_off, int64_t bits, int little) {
+    uint64_t v = 0;
+    for (int64_t i = 0; i < bits; i++) {
+        int64_t srcbit = little ? i : (bits - 1 - i);
+        int64_t logical = bit_off + i;
+        int bit = (s.ptr[logical / 8] >> (7 - (logical % 8))) & 1;
+        v |= ((uint64_t)bit) << (uint64_t)srcbit;
+    }
+    return v;
+}
+
+TBitStr t_bitstr_sub(TBitStr s, int64_t bit_off) {
+    int64_t total = s.bit_len - bit_off;
+    if (total < 0) { total = 0; }
+    TBitStr r = t_bitstr_new(total);
+    for (int64_t i = 0; i < total; i++) {
+        int bit = (s.ptr[(bit_off + i) / 8] >> (7 - ((bit_off + i) % 8))) & 1;
+        if (bit) { r.ptr[i / 8] |= (uint8_t)(1 << (7 - (i % 8))); }
+    }
+    r.bit_len = total;
+    return r;
+}
+
+
 uint8_t t_str_byte_at(TStr s, int64_t i) {
     if (i < 0 || i >= s.len) t_panic_bounds(i, s.len, "t_str_byte_at");
     return s.ptr[i];
