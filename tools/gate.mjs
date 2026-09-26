@@ -440,8 +440,10 @@ const r = await node("ir_snapshot.mjs", "--compiler", `${G1}.exe`, "--jobs", "1"
             const exe = join(ROOT, dir, "tc.exe");
             const cc = await run(CLANG, [
                 "-O0", "-o", exe,
-                join(ROOT, dir, "tc.c"), join(ROOT, "runtime", "t_runtime.c"),
+                // 运行时改为链接预编译 deps 库（含 vendored 第三方库），理由同 run_examples.mjs
+                join(ROOT, dir, "tc.c"),
                 "-I", join(ROOT, "runtime"), "-I", join(ROOT, dir), "-Wl,-subsystem:console",
+                join(ROOT, "out", "dbg", "deps", "t_runtime.lib"),
                 // C 后端 -O0 自举产物递归处理编译器自身超大源时会超出 1MB 默认 Windows 栈；
                 // LLVM 后端同档 -O0 不溢出（代码生成更省栈），故此处仅给验证用二进制放大栈即可，
                 // 不改变任何发射产物（IR 与 LLVM 后端逐字节相同，已验证）。

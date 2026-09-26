@@ -5,6 +5,20 @@
 
 #define _CRT_SECURE_NO_WARNINGS
 #include "t_runtime.h"
+// mimalloc：t 运行时的通用堆分配器（t_alloc / t_free 与 arena 底层大块）。
+// ⚠ 只在运行时实现里引入，t_runtime.h 保持「零第三方头」，生成的 .c 不受影响。
+#include <mimalloc.h>
+#ifdef _WIN32
+// mimalloc 的 Windows 大页路径用到 advapi32（OpenProcessToken / LookupPrivilegeValueA /
+// AdjustTokenPrivileges）。把这条依赖写进本 .obj 的 .drectve 段，下游链接自动携带，
+// 不必逐个改链接命令（LLVM 后端的 clang 链接、C 后端 clang 链接、门禁脚本各自一份）。
+#pragma comment(lib, "advapi32.lib")
+#endif
+// imath：任意精度整数（大整数格式化）；imath 自身的 malloc/realloc/free 在编译期
+// 被 -D 重定向到 mimalloc（见 tools/build_runtime.mjs），全运行时只有一套分配器。
+#include "imath/imath.h"
+// Ryu：double → 字符串（最短 / 定点 / 科学计数），替代 printf 的浮点格式化路径。
+#include "ryu/ryu.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -64,7 +78,7 @@ struct TArena {
 };
 
 TArena* t_arena_new(void) {
-    TArena* a = (TArena*)malloc(sizeof(TArena));
+    TArena* a = (TArena*)mi_malloc(sizeof(TArena));
     if (!a) t_fatal("arena: malloc failed");
 #ifdef _WIN32
     // 预留大虚拟空间（不占物理内存），tir 降低超大模块（如完整 tc.tc）时按需提交。
@@ -74,9 +88,11 @@ TArena* t_arena_new(void) {
     if (!a->base) t_fatal("arena: virtual reserve failed");
     a->committed = 0;
 #else
-    // POSIX 等：保持原单一 malloc 预提交行为（自举在 Windows 上完成）
+    // POSIX 等：保持原单一大块预提交行为（自举在 Windows 上完成）；大块走 mimalloc。
+    // ⚠ arena 本身仍是 bump 分配器（不支持单块回收），mimalloc 只作为底层大块来源，
+    //   并非 arena 的替代品——两者语义不同，不可互换。
     a->size = 512 * 1024 * 1024;
-    a->base = (uint8_t*)malloc(a->size);
+    a->base = (uint8_t*)mi_malloc(a->size);
     if (!a->base) t_fatal("arena: base malloc failed");
     a->committed = a->size;
 #endif
@@ -113,15 +129,15 @@ void t_arena_free_all(TArena* a) {
     }
 }
 
-// ── 通用堆分配（闭包 env / TClosure record）──
+// ── 通用堆分配（闭包 env / TClosure record）── 走 mimalloc
 void* t_alloc(size_t size) {
-    void* p = malloc(size);
+    void* p = mi_malloc(size);
     if (!p) t_fatal("t_alloc: malloc failed");
     return p;
 }
 
 void t_free(void* p) {
-    if (p) free(p);
+    if (p) mi_free(p);
 }
 
 void t_runtime_done(void) {
@@ -492,21 +508,8 @@ TStr t_format_uint(TStr spec, uint64_t v) {
 // 进制从低字节向高字节逐位做除法，生成十进制（或 2/8/16 进制）数字串。
 #define T_BIG_MAXBYTES 8192   // 65535 位 → 8192 字节
 
-static int big_is_zero(const uint8_t* m, int n) {
-    for (int i = 0; i < n; i++) if (m[i]) return 0;
-    return 1;
-}
-
-// 原地 floor(m / base)，返回余数（base ≤ 16，cur = rem*256 + byte 不会溢出 uint64）。
-static uint64_t big_divmod(uint8_t* m, int n, uint64_t base) {
-    uint64_t rem = 0;
-    for (int i = n - 1; i >= 0; i--) {
-        uint64_t cur = (rem << 8) | m[i];
-        m[i] = (uint8_t)(cur / base);
-        rem = cur % base;
-    }
-    return rem;
-}
+// 字节 → 16 进制（imath 导入用；imath 无 mp_import，走 16 进制字符串解析）
+static const char* T_HEXD = "0123456789ABCDEF";
 
 // 原地二补码取负（用于有符号负数的绝对值）。
 static void big_negate(uint8_t* m, int n) {
@@ -546,24 +549,49 @@ static TStr fmt_big_core(FmtSpec f, int neg, const uint8_t* magin, int nbytes) {
         else if (base == 16) altp = (upper ? "0X" : "0x");
     }
     int64_t mind = f.has_prec ? f.prec : 1;
-    uint8_t m[T_BIG_MAXBYTES];
-    int n = nbytes; if (n > T_BIG_MAXBYTES) n = T_BIG_MAXBYTES;
-    memcpy(m, magin, (size_t)n);
-    char digits[20000]; int dn = 0;
-    if (big_is_zero(m, n)) digits[dn++] = '0';
-    else { while (!big_is_zero(m, n)) { int d = (int)big_divmod(m, n, (uint64_t)base); digits[dn++] = (char)(d < 10 ? '0' + d : (upper ? 'A' : 'a') + (d - 10)); } }
+    // ★ 数字串由 imath（runtime/imath）生成：小端字节 → 大端 16 进制串 → mp_int → radix 串。
+    //   取代原先手写的「256 进制反复除 base」——后者仅支持 base ≤ 16，且为逐字节 O(n²) 除法。
+    char hex[T_BIG_MAXBYTES * 2 + 2];
+    int hn = 0;
+    int top = nbytes - 1; if (top >= T_BIG_MAXBYTES) top = T_BIG_MAXBYTES - 1;
+    while (top > 0 && magin[top] == 0) top--;      // 去前导零字节（至少保留 1 字节）
+    for (int i = top; i >= 0; i--) {
+        uint8_t b = magin[i];
+        hex[hn++] = T_HEXD[(b >> 4) & 0xF];
+        hex[hn++] = T_HEXD[b & 0xF];
+    }
+    hex[hn] = 0;
+    // ⚠ imath 的 mp_int 是 `mpz_t*`（指针 typedef），不是值类型：栈上是 mpz_t，再取地址。
+    mpz_t bzs; mp_int bz = &bzs;
+    if (mp_int_init(bz) != MP_OK) t_fatal("fmt_big: imath init failed");
+    if (mp_int_read_string(bz, 16, hex) != MP_OK) t_fatal("fmt_big: imath read failed");
+    int slen = (int)mp_int_string_len(bz, (mp_size)base);
+    char dbuf_stack[512];
+    char* digits = (slen + 2 <= (int)sizeof dbuf_stack)
+        ? dbuf_stack : (char*)mi_malloc((size_t)slen + 2);
+    if (mp_int_to_string(bz, (mp_size)base, digits, slen + 2) != MP_OK) {
+        t_fatal("fmt_big: imath convert failed");
+    }
+    mp_int_clear(bz);
+    int dn = 0; while (digits[dn]) dn++;
+    if (base == 16 && !upper) {   // imath 输出大写 hex；'x' 需小写
+        for (int i = 0; i < dn; i++) {
+            if (digits[i] >= 'A' && digits[i] <= 'F') digits[i] = (char)(digits[i] - 'A' + 'a');
+        }
+    }
     int total = dn; if (total < mind) total = (int)mind;
     int step = 0;
     if (f.group == ',') step = 3;
     else if (f.group == '_') step = (base == 10 ? 3 : 4);
     TSb* bdy = t_sb_new(t_arena_current());
+    int pad0 = total - dn;        // imath 输出已是高位在前，前导补零只补在最前面
     for (int i = 0; i < total; i++) {
-        // digits[] 由低位到高位存放（反复除 base 得到），故第 i 位（高位→低位）取 digits[total-1-i]
-        char c = (i < total - dn) ? '0' : digits[total - 1 - i];
+        char c = (i < pad0) ? '0' : digits[i - pad0];
         t_sb_append_char(bdy, (uint8_t)c);
         int remain = total - (i + 1);
         if (step > 0 && remain > 0 && (remain % step) == 0) t_sb_append_char(bdy, (uint8_t)(f.group == ',' ? ',' : '_'));
     }
+    if (digits != dbuf_stack) mi_free(digits);
     TStr body = t_sb_to_str(bdy);
     char pbuf[8]; int pn = 0;
     if (signc) pbuf[pn++] = signc;
@@ -610,6 +638,91 @@ static void append_float_grouped(TSb* b, const char* s, char group) {
     if (*dot) t_sb_append_cstr(b, dot);
 }
 
+// ── Ryu 输出规范化 ───────────────────────────────────────────────
+// Ryu 的特殊值字符串是 D/Java 风格（"Infinity" / "NaN" / "nan(snan)"），
+// 统一成 C printf 风格（"inf" / "nan"），保证切换前后输出一致。
+static void t_ryu_norm_special(char* s) {
+    int neg = 0, i = 0;
+    if (s[0] == '-') { neg = 1; i = 1; }
+    const char* rep = 0;
+    if (strncmp(s + i, "Infinity", 8) == 0) rep = "inf";
+    else if (strncmp(s + i, "NaN", 3) == 0 || strncmp(s + i, "nan", 3) == 0) rep = "nan";
+    else return;
+    char tmp[64]; int k = 0;
+    if (neg) tmp[k++] = '-';
+    for (const char* p = rep; *p; p++) tmp[k++] = *p;
+    tmp[k] = 0;
+    memcpy(s, tmp, (size_t)k + 1);
+}
+
+// %g 语义渲染：P 位有效数字 + 指数阈值切换 + 去尾随零。
+// 数字来源为 d2exp_buffered(v, P-1)——Ryu 对**真实值**一次正确舍入到 P 位有效数字，
+// 而非「取最短串再截断」的二次舍入。
+static void t_ryu_gfmt(double v, int prec, int alt, int upper, char* out) {
+    int P = prec > 0 ? prec : 1;
+    if (P > 400) {   // 超高精度：退回 libc（Ryu d2exp 输出随之变长，罕见路径）
+        char sf[40]; int si = 0;
+        sf[si++] = '%';
+        sf[si++] = '.';
+        si += snprintf(sf + si, sizeof(sf) - (size_t)si, "%d", P);
+        sf[si++] = upper ? 'G' : 'g'; sf[si] = 0;
+        // 调用方缓冲按 prec+64 分配（t_format_float），这里按同一公式取容量，
+        // 避免写死 512 在高精度下截断。
+        snprintf(out, (size_t)P + 64, sf, v);
+        return;
+    }
+    char buf[640];
+    int n = d2exp_buffered_n(v, (uint32_t)(P - 1), buf);
+    buf[n] = 0;
+    t_ryu_norm_special(buf);
+    if (strstr(buf, "inf") || strstr(buf, "nan")) { memcpy(out, buf, strlen(buf) + 1); return; }
+    // 解析 "[-]d[.ddd]e[+-]xx"
+    int i = 0;
+    char res[700]; int k = 0;
+    if (buf[i] == '-') { res[k++] = '-'; i++; }
+    char dig[600]; int dn = 0;
+    while (buf[i] && buf[i] != 'e' && buf[i] != 'E') { if (buf[i] != '.') dig[dn++] = buf[i]; i++; }
+    int exp = 0, esign = 1;
+    if (buf[i] == 'e' || buf[i] == 'E') {
+        i++;
+        if (buf[i] == '-') { esign = -1; i++; } else if (buf[i] == '+') { i++; }
+        while (buf[i] >= '0' && buf[i] <= '9') { exp = exp * 10 + (buf[i] - '0'); i++; }
+    }
+    exp *= esign;
+    int keep = dn;                       // %g 去掉尾随零（'#' 时保留）
+    if (!alt) { while (keep > 1 && dig[keep - 1] == '0') keep--; }
+    if (exp < -4 || exp >= P) {          // 科学计数：d[.ddd]e±xx，指数至少 2 位
+        res[k++] = dig[0];
+        if (keep > 1) { res[k++] = '.'; for (int j = 1; j < keep; j++) res[k++] = dig[j]; }
+        res[k++] = upper ? 'E' : 'e';
+        int ae = exp < 0 ? -exp : exp;
+        res[k++] = exp < 0 ? '-' : '+';
+        if (ae >= 100) {
+            res[k++] = (char)('0' + ae / 100);
+            res[k++] = (char)('0' + (ae / 10) % 10);
+            res[k++] = (char)('0' + ae % 10);
+        } else {
+            res[k++] = (char)('0' + ae / 10);
+            res[k++] = (char)('0' + ae % 10);
+        }
+    } else if (exp >= 0) {               // 定点，有整数部分
+        if (keep <= exp + 1) {
+            for (int j = 0; j < keep; j++) res[k++] = dig[j];
+            for (int j = 0; j < exp + 1 - keep; j++) res[k++] = '0';
+        } else {
+            for (int j = 0; j <= exp; j++) res[k++] = dig[j];
+            res[k++] = '.';
+            for (int j = exp + 1; j < keep; j++) res[k++] = dig[j];
+        }
+    } else {                             // 定点，纯小数
+        res[k++] = '0'; res[k++] = '.';
+        for (int j = 0; j < -exp - 1; j++) res[k++] = '0';
+        for (int j = 0; j < keep; j++) res[k++] = dig[j];
+    }
+    res[k] = 0;
+    memcpy(out, res, (size_t)k + 1);
+}
+
 TStr t_format_float(TStr spec, double v) {
     FmtSpec f = fmt_parse(spec);
     if (f.zero && f.align == 0) { f.align = '='; f.fill = '0'; }
@@ -622,27 +735,50 @@ TStr t_format_float(TStr spec, double v) {
     }
     int ispct = (tc == '%');
     double vv = ispct ? v * 100.0 : v;
-    char fmtc;
-    if (tc == 'e' || tc == 'E') fmtc = tc;
-    else if (tc == 'f' || tc == 'F') fmtc = tc;
-    else if (tc == 'g' || tc == 'G') fmtc = tc;
-    else if (ispct) fmtc = 'f';
-    else fmtc = 'g';
+    // ★ 浮点 → 字符串全部走 Ryu（runtime/ryu），不再经过 printf 浮点路径：
+    //     e/E  → d2exp_buffered（C 风格 "d.ddde±xx"，与 %e 同格式）
+    //     f/F  → d2fixed_buffered（定点，与 %f 同格式）
+    //     其余 → t_ryu_gfmt：%g 语义（P 位有效数字 + 指数阈值切换 + 去尾随零），
+    //            由 d2exp_buffered(v, P-1) 取得**正确舍入**的 P 位有效数字后自行渲染，
+    //            不做「最短串再截断」的二次舍入。
+    //   ⚠ 未采用 d2s（最短往返）：它输出 D/Java 风格、恒为科学计数法（0.0 → "0E0"），
+    //     与 t 既有的 %g 语义不兼容；引入它会改变浮点默认打印精度，属语言语义变更。
     int prec = f.has_prec ? (int)f.prec : 6;
-    char sf[40]; int si = 0;
-    sf[si++] = '%';
-    if (f.sign == '+') sf[si++] = '+'; else if (f.sign == ' ') sf[si++] = ' ';
-    if (f.alt) sf[si++] = '#';
-    sf[si++] = '.';
-    si += snprintf(sf + si, sizeof(sf) - (size_t)si, "%d", prec);
-    sf[si++] = fmtc; sf[si] = '\0';
-    char num[512];
-    snprintf(num, sizeof(num), sf, vv);
+    if (prec < 0) { prec = 0; }
+    // ⚠ Ryu 的 *_buffered_n 只写数字、**不补结尾 NUL**（只有 d2fixed_buffered /
+    //   d2exp_buffered 这类便利封装才写 '\0'）。漏掉这一步 → 下游 t_str_from_c 按
+    //   strlen 取长度会吃到上一次调用残留的字节（实测 format_demo 打出 "3.14]"、
+    //   "50.00000e+03<garbage>%"）。故必须按返回值显式补 NUL。
+    //   同时按 prec 估算容量：超大精度走堆，避免 512 字节栈缓冲溢出。
+    size_t need = (size_t)prec + 64;
+    char num_stack[512];
+    char* num = (need <= sizeof(num_stack)) ? num_stack : (char*)mi_malloc(need);
+    if (tc == 'e' || tc == 'E') {
+        int n = d2exp_buffered_n(vv, (uint32_t)prec, num);
+        num[n] = 0;
+        t_ryu_norm_special(num);
+        if (tc == 'E') { for (char* p = num; *p; p++) if (*p == 'e') *p = 'E'; }
+    } else if (tc == 'f' || tc == 'F' || ispct) {
+        int n = d2fixed_buffered_n(vv, (uint32_t)prec, num);
+        num[n] = 0;
+        t_ryu_norm_special(num);
+    } else {
+        t_ryu_gfmt(vv, prec, f.alt, (tc == 'G'), num);
+    }
+    // Ryu 只输出 '-'；'+' / ' ' 符号标志在此补上（与 printf 一致）
+    if ((f.sign == '+' || f.sign == ' ') && num[0] != '-') {
+        char tmp[520];
+        tmp[0] = (char)f.sign;
+        int k = 0; while (num[k]) { tmp[k + 1] = num[k]; k++; }
+        tmp[k + 1] = 0;
+        memcpy(num, tmp, (size_t)(k + 2));
+    }
     char signc = 0; const char* bodyc = num;
     if (num[0] == '-' || num[0] == '+' || num[0] == ' ') { signc = num[0]; bodyc = num + 1; }
     TSb* bdy = t_sb_new(t_arena_current());
     if (f.group) append_float_grouped(bdy, bodyc, f.group);
     else t_sb_append_cstr(bdy, bodyc);
+    if (num != num_stack) { mi_free(num); num = 0; bodyc = 0; }
     if (ispct) t_sb_append_char(bdy, (uint8_t)'%');
     TStr body = t_sb_to_str(bdy);
     char pbuf[2]; int pn = 0; if (signc) pbuf[pn++] = signc;
@@ -1595,15 +1731,17 @@ static uint64_t sym_hash(const uint8_t* p, int64_t n) {
 }
 
 static struct TSymPool* sym_pool_new(int64_t bits) {
-    struct TSymPool* p = (struct TSymPool*)calloc(1, sizeof(struct TSymPool));
+    // ⚠ 必须是 mi_*：sym_pool_free 用 mi_free 释放，混用 libc calloc 会堆损坏
+    //   （实测 sym_demo 在 sym_release 后静默截断输出）。
+    struct TSymPool* p = (struct TSymPool*)mi_calloc(1, sizeof(struct TSymPool));
     if (!p) t_fatal("sym: pool malloc failed");
     p->htab_cap = 16;
-    p->htab = (int32_t*)calloc((size_t)p->htab_cap, sizeof(int32_t));
+    p->htab = (int32_t*)mi_calloc((size_t)p->htab_cap, sizeof(int32_t));
     p->ent_cap = 8;
-    p->ent_off = (int64_t*)malloc(sizeof(int64_t) * (size_t)p->ent_cap);
-    p->ent_len = (int64_t*)malloc(sizeof(int64_t) * (size_t)p->ent_cap);
+    p->ent_off = (int64_t*)mi_malloc(sizeof(int64_t) * (size_t)p->ent_cap);
+    p->ent_len = (int64_t*)mi_malloc(sizeof(int64_t) * (size_t)p->ent_cap);
     p->bytes_cap = 256;
-    p->bytes = (uint8_t*)malloc((size_t)p->bytes_cap);
+    p->bytes = (uint8_t*)mi_malloc((size_t)p->bytes_cap);
     p->bits = bits;
     if (!p->htab || !p->ent_off || !p->ent_len || !p->bytes) t_fatal("sym: pool buffers malloc failed");
     return p;
@@ -1611,8 +1749,8 @@ static struct TSymPool* sym_pool_new(int64_t bits) {
 
 static void sym_pool_free(struct TSymPool* p) {
     if (!p) return;
-    free(p->htab); free(p->ent_off); free(p->ent_len); free(p->bytes);
-    free(p);
+    mi_free(p->htab); mi_free(p->ent_off); mi_free(p->ent_len); mi_free(p->bytes);
+    mi_free(p);
 }
 
 // 按 tag 查池；create!=0 时不存在则新建并登记进注册表
@@ -1622,12 +1760,12 @@ static struct TSymPool* sym_pool_for(TStr tag, int64_t bits, int create) {
     if (!create) return NULL;
     if (g_sym_reg.len >= g_sym_reg.cap) {
         int64_t nc = g_sym_reg.cap < 4 ? 4 : g_sym_reg.cap * 2;
-        TSymRegItem* ni = (TSymRegItem*)realloc(g_sym_reg.items, sizeof(TSymRegItem) * (size_t)nc);
+        TSymRegItem* ni = (TSymRegItem*)mi_realloc(g_sym_reg.items, sizeof(TSymRegItem) * (size_t)nc);
         if (!ni) t_fatal("sym: registry realloc failed");
         g_sym_reg.items = ni; g_sym_reg.cap = nc;
     }
     // 注册表持有 tag 的稳定副本（便于 release 时释放）
-    uint8_t* tb = (uint8_t*)malloc((size_t)(tag.len > 0 ? tag.len : 1));
+    uint8_t* tb = (uint8_t*)mi_malloc((size_t)(tag.len > 0 ? tag.len : 1));
     if (!tb) t_fatal("sym: tag malloc failed");
     if (tag.len > 0) memcpy(tb, tag.ptr, (size_t)tag.len);
     TStr tcopy; tcopy.ptr = tb; tcopy.len = tag.len;
@@ -1642,7 +1780,7 @@ static void sym_htab_rehash(struct TSymPool* p) {
     int64_t oldcap = p->htab_cap;
     int32_t* old = p->htab;
     p->htab_cap *= 2;
-    p->htab = (int32_t*)calloc((size_t)p->htab_cap, sizeof(int32_t));
+    p->htab = (int32_t*)mi_calloc((size_t)p->htab_cap, sizeof(int32_t));
     if (!p->htab) t_fatal("sym: htab rehash failed");
     for (int64_t i = 0; i < oldcap; i++) {
         int32_t slot = old[i];
@@ -1654,7 +1792,7 @@ static void sym_htab_rehash(struct TSymPool* p) {
             p->htab[j] = slot;
         }
     }
-    free(old);
+    mi_free(old);
 }
 
 uint32_t t_sym_intern(TStr tag, TStr str, int64_t bits) {
@@ -1672,7 +1810,7 @@ uint32_t t_sym_intern(TStr tag, TStr str, int64_t bits) {
     if (p->bytes_len + str.len > p->bytes_cap) {
         int64_t nc = p->bytes_cap;
         while (p->bytes_len + str.len > nc) nc *= 2;
-        uint8_t* nb = (uint8_t*)realloc(p->bytes, (size_t)nc);
+        uint8_t* nb = (uint8_t*)mi_realloc(p->bytes, (size_t)nc);
         if (!nb) t_fatal("sym: bytes realloc failed");
         p->bytes = nb; p->bytes_cap = nc;
     }
@@ -1682,8 +1820,8 @@ uint32_t t_sym_intern(TStr tag, TStr str, int64_t bits) {
     // 新 entry
     if (p->ent_count >= p->ent_cap) {
         int64_t nc = p->ent_cap * 2;
-        int64_t* no = (int64_t*)realloc(p->ent_off, sizeof(int64_t) * (size_t)nc);
-        int64_t* nl = (int64_t*)realloc(p->ent_len, sizeof(int64_t) * (size_t)nc);
+        int64_t* no = (int64_t*)mi_realloc(p->ent_off, sizeof(int64_t) * (size_t)nc);
+        int64_t* nl = (int64_t*)mi_realloc(p->ent_len, sizeof(int64_t) * (size_t)nc);
         if (!no || !nl) t_fatal("sym: entries realloc failed");
         p->ent_off = no; p->ent_len = nl; p->ent_cap = nc;
     }
@@ -1724,7 +1862,7 @@ void t_sym_release(TStr tag) {
     for (int64_t i = 0; i < g_sym_reg.len; i++) {
         if (t_str_eq(g_sym_reg.items[i].tag, tag)) {
             sym_pool_free(g_sym_reg.items[i].pool);
-            free((void*)g_sym_reg.items[i].tag.ptr);
+            mi_free((void*)g_sym_reg.items[i].tag.ptr);
             for (int64_t j = i; j < g_sym_reg.len - 1; j++) g_sym_reg.items[j] = g_sym_reg.items[j + 1];
             g_sym_reg.len--;
             return;
@@ -1735,9 +1873,9 @@ void t_sym_release(TStr tag) {
 void t_sym_release_all(void) {
     for (int64_t i = 0; i < g_sym_reg.len; i++) {
         sym_pool_free(g_sym_reg.items[i].pool);
-        free((void*)g_sym_reg.items[i].tag.ptr);
+        mi_free((void*)g_sym_reg.items[i].tag.ptr);
     }
-    free(g_sym_reg.items);
+    mi_free(g_sym_reg.items);
     g_sym_reg.items = NULL; g_sym_reg.len = 0; g_sym_reg.cap = 0;
 }
 
@@ -1749,11 +1887,11 @@ TStr t_file_read_all(const char* path) {
     long sz = ftell(f);
     if (sz < 0) { fclose(f); t_fatal("file_read_all: ftell failed"); }
     fseek(f, 0, SEEK_SET);
-    uint8_t* buf = (uint8_t*)malloc((size_t)sz + 1);
+    uint8_t* buf = (uint8_t*)mi_malloc((size_t)sz + 1);
     if (!buf) { fclose(f); t_fatal("file_read_all: malloc failed"); }
     size_t rd = fread(buf, 1, (size_t)sz, f);
     fclose(f);
-    if ((long)rd != sz) { free(buf); t_fatal("file_read_all: read mismatch"); }
+    if ((long)rd != sz) { mi_free(buf); t_fatal("file_read_all: read mismatch"); }
     buf[sz] = '\0'; // 便于当作 cstr 使用
     TStr r; r.ptr = buf; r.len = (int64_t)sz; return r; // 注意：此处用 malloc，由调用方持有至进程结束
 }
@@ -1764,12 +1902,12 @@ TStr t_file_read_all(const char* path) {
 // 用于 tc 的 REPL 模式交互读取；行缓冲按需增长，最终副本存进 arena（进程退出时回收）。
 TStr t_read_line(void) {
     size_t cap = 256;
-    char* buf = (char*)malloc(cap);
+    char* buf = (char*)mi_malloc(cap);
     if (!buf) t_fatal("read_line: malloc failed");
     int c = fgetc(stdin);
     if (c == EOF) {
         g_stdin_eof = 1;
-        free(buf);
+        mi_free(buf);
         return t_str_from_c("");
     }
     ungetc(c, stdin);   // 把首字符放回，统一在循环里处理（含 CRLF）
@@ -1778,7 +1916,7 @@ TStr t_read_line(void) {
     while (1) {
         if (len + 1 >= alloc) {
             alloc *= 2;
-            char* nb = (char*)realloc(buf, alloc);
+            char* nb = (char*)mi_realloc(buf, alloc);
             if (!nb) t_fatal("read_line: realloc failed");
             buf = nb;
         }
@@ -1790,7 +1928,7 @@ TStr t_read_line(void) {
     buf[len] = '\0';
     uint8_t* p = (uint8_t*)t_arena_alloc(g_arena, len + 1);
     memcpy(p, buf, len + 1);
-    free(buf);
+    mi_free(buf);
     TStr r; r.ptr = p; r.len = (int64_t)len; return r;
 }
 
@@ -2472,78 +2610,173 @@ TStr t_deser_str(int64_t f) {
     out.ptr = p; out.len = n; return out;
 }
 
-// ── 数学内建运行时包装实现（t_math_*）──
-#include <math.h>
-double t_math_sin(double x) { return sin(x); }
-float  t_math_sinf(float x) { return sinf(x); }
-double t_math_cos(double x) { return cos(x); }
-float  t_math_cosf(float x) { return cosf(x); }
-double t_math_tan(double x) { return tan(x); }
-float  t_math_tanf(float x) { return tanf(x); }
-double t_math_atan(double x) { return atan(x); }
-float  t_math_atanf(float x) { return atanf(x); }
-double t_math_atan2(double a, double c) { return atan2(a, c); }
-float  t_math_atan2f(float a, float c) { return atan2f(a, c); }
-double t_math_acos(double x) { return acos(x); }
-float  t_math_acosf(float x) { return acosf(x); }
-double t_math_asin(double x) { return asin(x); }
-float  t_math_asinf(float x) { return asinf(x); }
-double t_math_exp(double x) { return exp(x); }
-float  t_math_expf(float x) { return expf(x); }
-double t_math_log(double x) { return log(x); }
-float  t_math_logf(float x) { return logf(x); }
-double t_math_log10(double x) { return log10(x); }
-float  t_math_log10f(float x) { return log10f(x); }
-double t_math_pow(double a, double c) { return pow(a, c); }
-float  t_math_powf(float a, float c) { return powf(a, c); }
-double t_math_sinh(double x) { return sinh(x); }
-float  t_math_sinhf(float x) { return sinhf(x); }
-double t_math_cosh(double x) { return cosh(x); }
-float  t_math_coshf(float x) { return coshf(x); }
-double t_math_tanh(double x) { return tanh(x); }
-float  t_math_tanhf(float x) { return tanhf(x); }
-double t_math_sqrt(double x) { return sqrt(x); }
-float  t_math_sqrtf(float x) { return sqrtf(x); }
-double t_math_fmod(double a, double c) { return fmod(a, c); }
-float  t_math_fmodf(float a, float c) { return fmodf(a, c); }
-double t_math_fabs(double x) { return fabs(x); }
-float  t_math_fabsf(float x) { return fabsf(x); }
-double t_math_floor(double x) { return floor(x); }
-float  t_math_floorf(float x) { return floorf(x); }
-double t_math_ceil(double x) { return ceil(x); }
-float  t_math_ceilf(float x) { return ceilf(x); }
-double t_math_trunc(double x) { return trunc(x); }
-float  t_math_truncf(float x) { return truncf(x); }
-double t_math_round(double x) { return round(x); }
-float  t_math_roundf(float x) { return roundf(x); }
-double t_math_exp2(double x) { return exp2(x); }
-float  t_math_exp2f(float x) { return exp2f(x); }
-double t_math_log2(double x) { return log2(x); }
-float  t_math_log2f(float x) { return log2f(x); }
-double t_math_log1p(double x) { return log1p(x); }
-float  t_math_log1pf(float x) { return log1pf(x); }
-double t_math_expm1(double x) { return expm1(x); }
-float  t_math_expm1f(float x) { return expm1f(x); }
-double t_math_hypot(double a, double c) { return hypot(a, c); }
-float  t_math_hypotf(float a, float c) { return hypotf(a, c); }
-double t_math_cbrt(double x) { return cbrt(x); }
-float  t_math_cbrtf(float x) { return cbrtf(x); }
+// ── 数学内建运行时包装实现（t_math_*）────────────────────────────
+// ⚠ 弃用系统 libm：所有浮点数学经 vendored fdlibm（runtime/fdlibm）实现。
+//   fdlibm 的公开符号（sin/cos/pow/…）在编译期被 -D 重命名为 tfd_*
+//   （见 tools/build_runtime.mjs 的 FD_RENAME）：既避免与宿主 CRT 同名符号
+//   争用，也防止宿主 <math.h> 把 sin/cos 等声明成 intrinsic 后绕开 fdlibm。
+//   内部内核 __ieee754_* / __kernel_* 保持原名，本文件不直接引用。
+// 故此处**不再** include <math.h>；isnan/signbit 等分类谓词用编译器内建，
+// 它们不属于 libm（不产生任何库调用）。
+
+// —— fdlibm 提供的 f64 公开符号（重命名后）——
+extern double tfd_sin(double);
+extern double tfd_cos(double);
+extern double tfd_tan(double);
+extern double tfd_asin(double);
+extern double tfd_acos(double);
+extern double tfd_atan(double);
+extern double tfd_atan2(double, double);
+extern double tfd_exp(double);
+extern double tfd_log(double);
+extern double tfd_log10(double);
+extern double tfd_pow(double, double);
+extern double tfd_sinh(double);
+extern double tfd_cosh(double);
+extern double tfd_tanh(double);
+extern double tfd_sqrt(double);
+extern double tfd_fmod(double, double);
+extern double tfd_fabs(double);
+extern double tfd_floor(double);
+extern double tfd_ceil(double);
+extern double tfd_expm1(double);
+extern double tfd_log1p(double);
+extern double tfd_hypot(double, double);
+extern double tfd_cbrt(double);
+extern double tfd_copysign(double, double);
+extern double tfd_nextafter(double, double);
+extern double tfd_remainder(double, double);
+
+// —— fdlibm 未提供、在此补齐的 8 个符号（严格基于上面的 tfd_* 实现）——
+static const double T_LN2 = 0.693147180559945309417232121458176568;
+
+static double tfd_trunc(double x) {
+    // floor / ceil 对 |x| ≥ 2^52 原样返回，对 NaN 透传 NaN，无需额外分支。
+    return (x >= 0.0) ? tfd_floor(x) : tfd_ceil(x);
+}
+static double tfd_round(double x) {
+    // 四舍五入、半数远离零（round() 语义）；大数 x±0.5 == x，结果即 x。
+    return (x >= 0.0) ? tfd_floor(x + 0.5) : tfd_ceil(x - 0.5);
+}
+static double tfd_exp2(double x) { return tfd_pow(2.0, x); }
+static double tfd_log2(double x) { return tfd_log(x) / T_LN2; }
+static double tfd_fmin(double a, double b) {
+    if (__builtin_isnan(a)) return b;
+    if (__builtin_isnan(b)) return a;
+    return (a < b) ? a : b;   // ±0 由比较决定，与 fmin 一致
+}
+static double tfd_fmax(double a, double b) {
+    if (__builtin_isnan(a)) return b;
+    if (__builtin_isnan(b)) return a;
+    return (a > b) ? a : b;
+}
+static double tfd_fdim(double a, double b) {
+    if (__builtin_isnan(a) || __builtin_isnan(b)) return a - b;   // NaN 传播
+    if (a <= b) return 0.0;
+    return a - b;
+}
+// 无硬件 FMA 时的正确舍入 fused multiply-add（Dekker two-product + two-sum 补偿）。
+// ⚠ 不可用 __builtin_fma：无 FMA 指令时会退化成对 libm fma() 的调用（已弃用）。
+static void tfdx_two_sum(double a, double b, double* s, double* e) {
+    double x = a + b;
+    double bb = x - a;
+    *e = (a - (x - bb)) + (b - bb);
+    *s = x;
+}
+static void tfdx_two_prod(double a, double b, double* p, double* e) {
+    const double SPLIT = 134217729.0;   // 2^27 + 1
+    double t = a * SPLIT; double ah = t - (t - a); double al = a - ah;
+    t = b * SPLIT;        double bh = t - (t - b); double bl = b - bh;
+    *p = a * b;
+    *e = ((ah * bh - *p) + ah * bl + al * bh) + al * bl;
+}
+static double tfd_fma(double a, double b, double c) {
+    if (!__builtin_isfinite(a) || !__builtin_isfinite(b) || !__builtin_isfinite(c)) {
+        return a * b + c;               // Inf / NaN：交给硬件语义
+    }
+    double p, e, s, se;
+    tfdx_two_prod(a, b, &p, &e);        // a*b = p + e（精确）
+    if (!__builtin_isfinite(p)) return p + c;
+    tfdx_two_sum(p, c, &s, &se);        // p + c = s + se（精确）
+    if (!__builtin_isfinite(s)) return s;
+    double corr = e + se;
+    double r = s + corr;
+    if (r == 0.0 && corr != 0.0) return corr;   // 完全抵消：保留补偿项的符号
+    return r;
+}
+
+// —— t_math_* 包装：f64 直调 fdlibm；f32 变体以 double 计算后收敛回 float ——
+// （f32 走 double 是双舍入，误差概率极低；fdlibm 本身不提供 float 版入口。）
+double t_math_sin(double x) { return tfd_sin(x); }
+float  t_math_sinf(float x) { return (float)tfd_sin((double)x); }
+double t_math_cos(double x) { return tfd_cos(x); }
+float  t_math_cosf(float x) { return (float)tfd_cos((double)x); }
+double t_math_tan(double x) { return tfd_tan(x); }
+float  t_math_tanf(float x) { return (float)tfd_tan((double)x); }
+double t_math_atan(double x) { return tfd_atan(x); }
+float  t_math_atanf(float x) { return (float)tfd_atan((double)x); }
+double t_math_atan2(double a, double c) { return tfd_atan2(a, c); }
+float  t_math_atan2f(float a, float c) { return (float)tfd_atan2((double)a, (double)c); }
+double t_math_acos(double x) { return tfd_acos(x); }
+float  t_math_acosf(float x) { return (float)tfd_acos((double)x); }
+double t_math_asin(double x) { return tfd_asin(x); }
+float  t_math_asinf(float x) { return (float)tfd_asin((double)x); }
+double t_math_exp(double x) { return tfd_exp(x); }
+float  t_math_expf(float x) { return (float)tfd_exp((double)x); }
+double t_math_log(double x) { return tfd_log(x); }
+float  t_math_logf(float x) { return (float)tfd_log((double)x); }
+double t_math_log10(double x) { return tfd_log10(x); }
+float  t_math_log10f(float x) { return (float)tfd_log10((double)x); }
+double t_math_pow(double a, double c) { return tfd_pow(a, c); }
+float  t_math_powf(float a, float c) { return (float)tfd_pow((double)a, (double)c); }
+double t_math_sinh(double x) { return tfd_sinh(x); }
+float  t_math_sinhf(float x) { return (float)tfd_sinh((double)x); }
+double t_math_cosh(double x) { return tfd_cosh(x); }
+float  t_math_coshf(float x) { return (float)tfd_cosh((double)x); }
+double t_math_tanh(double x) { return tfd_tanh(x); }
+float  t_math_tanhf(float x) { return (float)tfd_tanh((double)x); }
+double t_math_sqrt(double x) { return tfd_sqrt(x); }
+float  t_math_sqrtf(float x) { return (float)tfd_sqrt((double)x); }
+double t_math_fmod(double a, double c) { return tfd_fmod(a, c); }
+float  t_math_fmodf(float a, float c) { return (float)tfd_fmod((double)a, (double)c); }
+double t_math_fabs(double x) { return tfd_fabs(x); }
+float  t_math_fabsf(float x) { return (float)tfd_fabs((double)x); }
+double t_math_floor(double x) { return tfd_floor(x); }
+float  t_math_floorf(float x) { return (float)tfd_floor((double)x); }
+double t_math_ceil(double x) { return tfd_ceil(x); }
+float  t_math_ceilf(float x) { return (float)tfd_ceil((double)x); }
+double t_math_trunc(double x) { return tfd_trunc(x); }
+float  t_math_truncf(float x) { return (float)tfd_trunc((double)x); }
+double t_math_round(double x) { return tfd_round(x); }
+float  t_math_roundf(float x) { return (float)tfd_round((double)x); }
+double t_math_exp2(double x) { return tfd_exp2(x); }
+float  t_math_exp2f(float x) { return (float)tfd_exp2((double)x); }
+double t_math_log2(double x) { return tfd_log2(x); }
+float  t_math_log2f(float x) { return (float)tfd_log2((double)x); }
+double t_math_log1p(double x) { return tfd_log1p(x); }
+float  t_math_log1pf(float x) { return (float)tfd_log1p((double)x); }
+double t_math_expm1(double x) { return tfd_expm1(x); }
+float  t_math_expm1f(float x) { return (float)tfd_expm1((double)x); }
+double t_math_hypot(double a, double c) { return tfd_hypot(a, c); }
+float  t_math_hypotf(float a, float c) { return (float)tfd_hypot((double)a, (double)c); }
+double t_math_cbrt(double x) { return tfd_cbrt(x); }
+float  t_math_cbrtf(float x) { return (float)tfd_cbrt((double)x); }
 
 // ── 扩展数学内建（推荐补充集）──
-double t_math_copysign(double a, double b) { return copysign(a, b); }
-float  t_math_copysignf(float a, float b) { return copysignf(a, b); }
-double t_math_nextafter(double a, double b) { return nextafter(a, b); }
-float  t_math_nextafterf(float a, float b) { return nextafterf(a, b); }
-double t_math_remainder(double a, double b) { return remainder(a, b); }
-float  t_math_remainderf(float a, float b) { return remainderf(a, b); }
-double t_math_fmin(double a, double b) { return fmin(a, b); }
-float  t_math_fminf(float a, float b) { return fminf(a, b); }
-double t_math_fmax(double a, double b) { return fmax(a, b); }
-float  t_math_fmaxf(float a, float b) { return fmaxf(a, b); }
-double t_math_fdim(double a, double b) { return fdim(a, b); }
-float  t_math_fdimf(float a, float b) { return fdimf(a, b); }
-double t_math_fma(double a, double b, double c) { return fma(a, b, c); }
-float  t_math_fmaf(float a, float b, float c) { return fmaf(a, b, c); }
+double t_math_copysign(double a, double b) { return tfd_copysign(a, b); }
+float  t_math_copysignf(float a, float b) { return (float)tfd_copysign((double)a, (double)b); }
+double t_math_nextafter(double a, double b) { return tfd_nextafter(a, b); }
+float  t_math_nextafterf(float a, float b) { return (float)tfd_nextafter((double)a, (double)b); }
+double t_math_remainder(double a, double b) { return tfd_remainder(a, b); }
+float  t_math_remainderf(float a, float b) { return (float)tfd_remainder((double)a, (double)b); }
+double t_math_fmin(double a, double b) { return tfd_fmin(a, b); }
+float  t_math_fminf(float a, float b) { return (float)tfd_fmin((double)a, (double)b); }
+double t_math_fmax(double a, double b) { return tfd_fmax(a, b); }
+float  t_math_fmaxf(float a, float b) { return (float)tfd_fmax((double)a, (double)b); }
+double t_math_fdim(double a, double b) { return tfd_fdim(a, b); }
+float  t_math_fdimf(float a, float b) { return (float)tfd_fdim((double)a, (double)b); }
+double t_math_fma(double a, double b, double c) { return tfd_fma(a, b, c); }
+float  t_math_fmaf(float a, float b, float c) { return (float)tfd_fma((double)a, (double)b, (double)c); }
 int32_t t_math_signbit(double x) { return __builtin_signbit(x); }
 int32_t t_math_isnan(double x) { return __builtin_isnan(x); }
 int32_t t_math_isinf(double x) { return __builtin_isinf(x); }

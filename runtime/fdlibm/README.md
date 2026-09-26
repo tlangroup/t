@@ -1,67 +1,72 @@
-# fdlibm 回落库（drop-in 目录）
+# fdlibm —— t 运行时的浮点数学实现（已启用，替代系统 libm）
 
-本目录用于放置 **fdlibm**（Free/NetBSD 双精度/单精度数学库，netlib 经典实现）
-的 C 源码，作为 **无系统 libm 目标（如 WASM、bare-metal）** 的编译期数学回落。
+本目录是 **fdlibm**（Sun 1993/2004 版，netlib 自由分发实现）的 C 源码，
+自 2026-09-26 起作为 **t 运行时唯一的浮点数学来源**：`runtime/t_runtime.c` 已
+**移除 `#include <math.h>`**，全部 `t_math_*` 包装改为调用本目录提供的实现。
 
-## 为什么需要它
+> ⚠ 本文件曾描述过一套「`g_fp_hw` 双分派 + LLVM `@llvm.sin.*` intrinsic 直映射 +
+>   drop-in 免改名回落」的方案。该方案**从未真正存在**：`src/` 里没有 `g_fp_hw`
+>   这个符号，也没有任何 `@llvm.sin.*` 发射。旧文档是设想稿，已按现状重写。
 
-`t` 的数学内建（`@sin` / `sin` / `sinf` …）在代码生成时：
+## 为什么用它
 
-- **LLVM 后端、目标支持硬件 FPU intrinsic**（`g_fp_hw == true`，如 x86-64 / ARM）：
-  `sin/cos/exp/exp2/log/log2/log10/pow/sqrt/fabs/floor/ceil/trunc/round`
-  直接映射 `@llvm.<op>.<ty>` 硬件指令；其余（tan/atan/asin/acos/atan2/sinh/cosh/tanh/
-  log1p/expm1/hypot/cbrt/fmod）回落到 `t_runtime` 中的 `t_math_*` 包装函数。
-- **回落路径**：`runtime/t_runtime.c` 里的 `t_math_*(...)` 包装直接调用平台 libm
-  （`#include <math.h>` 的 `sin` / `sinf` / `hypot` / `atan2` …）。
+- 系统 libm 是实现-defined 的：同一份 `t` 源码在 glibc / MSVC CRT / musl 上可能得到
+  末位不同的结果，破坏「双后端 + 跨平台逐字节可比」的不变式。
+- fdlibm 是 IEEE-754 的参考级实现，自带全部内核（`__ieee754_*` / `__kernel_*`），
+  不依赖宿主 libm，结果可复现。
 
-在 **WASM 等没有系统 libm** 的目标上，`g_fp_hw` 被置为 `false`，**全部**数学函数
-都走 `t_math_*` 回落。此时只要把 fdlibm 源码编进 `t_runtime.lib`，
-`t_math_*` 就会链接到 fdlibm 提供的同名符号，无需改任何包装代码。
+## 符号重命名（关键机制）
 
-## 如何放入 fdlibm
+fdlibm 的公开符号（`sin` / `pow` / `sqrt` …）与系统 libm **同名**。若不处理：
+宿主 `<math.h>` 常把这些名字声明为 intrinsic / 内联，可能在编译期就绕开我们的实现。
 
-1. 从 netlib 获取 fdlibm 源码：
-   `https://netlib.org/fdlibm/`（或发行版 `musl`/`newlib` 的 `math/` 子集）。
-2. 把下列 **`.c` 文件**复制进本目录 `runtime/fdlibm/`：
+故 `tools/build_runtime.mjs` 用 `-D` 在预处理期把 45 个公开名改写成 **`tfd_*` 前缀**
+（内部内核 `__ieee754_*` / `__kernel_*` 保持原名，不与 CRT 相撞）：
 
-   | 符号（double） | fdlibm 源文件（参考） |
-   |---|---|
-   | sin / cos / tan | `s_sin.c` `s_cos.c` `s_tan.c` `k_sin.c` `k_cos.c` `k_tan.c` `k_rem_pio2.c` `e_rem_pio2.c` |
-   | atan / asin / acos | `s_atan.c` `e_asin.c` `e_acos.c` |
-   | atan2 | `e_atan2.c` |
-   | exp / exp2 / log / log2 / log10 | `e_exp.c` `e_exp2.c` `e_log.c` `e_log2.c` `e_log10.c` |
-   | pow | `e_pow.c` `e_powf.c` |
-   | sinh / cosh / tanh | `e_sinh.c` `e_cosh.c` `e_tanh.c` |
-   | sqrt | 平台通常内联；无则加 `e_sqrt.c` |
-   | fmod / fabs / floor / ceil / trunc / round | `e_fmod.c` `s_fabs.c` `s_floor.c` `s_ceil.c` `s_trunc.c` `s_round.c` |
-   | log1p / expm1 | `s_log1p.c` `s_expm1.c` |
-   | hypot | `e_hypot.c` |
-   | cbrt | `s_cbrt.c` `e_cbrt.c` |
+```
+-Dsin=tfd_sin -Dcos=tfd_cos ... -Dsqrt=tfd_sqrt ... -Dsigngam=tfd_signgam
+```
 
-   单精度变体（`sinf`/`cosf`/`tanf`/`atan2f`/`powf`/`hypotf`/`cbrtf` …）由 fdlibm 的
-   浮点宏文件提供（`s_sinf.c` 等，内部 `#include "s_sin.c"` 并 `#define float`），
-   一并放入本目录即可。
+`t_runtime.c` 里 `extern double tfd_*(...)` 声明后直接调用。
+`s_matherr.c` 被排除（提供 `matherr`，与 CRT 冲突）。
 
-3. 编译 fdlibm 通常需要的宏（加在 `tools/build_runtime.mjs` 的 `fdlibm` 编译参数里，
-   或直接在源码顶部）：`-D_IEEE_LIBM -D__STDC__ -D_POSIX_SOURCE`。
-   具体以所取 fdlibm 版本的 `Makefile` / `README` 为准。
+## ⚠ 两个必知的坑（都踩过）
 
-## 构建接线
+1. **字节序探测失效（曾导致全库静默算错）**
+   `fdlibm.h` 只认 1990 年代的 `i386` / `__alpha` / `__osf__` 宏。现代编译器
+   （clang/gcc/MSVC on x86-64 / arm64 / riscv64）**一个都不命中**，于是静默落到
+   「大端」分支，`__HI(x)/__LO(x)` 取反 → double 高/低 32 位字互换：
+   `tfd_fabs(-3.5) == -3.5`、`tfd_sqrt(2.0) == 0.0`、`tfd_pow(2,10) == inf`。
+   已在 `fdlibm.h` 补上现代字节序宏（`__x86_64__` / `_M_X64` / `__aarch64__` /
+   `__BYTE_ORDER__` 兜底）。**换目标平台务必重验 `math_stdlib_demo`。**
 
-`tools/build_runtime.mjs` 在编 `t_runtime.lib` 时，会 **自动 glob 本目录下的 `*.c`**
-（`runtime/fdlibm/*.c`），与 `t_runtime.c` / `t_shim_ll.c` 一起编进归档。
+2. **类型双关需要 `-fno-strict-aliasing`**
+   `__HI(x)` 展开是 `*(int*)&x`，严格别名规则下是 UB，`-O2` 会重排「先写 `__HI`
+   再读 `x`」，导致发布态与调试态结果不一致。`build_runtime.mjs` 已为 fdlibm 单元
+   统一加上该标志。
 
-- 目录为空（默认）：回落到系统 libm（宿主 clang 自带 compiler-rt / MSVC CRT 的 libm）。
-- 目录有 fdlibm 源码：回落到 fdlibm 提供的同名符号。
+## fdlibm 没有、由 t 自行补的 8 个函数
 
-无需修改任何 `t_math_*` 包装代码——链接器按符号名解析。
+`s_` / `e_` 系列里没有（或版本太老没有）的，在 `t_runtime.c` 中基于 `tfd_*` 实现：
+
+| 函数 | 实现方式 |
+|---|---|
+| `trunc` | `x >= 0 ? tfd_floor(x) : tfd_ceil(x)` |
+| `round` | `x >= 0 ? tfd_floor(x+0.5) : tfd_ceil(x-0.5)` |
+| `exp2` | `tfd_pow(2.0, x)` |
+| `log2` | `tfd_log(x) / ln2` |
+| `fmin` / `fmax` / `fdim` | 手写 + NaN 传播 |
+| `fma` | Dekker two-product + two-sum（无需硬件 FMA） |
+
+单精度变体（`t_math_*f`）一律「双精度计算后再窄化」：`(float)tfd_*((double)x)`。
 
 ## 验证
 
 ```bash
-# 1) 放入 fdlibm 源码后重建运行时库
-node tools/build_runtime.mjs
-
-# 2) 跑双后端示例 + 自举门禁（WASM 目标需另设 g_fp_hw=false 并切到 WASM 工具链）
+node tools/build_runtime.mjs          # 重建 out/{dbg,rls}/deps/t_runtime.lib
+node tools/run_examples.mjs --only math_stdlib_demo,format_demo
 node tools/gate.mjs L2
 ```
+
+对拍探针 `out/_probe/probe_libs.c`（fdlibm vs 系统 libm，13 个探针值 × 30 个函数）
+应报 `0 mismatch(es)`。

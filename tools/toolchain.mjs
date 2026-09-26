@@ -48,7 +48,10 @@ export function resolveAr(clangDir) {
         "ar",
     ];
     for (const c of cands) {
-        try { execFileSync(c, ["--version"], { stdio: "pipe" }); return c; } catch {}
+        // ⚠ stdio:"pipe" 在 Git Bash / MSYS 下 spawn Windows 子进程会报 EBUSY
+        // （实测 llvm-ar.exe --version：pipe → EBUSY，ignore → OK）。探测只需要
+        // 「能否启动」，不需要读输出，故用 "ignore"。
+        try { execFileSync(c, ["--version"], { stdio: "ignore", windowsHide: true }); return c; } catch {}
     }
     return "ar";
 }
