@@ -4694,6 +4694,56 @@ pub fn tir_match_pattern_cond(arm: Node, scr: string, scr_base: string, scr_st: 
         if (rcond == "") { rcond = "1"; }
         return rcond;
     }
+    // ── 结构体 / 元组字面量模式（KI-002 修复）：逐字段相等比较 ──
+    // 对齐 C 后端 match_chain_from 的 struct_lit 分支（per-field `sname.field == literal` 的 AND 链）。
+    // 命名结构（p.sa 非空）直接用 p.sa；匿名元组（p.sa 空）由 scrutinee 的 TD 名反查合成结构名。
+    // 取址 / GEP / LOAD 复用 tir_member_addr 的权威配方（ADDR_OF 结构值 → GEP 前导 0 + 字段下标 → LOAD）。
+    if (p.kind == "struct_lit") {
+        var sname: string = p.sa;
+        if (sname == "" && scr_td >= 0 && scr_td < slice_len(sema.tds) as i64) {
+            sname = sema.tds[scr_td].name;
+        }
+        if (sname != "") {
+            var sbase: string = tir_strip_pct(sname);
+            var sptr: string = tir_tmp();
+            // ⚠ ADDR_OF 的 st 必须带 `%` 前缀（ptr<%Pt>）：tir_to_ll 的 ADDR_OF 直传指针分支
+            // 要求 `ll_starts(st, "%")` 成立，否则 GEP 基类型退化成无 `%` 的 `Pt` →
+            // LLVM "expected type" 报错。对齐 tir_member_addr（其 base_st 即 ptr<%…>）。
+            tir_emit(TIRInst{ op: TIR_OP_ADDR_OF, st: tir_st_from_str(base.sb_cat3("ptr<%", sbase, ">")), dst: tir_op(sptr), args: tir_a1(scr), is_comment: false, line: g_cur_line, cmt: "" });
+            var cond: string = "";
+            var fvp: i64 = p.la;
+            while (fvp >= 0) {
+                var fv: Node = base.nodes[base.kids[fvp].val];
+                var fname: string = fv.sa;
+                var fidx: i64 = tir_field_index(sname, fname);
+                var fst: string = tir_field_st(sname, fname);
+                var faddr: string = tir_tmp();
+                tir_emit(TIRInst{ op: TIR_OP_GEP, st: tir_st_from_str(fst), dst: tir_op(faddr), args: tir_a3(sptr, "0", base.i2s(fidx)), is_comment: false, line: g_cur_line, cmt: "" });
+                var fval: string = tir_tmp();
+                tir_emit(TIRInst{ op: TIR_OP_LOAD, st: tir_st_from_str(fst), dst: tir_op(fval), args: tir_a1(faddr), is_comment: false, line: g_cur_line, cmt: "" });
+                var ec: string = tir_tmp();
+                if (fst == "%TStr") {
+                    var pv: string = tir_emit_expr(fv.na).name;
+                    var cmp: string = tir_tmp();
+                    tir_emit(TIRInst{ op: TIR_OP_CALL, st: tir_st_from_str("i32"), dst: tir_op(cmp), args: tir_a3("@tll_str_eq", fval, pv), is_comment: false, line: g_cur_line, cmt: "" });
+                    tir_emit(TIRInst{ op: TIR_OP_NE, st: tir_st_from_str("i32"), dst: tir_op(ec), args: tir_a2(cmp, "0"), is_comment: false, line: g_cur_line, cmt: "" });
+                } else {
+                    var pv: string = tir_emit_expr(fv.na).name;
+                    tir_emit(TIRInst{ op: TIR_OP_EQ, st: tir_st_from_str(fst), dst: tir_op(ec), args: tir_a2(fval, pv), is_comment: false, line: g_cur_line, cmt: "" });
+                }
+                if (cond == "") { cond = ec; }
+                else {
+                    var comb: string = tir_tmp();
+                    tir_emit(TIRInst{ op: TIR_OP_AND, st: tir_st_from_str("i1"), dst: tir_op(comb), args: tir_a2(cond, ec), is_comment: false, line: g_cur_line, cmt: "" });
+                    cond = comb;
+                }
+                fvp = base.kids[fvp].next;
+            }
+            if (cond == "") { cond = "1"; }   // 空 {} 模式：恒真
+            return cond;
+        }
+        return "";
+    }
     // ── 枚举 / 变体构造器模式（ident 或 Enum.Case / Variant.Case 的 member）──
     var cname: string = p.sa;
     if (p.kind == "member") { cname = p.sa; }

@@ -192,7 +192,13 @@ TupleBind       ::= "var" TupleLitPat "=" Expr              // 直接解构绑�
 ## 16. 实施状态（进行中，2026-09-26）
 
 - **已落地（双后端验证通过）**：元组类型、字面量、字段访问、参数/返回值（`tuple_demo.tc` / `tuple_after_local.tc`）。
+- **✅ KI-002 已修复（2026-09-26，提交 wb）**：`tir_match_pattern_cond` 增补 `struct_lit` 分支，
+  按 `tir_member_addr` 同款配方（ADDR_OF 结构值 → GEP 前导 `0` + 字段下标 → LOAD）逐字段 `icmp` + `AND`
+  合成非空条件链；修复前 `Pt{ x: 0, y: 0 }` 在 LLVM 轨恒命中首臂（输出 `1`），修复后输出 `0`。
+  验证：`tests/known-issues/KI-002_struct_literal_pat.tc` LLVM 轨输出 `0`；新增
+  `examples/tuple_match_demo.tc`（+ `.expected.txt`）经 `run_examples` 双后端逐字节一致 PASS
+  （命名结构模式 + 具名元组合成结构 `_0/_1` 模式 + 部分字段模式全覆盖）。
+  ⚠ 关键坑：ADDR_OF 的 st 必须 `ptr<%Pt>`（带 `%`），否则 GEP 基类型退化成无 `%` 的 `Pt` → LLVM "expected type" 报错。
 - **待补（本文目标）**：
-  - KI-002：struct/元组字面量模式 LLVM 轨恒命中首臂（§8.1 / §14.1）。
   - 解构绑定模式 `.{a,b}` / `Pair{a,b}`（§8.2 / §14.2）。
-  - conformance + `tuple_match_demo.tc`（§9）。
+  - conformance `p_tuple_destructure` / `p_tuple_litpat`（§9，litpat 已通过 example 固化）。

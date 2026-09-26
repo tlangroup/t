@@ -342,6 +342,8 @@ if (((_tms1.x == 0) && (_tms1.y == 0))) { _tmr1 = 1; } else { _tmr1 = 0; }
 
 ⇒ 缺陷只在 **LLVM / TIR 轨**；推测与 §6.2 根因 ① 同族（`tir_match_pattern_cond` 对 struct_lit 模式返回空条件串 ⇒ dispatch 退化为无条件跳转，未走 `named` 回查分支）。
 
+**✅ 已修复（2026-09-26，元组特性 #2 一并落地）**：`src/tir.tc` 的 `tir_match_pattern_cond` 增补 `struct_lit` 分支，逐字段 `icmp` + `AND` 合成非空条件链（复用 `tir_member_addr` 的 `ADDR_OF`+`GEP`+`LOAD` 配方；`ADDR_OF` 的 `st` 须 `ptr<%Pt>` 带 `%`，否则 GEP 基类型非法）。修复后 `tc run`（LLVM 轨）输出 `0`；新增 `examples/tuple_match_demo.tc` 经 `run_examples` 双后端逐字节一致 PASS。待补：字面量模式的 sema 诊断（未知字段名 / 未定义标识符）。
+
 **为何门禁未拦住**：与 §6.2 同构 —— ① `tests/known-issues/` **不被 conformance / difftest / run_examples 自动扫描**（设计如此，仅手动跑）；② `examples/` 全仓无「struct/元组字面量模式 + 运行期判别」用例，既有 struct 示例一律用字段访问；③ `conformance` 只校验编译期行为。故该路径运行期**零覆盖**，错编长期不可见。
 
 **用户侧规避（必须）**：不要用 struct / 元组字面量模式做运行期判别，改写为显式比较：
@@ -356,6 +358,8 @@ fn at_origin(p: Pt) i64 {
 另一处相关静默（同一路径）：struct **字面量**（含模式位）里的**未知字段名不报诊断** —— `Pt{ zz: 0 }` 与 `Pt{ x: zzz, y: 0 }` 均 `tc check` 通过；后者在 C 轨会一路发射到 clang 才报 C 的未定义符号。字段名拼写需人工核对。
 
 **修复验收待办**：① LLVM 轨补发 struct_lit / 元组模式的逐字段比较（使其 IR 出现对应 `icmp` 与条件 `br`）；② 字面量模式补「未知字段名 + 未定义标识符」的 sema 诊断；③ 新增 `examples/` 常规门禁用例，覆盖 struct/元组字面量模式的**双后端运行期对拍**（建成前先用修复前的编译器确认用例会失败，避免空跑）。
+
+> 状态更新（2026-09-26）：① 与 ③ 已完成（见上「✅ 已修复」）；② 仍未做，属解构绑定特性的独立子项。
 
 ---
 
