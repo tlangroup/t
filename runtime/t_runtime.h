@@ -174,6 +174,8 @@ int64_t t_map_count(TMap* m);
 TStr    t_map_key_str_at(TMap* m, int64_t i);
 int64_t t_map_key_int_at(TMap* m, int64_t i);
 void*   t_map_val_at(TMap* m, int64_t i);        // 第 i 个插入序键对应的值字节指针
+TMap*   t_map_concat(TMap* a, TMap* b);           // map 合并（b 命中键覆盖 a）
+void    t_map_concat_into(TMap* a, TMap* b, TMap* out); // 灌入已建好的 out（shim 用，避免头文件暴露完整结构）
 
 // ── Sym：字符串驻留符号池（ECS Component 专用，M40）─────────────
 // Sym32("tag") / Sym16("tag")：Component 字段仅存 u32 / u16 id；真实字符串

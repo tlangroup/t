@@ -1362,6 +1362,31 @@ TMap* t_map_new(TArena* a, int64_t key_kind, int64_t val_size) {
     return m;
 }
 
+// map[K]V ++ map[K]V ⇒ map[K]V：把 a 的全部条目、再 b 的条目（b 命中键覆盖 a）灌入 out。
+// key/val 类型一致性由前端保证。out 须已按 a 的 arena / key_kind / val_size 建好。
+void t_map_concat_into(TMap* a, TMap* b, TMap* out) {
+    if (a == NULL || b == NULL || out == NULL) t_fatal("t_map_concat_into: null map operand");
+    int64_t kk = a->key_kind;
+    int64_t na = t_map_count(a);
+    for (int64_t i = 0; i < na; i++) {
+        if (kk == 0) { TStr k = t_map_key_str_at(a, i); void* v = t_map_val_at(a, i); t_map_put(out, &k, v); }
+        else { int64_t k = t_map_key_int_at(a, i); void* v = t_map_val_at(a, i); t_map_put(out, &k, v); }
+    }
+    int64_t nb = t_map_count(b);
+    for (int64_t i = 0; i < nb; i++) {
+        if (kk == 0) { TStr k = t_map_key_str_at(b, i); void* v = t_map_val_at(b, i); t_map_put(out, &k, v); }
+        else { int64_t k = t_map_key_int_at(b, i); void* v = t_map_val_at(b, i); t_map_put(out, &k, v); }
+    }
+}
+
+// map[K]V ++ map[K]V ⇒ map[K]V：新建 map（沿用 a 的 arena / key_kind / val_size），灌入两侧条目。
+TMap* t_map_concat(TMap* a, TMap* b) {
+    if (a == NULL || b == NULL) t_fatal("t_map_concat: null map operand");
+    TMap* r = t_map_new(a->a, a->key_kind, a->val_size);
+    t_map_concat_into(a, b, r);
+    return r;
+}
+
 static int64_t map_probe(TMap* m, uint64_t h) { return (int64_t)(h & (uint64_t)(m->cap - 1)); }
 
 static void map_rehash(TMap* m) {

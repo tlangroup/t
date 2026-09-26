@@ -3959,6 +3959,27 @@ pub fn ll_emit_inst(inst: TIRInst) void {
             sb_append_str(g_ll, ")\n");
             return;
         }
+        // map[K]V ++ map[K]V ⇒ map[K]V（st 为 ptr<void>：Concat 语境下唯一落到 ptr<void> 的是 map）。
+        // ⚠ map 变量是 alloca ptr 槽、槽内才是 TMap* 句柄；须 load 出句柄再传（与 map_len 同款），
+        // 直接传槽地址(ptr*)会被当 TMap* 解引用→读到槽首 8 字节的指针值当 key_kind→乱建空表。
+        // map 在 LLVM 侧即 TMap*(= ptr)，采用「返回值」形式（与 C 后端 t_map_concat 同构），
+        // 不走 sret——sret 要求 shim 做 `*out = *r` 赋值，而 TMap 在 shim 头文件仅前置声明（不完整），无法赋值。
+        if (st == "ptr<void>") {
+            ll_ensure_slot(d, "ptr<void>"); ll_set_st(d, "ptr<void>");
+            var la: string = ll_load(a, "ptr");
+            var lb: string = ll_load(b, "ptr");
+            ll_maybe_declare("tll_map_concat", "ptr", ["ptr", "ptr"]);
+            var r: string = ll_tmp();
+            sb_append_str(g_ll, "  ");
+            sb_append_str(g_ll, r);
+            sb_append_str(g_ll, " = call ptr @tll_map_concat(ptr ");
+            sb_append_str(g_ll, la);
+            sb_append_str(g_ll, ", ptr ");
+            sb_append_str(g_ll, lb);
+            sb_append_str(g_ll, ")\n");
+            ll_store(d, "ptr<void>", r);
+            return;
+        }
     }
     if (st == "%TStr" && o == TIR_OP_ADD) {
         var d: string = inst.dst.name;
