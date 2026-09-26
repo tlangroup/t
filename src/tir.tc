@@ -4694,6 +4694,66 @@ pub fn tir_match_pattern_cond(arm: Node, scr: string, scr_base: string, scr_st: 
         if (rcond == "") { rcond = "1"; }
         return rcond;
     }
+    // ── 结构体 / 元组字面量模式（KI-002 修复）：逐字段相等比较 ──
+    // 对齐 C 后端 match_chain_from 的 struct_lit 分支（per-field `sname.field == literal` 的 AND 链）。
+    // 命名结构（p.sa 非空）直接用 p.sa；匿名元组（p.sa 空）由 scrutinee 的 TD 名反查合成结构名。
+    // 取址 / GEP / LOAD 复用 tir_member_addr 的权威配方（ADDR_OF 结构值 → GEP 前导 0 + 字段下标 → LOAD）。
+    if (p.kind == "struct_lit") {
+        var sname: string = p.sa;
+        if (sname == "" && scr_td >= 0 && scr_td < slice_len(sema.tds) as i64) {
+            sname = sema.tds[scr_td].name;
+        }
+        if (sname != "") {
+            var sbase: string = tir_strip_pct(sname);
+            var sptr: string = tir_tmp();
+            // ⚠ ADDR_OF 的 st 必须带 `%` 前缀（ptr<%Pt>）：tir_to_ll 的 ADDR_OF 直传指针分支
+            // 要求 `ll_starts(st, "%")` 成立，否则 GEP 基类型退化成无 `%` 的 `Pt` →
+            // LLVM "expected type" 报错。对齐 tir_member_addr（其 base_st 即 ptr<%…>）。
+            tir_emit(TIRInst{ op: TIR_OP_ADDR_OF, st: tir_st_from_str(base.sb_cat3("ptr<%", sbase, ">")), dst: tir_op(sptr), args: tir_a1(scr), is_comment: false, line: g_cur_line, cmt: "" });
+        var cond: string = "";
+        var sl_pos: i64 = 0;   // 位置式（sa==""）字段按列表下标映射
+        var fvp: i64 = p.la;
+        while (fvp >= 0) {
+            var fv: Node = base.nodes[base.kids[fvp].val];
+            var fname: string = fv.sa;
+            var eff: string = fname;
+            if (fname == "") { eff = sema.struct_field_name_at(sname, sl_pos); sl_pos = sl_pos + 1; }
+            var fval_node: i64 = fv.na;
+            // 绑定字段（ident，含 _ 通配）：不参与比较条件，仅在命中臂的 body 内提取。
+            // 跳过以免把绑定标识符当字面量整体发射比较（静默错编）。
+            if (fval_node >= 0 && base.nodes[fval_node].kind == "ident") {
+                fvp = base.kids[fvp].next;
+                continue;
+            }
+            var fidx: i64 = tir_field_index(sname, eff);
+            var fst: string = tir_field_st(sname, eff);
+            var faddr: string = tir_tmp();
+            tir_emit(TIRInst{ op: TIR_OP_GEP, st: tir_st_from_str(fst), dst: tir_op(faddr), args: tir_a3(sptr, "0", base.i2s(fidx)), is_comment: false, line: g_cur_line, cmt: "" });
+                var fval: string = tir_tmp();
+                tir_emit(TIRInst{ op: TIR_OP_LOAD, st: tir_st_from_str(fst), dst: tir_op(fval), args: tir_a1(faddr), is_comment: false, line: g_cur_line, cmt: "" });
+                var ec: string = tir_tmp();
+                if (fst == "%TStr") {
+                    var pv: string = tir_emit_expr(fv.na).name;
+                    var cmp: string = tir_tmp();
+                    tir_emit(TIRInst{ op: TIR_OP_CALL, st: tir_st_from_str("i32"), dst: tir_op(cmp), args: tir_a3("@tll_str_eq", fval, pv), is_comment: false, line: g_cur_line, cmt: "" });
+                    tir_emit(TIRInst{ op: TIR_OP_NE, st: tir_st_from_str("i32"), dst: tir_op(ec), args: tir_a2(cmp, "0"), is_comment: false, line: g_cur_line, cmt: "" });
+                } else {
+                    var pv: string = tir_emit_expr(fv.na).name;
+                    tir_emit(TIRInst{ op: TIR_OP_EQ, st: tir_st_from_str(fst), dst: tir_op(ec), args: tir_a2(fval, pv), is_comment: false, line: g_cur_line, cmt: "" });
+                }
+                if (cond == "") { cond = ec; }
+                else {
+                    var comb: string = tir_tmp();
+                    tir_emit(TIRInst{ op: TIR_OP_AND, st: tir_st_from_str("i1"), dst: tir_op(comb), args: tir_a2(cond, ec), is_comment: false, line: g_cur_line, cmt: "" });
+                    cond = comb;
+                }
+                fvp = base.kids[fvp].next;
+            }
+            if (cond == "") { cond = "1"; }   // 空 {} 模式：恒真
+            return cond;
+        }
+        return "";
+    }
     // ── 枚举 / 变体构造器模式（ident 或 Enum.Case / Variant.Case 的 member）──
     var cname: string = p.sa;
     if (p.kind == "member") { cname = p.sa; }
@@ -4917,6 +4977,34 @@ pub fn tir_emit_match(n: Node, as_stmt: bool, est: i64) TirEmitRes {
                 sp_e2 = base.kids[sp_e2].next;
             }
         }
+        // 结构体 / 具名元组字面量模式：预声明字段绑定名 slot（类型取字段 TD，与 conpat/slice_pat 同构）。
+        // 命名结构名由模式 sa 给出；匿名元组由 scrutinee TD 反查合成结构名。
+        if (arm.na >= 0 && base.nodes[arm.na].kind == "struct_lit") {
+            var sl_name: string = base.nodes[arm.na].sa;
+            if (sl_name == "" && scr_td >= 0 && scr_td < slice_len(sema.tds) as i64) {
+                sl_name = sema.tds[scr_td].name;
+            }
+            var sl_fvp: i64 = base.nodes[arm.na].la;
+            var sl_pos_pre: i64 = 0;   // 位置式字段按列表下标映射
+            while (sl_fvp >= 0) {
+                var sl_fv: Node = base.nodes[base.kids[sl_fvp].val];
+                var sl_fname: string = sl_fv.sa;
+                var sl_eff: string = sl_fname;
+                if (sl_fname == "") { sl_eff = sema.struct_field_name_at(sl_name, sl_pos_pre); sl_pos_pre = sl_pos_pre + 1; }
+                var sl_fval: i64 = sl_fv.na;
+                if (sl_fval >= 0 && base.nodes[sl_fval].kind == "ident" && base.nodes[sl_fval].sa != "_") {
+                    var sl_bidx: i64 = tir_find_local_idx(base.nodes[sl_fval].sa);
+                    if (sl_bidx < 0) {
+                        var sl_ftd: i64 = -1;
+                        if (sl_name != "") { sl_ftd = tir_field_td(sl_name, sl_eff); }
+                        var sl_fst: string = tir_st_of_td(sl_ftd);
+                        if (sl_fst == "") { sl_fst = "i64"; }   // 兜底（字段类型不可得时）
+                        tir_new_named_slot(sl_ftd, sl_fst, base.nodes[sl_fval].sa);
+                    }
+                }
+                sl_fvp = base.kids[sl_fvp].next;
+            }
+        }
         // 位串模式：预声明段内绑定名 slot（定长段 → i64，/bitstr 尾段 → %TBitStr）
         if (arm.na >= 0 && base.nodes[arm.na].kind == "bitstr_pat") {
             var bsp2: Node = base.nodes[arm.na];
@@ -5067,6 +5155,41 @@ pub fn tir_emit_match(n: Node, as_stmt: bool, est: i64) TirEmitRes {
                 }
                 pos2 = pos2 + 1;
                 sp_e3 = base.kids[sp_e3].next;
+            }
+        }
+        // 结构体 / 具名元组字面量模式：提取绑定字段到预声明 slot（与 C 后端 match_chain_from 同语义）。
+        // 配方复用 tir_match_pattern_cond 的 struct_lit 分支：ADDR_OF 结构值 → GEP 字段偏移 → LOAD → STORE。
+        if (arm.na >= 0 && base.nodes[arm.na].kind == "struct_lit") {
+            var sl_name_b: string = base.nodes[arm.na].sa;
+            if (sl_name_b == "" && scr_td >= 0 && scr_td < slice_len(sema.tds) as i64) {
+                sl_name_b = sema.tds[scr_td].name;
+            }
+            if (sl_name_b != "") {
+                var sl_sbase_b: string = tir_tmp();
+                tir_emit(TIRInst{ op: TIR_OP_ADDR_OF, st: tir_st_from_str(base.sb_cat3("ptr<%", tir_strip_pct(sl_name_b), ">")), dst: tir_op(sl_sbase_b), args: tir_a1(scr), is_comment: false, line: g_cur_line, cmt: "" });
+                var sl_fvp_b: i64 = base.nodes[arm.na].la;
+                var sl_pos_b: i64 = 0;   // 位置式字段按列表下标映射
+                while (sl_fvp_b >= 0) {
+                    var sl_fv_b: Node = base.nodes[base.kids[sl_fvp_b].val];
+                    var sl_fname_b: string = sl_fv_b.sa;
+                    var sl_eff_b: string = sl_fname_b;
+                    if (sl_fname_b == "") { sl_eff_b = sema.struct_field_name_at(sl_name_b, sl_pos_b); sl_pos_b = sl_pos_b + 1; }
+                    var sl_fval_b: i64 = sl_fv_b.na;
+                    if (sl_fval_b >= 0 && base.nodes[sl_fval_b].kind == "ident" && base.nodes[sl_fval_b].sa != "_") {
+                        var sl_fidx_b: i64 = tir_field_index(sl_name_b, sl_eff_b);
+                        var sl_fst_b: string = tir_field_st(sl_name_b, sl_eff_b);
+                        var sl_faddr_b: string = tir_tmp();
+                        tir_emit(TIRInst{ op: TIR_OP_GEP, st: tir_st_from_str(sl_fst_b), dst: tir_op(sl_faddr_b), args: tir_a3(sl_sbase_b, "0", base.i2s(sl_fidx_b)), is_comment: false, line: g_cur_line, cmt: "" });
+                        var sl_fvload_b: string = tir_tmp();
+                        tir_emit(TIRInst{ op: TIR_OP_LOAD, st: tir_st_from_str(sl_fst_b), dst: tir_op(sl_fvload_b), args: tir_a1(sl_faddr_b), is_comment: false, line: g_cur_line, cmt: "" });
+                        var sl_bidx_b: i64 = tir_find_local_idx(base.nodes[sl_fval_b].sa);
+                        if (sl_bidx_b >= 0) {
+                            var sl_bslot_b: string = g_local_slots[sl_bidx_b];
+                            tir_emit(TIRInst{ op: TIR_OP_STORE, st: ST_NONE, dst: tir_op(sl_bslot_b), args: tir_a1(sl_fvload_b), is_comment: false, line: g_cur_line, cmt: "" });
+                        }
+                    }
+                    sl_fvp_b = base.kids[sl_fvp_b].next;
+                }
             }
         }
         // 位串模式解构（§6）：按累计位偏移提取段 → 绑定 slot（与 C 后端 match_chain_from 同语义）

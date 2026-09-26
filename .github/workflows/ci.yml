@@ -1,0 +1,87 @@
+# ─────────────────────────────────────────────────────────────
+# t 语言编译器 · 合并门禁 CI
+#
+# 触发时机：仅当向 main 分支进行「合并提交」时（即 push 到 main）。
+#   - 日常开发在 wb 分支进行；wb 上的提交 / 从 wb 开出的 PR 不会
+#     触发本流程，避免频繁提交反复跑重型门禁。
+#   - 设计文档（docs/design.md）在 wb 上完成、确认后，合并到 main
+#     → 本 workflow 自动运行，对合并后的代码做完整验证。
+#
+# 本流程等价于本地 `node tools/gate.mjs L1`：
+#   工具链断言 → 诊断不变量 → 静态检查(catn/shadow/dag)
+#   → 预编译 std → 一代自举 → IR 审计 → LLVM verifier
+#   → 产物快照比对 → conformance → 自举不动点(g2==g3)
+#   → examples 双后端 → HIR → 双轨对拍 → REPL。
+#   （L2 的 miropt 步依赖 wasmtime / riscv 工具链，属实验性 M 轨，
+#     不在 CI 跑；里程碑级验证请本地 `node tools/gate.mjs L2`。）
+#
+# 引导编译器（seed）：out/ 被 gitignore，仓库不随附编译器二进制。
+#   故在 ci/seed/tc.exe 提交一份「上一稳定版」tc.exe 作为自举种子；
+#   CI 用它编译 src/tc.tc 得到 g1，再跑完整自举与门禁。
+#   刷新种子：本地 `cp out/dbg/tc.exe ci/seed/tc.exe` 后提交
+#   （编译器自举契约变化、旧种子编不出新 src 时必须刷新）。
+# ─────────────────────────────────────────────────────────────
+
+name: CI (merge → main)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      gate_level:
+        description: "gate 等级（L1 / L2）"
+        required: false
+        default: "L1"
+
+# 仅读权限；门禁只验证代码，不推送。
+permissions:
+  contents: read
+
+# 同一 main 上的多次合并串行，避免重叠运行互相踩 out/。
+concurrency:
+  group: ci-merge-main
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    name: t compiler gate (${{ github.event.inputs.gate_level || 'L1' }})
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install LLVM / clang
+        shell: bash
+        run: |
+          # windows-latest 不预装 LLVM；用 winget 安装并加入 PATH。
+          # 若 winget 失败，可改用 `choco install llvm` 或预装镜像。
+          winget install LLVM.LLVM --accept-package-agreements --accept-source-agreements
+          echo "C:/Program Files/LLVM/bin" >> "$GITHUB_PATH"
+          clang --version || true
+
+      - name: Restore bootstrap seed compiler
+        shell: bash
+        run: |
+          mkdir -p out/dbg
+          cp ci/seed/tc.exe out/dbg/tc.exe
+          ls -la out/dbg/tc.exe
+
+      - name: Run gate ${{ github.event.inputs.gate_level || 'L1' }}
+        shell: bash
+        env:
+          TC_CLANG: "C:/Program Files/LLVM/bin/clang.exe"
+          PY: python
+        run: |
+          node tools/gate.mjs ${{ github.event.inputs.gate_level || 'L1' }}

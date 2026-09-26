@@ -1425,6 +1425,42 @@ pub fn match_conpat_binds_register(e: i64) void {
                     }
                     sb_e = base.kids[sb_e].next;
                 }
+            } else if (base.nodes[mr_an.na].kind == "struct_lit") {
+                // 结构体 / 具名元组 / 匿名元组位置式模式字段绑定预登记（L-09：
+                // 首臂体引用绑定时结果类型会退化成 unknown，导致 _tmrN 声明为 void*）。
+                // 与 slice_pat 同机制：从被匹配值类型反查结构名 → 逐字段取类型。
+                var sl_sname: string = base.nodes[mr_an.na].sa;   // 命名结构名；匿名元组为空
+                if (sl_sname == "") {
+                    var sl_scr: i64 = base.nodes[e].na;            // match subject 表达式
+                    var sl_std: i64 = -1;
+                    if (sl_scr >= 0) { sl_std = expr_type_desc(sl_scr); }
+                    if (sl_std >= 0) { sl_sname = sema.tds[sl_std].name; }
+                }
+                var sl_fh: i64 = -1;
+                if (sl_sname != "") { sl_fh = sema.find_struct_fields(sl_sname); }
+                var sl_p: i64 = base.nodes[mr_an.na].la;
+                var sl_pos: i64 = 0;
+                while (sl_p >= 0) {
+                    var sl_fv: Node = base.nodes[base.kids[sl_p].val];
+                    var sl_fname: string = sl_fv.sa;
+                    var sl_eff: string = sl_fname;
+                    if (sl_fname == "") { sl_eff = sema.struct_field_name_at(sl_sname, sl_pos); sl_pos = sl_pos + 1; }
+                    var sl_rhs: i64 = sl_fv.na;
+                    if (sl_rhs >= 0 && base.nodes[sl_rhs].kind == "ident" && base.nodes[sl_rhs].sa != "_") {
+                        // 字段绑定：从结构声明字段类型预登记（与运行时 match_chain_from 同源）。
+                        var sl_ftd: i64 = -1;
+                        if (sl_fh >= 0) {
+                            var sl_fc2: i64 = sl_fh;
+                            while (sl_fc2 >= 0) {
+                                var sl_ff: Node = base.nodes[base.kids[sl_fc2].val];
+                                if (sl_ff.sa == sl_eff) { sl_ftd = sema.resolve_type_desc(sl_ff.na); break; }
+                                sl_fc2 = base.kids[sl_fc2].next;
+                            }
+                        }
+                        fs_set(em_cur_fn, base.nodes[sl_rhs].sa, sl_ftd);
+                    }
+                    sl_p = base.kids[sl_p].next;
+                }
             }
         }
         mr_c = mr_k.next;
@@ -1534,24 +1570,69 @@ pub fn match_chain_from(c: i64, rname: string, sname: string) i64 {
         if (base.nodes[mc_an.na].kind == "range") {
             mc_cond = base.mk_range_test(base.mk_ident(sname, -1), base.mk_ident(sname, -1), mc_an.na);
         } else if (base.nodes[mc_an.na].kind == "struct_lit") {
-            // 结构体字面量模式（Pt{ x: 0, y: 0 }）：struct 无内建整体 ==，且整体比较会被
-            // LLVM 后端发射成「对两个 ptr 做 icmp eq i64」而类型错配（KI-002）。改为逐字段
-            // 等值比较 AND 链：sname.x == pat.x && sname.y == pat.y && …。
-            // 各字段值 fv.na 已由 sema 按结构体声明字段类型推断（如 i64），与 sname.f 同型。
+            // 结构体 / 具名元组字面量模式（Pt{ x: 0, y: 0 } / IntPair{ ._0 = 0, ._1 = 0 }）：
+            // struct 无内建整体 ==，且整体比较会被 LLVM 后端发射成「对两个 ptr 做 icmp eq i64」
+            // 而类型错配（KI-002）。改为逐字段等值比较 AND 链：sname.x == pat.x && …。
+            // 字段绑定（Pt{ x: a, y: b }）：ident 值不进比较链，改为在 body 前置 `auto a = sname.x;`
+            // 声明（与 slice_pat / bitstr_pat 的 g_conpat_binds 机制同构）。纯绑定臂（无字面量字段）
+            // mc_cond 保持 -1 → 该臂无条件命中（绑定即匹配任意该结构值）。
             var slp: i64 = base.nodes[mc_an.na].la;
             var sl_first: bool = true;
+            var sl_sname: string = base.nodes[mc_an.na].sa;   // 命名结构名；匿名元组为空
+            if (sl_sname == "") {
+                // 匿名元组位置式 `.{a,b}`：由 scrutinee 临时量类型反查合成结构名
+                var sl_std: i64 = expr_type_desc(base.mk_ident(sname, -1));
+                if (sl_std >= 0) { sl_sname = sema.tds[sl_std].name; }
+            }
+            var sl_fh: i64 = -1;
+            if (sl_sname != "") { sl_fh = sema.find_struct_fields(sl_sname); }
+            var sl_pos: i64 = 0;   // 位置式（sa==""）字段按列表下标映射
+            var sl_pre: i64 = -1;
+            var sl_pre_tail: i64 = -1;
             while (slp >= 0) {
                 var sl_fv: Node = base.nodes[base.kids[slp].val];
-                var sl_lhs: i64 = base.mk_member(sl_fv.sa, base.mk_ident(sname, -1), -1);
+                var sl_fname: string = sl_fv.sa;
+                var sl_eff: string = sl_fname;
+                if (sl_fname == "") { sl_eff = sema.struct_field_name_at(sl_sname, sl_pos); sl_pos = sl_pos + 1; }
                 var sl_rhs: i64 = sl_fv.na;
-                var sl_fc: i64 = base.mk_binary("==", sl_lhs, sl_rhs, -1);
-                if (sl_first) {
-                    mc_cond = sl_fc;
-                    sl_first = false;
-                } else {
-                    mc_cond = base.mk_binary("&&", mc_cond, sl_fc, -1);
+                if (sl_rhs >= 0 && base.nodes[sl_rhs].kind == "ident" && base.nodes[sl_rhs].sa == "_") {
+                    // 通配符 `_`：不参与绑定、不参与比较，整字段跳过（否则会生成
+                    // `sname.field == sname` 这种类型错配的非法 C）。
+                } else if (sl_rhs >= 0 && base.nodes[sl_rhs].kind == "ident" && base.nodes[sl_rhs].sa != "_") {
+                    // 字段绑定：声明为真实局部变量（与 slice_pat 同机制，不进 mb 栈）。
+                    var sl_ftd: i64 = -1;
+                    if (sl_fh >= 0) {
+                        var sl_fc2: i64 = sl_fh;
+                        while (sl_fc2 >= 0) {
+                            var sl_ff: Node = base.nodes[base.kids[sl_fc2].val];
+                            if (sl_ff.sa == sl_eff) { sl_ftd = sema.resolve_type_desc(sl_ff.na); break; }
+                            sl_fc2 = base.kids[sl_fc2].next;
+                        }
+                    }
+                    var sl_init: i64 = base.mk_member(sl_eff, base.mk_ident(sname, -1), -1);
+                    var sl_vd: i64 = base.mk_var_decl(base.nodes[sl_rhs].sa, false, c_td_to_tnode(sl_ftd), sl_init, -1);
+                    append(base.g_conpat_binds, sl_vd);
+                    fs_set(em_cur_fn, base.nodes[sl_rhs].sa, sl_ftd);
+                    sl_pre_tail = base.list_push(sl_pre, sl_pre_tail, sl_vd);
+                    if (sl_pre < 0) { sl_pre = sl_pre_tail; }
+                } else if (sl_rhs >= 0) {
+                    // 字面量字段：逐字段等值比较（KI-002 修复）。
+                    var sl_lhs: i64 = base.mk_member(sl_eff, base.mk_ident(sname, -1), -1);
+                    var sl_fc: i64 = base.mk_binary("==", sl_lhs, sl_rhs, -1);
+                    if (sl_first) {
+                        mc_cond = sl_fc;
+                        sl_first = false;
+                    } else {
+                        mc_cond = base.mk_binary("&&", mc_cond, sl_fc, -1);
+                    }
                 }
                 slp = base.kids[slp].next;
+            }
+            if (sl_pre >= 0) {
+                var sl_ptk: Child = base.kids[sl_pre_tail];
+                sl_ptk.next = mc_body;
+                slice_set(base.kids, sl_pre_tail, sl_ptk);
+                mc_body = sl_pre;
             }
         } else if (base.nodes[mc_an.na].kind == "slice_pat") {
             // 切片模式 [a, b, .., last] / [] / [x]（S6）：
