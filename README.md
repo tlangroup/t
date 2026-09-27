@@ -68,7 +68,9 @@ out/dbg/tc.exe check app.tc --json
 # Token 流导出
 out/dbg/tc.exe lex app.tc --json
 
-# C → 原生 exe：MSVC（需 /std:c11 /utf-8）或 clang 链接 runtime/t_runtime.c
+# C → 原生 exe：clang 链接预编译的 out/<mode>/deps/t_runtime.lib
+# （runtime 依赖 vendored 的 mimalloc/fdlibm/imath/Ryu，不再可从源码直编；
+#   该库缺失时先跑 node tools/build_runtime.mjs）
 
 # —— 包管理器/构建系统 tote：把编译委托给 tc ——
 out/dbg/tote.exe init                     # 生成 tote.toml 与 src/main.tc

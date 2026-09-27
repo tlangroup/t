@@ -1,6 +1,8 @@
 ﻿// ═══════════════════════════════════════════════════════════════
 // test_runtime.c — t_runtime C 单元测试（边界 + 功能）
-// 编译: gcc test_runtime.c t_runtime.c -o test_runtime && ./test_runtime
+// 编译（⚠ 2026-09-26 起 t_runtime.c 依赖 vendored 的 mimalloc/fdlibm/imath/Ryu，不可直编源码）：
+//   先用 `node tools/build_runtime.mjs` 产出 out/dbg/deps/t_runtime.lib，再执行 runtime\build_test.bat
+//   （等价命令：clang -std=c11 -O0 -I . -I mimalloc\include test_runtime.c ..\out\dbg\deps\t_runtime.lib -o test_runtime.exe）
 // 退出码 0 = 全部通过；非 0 = 有失败。
 // ═══════════════════════════════════════════════════════════════
 
