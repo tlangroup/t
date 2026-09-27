@@ -1005,6 +1005,18 @@ pub fn tir_st_of_td(td: i64) string {
     return "i64";
 }
 
+// 值布局存储型（与 tir_st_of_td 同构，但变体返回 %Name 而非 ptr<%Name>）。
+// 变体在函数 ABI 里以指针形态流转（tir_st_of_td 返回 ptr<%V>），但在切片/数组里
+// 是「按值存储」的 %V（8(tag) + mx 字节）。for-each / 下标 GEP 步长必须按值布局算，
+// 否则 stride 退化为 8（指针尺寸）→ []Variant 元素错位 → 段错误
+// （examples/shapes.tc：%Shape=24 字节，却按 8 字节步长寻址）。
+pub fn tir_st_value_of_td(td: i64) string {
+    if (td < 0) { return "i64"; }
+    if (td >= slice_len(sema.tds) as i64) { return "i64"; }
+    if (t_td_is_variant(td)) { return base.sb_cat2("%", sema.tds[td].name); }
+    return tir_st_of_td(td);
+}
+
 pub fn tir_strip_pct(s: string) string {
     if (str_len(s) > 0 && s[0] == 37) { return str_slice(s, 1, str_len(s)); }
     return s;
@@ -1413,6 +1425,12 @@ pub fn tir_make_closure_value(fnref: string, envref: string) string {
 pub var g_ssz_name: []string;      // "%tir__TIRType" 形态的 TIR 结构体类型名
 pub var g_ssz_fields: [][]string;  // 与上一表并行：各字段的 TIR ST 列表
 var g_ssz_depth: i64 = 0;          // 递归守卫（自引用结构体）
+// 变体真实字节尺寸：降准时捕获，供 tir_sizeof / 切片 elem_size 使用。
+// ⚠ 与 %V 类型体 { i64, [mx x i8] } 字节对齐一致：变体总尺寸 = 8(tag) + mx(payload 缓冲)。
+// 不可走 g_ssz_name 兜底 8 —— 否则 []Variant 切片 elem_size=8、步长错 → 元素错位 → 段错误
+// （examples/shapes.tc 即此坑：%Shape={i64,[16 x i8]} 实为 24 字节，却被当作 8 字节步长寻址）。
+pub var g_var_names: []string;     // 变体名（"Shape"），与 g_var_sizes 并行
+pub var g_var_sizes: []i64;        // 变体真实字节尺寸 = 8 + mx
 pub fn tir_add_struct_tt(name: string, field_head: i64) void {
     var sb: StringBuilder = sb_new();
     var fsts: []string = [];
@@ -1450,6 +1468,36 @@ pub fn tir_round8(v: i64) i64 {
     var r: i64 = v % 8;
     if (r == 0) { return v; }
     return v + (8 - r);
+}
+// 变体最大载荷字节尺寸 mx：复用 g_vf_keys/g_vf_nodes（case 字段节点缓存）按 8 对齐累加。
+// ⚠ 与降级的 %V 类型体 { i64, [mx x i8] } 同源；func 降级前的「预注册 pass」与 func 降级后的
+// 变体 type-table 发射均调用本函数，保证切片 elem_size 与类型体逐字节一致（否则步长错 → 段错误）。
+// 字段尺寸走 tir_size_bytes(resolve_type_desc)，与降级期同就绪状态，故两处结果一致。
+pub fn tir_variant_mx(vname: string) i64 {
+    var mx: i64 = 8;
+    var pki: i64 = 0;
+    var pkmax: i64 = slice_len(g_vf_keys) as i64;
+    if (slice_len(g_vf_nodes) as i64 < pkmax) { pkmax = slice_len(g_vf_nodes) as i64; }
+    while (pki < pkmax) {
+        var key: string = g_vf_keys[pki];
+        // 仅处理属于本变体的 case（key 形如 "Vname_Case"）
+        if (str_len(key) > str_len(vname) + 1
+            && str_slice(key, 0, str_len(vname) as i64) == vname
+            && key[str_len(vname)] == 95) {   // '_'
+            var pflds: []i64 = g_vf_nodes[pki];
+            var pm: i64 = slice_len(pflds) as i64;
+            var poff: i64 = 0;
+            var pfi: i64 = 0;
+            while (pfi < pm) {
+                poff = tir_round8(poff) + tir_size_bytes(sema.resolve_type_desc(pflds[pfi]));
+                pfi = pfi + 1;
+            }
+            poff = tir_round8(poff) + 8;
+            if (poff > mx) { mx = poff; }
+        }
+        pki = pki + 1;
+    }
+    return mx;
 }
 // 类型 TD → 字节尺寸（前端可用；递归变体按 16 兜底，避免无限递归；与 legacy ll_size_bytes 近似一致）。
 // ⚠ TD-vs-TI：td 是 sema.tds[]（TypeDef）索引，必须用 TD 字段（cat/name）判定，
@@ -1578,6 +1626,22 @@ pub fn lower_unit(mod: string, source: string) void {
         vf_ci = vf_ci + 1;
     }
 
+    // 预注册变体真实尺寸（在 func 降级之前）：[]Variant 切片的 elem_size / tir_sizeof 在 func
+    // 降级期就需要准确的变体字节尺寸（= 8(tag) + mx），而变体 type-table 发射在 func 降级之后。
+    // 若不预注册，tir_sizeof("%V") 在 func 降级期回落 8 → []Variant 切片步长错 → 元素错位 → 段错误
+    // （examples/shapes.tc：%Shape={i64,[16 x i8]} 实为 24 字节，却被当作 8 字节步长寻址）。
+    var vsz_i: i64 = 0;
+    while (vsz_i < n) {
+        var vsz_d: i64 = lex.decl_list[vsz_i];
+        var vsz_n: Node = base.nodes[vsz_d];
+        if (vsz_n.kind == "VariantDecl") {
+            var vsz_mx: i64 = tir_variant_mx(vsz_n.sa);
+            append(g_var_names, vsz_n.sa);
+            append(g_var_sizes, 8 + vsz_mx);
+        }
+        vsz_i = vsz_i + 1;
+    }
+
     // 预收集全部函数名（含泛型/库函数），供函数值闭包包装判定（tir_is_func_name）使用，
     // 不依赖函数体降级顺序。
     var j0: i64 = 0;
@@ -1625,34 +1689,17 @@ pub fn lower_unit(mod: string, source: string) void {
         var dvn: Node = base.nodes[dv];
         if (dvn.kind == "VariantDecl") {
             var vname: string = dvn.sa;
-            // paymax：查缓存字段节点 → resolve_type_desc → 8 对齐累加
-            var mx: i64 = 8;
-            var pc: i64 = dvn.lb;
-            while (pc >= 0) {
-                var pkc: Child = base.kids[pc];
-                var pvc: i64 = pkc.val;
-                var pvcn: Node = base.nodes[pvc];
-                var pkey: string = base.sb_cat3(vname, "_", pvcn.sa);
-                var pflds: []i64 = [];
-                var pki: i64 = 0;
-                var pmax: i64 = slice_len(vf_keys) as i64;
-                if (slice_len(vf_nodes) as i64 < pmax) { pmax = slice_len(vf_nodes) as i64; }
-                while (pki < pmax) {
-                    if (vf_keys[pki] == pkey) { pflds = vf_nodes[pki]; break; }
-                    pki = pki + 1;
-                }
-                if (slice_len(pflds) as i64 == 0) { tir_cmt(base.sb_cat6("DBG miss pkey=", pkey, " keys=", base.i2s(slice_len(vf_keys) as i64), " nodes=", base.i2s(slice_len(vf_nodes) as i64))); }
-                var pm: i64 = slice_len(pflds) as i64;
-                var poff: i64 = 0;
-                var pfi: i64 = 0;
-                while (pfi < pm) {
-                    poff = tir_round8(poff) + tir_size_bytes(sema.resolve_type_desc(pflds[pfi]));
-                    pfi = pfi + 1;
-                }
-                poff = tir_round8(poff) + 8;
-                if (poff > mx) { mx = poff; }
-                pc = pkc.next;
+            // 复用 func 降级前「预注册 pass」算好的变体真实尺寸（g_var_names/g_var_sizes），
+            // 保证 %V 类型体 { i64, [mx x i8] } 与切片 elem_size 逐字节一致（步长错 → 段错误）。
+            // 未命中（理论上不会发生，预注册 pass 已覆盖本模块全部 VariantDecl）则回退重算。
+            var mx: i64 = -1;
+            var vpi: i64 = 0;
+            var vpimax: i64 = slice_len(g_var_names) as i64;
+            while (vpi < vpimax) {
+                if (g_var_names[vpi] == vname) { mx = g_var_sizes[vpi] - 8; break; }
+                vpi = vpi + 1;
             }
+            if (mx < 0) { mx = tir_variant_mx(vname); }
             // %V type：tag 用 i64（8 字节）→ payload 固定在字节偏移 8，提取端可硬编码 8 基线（镜像 legacy ll_variant_paymax 的 +8）
             append(g_mod.types, TIRType{ name: base.sb_cat2("%", vname), body: base.sb_cat3("f0: i64, f1: [", base.i2s(mx), " x i8]") });
             // 各 case 构造器 @<V>_from_<C>
@@ -1718,6 +1765,69 @@ pub fn lower_unit(mod: string, source: string) void {
                 tir_emit(TIRInst{ op: TIR_OP_RET_VOID, st: ST_NONE, dst: tir_op(""), args: tir_a0(), is_comment: false, line: g_cur_line, cmt: "" });
                 if (g_recording_mir) { g_mir_cur.params = g_cur_func.params; append(g_mir.funcs, g_mir_cur); }
     append(g_mod.funcs, g_cur_func);
+                // ── 判别器 Name_is_Case(self: V) -> bool(i8) ──
+                // LLVM 后端消费 g_mod 但此前只发射 _from_ 构造器，缺 _is_/_as_ 函数体
+                // → 调用处仅 declare 不 define → 链接期 undefined symbol。C 后端走 legacy
+                // emit_variant_decl(static inline)，不读 g_mod，故此处补 TIR 函数不影响 C 后端。
+                {
+                    var eis: []TIRInst = [];
+                    // ⚠ 切片字段不可用内联数组字面量（`params: [ ... ]`）：C 后端会把它
+                    // 直译成 C 复合字面量 `.params = { ... }`，而 TSlice 是 {void*,len,cap}
+                    // 结构体 → `initializing 'void *' from 'TStr'` 编译错误（自举 C 轨失败）。
+                    // 必须先落成局部变量再赋值（见上一处 params2 的写法）。
+                    var pip2: []string = [base.sb_cat3("$self: ptr<%", vname, ">")];
+                    g_cur_func = TIRFunc{ name: base.sb_cat3(vname, "_is_", cname), params: pip2, ret_st: "i8", body: eis, is_extern: false, is_kernel: false, is_main: false };
+                    g_term = false; g_cur_line = 0;
+                    tir_emit(TIRInst{ op: TIR_OP_GEP, st: tir_st_from_str("i64"), dst: tir_op("$tp"), args: tir_a3("$self", "0", "0"), is_comment: false, line: g_cur_line, cmt: "" });
+                    tir_emit(TIRInst{ op: TIR_OP_LOAD, st: tir_st_from_str("i64"), dst: tir_op("$tv"), args: tir_a1("$tp"), is_comment: false, line: g_cur_line, cmt: "" });
+                    tir_emit(TIRInst{ op: TIR_OP_CONST, st: tir_st_from_str("i64"), dst: tir_op("$cv"), args: tir_a1(base.i2s(vcn2.ia)), is_comment: false, line: g_cur_line, cmt: "" });
+                    tir_emit(TIRInst{ op: TIR_OP_EQ, st: tir_st_from_str("i1"), dst: tir_op("$eq"), args: tir_a2("$tv", "$cv"), is_comment: false, line: g_cur_line, cmt: "" });
+                    tir_emit(TIRInst{ op: TIR_OP_ZEXT, st: tir_st_from_str("i8"), dst: tir_op("$rb"), args: tir_a1("$eq"), is_comment: false, line: g_cur_line, cmt: "" });
+                    tir_emit(tir_emit_ret("i8", "$rb"));
+                    if (g_recording_mir) { g_mir_cur.params = g_cur_func.params; append(g_mir.funcs, g_mir_cur); }
+                    append(g_mod.funcs, g_cur_func);
+                }
+                // ── 取载荷：单载荷 Name_as_Case(self)->Payload；多载荷 Name_as_Case_fK(self)->FieldK ──
+                // ⚠ 单/多载荷判定以「实际载荷字段数 nf2」为准（与 _from_ 构造器、conpat_walk
+                // 调用点命名完全一致：nf2>=2 → _as_C_fK；nf2==1 → _as_C）。决不能用 vc2.lb/vc2.na
+                // 指针判定——单载荷 case（如 Circle(f64)）其 lb 也可能 >=0，会误走多载荷分支生成
+                // `_as_Circle_f0`，而调用点按单载荷生成 `Shape_as_Circle` → 链接期 undefined symbol。
+                {
+                    var aoff: i64 = 0; var afi: i64 = 0;
+                    if (nf2 >= 2) {
+                        while (afi < nf2) {
+                            var aftd: i64 = flds2_tds[afi];
+                            var afst: string = tir_st_of_td(aftd);
+                            var eas: []TIRInst = [];
+                            var pap1: []string = [base.sb_cat3("$self: ptr<%", vname, ">")];
+                            g_cur_func = TIRFunc{ name: base.sb_cat5(vname, "_as_", cname, "_f", base.i2s(afi)), params: pap1, ret_st: afst, body: eas, is_extern: false, is_kernel: false, is_main: false };
+                            g_term = false; g_cur_line = 0;
+                            tir_emit(TIRInst{ op: TIR_OP_GEP, st: tir_st_from_str(base.sb_cat3("arr<i8 x ", base.i2s(mx), ">")), dst: tir_op("$pay"), args: tir_a3("$self", "0", "1"), is_comment: false, line: g_cur_line, cmt: "" });
+                            aoff = tir_round8(aoff);
+                            tir_emit(TIRInst{ op: TIR_OP_GEP, st: tir_st_from_str("i8"), dst: tir_op("$fp"), args: tir_a2("$pay", base.i2s(aoff)), is_comment: false, line: g_cur_line, cmt: "" });
+                            tir_emit(TIRInst{ op: TIR_OP_BITCAST, st: tir_st_from_str(base.sb_cat3("ptr<", afst, ">")), dst: tir_op("$fpp"), args: tir_a1("$fp"), is_comment: false, line: g_cur_line, cmt: "" });
+                            tir_emit(TIRInst{ op: TIR_OP_LOAD, st: tir_st_from_str(afst), dst: tir_op("$pv"), args: tir_a1("$fpp"), is_comment: false, line: g_cur_line, cmt: "" });
+                            tir_emit(tir_emit_ret(afst, "$pv"));
+                            if (g_recording_mir) { g_mir_cur.params = g_cur_func.params; append(g_mir.funcs, g_mir_cur); }
+                            append(g_mod.funcs, g_cur_func);
+                            aoff = aoff + tir_size_bytes(aftd);
+                            afi = afi + 1;
+                        }
+                    } else if (nf2 == 1) {
+                        var ast: string = tir_st_of_td(flds2_tds[0]);
+                        var eas2: []TIRInst = [];
+                        var pap2: []string = [base.sb_cat3("$self: ptr<%", vname, ">")];
+                        g_cur_func = TIRFunc{ name: base.sb_cat3(vname, "_as_", cname), params: pap2, ret_st: ast, body: eas2, is_extern: false, is_kernel: false, is_main: false };
+                        g_term = false; g_cur_line = 0;
+                        tir_emit(TIRInst{ op: TIR_OP_GEP, st: tir_st_from_str(base.sb_cat3("arr<i8 x ", base.i2s(mx), ">")), dst: tir_op("$pay"), args: tir_a3("$self", "0", "1"), is_comment: false, line: g_cur_line, cmt: "" });
+                        tir_emit(TIRInst{ op: TIR_OP_GEP, st: tir_st_from_str("i8"), dst: tir_op("$fp"), args: tir_a2("$pay", "0"), is_comment: false, line: g_cur_line, cmt: "" });
+                        tir_emit(TIRInst{ op: TIR_OP_BITCAST, st: tir_st_from_str(base.sb_cat3("ptr<", ast, ">")), dst: tir_op("$fpp"), args: tir_a1("$fp"), is_comment: false, line: g_cur_line, cmt: "" });
+                        tir_emit(TIRInst{ op: TIR_OP_LOAD, st: tir_st_from_str(ast), dst: tir_op("$pv"), args: tir_a1("$fpp"), is_comment: false, line: g_cur_line, cmt: "" });
+                        tir_emit(tir_emit_ret(ast, "$pv"));
+                        if (g_recording_mir) { g_mir_cur.params = g_cur_func.params; append(g_mir.funcs, g_mir_cur); }
+                        append(g_mod.funcs, g_cur_func);
+                    }
+                }
                 cc2 = kc2.next;
             }
         }
@@ -2511,7 +2621,7 @@ pub fn tir_emit_for_each(n: Node) void {
         tir_blk_pop();
         return;
     }
-    var elem_st: string = tir_st_of_td(etd);
+    var elem_st: string = tir_st_value_of_td(etd);   // 值布局：变体按 %V(24B) 而非 ptr<%V>(8B) 算 GEP 步长
     var iterr: TirEmitRes = tir_emit_expr(n.na); var iter: string = iterr.name;   // slot of %TSlice / arr<...>
     // 循环变量：按 n.sa 登记进 ident 查找表，循环体 ident 解析到本 slot
     var lv: string = tir_new_named_slot(etd, elem_st, n.sa);
@@ -3452,7 +3562,11 @@ pub fn tir_emit_call(e: i64) TirEmitRes {
         }
         // call void @<V>_from_<C> ( ptr<%V> $d <字段实参...> )
         tir_emit(tir_e_call("void", d, base.sb_cat2("@", cname), vargs));
-        return TirEmitRes{ name: d, st: tir_st_from_str(base.sb_cat3("ptr<", vname, ">")) };
+        // ⚠ 结果型必须是 ptr<%V>（带 %），与 tir_st_of_td(变体) 的 ABI 形态逐字一致。
+        // 此前写成 ptr<V>（缺 %）→ 与下方 variant 实参适配的 varg_want(ptr<%V>) 字符串不等
+        // → 已是指针形态的构造器结果被误判为「值形态」，再套一层 addr_of 取址
+        // → 被调方读到「指针值」当 tag → 恒命中 `_` 兜底臂（adt_list 全 -1）。
+        return TirEmitRes{ name: d, st: tir_st_from_str(base.sb_cat3("ptr<%", vname, ">")) };
 
     }
     if (cname == "map_new") {
@@ -3788,6 +3902,29 @@ pub fn tir_emit_call(e: i64) TirEmitRes {
             }
             // 形参是 []T 而实参是 [N]T：补 array→slice 视图（否则被调用方读到脏长度 → 段错误）。
             if (aptd >= 0 && sema.tds[aptd].cat == "slice") { aslot = tir_maybe_array_to_slice(aslot, k.val); }
+            // 形参是 variant：ABI 为 ptr<%V>（与 <V>_is_<C>/<V>_as_<C> 构造器一致），但调用方
+            // 持有的变体实参是 %V 值（for 循环变量 / 普通变体局部量均为 %V 值 alloca，slice 亦按
+            // 值存 24 字节）。若把值直接传进去，被调方按 ptr 解释 → 段错误。故值形态实参统一取地址
+            // 再传；实参已是 ptr<%V>（变体参数透传）则直传，不动。
+            // ⚠ variant td 的 cat 是 "named"（name=变体名），须用 t_td_is_variant 判定，不能写
+            // sema.tds[aptd].cat == "variant"（永远为假）。
+            if (aptd >= 0 && t_td_is_variant(aptd)) {
+                var varg_st: string = tir_st_to_str(__er11.st);
+                // ⚠ 期望型必须直接取 tir_st_of_td（变体 → ptr<%V>，单一真相源）。
+                // 此前写成 "ptr<%" + tir_st_value_of_td(aptd) + ">" → value_of_td 自身已带 %
+                // → 拼出 ptr<%%V> 与任何实参形态都不等 → 连已是 ptr<%V> 的构造器结果也被
+                // 多套一层 addr_of（多一层间接）→ 被调方把「指针」当 tag 读 → 恒走 `_` 臂。
+                var varg_want: string = tir_st_of_td(aptd);
+                if (varg_st != varg_want) {
+                    var vst: string = tir_st_value_of_td(aptd);
+                    var vtmp: string = base.sb_cat2("$__vap", base.i2s(g_slotc)); g_slotc = g_slotc + 1;
+                    tir_emit(tir_emit_slot(vst, vtmp));
+                    tir_emit(tir_emit_store(aslot, vtmp));
+                    var vptr: string = base.sb_cat2("$__vap", base.i2s(g_slotc)); g_slotc = g_slotc + 1;
+                    tir_emit(tir_emit_addr_of(varg_want, vptr, vtmp));
+                    aslot = vptr;
+                }
+            }
         }
         if (first == false) { sb_append_str(sb, " "); }
         sb_append_str(sb, aslot);
@@ -4371,6 +4508,11 @@ pub fn tir_member_read(e: i64) TirEmitRes {
 
 // 计算下标元素地址（ptr<elem_st>），写回 g_idx_elem_st。不支持的基类型降级为注释。
 pub fn tir_sizeof(st: string) i64 {
+    // 变体等 ABI 形态为 ptr<%V>，但值布局是 %V（8(tag)+mx 字节）：统一剥离 ptr< > 取内层，
+    // 否则 tir_sizeof("ptr<%Shape>") 回落 8 → []Variant 切片 elem_size=8、步长错 → 段错误。
+    if (str_len(st) >= 6 && str_slice(st, 0, 4) == "ptr<" && st[str_len(st) - 1] == 62) {
+        st = str_slice(st, 4, str_len(st) - 1);
+    }
     if (st == "i64" || st == "u64" || st == "f64") { return 8; }
     if (st == "i32" || st == "u32" || st == "f32") { return 4; }
     if (st == "i16" || st == "u16") { return 2; }
@@ -4396,6 +4538,18 @@ pub fn tir_sizeof(st: string) i64 {
                 return tir_round8(tot);
             }
             i = i + 1;
+        }
+    }
+    // 变体：降准时已捕获真实尺寸 8 + mx（与 %V 类型体 { i64, [mx x i8] } 字节对齐一致）。
+    // ⚠ 不可走下方兜底 8：否则 []Variant 切片 elem_size=8、步长错 → 元素错位 → 段错误
+    //    （shapes.tc 即此坑：%Shape={i64,[16 x i8]} 实为 24 字节，却被当作 8 字节步长寻址）。
+    if (str_len(st) >= 1 && st[0] == 37) {
+        var vnm: string = str_slice(st, 1, str_len(st) as i64);
+        var vi: i64 = 0;
+        var vn: i64 = slice_len(g_var_names) as i64;
+        while (vi < vn) {
+            if (g_var_names[vi] == vnm) { return g_var_sizes[vi]; }
+            vi = vi + 1;
         }
     }
     return 8;
