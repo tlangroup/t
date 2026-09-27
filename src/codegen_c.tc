@@ -5,11 +5,11 @@
 // 依赖：base, lex, parse, sema。
 // ══════════════════════════════════════════════════════════════════
 
-@import("src.base" :: *);
-@import("src.lex" :: *);
-@import("src.parse" :: *);
-@import("src.sema" :: *);
-@import("src.codegen_dev" :: *);   // Device M3：含 kernel 时内嵌 Device Dialect 文本
+const base = @import("src.base");
+const lex = @import("src.lex");
+const parse = @import("src.parse");
+const sema = @import("src.sema");
+const codegen_dev = @import("src.codegen_dev");   // Device M3：含 kernel 时内嵌 Device Dialect 文本
 
 // ═══════════════════════════════════════════════════════════════
 // M8: C Emitter（复刻 tc0/codegen/emitter.ts）
@@ -1383,7 +1383,7 @@ pub fn c_emit_map_lit(en: i64, mname: string, pad: string, keytd: i64, valtd: i6
 // 类型表里查不到该名字就会退化成 unknown → `void*`（L-09：绝不静默错编）。
 // 故在 match 发射入口先把本 match 全部 conpat 载荷绑定登记进函数作用域类型表。
 // 无 conpat 臂时此函数零副作用，既有程序的发射逐字节不变。
-// 单个 conpat 的载荷绑定登记；嵌套构造器模式递归下钻（`W(L(x))` 的 `x` 同样须登记）
+// 单个 conpat 的载荷绑定登记；嵌套构造器模式递归下钻（`W(base.L(x))` 的 `x` 同样须登记）
 pub fn conpat_binds_register_one(p: i64) void {
     var mr_p: Node = base.nodes[p];
     if (mr_p.kind != "conpat" || mr_p.na < 0 || mr_p.la < 0) {
@@ -1549,7 +1549,7 @@ pub fn match_chain_from(c: i64, rname: string, sname: string) i64 {
     if (mc_an.na >= 0 && base.nodes[mc_an.na].kind == "conpat") {
         // ADT 构造器解构（L-15）：条件 = `<V>_is_<C>(sname)`，body 前置载荷绑定。
         // 双后端共用此脱糖：<V>_is_<C> / <V>_as_<C> 已由 emit_variant_decl 发成 static inline。
-        // 嵌套模式 `W(L(x))` 由 conpat_walk 递归：内层判别并入同一 AND 条件链，
+        // 嵌套模式 `W(base.L(x))` 由 conpat_walk 递归：内层判别并入同一 AND 条件链，
         // 内层绑定的访问路径是 accessor 调用链 `Inner_as_L(Outer_as_W(s))`。
         cp_acc_cond = -1;
         cp_acc_pre = -1;
@@ -1715,7 +1715,7 @@ pub fn match_chain_from(c: i64, rname: string, sname: string) i64 {
                         bp_td = sema.td_named_mk("scalar", "i64");
                         bp_tnode = base.mk_scalar("i64", -1);
                         var bp_wn: Node = base.nodes[bp_sn.nb];
-                        var bp_bits: i64 = parse_int_len(bp_wn.sa, bp_wn.ia);
+                        var bp_bits: i64 = sema.parse_int_len(bp_wn.sa, bp_wn.ia);
                         var bp_little: i64 = 0;
                         if (bp_sn.sa == "little") { bp_little = 1; }
                         var bp_ahead: i64 = base.list_push(-1, -1, base.mk_ident(sname, -1));
@@ -1732,7 +1732,7 @@ pub fn match_chain_from(c: i64, rname: string, sname: string) i64 {
                 }
                 if (bp_sn.ba == false) {
                     var bp_wn2: Node = base.nodes[bp_sn.nb];
-                    if (bp_wn2.kind == "int") { bp_off = bp_off + parse_int_len(bp_wn2.sa, bp_wn2.ia); }
+                    if (bp_wn2.kind == "int") { bp_off = bp_off + sema.parse_int_len(bp_wn2.sa, bp_wn2.ia); }
                 }
                 bp_seg = base.kids[bp_seg].next;
             }
@@ -1805,7 +1805,7 @@ pub fn c_elem_ctype(slice_expr: i64) string {
 }
 
 // TD → 类型描述节点（供 mk_var_decl 的 na）。切片元素绑定在 C 后端声明为
-// 真实局部变量，类型须由此构造（var_decl 发射走 resolve_type_desc(na)）。
+// 真实局部变量，类型须由此构造（var_decl 发射走 sema.resolve_type_desc(na)）。
 pub fn c_td_to_tnode(td: i64) i64 {
     if (td < 0) { return base.mk_named("i64", -1); }
     var t: TD = sema.tds[td];
@@ -1980,7 +1980,7 @@ pub fn builtin_ret_td(cn: string) i64 {
     if (cn == "map_del") { return sema.td_named_mk("scalar", "bool"); }
     if (cn == "map_len") { return sema.td_named_mk("scalar", "i64"); }
     if (cn == "map_set") { return sema.td_mk("void"); }
-    // ⚠ map_new 返回类型依赖实参（被 new 的 map 变量的 key/val 类型），不可在此返回空壳 td_mk("map")：
+    // ⚠ map_new 返回类型依赖实参（被 new 的 map 变量的 key/val 类型），不可在此返回空壳 sema.td_mk("map")：
     // 空壳 td 的 key/val == -1，map_new 分支会访问 sema.tds[mt.key]→sema.tds[-1] 越界 panic（maps 崩溃同型）。
     // 返回 -1 让其回退到 tir_expr_td 的 meta_type_of_expr（拿到真实 map td），与基线行为一致。
     if (cn == "map_new") { return -1; }
@@ -2227,7 +2227,7 @@ pub fn emit_expr(e: i64) string {
         while (c >= 0) {
             var seg: Node = base.nodes[base.kids[c].val];
             if (seg.ba) { has_rest = true; }
-            else { var wn: Node = base.nodes[seg.nb]; fixed_bits = fixed_bits + parse_int_len(wn.sa, wn.ia); }
+            else { var wn: Node = base.nodes[seg.nb]; fixed_bits = fixed_bits + sema.parse_int_len(wn.sa, wn.ia); }
             c = base.kids[c].next;
         }
         var fixed_bytes: i64 = (fixed_bits + 7) / 8;
@@ -2248,7 +2248,7 @@ pub fn emit_expr(e: i64) string {
                 sb_append_str(sb, emit_expr(seg.na));
                 sb_append_str(sb, "), ");
                 var wn: Node = base.nodes[seg.nb];
-                sb_append_i64(sb, parse_int_len(wn.sa, wn.ia));
+                sb_append_i64(sb, sema.parse_int_len(wn.sa, wn.ia));
                 sb_append_str(sb, ", ");
                 sb_append_i64(sb, little);
                 sb_append_str(sb, "); ");
@@ -4779,6 +4779,8 @@ pub fn emit_func_decl(d: i64) void {
 
 pub fn emit_global_var(d: i64) void {
     var n: Node = base.nodes[d];
+    // 模块值别名 `var x = @import("M")`：同 emit_global_const，值是 import_expr，不发射。
+    if (n.nb >= 0 && base.nodes[n.nb].kind == "import_expr") { return; }
     hpush(base.sb_cat3("extern ", c_decl_of_node(n.na, n.sa), ";"));
     // Sym 全局变量：字段仅存 u32/u16 id。无初始化 → 零值；`= "str"` →
     // 运行期 intern（函数调用），须搬进 t__ginit（C 文件作用域不允许调用）。
@@ -4848,6 +4850,9 @@ pub fn emit_global_var(d: i64) void {
 
 pub fn emit_global_const(d: i64) void {
     var n: Node = base.nodes[d];
+    // 模块值别名 `const x = @import("M")`：值是 import_expr（非可运算值），
+    // 只作 `.field` 接收者由 sema 脱糖成 `<M>__field`，此处不可发射成 #define（否则 ill-formed）。
+    if (n.nb >= 0 && base.nodes[n.nb].kind == "import_expr") { return; }
     hpush(base.sb_cat6("#define ", n.sa, " (", emit_expr(n.nb), ")", ""));
 }
 

@@ -15,15 +15,15 @@
 // 每条指令以完整文本行存储（序列化即按行展开），Stage 4b 二进制格式在其上叠加。
 // ══════════════════════════════════════════════════════════════════
 
-@import("src.base" :: *);
-@import("src.sema" :: *);
-@import("src.lex" :: *);
+const base = @import("src.base");
+const sema = @import("src.sema");
+const lex = @import("src.lex");
 // S2：内建返回类型单一真相源（codegen_c.builtin_ret_td），供降级期查询内建调用返回 TD。
 // 单向导入 codegen_c（codegen_c 不导入 tir），无环；tc.tc 已先加载 codegen_c，顺序安全。
 @import("src.codegen_c" :: builtin_ret_td, fid_code_of);
 // 除/取余 op 文本→整数判别码的小模块（见 opmap.tc 注释：规避种子对 tir.tc 大模块的错编）。
 // 单向导入，opmap 自包含无回依赖，无环。
-@import("src.opmap" :: *);
+const opmap = @import("src.opmap");
 
 // ── 内存结构 ───────────────────────────────────────────────────
 pub struct TIRType {
@@ -1495,7 +1495,7 @@ pub fn tir_annotate_types(mod: string) void {
     var i: i64 = 0;
     while (i < tot) {
         // ⚠ 入口模块节点 g_node_mod == ""（base.tc node_new 用 g_cur_mod，入口为 ""），
-        // 而 mod 取自 base_no_tc(文件名)（如 "maps"），故须同时匹配 "" 才能注解入口模块节点。
+        // 而 mod 取自 base.base_no_tc(文件名)（如 "maps"），故须同时匹配 "" 才能注解入口模块节点。
         // 否则注解空跑、node.td 永不填充，tir_expr_td 只能回落 meta_type_of_expr（有越界 TD 索引缺陷）。
         if (base.g_node_mod[i] == mod || base.g_node_mod[i] == "") {
             var rtd: i64 = -1;
@@ -1563,7 +1563,7 @@ pub fn lower_unit(mod: string, source: string) void {
                 append(g_vf_nodes, vf_cnodes);
                 // 预热 TD 注册表：在 func 降级之前对每个字段类型节点调用一次 resolve_type_desc，
                 // 触发类型系统完成注册（type-table / TD 表），否则提取端在 match 降级期调用
-                // resolve_type_desc(cflds[bi3]) 时注册表尚未就绪 → 返回兜底 16 字节 → 偏移错位。
+                // sema.resolve_type_desc(cflds[bi3]) 时注册表尚未就绪 → 返回兜底 16 字节 → 偏移错位。
                 // 此处仅预热，不缓存（首遍解析出的 TD 可能尚未完全就绪，见下方 g_vf_tds 占位）。
                 var vf_wi: i64 = 0;
                 while (vf_wi < slice_len(vf_cnodes) as i64) {
@@ -1956,7 +1956,7 @@ pub fn tir_func_ret_td(d: i64) i64 {
     // FuncDecl 的返回类型 desc 存于 n.la 链之后的类型信息；复用 resolve_type_desc 取函数返回。
     // 现有实现中函数返回类型在 sema 通过 ti 记录，这里用 fn 签名 td 解析：
     var n: Node = base.nodes[d];
-    // n.na 通常为返回类型 desc 节点（见 mk_FuncDecl 布局）；退回用 resolve_type_desc(n.la 首个 child 的父)
+    // n.na 通常为返回类型 desc 节点（见 mk_FuncDecl 布局）；退回用 sema.resolve_type_desc(n.la 首个 child 的父)
     if (n.na >= 0) {
         var rt: i64 = sema.resolve_type_desc(n.na);
         if (rt >= 0) { return rt; }
@@ -2740,7 +2740,7 @@ pub fn tir_emit_assign(n: Node, est: i64) TirEmitRes {
             tir_emit(TIRInst{ op: TIR_OP_LOAD, st: tir_st_from_str(lst), dst: tir_op(cur), args: tir_a1(g_local_slots[idx]), is_comment: false, line: g_cur_line, cmt: "" });
             var rsr: TirEmitRes = tir_emit_expr(n.nb); var rs: string = rsr.name;
             var dst: string = tir_tmp();
-            tir_emit(tir_emit_binop(tir_op_from_str(tir_binop(baseop, lst)), lst, dst, cur, rs));
+            tir_emit(tir_emit_binop(opmap.tir_op_from_str(opmap.tir_binop(baseop, lst)), lst, dst, cur, rs));
             tir_emit(TIRInst{ op: TIR_OP_STORE, st: ST_NONE, dst: tir_op(g_local_slots[idx]), args: tir_a1(dst), is_comment: false, line: g_cur_line, cmt: "" });
             return TirEmitRes{ name: dst, st: est };
         }
@@ -2819,7 +2819,7 @@ pub fn tir_emit_expr(e: i64) TirEmitRes {
     }
     // 位串字面量 `<<seg:W, ...>>`（§15）：在 TIR 轨构造 TBitStr 并逐段写位，
     // 与 C 后端 codegen_c.emit 同构（t_bitstr_new + t_bitstr_append_val / tll_bitstr_concat）。
-    // 复用 %TStr 的 ptr-out(sret) 策略：局部槽 = alloca %TBitStr，tll_ 函数以 ptr 传参。
+    // 复用 %TStr 的 ptr-base.out(sret) 策略：局部槽 = alloca %TBitStr，tll_ 函数以 ptr 传参。
     if (kd == "bitstr") {
         var bs: string = tir_new_named_slot(-1, "%TBitStr", "bs");
         // 固定段总位宽（容量提示；变长段运行时由 append/concat 累积 bit_len）
@@ -2878,7 +2878,7 @@ pub fn tir_emit_expr(e: i64) TirEmitRes {
     if (kd == "binary") { return tir_emit_binary(n, e); }
     if (kd == "unary") { return tir_emit_unary(n); }
     if (kd == "call") { return tir_emit_call(e); }
-    if (kd == "mbuiltin") { return tir_emit_call(e); }   // @name(args) 在表达式位统一为 mbuiltin 节点；降级为普通调用发射
+    if (kd == "mbuiltin") { return tir_emit_call(e); }   // @sema.name(args) 在表达式位统一为 mbuiltin 节点；降级为普通调用发射
     if (kd == "member") { return tir_member_read(e); }
     if (kd == "cast") { return tir_emit_cast(n, est); }
     if (kd == "struct_lit" || kd == "struct") { return tir_emit_struct_lit(e); }
@@ -2934,7 +2934,7 @@ pub fn tir_ser_sel(td: i64) i64 {
 // 序列化右值的类型描述：双轨对齐旧轨 codegen_ll.ll_etd（一律走 codegen_c.expr_type_desc）。
 // ⚠ 但 expr_type_desc 的 ident 分支依赖 codegen_c 的 fs/tm 符号表（由旧轨 emit 填充），
 //   新轨（tir）不填充那些表 → 变量会回落成 unknown → 误判为 int → 串口宽度错乱
-//   （例：row(f,"n",7) 把字符串变量 k 当 i64 序列化，fid_read_demo 字节流错位→长度前缀爆炸→malloc failed）。
+//   （例：sema.row(f,"n",7) 把字符串变量 k 当 i64 序列化，fid_read_demo 字节流错位→长度前缀爆炸→malloc failed）。
 // 故：字面量（int/float/bool/string/atom）用 expr_type_desc 拿默认位宽（整型→i64，规避 sema 把裸字面量
 //   标成 i8 的缓存污染）；变量 / 成员 / 索引 / 调用用 tir_expr_td（走新轨 g_local_tds / builtin_ret_td）。
 pub fn tir_ser_val_td(e: i64) i64 {
@@ -2993,7 +2993,7 @@ pub fn tir_atoi(s: string) i64 {
 
 // `f < v`：按 v 的类型选 tll_ser_*，返回目标 fid（i64）。
 pub fn tir_emit_serialize(n: Node) TirEmitRes {
-    var fslot: string = tir_emit_expr(n.na).name;   // fid (i64)
+    var fslot: string = tir_emit_expr(n.na).name;   // sema.fid(i64)
     var vres: TirEmitRes = tir_emit_expr(n.nb);
     var vslot: string = vres.name;
     // ⚠ 值类型：字面量走 codegen_c.expr_type_desc（拿默认位宽 i64，规避 sema 把裸整数字面量
@@ -3039,7 +3039,7 @@ pub fn tir_emit_serialize(n: Node) TirEmitRes {
 
 // `f > Type`：按 Type 选 tll_deser_*，返回裸 Type 值（窄整型/浮点按需收窄）。
 pub fn tir_emit_deserialize(n: Node) TirEmitRes {
-    var fslot: string = tir_emit_expr(n.na).name;   // fid (i64)
+    var fslot: string = tir_emit_expr(n.na).name;   // sema.fid(i64)
     var ldtd: i64 = sema.deser_type_of(n.nb);
     var sel: i64 = tir_ser_sel(ldtd);
     var sn: string = sema.td_sname(ldtd);
@@ -3262,12 +3262,12 @@ pub fn tir_emit_binary(n: Node, e: i64) TirEmitRes {
         slice_set(sema.tds, ccat_td3, ccat_t3);
         ost = tir_st_of_td(ccat_td3);
     }
-    var opc: string = tir_binop(n.sa, ost);
+    var opc: string = opmap.tir_binop(n.sa, ost);
     var d: string = tir_tmp();
     var __bin_args: []TirOperand = [];
     append(__bin_args, tir_op_tok(tir_os(ls, ostc)));
     append(__bin_args, tir_op_tok(tir_os(rs, ostc)));
-    tir_emit(TIRInst{ op: tir_op_from_str(opc), st: tir_st_from_str(ost), dst: tir_op(d), args: __bin_args, is_comment: false, line: g_cur_line, cmt: "" });
+    tir_emit(TIRInst{ op: opmap.tir_op_from_str(opc), st: tir_st_from_str(ost), dst: tir_op(d), args: __bin_args, is_comment: false, line: g_cur_line, cmt: "" });
     // 比较运算结果存储型为 i1（icmp/fcmp），其余（算术）为操作数存储型 ost。
     if (n.sa == "==" || n.sa == "!=" || n.sa == "<" || n.sa == ">" || n.sa == "<=" || n.sa == ">=") {
         return TirEmitRes{ name: d, st: ST_I1 };
@@ -3345,7 +3345,7 @@ pub fn tir_emit_unary(n: Node) TirEmitRes {
 
 pub fn tir_emit_call(e: i64) TirEmitRes {
     var n: Node = base.nodes[e];
-    // mbuiltin 节点（@name(args)）：名字存于 n.sa，n.na 为 -1（空闲，见 sema.tc:10609）；
+    // mbuiltin 节点（@sema.name(args)）：名字存于 n.sa，n.na 为 -1（空闲，见 sema.tc:10609）；
     // 其余 call 节点名字在 callee 子节点 n.na 的 .sa。@vlen/@reduce_*/@splat 等 SIMD 内建
     // 保持 mbuiltin 形态（sema 未降级为普通 call），此前误读 base.nodes[n.na]=base.nodes[-1]
     // → t_slice_at 越界 panic。故 mbuiltin 直接取 n.sa，且 callee 退回自身（kind 非 member，
@@ -3671,7 +3671,7 @@ pub fn tir_emit_call(e: i64) TirEmitRes {
         return TirEmitRes{ name: d, st: tir_st_from_str(vst) };
     }
     // ── @Tile 编译期内省：sema 已把行/列/flavor 回填到 mbuiltin 节点 n.ia/n.ib/n.lc ──
-    // （sema.tc:5024），直接发射编译期常量 i64（同旧轨 ll_vec_mbuiltin 返回 i2s(n.ia)，
+    // （sema.tc:5024），直接发射编译期常量 i64（同旧轨 ll_vec_mbuiltin 返回 base.i2s(n.ia)，
     // 无需 translator 支持）。注意：mbuiltin 节点 n 即本调用节点，n.ia/n.ib/n.lc 可直接读。
     if (cname == "tile_rows" || cname == "tile_cols" || cname == "tile_flavor") {
         var dimv: i64 = 0;

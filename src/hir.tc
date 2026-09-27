@@ -15,8 +15,8 @@
 // 语义体仍可经 `nd`（每条指令携带的源 CST 节点 id）回到节点做变更/诊断。
 // ═════════════════════════════════════════════════════════════
 
-@import("src.base" :: *);
-@import("src.lex" :: *);
+const base = @import("src.base");
+const lex = @import("src.lex");
 
 // ── 操作码（与 tir.tc 的 TIR_OP_* 同范式：pub const i64）────────
 pub const HIR_OP_INVALID: i64 = 0;
@@ -395,6 +395,14 @@ pub fn hir_lower_decl(d: i64) i64 {
         }
         idx = hir_emit(HIR_OP_UNION_DECL, -1, d, fargs, n.sa, "", n.ln);
     } else if (k == "GlobalConstDecl" || k == "GlobalVarDecl") {
+        // 模块值别名 `const X = @import("src.X")` / `var X = @import("src.X")`：
+        // 编译期导入别名，运行期无实体。降级为 IMPORT_DECL（与 ImportModDecl 同款 op），
+        // 不产生 RAW 逃生舱。sema 仍据 AST 的 import_expr 节点识别模块值（is_modval_import_decl）。
+        if (n.nb >= 0 && base.nodes[n.nb].kind == "import_expr") {
+            idx = hir_emit(HIR_OP_IMPORT_DECL, -1, d, [], base.nodes[n.nb].sa, n.sa, n.ln);
+            g_hir.node_to_hir[d] = idx;
+            return idx;
+        }
         var init: i64 = -1;
         if (n.nb >= 0) { init = hir_lower_expr(n.nb); }
         idx = hir_emit(HIR_OP_GLOBAL_DECL, -1, d, [init], n.sa, hir_type_text(n.na), n.ln);
@@ -735,6 +743,13 @@ pub fn hir_lower_expr(n: i64) i64 {
         // 不递归 lower 子节点（bitstr_seg 链表 / 绑定 ident）、不建 node_to_hir 映射，
         // 让 sema 全程走 CST 路径发射（codegen_c 直接消费 bitstr 节点），
         // 保证 RAW 逃生舱计数 0、HIR 二进制往返一致。
+        return hir_emit(HIR_OP_BLOCK, -1, n, [], "", "", nd.ln);
+    } else if (k == "import_expr") {
+        // 模块命名空间值（@import("M")）：运行期无实体，不递归 lower 子节点、
+        // 不建 node_to_hir 映射，返回不透明 BLOCK 容器（与 block_expr / unit_lit 同策略），
+        // 保证 RAW 逃生舱归零、HIR 二进制往返一致。仅在 `const x = @import("M").foo`
+        // 这类「import_expr 作成员接收者」的嵌套位置命中（直接 `const X = @import("M")`
+        // 已在 hir_lower_decl 降级为 IMPORT_DECL）。
         return hir_emit(HIR_OP_BLOCK, -1, n, [], "", "", nd.ln);
     } else {
         // 未覆盖表达式：逃生舱
