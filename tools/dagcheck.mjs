@@ -59,6 +59,11 @@ for (const m of TC_MODULES) {
       const mo = re.exec(lines[i]);
       if (!mo) continue;
       const nm = mo[1] || mo[2];
+      // 模块值别名 `const X = @import("src.X")` 是**导入**，不是本模块的符号定义：
+      // 其实际符号定义在被导入模块内，且名称会与被导入模块里的局部变量（如 `var base`）
+      // 撞名，被朴素的标识符扫描误判为「反向引用」。故从 defs 排除，与旧的 `:: *` /
+      // `:: sel` 导入形态保持一致（旧形态下模块句柄名不进入顶层 defs）。
+      if (kind === 'const' && /@import/.test(lines[i])) break;
       if (defs.has(nm)) dups.push([nm, defs.get(nm).mod, m]);
       else defs.set(nm, { mod: m, kind, line: i + 1 });
       break;

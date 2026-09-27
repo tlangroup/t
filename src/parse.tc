@@ -6,8 +6,8 @@
 // 依赖：base, lex。
 // ══════════════════════════════════════════════════════════════════
 
-@import("src.base" :: *);
-@import("src.lex" :: *);
+const base = @import("src.base");
+const lex = @import("src.lex");
 
 // 解析期致命错误：登记结构化诊断（带文件/行列）→ 输出 JSON → 退出。
 //
@@ -701,6 +701,10 @@ pub fn looks_like_struct_lit() bool {
     if (lex.peek_t(1) == "Dot" && lex.peek_t(2) == "Identifier" && lex.peek_t(3) == "Assign") {
         return true;
     }
+    // 新增：变体构造字面量 `V { .Case }` / `V { .Case(args) }`（`.Case` 后非 `=`）。
+    if (lex.peek_t(1) == "Dot" && lex.peek_t(2) == "Identifier" && lex.peek_t(3) != "Assign") {
+        return true;
+    }
     return false;
 }
 
@@ -840,6 +844,12 @@ pub fn parse_struct_lit(type_name: string, ti: i64) i64 {
         slice_set(base.nodes, id, nl);
         return id;
     }
+    // 变体构造字面量 `V { .Case }` / `V { .Case(args) }`：首个字段位出现 `.Case` 且其后
+    // 不是 `=`（与具名字段 `.x = v` 区分），即视为变体 case 构造（变体恒单构造子，仅一个）。
+    // 脱糖交由 sema（variant_lit → <V>_from_<C>(args) 调用，复用既有 V_from_C 发射路径）。
+    if (lex.cur_t() == "Dot" && lex.peek_t(1) == "Identifier" && lex.peek_t(2) != "Assign") {
+        return parse_variant_lit(type_name, ti);
+    }
     // 具名字段：接受旧式 `x: v` 与新式 `.x = v`（两者并存以保自举不动点）。
     while (lex.cur_t() != "RBrace" && lex.cur_t() != "Eof") {
         var fname: string;
@@ -865,6 +875,40 @@ pub fn parse_struct_lit(type_name: string, ti: i64) i64 {
     }
     expect_tok("RBrace");
     var id: i64 = base.mk_struct_lit(type_name, head, ti);
+    return id;
+}
+
+// 变体构造字面量 `V { .Case }` / `V { .Case(args) }`：解析出变体类型名（type_name）、case 名
+// （sa 存于节点 sb）、可选载荷实参链表（na）。sema 据节点重写为 `<V>_from_<C>(args)` 调用，
+// 复用既有变体构造器发射路径（双后端零改动）。变体恒单构造子，故 `}` 后不允许更多字段。
+pub fn parse_variant_lit(type_name: string, ti: i64) i64 {
+    lex.advance_i();                                    // 吃掉 Dot
+    var cti: i64 = lex.advance_i();                     // 吃掉 case 名 Identifier
+    var cname: string = lex.tk_v(cti);
+    var args: i64 = -1;
+    if (lex.cur_t() == "LParen") {
+        lex.advance_i();                                // 吃掉 LParen
+        var head: i64 = -1;
+        var tail: i64 = -1;
+        if (lex.cur_t() != "RParen") {
+            while (lex.cur_t() != "RParen" && lex.cur_t() != "Eof") {
+                var a: i64 = parse_expr();
+                tail = base.list_push(head, tail, a);
+                if (head < 0) { head = tail; }
+                if (lex.cur_t() == "Comma") { lex.advance_i(); } else { break; }
+            }
+        }
+        expect_tok("RParen");
+        args = head;
+    }
+    expect_tok("RBrace");
+    var id: i64 = base.node_new("variant_lit");
+    var nn: Node = base.nodes[id];
+    nn.sa = type_name;                                  // 变体类型名（如 "List"）
+    nn.sb = cname;                                      // case 名（如 "Nil" / "One"）
+    nn.na = args;                                       // 载荷实参链表头（无参为 -1）
+    slice_set(base.nodes, id, nn);
+    base.node_at(id, ti);
     return id;
 }
 
@@ -1337,7 +1381,7 @@ pub fn ann_first_arg(ann_idx: i64) i64 {
 
 pub fn parse_enum_decl(name: string, anns: i64) i64 {
     // 关键字 `enum` 已由调用方消费（name-first 路径的 parse_decl_body dispatch，
-    // 或关键字领头桥 `enum Name`）；此处不再 advance_i()。
+    // 或关键字领头桥 `enum Name`）；此处不再 lex.advance_i()。
     var underlying: string = "u32";
     if (lex.cur_t() == "Colon") {
         lex.advance_i();
@@ -1462,7 +1506,7 @@ pub fn bp_has_type2(a: i64, b: i64) bool {
     return false;
 }
 
-// 成员二分形态选型：@Integer 命中（bitpack 位宽成员）→ mk_scalar("void", -1)；否则用 @type 结果
+// 成员二分形态选型：@Integer 命中（bitpack 位宽成员）→ base.mk_scalar("void", -1)；否则用 @type 结果
 pub fn sfield_na(bits: string, tn: i64) i64 {
     if (bits != "") {
         return base.mk_scalar("void", -1);
@@ -2885,7 +2929,7 @@ pub fn parse_declaration() i64 {
 
     // ── LL(1) 关键字领头桥接：`enum Name {...}` / `struct Name {...}`（兼容 df5 文法）──
     // 与上方 `fn Name` 桥同构：消费关键字 → 读名字 → 复用 name-first 实现。
-    // 注意：parse_enum_decl/parse_struct_decl 内部已不再自行 advance_i() 关键字，
+    // 注意：parse_enum_decl/parse_struct_decl 内部已不再自行 lex.advance_i() 关键字，
     // 故此处必须显式消费 `enum`/`struct`。
     if (lex.cur_t() == "KwEnum") {
         lex.advance_i();   // 吃掉 `enum`
@@ -2936,8 +2980,8 @@ pub fn parse_declaration() i64 {
 
     // ── 关键字领头桥接（续）：union / flag / variant / agent / flag_set ──
     // 与 enum/struct 桥同构：消费关键字 → 取名字 → 复用 name-first 实现。
-    // union/flag/variant/agent/flag_set 的 parse_*_decl 内部自行 advance_i() 吞掉关键字，
-    // 故此处消费关键字后，名字 token 留给函数体首行 advance_i() 吞掉（名字已作参数传入，不再从 token 读）。
+    // union/flag/variant/agent/flag_set 的 parse_*_decl 内部自行 lex.advance_i() 吞掉关键字，
+    // 故此处消费关键字后，名字 token 留给函数体首行 lex.advance_i() 吞掉（名字已作参数传入，不再从 token 读）。
     // 局部变量用 *_b 后缀，避免与后续模块（sema/codegen_*）中的同名函数撞名导致 dag 反向引用误报。
     if (lex.cur_t() == "KwUnion") {
         lex.advance_i();
@@ -4539,6 +4583,9 @@ pub fn parse_primary() i64 {
     var t: string = lex.cur_t();
     // M-meta Phase D：编译期内建 `@name(...)`。`@` 在**表达式起始位**此前空闲
     // （注解只在声明前 / 类型后，字段 tagID 是 `@ <int>`），故不与既有文法冲突。
+    if (t == "At" && lex.peek_t(1) == "KwImport") {
+        return parse_import_expr();
+    }
     if (t == "At" && lex.peek_t(1) == "Identifier") {
         return parse_meta_builtin();
     }
@@ -4699,6 +4746,28 @@ pub fn parse_primary() i64 {
     }
     parse_fatal(base.sb_cat2("unexpected token in expression: ", lex.cur_v()));
     return -1;
+}
+
+// 模块值表达式（M-ModuleValue）：`@import("X")` 在**表达式位置**出现，产出一个
+// 「模块命名空间值」节点 import_expr（sa = 模块路径，如 "src.base"）。它与顶层
+// `@import("X")` 声明互不冲突（声明在 parse_declaration 已被拦截，表达式位不会走到这里）。
+// 语义上它不是一个可运算的值，只能作为 `.field` 接收者，经 sema 解析成 `<模块key>__<field>`
+// 真实符号（见 sema.infer_expr 的模块值成员访问分支）；故从不进入运行期、不影响 IR。
+pub fn parse_import_expr() i64 {
+    var ati: i64 = lex.pos;            // `@` 位置（仅记录，未用；node_at 用 import 关键字索引）
+    lex.advance_i();                    // 吃掉 `@`
+    var iti: i64 = lex.advance_i();    // 吃掉 `import`（KwImport），iti = 其 token 索引
+    expect_tok("LParen");
+    var mname: string = expect_tok("String");
+    // 表达式形式的模块值不接 `::` 选择性/通配项（那些是声明语义）；保持 `const m = @import("X")`。
+    // 注意：表达式不消费自身的 `;`（由外层 const/语句解析器负责，见 parse_global_var 的 expect Semicolon）。
+    expect_tok("RParen");
+    var id: i64 = base.node_new("import_expr");
+    var nn: Node = base.nodes[id];
+    nn.sa = mname;
+    slice_set(base.nodes, id, nn);
+    base.node_at(id, iti);             // 用 import 关键字的 token 索引作源位置（ti<0 会越界 t_slice_at）
+    return id;
 }
 
 // 判断当前 `.X`（后接可选的 `(...)` 载荷）是否为 match 下一臂的模式（其后紧跟 `=>`）。
