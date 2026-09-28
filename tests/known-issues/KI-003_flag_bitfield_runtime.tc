@@ -1,0 +1,51 @@
+// KI-003 · flag 位域：运行时符号 t_flag_get / t_flag_set 未实现
+// 本目录不被 conformance/difftest 自动扫描，仅作为已知缺陷复现/修复回归用例手动运行。
+//
+// 现象（实测 2026-09-28，out/dbg/tc.exe = g4，d6291a3）：
+//   最小复现与 examples/bitflags.tc 一样，**LLVM 与 C 双后端都在链接期失败**，
+//   说明缺陷不在代码生成而在 runtime（两个后端各自都正确发射了对符号的引用）：
+//
+//   LLVM 后端：
+//     lld-link: error: undefined symbol: t_flag_get
+//     lld-link: error: undefined symbol: t_flag_set
+//   C 后端（--emit-c + clang）：
+//     同类 undefined symbol（clang 链接 4 处 error）
+//
+// 根因：
+//   `flag_get(p, Perm.readable)` / `flag_set(...)` 是内建，两个后端都把它降级为
+//   对 runtime 符号 t_flag_get / t_flag_set 的调用，但 runtime/t_runtime.c 里
+//   **根本没有这两个函数的定义**（src/codegen_c.tc 只有 emit_flag_set_decl 的
+//   声明侧，无对应实现）。flag 位域因此是「能过类型检查、不能链接」的半成品特性。
+//
+// 影响面：examples/bitflags.tc 无法运行，已被 tools/run_examples.mjs 的
+//   SMOKE_SKIP 表排除（否则每日全量 CI 会天天红，掩盖真实回归）。
+//
+// 期望（修复后）：本文件 tc run 输出 `r=1 w=0 level=5 owner=7`；
+//   examples/bitflags.tc 同样跑通，并从 SMOKE_SKIP 移除、恢复覆盖。
+//
+// 修复验收：① 本文件 LLVM/C 双后端均链接并运行成功且输出一致；
+//           ② run_examples.mjs SMOKE_SKIP 中 bitflags 条目删除后 `--all` 仍全绿。
+
+flag Perm[u16] {
+    readable:  1;
+    writable:  1;
+    level:     4;
+    owner_id:  8;
+}
+
+fn main() i32 @main {
+    var p: Perm = 0;
+    flag_set(p, Perm.readable, 1);
+    flag_set(p, Perm.level, 5);
+    flag_set(p, Perm.owner_id, 7);
+
+    print("r=");
+    print(int_to_str(flag_get(p, Perm.readable) as i64));
+    print(" w=");
+    print(int_to_str(flag_get(p, Perm.writable) as i64));
+    print(" level=");
+    print(int_to_str(flag_get(p, Perm.level) as i64));
+    print(" owner=");
+    println(int_to_str(flag_get(p, Perm.owner_id) as i64));
+    return 0;
+}

@@ -1,0 +1,157 @@
+# ─────────────────────────────────────────────────────────────
+# t 语言编译器 · 每日全量 CI（全部测试 + 全部示例）
+#
+# 与 ci.yml 的分工：
+#   ci.yml      —— 合并门禁。仅 push 到 main 时跑 gate L1，追求「快反馈」。
+#   nightly.yml —— 每日全量。定时跑「全部测试 + 全部示例」，追求「广覆盖」，
+#                  捕获不随合并发生的退化（工具链漂移、非确定行为、依赖老化）。
+#
+# 触发时机：
+#   ① schedule：每日 UTC 18:00（北京时间次日 02:00，避开白天开发高峰）。
+#      注意 GitHub 定时任务在高负载时会延迟甚至跳过；需要立即验证时用 ②。
+#   ② workflow_dispatch：手动触发，可选只跑 dbg / rls。
+#
+# 覆盖范围：
+#   全部测试（4 套 runner）
+#     - tools/conformance.mjs   规范符合性套件，tests/conformance/**（316 用例）
+#     - tools/hir_test.mjs      HIR AstGen + 二进制往返 + RAW 逃生舱归零
+#     - tools/hir_eval_test.mjs HIR 解释器 / CTFE
+#     - tools/repl_test.mjs     REPL 冒烟（read_line arena OOM 回归）
+#   全部示例（115 个，双后端）
+#     - tools/run_examples.mjs --all
+#         · 有 .expected.txt 的示例：LLVM/C 双后端各自跑通 + 输出比对 golden + 双后端一致
+#         · 无 .expected.txt 但有 @main 的示例：**smoke 模式** —— 双后端各自跑通且
+#           输出逐字节一致（无 golden 文件，跨后端对拍即判据）
+#         · 无 @main 的示例是库模块（agentkit / physics / c_interop_lib 等），
+#           build/run 无入口，其编译期覆盖由 ir_snapshot（全量目标）与导入它的
+#           示例间接保证，故不在此跑。
+#     - dbg 与 rls 两种模式各跑一遍（rls 走 -O2 运行时，覆盖优化态下的行为差异）
+#
+# ⚠ 被测编译器必须是「当前源码编出的」编译器，不能直接拿 ci/seed/tc.exe：
+#    种子是上一稳定版，测的是旧代码。故先自举出 g1（种子编 src/tc.tc），
+#    再用 g1 跑全部测试与示例。（g1 由旧发射器编出，语义等价；与 gate 的
+#    conformance / run_examples 步骤取同一代。）
+#
+# 引导编译器（seed）：out/ 被 gitignore，故 ci/seed/tc.exe 随仓库提交。
+# ─────────────────────────────────────────────────────────────
+
+name: Nightly (all tests + all examples)
+
+on:
+  schedule:
+    # 每日 UTC 18:00 = 北京时间次日 02:00
+    - cron: "0 18 * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "示例运行模式（all / dbg / rls）"
+        required: false
+        default: "all"
+        type: choice
+        options: [all, dbg, rls]
+
+# 仅读权限；本流程只验证代码，不推送。
+permissions:
+  contents: read
+
+# 与 ci.yml 用不同的 group：合并门禁与每日全量可并存，互不取消。
+concurrency:
+  group: nightly-full
+  cancel-in-progress: false
+
+jobs:
+  nightly:
+    name: nightly full (${{ github.event.inputs.mode || 'all' }})
+    runs-on: windows-latest
+    # 自举 ~3min + conformance ~2min + 示例两轮各 ~10min，留足余量。
+    timeout-minutes: 240
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      # LLVM 体积大且 winget 源偶发慢/失败，缓存其安装目录避免每次重装。
+      # 缓存键与 ci.yml 保持一致，两个 workflow 共享同一份缓存。
+      - name: Cache LLVM / clang
+        id: llvm-cache
+        uses: actions/cache@v4
+        with:
+          path: C:/Program Files/LLVM
+          key: llvm-windows-latest-v1
+
+      - name: Install LLVM / clang (cache miss only)
+        if: steps.llvm-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          winget install LLVM.LLVM --accept-package-agreements --accept-source-agreements
+          clang --version || true
+
+      - name: Add LLVM to PATH
+        shell: bash
+        run: echo "C:/Program Files/LLVM/bin" >> "$GITHUB_PATH"
+
+      # dbg(-O0) 与 rls(-O2) 两份运行时静态库都预编译；示例要跑两种模式。
+      - name: Build runtime static libs
+        shell: bash
+        env:
+          TC_CLANG: "C:/Program Files/LLVM/bin/clang.exe"
+        run: node tools/build_runtime.mjs
+
+      - name: Restore bootstrap seed compiler
+        shell: bash
+        run: |
+          mkdir -p out/dbg
+          cp ci/seed/tc.exe out/dbg/tc.exe
+          ls -la out/dbg/tc.exe
+
+      # 自举出当前源码的编译器 g1 —— 后续所有测试与示例都以它为被测对象。
+      - name: Bootstrap g1 from seed
+        shell: bash
+        env:
+          TC_CLANG: "C:/Program Files/LLVM/bin/clang.exe"
+        run: |
+          out/dbg/tc.exe build src/tc.tc --output out/dbg/g1 --mode dbg
+          ls -la out/dbg/g1.exe
+
+      # ── 全部测试 ──────────────────────────────────────────────
+      - name: All tests · conformance (tests/conformance/**)
+        shell: bash
+        env:
+          PY: python
+        run: node tools/conformance.mjs --compiler out/dbg/g1.exe
+
+      - name: All tests · HIR AstGen (emit-hir + binary roundtrip)
+        shell: bash
+        run: node tools/hir_test.mjs --compiler out/dbg/g1.exe
+
+      - name: All tests · HIR interpreter (CTFE)
+        shell: bash
+        run: node tools/hir_eval_test.mjs --compiler out/dbg/g1.exe
+
+      - name: All tests · REPL smoke
+        shell: bash
+        run: node tools/repl_test.mjs --compiler out/dbg/g1.exe
+
+      # ── 全部示例 ──────────────────────────────────────────────
+      - name: All examples (dbg, both backends)
+        if: ${{ github.event.inputs.mode != 'rls' }}
+        shell: bash
+        env:
+          TC_CLANG: "C:/Program Files/LLVM/bin/clang.exe"
+        run: node tools/run_examples.mjs --all --compiler out/dbg/g1.exe --mode dbg
+
+      - name: All examples (rls, both backends)
+        if: ${{ github.event.inputs.mode != 'dbg' }}
+        shell: bash
+        env:
+          TC_CLANG: "C:/Program Files/LLVM/bin/clang.exe"
+        run: node tools/run_examples.mjs --all --compiler out/dbg/g1.exe --mode rls
