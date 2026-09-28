@@ -43,7 +43,7 @@ function runTc(args) {
 // ── 待测文件集 ────────────────────────────────────────────────
 // hir_demo（回归样例）+ 编译器自身源码（最大、最复杂的真实源）+ 若干 examples。
 import { readdirSync, existsSync } from "node:fs";
-const FILES = [join(ROOT, "out", "hir_probe", "hir_demo.tc")];
+const FILES = [join(ROOT, "tests", "hir_probe", "hir_demo.tc")];
 if (existsSync(join(ROOT, "src", "tc.tc"))) FILES.push(join(ROOT, "src", "tc.tc"));
 const exDir = join(ROOT, "examples");
 if (existsSync(exDir)) {
@@ -70,7 +70,7 @@ if (process.argv.includes("--full")) {
     if (existsSync(t)) for (const f of readdirSync(t).filter((f) => f.endsWith(".tc")).sort()) COV_FILES.push(join(t, f));
 }
 
-const roundTripFiles = [join(ROOT, "out", "hir_probe", "hir_demo.tc")];
+const roundTripFiles = [join(ROOT, "tests", "hir_probe", "hir_demo.tc")];
 if (existsSync(join(ROOT, "src", "tc.tc"))) roundTripFiles.push(join(ROOT, "src", "tc.tc"));
 
 let failures = 0;
@@ -106,7 +106,7 @@ async function checkText(f) {
 }
 
 async function checkRoundTrip(f) {
-    const binPath = join(ROOT, "out", "hir_probe", `_rt_${Date.now()}_${Math.floor(Math.random() * 1e6)}.hirbin`);
+    const binPath = join(ROOT, "out", `_rt_${Date.now()}_${Math.floor(Math.random() * 1e6)}.hirbin`);
     const r1 = await runTc(["emit-hir", f, "--bin", "--output", binPath]);
     if (r1.code !== 0) {
         failures++; fails.push(`${f} (--bin 失败)`);

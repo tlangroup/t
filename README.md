@@ -7,7 +7,7 @@
 工具链分工（M38 起重构）：
 - **`tc`** — 纯粹的**编译器**：负责 `lex / check / compile / emit-ll / build / run` 与链接（LLVM 或 C 后端）。入口 `src/tc.tc`，本体按编译步骤拆分为 `src/{base,lex,parse,sema,codegen_c,codegen_ll}.tc`（见「编译器源码结构」），二进制 `out/<mode>/tc.exe`。
 - **`tote`** — **包管理器与构建系统**：自身不实现编译器，而是把编译/链接委托给 `tc`；并负责包清单 `tote.toml`、`init` 脚手架与依赖登记（`install`）。源码 `src/tote.tc`，二进制 `out/<mode>/tote.exe`。
-- **`totter`**（数据驱动生成器）— **已放弃（abandoned），保留不删除**：`src/totter.tc` 与冻结快照 `gen/tc.tc` 仍在仓库中，已退出 canonical 流水线，不再维护、不再重跑。
+- **`totter`**（数据驱动生成器）— **已删除（abandoned）**：原 `src/totter.tc` 与冻结快照 `gen/tc.tc` 已于 2026-09-28 移除；其 `GEN:` 区间已冻结于 `src/tc.tc` 手写维护，不再重跑、不再维护。
 
 ## 实现
 
@@ -15,7 +15,7 @@
 |------|------|------|
 | **tc（编译器）** | `src/tc.tc` + 6 个分层模块（t 语言编写，自宿主） | **活跃开发** — 一切语言演进发生在这里 |
 | **tote（包管理器/构建系统）** | `src/tote.tc`（t 语言编写，自宿主） | **活跃开发** — 编译委托 tc，负责包与构建编排 |
-| totter（数据驱动生成器） | `src/totter.tc` | **已放弃（保留）** — 不再参与构建流水线，不再维护 |
+| totter（数据驱动生成器） | （已删除） | **已删除** — 2026-09-28 移除，不再参与构建流水线 |
 | tc0（种子） | `seed/tc0/`（TypeScript，冻结副本）；`tc0/`（工作副本，frozen） | **冻结** — 仅作参照实现与灾难恢复信任根，不再演进 |
 
 稳定版：编译器 `out/rls/tc.exe`（发布优化）/ `out/dbg/tc.exe`（调试，由 `src/tc.tc` 编译而来）；包管理器/构建系统 `out/dbg/tote.exe`（由 `src/tote.tc` 编译而来，内部调用 `tc`）。
@@ -89,13 +89,12 @@ out/dbg/tote.exe install <pkg>            # 在 tote.toml 登记一个依赖
 
 ## 目录
 
-- `src/` — 编译器 `tc.tc`（完整编译器，自宿主）、包管理器/构建系统 `tote.tc`（驱动，委托 tc）、生成器 `totter.tc`（已放弃，保留）；`lexer.tc`、`parser.tc`、`checker.tc`（历史分阶段模块）
+- `src/` — 编译器 `tc.tc`（完整编译器，自宿主）、包管理器/构建系统 `tote.tc`（驱动，委托 tc）；`lexer.tc`、`parser.tc`、`checker.tc`（历史分阶段模块）
 - `examples/` — 示例代码（cargo 风格，`tc run --example <name>` 或 `tote run --example <name>` 直接运行）
 - `seed/` — 种子编译器 tc0 冻结封存（永不删除，见 `seed/README.md`）
 - `tc0/` — tc0 TypeScript 工作副本（frozen）
 - `runtime/` — C 运行时（arena / TStr / TSb / TSlice / TMap）
-- `out/` — 编译产物根目录（见下「构建产物 `out/`」）；`out/ebnf.json` 为 totter 生成器的中间数据（由 `tools/gen_ebnf.mjs` 从 `docs/reference.md` 抽取；totter 已放弃，该文件冻结）
-- `gen/tc.tc` — 由旧 totter 生成的编译器拷贝（**冻结快照**，totter 放弃后不再更新）
+- `out/` — 编译产物根目录（见下「构建产物 `out/`」）
 - `docs/spec.md` — 语言规范（唯一事实来源）；`docs/bootstrap.md` — 自举路线图（M1–M12；自举判据见 §4.1 修订说明）
 - `tests/samples/`、`tests/err_samples/` — 差分测试样例
 - `tests/conformance/` — 规范符合性套件（指令头 `// EXPECT: pass|error|warning T_CODE...`）
@@ -111,7 +110,6 @@ out/
 │   ├── deps/           # 依赖静态库（t_runtime.lib，由 tools/build_runtime.mjs 预编译）
 │   ├── tc.exe          # 调试版编译器（缺省 --mode）
 │   ├── tote.exe        # 调试版包管理器/构建系统（委托 tc）
-│   ├── totter.exe      # 生成器（已放弃，保留，不再构建）
 │   ├── *.obj / *.ll    # 中间目标文件 / LLVM IR
 │   └── *.pdb           # debug 符号信息
 ├── rls/                # 发布优化构建：clang -O2
@@ -119,7 +117,6 @@ out/
 │   ├── tc.exe          # 发布版编译器
 │   ├── tote.exe        # 发布版包管理器/构建系统
 │   └── archive/        # 发布归档文件
-├── ebnf.json           # 生成器中间数据（totter 读取，已放弃）
 └── difftest/ bootstrap/ examples/ …  # 各工具的中间/产物目录
 ```
 
@@ -133,7 +130,7 @@ out/
 ### canonical 流水线（自举）
 
 ```bash
-node tools/gen_ebnf.mjs                      # → out/ebnf.json
+node tools/gen_ebnf.mjs                      # → tnote 项目 notebook-web/data/ebnf.json（与 t 仓库解耦；totter 已删除，该生成路径不再使用）
 node tools/build_runtime.mjs                 # → out/{dbg,rls}/deps/t_runtime.lib
 # 用上一稳定版（旧 tc）自举出新的 tc；随后全部用 tc 自身
 out/dbg/tc.exe build src/tc.tc --output out/dbg/tc          # 调试版编译器 tc
@@ -141,7 +138,7 @@ out/dbg/tc.exe build src/tc.tc --mode rls --output out/rls/tc   # 发布版编�
 # 包管理器/构建系统 tote：编译委托 tc
 out/dbg/tc.exe build src/tote.tc --output out/dbg/tote      # 调试版 tote
 out/dbg/tc.exe build src/tote.tc --mode rls --output out/rls/tote  # 发布版 tote
-# （totter 已放弃：不再执行 out/dbg/tc.exe build src/totter.tc 与 cp gen/tc.tc src/tc.tc）
+# （totter 已删除：历史上曾执行 out/dbg/tc.exe build src/totter.tc 与 cp gen/tc.tc src/tc.tc，现已移除）
 ```
 
 ## 验证命令
@@ -167,13 +164,13 @@ node tools/run_examples.mjs --compiler out/rls/tc.exe --mode rls
 
 > `tools/bootstrap.mjs`（tc0 三轮自编译）与 `gen/tc.tc`（旧 totter 产物）为**遗留/冻结**内容：`tc0/` 已冻结，其 C 后端对
 > `append(x, sb_to_str(...))` 会生成 `&t_sb_to_str(...)`（取临时量地址），MSVC 报 `C2102`。该失败为既有基线，不作为门禁。
-> `totter` 生成器自 M38 起放弃，其 `src + gen` 仅作历史快照保留，不再重跑、不再维护。
+> （注：旧 `totter` 生成器与其冻结产物 `gen/tc.tc` 已于 2026-09-28 移除；其 `GEN:` 区间已冻结于 `src/tc.tc` 手写维护。）
 
 ## Stage 3 自迭代开发规则（版本晋升）
 
 1. 任何语言新特性：先改 `docs/spec.md` → 补符合性测试 → 再改 `src/tc.tc`（编译器）或 `src/tote.tc`（构建/包），三步缺一不可。
 2. 修改 `src/tc.tc` 后：用当前稳定版 tc 编译出新版 → 跑符合性套件 + difftest → 不动点复验 → 通过后晋升为稳定版。
-3. `seed/` 目录与 `tc0/` 冻结不动；`tests/conformance/` 只增不删；`src/totter.tc` / `gen/tc.tc` 已放弃、冻结保留、不再演进。
+3. `seed/` 目录与 `tc0/` 冻结不动；`tests/conformance/` 只增不删（旧 `totter` 生成器与 `gen/tc.tc` 冻结快照已于 2026-09-28 移除）。
 
 ## 历史命名
 
