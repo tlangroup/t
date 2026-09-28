@@ -185,16 +185,14 @@ const SMOKE_SKIP = new Map([
     ["agent_npc_mind_llm", "交互式：阻塞读 stdin，无人值守环境不可跑"],
 
     // ── ④ 已知缺陷（修好后从本表移除、恢复覆盖）────────────
-    // flag 位域的运行时符号 t_flag_get / t_flag_set 未实现，LLVM 与 C 双后端均
-    // 链接失败（lld-link: undefined symbol）。
-    ["bitflags", "KI-003：flag 位域运行时符号未实现，双后端均链接失败"],
-    // f-string `!j` 对位于切片字段之后的 f64 / bool 字段取偏移错，LLVM 后端输出
-    // score=4.94066e-324 / ok=false（C 后端 1.5 / true 正确）。
-    ["fmt_json_a1a", "KI-004：!j 对切片字段之后的 f64/bool 取偏移错（LLVM 端）"],
-    // device 子系统在 cpu-emu 桩上崩溃：_cpuemu_check 双后端 segfault，
-    // vecadd_device_full 仅 LLVM segfault（C 端按设计优雅降级）。
-    ["_cpuemu_check", "KI-005：device cpu-emu 路径 segfault（双后端）"],
-    ["vecadd_device_full", "KI-005：device 示例 LLVM 后端 segfault"],
+    // device 子系统（LLVM 后端发射 __t_devmod_blob + device.* 调用；cpu-emu
+    // 解释器 brace 配对 / 指针参数识别 / atomic_add 解析均已修）：内核已能执行、
+    // rc=0、不崩。但示例 host 侧用 [256]f32 定长数组，LLVM 后端对该类堆分配数组
+    // 的元素赋值 ha[k]=x 实际不落盘（读回为 mimalloc 残留 0x200），h2d 拷不进真
+    // 数据 → 端到端输出对拍失败。此为独立的 LLVM 后端数组 store bug，非 device
+    // 子系统范围，单独登记为 KI 待修；修好后从本表移除。
+    ["_cpuemu_check", "KI-005：device 内核已能跑(rc=0)，但 host 定长数组元素赋值在 LLVM 后端不落盘，端到端对拍失败（独立 KI）"],
+    ["vecadd_device_full", "KI-005：同上——host 定长数组元素赋值 LLVM 后端不落盘，hc 对拍失败（独立 KI）"],
 ]);
 
 // 无 @main 的示例是「被别的示例 import 的库模块」：build/run 需要入口，

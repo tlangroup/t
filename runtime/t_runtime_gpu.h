@@ -25,11 +25,11 @@ void    tll_gpu_free(int64_t p);
 void tll_gpu_h2d(int64_t dst, int64_t src, int64_t bytes);
 void tll_gpu_d2h(int64_t dst, int64_t src, int64_t bytes);
 
-// 发射内核：blob = 内嵌的 Device Dialect 文本（@__t_devmod_blob），
-// name = 内核名（char*，运行时取 TStr 的 data 字段），grid/block = 1D 配置，
-// nargs = 变长实参数目，argv = i64[] 句柄数组。返回 0 成功，-1 失败（桩）。
-int32_t tll_gpu_launch(const char* blob, const char* name,
-                       int32_t grid, int32_t block, int32_t nargs, int64_t* argv);
+// 发射内核：blob 由编译器内嵌为模块级全局 @__t_devmod_blob（本函数经 extern 引用，
+// 避免 host 双后端各自传 blob 指针），name = 内核名（char*，运行时取 TStr 的 data 字段），
+// grid/block = 1D 配置，nargs = 变长实参数目，argv = i64[] 句柄数组。
+// 返回 0 成功，-1 失败（桩）。grid/block/nargs 用 int64 与 host 双后端（TIR 整型一律 i64）逐字对齐。
+int64_t tll_gpu_launch(const char* name, int64_t grid, int64_t block, int64_t nargs, int64_t* argv);
 
 #ifdef __cplusplus
 }

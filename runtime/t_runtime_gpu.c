@@ -63,6 +63,8 @@ static const char* ssa_scan(const char* p, char* out) {
 }
 
 // 在 blob 中定位 `@name` 的 kernel_func，返回其函数体起始（'{' 之后）与长度（到匹配 '}'）。
+// ⚠ 必须用括号配对找真正的闭合 '}'：函数体内含 {dim = 0 : i32} / {elem = f32} 等内嵌 '}'，
+// 朴素 strchr(ob,'}') 会命中第一个内嵌 '}'，把函数体截断到首条指令之前（kernel 等于空跑 → 结果垃圾）。
 static const char* find_kernel_body(const char* blob, const char* name, int* out_len) {
     char pat[128];
     snprintf(pat, sizeof(pat), "device.kernel_func @%s", name);
@@ -70,10 +72,18 @@ static const char* find_kernel_body(const char* blob, const char* name, int* out
     if (!fn) return NULL;
     const char* ob = strchr(fn, '{');
     if (!ob) return NULL;
-    const char* cb = strchr(ob, '}'); // demo dialect 无嵌套大括号
-    if (!cb) return NULL;
-    *out_len = (int)(cb - ob - 1);
-    return ob + 1;
+    // 括号配对：从 ob（首个 '{'）起，遇 '{' +1、遇 '}' -1，归零即真正闭合。
+    int depth = 0;
+    const char* p = ob;
+    while (*p) {
+        if (*p == '{') depth = depth + 1;
+        else if (*p == '}') {
+            depth = depth - 1;
+            if (depth == 0) { *out_len = (int)(p - ob - 1); return ob + 1; }
+        }
+        p = p + 1;
+    }
+    return NULL;
 }
 
 // 解析 `^entry(%a : T, %b : T, ...) ` 的参数名与类型（ptr vs 标量）。
@@ -94,7 +104,7 @@ static int parse_entry_args(const char* fnline, char names[][16], int* isptr) {
         if (!colon) break;
         const char* t = colon + 1;
         while (*t == ' ' || *t == '\t') t++;
-        isptr[n] = (strncmp(t, "!llvm.ptr", 10) == 0) ? 1 : 0;
+        isptr[n] = (strncmp(t, "!llvm.ptr", 9) == 0) ? 1 : 0;
         strncpy(names[n], nm, 15); names[n][15] = 0;
         n++;
         const char* comma = strchr(colon, ',');
@@ -145,19 +155,33 @@ static int gpu_emu_run(const char* blob, const char* name,
                         int v = 0; sscanf(rhs, "arith.constant %d", &v);
                         Ssa* s = ssa_set(dstnm, 1); if (s) s->i = (int32_t)v;
                     } else if (strstr(rhs, "device.shared_alloc")) {
-                        char m[16]; const char* ap = strchr(rhs, '(');
-                        if (ap) { const char* mp = strchr(ap, '%'); if (mp) { ssa_scan(mp, m);
-                            Ssa* sm = ssa_get(m); int cnt = sm ? sm->i : 0;
-                            if (!g_shared) g_shared = mi_malloc((size_t)cnt * 4);
-                            Ssa* s = ssa_set(dstnm, 3); if (s) s->p = g_shared; } }
+                        // 计数实参可能是 ssa（%v1）或字面量（256）：两种都解析，
+                        // 缺失时退化为 1 个元素，避免 mi_malloc(0)/负长度。
+                        int cnt = 0;
+                        const char* ap = strchr(rhs, '(');
+                        if (ap) {
+                            const char* mp = strchr(ap, '%');
+                            if (mp) { char m[16]; ssa_scan(mp, m); Ssa* sm = ssa_get(m); cnt = sm ? sm->i : 0; }
+                            else { const char* np = ap + 1; while (*np == ' ' || *np == '\t') np++; cnt = atoi(np); }
+                        } else {
+                            const char* sp = strstr(rhs, "shared_alloc");
+                            if (sp) { const char* np = sp + 12; while (*np == ' ' || *np == '\t') np++; cnt = atoi(np); }
+                        }
+                        if (cnt < 1) cnt = 1;
+                        if (!g_shared) g_shared = mi_malloc((size_t)cnt * 4);
+                        Ssa* s = ssa_set(dstnm, 3); if (s) s->p = g_shared;
                     } else if (strstr(rhs, "llvm.getelementptr")) {
                         char b[16], i[16]; const char* bp = strchr(rhs, '%');
                         if (bp) { const char* ba = ssa_scan(bp, b);
                             const char* ip = strchr(ba, '%'); if (ip) ssa_scan(ip, i); }
                         Ssa* sb = ssa_get(b); Ssa* si = ssa_get(i);
-                        int esz = 4; if (strstr(rhs, ", i64")) esz = 8;
-                        void* addr = (char*)sb->p + (int)si->i * esz;
-                        Ssa* s = ssa_set(dstnm, 3); if (s) s->p = addr;
+                        // ⚠ 防御：基/索引 ssa 未解析（拼写/方言漂移）时跳过本指令，
+                        // 绝不解引用 NULL（此前 reduce_atomic 在共享缓冲寻址上段错误）。
+                        if (sb && si) {
+                            int esz = 4; if (strstr(rhs, ", i64")) esz = 8;
+                            void* addr = (char*)sb->p + (int)si->i * esz;
+                            Ssa* s = ssa_set(dstnm, 3); if (s) s->p = addr;
+                        }
                     } else if (strstr(rhs, "llvm.load")) {
                         char s[16]; const char* sp = strchr(rhs, '%');
                         if (sp) ssa_scan(sp, s);
@@ -170,14 +194,17 @@ static int gpu_emu_run(const char* blob, const char* name,
                             const char* bp2 = strchr(aa, '%'); if (bp2) ssa_scan(bp2, b); }
                         Ssa* sa = ssa_get(a); Ssa* sb = ssa_get(b);
                         Ssa* s = ssa_set(dstnm, 2); if (s && sa && sb) s->f = sa->f + sb->f;
-                    } else if (strstr(rhs, "device.atomic_add")) {
-                        char pnm[16], vnm[16]; const char* pp = strchr(rhs, '(');
-                        if (pp) { const char* pa = strchr(pp, '%'); if (pa) { ssa_scan(pa, pnm);
-                            const char* vp = strchr(pa, '%'); if (vp) ssa_scan(vp, vnm); } }
-                        Ssa* sp = ssa_get(pnm); Ssa* sv = ssa_get(vnm);
-                        if (sp && sv) { float old = *(float*)sp->p; *(float*)sp->p = old + sv->f;
-                            Ssa* s = ssa_set(dstnm, 2); if (s) s->f = old; }
-                    }
+            } else if (strstr(rhs, "device.atomic_add")) {
+                char pnm[16], vnm[16]; const char* pp = strchr(rhs, '(');
+                // ⚠ pa 已指向第一个 '%'（指针名），须从 pa+1 再找第二个 '%'（值名）；
+                // 此前误用 strchr(pa,'%') 会重新命中同一个 '%'（= 指针名本身），
+                // 导致 atomic_add 写回/读取错 SSA → reduce_atomic 求和错误。
+                if (pp) { const char* pa = strchr(pp, '%'); if (pa) { ssa_scan(pa, pnm);
+                    const char* vp = strchr(pa + 1, '%'); if (vp) ssa_scan(vp, vnm); } }
+                Ssa* sp = ssa_get(pnm); Ssa* sv = ssa_get(vnm);
+                if (sp && sv) { float old = *(float*)sp->p; *(float*)sp->p = old + sv->f;
+                    Ssa* s = ssa_set(dstnm, 2); if (s) s->f = old; }
+            }
                     // 其余带 dst 的 op（未来扩展）忽略
                 } else {
                     if (strstr(q, "llvm.store")) {
@@ -185,7 +212,7 @@ static int gpu_emu_run(const char* blob, const char* name,
                         if (vp) { const char* va = ssa_scan(vp, v);
                             const char* dp = strchr(va, '%'); if (dp) ssa_scan(dp, d); }
                         Ssa* sv = ssa_get(v); Ssa* sd = ssa_get(d);
-                        if (sv && sd) *(float*)sd->p = sv->f;
+                        if (sv && sd) { *(float*)sd->p = sv->f; }
                     } else if (strstr(q, "device.barrier")) {
                         // host 顺序执行已隐含线程间同步
                     } else if (strstr(q, "device.return")) {
@@ -214,11 +241,11 @@ void tll_gpu_d2h(int64_t dst, int64_t src, int64_t bytes) {
     memcpy((void*)(intptr_t)dst, (void*)(intptr_t)src, (size_t)bytes);
 }
 
-int32_t tll_gpu_launch(const char* blob, const char* name,
-                       int32_t grid, int32_t block, int32_t nargs, int64_t* argv) {
-    int rc = gpu_emu_run(blob, name ? name : "", grid, block, nargs, argv);
-    if (rc == 0) fprintf(stderr, "device: tll_gpu_launch(\"%s\") cpu-emu OK (%d threads)\n",
-                          name ? name : "", (int)grid * (int)block);
+// blob 由编译器内嵌为模块级全局 @__t_devmod_blob（C/LLVM 双后端均发射）；本函数经 extern 引用。
+// host 双后端发射形态已对齐，运行期无任何 stderr 噪声。
+int64_t tll_gpu_launch(const char* name, int64_t grid, int64_t block, int64_t nargs, int64_t* argv) {
+    extern const char __t_devmod_blob[];
+    int rc = gpu_emu_run(__t_devmod_blob, name ? name : "", (int32_t)grid, (int32_t)block, (int32_t)nargs, argv);
     return rc;
 }
 

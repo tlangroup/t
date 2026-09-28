@@ -3531,6 +3531,84 @@ pub fn tir_emit_call(e: i64) TirEmitRes {
         tir_emit(TIRInst{ op: TIR_OP_CALL, st: tir_st_from_str("%TStr"), dst: tir_op(d), args: tir_a3("@sym_str", tagd, idd), is_comment: false, line: g_cur_line, cmt: "" });
         return TirEmitRes{ name: d, st: tir_st_from_str(retst) };
     }
+    // ── KI-005：device host trampoline（alloc_bytes/free/h2d/d2h/launch）────────
+    // 与 C 后端 c_device_call 对齐：device.<m> 成员调用降级为 tll_gpu_* 运行库调用。
+    // LLVM 后端此前把 device.launch 当 @device 全局的 TClosure 成员调用（取非法 code 指针）→ 段错误；
+    // 这里在通用 call 路径之前拦截，直接发射 tll_gpu_*（blob 由编译器内嵌 @__t_devmod_blob，运行时 extern 引用）。
+    if (callee.kind == "member") {
+        var recv: Node = base.nodes[callee.na];
+        if (recv.kind == "ident" && recv.sa == "device") {
+            var dev_args: []i64 = [];
+            var dc: i64 = n.la;
+            while (dc >= 0) { append(dev_args, base.kids[dc].val); dc = base.kids[dc].next; }
+            if (cname == "alloc_bytes") {
+                var sz: string = tir_emit_expr(dev_args[0]).name;
+                tir_emit(tir_e_call("i64", d, "@tll_gpu_alloc", tir_cargs1(sz)));
+                return TirEmitRes{ name: d, st: tir_st_from_str("i64") };
+            }
+            if (cname == "free") {
+                var p: string = tir_emit_expr(dev_args[0]).name;
+                tir_emit(tir_e_call("void", d, "@tll_gpu_free", tir_cargs1(p)));
+                return TirEmitRes{ name: d, st: tir_st_from_str(retst) };
+            }
+            if (cname == "h2d") {
+                var d0: string = tir_emit_expr(dev_args[0]).name;
+                var s0: string = tir_emit_expr(dev_args[1]).name;
+                var n0: string = tir_emit_expr(dev_args[2]).name;
+                tir_emit(tir_e_call("void", d, "@tll_gpu_h2d", tir_cargs3(d0, s0, n0)));
+                return TirEmitRes{ name: d, st: tir_st_from_str(retst) };
+            }
+            if (cname == "d2h") {
+                var d0: string = tir_emit_expr(dev_args[0]).name;
+                var s0: string = tir_emit_expr(dev_args[1]).name;
+                var n0: string = tir_emit_expr(dev_args[2]).name;
+                tir_emit(tir_e_call("void", d, "@tll_gpu_d2h", tir_cargs3(d0, s0, n0)));
+                return TirEmitRes{ name: d, st: tir_st_from_str(retst) };
+            }
+            if (cname == "launch") {
+                // name: TStr → 取 data 字段（field 0）指针即 const char*；grid/block/nargs 为 i64；
+                // 变长实参打包成 arr<i64 x N> 栈数组，传其基址（opaque ptr 等价 int64_t*）。
+                var nslot: string = tir_emit_expr(dev_args[0]).name;   // %TStr 值
+                var gidx0: []string = []; append(gidx0, "0");
+                var faddr: string = tir_tmp();
+                tir_emit(tir_emit_gep("ptr", faddr, nslot, gidx0));
+                var datap: string = tir_tmp();
+                tir_emit(tir_emit_load("ptr", datap, faddr));
+                var grids: string = tir_emit_expr(dev_args[1]).name;   // i64
+                var blocks: string = tir_emit_expr(dev_args[2]).name;  // i64
+                var nargs: i64 = slice_len(dev_args) as i64 - 3;
+                if (nargs < 0) { nargs = 0; }
+                var nargss: string = tir_const_i64(nargs);
+                var argvp: string;
+                if (nargs > 0) {
+                    var arrst: string = base.sb_cat3("arr<i64 x ", base.i2s(nargs), ">");
+                    var back: string = tir_tmp();
+                    tir_emit(tir_emit_slot(arrst, back));
+                    var ki2: i64 = 0;
+                    while (ki2 < nargs) {
+                        var ev: string = tir_emit_expr(dev_args[3 + ki2]).name;
+                        var eaddr: string = tir_tmp();
+                        tir_emit(tir_emit_addr_of(arrst, eaddr, back));
+                        var gidxk: []string = []; append(gidxk, base.i2s(ki2));
+                        var faddr2: string = tir_tmp();
+                        tir_emit(tir_emit_gep("i64", faddr2, eaddr, gidxk));
+                        tir_emit(tir_emit_store(ev, faddr2));
+                        ki2 = ki2 + 1;
+                    }
+                    argvp = tir_tmp();
+                    tir_emit(tir_emit_addr_of(arrst, argvp, back));
+                } else {
+                    argvp = tir_tmp();
+                    tir_emit(tir_emit_const_ptr_null("ptr<i64>", argvp));
+                }
+                var __la: []string = [];
+                append(__la, datap); append(__la, grids); append(__la, blocks); append(__la, nargss); append(__la, argvp);
+                tir_emit(tir_e_call("i64", d, "@tll_gpu_launch", __la));
+                return TirEmitRes{ name: d, st: tir_st_from_str("i64") };
+            }
+            // 未知 device 方法：不拦截，落到下方通用 call 路径（不应发生）
+        }
+    }
     // 变体构造器（返回类型为变体）：统一走 sret——先开 ptr<%V> 槽，构造器写入该槽，调用返回 void。
     // 这样变体值始终以 ptr<%V> 形态流转（对齐 struct_new / match 提取 / 跨函数传参），避免结构体按值返回 ABI 坑。
     if (ret_td >= 0 && t_td_is_variant(ret_td)) {
@@ -3984,6 +4062,19 @@ pub fn tir_emit_call(e: i64) TirEmitRes {
     } else {
         tir_emit(tir_e_call(retst, d, callee_ref, cargs));
     }
+    // ── KI-003：flag_set 写回（LLVM 后端）────────────────────────────────
+    // t 的 flag_set(p, mask, val) 语义等价 C 后端宏 ((p) = t_flag_set(p, mask, val))：
+    // 必须要把调用返回值写回首参 lvalue。C 后端靠宏内联赋值实现；TIR/LLVM 路径此前
+    // 只把结果留在临时 %d，首参 p 是值传递副本，运行期 p 始终为初始 0 → 位域全 0。
+    // 此处取首参地址并 STORE 调用结果 d 回去，与 C 宏逐字等价（flag_get 只读，无需写回）。
+    if (cname == "flag_set") {
+        var a0n: i64 = -1;
+        if (n.la >= 0) { a0n = base.kids[n.la].val; }
+        if (a0n >= 0) {
+            var addrr: TirEmitRes = tir_addr_of(a0n);
+            tir_emit(tir_emit_store(d, addrr.name));
+        }
+    }
     return TirEmitRes{ name: d, st: tir_st_from_str(retst) };
 }
 
@@ -4222,7 +4313,24 @@ pub fn tir_emit_struct_lit(e: i64) TirEmitRes {
                 if (fnames[j] == ff.sa) { vv = fvals[j]; vst = fvalsts[j]; matched = matched + 1; }
                 j = j + 1;
             }
-            if (str_len(vv) > 0) { append(__sl_args, tir_op_st(vv, vst)); }
+            if (str_len(vv) > 0) {
+                // 提供了值：按原样落槽（vst 为发射端 ST 码，与字段声明类型一致）。
+                append(__sl_args, tir_op_st(vv, vst));
+            } else {
+                // ⚠ 修复 KI-004：省略字段绝不能「跳过」。后端 STRUCT_NEW 以
+                // "i32 0, i32 <arg_index>" GEP 把实参按**声明序槽位**落槽，若跳过，
+                // 位于切片/聚合字段之后的字段会被整体左移一位 → 读到错误偏移的垃圾
+                // （实测 score 1.5→4.94066e-324、ok true→false）。
+                // 改用「声明类型零值」补齐：emit 一个 0 实参的 STRUCT_NEW 物化该字段
+                // 类型的零化槽（alloca + zeroinitializer，st 已登记），再作为实参落
+                // **声明序对应槽位**，使后续字段索引不被打乱。C 后端走 AST 复合字面量
+                // 的 .field 指定，天然正确，不受此处影响。
+                var ftd: i64 = tir_field_td(n.sa, ff.sa);
+                var fstr: string = tir_st_of_td(ftd);
+                var zs: string = tir_tmp();
+                tir_emit(TIRInst{ op: TIR_OP_STRUCT_NEW, st: tir_st_from_str(fstr), dst: tir_op(zs), args: [], is_comment: false, line: g_cur_line, cmt: "" });
+                append(__sl_args, tir_op_st(zs, tir_st_from_str(fstr)));
+            }
             c = kk.next;
         }
         // V004：具名字面量写入了非声明字段 —— 位置落槽后端会把它静默错位。
