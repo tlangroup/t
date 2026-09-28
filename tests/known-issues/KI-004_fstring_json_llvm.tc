@@ -1,0 +1,44 @@
+// KI-004 · f-string `!j`（JSON 转换）在 LLVM 后端对**切片字段之后的** f64 / bool 字段取值错编
+// 本目录不被 conformance/difftest 自动扫描，仅作为已知缺陷复现/修复回归用例手动运行。
+//
+// 现象（实测 2026-09-28，out/dbg/tc.exe = g4，d6291a3；由新增的
+//   `tools/run_examples.mjs --all` smoke 模式首次暴露 —— 该示例此前无
+//   .expected.txt，**零运行时覆盖**，缺陷潜伏至今）：
+//
+//   C 后端（oracle，`tc compile --emit-c`）：
+//     {"name":"box","origin":{"x":1,"y":2},"tags":["a","bb","d"],"score":1.5,"ok":true}
+//   LLVM 后端（`tc build`）：
+//     {"name":"box","origin":{"x":1,"y":2},"tags":["a","bb","d"],"score":4.94066e-324,"ok":false}
+//                                                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+//   score 1.5 → 4.94066e-324（位型 0x1 的最小非规约双精度 = 把别处的字节当 double 读），
+//   ok true → false。
+//
+// 成因边界（实测缩小范围，很重要）：
+//   · 只放 `name:string + score:f64 + ok:bool` 三个字段 → **双后端都是对的**，不触发。
+//   · 在 score 前面插入 `tags: []string`（切片字段）→ 立即触发。
+//   ⇒ 不是「!j 不支持 f64/bool」，而是 **struct 中位于切片字段之后的字段，
+//     LLVM 后端取字段的偏移量算错**（切片按 8 字节对齐时真实占位与发射端假定不一致），
+//     于是 score 读到 tags 之后的错误位置。i64/string/嵌套 struct 字段之所以看起来
+//     「正确」，是因为它们排在切片**之前**，偏移尚未错位。
+//
+// 影响面：examples/fmt_json_a1a.tc 双后端输出不一致，已被
+//   tools/run_examples.mjs 的 SMOKE_SKIP 表排除（否则每日全量 CI 天天红）。
+//
+// 修复验收：① 本文件 LLVM 与 C 后端输出逐字节一致（score 1.5 / ok true）；
+//           ② SMOKE_SKIP 中 fmt_json_a1a 条目删除后 `run_examples --all` 仍全绿。
+
+struct Point { x: i64; y: i64; }
+
+struct Shape {
+    name: string;
+    origin: Point;
+    tags: []string;
+    score: f64;
+    ok: bool;
+}
+
+fn main() i64 @main {
+    var s: Shape = Shape{ name: "box", origin: Point{ x: 1, y: 2 }, score: 1.5, ok: true };
+    println(f"{s!j}");
+    return 0;
+}
