@@ -376,6 +376,21 @@ int32_t t_math_isinf(double);
 int32_t t_math_isfinite(double);
 int32_t t_math_isnormal(double);
 
+// ── flag 位域（内建 flag_set / flag_get 的运行时支撑）─────────────
+// LLVM 后端把 `flag_set(p, m, v)` 降级为 `p = t_flag_set(p, m, v)`（按值传参、
+// 返回新的 flags 值）；C 后端发射裸 `flag_set(...)` 语句（首实参恒为左值变量），
+// 故用宏把返回值写回首实参，使双后端语义一致（详见 KI-003）。
+// 约定：mask = (2^len - 1) << shift（与前端 Perm_X_MASK 宏一致）；内部按 mask 的
+// 最低置位偏移 shift 解包 / 打包；flags / val 均为字段语义展开后的整数（u16 经
+// i64 槽传递，低 16 位有效）。
+int64_t t_flag_set(int64_t flags, int64_t mask, int64_t val);
+int64_t t_flag_get(int64_t flags, int64_t mask);
+#ifndef t_flag_set_macro_defined
+#define t_flag_set_macro_defined
+#define flag_set(flags, mask, val) ((flags) = t_flag_set((flags), (mask), (val)))
+#define flag_get(flags, mask)      (t_flag_get((flags), (mask)))
+#endif
+
 #ifdef __cplusplus
 }
 #endif

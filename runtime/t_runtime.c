@@ -2837,4 +2837,28 @@ int t_cpu_has_cstr(const char* feat) {
     if (strcmp(feat, "avx512f") == 0) { return __builtin_cpu_supports("avx512f"); }
     return 0;
 #endif
+
+}
+
+// ── flag 位域运行时（KI-003）────────────────────────────────────
+// 与前端 Perm_X_MASK / Perm_X_SHIFT 宏同一套约定：mask = (2^len - 1) << shift。
+// flags / val 为字段语义展开后的整数（u16 经 i64 槽传递，低 16 位有效）。
+// 内部按 mask 的最低置位偏移 shift 解包 / 打包，避免对 len 的额外参数依赖，
+// 使单 bit 与多 bit 字段共用同一实现。
+static int64_t t_flag_shift(int64_t mask) {
+    uint64_t m = (uint64_t)mask;
+    int shift = 0;
+    while (m != 0 && (m & 1u) == 0) { m >>= 1; shift++; }
+    return (int64_t)shift;
+}
+
+int64_t t_flag_set(int64_t flags, int64_t mask, int64_t val) {
+    int64_t shift = t_flag_shift(mask);
+    int64_t field = (val << shift) & mask;
+    return (flags & ~mask) | field;
+}
+
+int64_t t_flag_get(int64_t flags, int64_t mask) {
+    int64_t shift = t_flag_shift(mask);
+    return (flags & mask) >> shift;
 }

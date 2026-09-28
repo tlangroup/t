@@ -18,7 +18,8 @@ const llname = @import("src.llname");  // ⚠ 飞地规避：命名/槽分配子
 // 此处自包含发射 @__ti_<T> 全局常量（与 codegen_ll 同布局），复用 sema/lex 的字段元数据。
 @import("src.sema" :: resolve_type_desc, td_readable);
 @import("src.lex" :: decl_list);
-@import("src.codegen_c" :: is_ref_type, math_is_mbuiltin_c);
+@import("src.codegen_c" :: is_ref_type, math_is_mbuiltin_c, c_dev_has_kernels);
+@import("src.codegen_dev" :: emit_device_module);
 
 pub var g_ll: StringBuilder;
 pub var g_ll_tmpc: i64;
@@ -4768,6 +4769,27 @@ pub fn tir_to_ll_emit(module: TIRModule) string {
     // type_info 反射全局常量（@__ti_<T> / @__ti_<T>_f / 字段名·类型名字符串字面量）拼入模块作用域
     sb_append_str(g_ll, sb_to_str(g_ti_defs));
     ll_emit_opaque_defs();
+    // ── KI-005 Part A：发射 @__t_devmod_blob（device host trampoline 内核 blob）──
+    // 与 C 后端 emit_unit 语义对齐：仅当模块含 kernel fn 时发射，供 tll_gpu_launch 经
+    // extern 引用。blob 经 codegen_dev.emit_device_module() 序列化（同 C 后端 emit_unit），
+    // tir.tir_esc 转义为合法 LLVM c"" 字面量。
+    if (c_dev_has_kernels()) {
+        var blob: string = emit_device_module();
+        if (str_len(blob) > 0) {
+            var esc: string = tir.tir_esc(blob);
+            var blen: i64 = 0;
+            var cn: i64 = str_len(esc); var ci: i64 = 0;
+            while (ci < cn) {
+                if (str_at(esc, ci) == 92) { ci = ci + 3; } else { ci = ci + 1; }
+                blen = blen + 1;
+            }
+            sb_append_str(g_ll, "@__t_devmod_blob = constant [");
+            sb_append_i64(g_ll, blen);
+            sb_append_str(g_ll, " x i8] c\"");
+            sb_append_str(g_ll, esc);
+            sb_append_str(g_ll, "\", align 1\n");
+        }
+    }
     ll_emit_main_wrapper();
     return sb_to_str(g_ll);
 }
