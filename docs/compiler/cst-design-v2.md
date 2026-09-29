@@ -125,8 +125,9 @@
 - 新建 **`lib/std/rc/cst.tc`**（库模块 `std.rc.cst`，文件头 `@module(pub)`），首批搬入**关键字表 + `kw_lookup`**（原 `src/lex.tc` 的 `GEN:kw_lookup` 区间，32–56 行）。
 - **为何选它做试点**（三条均已核实）：
   1. **零外部引用**——`grep` 全 `src/*.tc`，`g_kw_text`/`g_kw_kind`/`g_kw_count`/`kw_lookup`/`KwEntry` 除 `src/lex.tc` 外**无任何命中**；影响面完全隔离。
-  2. **无运行期全局初始化**——`g_kw_text`/`g_kw_kind` 是 `[41]string` **静态定长数组**（HEAD `df2bc21` 刚改为编译期初始化，`init_keywords()` 已空）→ 不踩 §4.14.7 的库 `t__ginit` 约束。
-  3. 自包含、可整段搬迁，无需拆分。
+ 2. **无运行期全局初始化（源码层）**——`g_kw_text`/`g_kw_kind` 是 `[41]string` **静态定长数组**（HEAD `df2bc21` 已改为编译期初始化，`init_keywords()` 已空）。
+    ⚠ **该理由事后被证伪（见下方「`.tlib` 预编译实测」）**：源码层是常量，但 **LLVM 侧仍发成 `zeroinitializer` + `t.__ginit` 逐元素回填**（`g1.ll:662834` / `664915`）。也就是说「是否踩 §4.14.7」**不看源码是不是常量，只看发射产物是否依赖 `t.__ginit`**——本例依赖。结论不变（仍不能安全预编译为 `.tlib`），但**判据必须改写**。
+ 3. 自包含、可整段搬迁，无需拆分。
 
 ### 实施中发现的硬约束（已回改设计）
 
@@ -160,10 +161,30 @@
 | `tc check src/tc.tc` | ✅ EXIT=0，**error 数 0**（仅基线既有的 `T-NAM-W402` 等 warning） |
 | `gate L0` | `boot1` **PASS 175.7s**（新代码能自举）、`irverify` PASS、`llvmverify` PASS；**`snapshot` FAIL：「3 处与 LLVM 自举基线不符」** |
 | 差异性质定位 | ✅ **`g1.ll` 出现 `cst__KwEntry` / `cst__g_kw_count` / `cst__g_kw_kind` / `cst__g_kw_text` / `cst__init_keywords` / `cst__kw_lookup` 六个重整符号；旧基线中 `cst__` 计数为 0** ⇒ 差异 = 预期符号重整，**非回归**。与 §4.14.7 预判一致 |
-| 重录基线 `ir_snapshot.mjs --update --compiler out/dbg/g1.exe --jobs 1` | 进行中 |
-| `gate L1` 复跑 | 待重录后执行 |
+| 重录基线 `ir_snapshot.mjs --update --compiler out/dbg/g1.exe --jobs 1` | ✅ 完成（约 9 min）；diff 仅 6 行：3 行元信息（updated / compilerMd5 / srcHash）+ `src/tc.tc::c/h/ll` 三条 md5。**其余 114 个目标（examples / tests / tote）逐字节未变** |
+| `gate L1` 复跑 | ✅ **15 passed / 0 failed / 2 skipped**（1513.4s），与前基线**同构**（仍 2 SKIP ⇒ 快照推理仍成立）；`boot1` 190s / `snapshot` 550s / `boot23` 338s / `diffpipe` 258s / `conform` 94s |
+| 一代收敛 | ✅ `g1.ll == g2.ll == g3.ll`（md5 `1738dd7e…`）⇒ 判据 A（自举不动点）**绿** |
+| 同步 `cp out/dbg/g1.exe out/dbg/tc.exe` + `gate L0` 复跑 | ✅ **10 passed / 0 failed**（833.4s）⇒ 重录后的基线在「新一代编译器」下**依然有效**，非一次性巧合 |
+| 提交 / 合并 / CI | ✅ `ec8400a`（分支 `wb`）→ 合并入 `main` 为 `4b63ced` 并推送，触发 `ci.yml`（push to main → `gate L1`） |
 
 > **一个值得记录的观察**：`g1.ll` 的**字节大小与基线完全相同**（47554130），但 md5 不同——重整把 `g_kw_text` 换成 `cst__g_kw_text`，长度变化被其它对齐/命名变化抵消。**故「文件大小相同」不能作为 IR 未变的判据**，必须看 md5（这也是 §4.10.0 坚持用 md5 + 快照而非尺寸的原因）。
+
+### `.tlib` 预编译实测：两个独立硬阻点（S0a 收尾阶段发现）
+
+把 `rc.cst` 加入 `tools/build_std.mjs` 的 `MODULES` 后实测 `node tools/build_std.mjs`（编译器 `out/dbg/tc.exe`），**两个独立失败**：
+
+| # | 现象 | 根因 | 性质 |
+|---|---|---|---|
+| 1 | `out/lib/std/rc/cst.ll:24:33: error: use of undefined value '@tll_alloc'` → `clang -c (lib) failed` | 运行时 shim 声明（`tll_alloc` / `t_runtime_init` / `t_arena_new` …）由 **`ll_emit_main_wrapper`** 发射，而它第一行即 **`if (g_has_main == false) { return; }`**（`src/tir_to_ll.tc:4993`）。库模式无 `main` ⇒ 一个 shim 声明都不发 ⇒ 库里一旦用到堆分配必崩。（同文件里 `tll_str_eq` 能声明，是走了另一条按需声明路径） | **响亮失败**（链接期报错，不会静默） |
+| 2 | 产物中 `@cst__g_kw_text = global [41 x %TStr] zeroinitializer`，**没有 `t.__ginit`**，也没有常量初始化器 | 库模式**跳过 `t.__ginit`**（rule 6b）；而带初始化器的全局**一律**走「zeroinit + ginit 回填」发射，真值**全靠主程序启动时回填** | **静默错编**（若链接进主程序，关键字表**永久全零**，`kw_lookup` 恒返回 `""`，且不报错） |
+
+补充实测：`pub var` → `pub const` **不能**解决 #2（`const` 全局同样发 `zeroinitializer`，且会触发 `UPPER_SNAKE_CASE` lint warning）；故**判据不是「源码是否常量」而是「发射是否依赖 `t.__ginit`」**。
+
+**处置（已落地）**：
+- `MODULES` **保持 `["mem","math"]`**，不列 `rc.cst`；`std.rc.cst` 走**源码内联导入**（无 `.tlib` 时编译器自动内联，已由 gate L1 15/0 验证）。
+- `build_std.mjs` 仍做**通用化改造**（点分逻辑名 → `dots_to_slashes` 自动推出源路径与产物路径 + `mkdir -p` 父目录），为将来嵌套模块（如 `std.rc.cst.lex`）**预留**，不改语义。
+- 新增 **R-LIB-PURE 规则**（§4.14.7）：`.tlib` 适用面 = **纯函数 + 零初始化全局**。已预编译的 `mem`/`math` 天然满足（无全局状态），故现状安全。
+- 解除阻塞的前置（**不属 S0 范围**）：① 库模式补发 shim 声明；② 全局改发**静态常量初始化器**（LLVM `global [41 x %TStr] [ ... ]`）——② 同时是主程序优化（省掉 ginit 里 41×N 条 store），但会**大幅改变 IR**，须单独立项并整体重录基线。
 
 ---
 
@@ -583,7 +604,7 @@ pub struct Span {
 
 | 阶段 | 动作 | 依赖 | IR 影响 | 风险 | 验收 |
 |---|---|---|---|---|---|
-| **S0（P0，最先做）** | 语法树代码从 `src` 内联迁入 **std 库模块 `std.rc.cst`**（`lib/std/rc/cst.tc`）；`src/base.tc`/`src/lex.tc`/`src/parse.tc` 暂改为 **re-export 垫片**（§4.14.4）；**同时**把 41 项关键字表按 §4.15 拆入 `std.rc.cst.lex`（强制→`Kw*`、其余→`Ident`+`ctx_kw_role`） | 无（`base` 是无 `@import` 的叶子，`lex`→`base`、`parse`→`base`+`lex`，依赖链干净） | **有**（`mangle_modules` 把符号重整为 `cst__xxx`；**即便走内联回退也重整**——rule 2 的「IR 不变」只对**入口模块**成立） | **中**（构建期循环 + 种子约束 + 库全局状态约束 §4.14.7，非原先标的「低」） | 不动点 A 绿；**基线 B 重录**且差异仅为「std 符号外部化」一类预期变化；`std.rc.cst.tlib` 产出（含 §4.14.5 落地清单三项：建 `lib/std/rc/` / `build_std.mjs` 的 `MODULES` 加 `rc.cst` / 产物落 `out/lib/std/rc/cst.tlib`）；**CI 用 seed 能编出 cst.tc**（否则先刷新种子） |
+| **S0（P0，最先做）** | 语法树代码从 `src` 内联迁入 **std 库模块 `std.rc.cst`**（`lib/std/rc/cst.tc`）；`src/base.tc`/`src/lex.tc`/`src/parse.tc` 暂改为 **re-export 垫片**（§4.14.4）；**同时**把 41 项关键字表按 §4.15 拆入 `std.rc.cst.lex`（强制→`Kw*`、其余→`Ident`+`ctx_kw_role`） | 无（`base` 是无 `@import` 的叶子，`lex`→`base`、`parse`→`base`+`lex`，依赖链干净） | **有**（`mangle_modules` 把符号重整为 `cst__xxx`；**即便走内联回退也重整**——rule 2 的「IR 不变」只对**入口模块**成立） | **中**（构建期循环 + 种子约束 + 库全局状态约束 §4.14.7，非原先标的「低」） | 不动点 A 绿；**基线 B 重录**且差异仅为「std 符号外部化」一类预期变化；`lib/std/rc/cst.tc` 建立并经 `@import("std.rc.cst")` 内联导入跑通（**`.tlib` 预编译按 §4.14.7.1 实测暂缓**，`build_std.mjs` 只做点分路径通用化预留）；**CI 用 seed 能编出 cst.tc**（否则先刷新种子） |
 | **S1（P0）** | `kind: string` → 数值枚举 `NK_*`；新增 `nk_name()`；所有 `if k=="x"` 改 `match(k)`（§4.4.1）；**保留**全部旧字段不删、**新增** `tag` 字段；关键词枚举化（`KwMod`/`KwAttr`/`KwRole`）+ `KwMod::Entry` + `CfgPred` 字段（§4.16.6） | S0 | **有**（`Node` 增字段 → 布局变化） | 低 | 不动点 A 绿；**基线 B 重录**；`conformance` 诊断码不变 |
 | **S2（P0）** | **S2a（前置）：新建 `tools/cstgen.mjs` + `tools/cst_kinds.json`**（§4.3 注）；S2b：由生成器产出分表 `tbl_*` + `NodeRef` + 类型化 `mk_*`；`parse` 双写旧 `Node` 与新分表；新增类型化访问器 `node_X_field` | S1 | **有**（新增全局分表变量） | 中 | 不动点 A 绿；**基线 B 重录**；`hir_test` RAW 计数不变；`cstgen --check` 生成物与清单一致 |
 | **S3（P0）** | 跨切面属性迁到侧表（`node_type/resolve/mod/file/scope`），删 `Node.td` 与全局平行数组；`sema` 查侧表而非节点字段；侧表统一登记 `SideTable{name,owner,dirty}`（§4.5） | S2 | **有**（删字段） | 中 | 不动点 A 绿；**基线 B 重录** |
@@ -842,11 +863,12 @@ lib/std/rc/cst.tc        ← 库模块 std.rc.cst（单一伞模块，pub 导出
   1. 种子/当前编译器先用其内置副本（或冻结快照）产出 `out/lib/std/rc/cst.tlib`；
   2. 再编译 `src/tc.tc` 等（它们 `@import("std.rc.cst")`），链接该 `.tlib`。
 - 与 `docs/reference.md` 的 `tools/build_std.mjs`（std 预编译）同构；`tools/bootstrap.mjs` 在 S0 阶段把「先建 `std.rc.cst.tlib`」纳入前置步骤。
-- 因 `src/base.tc` 等仅作 re-export 垫片，自举 `g1` 的 `.ll` md5 **逐字节不变**（验收同 G2）。
-- **S0 落地清单（与现实文件对齐，易漏三项）**：
-  1. 新建目录 **`lib/std/rc/`**（当前 `lib/std/` 下只有扁平 `*.tc`，**无 `rc/` 子目录**），落 `lib/std/rc/cst.tc`；
-  2. **`tools/build_std.mjs:32` 的 `MODULES` 目前是 `["mem","math"]`**——必须加入 **`"rc.cst"`**，否则 `out/lib/std/rc/cst.tlib`（发布态）与 `.tlibd`（调试态）不会被预编译，消费方 `@import("std.rc.cst")` 在链接模式下直接解析失败；
-  3. 路径映射沿用 `build_std.mjs` 的 `dots_to_slashes` 规则：`std.rc.cst` → **`out/lib/std/rc/cst.tlib`**（多层点路径自然成立，与 `std.mem` → `out/lib/std/mem.tlib` 同构），**不要**退回旧的扁平 `out/lib/<mod>.tlib`。
+- ⚠ **（已证伪并修正）**「因 `src/base.tc` 等仅作 re-export 垫片 ⇒ 自举 `g1` 的 `.ll` md5 **逐字节不变**」**不成立**：跨包库导入经 `mangle_modules` **必然重整**符号（`g_kw_text` → `cst__g_kw_text`），**即便走内联回退也重整**（rule 2 的「IR 不变」只对**入口模块**成立）。故 S0 **必改 IR、必按 §4.10.0 重录基线 B**，判据 A（自举不动点）才是硬门。
+- **S0 落地清单（与现实文件对齐；第 2 项已按实测改写）**：
+  1. 新建目录 **`lib/std/rc/`**（当前 `lib/std/` 下只有扁平 `*.tc`，**无 `rc/` 子目录**），落 `lib/std/rc/cst.tc`；—— ✅ 已完成
+  2. **`tools/build_std.mjs:32` 的 `MODULES` ——暂不加 `"rc.cst"`**（早先设计写「必须加入」，**已按实测推翻**）。原因见 §4.14.7：库模式（a）不发射运行时 shim 声明 → `tll_alloc` undefined；（b）跳过 `t.__ginit` → 带初始化器的全局**永久为零且静默**。在编译器侧补上这两点前，`std.rc.cst` 走**源码内联导入**（无 `.tlib` 时编译器自动内联），**功能与门禁均不受影响**（gate L1 15/0 已验证）。
+     - 已做的**通用化改造**（不改语义、为将来嵌套模块预留）：`MODULES` 支持**点分逻辑名**，由 `dots_to_slashes` 同时推出源路径（`lib/std/rc/cst.tc`）与产物路径（`out/lib/std/rc/cst.tlib`），并 `mkdir -p` 父目录。将来解除阻塞时**只需往 `MODULES` 里加一项**。
+  3. 路径映射沿用 `dots_to_slashes` 规则：`std.rc.cst` → **`out/lib/std/rc/cst.tlib`**（多层点路径自然成立，与 `std.mem` → `out/lib/std/mem.tlib` 同构），**不要**退回旧的扁平 `out/lib/<mod>.tlib`。
 
 ### 4.14.6 与 S1–S8 的关系
 
@@ -864,6 +886,41 @@ lib/std/rc/cst.tc        ← 库模块 std.rc.cst（单一伞模块，pub 导出
   2. **S0b（后置，需先验证）**：`base`/`parse` 的节点池（`nodes[]` / `kids[]` / `g_idecl_*`）**暂缓**搬入 `.tlib`，直至「库全局初始化」被专门验证或支持。候选解法：① 由主程序显式调用库的显式 init 函数（约定名 + 驱动层调用）；② 让链接模式保留并执行库的 `t__ginit`。二者都需要编译器侧改动，**不属 S0 范围**。
 - **工具可读性目标（G9）不受影响**：即便 S0b 未做，`tc fmt` / `tc lint` 仍可 `@import("std.rc.cst")` 引用已搬入的部分；尚未搬入的部分短期内仍走 `src` 内联，G7「共用底层」的**方向**已确立。
 - **IR 必变（再次确认）**：跨包库导入经 `mangle_modules` 把符号重整为 `cst__xxx`（`g_kw_text` → `cst__g_kw_text`）。⚠ 注意 **rule 2 的「IR 逐字节不变」只对入口模块成立**（入口别名 `""` 永不重整）；跨模块 import 库**必然重整**，**即便走内联回退也重整**。故 S0a 就需按 §4.10.0 重录基线。
+
+#### 4.14.7.1 实测证据：库模式的两个失效点（`node tools/build_std.mjs` 直接观测）
+
+> 把 `rc.cst` 加入 `MODULES` 后实测（编译器 `out/dbg/tc.exe`），得到**两条独立证据**，均**可复现**：
+
+```llvm
+; out/lib/std/rc/cst.ll（--lib 产物，节选）
+%cst__kw_lookup.t2 = call ptr @tll_alloc(i64 %cst__kw_lookup.t2.bytes)   ; ← ① 调用了…
+…
+declare i32 @tll_str_eq(ptr, ptr)                                       ; ← 只有按需声明
+@cst__g_kw_text = global [41 x %TStr] zeroinitializer                   ; ← ② 真值全部丢失
+```
+
+| 失效点 | 机制 | 证据 | 后果 |
+|---|---|---|---|
+| ① **shim 声明缺失** | `tll_alloc` / `t_runtime_init` / `t_arena_new` 等由 `src/tir_to_ll.tc::ll_emit_main_wrapper` 发射，首行 `if (g_has_main == false) { return; }`（:4993） | `clang -c` 报 `use of undefined value '@tll_alloc'` | **响亮失败**（链接期中断，不会静默） |
+| ② **全局初始化丢失** | 带初始化器的全局**一律**发成 `zeroinitializer`，真值由 `t.__ginit` 逐元素回填（`g1.ll:662834` 回填、`664915` 定义）；库模式**不发射 `t.__ginit`** | 对比 `g1.ll`（主程序）有 `define void @t.__ginit()` 且含 41×3 条 store，而 `cst.ll`（库）无此函数 | **静默错编**：链接后关键字表恒为全零，`kw_lookup` 恒返回 `""` |
+
+对照组：`std.mem` / `std.math` **无全局状态** ⇒ 两条失效点都不触发 ⇒ 现状预编译安全。**这就是 R-LIB-PURE 的经验来源。**
+
+#### 4.14.7.2 R-LIB-PURE：`.tlib` 模块的准入规则（新增硬规则）
+
+> **规则**：一个模块可被预编译为 `.tlib` 并被链接消费，**当且仅当**它满足：
+> 1. **零初始化全局**——不发任何带初始化器的模块级 `var`/`const`（判据是**发射产物是否依赖 `t.__ginit`**，不是源码看起来是否常量：`const` 同样发 `zeroinitializer`）；
+> 2. **纯/自包含**——不依赖主程序才有的进程级全局（`t_atom_table` / `t_atom_count` / arena）；
+> 3. **可选**：确需堆分配时，须先解除失效点 ①（库模式补发 shim 声明）。
+>
+> **违反后果不对称**：违反 ① ⇒ **静默全零**（最危险，门禁可能照样绿）；违反 ③ ⇒ 链接期报错（安全）。
+> **建议的护栏（未落地，登记为待办）**：在 `--lib` 路径上，对「带初始化器的全局」发**诊断（warning→ 后续可升 error）**或至少在 `build_std.mjs` 里做静态扫描，把静默失败变成响亮失败。
+
+#### 4.14.7.3 S0b 的前置（解锁条件）
+
+S0b（`base`/`parse` 节点池迁入 `.tlib`）**必须先**解决：
+1. **库模式 shim 声明**（小改：`ll_emit_main_wrapper` 的 declare 段抽成 `ll_emit_runtime_declares()`，库模式也调）——**不改动任何成功路径的 IR**，风险低；
+2. **全局静态初始化器发射**（中改：把常量初始化器直接发成 LLVM `global … [ ... ]`，让全局不再依赖 `t.__ginit`）——顺带是主程序优化（省掉 ginit 中每条 store），但**会大幅改变 IR**，须**单独立项 + 整体重录基线 B**，不可与 S0/S1 混在同一提交。
 
 ---
 
