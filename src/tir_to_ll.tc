@@ -364,6 +364,13 @@ pub fn ll_ensure_slot(name: string, st: string) void {
     // 类型退化成 `%TStr = type opaque` + `alloca arr<%TStr x 0>`。
     // 注意：alloca 在序言按名排序发射，早于 STR_AT 处的 i64 请求，
     // 故只能在分配处统一加宽，不能在 STR_AT 处补救。
+    // ⚠ 2026-09-28 修正（KI-006 运行时索引 bug）：f32 槽**绝不**在此加宽。
+    // 曾误将 f32 槽加宽到 i64 以容纳 GEP_IDX 结果指针(ptr,8B)，但同时把真正的
+    // f32 值槽也变成 i64 → load 成 i64 再传给期望 float 的内建(如 __fmt_2) → 值错乱
+    // （literal_demo 的 `single` 打印成 0）。正确修法在序言预扫描（见 tir_to_ll_emit
+    // 第 2 遍开头）：GEP_IDX 的结果槽承载指针，按 `ptr<elem>`(8B) 分配；其余 f32 值
+    // 槽保持 float(4B)，load 仍是 float，不受影响。i64 元素因 ptr<i64> → alloca i64(8B)
+    // 本就容纳指针，不受影响。
     var ast: string = st;
     if (ast == "i1" || ast == "bool" || ast == "i8" || ast == "u8" || ast == "i16" || ast == "u16" || ast == "i32" || ast == "u32") { ast = "i64"; }
     sb_append_str(g_ll, llname.ll_emit_alloca(name, ast));
@@ -878,7 +885,8 @@ pub fn ll_is_int(st: string) bool {
 pub fn ll_is_scalar_st(st: string) bool {
     if (st == "bool" || st == "i1" || st == "i8" || st == "i16" ||
         st == "i32" || st == "i64" || st == "u8" || st == "u16" ||
-        st == "u32" || st == "u64" || st == "f32" || st == "f64") { return true; }
+        st == "u32" || st == "u64" || st == "f32" || st == "f64" ||
+        st == "float" || st == "double") { return true; }
     // 任意位宽整数（AWI）：i<N>/u<N>（N>64，如 i128/u128）也是标量，须被 STORE 宽度换算门禁识别，
     // 否则 `store i128 ..., ptr %x` 被当成非标量跳过 → 高位丢失。
     if ((llname.ll_starts(st, "i") || llname.ll_starts(st, "u")) && base.awi_bits(st) > 64) { return true; }
@@ -886,7 +894,7 @@ pub fn ll_is_scalar_st(st: string) bool {
 }
 
 pub fn ll_is_float(st: string) bool {
-    if (st == "f32" || st == "f64") { return true; }
+    if (st == "f32" || st == "f64" || st == "float" || st == "double") { return true; }
     // 浮点向量（vec<f32 x N> / vec<f64 x N>）：本身是浮点类型，逐元素算术须走 fadd/fmul/fcmp，
     // 不能当整数（否则 emit 出非法的 `add <2 x double>`，链接期即被 LLVM 拒绝）。
     // 与标量对称：vec 的 cast（sitofp/fpext/fptrunc）在 LLVM 中同样合法，宽化无副作用。
@@ -3116,8 +3124,17 @@ pub fn ll_emit_inst(inst: TIRInst) void {
                 } else {
                     var p: string = ll_load(dst, dstst);
                     var v: string = ll_load(src, srcst);
+                    // ⚠ 解引用写穿的目标元素类型必须取 ptr<inner> 的 inner（与 addrslot 分支同构）：
+                    // 否则 store i64 到 i32 元素 / store double 到 float 元素会按源宽写穿、踩坏相邻
+                    // 元素（f32 定长数组元素赋值整行 0；见 KI-006）。仅在源与目标均为标量时换算，
+                    // 聚合/指针值保持原语义。
+                    var wst: string = srcst;
+                    if (ll_is_scalar_st(srcst) && ll_is_scalar_st(inner)) {
+                        v = ll_coerce_scalar(v, srcst, inner);
+                        wst = inner;
+                    }
                     sb_append_str(g_ll, "  store ");
-                    sb_append_str(g_ll, llname.st_to_ll(srcst));
+                    sb_append_str(g_ll, llname.st_to_ll(wst));
                     sb_append_str(g_ll, " ");
                     sb_append_str(g_ll, v);
                     sb_append_str(g_ll, ", ptr ");
@@ -4740,6 +4757,11 @@ pub fn tir_to_ll_emit(module: TIRModule) string {
             var pins: TIRInst = f.body[pscan];
             if (pins.is_comment == false && str_len(pins.dst.name) >= 1 && pins.dst.name[0] == 36) {
                 var pst: string = tir.tir_st_to_str(pins.st);
+                // ⚠ KI-006 修正：GEP_IDX 结果槽承载元素指针(ptr<elem>, 8B)。若按元素类型
+                // （如 f32=4B）分配，后续 `store ptr`(8B) 会写穿窄槽、踩坏相邻栈槽
+                // （循环变量/值）→ 运行时索引数组元素赋值不落盘（读回恒 0）。故此处
+                // 强制按指针宽度分配；其余值槽保持原类型（f32 仍为 float，不被误加宽）。
+                if (pins.op == TIR_OP_GEP_IDX) { pst = base.sb_cat3("ptr<", pst, ">"); }
                 if (str_len(pst) > 0 && pst != "void") {
                     ll_ensure_slot(pins.dst.name, pst);
                 }

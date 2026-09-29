@@ -35,23 +35,31 @@
 
 修复后：**两个示例内核都能执行、rc=0、不再 segfault**（双后端）。
 
-## 剩余拦路（独立 KI · 非 device 子系统范围）
+## 剩余拦路（独立 KI · 非 device 子系统范围）——已修复（KI-006）
 
 示例 host 侧用 `[256]f32` 定长数组初始化并 h2d 拷入。实测 LLVM 后端对**堆分配的定长
 数组元素赋值 `ha[k] = x` 实际不落盘**——读回为 mimalloc 残留模式 `0x200`（≈float
 `1.43e-42`），h2d 因此拷不进真数据，端到端输出对拍失败。纯 host 最小复现
 （`var ha:[256]f32; while{ha[k]=(k as f32)}; print(ha[0])`）即触发，`const=1.5` 等
 字面量打印正常 ⇒ 是 LLVM 后端**堆数组元素 store** 的通用 bug，与本 KI 的 device 代码生成
-无关。该 bug 会同时影响常规程序，需单独立 KI 修复并过 gate 验证。
+无关。
 
-> 注：C 后端在 device 示例上另有独立编译错误（`t_slice_at` 相关），同样需另立 KI，
-> 不在本 KI 范围。
+**该 bug 已于 2026-09-28 由 KI-006 修复**：根因为 `tir_to_ll_emit` 函数入口**序言预扫描**
+对 `GEP_IDX` 结果临时槽按**元素类型**（如 `f32`=4B）分配，但该槽实际承载 8B 元素指针
+（`ptr<float>`），后续 `store ptr`（8B）写穿 4B 槽、踩坏相邻栈槽。修复改为序言预扫描对
+`GEP_IDX` 结果槽按 `ptr<elem>`（8B）分配（详见 `KI-006_f32_heap_array_store.md`）。修复后
+LLVM 后端两个示例均 `rc=0` 且 `hc/ho` 输出与期望逐字节一致。
+C 后端在 `_cpuemu_check` 的 `reduce_atomic` 第二 launch 后仍 segfault（C 后端独立 device
+运行时问题，非 store bug），故两示例仍留 `SMOKE_SKIP`，待 C 后端 device 运行时单独修。
 
 ## 当前处置
 
 - device 代码生成 + 解释器已修（内核可跑、rc=0），作为 KI-005 的**子系统本体**完成。
-- 两个示例因上述独立 LLVM 堆数组 store bug 仍无法端到端对拍，保留在
-  `tools/run_examples.mjs` 的 `SMOKE_SKIP`，理由更新为「host 定长数组元素赋值不落盘」。
+- 两示例的 host 侧 f32 堆数组 store bug 已由 **KI-006** 修复：LLVM 后端现已 `rc=0` 且输出
+  正确；C 后端 `vec_add` 段也正确，但 `_cpuemu_check` 在 `reduce_atomic` 第二 launch 后
+  segfault（C 后端独立 device 运行时问题）。因 `run_examples` 双后端对拍要求两后端都过，
+  两示例仍留 `tools/run_examples.mjs` 的 `SMOKE_SKIP`，理由更新为「KI-006 LLVM 已修，
+  C 后端 device 运行时待齐」。
 - `KI-003` 的 `bitflags` 已修，已从 `SMOKE_SKIP` 移除。
 
 ## 修复验收（分阶段）

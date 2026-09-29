@@ -191,8 +191,14 @@ const SMOKE_SKIP = new Map([
     // 的元素赋值 ha[k]=x 实际不落盘（读回为 mimalloc 残留 0x200），h2d 拷不进真
     // 数据 → 端到端输出对拍失败。此为独立的 LLVM 后端数组 store bug，非 device
     // 子系统范围，单独登记为 KI 待修；修好后从本表移除。
-    ["_cpuemu_check", "KI-005：device 内核已能跑(rc=0)，但 host 定长数组元素赋值在 LLVM 后端不落盘，端到端对拍失败（独立 KI）"],
-    ["vecadd_device_full", "KI-005：同上——host 定长数组元素赋值 LLVM 后端不落盘，hc 对拍失败（独立 KI）"],
+    // KI-006（2026-09-28）已修复 LLVM 后端 f32 堆数组元素 store 不落盘：
+    //   现 LLVM 后端两个示例均 rc=0、hc/ho 输出与期望逐字节一致（host 定长数组
+    //   元素赋值 + h2d 全链路打通）。但 C 后端 _cpuemu_check 在 reduce_atomic 第二
+    //   次 launch 后 segfault（独立 device 运行时问题，非 store bug），vecadd_device_full
+    //   C 后端 rc=0。双后端 run_examples 要求两后端都过，故仍留 SMOKE_SKIP，待 C 后端
+    //   device 运行时单独修。LLVM 单后端覆盖已由 KI-006 验收保证。
+    ["_cpuemu_check", "KI-006：LLVM 后端 f32 堆数组 store 已修(示例 rc=0 输出正确)；C 后端 reduce_atomic 第二 launch 后 segfault（独立 device 运行时问题），双后端待齐"],
+    ["vecadd_device_full", "KI-006：LLVM 后端 rc=0 输出正确；C 后端仍待 device 运行时单独修，双后端待齐"],
 ]);
 
 // 无 @main 的示例是「被别的示例 import 的库模块」：build/run 需要入口，
