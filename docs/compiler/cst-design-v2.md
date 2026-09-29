@@ -188,6 +188,58 @@
 
 ---
 
+## 0.10 S1 实施启动：kind 宇宙普查与枚举化
+
+> 状态：**进行中**。本节记录 S1（§4.4.1 kind 数值化）开工前的**源码实证**与据此改写的方案。
+
+### 0.10.1 普查工具链（先建工具，再动手改码）
+
+| 工具 | 作用 |
+|---|---|
+| `tools/cst_kinds_census.mjs` | 从 `src/*.tc` 抽取四类证据（① `node_new("K")` 产生点 ② `mk_X(` 调用 ③ `.kind == "K"` 判定 ④ `.kind = "K"` 改写），产出清单 **`tools/cst_kinds.json`** |
+| `tools/cstgen.mjs` | 消费清单，生成 `lib/std/rc/cst.tc` 的 `GEN:kinds` 区间（`g_nkn_count` / `node_kind_names` / `NK_*` / `nk_name` / `nk_of_kind` / `is_node_kind`）；`--check` 供门禁断言「生成物 == 清单」（S2a 验收项提前具备） |
+
+### 0.10.2 三个改变方案的实测事实
+
+| # | 事实 | 证据 | 对方案的影响 |
+|---|---|---|---|
+| 1 | **注册表不完整**：`node_kind_names` 只有 86 项，实证 Node kind 有 **105** 项，漏 19 个（`ClauseDead` / `block_expr` / `import_expr` / `variant_lit` / `deserialize` / `conpat` / `bitstr*` / `slice_pat` / `unit_lit` / `typeinfo` …） | census 报告 | 枚举**必须**按实证全集建，否则这些 kind 一律落到 "未注册"，将来 `match(nr_tag)` 分派会出现「全走 unknown 兜底臂」的静默退化 |
+| 2 | **`.kind` 是多个互不相交宇宙共用的字段名**：`Node.kind` / `TypeDesc.kind` / `HvValue.kind` / token kind 混在一起。仅出现在比较式里的 28 个串（`Array` / `Map` / `Void` / `Pointer` / `Slice` …）实为 **TypeDesc.kind**，不是 Node kind | census 分类（按「有无产生点」区分） | 枚举**必须按宇宙隔离**，禁止把 TypeDesc 串并进 `NK_*`——与 §4.4.1 的 `Sym16/32/64(tag)`「不同集合不可比较」**同一原则** |
+| 3 | **9 个 kind 会在构造后被改写**（`n.kind = "block"` / `"ident"` / `"paren"` / `"FuncDecl"` / `"closure_make"` / `"serialize"` / `"deserialize"` / `"ClauseDead"` / `"block_expr"`，共 20 处赋值） | census「构造后改写」表 | **S1 不落地 `tag` 字段**（见 0.10.3 裁定） |
+
+附带事实：`is_node_kind` / `node_kind_names` **零外部消费点**（只有 `src/tc.tc:104` 调一次空的 `init_node_kinds`），注册表实质是**死代码** ⇒ 把它从 86 扩到 105 **零语义风险**，且迁入 `std.rc.cst` 也只影响符号重整。
+
+### 0.10.3 裁定：S1 **不**新增 `Node.tag` 字段（偏离 §4.10.3 原措辞，理由如下）
+
+原方案：S1「新增 `tag` 字段；`Node` 布局变化」。**实施期改为延后到 S2**，理由：
+
+1. **陈旧状态风险**：`tag` 是 `kind` 的**派生值**；既然有 20 处构造后改写 + 3 处 `dst.kind = src.kind` 整节点拷贝，任何一处漏同步 ⇒ `tag` 与 `kind` 不一致，且**不报错**（正是 §1.3 第 7 类「静默错编」）。
+2. **当前零消费者**：字段在 S2 分表落地前无人读取，纯属负担。
+3. **S2 有条件安全落地**：S2 会重写 `mk_*`/节点写入路径，届时可统一收口为 **`node_set_kind(ni, k)`**（同时写 `kind`+`tag`）+ **节点拷贝走 `node_copy()`**，并用 `grep "\.kind = "` 断言「零裸写」——这才是可验证的穷尽性，而不是靠人肉记住 20 处。
+4. **能力无损**：S2 的访问者在进入节点时算一次 `nk_of_kind`（此时 kind 已稳定），之后全整数分派，与原方案的 O(1) 等价。
+
+> 过渡实现取舍：`nk_of_kind` 目前是**线性扫描**（105 次串比较）。原因：t 语言层**没有暴露字符串序比较**（runtime 只有 `tll_str_eq`，无 `strcmp`），无法二分；且它当前只在 `is_node_kind` 内部被调用（死代码路径）。S2 落地 `tag` 后该开销自然消失。
+
+### 0.10.4 本轮改动内容
+
+1. `lib/std/rc/cst.tc` 新增 **`GEN:kinds` 区间**（105 个 kind + `NK_*` 常量 + `nk_name` / `nk_of_kind` / `is_node_kind`），由 `cstgen.mjs` 生成。
+2. `src/base.tc`：删除原 86 项注册表（含 `init_node_kinds` / `is_node_kind`），文件头加 **`pub @import("std.rc.cst" :: *)`** 重导出 —— 与 S0a 的 `lex.tc` 同构，`base.init_node_kinds()`（`src/tc.tc:104`）等引用点**零改动**。
+3. 新增门禁步骤 **`cstkinds`（CST kind 清单一致性，`cstgen --check`）**，紧随 `diagdef` 之后 —— 把「生成物 == 清单」提升为硬不变量，与 `gen_diag --check` 同构。
+4. 验证（全部实测）：
+
+| 步骤 | 结果 |
+|---|---|
+| `tc check src/tc.tc` | ✅ EXIT=0，errors **0**（warnings 291，与改动前同量级；**cst.tc 零告警** → `NK_*` 命名合规） |
+| `dagcheck.mjs` | ✅ OK：9 模块 / 1218 个顶层符号，**无反向引用**（`base → std.rc.cst` 属外部库边，不计入 src DAG） |
+| `cstgen --check` | ✅ OK（105 个 kind，生成物与清单一致） |
+| `gate L0`（改动后首跑） | `boot1` **PASS 175.4s**（新代码能自举）、irverify/llvmverify PASS；**`snapshot` FAIL「3 处不符」**（预期：`src/tc.tc` 的 c/h/ll 三个 md5，因编译器自身代码增量） |
+| 重录基线（g1） | ✅ 117 targets / 354 entries（482.4s）；`git diff` **仅 6 行**：3 行元信息 + `src/tc.tc::c/h/ll` 三条 md5；**其余 114 个目标逐字节未变** |
+| `gate L1` | ✅ **15 passed / 0 failed / 2 skipped**（1505.6s）——含 `自举不动点 (g2==g3)` PASS 346.7s、`conformance` PASS 90.8s、`双轨对拍` PASS 270.5s |
+| 一代收敛 | ✅ `g1.ll == g2.ll == g3.ll`（md5 `16c506c6…`）⇒ 判据 A 绿 |
+| 同步 `cp out/dbg/g1.exe out/dbg/tc.exe` + `gate L0` 复跑 | ✅ **10 passed / 0 failed**（778.4s）⇒ 重录基线在新一代编译器下仍有效 |
+
+---
+
 ## 1. 当前实现剖析（基于真实代码）
 
 ### 1.1 三层「树 / IR」现状
@@ -477,6 +529,19 @@ pub fn mk_binary(op: Sym16("Op"), lhs: NodeRef, rhs: NodeRef, span: Span) NodeRe
 - **与驻留的协同**：同一池内 id 由 intern **从 0 开始密集、连续**分配，跳转表可做到**无空洞紧凑索引**；即便偶发空洞，编译器亦可选取「跳转表 + 二分」混合。相比字符串 `==`（`O(字符长)`）与哈希 `map`（探测开销 + 缓存不友好），整数跳转表是确定 `O(1)` 且缓存友好。
 - **约束**：跳转表优化要求 `match` 分支为**编译期已知整数常量**；跨池 `match`（如把 `Sym16("Op")` 当 `Sym32("Ident")` 比）在类型层已被拒绝，不会进入同一张表。用户扩展的新修饰/属性（`KwMod`/`KwAttr` 增项，§4.15.3）只是向既有整数枚举新增常量分支，自动并入跳转表、零额外成本。
 
+#### 4.4.1.1 R-KIND-UNIVERSE：kind 枚举必须按「宇宙」隔离（S1 普查实证新增）
+
+> **事实**（`tools/cst_kinds_census.mjs` 实证）：`.kind` 这个字段名在 `src/` 里被 **4 个互不相交的宇宙**共用——
+> `Node.kind`（CST 节点，105 项）/ `TypeDesc.kind`（类型：Array / Map / Void / Pointer / Slice …）/ `HvValue.kind`（CTFE 值：HV_INT / HV_F64 …）/ `Tok.t`（token 类型）。
+>
+> **规则**：
+> 1. **一个宇宙 = 一个枚举 = 一个符号池**，禁止把 TypeDesc 串并进 `NK_*`（与 `Sym16/32/64(tag)`「不同集合不可比较」**同一原则**）；
+> 2. 枚举**唯一来源**是 `tools/cst_kinds.json`（实证抽取），**不是**手工维护的 `node_kind_names`——实测后者漏了 19 个真实 Node kind（见 §0.10.2）；
+> 3. 判定某串属于哪个宇宙的**唯一可靠证据是「有无产生点」**（`node_new("K")` / `mk_X(`）。只出现在比较式里的串默认**不属于** Node 宇宙，须人工核定后列入 `cst_kinds_census.mjs` 的 `REWRITE_ONLY_NODE_KINDS`；
+> 4. 生成物与清单的一致性由 `cstgen --check` 断言（S2a 验收项）。
+>
+> **为什么不用运行时类型区分**：这些宇宙在 `t` 里目前都只是 `string`，靠字段名区分只是约定；一旦合成一个枚举，越界值会静默落到 `unknown` 臂 —— 又一处「不崩溃的错编」。
+
 ### 4.5 属性侧表（SoA，keyed by NodeRef）
 
 把当前散落的全局平行数组统一为「以 NodeRef 为键的侧表」。语法树本身不再携带类型/解析/作用域。
@@ -605,7 +670,7 @@ pub struct Span {
 | 阶段 | 动作 | 依赖 | IR 影响 | 风险 | 验收 |
 |---|---|---|---|---|---|
 | **S0（P0，最先做）** | 语法树代码从 `src` 内联迁入 **std 库模块 `std.rc.cst`**（`lib/std/rc/cst.tc`）；`src/base.tc`/`src/lex.tc`/`src/parse.tc` 暂改为 **re-export 垫片**（§4.14.4）；**同时**把 41 项关键字表按 §4.15 拆入 `std.rc.cst.lex`（强制→`Kw*`、其余→`Ident`+`ctx_kw_role`） | 无（`base` 是无 `@import` 的叶子，`lex`→`base`、`parse`→`base`+`lex`，依赖链干净） | **有**（`mangle_modules` 把符号重整为 `cst__xxx`；**即便走内联回退也重整**——rule 2 的「IR 不变」只对**入口模块**成立） | **中**（构建期循环 + 种子约束 + 库全局状态约束 §4.14.7，非原先标的「低」） | 不动点 A 绿；**基线 B 重录**且差异仅为「std 符号外部化」一类预期变化；`lib/std/rc/cst.tc` 建立并经 `@import("std.rc.cst")` 内联导入跑通（**`.tlib` 预编译按 §4.14.7.1 实测暂缓**，`build_std.mjs` 只做点分路径通用化预留）；**CI 用 seed 能编出 cst.tc**（否则先刷新种子） |
-| **S1（P0）** | `kind: string` → 数值枚举 `NK_*`；新增 `nk_name()`；所有 `if k=="x"` 改 `match(k)`（§4.4.1）；**保留**全部旧字段不删、**新增** `tag` 字段；关键词枚举化（`KwMod`/`KwAttr`/`KwRole`）+ `KwMod::Entry` + `CfgPred` 字段（§4.16.6） | S0 | **有**（`Node` 增字段 → 布局变化） | 低 | 不动点 A 绿；**基线 B 重录**；`conformance` 诊断码不变 |
+| **S1（P0）** | ① kind **宇宙普查**（`cst_kinds_census` → `cst_kinds.json`）；② 建 `tools/cstgen.mjs`（`--emit` / `--check`，S2a 前置）；③ `kind: string` → 数值枚举 `NK_*` + `nk_name()` / `nk_of_kind()`，注册表按实证从 86 扩到 **105** 并迁入 `std.rc.cst`；④ **暂不新增 `tag` 字段**（裁定见 §0.10.3：20 处构造后改写 + 3 处整节点拷贝 ⇒ 派生字段易陈旧 ⇒ 延后到 S2，随 `node_set_kind` / `node_copy` 收口）；⑤ 关键词枚举化（`KwMod`/`KwAttr`/`KwRole`）+ `KwMod::Entry` + `CfgPred` 字段（§4.16.6） | S0 | **有**（注册表迁入 cst → 符号重整；**不**改 `Node` 布局） | 低 | 不动点 A 绿；**基线 B 重录**；`conformance` 诊断码不变；`cstgen --check` 通过；`dagcheck` 无反向引用 |
 | **S2（P0）** | **S2a（前置）：新建 `tools/cstgen.mjs` + `tools/cst_kinds.json`**（§4.3 注）；S2b：由生成器产出分表 `tbl_*` + `NodeRef` + 类型化 `mk_*`；`parse` 双写旧 `Node` 与新分表；新增类型化访问器 `node_X_field` | S1 | **有**（新增全局分表变量） | 中 | 不动点 A 绿；**基线 B 重录**；`hir_test` RAW 计数不变；`cstgen --check` 生成物与清单一致 |
 | **S3（P0）** | 跨切面属性迁到侧表（`node_type/resolve/mod/file/scope`），删 `Node.td` 与全局平行数组；`sema` 查侧表而非节点字段；侧表统一登记 `SideTable{name,owner,dirty}`（§4.5） | S2 | **有**（删字段） | 中 | 不动点 A 绿；**基线 B 重录** |
 | **S4（P1）** | 消费者逐步换用访问者（生成的 `node_visit`/`transform`）；**删除旧 `base.Node` 字段**；**删除 re-export 垫片**（§4.14.4），`src` 直接 `@import("std.rc.cst")`；`node_to_hir` 桥切到 `NodeRef` | S3 | **有**（删字段 + 去垫片） | 高 | `hir_test` 穷尽性守住（`node_visit` 分支数 == `NK_*` 数）；gate L2 + nightly 全绿；**基线 B 重录** |
