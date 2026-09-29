@@ -188,6 +188,17 @@ const steps = [
         },
     },
     {
+        // CST kind 枚举由 tools/cstgen.mjs 依 tools/cst_kinds.json 生成。
+        // 手写 kind 表必然与源码实证漂移（实测原 86 项表漏了 19 个真实 kind），
+        // 漂移的表现是「节点落到 unknown 分派臂」——不报错，最难查的一类。
+        // 故把「生成物 == 清单」提升为门禁不变量（见 cst-design-v2 §0.10.1）。
+        id: "cstkinds", lv: 0, name: "CST kind 清单一致性 (cstgen --check)",
+        run: async () => {
+            const r = await node("cstgen.mjs", "--check");
+            return { ok: r.code === 0, note: lastLine(r.out, 2) };
+        },
+    },
+    {
         id: "static", lv: 0, name: "静态检查 (catn + shadow + dag)",
         run: async () => {
             const a = await node("catn_check.mjs");
