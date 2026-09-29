@@ -240,6 +240,67 @@
 
 ---
 
+## 0.11 S1b：上下文关键词下沉（试点批）
+
+> 状态：**进行中**。§4.15 的落地方式经实施期复核后改为**分批下沉**，本节记录第一批的取舍与验收。
+
+### 0.11.1 为什么不能「整表一次性翻转」
+
+`src/parse.tc` 的 99 处 `Kw*` 判定里，有一类是**报错分支**而非消费分支，例如：
+
+```c
+if (t == "KwStruct") {   // 旧式 `Name struct` 已废弃 → 报 T-PAR-E102
+    parse_fatal_at("T-PAR-E102", "... `Name struct` is no longer supported", lex.pos);
+}
+```
+
+若把 `struct` 一并翻成 `Ident`，这些**诊断会静默失效**（旧式写法不再报错，而是被解析成别的东西），
+conformance 的 `fail/` 用例随即转红。故下沉必须**逐词检查「是否与报错分支耦合」**。
+
+### 0.11.2 判定改写规则（本批确立的实现范式）
+
+上下文关键词在词法层已是 `Identifier`，因此 parser 判定**一律改为按词文本、不按 token 类型**：
+
+```c
+- if (lex.cur_t() == "KwPub") {        // 旧：按 token 类型
++ if (lex.cur_v() == "pub") {          // 新：按词文本（两种 token 下都成立）
+```
+
+- `cur_t()=="KwX"` 与 `cur_v()=="x"` 在翻转前**等价**（`Kw*` token 的 `v` 就是该词文本），
+  故改写本身**零行为变化**，可独立验证；翻转只改 `std.rc.cst` 的 `g_kw_tier` 一行数据。
+- 捕获在变量里的（`var t: string = lex.cur_t();` → `t == "KwX"`）需**同时**取文本
+  （`var tv: string = lex.cur_v();` → `tv == "x"`）。⚠ 只在**同一 token 位置**做判定时才成立；
+  跨位置持有 token 类型变量的地方不能这么改。
+
+### 0.11.3 第一批下沉的 4 个词 + 两条排除理由
+
+| 词 | 类别 | 判定点 | 结论 |
+|---|---|---|---|
+| `pub` / `kernel` / `overload` / `extend` | 上下文·修饰 | 全部在**声明起始位消费前缀**（7 处） | ✅ 下沉 |
+
+**排除 `comptime`（必须留强制）**：它在**表达式层**是前缀 `comptime expr`（`parse_primary`），
+与「标识符 `comptime`」在 1-token 前瞻内**不可区分**（`return comptime;` vs `comptime x`）→
+按 §4.15.1 判定规则属强制。（本批最初误列 `comptime`，实施期按此理由剔除。）
+
+**排除类型构造词（`struct`/`enum`/`flag`/`union`/`variant`/`agent`/`type`/`map`…）**：
+它们的判定点里混有**旧式 `Name struct` 报错分支**，须随各自分支一并处理，不属第一批。
+
+### 0.11.4 验收（试点用例 + 门禁）
+
+| 检查 | 结果 |
+|---|---|
+| 试点用例：`var pub/kernel/overload/extend: i32` | 改前 **T-PAR-E101**（expected Identifier）；改后 **0 error** |
+| 目标场景：`struct S { pub: i32; kernel: i32 }` + `s.pub` / `s.kernel` | 改后 **0 error**（§4.15 的「点号后无歧义 ⇒ 降为字段名」落地） |
+| 回归：`pub fn f()` 顶层声明仍可用 | 0 error |
+| 回归：局部 `pub var x` 仍报 **T-MOD-E556** | ✅ 诊断保留（未因下沉而静默失效） |
+| 真实示例 `examples/adt_list.tc` | 0 error |
+| `gate L0`（改动后首跑） | `boot1` PASS 175.4s；**`snapshot` FAIL 仅「3 处」**（= `src/tc.tc::c/h/ll`）⇒ **token 流变化未影响任何 example/test 产物** |
+| 重录基线（g1） | ✅ 117 targets / 354 entries；`git diff` **仍只 6 行**（3 元信息 + src/tc.tc 三条 md5） |
+| `gate L1` | ✅ **16 passed / 0 failed / 2 skipped**（1457.7s）——含不动点 349.6s、conformance 93.3s、双轨对拍 261.1s |
+| 一代收敛 + 同步后 L0 复跑 | ✅ `g1.ll==g2.ll==g3.ll`（`ef3872cd…`）；**L0 11 passed / 0 failed**（879.3s） |
+
+---
+
 ## 1. 当前实现剖析（基于真实代码）
 
 ### 1.1 三层「树 / IR」现状
