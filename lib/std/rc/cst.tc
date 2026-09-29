@@ -37,16 +37,47 @@ pub var g_kw_count: i64 = 41;
 pub var g_kw_text: [41]string = ["fn", "struct", "enum", "flag", "union", "variant", "agent", "var", "const", "let", "comptime", "meta", "type", "if", "else", "match", "when", "for", "while", "break", "continue", "return", "true", "false", "null", "map", "import", "pub", "as", "in", "defer", "void", "unit", "string", "StringBuilder", "auto", "any", "kernel", "overload", "extend", "meta"];
 pub var g_kw_kind: [41]string = ["KwFunc", "KwStruct", "KwEnum", "KwFlag", "KwUnion", "KwVariant", "KwAgent", "KwVar", "KwConst", "KwLet", "KwComptime", "KwMeta", "KwType", "KwIf", "KwElse", "KwMatch", "KwWhen", "KwFor", "KwWhile", "KwBreak", "KwContinue", "KwReturn", "KwTrue", "KwFalse", "KwNull", "KwMap", "KwImport", "KwPub", "KwAs", "KwIn", "KwDefer", "KwVoid", "KwUnit", "KwString", "KwStringBuilder", "KwAuto", "KwAny", "KwKernel", "KwOverload", "KwExtend", "KwMeta"];
 
+// ── S1b：关键词分级表（§4.15 三级分类；与 g_kw_text 严格同序的并行数组）──
+//   "forced" = 强制关键词：lexer 仍发专有 `Kw*` token，歧义位置优先、不可回退为标识符。
+//   "mod"    = 上下文·修饰关键词：lexer 发 **Identifier**，由 parser 按位置识别
+//              （判定一律改按**词文本** `cur_v()`，与 token 类型解耦，见下方 kw_lookup）。
+//   "attr"   = 上下文·属性关键词（align / offset / pack …，尚未引入，预留）。
+// ⚠ 分级按 §4.15.6「三阶段演进」**分批下沉**，不一次性全翻。本批下沉 4 个词：
+//    pub / kernel / overload / extend —— 它们的**全部判定点**都在「声明起始位置消费前缀」，
+//    不与报错分支耦合，且在表达式/语句起始位无前缀歧义。
+// 两条排除理由（后续批次同样要先做这两项检查）：
+//   * **comptime 必须留强制**：它在**表达式层**是前缀 `comptime expr`（parse_primary），
+//     与「标识符 comptime」在 1-token 前瞻内不可区分（`return comptime;` vs `comptime x`）
+//     ⇒ 按 §4.15.1 判定规则属强制。
+//   * 对比 `t == "KwStruct"` 那类**旧式 `Name struct` 报错分支**：整表翻转会让诊断静默失效，
+//     conformance 的 fail/ 用例会红 ⇒ 类型构造词须随各自报错分支一并处理，不本批做。
+//    后续批次见 docs/compiler/cst-design-v2.md §4.15.7。
+pub var g_kw_tier: [41]string = ["forced", "forced", "forced", "forced", "forced", "forced", "forced", "forced", "forced", "forced", "forced", "forced", "forced", "forced", "forced", "forced", "forced", "forced", "forced", "forced", "forced", "forced", "forced", "forced", "forced", "forced", "forced", "mod", "forced", "forced", "forced", "forced", "forced", "forced", "forced", "forced", "forced", "mod", "mod", "mod", "forced"];
 
 pub fn init_keywords() void {
     // 静态定长并行数组已编译期初始化（见 g_kw_count / g_kw_text / g_kw_kind），无需运行时 append 填充。
 
 }
 
+// 取该词的强制 token 名；**上下文关键词返回 ""** ⇒ lexer 发 Identifier（src/lex.tc:723）。
+// 返回 "" 的语义由调用方解释为「普通标识符」，这正是 §4.15 要的下沉。
 pub fn kw_lookup(text: string) string {
     var i: i64 = 0;
     while (i < g_kw_count) {
-        if (g_kw_text[i] == text) { return g_kw_kind[i]; }
+        if (g_kw_text[i] == text) {
+            if (g_kw_tier[i] == "forced") { return g_kw_kind[i]; }
+            return "";
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+// 分级查询（供 fmt / lint / 未来的诊断与补全消费）。
+pub fn kw_tier(text: string) string {
+    var i: i64 = 0;
+    while (i < g_kw_count) {
+        if (g_kw_text[i] == text) { return g_kw_tier[i]; }
         i = i + 1;
     }
     return "";
