@@ -471,11 +471,24 @@ if (n.td > 0) { n.td = -1; }          // ← 写在副本上：从未写回 node
 >
 > gate L2 中与「删结构体字段」直接相关的步骤全部 PASS：**C 后端自举 `cself`**（223s，`tc.c → clang → conformance`）、**MIR 中端优化 differential 四轨**（185s）、**run_examples 双后端并行**（567s）、**自举四代不动点 `g2 == g3 == g4`**（131s）、**difftest 代际/外部对拍**、**rls 快速通道**。
 
-### 0.13.6 S3 剩余子步（待推进）
+### 0.13.7 step3：`node_resolve` 侧表（取代 `g_idecl_n/d`，已落地 ✅）
 
-1. `node_resolve` 迁侧表（ident → 声明），取代 `g_idecl_n/d` 的 last-write-wins 反向扫描（`O(n)` → `O(1)`）。
-2. `node_scope` 迁侧表（取代 `g_seen` 的「append-only + 哨兵 + 反向扫」黑魔法，规避 §4.5 提到的 `-O2` 自别名崩溃）。
-3. **删除原始全局平行数组**（`g_node_mod` / `g_node_file` / `g_idecl_*` / `g_seen` / `g_const_decl_ids`），届时 S3 的「删全局平行数组」验收项闭合 → 进入 S4。
+**等价性论证（先于编码）**：旧 `idecl_set(idn, decl)` 是 last-write-wins 反向扫描——对 `idn` 的多次写入，最终值 = **最后一次 `idecl_set` 调用**的值（命中即原地更新，不重复 append）。改为 `node_resolve[idn] = decl` 直接 O(1) 覆盖写后，同一 `idn` 的多次写入最终值**完全相同** ⇒ 解析结果与旧实现逐字节一致 ⇒ 用户程序 IR 不变。
+
+**事实普查**：`g_idecl_*` 仅 `base.tc` 内部 8 处引用；外部仅经 `idecl_set`/`idecl_get` 包装（sema×2、codegen_c×1、tir×2，均 `base.`-前缀），无文件直接读 `g_idecl_n/d`。
+
+**落地**：
+- `base.tc` 新增侧表 `pub var g_node_resolve: []i64`（默认 -1），登记第 3 张内置侧表 `node_resolve`（owner `S3`）；新增访问器 `node_resolve(id)`（越界返回 -1）/ `node_set_resolve(id, decl)`。
+- `node_new` 同步 `append(g_node_resolve, -1)`，与 `nodes` 严格平行（并行安全前提同 §0.13.4，未变）。
+- **删除** `g_idecl_n` / `g_idecl_d` 全局 + `idecl_set` / `idecl_get` 函数；5 处调用点重命名为 `base.node_set_resolve` / `base.node_resolve`（编译期可捕获遗漏）。`sema_idecl_infer_idents` 等函数名保留（仅语义函数，非全局）。
+
+**验证（待后台自举确认）**：`tc check` EXIT=0 / 0 errors；自举不动点 `g2.ll==g3.ll`；基线重录差异**仅** `src/tc.tc::{c,h,ll}`（编译器自身源变化），**非编译器目标 IR 变化 = 0**（等价性铁证）。
+
+### 0.13.8 S3 剩余子步（待推进）
+
+1. `node_scope` 迁侧表（取代 `g_seen` 的「append-only + 哨兵 + 反向扫」黑魔法，规避 §4.5 提到的 `-O2` 自别名崩溃）。⚠ **高风险**：`g_seen` 在 `codegen_c.tc` 有 28 处、按**发射序**工作、且注释自陈「当前帧内名字本就唯一 → mangle 恒为空操作」，被 `-O2` 自别名红线两次绊倒；迁 `node_scope[]` 需重建作用域树，非纯搬迁，单独评审。
+2. `g_const_decl_ids` → `node_const[]` 侧表（「const 声明集合」成员判定，parse×4 + sema×1）。
+3. **删除原始全局平行数组**（`g_node_mod` / `g_node_file` / `g_seen` / `g_local_decls` / `g_conpat_binds` / `g_const_decl_ids`），届时 S3 的「删全局平行数组」验收项闭合 → 进入 S4（消费方切 `u64 NodeRef`）。
 
 ---
 

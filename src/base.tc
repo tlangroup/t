@@ -1755,6 +1755,7 @@ pub var g_cur_mod: string;              // 解析期当前模块别名（load_mo
 pub var g_node_mod: []string;           // 与 nodes 平行的数组：nodes[i] 所属模块别名（"" = 入口）
 pub var g_node_file: []string;          // 与 nodes 平行的数组：nodes[i] 所属源文件（多模块编译单元下诊断定位用）
 pub var g_node_td: []i64;               // S3 §4.5 node_type 侧表：nodes[i] 的 HIR 类型槽 TD 索引（0 = 未定型；-1 = 已丢弃）
+pub var g_node_resolve: []i64;          // S3 §4.5 node_resolve 侧表：ident 节点 i 解析到的声明节点（替代 g_idecl_* 反向扫描，O(1)）
 
 // ── S3（§4.5）：侧表登记 + provenance 侧表读取面 ──────────────────────────────
 // 跨切面属性统一登记 SideTable{name,owner,dirty}，PassManager 据 name 建拓扑与置脏。
@@ -1779,6 +1780,7 @@ pub fn sidetable_init() void {
     g_st_inited = true;
     sidetable_register("node_provenance", "S3");
     sidetable_register("node_type", "S3");
+    sidetable_register("node_resolve", "S3");
 }
 pub fn node_mod(id: i64) string {
     sidetable_init();
@@ -1803,6 +1805,21 @@ pub fn node_set_type(id: i64, td: i64) void {
     slice_set(g_node_td, id, td);
 }
 
+// ── node_resolve 侧表（§4.5）：取代 g_idecl_n/g_idecl_d 平行数组 + last-write-wins 反向扫描 ──
+// ident 节点 i → 其解析到的声明节点。sema 解析标识符时写 node_set_resolve(i, decl)，
+// 后端发射标识符时读 node_resolve(i) 反查（得到被 shadow 的正确声明）。
+// 等价性：旧 idecl_set 的「反向扫描命中即更新」==「对 node_resolve[i] 直接 O(1) 覆盖写」——
+// 同一 i 的多次写入最终值均为最后一次调用的值，故解析结果与旧实现逐字节一致（用户 IR 不变）。
+pub fn node_resolve(id: i64) i64 {
+    sidetable_init();
+    if (id < 0 || id >= slice_len(g_node_resolve)) { return -1; }
+    return g_node_resolve[id];
+}
+pub fn node_set_resolve(id: i64, decl: i64) void {
+    if (id < 0 || id >= slice_len(g_node_resolve)) { return; }
+    slice_set(g_node_resolve, id, decl);
+}
+
 pub struct Child {
     val: i64;
     next: i64;
@@ -1811,32 +1828,11 @@ pub struct Child {
 pub var kids: []Child;
 
 // ident 节点 → 其解析到的声明节点（支持同作用域重名 shadowing：后端按声明唯一命名）。
-// sema 解析标识符时写入；后端发射标识符时反查，得到正确的（被 shadow 的）声明。
-pub var g_idecl_n: []i64;
-pub var g_idecl_d: []i64;
-pub fn idecl_set(idn: i64, decl: i64) void {
-    // last-write-wins：同标识符节点在语义分析期可能被多次访问（不同作用域），
-    // 须以「最后/最内层作用域」的解析为准——那才是 shadowing 下实际生效的声明。
-    // 首次写入版的 bug：节点若在「重声明之前的作用域」被首次访问就定死成旧声明，
-    // 导致循环体等位置的引用错误指向未唯一化的旧声明（tc.c 报 undeclared identifier）。
-    var n: i64 = slice_len(g_idecl_n) as i64;
-    var i: i64 = n - 1;
-    while (i >= 0) {
-        if (g_idecl_n[i] == idn) { g_idecl_d[i] = decl; return; }
-        i = i - 1;
-    }
-    append(g_idecl_n, idn);
-    append(g_idecl_d, decl);
-}
-pub fn idecl_get(idn: i64) i64 {
-    var n: i64 = slice_len(g_idecl_n) as i64;
-    var i: i64 = n - 1;
-    while (i >= 0) {
-        if (g_idecl_n[i] == idn) { return g_idecl_d[i]; }
-        i = i - 1;
-    }
-    return -1;
-}
+// S3 §4.5：原 g_idecl_n/g_idecl_d 平行数组 + last-write-wins 反向扫描已迁为节点 id
+// 键控的 node_resolve[] 侧表（见上方声明 + 上方 node_resolve()/node_set_resolve()）。
+// 等价性：idecl_set 的「反向扫描命中即更新」等价于「对 node_resolve[id] 直接 O(1) 覆盖写」——
+// 同一 id 的多次写入最终值均为最后一次调用的值，故解析结果与旧实现逐字节一致。
+// sema 解析标识符时调 node_set_resolve(id, decl)；后端发射标识符时调 node_resolve(id) 反查。
 
 // 后端：同函数内重名局部变量唯一化命名（shadowing 支持）。
 //
@@ -1959,6 +1955,7 @@ pub fn node_new(kind: string) i64 {
     append(g_node_mod, g_cur_mod);   // provenance：记录本节点所属模块别名（"" = 入口）
     append(g_node_file, g_file);      // provenance：记录本节点所属源文件（load_module_file 内 g_file 已切到该模块文件）
     append(g_node_td, 0);             // S3 §4.5 node_type 侧表：默认未定型（0），由 sema/tir 经 node_set_type 写入
+    append(g_node_resolve, -1);       // S3 §4.5 node_resolve 侧表：默认 -1（未解析到声明）
     append(g_node_nref, 0);            // S2 双写：与 nodes[] 按 id 对齐的平行 NodeRef 数组（默认 0 = 未登记）
     return (slice_len(nodes) as i64) - 1;
 }
