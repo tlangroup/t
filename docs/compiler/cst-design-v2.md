@@ -303,7 +303,7 @@ conformance 的 `fail/` 用例随即转红。故下沉必须**逐词检查「是
 
 ## 0.12 S2 实施：NodeRef 双写落地 + 种子递归根因实证
 
-> 状态：**S2 pilot 已落地并达成自举不动点**；**S2b（种子语义分析失控递归）已修复**（见 §0.12.5），全量铺开（per-kind `tbl_*` + `cst_register_*`）现已可在修复后种子下推进。
+> 状态：**S2 全量铺开已落地并达成自举不动点**——91 kind 的 `tbl_*` SoA 切片 + `cst_register_*` 双写登记 + 92 个 `mk_*` 挂接，经 `tools/cst_rollout.mjs` + `tools/cstgen.mjs` 生成并接线；**S2b（种子失控递归）已修复**（见 §0.12.5）。C 后端固定点 `C_b==C_c` 已达成（genB/genC `tc.h`/`tc.c` 逐字节 `SAME`，详见 §0.12.6）。
 
 ### 0.12.1 根因纠正（推翻「通用种子递归 bug」旧结论）
 
@@ -393,10 +393,15 @@ sema__check_func_decl_ex → … → sema__infer_expr_hir → sema__cs_if → se
 - **150 个压力全局**：修复种子 `FIXED_STRESS150_EXIT=1`（普通语义错 `T-PAR-E101`，parser 约束，与 sema 无关），**无栈溢出** → 修复可扩展到远超全量 S2 规模。
 - **自举不动点零回归**：修复种子同样达成 `C_b==C_c`（`SAME/SAME`，`S2 SELF-HOST FIXED POINT REACHED`，经由 `tools/fb_fixed.sh`：`sed 's#tc.exe#tc_new.exe#' tools/fb_bash.sh` 用 `out/dbg/tc_new.exe` 作 gen0）→ 证明 S2b 修复**零 IR 分化**。
 
+**S2 全量铺开（已落地 ✅，本会话）**：
+- 由 `tools/cst_rollout.mjs` 自动抽取 `src/base.tc` 全部 **92 个 `mk_*`** 的字段 schema（同一 kind 多构造器如 `pointer` 的 `mk_pointer`/`mk_dev_ptr` 取**字段并集**、缺失字段补类型默认值），写出 `tools/cst_nodes.json`（**91 个 kind**）。
+- `tools/cstgen.mjs` 据此生成 `base.tc` 的 `GEN:node-structs` 区：每个 kind 一组 `tbl_<RecK>_<field>` 逐字段 typed 全局切片 + `Rec<K>` 结构 + `cst_register_<RecK>(...)` 双写登记 + `cst_get_<RecK>(i)` 读取。
+- `cst_rollout.mjs` 向 92 个 `mk_*` 注入 `cst_register_<RecK>(...)` 调用（统一锚定在 `return id;` 前、独立成行、幂等），达成双写；旧 `nodes[]` 仍是真相源，分表为其 SoA 镜像。
+- **验证**：修复后种子 `out/dbg/tc_new.exe` 编译含全量 SoA 的 `src/tc.tc` → **EXIT=0 / 0 errors**（此前 S1b 种子在此规模必崩）；3 代自举 `tools/fb_fixed.sh` → genB/genC `tc.h`/`tc.c` 逐字节 `SAME`，`S2 SELF-HOST FIXED POINT REACHED`（tc.c 均 **2,399,955** 字节）→ **零 IR 分化**。
+
 **后续待办**：
-1. **全量铺开**：105 kind 的 `tbl_<kind>_<field>` 切片 + `cst_register_X` 生成 + 92 个 `mk_*` 双写挂接（本 pilot 仅含 `g_node_nref`，未挂接）。S2b 已修复，现在可在种子下编译有意义的 S2 增补。
-2. **重录基线 + 跑 gate L0/L1**（按 §4.10.2 序列），合并到 `wb/main` 触发 CI。
-3. **同步修复后种子**：`out/dbg/tc_new.exe`（含 S2b 循环断路器）= 当前有效种子，需决定是否替换 `out/dbg/tc.exe` 或提交为新的 `ci/seed`。
+1. **重录基线 + 跑 gate L0/L1**（按 §4.10.2 序列，LLVM 后端权威固定点 `g2.ll==g3.ll==g4.ll` 复核），合并到 `wb/main` 触发 CI。
+2. **同步修复后种子**：将自举产物（`out/fb/genB/g2.exe`，与 genC 逐字节等价的 S2 编译器）替换为 `out/dbg/tc.exe` 或提交为新的 `ci/seed`。
 
 ---
 

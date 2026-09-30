@@ -98,22 +98,56 @@ if (!existsSync(NODES_MANIFEST)) {
   process.exit(2);
 }
 const NM = JSON.parse(readFileSync(NODES_MANIFEST, "utf8"));
+
+function recName(kind) {
+  return kind.split("_").map((s) => (s.length ? s[0].toUpperCase() + s.slice(1) : s)).join("");
+}
+
 const NL = [];
 NL.push(NODES_BEGIN);
-NL.push(`// ── S2 pilot：按 kind 分表（struct-of-arrays）的运行时子集 ──`);
-NL.push(`// 仅落地与 nodes[] 按 id 对齐的平行 NodeRef 数组 g_node_nref（默认 0 = 未登记），`);
-NL.push(`// 及 per-kind 的 SoA 逐字段 typed 全局切片 tbl_*（声明预留，登记函数延后 S2b）。`);
-NL.push(`// 全部落在主程序模块 base.tc（§4.14.7：库模块跳过 t__ginit，可变全局会被静默清零）。`);
-NL.push(`// 注：per-kind 的 SoA 逐字段 typed 全局切片 tbl_* 暂未生成——S1b 种子编译器在 base.tc`);
-NL.push(`// 内声明约 10+ 个切片类型全局变量时会陷入语义分析失控递归（实证见 §0.12），故延后到`);
-NL.push(`// S2b 修种子后铺开。当前仅建立与 nodes[] 按 id 对齐的平行 NodeRef 数组 g_node_nref`);
-NL.push(`// （node_new 双写保证正确），足以验证双写机制；cst_nref_of 为校验读取接口。`);
+NL.push(`// ── S2：按 kind 分表（struct-of-arrays）的运行时子集 ──`);
+NL.push(`// 由 tools/cstgen.mjs 依据 tools/cst_nodes.json 生成：每个 kind 一组`);
+NL.push(`// 逐字段独立 typed 全局切片 tbl_<RecK>_<field> + Rec<K> 结构 + cst_register_<RecK> 双写登记`);
+NL.push(`// + cst_get_<RecK> 读取。运行时可变全局刻意落在主程序模块 base.tc（§4.14.7：库模块`);
+NL.push(`// 跳过 t__ginit，可变全局会被静默清零）。旧 nodes[] 仍是真相源，本区为其 SoA 镜像。`);
+NL.push(``);
+NL.push(`// 平行 NodeRef 数组 g_node_nref（默认 0 = 未登记），node_new 双写保证正确。`);
 NL.push(`pub var g_node_nref: []u64;`);
-NL.push(`// 校验双写：给定旧节点 id，返回其新分表 NodeRef；未登记（pilot 外 / 尚未登记）返回 0。`);
 NL.push(`pub fn cst_nref_of(id: i64) u64 {`);
 NL.push(`    if (id < 0 || id >= slice_len(g_node_nref)) { return 0; }`);
 NL.push(`    return g_node_nref[id];`);
 NL.push(`}`);
+NL.push(``);
+let genKinds = 0;
+for (const kind of NM.pilot) {
+  const spec = NM.nodes[kind];
+  if (!spec) continue;
+  const R = spec.rec;
+  const fields = spec.fields || []; // [[name, type], ...]
+  if (!R) continue;
+  genKinds++;
+  // 逐字段 typed 全局切片 + Rec<K> 结构（仅当有字段）
+  if (fields.length > 0) {
+    for (const [f, t] of fields) NL.push(`pub var tbl_${R}_${f}: []${t};`);
+    NL.push(`pub struct ${R} {`);
+    for (const [f, t] of fields) NL.push(`    ${f}: ${t};`);
+    NL.push(`}`);
+  }
+  // 双写登记：mk_* 在创建节点后调用，按创建顺序 append（零字段 kind 退化为 no-op）
+  const sig = fields.map(([f, t]) => `${f}: ${t}`).join(", ");
+  NL.push(`pub fn cst_register_${R}(${sig}) void {`);
+  for (const [f] of fields) NL.push(`    append(tbl_${R}_${f}, ${f});`);
+  NL.push(`}`);
+  // 读取（仅当有字段）
+  if (fields.length > 0) {
+    NL.push(`pub fn cst_get_${R}(i: i64) ${R} {`);
+    NL.push(`    var r: ${R};`);
+    for (const [f] of fields) NL.push(`    r.${f} = tbl_${R}_${f}[i];`);
+    NL.push(`    return r;`);
+    NL.push(`}`);
+  }
+  NL.push(``);
+}
 NL.push(NODES_END);
 const nodesBlock = NL.join("\n");
 
