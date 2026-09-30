@@ -301,6 +301,105 @@ conformance 的 `fail/` 用例随即转红。故下沉必须**逐词检查「是
 
 ---
 
+## 0.12 S2 实施：NodeRef 双写落地 + 种子递归根因实证
+
+> 状态：**S2 pilot 已落地并达成自举不动点**；**S2b（种子语义分析失控递归）已修复**（见 §0.12.5），全量铺开（per-kind `tbl_*` + `cst_register_*`）现已可在修复后种子下推进。
+
+### 0.12.1 根因纠正（推翻「通用种子递归 bug」旧结论）
+
+前序总结曾断言「S1b 种子存在通用 LLVM 发射 / 语义分析失控递归 bug（约 10 个全局切片即触发）」。经实证**证伪**：
+
+| 验证 | 命令（种子 = `out/dbg/tc.exe`，S1b） | 结果 |
+|---|---|---|
+| 还原 `src/base.tc` 到 HEAD（`d573dbb`）后全量编译 | `tc.exe check src/tc.tc` | **EXIT=0**（291 warnings / 0 errors） |
+| 结论 | 种子本身无通用递归 bug；崩溃确由 S2 新增代码触发 | — |
+
+### 0.12.2 真实触发规律（12 轮隔离实证，`out/_probe/iso*.py` + `mini_*.tc`）
+
+对 base.tc 逐项叠加 / 剥离 S2 组件，精确定位种子在**全程序编译**语境下的失控递归（崩溃码 `EXIT=127` / `0xC00000FD` / `3221225725` = Windows `STATUS_STACK_OVERFLOW`）：
+
+| 组件组合 | 结果 |
+|---|---|
+| `CstTables` 10 字段结构体（单独） | OK |
+| `mk_noderef` / `Span` / `mk_span` 辅助函数（单独） | OK |
+| `cst_register_binary` / `cst_nref_of` 任一函数（单独） | OK |
+| 3 个裸全局切片（单独） | OK |
+| 全局结构体（切片字段）+ 1~2 函数 | OK |
+| 全局结构体 + **5 函数** | **CRASH** |
+| 全局结构体 + 6 个 reg 函数 | **CRASH** |
+| **10 个裸全局切片 + 1 函数** | **CRASH** |
+| 仅 `g_node_nref` + `node_new` 内 `append`（MIN_gnref_only） | OK |
+| 上述 + 9 个 `tbl_*` 裸全局切片 | **CRASH**（与 1 函数共存即越阈值） |
+| `mini_base.tc`（小文件，struct+funcs） | **OK（不复现）** |
+
+**结论**：S1b 种子在**全程序编译**时，对 import 模块 `base.tc` 携带「全局结构体（切片字段）+ ~5 函数」或「~10+ 切片类型全局声明 + 函数」的组合陷入语义分析失控递归（栈溢出）。与具体语句（裸全局 / 结构体字段、索引读写、`append`、`slice_len`、`mk_noderef` 调用）**无关**——本质是**声明数量 / 组合阈值效应**。该 bug **不在最小程序上复现**，属种子全程序 / 跨模块语义分析缺陷，**须修种子才能根治**（即 S2b）。
+
+### 0.12.3 已落地的最小可编译 S2 设计（彻底绕过种子 bug）
+
+- **`src/base.tc`（GEN:node-structs 区间）**：仅
+  ```c
+  pub var g_node_nref: []u64;            // 与 nodes[] 按 id 对齐的平行 NodeRef 数组（默认 0 = 未登记）
+  pub fn cst_nref_of(id: i64) u64 {      // 校验双写：旧节点 id → 新分表 NodeRef；未登记返回 0
+      if (id < 0 || id >= slice_len(g_node_nref)) { return 0; }
+      return g_node_nref[id];
+  }
+  ```
+  并在 `node_new`（约 263 行，`append(g_node_file, g_file)` 之后）双写：
+  ```c
+  append(g_node_nref, 0);   // S2 双写：与 nodes[] 按 id 对齐；当前全写 0（未登记）
+  ```
+  **不含** `CstTables` 结构体 / `cst_register_*` / 辅助函数。
+- **`tools/cstgen.mjs`（目标 2）**：改为生成**逐字段独立 typed 全局切片**（符合 §4.14.7「逐字段独立 typed 切片」语义）；当前仅生成 `g_node_nref`，`tbl_*` 与 `cst_register_*` 生成代码注释标注「延后 S2b 修种子后铺开」。
+- **行为保持**：因 `parse.tc` 从未挂接 `cst_register_*`，旧 IR 零变化；当前双写写入的全是 0，纯验证机制，不引入语义差异。
+
+**验证**：`seed check src/tc.tc` → **EXIT=0**；`seed compile src/tc.tc --emit-c` → **EMIT_EXIT=0**（产出 `tc.c` 2.3MB + `tc.h`）。
+
+### 0.12.4 自举不动点（关键门禁，已达成 ✅）
+
+用种子作 gen0 验证 S2 自举（C 后端固定点 `C_b == C_c`）：
+
+- `tools/fb.mjs`：node 版，逻辑正确但 `execFileSync` 在 Windows 上对 `tc.exe` 触发 `EBUSY`（errno -4082，文件锁），**未采用**。
+- `tools/fb_bash.sh`：**bash 驱动版**（直接 spawn `tc.exe` 与 `clang`，绕开 node EBUSY），注入 `ensureMsvcEnv()` 的 `LIB`/`INCLUDE`，链接用 `-Wl,/STACK:268435456`（**去掉 `/LARGEADDRESSAWARE`**——lld-link 将其误解析为输入文件导致链接失败）。
+
+运行结果：
+```
+gen1: SEED   -> g1.exe   (emit rc=0, link rc=0)
+gen2: g1     -> g2.exe   (emit rc=0, link rc=0)
+gen3: g2     -> g3.exe   (emit rc=0, link rc=0)
+genB/tc.h : SAME
+genB/tc.c : SAME
+S2 SELF-HOST FIXED POINT REACHED
+```
+产物位于 `out/fb/gen{A,B,C}/`。这证明 S2 双写脚手架**不引入任何 IR 分化且编译器可自举**。
+
+> 注：项目规范的权威固定点是 LLVM 后端 `g2.ll==g3.ll==g4.ll`；本分支 S2 pilot 以 C 后端固定点 `C_b==C_c` 验证（确认 C 路径零分化 + 自举可达）。S2b（种子失控递归）**已修复**（见 §0.12.5），修复后种子同样达成 `C_b==C_c` 固定点。
+
+### 0.12.5 S2b 根因与修复记录（已落地 ✅）
+
+**根因（实证定位，推翻「通用种子递归 bug」与「声明数量阈值」旧结论）**：`src/sema.tc` 中 `infer_expr`（HIR 表达式类型推断）与 `ie_sub`（取操作数定义指令）形成**相互递归**——`ie_sub` 无条件 `return infer_expr(fb)`，`infer_expr` 在多数 kind 分支调用 `ie_sub(ei,0,n.na)`；当 HIR 的 **def-use 图存在回边（环）** 时无限 / 极深递归 → `STATUS_STACK_OVERFLOW`（`EXIT=127` / `0xC00000FD` / `3221225725`）。此前误判为「声明数量 / 组合阈值效应」，实为 **def-use 成环**；ASan（512MB 栈）构建在同样压力输入下**完成（RC=0）**，印证递归有限但极深（深度随环规模增长）。ASan 调用链确认：
+```
+sema__check_func_decl_ex → … → sema__infer_expr_hir → sema__cs_if → sema__check_stmt_hir
+  → … → sema__ie_sub ⇄ sema__infer_expr   (数千次重复)
+```
+
+**修复（循环断路器，只切真环、不误伤 DAG 共享操作数）**：
+- 新增全局 `var g_infer_on: []i64;`（推理中标记）。
+- `infer_expr` 入口：置 `g_infer_on[e]=1`，`defer { g_infer_on[e]=0; }`（覆盖所有 return / 脱糖自调用出口）。
+- 新增守卫 `ie_infer(fb)`：若 `g_infer_on[fb]==1`（def-use 成环）返回 `Unknown` 切断递归；否则 `return infer_expr(fb)`。
+- 将 `ie_sub*` / `infer_expr_hir` 等**全部调用站点**的 `infer_expr(fb)` 改为 `ie_infer(fb)`（仅 `ie_infer` 体内保留 `infer_expr(fb)` 避免自递归）；`cs_if` 处 `if (fb >= 0) { return ie_infer(fb); }` 同步改守卫。最终 grep 核验：仅 `ie_infer` 体内（~5441 行）保留 `infer_expr(fb)`，其余 11 处调用站点（5450/5455/5464/5470/5482/5489/5501/5509/7900 等）均为 `ie_infer(fb)`。
+
+**验证**：
+- **14 个压力全局**：旧种子 `EXIT=127`（崩）；修复种子 `FIXED_STRESS_EXIT=0`，**291 warnings / 0 errors（与 pristine 完全一致）**。
+- **150 个压力全局**：修复种子 `FIXED_STRESS150_EXIT=1`（普通语义错 `T-PAR-E101`，parser 约束，与 sema 无关），**无栈溢出** → 修复可扩展到远超全量 S2 规模。
+- **自举不动点零回归**：修复种子同样达成 `C_b==C_c`（`SAME/SAME`，`S2 SELF-HOST FIXED POINT REACHED`，经由 `tools/fb_fixed.sh`：`sed 's#tc.exe#tc_new.exe#' tools/fb_bash.sh` 用 `out/dbg/tc_new.exe` 作 gen0）→ 证明 S2b 修复**零 IR 分化**。
+
+**后续待办**：
+1. **全量铺开**：105 kind 的 `tbl_<kind>_<field>` 切片 + `cst_register_X` 生成 + 92 个 `mk_*` 双写挂接（本 pilot 仅含 `g_node_nref`，未挂接）。S2b 已修复，现在可在种子下编译有意义的 S2 增补。
+2. **重录基线 + 跑 gate L0/L1**（按 §4.10.2 序列），合并到 `wb/main` 触发 CI。
+3. **同步修复后种子**：`out/dbg/tc_new.exe`（含 S2b 循环断路器）= 当前有效种子，需决定是否替换 `out/dbg/tc.exe` 或提交为新的 `ci/seed`。
+
+---
+
 ## 1. 当前实现剖析（基于真实代码）
 
 ### 1.1 三层「树 / IR」现状
