@@ -1130,9 +1130,9 @@ pub fn tir_expr_td(e: i64) i64 {
     }
     // v3 §5.3：优先读 HIR 类型槽（sema 一次性填入），避免每次重推导 + 影子表反推。
     // ⚠ 缓存值须做越界检查：node.td 可能取自更大 sema.tds 上下文的残留索引，直接返回会毒化下游 sema.tds[td] 索引。
-    var cached_td: i64 = base.nodes[e].td;
+    var cached_td: i64 = base.node_type(e);
     if (cached_td > 0 && cached_td < slice_len(sema.tds) as i64) { return cached_td; }
-    if (cached_td > 0) { base.nodes[e].td = -1; }   // 越界缓存：丢弃，回落下方重新推导
+    if (cached_td > 0) { base.node_set_type(e, -1); }   // 越界缓存：丢弃，回落下方重新推导
     var n: Node = base.nodes[e];
     var d: i64 = -1;
     // 变体构造器调用 V_from_C：直接返回变体 TD，绕过 meta_type_of_expr。
@@ -1184,7 +1184,7 @@ pub fn tir_expr_td(e: i64) i64 {
     }
     // ⚠ 越界 TD 索引掩盖（潜伏缺陷）：resolve_type_desc 偶发返回越界索引，须拦下，否则下游 sema.tds[td] panic。
     if (d >= slice_len(sema.tds) as i64) { d = -1; }
-    if (d > 0) { base.nodes[e].td = d; }   // 回填类型槽：后续查询走槽而非影子表
+    if (d > 0) { base.node_set_type(e, d); }   // 回填类型槽：后续查询走槽而非影子表
     return d;
 }
 
@@ -1195,8 +1195,11 @@ pub fn tir_expr_st(e: i64) string {
     // 局部/形参：优先读 HIR 类型槽（S1 预标注已填），影子表 `g_local_sts` 仅兜底
     if (kd == "ident") {
         // ⚠ 缓存的 node.td 须越界检查；越界则丢弃并回落影子表 g_local_sts（持有本模块真实发射类型）。
-        if (n.td > 0 && n.td < slice_len(sema.tds) as i64) { return tir_st_of_td(n.td); }
-        if (n.td > 0) { n.td = -1; }
+        var ntd: i64 = base.node_type(e);
+        if (ntd > 0 && ntd < slice_len(sema.tds) as i64) { return tir_st_of_td(ntd); }
+        // ⚠ 严格等价说明：原 `n.td = -1` 写在 `var n: Node = base.nodes[e]` 的**值拷贝**上，从未写回
+        // nodes[]（且此后不再读 n.td），故无实际效果；迁侧表时不得升级为 node_set_type，否则改变行为。
+        // 越界缓存的真正回收点在上方 tir_expr_td 顶部（base.node_set_type(e, -1)），语义已对齐。
         var idx: i64 = tir_find_local_idx(n.sa);
         if (idx >= 0) {
             // 影子表理论上同步（tir_new_named_slot 四表同时 append），此处为防御性上界保护。
@@ -1561,7 +1564,7 @@ pub fn tir_annotate_types(mod: string) void {
             }
             // ⚠ 越界检查：resolve_type_desc 偶发返回越界 TD 索引，缓存后会毒化下游 sema.tds[td] 索引 → panic。
             // 越界则不写槽，让发射期回落 meta_type_of_expr / 影子表（与基线行为一致）。
-            if (rtd >= 0 && rtd < slice_len(sema.tds) as i64) { base.nodes[i].td = rtd; }
+            if (rtd >= 0 && rtd < slice_len(sema.tds) as i64) { base.node_set_type(i, rtd); }
         }
         i = i + 1;
     }

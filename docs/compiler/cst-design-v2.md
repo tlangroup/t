@@ -407,6 +407,78 @@ sema__check_func_decl_ex → … → sema__infer_expr_hir → sema__cs_if → se
 
 ---
 
+## 0.13 S3 实施：跨切面属性迁侧表（`provenance` → `node_type`）
+
+> 目标（§4.10.3 / §4.5）：**跨切面属性迁到侧表**（`node_type/resolve/mod/file/scope`），删 `Node.td` 与全局平行数组；`sema` 查侧表而非节点字段；侧表统一登记 `SideTable{name,owner,dirty}`。
+> 执行策略：**按属性拆分子步**（每个子步独立验证 + 独立提交），避免一次性大改触发自举回归（§4.10.3 注的教训）。
+
+### 0.13.1 step1：provenance 侧表登记 + 读取面路由（已落地 ✅）
+
+- `base.tc` 落地 §4.5 的登记设施：`struct SideTable{name,owner,dirty}` + `pub var g_sidetables` + `sidetable_register(name, owner)`。
+- **provenance**（节点所属模块/文件）成为第一张登记的内置侧表，表名 `node_provenance`（owner `S3`）；存储仍复用既有平行数组 `g_node_mod`/`g_node_file`（与 `nodes[]` 按 id 对齐）。
+- 读取面新增访问器 `node_mod(id)` / `node_file(id)`；外部消费方（parse/sema/tir/tir_to_ll 共 ~13 处）从 `base.g_node_mod[X]` / `base__g_node_mod[X]` 改走访问器。**存储全局暂保留**，待全部属性迁完后统一删除（避免半途断链）。
+- 验证：`tc check src/tc.tc` EXIT=0 / 0 errors；自举不动点 `g2.ll == g3.ll`（md5 `016de6df…`，48,659,619 B）；基线重录 354 条目，差异**仅** `src/tc.tc::{c,h,ll}`；`gate L1` **16 passed / 0 failed**。
+- 提交 `b78f9fd`。
+
+### 0.13.2 step2：`Node.td` → `node_type` 侧表 + 删除字段（已落地 ✅）
+
+**先做事实普查，再动手**（避免被「同名不同结构体」误导）：全局 `\.td` 有 **33 处**引用，但其中真正属于 `Node.td` 的只有 **7 处**——其余是 `MIRGlobal.td` / `TMIRGlobal.td` / `TIRGlobal.td` 等**同名但不同结构体**的字段，以及注释。真正的 `Node.td` 面其实极小：
+
+| 类别 | 位置 | 迁移后 |
+|---|---|---|
+| 字段声明 | `base.tc` `struct Node` | **删除** `td: i64` |
+| 初始化 | `base.tc` `node_new` 的 `n.td = 0` | `append(g_node_td, 0)` |
+| 写回 | `tir.tc` `tir_expr_td` 回填 / `S1` 预标注 / 越界丢弃 | `base.node_set_type(...)` |
+| 读 | `tir.tc` `tir_expr_td` 缓存早返回 / `tir_expr_st` ident 分支 | `base.node_type(...)` |
+
+- 新增侧表 `pub var g_node_td: []i64`（0 = 未定型；> 0 = TD 索引；-1 = 已丢弃），并登记第 2 张内置侧表 `node_type`（owner `S3`）；`sidetable_init()` 幂等登记 `node_provenance` + `node_type` 两张，供后续 PassManager 建依赖拓扑（§4.12）。
+- 至此 **语法树不再携带类型**——跨切面类型属性由侧表以节点 id 为键持有，`Node` 布局与下游阶段解耦。
+
+### 0.13.3 一处「无效写」的等价性处置（重要，勿在这个坑上顺手「修」）
+
+`tir_expr_st` 的 ident 分支原有：
+
+```tc
+var n: Node = base.nodes[e];          // ← 值拷贝，不是引用
+if (n.td > 0 && n.td < slice_len(sema.tds) as i64) { return tir_st_of_td(n.td); }
+if (n.td > 0) { n.td = -1; }          // ← 写在副本上：从未写回 nodes[]
+```
+
+`n` 是 `base.nodes[e]` 的**值拷贝**，且此后不再读 `n.td` ⇒ `n.td = -1` **完全没有实际效果**（作者意图应是清掉越界缓存，但写错了对象）。
+**迁移时不得顺手把它升级为 `node_set_type(e, -1)`**——那会真的写回并改变缓存回收行为，把一个纯搬迁变成一次语义改动。本步的做法是**删除该无效写并就地注释说明**；越界缓存的真正回收点在 `tir_expr_td` 顶部（`base.node_set_type(e, -1)`），两处语义已对齐。
+
+> 教训：重构阶段发现疑似 bug，**默认按严格等价搬迁**，把 bug 连同处置理由写进注释单独提 issue；不要夹带修复（否则这轮验证里复现的指标变化无法归因）。
+
+### 0.13.4 并行安全前提（必须先证明）
+
+侧表与 `nodes[]` 必须**严格等长**，否则下标错位 → **不崩溃的静默错编**（最难查的一类）。已核查并满足：
+
+- `append(nodes, n)` 在全仓**唯一**（`base.tc` 的 `node_new`），故在它之后同步 `append(g_node_td, 0)` 即保证平行；
+- `nodes` **无**整体赋值 / 截断 / 清空（grep `nodes = ` 无真命中，`g_vf_nodes` 是另一个变量）；
+- 其余 88 处 `slice_set(nodes, ...)` 为**原地更新**，不改变长度。
+
+### 0.13.5 验证
+
+| 判据 | 结果 |
+|---|---|
+| `tc check src/tc.tc` | EXIT=0 / **0 errors** |
+| 判据 A：自举不动点 | `g2.ll == g3.ll` md5 **`0ab64e81ede7d3cd1a8f2d79efae7383`**（48,659,438 B） |
+| 判据 B：基线重录 | 354 条目；**changed = 仅 `src/tc.tc::{c,h,ll}`，ADDED = 0，REMOVED = 0** |
+| **非编译器目标 IR 变化** | **0** |
+| 门禁 | **`gate L2` 24 passed / 0 failed**（2689s） |
+
+> 「非编译器目标 IR 变化 = 0」是本次搬迁的**等价性铁证**：删掉 `Node.td` 后，全部 examples / conformance / tests 的 IR **逐字节不变**——即「编译器自身的 IR 变了（源变了），但它编出来的任何成品都没变」。
+>
+> gate L2 中与「删结构体字段」直接相关的步骤全部 PASS：**C 后端自举 `cself`**（223s，`tc.c → clang → conformance`）、**MIR 中端优化 differential 四轨**（185s）、**run_examples 双后端并行**（567s）、**自举四代不动点 `g2 == g3 == g4`**（131s）、**difftest 代际/外部对拍**、**rls 快速通道**。
+
+### 0.13.6 S3 剩余子步（待推进）
+
+1. `node_resolve` 迁侧表（ident → 声明），取代 `g_idecl_n/d` 的 last-write-wins 反向扫描（`O(n)` → `O(1)`）。
+2. `node_scope` 迁侧表（取代 `g_seen` 的「append-only + 哨兵 + 反向扫」黑魔法，规避 §4.5 提到的 `-O2` 自别名崩溃）。
+3. **删除原始全局平行数组**（`g_node_mod` / `g_node_file` / `g_idecl_*` / `g_seen` / `g_const_decl_ids`），届时 S3 的「删全局平行数组」验收项闭合 → 进入 S4。
+
+---
+
 ## 1. 当前实现剖析（基于真实代码）
 
 ### 1.1 三层「树 / IR」现状
