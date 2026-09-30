@@ -799,12 +799,18 @@ fn main() i32 @main {
         }
         parse.parse_unit();
         if (is_lib) { base.g_cur_mod = ""; }
+        file_write_all("out/dbg/_phase.log", "run_check\n");
         sema.run_check();
+        file_write_all("out/dbg/_phase.log", "run_check_done\n");
         sema.run_device_check();
+        file_write_all("out/dbg/_phase.log", "device_check_done\n");
         comptime_fold.comptime_fold_pass();
+        file_write_all("out/dbg/_phase.log", "comptime_done\n");
         sema.meta_trace_flush();
         sema.flag_pass();
+        file_write_all("out/dbg/_phase.log", "flag_done\n");
         sema.ann_pass();
+        file_write_all("out/dbg/_phase.log", "ann_done\n");
         if (sema.has_errors()) {
             base.emit_diags();
             return 1;
@@ -849,9 +855,13 @@ fn main() i32 @main {
             out_ext = ".s";
         } else if (backend == "tir") {
             // S5 新轨（--backend tir 时进入）：sema → TIR → LLVM，结构化翻译（无文本 round-trip，§5.3/§5.6 合规）
+            file_write_all("out/dbg/_phase.log", "lower_start\n");
             tir.lower_unit(mod2, src_file);
+            file_write_all("out/dbg/_phase.log", "lower_done\n");
             tir.tir_verify_module();
+            file_write_all("out/dbg/_phase.log", "verify_done\n");
             lltext = tir_to_ll.tir_to_ll_emit(tir.g_mod);
+            file_write_all("out/dbg/_phase.log", "emit_done\n");
             out_text = lltext;
 
             out_text = lltext;
@@ -917,8 +927,14 @@ fn main() i32 @main {
         //   clang 错误）。缺失时直接报可操作诊断。
         var deps_lib: string = base.sb_cat3("out/", mode, "/deps/t_runtime.lib");
         var use_lib: bool = sema.path_exists(deps_lib);
-        var opt: string = "-O2";
-        if (mode == "dbg") { opt = "-O0 -gcodeview"; }
+        // ⚠ dbg 也走 -O2（保留 -gcodeview 供调试符号）：tir_to_ll 发射的 IR 采用全栈分配
+        // （每个局部一个 alloca）且无尾调用消除；编译器自举编译自身巨型 src/tc.tc 时 -O0
+        // 帧过大、深递归无 TCO ⇒ 爆栈（exit 127 / STATUS_STACK_OVERFLOW）。-O2 折叠尾递归后
+        // 4GB 预留栈绰绰有余。
+        // 发射产物 .ll 由发射器逻辑决定，与宿主编译器优化级别无关（已验证 -O0/-O2 发射
+        // 逐字节一致），故提高 dbg 优化级不影响任何 IR 快照 / 示例 / conformance 结果。
+        var opt: string = "-O2 -gcodeview";
+        if (mode == "rls") { opt = "-O2"; }
         var csb2: StringBuilder = sb_new();
         sb_append_str(csb2, "\"");
         sb_append_str(csb2, clang_p);

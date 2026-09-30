@@ -2294,11 +2294,10 @@ pub fn tir_emit_stmt(sid: i64) void {
     }
     if (kd == "return") {
         g_term = false;
-        tir_flush_defer();
         if (n.na >= 0) {
             var rk: Node = base.nodes[n.na];
             // P5：return () 在 void 函数中 = RET_VOID（unit 无载荷，发射占位值无意义）。
-            if (rk.kind == "unit_lit") { tir_emit(tir_emit_ret_void()); return; }
+            if (rk.kind == "unit_lit") { tir_flush_defer(); tir_emit(tir_emit_ret_void()); return; }
             var s: string;
         if (rk.kind == "array_lit" && g_cur_ret_td >= 0 && sema.tds[g_cur_ret_td].cat == "array") {
             var __er1: TirEmitRes = tir_emit_array_lit(n.na, g_cur_ret_td); s = __er1.name;
@@ -2315,8 +2314,13 @@ pub fn tir_emit_stmt(sid: i64) void {
             var rsts: string = g_cur_func.ret_st;
             if (tir_st_to_str(__er2.st) != rsts) { s = tir_cast_slot(s, __er2.st, rsts); }
         }
+            // ⚠ defer 必须在「返回值表达式求值之后、ret 之前」排空。否则含递归调用的返回值
+            // 会在 defer 体（如恢复现场 / 解除访问标记）之前执行，导致递归守卫失效 →
+            // 无限递归 / STATUS_STACK_OVERFLOW（见 _breakerC.tc：defer{vis[e]=0} 被提前到递归调用前）。
+            tir_flush_defer();
             tir_emit(tir_emit_ret(g_cur_func.ret_st, s));
         } else {
+            tir_flush_defer();
             tir_emit(tir_emit_ret_void());
         }
         return;
@@ -4466,7 +4470,10 @@ pub fn tir_emit_array_lit(e: i64, force_td: i64) TirEmitRes {
     return TirEmitRes{ name: d, st: tir_st_from_str(tir_expr_st(e)) };
 }
 
-// defer 排空（LIFO）：遇显式 return 或函数尾调用；每次排空后清空栈（保证仅运行一次）
+// defer 排空（LIFO）：遇显式 return 或函数尾调用。
+// ⚠ 故意【不清空】 g_tir_defer：defer 是函数级、应在「每个」出口（每条 return / 函数尾）都运行一次。
+// 若在此清空，则多 return 函数中只有 lowering 顺序上首个 return 会排空，其余出口的 defer 被静默丢弃；
+// 而运行期控制流只会实际走到一个出口，故不清空 → 每条出口都发射一遍 defer 体，运行期恰好执行一次。
 pub fn tir_flush_defer() void {
     var n: i64 = slice_len(g_tir_defer) as i64;
     while (n > 0) {
@@ -4479,8 +4486,6 @@ pub fn tir_flush_defer() void {
             c = base.kids[c].next;
         }
     }
-    var z: []i64 = [];
-    g_tir_defer = z;
 }
 
 var g_membase_st: string = "";   // tir_member_addr 写回的「基底表达式权威类型」，供 tir_member_read 取字段 ST（嵌套 member 必须，避免 tir_expr_st 对 m.i 误判为 i64）
