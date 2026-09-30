@@ -5430,15 +5430,28 @@ pub fn ie_mis(ei: i64, fb: i64) void {
     }
 }
 
-// S2b：def-use 遍历的循环断路器。ie_sub* 系列在取操作数定义指令后会调用
-// ie_infer(fb)；若 fb 当前正在被推理（g_infer_on[fb] == 1，即 def-use 图成环），
-// 直接返回 Unknown 切断失控递归。marker 由 infer_expr 在进入/退出时置位与清零（defer）。
+// S2b：def-use 遍历的循环断路器。
+// 关键坑：t 的 LLVM 后端对**递归函数内的 `defer`** 发射错误——清理语句被提前执行（在子递归
+// 调用前就把标记清零），导致真环检测失效、self-host 编译自身大源时无限递归栈溢出
+// （exit 127 / 0xC00000FD）。故**禁用 defer**，改用 `infer_expr` 包装层在 body 返回后显式
+// 清零（语义等价于正确实现的 defer）。标记存于全局切片 `g_infer_on`（与 C 后端一致，已验证
+// 正确）；首入一次性预扩到 base.nodes 长度 + 8M 余量，递归中不再 realloc，避免切片重分配
+// 造成已置位标记丢失（LLVM 后端对全局切片重分配敏感）。
 var g_infer_on: []i64;
+var g_rec_depth: i64 = 0;
 pub fn ie_infer(fb: i64) i64 {
     if (fb < 0) { return ti_mk("Unknown"); }
-    while (slice_len(g_infer_on) <= fb) { append(g_infer_on, 0); }
-    if (g_infer_on[fb] == 1) { return ti_mk("Unknown"); }
-    return infer_expr(fb);
+    if (fb < slice_len(g_infer_on) && g_infer_on[fb] == 1) { return ti_mk("Unknown"); }
+    g_rec_depth = g_rec_depth + 1;
+    if (g_rec_depth == 50000 || g_rec_depth == 100000 || g_rec_depth == 150000
+        || g_rec_depth == 200000 || g_rec_depth == 250000) {
+        var kd: string = "?";
+        if (fb >= 0 && fb < slice_len(base.nodes)) { kd = base.nodes[fb].kind; }
+        eprint("REC@ie_infer depth=" + base.i2s(g_rec_depth) + " fb=" + base.i2s(fb) + " kind=" + kd);
+    }
+    var r2: i64 = infer_expr(fb);
+    g_rec_depth = g_rec_depth - 1;
+    return r2;
 }
 
 pub fn ie_sub(ei: i64, k: i64, fb: i64) i64 {
@@ -5907,13 +5920,48 @@ pub fn g_modval_get(name: string) string {
 }
 
 pub fn infer_expr(e: i64) i64 {
-    // S2b 循环断路器：进入推理链即置位 g_infer_on[e]，函数退出（含所有 return / 脱糖自调用）
-    // 经 defer 清零；故「同一节点被共享多次引用（合法 DAG 复用）」不会被误伤——只有真正的
-    // 嵌套环（def-use 图成环）才被下方 ie_infer 切断。
+    // S2b 循环断路器（LLVM 后端安全版，关键修复见 g_infer_on 声明处注释）。
+    // 包装层：进入置位标记、调用 body、返回前显式清零。**严禁使用 defer**——
+    // t 的 LLVM 后端对递归函数内的 defer 发射错误（清理被提前执行），会导致标记在子递归前
+    // 被清零、真环检测失效、self-host 时无限递归栈溢出（exit 127 / 0xC00000FD）。
     if (e < 0) { return ti_mk("Unknown"); }
-    while (slice_len(g_infer_on) <= e) { append(g_infer_on, 0); }
-    g_infer_on[e] = 1;
-    defer { g_infer_on[e] = 0; }
+    // 首入（g_infer_on 尚空）时一次性预扩标记切片（base.nodes 长度 + 8M 余量覆盖脱糖新增
+    // 节点），之后不再 append/realloc，避免切片底层数据指针重分配造成已置位标记丢失。
+    // 注意：用 `== 0` 门控而非每入重查 base.nodes——base.nodes 在推理中会随脱糖增长，
+    // 若每入重查会触发递归中 realloc，丢失已置位标记。
+    if (slice_len(g_infer_on) == 0) {
+        var cap: i64 = slice_len(base.nodes) + 8000000;
+        while (slice_len(g_infer_on) < cap) { append(g_infer_on, 0); }
+    }
+    if (e >= slice_len(g_infer_on)) {
+        // 越界（脱糖新增节点超出预扩余量，极罕见）：跳过标记，放弃该点环检测。
+        return infer_expr_body(e);
+    }
+    // 循环断路器（LLVM 后端安全版，关键修复见 g_infer_on 声明处注释）。
+    // 清零策略：仅当本调用「首次置位」该节点标记时才负责清零（锁所有权语义），与正确实现的
+    // `defer` 等价；但 t 的 LLVM 后端对递归函数内 `defer` 发射错误（清理被提前执行），故用
+    // 显式「所有权」模拟。关键不变量：脱糖自重入 `return infer_expr(e)` 复用同一 e（标记已由
+    // 外层置位），内层 owned==0 不得清零——否则会抹掉仍在推理中的祖先链标记，使经 `ie_infer`
+    // 回指祖先的环检测失效 → 无限递归栈溢出（exit 127 / 0xC00000FD）。
+    var owned: i64 = 0;
+    if (g_infer_on[e] == 0) {
+        g_infer_on[e] = 1;
+        owned = 1;
+    }
+    g_rec_depth = g_rec_depth + 1;
+    if (g_rec_depth == 50000 || g_rec_depth == 100000 || g_rec_depth == 150000
+        || g_rec_depth == 200000 || g_rec_depth == 250000) {
+        var kd: string = "?";
+        if (e >= 0 && e < slice_len(base.nodes)) { kd = base.nodes[e].kind; }
+        eprint("REC@infer_expr depth=" + base.i2s(g_rec_depth) + " e=" + base.i2s(e) + " kind=" + kd);
+    }
+    var r: i64 = infer_expr_body(e);
+    g_rec_depth = g_rec_depth - 1;
+    if (owned == 1) { g_infer_on[e] = 0; }
+    return r;
+}
+
+pub fn infer_expr_body(e: i64) i64 {
     var n: Node = base.nodes[e];
     // ── 模块值 / 变体字面量 脱糖（在 hir_tag 派发前，避免新节点 kind 落入默认分支）──
     if (n.kind == "variant_lit") {
