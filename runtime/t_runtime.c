@@ -1795,7 +1795,7 @@ static void sym_htab_rehash(struct TSymPool* p) {
     mi_free(old);
 }
 
-uint32_t t_sym_intern(TStr tag, TStr str, int64_t bits) {
+uint64_t t_sym_intern(TStr tag, TStr str, int64_t bits) {
     struct TSymPool* p = sym_pool_for(tag, bits, 1);
     uint64_t h = sym_hash(str.ptr, str.len);
     int64_t idx = (int64_t)(h & (uint64_t)(p->htab_cap - 1));
@@ -1803,7 +1803,7 @@ uint32_t t_sym_intern(TStr tag, TStr str, int64_t bits) {
         int64_t id = p->htab[idx] - 1;
         if (p->ent_len[id] == str.len &&
             (str.len == 0 || memcmp(p->bytes + p->ent_off[id], str.ptr, (size_t)str.len) == 0))
-            return (uint32_t)id;
+            return (uint64_t)id;
         idx = (idx + 1) & (p->htab_cap - 1);
     }
     // 新字符串：写入 bytes（必要时 realloc；entries 存偏移，移动安全）
@@ -1827,16 +1827,17 @@ uint32_t t_sym_intern(TStr tag, TStr str, int64_t bits) {
     }
     int64_t id = p->ent_count;
     if (bits == 16 && id >= 65535) t_fatal("sym: Sym16 pool overflow (>65535 strings)");
+    if (bits == 64 && id >= 9223372036854775807LL) t_fatal("sym: Sym64 pool overflow (>2^63 strings)");
     p->ent_off[id] = off;
     p->ent_len[id] = str.len;
     p->ent_count++;
-    p->htab[idx] = (int32_t)(id + 1);
+    p->htab[idx] = id + 1;
     p->htab_used++;
     if (p->htab_used * 10 >= p->htab_cap * 7) sym_htab_rehash(p);
-    return (uint32_t)id;
+    return (uint64_t)id;
 }
 
-TStr t_sym_str(TStr tag, uint32_t id) {
+TStr t_sym_str(TStr tag, uint64_t id) {
     struct TSymPool* p = sym_pool_for(tag, 32, 0);
     if (!p || (int64_t)id >= p->ent_count) { TStr e; e.ptr = (const uint8_t*)""; e.len = 0; return e; }
     TStr r; r.ptr = p->bytes + p->ent_off[id]; r.len = p->ent_len[id]; return r;

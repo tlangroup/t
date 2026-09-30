@@ -145,8 +145,12 @@ void*   tll_map_val_at(TMap* m, int64_t i)              { return t_map_val_at(m,
 
 // ── Sym ────────────────────────────────────────────────────────
 // 聚合参数(TStr)按指针传入；返回聚合(string)用末位 out 指针；返回标量(id)直接返回。
-uint32_t tll_sym_intern(TStr* tag, TStr* str, int64_t bits)  { return t_sym_intern(*tag, *str, bits); }
-void     tll_sym_str(TStr* tag, uint32_t id, TStr* out)      { *out = t_sym_str(*tag, id); }
+// 16/32 位 Sym 走 tll_sym_intern/tll_sym_str（i32 id，与既有 IR 契约一致）；
+// 64 位 Sym 走 tll_sym_intern64/tll_sym_str64（i64 id）。
+uint32_t tll_sym_intern(TStr* tag, TStr* str, int64_t bits)  { return (uint32_t)t_sym_intern(*tag, *str, bits); }
+uint64_t tll_sym_intern64(TStr* tag, TStr* str, int64_t bits){ return t_sym_intern(*tag, *str, bits); }
+void     tll_sym_str(TStr* tag, uint32_t id, TStr* out)      { *out = t_sym_str(*tag, (uint64_t)id); }
+void     tll_sym_str64(TStr* tag, uint64_t id, TStr* out)    { *out = t_sym_str(*tag, id); }
 void     tll_sym_release(TStr* tag)                          { t_sym_release(*tag); }
 void     tll_sym_release_all(void)                           { t_sym_release_all(); }
 

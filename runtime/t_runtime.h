@@ -187,8 +187,8 @@ void    t_map_concat_into(TMap* a, TMap* b, TMap* out); // 灌入已建好的 ou
 //   sym_release_all()  —— 释放所有池
 // 池内存独立 malloc/free，不走 arena，以支持运行期真正回收；
 // 一个轻量全局注册表（Symbols）按 tag 索引所有池，仅用于查找/释放，不在热路径分配。
-uint32_t t_sym_intern(TStr tag, TStr str, int64_t bits);  // 驻留字符串→id（去重；bits=16/32 校验上限）
-TStr     t_sym_str(TStr tag, uint32_t id);                // id→字符串（无效 id 返回空串）
+uint64_t t_sym_intern(TStr tag, TStr str, int64_t bits);  // 驻留字符串→id（去重；bits=16/32/64 校验上限）
+TStr     t_sym_str(TStr tag, uint64_t id);                // id→字符串（无效 id 返回空串）
 void     t_sym_release(TStr tag);                         // 释放该 tag 整池
 void     t_sym_release_all(void);                         // 释放所有池
 

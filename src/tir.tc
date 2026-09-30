@@ -989,6 +989,7 @@ pub fn tir_st_of_td(td: i64) string {
     if (t.cat == "optional") { return base.sb_cat3("ptr<", tir_st_of_td(t.elem), ">"); }  // Stage 1 opt.boxed
     if (t.cat == "sym") {
         if (t.alen == 16) { return "u16"; }
+        if (t.alen == 64) { return "u64"; }
         return "u32";
     }
     if (t.cat == "typeinfo" || t.cat == "fieldinfo") { return "ptr<void>"; }
@@ -1997,6 +1998,11 @@ pub fn tir_emit_ginit() void {
                         var st16: string = tir_tmp();
                         tir_emit(tir_e_cast(TIR_OP_TRUNC, "i16", st16, sidv));
                         tir_emit(tir_emit_store(st16, base.sb_cat2("@", nm)));
+                    } else if (gst == "i64" || gst == "u64") {
+                        // 64 位：intern 结果（i64）直接 store 进 @nm（声明为 i64，两侧同宽）。
+                        var sidv: string = tir_tmp();
+                        tir_emit(tir_e_call("i64", sidv, "@sym_intern64", tir_cargs3(tagslot, valslot, bitsslot)));
+                        tir_emit(tir_emit_store(sidv, base.sb_cat2("@", nm)));
                     } else {
                         // 32 位：intern 结果先落临时槽（translator 的 `call` 解析器不支持
                         // 全局 DST —— toks[2] 以 '@' 开头会被当成 callee）。再 store 进全局；
@@ -2222,6 +2228,9 @@ pub fn tir_emit_stmt(sid: i64) void {
                 var st16: string = tir_tmp();
                 tir_emit(TIRInst{ op: TIR_OP_TRUNC, st: tir_st_from_str("i16"), dst: tir_op(st16), args: tir_a1(sidv), is_comment: false, line: g_cur_line, cmt: "" });
                 tir_emit(TIRInst{ op: TIR_OP_STORE, st: ST_NONE, dst: tir_op(slot), args: tir_a1(st16), is_comment: false, line: g_cur_line, cmt: "" });
+            } else if (st == "i64" || st == "u64") {
+                // 64 位：intern 结果（i64）直接写进变量槽（call 的 DST=slot），绕开 translator store 的窄化 trunc。
+                tir_emit(TIRInst{ op: TIR_OP_CALL, st: tir_st_from_str("i64"), dst: tir_op(slot), args: tir_a4("@sym_intern64", tagslot, valslot, bitsslot), is_comment: false, line: g_cur_line, cmt: "" });
             } else {
                 tir_emit(TIRInst{ op: TIR_OP_CALL, st: tir_st_from_str("i32"), dst: tir_op(slot), args: tir_a4("@sym_intern", tagslot, valslot, bitsslot), is_comment: false, line: g_cur_line, cmt: "" });
             }
@@ -2768,7 +2777,12 @@ pub fn tir_emit_assign(n: Node, est: i64) TirEmitRes {
                     var lst: string = g_local_sts[idx];
                     var sidv: string = g_local_slots[idx];
                     if (lst == "i16" || lst == "u16") { sidv = tir_tmp(); }
-                    tir_emit(TIRInst{ op: TIR_OP_CALL, st: tir_st_from_str("i32"), dst: tir_op(sidv), args: tir_a4("@sym_intern", tagslot, rhs, bitsslot), is_comment: false, line: g_cur_line, cmt: "" });
+                    if (lst == "i64" || lst == "u64") {
+                        // 64 位：intern 结果（i64）直接写进变量槽（call 的 DST=slot）。
+                        tir_emit(TIRInst{ op: TIR_OP_CALL, st: tir_st_from_str("i64"), dst: tir_op(sidv), args: tir_a4("@sym_intern64", tagslot, rhs, bitsslot), is_comment: false, line: g_cur_line, cmt: "" });
+                    } else {
+                        tir_emit(TIRInst{ op: TIR_OP_CALL, st: tir_st_from_str("i32"), dst: tir_op(sidv), args: tir_a4("@sym_intern", tagslot, rhs, bitsslot), is_comment: false, line: g_cur_line, cmt: "" });
+                    }
                     if (lst == "i16" || lst == "u16") {
                         var st16: string = tir_tmp();
                         tir_emit(TIRInst{ op: TIR_OP_TRUNC, st: tir_st_from_str("i16"), dst: tir_op(st16), args: tir_a1(sidv), is_comment: false, line: g_cur_line, cmt: "" });
