@@ -1738,7 +1738,9 @@ pub struct Node {
     la: i64;
     lb: i64;
     lc: i64;
-    td: i64;    // HIR 类型槽：表达式节点的 TD 索引（sema 一次性填入；0 = 未定型）。v3 §2：消除 ll_etd/expr_type_desc 重推导的根因
+    // S3（§4.5）：原 `td`（HIR 类型槽）已迁出为属性侧表 `g_node_td`，访问面走
+    // `node_type()` / `node_set_type()`。语法树不再携带类型——跨切面属性改由侧表
+    // 以节点 id 为键持有，降低 Node 布局与下游阶段的耦合（替换前：`td: i64`）。
     ln: u64;    // anchor token 行（诊断用；0 = 无）
     cl: u64;    // anchor token 列
     tv: string; // anchor token 文本（endCol = col + len(tv)）
@@ -1752,6 +1754,7 @@ pub var nodes: []Node;
 pub var g_cur_mod: string;              // 解析期当前模块别名（load_module_file 内设置）
 pub var g_node_mod: []string;           // 与 nodes 平行的数组：nodes[i] 所属模块别名（"" = 入口）
 pub var g_node_file: []string;          // 与 nodes 平行的数组：nodes[i] 所属源文件（多模块编译单元下诊断定位用）
+pub var g_node_td: []i64;               // S3 §4.5 node_type 侧表：nodes[i] 的 HIR 类型槽 TD 索引（0 = 未定型；-1 = 已丢弃）
 
 // ── S3（§4.5）：侧表登记 + provenance 侧表读取面 ──────────────────────────────
 // 跨切面属性统一登记 SideTable{name,owner,dirty}，PassManager 据 name 建拓扑与置脏。
@@ -1769,14 +1772,35 @@ pub fn sidetable_register(name: string, owner: string) i64 {
     append(g_sidetables, SideTable{name: name, owner: owner, dirty: false});
     return slice_len(g_sidetables) - 1;
 }
+// 惰性登记全部内置侧表（幂等，首次访问任一访问器时触发）：
+// PassManager 后续按 SideTable.name 建依赖拓扑与失效（§4.12 owns/requires）。
+pub fn sidetable_init() void {
+    if (g_st_inited) { return; }
+    g_st_inited = true;
+    sidetable_register("node_provenance", "S3");
+    sidetable_register("node_type", "S3");
+}
 pub fn node_mod(id: i64) string {
-    if (g_st_inited == false) { g_st_inited = true; sidetable_register("node_provenance", "S3"); }
+    sidetable_init();
     if (id < 0 || id >= slice_len(g_node_mod)) { return ""; }
     return g_node_mod[id];
 }
 pub fn node_file(id: i64) string {
     if (id < 0 || id >= slice_len(g_node_file)) { return ""; }
     return g_node_file[id];
+}
+
+// ── node_type 侧表（§4.5）：取代已删除的 `Node.td` 字段 ──────────────────────
+// 语义与原字段一致：0 = 未定型；> 0 = TD 索引（读取方仍须做上界检查）；
+// -1 = 缓存被判定越界并丢弃（回落重推导）。此处为纯搬迁，不改变任何行为。
+pub fn node_type(id: i64) i64 {
+    sidetable_init();
+    if (id < 0 || id >= slice_len(g_node_td)) { return 0; }
+    return g_node_td[id];
+}
+pub fn node_set_type(id: i64, td: i64) void {
+    if (id < 0 || id >= slice_len(g_node_td)) { return; }
+    slice_set(g_node_td, id, td);
 }
 
 pub struct Child {
@@ -1931,10 +1955,10 @@ pub fn node_new(kind: string) i64 {
     n.ln = 0;
     n.cl = 0;
     n.tv = "";
-    n.td = 0;    // HIR 类型槽：默认未定型，sema 在类型检查期写入
     append(nodes, n);
     append(g_node_mod, g_cur_mod);   // provenance：记录本节点所属模块别名（"" = 入口）
     append(g_node_file, g_file);      // provenance：记录本节点所属源文件（load_module_file 内 g_file 已切到该模块文件）
+    append(g_node_td, 0);             // S3 §4.5 node_type 侧表：默认未定型（0），由 sema/tir 经 node_set_type 写入
     append(g_node_nref, 0);            // S2 双写：与 nodes[] 按 id 对齐的平行 NodeRef 数组（默认 0 = 未登记）
     return (slice_len(nodes) as i64) - 1;
 }
