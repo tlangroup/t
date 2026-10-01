@@ -499,7 +499,28 @@ if (n.td > 0) { n.td = -1; }          // ← 写在副本上：从未写回 node
 
 1. ✅ `node_scope` 取代 `g_seen`（**工作 A**，commit `1d6f431`）：扁平 `g_seen`+哨兵+空操作 pop → 作用域帧栈（`g_frame_keys`/`g_frame_starts`/`g_frame_owners`/`g_frame_sp`）+ 第 6 张 S3 侧表 `g_node_scope[]`，行为逐字节等价。等价性铁证：IR 基线仅 `src/tc.tc::{c,h,ll}` 变化，非编译器目标 = 0；gate L2 **24/0**（含自举四代不动点 g2==g3==g4）。⚠ 关键坑：`g_seen_pop` 必须保持**空操作**（不回退 sp）——否则嵌套块之后的外层变量会误看到块前同级变量（实测 `string_utils.tc::c` 漂移）；旧哨兵的帧隔离语义由 `g_frame_starts[sp-1]` 固定为「最近一次 push 的起始下标」还原。
 2. （已完成 ✅）`g_const_decl_ids` → `node_const[]` 侧表，见 §0.13.7b step4。
-3. **删除原始全局平行数组**：`g_seen` 已删（被 `g_frame_*` + `g_node_scope` 取代）；`g_node_mod`/`g_node_file` 已是侧表保留；`g_local_decls`/`g_conpat_binds` 仍被 mangle 逻辑使用，待 `node_conpat` 侧表化后清理。S3 侧表化（provenance / type / resolve / const / scope 五张）**全部落地** → 进入 **S4**（消费方切 `u64 NodeRef`）。
+3. **删除原始全局平行数组**：`g_seen` 已删（被 `g_frame_*` + `g_node_scope` 取代）；`g_node_mod`/`g_node_file` 已是侧表保留；`g_local_decls`/`g_conpat_binds` 仍被 mangle 逻辑使用，待 `node_conpat` 侧表化后清理。S3 侧表化（provenance / type / resolve / const / scope 五张）**全部落地** → 进入 **S4**（消费方切 `u64 NodeRef`，见 §0.14）。
+
+### 0.14 S4 实施记录（消费方切 u64 NodeRef）
+
+> S4 真实范围（§4.3 / §4.10 阶段表）：消费者逐步换用访问者、删除旧 `base.Node` 字段、删 re-export 垫片、`node_to_hir` 桥切到 `NodeRef`。这是编译器级表示迁移，量级远大于 S3，**按最小可验证增量推进**。
+
+#### 0.14.1 step1：激活 `g_node_nref`（tag|idx 打包）+ NodeRef 打包/解包 helper（commit `821c19b`，2026-10-01）
+
+- **动机**：S2 已埋 `g_node_nref: []u64` 占位（全 0）与 SoA `tbl_*` 分表（由 `tools/cstgen.mjs` 生成 `cst_register_*` 双写）；但 `g_node_nref` 从未写入 `tag|idx`，`NodeRef` 类型与 `mk_noderef`/`nr_tag`/`nr_idx` 亦未定义。本步把统一引用表示落地为可用基础设施（尚未切换任何消费方）。
+- **改动**（`src/base.tc`）：
+  - 定义 `mk_noderef(tag, idx)` / `nr_tag(n)` / `nr_idx(n)`：单 u64 高 32 位 = kind-tag（`nk_of_kind(kind)` 的 `NK_*` 枚举值），低 32 位 = 节点索引。
+  - `node_new` 写入 `g_node_nref[id] = mk_noderef(nk_of_kind(kind), id)`；未注册 kind 暂归 `tag=0`（当前无消费方，安全）。
+  - ⚠ **t 当前无 `type` 别名语法**（§4.3 的 `pub type NodeRef = u64` 是目标设计、尚未落地），故 NodeRef 暂以 `u64` 直接表示；helper 落在 `GEN:node-structs` 生成区**之外**，避免破坏 `cstgen --check` 一致性。
+- **坑**：初版把 helper 误放进 `GEN:node-structs` 区导致 `cstgen --check` 失败；移出即恢复。另发现 `cst_nodes.json` 已扩 105 kind 但 `GEN:kinds` 未同步，`cstgen --emit` 补到 105（磁盘内容与 HEAD 一致，git 未显差异）。
+- **验证（等价性铁证）**：IR 基线差异仅 `src/tc.tc::{c,h,ll}`（3 DIFF / 0 NEW / 0 GONE），**非编译器目标 IR 变化 = 0**；gate L2 **24/0**（含自举四代不动点 g2==g3==g4、双轨对拍、REPL 冒烟、run_examples 双后端）。
+
+#### 0.14.2 后续子步（待推进，按风险分级）
+
+1. **`node_*` 访问器切 `u64 NodeRef`**：`node_type`/`node_resolve`/`node_mod`/`node_file`/`node_const`/`node_scope` 的入参从 `i64` 改为 `u64 NodeRef`（内部 `nr_idx`），调用点同步 `cst_nref_of(id)`。中风险，需全量门禁。
+2. **`mk_*` 构造器返回 `u64 NodeRef`**：与 SoA `cst_register_*` 双写对齐，调用方从「持有 i64 id」过渡到「持有 NodeRef」。高风险（跨 parse/sema/hir/tir/codegen 全量签名变更）。
+3. **`node_to_hir` 桥 / HIR 节点 `nd` 字段切 `u64 NodeRef`**；最终删旧 `base.Node` 字段 + 删 re-export 垫片（§4.14.4）。最高风险，单独 epic。
+4. 收尾：`g_local_decls`/`g_conpat_binds` 迁 `node_conpat[]` 侧表后清理；`node_*`（旧 i64 版）访问器退役。
 
 ### 0.13.9 `node_scope` 设计（经批判修订；原"统一作用域基础设施"方案已降级）
 
