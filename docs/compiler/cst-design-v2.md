@@ -708,6 +708,66 @@ S4   821c19b → a9c2970 → 72d461f → 2bea53f → 93eb234
 
 ---
 
+### 0.16 S6 实施记录（lower_policy 降级策略表 + SAST + DesugarPass）
+
+> S6 范围（§4.10.3 / §4.11）：① 引入 `lower_policy[]`（cstgen 生成）；② `hir.tc` 硬编码「不透明 BLOCK」分支改查表；③ 引入 SAST 渐进降级层（§4.11.4）；④ 脱糖函数收口为 `g_desugar_passes`（按 `order`），`sema` 驱动遍历。按最小可验证增量推进。**本轮只做 ①+②**，③④ 留后续步。
+
+#### 0.16.1 step1：`lower_policy[]` 引入 + 6 个硬编码分支改查表
+
+**改动（3 处）**
+
+1. `tools/cst_kinds.json`：新增 `lower_policy_opaque` 白名单（**9 个** kind）
+   —— `block_expr` / `while` / `for` / `for_each` / `unit_lit` / `bitstr` / `bitstr_pat` / `import_expr` / `variant_lit`。
+2. `tools/cstgen.mjs`：KINDS 生成段追加 `LOWER_DIRECT/LOWER_EXPAND/LOWER_OPAQUE` 常量、
+   `pub var lower_policy: [105]i64`（默认 `LOWER_DIRECT`，白名单置 `LOWER_OPAQUE`）、
+   `pub fn lower_policy_of(k: string) i64`；并对白名单做「未知 kind」校验（不在 registry/universe 即 exit 2）。
+3. `src/hir.tc`：`hir_lower_expr` 内原 6 个硬编码 `else if (k == "...")` 分支（721–766）
+   合并为**单个查表分支** `base.lower_policy_of(k) == base.LOWER_OPAQUE`，
+   置于**原位置**（前置分支顺序一字不动）。原 6 段注释的关键坑已合并保留。
+
+**等价性论证（决定性，三层）**
+
+- **L1 返回一致**：原 6 个分支的 return **完全相同** —— 都是
+  `return hir_emit(HIR_OP_BLOCK, -1, n, [], "", "", nd.ln);`。
+- **L2 无前置遮蔽**：grep 验证这 9 个 kind 在 721 行**之前**的前置分支中**无一匹配**
+  （`while/for/for_each` 另有 512/524/530 三处判断，但在**另一个函数**，不属 `hir_lower_expr` 链）。
+- **L3 位置不变**：合并分支仍落在「前置分支之后、`else` RAW 逃生舱之前」，
+  故命中集合与逃逸集合均与原状逐点相同 ⇒ **行为逐字节等价**。
+
+**关键事实（备查，勿踩）**
+
+- 目标 9 个 kind 中只有 `while`(85) / `for`(46) / `for_each`(47) 在 registry（86 项），
+  其余 6 个**只在 universe**；但 cstgen 的 `NK_*` 常量覆盖 registry+universe，故**全部存在**
+  （`g_nkn_count = 105`）。不要因为「不在 registry」就误判常量缺失。
+- `hir.tc` 是**模块值导入** `const base = @import("src.base")`，故必须写
+  `base.lower_policy_of` / `base.LOWER_OPAQUE`；`base.tc` 的 `pub @import("std.rc.cst" :: *)`
+  重导出使二者可解析（与 `base.init_node_kinds()` 同理）。
+- `nk_of_kind` 是 **O(105) 线性扫描**（t 无字符串序比较，无法二分）。查表分支放在原位置，
+  仅「前置分支全未命中」的节点才付这次扫描，与原字符串链量级相当；未做前置快路径优化（留待性能需要时）。
+- 静态定长数组初始化器用**数字字面量**（`0`/`2`）而非常量名，规避初始化器引用常量的潜在限制。
+
+**⚠ 踩坑（本次，务必记取）**
+
+- 用 Edit 工具替换 46 行大块时，因手工复制正文多敲一个空格（`"C  backend"`）导致精确匹配失败。
+  **改用 Python 按行号精确替换**（`lines[720:766] = [...]`，二进制 `rb/wb` 读写以保行尾）。
+  ⚠ 此法**仅对无 GEN 生成区的文件可用** —— `hir.tc` 无 GEN 区故安全；
+  `base.tc`（GEN:node-structs）与 `lib/std/rc/cst.tc`（GEN:kinds）**绝不可**如此改（会污染生成区触发 `cstgen --check` 红灯）。
+
+**验证（step1 门禁结果）**
+
+- `tc check src/tc.tc`：**0 errors / 510 warnings**（预存 style warning 数一致）⇒ `base.lower_policy_of` / `base.LOWER_OPAQUE` 解析成功。
+- `cstgen --check` 绿灯（kinds 105 / node-structs 91）；产物表实测 9 个 OPAQUE 全部落在预期 `NK_*` 下标。
+- **gate L2（完整复跑）= 24 passed / 0 failed（2050.1s）**：自举一代、LLVM verifier、产物快照、
+  conformance 诊断、**自举四代不动点 `g2==g3==g4`**、run_examples 双后端、
+  **HIR AstGen 验证（emit-hir + 二进制往返）**、HIR 解释器、双轨对拍、MIR differential、
+  C 后端自举、difftest tc0 外部对拍、rls 快速通道、tote 冒烟 —— 全绿。
+- 首跑快照曾报 **3 DIFF（仅 `src/tc.tc::{c,h,ll}`，0 NEW / 0 GONE）** ⇒ 新增 `lower_policy`
+  全局数组 + `lower_policy_of` 致自编译表示变化（与 S3/S4 各步同型良性漂移，其余 351 份目标
+  逐字节不变证明行为等价）；`--update` 重录基线后复跑只读快照 = **354 份逐字节相同**，完整 gate 24/0。
+- 同步：`out/dbg/tc.exe ← g4`、`out/rls/tc.exe ← gr`。
+
+---
+
 ## 1. 当前实现剖析（基于真实代码）
 
 ### 1.1 三层「树 / IR」现状

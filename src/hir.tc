@@ -718,51 +718,24 @@ pub fn hir_lower_expr(n: i64) i64 {
             sp_e = base.kids[sp_e].next;
         }
         idx = hir_emit(HIR_OP_SLICE_PAT, slot, n, sp_args, "", "", nd.ln);
-    } else if (k == "block_expr") {
-        // P1 Stage 1b：多语句值块 —— HIR 侧用**不透明 BLOCK 容器**表示。
+    } else if (base.lower_policy_of(k) == base.LOWER_OPAQUE) {
+        // S6（§4.11.2）：**不透明 BLOCK 承接** —— 由 lower_policy 表驱动，取代原先
+        // 6 个硬编码 `k == "..."` 分支。当前表内 LOWER_OPAQUE 共 9 个 kind：
+        //   block_expr / while / for / for_each / unit_lit / bitstr / bitstr_pat /
+        //   import_expr / variant_lit（清单见 tools/cst_kinds.json 的 lower_policy_opaque）。
+        // 今后新增「块式糖」只需在清单里标注，**不再改 hir.tc 代码**。
+        // 等价性：原 6 个分支的 return 语句完全相同，且这 9 个 kind 在原链中均只在
+        // 此处命中（前置分支无一匹配），故合并为单分支后行为逐字节等价。
         //
-        // ⚠ 绝不能在这里递归 lower 块内语句 / 尾随表达式（2026-09-24 实测血的教训）：
+        // ⚠ 绝不能在这里递归 lower 子节点 / 给本节点建 node_to_hir 映射
+        //   （2026-09-24 实测血的教训，对 block_expr 尤其致命）：
         //   一旦子节点有了 HIR 映射，sema 对它们就改走 **HIR 路径**（ie_inst >= 0），
         //   而 HIR 侧**不做块作用域** ⇒ 尾随表达式引用的块内 var 查不到 ⇒
         //   `T-SEM-E201 未定义的标识符 t`（examples/p1_block_expr.tc 直接编不过）。
-        //   同理也不能给本节点建 node_to_hir 映射（那会让 sema 绕过 sema.infer_block_expr
-        //   的 CST 遍历）。故：不递归、不建映射、直接 return —— sema 全程走 CST，
-        //   块内 var 在 scope_new 作用域里正确注册，HIR 侧只保证不落 RAW 逃生舱。
-        return hir_emit(HIR_OP_BLOCK, -1, n, [], "", "", nd.ln);
-    } else if (k == "while" || k == "for" || k == "for_each") {
-        // P3 值循环（循环 else 完成子句 / 循环作表达式取值）：sema 在 infer 期已将其
-        // 原地脱糖为 block_expr 并走 CST 路径生成代码。emit-hir 若在脱糖之前降级
-        // （HIR 测试扫描路径不跑 sema 发射），此处按**不透明 BLOCK 容器**处理——
-        // 不递归 lower 子节点、不建 node_to_hir 映射（否则 sema 会改走 HIR 路径而
-        // 静默错编，与 block_expr 同坑），保证 RAW 逃生舱归零、HIR 二进制往返一致。
-        return hir_emit(HIR_OP_BLOCK, -1, n, [], "", "", nd.ln);
-    } else if (k == "unit_lit") {
-        // P5：() 是 unit 值，运行期无实体；HIR 侧用无槽位的不透明 BLOCK 表示，
-        // 与 block_expr / while / for 同款（不递归 lower、不建 node_to_hir 映射，
-        // 让 sema 全程走 CST 路径），保证 RAW 逃生舱计数 0。
-        return hir_emit(HIR_OP_BLOCK, -1, n, [], "", "", nd.ln);
-    } else if (k == "bitstr" || k == "bitstr_pat") {
-        // 位串字面量 / 模式（§15 位串类型，C 后端已实现，LLVM 后端为后续增量）：
-        // HIR 侧用无槽位的不透明 BLOCK 容器表示，与 block_expr / unit_lit 同款——
-        // 不递归 lower 子节点（bitstr_seg 链表 / 绑定 ident）、不建 node_to_hir 映射，
-        // 让 sema 全程走 CST 路径发射（codegen_c 直接消费 bitstr 节点），
-        // 保证 RAW 逃生舱计数 0、HIR 二进制往返一致。
-        return hir_emit(HIR_OP_BLOCK, -1, n, [], "", "", nd.ln);
-    } else if (k == "import_expr") {
-        // 模块命名空间值（@import("M")）：运行期无实体，不递归 lower 子节点、
-        // 不建 node_to_hir 映射，返回不透明 BLOCK 容器（与 block_expr / unit_lit 同策略），
-        // 保证 RAW 逃生舱归零、HIR 二进制往返一致。仅在 `const x = @import("M").foo`
-        // 这类「import_expr 作成员接收者」的嵌套位置命中（直接 `const X = @import("M")`
-        // 已在 hir_lower_decl 降级为 IMPORT_DECL）。
-        return hir_emit(HIR_OP_BLOCK, -1, n, [], "", "", nd.ln);
-    } else if (k == "variant_lit") {
-        // 变体字面量 `V { .Case }` / `V { .Case(args) }`（去黑魔法后的规范写法）：
-        // 与 unit_lit / bitstr / import_expr 同策略——用无槽位不透明 BLOCK 承接，
-        // **不递归 lower 子节点、不建 node_to_hir 映射**，让 sema 全程走 CST 路径
-        // （由 sema.infer_expr 的 variant_lit 分支脱糖为 `<V>_from_<Case>(...)` 调用）。
-        // ⚠ 一旦在此建了 node_to_hir 映射，sema 会改走 HIR 路径（ie_inst >= 0），
-        //   脱糖分支不再命中 → 变体字面量在 LLVM 轨被直接发射成 tag 整数。
-        //   同时保证 RAW 逃生舱归零（hir_test 硬失败项）与 HIR 二进制往返一致。
+        //   建映射还会让 sema 绕过 CST 脱糖：while/for 绕开 infer 期原地脱糖，
+        //   variant_lit 绕开 sema.infer_expr 的 `<V>_from_<Case>(...)` 脱糖
+        //   ⇒ 变体字面量在 LLVM 轨被直接发射成 tag 整数（静默错编）。
+        //   故：不递归、不建映射、直接 return —— sema 全程走 CST，HIR 侧只保证不落 RAW。
         return hir_emit(HIR_OP_BLOCK, -1, n, [], "", "", nd.ln);
     } else {
         // 未覆盖表达式：逃生舱
