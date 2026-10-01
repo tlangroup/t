@@ -92,7 +92,7 @@ pub const HIR_OP_SLICE_PAT: i64 = 65;   // match 切片/数组模式：args=[res
 pub struct HirInst {
     op: i64;
     dst: i64;       // 结果临时槽（-1=无）
-    nd: i64;        // 源 CST 节点 id（sema 桥；合成指令为 -1）
+    nd: u64;       // 源 CST 节点引用 NodeRef（sema 桥；合成指令为 hir_nd_none()）
     args: []i64;    // 操作数 inst 索引（-1 = null/空）
     sa: string;     // 名字/运算符/被调名/字段名/未解析类型文本等
     ty: string;     // 未解析类型 expr 文本（pre-type；空 = N/A）
@@ -112,6 +112,10 @@ pub var g_hir: HirModule;
 pub var g_hir_next: i64;        // 临时槽计数器
 pub var g_last_src: string = ""; // 最近一次 AstGen 的源文本（sema 期重建 HIR 复用）
 pub const HIR_VERSION: string = "hir-v2";
+// 合成指令的源节点占位（等价旧 i64 哨兵 -1；nd 已升为 u64 NodeRef）。
+// 用函数而非 `pub const`：模块级 u64 常量高位被置位会被发射成 `i64 0xFFFFFFFFFFFFFFFF`（超 i64 有符号上界），clang 拒收；
+// `-1 as u64` 实测发射为合法的 `i64 -1`（LLVM 底层 u64==i64，位模式全 1 不变），既绕开发射 bug 又保持序列化逐字节等价。
+pub fn hir_nd_none() u64 { return -1 as u64; }
 
 pub fn hir_reset() void {
     g_hir.insts = [];
@@ -172,7 +176,7 @@ pub fn hir_inst_node(i: i64) i64 {
     if (i < 0) { return -1; }
     if (i >= slice_len(g_hir.insts) as i64) { return -1; }
     var inst: HirInst = g_hir.insts[i];
-    return inst.nd;
+    return inst.nd as i64;   // 经 as 收窄回 i64 节点 id：迁移期 NodeRef==裸索引，逐位等价（哨兵 HIR_ND_NONE 收窄回 -1）
 }
 
 pub fn hir_op_of(i: i64) i64 {
@@ -1008,7 +1012,7 @@ pub fn hir_to_text(m: HirModule) string {
         var line: string = base.sb_cat2(base.i2s(i), ":");
         line = base.sb_cat2(line, hir_op_name(inst.op));
         if (inst.dst >= 0) { line = base.sb_cat3(line, " dst=%", base.i2s(inst.dst)); }
-        if (inst.nd >= 0) { line = base.sb_cat3(line, " nd=", base.i2s(inst.nd)); }
+        if (inst.nd != hir_nd_none()) { line = base.sb_cat3(line, " nd=", base.i2s(inst.nd)); }
         if (inst.sa != "") { line = base.sb_cat3(line, " name=", inst.sa); }
         if (inst.ty != "") { line = base.sb_cat3(line, " ty=", inst.ty); }
         line = base.sb_cat3(line, " args=", hir_args_str(inst.args));

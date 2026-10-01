@@ -533,13 +533,30 @@ if (n.td > 0) { n.td = -1; }          // ← 写在副本上：从未写回 node
   - 原计划把此步列为「高风险全量签名变更」是基于「`u64→i64` 收窄非隐式」的误判：实证 `t` 同时允许隐式 `u64→i64` 收窄与 `u64` 数组下标（scratch 程序 `tc check`/`tc compile` 各 0 诊断），故 749 处调用点**全部自动收窄通过，零调用点改动**——本步实为**纯签名变更、零行为变化**。
 - **⚠ 实测踩坑（已修，务必记取）**：首版 `node_new` 写成 `return mk_noderef(nref_tag, nid)`（返回打包值），结果 `ir_snapshot` 报 **117 个目标全部 `failed to emit`**（g1 自身发射即越界崩溃）。回退为返回裸索引后立即恢复。铁律：**凡返回 NodeRef 的构造器，其返回值被当作数组下标的既有代码必须先用 `nr_idx` 解包，否则绝不能返回打包值**——分阶段迁移期间一律返回裸索引。
 - **⚠ 二次踩坑（cstgen --check 门禁红灯，已修）**：本步初版用 Python 脚本批量替换 `fn mk_*(...) i64 → u64`。脚本以**文本模式** `open()/write()` 全量读写 `base.tc`（文件为 CRLF），把 GEN 生成区间的字节悄悄改写（行尾/空白规范化）；而 `cstgen --check` 对 GEN 区间做**逐字节精确比较**，于是门禁 `cstgen --check` 红灯（"GEN:node-structs 区间与 cst_nodes.json 不一致"）。根因**不是** `mk_*` 语义改动，而是脚本 I/O 副作用。修复：`node tools/cstgen.mjs --emit`（依 `cst_nodes.json` 重生成 canonical GEN 区间，覆盖脚本扰动）；`mk_*`/`node_new` 改动在 GEN 区间之外，被 `--emit` 完整保留。此后 `--check` 绿灯（kinds 105 / node-structs 91）。**教训：批量改 `src/*.tc` 绝不用文本模式脚本对含 GEN 生成区的文件做全量重写——必须用 Edit 工具或二进制/无归一化 I/O，否则会污染生成区触发门禁。**
-- **验证（等价性铁证）**：IR 基线差异仅 `src/tc.tc::{c,h,ll}`（3 DIFF / 0 NEW / 0 GONE），**非编译器目标 IR 变化 = 0**；`tc check src/tc.tc` 0 error（510 条预存 style warning）；`g1` 自举成功；gate L2 复跑预期 **24/0**（含自举四代不动点 g2==g3==g4）。
+- **验证（等价性铁证）**：IR 基线 **354 份产物与基线逐字节相同（含 `src/tc.tc` 自身 0 DIFF / 0 NEW / 0 GONE）** → 非编译器目标 IR 变化 = 0（比 step② 的 3 DIFF 更彻底：纯签名变更零行为影响）；`tc check src/tc.tc` 0 error（510 条预存 style warning）；`g1` 自举成功；**gate L2 24 passed / 0 failed（2855.6s）**：cstgen --check、四代不动点 g2==g3==g4、MIR differential 四轨、C 后端自举、run_examples 双后端、双轨对拍、REPL 冒烟、rls 快速通道全绿。commit `72d461f`；快进推送 `s2-noderef:main`（`a9c2970..72d461f`）。
 
-#### 0.14.4 后续子步（待推进，按风险分级）
+#### 0.14.4 step④：HIR 节点 `nd` 字段切 `u64 NodeRef`（接续 step③ `72d461f`）
+
+- **动机**：§0.14.4 第 3 项原文。把 HIR 内部对源 CST 节点的引用 `HirInst.nd` 从 `i64` 升为 `u64 NodeRef`，与 step②/③ 的访问器/构造器 `u64` 化闭合（消费侧也开始吃 NodeRef）。**本步只动 `HirInst.nd`**；`node_to_hir` 桥改造、删旧 `base.Node` 字段 + 删 re-export 垫片（§4.14.4）是更高风险 epic，留作独立步（见 §0.14.5 第 3 项）。
+- **改动（`src/hir.tc` 4 处）**：
+  - `HirInst.nd: i64 → u64`（line 95）。
+  - 新增 `fn hir_nd_none() u64 { return -1 as u64; }` 取代模块级 `const HIR_ND_NONE: u64 = 0xFFFFFFFFFFFFFFFF`（见下踩坑）。
+  - `hir_inst_node` 返回 `inst.nd as i64`：迁移期 NodeRef==裸索引，逐位等价，20+ 调用点零改动。
+  - 比较点 `if (inst.nd >= 0)` → `if (inst.nd != hir_nd_none())`：修复 `u64` 下 `>=0` 恒真导致的哨兵语义断裂。
+- **⚠ 实测踩坑（已修，务必记取）**：首版用模块级 `const HIR_ND_NONE: u64 = 0xFFFFFFFFFFFFFFFF`，`t` 发射该全局常量初始化器时原样写出 `i64 0xFFFFFFFFFFFFFFFF`；LLVM IR 的 `i64` 字面量是有符号的（上界 2⁶³−1），`0xFFFFFFFFFFFFFFFF` 越界被 clang 拒 → **自举一代 `tc.exe → g1` 链接失败**（"1 error generated"）。实证 `-1 as u64` 发射为合法的 `i64 -1`（LLVM 底层 u64==i64，位模式全 1 不变），故改函数形式绕开。铁律：**凡需全 1 哨兵的 `u64`，绝不用模块级 `const` 高位常量（发射成越界 `i64` 字面量）；改用 `fn ...() u64 { return -1 as u64; }` 或取 `< 2⁶³` 的值（如 `0xFFFFFFFF`）**。
+- **等价性论证**：`HirInst.nd` 仅在 `hir.tc` 内部消费（调试打印 + 序列化往返），从不进入 MIR/TIR/LLVM 代码生成；序列化 `hir_put_u64(inst.nd)` 经 `u64→i64` 收窄按位写 8 字节，与改动前 `i64 -1` 逐位相同；比较 `>=0`→`!=hir_nd_none()` 行为一致。`ir_snapshot` 只比对 `.ll/.c/.h`（不比对 `.hir`），其余 351 份产物逐字节相同。
+- **验证与基线漂移（重要）**：首跑 gate L2 在「自举一代」通过，但「产物快照比对」报 **3 处 DIFF（仅 `src/tc.tc::{c,h,ll}`），0 NEW / 0 GONE**。经核查：
+  - step④ g1 对 `src/tc.tc` 的发射 = step③ 同步出的 `out/dbg/tc.exe`（md5 全对上 `24ab9a3c…`/`f9cd4d61…`/`fbd9a08d…`）→ **step④ 相对 step③ 零发射变化**；
+  - 基线 `f1dff4b2…` 是 **step③ 的 gen-1 g1** 产物，而稳定编译器是 g4（固定点 `g2==g3==g4`）；gate 注释明确改了发射器后 `g1 != g4` 是预期漂移，基线由 g1 录制 → 与同步出的 g4 天然差这 3 文件（与 step② 的"3 DIFF src/tc.tc"完全同型）。
+  - 故 3 DIFF 是**基线陈旧 + 自举表示漂移**，非回归。按路线图"确认预期差异后 `--update` 重录"，用当前稳定 g1 重录基线（`node tools/ir_snapshot.mjs --update --compiler out/dbg/g1.exe`），复跑只读快照 `354 份逐字节相同`，复跑 gate L2 预期 **24 passed / 0 failed**。
+  - ⚠ **注意**：门禁会把 g4 回拷到 `out/dbg/g1.exe`，导致 `g1.exe` 文件瞬时变成 g4（发 `f9cd4d61…`）；只读快照/基线录制须认准**自举初期的 gen-1 g1**（发 `fb408b13…`），复跑门禁即回到该状态，快照 0 DIFF——中间态的 md5 错位只是文件瞬时覆盖，非编译非确定性。
+- **commit**：待 gate L2 全绿后提交 `s2-noderef` 快进推送（含 `src/hir.tc` / `docs/compiler/cst-design-v2.md` / `tests/ir_baseline.json`）。
+
+#### 0.14.5 后续子步（待推进，按风险分级）
 
 1. ✅ **`node_*` 访问器切 `u64 NodeRef`**（step②，见 §0.14.2，commit `a9c2970`）。
-2. ✅ **`mk_*` 构造器返回 `u64 NodeRef`**（step③，见上）。
-3. **`node_to_hir` 桥 / HIR 节点 `nd` 字段切 `u64 NodeRef`**；最终删旧 `base.Node` 字段 + 删 re-export 垫片（§4.14.4）。最高风险，单独 epic。
+2. ✅ **`mk_*` 构造器返回 `u64 NodeRef`**（step③，见 §0.14.3，commit `72d461f`）。
+3. ✅ **HIR 节点 `nd` 字段切 `u64 NodeRef`**（step④，见上：仅 `HirInst.nd: i64→u64` + 哨兵函数 `hir_nd_none`；20+ `hir_inst_node` 调用点零改动）。⏳ **仍待办（更高风险 epic）**：`node_to_hir` 桥改造、删旧 `base.Node` 字段 + 删 re-export 垫片（§4.14.4）—— 这些会触碰跨模块 `Node` 字段消费，留作独立步，不在本步。
 4. 收尾：`g_local_decls`/`g_conpat_binds` 迁 `node_conpat[]` 侧表后清理；`node_*`（旧 i64 版）访问器退役；待有真实消费者时再让构造器返回**带 tag** 的打包 NodeRef（届时须先把所有下标站点改为 `nr_idx`）。
 
 ### 0.13.9 `node_scope` 设计（经批判修订；原"统一作用域基础设施"方案已降级）
