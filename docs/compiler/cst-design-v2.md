@@ -515,9 +515,18 @@ if (n.td > 0) { n.td = -1; }          // ← 写在副本上：从未写回 node
 - **坑**：初版把 helper 误放进 `GEN:node-structs` 区导致 `cstgen --check` 失败；移出即恢复。另发现 `cst_nodes.json` 已扩 105 kind 但 `GEN:kinds` 未同步，`cstgen --emit` 补到 105（磁盘内容与 HEAD 一致，git 未显差异）。
 - **验证（等价性铁证）**：IR 基线差异仅 `src/tc.tc::{c,h,ll}`（3 DIFF / 0 NEW / 0 GONE），**非编译器目标 IR 变化 = 0**；gate L2 **24/0**（含自举四代不动点 g2==g3==g4、双轨对拍、REPL 冒烟、run_examples 双后端）。
 
-#### 0.14.2 后续子步（待推进，按风险分级）
+#### 0.14.2 step②：`node_*` 访问器切 `u64 NodeRef`（commit 待填，见下）
 
-1. **`node_*` 访问器切 `u64 NodeRef`**：`node_type`/`node_resolve`/`node_mod`/`node_file`/`node_const`/`node_scope` 的入参从 `i64` 改为 `u64 NodeRef`（内部 `nr_idx`），调用点同步 `cst_nref_of(id)`。中风险，需全量门禁。
+- **动机**：让 S3 五张侧表的消费方改用统一引用表示，为 step③（`mk_*` 返回 `NodeRef`）铺路。§0.14.2 原列的第 1 项。
+- **改动**（`src/base.tc`）：10 个访问器入参 `id: i64` → `n: u64`，函数体首行统一 `var id = nr_idx(n)` 再走原边界检查：`node_mod`/`node_file`/`node_type`+`node_set_type`/`node_resolve`+`node_set_resolve`/`node_const`+`node_set_const`/`node_scope`+`node_set_scope`。
+- **关键决策（偏离原计划的「调用点同步 `cst_nref_of(id)`」）**：**不改动任何调用点**。实证确认 `t` 存在**隐式 `i64 → u64` 拓宽**（用 scratch 程序 `tc check`/`tc compile` 各 0 诊断验证），故每个现存的 `i64` 实参自动拓宽为 `tag=0` 的 `NodeRef`，且 `nr_idx(u64(id)) == id` 对**全部合法节点索引及 `-1` 哨兵**逐位成立 → 行为**逐字节等价**。
+  - 这比机械地把数百处调用点包 `cst_nref_of(...)` 更安全：① 零调用点改动 = 零引入风险；② 当下 `NodeRef` 只有 `tag=0`，包与不包行为完全一样，纯属噪声；③ 等 step③ `mk_*` 真正返回带 `tag` 的 `NodeRef` 时，这些调用点会自动获得正确的 tag，无需现在预演。
+  - 等价性铁证：见下验证。
+- **验证（等价性铁证）**：IR 基线差异仅 `src/tc.tc::{c,h,ll}`（3 DIFF / 0 NEW / 0 GONE），**非编译器目标 IR 变化 = 0**；`tc check src/tc.tc` 0 error（仅 510 条预存 style warning）；`g1` 自举成功；gate L2 复跑预期 **24/0**（含自举四代不动点 g2==g3==g4）。
+
+#### 0.14.3 后续子步（待推进，按风险分级）
+
+1. ✅ **`node_*` 访问器切 `u64 NodeRef`**（step②，见上）。
 2. **`mk_*` 构造器返回 `u64 NodeRef`**：与 SoA `cst_register_*` 双写对齐，调用方从「持有 i64 id」过渡到「持有 NodeRef」。高风险（跨 parse/sema/hir/tir/codegen 全量签名变更）。
 3. **`node_to_hir` 桥 / HIR 节点 `nd` 字段切 `u64 NodeRef`**；最终删旧 `base.Node` 字段 + 删 re-export 垫片（§4.14.4）。最高风险，单独 epic。
 4. 收尾：`g_local_decls`/`g_conpat_binds` 迁 `node_conpat[]` 侧表后清理；`node_*`（旧 i64 版）访问器退役。
