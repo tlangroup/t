@@ -1756,6 +1756,7 @@ pub var g_node_mod: []string;           // 与 nodes 平行的数组：nodes[i] 
 pub var g_node_file: []string;          // 与 nodes 平行的数组：nodes[i] 所属源文件（多模块编译单元下诊断定位用）
 pub var g_node_td: []i64;               // S3 §4.5 node_type 侧表：nodes[i] 的 HIR 类型槽 TD 索引（0 = 未定型；-1 = 已丢弃）
 pub var g_node_resolve: []i64;          // S3 §4.5 node_resolve 侧表：ident 节点 i 解析到的声明节点（替代 g_idecl_* 反向扫描，O(1)）
+pub var g_node_const: []i64;             // S3 §4.5 node_const 侧表：nodes[i] 是否为 const 声明（1 = 是；0 = 否；替代 g_const_decl_ids 列表 + 线性扫描）
 
 // ── S3（§4.5）：侧表登记 + provenance 侧表读取面 ──────────────────────────────
 // 跨切面属性统一登记 SideTable{name,owner,dirty}，PassManager 据 name 建拓扑与置脏。
@@ -1781,6 +1782,7 @@ pub fn sidetable_init() void {
     sidetable_register("node_provenance", "S3");
     sidetable_register("node_type", "S3");
     sidetable_register("node_resolve", "S3");
+    sidetable_register("node_const", "S3");
 }
 pub fn node_mod(id: i64) string {
     sidetable_init();
@@ -1818,6 +1820,22 @@ pub fn node_resolve(id: i64) i64 {
 pub fn node_set_resolve(id: i64, decl: i64) void {
     if (id < 0 || id >= slice_len(g_node_resolve)) { return; }
     slice_set(g_node_resolve, id, decl);
+}
+
+// ── node_const 侧表（§4.5）：取代 g_const_decl_ids 平行数组 + 线性扫描 ──
+// nodes[i] 是否为 const 声明（1 = 是；0 = 否）。parse 在 KwConst 处调 node_set_const(id) 登记；
+// sema 经 node_const(id) != 0 判定「该声明是否 const」（实施 const 静态引用规则，见 sema.check_const_ref）。
+// 等价性：旧 g_const_decl_ids 为「decl id 列表」，g_const_decl_has(d) 线性扫描判属；
+// 新 g_node_const[d] 为 per-node 标志，node_set_const(d) 在原 4 个 append 点置 1，
+// 二者成员集合逐字节一致 → 用户 IR 不变。
+pub fn node_const(id: i64) i64 {
+    sidetable_init();
+    if (id < 0 || id >= slice_len(g_node_const)) { return 0; }
+    return g_node_const[id];
+}
+pub fn node_set_const(id: i64) void {
+    if (id < 0 || id >= slice_len(g_node_const)) { return; }
+    slice_set(g_node_const, id, 1);
 }
 
 pub struct Child {
@@ -1907,19 +1925,8 @@ pub fn g_conpat_bind_has(d: i64) bool {
     return false;
 }
 
-// const 声明节点 id 集合：解析期在 KwConst 处登记（区别于 let —— 二者 ba 均为 true，
-// 但顶层 const/let 同为 GlobalConstDecl 且 bb 被 comptime 占用，无法靠字段区分）。
-// 用于 sema 实施「const 只可引用静态常量」规则（见 sema.tc check_const_ref）。
-pub var g_const_decl_ids: []i64;
-pub fn g_const_decl_has(d: i64) bool {
-    var n: i64 = slice_len(g_const_decl_ids) as i64;
-    var i: i64 = n - 1;
-    while (i >= 0) {
-        if (g_const_decl_ids[i] == d) { return true; }
-        i = i - 1;
-    }
-    return false;
-}
+// const 声明成员判定已迁 node_const[] 侧表（见上方 node_const()/node_set_const()）。
+// 旧 g_const_decl_ids 平行数组 + g_const_decl_has 线性扫描已删除（§4.5 per-node 标志，O(1)）。
 
 // 新建节点：全部字段置于"空"语义，返回索引
 pub fn node_new(kind: string) i64 {
@@ -1956,6 +1963,7 @@ pub fn node_new(kind: string) i64 {
     append(g_node_file, g_file);      // provenance：记录本节点所属源文件（load_module_file 内 g_file 已切到该模块文件）
     append(g_node_td, 0);             // S3 §4.5 node_type 侧表：默认未定型（0），由 sema/tir 经 node_set_type 写入
     append(g_node_resolve, -1);       // S3 §4.5 node_resolve 侧表：默认 -1（未解析到声明）
+    append(g_node_const, 0);           // S3 §4.5 node_const 侧表：默认 0（非 const 声明）
     append(g_node_nref, 0);            // S2 双写：与 nodes[] 按 id 对齐的平行 NodeRef 数组（默认 0 = 未登记）
     return (slice_len(nodes) as i64) - 1;
 }

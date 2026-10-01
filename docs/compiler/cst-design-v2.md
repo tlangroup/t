@@ -484,11 +484,22 @@ if (n.td > 0) { n.td = -1; }          // ← 写在副本上：从未写回 node
 
 **验证（待后台自举确认）**：`tc check` EXIT=0 / 0 errors；自举不动点 `g2.ll==g3.ll`；基线重录差异**仅** `src/tc.tc::{c,h,ll}`（编译器自身源变化），**非编译器目标 IR 变化 = 0**（等价性铁证）。
 
+### 0.13.7b step4：`node_const` 侧表（取代 `g_const_decl_ids`，已落地 ✅）
+
+**等价性论证（先于编码）**：旧 `g_const_decl_ids` 是「decl id 列表」，`g_const_decl_has(d)` 线性扫描判属（O(n)）。改为 per-node 标志 `g_node_const[d]`（默认 0；`node_set_const(d)` 置 1）后，成员集合**逐字节一致**——`node_set_const` 仅在原 4 个 `append(base.g_const_decl_ids, X)` 点调用（parse `parse_const_stmt` / 全局 `KwConst` / 局部 `KwConst` ×2），写入的 `d` 值完全相同；`node_const(d) != 0` 与 `g_const_decl_has(d)` 真值表一致 ⇒ 用户程序 IR 不变。
+
+**落地**：
+- `base.tc` 新增侧表 `pub var g_node_const: []i64`（默认 0），登记第 4 张内置侧表 `node_const`（owner `S3`）；新增访问器 `node_const(id)`（越界返回 0）/ `node_set_const(id)`（置 1）。
+- `node_new` 同步 `append(g_node_const, 0)`，与 `nodes` 严格平行（并行安全前提同 §0.13.4，未变）。
+- **删除** `g_const_decl_ids` 全局 + `g_const_decl_has` 函数；4 处 `append(base.g_const_decl_ids, X)`（parse.tc）→ `base.node_set_const(X)`；4 处 `base.g_const_decl_has(X)`（sema.tc `check_const_ref` 路径）→ `base.node_const(X) != 0`。
+
+**验证（待后台自举确认）**：`tc check` EXIT=0 / 0 errors；自举不动点 `g2.ll==g3.ll`；基线重录差异**仅** `src/tc.tc::{c,h,ll}`，**非编译器目标 IR 变化 = 0**（等价性铁证）。
+
 ### 0.13.8 S3 剩余子步（待推进）
 
 1. `node_scope` 迁侧表（取代 `g_seen` 的「append-only + 哨兵 + 反向扫」黑魔法，规避 §4.5 提到的 `-O2` 自别名崩溃）。⚠ **高风险**：`g_seen` 在 `codegen_c.tc` 有 28 处、按**发射序**工作、且注释自陈「当前帧内名字本就唯一 → mangle 恒为空操作」，被 `-O2` 自别名红线两次绊倒；迁 `node_scope[]` 需重建作用域树，非纯搬迁，单独评审。
-2. `g_const_decl_ids` → `node_const[]` 侧表（「const 声明集合」成员判定，parse×4 + sema×1）。
-3. **删除原始全局平行数组**（`g_node_mod` / `g_node_file` / `g_seen` / `g_local_decls` / `g_conpat_binds` / `g_const_decl_ids`），届时 S3 的「删全局平行数组」验收项闭合 → 进入 S4（消费方切 `u64 NodeRef`）。
+2. （已完成 ✅）`g_const_decl_ids` → `node_const[]` 侧表，见 §0.13.7b step4。
+3. **删除原始全局平行数组**（`g_node_mod` / `g_node_file` / `g_seen` / `g_local_decls` / `g_conpat_binds`），届时 S3 的「删全局平行数组」验收项闭合 → 进入 S4（消费方切 `u64 NodeRef`）。
 
 ---
 
