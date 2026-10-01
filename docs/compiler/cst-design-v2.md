@@ -559,6 +559,43 @@ if (n.td > 0) { n.td = -1; }          // ← 写在副本上：从未写回 node
 3. ✅ **HIR 节点 `nd` 字段切 `u64 NodeRef`**（step④，见上：仅 `HirInst.nd: i64→u64` + 哨兵函数 `hir_nd_none`；20+ `hir_inst_node` 调用点零改动）。⏳ **仍待办（更高风险 epic）**：`node_to_hir` 桥改造、删旧 `base.Node` 字段 + 删 re-export 垫片（§4.14.4）—— 这些会触碰跨模块 `Node` 字段消费，留作独立步，不在本步。
 4. 收尾：`g_local_decls`/`g_conpat_binds` 迁 `node_conpat[]` 侧表后清理；`node_*`（旧 i64 版）访问器退役；待有真实消费者时再让构造器返回**带 tag** 的打包 NodeRef（届时须先把所有下标站点改为 `nr_idx`）。
 
+#### 0.14.6 最高风险 epic 拆解规划（2026-10-01 调研）
+
+> **研判结论（2026-10-01）**：推荐**方案 A**（S4 在 step④ 收口，删 `base.Node` 单结构体降为 deferred 未来 epic）。理由见「推荐 A 的理由」与下方三维度权衡；方案 B 的 SoA 重构在当前无真实消费者，孤立推进风险/收益比不划算，应留待模块系统搬迁（base.tc→`std.rc.cst`）或工作 B 启动时借势。
+
+**现状盘点（决定性数据）**
+- `pub struct Node`（base.tc:1729-1760）仍持有约 30 个核心 AST 字段：`kind/sa/sb/sc/se/has_sa..has_sc/ia/ib/ba..bf/na/nb/nc/nd/memspace/la/lb/lc/ln/cl/tv`。
+- 已迁出的侧表**仅覆盖跨切面属性**：`g_node_td/mod/file/resolve/const/scope/nref`（7 个）；**核心 AST 字段（na/nb/nc/nd/kind/sa/ia/la/lc 等）尚无对应侧表**。
+- `pub var nodes: []Node`（base.tc:1762）仍在存储 Node 值本身。
+- 消费面规模（grep `base.nodes[id]` / `var n: Node = base.nodes[...]`）：`sema.tc` 370、`codegen_c.tc` 110、`parse.tc` 105、`tir.tc` 111、`hir.tc` 22、`comptime_fold.tc` 10、`codegen_dev.tc` 22、`codegen_c_tmir/wasm/mir/tmir/tir_to_ll` 少量 ≈ **750+ 处字段访问点**。
+
+**S4 主线已在 step④ 收口（类型层 NodeRef 化闭合）**
+- step②/③/④ 把 `node_*` 访问器、`mk_*` 构造器、`HirInst.nd` 全部升 `u64 NodeRef`，且已证等价性（step④ 输出 md5 与 step③ 全对上；gate L2 24/0）。
+- 迁移期 `NodeRef == 裸索引`（`node_new` 返回裸索引、tag 仅存 `g_node_nref`），所有 `base.nodes[id]` 下标站点继续以裸索引工作，零改动。
+- 故「消费方切 `u64 NodeRef`」在**类型契约层已闭合**：外部 API（访问器/构造器/HIR 桥）已吃 NodeRef，内部表示仍是 AoS 的 `Node`。
+
+**两个互斥方案**
+
+**方案 A — S4 收口，删 Node 降为 deferred（推荐）**
+- S4 的交付 = 类型层 NodeRef 化（step②/③/④ 已完成且 verify 全绿），即 §0.14.4 第 3 项「HIR 节点 `nd` 切 `u64 NodeRef`」已交付；「删旧 `base.Node` + 删 re-export 垫片」从 S4 主线移除，正式降格为 **deferred 未来 epic**。
+- 依据：删 Node 单结构体本质是「AST 表示 AoS→SoA」重构，真实驱动力应是 ① 性能（SoA 缓存友好）/ ② 模块系统（base.tc 整体迁 `std.rc.cst` 时 Node 不能仍是 base.tc 全局 struct）/ ③ 增量编译（按需加载字段）——三者均属未来需求。§0.14.5 第 4 项「待有真实消费者时再让构造器返回**带 tag** 的打包 NodeRef（须先把所有下标站点改为 `nr_idx`）」即此意：当前无真实消费者需要打包 NodeRef，且打包的前置（`nr_idx` 改造）远未就绪。
+- 收尾仅做低风险项：§0.14.5 第 4 项的 `g_local_decls`/`g_conpat_binds→node_conpat` 侧表清理（若已迁则退役旧访问器占位——但 step② 已使 `node_*` 是 u64 版、旧 i64 版不复存在，故该项实际已闭合）。
+- 代价/风险/门禁：零。
+
+**方案 B — 完整 SoA 重构（高风险，~750 处迁移）**
+- step⑤（基础设施）：为 Node 剩余全部字段建 `g_node_*` 侧表 + `node_field()` 访问器；`node_new` 创建节点时把每个字段写入对应侧表，同时**保留 `nodes[]` 并存**直到所有消费方迁完。纯新增、不改消费方，发射 IR 不变（gate 验证）。
+- step⑥（hir.tc 先行）：22 处 `var n: base.Node = base.nodes[tn]` 迁到 `u64 NodeRef` + `node_field()`，验证模式与热路径性能。
+- step⑦a-d（逐后端）：`sema`(370)/`codegen_c`(110)/`parse`(105)/`tir`(111) 逐个把 `base.nodes[id].field` 改成 `node_field(id)`，每个后端一 commit + gate。
+- step⑧（删 Node）：所有消费方迁完后删 `pub struct Node` + `nodes[]` + re-export 垫片，侧表成唯一真相源；若要「打包 NodeRef」还需前置把 step⑦ 所有下标站点改为 `nr_idx()`（避免 `u64→i64` 收窄不解包 tag 导致越界）。
+- 风险：① ~750 处机械改动，静默错编风险高；② `node_field(id)` 函数调用（bounds 检查 + sidetable_init 开销）在热路径（孩子遍历 `n.na/n.nb`）的性能回归，除非编译器能 inline；③ SideTable 机制（§4.5）本为跨切面属性设计，塞入核心 AST 字段语义不符，需先扩展其语义；④ 7-8 次 45 分钟 gate（~6 小时门禁墙）。
+- 等价性验证：每步必须 `ir_snapshot` 逐字节比对（预期仅 `src/tc.tc` 漂移则 `--update`），且四代不动点 `g2==g3==g4` 不破。
+
+**推荐 A 的理由**
+1. S4 类型层契约已闭合，外部 API 已消费 NodeRef；删 Node 不改变任何可观测行为，纯内部表示变更。
+2. 无当下消费者需要打包 NodeRef（`node_new` 裸索引返回安全，所有下标站点依赖裸索引）。
+3. 方案 B 的 SoA 收益（性能/模块化/增量）在当前阶段无法兑现，却要付 ~6 小时门禁 + 750 处高风险机械改动；等工作 B（sema 统一词法树/增量/IDE）或模块系统真正需要时再启动，可与其合并、一次性借势。
+4. 保留 `nodes[]` 并存不阻塞任何已规划工作；base.tc→`std.rc.cst` 搬迁才是删垫片/删 Node 的真正时机，那是一个更大的独立迁移 epic。
+
 ### 0.13.9 `node_scope` 设计（经批判修订；原"统一作用域基础设施"方案已降级）
 
 > **已落地（commit `1d6f431`，2026-10-01）**：工作 A 已按本设计实现并通过 gate L2 24/0。下文为设计依据与边界；实现细节与验证见 §0.13.8 第 1 项。工作 B（sema 统一词法树 / 增量 / IDE / 相位 CTFE walker）仍为独立 R&D epic，未启动。
