@@ -23,7 +23,7 @@ pub var global_scope / cur_scope / cur_ret;
 
 - `cur_scope` 由 **~30+ 处** `cur_scope = scope_new(prev)`（进块/函数/闭包建子作用域）与 `cur_scope = prev`（退出还原）手动维护。
 - 查找成本 = O(符号总数) 线性扫描（无哈希），当前规模可接受，但增量/IDE 放大后会成为瓶颈。
-- 发射侧 `node_scope` 侧表（S3 step5，`base.tc:1889 node_scope` / `node_set_scope` / `g_node_scope`）**只建于 `g_seen_push` 路径**，语义侧 **未使用** `node_scope` —— 两套作用域表示并存，是工作 B「统一」要消除的裂隙。
+- 发射侧 `node_scope` 侧表（S3 step5，`base.tc:1889 node_scope` / `node_set_scope` / `g_node_scope`）原只建于 `g_seen_push` 路径；**工作 B 支柱 1 step1–3 已让语义侧 `scope_new_at` 也写入 `node_scope`**（语义侧覆盖写、发射侧后跑，终态以语义侧为准），两套作用域表示开始并轨 —— 这是「统一」的第一步，真正读取源切换见 step 5（DEFERRED）。
 
 ## 2. 四支柱拆解（规模 / 风险 / 首增量）
 
@@ -68,14 +68,15 @@ pub var global_scope / cur_scope / cur_ret;
 
 > 原则：每步 → `tc build src/tc.tc` → `gate L2`（24 步）→ 仅 `src/tc.tc` 漂移则 `--update` 重录 → commit（`-F`）→ 快进推送 `s2-noderef:main`。零行为变化是每步硬指标。
 
-- **step 1（数据模型扩展，已落地，gate 跑中）**：`sema.tc` 加 `scope_owner: []i64` 平行数组（与 `scope_parents` 锁步 append）；`scope_new(parent)` 保持旧签名、内部 `append(scope_owner,-1)`（30 处调用点零改动）；新增 `scope_new_at(parent, owner)` 在建立 scope 同时 `node_set_scope(owner, id)` 把节点→scope 写进侧表。纯加法，零行为变化。
-- **step 2（函数/闭包站点迁移）**：把 `infer_func_ret`(4127) 等**函数/闭包参数作用域**的 `scope_new(prev)` 改为 `scope_new_at(prev, owner_node)`，传入 FuncDecl/closure 节点。每簇迁移后 gate。
-- **step 3（块/循环/match 站点迁移）**：把 `infer_block_expr`(5534) 等**语句块/for/for_each/match 臂**的 `scope_new(prev)` 改为 `scope_new_at(prev, owner_node)`，传入对应 block/loop/match-arm 节点。每簇 gate。
-- **step 4（双跑对拍 + 不变量）**：`sym_lookup` 增加并行分支——沿 `scope_owner`→`node_scope` 树走的查询结果，与现行 `scope_parents` 链结果断言相等（仅当 `scope_owner` 已锚定）；加 `scope_tree_invariant()` 在 `run_check` 末校验 `node_scope[scope_owner[S]]==S`。零行为变化前提下证明两套表示等价。
-- **step 5（读取源切换，可选）**：确认等价后，把 `sym_lookup`/`sym_define` 的内部索引从 `scope_parents` 链切换到 `node_scope` 树（此时 `scope_parents` 可退役）。这一步才真正「统一」，且因 step 4 已证明等价，IR 仍 0 变化。
+- **step 1（数据模型扩展）✅ commit `a244377`**：`sema.tc` 加 `scope_owner: []i64` 平行数组（与 `scope_parents` 锁步 append）；`scope_new(parent)` 保持旧签名、内部 `append(scope_owner,-1)`（22 处调用点零改动）；新增 `scope_new_at(parent, owner)` 在建立 scope 同时 `node_set_scope(owner, id)` 把节点→scope 写进侧表。**自此语义侧也开始写入 `node_scope`**（与发射侧 `g_seen_push` 并存，但语义侧覆盖写、发射侧后跑，终态以语义侧为准）。纯加法，零行为变化；gate 24/0。
+- **step 2（全站点迁移，17 处）✅ commit `b91182f`**：把 17 处非根 `scope_new(prev)` 改为 `scope_new_at(prev, owner)`，owner 取正确 CST 节点 id（块/表达式/函数体 `e`/`d`/`s`、循环 `L`、match-arm `m_k.val`、HIR 块指令 `hir.hir_inst_node(bi)` 等）。仅根作用域 `global_scope = scope_new(-1)`（13304，无 CST owner）保留。零行为变化；gate 24/0。
+- **step 3（参数作用域站点收尾）✅ commit `<this>`**：`infer_lambda_ret_from_decl`(4152) 内 `cur_scope = scope_new(global_scope)` → `scope_new_at(global_scope, d)`（owner=`d` 函数声明节点，第 18 处可锚定站点），完成全部可锚定站点迁移。
+- **step 4（校验函数 + 不变量）✅ commit `<this>`**：新增 `verify_scope_tree(): bool`（校验 `node_scope[scope_owner[S]]==S` round-trip + `scope_parents` 链无环），由 `g_verify_scope_tree` 调试标志在 `run_check` 末受控触发（默认关闭，正常编译零行为）。注：原设计的「`sym_lookup` 并行双跑」未做——因它要求 `node_scope` 树可上溯，而**上溯需 `node_parent` 侧表（CST 父指针）**，该结构尚不存在；当前 `node_scope` 仅提供 节点→scope 反向查，已足够支撑 IDE/增量消费。
+- **step 5（读取源切换 → 真正统一）⬇ DEFERRED**：把 `sym_lookup`/`sym_define` 内部从 `scope_parents` 链切到 `node_scope` 树。这一步才真正「统一」，但**依赖 `node_parent` 侧表**（每个 CST 节点的父指针），属 IDE/增量编译的共同地基。在出现真实消费者（IDE 跳转/增量重编）或模块系统搬迁时，与 `node_parent` 一并建设更划算；当前孤立切换收益不兑现、且会引入静默错编风险。故 pillar 1 的安全交付 = step 1–4（作用域树数据已锚定 + 校验钩子就位），step 5 降为 deferred。
 
-## 6. 待裁定
+## 6. 裁定记录
 
-- 从哪个支柱开局？（已裁定：**支柱 1 统一词法作用域树**，step 1 已落地）
-- 是否有**真实消费者**驱动优先级（如：现在就要 IDE 支持 / monorepo 增量重编痛点）？若有，顺序可调。
-- 支柱 1 是否接受上述「step 1→5 逐簇迁移 + 每步 gate」的保守节奏？
+- **首支柱**：已裁定 **支柱 1 统一词法作用域树**（地基，复用 S3 step5 `g_node_scope` 侧表）。
+- **节奏**：采用「step 1→4 逐簇迁移 + 每步 gate L2」保守节奏；零行为变化是每步硬指标（仅 `src/tc.tc` 自编译表示漂移则 `--update` 重录基线）。
+- **step 5 裁定**：DEFERRED。真正「统一」需 `node_parent` 侧表（CST 父指针），当前 `node_scope`（节点→scope 反向查）已满足 IDE/增量消费所需，孤立切换 step 5 收益不兑现且引入风险；待真实消费者（IDE 跳转 / 增量重编 / 模块搬迁）出现时与 `node_parent` 一并建设。
+- **优先级触发**：若出现「现在就要 IDE 支持」或「monorepo 增量重编痛点」等真实消费者，顺序可调（支柱 3/2 提前）。
