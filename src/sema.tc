@@ -1132,6 +1132,31 @@ pub fn scope_new_at(parent: i64, owner: i64) i64 {
     return (slice_len(scope_parents) as i64) - 1;
 }
 
+// 工作 B 支柱 1：一致性校验（仅 g_verify_scope_tree=true 时调用，正常编译零行为）。
+// 验证：① 每个已锚定 scope 的 owner 节点经 node_scope 反向查回自身（round-trip 一致）；
+//       ② scope_parents 链无环、最终收敛到 -1（合法树）。
+pub var g_verify_scope_tree: bool = false;
+
+pub fn verify_scope_tree() bool {
+    var n: i64 = slice_len(scope_parents) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        if (scope_owner[i] >= 0) {
+            var back: i64 = base.node_scope((scope_owner[i] as u64));
+            if (back != i) { return false; }
+        }
+        var p: i64 = scope_parents[i];
+        var steps: i64 = 0;
+        while (p >= 0 && steps <= n) {
+            p = scope_parents[p];
+            steps = steps + 1;
+        }
+        if (steps > n) { return false; }   // 有环
+        i = i + 1;
+    }
+    return true;
+}
+
 // 仅在指定 scope 内查找（不上溯）。返回**最后**一个匹配，使同作用域内后声明的
 // 局部变量 shadow 先声明的（主流语言语义：Rust/JS 同块重定义后者生效）。
 // 非 var 种类在 sym_define 处已做去重（最多一个），故 last==first，无副作用。
@@ -4137,7 +4162,7 @@ pub fn infer_lambda_ret_from_decl(d: i64) i64 {
     // 在参数作用域里扫描 return 表达式
     var prev_scope: i64 = cur_scope;
     var prev_ret: i64 = cur_ret;
-    cur_scope = scope_new(global_scope);
+    cur_scope = scope_new_at(global_scope, d);
     var p: i64 = n.lb;
     while (p >= 0) {
         var pk: Child = base.kids[p];
@@ -13422,6 +13447,10 @@ pub fn run_check() void {
             + " 次 / 回落 CST " + base.i2s(g_hir_edge_cst)
             + " 次（无指令 " + base.i2s(g_hir_edge_noinst)
             + " / 操作数不符 " + base.i2s(g_hir_edge_mis) + "）");
+    }
+    // 工作 B 支柱 1：调试期作用域树一致性校验（默认关闭，零行为影响）。
+    if (g_verify_scope_tree) {
+        if (verify_scope_tree() == false) { eprint("WARN: scope tree inconsistent"); }
     }
 }
 
