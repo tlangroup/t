@@ -83,6 +83,31 @@ L.push(`    return -1;`);
 L.push(`}`);
 L.push("");
 L.push(`pub fn is_node_kind(k: string) bool { return nk_of_kind(k) >= 0; }`);
+
+// ── S6（§4.11.2）：每 kind 的 HIR 降级策略表 ──
+// 默认 LOWER_DIRECT；清单 tools/cst_kinds.json 的 `lower_policy_opaque` 白名单标 LOWER_OPAQUE。
+// ⚠ LOWER_OPAQUE 是**过渡机制**（不透明 BLOCK 承接，与「糖须全脱糖」铁律方向相反）：
+//   仅限设计期白名单的既有块式糖，用户新糖禁止新增；随这些 kind 逐一获得真正的
+//   DesugarPass 而逐条退役，目标归零。门禁应跟踪该条目数，只减不增。
+// 初始化器用数字字面量（不用常量名），避免静态定长数组初始化器引用常量的潜在限制。
+const POLICY_OPAQUE = new Set(MK.lower_policy_opaque || []);
+for (const k of POLICY_OPAQUE) {
+  if (!seen.has(k)) {
+    console.error(`[cstgen] lower_policy_opaque 含未知 kind '${k}'（不在 registry/universe 中）`);
+    process.exit(2);
+  }
+}
+L.push("");
+L.push("// S6 §4.11.2：HIR 降级策略（下标 = NK_*）。0=DIRECT / 1=EXPAND / 2=OPAQUE。");
+L.push("pub const LOWER_DIRECT: i64 = 0;");
+L.push("pub const LOWER_EXPAND: i64 = 1;");
+L.push("pub const LOWER_OPAQUE: i64 = 2;");
+L.push(`pub var lower_policy: [${N}]i64 = [${ordered.map((k) => (POLICY_OPAQUE.has(k) ? "2" : "0")).join(", ")}];`);
+L.push(`pub fn lower_policy_of(k: string) i64 {`);
+L.push(`    var t: i64 = nk_of_kind(k);`);
+L.push(`    if (t < 0) { return LOWER_DIRECT; }`);
+L.push(`    return lower_policy[t];`);
+L.push(`}`);
 L.push(KINDS_END);
 const kindsBlock = L.join("\n");
 
