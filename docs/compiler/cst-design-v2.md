@@ -499,7 +499,8 @@ if (n.td > 0) { n.td = -1; }          // ← 写在副本上：从未写回 node
 
 1. ✅ `node_scope` 取代 `g_seen`（**工作 A**，commit `1d6f431`）：扁平 `g_seen`+哨兵+空操作 pop → 作用域帧栈（`g_frame_keys`/`g_frame_starts`/`g_frame_owners`/`g_frame_sp`）+ 第 6 张 S3 侧表 `g_node_scope[]`，行为逐字节等价。等价性铁证：IR 基线仅 `src/tc.tc::{c,h,ll}` 变化，非编译器目标 = 0；gate L2 **24/0**（含自举四代不动点 g2==g3==g4）。⚠ 关键坑：`g_seen_pop` 必须保持**空操作**（不回退 sp）——否则嵌套块之后的外层变量会误看到块前同级变量（实测 `string_utils.tc::c` 漂移）；旧哨兵的帧隔离语义由 `g_frame_starts[sp-1]` 固定为「最近一次 push 的起始下标」还原。
 2. （已完成 ✅）`g_const_decl_ids` → `node_const[]` 侧表，见 §0.13.7b step4。
-3. **删除原始全局平行数组**：`g_seen` 已删（被 `g_frame_*` + `g_node_scope` 取代）；`g_node_mod`/`g_node_file` 已是侧表保留；`g_local_decls`/`g_conpat_binds` 仍被 mangle 逻辑使用，待 `node_conpat` 侧表化后清理。S3 侧表化（provenance / type / resolve / const / scope 五张）**全部落地** → 进入 **S4**（消费方切 `u64 NodeRef`，见 §0.14）。
+3. **删除原始全局平行数组**：`g_seen` 已删（被 `g_frame_*` + `g_node_scope` 取代）；`g_node_mod`/`g_node_file` 已是侧表保留；`g_local_decls`/`g_conpat_binds` **仍被 mangle 逻辑使用**（2026-10-02 复核确认：base.tc:1893/1952 仍在，`codegen_c.tc` 1526/1615/1670/1729/3492 使用；`node_conpat[]` 侧表尚无），待 `node_conpat` 侧表化后清理。S3 侧表化（provenance / type / resolve / const / scope 五张）**全部落地** → 进入 **S4**（消费方切 `u64 NodeRef`，见 §0.14）。
+  - ⚠ **S3 因此应记为 partial**：§4.10.3 对 S3 的要求是「删 `Node.td` **与全局平行数组**」，`Node.td` 已删，但 `g_local_decls`/`g_conpat_binds` 两个全局平行数组未清。该遗留项归 §0.14.5 第 4b 项（deferred）。
 
 ### 0.14 S4 实施记录（消费方切 u64 NodeRef）
 
@@ -550,14 +551,17 @@ if (n.td > 0) { n.td = -1; }          // ← 写在副本上：从未写回 node
   - 基线 `f1dff4b2…` 是 **step③ 的 gen-1 g1** 产物，而稳定编译器是 g4（固定点 `g2==g3==g4`）；gate 注释明确改了发射器后 `g1 != g4` 是预期漂移，基线由 g1 录制 → 与同步出的 g4 天然差这 3 文件（与 step② 的"3 DIFF src/tc.tc"完全同型）。
   - 故 3 DIFF 是**基线陈旧 + 自举表示漂移**，非回归。按路线图"确认预期差异后 `--update` 重录"，用当前稳定 g1 重录基线（`node tools/ir_snapshot.mjs --update --compiler out/dbg/g1.exe`），复跑只读快照 `354 份逐字节相同`，复跑 gate L2 预期 **24 passed / 0 failed**。
   - ⚠ **注意**：门禁会把 g4 回拷到 `out/dbg/g1.exe`，导致 `g1.exe` 文件瞬时变成 g4（发 `f9cd4d61…`）；只读快照/基线录制须认准**自举初期的 gen-1 g1**（发 `fb408b13…`），复跑门禁即回到该状态，快照 0 DIFF——中间态的 md5 错位只是文件瞬时覆盖，非编译非确定性。
-- **commit**：待 gate L2 全绿后提交 `s2-noderef` 快进推送（含 `src/hir.tc` / `docs/compiler/cst-design-v2.md` / `tests/ir_baseline.json`）。
+- **commit**：commit `2bea53f`（`src/hir.tc` / `docs/compiler/cst-design-v2.md` / `tests/ir_baseline.json`）；快进推送 `s2-noderef:main`（`72d461f..2bea53f`）。gate L2 **24/0**（重录基线后复跑）。
 
 #### 0.14.5 后续子步（待推进，按风险分级）
 
 1. ✅ **`node_*` 访问器切 `u64 NodeRef`**（step②，见 §0.14.2，commit `a9c2970`）。
 2. ✅ **`mk_*` 构造器返回 `u64 NodeRef`**（step③，见 §0.14.3，commit `72d461f`）。
 3. ✅ **HIR 节点 `nd` 字段切 `u64 NodeRef`**（step④，见上：仅 `HirInst.nd: i64→u64` + 哨兵函数 `hir_nd_none`；20+ `hir_inst_node` 调用点零改动）。⏳ **仍待办（更高风险 epic）**：`node_to_hir` 桥改造、删旧 `base.Node` 字段 + 删 re-export 垫片（§4.14.4）—— 这些会触碰跨模块 `Node` 字段消费，留作独立步，不在本步。
-4. 收尾：`g_local_decls`/`g_conpat_binds` 迁 `node_conpat[]` 侧表后清理；`node_*`（旧 i64 版）访问器退役；待有真实消费者时再让构造器返回**带 tag** 的打包 NodeRef（届时须先把所有下标站点改为 `nr_idx`）。
+4. 收尾（拆分标注状态，2026-10-02 复核）：
+   - 4a. ✅ **`node_*` 旧 i64 版访问器退役** —— 已闭合（step② 整体改 u64 版）。
+   - 4b. ⏳ **`g_local_decls`/`g_conpat_binds` 迁 `node_conpat[]` 侧表后清理** —— **未做**（二者仍在 base.tc:1893/1952，被 codegen_c 使用；`node_conpat` 侧表尚无）。属 S3「删全局平行数组」遗留，deferred。
+   - 4c. ⏳ **让构造器返回带 tag 的打包 NodeRef** —— 待有真实消费者（届时须先把所有下标站点改为 `nr_idx`）。
 
 #### 0.14.6 最高风险 epic 拆解规划（2026-10-01 调研）
 
@@ -579,7 +583,11 @@ if (n.td > 0) { n.td = -1; }          // ← 写在副本上：从未写回 node
 **方案 A — S4 收口，删 Node 降为 deferred（推荐）**
 - S4 的交付 = 类型层 NodeRef 化（step②/③/④ 已完成且 verify 全绿），即 §0.14.4 第 3 项「HIR 节点 `nd` 切 `u64 NodeRef`」已交付；「删旧 `base.Node` + 删 re-export 垫片」从 S4 主线移除，正式降格为 **deferred 未来 epic**。
 - 依据：删 Node 单结构体本质是「AST 表示 AoS→SoA」重构，真实驱动力应是 ① 性能（SoA 缓存友好）/ ② 模块系统（base.tc 整体迁 `std.rc.cst` 时 Node 不能仍是 base.tc 全局 struct）/ ③ 增量编译（按需加载字段）——三者均属未来需求。§0.14.5 第 4 项「待有真实消费者时再让构造器返回**带 tag** 的打包 NodeRef（须先把所有下标站点改为 `nr_idx`）」即此意：当前无真实消费者需要打包 NodeRef，且打包的前置（`nr_idx` 改造）远未就绪。
-- 收尾仅做低风险项：§0.14.5 第 4 项的 `g_local_decls`/`g_conpat_binds→node_conpat` 侧表清理（若已迁则退役旧访问器占位——但 step② 已使 `node_*` 是 u64 版、旧 i64 版不复存在，故该项实际已闭合）。
+- 收尾仅做低风险项：§0.14.5 第 4 项的 **`node_*` 旧 i64 版访问器退役**——该项**已闭合**（step② 已把它们整体改成 u64 版，旧 i64 版不复存在）。
+- **⚠ 更正（2026-10-02 复核，原文有误）**：上一版曾写「`g_local_decls`/`g_conpat_binds→node_conpat` 侧表清理…故该项实际已闭合」，**此断言与代码事实不符，已撤回**。实测：
+  - `g_local_decls`（base.tc:1893）与 `g_conpat_binds`（base.tc:1952）**仍在**，且被 `codegen_c.tc`（1526/1615/1670/1729/3492）实际使用；
+  - `node_conpat[]` 侧表**不存在**（侧表登记册 base.tc:1795–1799 只有 `node_provenance/type/resolve/const/scope` 五张）。
+  - 故该项**未闭合**，仍是 S3「删全局平行数组」的遗留项（与 §0.13.8 第 3 项一致），继续列为 deferred，**不得**凭「step② 退役了旧访问器」推断它已完成——二者是不同对象。
 - 代价/风险/门禁：零。
 
 **方案 B — 完整 SoA 重构（高风险，~750 处迁移）**
@@ -595,6 +603,13 @@ if (n.td > 0) { n.td = -1; }          // ← 写在副本上：从未写回 node
 2. 无当下消费者需要打包 NodeRef（`node_new` 裸索引返回安全，所有下标站点依赖裸索引）。
 3. 方案 B 的 SoA 收益（性能/模块化/增量）在当前阶段无法兑现，却要付 ~6 小时门禁 + 750 处高风险机械改动；等工作 B（sema 统一词法树/增量/IDE）或模块系统真正需要时再启动，可与其合并、一次性借势。
 4. 保留 `nodes[]` 并存不阻塞任何已规划工作；base.tc→`std.rc.cst` 搬迁才是删垫片/删 Node 的真正时机，那是一个更大的独立迁移 epic。
+
+**⚠ S4「收口」的真实语义 = PARTIAL（务必按此理解，勿当作阶段已完成）**
+
+按 §4.10.3 阶段表，S4 原列四项：「消费者换访问者 `node_visit`/`transform」+「删旧 `base.Node` 字段」+「删 re-export 垫片」+「`node_to_hir` 桥切 `NodeRef`」。**实际只交付了「消费方切 `u64 NodeRef`」的类型层**（step②/③/④），上述四项**全部 deferred**。故 S4 应记为 **partial**，不是 done。
+
+- **硬前置约束（承接 §4.10.3 依赖图注释，不得随 S4 降格而丢失）**：原文「**工程上应先完成 S4（删旧 `base.Node` 字段），否则 S8 的插件 API 会同时暴露新旧两套节点表示**」。该项现已 deferred，因此其约束**顺延为：删 `base.Node` 字段 + 删 re-export 垫片必须在 S8 之前完成**。S5/S6/S7 不依赖它（S6 依赖 S3、S7 依赖 S6、S5 可并行），故推迟不阻塞后继阶段；但进入 S8 前必须回来收口，否则新旧两套表示同时暴露给插件 API。
+- **验收判据同步说明**：§4.10.3 给 S4 的验收是「`hir_test` 穷尽性守住（`node_visit` 分支数 == `NK_*` 数）」——因 `node_visit`/`transform` 未建，该判据**当前不适用**；S4-partial 的实际验收退化为「不动点 A 绿 + gate L2 24/0 + 基线 B 已按预期重录」（§4.10.0）。
 
 ### 0.13.9 `node_scope` 设计（经批判修订；原"统一作用域基础设施"方案已降级）
 
@@ -639,6 +654,57 @@ pub fn node_set_scope(id: i64, s: i64) void {...}
 - 工作 A 不动 `sym_define`/`sym_lookup`/`scope_parents`/`ll_mangle`。
 - `conpat` 豁免：`g_conpat_bind_has` 是独立谓词，单独迁成 `node_conpat[]` 侧表（属 S3 剩余清单 `g_conpat_binds`），mangle 决策时跳过，**不塞进 `node_scope`**。
 - 工作 B（sema 统一词法树、增量/IDE、相位 CTFE walker）列为**后续独立 epic**，本文档不展开实施，待真实需求触发。
+
+---
+
+### 0.15 路线偏离总账（2026-10-02 复核：§4.10.3 阶段表 ↔ 仓库实际实施对账）
+
+> 目的：逐项对账「路线要求」与「实际提交序列」，对每处偏离给出**正确性证明**或**修正**。
+
+**实际实施序列（git log，均已快进推送 main）**
+
+```
+S0   ec8400a / 4b63ced / e3aacf2   关键字表 + kind 迁入 std.rc.cst；.tlib 预编译实测暂缓
+S1a  c5178ca                        kind 宇宙普查 + cstgen + 105 项 NK_*；base.tc 转重导出垫片
+S1b  d573dbb                        上下文关键词下沉试点
+S2   c264fbf / c6634b6 / 349bc50    NodeRef 双写 + SoA 分表 + 双后端自举不动点
+S3   b78f9fd → 01d8b82 → 926e6f6 → a78d9ba → 1d6f431
+     provenance / node_type / node_resolve / node_const / node_scope 五张侧表
+S4   821c19b → a9c2970 → 72d461f → 2bea53f → 93eb234
+     step1 g_node_nref 激活 → step② 访问器 → step③ mk_* → step④ HirInst.nd → 收口裁定
+工作B a244377 → b91182f → 8e58623   支柱 1 step1/2/(3+4)
+```
+
+**对账表**
+
+| # | 路线要求 | 实际落地 | 判定 |
+|---|---|---|---|
+| 1 | S0 `.tlib` 预编译库模块 | 暂缓（`build_std.mjs` 只做点分路径预留） | ✅ **非偏离** —— §4.14.7.1 实测两个硬阻点，§4.10.3 S0 行已内化该暂缓 |
+| 2 | S1 是否新增 `Node.tag` | 延后到 S2/S4 | ✅ **非偏离** —— §0.10.3 已裁定并同步修正 §4.10.3 措辞 |
+| 3 | S3「删 `Node.td` **与全局平行数组**」 | 删了 `Node.td`/`g_idecl_*`/`g_seen`；**`g_local_decls`+`g_conpat_binds` 仍在**（base.tc:1893/1952，被 `codegen_c.tc` 使用） | ⚠ **未闭合** ⇒ S3 亦应记为 **partial** |
+| 4 | S4 四项（访问者 / 删 `base.Node` 字段 / 删 re-export 垫片 / `node_to_hir` 桥切 NodeRef） | 只交付「消费方切 `u64 NodeRef`」类型层 | ⚠ **偏离（partial）** —— 论证见 §0.14.6（方案 A），**硬前置已顺延，见 §0.14.6 末** |
+| 5 | 工作 B「**待真实消费者触发** + 另立 sign-off」（§0.13.9） | 由**用户裁定**启动（`work-b-design.md` 第 4 行自述） | ⚠ **偏离** —— 证明与边界见下 |
+
+**偏离 5（工作 B 启动门槛）的证明与边界**
+
+- **事实**：门槛确被绕过——触发条件是「用户裁定」，而非 §0.13.9 要求的「真实消费者（IDE / 增量编译）出现」。
+- **正确性证明（为何可接受）**：实际落地被严格约束在**零行为变化子集**内。支柱 1 step1–4 仅为 ①`scope_owner` 数据模型扩展、②`scope_new_at` 把语义作用域锚定到 CST 节点、③`verify_scope_tree`（调试标志默认关闭）。门禁事实（如实记录，勿夸写）：**step1 / step2 各自跑满完整 gate L2 = 24 passed / 0 failed**；**step3+4 未跑满 24 步**——其 gate 首跑在「产物快照比对」报 3 DIFF（仅 `src/tc.tc::{c,h,ll}`，0 NEW/0 GONE）后 fail-fast 中止，前置 8 步（工具链/诊断/CST 清单/静态检查/预编译 std/自举一代/IR 审计/LLVM verifier）全绿；`--update` 重录基线后复跑只读快照 = **354 份产物逐字节相同（0 DIFF）**。因 `src` 未再变更，其余步骤沿用既有绿灯。而 §0.13.9 真正设防的对象——**「解析器重构」（`sym_lookup` 上溯从 `scope_parents` 链迁到 `node_scope` 树）**——即支柱 1 **step5，已 DEFERRED，未执行**。换言之：启动的是窄化到零风险的地基基建，被门槛保护的部分一根未碰。
+- **边界约束（继续有效，不因本次启动而解除）**：**step5 及支柱 2/3 仍受 §0.13.9「真实消费者触发」门槛约束**；在 IDE / 增量编译出现明确需求前，不得推进 step5。
+
+**偏离 4 的处置**：已在 §0.14.6 论证（方案 A）+ 本轮补记「S4 = PARTIAL」与「删 Node/删垫片必须在 **S8 之前**完成」的硬前置，防止该项随 S4 标"完成"而丢失。
+
+**已修正的文档错误（本轮）**
+
+1. §0.14.6 曾断言 `g_local_decls`/`g_conpat_binds→node_conpat`「**故该项实际已闭合**」——**与代码矛盾，已撤回**；改为如实标注未闭合（见 §0.14.6 更正段与 §0.14.5 第 4b 项）。
+2. §0.14.4 末仍写「**commit**：待 gate L2 全绿后提交」——实际已提交 `2bea53f` 并推送，已更新。
+3. §0.14.5 第 4 项原把「访问器退役 / conpat 侧表化 / 打包 NodeRef」三事混为一条导致状态误读，已拆为 4a/4b/4c 分别标注。
+
+**关键路径现状与下一步建议**
+
+- 已完成：`S0 → S1 → S2 → S3(partial) → S4(partial)`。
+- 尚未启动：**S5**（Span / trivia / `.ast`，P2，可并行）、**S6**（`lower_policy[]` + SAST，P1，**依赖 S3 已满足**）、**S7**（PassManager）、**S8**（`@desugar`/`@pass` + fmt/lint）。
+- 当前占用：工作 B 支柱 1（路线外 R&D epic，step5 DEFERRED）。
+- ⚠ **路线提示**：按 §4.10.3，S4 之后主线下一步应为 **S6**（或并行 S5）；当前走工作 B 属路线外 R&D。**若目标是推进主线，下一步建议回 S6**（其依赖 S3 已满足，且 S6 会产出 `HIR_OP_RAW == 0` 的正向断言，收益明确）。
 
 ---
 
