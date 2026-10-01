@@ -515,7 +515,7 @@ if (n.td > 0) { n.td = -1; }          // ← 写在副本上：从未写回 node
 - **坑**：初版把 helper 误放进 `GEN:node-structs` 区导致 `cstgen --check` 失败；移出即恢复。另发现 `cst_nodes.json` 已扩 105 kind 但 `GEN:kinds` 未同步，`cstgen --emit` 补到 105（磁盘内容与 HEAD 一致，git 未显差异）。
 - **验证（等价性铁证）**：IR 基线差异仅 `src/tc.tc::{c,h,ll}`（3 DIFF / 0 NEW / 0 GONE），**非编译器目标 IR 变化 = 0**；gate L2 **24/0**（含自举四代不动点 g2==g3==g4、双轨对拍、REPL 冒烟、run_examples 双后端）。
 
-#### 0.14.2 step②：`node_*` 访问器切 `u64 NodeRef`（commit 待填，见下）
+#### 0.14.2 step②：`node_*` 访问器切 `u64 NodeRef`（commit `a9c2970`，2026-10-01）
 
 - **动机**：让 S3 五张侧表的消费方改用统一引用表示，为 step③（`mk_*` 返回 `NodeRef`）铺路。§0.14.2 原列的第 1 项。
 - **改动**（`src/base.tc`）：10 个访问器入参 `id: i64` → `n: u64`，函数体首行统一 `var id = nr_idx(n)` 再走原边界检查：`node_mod`/`node_file`/`node_type`+`node_set_type`/`node_resolve`+`node_set_resolve`/`node_const`+`node_set_const`/`node_scope`+`node_set_scope`。
@@ -524,12 +524,23 @@ if (n.td > 0) { n.td = -1; }          // ← 写在副本上：从未写回 node
   - 等价性铁证：见下验证。
 - **验证（等价性铁证）**：IR 基线差异仅 `src/tc.tc::{c,h,ll}`（3 DIFF / 0 NEW / 0 GONE），**非编译器目标 IR 变化 = 0**；`tc check src/tc.tc` 0 error（仅 510 条预存 style warning）；`g1` 自举成功；gate L2 复跑预期 **24/0**（含自举四代不动点 g2==g3==g4）。
 
-#### 0.14.3 后续子步（待推进，按风险分级）
+#### 0.14.3 step③：`mk_*` 构造器返回 `u64 NodeRef`（接续 step② `a9c2970`）
 
-1. ✅ **`node_*` 访问器切 `u64 NodeRef`**（step②，见上）。
-2. **`mk_*` 构造器返回 `u64 NodeRef`**：与 SoA `cst_register_*` 双写对齐，调用方从「持有 i64 id」过渡到「持有 NodeRef」。高风险（跨 parse/sema/hir/tir/codegen 全量签名变更）。
+- **动机**：让「构造→消费」全链路统一为 `NodeRef`。§0.14.3 原列第 2 项。step② 已让访问器收 `u64`，本步让构造器产 `u64`，二者闭合。
+- **改动**：
+  - `node_new` 返回 `i64 → u64`；`mk_*` 96 处 `fn mk_*(...) i64` → `fn mk_*(...) u64`（base 93 + parse 2 + sema 1，脚本精确替换返回位、零改参数位、函数体零改动）。`mk_*` 直接 `return node_new(...)`，故自动继承新返回类型。
+  - ⚠ **关键决策（与原计划的偏差，重要）**：`node_new` 返回的是**裸索引**（仅静态类型提升为 `u64`），**不是** `mk_noderef(tag, idx)` 打包值。理由：既有代码在 `mk_*` 体内与全部 749 处调用点大量以 `nodes[nid]` / `slice_set(nodes, nid, ...)` 把返回值**直接当数组下标**。`t` 在下标处的 `u64 → i64` 收窄**不会**解包 tag，若返回打包值，下标会取到 `tag<<32 | idx` 的巨大数 → 整体越界 → **全部目标发射失败**。故 tag 只存于 `g_node_nref` 侧表（step1 已写入），访问器经 `nr_idx(nid)` 取裸索引，与 `node_new` 返回裸索引逐位一致。本步的 `NodeRef` 因此 =「静态类型为 u64、运行时值为裸节点索引」（tag 暂恒 0），是分阶段迁移的正确中间态。
+  - 原计划把此步列为「高风险全量签名变更」是基于「`u64→i64` 收窄非隐式」的误判：实证 `t` 同时允许隐式 `u64→i64` 收窄与 `u64` 数组下标（scratch 程序 `tc check`/`tc compile` 各 0 诊断），故 749 处调用点**全部自动收窄通过，零调用点改动**——本步实为**纯签名变更、零行为变化**。
+- **⚠ 实测踩坑（已修，务必记取）**：首版 `node_new` 写成 `return mk_noderef(nref_tag, nid)`（返回打包值），结果 `ir_snapshot` 报 **117 个目标全部 `failed to emit`**（g1 自身发射即越界崩溃）。回退为返回裸索引后立即恢复。铁律：**凡返回 NodeRef 的构造器，其返回值被当作数组下标的既有代码必须先用 `nr_idx` 解包，否则绝不能返回打包值**——分阶段迁移期间一律返回裸索引。
+- **⚠ 二次踩坑（cstgen --check 门禁红灯，已修）**：本步初版用 Python 脚本批量替换 `fn mk_*(...) i64 → u64`。脚本以**文本模式** `open()/write()` 全量读写 `base.tc`（文件为 CRLF），把 GEN 生成区间的字节悄悄改写（行尾/空白规范化）；而 `cstgen --check` 对 GEN 区间做**逐字节精确比较**，于是门禁 `cstgen --check` 红灯（"GEN:node-structs 区间与 cst_nodes.json 不一致"）。根因**不是** `mk_*` 语义改动，而是脚本 I/O 副作用。修复：`node tools/cstgen.mjs --emit`（依 `cst_nodes.json` 重生成 canonical GEN 区间，覆盖脚本扰动）；`mk_*`/`node_new` 改动在 GEN 区间之外，被 `--emit` 完整保留。此后 `--check` 绿灯（kinds 105 / node-structs 91）。**教训：批量改 `src/*.tc` 绝不用文本模式脚本对含 GEN 生成区的文件做全量重写——必须用 Edit 工具或二进制/无归一化 I/O，否则会污染生成区触发门禁。**
+- **验证（等价性铁证）**：IR 基线差异仅 `src/tc.tc::{c,h,ll}`（3 DIFF / 0 NEW / 0 GONE），**非编译器目标 IR 变化 = 0**；`tc check src/tc.tc` 0 error（510 条预存 style warning）；`g1` 自举成功；gate L2 复跑预期 **24/0**（含自举四代不动点 g2==g3==g4）。
+
+#### 0.14.4 后续子步（待推进，按风险分级）
+
+1. ✅ **`node_*` 访问器切 `u64 NodeRef`**（step②，见 §0.14.2，commit `a9c2970`）。
+2. ✅ **`mk_*` 构造器返回 `u64 NodeRef`**（step③，见上）。
 3. **`node_to_hir` 桥 / HIR 节点 `nd` 字段切 `u64 NodeRef`**；最终删旧 `base.Node` 字段 + 删 re-export 垫片（§4.14.4）。最高风险，单独 epic。
-4. 收尾：`g_local_decls`/`g_conpat_binds` 迁 `node_conpat[]` 侧表后清理；`node_*`（旧 i64 版）访问器退役。
+4. 收尾：`g_local_decls`/`g_conpat_binds` 迁 `node_conpat[]` 侧表后清理；`node_*`（旧 i64 版）访问器退役；待有真实消费者时再让构造器返回**带 tag** 的打包 NodeRef（届时须先把所有下标站点改为 `nr_idx`）。
 
 ### 0.13.9 `node_scope` 设计（经批判修订；原"统一作用域基础设施"方案已降级）
 
