@@ -501,6 +501,48 @@ if (n.td > 0) { n.td = -1; }          // ← 写在副本上：从未写回 node
 2. （已完成 ✅）`g_const_decl_ids` → `node_const[]` 侧表，见 §0.13.7b step4。
 3. **删除原始全局平行数组**（`g_node_mod` / `g_node_file` / `g_seen` / `g_local_decls` / `g_conpat_binds`），届时 S3 的「删全局平行数组」验收项闭合 → 进入 S4（消费方切 `u64 NodeRef`）。
 
+### 0.13.9 `node_scope` 设计（经批判修订；原"统一作用域基础设施"方案已降级）
+
+> **修订记录（2026-10-01）**：初版按用户四要求升级为"统一作用域树+图"方案。经批判后判定该方案**混淆了名字解析与标识符重名、把 S3 收口任务偷换成解析器重写、且含大量无当下消费者的过度工程**，故降级为下方的"窄而安全"设计。四要求的合理内核被保留并重新落地（见各条）。
+
+#### 事实纠偏（修订依据）
+- **LLVM 后端并不使用 `g_seen`**：C 后端重名用 `g_seen`（base.tc:1880、`codegen_c.tc`），LLVM 后端重名用 `src/llname.tc` 的 `ll_mangle`/`g_ll_addrslot`（`tir_to_ll.tc:429/454/1270` 等）。二者是**不同关注点**：sema 做*名字解析*（`x` 绑定到哪个声明）、`g_seen` 做 *C 发射重名*、LLVM 做 *LLVM 名*。碰撞域（词法 vs 发射序）与失败模式都不同，硬塞进一棵树是错误耦合。原"三套互不相通"表述有误。
+- 闭包（`closure_make`/`closure_capture`/`lambda`，sema.tc:4135/5242/6409）与 comptime 泛型（`comptime T: any`/`meta T: type`/`instantiate_generic`，sema.tc:1553–2005）**真实存在**，故"expr 粒度""相位"不是空想，但落点须精确（见下）。
+
+#### 修订后设计：拆为两类工作，风险分级
+- **工作 A（S3 收口，安全）：只替换 `g_seen`。** 纯发射侧重构：`g_node_scope[]` 侧表由*发射帧树*（原 24 个 `g_seen_push` 站点）构建，mangle 决策读它。sema 解析器、`llname.ll_mangle` **完全不动**。这就是 §0.13.8 的原意，IR 非编译器目标变化=0，从根上消除 `-O2` 自别名隐患。
+- **工作 B（独立 R&D epic，需另立 sign-off）：sema 统一词法作用域树 + 工具链。** 这是**解析器重构**（把 `sym_lookup` 上溯从 `scope_parents` 链迁到 `node_scope` 树），不是 S3 性质的任务，量级大一个数量级、会破坏"IR 变化=0"纪律。只在出现真实消费者（IDE / 增量编译）时才启动，不塞进 S3。
+
+#### 四要求的合理内核如何落地（修订版）
+- **#1 基础统一 → 仅"发射侧"统一，不碰解析侧**。`g_node_scope`/`g_scopes` 取代 `g_seen` 的发射帧；sema 与 LLVM 的*名字来源*仍各自保留（sema 的 `scope_parents` 链、LLVM 的 `ll_mangle`）。不强行三合一。
+- **#2 粒度精细化 → 仅"引入绑定的表达式"才建 expr 作用域**。scope 树节点 = `module`(=现有 `global_scope`/`node_mod`，**不新增 kind**) / `function` / `block`(原 24 push 站点) / **绑定表达式**（闭包体经 `closure_capture`、for-in 迭代器绑定、if/match 绑定器）。**不为任意表达式建 scope**（否则每个二元子表达式都建节点，树爆炸）。
+- **#3 工程化升级 → 从"现在就建图"降级为"数据模型可扩展"**。侧表保留 `parent`+`owner`(+`kind`)，未来可加 `ScopeEdge`；但**现在不建图机械、不做增量脏传播、不做 IDE 持久化**。无当下消费者即不投入。
+- **#4 编译时/运行时分离 → 相位挂在符号上，不拆 scope**。保留唯一词法树；仅 CTFE 需要处给符号加 `phase`(runtime/comptime/both)（已有 `is_comptime`/`closure_capture` 雏形可复用）。CTFE 在唯一词法树里走 comptime 子树求值。按相位拆 scope 会复制词法相同的 scope、引发不一致解析，故不做。
+
+#### 核心技术模型（工作 A 范围）
+```c
+pub var g_scopes:     []Scope;     // Scope{ id, parent, owner(块节点 id), kind(1=fn/2=block/3=expr) }
+pub var g_node_scope: []i64;       // 与 nodes 平行：节点→所属 scope id（默认 -1）
+pub fn node_scope(id: i64) i64 {...}
+pub fn node_set_scope(id: i64, s: i64) void {...}
+// build_scope_tree()：在发射期对每个 g_seen_push 站点对应的 AST 块节点建一个 parent=当前scope 的子作用域，
+//   owner=该块节点；var_decl 落入当前作用域并 node_set_scope(var_decl, scope.id)。
+// mangle 决策（替代 g_seen_has+g_seen_add）：取 s=node_scope(sid)，扫 s.decls（同作用域、排除自身）
+//   若有同名 n.sa 且非 conpat 绑定 → cname=name__sid，记 g_local_decls。独立块永不比较 → 与 g_seen 哨兵隔离逐字节一致。
+```
+- 经 `sidetable_register("node_scope", "S3")` 登记（第 6 张侧表，与 `node_mod` 正交互补）。
+
+#### 等价性证明协议（消除"高风险"）
+- **阶段 0**：加 `g_node_scope`+`build_scope_tree`，`g_seen` **双跑**，对每个 `var_decl` dump `(fn, scope_owner, name, mangled?)` 与 `g_seen` 版对比，`run_examples --all` 断言全相等。**零行为变化**。
+- **阶段 1**：证明相等后，codegen_c 切读 `node_scope`，删 `g_seen_*`（原 S3-step5）。重跑 gate L2 + 基线（行为不变 → IR 变化=0）。
+- **阶段 2（收口）**：删 `g_seen` 相关全局，`node_scope` 验收闭合 → S3 全部完成 → 进 S4（消费方切 `u64 NodeRef`）。
+- 每阶段 gate L2 + 基线 0 变化 + 提交推 main。
+
+#### 与工作 B 的边界（防范围蔓延）
+- 工作 A 不动 `sym_define`/`sym_lookup`/`scope_parents`/`ll_mangle`。
+- `conpat` 豁免：`g_conpat_bind_has` 是独立谓词，单独迁成 `node_conpat[]` 侧表（属 S3 剩余清单 `g_conpat_binds`），mangle 决策时跳过，**不塞进 `node_scope`**。
+- 工作 B（sema 统一词法树、增量/IDE、相位 CTFE walker）列为**后续独立 epic**，本文档不展开实施，待真实需求触发。
+
 ---
 
 ## 1. 当前实现剖析（基于真实代码）
