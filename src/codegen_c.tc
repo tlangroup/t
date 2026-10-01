@@ -3439,7 +3439,7 @@ pub fn emit_stmt(sid: i64, indent: i64) void {
     }
     // comptime_block：无 CTFE，退化为运行期内联块（避免被静默丢弃）
     if (n.kind == "comptime_block") {
-        base.g_seen_push();
+        base.g_seen_push(sid);
         spush(base.sb_cat2(pad, "{"));
         var cb: i64 = n.la;
         while (cb >= 0) {
@@ -3480,8 +3480,8 @@ pub fn emit_stmt(sid: i64, indent: i64) void {
         }
         // 同函数内重名局部变量（shadowing）：与 LLVM 后端同机制。
         // conpat 载荷绑定（match 构造器解构出的 x）身处各臂独立代码块，不做唯一化重整。
-        // g_seen 为 append-only 扁平表 + 帧哨兵（进块 push 一枚哨兵 / 出块 pop 为空操作）：
-        // 同名局部只有落在「同一帧」（真正同块重名）才唯一化 mangle；落在独立块
+        // g_seen 为作用域帧栈（进块 g_seen_push(owner) 建帧 / 出块 g_seen_pop 收缩栈深）；
+        // g_seen_has 只扫「当前帧」：同名局部只有落在同一帧（真正同块重名）才唯一化 mangle；落在独立块
         // （C 块作用域天然隔离）则不 mangle —— 引用端经 idecl 反查同名声明，两端自洽，
         // 根治此前扁平 g_seen 把独立块内同名局部误 mangle（声明 name__<sid> 而引用端仍 name）的 bug。
         if (em_in_fn) {
@@ -3633,7 +3633,7 @@ pub fn emit_stmt(sid: i64, indent: i64) void {
             var mfat: string = "t_map_key_int_at";
             if (sema.tds[it.key].cat == "string") { mfat = "t_map_key_str_at"; }
             var mfit: string = emit_expr(n.na);
-            base.g_seen_push();
+            base.g_seen_push(sid);
             spush(base.sb_cat4(pad, "for (int64_t _fe_i = 0; _fe_i < t_map_count(", mfit, "); _fe_i = _fe_i + 1) {"));
             spush(base.sb_cat6(base.sb_cat2(pad, "    "), mfkc, " ", n.sa, base.sb_cat6(" = ", mfat, "(", mfit, ", _fe_i);", ""), ""));
             // 双变量形式 `for (k, v in m)`：v 由插入序下标直接取值
@@ -3658,7 +3658,7 @@ pub fn emit_stmt(sid: i64, indent: i64) void {
         // bitstr 字节迭代：元素 u8，游标走 TBitStr.ptr[_fe_i]，计数 = ceil(bit_len/8)。
         if (it.cat == "bitstr") {
             var iterb: string = emit_expr(n.na);
-            base.g_seen_push();
+            base.g_seen_push(sid);
             spush(base.sb_cat6(pad, "for (int64_t _fe_i = 0; _fe_i < ((t_bitstr_bitlen(", iterb, ") + 7) / 8); _fe_i = _fe_i + 1) {", "", ""));
             spush(base.sb_cat6(base.sb_cat2(pad, "    "), "uint8_t ", n.sa, " = ", iterb, ".ptr[_fe_i];"));
             var b2: i64 = n.la;
@@ -3672,7 +3672,7 @@ pub fn emit_stmt(sid: i64, indent: i64) void {
             return;
         }
         var iter: string = emit_expr(n.na);
-        base.g_seen_push();
+        base.g_seen_push(sid);
         spush(base.sb_cat6(pad, "for (int64_t _fe_i = 0; _fe_i < t_slice_len(", iter, "); _fe_i = _fe_i + 1) {", "", ""));
         spush(base.sb_cat6(base.sb_cat2(pad, "    "), c_decl_of(fe_elem_td, n.sa), " = *((", c_ptr_to(fe_elem_td), base.sb_cat4(")t_slice_at(", iter, ", _fe_i));", ""), ""));
         var b: i64 = n.la;
@@ -3686,7 +3686,7 @@ pub fn emit_stmt(sid: i64, indent: i64) void {
         return;
     }
     if (n.kind == "if") {
-        base.g_seen_push();
+        base.g_seen_push(sid);
         spush(base.sb_cat4(pad, "if (", emit_expr(n.na), ") {"));
         var tb: i64 = n.la;
         while (tb >= 0) {
@@ -3697,7 +3697,7 @@ pub fn emit_stmt(sid: i64, indent: i64) void {
         if (n.lb > -2) {
             base.g_seen_pop();
             spush(base.sb_cat2(pad, "} else {"));
-            base.g_seen_push();
+            base.g_seen_push(sid);
             var eb: i64 = n.lb;
             while (eb >= 0) {
                 var ek: Child = base.kids[eb];
@@ -3710,7 +3710,7 @@ pub fn emit_stmt(sid: i64, indent: i64) void {
         return;
     }
     if (n.kind == "while") {
-        base.g_seen_push();
+        base.g_seen_push(sid);
         spush(base.sb_cat4(pad, "while (", emit_expr(n.na), ") {"));
         var wb: i64 = n.la;
         while (wb >= 0) {
@@ -3750,7 +3750,7 @@ pub fn emit_stmt(sid: i64, indent: i64) void {
             upd = emit_expr(n.nc);
         }
         sappend_last(base.sb_cat6("; ", cnd, "; ", upd, ") {", ""));
-        base.g_seen_push();
+        base.g_seen_push(sid);
         var fb: i64 = n.la;
         while (fb >= 0) {
             var fk: Child = base.kids[fb];
@@ -3767,7 +3767,7 @@ pub fn emit_stmt(sid: i64, indent: i64) void {
         while (di >= 0) {
             var dnode: Node = base.nodes[g_defer[di]];
             var dpad: string = mk_pad(indent);
-            base.g_seen_push();
+            base.g_seen_push(g_defer[di]);
             spush(base.sb_cat2(dpad, "{"));
             var dbb: i64 = dnode.la;
             while (dbb >= 0) {
@@ -3806,7 +3806,7 @@ pub fn emit_stmt(sid: i64, indent: i64) void {
         return;
     }
     if (n.kind == "block") {
-        base.g_seen_push();
+        base.g_seen_push(sid);
         spush(base.sb_cat2(pad, "{"));
         var bb: i64 = n.la;
         while (bb >= 0) {
@@ -4711,7 +4711,7 @@ pub fn emit_func_decl(d: i64) void {
     em_in_fn = true;
     em_cur_ret = sema.resolve_type_desc(n.na);
     g_defer_n = 0;   // 每个函数独立延迟栈
-    base.g_seen_push();   // 函数体作用域栈底帧：隔离不同函数、承接块级嵌套帧
+    base.g_seen_push(d);   // 函数体作用域栈底帧：隔离不同函数、承接块级嵌套帧
     spush(base.sb_cat2(sig, " {"));
     if (n.lc > -2) {
         var b: i64 = n.lc;
@@ -4726,7 +4726,7 @@ pub fn emit_func_decl(d: i64) void {
         var di: i64 = g_defer_n - 1;
         while (di >= 0) {
             var dnode: Node = base.nodes[g_defer[di]];
-            base.g_seen_push();
+            base.g_seen_push(g_defer[di]);
             spush("    {");
             var dbb: i64 = dnode.la;
             while (dbb >= 0) {
