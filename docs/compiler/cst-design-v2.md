@@ -497,11 +497,13 @@ if (n.td > 0) { n.td = -1; }          // ← 写在副本上：从未写回 node
 
 ### 0.13.8 S3 剩余子步（待推进）
 
-1. `node_scope` 迁侧表（取代 `g_seen` 的「append-only + 哨兵 + 反向扫」黑魔法，规避 §4.5 提到的 `-O2` 自别名崩溃）。⚠ **高风险**：`g_seen` 在 `codegen_c.tc` 有 28 处、按**发射序**工作、且注释自陈「当前帧内名字本就唯一 → mangle 恒为空操作」，被 `-O2` 自别名红线两次绊倒；迁 `node_scope[]` 需重建作用域树，非纯搬迁，单独评审。
+1. ✅ `node_scope` 取代 `g_seen`（**工作 A**，commit `1d6f431`）：扁平 `g_seen`+哨兵+空操作 pop → 作用域帧栈（`g_frame_keys`/`g_frame_starts`/`g_frame_owners`/`g_frame_sp`）+ 第 6 张 S3 侧表 `g_node_scope[]`，行为逐字节等价。等价性铁证：IR 基线仅 `src/tc.tc::{c,h,ll}` 变化，非编译器目标 = 0；gate L2 **24/0**（含自举四代不动点 g2==g3==g4）。⚠ 关键坑：`g_seen_pop` 必须保持**空操作**（不回退 sp）——否则嵌套块之后的外层变量会误看到块前同级变量（实测 `string_utils.tc::c` 漂移）；旧哨兵的帧隔离语义由 `g_frame_starts[sp-1]` 固定为「最近一次 push 的起始下标」还原。
 2. （已完成 ✅）`g_const_decl_ids` → `node_const[]` 侧表，见 §0.13.7b step4。
-3. **删除原始全局平行数组**（`g_node_mod` / `g_node_file` / `g_seen` / `g_local_decls` / `g_conpat_binds`），届时 S3 的「删全局平行数组」验收项闭合 → 进入 S4（消费方切 `u64 NodeRef`）。
+3. **删除原始全局平行数组**：`g_seen` 已删（被 `g_frame_*` + `g_node_scope` 取代）；`g_node_mod`/`g_node_file` 已是侧表保留；`g_local_decls`/`g_conpat_binds` 仍被 mangle 逻辑使用，待 `node_conpat` 侧表化后清理。S3 侧表化（provenance / type / resolve / const / scope 五张）**全部落地** → 进入 **S4**（消费方切 `u64 NodeRef`）。
 
 ### 0.13.9 `node_scope` 设计（经批判修订；原"统一作用域基础设施"方案已降级）
+
+> **已落地（commit `1d6f431`，2026-10-01）**：工作 A 已按本设计实现并通过 gate L2 24/0。下文为设计依据与边界；实现细节与验证见 §0.13.8 第 1 项。工作 B（sema 统一词法树 / 增量 / IDE / 相位 CTFE walker）仍为独立 R&D epic，未启动。
 
 > **修订记录（2026-10-01）**：初版按用户四要求升级为"统一作用域树+图"方案。经批判后判定该方案**混淆了名字解析与标识符重名、把 S3 收口任务偷换成解析器重写、且含大量无当下消费者的过度工程**，故降级为下方的"窄而安全"设计。四要求的合理内核被保留并重新落地（见各条）。
 
