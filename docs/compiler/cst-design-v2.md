@@ -694,6 +694,7 @@ S4   821c19b → a9c2970 → 72d461f → 2bea53f → 93eb234
 S6   4c38666 / ffac9e1             lower_policy[] 查表替换 6 硬编码分支 + g_desugar_passes 注册表收口（§0.16.1/0.16.2）
 S7   88c8114 / 021eae8             PassManager 框架 + passes_validate 全管线注册（§0.16.3/0.16.4）
 S5   22dfefd                       step1：Span 结构 + node_span 侧表（纯加法，零行为；读方迁移留 step2，§0.16.5）
+S8   （见 §0.16.11）                step1：tc fmt trivia 感知再发射（忠实还原基础版；base.Node 仍存在，与 S4 epic 解耦，§0.15 偏离 6 合理）
 ```
 
 **对账表**
@@ -705,6 +706,7 @@ S5   22dfefd                       step1：Span 结构 + node_span 侧表（纯�
 | 3 | S3「删 `Node.td` **与全局平行数组**」 | 删了 `Node.td`/`g_idecl_*`/`g_seen`；**`g_local_decls`+`g_conpat_binds` 仍在**（base.tc:1893/1952，被 `codegen_c.tc` 使用） | ⚠ **未闭合** ⇒ S3 亦应记为 **partial** |
 | 4 | S4 四项（访问者 / 删 `base.Node` 字段 / 删 re-export 垫片 / `node_to_hir` 桥切 NodeRef） | 只交付「消费方切 `u64 NodeRef`」类型层 | ⚠ **偏离（partial）** —— 论证见 §0.14.6（方案 A），**硬前置已顺延，见 §0.14.6 末** |
 | 5 | 工作 B「**待真实消费者触发** + 另立 sign-off」（§0.13.9） | 由**用户裁定**启动（`work-b-design.md` 第 4 行自述） | ⚠ **偏离** —— 证明与边界见下 |
+| 6 | S8 依赖 S4 硬前置（删 `base.Node` 字段 + 删 re-export 垫片，§4.14.6 / §0.14.6） | S8 step1 `tc fmt` 在 **`base.Node` 仍存在** 下落地（§0.16.11，gate L2 24/0） | ⚠ **偏离（合理）** —— S8 fmt 在 G7 架构下只消费 CST + trivia，不依赖不可变 AST / 删 Node；证明见下 |
 
 **偏离 5（工作 B 启动门槛）的证明与边界**
 
@@ -714,6 +716,12 @@ S5   22dfefd                       step1：Span 结构 + node_span 侧表（纯�
 
 **偏离 4 的处置**：已在 §0.14.6 论证（方案 A）+ 本轮补记「S4 = PARTIAL」与「删 Node/删垫片必须在 **S8 之前**完成」的硬前置，防止该项随 S4 标"完成"而丢失。
 
+**偏离 6 的处置（S8 与 S4 epic 解耦）**：原 §4.14.6 / §4.10.3 把「删 `base.Node` 字段 + 删 re-export 垫片」列为 S8 的硬前置。本轮在 **`base.Node` 仍存在** 下落地 S8 step1 `tc fmt`（§0.16.11），理由与证明：
+- **架构解耦**：G7 架构下 `fmt` 只消费 CST + trivia（`cst_format_tokens` 归并 `toks` 与 `g_trivia_toks`），不读取 `base.Node` 载荷、不依赖不可变 AST、不需要删 Node。故 S8 step1 与 S4 收口 epic（§0.14.7）**无硬依赖关系**。
+- **零语义改动**：本步仅在 lexer 加 `Tok.src` 字段（含引号/转义的逐字节源文本）+ 收紧 `tokenize` 为 append-only 契约（修 f-string 重 tokenize 越界）+ 新增 `cst_format_tokens`/`fmt` 子命令。`Tok.v` 语义值不变 ⇒ parser/codegen 行为完全不变。
+- **正确性证明**：IR 快照 **3 DIFF（仅 `src/tc.tc::{c,h,ll}`，0 NEW/0 GONE）**——纯自编译表示漂移，用户程序 IR 中性；**gate L2 = 24 passed / 0 failed**（四代不动点 `g2==g3==g4` / conformance / 双后端 / C 自举 / rls / tote 全绿）；`examples/*.tc` 全部 115 个 `tc fmt` 输出与源逐字节一致（SMOKE_FAIL=0）。
+- **边界约束（继续有效）**：偏离 6 **不解除** S4 epic 的硬前置地位——S8 后续若需要基于节点的 AST 重写（如 step2 规范化重排若改走 HIR 侧表），仍可能触及 `base.Node` 载荷；届时按 §0.14.6 既定方案收口。但当前 step1/step2（纯词法/结构重排）均不依赖删 Node，S8 与 S4 epic 可并行推进，互不阻塞。
+
 **已修正的文档错误（本轮）**
 
 1. §0.14.6 曾断言 `g_local_decls`/`g_conpat_binds→node_conpat`「**故该项实际已闭合**」——**与代码矛盾，已撤回**；改为如实标注未闭合（见 §0.14.6 更正段与 §0.14.5 第 4b 项）。
@@ -722,12 +730,12 @@ S5   22dfefd                       step1：Span 结构 + node_span 侧表（纯�
 
 **关键路径现状与下一步建议**
 
-- 已完成：`S0 → S1 → S2 → S3(partial) → S4(partial) → S6 → S7 → S5(step1 + step2 + step3 + step4 + step5)`（S6/S7 全绿 gate L2 24/0；S5 step1/2/3 见 §0.16.5–§0.16.7；S5 step4 `.ast` 序列化 + `tc dump-ast` 纯加法已 gate L2 24/0（§0.16.8）；S5 step5 trivia 侧表 + `assign_trivia` 已 gate L2 24/0（§0.16.9））。
+- 已完成：`S0 → S1 → S2 → S3(partial) → S4(partial,SoA epic 启动 pilot se) → S6 → S7 → S5(step1–5) → S8 step1(tc fmt 忠实还原基础版)`（S6/S7 全绿 gate L2 24/0；S5 step1/2/3 见 §0.16.5–§0.16.7；S5 step4 `.ast` 序列化 + `tc dump-ast` 纯加法已 gate L2 24/0（§0.16.8）；S5 step5 trivia 侧表 + `assign_trivia` 已 gate L2 24/0（§0.16.9）；S8 step1 `tc fmt` 见 §0.16.11，gate L2 24/0）。
 - 进行中 / 尚未启动：
-  - **S4 收口 epic（删 `base.Node` 字段 = 节点载荷 SoA 外置）**：用户 2026-10-02 裁定**启动**，采用 staged bootstrap（§0.14.7）。Pilot `se` 已完成（`tc check` 0 err + g1 自举 + c_interop `@c_export` 运行验证 + IR 快照 0 NEW/0 GONE）；剩余 ~23 字段按使用量升序逐组外置，每组独立验证，全部完成后删 `Node`+`nodes[]`。
-  - **S8**（`@desugar`/`@pass` + fmt/lint）：依赖 S4 硬前置收口（删 `base.Node` 字段 + 删 re-export 垫片，见 §0.14.6 / §0.14.7）；S5 已在 S8 前完成（step1–5 全绿），trivia 注释保留前提就绪。
+  - **S4 收口 epic（删 `base.Node` 字段 = 节点载荷 SoA 外置）**：用户 2026-10-02 裁定**启动**，采用 staged bootstrap（§0.14.7）。Pilot `se` 已完成（`tc check` 0 err + g1 自举 + c_interop `@c_export` 运行验证 + IR 快照 0 NEW/0 GONE）；剩余 ~23 字段按使用量升序逐组外置，每组独立验证，全部完成后删 `Node`+`nodes[]`。（本轮主线转向 S8 step1，epic 阶段性暂停，未废弃。）
+  - **S8**（`@desugar`/`@pass` + fmt/lint）：**step1 `tc fmt` 已落地（§0.16.11，gate L2 24/0）**——在 `base.Node` 仍存在下实现，与 S4 epic 解耦（§0.15 偏离 6 合理）；后续 step2（基于结构的规范化重排：缩进/空行/对齐）+ `@desugar`/`@pass` 用户扩展原语 + `tc lint`（消费 HIR+侧表）仍按 §4.13 推进。S5 已在 S8 前完成（step1–5 全绿），trivia 注释保留前提就绪。
   - 工作 B 支柱 1 step5 + 支柱 2/3：仍受 §0.13.9「真实消费者触发」门槛约束（DEFERRED）。
-- 当前主线位置：**S4 收口 epic 进行中（SoA 节点载荷外置，pilot `se` 完成，§0.14.7）**；S5 已收口；S8 的硬前置即此 epic。
+- 当前主线位置：**S8 step1 `tc fmt` 已收口（§0.16.11，gate L2 24/0）；S4 收口 epic 阶段性暂停于 pilot `se`（§0.14.7），可随时接续**；S5 已收口。
 - ⚠ **路线一致性**：S6→S7→S5 严格沿 §4.10.3 阶段表推进（S4 之后 S6，并可并行 S5），无偏离；S4 收口 epic 是 §0.14.6 已裁定 deferred 项在当前 S8 临近下的重启，属「保持偏离合理性」框架内的合理推进，非新偏离。
 
 ---
@@ -1081,12 +1089,52 @@ S5   22dfefd                       step1：Span 结构 + node_span 侧表（纯�
 
 ---
 
+#### §0.16.11 S8 step1（`tc fmt` 的 trivia 感知再发射：忠实还原基础版）✅ 已落地（2026-10-02）
+
+> 范围（§4.1 G7 / §0.17）：S8 首步 = `tc fmt` 的源码再发射基础能力——把词法 token 流（`toks`，每个 token 的精确源文本）与 trivia 流（`g_trivia_toks`，空白/换行/注释的精确文本）按 `(line,col)` 双指针归并，还原出与源**逐字符一致**的重排文本。当前为「忠实还原」基础版（不重排，仅还原）；后续 step2 叠加基于结构（CST 节点）的规范化重排（缩进/空行/对齐）。
+> **偏离裁定（保持合理）**：原路线 S8 的硬前置是「删 `base.Node` 字段 + 删 re-export 垫片」（§4.14.6 / §0.14.6）。本步在 **`base.Node` 仍存在** 下落地——G7 架构下 `fmt` 只消费 CST + trivia，**不依赖不可变 AST / 删 Node**，故 S8 step1 与 S4 收口 epic **解耦**。证明：本步零语义改动（仅 lexer `Tok.src` 字段 + `tokenize` append-only 契约 + `cst_format_tokens` 新函数 + `fmt` 子命令），IR 快照 3 DIFF/0 NEW/0 GONE（仅 `src/tc.tc` 自编译表示漂移），gate L2 24/0（见下）；S4 epic 仍按 §0.14.7 单独推进，不受影响。该偏离记入 §0.15 偏离 6。
+
+**改动（纯加法 + lexer 契约收紧，零用户编译行为变化）**
+- `src/base.tc`：
+  - `Tok` 结构新增 `src: string` 字段——**逐字节源文本**（含引号/转义原文）；既有的 `v` 是语义值（字符串/字符已去引号、数字已规范化，供 parser 消费）。`push_tok` 默认 `src = value`（对绝大多数 token `v` 即逐字节源文本）。
+  - 新增 `cst_format_tokens() string`：双指针归并 `toks` 与 `g_trivia_toks`。两者均由 lexer 按源码左→右顺序 append、内部各自按 `(line,col)` 有序、在源位置上互不重叠（trivia 占间隙），故双指针归并等价于全序列按 `(line,col)` 排序后连结各 token 精确文本，即得原始源码。发射用 `toks[i].src`（保真含引号/转义/数字原形态），trivia 发射用 `g_trivia_toks[j].text`。
+- `src/lex.tc`：
+  - **append-only 契约收紧（关键）**：`tokenize` 不再在入口 `base.toks = []` / `base.g_trivia_toks = []` 重置，改为**追加**。重置下放到消费方命令层（`fmt`/`dump-ast` 各自在调用前重置）。**理由**：`parse.tc::fstr_parse_expr`（f-string 插值解析）会再次 `lex.tokenize(子表达式)` 把插值子 token **追加**进 `base.toks` 尾部并改写其行列；若 `tokenize` 重置，会清空主 token 流、令外层 `pos` 越界（`index_out_of_bounds`）。`tokenize` 顶部注释固化此契约。
+  - `String` / `r-string` / 字符字面量（单字节 `'A'` 与多字节 rune `'中'`）/ 数字字面量 在 `push_tok` 后，用 `str_slice(src, start, i)` 把 `tk.src` 覆盖为**含引号/转义/规范化前**的逐字节原文（`'中'`→`E4 B8 AD`、`1_000_000`/`0x1F`/`"key"` 全部保真）。
+- `src/tc.tc`：新增 `fmt` 子命令。因 `parse_unit` 会经 `fstr_parse_expr` 再次 `tokenize`、把插值子 token 追加进 `toks`，破坏「token 流 == 源码 token 序列」的逐字节还原，**`fmt` 只跑词法、不调 `parse_unit`**：命令层先重置 `base.toks`/`base.g_trivia_toks`，再 `lex.tokenize(src)`，最后 `base.cst_format_tokens()`；支持 `<file.tc>` / `--example <name>` / `--output <path>`。
+
+**关键修复（二层保真缺陷）**
+- **缺陷 1（append-only 契约）**：旧 `tokenize` 入口重置 `base.toks`/`base.g_trivia_toks`。初判「fmt 丢全部空白 + 尾部 `psma`」是 toks 未重置，深挖后定位真正根因：重置打破 append-only 契约，`fstr_parse_expr` 重 tokenize f-string 插值会清空主流并令外层 `pos` 越界（崩溃表现 `index_out_of_bounds, index:39, length:2`）。修复：删重置、重置下放命令层、`fmt` 不调 `parse_unit`。
+- **缺陷 2（`Tok.src` 逐字节源文本）**：`Tok.v` 是去引号/规范化值（如 `"a"` 的 `v` 为 `a`）。若 `cst_format_tokens` 用 `.v` 还原，字符串字面量会**丢引号**（`"a"`→`a`，map 键引号脱落，MATCH=NO）。修复：加 `src` 字段并在字面量 push 点覆盖为含引号原文，发射改 `.src`。
+
+**等价性 / 安全性**
+- `cst_format_tokens` 仅被 `fmt` 子命令可达；`fmt` 不跑 `sema`/`codegen`，对普通编译（check/compile/examples）IR 零影响。
+- `Tok.src` 仅增加结构体字段 + lexer 写该字段，不改变 token 的语义值 `v` ⇒ parser 行为完全不变。
+- 自编译表示：新增 `Tok.src` 字段 + `cst_format_tokens` 函数，经 `@import` 传播到 `src/tc.tc`；因 `fmt` 命令分发可达，对 examples/`tote.tc` 树摇后仅改变 `tc.tc` 自身 IR ⇒ 首跑快照 **3 DIFF（仅 `src/tc.tc::{c,h,ll}`，0 NEW / 0 GONE）**，与 §0.16.5–§0.16.9 同型良性自编译表示漂移。
+
+**手动验证（gate 不调 `fmt`，故单独验证字节一致性）**
+- `out/_probe_trivia.tc`（文件前导/行尾/块注释，含中文）：`g1.exe fmt` 输出 `out/_fmt_probe*.txt` 与源**逐字节一致**（MATCH=YES）。
+- `examples/mini.tc`（struct Point + 4 个 `!j` f-string，原 MD5 `303AF749FBFF87F86CCC6ED21FAB977B`）：fmt 输出与源 MATCH=YES（f-string 插值 + map 字符串键引号均保真）。
+- 自建 `out/_fmt_edge.tc`（`'A'`/`'中'`/`1_000_000`/`0x1F`/`["key":42,"k2":7]`）：hex 确认 `'中'`=`E4 B8 AD`、`'A'`/`1_000_000`/`0x1F`/`"key"`/`"k2"` 全部逐字节保真（该探针文件因 PowerShell BOM 致 MD5 不符，真实源码不受影响）。
+- `fmt` 幂等：`g1.exe fmt mini.tc` 二次输出 `mini5b` == `mini5`（YES）。
+- **全量冒烟**：`examples/*.tc` 共 115 个 `tc fmt` 输出与源逐字节比对 → **SMOKE_OK=115 SMOKE_FAIL=0 TOTAL=115**。
+- `tc check src/tc.tc`：0 errors（仅 T-NAM-W401/W402、T-MOD-W561 等预存风格告警）。
+
+**验证（gate L2 24/0 全绿）**
+- 首跑快照 **3 DIFF（仅 `src/tc.tc::{c,h,ll}`，0 NEW / 0 GONE）** ⇒ 良性自编译表示漂移，人工确认无误。
+- `ir_snapshot.mjs --update --compiler out/dbg/g1.exe` 重录基线（117 targets / 354 entries，2026-10-02）。
+- 首跑 gate L2（基线仍陈旧）= **23 passed / 1 failed（3019.5s）**，**唯一失败项即「产物快照比对」**——因基线未更新而报 3 DIFF，**非回归**：同轮 23 步语义全绿，含自举一代、自举不动点 `g2==g3`、**自举四代不动点 `g2==g3==g4`**、conformance、run_examples 双后端、C 后端自举、rls、tote。
+- 基线重录后**复跑 gate L2 = 24 passed / 0 failed（2956.1s）**：24 步全绿（工具链 / 诊断 / CST 清单 / 静态 / std 预编译 / 自举一代 / IR 审计 / LLVM verifier / **产物快照比对 0 DIFF** / conformance / UNSUPPORTED / 自举不动点 g2==g3 / run_examples dbg 双后端 / HIR AstGen / HIR CTFE / difftest g2↔g3 / 双轨对拍 / REPL 冒烟 / **四代不动点 g2==g3==g4** / MIR differential / C 后端自举 / difftest tc0 / rls 快速通道 / tote）。
+- 同步 `cp out/dbg/g4.exe out/dbg/tc.exe && cp out/rls/gr.exe out/rls/tc.exe`（种子升到当前不动点）。
+
+---
+
 ## 0.17 S5 收口路线（step1 → stepN，P2，可并行于 S2–S4）
 
 > S5 = `Span` 取代 `ln/cl/tv` + CST `.ast` 序列化 + trivia（span 间隙）+ error node（§4.10.3）。
 > 当前完成 **step1（§0.16.5）+ step2（§0.16.6）+ step3（§0.16.7）+ step4（§0.16.8）+ step5（§0.16.9）**，S5 已全绿 gate L2 24/0，S8 fmt/lint 的注释保留前提就绪。后续步（尚未实施）：
 > - step2–step5 均已完成（见 §0.16.6–§0.16.9）：step2 读方迁 `node_span_id`、step3 删 `ln/cl/tv` 字段、step4 `.ast` 序列化 + `tc dump-ast`、step5 trivia 侧表 + `assign_trivia`；S5 全绿 gate L2 24/0。
-> - ⚠ S5 已完成（step1–5 全绿 gate L2 24/0），S8 fmt/lint 的 trivia 前提已满足；S8 现仅阻塞于其自身硬前置「S4 删 `base.Node` 字段 + 删 re-export 垫片」（见 §0.14.6）。当前 `owns`（侧表失效）
+> - ⚠ S5 已完成（step1–5 全绿 gate L2 24/0），S8 fmt/lint 的 trivia 前提已满足。**S8 step1（`tc fmt` 忠实还原基础版）已落地并验证 gate L2 24/0（§0.16.11）**——在 `base.Node` 仍存在下实现，与原路线「S8 依赖 S4 硬前置」偏离，记入 §0.15 偏离 6（合理）。该偏离不阻塞 S4 收口 epic（§0.14.7）；后续 S8 step2（基于结构的规范化重排）仍未依赖删 Node，S8 整体与 S4 epic 解耦推进。当前 `owns`（侧表失效）
 >   仍待 `ModuleRef`，与 S7 同阻塞。
 
 ---

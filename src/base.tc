@@ -1710,7 +1710,8 @@ pub fn nr_idx(n: u64) i64 { return ((n << 32) >> 32) as i64; }
 
 pub struct Tok {
     t: string;      // token 类型名（同 lex --json 的 type）
-    v: string;      // 文本值
+    v: string;      // 文本值（字符串/字符已去引号、数字已规范化；供 parser 语义消费）
+    src: string;    // 逐字节源文本（含引号/转义原文；S8 fmt 归并保真用，默认 == v，仅 String/字符字面量处覆盖为含引号原文）
     line: u64;
     col: u64;
 }
@@ -1957,6 +1958,44 @@ pub fn cst_to_ast_str(roots: []i64) string {
     sb_append_char(g_cst_sb, 41);            // ')'
     sb_append_char(g_cst_sb, 10);
     return sb_to_str(g_cst_sb);
+}
+
+// ── S8 step1（§0.16.11）：`tc fmt` 的 trivia 感知再发射基础 ──────────────────
+// 把词法 token 流（toks，含源码全部代码 token 的精确文本 v）与 trivia 流
+// （g_trivia_toks，空白/换行/注释的精确文本）按 (line,col) 双指针归并，还原出
+// 与源逐字符一致的重排文本。这是 fmt 消费 CST+trivia（G7）能力的首步落地：
+// 当前为「忠实还原」基础版，后续 step2 叠加基于结构（节点）的规范化重排（缩进/空行/对齐）。
+// 归并正确性：toks 与 g_trivia_toks 均由 lexer 按源码左→右顺序 append，各自内部
+// 已按 (line,col) 有序；二者在源位置上底互不重叠（trivia 占间隙），故双指针归并即
+// 等价于全序列按 (line,col) 排序，连结各 token 的精确文本即得原始源码。
+pub fn cst_format_tokens() string {
+    var sb: StringBuilder = sb_new();
+    var nt: i64 = slice_len(toks) as i64;
+    var ntr: i64 = slice_len(g_trivia_toks) as i64;
+    var i: i64 = 0;   // toks 游标
+    var j: i64 = 0;   // g_trivia_toks 游标
+    while (i < nt || j < ntr) {
+        var use_tok: bool = false;
+        if (i >= nt) {
+            use_tok = false;
+        } else if (j >= ntr) {
+            use_tok = true;
+        } else {
+            var tk = toks[i];
+            var tr = g_trivia_toks[j];
+            if (tk.line < tr.line) { use_tok = true; }
+            else if (tk.line > tr.line) { use_tok = false; }
+            else { if (tk.col <= tr.col) { use_tok = true; } else { use_tok = false; } }
+        }
+        if (use_tok) {
+            sb_append_str(sb, toks[i].src);
+            i = i + 1;
+        } else {
+            sb_append_str(sb, g_trivia_toks[j].text);
+            j = j + 1;
+        }
+    }
+    return sb_to_str(sb);
 }
 
 // ── node_type 侧表（§4.5）：取代已删除的 `Node.td` 字段 ──────────────────────
