@@ -13325,7 +13325,48 @@ pub fn lower_array_len_infer() void {
     }
 }
 
+// ── S6（§4.11.3）：注册式脱糖 Pass 注册表 ────────────────────────────
+// 把 run_check 里原先硬编码的「模块级脱糖调用序列」收口为**有序注册表**驱动。
+// 当前只收口**模块作用域**的 4 个脱糖入口（func_clauses / lambdas / array_len_infer /
+// imports）；其余**逐节点**脱糖（desugar_value_loop / lower_for_range / lower_for_array /
+// desugar_format_call / lower_pipe / lower_range_index / lower_in_range）仍在 infer 期
+// 就地调用 —— 它们要统一为节点级 `run: fn(NodeRef) NodeRef` 须先有不可变 AST 改写
+// 基础设施（当前未就绪），与 §4.11.3 节点级签名目标一并 DEFERRED（同 S4 删 Node 的延期类）。
+pub struct DesugarPass {
+    name: string;       // 脱糖名（审计 / 门禁对账用）
+    order: i64;         // 脱糖顺序：func_clauses(1) < lambdas(2) < array_len_infer(3) < imports(4)
+    raw_impact: i64;    // 预估对 HIR_OP_RAW 计数影响（门禁对账用，当前均为 0）
+}
+pub var g_desugar_passes: []DesugarPass;
+pub fn register_desugar(p: DesugarPass) void { append(g_desugar_passes, p); }
+// 按 order 升序跑 (lo, hi] 区间内的已注册脱糖 Pass；由调用方切分区间，避免重复跑。
+// ⚠ 分派用 `order` 直查，不把 fn 值存进结构体字段：t 的 LLVM 后端不支持「调用存于
+// 结构体字段的 fn 值」（TClosure env 在字段取值路径上未正确 setup，自举 gen-1 clang
+// 报 "1 error generated"）；节点级 `run: fn(NodeRef) NodeRef` 统一改造一并 DEFERRED。
+pub fn desugar_run_range(lo: i64, hi: i64) void {
+    var i: i64 = 0;
+    while (i < slice_len(g_desugar_passes) as i64) {
+        var p: DesugarPass = g_desugar_passes[i];
+        if (lo < p.order && p.order <= hi) {
+            if (p.order == 1) { parse__desugar_func_clauses(); }
+            else if (p.order == 2) { parse__desugar_lambdas(); }
+            else if (p.order == 3) { lower_array_len_infer(); }
+            else if (p.order == 4) { desugar_imports(); }
+        }
+        i = i + 1;
+    }
+}
+// 注册 4 个模块级脱糖 Pass（与 run_check 原硬编码顺序一致）。
+pub fn desugar_init() void {
+    g_desugar_passes = [];
+    var p1: DesugarPass; p1.name = "func_clauses";    p1.order = 1; p1.raw_impact = 0; register_desugar(p1);
+    var p2: DesugarPass; p2.name = "lambdas";         p2.order = 2; p2.raw_impact = 0; register_desugar(p2);
+    var p3: DesugarPass; p3.name = "array_len_infer"; p3.order = 3; p3.raw_impact = 0; register_desugar(p3);
+    var p4: DesugarPass; p4.name = "imports";         p4.order = 4; p4.raw_impact = 0; register_desugar(p4);
+}
+
 pub fn run_check() void {
+    desugar_init();
     global_scope = scope_new(-1);
     cur_scope = global_scope;
     cur_ret = ti_mk("Void");
@@ -13336,15 +13377,10 @@ pub fn run_check() void {
     resolve_modules();
     mangle_modules();
 
-    // 子句合并 + lambda 提升：必须在 register 之前跑（子句组先并成单一 FuncDecl，
-    // 否则同名多条 FuncDecl 会被 register 当成重复定义）。覆盖模块内联后的整张 decl_list。
-    parse__desugar_func_clauses();
-    parse__desugar_lambdas();
+    // S6（§4.11.3）：模块级脱糖改由注册表驱动（func_clauses(1)+lambdas(2)+
+    // array_len_infer(3)，顺序与原硬编码一致，行为等价）。
+    desugar_run_range(-1, 3);
     g_vl_checked = [];
-
-    // `[_]T` 长度推断：必须在 register_decl 之前（register 急切解析类型），
-    // 且在模块内联/desugar 之后（此时全部声明与函数体节点均已入池）。
-    lower_array_len_infer();
 
     // 注册分三趟，因为 register_decl 对 FuncDecl **急切解析形参/返回类型**：
     //   A 纯类型声明（struct/enum/flag/flag_set/union/variant）—— 彼此无依赖，只登记名字；
@@ -13390,7 +13426,7 @@ pub fn run_check() void {
         }
         ib = ib + 1;
     }
-    desugar_imports();
+    desugar_run_range(3, 4);  // S6（§4.11.3）：imports(4)，在 register 之后、mb/meta_pass 之前，行为等价
     mark_call_callees();
     // Phase D：先折 `@type_*` 编译期内建（纯类型查询，无环境依赖），
     // 这样 `meta 8 + @type_size(i64)` 里的内层在 CTFE 看到时已是字面量。
