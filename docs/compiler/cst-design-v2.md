@@ -611,6 +611,24 @@ if (n.td > 0) { n.td = -1; }          // ← 写在副本上：从未写回 node
 - **硬前置约束（承接 §4.10.3 依赖图注释，不得随 S4 降格而丢失）**：原文「**工程上应先完成 S4（删旧 `base.Node` 字段），否则 S8 的插件 API 会同时暴露新旧两套节点表示**」。该项现已 deferred，因此其约束**顺延为：删 `base.Node` 字段 + 删 re-export 垫片必须在 S8 之前完成**。S5/S6/S7 不依赖它（S6 依赖 S3、S7 依赖 S6、S5 可并行），故推迟不阻塞后继阶段；但进入 S8 前必须回来收口，否则新旧两套表示同时暴露给插件 API。
 - **验收判据同步说明**：§4.10.3 给 S4 的验收是「`hir_test` 穷尽性守住（`node_visit` 分支数 == `NK_*` 数）」——因 `node_visit`/`transform` 未建，该判据**当前不适用**；S4-partial 的实际验收退化为「不动点 A 绿 + gate L2 24/0 + 基线 B 已按预期重录」（§4.10.0）。
 
+### 0.14.7 SoA 节点载荷外置迁移启动（2026-10-02，用户裁定「启动 SoA 迁移」）
+
+> **背景**：§0.14.6 方案 A 把「删 `base.Node` 字段 + 删 re-export 垫片」降格为 deferred 未来 epic，硬前置顺延到 S8 之前。现 S5 已收口（§0.16.9），S8 的硬前置即此；用户 2026-10-02 裁定**启动**该 epic，采用 **staged bootstrap**（每字段组独立验证自举不动点 + gate 全绿 / 或 IR 快照 0 NEW/0 GONE），接受多 session 推进。
+
+**迁移范式（已 pilot 验证）**
+- 每个 `Node` 字段 `F: T` → 平行侧表 `g_node_F: []T`（与 `nodes` 按 id 对齐）+ 访问器 `node_F(n: u64) T` / `node_set_F(n: u64, v: T)`（经 `nr_idx` 取裸索引，带越界哨兵，仿 `node_mod`）。
+- `node_new` 内：删 `n.F = 默认值`，改 `append(g_node_F, 默认值)`。
+- 全部读取点 `base.nodes[x].F` / 局部 `var n: Node = …; n.F` → `node_F(id/d/…)`；全部写入点 `n.F = v; slice_set(nodes, x, n)` → `node_set_F(x, v)`。
+- 该字段在 `pub struct Node` 中**删除**（强制编译期清零剩余引用，确保无遗漏站点）。
+- `sidetable_init()` 注册 `"node_F"`（与 S3 侧表一致）。
+
+**Pilot：`se`（C 互操作导出 ABI 符号名）**
+- 5 处站点：base.tc `cst_dump` 读 + `node_new` 默认；codegen_c.tc `emit_func_decl` 读（`cx_name = node_se(d)`）；parse.tc 3 处写（`base.node_set_se(fd, fname)`）。
+- 验证：`tc check` 0 error；`g1` 自举重建成功；`examples/c_interop.tc`（`@c_export`）经 g1 C 后端编译运行输出 `5`/`55`，生成 C 为干净名 `int64_t add(...)`/`fib(...)`（证实 se 侧表读回正确）；IR 快照 **3 DIFF（`src/tc.tc::{c,h,ll}`，0 NEW/0 GONE）** → 用户程序 IR 中性。
+- ⚠ **通用安全规则（本轮再印证）**：凡「无此节点」哨兵的 `-1` 必须显式整型（`var x: i64 = -1`），不可裸写 `var x = -1`（t 推断 `u8` 致符号扩展越界崩溃——见 S5 step5 教训）。
+
+**后续批次（待做，按使用量升序、每组独立绿）**：`se` 之后依次 `memspace / ba / bb / bc / bd / be / bf / ia / ib / has_sa / has_sb / has_sc / sa / sb / sc / la / lb / lc / na / nb / nc / nd`；全部完成后删 `pub struct Node` + `nodes[]` + `node_new` 的 Node 构造 + 全部 `slice_set(nodes, …)`，`id` 字段随 `Node` 一并消失（届时裸索引即句柄），S4 方真正收口（随后补 `node_to_hir` 桥改造 + 删 re-export 垫片，见 §4.14.4）。
+
 ### 0.13.9 `node_scope` 设计（经批判修订；原"统一作用域基础设施"方案已降级）
 
 > **已落地（commit `1d6f431`，2026-10-01）**：工作 A 已按本设计实现并通过 gate L2 24/0。下文为设计依据与边界；实现细节与验证见 §0.13.8 第 1 项。工作 B（sema 统一词法树 / 增量 / IDE / 相位 CTFE walker）仍为独立 R&D epic，未启动。
@@ -705,11 +723,12 @@ S5   22dfefd                       step1：Span 结构 + node_span 侧表（纯�
 **关键路径现状与下一步建议**
 
 - 已完成：`S0 → S1 → S2 → S3(partial) → S4(partial) → S6 → S7 → S5(step1 + step2 + step3 + step4 + step5)`（S6/S7 全绿 gate L2 24/0；S5 step1/2/3 见 §0.16.5–§0.16.7；S5 step4 `.ast` 序列化 + `tc dump-ast` 纯加法已 gate L2 24/0（§0.16.8）；S5 step5 trivia 侧表 + `assign_trivia` 已 gate L2 24/0（§0.16.9））。
-- 尚未启动 / 进行中：
-  - **S8**（`@desugar`/`@pass` + fmt/lint）：依赖 S4 硬前置「删 `base.Node` 字段 + 删 re-export 垫片」完成（见 §0.14.6）；S5 已在 S8 前完成（step1–5 全绿），trivia 注释保留前提就绪。
+- 进行中 / 尚未启动：
+  - **S4 收口 epic（删 `base.Node` 字段 = 节点载荷 SoA 外置）**：用户 2026-10-02 裁定**启动**，采用 staged bootstrap（§0.14.7）。Pilot `se` 已完成（`tc check` 0 err + g1 自举 + c_interop `@c_export` 运行验证 + IR 快照 0 NEW/0 GONE）；剩余 ~23 字段按使用量升序逐组外置，每组独立验证，全部完成后删 `Node`+`nodes[]`。
+  - **S8**（`@desugar`/`@pass` + fmt/lint）：依赖 S4 硬前置收口（删 `base.Node` 字段 + 删 re-export 垫片，见 §0.14.6 / §0.14.7）；S5 已在 S8 前完成（step1–5 全绿），trivia 注释保留前提就绪。
   - 工作 B 支柱 1 step5 + 支柱 2/3：仍受 §0.13.9「真实消费者触发」门槛约束（DEFERRED）。
-- 当前主线位置：**S5 已收口（step1–5 全绿 gate L2 24/0）**；下一硬前置为 S8，其依赖 S4 硬前置「删 `base.Node` 字段 + 删 re-export 垫片」完成（见 §0.14.6）。
-- ⚠ **路线一致性**：本段（S6→S7→S5）严格沿 §4.10.3 阶段表推进（S4 之后 S6，并可并行 S5），无路线偏离。
+- 当前主线位置：**S4 收口 epic 进行中（SoA 节点载荷外置，pilot `se` 完成，§0.14.7）**；S5 已收口；S8 的硬前置即此 epic。
+- ⚠ **路线一致性**：S6→S7→S5 严格沿 §4.10.3 阶段表推进（S4 之后 S6，并可并行 S5），无偏离；S4 收口 epic 是 §0.14.6 已裁定 deferred 项在当前 S8 临近下的重启，属「保持偏离合理性」框架内的合理推进，非新偏离。
 
 ---
 
