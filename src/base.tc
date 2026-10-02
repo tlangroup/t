@@ -1781,6 +1781,23 @@ pub var g_node_resolve: []i64;          // S3 §4.5 node_resolve 侧表：ident 
 pub var g_node_const: []i64;             // S3 §4.5 node_const 侧表：nodes[i] 是否为 const 声明（1 = 是；0 = 否；替代 g_const_decl_ids 列表 + 线性扫描）
 pub var g_node_span: []Span;              // S5 §4.8 node_span 側表：nodes[i] 的源码区间 Span（取代 ln/cl/tv 的结构化表示）
 
+// ── S5 §4.8 trivia（span 间隙表示）─────────────────────────────
+// trivia = 注释/空白，不作为独立子节点，而是录在「节点之间的间隙」里（leading/trailing 两段）。
+// 表征采用 (line,col,text) + kind；§4.8 原写「字节范围指向源文本」，本步用 (line,col,text)
+// 等价表征（text 直接来自源，未复制到每个节点），字节范围形式留作 S8 fmt 需要时再升级（§4.8「局部扩展」）。
+pub struct TriviaTok {
+    kind: string;   // "Ws" / "Newline" / "LineComment" / "BlockComment"
+    text: string;   // 源文本片段（指向源，仅存于本列表，不复制到每个节点）
+    line: u64;
+    col: u64;
+}
+pub var g_trivia_toks: []TriviaTok;        // lexer 在 tokenize 期逐段保留的 trivia（按源序）；dump-ast / S8 fmt 消费
+pub struct Trivia {
+    leading: []u64;   // g_trivia_toks 下标列表：本节点前的间隙 trivia
+    trailing: []u64;  // 本节点后的间隙 trivia
+}
+pub var g_node_trivia: []Trivia;           // S5 §4.8 trivia 侧表：nodes[i] 的 leading/trailing 间隙 trivia
+
 // ── S3（§4.5）：侧表登记 + provenance 侧表读取面 ──────────────────────────────
 // 跨切面属性统一登记 SideTable{name,owner,dirty}，PassManager 据 name 建拓扑与置脏。
 // provenance（节点所属模块/文件）是第一个迁过来的跨切面属性：存储仍走上面两个全局平行
@@ -1850,6 +1867,26 @@ pub fn cst_indent(depth: i64) void {
     var i: i64 = 0;
     while (i < depth * 2) { sb_append_char(g_cst_sb, 32); i = i + 1; }   // 32 = space
 }
+// trivia 单条紧凑打印（kind[转义文本]），供 cst_dump 内联展示
+pub fn cst_trivia_one(idx: i64) void {
+    if (idx < 0 || idx >= slice_len(g_trivia_toks)) { sb_append_str(g_cst_sb, " ??BADTRIV"); return; }
+    var tt = g_trivia_toks[idx];
+    sb_append_str(g_cst_sb, " ");
+    sb_append_str(g_cst_sb, tt.kind);
+    sb_append_char(g_cst_sb, 91);  // '['
+    var tl = str_len(tt.text);
+    var ci: i64 = 0;
+    while (ci < tl) {
+        var ch = tt.text[ci];
+        if (ch == 10) { sb_append_str(g_cst_sb, "\\n"); }
+        else if (ch == 9) { sb_append_str(g_cst_sb, "\\t"); }
+        else if (ch == 92) { sb_append_str(g_cst_sb, "\\\\"); }
+        else if (ch == 34) { sb_append_str(g_cst_sb, "\\\""); }
+        else { sb_append_char(g_cst_sb, ch); }
+        ci = ci + 1;
+    }
+    sb_append_char(g_cst_sb, 93);  // ']'
+}
 pub fn cst_dump(role: string, id: i64, depth: i64) void {
     if (id < 0) { return; }
     sb_append_char(g_cst_sb, 10);            // 10 = '\n'
@@ -1884,6 +1921,16 @@ pub fn cst_dump(role: string, id: i64, depth: i64) void {
     if (n.bd) { sb_append_str(g_cst_sb, " bd"); }
     if (n.be) { sb_append_str(g_cst_sb, " be"); }
     if (n.bf) { sb_append_str(g_cst_sb, " bf"); }
+    // trivia（S5 §4.8）：#< = leading 间隙 trivia，#> = trailing 间隙 trivia
+    var trv = node_trivia((id as u64));
+    if (slice_len(trv.leading) > 0) {
+        var li: i64 = 0;
+        while (li < slice_len(trv.leading)) { sb_append_str(g_cst_sb, " #<"); cst_trivia_one(trv.leading[li]); li = li + 1; }
+    }
+    if (slice_len(trv.trailing) > 0) {
+        var ti: i64 = 0;
+        while (ti < slice_len(trv.trailing)) { sb_append_str(g_cst_sb, " #>"); cst_trivia_one(trv.trailing[ti]); ti = ti + 1; }
+    }
     // 子节点：先名字子节点（role 标注），再 kids 池（la/lb/lc 三条链，无 role）
     if (n.na >= 0) { cst_dump("na", n.na, depth + 1); }
     if (n.nb >= 0) { cst_dump("nb", n.nb, depth + 1); }
@@ -2095,6 +2142,7 @@ pub fn node_new(kind: string) u64 {
     append(g_node_const, 0);           // S3 §4.5 node_const 侧表：默认 0（非 const 声明）
     append(g_node_scope, -1);          // S3 §0.13.9 node_scope 侧表：默认 -1（未归属任何作用域帧）
     append(g_node_span, Span{ line: 0, col: 0, end_col: 0 });   // S5 §4.8 node_span 侧表：默认零区间（与 ln/cl/tv 初始化 0 对齐）
+    append(g_node_trivia, Trivia{ leading: [], trailing: [] });  // S5 §4.8 trivia 侧表：默认无间隙 trivia（assign_trivia 后填充）
     var nref_tag: i64 = nk_of_kind(kind);
     if (nref_tag < 0) { nref_tag = 0; }   // 未注册 kind 暂归 tag=0（g_node_nref 当前无消费方，安全）
     append(g_node_nref, mk_noderef(nref_tag, (slice_len(nodes) as i64) - 1));   // S4：打包 tag|idx 存入侧表（供未来消费方）
@@ -2111,6 +2159,96 @@ pub fn node_new(kind: string) u64 {
 pub fn node_at(ni: i64, ti: i64) void {
     var tk: Tok = toks[ti];
     node_set_span((ni as u64), Span{ line: (tk.line as u64), col: (tk.col as u64), end_col: (tk.col as u64) + str_len(tk.v) });
+}
+
+// S5 §4.8：读方访问节点间隙 trivia（leading/trailing 的 g_trivia_toks 下标列表）
+pub fn node_trivia(n: u64) Trivia {
+    var id = nr_idx(n);
+    if (id < 0 || id >= slice_len(g_node_trivia)) { var z: Trivia; return z; }
+    return g_node_trivia[id];
+}
+
+// S5 §4.8：把 g_trivia_toks（按源序）分配到各节点的 leading/trailing 间隙。
+// 规则（Roslyn 式，逐 token 独立归属）：找 prev = 位置严格 < T 的最后一节点，
+// next = 位置严格 > T 的首节点。若 T 与 prev 同 line（无换行分隔）→ trailing of prev；
+// 否则（跨 line，换行分隔）→ leading of next。文件前导 trivia（无 prev）归首节点 leading，
+// 文件尾部 trivia（无 next）归末节点 trailing。仅源码锚定节点（span.line>0）参与；
+// 合成节点（span 0,0,0）跳过，避免抢走前导 trivia。多行锚定节点以「起始 line」近似。
+// 纯工具函数，编译发射路径不调用；仅 dump-ast / S8 fmt 驱动。
+pub fn assign_trivia() void {
+    var nn = slice_len(nodes);
+    if (nn == 0) { return; }
+    // 仅纳入源码锚定节点
+    var order: []i64 = [];
+    var ki: i64 = 0;
+    while (ki < nn) {
+        if (g_node_span[ki].line > 0) { append(order, ki); }
+        ki = ki + 1;
+    }
+    // 插入排序 by (line, col)
+    var mi: i64 = 0;
+    while (mi < slice_len(order)) {
+        var p = mi;
+        while (p > 0) {
+            var a = order[p - 1]; var b = order[p];
+            var sa = g_node_span[a]; var sb = g_node_span[b];
+            var swap = false;
+            if (sa.line > sb.line) { swap = true; }
+            else if (sa.line == sb.line && sa.col > sb.col) { swap = true; }
+            if (swap == false) { break; }
+            order[p - 1] = b; order[p] = a;
+            p = p - 1;
+        }
+        mi = mi + 1;
+    }
+    // 逐 trivia token 独立归属（g_trivia_toks 已按源序，直接索引 tk，无需再排序）。
+    // 归属规则（Roslyn 式）：prev = 位置严格 < T 的最后一节点，next = 位置严格 > T 的首节点；
+    // T 与 prev 同 line（无换行分隔）→ trailing of prev，否则（跨 line）→ leading of next。
+    // 写回用「复制进全新本地数组再赋回」模式，规避 t 空切片共享 backing 的别名陷阱。
+    var no = slice_len(order);
+    var nt = slice_len(g_trivia_toks);
+    var tk: i64 = 0;
+    while (tk < nt) {
+        var T = g_trivia_toks[tk];
+        var pi: i64 = 0;
+        while (pi < no) {
+            var Ppos = g_node_span[order[pi]];
+            if (Ppos.line < T.line) { pi = pi + 1; continue; }
+            if (Ppos.line == T.line && Ppos.col < T.col) { pi = pi + 1; continue; }
+            break;
+        }
+        var prev: i64 = -1;   // 必须为 i64：t 会把裸 `-1` 推断成 u8(=255)，slice 下标又符号扩展成 -1，导致 g_node_span[-1] 越界崩溃
+        if (pi > 0) { prev = order[pi - 1]; }
+        var next: i64 = -1;
+        if (pi < no) { next = order[pi]; }
+        var attach_lead = false;
+        if (prev >= 0 && next >= 0) {
+            if (T.line == g_node_span[prev].line) { attach_lead = false; }   // 同 line（无换行）→ trailing of prev
+            else { attach_lead = true; }                                    // 跨 line（换行分隔）→ leading of next
+        } else if (prev >= 0) {
+            attach_lead = false;   // 仅 prev（文件尾部 trivia）→ trailing of prev
+        } else if (next >= 0) {
+            attach_lead = true;    // 仅 next（文件前导 trivia）→ leading of next
+        }
+        if (attach_lead && next >= 0) {
+            var tr = g_node_trivia[next];
+            var ld: []u64 = [];
+            var c: i64 = 0;
+            while (c < slice_len(tr.leading)) { append(ld, tr.leading[c]); c = c + 1; }
+            append(ld, tk);
+            tr.leading = ld;
+            slice_set(g_node_trivia, next, tr);
+        } else if (prev >= 0) {
+            var tr = g_node_trivia[prev];
+            var tl: []u64 = [];
+            var c: i64 = 0;
+            while (c < slice_len(tr.trailing)) { append(tl, tr.trailing[c]); c = c + 1; }
+            append(tl, tk);
+            tr.trailing = tl;
+            slice_set(g_node_trivia, prev, tr);
+        }
+        tk = tk + 1;
+    }
 }
 
 // ── 节点种类注册表（来自 reference.md §2.9 NodeTable）──

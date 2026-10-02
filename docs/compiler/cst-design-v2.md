@@ -704,12 +704,11 @@ S5   22dfefd                       step1：Span 结构 + node_span 侧表（纯�
 
 **关键路径现状与下一步建议**
 
-- 已完成：`S0 → S1 → S2 → S3(partial) → S4(partial) → S6 → S7 → S5(step1 + step2 + step3 + step4)`（S6/S7 全绿 gate L2 24/0；S5 step1/2/3 见 §0.16.5–§0.16.7；S5 step4 `.ast` 序列化 + `tc dump-ast` 纯加法已 gate L2 24/0，见 §0.16.8）。
+- 已完成：`S0 → S1 → S2 → S3(partial) → S4(partial) → S6 → S7 → S5(step1 + step2 + step3 + step4 + step5)`（S6/S7 全绿 gate L2 24/0；S5 step1/2/3 见 §0.16.5–§0.16.7；S5 step4 `.ast` 序列化 + `tc dump-ast` 纯加法已 gate L2 24/0（§0.16.8）；S5 step5 trivia 侧表 + `assign_trivia` 已 gate L2 24/0（§0.16.9））。
 - 尚未启动 / 进行中：
-  - **S5 step5**：trivia（span 间隙的注释/空白；先于 S8 的 fmt/lint 注释保留，§4.8 裁定先做 span 间隙）。
-  - **S8**（`@desugar`/`@pass` + fmt/lint）：依赖 S4 硬前置「删 `base.Node` 字段 + 删 re-export 垫片」完成（见 §0.14.6），且 S5 须在 S8 前完成（当前 S5 step1–4 已落地，仅 step5 trivia 待办）。
+  - **S8**（`@desugar`/`@pass` + fmt/lint）：依赖 S4 硬前置「删 `base.Node` 字段 + 删 re-export 垫片」完成（见 §0.14.6）；S5 已在 S8 前完成（step1–5 全绿），trivia 注释保留前提就绪。
   - 工作 B 支柱 1 step5 + 支柱 2/3：仍受 §0.13.9「真实消费者触发」门槛约束（DEFERRED）。
-- 当前主线位置：**S5 step5**（trivia：span 间隙的 leading/trailing 字节范围；step4 已落地 `.ast` 序列化能力）。
+- 当前主线位置：**S5 已收口（step1–5 全绿 gate L2 24/0）**；下一硬前置为 S8，其依赖 S4 硬前置「删 `base.Node` 字段 + 删 re-export 垫片」完成（见 §0.14.6）。
 - ⚠ **路线一致性**：本段（S6→S7→S5）严格沿 §4.10.3 阶段表推进（S4 之后 S6，并可并行 S5），无路线偏离。
 
 ---
@@ -1027,18 +1026,48 @@ S5   22dfefd                       step1：Span 结构 + node_span 侧表（纯�
   3. 补 parse-back 需改造解析器入口为「吃 `.ast` 而非吃 token 流」，属独立工作，提前做无当下收益且风险更高。
 - 故本步是「序列化能力就位、往返留待消费者」的**分阶段合理偏离**，不破坏 §4.10.3 的 S5 完成判据（S5 在 S8 之前完成即可；S8 启动时再补 parse-back 并补齐 `.ast` 往返一致验收）。
 
+#### §0.16.9 S5 step5（trivia span 间隙 leading/trailing 侧表 + `assign_trivia`）✅ 已落地并验证（gate L2 24/0，2026-10-02）
+
+> 范围（§4.8 / §0.17）：S5 第五步 = trivia（注释/空白的 span 间隙），先于 S8 的 fmt/lint 注释保留。§4.8 裁定「先做 span 间隙（leading/trailing 指向源文本），不动 `node_visit`/`mk_*`、不增节点数」；本步在此裁定内落地。
+
+**改动（纯加法，零编译行为变化）**
+- `src/base.tc`：
+  - 新增 `TriviaTok{ kind, text, line, col }` + 模块级 `g_trivia_toks: []TriviaTok`（lexer 在 `tokenize` 期逐段保留，按源序）；`kind ∈ {Ws, Newline, LineComment, BlockComment}`。
+  - 新增 `Trivia{ leading: []u64, trailing: []u64 }` + 侧表 `g_node_trivia: []Trivia`（与 `nodes[]` 平行，`Trivia` 内两字段存 `g_trivia_toks` 下标列表）。
+  - `node_new` 内 `append(g_node_trivia, Trivia{ leading: [], trailing: [] })`（与 `g_node_span` 等侧表对齐）。
+  - 新增读方 `node_trivia(n: u64) Trivia`、写方 `assign_trivia() void`（Roslyn 式逐 token 独立归属：找 prev=位置严格 < T 的末节点 / next=位置严格 > T 的首节点；T 与 prev 同 line（无换行分隔）→ trailing of prev，否则 leading of next；仅纳入 `g_node_span.line>0` 的源码锚定节点）。
+  - `cst_dump` 在节点标志后、子节点遍历前打印 `#<`(leading)/`#>`(trailing) trivia；新增 `cst_trivia_one(idx)`（转义 `\n`/`\t`/反斜杠/引号后打印 `kind[text]`）。
+- `src/lex.tc`：`tokenize` 把原本 `continue` 丢弃的 4 类（空白/换行/行注释/块注释）改为 `append(base.g_trivia_toks, base.TriviaTok{…})`；开头 `base.g_trivia_toks = []` 每轮重置。实 token 流 `toks` 不变 ⇒ 解析/AST/发射零影响。
+- `src/tc.tc`：`dump-ast` 子命令在 `parse.parse_unit()` 后插入 `base.assign_trivia()`，再 `cst_to_ast_str(lex.decl_list)`（仍不跑 sema）。
+- `out/_probe_trivia.tc`：探针（文件前导注释 / 行尾注释 / 跨行块注释 / `// 调用` 同 line 尾注）。
+
+**关键修复（崩溃根因）**
+- `assign_trivia` 内 `var prev = -1` / `var next = -1` 被 t 推断为 `u8`（=255）；slice 下标对 `u8` 符号扩展成 `i64 -1`，致 `g_node_span[-1]` 越界崩溃（`index_out_of_bounds, index: -1`）。改为显式 `var prev: i64 = -1` / `var next: i64 = -1`，`>= 0` 哨兵判定恢复正确。
+
+**等价性 / 安全性**
+- trivia 侧表仅被 `dump-ast` 读，任何发射路径（`codegen_c`/`codegen_ll`/tir）均不触碰 ⇒ 普通编译（check/compile/examples）IR 不受影响。
+- 自编译表示：新增 `TriviaTok`/`Trivia` 两类型 + `g_trivia_toks`/`g_node_trivia` 两全局 + `node_trivia`/`assign_trivia`/`cst_trivia_one` 三函数，经 `@import` 传播到 `tc.tc`；因 `assign_trivia` 仅被 `dump-ast`（`tc.tc` 命令分发）可达，对 examples/`tote.tc` 被树摇消除 ⇒ 首跑快照 **3 DIFF（仅 `src/tc.tc::{c,h,ll}`，0 NEW / 0 GONE）**，同 step1–3 良性自编译表示漂移（比 step4 的 5 DIFF 少，因未触达 `tote.tc`）。
+
+**手动验证（gate 不调用 `dump-ast`，故单独验证）**
+- `out/dbg/g1.exe dump-ast out/_probe_trivia.tc`：无崩溃；`// 文件前导注释`→ `add` leading；`// 行尾注释`→ `add` trailing（同 line）；`// 计算`→ `b` ident trailing（同 line 末节点）；`// 调用`→ `2` 字面量 trailing（同 line 末节点，不再错归 `return` leading）；`/* 块注释 … */`（跨 line）→ `main` leading。归属符合 Roslyn 式。
+
+**验证（gate L2 24/0 全绿）**
+- `tc check src/tc.tc`：0 errors（warning 数随新符号微增，无新增 error）。
+- 首跑快照 3 DIFF（0 NEW / 0 GONE）→ `ir_snapshot.mjs --update --compiler out/dbg/g1.exe` 重录基线（117 targets / 354 entries，updated 2026-10-02 10:25:54）后复跑 gate L2：**24 passed / 0 failed（2492.9s）**，含四代自举不动点 `g2==g3==g4`、conformance、run_examples 双后端、HIR AstGen/comptime-eval、双轨对拍、difftest tc0、C 后端自举、rls、tote 全绿。
+- 同步 `cp out/dbg/g4.exe out/dbg/tc.exe && cp out/rls/gr.exe out/rls/tc.exe`（种子升到当前不动点）。
+
+**偏离裁定（保持合理）**
+- §4.8 原写「字节范围指向源文本（不复制内容）」；本步用 `(line, col, text)` 等价表征——`text` 直接来自源文本（经 `str_slice` 取），未复制到每个节点，字节范围形式留作 S8 fmt 需要时升级为「存储源偏移区间、按需回查源文件」的紧凑形态。属 §4.8「局部扩展」裁定内的合理分阶段实现，未改变「不动 `node_visit`/`mk_*`、不增节点数、error node 留作未来可选」的约束。
+- 归属采用 Roslyn 式（同 line→trailing of prev，跨 line→leading of next；文件前导→首节点 leading，文件尾部→末节点 trailing），未引入 green/red 不可变树或 error node——后者仍按 §4.8 留作未来（IDE 增量重解析真实消费者出现时再接）。
+
 ---
 
 ## 0.17 S5 收口路线（step1 → stepN，P2，可并行于 S2–S4）
 
 > S5 = `Span` 取代 `ln/cl/tv` + CST `.ast` 序列化 + trivia（span 间隙）+ error node（§4.10.3）。
-> 当前完成 **step1（Span 侧表加法，§0.16.5）+ step2（读方迁 `node_span_id`，§0.16.6）+ step3（删 `ln/cl/tv` 字段，§0.16.7）**。后续步（尚未实施）：
-> - step2：迁移全部 `ln/cl/tv` **读取方**（诊断定位、emit 行号、`nd.ln` 等）到 `node_span()`，
->   双写期保留 `ln/cl/tv` 以维持兼容；conformance 诊断期望（行/列来源换 Span）同步核验。
-> - step3：删除 `Node.ln/cl/tv` 字段（与 S3 删 `Node.td` 同构），`node_span` 成为唯一位置来源。
-> - step4：CST `.ast` 序列化（供 IDE / 增量重编锚点）。
-> - step5：trivia（span 间隙，leading/trailing 指向源文本）—— 先于 S8 的 fmt/lint 注释保留。
-> - ⚠ S5 是 S8 的硬依赖（fmt 需 trivia 保留注释/空白）；进入 S8 前必须完成。当前 `owns`（侧表失效）
+> 当前完成 **step1（§0.16.5）+ step2（§0.16.6）+ step3（§0.16.7）+ step4（§0.16.8）+ step5（§0.16.9）**，S5 已全绿 gate L2 24/0，S8 fmt/lint 的注释保留前提就绪。后续步（尚未实施）：
+> - step2–step5 均已完成（见 §0.16.6–§0.16.9）：step2 读方迁 `node_span_id`、step3 删 `ln/cl/tv` 字段、step4 `.ast` 序列化 + `tc dump-ast`、step5 trivia 侧表 + `assign_trivia`；S5 全绿 gate L2 24/0。
+> - ⚠ S5 已完成（step1–5 全绿 gate L2 24/0），S8 fmt/lint 的 trivia 前提已满足；S8 现仅阻塞于其自身硬前置「S4 删 `base.Node` 字段 + 删 re-export 垫片」（见 §0.14.6）。当前 `owns`（侧表失效）
 >   仍待 `ModuleRef`，与 S7 同阻塞。
 
 ---
