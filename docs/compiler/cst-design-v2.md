@@ -766,6 +766,72 @@ S4   821c19b → a9c2970 → 72d461f → 2bea53f → 93eb234
   逐字节不变证明行为等价）；`--update` 重录基线后复跑只读快照 = **354 份逐字节相同**，完整 gate 24/0。
 - 同步：`out/dbg/tc.exe ← g4`、`out/rls/tc.exe ← gr`。
 
+#### 0.16.2 step2：`g_desugar_passes` 注册表收口（§4.11.3 第一刀）
+
+> 注：§4.11.3 的「SAST 渐进降级层（§4.11.4）」与「节点级 `run: fn(NodeRef) NodeRef` 统一」
+> 属同一延期类（见本步「偏离与边界」），本轮**只收口模块级脱糖为有序注册表**。
+
+**改动（仅 `src/sema.tc`）**
+
+1. 新增 `DesugarPass` 结构体（`name: string` / `order: i64` / `raw_impact: i64` —— **不含 fn 类型字段**，原因见关键事实）、
+   `g_desugar_passes: []DesugarPass`、`register_desugar(p)`、`desugar_run_range(lo, hi)`（跑 `(lo, hi]` 区间、
+   order 升序、由调用方切分区间避免重跑）。
+2. `desugar_init()`：重置 `g_desugar_passes = []` 并注册 **4 个模块级脱糖 Pass**，顺序与 run_check
+   原硬编码一致 —— `func_clauses`(1) < `lambdas`(2) < `array_len_infer`(3) < `imports`(4)。
+3. `run_check` 两处调用点改写：
+   - `resolve_modules/mangle_modules` 之后、register 之前：`parse__desugar_func_clauses()` +
+     `parse__desugar_lambdas()` + `lower_array_len_infer()` 三连 → **`desugar_run_range(-1, 3)`**；
+   - register 之后、`mark_call_callees()` 之前：`desugar_imports()` → **`desugar_run_range(3, 4)`**。
+   - `g_vl_checked = []` 仍保留（现置于 range 调用之后、register 之前；`lower_array_len_infer`
+     不读该标志、value_loop 在更晚的 check 期才用，位置变化无行为影响）。
+
+**等价性论证（决定性）**
+
+- 4 个脱糖函数的**身份、相对顺序、与 register / mb_pass / meta_pass 的交错位置**原样保留：
+  range(-1,3) 覆盖 1/2/3，range(3,4) 覆盖 4，**无重跑、无漏跑**。
+- 分派用 `order` 直查（`desugar_run_range` 内 `if p.order==1/2/3/4` 调对应函数），不把 fn 值存结构体字段
+  （t 的 LLVM 后端不支持该调用形态，见关键事实）；被调函数即原 4 个脱糖函数，**调用语义与原 `f()` 完全相同**。
+- `desugar_init()` 在 `run_check` 首行重置列表 ⇒ 多次 `run_check`（测试进程内重入）状态干净。
+
+**关键事实（备查，勿踩）**
+
+- **t 语言：`{ field: value }` struct 字面量语法解析器不支持**（实测 `T_PARSE_SYNTAX`）；
+  结构体一律 `var x: T; x.f = v;` 逐字段赋值（与 `hir.tc::hir_emit` 同范式）。注册表构造须用后者。
+- **`fn` 类型可作变量并调用（C/LLVM 双后端均通过）**，但**存进结构体字段后通过字段调用在 LLVM 后端失败**：
+  自举 gen-1 报 `call void @sema___desugar_thunk_func_clauses()` → \"1 error generated\"（TClosure env 在
+  结构体字段取值路径上未正确 setup 签名）。故注册表**不把 fn 值存结构体字段**，改为 `order` 直查分派。
+  （`{field:value}` struct 字面量本身也不被解析器支持，须 `var x:T; x.f=v;` 逐字段赋值。）
+- 仅收口**模块作用域**的 4 个脱糖入口；**逐节点**脱糖（`desugar_value_loop` / `lower_for_range` /
+  `lower_for_array` / `desugar_format_call` / `lower_pipe` / `lower_range_index` / `lower_in_range`）
+  仍在 infer 期就地调用 —— 它们统一为节点级签名须先有**不可变 AST 改写基础设施**（当前无），属 DEFERRED。
+
+**偏离与边界（与 §4.11.3 原文的差异，已论证成立）**
+
+- §4.11.3 设计 `run: fn(NodeRef) NodeRef` + 「节点级改写、不原地改入参（G2）」。当前实现保留
+  `run: fn() void` + 原地改写 CST —— 因为整条脱糖管线**依赖原地改写**（sema 遍历 CST 时节点就地脱糖），
+  改节点级需先建「克隆节点 / 替换子节点」基础设施，工作量与风险同 S4「删 `base.Node`」。
+  与 S4 同理**延期**，且门禁真正设防的「注册表驱动 + 正向断言」已落地；未被削弱的部分一根未动。
+- SAST（§4.11.4）是**瞬态中间层**，无独立数据结构：本步的 `g_desugar_passes` 按 order 渐进跑
+  即实现「CST →（pass1）→ 中间态 →（pass2）→ core」；当前 4 个 pass 全部为一次性 module-level，
+  中间态仅在单趟内存在，符合「不得固化成第二种 AST」约束。
+
+**验证（step2 门禁结果）**
+
+- `tc check src/tc.tc`：**0 errors / 510 warnings**（与基线一致）。
+- **首跑 gate L2 FAIL（任务 `KfniUu`，125.6s）**：自举一代（LLVM/clang）报
+  `call void @sema___desugar_thunk_func_clauses()` → "1 error generated"。**根因**：初版把
+  `fn() void` 存进 `DesugarPass.run` 结构体字段、经 `p.run()` 调用，t 的 LLVM 后端不支持该形态
+  （TClosure env 在结构体字段取值路径上未正确 setup）。**修复**：去掉 `run` 字段与 thunk，
+  `desugar_run_range` 改用 `order` 直查分派（仍 4 函数、同顺序、同交错），行为等价；重跑 `tc check` 0 error。
+- 复跑 gate L2 = **24 passed / 0 failed（2728.6s）**：自举一代、IR 静态审计、LLVM IR verifier、
+  conformance、**自举四代不动点 `g2==g3==g4`**、run_examples 双后端、**HIR AstGen 验证（emit-hir +
+  二进制往返）**、HIR 解释器、difftest g2↔g3、LLVM↔TIR 对拍、REPL 冒烟、MIR differential、
+  C 后端自举、difftest tc0、rls 快速通道、tote 冒烟 —— 全绿。
+- 首跑快照曾报 **3 DIFF（仅 `src/tc.tc::{c,h,ll}`，0 NEW / 0 GONE）** ⇒ 新增 `g_desugar_passes` /
+  `desugar_*` 全局符号致自编译表示变化（与 S3/S4/work-b/step1 同型良性漂移）；`--update` 重录基线后
+  复跑只读快照 = **354 份逐字节相同**，完整 gate 24/0。
+- 同步：`out/dbg/tc.exe ← g4`、`out/rls/tc.exe ← gr`。
+
 ---
 
 ## 1. 当前实现剖析（基于真实代码）
