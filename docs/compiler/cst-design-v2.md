@@ -990,7 +990,7 @@ S5   22dfefd                       step1：Span 结构 + node_span 侧表（纯�
 - `ir_snapshot.mjs --update --compiler out/dbg/g1.exe` 重录基线（117 targets / 354 entries）后复跑 gate L2：**24 passed / 0 failed（2629.8s）**，含自举四代不动点 `g2==g3==g4`、conformance、run_examples 双后端、C 后端自举、双轨对拍、rls 快速通道全绿。
 - 同步 `cp out/dbg/g4.exe out/dbg/tc.exe && cp out/rls/gr.exe out/rls/tc.exe`（种子编译器升到当前不动点）。
 
-#### §0.16.8 S5 step4（CST `.ast` 序列化 + `tc dump-ast`，纯加法）✅ 已落地并验证（gate L2 24/0）
+#### §0.16.8 S5 step4（CST `.ast` 序列化 + `tc dump-ast`，纯加法）✅ 已落地并验证（gate L2 24/0，commit `c34a576`）
 
 > 范围（§4.10.3 / §4.8 / §0.17）：S5 第四步 = CST `.ast` 序列化（供 IDE / 增量重编锚点 / `tc --format` 往返）。
 > 本步交付**序列化（dump）能力 + `tc dump-ast` 子命令**；解析回填 / 往返一致性（parse-back）留待 S8 的 fmt / IDE 真实消费者出现时再接（属 §0.13.9「真实消费者触发」门槛内的合理偏离，见下方「偏离裁定」）。
