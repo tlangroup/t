@@ -904,6 +904,42 @@ S4   821c19b → a9c2970 → 72d461f → 2bea53f → 93eb234
 - 首跑快照 3 DIFF（仅 `src/tc.tc::{c,h,ll}`，0 NEW/0 GONE，新增全局符号致良性自编译表示漂移），
   `--update` 重录基线后复跑 **354 份逐字节相同** ⇒ 完整 gate 24/0。
 
+#### §0.16.5 S5 step1（Span 结构 + node_span 侧表，纯加法）✅ 进行中（gate `YWRjTP`）
+
+**改动（`src/base.tc`）**
+- 新增 `pub struct Span { line, col, end_col: u64 }`（§4.8 结构化源码区间，取代 `ln/cl/tv` 三字段）。
+- 新增 `g_node_span: []Span` 平行侧表 + `node_span(n)` / `node_set_span(n, s)` 访问器（沿用 S3 侧表范式，
+  经 `nr_idx` 取裸索引；越界返回零 Span）。
+- `sidetable_init()` 登记 `"node_span"`（owner=`S5`）。
+- `node_new`：`append(g_node_span, Span{0,0,0})`（与 `ln/cl/tv` 零初始化锁步）。
+- `node_at`：绑定 token 时同步 `node_set_span(ni, Span{ line:tk.line, col:tk.col, end_col:tk.col+str_len(tk.v) })`。
+- **保留 `ln/cl/tv` 作本阶段活源**，侧表暂无任何读取方 ⇒ **零行为变化**。
+
+**等价性（关键）**
+- 仅新增一个与 `nodes[]` 平行的全局数组并锁步填充；`ln/cl/tv` 的读写路径一字未动，诊断/发射行号来源不变。
+- `g_node_span` 当前无人读取，IR 发射完全不触达 ⇒ 自举不动点 `g2==g3==g4` 必保持。
+
+**验证（step1 门禁结果）**
+- `tc check src/tc.tc`：**0 errors / 515 warnings**（与 S7 step2 基线一致）。
+- gate L2：**24 passed / 0 failed（1535.2s）**——含自举四代不动点 `g2==g3==g4`、run_examples 双后端、
+  HIR AstGen 验证、LLVM↔TIR 双轨对拍、C 后端自举、rls 快速通道全绿。
+- 首跑快照 3 DIFF（仅 `src/tc.tc::{c,h,ll}`，0 NEW/0 GONE，新增 `g_node_span` 全局符号致良性自编译表示漂移），
+  `--update` 重录基线后复跑 **354 份逐字节相同** ⇒ 完整 gate 24/0。
+
+---
+
+## 0.17 S5 收口路线（step1 → stepN，P2，可并行于 S2–S4）
+
+> S5 = `Span` 取代 `ln/cl/tv` + CST `.ast` 序列化 + trivia（span 间隙）+ error node（§4.10.3）。
+> 当前仅完成 **step1（Span 侧表加法）**。后续步（本仓库尚未实施，列出供推进）：
+> - step2：迁移全部 `ln/cl/tv` **读取方**（诊断定位、emit 行号、`nd.ln` 等）到 `node_span()`，
+>   双写期保留 `ln/cl/tv` 以维持兼容；conformance 诊断期望（行/列来源换 Span）同步核验。
+> - step3：删除 `Node.ln/cl/tv` 字段（与 S3 删 `Node.td` 同构），`node_span` 成为唯一位置来源。
+> - step4：CST `.ast` 序列化（供 IDE / 增量重编锚点）。
+> - step5：trivia（span 间隙，leading/trailing 指向源文本）—— 先于 S8 的 fmt/lint 注释保留。
+> - ⚠ S5 是 S8 的硬依赖（fmt 需 trivia 保留注释/空白）；进入 S8 前必须完成。当前 `owns`（侧表失效）
+>   仍待 `ModuleRef`，与 S7 同阻塞。
+
 ---
 
 ## 1. 当前实现剖析（基于真实代码）
