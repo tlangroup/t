@@ -1754,9 +1754,11 @@ pub struct Node {
     // S3（§4.5）：原 `td`（HIR 类型槽）已迁出为属性侧表 `g_node_td`，访问面走
     // `node_type()` / `node_set_type()`。语法树不再携带类型——跨切面属性改由侧表
     // 以节点 id 为键持有，降低 Node 布局与下游阶段的耦合（替换前：`td: i64`）。
-    ln: u64;    // anchor token 行（诊断用；0 = 无）
+    ln: u64;    // anchor token 行（诊断用；0 = 无）—— S5 step2 起读方迁 node_span_id，本字段将于 step3 删除
     cl: u64;    // anchor token 列
     tv: string; // anchor token 文本（endCol = col + len(tv)）
+    id: i64;    // S5 step2 过渡：节点裸索引（== nodes 下标），供 X.ln → node_span_id(X.id) 机械迁移读方；
+                // 与 ln/cl/tv 同为「待退役」字段，S4 epic 删 base.Node 时一并移除（NodeRef 即句柄，无需自存 id）
 }
 
 // S5（§4.10.3 / §4.8）：源码区间 Span（取代 `ln/cl/tv` 三字段的结构化表示）。
@@ -1824,16 +1826,21 @@ pub fn node_file(n: u64) string {
 
 // ── node_span 侧表（§4.8 / S5）：取代 `Node.ln/cl/tv` 三字段的结构化源码区间 ──
 // step1 仅建表 + 锁步填充（node_new 初始化 0 + node_at 绑定），暂未迁读方；`ln/cl/tv` 仍为本阶段活源。
-pub fn node_span(n: u64) Span {
+pub fn node_span_id(idx: i64) Span {
     sidetable_init();
-    var id = nr_idx(n);
-    if (id < 0 || id >= slice_len(g_node_span)) { var z: Span; return z; }
-    return g_node_span[id];
+    if (idx < 0 || idx >= slice_len(g_node_span)) { var z: Span; return z; }
+    return g_node_span[idx];
+}
+pub fn node_set_span_id(idx: i64, s: Span) void {
+    sidetable_init();
+    if (idx < 0 || idx >= slice_len(g_node_span)) { return; }
+    slice_set(g_node_span, idx, s);
+}
+pub fn node_span(n: u64) Span {
+    return node_span_id(nr_idx(n));
 }
 pub fn node_set_span(n: u64, s: Span) void {
-    var id = nr_idx(n);
-    if (id < 0 || id >= slice_len(g_node_span)) { return; }
-    slice_set(g_node_span, id, s);
+    node_set_span_id(nr_idx(n), s);
 }
 
 // ── node_type 侧表（§4.5）：取代已删除的 `Node.td` 字段 ──────────────────────
@@ -2019,6 +2026,7 @@ pub fn node_new(kind: string) u64 {
     n.ln = 0;
     n.cl = 0;
     n.tv = "";
+    n.id = slice_len(nodes);   // S5 step2：裸索引（append 后恰为该节点下标），供 node_span_id 机械读方迁移
     append(nodes, n);
     append(g_node_mod, g_cur_mod);   // provenance：记录本节点所属模块别名（"" = 入口）
     append(g_node_file, g_file);      // provenance：记录本节点所属源文件（load_module_file 内 g_file 已切到该模块文件）
