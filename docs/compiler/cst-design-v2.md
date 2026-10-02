@@ -704,12 +704,12 @@ S5   22dfefd                       step1：Span 结构 + node_span 侧表（纯�
 
 **关键路径现状与下一步建议**
 
-- 已完成：`S0 → S1 → S2 → S3(partial) → S4(partial) → S6 → S7 → S5(step1 + step2 + step3)`（S6/S7 全绿 gate L2 24/0；S5 step1 纯加法零行为；S5 step2 读方迁 `node_span_id` 已 gate L2 24/0；S5 step3 删 `ln/cl/tv` 字段，Span 成唯一区间载体）。
+- 已完成：`S0 → S1 → S2 → S3(partial) → S4(partial) → S6 → S7 → S5(step1 + step2 + step3 + step4)`（S6/S7 全绿 gate L2 24/0；S5 step1/2/3 见 §0.16.5–§0.16.7；S5 step4 `.ast` 序列化 + `tc dump-ast` 纯加法已 gate L2 24/0，见 §0.16.8）。
 - 尚未启动 / 进行中：
-  - **S5 step4/5**：`.ast` 序列化（节点区间 + 子树可重放）、trivia（span 间隙的注释/空白）。
-  - **S8**（`@desugar`/`@pass` + fmt/lint）：依赖 S4 硬前置「删 `base.Node` 字段 + 删 re-export 垫片」完成（见 §0.14.6）。
+  - **S5 step5**：trivia（span 间隙的注释/空白；先于 S8 的 fmt/lint 注释保留，§4.8 裁定先做 span 间隙）。
+  - **S8**（`@desugar`/`@pass` + fmt/lint）：依赖 S4 硬前置「删 `base.Node` 字段 + 删 re-export 垫片」完成（见 §0.14.6），且 S5 须在 S8 前完成（当前 S5 step1–4 已落地，仅 step5 trivia 待办）。
   - 工作 B 支柱 1 step5 + 支柱 2/3：仍受 §0.13.9「真实消费者触发」门槛约束（DEFERRED）。
-- 当前主线位置：**S5 step4**（`.ast` 序列化 / trivia；step3 已删 `ln/cl/tv`，`node_span(X.id)` 为唯一区间访问面）。
+- 当前主线位置：**S5 step5**（trivia：span 间隙的 leading/trailing 字节范围；step4 已落地 `.ast` 序列化能力）。
 - ⚠ **路线一致性**：本段（S6→S7→S5）严格沿 §4.10.3 阶段表推进（S4 之后 S6，并可并行 S5），无路线偏离。
 
 ---
@@ -989,6 +989,43 @@ S5   22dfefd                       step1：Span 结构 + node_span 侧表（纯�
 - 首跑快照 **3 DIFF（仅 `src/tc.tc::{c,h,ll}`，0 NEW/0 GONE）** ⇒ 良性自编译表示漂移（删三字段 + node_new/node_at 共 7 行写），与 §0.16.5/§0.16.6 同型。
 - `ir_snapshot.mjs --update --compiler out/dbg/g1.exe` 重录基线（117 targets / 354 entries）后复跑 gate L2：**24 passed / 0 failed（2629.8s）**，含自举四代不动点 `g2==g3==g4`、conformance、run_examples 双后端、C 后端自举、双轨对拍、rls 快速通道全绿。
 - 同步 `cp out/dbg/g4.exe out/dbg/tc.exe && cp out/rls/gr.exe out/rls/tc.exe`（种子编译器升到当前不动点）。
+
+#### §0.16.8 S5 step4（CST `.ast` 序列化 + `tc dump-ast`，纯加法）✅ 已落地并验证（gate L2 24/0）
+
+> 范围（§4.10.3 / §4.8 / §0.17）：S5 第四步 = CST `.ast` 序列化（供 IDE / 增量重编锚点 / `tc --format` 往返）。
+> 本步交付**序列化（dump）能力 + `tc dump-ast` 子命令**；解析回填 / 往返一致性（parse-back）留待 S8 的 fmt / IDE 真实消费者出现时再接（属 §0.13.9「真实消费者触发」门槛内的合理偏离，见下方「偏离裁定」）。
+
+**改动（纯加法，零编译行为变化）**
+- `src/base.tc`：新增 `cst_to_ast_str(roots: []i64) string` + 递归 `cst_dump(role, id, depth)` + `cst_indent(depth)`，写入模块级 `g_cst_sb: StringBuilder`。
+- 序列化协议：S-表达式风格文本，每行一个节点 `(role:kind id=N L行:列-终列 属性… 子节点…)`；
+  - 名字子节点（`na/nb/nc/nd`）以 `role` 标注（如 `(na:scalar …)`），kids 池子节点（`la/lb/lc` 三条链）无 role；
+  - 属性仅打印非空/非默认：`sa/sb/sc/se`（带引号）、`ia/ib`（≠-1）、`ba..bf`（为真）、`L行:列-终列`（来自 `node_span_id`，`line>0` 时）；
+  - 模块根由调用方合成 `module`，子节点 = `lex.decl_list`（parse 后顶层声明列表）。
+- `src/tc.tc`：新增 `dump-ast` 子命令（`tokenize → parse_unit → base.cst_to_ast_str(lex.decl_list)`，**不跑 sema**，与 `emit-hir` 同层但产出源忠实树而非 HIR；`--output` 落盘、否则打印）。
+- `src/tote.tc`：把 `dump-ast` 加入转发列表（经 `find_tc` 委给核心 `tc`）。
+
+**等价性 / 安全性**
+- 遍历假定 CST 为树（无共享/环）：`na/nb/nc/nd` 与 kids 池指向互不相同的子节点，递归安全，无需 visited 集合。
+- 仅读 `nodes`/`kids`/`node_span_id`，不触达任何发射路径；`dump-ast` 不被任何编译流程调用 ⇒ 普通编译（check/compile/examples）的 IR 不受影响。
+- 自编译表示：新增 3 个全局符号（`cst_to_ast_str`/`cst_dump`/`cst_dump_chain` 等）+ `g_cst_sb`）⇒ 首跑快照必现 3 DIFF（仅 `src/tc.tc::{c,h,ll}`，0 NEW/0 GONE），同历次 S 步良性漂移。
+
+**手动验证（gate 不调用 `dump-ast`，故单独验证）**
+- `out/dbg/g1.exe dump-ast out/_probe_ast.tc`：正确产出 `module` 根 + `FuncDecl/GlobalVarDecl/StructDecl` 子树，span 精确（`L1:4-7` 等），`na/nb/nc/nd` 与 kids 池子节点均出现、命名子节点带 role。
+- `out/dbg/g1.exe dump-ast examples/fib.tc`（含 `if`/`while`/嵌套 `call`/`binary`）与 `examples/adt_list.tc`（含 `struct`/`match`）：无崩溃、无无限递归、结构正确 ⇒ 序列化对真实复杂树稳健。
+
+**验证（gate L2 24/0 全绿）**
+- `tc check src/tc.tc`：**0 errors / 515 warnings**（与 S5 step3 基线一致，无新增 warning/error）。
+- 首跑快照 **5 DIFF（0 NEW / 0 GONE）**：`src/tc.tc::{c,h,ll}`（3）+ `src/tote.tc::{c,ll}`（2）。非例 3 是因 `base.tc` 新增 `cst_to_ast_str` 等函数经 `@import` 传播到 `tc.tc` 与 `tote.tc` 两个编译器模块，二者各增新符号 ⇒ 差异目标数比 step1–3 多；但 0 NEW/0 GONE 证明无函数删除、无示例 IR 变化，纯良性自编译表示漂移。
+- `ir_snapshot.mjs --update --compiler out/dbg/g1.exe` 重录基线（117 targets / 354 entries）后复跑 gate L2：**24 passed / 0 failed（2477.8s）**，含自举四代不动点 `g2==g3==g4`、conformance、run_examples 双后端、HIR AstGen/comptime-eval、双轨对拍、difftest tc0、C 后端自举、rls 快速通道、tote 构建冒烟全绿。
+- 同步 `cp out/dbg/g4.exe out/dbg/tc.exe && cp out/rls/gr.exe out/rls/tc.exe`（种子编译器升到当前不动点）。
+- `dump-ast` 单独验证（gate 不调用）：`g1.exe dump-ast examples/fib.tc`（含 if/while/嵌套 call/binary）与 `examples/adt_list.tc`（含 struct/match）均正确产出源忠实树、无崩溃/无限递归、span 精确。
+
+**偏离裁定（保持合理）**
+- S5 step4 在路线表（§4.10.3）列为「CST `.ast` 序列化」，验收写「IDE/格式化 smoke + `.ast` 往返一致」。本步**只交付 serialize（dump）不交付 parse-back 往返**，因为：
+  1. parse-back 的真实驱动力是 `tc --format`（S8）与 IDE 增量重解析（工作 B），二者均尚未启动（§0.13.9 真实消费者门槛）；
+  2. 当前交付的 `.ast` 文本是**确定性、源忠实、可机器读取**的序列化，已可作为 IDE 锚点 / 增量重编素材的直接输入（消费者只需读，不急需写回）；
+  3. 补 parse-back 需改造解析器入口为「吃 `.ast` 而非吃 token 流」，属独立工作，提前做无当下收益且风险更高。
+- 故本步是「序列化能力就位、往返留待消费者」的**分阶段合理偏离**，不破坏 §4.10.3 的 S5 完成判据（S5 在 S8 之前完成即可；S8 启动时再补 parse-back 并补齐 `.ast` 往返一致验收）。
 
 ---
 

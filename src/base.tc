@@ -1840,6 +1840,72 @@ pub fn node_set_span(n: u64, s: Span) void {
     node_set_span_id(nr_idx(n), s);
 }
 
+// ── S5 step4：CST `.ast` 序列化（供 IDE / 增量重编锚点 / `tc --format` 往返）──
+// 纯加法：仅遍历 parse 后 CST（nodes + kids 池），不改任何编译行为、不触达任何发射路径。
+// 输出 S-表达式风格文本：每行一个节点，`(role:kind id=N L行:列-终列 属性… 子节点…)`；
+// 名字子节点（na/nb/nc/nd）以 role 标注，kids 池子节点无 role；模块根由调用方合成 `module`。
+// 遍历假定 CST 为树（无共享/环）：na/nb/nc/nd 与 kids 池指向互不相同的子节点，递归安全。
+pub var g_cst_sb: StringBuilder;
+pub fn cst_indent(depth: i64) void {
+    var i: i64 = 0;
+    while (i < depth * 2) { sb_append_char(g_cst_sb, 32); i = i + 1; }   // 32 = space
+}
+pub fn cst_dump(role: string, id: i64, depth: i64) void {
+    if (id < 0) { return; }
+    sb_append_char(g_cst_sb, 10);            // 10 = '\n'
+    cst_indent(depth);
+    sb_append_char(g_cst_sb, 40);            // 40 = '('
+    if (str_len(role) > 0) {
+        sb_append_str(g_cst_sb, role);
+        sb_append_char(g_cst_sb, 58);        // 58 = ':'
+    }
+    var n: Node = nodes[id];
+    sb_append_str(g_cst_sb, n.kind);
+    sb_append_str(g_cst_sb, " id=");
+    sb_append_i64(g_cst_sb, id);
+    var sp: Span = node_span_id(id);
+    if (sp.line > 0) {
+        sb_append_str(g_cst_sb, " L");
+        sb_append_i64(g_cst_sb, sp.line);
+        sb_append_char(g_cst_sb, 58);        // ':'
+        sb_append_i64(g_cst_sb, sp.col);
+        sb_append_char(g_cst_sb, 45);        // 45 = '-'
+        sb_append_i64(g_cst_sb, sp.end_col);
+    }
+    if (str_len(n.sa) > 0) { sb_append_str(g_cst_sb, " sa=\""); sb_append_str(g_cst_sb, n.sa); sb_append_char(g_cst_sb, 34); }
+    if (str_len(n.sb) > 0) { sb_append_str(g_cst_sb, " sb=\""); sb_append_str(g_cst_sb, n.sb); sb_append_char(g_cst_sb, 34); }
+    if (str_len(n.sc) > 0) { sb_append_str(g_cst_sb, " sc=\""); sb_append_str(g_cst_sb, n.sc); sb_append_char(g_cst_sb, 34); }
+    if (str_len(n.se) > 0) { sb_append_str(g_cst_sb, " se=\""); sb_append_str(g_cst_sb, n.se); sb_append_char(g_cst_sb, 34); }
+    if (n.ia != -1) { sb_append_str(g_cst_sb, " ia="); sb_append_i64(g_cst_sb, n.ia); }
+    if (n.ib != -1) { sb_append_str(g_cst_sb, " ib="); sb_append_i64(g_cst_sb, n.ib); }
+    if (n.ba) { sb_append_str(g_cst_sb, " ba"); }
+    if (n.bb) { sb_append_str(g_cst_sb, " bb"); }
+    if (n.bc) { sb_append_str(g_cst_sb, " bc"); }
+    if (n.bd) { sb_append_str(g_cst_sb, " bd"); }
+    if (n.be) { sb_append_str(g_cst_sb, " be"); }
+    if (n.bf) { sb_append_str(g_cst_sb, " bf"); }
+    // 子节点：先名字子节点（role 标注），再 kids 池（la/lb/lc 三条链，无 role）
+    if (n.na >= 0) { cst_dump("na", n.na, depth + 1); }
+    if (n.nb >= 0) { cst_dump("nb", n.nb, depth + 1); }
+    if (n.nc >= 0) { cst_dump("nc", n.nc, depth + 1); }
+    if (n.nd >= 0) { cst_dump("nd", n.nd, depth + 1); }
+    var c: i64 = n.la; while (c >= 0) { cst_dump("", kids[c].val, depth + 1); c = kids[c].next; }
+    c = n.lb; while (c >= 0) { cst_dump("", kids[c].val, depth + 1); c = kids[c].next; }
+    c = n.lc; while (c >= 0) { cst_dump("", kids[c].val, depth + 1); c = kids[c].next; }
+    sb_append_char(g_cst_sb, 41);            // 41 = ')'
+}
+pub fn cst_to_ast_str(roots: []i64) string {
+    g_cst_sb = sb_new();
+    sb_append_char(g_cst_sb, 40);            // '('
+    sb_append_str(g_cst_sb, "module");
+    var i: i64 = 0;
+    var m: i64 = slice_len(roots) as i64;
+    while (i < m) { cst_dump("", roots[i], 1); i = i + 1; }
+    sb_append_char(g_cst_sb, 41);            // ')'
+    sb_append_char(g_cst_sb, 10);
+    return sb_to_str(g_cst_sb);
+}
+
 // ── node_type 侧表（§4.5）：取代已删除的 `Node.td` 字段 ──────────────────────
 // 语义与原字段一致：0 = 未定型；> 0 = TD 索引（读取方仍须做上界检查）；
 // -1 = 缓存被判定越界并丢弃（回落重推导）。此处为纯搬迁，不改变任何行为。
