@@ -865,14 +865,41 @@ S4   821c19b → a9c2970 → 72d461f → 2bea53f → 93eb234
 **偏离与边界（与 §4.12 原文差异，已论证成立）**
 
 - §4.12.2 `Pass` 含 `owns`/`requires`（`[]Sym32("Table")`）+ 拓扑排序 + 失效；当前 step1 **未含**
-  （无真实跨 Pass 侧表依赖需编码，且 `Sym32` 为文档伪码、真实侧表名为 `string`）。step2 引入
-  `owns`/`requires: []string` + `passes_validate()`（拓扑无环 + requires 可满足，§4.12.5「门禁即报」）。
-- §4.12.4 要求门禁增 `g_passes` 拓扑断言 —— 随 step2 的 `passes_validate()` 落地。
+  `requires`/`owns`（无真实跨 Pass 侧表依赖需编码，且 `Sym32` 为文档伪码、真实侧表名为 `string`）。
+  step2 已引入 `requires: []string` + `passes_validate()`（拓扑无环 + requires 可满足，§4.12.5「门禁即报」）。
+  ⚠ `owns`（侧表失效）步因 `ModuleRef` 不存在而**仍 DEFERRED**——当前无真实消费方触发，留待 S7 后续或 S8。
+- §4.12.4 要求门禁增 `g_passes` 拓扑断言 —— 随 step2 的 `passes_validate()` 落地（由 `g_verify_passes`
+  调试开关在 `run_check` 末受控触发，默认关闭、零行为）。
 
 **验证（step1 门禁结果）**
 
 - `tc check src/tc.tc`：**0 errors / 510 warnings**（与基线一致）。
 - gate L2：**24 passed / 0 failed（1706.6s）**——含自举四代不动点 `g2==g3==g4`、run_examples 双后端、
+  HIR AstGen 验证（emit-hir + 二进制往返）、LLVM↔TIR 双轨对拍、C 后端自举、rls 快速通道全绿。
+- 首跑快照 3 DIFF（仅 `src/tc.tc::{c,h,ll}`，0 NEW/0 GONE，新增全局符号致良性自编译表示漂移），
+  `--update` 重录基线后复跑 **354 份逐字节相同** ⇒ 完整 gate 24/0。
+
+#### §0.16.4 S7 step2（Pass 依赖拓扑 + 全管线注册）✅ `88c8114` 之后、`TBR` 前
+
+**改动（`src/sema.tc`）**
+- `Pass` 扩展 `requires: []string`（依赖前置 Pass）+ `auto_run: bool`（是否由 `run_passes` 自动调度）。
+- `passes_init()` 注册**全部 6 个真实处理节点**，构成完整管线图：
+  - `run_check` 内自动调度（`auto_run=true`）：`mark_call_callees → mb_pass → meta_pass`（requires 链逐级依赖）。
+  - `run_check` 外由 `src/tc.tc` 显式调度（`auto_run=false`）：`comptime_fold_pass → flag_pass → ann_pass`（requires 链）。
+- `run_passes()` 仅调度 `auto_run==true` 的 Pass（三趟，与原硬编码逐点相同）；`comptime_fold_pass` 等
+  仍由 `src/tc.tc` 调用，**行为一字未变**（未改动顶层管线结构与双后端发射）。
+- 新增 `passes_find` / `passes_has` / `passes_validate`（① 无重复 name ② 所有 requires 目标已注册
+  ③ 依赖图无环，步数计数器判环）/ `passes_reach_depth`（递归深度 > n 即环）。
+- `g_verify_passes` 调试开关（`run_check` 末受控触发，默认关闭、零行为）；与 `g_verify_scope_tree` 同构。
+
+**等价性（为何零行为变化）**
+- `run_passes` 仍只跑 `auto_run=true` 的三趟、`name` 直查分发，与原 `mark_call_callees(); mb_pass(); meta_pass();`
+  顺序/调用逐点相同；`comptime_fold_pass`/`flag_pass`/`ann_pass` 调用点未从 `src/tc.tc` 移除。
+- `passes_validate` 仅在 `g_verify_passes=true` 时跑，正常编译完全不触达 ⇒ 零行为。
+
+**验证（step2 门禁结果）**
+- `tc check src/tc.tc`：**0 errors / 515 warnings**（较 step1 基线 +5，来自新增 `requires`/`auto_run` 字段与校验函数，良性）。
+- gate L2：**24 passed / 0 failed（1581.8s）**——含自举四代不动点 `g2==g3==g4`、run_examples 双后端、
   HIR AstGen 验证（emit-hir + 二进制往返）、LLVM↔TIR 双轨对拍、C 后端自举、rls 快速通道全绿。
 - 首跑快照 3 DIFF（仅 `src/tc.tc::{c,h,ll}`，0 NEW/0 GONE，新增全局符号致良性自编译表示漂移），
   `--update` 重录基线后复跑 **354 份逐字节相同** ⇒ 完整 gate 24/0。
