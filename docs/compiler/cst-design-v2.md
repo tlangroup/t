@@ -932,7 +932,7 @@ S5   22dfefd                       step1：Span 结构 + node_span 侧表（纯�
 - 首跑快照 3 DIFF（仅 `src/tc.tc::{c,h,ll}`，0 NEW/0 GONE，新增 `g_node_span` 全局符号致良性自编译表示漂移），
   `--update` 重录基线后复跑 **354 份逐字节相同** ⇒ 完整 gate 24/0。
 
-#### §0.16.6 S5 step2（读方迁 `node_span_id`，跨 4 文件 ~120 处）✅ 已落地并验证（gate L2 24/0）
+#### §0.16.6 S5 step2（读方迁 `node_span_id`，跨 4 文件 ~120 处）✅ 已落地并验证（gate L2 24/0，commit `e339703`）
 
 > 范围（§4.10.3 / §4.8）：把 `ln/cl/tv` 全部读方与「克隆/合成节点抄锚点」的写方，从 `Node` 字段切换到
 > `node_span` 侧表（`node_span_id(idx)` / `node_set_span_id(idx, s)`），为 step3「删 `Node.ln/cl/tv` 字段」清场。
