@@ -1759,6 +1759,16 @@ pub struct Node {
     tv: string; // anchor token 文本（endCol = col + len(tv)）
 }
 
+// S5（§4.10.3 / §4.8）：源码区间 Span（取代 `ln/cl/tv` 三字段的结构化表示）。
+// 当前 step1 仅作**加法侧表**：与 `ln/cl/tv` 锁步填充（node_new 初始化 + node_at 绑定），
+// 暂无任何读取方 ⇒ 零行为变化。`ln/cl/tv` 仍为本阶段活源，后续步迁移读方后再退役
+// （与 S3 字段外置范式一致：先建侧表 → 迁移读方 → 删旧字段）。
+pub struct Span {
+    line: u64;     // 起始行（1-based；0 = 无）
+    col: u64;      // 起始列（1-based）
+    end_col: u64;  // 终止列 = col + len(tv)（独占上界）
+}
+
 pub var nodes: []Node;
 
 // ── 命名空间隔离（外部库真正落地）──────────────────────────────
@@ -1770,6 +1780,7 @@ pub var g_node_file: []string;          // 与 nodes 平行的数组：nodes[i] 
 pub var g_node_td: []i64;               // S3 §4.5 node_type 侧表：nodes[i] 的 HIR 类型槽 TD 索引（0 = 未定型；-1 = 已丢弃）
 pub var g_node_resolve: []i64;          // S3 §4.5 node_resolve 侧表：ident 节点 i 解析到的声明节点（替代 g_idecl_* 反向扫描，O(1)）
 pub var g_node_const: []i64;             // S3 §4.5 node_const 侧表：nodes[i] 是否为 const 声明（1 = 是；0 = 否；替代 g_const_decl_ids 列表 + 线性扫描）
+pub var g_node_span: []Span;              // S5 §4.8 node_span 側表：nodes[i] 的源码区间 Span（取代 ln/cl/tv 的结构化表示）
 
 // ── S3（§4.5）：侧表登记 + provenance 侧表读取面 ──────────────────────────────
 // 跨切面属性统一登记 SideTable{name,owner,dirty}，PassManager 据 name 建拓扑与置脏。
@@ -1797,6 +1808,7 @@ pub fn sidetable_init() void {
     sidetable_register("node_resolve", "S3");
     sidetable_register("node_const", "S3");
     sidetable_register("node_scope", "S3");
+    sidetable_register("node_span", "S5");
 }
 pub fn node_mod(n: u64) string {
     sidetable_init();
@@ -1808,6 +1820,20 @@ pub fn node_file(n: u64) string {
     var id = nr_idx(n);
     if (id < 0 || id >= slice_len(g_node_file)) { return ""; }
     return g_node_file[id];
+}
+
+// ── node_span 侧表（§4.8 / S5）：取代 `Node.ln/cl/tv` 三字段的结构化源码区间 ──
+// step1 仅建表 + 锁步填充（node_new 初始化 0 + node_at 绑定），暂未迁读方；`ln/cl/tv` 仍为本阶段活源。
+pub fn node_span(n: u64) Span {
+    sidetable_init();
+    var id = nr_idx(n);
+    if (id < 0 || id >= slice_len(g_node_span)) { var z: Span; return z; }
+    return g_node_span[id];
+}
+pub fn node_set_span(n: u64, s: Span) void {
+    var id = nr_idx(n);
+    if (id < 0 || id >= slice_len(g_node_span)) { return; }
+    slice_set(g_node_span, id, s);
 }
 
 // ── node_type 侧表（§4.5）：取代已删除的 `Node.td` 字段 ──────────────────────
@@ -2000,6 +2026,7 @@ pub fn node_new(kind: string) u64 {
     append(g_node_resolve, -1);       // S3 §4.5 node_resolve 侧表：默认 -1（未解析到声明）
     append(g_node_const, 0);           // S3 §4.5 node_const 侧表：默认 0（非 const 声明）
     append(g_node_scope, -1);          // S3 §0.13.9 node_scope 侧表：默认 -1（未归属任何作用域帧）
+    append(g_node_span, Span{ line: 0, col: 0, end_col: 0 });   // S5 §4.8 node_span 侧表：默认零区间（与 ln/cl/tv 初始化 0 对齐）
     var nref_tag: i64 = nk_of_kind(kind);
     if (nref_tag < 0) { nref_tag = 0; }   // 未注册 kind 暂归 tag=0（g_node_nref 当前无消费方，安全）
     append(g_node_nref, mk_noderef(nref_tag, (slice_len(nodes) as i64) - 1));   // S4：打包 tag|idx 存入侧表（供未来消费方）
@@ -2018,6 +2045,8 @@ pub fn node_at(ni: i64, ti: i64) void {
     n.cl = tk.col;
     n.tv = tk.v;
     slice_set(nodes, ni, n);
+    // S5 §4.8：与 ln/cl/tv 锁步填充 node_span 侧表（end_col = col + len(tv)，独占上界）。
+    node_set_span((ni as u64), Span{ line: (tk.line as u64), col: (tk.col as u64), end_col: (tk.col as u64) + str_len(tk.v) });
 }
 
 // ── 节点种类注册表（来自 reference.md §2.9 NodeTable）──
