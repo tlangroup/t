@@ -673,6 +673,9 @@ S3   b78f9fd → 01d8b82 → 926e6f6 → a78d9ba → 1d6f431
 S4   821c19b → a9c2970 → 72d461f → 2bea53f → 93eb234
      step1 g_node_nref 激活 → step② 访问器 → step③ mk_* → step④ HirInst.nd → 收口裁定
 工作B a244377 → b91182f → 8e58623   支柱 1 step1/2/(3+4)
+S6   4c38666 / ffac9e1             lower_policy[] 查表替换 6 硬编码分支 + g_desugar_passes 注册表收口（§0.16.1/0.16.2）
+S7   88c8114 / 021eae8             PassManager 框架 + passes_validate 全管线注册（§0.16.3/0.16.4）
+S5   22dfefd                       step1：Span 结构 + node_span 侧表（纯加法，零行为；读方迁移留 step2，§0.16.5）
 ```
 
 **对账表**
@@ -701,10 +704,13 @@ S4   821c19b → a9c2970 → 72d461f → 2bea53f → 93eb234
 
 **关键路径现状与下一步建议**
 
-- 已完成：`S0 → S1 → S2 → S3(partial) → S4(partial)`。
-- 尚未启动：**S5**（Span / trivia / `.ast`，P2，可并行）、**S6**（`lower_policy[]` + SAST，P1，**依赖 S3 已满足**）、**S7**（PassManager）、**S8**（`@desugar`/`@pass` + fmt/lint）。
-- 当前占用：工作 B 支柱 1（路线外 R&D epic，step5 DEFERRED）。
-- ⚠ **路线提示**：按 §4.10.3，S4 之后主线下一步应为 **S6**（或并行 S5）；当前走工作 B 属路线外 R&D。**若目标是推进主线，下一步建议回 S6**（其依赖 S3 已满足，且 S6 会产出 `HIR_OP_RAW == 0` 的正向断言，收益明确）。
+- 已完成：`S0 → S1 → S2 → S3(partial) → S4(partial) → S6 → S7 → S5(step1 + step2)`（S6/S7 全绿 gate L2 24/0；S5 step1 纯加法零行为；S5 step2 读方迁 `node_span_id` 已 gate L2 24/0 验证）。
+- 尚未启动 / 进行中：
+  - **S5 step3+**：删 `Node.ln/cl/tv` 字段（双写过渡已就绪，读方已全切 `node_span_id`）→ step4/5（`.ast` 序列化、trivia）。
+  - **S8**（`@desugar`/`@pass` + fmt/lint）：依赖 S4 硬前置「删 `base.Node` 字段 + 删 re-export 垫片」完成（见 §0.14.6）。
+  - 工作 B 支柱 1 step5 + 支柱 2/3：仍受 §0.13.9「真实消费者触发」门槛约束（DEFERRED）。
+- 当前主线位置：**S5 step3**（删 `Node.ln/cl/tv` 字段，读方已全切侧表，可安全删除）。
+- ⚠ **路线一致性**：本段（S6→S7→S5）严格沿 §4.10.3 阶段表推进（S4 之后 S6，并可并行 S5），无路线偏离。
 
 ---
 
@@ -904,7 +910,7 @@ S4   821c19b → a9c2970 → 72d461f → 2bea53f → 93eb234
 - 首跑快照 3 DIFF（仅 `src/tc.tc::{c,h,ll}`，0 NEW/0 GONE，新增全局符号致良性自编译表示漂移），
   `--update` 重录基线后复跑 **354 份逐字节相同** ⇒ 完整 gate 24/0。
 
-#### §0.16.5 S5 step1（Span 结构 + node_span 侧表，纯加法）✅ 进行中（gate `YWRjTP`）
+#### §0.16.5 S5 step1（Span 结构 + node_span 侧表，纯加法）✅ 已落地（`22dfefd`，gate `24/0`）
 
 **改动（`src/base.tc`）**
 - 新增 `pub struct Span { line, col, end_col: u64 }`（§4.8 结构化源码区间，取代 `ln/cl/tv` 三字段）。
@@ -926,12 +932,48 @@ S4   821c19b → a9c2970 → 72d461f → 2bea53f → 93eb234
 - 首跑快照 3 DIFF（仅 `src/tc.tc::{c,h,ll}`，0 NEW/0 GONE，新增 `g_node_span` 全局符号致良性自编译表示漂移），
   `--update` 重录基线后复跑 **354 份逐字节相同** ⇒ 完整 gate 24/0。
 
+#### §0.16.6 S5 step2（读方迁 `node_span_id`，跨 4 文件 ~120 处）✅ 已落地并验证（gate L2 24/0）
+
+> 范围（§4.10.3 / §4.8）：把 `ln/cl/tv` 全部读方与「克隆/合成节点抄锚点」的写方，从 `Node` 字段切换到
+> `node_span` 侧表（`node_span_id(idx)` / `node_set_span_id(idx, s)`），为 step3「删 `Node.ln/cl/tv` 字段」清场。
+
+**根阻点与解法（关键决策）**
+- `base.Node` 值**不携带自身 id**（§0.16.5 已确认 `Node` 无 `id` 字段），而 `node_span(n)` 以
+> `NodeRef`（u64，tag|idx 打包）为键。逐点 `X.ln → node_span(<X 的 id>)` 需人工溯源每个 `X` 的 NodeRef，
+> 跨 `hir/sema/parse/tir` 共 ~120 处、且多数为异构局部变量（`vn`/`pn`/`arm`/`en`/`f`/`m_an`/`n3`/`an`…），
+> 盲目逐点改易错且每次错配需重跑整个 gate L2（~45min）才能被 conformance 诊断行号捕获。
+- **解法：引入过渡字段 `Node.id: i64`（裸索引 == `nodes` 下标）**。则 `X.ln` 统一改写为
+> `base.node_span_id(X.id).line`、`X.cl` → `.col`；克隆/合成抄锚点 `X.ln = Y.ln` 改写为
+> `base.node_set_span_id(X.id, base.node_span_id(Y.id))`（一次写入整段 Span）。该字段与 `ln/cl/tv` 同属
+> 「待退役」集合，**S4 epic 删 `base.Node` 时一并移除**（届时 `NodeRef` 即句柄，无需自存 id）。
+- 新增 `node_span_id(idx: i64)` / `node_set_span_id(idx: i64, s)`（裸索引版），`node_span(n: u64)` 委托前者；
+> `node_new` 在 `append(nodes, n)` 前写 `n.id = slice_len(nodes)`（即该节点下标）。
+
+**改动（机械迁移，脚本 `tools/_s5migrate.py` 驱动）**
+- 读方：`X.ln`/`X.cl` → `base.node_span_id(X.id).line`/`.col`；`base.nodes[IDX].ln/.cl` → `base.node_span_id(IDX).line/.col`。
+- 写方（克隆/合成抄锚点，~11 处）：`X.ln = Y.ln` 等三连 → 单次 `base.node_set_span_id(X.id, base.node_span_id(Y.id))`
+  （幂等，三连退化为同一条调用，无害）。
+- `tv` 读取仅 1 处（sema `desugar_module_path` 算 `end_col`）：`str_len(n3.tv)` → `end_col - col`，等价于原 `col + len(tv)`。
+
+**等价性（决定性）**
+- 自编译表示：仅 `Node` 增一个 `id: i64` 字段 + 新增 `node_span_id`/`node_set_span_id` 两个全局符号 ⇒ 首跑快照必现
+> 3 DIFF（仅 `src/tc.tc::{c,h,ll}`，0 NEW/0 GONE），与历次 S 步同型良性漂移。
+- 运行期语义：`node_at` 仍按 `tk.line/col` 锁步填 `ln/cl/tv` 与 `node_span`（step1 已落地）；克隆/合成节点
+> 抄锚点现在同步抄整段 Span ⇒ 任一节点 `node_span_id(idx)` 与其 `ln/cl/tv` **逐字节相等**。读方切换后诊断行号不变
+> ⇒ conformance / run_examples 双后端对拍必保持。
+
+**验证（gate L2 24/0 全绿）**
+- `tc check src/tc.tc`：**0 errors / 515 warnings**（与 S5 step1 基线一致，无新增 warning/error）。
+- 首跑快照 **3 DIFF（仅 `src/tc.tc::{c,h,ll}`，0 NEW/0 GONE）** ⇒ 良性自编译表示漂移（新增 `Node.id` 字段 + `node_span_id`/`node_set_span_id` 两个全局符号），符合 §0.16.5 同型预测。
+- `ir_snapshot.mjs --update --compiler out/dbg/g1.exe` 重录基线（117 targets / 354 entries）后复跑 gate L2：**24 passed / 0 failed（1666s）**，含自举四代不动点 `g2==g3==g4`、conformance、run_examples 双后端、C 后端自举、双轨对拍、rls 快速通道全绿。
+- 同步 `cp out/dbg/g4.exe out/dbg/tc.exe && cp out/rls/gr.exe out/rls/tc.exe`（种子编译器升到当前不动点）。
+
 ---
 
 ## 0.17 S5 收口路线（step1 → stepN，P2，可并行于 S2–S4）
 
 > S5 = `Span` 取代 `ln/cl/tv` + CST `.ast` 序列化 + trivia（span 间隙）+ error node（§4.10.3）。
-> 当前仅完成 **step1（Span 侧表加法）**。后续步（本仓库尚未实施，列出供推进）：
+> 当前完成 **step1（Span 侧表加法，§0.16.5）+ step2（读方迁 `node_span_id`，§0.16.6）**。后续步（尚未实施）：
 > - step2：迁移全部 `ln/cl/tv` **读取方**（诊断定位、emit 行号、`nd.ln` 等）到 `node_span()`，
 >   双写期保留 `ln/cl/tv` 以维持兼容；conformance 诊断期望（行/列来源换 Span）同步核验。
 > - step3：删除 `Node.ln/cl/tv` 字段（与 S3 删 `Node.td` 同构），`node_span` 成为唯一位置来源。
