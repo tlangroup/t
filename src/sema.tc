@@ -13365,6 +13365,50 @@ pub fn desugar_init() void {
     var p4: DesugarPass; p4.name = "imports";         p4.order = 4; p4.raw_impact = 0; register_desugar(p4);
 }
 
+// ── S7（§4.12）：管线处理节点（Pass）框架 ────────────────────────────
+// 把 run_check 里原先硬编码的「模块级处理节点序列」（mark_call_callees / mb_pass /
+// meta_pass）收口为**注册式 PassManager**。当前 step1 仅建立数据模型 + 统一执行入口
+// run_passes()（按注册序分发，与原硬编码顺序逐点相同 ⇒ 行为等价）；拓扑排序 / 依赖失效
+// 见 §4.12.3，留 step2。
+//
+// ⚠ 不把 `run: fn() void` 存进结构体字段：t 的 LLVM 后端不支持「调用存于结构体字段的
+//   fn 值」（与脱糖注册表同坑）。统一用 `name` 直接分发（run_passes 内 if-else）。
+pub const PASS_ANALYSIS:  i64 = 0;   // 只读 IR，产出侧表（类型 / 借用 / 可达性）
+pub const PASS_TRANSFORM: i64 = 1;   // 改写 IR（comptime 折叠 / 内联 / DCE）
+// stage：HIR=1, MIR=2, TIR=3, TMIR=4
+pub struct Pass {
+    name: string;        // Pass 名（审计 / 门禁对账用）
+    stage: i64;          // 作用 IR 层
+    kind: i64;           // PASS_ANALYSIS | PASS_TRANSFORM
+}
+pub var g_passes: []Pass;
+pub fn register_pass(p: Pass) void { append(g_passes, p); }
+// 注册现有真实处理节点（顺序与 run_check 原硬编码一致：mark_call_callees → mb_pass → meta_pass）。
+pub fn passes_init() void {
+    g_passes = [];
+    var p1: Pass; p1.name = "mark_call_callees"; p1.stage = 1; p1.kind = PASS_ANALYSIS;   register_pass(p1);
+    var p2: Pass; p2.name = "mb_pass";           p2.stage = 1; p2.kind = PASS_TRANSFORM; register_pass(p2);
+    var p3: Pass; p3.name = "meta_pass";         p3.stage = 1; p3.kind = PASS_TRANSFORM; register_pass(p3);
+    // 注：comptime_fold_pass / flag_pass / ann_pass 现行由 src/tc.tc 驱动在 run_check 之外调用，
+    // 暂不入本 run_passes()（避免改动顶层管线结构）；step2 一并纳入统一调度。
+}
+// 统一执行入口：按注册序遍历 g_passes，按 name 直接分发到真实处理函数（LLVM 安全）。
+// 顺序约束（务必保持）：mark_call_callees 先建调用图；mb_pass（Phase D：先折 `@type_*`
+// 编译期内建，使 `meta 8 + @type_size(i64)` 内层已是字面量）须在 check_decl 之前；
+// meta_pass（Phase B：CTFE 折叠 `meta <expr>` / 执行 `meta {}`）须紧随 mb_pass、且在
+// check_decl 之前（折叠后 checker 看到普通字面量，双后端无需为 meta 单独发射，
+// 见 docs/compiler/meta_design.md §9 Phase B）。
+pub fn run_passes() void {
+    var i: i64 = 0;
+    while (i < slice_len(g_passes) as i64) {
+        var p: Pass = g_passes[i];
+        if (p.name == "mark_call_callees") { mark_call_callees(); }
+        else if (p.name == "mb_pass") { mb_pass(); }
+        else if (p.name == "meta_pass") { meta_pass(); }
+        i = i + 1;
+    }
+}
+
 pub fn run_check() void {
     desugar_init();
     global_scope = scope_new(-1);
@@ -13427,14 +13471,8 @@ pub fn run_check() void {
         ib = ib + 1;
     }
     desugar_run_range(3, 4);  // S6（§4.11.3）：imports(4)，在 register 之后、mb/meta_pass 之前，行为等价
-    mark_call_callees();
-    // Phase D：先折 `@type_*` 编译期内建（纯类型查询，无环境依赖），
-    // 这样 `meta 8 + @type_size(i64)` 里的内层在 CTFE 看到时已是字面量。
-    mb_pass();
-    // Phase B：CTFE —— 折叠 `meta <expr>`、执行 `meta { }`。
-    // 必须在 check_decl 之前：折叠后 checker 看到的是普通字面量，
-    // 双后端也因此无需为 meta 单独发射（见 docs/compiler/meta_design.md §9 Phase B）。
-    meta_pass();
+    passes_init();
+    run_passes();   // S7（§4.12）：mark_call_callees → mb_pass → meta_pass，按注册序分发，行为等价
     // ⚠ 再重建一次 HIR：mb_pass / meta_pass 会**改结构**（编译期块执行完即清空语句表、
     // `meta <expr>` 就地折叠成字面量）。注册期那一份指令流已与当前 CST 脱节 ——
     // 照它走会把「已被删除的语句」重新检查一遍（实测：`comptime {}` 里的

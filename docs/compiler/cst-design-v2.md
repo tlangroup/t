@@ -832,6 +832,51 @@ S4   821c19b → a9c2970 → 72d461f → 2bea53f → 93eb234
   复跑只读快照 = **354 份逐字节相同**，完整 gate 24/0。
 - 同步：`out/dbg/tc.exe ← g4`、`out/rls/tc.exe ← gr`。
 
+#### 0.16.3 step3（S7 启动）：`Pass`/`PassManager` 框架 + 统一执行入口
+
+> S7（§4.12）起步。当前 step1 **仅建立数据模型 + 统一执行入口**（`run_passes()` 按注册序分发），
+> 行为等价于原 `run_check` 硬编码序列；拓扑排序 / 依赖失效（§4.12.3）留 step2。
+
+**改动（仅 `src/sema.tc`）**
+
+1. 新增 `Pass` 结构体（`name: string` / `stage: i64` / `kind: i64`）、`g_passes`、`register_pass`、
+   `passes_init()`（注册 `mark_call_callees`(ANALYSIS) → `mb_pass`(TRANSFORM) → `meta_pass`(TRANSFORM)，
+   顺序同原硬编码）、`run_passes()`（遍历 `g_passes`、按 `name` 直接分发到真实处理函数）。
+2. `run_check` 内 `mark_call_callees(); mb_pass(); meta_pass();` 三连 → `passes_init(); run_passes();`。
+   `comptime_fold_pass` / `flag_pass` / `ann_pass` 由 `src/tc.tc` 驱动在 `run_check` 之外调用，暂不入
+   `run_passes()`（避免改动顶层管线结构），step2 一并纳入统一调度。
+
+**等价性论证（决定性）**
+
+- `run_passes()` 按**注册序**遍历，注册序 = 原硬编码序（`mark_call_callees` → `mb_pass` → `meta_pass`），
+  且 `run_check` 内 `desugar_run_range(3,4)` 与 `passes_init()/run_passes()` 的相对位置、其后 `hir.hir_build`
+  重建与 `check_decl_hir` 循环**一字未动** ⇒ 执行序列逐点相同 ⇒ 行为等价。
+- 顺序约束（Phase D / Phase B）以注释固化进 `run_passes()`：mb_pass 须先于 check_decl（先折 `@type_*`），
+  meta_pass 须紧随 mb_pass、且在 check_decl 之前（CTFE 折叠后 checker 见普通字面量）。
+
+**关键事实（备查，勿踩）**
+
+- **`Pass` 不存 `run: fn() void` 字段**：t 的 LLVM 后端不支持「调用存于结构体字段的 fn 值」
+  （与脱糖注册表 `DesugarPass` 同坑，S6 step2 已踩）。故统一用 `name` 字符串直接分发，不存函数指针。
+- `ModuleRef` 当前不存在，`Pass` 设计签名 `fn(mod: ModuleRef) void`（§4.12.2）暂以「模块级 `fn() void`、
+  直接操作全局状态」等价实现（与 `run_check` 原调用一致）；待 `ModuleRef` 落地再升级。
+- 仅收口 `run_check` 内的 3 个 Pass；`comptime_fold_pass`/`flag_pass`/`ann_pass` 仍在 `src/tc.tc` 驱动层调用。
+
+**偏离与边界（与 §4.12 原文差异，已论证成立）**
+
+- §4.12.2 `Pass` 含 `owns`/`requires`（`[]Sym32("Table")`）+ 拓扑排序 + 失效；当前 step1 **未含**
+  （无真实跨 Pass 侧表依赖需编码，且 `Sym32` 为文档伪码、真实侧表名为 `string`）。step2 引入
+  `owns`/`requires: []string` + `passes_validate()`（拓扑无环 + requires 可满足，§4.12.5「门禁即报」）。
+- §4.12.4 要求门禁增 `g_passes` 拓扑断言 —— 随 step2 的 `passes_validate()` 落地。
+
+**验证（step1 门禁结果）**
+
+- `tc check src/tc.tc`：**0 errors / 510 warnings**（与基线一致）。
+- gate L2：**24 passed / 0 failed（1706.6s）**——含自举四代不动点 `g2==g3==g4`、run_examples 双后端、
+  HIR AstGen 验证（emit-hir + 二进制往返）、LLVM↔TIR 双轨对拍、C 后端自举、rls 快速通道全绿。
+- 首跑快照 3 DIFF（仅 `src/tc.tc::{c,h,ll}`，0 NEW/0 GONE，新增全局符号致良性自编译表示漂移），
+  `--update` 重录基线后复跑 **354 份逐字节相同** ⇒ 完整 gate 24/0。
+
 ---
 
 ## 1. 当前实现剖析（基于真实代码）
