@@ -968,7 +968,7 @@ S5   22dfefd                       step1：Span 结构 + node_span 侧表（纯�
 - `ir_snapshot.mjs --update --compiler out/dbg/g1.exe` 重录基线（117 targets / 354 entries）后复跑 gate L2：**24 passed / 0 failed（1666s）**，含自举四代不动点 `g2==g3==g4`、conformance、run_examples 双后端、C 后端自举、双轨对拍、rls 快速通道全绿。
 - 同步 `cp out/dbg/g4.exe out/dbg/tc.exe && cp out/rls/gr.exe out/rls/tc.exe`（种子编译器升到当前不动点）。
 
-#### §0.16.7 S5 step3（删 `Node.ln/cl/tv` 字段，Span 成唯一区间载体）✅ 已落地并验证（gate L2 24/0）
+#### §0.16.7 S5 step3（删 `Node.ln/cl/tv` 字段，Span 成唯一区间载体）✅ 已落地并验证（gate L2 24/0，commit `5184382`）
 
 > 范围（§4.10.3 / §4.8）：step2 把全部读方迁到 `node_span_id(X.id)` 后，`Node.ln/cl/tv` 成死字段，本步删除。
 
