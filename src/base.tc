@@ -1754,17 +1754,14 @@ pub struct Node {
     // S3（§4.5）：原 `td`（HIR 类型槽）已迁出为属性侧表 `g_node_td`，访问面走
     // `node_type()` / `node_set_type()`。语法树不再携带类型——跨切面属性改由侧表
     // 以节点 id 为键持有，降低 Node 布局与下游阶段的耦合（替换前：`td: i64`）。
-    ln: u64;    // anchor token 行（诊断用；0 = 无）—— S5 step2 起读方迁 node_span_id，本字段将于 step3 删除
-    cl: u64;    // anchor token 列
-    tv: string; // anchor token 文本（endCol = col + len(tv)）
     id: i64;    // S5 step2 过渡：节点裸索引（== nodes 下标），供 X.ln → node_span_id(X.id) 机械迁移读方；
-                // 与 ln/cl/tv 同为「待退役」字段，S4 epic 删 base.Node 时一并移除（NodeRef 即句柄，无需自存 id）
+                // 待退役字段，S4 epic 删 base.Node 时一并移除（NodeRef 即句柄，无需自存 id）
 }
 
 // S5（§4.10.3 / §4.8）：源码区间 Span（取代 `ln/cl/tv` 三字段的结构化表示）。
-// 当前 step1 仅作**加法侧表**：与 `ln/cl/tv` 锁步填充（node_new 初始化 + node_at 绑定），
-// 暂无任何读取方 ⇒ 零行为变化。`ln/cl/tv` 仍为本阶段活源，后续步迁移读方后再退役
-// （与 S3 字段外置范式一致：先建侧表 → 迁移读方 → 删旧字段）。
+// step1 建侧表（node_new 初始化零区间 + node_at 绑定）；step2 读方迁 node_span_id(X.id)；
+// step3 删 `Node.ln/cl/tv` 字段，Span 成为唯一源码区间载体（读方经 node_span_id(X.id) 取，
+// X.id 由 node_new 写入）。诊断行号与删字段前逐字节一致（与 S3 字段外置范式一致）。
 pub struct Span {
     line: u64;     // 起始行（1-based；0 = 无）
     col: u64;      // 起始列（1-based）
@@ -1825,7 +1822,7 @@ pub fn node_file(n: u64) string {
 }
 
 // ── node_span 侧表（§4.8 / S5）：取代 `Node.ln/cl/tv` 三字段的结构化源码区间 ──
-// step1 仅建表 + 锁步填充（node_new 初始化 0 + node_at 绑定），暂未迁读方；`ln/cl/tv` 仍为本阶段活源。
+// step3 起 `Node.ln/cl/tv` 已删除，本侧表为唯一源码区间载体；node_new 初始化零区间 + node_at 写整段 Span。
 pub fn node_span_id(idx: i64) Span {
     sidetable_init();
     if (idx < 0 || idx >= slice_len(g_node_span)) { var z: Span; return z; }
@@ -2023,9 +2020,6 @@ pub fn node_new(kind: string) u64 {
     n.la = -1;
     n.lb = -1;
     n.lc = -1;
-    n.ln = 0;
-    n.cl = 0;
-    n.tv = "";
     n.id = slice_len(nodes);   // S5 step2：裸索引（append 后恰为该节点下标），供 node_span_id 机械读方迁移
     append(nodes, n);
     append(g_node_mod, g_cur_mod);   // provenance：记录本节点所属模块别名（"" = 入口）
@@ -2046,14 +2040,10 @@ pub fn node_new(kind: string) u64 {
 }
 
 // 给节点打 anchor token（诊断定位用），tok 索引 → line/col/text
+// S5 step3：ln/cl/tv 字段已删除，此处只写 node_span 侧表（g_node_span[idx]），
+// 与 node_new 的零区间 append 对齐；读方经 node_span_id(X.id) 取，诊断行号与删字段前逐字节一致。
 pub fn node_at(ni: i64, ti: i64) void {
     var tk: Tok = toks[ti];
-    var n: Node = nodes[ni];
-    n.ln = tk.line;
-    n.cl = tk.col;
-    n.tv = tk.v;
-    slice_set(nodes, ni, n);
-    // S5 §4.8：与 ln/cl/tv 锁步填充 node_span 侧表（end_col = col + len(tv)，独占上界）。
     node_set_span((ni as u64), Span{ line: (tk.line as u64), col: (tk.col as u64), end_col: (tk.col as u64) + str_len(tk.v) });
 }
 
