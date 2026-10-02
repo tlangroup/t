@@ -704,12 +704,12 @@ S5   22dfefd                       step1：Span 结构 + node_span 侧表（纯�
 
 **关键路径现状与下一步建议**
 
-- 已完成：`S0 → S1 → S2 → S3(partial) → S4(partial) → S6 → S7 → S5(step1 + step2)`（S6/S7 全绿 gate L2 24/0；S5 step1 纯加法零行为；S5 step2 读方迁 `node_span_id` 已 gate L2 24/0 验证）。
+- 已完成：`S0 → S1 → S2 → S3(partial) → S4(partial) → S6 → S7 → S5(step1 + step2 + step3)`（S6/S7 全绿 gate L2 24/0；S5 step1 纯加法零行为；S5 step2 读方迁 `node_span_id` 已 gate L2 24/0；S5 step3 删 `ln/cl/tv` 字段，Span 成唯一区间载体）。
 - 尚未启动 / 进行中：
-  - **S5 step3+**：删 `Node.ln/cl/tv` 字段（双写过渡已就绪，读方已全切 `node_span_id`）→ step4/5（`.ast` 序列化、trivia）。
+  - **S5 step4/5**：`.ast` 序列化（节点区间 + 子树可重放）、trivia（span 间隙的注释/空白）。
   - **S8**（`@desugar`/`@pass` + fmt/lint）：依赖 S4 硬前置「删 `base.Node` 字段 + 删 re-export 垫片」完成（见 §0.14.6）。
   - 工作 B 支柱 1 step5 + 支柱 2/3：仍受 §0.13.9「真实消费者触发」门槛约束（DEFERRED）。
-- 当前主线位置：**S5 step3**（删 `Node.ln/cl/tv` 字段，读方已全切侧表，可安全删除）。
+- 当前主线位置：**S5 step4**（`.ast` 序列化 / trivia；step3 已删 `ln/cl/tv`，`node_span(X.id)` 为唯一区间访问面）。
 - ⚠ **路线一致性**：本段（S6→S7→S5）严格沿 §4.10.3 阶段表推进（S4 之后 S6，并可并行 S5），无路线偏离。
 
 ---
@@ -968,12 +968,34 @@ S5   22dfefd                       step1：Span 结构 + node_span 侧表（纯�
 - `ir_snapshot.mjs --update --compiler out/dbg/g1.exe` 重录基线（117 targets / 354 entries）后复跑 gate L2：**24 passed / 0 failed（1666s）**，含自举四代不动点 `g2==g3==g4`、conformance、run_examples 双后端、C 后端自举、双轨对拍、rls 快速通道全绿。
 - 同步 `cp out/dbg/g4.exe out/dbg/tc.exe && cp out/rls/gr.exe out/rls/tc.exe`（种子编译器升到当前不动点）。
 
+#### §0.16.7 S5 step3（删 `Node.ln/cl/tv` 字段，Span 成唯一区间载体）✅ 已落地并验证（gate L2 24/0）
+
+> 范围（§4.10.3 / §4.8）：step2 把全部读方迁到 `node_span_id(X.id)` 后，`Node.ln/cl/tv` 成死字段，本步删除。
+
+**改动（纯删死字段，零读方依赖）**
+- `base.Node` 删除 `ln: u64` / `cl: u64` / `tv: string` 三字段（保留过渡字段 `id: i64`，待 S4 epic 删 Node 时移除）。
+- `node_new`：删 `n.ln = 0; n.cl = 0; n.tv = "";` 三行零初始化（侧表零区间 `append(g_node_span, Span{0,0,0})` 保留）。
+- `node_at`：删 `var n: Node = nodes[ni]; n.ln = tk.line; ...; slice_set(nodes, ni, n);` 整段（读改写节点值再写回，删字段后变空操作），仅留 `node_set_span((ni as u64), Span{...})` 写侧表。
+- 注释：§4.8 区间说明与 `node_span` 侧表说明更新为「step3 起 `ln/cl/tv` 已删，Span 为唯一区间载体」。
+
+**等价性（决定性）**
+- 删字段前：`node_at` 同时写 `n.ln/cl/tv` 与 `node_set_span`；删字段后只写 `node_set_span`。两路在删前**锁步相等**（node_at 同源 tk.line/col、end_col=col+len(tv)），故任何节点 `g_node_span[idx]` 内容与删前 `ln/cl/tv` 逐字节一致。
+- 读方（step2 已全切 `node_span_id(X.id)`）取 `g_node_span[X.id]`，与「取 `Node.ln/cl/tv`」逐字节相同 ⇒ 诊断行号/列不变。
+- `node_new` 零区间 append 与删前 `n.ln=0` 零值对齐 ⇒ 未打 anchor 的节点 Span 仍为零区间，行为不变。
+- 自编译表示：删三字段 + 删 node_new/node_at 共 7 行写 ⇒ 首跑快照必现 3 DIFF（仅 `src/tc.tc::{c,h,ll}`，0 NEW/0 GONE），同 §0.16.5/§0.16.6 良性漂移。
+
+**验证（gate L2 24/0 全绿）**
+- `tc check src/tc.tc`：**0 errors / 515 warnings**（与 S5 step2 基线一致，无新增 warning/error）。
+- 首跑快照 **3 DIFF（仅 `src/tc.tc::{c,h,ll}`，0 NEW/0 GONE）** ⇒ 良性自编译表示漂移（删三字段 + node_new/node_at 共 7 行写），与 §0.16.5/§0.16.6 同型。
+- `ir_snapshot.mjs --update --compiler out/dbg/g1.exe` 重录基线（117 targets / 354 entries）后复跑 gate L2：**24 passed / 0 failed（2629.8s）**，含自举四代不动点 `g2==g3==g4`、conformance、run_examples 双后端、C 后端自举、双轨对拍、rls 快速通道全绿。
+- 同步 `cp out/dbg/g4.exe out/dbg/tc.exe && cp out/rls/gr.exe out/rls/tc.exe`（种子编译器升到当前不动点）。
+
 ---
 
 ## 0.17 S5 收口路线（step1 → stepN，P2，可并行于 S2–S4）
 
 > S5 = `Span` 取代 `ln/cl/tv` + CST `.ast` 序列化 + trivia（span 间隙）+ error node（§4.10.3）。
-> 当前完成 **step1（Span 侧表加法，§0.16.5）+ step2（读方迁 `node_span_id`，§0.16.6）**。后续步（尚未实施）：
+> 当前完成 **step1（Span 侧表加法，§0.16.5）+ step2（读方迁 `node_span_id`，§0.16.6）+ step3（删 `ln/cl/tv` 字段，§0.16.7）**。后续步（尚未实施）：
 > - step2：迁移全部 `ln/cl/tv` **读取方**（诊断定位、emit 行号、`nd.ln` 等）到 `node_span()`，
 >   双写期保留 `ln/cl/tv` 以维持兼容；conformance 诊断期望（行/列来源换 Span）同步核验。
 > - step3：删除 `Node.ln/cl/tv` 字段（与 S3 删 `Node.td` 同构），`node_span` 成为唯一位置来源。
