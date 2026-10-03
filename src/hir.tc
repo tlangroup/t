@@ -882,6 +882,153 @@ pub fn hir_lower_struct_lit(n: i64, slot: i64) i64 {
     return hir_emit(HIR_OP_CONSTRUCT, slot, n, args, nd.sa, csv, base.node_span_id(nd.id).line);
 }
 
+// ── S8 step3（§0.16.13）：tc lint —— HIR 上的结构化规则 ──────────────────
+// G7（§4.13.3）：lint 只消费 HIR（+ 语义侧表），与 fmt 共用 lexer/parser 底层，
+// 不各自实现解析与遍历。v1 = 三条**高置信**结构规则，全部只读 HIR、不改 IR、
+// 不依赖类型（本步不跑 sema，故无类型信息）：
+//   T-LINT-W001 不可达语句：block 内 return/break/continue 之后的语句
+//   T-LINT-W002 空块：if 的 then 为空（且无 else 或 else 亦空）；loop/for/forin 体为空
+//   T-LINT-W003 无副作用的表达式语句：值被丢弃（**块尾语句除外** —— 它是块的值）
+// 语义侧表规则（未使用符号、类型相关）留后续步。
+// ⚠ 取舍：宁可漏报（false negative）也不误报（false positive）—— lint 一旦刷屏就没人看。
+
+pub var g_lint_count: i64 = 0;
+
+pub fn lint_reset() void {
+    g_lint_count = 0;
+}
+
+// 统一输出格式（可 grep / 可入 CI）：<file>:<line>: T-LINT-Wxxx: <msg>
+pub fn lint_emit(code: string, line: u64, msg: string) void {
+    println(base.sb_cat6(base.g_file, ":", base.i2s(line as i64), ": ", code, base.sb_cat2(": ", msg)));
+    g_lint_count = g_lint_count + 1;
+}
+
+// 终结指令：它之后的同级语句不可达
+pub fn lint_is_terminator(op: i64) bool {
+    if (op == HIR_OP_RETURN) { return true; }
+    if (op == HIR_OP_BREAK) { return true; }
+    if (op == HIR_OP_CONTINUE) { return true; }
+    return false;
+}
+
+// 无副作用：作为「表达式语句」出现即等于丢弃结果。
+// 刻意**不含** CALL / METHOD_CALL / ASSIGN / FIELD_SET / INDEX_SET / DEFER /
+// COMPTIME / MATCH / CLOSURE_MAKE —— 它们可能有副作用或本身就是用法。
+// ⚠ **BINOP 只放行算术运算符**：`<` 在 t 里既是「小于」又是 **fid 写入操作符**
+//   （`stdout < "x"`、`j < 12 < true`，见 examples/fid_demo.tc），有副作用；
+//   lint 是 pre-type 的（不跑 sema），**无法凭类型区分二者**，故整类排除。
+//   UNOP 同理整类排除（`&` / `*` 语义依赖上下文）。宁可漏报，不可误报。
+pub fn lint_is_pure(op: i64, sa: string) bool {
+    if (op == HIR_OP_LIT_INT) { return true; }
+    if (op == HIR_OP_LIT_FLOAT) { return true; }
+    if (op == HIR_OP_LIT_STR) { return true; }
+    if (op == HIR_OP_LIT_BOOL) { return true; }
+    if (op == HIR_OP_LIT_NULL) { return true; }
+    if (op == HIR_OP_LOCAL_REF) { return true; }
+    if (op == HIR_OP_PARAM_REF) { return true; }
+    if (op == HIR_OP_FIELD_REF) { return true; }
+    if (op == HIR_OP_INDEX_REF) { return true; }
+    if (op == HIR_OP_CAST) { return true; }
+    if (op == HIR_OP_ARRAY) { return true; }
+    if (op == HIR_OP_MAP_LIT) { return true; }
+    if (op == HIR_OP_RANGE) { return true; }
+    if (op == HIR_OP_BINOP) {
+        if (sa == "+") { return true; }
+        if (sa == "-") { return true; }
+        if (sa == "*") { return true; }
+        if (sa == "/") { return true; }
+        if (sa == "%") { return true; }
+        return false;
+    }
+    return false;
+}
+
+// 块是否为空（-1 = 缺席；BLOCK 有 0 个语句 = 空块）
+pub fn lint_block_empty(bi: i64) bool {
+    if (bi < 0) { return true; }
+    if (bi >= slice_len(g_hir.insts) as i64) { return true; }
+    var b: HirInst = g_hir.insts[bi];
+    if (slice_len(b.args) as i64 == 0) { return true; }
+    return false;
+}
+
+// 块内语句序列上的规则（W001 / W003）
+pub fn lint_block(bi: i64) void {
+    if (bi < 0) { return; }
+    if (bi >= slice_len(g_hir.insts) as i64) { return; }
+    var b: HirInst = g_hir.insts[bi];
+    var n: i64 = slice_len(b.args) as i64;
+    var k: i64 = 0;
+    var dead: bool = false;
+    while (k < n) {
+        var si: i64 = b.args[k];
+        if (si >= 0 && si < slice_len(g_hir.insts) as i64) {
+            var s: HirInst = g_hir.insts[si];
+            if (dead) {
+                // 每条终结指令之后**只报第一条**死语句（避免同一处刷屏）
+                if (lint_is_terminator(s.op) == false) {
+                    lint_emit("T-LINT-W001", s.line,
+                        base.sb_cat3("unreachable statement after return/break/continue (", hir_op_name(s.op), ")"));
+                    dead = false;
+                }
+            } else {
+                if (lint_is_terminator(s.op)) { dead = true; }
+                // W003：块尾语句是「块的值」（t 的 value-if / value-block），不算丢弃
+                if (k + 1 < n && s.op == HIR_OP_EXPR_STMT) {
+                    var ei: i64 = hir_arg(si, 0);
+                    var eo: i64 = hir_op_of(ei);
+                    if (ei >= 0 && ei < slice_len(g_hir.insts) as i64) {
+                        var e2: HirInst = g_hir.insts[ei];
+                        if (lint_is_pure(eo, e2.sa)) {
+                            lint_emit("T-LINT-W003", s.line,
+                                base.sb_cat3("expression statement has no effect; result discarded (", hir_op_name(eo), ")"));
+                        }
+                    }
+                }
+            }
+        }
+        k = k + 1;
+    }
+}
+
+// 全量扫描（不递归：所有 BLOCK / IF / LOOP 指令都在 g_hir.insts 里）
+pub fn lint_run() i64 {
+    lint_reset();
+    var n: i64 = slice_len(g_hir.insts) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        var it: HirInst = g_hir.insts[i];
+        if (it.op == HIR_OP_BLOCK) { lint_block(i); }
+        if (it.op == HIR_OP_IF) {
+            var tb: i64 = hir_arg(i, 1);
+            var eb: i64 = hir_arg(i, 2);
+            if (lint_block_empty(tb)) {
+                if (eb < 0 || lint_block_empty(eb)) {
+                    lint_emit("T-LINT-W002", it.line, "if statement has an empty then-branch and no else-branch");
+                }
+            }
+        }
+        if (it.op == HIR_OP_LOOP) {
+            if (lint_block_empty(hir_arg(i, 1))) {
+                lint_emit("T-LINT-W002", it.line, "loop body is empty (statement has no effect)");
+            }
+        }
+        if (it.op == HIR_OP_FOR) {
+            if (lint_block_empty(hir_arg(i, 3))) {
+                lint_emit("T-LINT-W002", it.line, "for body is empty (statement has no effect)");
+            }
+        }
+        if (it.op == HIR_OP_FORIN) {
+            if (lint_block_empty(hir_arg(i, 1))) {
+                lint_emit("T-LINT-W002", it.line, "for-in body is empty (statement has no effect)");
+            }
+        }
+        i = i + 1;
+    }
+    return g_lint_count;
+}
+
 // ── 序列化：文本（diff 友好）─────────────────────────────────
 pub fn hir_op_name(op: i64) string {
     if (op == HIR_OP_LIT_INT) { return "lit_int"; }
