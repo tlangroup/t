@@ -1091,7 +1091,7 @@ S8   （见 §0.16.11）                step1：tc fmt trivia 感知再发射（
 
 #### §0.16.11 S8 step1（`tc fmt` 的 trivia 感知再发射：忠实还原基础版）✅ 已落地（2026-10-02）
 
-> 范围（§4.1 G7 / §0.17）：S8 首步 = `tc fmt` 的源码再发射基础能力——把词法 token 流（`toks`，每个 token 的精确源文本）与 trivia 流（`g_trivia_toks`，空白/换行/注释的精确文本）按 `(line,col)` 双指针归并，还原出与源**逐字符一致**的重排文本。当前为「忠实还原」基础版（不重排，仅还原）；后续 step2 叠加基于结构（CST 节点）的规范化重排（缩进/空行/对齐）。
+> 范围（§4.1 G7 / §0.17）：S8 首步 = `tc fmt` 的源码再发射基础能力——把词法 token 流（`toks`，每个 token 的精确源文本）与 trivia 流（`g_trivia_toks`，空白/换行/注释的精确文本）按 `(line,col)` 双指针归并，还原出与源**逐字符一致**的重排文本。当前为「忠实还原」基础版（不重排，仅还原）。**step2（规范化重排）已落地，见 §0.16.12** —— CLI 默认走规范化重排，`--identity` 保留本步忠实还原。
 > **偏离裁定（保持合理）**：原路线 S8 的硬前置是「删 `base.Node` 字段 + 删 re-export 垫片」（§4.14.6 / §0.14.6）。本步在 **`base.Node` 仍存在** 下落地——G7 架构下 `fmt` 只消费 CST + trivia，**不依赖不可变 AST / 删 Node**，故 S8 step1 与 S4 收口 epic **解耦**。证明：本步零语义改动（仅 lexer `Tok.src` 字段 + `tokenize` append-only 契约 + `cst_format_tokens` 新函数 + `fmt` 子命令），IR 快照 3 DIFF/0 NEW/0 GONE（仅 `src/tc.tc` 自编译表示漂移），gate L2 24/0（见下）；S4 epic 仍按 §0.14.7 单独推进，不受影响。该偏离记入 §0.15 偏离 6。
 
 **改动（纯加法 + lexer 契约收紧，零用户编译行为变化）**
@@ -1129,12 +1129,55 @@ S8   （见 §0.16.11）                step1：tc fmt trivia 感知再发射（
 
 ---
 
+#### §0.16.12 S8 step2（`tc fmt` 基于结构的规范化重排）✅ 已落地（2026-10-03）
+
+> 范围（§4.1 G7 / §0.17）：S8 第二步 = 在 step1「忠实还原」之上做**真正的排版规范化**。CLI：`tc fmt <file>` 默认走规范化重排；新增 `--identity` 保留 step1 忠实还原（逐字节复现，用于验证归并正确性）。
+
+**CLI 语义**
+- 默认（规范化）：括号深度缩进（4 空格/级）+ 去行尾空白 + 连续空行折叠为至多 1 个空行 + 注释原样保留。
+- `--identity`：step1 的 `cst_format_tokens()`，逐字节复现源码。
+
+**改动**
+- `src/base.tc`：新增 `cst_spaces(n)`（生成 n 个空格）与 `cst_format_normalized(wid)`——与 `cst_format_tokens` 同样的 `(line,col)` 双指针归并，但叠加排版状态机：`depth`（括号嵌套深度）、`at_bol`（行首）、`pend_ws`（行内待决空白，**遇换行丢弃 ⇒ 去行尾空白**）、`nl_run`（连续换行计数，折叠多空行）。闭括号 `}`/`]`/`)` 位于行首时，该行缩进按 `depth-1` 计（先减后写）。
+- `src/tc.tc`：`fmt` 子命令加 `--identity` 开关；默认调 `cst_format_normalized(4)`。
+
+**关键设计：结构信息来源 = token 流括号深度，而非 CST 节点**
+- 与 step1 同源约束：`fmt` **不调 `parse_unit`**——`fstr_parse_expr` 会把 f-string 插值子 token **追加**到 `base.toks` 尾部并改写其行列，污染「token 流 == 源码序列」（见 lex.tc append-only 契约注释）。
+- 故结构取自 token 流自身的 `{ [ (` / `} ] )` 嵌套深度。该信息已足够支撑「缩进 + 空行」这一层排版；**参数对齐（alignment）等更细的重排需 CST/节点信息，留作后续增强**（见下方限制）。这与 §0.15 偏离 6 同源：`fmt` 只消费词法流 + trivia。
+
+**不变式（格式化正确性的定义）**
+- **只改 trivia，绝不动 token 文本与顺序** ⇒ token 流（`type`+`value` 序列）与源逐项一致。t 是花括号语言、空白无语义，故 token 序列不变 ⇒ **语义必然不变**。
+- 该不变式由 `tc lex` 序列比对守住（忽略因重排而变的 `line`/`col`，只比 `type`+`value`）。
+
+**⚠ 致命坑（t 语言，新，必记）**
+- **`unit` 是 t 的类型关键字**（P5：`unit` 为 `void` 别名，见 `parse.tc:5168`「类型关键字 string/void/map/unit」）。故 `fn f(unit: i64)` 会被解析成「类型关键字 `unit` + 期待 `)`」→ 报 `T-PAR-E101 期待 RParen，实际读到 :`。**禁止用 `unit` 作标识符/形参名**；本步已把形参重命名为 `wid`。同理需避开 `void`/`map`/`string` 等类型关键字作形参名。
+
+**验证**
+- `tc check src/tc.tc`：0 errors（531 条预存风格告警）。
+- **全量 115 例三合一验证（`out/_fmt_verify.mjs`，临时脚本）**：
+  - **① token 序列不变式：TOKSEQ_OK=115 / FAIL=0** —— 格式化前后 `tc lex` 的 `type`+`value` 序列全部逐项一致 ⇒ 语义不变铁证。
+  - **② 幂等：IDEMPOTENT_OK=115 / FAIL=0** —— `fmt(fmt(x)) == fmt(x)`。
+  - **③ step1 回归：IDENTITY_OK=115 / FAIL=0** —— `--identity` 仍逐字节复现源码。
+  - **仅 3 个文件被重排、112 个原样不动** —— 反证 4 空格/级确为仓库主导风格，格式化器与既有代码风格一致。
+- 3 处重排逐文件核对：`mini.tc`/`str_concat.tc` = 2 空格 → 4 空格（向主导风格收敛，正确）；`pipeline_demo.tc` = 多行调用续行 8 → 12 空格（按 `format(` 嵌套深度对齐，与作者手工对齐不同，两者皆合理，token 序列不变）。
+- IR 快照：**3 DIFF（仅 `src/tc.tc::{c,h,ll}`，0 NEW / 0 GONE）** ⇒ 良性自编译表示漂移（新增 `cst_spaces`/`cst_format_normalized` 符号经 `@import` 传播到 `tc.tc`）→ `--update` 重录基线（117 targets / 354 entries）。
+- **gate L2 = 24 passed / 0 failed（2909.2s）**（四代自举不动点 `g2==g3==g4`、产物快照比对 468.1s、conformance、run_examples 双后端、HIR AstGen/comptime-eval、双轨对拍、difftest tc0、C 后端自举、rls、tote 全绿）。
+- 同步 `cp out/dbg/g4.exe out/dbg/tc.exe && cp out/rls/gr.exe out/rls/tc.exe`。
+
+**已知限制（如实记录，非缺陷）**
+- 续行缩进按**括号深度**，不做参数对齐（alignment）；故 `println(format(...)` 这类嵌套调用的续行会比部分手工排版更深一档（见 `pipeline_demo.tc`）。
+- 行内水平空白**原样保留**（仅规范化行首缩进与行尾空白），故不会破坏作者已有的对齐意图。
+- 块注释内部换行原样保留，不重排。
+- 上述均属「最小化结构格式化器」的既有边界；更细的重排（参数对齐、换行决策）需 CST/节点信息，与 S4 收口 epic（删 `base.Node`）无依赖关系，可独立后续增强。
+
+---
+
 ## 0.17 S5 收口路线（step1 → stepN，P2，可并行于 S2–S4）
 
 > S5 = `Span` 取代 `ln/cl/tv` + CST `.ast` 序列化 + trivia（span 间隙）+ error node（§4.10.3）。
 > 当前完成 **step1（§0.16.5）+ step2（§0.16.6）+ step3（§0.16.7）+ step4（§0.16.8）+ step5（§0.16.9）**，S5 已全绿 gate L2 24/0，S8 fmt/lint 的注释保留前提就绪。后续步（尚未实施）：
 > - step2–step5 均已完成（见 §0.16.6–§0.16.9）：step2 读方迁 `node_span_id`、step3 删 `ln/cl/tv` 字段、step4 `.ast` 序列化 + `tc dump-ast`、step5 trivia 侧表 + `assign_trivia`；S5 全绿 gate L2 24/0。
-> - ⚠ S5 已完成（step1–5 全绿 gate L2 24/0），S8 fmt/lint 的 trivia 前提已满足。**S8 step1（`tc fmt` 忠实还原基础版）已落地并验证 gate L2 24/0（§0.16.11）**——在 `base.Node` 仍存在下实现，与原路线「S8 依赖 S4 硬前置」偏离，记入 §0.15 偏离 6（合理）。该偏离不阻塞 S4 收口 epic（§0.14.7）；后续 S8 step2（基于结构的规范化重排）仍未依赖删 Node，S8 整体与 S4 epic 解耦推进。当前 `owns`（侧表失效）
+> - ⚠ S5 已完成（step1–5 全绿 gate L2 24/0），S8 fmt/lint 的 trivia 前提已满足。**S8 step1（`tc fmt` 忠实还原，§0.16.11）+ step2（规范化重排，§0.16.12）均已落地并验证 gate L2 24/0**——两步都在 `base.Node` 仍存在下实现，与原路线「S8 依赖 S4 硬前置」偏离，记入 §0.15 偏离 6（合理）：`fmt` 只消费词法流 + trivia，不依赖删 Node。该偏离不阻塞 S4 收口 epic（§0.14.7）；S8 整体与 S4 epic 解耦推进。当前 `owns`（侧表失效）
 >   仍待 `ModuleRef`，与 S7 同阻塞。
 
 ---

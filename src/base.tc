@@ -1998,6 +1998,101 @@ pub fn cst_format_tokens() string {
     return sb_to_str(sb);
 }
 
+// ── S8 step2（§0.16.12）：基于结构的规范化重排 ───────────────────────────────
+// step1 的 `cst_format_tokens` 是「忠实还原」（逐字节复现源码，证明归并正确）；
+// 本步在此基础上做真正的排版规范化：
+//   ① 缩进 = 括号嵌套深度 × wid（默认 4 空格，与 examples 主导风格一致）；
+//   ② 行尾空白去除；③ 连续空行折叠为至多 1 个空行；
+//   ④ 注释（LineComment / BlockComment）原样保留 —— 注释是用户资产，不重排其内部。
+//
+// 不变式（格式化正确性的定义）：**只改 trivia，绝不动 token 文本与顺序** ⇒
+// token 流（type+value 序列）与源逐项一致。t 是花括号语言、空白无语义，
+// 故 token 序列不变 ⇒ 语义必然不变。该不变式由 `tc lex` 序列比对守住（§0.16.12）。
+//
+// 结构信息来源 = **token 流的括号深度**，而非 CST 节点：`fmt` 不调 `parse_unit`
+// （fstr_parse_expr 会把 f-string 插值 token 追加到 toks 尾部，污染 token 流，
+// 见 lex.tc 顶部 append-only 契约注释）。括号深度已足够支撑缩进/空行这一层排版。
+pub fn cst_spaces(n: i64) string {
+    var s: StringBuilder = sb_new();
+    var i: i64 = 0;
+    while (i < n) { sb_append_char(s, 32); i = i + 1; }   // 32 = space
+    return sb_to_str(s);
+}
+
+pub fn cst_format_normalized(wid: i64) string {
+    var sb: StringBuilder = sb_new();
+    var nt: i64 = slice_len(toks) as i64;
+    var ntr: i64 = slice_len(g_trivia_toks) as i64;
+    var i: i64 = 0;              // toks 游标
+    var j: i64 = 0;              // g_trivia_toks 游标
+    var depth: i64 = 0;          // 括号嵌套深度
+    var at_bol: bool = true;     // 行首（本行尚未写缩进与内容）
+    var pend_ws: string = "";    // 行内待决空白（遇换行丢弃 ⇒ 去行尾空白）
+    var nl_run: i64 = 0;         // 连续换行计数（用于折叠多空行）
+    while (i < nt || j < ntr) {
+        var use_tok: bool = false;
+        if (i >= nt) {
+            use_tok = false;
+        } else if (j >= ntr) {
+            use_tok = true;
+        } else {
+            var tk = toks[i];
+            var tr = g_trivia_toks[j];
+            if (tk.line < tr.line) { use_tok = true; }
+            else if (tk.line > tr.line) { use_tok = false; }
+            else { if (tk.col <= tr.col) { use_tok = true; } else { use_tok = false; } }
+        }
+        if (use_tok) {
+            var tx: string = toks[i].src;
+            var is_open: bool = false;
+            var is_close: bool = false;
+            if (str_len(tx) == 1) {
+                var c0: i64 = tx[0] as i64;
+                if (c0 == 123 || c0 == 91 || c0 == 40) { is_open = true; }    // { [ (
+                if (c0 == 125 || c0 == 93 || c0 == 41) { is_close = true; }   // } ] )
+            }
+            var d: i64 = depth;
+            if (is_close) { d = depth - 1; }
+            if (d < 0) { d = 0; }
+            if (at_bol) {
+                sb_append_str(sb, cst_spaces(d * wid));
+                at_bol = false;
+            } else if (str_len(pend_ws) > 0) {
+                sb_append_str(sb, pend_ws);
+            }
+            pend_ws = "";
+            sb_append_str(sb, tx);
+            if (is_open) { depth = depth + 1; }
+            if (is_close) { depth = depth - 1; if (depth < 0) { depth = 0; } }
+            nl_run = 0;
+            i = i + 1;
+        } else {
+            var tr2 = g_trivia_toks[j];
+            if (tr2.kind == "Newline") {
+                pend_ws = "";
+                if (nl_run < 2) { sb_append_str(sb, "\n"); }   // 至多保留 1 个空行
+                nl_run = nl_run + 1;
+                at_bol = true;
+            } else if (tr2.kind == "Ws") {
+                if (at_bol == false) { pend_ws = tr2.text; }   // 行首空白由缩进统一给出
+            } else {
+                // LineComment / BlockComment：原样保留
+                if (at_bol) {
+                    sb_append_str(sb, cst_spaces(depth * wid));
+                    at_bol = false;
+                } else if (str_len(pend_ws) > 0) {
+                    sb_append_str(sb, pend_ws);
+                }
+                pend_ws = "";
+                sb_append_str(sb, tr2.text);
+                nl_run = 0;
+            }
+            j = j + 1;
+        }
+    }
+    return sb_to_str(sb);
+}
+
 // ── node_type 侧表（§4.5）：取代已删除的 `Node.td` 字段 ──────────────────────
 // 语义与原字段一致：0 = 未定型；> 0 = TD 索引（读取方仍须做上界检查）；
 // -1 = 缓存被判定越界并丢弃（回落重推导）。此处为纯搬迁，不改变任何行为。
