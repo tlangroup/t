@@ -644,8 +644,21 @@ if (n.td > 0) { n.td = -1; }          // ← 写在副本上：从未写回 node
 - 处置（与 snapshot 步同一做法：**调用处传 `timeoutMs`，不抬高全局默认值**）：`双轨对拍` 步放宽到 20min。**只抬预算、不改判据**（新旧轨不一致仍硬失败）。放宽后第三次 gate = **25/0**。
 - 沉淀：**门禁出现「耗时≈480.0s 且手跑可过」的失败时，先按硬超时/资源竞争处置，勿当成回归**；并注意一个被杀的步骤会连带拖挂后续步骤，需逐项手跑复验。
 
+**批次 3：`be` / `bf`（声明级 bool 标记组，2026-10-03）**
+- 选组依据：实测使用量最低的未迁字段（`be 6` / `bf 12`），且**语义内聚** —— 二者都是「声明（FuncDecl）级 bool 标记」：`be` = 是否 `@c_export`（C 互操作导出，生成 C ABI 平铺入口）；`bf` = 是否 `kernel fn`（Device 入口，host 双后端跳过、`codegen_dev` 处理）。
+- 普查结论（纪律先行）：`.be` 全 6 处、`.bf` 全 12 处**均为真 Node 站点**（本组无 `has_*` 那类同名 record-struct 假阳性）；且**无整节点赋值**、`nodes` 仅在 `node_new` 内 append、无整体重置 ⇒ 侧表对齐有保障（同批次 2 的排查项）。
+- 存储：`g_node_be / g_node_bf: []i64`（沿用 `g_node_const` 的 **0/1 先例**）。
+- ⚠ **默认值方向与批次 2 相反** —— 旧 `node_new` 写的是 `n.be = false; n.bf = false;`（而 `has_*` 写的是 `= true`）⇒ `node_new` append **0**，且**访问器越界返回 `false`**。搬迁新组时**不许照抄上一组的「默认 true」写法**，必须先回看旧 `node_new` 的初始化值。
+- 站点（18 处）：
+  - `be`：写 = `parse.tc` 三处 `@c_export` 分支（原 `base.nodes[fd].be = true`）；读 = `codegen_c.tc::emit_func_decl`（**唯一读方**，配合 `node_se` 决定 clean-name / 转发器）；`base.tc` 的 dump 打印。
+  - `bf`：写 = `parse.tc::parse_func_decl` 的 `is_kernel` 分支 —— 原写法是**「取值 → 改字段 → `slice_set` 回写」**，外置后直接 `node_set_bf(id, true)`，回写步骤随之消失（SoA 附带收益：减少一次整节点写）；读 = `codegen_c`（2 处）/ `codegen_dev` / `sema`（3 处，含 `dev_check_list` 传参）/ `tir` / `tc.tc::module_has_kernels`。
+- ✅ **本组无覆盖缺口**（与批次 2 的 `@bitpack` 零覆盖不同）：语料中 `@c_export` 有 `c_interop.tc` / `c_interop_lib.tc`，`kernel fn` 有 `vecadd_device.tc` / `vecadd_device_full.tc` / `_cpuemu_check.tc`。故仍按 epic 方法补做**差分对拍**（变更前种子 vs 新 g1）作双保险，三个用例 `.c`/`.h` 均 **IDENTICAL**；并**显式验证路径可达**（防"空路径"假绿）：`c_interop.h` 输出 clean name `int64_t add(...)` / `int64_t fib(...)` ⇒ be 生效；`vecadd_device.h` **不含** `vec_add` 声明 ⇒ bf 的「host 跳过 kernel」生效。
+- 验证：`tc check` 0 error；g1 重建成功（2m10s）；差分对拍 3/3 IDENTICAL + 路径可达；IR 快照 **3 DIFF / 0 NEW / 0 GONE**（仅 `src/tc.tc::{c,h,ll}`；114 个 example 目标全不变，快照覆盖 `[ll,c,dev]` 三轨）→ `--update` 重录基线（117 targets / 354 entries）；**gate L2 = 25 passed / 0 failed（2960.0s）**，四代不动点 `g2==g3==g4` + lint 冒烟 27.0s 全绿。已同步种子 `g4→out/dbg/tc.exe`、`gr→out/rls/tc.exe`。
+- ✅ **反证上一批的门禁假失败处置正确**：本轮 `双轨对拍` **PASS（286.5s）**、连带曾失败的 `REPL 冒烟` **PASS（24.7s）** —— 放宽 `timeoutMs`（只抬预算不改判据）后连续两轮不再出现，确认此前是资源竞争而非回归。
+
 **剩余字段实测使用量（`.F` 命中数；泛型名字段含非 Node 假阳性，仅作排序参考）**
-`has_sb 3 / has_sa 5 / be 6 / has_sc 10 / bf 12 / memspace 13 / bd 15 / bc 30 / sc 33 / bb 38 / nd 40 / ib 65 / nc 80 / ba 91 / lc 92 / sb 150 / ia 153 / lb 218 / id 237 / nb 461 / la 500 / na 1070 / kind 1187 / sa 1268`（✅ 已迁：`se`、`has_sa`、`has_sb`、`has_sc`）。
+`be 6 / bf 12 / memspace 13 / bd 15 / bc 30 / sc 33 / bb 38 / nd 40 / ib 65 / nc 80 / ba 91 / lc 92 / sb 150 / ia 153 / lb 218 / id 237 / nb 461 / la 500 / na 1070 / kind 1187 / sa 1268`（✅ 已迁：`se`、`has_sa`、`has_sb`、`has_sc`、`be`、`bf`）。
+> ⚠ `memspace` 的 13 处里多数是**同名假阳性**：`tbl_RecPointer_memspace`（S2 已 SoA 化的 record struct）、`sema` 的 `TD.memspace`、`tir/codegen_c` 的 `t.memspace`。真实 Node 站点仅 ~5 处（定义 / `node_new` 默认 / `mk_pointer_as` 写 / `codegen_dev`+`sema` 读），实际工作量低于计数。
 
 **后续批次（待做，按使用量升序、每组独立绿）**全部完成后删 `pub struct Node` + `nodes[]` + `node_new` 的 Node 构造 + 全部 `slice_set(nodes, …)`，`id` 字段随 `Node` 一并消失（届时裸索引即句柄），S4 方真正收口（随后补 `node_to_hir` 桥改造 + 删 re-export 垫片，见 §4.14.4）。
 
