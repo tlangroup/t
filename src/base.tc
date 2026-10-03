@@ -1771,7 +1771,10 @@ pub struct Node {
     // （0=host；1=global/dev_ptr；3=shared；5=local），仅 pointer 类型节点使用。
     la: i64;
     lb: i64;
-    lc: i64;
+    // S4 第十一批（§0.14.7）：lc 已迁出为属性侧表 g_node_lc，访问面走 node_lc()/node_set_lc()
+    // （默认 **-1** = 空 kids 链；⚠ 另有特殊哨兵 **-2** = 本体已由别处消费的合成声明，
+    //   判据遍布 `if (n.lc > -2)` / `if (n.lc != -2)` / `if (n.lc == -2)`，详见 node_lc 处注释）。
+    // `la`/`lb`/`lc` 同族：都是 **kids 链表头下标**而非节点 id，务必走 `*_kids`/`*_list` 链表下钻。
     // S3（§4.5）：原 `td`（HIR 类型槽）已迁出为属性侧表 `g_node_td`，访问面走
     // `node_type()` / `node_set_type()`。语法树不再携带类型——跨切面属性改由侧表
     // 以节点 id 为键持有，降低 Node 布局与下游阶段的耦合（替换前：`td: i64`）。
@@ -1862,6 +1865,8 @@ pub var g_node_sc: []string;               // S4 第六批：nodes[i] 的 sc 字
 pub var g_node_nc: []i64;                  // S4 第九批：nodes[i] 的 nc 子节点索引（默认 -1 = 无）
 pub var g_node_ba: []i64;                  // S4 第十批：nodes[i] 的 ba 通用 bool 载荷（默认 0 = false）
                                            // ⚠ 该槽按 kind **复用**于多种语义（见 node_ba 处注释）
+pub var g_node_lc: []i64;                  // S4 第十一批：nodes[i] 的 lc kids 链表头（默认 -1 = 空链）
+                                           // ⚠ 另含特殊哨兵 **-2**（见 node_lc 处注释）
 
 // ── S3（§4.5）：侧表登记 + provenance 侧表读取面 ──────────────────────────────
 // 跨切面属性统一登记 SideTable{name,owner,dirty}，PassManager 据 name 建拓扑与置脏。
@@ -1905,6 +1910,7 @@ pub fn sidetable_init() void {
     sidetable_register("node_sc", "S4");        // SoA：字符串载荷（别名/bitpack 标量/lambda 标记/suite 路径；第六批）
     sidetable_register("node_nc", "S4");        // SoA：nc 子节点索引（第九批，默认 -1）
     sidetable_register("node_ba", "S4");        // SoA：ba 通用 bool 载荷（第十批，默认 false）
+    sidetable_register("node_lc", "S4");        // SoA：lc kids 链表头（第十一批，默认 -1）
 }
 pub fn node_mod(n: u64) string {
     sidetable_init();
@@ -2023,7 +2029,7 @@ pub fn cst_dump(role: string, id: i64, depth: i64) void {
     if (n_nd >= 0) { cst_dump("nd", n_nd, depth + 1); }
     var c: i64 = n.la; while (c >= 0) { cst_dump("", kids[c].val, depth + 1); c = kids[c].next; }
     c = n.lb; while (c >= 0) { cst_dump("", kids[c].val, depth + 1); c = kids[c].next; }
-    c = n.lc; while (c >= 0) { cst_dump("", kids[c].val, depth + 1); c = kids[c].next; }
+    c = node_lc((id as u64)); while (c >= 0) { cst_dump("", kids[c].val, depth + 1); c = kids[c].next; }   // S4 §0.14.7 SoA：侧表读（原 n.lc；第十一批）
     sb_append_char(g_cst_sb, 41);            // 41 = ')'
 }
 pub fn cst_to_ast_str(roots: []i64) string {
@@ -2439,6 +2445,29 @@ pub fn node_set_ba(n: u64, v: bool) void {
     if (id < 0 || id >= slice_len(g_node_ba)) { return; }
     if (v) { slice_set(g_node_ba, id, 1); } else { slice_set(g_node_ba, id, 0); }
 }
+// S4 第十一批（§0.14.7）：kids 链表头 lc（默认 **-1 = 空链**，等价旧 `n.lc = -1`）。
+// `la`/`lb`/`lc` 同族，都是「子节点/语句在 kids 池里的链表头下标」而非节点 id
+// （⚠ 这是本族最容易搞错的一点：`lc` 必须走 `*_kids` / `*_list` 系列的链表下钻，
+//   当成节点 id 用会张冠李戴 —— 见 sema::instantiate_generic、parse::parse_method_decl 的注释）。
+// ⚠ **特殊哨兵 `-2`**：`FuncDecl` / `lambda` 等带体节点用 `lc == -2` 表示
+//   「本体已由别处消费 / 是外部注入的合成声明」，需跳过常规语句遍历与检查。
+//   判据遍布各处：`if (n.lc > -2)`（parse::desugar_lambdas、tir::tir_lower_func、
+//   codegen_c::build_type_map / emit_func_decl）、`if (n.lc != -2)`（sema::instantiate_generic、
+//   ovl_instantiate、desugar_imports、meta_pass）、`if (n.lc == -2)`（sema::check_func_decl_ex、
+//   meta_eval_call）。写入点只有 sema 里 4 个合成 FuncDecl 的构造实参（`mk_FuncDecl(..., -2, ...)`）。
+//   ⇒ 侧表默认值必须是 **-1 而非 -2**，且越界读必须返 **-1**（返 -2 会让「越界节点」被
+//   误判成「已消费的合成声明」而跳过检查，是静默错误）。
+pub fn node_lc(n: u64) i64 {
+    sidetable_init();
+    var id = nr_idx(n);
+    if (id < 0 || id >= slice_len(g_node_lc)) { return -1; }
+    return g_node_lc[id];
+}
+pub fn node_set_lc(n: u64, v: i64) void {
+    var id = nr_idx(n);
+    if (id < 0 || id >= slice_len(g_node_lc)) { return; }
+    slice_set(g_node_lc, id, v);
+}
 // S4 第六批（§0.14.7）：字符串载荷 sc（默认 ""）。**本批为 sa/sb/sc 字符串整族外置预演**
 // ——首个 `[]string` 类型侧表，验证「非标量侧表 + node_new 锁步 append」范式成立。
 //   sc 按 kind 复用 4 种语义（本次只做等价搬迁，未拆语义）：
@@ -2585,7 +2614,7 @@ pub fn node_new(kind: string) u64 {
     // S4 第四批（§0.14.7）：memspace 已外置为侧表（默认 0=host，见下方 append）
     n.la = -1;
     n.lb = -1;
-    n.lc = -1;
+    // S4 第十一批（§0.14.7）：lc 已外置为侧表 g_node_lc（默认 -1 = 空链，见下方 append）
     n.id = slice_len(nodes);   // S5 step2：裸索引（append 后恰为该节点下标），供 node_span_id 机械读方迁移
     append(nodes, n);
     append(g_node_mod, g_cur_mod);   // provenance：记录本节点所属模块别名（"" = 入口）
@@ -2611,6 +2640,7 @@ pub fn node_new(kind: string) u64 {
     append(g_node_sc, "");                                  // S4 §0.14.7 SoA：sc 默认空串（第六批）
     append(g_node_nc, -1);                                  // S4 §0.14.7 SoA：nc 默认 -1（无子节点；第九批）
     append(g_node_ba, 0);                                   // S4 §0.14.7 SoA：ba 默认 false（第十批）
+    append(g_node_lc, -1);                                  // S4 §0.14.7 SoA：lc 默认 -1（空 kids 链；第十一批）
     var nref_tag: i64 = nk_of_kind(kind);
     if (nref_tag < 0) { nref_tag = 0; }   // 未注册 kind 暂归 tag=0（g_node_nref 当前无消费方，安全）
     append(g_node_nref, mk_noderef(nref_tag, (slice_len(nodes) as i64) - 1));   // S4：打包 tag|idx 存入侧表（供未来消费方）
@@ -2822,7 +2852,7 @@ pub fn mk_FuncDecl(sa: string, ba: bool, bb: bool, na: i64, la: i64, lb: i64, lc
     n.na = na;
     n.la = la;
     n.lb = lb;
-    n.lc = lc;
+    node_set_lc((id as u64), lc);   // S4 §0.14.7 SoA：取代 `n.lc = lc`（形参保留，调用点不变；第十一批）
     slice_set(nodes, id, n);
     if (ti >= 0) { node_at(id, ti); }
         cst_register_RecFuncDecl(sa, ba, bb, na, la, lb, lc); // S2 dual-write
@@ -2849,7 +2879,7 @@ pub fn mk_lambda(sa: string, na: i64, la: i64, lb: i64, lc: i64, ti: i64) u64 {
     n.na = na;
     n.la = la;
     n.lb = lb;
-    n.lc = lc;
+    node_set_lc((id as u64), lc);   // S4 §0.14.7 SoA：取代 `n.lc = lc`（形参保留，调用点不变；第十一批）
     slice_set(nodes, id, n);
     if (ti >= 0) { node_at(id, ti); }
         cst_register_RecLambda(sa, na, la, lb, lc); // S2 dual-write
