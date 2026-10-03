@@ -694,7 +694,9 @@ S4   821c19b → a9c2970 → 72d461f → 2bea53f → 93eb234
 S6   4c38666 / ffac9e1             lower_policy[] 查表替换 6 硬编码分支 + g_desugar_passes 注册表收口（§0.16.1/0.16.2）
 S7   88c8114 / 021eae8             PassManager 框架 + passes_validate 全管线注册（§0.16.3/0.16.4）
 S5   22dfefd                       step1：Span 结构 + node_span 侧表（纯加法，零行为；读方迁移留 step2，§0.16.5）
-S8   （见 §0.16.11）                step1：tc fmt trivia 感知再发射（忠实还原基础版；base.Node 仍存在，与 S4 epic 解耦，§0.15 偏离 6 合理）
+S8   e33ed23 / b47210c             step1：tc fmt trivia 感知再发射（忠实还原基础版）→ step2：规范化重排
+                                   → step3：tc lint（HIR 结构化规则 + lint_smoke 门禁步）
+                                   三步均在 base.Node 仍存在下落地，与 S4 epic 解耦（§0.15 偏离 6 合理）
 ```
 
 **对账表**
@@ -730,10 +732,11 @@ S8   （见 §0.16.11）                step1：tc fmt trivia 感知再发射（
 
 **关键路径现状与下一步建议**
 
-- 已完成：`S0 → S1 → S2 → S3(partial) → S4(partial,SoA epic 启动 pilot se) → S6 → S7 → S5(step1–5) → S8 step1(tc fmt 忠实还原基础版)`（S6/S7 全绿 gate L2 24/0；S5 step1/2/3 见 §0.16.5–§0.16.7；S5 step4 `.ast` 序列化 + `tc dump-ast` 纯加法已 gate L2 24/0（§0.16.8）；S5 step5 trivia 侧表 + `assign_trivia` 已 gate L2 24/0（§0.16.9）；S8 step1 `tc fmt` 见 §0.16.11，gate L2 24/0）。
+- 已完成：`S0 → S1 → S2 → S3(partial) → S4(partial,SoA epic 启动 pilot se) → S6 → S7 → S5(step1–5) → S8 step1(tc fmt 忠实还原) → S8 step2(规范化重排) → S8 step3(tc lint)`（S6/S7 全绿 gate L2 24/0；S5 step1/2/3 见 §0.16.5–§0.16.7；S5 step4 `.ast` 序列化 + `tc dump-ast` 纯加法已 gate L2 24/0（§0.16.8）；S5 step5 trivia 侧表 + `assign_trivia` 已 gate L2 24/0（§0.16.9）；S8 step1 见 §0.16.11（gate L2 24/0）；step2 见 §0.16.12（gate L2 24/0，2909.2s）；step3 见 §0.16.13（gate L2 **25/0**：新增 `lint_smoke` 步，见 §0.16.13「门禁新增一步」）。
+  - ⚠ **门禁步数变更**：step3 起 L2 由 24 步变 **25 步**（新增 `lint_smoke`）；后续引用「gate L2 24/0」处需按此更新。
 - 进行中 / 尚未启动：
   - **S4 收口 epic（删 `base.Node` 字段 = 节点载荷 SoA 外置）**：用户 2026-10-02 裁定**启动**，采用 staged bootstrap（§0.14.7）。Pilot `se` 已完成（`tc check` 0 err + g1 自举 + c_interop `@c_export` 运行验证 + IR 快照 0 NEW/0 GONE）；剩余 ~23 字段按使用量升序逐组外置，每组独立验证，全部完成后删 `Node`+`nodes[]`。（本轮主线转向 S8 step1，epic 阶段性暂停，未废弃。）
-  - **S8**（`@desugar`/`@pass` + fmt/lint）：**step1 `tc fmt` 已落地（§0.16.11，gate L2 24/0）**——在 `base.Node` 仍存在下实现，与 S4 epic 解耦（§0.15 偏离 6 合理）；后续 step2（基于结构的规范化重排：缩进/空行/对齐）+ `@desugar`/`@pass` 用户扩展原语 + `tc lint`（消费 HIR+侧表）仍按 §4.13 推进。S5 已在 S8 前完成（step1–5 全绿），trivia 注释保留前提就绪。
+  - **S8**（`@desugar`/`@pass` + fmt/lint）：**step1 `tc fmt` 忠实还原（§0.16.11）+ step2 规范化重排（§0.16.12）+ step3 `tc lint`（§0.16.13）均已落地并 gate L2 全绿**——三步都在 `base.Node` 仍存在下实现，与 S4 epic 解耦（§0.15 偏离 6 合理）：fmt 吃词法流 + trivia、lint 吃 HIR，都不碰 `Node` 载荷。剩余 `@desugar`/`@pass` 用户扩展原语**仍受 S4 硬前置约束**（§4.10.3：插件 API 不得同时暴露新旧两套节点表示），并另受 `ModuleRef` 不存在、LLVM 后端不支持结构体字段 fn 值调用两项阻塞。S5 已在 S8 前完成（step1–5 全绿），trivia 注释保留前提就绪。
   - 工作 B 支柱 1 step5 + 支柱 2/3：仍受 §0.13.9「真实消费者触发」门槛约束（DEFERRED）。
 - 当前主线位置：**S8 step1 `tc fmt` 已收口（§0.16.11，gate L2 24/0）；S4 收口 epic 阶段性暂停于 pilot `se`（§0.14.7），可随时接续**；S5 已收口。
 - ⚠ **路线一致性**：S6→S7→S5 严格沿 §4.10.3 阶段表推进（S4 之后 S6，并可并行 S5），无偏离；S4 收口 epic 是 §0.14.6 已裁定 deferred 项在当前 S8 临近下的重启，属「保持偏离合理性」框架内的合理推进，非新偏离。
@@ -1170,6 +1173,49 @@ S8   （见 §0.16.11）                step1：tc fmt trivia 感知再发射（
 - 块注释内部换行原样保留，不重排。
 - 上述均属「最小化结构格式化器」的既有边界；更细的重排（参数对齐、换行决策）需 CST/节点信息，与 S4 收口 epic（删 `base.Node`）无依赖关系，可独立后续增强。
 
+#### §0.16.13 S8 step3（`tc lint`：HIR 上的结构化静态检查）✅ 已落地（2026-10-03）
+
+> 范围（§4.1 G7 / §4.13.3）：G7 要求 fmt 与 lint **共用底层、消费层分离** —— `fmt` 只吃 CST + trivia（§0.16.11 / §0.16.12），`lint` 只吃 **HIR（+ 语义侧表）**。本步落地 `tc lint` v1。
+
+**CLI**：`tc lint <file.tc> | --example <name> [--strict]`
+- 默认退出码 0（信息性报告）；`--strict` = 有命中即退 1（供 CI 使用）。
+- 输出格式 `<file>:<line>: T-LINT-Wxxx: <msg>`（可 grep / 可入 CI）。
+
+**为何本命令可以跑 `parse_unit`（与 fmt 相反）**
+- `fmt` 不能跑 `parse_unit`：`fstr_parse_expr` 把 f-string 插值 token **追加**进 `toks`，破坏「token 流 == 源码序列」的逐字节还原（§0.16.11 的 append-only 契约）。
+- `lint` 不需要与源码逐字节对应——它只关心 HIR 结构，故走与 `emit-hir` **同一条前端路径**（`tokenize → parse_unit → hir_build`），**不跑 sema**（pre-type HIR），因此拿不到类型；v1 三条规则都是纯结构性的，不依赖类型。
+
+**三条规则（v1，高置信）**
+| 码 | 规则 | 实现 |
+|---|---|---|
+| `T-LINT-W001` | 不可达语句：`block` 内 `return`/`break`/`continue` 之后的语句（每条终结指令**只报第一条**，避免刷屏） | `hir.lint_block` |
+| `T-LINT-W002` | 空块：`if` 的 then 为空且无 else（或 else 亦空）；`loop` / `for` / `for-in` 体为空 | `hir.lint_run` |
+| `T-LINT-W003` | 无副作用的表达式语句（值被丢弃）；**块尾语句除外** | `hir.lint_block` |
+
+**取舍原则：宁可漏报（false negative），不可误报（false positive）** —— 刷屏的 linter 没人看。两条由此推导出的硬约束：
+- **W003 的 BINOP 只放行算术运算符 `+ - * / %`**：`<` 在 t 里既是「小于」又是 **fid 写入操作符**（`stdout < "x"`、`j < 12 < true`，见 `examples/fid_demo.tc`）—— **有副作用**。lint 是 pre-type 的（不跑 sema），**无法凭类型区分二者**，故整类排除；UNOP 同理（`&` / `*` 语义依赖上下文）。
+  - ⚠ 实测证据：不排除时 examples 上的 15 条命中**全部**是 fid `<` 误报；排除后 examples 归零。
+- **W003 跳过块尾语句**：t 的 value-if / value-block（`var v = if (true) { 7; } else { 9; };`）中尾表达式是**块的值**，不是丢弃。
+
+**实测命中（115 个 examples + 21 个 `src/*.tc`）**
+- `examples/`：**0 命中**（零误报）—— 已由新增门禁步锁死（见下）。
+- `src/`：**5 条真阳性**：`src/hir_eval.tc:680 / 699 / 713` 与 `src/tir.tc:1182` = 空 `if` then 分支（前三条体内**只有注释**，语义上是 no-op 条件语句）；`src/sema.tc:13139` = `return -1;` 之后残留的重复分支，是**真实死代码**。
+  - 处置：**本步不修**（保持提交聚焦；改 `src/` 会牵动 IR 与不动点，属独立清理任务）。记为 TODO。lint 的价值正体现于此——它在编译器自身源码里挖出了人工没注意到的死代码。
+
+**门禁新增一步（id `lint_smoke`，lv 2）**：`node tools/lint_smoke.mjs --compiler <g1.exe>` 断言 `examples/` 命中数为 **0**。
+- 判据**只覆盖 `examples/`**：`src/` 的命中是真阳性清理 TODO；若纳入断言，「先清死代码」会变成门禁的**隐藏前置条件**。
+
+**后续（需跑 sema 的语义侧表规则）**：未使用符号、类型相关检查；以及用户 `@pass` 产出的侧表供 lint 直接消费（§4.13.3）。本步不含——pre-type HIR 拿不到类型。
+
+**验证**
+- `tc check src/tc.tc`：0 errors（531 条预存风格告警）。
+- 探针：`out/_lintprobe.tc` 命中 W001(4) + W002(10)；`out/_lintprobe2.tc` 命中 W003(4)，且块尾 `a;` 与 value-if 的 `{ 7; }` **均不误报**。
+- `tools/lint_smoke.mjs --compiler out/dbg/g1.exe`：`115 files / findings=0`。
+- IR 快照：**3 DIFF / 0 NEW / 0 GONE**（仅 `src/tc.tc::{c,h,ll}`；`src/hir.tc` 新增符号经 `@import` 传播进 tc.tc 的 IR，属良性自编译漂移）→ `--update` 重录基线（117 targets / 354 entries）。
+- **gate L2 = 25 passed / 0 failed（2823.8s）**（四代自举不动点 `g2==g3==g4`、产物快照比对 421.0s、conformance、run_examples 双后端、HIR AstGen/comptime-eval、双轨对拍、difftest tc0、C 后端自举、rls、tote、**新增 `tc lint 冒烟` 22.4s** 全绿）。
+- 同步 `cp out/dbg/g4.exe out/dbg/tc.exe && cp out/rls/gr.exe out/rls/tc.exe`（种子升到当前不动点）。
+- ⚠ **自此 L2 为 25 步**（step3 新增 `lint_smoke`）；历史文档中的「24/0」指 step3 之前的门禁。
+
 ---
 
 ## 0.17 S5 收口路线（step1 → stepN，P2，可并行于 S2–S4）
@@ -1177,7 +1223,8 @@ S8   （见 §0.16.11）                step1：tc fmt trivia 感知再发射（
 > S5 = `Span` 取代 `ln/cl/tv` + CST `.ast` 序列化 + trivia（span 间隙）+ error node（§4.10.3）。
 > 当前完成 **step1（§0.16.5）+ step2（§0.16.6）+ step3（§0.16.7）+ step4（§0.16.8）+ step5（§0.16.9）**，S5 已全绿 gate L2 24/0，S8 fmt/lint 的注释保留前提就绪。后续步（尚未实施）：
 > - step2–step5 均已完成（见 §0.16.6–§0.16.9）：step2 读方迁 `node_span_id`、step3 删 `ln/cl/tv` 字段、step4 `.ast` 序列化 + `tc dump-ast`、step5 trivia 侧表 + `assign_trivia`；S5 全绿 gate L2 24/0。
-> - ⚠ S5 已完成（step1–5 全绿 gate L2 24/0），S8 fmt/lint 的 trivia 前提已满足。**S8 step1（`tc fmt` 忠实还原，§0.16.11）+ step2（规范化重排，§0.16.12）均已落地并验证 gate L2 24/0**——两步都在 `base.Node` 仍存在下实现，与原路线「S8 依赖 S4 硬前置」偏离，记入 §0.15 偏离 6（合理）：`fmt` 只消费词法流 + trivia，不依赖删 Node。该偏离不阻塞 S4 收口 epic（§0.14.7）；S8 整体与 S4 epic 解耦推进。当前 `owns`（侧表失效）
+> - ⚠ S5 已完成（step1–5 全绿 gate L2 24/0），S8 fmt/lint 的 trivia 前提已满足。**S8 step1（`tc fmt` 忠实还原，§0.16.11）+ step2（规范化重排，§0.16.12）+ step3（`tc lint`，§0.16.13）均已落地并验证 gate L2 全绿**——三步都在 `base.Node` 仍存在下实现，与原路线「S8 依赖 S4 硬前置」偏离，记入 §0.15 偏离 6（合理）：fmt 只消费词法流 + trivia、lint 只消费 HIR，均不依赖删 Node。该偏离不阻塞 S4 收口 epic（§0.14.7）；S8 的 fmt/lint 部分与 S4 epic 解耦推进。
+>   ⚠ **仍未落地的是 `@desugar` / `@pass` 用户扩展原语**——它们会向用户暴露节点表示，故**仍受 S4 硬前置约束**（§4.10.3）；另受 `ModuleRef` 不存在 + LLVM 后端不支持结构体字段 fn 值调用两项阻塞。当前 `owns`（侧表失效）
 >   仍待 `ModuleRef`，与 S7 同阻塞。
 
 ---

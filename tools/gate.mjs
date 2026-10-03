@@ -519,6 +519,20 @@ const r = await node("ir_snapshot.mjs", "--compiler", `${G1}.exe`, "--jobs", "1"
             return { ok: h.code === 0, note: h.code === 0 ? "构建 + --help 正常" : `--help 退出码 ${h.code}` };
         },
     },
+    {
+        id: "lint_smoke", lv: 2, name: "tc lint 冒烟 (examples 零误报)",
+        run: async () => {
+            // S8 step3（§0.16.13）：lint 的核心质量属性是「**零误报**」—— 刷屏的 linter 没人看。
+            // 本步锁死该不变量：任一规则在既有语料上回归出误报即刻红。
+            // ⚠ 判据只覆盖 examples/：src/*.tc 的命中是**真阳性**（空 if / 死代码），
+            //   属清理 TODO —— 若纳入断言，「先清死代码」会变成门禁的隐藏前置条件。
+            if (existsSync(join(ROOT, `${G1}.exe`)) === false) {
+                return { ok: false, note: "g1.exe 缺失：前置自举步骤未产出，本步无从判定" };
+            }
+            const r = await node("lint_smoke.mjs", "--compiler", `${G1}.exe`);
+            return { ok: r.code === 0, note: lastLine(r.out, 2) };
+        },
+    },
 ];
 
 // ── 执行 ─────────────────────────────────────────────────────────
