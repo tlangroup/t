@@ -1740,8 +1740,10 @@ pub struct Node {
     bb: bool;
     bc: bool;   // 模块系统：该声明是否被 `pub` 修饰（顶层可见性）
     bd: bool;   // 模块系统：该 import 是否走库搜索路径（true=lib/依赖库，false=src 源码根；见 parse_at_import_decl / handle_one_import）
-    be: bool;   // C 互操作导出：该声明是否标记 `@c_export`（生成 C ABI 平铺入口）
-    bf: bool;   // Device 子系统：该声明是否为 `kernel fn`（设备入口；host 双后端跳过，codegen_dev 处理）
+    // S4 第三批（§0.14.7）：be/bf 已迁出为属性侧表 g_node_be / g_node_bf，
+    // 访问面走 node_be()/node_set_be() 与 node_bf()/node_set_bf()（默认 false）。
+    //   be = C 互操作导出：该声明是否标记 `@c_export`（生成 C ABI 平铺入口）
+    //   bf = Device 子系统：该声明是否为 `kernel fn`（host 双后端跳过，codegen_dev 处理）
     na: i64;
     nb: i64;
     nc: i64;
@@ -1807,6 +1809,13 @@ pub var g_node_se: []string;               // 与 nodes 平行：nodes[i] 的 C 
 pub var g_node_has_sa: []i64;              // nodes[i] 的 has_sa（默认 1）
 pub var g_node_has_sb: []i64;              // nodes[i] 的 has_sb（默认 1）
 pub var g_node_has_sc: []i64;              // nodes[i] 的 has_sc（默认 1）
+// S4 第三批（§0.14.7）：声明级 bool 标记组 be / bf。
+// ⚠ 与上一批方向相反：旧 node_new 写 `n.be = false; n.bf = false;` ⇒ 此处默认 **0（false）**，
+//   访问器越界返回 false（按字段默认值对齐）。搬迁时勿照抄 has_* 的「默认 true」写法。
+//   - be：C 互操作导出 —— 该声明是否标记 `@c_export`（生成 C ABI 平铺入口）
+//   - bf：Device 子系统 —— 该声明是否为 `kernel fn`（设备入口；host 双后端跳过，codegen_dev 处理）
+pub var g_node_be: []i64;                  // nodes[i] 的 be（默认 0 = 非 @c_export）
+pub var g_node_bf: []i64;                  // nodes[i] 的 bf（默认 0 = 非 kernel fn）
 
 // ── S3（§4.5）：侧表登记 + provenance 侧表读取面 ──────────────────────────────
 // 跨切面属性统一登记 SideTable{name,owner,dirty}，PassManager 据 name 建拓扑与置脏。
@@ -1839,6 +1848,8 @@ pub fn sidetable_init() void {
     sidetable_register("node_has_sa", "S4");   // SoA：sa 存在性标志（第二批）
     sidetable_register("node_has_sb", "S4");   // SoA：sb 存在性标志（第二批）
     sidetable_register("node_has_sc", "S4");   // SoA：sc 存在性标志（第二批）
+    sidetable_register("node_be", "S4");       // SoA：@c_export 标记（第三批）
+    sidetable_register("node_bf", "S4");       // SoA：kernel fn 标记（第三批）
 }
 pub fn node_mod(n: u64) string {
     sidetable_init();
@@ -1934,8 +1945,8 @@ pub fn cst_dump(role: string, id: i64, depth: i64) void {
     if (n.bb) { sb_append_str(g_cst_sb, " bb"); }
     if (n.bc) { sb_append_str(g_cst_sb, " bc"); }
     if (n.bd) { sb_append_str(g_cst_sb, " bd"); }
-    if (n.be) { sb_append_str(g_cst_sb, " be"); }
-    if (n.bf) { sb_append_str(g_cst_sb, " bf"); }
+    if (node_be((id as u64))) { sb_append_str(g_cst_sb, " be"); }   // S4 §0.14.7 SoA：侧表读（原 n.be）
+    if (node_bf((id as u64))) { sb_append_str(g_cst_sb, " bf"); }   // S4 §0.14.7 SoA：侧表读（原 n.bf）
     // trivia（S5 §4.8）：#< = leading 间隙 trivia，#> = trailing 间隙 trivia
     var trv = node_trivia((id as u64));
     if (slice_len(trv.leading) > 0) {
@@ -2204,6 +2215,36 @@ pub fn node_set_has_sc(n: u64, v: bool) void {
     if (v) { slice_set(g_node_has_sc, id, 1); } else { slice_set(g_node_has_sc, id, 0); }
 }
 
+// S4 第三批（§0.14.7）SoA：Node.be / Node.bf 声明级标记侧表访问面。
+// ⚠ 默认值方向：**false**（旧 node_new 写 `n.be = false; n.bf = false;`），故 node_new
+//   append **0**、越界返回 **false** —— 与上一批 has_*（默认 true）相反，勿照抄。
+// 站点画像（普查后真实 Node 站点：be 6 / bf 12，无同名假阳性、无整节点赋值）：
+//   - be：写 = parse.tc 三处 `@c_export` 分支；读 = codegen_c emit_func_decl（唯一）；dump 打印。
+//   - bf：写 = parse.tc parse_func_decl 的 is_kernel 分支（值拷贝+slice_set 回写 ⇒ 改为直接写侧表）；
+//     读 = codegen_c / codegen_dev / sema / tir / tc（module_has_kernels）多处 FuncDecl 判定。
+pub fn node_be(n: u64) bool {
+    sidetable_init();
+    var id = nr_idx(n);
+    if (id < 0 || id >= slice_len(g_node_be)) { return false; }
+    return g_node_be[id] != 0;
+}
+pub fn node_set_be(n: u64, v: bool) void {
+    var id = nr_idx(n);
+    if (id < 0 || id >= slice_len(g_node_be)) { return; }
+    if (v) { slice_set(g_node_be, id, 1); } else { slice_set(g_node_be, id, 0); }
+}
+pub fn node_bf(n: u64) bool {
+    sidetable_init();
+    var id = nr_idx(n);
+    if (id < 0 || id >= slice_len(g_node_bf)) { return false; }
+    return g_node_bf[id] != 0;
+}
+pub fn node_set_bf(n: u64, v: bool) void {
+    var id = nr_idx(n);
+    if (id < 0 || id >= slice_len(g_node_bf)) { return; }
+    if (v) { slice_set(g_node_bf, id, 1); } else { slice_set(g_node_bf, id, 0); }
+}
+
 pub struct Child {
     val: i64;
     next: i64;
@@ -2321,8 +2362,7 @@ pub fn node_new(kind: string) u64 {
     n.bb = false;
     n.bc = false;
     n.bd = false;
-    n.be = false;
-    n.bf = false;
+    // S4 第三批（§0.14.7）：be/bf 已外置为侧表（默认 0=false，见下方 append）
     n.na = -1;
     n.nb = -1;
     n.nc = -1;
@@ -2345,6 +2385,8 @@ pub fn node_new(kind: string) u64 {
     append(g_node_has_sa, 1);                               // S4 §0.14.7 SoA：has_sa 默认 **true**（等价旧 `n.has_sa = true`）
     append(g_node_has_sb, 1);                               // S4 §0.14.7 SoA：has_sb 默认 true
     append(g_node_has_sc, 1);                               // S4 §0.14.7 SoA：has_sc 默认 true
+    append(g_node_be, 0);                                   // S4 §0.14.7 SoA：be 默认 **false**（等价旧 `n.be = false`）
+    append(g_node_bf, 0);                                   // S4 §0.14.7 SoA：bf 默认 false
     var nref_tag: i64 = nk_of_kind(kind);
     if (nref_tag < 0) { nref_tag = 0; }   // 未注册 kind 暂归 tag=0（g_node_nref 当前无消费方，安全）
     append(g_node_nref, mk_noderef(nref_tag, (slice_len(nodes) as i64) - 1));   // S4：打包 tag|idx 存入侧表（供未来消费方）
