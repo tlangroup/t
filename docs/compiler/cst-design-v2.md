@@ -753,9 +753,31 @@ if (n.td > 0) { n.td = -1; }          // ← 写在副本上：从未写回 node
   ⚠ 首轮 gate 在 conformance 步报 `f44_fid_read_agg missing code T_FID_DESERIALIZE_AGG`，但 stderr 显示是**沙箱拦截了该用例文件的读取**（`[sandbox] … (file-read)`）；隔离重跑 `tools/conformance.mjs` 得 **316 passed / 0 failed** ⇒ 属环境偶发，与本次改动无关（第二次完整 gate 该步 PASS 149.3s）。
 - ⚠ **方法论收获**：IR 快照的「examples 出现 DIFF」是本轮唯一能暴露该 bug 的信号（C 后端对拍完全看不出来——跨后端语义差异把增量丢失掩掉了）。后续每批**必须**同时看「examples 是否 0 DIFF」，不能只看 0 NEW/0 GONE。
 
+**批次 10：`ba`（通用 bool 载荷，bool 范式第五次复用；含「形参 `.id` 隐患」的系统性复查，2026-10-04）**
+- 选组：`ba` 是当时剩余量级最低的一档（grep 91），且是**最后一个 bool 载荷**（`bool` 侧表范式此前已被 `bd`/`be`/`bf`/`bb`/`bc` 五批验证）⇒ 单批风险最低。
+- 普查（纪律先行）：91 处 `.ba` 命中里 **8 处假阳性**（`base.tc` 的 `r.ba = tbl_Rec{FuncDecl,StructDecl,BitstrSeg,Bool,Arm,Range,VarDecl,ImportItem}_ba[i]`，全是 S2 per-kind record 的**读**，从不从 `nodes[]` 取 `ba`；`cst_register_RecBool(ba)` 等 dual-write 直接收形参）⇒ **真实 Node 站点 83 处**（base 内 12 + 其余 71：写 9 + 读 62）。
+- 存储：`g_node_ba: []i64`（默认 **`0` = false**；越界读返 `false`）+ `node_ba()` / `node_set_ba()`（**bool 进出**，与 `node_bb/node_bc` 同形）+ `sidetable_register("node_ba","S4")` + `node_new` 锁步 `append(0)`。八个构造器（`mk_FuncDecl` / `mk_StructDecl` / `mk_bitstr_seg` / `mk_bool` / `mk_arm` / `mk_range` / `mk_var_decl` / `mk_ImportItem`）**保留 `ba`/`rest`/`wild` 形参**，只把 `n.ba = X` 换成 `node_set_ba((id as u64), X)` ⇒ 调用点与 `cst_register_Rec*` 的 S2 dual-write 签名全不动（沿用批次 5 起的范式）。
+- ⚠ **`ba` 是复用最重的 bool 槽：按 kind 承载 8 种互不相干的语义**（本批只做等价搬迁，未拆语义）：
+  ① `bool` 字面量的**真值**（量最大、最热）｜② `var_decl` 是否 **`const`/`let`**（只读绑定；`cs_assignment` / `check_stmt_cst` 据此报 `T-SEM-E762`）｜③ `arm` 是否 `_` **通配**｜④ `P`（形参）是否 `_` **通配**｜⑤ `range` 是否**闭合区间** `..=`（脱糖为 `<=` 而非 `<`）｜⑥ `bitstr_seg` 是否**变长尾段** `rest/bitstr`｜⑦ `ImportItem` 是否**通配** `:: *`｜⑧ `StructDecl` / `VariantDecl`（抽象/开放变体，尾部 `_`）/ `FuncDecl`（clause 脱糖主体）各自的结构性标记。
+- ✅ **批次 9 隐患的系统性复查（本批开工前必做）**：批次 9 发现「`Node` **形参**的 `.id` 是垃圾值」后，本批开工前先跑了一次全量普查——扫描 `src/*.tc` 全部 `node_X((V.id as u64))` 站点共 **113 处**，逐个回溯到所属函数头判定 `V` 是「形参 `V: Node`」还是「局部 `var V: Node = nodes[…]`」，结果 **0 处形参**（含本批新增的 57 处）⇒ 该隐患无残留。**此普查应作为后续每批的固定前置步骤**（`Node` 尾部 `id` 字段仍在，风险敞口持续存在）。
+- ✅ 覆盖与等价证据（`ba` 的 8 种语义全部有语料，且**均验证非默认/非平凡路径可达**）：
+  ① bool 真值 —— `mini`（`{"x":3,"y":-7} [1,2,3] …`）、`match_demo`、`overload_demo`；
+  ② `const`/`let` 只读 —— `tests/conformance/fail/f140_ref_write_readonly.tc`（`let r1 = &a; *r1 = 5;`）双编译器均报 **`T-SEM-E762`**（证明 `var_decl.ba=true` 被写入且被 `cs_assignment` 读出）；
+  ③ arm 通配 —— `match_demo` 的 6 处 `_ =>` 臂；
+  ④ 形参通配 —— `clause_demo`（`fn classify(_) string`）、`overload_demo`（`overload fn describe(_)` / `greet(_)` / `tag(_)`）；
+  ⑤ 闭合区间 `..=` —— `match_ext`（`match_ext ok`）；
+  ⑥ 位串变长尾段 —— `bitstr_protocol`（`payload/bitstr` 尾段解构，实跑 `5 2 8 222 173 190 239 4`）；
+  ⑦ 导入通配 —— examples 无 `:: *` 用例（现有 import 全是整模块 `@import("x")`），故自建 probe `@import("std.math" :: *); abs(0 - 7)`：双编译器实跑均 `v=7` ⇒ `ImportItem.ba=true` 路径可达且 `sel_register` 读侧表正确；
+  ⑧ 抽象变体 —— `adt_status`（`variant Status { Ok(i64); Err(i64); _ }`，实跑 `7 -3`）；
+  ⑨ 附带覆盖 sema 的 `m_an.ba = true` 分支（切片 `[..]` / 范围 `..` 全通配臂改写）—— `match_slice` / `match_ext`；
+  以上 **14 个 example 编译 + 实跑输出逐行 IDENTICAL**，另有 2 个自建 probe 一致；
+  ⑩ **`src/tc.tc` 自身 —— 2.47MB `.c` + 130KB `.h` 逐字节 IDENTICAL**（md5 `6847634b…` / `41704e46…`，seed 与 g1 一致），覆盖 `clone_node` 传播、`meta_fold_expr` / `mb_fold_inplace` / `comptime_rewrite_to_literal` 整节点改写、八个构造器与全部读方。
+- 验证：`tc check` **0 error**（531 warning 全为既有命名风格告警 `T-NAM-W401/W402`/`T-MOD-W561`，与批次 9 完全一致，无一条与 ba 相关）；g1 自举 2m14s（注释清理后复建 3m19s，产物 md5 不变 ⇒ 注释不影响 codegen）；IR 快照 **3 DIFF / 0 NEW / 0 GONE（仅 `src/tc.tc::{c,h,ll}`）** ⇒ `--update` 重录基线（117 targets / 354 entries，207.6s）。
+- **gate L2 = 25 passed / 0 failed（1755.0s）**：工具链断言 0.3s、诊断注册表 0.1s、CST kind 清单 0.1s、静态检查 0.7s、预编译 std 1.8s、**自举一代 152.0s**、IR 静态审计 1.3s、LLVM verifier 1.5s、产物快照比对 253.4s、conformance 50.3s、UNSUPPORTED 0.4s、**自举不动点 g2==g3 272.6s**、run_examples 140.9s、HIR AstGen 10.1s、HIR 解释器 1.0s、difftest 代际 3.2s、双轨对拍 67.3s、REPL 冒烟 4.6s、**四代不动点 g2==g3==g4 158.6s**、MIR differential 60.8s、C 后端自举 211.7s、difftest tc0 40.1s、rls 快速通道 318.1s、tote 冒烟 1.0s、lint 冒烟 3.3s 全绿。已同步 `g4→out/dbg/tc.exe`、`gr→out/rls/tc.exe`（同步后 `tc check` 复检仍 0 error / 531 warning）。
+
 **剩余字段实测使用量（`.F` 命中数；泛型名字段含非 Node 假阳性，仅作排序参考）**
-`ba 91 / lc 92 / sb 150 / ia 153 / lb 218 / nb 461 / la 500 / na 1071 / kind 1187 / sa 1268`（`id` 为 S5 step2 过渡字段，随 `Node` 一并消失，不单列迁移）（✅ 已迁：`se`、`has_sa`、`has_sb`、`has_sc`、`be`、`bf`、`memspace`、`bd`、`bb`、`bc`、`sc`、`nd`、`ib`、`nc` —— 共 14 个字段）。
-> 迁移至此，`Node` 的**低使用量尾部（≤80）已清空**，剩余全部 ≥91。三类侧表范式（bool / string / 索引）**全部验证成立**，`na/nb/nc/nd` 四槽已外置其二（`nd`、`nc`），后续外置只剩工作量、无范式风险。剩余 10 个字段中 `ba 91` 是**最后一个 bool 载荷**（宜单独一批）；`sa 1268` / `kind 1187` / `na 1071` 为量级最大的三座高峰（各自宜单独成批或按语义切分）。下一档建议 **`ba 91`**（最后一个 bool 载荷，标量范式最简单）或 **`lc 92`**（与 `la/lb` 同族的 kids 链槽）。越往后站点越多、单批风险越高，后续宜**继续小组合 + 组内独立验证**；且每批**必须核对 examples 是否 0 DIFF**（批次 9 的方法论收获）。
+`lc 92 / sb 150 / ia 153 / lb 218 / nb 461 / la 500 / na 1071 / kind 1187 / sa 1268`（`id` 为 S5 step2 过渡字段，随 `Node` 一并消失，不单列迁移）（✅ 已迁：`se`、`has_sa`、`has_sb`、`has_sc`、`be`、`bf`、`memspace`、`bd`、`bb`、`bc`、`sc`、`nd`、`ib`、`nc`、`ba` —— 共 15 个字段）。
+> 迁移至此，`Node` 的**全部 bool 载荷已清空**（`ba` 是最后一个）；`na/nb/nc/nd` 四槽已外置其二（`nd`、`nc`）。三类侧表范式（bool / string / 索引）**全部验证成立**，后续外置只剩工作量、无范式风险。剩余 9 个字段中 `lc 92`（与 `la/lb` 同族的 kids 链槽）为最低一档；`sb 150` / `ia 153` 次之；`sa 1268` / `kind 1187` / `na 1071` 为量级最大的三座高峰（各自宜单独成批或按语义切分）。下一档建议 **`lc 92`**（kids 链槽族，与已迁的索引型范式兼容）或 **`sb 150`**（与批次 6 的 `sc` 同族的 `[]string` 侧表，范式已验证）。越往后站点越多、单批风险越高，后续宜**继续小组合 + 组内独立验证**；且每批**开工前必须普查 `node_X((V.id as u64))` 是否落在 `Node` 形参上**（批次 9 致命坑的系统性防线，本批已跑 113 处 / 0 命中），收尾时**必须核对 examples 是否 0 DIFF**（批次 9 的方法论收获）。
 
 **后续批次（待做，按使用量升序、每组独立绿）**全部完成后删 `pub struct Node` + `nodes[]` + `node_new` 的 Node 构造 + 全部 `slice_set(nodes, …)`，`id` 字段随 `Node` 一并消失（届时裸索引即句柄），S4 方真正收口（随后补 `node_to_hir` 桥改造 + 删 re-export 垫片，见 §4.14.4）。
 
