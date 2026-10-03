@@ -1731,7 +1731,11 @@ pub struct Node {
     kind: string;
     sa: string;
     sb: string;
-    sc: string;
+    // S4 第六批（§0.14.7）：sc 已迁出为属性侧表 g_node_sc，访问面走 node_sc()/node_set_sc()
+    // （默认 ""）。⚠ 该字段按 kind **复用**于 5 种语义（详见 node_sc 处注释）：ImportDecl/
+    // ImportModDecl 的用户别名、StructDecl 的 @bitpack 标量成员类型名、FuncDecl 的
+    // "__lambda__" Lambda 脱糖标记、FuncDecl 的 suite 测试路径、P Param 暂存的 owner 类型名。
+    // 本批只做等价搬迁，未拆语义（拆语义属独立变更，会让本轮验证指标无法归因）。
     // S4 第二批（§0.14.7）：has_sa/has_sb/has_sc 已迁出为属性侧表 g_node_has_*，
     // 访问面走 node_has_X() / node_set_has_X()（存在性标志：X 语义是否为 null；默认 true）。
     ia: i64;
@@ -1843,6 +1847,7 @@ pub var g_node_bd: []i64;                  // nodes[i] 的 bd（默认 0 = false
 //   仅函数体内由 `n.bb = bb` 改为 `node_set_bb(id, bb)`。
 pub var g_node_bb: []i64;                  // nodes[i] 的 bb（默认 0 = false）
 pub var g_node_bc: []i64;                  // nodes[i] 的 bc（默认 0 = 非 pub）
+pub var g_node_sc: []string;               // S4 第六批：nodes[i] 的 sc 字符串载荷（默认 ""）
 
 // ── S3（§4.5）：侧表登记 + provenance 侧表读取面 ──────────────────────────────
 // 跨切面属性统一登记 SideTable{name,owner,dirty}，PassManager 据 name 建拓扑与置脏。
@@ -1881,6 +1886,7 @@ pub fn sidetable_init() void {
     sidetable_register("node_bd", "S4");        // SoA：import 库路径 / member-callee 标记（第四批）
     sidetable_register("node_bb", "S4");        // SoA：bool 载荷 is_let/编译期类型参数/显式 offset（第五批）
     sidetable_register("node_bc", "S4");        // SoA：`pub` 顶层可见性标记（第五批）
+    sidetable_register("node_sc", "S4");        // SoA：字符串载荷（别名/bitpack 标量/lambda 标记/suite 路径；第六批）
 }
 pub fn node_mod(n: u64) string {
     sidetable_init();
@@ -1967,7 +1973,8 @@ pub fn cst_dump(role: string, id: i64, depth: i64) void {
     }
     if (str_len(n.sa) > 0) { sb_append_str(g_cst_sb, " sa=\""); sb_append_str(g_cst_sb, n.sa); sb_append_char(g_cst_sb, 34); }
     if (str_len(n.sb) > 0) { sb_append_str(g_cst_sb, " sb=\""); sb_append_str(g_cst_sb, n.sb); sb_append_char(g_cst_sb, 34); }
-    if (str_len(n.sc) > 0) { sb_append_str(g_cst_sb, " sc=\""); sb_append_str(g_cst_sb, n.sc); sb_append_char(g_cst_sb, 34); }
+    var n_sc = node_sc((id as u64));
+    if (str_len(n_sc) > 0) { sb_append_str(g_cst_sb, " sc=\""); sb_append_str(g_cst_sb, n_sc); sb_append_char(g_cst_sb, 34); }
     var n_se = node_se((id as u64));
     if (str_len(n_se) > 0) { sb_append_str(g_cst_sb, " se=\""); sb_append_str(g_cst_sb, n_se); sb_append_char(g_cst_sb, 34); }
     if (n.ia != -1) { sb_append_str(g_cst_sb, " ia="); sb_append_i64(g_cst_sb, n.ia); }
@@ -2328,6 +2335,27 @@ pub fn node_set_bc(n: u64, v: bool) void {
     if (id < 0 || id >= slice_len(g_node_bc)) { return; }
     if (v) { slice_set(g_node_bc, id, 1); } else { slice_set(g_node_bc, id, 0); }
 }
+// S4 第六批（§0.14.7）：字符串载荷 sc（默认 ""）。**本批为 sa/sb/sc 字符串整族外置预演**
+// ——首个 `[]string` 类型侧表，验证「非标量侧表 + node_new 锁步 append」范式成立。
+//   sc 按 kind 复用 4 种语义（本次只做等价搬迁，未拆语义）：
+//     ① ImportDecl / ImportModDecl：用户书写别名（`import x as m` 的 m）
+//     ② StructDecl：@bitpack 标量成员类型名（`n.has_sc` 为真时有效）
+//     ③ FuncDecl：`"__lambda__"` = Lambda 脱糖标记（检查期据此判定捕获失败）
+//     ④ FuncDecl：suite 测试路径（`g_suite_path`，由 parse 写入）
+//     ⑤ P Param：结构体方法脱糖时暂存的 owner 类型名 vname
+//   写点 = mk_ImportDecl / mk_ImportModDecl / mk_StructDecl（形参保留，调用点不变）
+//          + parse（lambda 标记、suite 路径）+ sema（P.sc = vname）+ clone_node 传播。
+pub fn node_sc(n: u64) string {
+    sidetable_init();
+    var id = nr_idx(n);
+    if (id < 0 || id >= slice_len(g_node_sc)) { return ""; }
+    return g_node_sc[id];
+}
+pub fn node_set_sc(n: u64, v: string) void {
+    var id = nr_idx(n);
+    if (id < 0 || id >= slice_len(g_node_sc)) { return; }
+    slice_set(g_node_sc, id, v);
+}
 
 pub struct Child {
     val: i64;
@@ -2438,7 +2466,7 @@ pub fn node_new(kind: string) u64 {
     n.kind = kind;
     n.sa = "";
     n.sb = "";
-    n.sc = "";
+    // S4 第六批（§0.14.7）：sc 已外置为侧表（默认空串，见下方 append）
     // S4 第二批（§0.14.7）：has_sa/has_sb/has_sc 已外置为侧表（默认 1=true，见下方 append）
     n.ia = -1;
     n.ib = -1;
@@ -2474,6 +2502,7 @@ pub fn node_new(kind: string) u64 {
     append(g_node_bd, 0);                                   // S4 §0.14.7 SoA：bd 默认 false
     append(g_node_bb, 0);                                   // S4 §0.14.7 SoA：bb 默认 false
     append(g_node_bc, 0);                                   // S4 §0.14.7 SoA：bc 默认 false（非 pub）
+    append(g_node_sc, "");                                  // S4 §0.14.7 SoA：sc 默认空串（第六批）
     var nref_tag: i64 = nk_of_kind(kind);
     if (nref_tag < 0) { nref_tag = 0; }   // 未注册 kind 暂归 tag=0（g_node_nref 当前无消费方，安全）
     append(g_node_nref, mk_noderef(nref_tag, (slice_len(nodes) as i64) - 1));   // S4：打包 tag|idx 存入侧表（供未来消费方）
@@ -2803,7 +2832,7 @@ pub fn mk_ImportDecl(sb: string, sc: string, has_sa: bool, has_sc: bool, la: i64
     var id: i64 = node_new("ImportDecl");
     var n: Node = nodes[id];
     n.sb = sb;
-    n.sc = sc;
+    node_set_sc((id as u64), sc);   // S4 §0.14.7 SoA：取代 `n.sc = sc`（形参保留，调用点不变）
     node_set_has_sa((id as u64), has_sa);   // S4 §0.14.7 SoA：取代 `n.has_sa = has_sa`
     node_set_has_sc((id as u64), has_sc);
     n.la = la;
@@ -2819,7 +2848,7 @@ pub fn mk_ImportModDecl(sb: string, sc: string, has_sc: bool, is_lib_path: bool,
     var id: i64 = node_new("ImportModDecl");
     var n: Node = nodes[id];
     n.sb = sb;
-    n.sc = sc;
+    node_set_sc((id as u64), sc);   // S4 §0.14.7 SoA：取代 `n.sc = sc`（形参保留，调用点不变）
     node_set_has_sc((id as u64), has_sc);   // S4 §0.14.7 SoA：取代 `n.has_sc = has_sc`
     node_set_bd((id as u64), is_lib_path);   // S4 §0.14.7 SoA：取代 `n.bd = is_lib_path`（true = 走库搜索路径）
     n.la = la;
@@ -2884,7 +2913,7 @@ pub fn mk_StructDecl(sa: string, sb: string, sc: string, has_sc: bool, ba: bool,
     var n: Node = nodes[id];
     n.sa = sa;
     n.sb = sb;
-    n.sc = sc;
+    node_set_sc((id as u64), sc);   // S4 §0.14.7 SoA：取代 `n.sc = sc`（形参保留，调用点不变）
     node_set_has_sc((id as u64), has_sc);   // S4 §0.14.7 SoA：取代 `n.has_sc = has_sc`
     n.ba = ba;
     n.la = la;
