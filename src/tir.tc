@@ -2282,7 +2282,10 @@ pub fn tir_emit_stmt(sid: i64) void {
         return;
     }
     if (kd == "if") { tir_emit_if(n); return; }
-    if (kd == "for") { tir_emit_for(n); return; }
+    // ⚠ 传 **节点索引** 而非 Node 值：Node 结构体值传参时末尾字段 `id` 不可靠
+    //   （实测形参 n.id 读到垃圾值 75，真实下标为 331），故凡需按 id 查侧表的
+    //   发射函数一律收 sid（本批 nc 迁移时定位，详见 §0.14.7 第九批「坑」）。
+    if (kd == "for") { tir_emit_for(sid); return; }
     if (kd == "while") { tir_emit_while(n); return; }
     if (kd == "for_each") { tir_emit_for_each(n); return; }
     if (kd == "block") {
@@ -2413,7 +2416,9 @@ pub fn tir_emit_if(n: Node) void {
     tir_block(endL);
 }
 
-pub fn tir_emit_for(n: Node) void {
+// ⚠ 形参是**节点索引 sid** 而非 Node 值：见调用点注释（Node 值传参会丢末尾 id 字段）。
+pub fn tir_emit_for(sid: i64) void {
+    var n: Node = base.nodes[sid];
     if (n.na >= 0) { tir_emit_stmt(n.na); }    // 初始化（通常 var_decl）
     var headL: string = tir_lbl("for.h");
     var bodyL: string = tir_lbl("for.b");
@@ -2440,7 +2445,8 @@ pub fn tir_emit_for(n: Node) void {
     tir_blk_pop();
     tir_emit(tir_emit_br(contL));   // body 末尾跳增量块（continue 也跳此）
     tir_block(contL);
-    if (n.nc >= 0) { tir_emit_stmt(n.nc); }     // 增量（通常 assignment）
+    var nc_upd: i64 = base.node_nc((sid as u64));   // S4 §0.14.7 SoA：侧表读（原 n.nc；第九批）
+    if (nc_upd >= 0) { tir_emit_stmt(nc_upd); }     // 增量（通常 assignment）
     tir_emit(tir_emit_br(headL));
     tir_block(endL);
     tir_loop_pop();
@@ -5149,10 +5155,10 @@ pub fn tir_emit_match(n: Node, as_stmt: bool, est: i64) TirEmitRes {
         var rst: string = "i64";
         if (nArm > 0) {
             var fbn: Node = base.nodes[armIds[0]];
-            if (fbn.nc >= 0) {
-                rtd = tir_expr_td(fbn.nc);
+            if (base.node_nc((fbn.id as u64)) >= 0) {
+                rtd = tir_expr_td(base.node_nc((fbn.id as u64)));
                 if (rtd < 0) { rtd = scr_td; }
-                rst = tir_expr_st(fbn.nc);
+                rst = tir_expr_st(base.node_nc((fbn.id as u64)));
             }
         }
         if (rst == "" || rst == "ptr" || rst == "i64") {
@@ -5513,9 +5519,9 @@ pub fn tir_emit_match(n: Node, as_stmt: bool, est: i64) TirEmitRes {
             }
         }
         if (as_stmt) {
-            tir_emit_stmt(arm.nc);
+            tir_emit_stmt(base.node_nc((arm.id as u64)));
         } else {
-            var bvr: TirEmitRes = tir_emit_expr(arm.nc); var bv: string = bvr.name;
+            var bvr: TirEmitRes = tir_emit_expr(base.node_nc((arm.id as u64))); var bv: string = bvr.name;
             if (res != "") { tir_emit(TIRInst{ op: TIR_OP_STORE, st: ST_NONE, dst: tir_op(res), args: tir_a1(bv), is_comment: false, line: g_cur_line, cmt: "" }); }
         }
         tir_blk_pop();

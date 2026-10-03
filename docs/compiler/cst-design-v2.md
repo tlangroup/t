@@ -731,9 +731,31 @@ if (n.td > 0) { n.td = -1; }          // ← 写在副本上：从未写回 node
   ⑦ **`src/tc.tc` 自身 —— 2.46MB `.c` + 129KB `.h` 逐字节 IDENTICAL**（覆盖 `clone_node` 传播、tagID 决议、flag 布局、全部读方）。侧表默认值若为 `0` 或任一站点漏迁，此对拍必然不等。
 - 验证：`tc check` 0 error；g1 重建 4m28s；IR 快照 **3 DIFF / 0 NEW / 0 GONE**（仅 `src/tc.tc::{c,h,ll}`）→ `--update` 重录基线（117 targets / 354 entries）；**gate L2 = 25 passed / 0 failed**；已同步种子 `g4→out/dbg/tc.exe`、`gr→out/rls/tc.exe`。
 
+**批次 9：`nc`（第三子节点槽，索引型范式第二次复用；⚠ 本批暴露「Node 值传参丢 id」致命坑，2026-10-03）**
+- 选组：`nc` 是当时剩余量级最低的一档（grep 80），且与批次 7 的 `nd` 同属 `na/nb/nc/nd` 四槽中的「子节点索引」族 ⇒ 直接复用已验证的 `-1` 哨兵范式，单批风险最低。
+- 普查（纪律先行）：80 处 `.nc` 命中里 **15 处假阳性**（`tbl_RecFor_nc` / `tbl_RecArm_nc` / `tbl_RecTile_nc` 三处声明 + 三处 `r.nc = tbl_…[i]` 读取 + 注释）⇒ **真实站点 65 处**（写 9 + 读 56）。
+- 存储：`g_node_nc: []i64`（默认 **`-1`** = 无该子节点；越界读也返 `-1`）+ `node_nc()` / `node_set_nc()` + `sidetable_register("node_nc","S4")` + `node_new` 锁步 `append(-1)`。构造器 `mk_for` / `mk_arm` / `mk_tile` **保留 `nc` 形参**，只把 `n.nc = nc` 换成 `node_set_nc((id as u64), nc)` ⇒ 调用点与三个 `cst_register_Rec*` 的 S2 dual-write 签名全不动（沿用批次 5 起的范式）。
+- `nc` 语义（按 kind 复用，本批只做等价搬迁、未拆语义）：① `for` 的**增量表达式**（continue 块，tir 在 `contL` 块发射）｜② `arm`（match 臂）的**体表达式**（`na`=等值模式、`nb`=when 守卫）｜③ `tile` 的 **cols 表达式节点**（`na`=元素类型、`nb`=rows、`nd`=flavor）｜④ `P`（绑定参数）的 **when 守卫表达式**｜⑤ 其余通用第三子节点槽。
+- ⚠⚠ **本批致命坑（新发现；已入 `topics/impl-rules.md`）：`Node` 结构体按值传参时，末尾字段 `id` 不可靠。**
+  迁移时读点统一写成 `base.node_nc((X.id as u64))`（`X` 为 Node 值变量）。这对**局部 `var X: Node = base.nodes[…]`** 成立——实测诊断 `sid=331 nid=331 nc=330`，逐点等价；但 `tir::tir_emit_for(n: Node)` 收的是**形参**，实测 `n.na` 正确（322）而 **`n.id` 读到垃圾值 75**（真实下标 331），于是 `node_nc` 实际读的是 `nodes[75].nc = -1` ⇒ **for 增量被当作「无」而不发射**，定长数组 `!j` 编码的下标循环丢失 `jx0 = jx0 + 1`，实跑 **`arena: out of memory`**（死循环），而 C 后端因原生 `for(;cond;incr)` 语义掩掉该差异、产物仍逐字节一致。
+  根因不在侧表本身（侧表读写逐点等价，诊断已证），而在**依赖了形参 Node 的 `.id`**。
+  修复：`tir_emit_for` 改收**节点索引 `sid: i64`**（函数内 `var n: Node = base.nodes[sid]`），调用点 `tir_emit_for(sid)`；其余读点不动（均为局部变量取值）。
+  **铁律**：凡要按 id 查侧表，**禁止在 `Node` 形参上读 `.id`**——要么用局部 `base.nodes[…]` 取值，要么把索引作为形参传入。（`Node.id` 是 S5 step2 的过渡字段，且是 `Node` 结构的**最后一个**字段，值传参时不可信；改动前从不读它，故此前未暴露。）
+- ✅ 覆盖与等价证据（`nc` 的五种语义全部有语料，且**均验证非默认路径可达**）：
+  ① for 增量 —— `mini.tc`（定长数组 `[3]i64` 的 `!j` 按下标遍历；**死循环强判据**：修复前 g1 实跑 `arena: out of memory`、seed 正确输出 `[10,20,30]`，修复后双方逐字节一致）、`array_range`（`90/90/30`）、`p3_loop_value`（值循环 for 脱糖，走 `desugar_value_loop` 的 `mk_for(n.na, n.nb, node_nc(n.id), …)`，输出 `ok=5`）；
+  ② arm 体 —— `match_demo`（`zero one two many zero positive negative 42 …`）；
+  ③ tile cols —— `tile_demo`（`… 21 6 1 10`）；
+  ④ P when 守卫 —— `clause_demo` / `overload_demo` / `overload_catchall`（`zero positive negative 20 200 …` / `zero one many …` / `default big negative`）；
+  以上 8 个 example 编译 + 实跑输出**逐行 IDENTICAL**；
+  ⑤ **`src/tc.tc` 自身 —— 2.46MB `.c` + 130KB `.h` 逐字节 IDENTICAL**（md5 `cc7be409…` / `56f91b90…`，seed 与 g1 一致），且与 IR 快照 `src/tc.tc::c` 的 `now` 值吻合 ⇒ 该 3 DIFF 属源码变更导致的预期表示漂移。
+- 验证：`tc check` **0 error**（531 warning 全为既有命名风格告警 `T-NAM-W401/W402`/`T-MOD-W561`，无一条与 nc 相关）；g1 自举 2m46s；**首轮 IR 快照异常 = 12 DIFF**（含 9 个 examples，与既往批次「仅 `src/tc.tc` 变」的形态不符）⇒ 按异常信号追查，定位上述致命坑并修复后复跑，回到 **3 DIFF / 0 NEW / 0 GONE（仅 `src/tc.tc::{c,h,ll}`）** ⇒ `--update` 重录基线（117 targets / 354 entries，334.9s）。
+- **gate L2 = 25 passed / 0 failed（3533.6s）**：产物快照比对 468.6s、conformance 149.3s、自举不动点 g2==g3 321.8s、run_examples 694.9s、双轨对拍 381.6s、**四代不动点 g2==g3==g4 174.9s**、MIR 中端 differential 249.5s、C 后端自举 294.0s、rls 400.2s、lint 冒烟 30.3s 全绿。已同步 `g4→out/dbg/tc.exe`、`gr→out/rls/tc.exe`。
+  ⚠ 首轮 gate 在 conformance 步报 `f44_fid_read_agg missing code T_FID_DESERIALIZE_AGG`，但 stderr 显示是**沙箱拦截了该用例文件的读取**（`[sandbox] … (file-read)`）；隔离重跑 `tools/conformance.mjs` 得 **316 passed / 0 failed** ⇒ 属环境偶发，与本次改动无关（第二次完整 gate 该步 PASS 149.3s）。
+- ⚠ **方法论收获**：IR 快照的「examples 出现 DIFF」是本轮唯一能暴露该 bug 的信号（C 后端对拍完全看不出来——跨后端语义差异把增量丢失掩掉了）。后续每批**必须**同时看「examples 是否 0 DIFF」，不能只看 0 NEW/0 GONE。
+
 **剩余字段实测使用量（`.F` 命中数；泛型名字段含非 Node 假阳性，仅作排序参考）**
-`nc 80 / ba 91 / lc 92 / sb 150 / ia 153 / lb 218 / id 237 / nb 461 / la 500 / na 1070 / kind 1187 / sa 1268`（✅ 已迁：`se`、`has_sa`、`has_sb`、`has_sc`、`be`、`bf`、`memspace`、`bd`、`bb`、`bc`、`sc`、`nd`、`ib` —— 共 13 个字段）。
-> 迁移至此，`Node` 的**低使用量尾部（≤65）已清空**，剩余全部 ≥80。三类侧表范式（bool / string / 索引）**全部验证成立**，后续外置只剩工作量、无范式风险。剩余 12 个字段中 `ba 91` 是最后一个 bool 载荷；`sa 1268` / `kind 1187` / `na 1070` 为量级最大的三座高峰（各自宜单独成批或按语义切分）。下一档建议 **`nc 80`**（与已迁的 `nd` 同族，语义内聚，复用索引型范式；假阳性源为 `RecFor.nc` / `RecArm.nc` / `RecTile.nc`）或 **`ba 91`**（最后一个 bool 载荷，宜单独一批）。越往后站点越多、单批风险越高，后续宜**继续小组合 + 组内独立验证**。
+`ba 91 / lc 92 / sb 150 / ia 153 / lb 218 / nb 461 / la 500 / na 1071 / kind 1187 / sa 1268`（`id` 为 S5 step2 过渡字段，随 `Node` 一并消失，不单列迁移）（✅ 已迁：`se`、`has_sa`、`has_sb`、`has_sc`、`be`、`bf`、`memspace`、`bd`、`bb`、`bc`、`sc`、`nd`、`ib`、`nc` —— 共 14 个字段）。
+> 迁移至此，`Node` 的**低使用量尾部（≤80）已清空**，剩余全部 ≥91。三类侧表范式（bool / string / 索引）**全部验证成立**，`na/nb/nc/nd` 四槽已外置其二（`nd`、`nc`），后续外置只剩工作量、无范式风险。剩余 10 个字段中 `ba 91` 是**最后一个 bool 载荷**（宜单独一批）；`sa 1268` / `kind 1187` / `na 1071` 为量级最大的三座高峰（各自宜单独成批或按语义切分）。下一档建议 **`ba 91`**（最后一个 bool 载荷，标量范式最简单）或 **`lc 92`**（与 `la/lb` 同族的 kids 链槽）。越往后站点越多、单批风险越高，后续宜**继续小组合 + 组内独立验证**；且每批**必须核对 examples 是否 0 DIFF**（批次 9 的方法论收获）。
 
 **后续批次（待做，按使用量升序、每组独立绿）**全部完成后删 `pub struct Node` + `nodes[]` + `node_new` 的 Node 构造 + 全部 `slice_set(nodes, …)`，`id` 字段随 `Node` 一并消失（届时裸索引即句柄），S4 方真正收口（随后补 `node_to_hir` 桥改造 + 删 re-export 垫片，见 §4.14.4）。
 
