@@ -1756,7 +1756,9 @@ pub struct Node {
     na: i64;
     nb: i64;
     nc: i64;
-    nd: i64;
+    // S4 第七批（§0.14.7）：nd 已迁出为属性侧表 g_node_nd，访问面走 node_nd()/node_set_nd()
+    // （默认 **-1** = 无该子节点；越界读也返 -1）。na/nb/nc/nd 四槽里 nd 量级最低（真站点 22），
+    // 先迁它以验证「索引型（非 bool / 非 string）侧表」范式，再动 na/nb/nc。
     // S4 第四批（§0.14.7）：memspace 已迁出为属性侧表 g_node_memspace，访问面走
     // node_memspace()/node_set_memspace()（默认 0）。Device 指针地址空间
     // （0=host；1=global/dev_ptr；3=shared；5=local），仅 pointer 类型节点使用。
@@ -1847,6 +1849,7 @@ pub var g_node_bd: []i64;                  // nodes[i] 的 bd（默认 0 = false
 //   仅函数体内由 `n.bb = bb` 改为 `node_set_bb(id, bb)`。
 pub var g_node_bb: []i64;                  // nodes[i] 的 bb（默认 0 = false）
 pub var g_node_bc: []i64;                  // nodes[i] 的 bc（默认 0 = 非 pub）
+pub var g_node_nd: []i64;                  // nodes[i] 的 nd 子节点索引（默认 -1 = 无）
 pub var g_node_sc: []string;               // S4 第六批：nodes[i] 的 sc 字符串载荷（默认 ""）
 
 // ── S3（§4.5）：侧表登记 + provenance 侧表读取面 ──────────────────────────────
@@ -1886,6 +1889,7 @@ pub fn sidetable_init() void {
     sidetable_register("node_bd", "S4");        // SoA：import 库路径 / member-callee 标记（第四批）
     sidetable_register("node_bb", "S4");        // SoA：bool 载荷 is_let/编译期类型参数/显式 offset（第五批）
     sidetable_register("node_bc", "S4");        // SoA：`pub` 顶层可见性标记（第五批）
+    sidetable_register("node_nd", "S4");        // SoA：nd 子节点索引（第七批，默认 -1）
     sidetable_register("node_sc", "S4");        // SoA：字符串载荷（别名/bitpack 标量/lambda 标记/suite 路径；第六批）
 }
 pub fn node_mod(n: u64) string {
@@ -1999,7 +2003,8 @@ pub fn cst_dump(role: string, id: i64, depth: i64) void {
     if (n.na >= 0) { cst_dump("na", n.na, depth + 1); }
     if (n.nb >= 0) { cst_dump("nb", n.nb, depth + 1); }
     if (n.nc >= 0) { cst_dump("nc", n.nc, depth + 1); }
-    if (n.nd >= 0) { cst_dump("nd", n.nd, depth + 1); }
+    var n_nd: i64 = node_nd((id as u64));   // S4 §0.14.7 SoA：侧表读（原 n.nd）
+    if (n_nd >= 0) { cst_dump("nd", n_nd, depth + 1); }
     var c: i64 = n.la; while (c >= 0) { cst_dump("", kids[c].val, depth + 1); c = kids[c].next; }
     c = n.lb; while (c >= 0) { cst_dump("", kids[c].val, depth + 1); c = kids[c].next; }
     c = n.lc; while (c >= 0) { cst_dump("", kids[c].val, depth + 1); c = kids[c].next; }
@@ -2335,6 +2340,22 @@ pub fn node_set_bc(n: u64, v: bool) void {
     if (id < 0 || id >= slice_len(g_node_bc)) { return; }
     if (v) { slice_set(g_node_bc, id, 1); } else { slice_set(g_node_bc, id, 0); }
 }
+// S4 第七批（§0.14.7）：子节点索引 nd（默认 -1 = 无该子节点；越界读返 -1，与 node_new
+// 旧默认值逐点一致）。na/nb/nc/nd 是 Node 的四个「具名子节点槽」，本批先迁量级最低的 nd
+// （真站点 22；grep 命中 30 里 8 处是 RecTile.nd / HIRInst.nd 假阳性）。
+//   nd 语义：通用第四子节点槽（类型节点的 flavor/第二长度、表达式的第四操作数等）。
+// ⚠ 它是 **i64 索引**而非 bool：越界读必须返 -1（不是 0），否则把「无子节点」读成「子节点 0」。
+pub fn node_nd(n: u64) i64 {
+    sidetable_init();
+    var id = nr_idx(n);
+    if (id < 0 || id >= slice_len(g_node_nd)) { return -1; }
+    return g_node_nd[id];
+}
+pub fn node_set_nd(n: u64, v: i64) void {
+    var id = nr_idx(n);
+    if (id < 0 || id >= slice_len(g_node_nd)) { return; }
+    slice_set(g_node_nd, id, v);
+}
 // S4 第六批（§0.14.7）：字符串载荷 sc（默认 ""）。**本批为 sa/sb/sc 字符串整族外置预演**
 // ——首个 `[]string` 类型侧表，验证「非标量侧表 + node_new 锁步 append」范式成立。
 //   sc 按 kind 复用 4 种语义（本次只做等价搬迁，未拆语义）：
@@ -2477,7 +2498,7 @@ pub fn node_new(kind: string) u64 {
     n.na = -1;
     n.nb = -1;
     n.nc = -1;
-    n.nd = -1;
+    // S4 §0.14.7 SoA：nd 已外置为侧表（下方 append(-1) 锁步）
     // S4 第四批（§0.14.7）：memspace 已外置为侧表（默认 0=host，见下方 append）
     n.la = -1;
     n.lb = -1;
@@ -2502,6 +2523,7 @@ pub fn node_new(kind: string) u64 {
     append(g_node_bd, 0);                                   // S4 §0.14.7 SoA：bd 默认 false
     append(g_node_bb, 0);                                   // S4 §0.14.7 SoA：bb 默认 false
     append(g_node_bc, 0);                                   // S4 §0.14.7 SoA：bc 默认 false（非 pub）
+    append(g_node_nd, -1);                                  // S4 §0.14.7 SoA：nd 默认 -1（无子节点）
     append(g_node_sc, "");                                  // S4 §0.14.7 SoA：sc 默认空串（第六批）
     var nref_tag: i64 = nk_of_kind(kind);
     if (nref_tag < 0) { nref_tag = 0; }   // 未注册 kind 暂归 tag=0（g_node_nref 当前无消费方，安全）
@@ -3703,7 +3725,7 @@ pub fn mk_tile(na: i64, nb: i64, nc: i64, nd: i64, ti: i64) u64 {
     n.na = na;
     n.nb = nb;
     n.nc = nc;
-    n.nd = nd;
+    node_set_nd((id as u64), nd);   // S4 §0.14.7 SoA：取代 `n.nd = nd`（形参保留，调用点不变）
     n.ia = -1;
     n.ib = -1;
     n.la = -1;

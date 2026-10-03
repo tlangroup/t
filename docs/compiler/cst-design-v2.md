@@ -699,9 +699,24 @@ if (n.td > 0) { n.td = -1; }          // ← 写在副本上：从未写回 node
   ⑥ **`src/tc.tc` 自身 —— 2.46MB `.c` + 129KB `.h` 逐字节 IDENTICAL**（覆盖 `__lambda__` 全路径与 clone_node 传播）。侧表默认值若错位或站点漏迁，此对拍必然不等。
 - 验证：`tc check` 0 error；g1 重建 2m34s；差分对拍三层全 IDENTICAL + 五种语义路径均可达；IR 快照 **3 DIFF / 0 NEW / 0 GONE**（仅 `src/tc.tc::{c,h,ll}`；114 个 example 目标全不变，覆盖 `[ll,c,dev]`）→ `--update` 重录基线（117 targets / 354 entries）；**gate L2 = 25 passed / 0 failed**；已同步种子 `g4→out/dbg/tc.exe`、`gr→out/rls/tc.exe`。
 
+**批次 7：`nd`（子节点索引，na/nb/nc/nd 四槽外置预演，2026-10-03）**
+- 选组：`nd` 是当时剩余最低一档（grep 40）且已是**孤品**（同族 `na`/`nb`/`nc` 未迁）。本批的真实目标是验证**「索引型侧表」范式**成立（前 6 批只覆盖 bool 与 string 两类），为 `na 1070` / `nb 461` / `nc 80` 三座量级高峰铺路。
+- 普查（纪律先行）：30 处 `.nd` 命中里 **8 处是同名结构体假阳性** —— `RecTile.nd`（`base.tc:1641` 的 `r.nd = tbl_RecTile_nd[i]`，S2 per-kind record）与 `HIRInst.nd`（`hir.tc:142/179/1135/1205/1267`，HIR 指令的 nd 槽，与 CST 节点无关）。**真实 Node 站点 22 处**。
+- 存储：`g_node_nd: []i64`（默认 **`-1`** = 无该子节点；**越界读也返 `-1`**）。`node_new` 锁步 `append(g_node_nd, -1)`。
+- ⚠ **索引型侧表与 bool 侧表的关键差异**：默认值与越界读返回值必须是 **`-1`（哨兵）而非 `0`**。若错写成 `0`，会把「无子节点」读成「子节点 = 节点 0」，是**静默错误**（不崩、不报错，只在深层子树上产出错误结构）。这是本类侧表独有的失败模式，bool/string 类不存在。
+- 站点（22 处）：写 —— `mk_tile`（`nd` 为构造器形参，沿用批次 5 范式：**保留形参、只改函数体** ⇒ 调用点与 `cst_register_RecTile` 的 dual-write 签名不动）、`clone_node` 传播、`subst_type_in_node` / `meta_subst_val_node` / `subst_type_ident_node` 三个替换函数的读改写同槽、`meta_fold_expr` 与 `@zeroed` 折叠的整节点传播、`comptime_rewrite_to_literal` 的子节点槽清零、`dev_safe_node` 的零节点初始化（**直接删除**——侧表越界读天然返 `-1`，与原 `n.nd = -1` 等价，无需保留）；读 —— `cst_dump`、`hir::hir_type_text`（`@Tile(...)` 文本重建）、`sema`（`tile_fold_child` flavor、`fmt_scan_subtree`、`expr_has_local_addr`、`dev_check_node`、`meta_walk`×2、`mb_walk`）、`parse`（`cap_scan`、`lam_find`、`clone_type_node`、`desugar_self_node`）、`comptime_fold`（`comptime_has_runtime_ref`）。
+- ⚠ **本批新踩的工具坑：行尾注释吞掉闭合括号**。批量替换时把 `// 注释` 追加到形如 `if (…) { return …; }` 的**单行**语句尾部，会把该行末尾的 `}` 一并纳入注释 ⇒ 块未闭合 ⇒ 后续 `pub fn` 被判为嵌套声明，报 **`T-MOD-E556`（`pub` 只能修饰顶层声明）**，且报错位置在**下一个函数**而非改动行，极易误判。本批在 `parse.tc:2172` 与 `hir.tc:287` 各踩一次。规避：**替换前先看 old-string 是否含行尾 `}`；若不含，注释必须另起一行写在语句之上**。
+- ⚠ 另一个既有坑的变体：`src/*.tc` **逐文件行尾不同**（本批实测 `parse/sema/hir/tir` = CRLF，`base/codegen_dev/comptime_fold/tc` = LF），脚本须**按文件自适应探测**，不能全局假定 CRLF。
+- ✅ **覆盖与等价证据**：`nd` 的主力语料是 `@Tile(rows, cols, T, flavor)` 的第四参（flavor 槽），`examples/tile_demo.tc` 完整覆盖且**含非默认值路径**（`hardware`=0 与 `simulate`=1）：
+  ① `tile_demo` 实跑（`tc run`）新旧双方输出**逐行一致**，含 `@tile_flavor(e)` = **1**（证明 nd 槽被写入、被 `tile_fold_child` 读出、经 `hir_type_text` 重建，非默认值路径可达）；
+  ② 17 个 example 编译产物（`.c`/`.h`）**全部 IDENTICAL**（含 `vector_demo`、`generics_demo`、`meta`、`fmt_json_a1a`、`fstring_json`、三个 lambda/closure 例）；
+  ③ 自建泛型×tile probe（`fn tsum(comptime T: type) { var a: @Tile(2,2,T,simulate); … }`，类型参数嵌在 `@Tile` 内部 ⇒ 触发 `subst_type_in_node` 递归进 tile 的 nd 分支）—— 产物 IDENTICAL，实跑退出码双方均 **24**（`tsum(i32)=12 + tsum(i64)=12`）；
+  ④ **`src/tc.tc` 自身 —— 2.46MB `.c` + 129KB `.h` 逐字节 IDENTICAL**（覆盖 `clone_node` 传播、三个 subst 函数、`meta_walk`/`mb_walk`/`cap_scan`/`lam_find`/`desugar_self_node`/`comptime_fold` 全部读方）。侧表默认值若为 `0` 或站点漏迁，此对拍必然不等。
+- 验证：`tc check` 0 error；g1 重建 2m36s；IR 快照 **3 DIFF / 0 NEW / 0 GONE**（仅 `src/tc.tc::{c,h,ll}`）→ `--update` 重录基线（117 targets / 354 entries）；**gate L2 = 25 passed / 0 failed**；已同步种子 `g4→out/dbg/tc.exe`、`gr→out/rls/tc.exe`。
+
 **剩余字段实测使用量（`.F` 命中数；泛型名字段含非 Node 假阳性，仅作排序参考）**
-`nd 40 / ib 65 / nc 80 / ba 91 / lc 92 / sb 150 / ia 153 / lb 218 / id 237 / nb 461 / la 500 / na 1070 / kind 1187 / sa 1268`（✅ 已迁：`se`、`has_sa`、`has_sb`、`has_sc`、`be`、`bf`、`memspace`、`bd`、`bb`、`bc`、`sc` —— 共 11 个字段）。
-> 迁移至此，`Node` 的**低使用量尾部（≤40）仅剩 `nd 40`**；其余全部 ≥65。已外置 11 个字段、剩余 14 个，其中 `ba 91` 是最后一个 bool 载荷，`sa 1268` / `kind 1187` / `na 1070` 为量级最大的三座高峰（各自宜单独成批）。越往后站点越多、单批风险越高，后续宜**继续小组合 + 组内独立验证**；下一档建议 `nd`+`nc`（子节点索引，语义内聚，`nd` 已剩孤品）或 `ib`。`[]string` 侧表范式已由 `sc` 验证成立，`sa`/`sb` 外置不再有范式风险、只剩工作量。
+`ib 65 / nc 80 / ba 91 / lc 92 / sb 150 / ia 153 / lb 218 / id 237 / nb 461 / la 500 / na 1070 / kind 1187 / sa 1268`（✅ 已迁：`se`、`has_sa`、`has_sb`、`has_sc`、`be`、`bf`、`memspace`、`bd`、`bb`、`bc`、`sc`、`nd` —— 共 12 个字段）。
+> 迁移至此，`Node` 的**低使用量尾部（≤40）已清空**，剩余全部 ≥65。三类侧表范式（bool / string / 索引）**全部验证成立**，后续外置只剩工作量、无范式风险。剩余 13 个字段中 `ba 91` 是最后一个 bool 载荷；`sa 1268` / `kind 1187` / `na 1070` 为量级最大的三座高峰（各自宜单独成批或按语义切分）。下一档建议 **`nc 80`**（与已迁的 `nd` 同族，语义内聚，可复用本批的索引型范式）或 `ib 65`（标量 int 载荷，量级最低）。越往后站点越多、单批风险越高，后续宜**继续小组合 + 组内独立验证**。
 
 **后续批次（待做，按使用量升序、每组独立绿）**全部完成后删 `pub struct Node` + `nodes[]` + `node_new` 的 Node 构造 + 全部 `slice_set(nodes, …)`，`id` 字段随 `Node` 一并消失（届时裸索引即句柄），S4 方真正收口（随后补 `node_to_hir` 桥改造 + 删 re-export 垫片，见 §4.14.4）。
 
