@@ -627,7 +627,27 @@ if (n.td > 0) { n.td = -1; }          // ← 写在副本上：从未写回 node
 - 验证：`tc check` 0 error；`g1` 自举重建成功；`examples/c_interop.tc`（`@c_export`）经 g1 C 后端编译运行输出 `5`/`55`，生成 C 为干净名 `int64_t add(...)`/`fib(...)`（证实 se 侧表读回正确）；IR 快照 **3 DIFF（`src/tc.tc::{c,h,ll}`，0 NEW/0 GONE）** → 用户程序 IR 中性。
 - ⚠ **通用安全规则（本轮再印证）**：凡「无此节点」哨兵的 `-1` 必须显式整型（`var x: i64 = -1`），不可裸写 `var x = -1`（t 推断 `u8` 致符号扩展越界崩溃——见 S5 step5 教训）。
 
-**后续批次（待做，按使用量升序、每组独立绿）**：`se` 之后依次 `memspace / ba / bb / bc / bd / be / bf / ia / ib / has_sa / has_sb / has_sc / sa / sb / sc / la / lb / lc / na / nb / nc / nd`；全部完成后删 `pub struct Node` + `nodes[]` + `node_new` 的 Node 构造 + 全部 `slice_set(nodes, …)`，`id` 字段随 `Node` 一并消失（届时裸索引即句柄），S4 方真正收口（随后补 `node_to_hir` 桥改造 + 删 re-export 垫片，见 §4.14.4）。
+**批次 2：`has_sa` / `has_sb` / `has_sc`（存在性标志位组，2026-10-03）**
+- **先做同名字段普查（§0.13 / S3「6019 血泪」纪律）**：`.has_sa|.has_sb|.has_sc` 全部命中 18 处，其中 **4 处是同名假阳性** —— `base.tc:408/409/437/557` 的 `r.has_sa/r.has_sc` 属于 S2 已 SoA 化的 **per-kind record struct**（`RecImportDecl` / `RecImportModDecl` / `RecStructDecl`，配套 `tbl_RecXxx_has_sc`），与 `Node` 无关。**真实 Node 站点仅 10 处**，普查砍掉 22% 假工作量。
+- 另查**整节点赋值**（`nodes[a] = nodes[b]` / `slice_set(nodes, a, nodes[b])`）：**不存在**（唯一一条 `slice_set(nodes, id, nodes[id])` 是同节点自赋值的空操作）⇒ 字段外置后不会因值拷贝而丢失传播，搬迁安全。
+- 存储：`g_node_has_sa / g_node_has_sb / g_node_has_sc: []i64`（沿用 `g_node_const` 的 **0/1 先例**而非 `[]bool`，与既有侧表切片类型保持一致）。
+- ⚠ **默认值必须是 `1`（true）** —— 旧 `node_new` 写的是 `n.has_sa = true`，只有 3 个 `mk_*` 构造器才可能置 false。故：`node_new` append `1`，且**访问器越界返回 `true`**（按「字段默认值」对齐，而非返回 0；仿 `node_se` 越界返 `""` 的处理）。这是本组最易错的一点。
+- 站点（10 处）：`node_new`（默认值）、`mk_ImportDecl`(sa,sc) / `mk_ImportModDecl`(sc) / `mk_StructDecl`(sc) 写；`codegen_c.tc::emit_struct_decl` 读（`n.ba && base.node_has_sc(d)`，**唯一读方**）；`sema.tc::clone_node` 跨节点传播（**唯一传播点**，原 `nn.has_X = sn.has_X`）。
+- ⚠ **覆盖缺口与补强（重要方法）**：该读方是 `@bitpack` 判定，而 **115 个 examples 对 `@bitpack` 零覆盖** ⇒ IR 快照**无法**证明其等价。故补做**差分对拍**：`tc compile out/_bitprobe2.tc`（含 `@bitpack(Backing) struct Flags`，且已否决两个错误写法 —— 参数不能是 `u32` 这类**类型关键字**、也不能缺省）分别由**变更前种子 `out/dbg/tc.exe`（= step3 的 g4）**与**新 g1** 发射，`.h` / `.c` **逐字节相同**；并确认产物里出现 `// @bitpack(Backing) struct`（证明该代码路径确实被触达，而非双方都没走到）。
+  → 沉淀为 epic 通用方法：**IR 快照覆盖不到的站点，一律用「变更前编译器 vs 新编译器」差分对拍补证**，并显式验证路径可达。
+- 验证：`tc check` 0 error；g1 重建成功；差分对拍 `.h`/`.c` IDENTICAL；IR 快照 **3 DIFF（`src/tc.tc::{c,h,ll}`，0 NEW/0 GONE）** ⇒ 114 个 example 目标全部不变；**gate L2 = 25 passed / 0 failed（2732.9s）**。
+
+**⚠ 本轮踩到的门禁假失败（已定位并修，记入速查）**
+- 前两次 gate L2 分别 **24/1**（`双轨对拍` 228.0s，87/88）与 **23/2**（`双轨对拍` **恰 480.0s** + 连带 `REPL 冒烟` 35.0s 失败）。
+- 判据：① 唯一「真」失败项耗时**恰 480.0s** = `STEP_TIMEOUT_MS`（8min）硬超时被 SIGKILL（速查坑已知形态）；② 同参数**手跑 `_diffpipe.mjs` 两次均 88/88**（196s / 259s）、`repl_test.mjs` 手跑 **4/4 全过**；③ `REPL` 与本次 src 改动**毫无关系**（4 条 read_line 冒烟），它失败只能来自资源竞争。
+- 根因：`双轨对拍` 88 用例 × 双轨（LLVM + TIR）全量编译 + clang 链接，紧接在 `run_examples`（本轮 492.4s，已放宽到 20min）之后跑，**受资源竞争影响显著**。被 SIGKILL 的步骤留下孤儿进程 → 拖慢/拖挂后续步骤。
+- 处置（与 snapshot 步同一做法：**调用处传 `timeoutMs`，不抬高全局默认值**）：`双轨对拍` 步放宽到 20min。**只抬预算、不改判据**（新旧轨不一致仍硬失败）。放宽后第三次 gate = **25/0**。
+- 沉淀：**门禁出现「耗时≈480.0s 且手跑可过」的失败时，先按硬超时/资源竞争处置，勿当成回归**；并注意一个被杀的步骤会连带拖挂后续步骤，需逐项手跑复验。
+
+**剩余字段实测使用量（`.F` 命中数；泛型名字段含非 Node 假阳性，仅作排序参考）**
+`has_sb 3 / has_sa 5 / be 6 / has_sc 10 / bf 12 / memspace 13 / bd 15 / bc 30 / sc 33 / bb 38 / nd 40 / ib 65 / nc 80 / ba 91 / lc 92 / sb 150 / ia 153 / lb 218 / id 237 / nb 461 / la 500 / na 1070 / kind 1187 / sa 1268`（✅ 已迁：`se`、`has_sa`、`has_sb`、`has_sc`）。
+
+**后续批次（待做，按使用量升序、每组独立绿）**全部完成后删 `pub struct Node` + `nodes[]` + `node_new` 的 Node 构造 + 全部 `slice_set(nodes, …)`，`id` 字段随 `Node` 一并消失（届时裸索引即句柄），S4 方真正收口（随后补 `node_to_hir` 桥改造 + 删 re-export 垫片，见 §4.14.4）。
 
 ### 0.13.9 `node_scope` 设计（经批判修订；原"统一作用域基础设施"方案已降级）
 

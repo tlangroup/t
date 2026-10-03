@@ -395,7 +395,14 @@ const r = await node("ir_snapshot.mjs", "--compiler", `${G1}.exe`, "--jobs", "1"
             // 而非冻结的种子 tc.exe —— 种子 predate overload fn 语法，无法编译本期新增的
             // overload_type / overload_catchall 等示例，会误报双轨不一致。
             if (existsSync(`${G3}.exe`) === false) return { ok: false, note: "g3.exe 缺失：前置自举步骤未产出" };
-            const r = await node("_diffpipe.mjs", "--mode", "dbg", "--jobs", "4", "--strict", "--compiler", `${G3}.exe`);
+            // ⚠ 单步超时放宽（与 snapshot 步同一做法：调用处传 timeoutMs，不抬高全局默认值）：
+            //   本步 88 用例 × 双轨（LLVM + TIR）全量编译 + clang 链接，紧接在
+            //   run_examples（~450–490s，本身已放宽到 20min）之后跑，实测受**资源竞争**
+            //   影响显著：手跑 ~200–260s 全绿，门禁内却两次撞上 STEP_TIMEOUT_MS=8min
+            //   （一次 480.0s 被 SIGKILL，一次 228s 但有 1 例两轨无输出）。放宽到 20min
+            //   只抬高预算、**不改变判据**（新旧轨不一致仍硬失败）。
+            const r = await node("_diffpipe.mjs", "--mode", "dbg", "--jobs", "4", "--strict", "--compiler", `${G3}.exe`,
+                { timeoutMs: 20 * 60 * 1000 });
             const lines = r.out.split("\n").filter((l) => l.startsWith("_diffpipe:"));
             const summary = lines.length ? lines[lines.length - 1].replace(/^_diffpipe:\s*/, "") : lastLine(r.out, 2);
             return { ok: r.code === 0, note: summary };
