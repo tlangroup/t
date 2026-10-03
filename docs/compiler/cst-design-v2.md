@@ -667,9 +667,24 @@ if (n.td > 0) { n.td = -1; }          // ← 写在副本上：从未写回 node
   - `memspace` 的读方 `codegen_dev` **只在 device 轨执行**（C 轨不触达），故额外做 **`emit-dev` 轨对拍**：`vecadd_device.tc` 的 `.mlir` **DEV_IDENTICAL**，且产物含 **`!llvm.ptr<1>`×25（global/dev_ptr）+ `!llvm.ptr<3>`×4（shared）** ⇒ 非 0 的 memspace 值被正确写入并读出（侧表默认值若错位会立即暴露），`kernel_func`×2 证明 bf 路径同时可达。
 - 验证：`tc check` 0 error；g1 重建 2m26s；差分对拍 5/5 IDENTICAL + dev 轨 IDENTICAL + 路径可达；IR 快照 **3 DIFF / 0 NEW / 0 GONE**（仅 `src/tc.tc::{c,h,ll}`；114 个 example 目标全不变，覆盖 `[ll,c,dev]`）→ `--update` 重录基线（117 targets / 354 entries）；**gate L2 = 25 passed / 0 failed（3019.0s）**，四代不动点 `g2==g3==g4` + 双轨对拍 320.1s + REPL 25.6s + lint 冒烟 24.8s 全绿。已同步种子 `g4→out/dbg/tc.exe`、`gr→out/rls/tc.exe`。
 
+**批次 5：`bb` / `bc`（bool 载荷组，2026-10-03）**
+- 选组：剩余最低两档（`bc 30` / `bb 38`），且同属 bool 载荷家族（与 `ba` 三连；`ba 91` 量级偏大，留待下批单独处理）。
+- 普查（纪律先行）：`bc` 30 处命中里 2 处在注释中 ⇒ 真站点 29；`bb` 38 处里 **4 处是 S2 record-struct 假阳性** —— `base.tc:215/349/378/522` 的 `r.bb = tbl_RecFuncDecl_bb[i]` 等（`RecFuncDecl` / `RecGlobalConstDecl` / `RecGlobalVarDecl` / `RecSL`，S2 已 SoA 化的 per-kind record）⇒ 真站点 34。
+- ⚠ **本组新形态：`bb` 同时是 4 个 `mk_*` 构造器的形参**（`mk_FuncDecl` / `mk_GlobalConstDecl` / `mk_GlobalVarDecl` / `mk_SL`）。处置：**保留形参、只改函数体**（`n.bb = bb` → `node_set_bb((id as u64), bb)`）⇒ 15 处 `mk_FuncDecl(...)` 调用点与 `cst_register_Rec*` 的 S2 dual-write **签名全部不动**，把「跨模块签名变更」级风险降为「局部一行」。这是本组能安全并入同一批的关键。沉淀为范式：**构造器形参不必随字段外置而删除**，形参作为构造参数仍可语义自洽地转写为侧表写。
+- ⚠ **新坑：局部 `base` 遮蔽模块名（通用，记入速查）**：`sema::fr_resolve_bitfield` / `fr_resolve_flag` 与 `codegen_c` 的 flag 布局函数内都有局部变量 `var base: i64`（位基址），**遮蔽了 base 模块名** ⇒ 这些作用域内不能写 `base.node_bb(...)`（会被解析成对 i64 取字段），必须直呼降级名 **`base__node_bb(...)`**。本组共 3 处（sema×2、codegen_c×1）。
+- 语义复用（勿擅自拆分）：`bb` 按 kind 承载 4 种语义 —— `let`/`auto` 的 is_let（VarDecl）、comptime 类型参数（`P`）、`comptime fn` 标记（FuncDecl）、`SL` 显式 offset 标志。外置只做**等价搬迁**（单一 `g_node_bb`），语义拆分属独立重构，不在本 epic 范围。`bc` 语义单一：声明是否被 `pub` 修饰（顶层跨模块可见性）。
+- 存储：`g_node_bb / g_node_bc: []i64`（默认 **0 = false**，与 `be`/`bf`/`bd` 同向；第三次印证「默认值必须回看旧 `node_new` 而非沿用上一组」）。
+- 站点（63 处）：`bc` —— 写 19 处集中在 `parse`（各类顶层声明的 `is_export` 分支，`nodes[d].bc = true` → `node_set_bc`）；读 `sema`（reexport 判定、`collect_module_defs` 的 `def_add`）、`tir`（链接库 `tir_emit_extern` 门控）、`tir_to_ll`（lib 导出 json）；传播 `sema::clone_node`。`bb` —— 写 `parse`（auto/let/P.pcomp）+ 4 个 `mk_*`；读 `sema`（`func_is_generic`、`instantiate_generic`、flag/SL offset、`comptime fn` 判定、meta 折叠筛选）、`tir`、`codegen_c`、`hir`（HIR GlobalDecl `ba` 位）。
+  - SoA 附带收益：4 处「取值 → 改字段 → `slice_set` 回写整节点」简化为单 setter（parse 的 `auto`/`let`/`P.pcomp`、sema 的 ident 未解析一次性诊断位与 match 重入位）。
+- ✅ **覆盖与等价证据（本组最强，因语料天然零覆盖）**：`bc` 与 `bb` 的 is_let 分支在 115 个 examples 上**覆盖极弱**（examples 无 `let`、pub 消费需跨模块），故按 epic 通用方法做**三层差分对拍**（变更前种子 `out/dbg/tc.exe` = 批次 4 的 g4 vs 新 g1，编译同一份源）：
+  ① 7 个 examples：`physics` / `agentkit` / `c_interop`（pub 顶层声明）、`bitstr_demo` / `bitstr_protocol`（SL 显式 offset ⇒ bb 非 0）、`generics_demo`（comptime 类型参数 ⇒ P.bb）、`meta`（`comptime fn` ⇒ FuncDecl.bb）—— `.c`/`.h` 全 IDENTICAL；
+  ② 自建 probe `out/_p5let.tc`（`let` + `auto` + `pub fn` + `pub struct`）—— IDENTICAL，且**显式验证路径可达**：产物含 `int64_t lv = 5;`（let 发射）、`uint8_t au = 3;`（auto 走 is_let）、`pub_add`；
+  ③ **`src/tc.tc` 自身**（497+188+430+239 处 pub 声明、34+63 处 comptime，覆盖 `bc` 全部读方与 `bb` 全部 4 种语义）—— **2.4MB `.c` + 129KB `.h` 逐字节 IDENTICAL**。侧表默认值若错位（true/false 反向）或站点漏迁，此对拍必然不等。
+- 验证：`tc check` 0 error；g1 重建 2m27s；IR 快照 **3 DIFF / 0 NEW / 0 GONE**（仅 `src/tc.tc::{c,h,ll}`；114 个 example 目标全不变，覆盖 `[ll,c,dev]`）→ `--update` 重录基线（117 targets / 354 entries）；**gate L2 = 25 passed / 0 failed（2957.2s）** —— 产物快照比对 PASS（447.3s，重录后由 DIFF 转 PASS）、自举四代不动点 `g2==g3==g4`（154.8s）、run_examples 双后端（568.1s）、双轨对拍（288.3s）、C 后端自举（234.4s）、MIR differential（193.1s）、lint 冒烟 22.9s 全绿。已同步种子 `g4→out/dbg/tc.exe`、`gr→out/rls/tc.exe`。
+
 **剩余字段实测使用量（`.F` 命中数；泛型名字段含非 Node 假阳性，仅作排序参考）**
-`bc 30 / sc 33 / bb 38 / nd 40 / ib 65 / nc 80 / ba 91 / lc 92 / sb 150 / ia 153 / lb 218 / id 237 / nb 461 / la 500 / na 1070 / kind 1187 / sa 1268`（✅ 已迁：`se`、`has_sa`、`has_sb`、`has_sc`、`be`、`bf`、`memspace`、`bd`）。
-> 迁移至此，`Node` 的**低使用量尾部（≤15）已清空**；剩余全部 ≥30，其中 `bc 30` / `sc 33` / `bb 38` / `nd 40` 为下一档。越往后站点越多、单批风险越高，后续宜**继续小组合 + 组内独立验证**，并在语义内聚处（如 `ba/bb/bc` 三个 bool 可见性/属性标志）合并处理。
+`sc 33 / nd 40 / ib 65 / nc 80 / ba 91 / lc 92 / sb 150 / ia 153 / lb 218 / id 237 / nb 461 / la 500 / na 1070 / kind 1187 / sa 1268`（✅ 已迁：`se`、`has_sa`、`has_sb`、`has_sc`、`be`、`bf`、`memspace`、`bd`、`bb`、`bc`）。
+> 迁移至此，`Node` 的**低使用量尾部（≤40）仅剩 `sc 33` / `nd 40`**；其余全部 ≥65（`ba 91` 是最后一个 bool 载荷）。越往后站点越多、单批风险越高，后续宜**继续小组合 + 组内独立验证**；下一档建议 `sc`（字符串载荷，与 `sa`/`sb` 同族，为 sa/sb/sc 整族外置预演）或 `nd`+`nc`（子节点索引，语义内聚）。`ba` 量级 91，宜单独一批。
 
 **后续批次（待做，按使用量升序、每组独立绿）**全部完成后删 `pub struct Node` + `nodes[]` + `node_new` 的 Node 构造 + 全部 `slice_set(nodes, …)`，`id` 字段随 `Node` 一并消失（届时裸索引即句柄），S4 方真正收口（随后补 `node_to_hir` 桥改造 + 删 re-export 垫片，见 §4.14.4）。
 
