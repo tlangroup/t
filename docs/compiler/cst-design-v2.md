@@ -656,9 +656,20 @@ if (n.td > 0) { n.td = -1; }          // ← 写在副本上：从未写回 node
 - 验证：`tc check` 0 error；g1 重建成功（2m10s）；差分对拍 3/3 IDENTICAL + 路径可达；IR 快照 **3 DIFF / 0 NEW / 0 GONE**（仅 `src/tc.tc::{c,h,ll}`；114 个 example 目标全不变，快照覆盖 `[ll,c,dev]` 三轨）→ `--update` 重录基线（117 targets / 354 entries）；**gate L2 = 25 passed / 0 failed（2960.0s）**，四代不动点 `g2==g3==g4` + lint 冒烟 27.0s 全绿。已同步种子 `g4→out/dbg/tc.exe`、`gr→out/rls/tc.exe`。
 - ✅ **反证上一批的门禁假失败处置正确**：本轮 `双轨对拍` **PASS（286.5s）**、连带曾失败的 `REPL 冒烟` **PASS（24.7s）** —— 放宽 `timeoutMs`（只抬预算不改判据）后连续两轮不再出现，确认此前是资源竞争而非回归。
 
+**批次 4：`memspace` / `bd`（Device 地址空间 + 模块/成员标记，2026-10-03）**
+- 选组：紧接批次 3 的两个最低量字段。**两者语义并不内聚**，但都属「低量 + 有语料覆盖」的可安全搬迁项，故同批实施、**组内各自独立验证**（`tc check` + 重建 g1 + 差分对拍 + IR 快照），批次边界跑一次 gate L2（沿用 §0.14.7 的 staged 纪律：完整 gate 只在批次边界跑）。
+- ⚠ **普查大量砍掉假工作量（本组最典型）**：`memspace` 计数 13 处，其中 **7 处是同名假阳性** —— `tbl_RecPointer_memspace` + `RecPointer` struct（S2 已 SoA 化的 per-kind record，base.tc:1351-1363）、`sema` 的 `TD.memspace`（类型描述，sema.tc:32）、`tir`/`codegen_c` 的 `t.memspace`（同一个 TD）。**真实 Node 站点仅 6 处**。`bd` 计数 15 处，`base.tc:417/423/426/438` 的 4 处属 `RecImportModDecl`（S2 record struct）⇒ 真实站点 11 处。
+- ⚠ **`bd` 字段被复用（重要，勿擅自拆分语义）**：同一字段承载两种语义 —— ① `ImportDecl`/`ImportModDecl` = 是否走库搜索路径（`lib/` 依赖库 vs `src` 源码根）；② `member` 节点 = 是否是某个 `call` 的 callee（由 `sema::mark_call_callees` 置位，`infer_expr_body` 据此抑制「结构体无此字段」的 T-SEM-E208 误报，见 sema.tc:7598-7601 注释）。外置只做**等价搬迁**（单一 `g_node_bd` 侧表），语义拆分属独立重构，不在本 epic 范围。
+- 存储：`g_node_memspace: []i64`（默认 **0** = host，值域 0/1/3/5）、`g_node_bd: []i64`（默认 **0** = false）。两者默认值均为「零」，与批次 3 同向（再次印证：默认值必须回看旧 `node_new`，而非沿用上一组）。
+- 站点（17 处）：`memspace` —— 写 `mk_dev_ptr`（`node_set_memspace`）；读 `codegen_dev::dev_type_of`（发 `!llvm.ptr<as>`）、`sema::resolve_type_desc`（透传 `TD.memspace`）。`bd` —— 写 `mk_ImportModDecl`（库路径）、`parse`（`test "..."` 合成函数标记）、`sema::mark_call_callees`（member callee）；读 `sema`（3 处 import 库路径判定 + 1 处字段误报抑制）、`test.tc`（3 处测试筛选）、dump；传播 `sema::clone_node`。
+  - SoA 附带收益：`parse` 的测试函数分支原本是「取值 → 改 `bd`/`sb`/`sc`/`bc` → `slice_set` 回写」，其中 `bd` 已改走侧表（其余字段仍在 Node 上，回写保留）；`sema::mark_call_callees` 的 `ce.bd = true` 同理。
+- ✅ **覆盖与等价证据（本组最强）**：三种 bd 语义均有语料覆盖 —— ① 库路径：`@import("std.sort")`（bsearch_demo）、② 测试标记：`testing_demo.tc`、③ member callee：普遍方法调用。差分对拍（变更前种子 vs 新 g1）5/5 IDENTICAL（testing_demo / bsearch_demo / vecadd_device / vecadd_device_full / c_interop），并显式验证路径可达：产物含 `__test_`×5、`sort`×19。
+  - `memspace` 的读方 `codegen_dev` **只在 device 轨执行**（C 轨不触达），故额外做 **`emit-dev` 轨对拍**：`vecadd_device.tc` 的 `.mlir` **DEV_IDENTICAL**，且产物含 **`!llvm.ptr<1>`×25（global/dev_ptr）+ `!llvm.ptr<3>`×4（shared）** ⇒ 非 0 的 memspace 值被正确写入并读出（侧表默认值若错位会立即暴露），`kernel_func`×2 证明 bf 路径同时可达。
+- 验证：`tc check` 0 error；g1 重建 2m26s；差分对拍 5/5 IDENTICAL + dev 轨 IDENTICAL + 路径可达；IR 快照 **3 DIFF / 0 NEW / 0 GONE**（仅 `src/tc.tc::{c,h,ll}`；114 个 example 目标全不变，覆盖 `[ll,c,dev]`）→ `--update` 重录基线（117 targets / 354 entries）；**gate L2 = 25 passed / 0 failed（3019.0s）**，四代不动点 `g2==g3==g4` + 双轨对拍 320.1s + REPL 25.6s + lint 冒烟 24.8s 全绿。已同步种子 `g4→out/dbg/tc.exe`、`gr→out/rls/tc.exe`。
+
 **剩余字段实测使用量（`.F` 命中数；泛型名字段含非 Node 假阳性，仅作排序参考）**
-`be 6 / bf 12 / memspace 13 / bd 15 / bc 30 / sc 33 / bb 38 / nd 40 / ib 65 / nc 80 / ba 91 / lc 92 / sb 150 / ia 153 / lb 218 / id 237 / nb 461 / la 500 / na 1070 / kind 1187 / sa 1268`（✅ 已迁：`se`、`has_sa`、`has_sb`、`has_sc`、`be`、`bf`）。
-> ⚠ `memspace` 的 13 处里多数是**同名假阳性**：`tbl_RecPointer_memspace`（S2 已 SoA 化的 record struct）、`sema` 的 `TD.memspace`、`tir/codegen_c` 的 `t.memspace`。真实 Node 站点仅 ~5 处（定义 / `node_new` 默认 / `mk_pointer_as` 写 / `codegen_dev`+`sema` 读），实际工作量低于计数。
+`bc 30 / sc 33 / bb 38 / nd 40 / ib 65 / nc 80 / ba 91 / lc 92 / sb 150 / ia 153 / lb 218 / id 237 / nb 461 / la 500 / na 1070 / kind 1187 / sa 1268`（✅ 已迁：`se`、`has_sa`、`has_sb`、`has_sc`、`be`、`bf`、`memspace`、`bd`）。
+> 迁移至此，`Node` 的**低使用量尾部（≤15）已清空**；剩余全部 ≥30，其中 `bc 30` / `sc 33` / `bb 38` / `nd 40` 为下一档。越往后站点越多、单批风险越高，后续宜**继续小组合 + 组内独立验证**，并在语义内聚处（如 `ba/bb/bc` 三个 bool 可见性/属性标志）合并处理。
 
 **后续批次（待做，按使用量升序、每组独立绿）**全部完成后删 `pub struct Node` + `nodes[]` + `node_new` 的 Node 构造 + 全部 `slice_set(nodes, …)`，`id` 字段随 `Node` 一并消失（届时裸索引即句柄），S4 方真正收口（随后补 `node_to_hir` 桥改造 + 删 re-export 垫片，见 §4.14.4）。
 

@@ -1653,7 +1653,9 @@ pub fn clone_node(src: i64) i64 {
     base.node_set_has_sb((id as u64), base.node_has_sb((src as u64)));
     base.node_set_has_sc((id as u64), base.node_has_sc((src as u64)));
     nn.ia = sn.ia; nn.ib = sn.ib;
-    nn.ba = sn.ba; nn.bb = sn.bb; nn.bc = sn.bc; nn.bd = sn.bd;
+    nn.ba = sn.ba; nn.bb = sn.bb; nn.bc = sn.bc;
+    // S4 §0.14.7 SoA：bd 已外置，跨节点传播走侧表访问器（取代 `nn.bd = sn.bd`）
+    base.node_set_bd((id as u64), base.node_bd((src as u64)));
     nn.na = clone_node(sn.na);
     nn.nb = clone_node(sn.nb);
     nn.nc = clone_node(sn.nc);
@@ -7598,7 +7600,7 @@ pub fn infer_expr_body(e: i64) i64 {
                         // 仅在「确实解析到了 StructDecl」时报，未解析/外部类型仍放行。
                         // bd 标记 = 该 member 是某个 call 的 callee（方法调用写法，如
                         // @derive 的 `p.clone()`），不是字段读，交由 call 分支处理。
-                        if (n.bd == false) {
+                        if (base.node_bd((e as u64)) == false) {   // S4 §0.14.7 SoA：原 `n.bd`（n = base.nodes[e]）
                             parse.fc_err("T-SEM-E208",
                                 base.sb_cat4("结构体 `", tip_name(obt), "` 没有字段 `",
                                     base.sb_cat2(n.sa, "`：请检查拼写，或先在 struct 声明中加上该字段")), e);
@@ -10035,7 +10037,7 @@ pub fn handle_one_import(imp: i64) void {
     // 库导入（路径首段非 src）：走库搜索路径（入口/lib、工程根/lib、out/lib 预编译缓存），
     // 命中 .tc 源码则内联（名字重整后即为命名空间隔离）；若同时命中 .tlib 预编译产物则走外链模式。
     var chosen: string = "";
-    if (base__nodes[imp].bd) {
+    if (base.node_bd((imp as u64))) {   // S4 §0.14.7 SoA：原 `base__nodes[imp].bd`
         chosen = resolve_external_lib(nm);
         if (chosen == "") {
             parse__fc_err("T-MOD-E550",
@@ -10086,7 +10088,7 @@ pub fn handle_one_import(imp: i64) void {
     // 链接模式探测：存在 .tlib 预编译产物且未用 as 别名（归档按规范名构建，as 别名会错配）→ 外链。
     // 库源码仍载入供类型检查，但导出符号改发 declare、私有跳过，归档在链接期并入（真·独立编译+链接）。
     var ar: string = "";
-    if (base__nodes[imp].bd && user_alias == "" && in_mod_visited(chosen) == false) {
+    if (base.node_bd((imp as u64)) && user_alias == "" && in_mod_visited(chosen) == false) {   // S4 §0.14.7 SoA
         ar = resolve_external_lib_archive(nm);
     }
     // 记录依赖图边（父 -> 子），供 --emit-deps 输出（父 = 当前活跃栈顶）。
@@ -10102,7 +10104,7 @@ pub fn handle_one_import(imp: i64) void {
     }
     append(lex__g_mod_visited, chosen);
     mod_stack_push(chosen, alias);            // 进入：压栈
-    mod_attr_add(alias, base__nodes[imp].bd);       // 登记：bd=true ⇒ 来自库（跨包）
+    mod_attr_add(alias, base.node_bd((imp as u64)));       // 登记：bd=true ⇒ 来自库（跨包）；S4 §0.14.7 SoA
     load_module_file(chosen, alias);
     lex__g_mod_stack = slice_pop_str(lex__g_mod_stack);          // 离开：弹栈
     lex__g_mod_stack_alias = slice_pop_str(lex__g_mod_stack_alias);
@@ -13627,7 +13629,9 @@ pub fn mark_call_callees() void {
         if (nd.kind == "call" && nd.na >= 0) {
             var ce: Node = base__nodes[nd.na];
             if (ce.kind == "member") {
-                ce.bd = true;
+                // S4 §0.14.7 SoA：bd 已外置（原 `ce.bd = true` + 整节点回写）。
+                // 注意 bd 字段此处是**第二种语义**：member 节点 = 某 call 的 callee。
+                base.node_set_bd((nd.na as u64), true);
                 slice_set(base__nodes, nd.na, ce);
             }
         }
@@ -14411,7 +14415,8 @@ pub fn resolve_type_desc(tn: i64) i64 {
     if (n.kind == "pointer") {
         // 地址空间透传：dev_ptr[T]/shared[T]/local[T] 解析出的 pointer 节点带 n.memspace（as=1/3/5），
         // 普通 *T 为 0。统一经 td_ptr_mk 落 TD.memspace，供 ll_td 发 `ptr addrspace(N)`。
-        return td_ptr_mk(resolve_type_desc(n.na), n.memspace);
+        // S4 §0.14.7 SoA：memspace 已外置（原 `n.memspace`；n = base.nodes[tn]）
+        return td_ptr_mk(resolve_type_desc(n.na), base.node_memspace((tn as u64)));
     }
     // 可选类型 ?T：双后端统一落「指向元素的指针」（none = 空指针）。
     // 缺失此分支时 ?T 会被 resolve 成 unknown → LLVM 把 ?i64 的函数返回类型
