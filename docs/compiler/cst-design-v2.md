@@ -682,9 +682,26 @@ if (n.td > 0) { n.td = -1; }          // ← 写在副本上：从未写回 node
   ③ **`src/tc.tc` 自身**（497+188+430+239 处 pub 声明、34+63 处 comptime，覆盖 `bc` 全部读方与 `bb` 全部 4 种语义）—— **2.4MB `.c` + 129KB `.h` 逐字节 IDENTICAL**。侧表默认值若错位（true/false 反向）或站点漏迁，此对拍必然不等。
 - 验证：`tc check` 0 error；g1 重建 2m27s；IR 快照 **3 DIFF / 0 NEW / 0 GONE**（仅 `src/tc.tc::{c,h,ll}`；114 个 example 目标全不变，覆盖 `[ll,c,dev]`）→ `--update` 重录基线（117 targets / 354 entries）；**gate L2 = 25 passed / 0 failed（2957.2s）** —— 产物快照比对 PASS（447.3s，重录后由 DIFF 转 PASS）、自举四代不动点 `g2==g3==g4`（154.8s）、run_examples 双后端（568.1s）、双轨对拍（288.3s）、C 后端自举（234.4s）、MIR differential（193.1s）、lint 冒烟 22.9s 全绿。已同步种子 `g4→out/dbg/tc.exe`、`gr→out/rls/tc.exe`。
 
+**批次 6：`sc`（字符串载荷，sa/sb/sc 整族外置预演，2026-10-03）**
+- 选组：`sc 33` 为当时剩余最低一档，且是 **首个 `[]string` 类型侧表** —— 先前 5 批全是 `[]i64`（bool 以 0/1 表示）。本批的真实目标是**验证「非标量侧表 + `node_new` 锁步 append」范式成立**，为 `sa`/`sb`（杀手级量级 1268/150）整族外置铺路。
+- 普查（纪律先行）：33 处 `.sc` 命中里 **14 处是同名结构体假阳性**，来自三个不同的结构体 —— `RecImportDecl` / `RecImportModDecl` / `RecStructDecl`（S2 已 SoA 化的 per-kind record，`cst_get_Rec*` 里的 `r.sc = tbl_RecX_sc[i]`）、`Diag.sc`（诊断起始列，base.tc:3984/3998/5156/5170/5244/5245）、`FixS.sc`（修复起始列，base.tc:4057）。**真实 Node 站点 19 处**。
+- ⚠ **`sc` 按 kind 复用 5 种语义（本批最多，勿擅自拆分）**：① `ImportDecl`/`ImportModDecl` 的用户书写别名（`@import("x" as m)` 的 `m`）；② `StructDecl` 的 `@bitpack(T)` 标量成员类型名（`node_has_sc` 为真时有效）；③ `FuncDecl` 的 `"__lambda__"` Lambda 脱糖标记（检查期据此把未解析标识符判为「捕获失败」，LLVM 后端据此前置 env 首参）；④ `FuncDecl` 的 suite 测试路径（`g_suite_path`，`tc test` 的显示名前缀）；⑤ `P` Param 的 conpat variant 类型名（后端据此拼 `<V>_is_<C>` / `<V>_as_<C>`）。外置只做**等价搬迁**（单一 `g_node_sc`），语义拆分属独立重构，不在本 epic 范围。
+- 存储：`g_node_sc: []string`（默认 **`""`**；越界读返 `""`，与 `node_mod`/`node_file` 同规约）。`node_new` 锁步 `append(g_node_sc, "")`。
+- 站点（19 处）：写 —— `mk_ImportDecl` / `mk_ImportModDecl` / `mk_StructDecl`（三者 `sc` 均为**构造器形参**，沿用批次 5 沉淀的范式：**保留形参、只改函数体** ⇒ 调用点与 `cst_register_Rec*` 的 S2 dual-write 签名全不动）、`parse`（lambda 标记、suite 路径）、`sema`（conpat `P.sc = vname`）、`clone_node` 传播；读 —— `cst_dump`、`hir`（`HIR_OP_IMPORT_DECL` 的 b 串）、`sema`（`g_in_lambda` 判定、`handle_one_import` 的 `user_alias`、lambda 无捕获识别）、`tir`（env 首参前置门控）、`codegen_c`（`conpat_walk` 的 variant 名、`@bitpack` 标量类型）、`test`（测试显示名 `sc + " / " + sb`）。
+- ⚠ **搬迁前必查「值拷贝是否有回写」（为本批特设检查项）**：Node 值拷贝上的写若无 `slice_set` 回写即为**无效写**，此时迁到侧表会把「无效写」变成「真实生效」，属于**顺手改 bug**、会让本轮验证指标无法归因（违反 §0.14.7 等价搬迁铁律）。本批逐个确认了三处值拷贝写均有回写：`parse::lift_one_lambda` 的 `fdn.sc`（两条出口各有 `slice_set`，parse.tc:1894/1958）、`parse::parse_test_decl` 的 `fn_n.sc`（2600）、`sema::conpat_check` 的 `pn.sc`（3105）⇒ 均可安全等价搬迁为 setter。
+- ⚠ **工具坑（本批新踩）**：`src/*.tc` 是 **CRLF 行尾**，多行跨行替换模式必须写 `\r\n`；用纯 `\n` 构造的 old-string 会静默匹配失败（Python 需以 `newline=''` 打开才保留 `\r\n`）。
+- ✅ **覆盖与等价证据（本组最强，因 examples 天然零覆盖）**：五种语义中 **①②③ 在 examples 上覆盖极弱**（`examples/` 无 `@bitpack`、无 `import X as Y`、无 `suite`，仓库内 `src`/`lib` 也一个 `as` 别名都没有），故自建 3 份 probe 并按 epic 通用方法做差分对拍（变更前种子 vs 新 g1，编译同一份源）：
+  ① `@import("std.math" as mm); return mm.abs(-5);` —— IDENTICAL，且**路径可达**：产物含 **`mm__abs`**（mangle 消费了 sc=mm；若侧表读失效会退化为「未定义的标识符 mm」而非编译通过）；
+  ② `struct Proto @bitpack(u16) { cmd: i64; len: i64; }` —— IDENTICAL，路径可达：`.h` 含 **`// @bitpack(u16) struct`**；
+  ③ `suite "math" { test … }` 含嵌套 suite —— `tc test` 双方同为 `test math / dbl 应翻倍` + `test math / nest / zero` 2 passed，路径可达（显示名 = `sc + " / " + sb`，正是 `test.tc:252` 的消费者；旧 doc 曾误记 examples 无 suite，实为 `tests/samples` 有）；
+  ④ `__lambda__` —— `lambda_demo` / `closure_demo` / `closure_struct_demo` 三个 example IDENTICAL；
+  ⑤ conpat variant 名 —— `adt_status` 等 12 个 example IDENTICAL，路径可达：`.c` 含 **`Status_is_Ok`** / **`Status_as_Ok`**（消费 copat 的 sc=Status）；
+  ⑥ **`src/tc.tc` 自身 —— 2.46MB `.c` + 129KB `.h` 逐字节 IDENTICAL**（覆盖 `__lambda__` 全路径与 clone_node 传播）。侧表默认值若错位或站点漏迁，此对拍必然不等。
+- 验证：`tc check` 0 error；g1 重建 2m34s；差分对拍三层全 IDENTICAL + 五种语义路径均可达；IR 快照 **3 DIFF / 0 NEW / 0 GONE**（仅 `src/tc.tc::{c,h,ll}`；114 个 example 目标全不变，覆盖 `[ll,c,dev]`）→ `--update` 重录基线（117 targets / 354 entries）；**gate L2 = 25 passed / 0 failed**；已同步种子 `g4→out/dbg/tc.exe`、`gr→out/rls/tc.exe`。
+
 **剩余字段实测使用量（`.F` 命中数；泛型名字段含非 Node 假阳性，仅作排序参考）**
-`sc 33 / nd 40 / ib 65 / nc 80 / ba 91 / lc 92 / sb 150 / ia 153 / lb 218 / id 237 / nb 461 / la 500 / na 1070 / kind 1187 / sa 1268`（✅ 已迁：`se`、`has_sa`、`has_sb`、`has_sc`、`be`、`bf`、`memspace`、`bd`、`bb`、`bc`）。
-> 迁移至此，`Node` 的**低使用量尾部（≤40）仅剩 `sc 33` / `nd 40`**；其余全部 ≥65（`ba 91` 是最后一个 bool 载荷）。越往后站点越多、单批风险越高，后续宜**继续小组合 + 组内独立验证**；下一档建议 `sc`（字符串载荷，与 `sa`/`sb` 同族，为 sa/sb/sc 整族外置预演）或 `nd`+`nc`（子节点索引，语义内聚）。`ba` 量级 91，宜单独一批。
+`nd 40 / ib 65 / nc 80 / ba 91 / lc 92 / sb 150 / ia 153 / lb 218 / id 237 / nb 461 / la 500 / na 1070 / kind 1187 / sa 1268`（✅ 已迁：`se`、`has_sa`、`has_sb`、`has_sc`、`be`、`bf`、`memspace`、`bd`、`bb`、`bc`、`sc` —— 共 11 个字段）。
+> 迁移至此，`Node` 的**低使用量尾部（≤40）仅剩 `nd 40`**；其余全部 ≥65。已外置 11 个字段、剩余 14 个，其中 `ba 91` 是最后一个 bool 载荷，`sa 1268` / `kind 1187` / `na 1070` 为量级最大的三座高峰（各自宜单独成批）。越往后站点越多、单批风险越高，后续宜**继续小组合 + 组内独立验证**；下一档建议 `nd`+`nc`（子节点索引，语义内聚，`nd` 已剩孤品）或 `ib`。`[]string` 侧表范式已由 `sc` 验证成立，`sa`/`sb` 外置不再有范式风险、只剩工作量。
 
 **后续批次（待做，按使用量升序、每组独立绿）**全部完成后删 `pub struct Node` + `nodes[]` + `node_new` 的 Node 构造 + 全部 `slice_set(nodes, …)`，`id` 字段随 `Node` 一并消失（届时裸索引即句柄），S4 方真正收口（随后补 `node_to_hir` 桥改造 + 删 re-export 垫片，见 §4.14.4）。
 
