@@ -714,9 +714,26 @@ if (n.td > 0) { n.td = -1; }          // ← 写在副本上：从未写回 node
   ④ **`src/tc.tc` 自身 —— 2.46MB `.c` + 129KB `.h` 逐字节 IDENTICAL**（覆盖 `clone_node` 传播、三个 subst 函数、`meta_walk`/`mb_walk`/`cap_scan`/`lam_find`/`desugar_self_node`/`comptime_fold` 全部读方）。侧表默认值若为 `0` 或站点漏迁，此对拍必然不等。
 - 验证：`tc check` 0 error；g1 重建 2m36s；IR 快照 **3 DIFF / 0 NEW / 0 GONE**（仅 `src/tc.tc::{c,h,ll}`）→ `--update` 重录基线（117 targets / 354 entries）；**gate L2 = 25 passed / 0 failed**；已同步种子 `g4→out/dbg/tc.exe`、`gr→out/rls/tc.exe`。
 
+**批次 8：`ib`（通用整数槽，索引型侧表范式复用，2026-10-03）**
+- 选组：`ib` 是当时剩余量级最低的一档（grep 59），且与批次 7 的 `nd` 同属**索引型**载荷 ⇒ 可直接复用刚验证过的 `-1` 哨兵范式，单批风险最低。
+- 普查（纪律先行）：59 处 `.ib` 命中里 **15 处是假阳性** —— 3 处 S2 per-kind record 读取（`base.tc:524` `r.ib = tbl_RecSL_ib[i]`、`1646` `tbl_RecTile_ib`、`1693` `tbl_RecConpat_ib`）+ 12 处注释。**真实 Node 站点 44 处**。
+- 存储：`g_node_ib: []i64`（默认 **`-1`** = 无标记；**越界读也返 `-1`**）。`node_new` 锁步 `append(g_node_ib, -1)`。
+- ⚠ **`ib` 是复用最重的字段：按 kind 承载 6 种互不相干的语义**（本批只做等价搬迁，未拆语义）：
+  ① `SL`（flag 槽位）的显式 offset（配合 `bb` 标志位；`@offset(n)` 注解）｜② `tile` 节点折叠出的**列数**（`ia`=行、`ib`=列、`la`=flavor）｜③ `array_lit` 被 sema 回填的 **TD 下标**（`>=0` 表示此字面量构造向量/瓦片，`cat` 查 `tds[ib]`；⚠ 标记只能挂 `ib`——`array_lit` 的 `ia` 在 sema 之后会被抹回 `-1`，历史实测）｜④ `conpat` 的子模式个数 / `VC`（variant case）的载荷个数（多载荷 `>=2`）｜⑤ `F`（结构体字段）的 **tagID**（`>=1` 显式 `@N` / 全自动顺序分配 `1,2,3…` / `-1` 未分配）｜⑥ leading-dot 结构体字面量 `.{...}` 的标记（`==1`）。
+- 站点（44 处）：写 —— `mk_SL` / `mk_tile` / `mk_conpat`（`ib` 均为构造器形参，沿用批次 5 范式：**保留形参、只改函数体** ⇒ 调用点与三个 `cst_register_Rec*` 的 dual-write 签名全不动）、`parse` 5 处（合成 `F` 节点、`F.tagID`、leading-dot 标记、`VC` 载荷数，均有 `slice_set` 回写）、`sema` 8 处（`tile_resolve` 列数回填、`clone_node` 传播、向量/瓦片字面量 TD 标记、`@tsplat`/tile 内省回填、struct tagID 全自动分配）；读 —— `cst_dump`、`sema` 12 处（`tile_resolve` 已折叠判定、`conpat_check` 的 want/got、`resolve_type_desc`、struct tagID 统计与去重、flag 布局显式 offset ×2、leading-dot ×2）、`codegen_c` 9 处（`@tsplat` 列数、conpat 多载荷访问器、`@tile_cols` 内省、向量/瓦片字面量发射、`array_lit` 二次包裹门控、flag 布局、type_info 序列化 tagID）、`tir` 2 处、`tir_to_ll` 1 处。
+- ⚠ **本批新踩的坑：按「首个匹配行」定位字段会命中同名的 S2 record**。脚本用「找第一个 `ib: i64;`」删字段，实际删掉的是 `base.tc:506` 的 **`RecSL.ib`**（S2 per-kind record，与 `Node` 无关），`Node.ib` 反而没删。正确做法：**先定位 `pub struct Node {` 的行号，再在其块内查找**；或用带上下文的 `old_string`（`ia: i64;\n ib: i64;\n ba: bool;`）让工具因「不唯一」报错来暴露歧义。已写进 `topics/impl-rules.md`。
+- ✅ **覆盖与等价证据**：`ib` 的 6 种语义全部有现成语料，且**均验证了非默认值路径可达**：
+  ① 显式 offset —— examples 无 `@offset` 用例（`tests/samples/game_ecs.tc` 有但是旧 `import(X)` 语法已废弃、编译不过），故自建 probe `flag Slot[u32] { lo: 8 @offset(0); hi: 8 @offset(16); tag: 4 @offset(24); }`：产物 IDENTICAL，实跑退出码双方均 **9**（`flag_get(lo)=3 + hi=5 + tag=1` —— offset 若读错则位域重叠、值必然不同）；`bitflags` / `bitstr_demo` / `bitstr_protocol` 实跑输出一致；
+  ② tile 列数 —— `tile_demo` 实跑双方同为 `6 / 1 / 10`；
+  ⑤ tagID —— `tagid_typeinfo` 产物 `__ti_Point_f[]` 含 `, 1 }` / `, 2 }` / `, 3 }`（显式 `@1/@2/@3`），`__ti_Auto_f[]` 同为 `1/2/3`（**全自动分配分支**）⇒ 两条分支都被消费；
+  ⑥ leading-dot —— `tuple_demo` 实跑输出逐行一致（`t.0=1 t.1=hi t.2=true` …）；
+  ③④ —— `adt_multi` / `adt_shape` / `adt_status` / `match_ext` / `shapes` / `vdot_all` / `vector_demo` 等 17 个 example 编译产物**全部 IDENTICAL**；
+  ⑦ **`src/tc.tc` 自身 —— 2.46MB `.c` + 129KB `.h` 逐字节 IDENTICAL**（覆盖 `clone_node` 传播、tagID 决议、flag 布局、全部读方）。侧表默认值若为 `0` 或任一站点漏迁，此对拍必然不等。
+- 验证：`tc check` 0 error；g1 重建 4m28s；IR 快照 **3 DIFF / 0 NEW / 0 GONE**（仅 `src/tc.tc::{c,h,ll}`）→ `--update` 重录基线（117 targets / 354 entries）；**gate L2 = 25 passed / 0 failed**；已同步种子 `g4→out/dbg/tc.exe`、`gr→out/rls/tc.exe`。
+
 **剩余字段实测使用量（`.F` 命中数；泛型名字段含非 Node 假阳性，仅作排序参考）**
-`ib 65 / nc 80 / ba 91 / lc 92 / sb 150 / ia 153 / lb 218 / id 237 / nb 461 / la 500 / na 1070 / kind 1187 / sa 1268`（✅ 已迁：`se`、`has_sa`、`has_sb`、`has_sc`、`be`、`bf`、`memspace`、`bd`、`bb`、`bc`、`sc`、`nd` —— 共 12 个字段）。
-> 迁移至此，`Node` 的**低使用量尾部（≤40）已清空**，剩余全部 ≥65。三类侧表范式（bool / string / 索引）**全部验证成立**，后续外置只剩工作量、无范式风险。剩余 13 个字段中 `ba 91` 是最后一个 bool 载荷；`sa 1268` / `kind 1187` / `na 1070` 为量级最大的三座高峰（各自宜单独成批或按语义切分）。下一档建议 **`nc 80`**（与已迁的 `nd` 同族，语义内聚，可复用本批的索引型范式）或 `ib 65`（标量 int 载荷，量级最低）。越往后站点越多、单批风险越高，后续宜**继续小组合 + 组内独立验证**。
+`nc 80 / ba 91 / lc 92 / sb 150 / ia 153 / lb 218 / id 237 / nb 461 / la 500 / na 1070 / kind 1187 / sa 1268`（✅ 已迁：`se`、`has_sa`、`has_sb`、`has_sc`、`be`、`bf`、`memspace`、`bd`、`bb`、`bc`、`sc`、`nd`、`ib` —— 共 13 个字段）。
+> 迁移至此，`Node` 的**低使用量尾部（≤65）已清空**，剩余全部 ≥80。三类侧表范式（bool / string / 索引）**全部验证成立**，后续外置只剩工作量、无范式风险。剩余 12 个字段中 `ba 91` 是最后一个 bool 载荷；`sa 1268` / `kind 1187` / `na 1070` 为量级最大的三座高峰（各自宜单独成批或按语义切分）。下一档建议 **`nc 80`**（与已迁的 `nd` 同族，语义内聚，复用索引型范式；假阳性源为 `RecFor.nc` / `RecArm.nc` / `RecTile.nc`）或 **`ba 91`**（最后一个 bool 载荷，宜单独一批）。越往后站点越多、单批风险越高，后续宜**继续小组合 + 组内独立验证**。
 
 **后续批次（待做，按使用量升序、每组独立绿）**全部完成后删 `pub struct Node` + `nodes[]` + `node_new` 的 Node 构造 + 全部 `slice_set(nodes, …)`，`id` 字段随 `Node` 一并消失（届时裸索引即句柄），S4 方真正收口（随后补 `node_to_hir` 桥改造 + 删 re-export 垫片，见 §4.14.4）。
 

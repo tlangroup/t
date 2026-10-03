@@ -745,11 +745,12 @@ pub fn expr_type_desc(e: i64) i64 {
         if (n.sa == "tsplat") {
             // @tsplat(scalar, rows, cols) -> @Tile(rows, cols, typeof(scalar), hardware)
             // sema 的 tsplat 分支已回填 n.sb（元素标量类型名）/ n.ia（行）/ n.ib（列）。
-            if (str_len(n.sb) > 0 && n.ia > 0 && n.ib > 0) {
+            var n_ib: i64 = base.node_ib((e as u64));   // S4 §0.14.7 SoA：侧表读（原 n.ib）
+    if (str_len(n.sb) > 0 && n.ia > 0 && n_ib > 0) {
                 var tzsc: i64 = sema.td_named_mk("scalar", n.sb);
                 var tzrow: i64 = sema.td_elem_mk("array", tzsc);
                 var tzrowd: TD = sema.tds[tzrow];
-                tzrowd.alen = n.ib;
+                tzrowd.alen = n_ib;
                 slice_set(sema.tds, tzrow, tzrowd);
                 var tztil: i64 = sema.td_elem_mk("tile", tzrow);
                 var tztiled: TD = sema.tds[tztil];
@@ -1514,7 +1515,7 @@ pub fn conpat_walk(p: i64, subj: i64) void {
         // 多载荷（cp.ib >= 2，conpat_check 已保证个数与声明一致）逐字段访问器
         // `_as_<C>_f<k>`；单载荷沿用 `_as_<C>`，保证既有 variant 发射字节不变。
         var cp_accn: string;
-        if (cp.ib >= 2) {
+        if (base.node_ib((p as u64)) >= 2) {   // S4 §0.14.7 SoA：侧表读（原 cp.ib）
             cp_accn = base.sb_cat4(cp_v, "_as_", cp_c, base.sb_cat2("_f", base.i2s(bi)));
         } else {
             cp_accn = base.sb_cat3(cp_v, "_as_", cp_c);
@@ -2754,7 +2755,7 @@ pub fn emit_expr(e: i64) string {
         if (n.sa == "tile_rows" || n.sa == "tile_cols" || n.sa == "tile_flavor") {
             var tztvd: i64 = -1;
             if (n.sa == "tile_rows") { tztvd = n.ia; }
-            else if (n.sa == "tile_cols") { tztvd = n.ib; }
+            else if (n.sa == "tile_cols") { tztvd = base.node_ib((e as u64)); }   // S4 §0.14.7 SoA：侧表读（原 n.ib）
             else { tztvd = n.lc; }
             return base.i2s(tztvd);
         }
@@ -3138,8 +3139,9 @@ pub fn emit_expr(e: i64) string {
         // 向量字面量构造：`[a,b,c,d]` 被 sema 标记为向量 TD（n.ib>=0 且 cat==vector）
         // → 发射 C 向量复合字面量 `(VTY){a,b,c,d}`（VTY 含 vector_size 属性）。
         // ⚠ 标记走 ib 而非 ia：array_lit 的 ia 在 sema 之后会被抹回 -1。
-        if (n.ib >= 0 && sema.tds[n.ib].cat == "vector") {
-            var vty: string = desc_to_c(n.ib);
+        var n_ibv: i64 = base.node_ib((e as u64));   // S4 §0.14.7 SoA：侧表读（原 n.ib）
+    if (n_ibv >= 0 && sema.tds[n_ibv].cat == "vector") {
+            var vty: string = desc_to_c(n_ibv);
             var sbv: StringBuilder = sb_new();
             sb_append_char(sbv, 40);
             sb_append_str(sbv, vty);
@@ -3159,8 +3161,8 @@ pub fn emit_expr(e: i64) string {
         }
         // 瓦片字面量构造：`[[a,b],[c,d]]` 被 sema 标记为瓦片 TD（n.ib>=0 且 cat==tile）
         // → 发射扁平 T* 缓冲 `(T*)(&(T[rows*cols]){a,b,c,d})`（行主序），两个后端数据布局一致。
-        if (n.ib >= 0 && sema.tds[n.ib].cat == "tile") {
-            var ttd: i64 = n.ib;
+        if (n_ibv >= 0 && sema.tds[n_ibv].cat == "tile") {
+            var ttd: i64 = n_ibv;
             var rowtd2: i64 = sema.tds[ttd].elem;
             var scaltd: i64 = sema.tds[rowtd2].elem;
             var scalty: string = desc_to_c(scaltd);
@@ -3342,7 +3344,7 @@ pub fn c_emit_call_arg(aen: i64) string {
         s = c_slice_lit_expr(aen, c_arg_expect_td);
     } else {
         s = emit_expr(aen);
-        if (base.nodes[aen].kind == "array_lit" && base.nodes[aen].ib < 0) {
+        if (base.nodes[aen].kind == "array_lit" && base.node_ib((aen as u64)) < 0) {   // S4 §0.14.7 SoA：侧表读（原 .ib）
             var aty: string = c_array_lit_value_ty(aen);
             if (aty != "") {
                 s = base.sb_cat4("(", aty, ")", s);
@@ -3863,7 +3865,7 @@ pub fn fr_layout(d: i64) i64 {
         // S4 §0.14.7 SoA：侧表读（原 sl.bb）。⚠ 本函数内有局部 `var base: i64` 遮蔽 base 模块，
         // 故此处直呼降级名 `base__node_bb`，不能写 `base.node_bb`。
         if (base__node_bb((sl.id as u64))) {
-            start = sl.ib;
+            start = base__node_ib((sl.id as u64));   // S4 §0.14.7 SoA：侧表读（原 sl.ib）
         }
         var end: i64 = start + sl.ia;
         append(fl_names, sl.sa);
@@ -5233,7 +5235,7 @@ pub fn emit_type_info_c(tname: string) string {
             sb_append_str(fsb, base.sb_cat3("sizeof(", cty, "), "));
             sb_append_i64(fsb, isp);
             sb_append_str(fsb, ", ");
-            sb_append_i64(fsb, f.ib);   // 字段 tagID（@N 显式 / 全自动自动分配）
+            sb_append_i64(fsb, base.node_ib((k.val as u64)));   // S4 §0.14.7 SoA：侧表读（原 f.ib，字段 tagID）
             sb_append_str(fsb, " }");
             n = n + 1;
         }

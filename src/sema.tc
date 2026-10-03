@@ -438,8 +438,9 @@ pub fn tile_resolve(tn: i64) i64 {
     var n: Node = base.nodes[tn];
     var telem: i64 = resolve_ti(n.na);
     // 已折叠且已校验：直接重建 TI（resolve_ti 可能多次进入同一节点）
-    if (n.ia >= 1 && n.ib >= 1 && n.la >= 0) {
-        return ti_tile(telem, n.ia, n.ib, n.la);
+    var n_ib: i64 = base.node_ib((tn as u64));   // S4 §0.14.7 SoA：侧表读（原 n.ib）
+    if (n.ia >= 1 && n_ib >= 1 && n.la >= 0) {
+        return ti_tile(telem, n.ia, n_ib, n.la);
     }
     var first: bool = tile_checked_has(tn) == false;
     if (first) { append(g_tile_checked, tn); }
@@ -497,7 +498,7 @@ pub fn tile_resolve(tn: i64) i64 {
     }
     var tn2: Node = base.nodes[tn];
     tn2.ia = rows;
-    tn2.ib = cols;
+    base.node_set_ib((tn as u64), cols);   // S4 §0.14.7 SoA：取代 `tn2.ib`（下方 slice_set 回写生效）
     tn2.la = flavor;
     slice_set(base.nodes, tn, tn2);
     return ti_tile(telem, rows, cols, flavor);
@@ -1654,7 +1655,8 @@ pub fn clone_node(src: i64) i64 {
     base.node_set_has_sa((id as u64), base.node_has_sa((src as u64)));
     base.node_set_has_sb((id as u64), base.node_has_sb((src as u64)));
     base.node_set_has_sc((id as u64), base.node_has_sc((src as u64)));
-    nn.ia = sn.ia; nn.ib = sn.ib;
+    nn.ia = sn.ia;
+    base.node_set_ib((id as u64), base.node_ib((src as u64)));   // S4 §0.14.7 SoA：取代 `nn.ib = sn.ib`
     nn.ba = sn.ba;
     // S4 §0.14.7 SoA：bb/bc 已外置，跨节点传播走侧表访问器（取代 `nn.bb = sn.bb; nn.bc = sn.bc;`）
     base.node_set_bb((id as u64), base.node_bb((src as u64)));
@@ -3089,11 +3091,11 @@ pub fn conpat_check(pat: i64, scr: i64, rep: bool) void {
     // 载荷个数：单元 0、单载荷 1、多载荷 = vcn.ib（>=2，载荷类型链在 vcn.lb）
     var want: i64 = 0;
     if (vcn.lb >= 0) {
-        want = vcn.ib;
+        want = base.node_ib((vc as u64));   // S4 §0.14.7 SoA：侧表读（原 vcn.ib）
     } else if (vcn.na >= 0) {
         want = 1;
     }
-    var got: i64 = pn.ib;
+    var got: i64 = base.node_ib((pat as u64));   // S4 §0.14.7 SoA：侧表读（原 pn.ib）
     if (got != want) {
         if (rep) {
             parse.fc_err("T-MAT-E743",
@@ -5362,7 +5364,7 @@ pub fn tuple_lit_type_name(elem_tis: []i64) string {
             var fnn: Node = base.nodes[fid];
             fnn.sa = base.sb_cat2("_", base.i2s(idx));
             fnn.na = elem_nodes[idx];   // 字段类型节点（元素类型，sema 期 resolve_ti 解析）
-            fnn.ib = -1;
+            base.node_set_ib((fid as u64), -1);   // S4 §0.14.7 SoA：取代 `fnn.ib`（下方 slice_set 回写生效）
             fnn.la = -1;
             fnn.nb = -1;
             slice_set(base.nodes, fid, fnn);
@@ -6284,7 +6286,7 @@ pub fn infer_expr_body(e: i64) i64 {
                 var spn: Node = base.nodes[e];
                 spn.sb = tip_name(sti);
                 spn.ia = rows;
-                spn.ib = cols;
+                base.node_set_ib((e as u64), cols);   // S4 §0.14.7 SoA：取代 `spn.ib`（下方 slice_set 回写生效）
                 slice_set(base.nodes, e, spn);
                 return ti_tile(sti, rows, cols, 0);
             }
@@ -6307,7 +6309,7 @@ pub fn infer_expr_body(e: i64) i64 {
                 // 覆盖它会破坏实参解析，使二次类型推断取到错误节点（如 main 函数节点）而误报 E926。
                 var spn2: Node = base.nodes[e];
                 spn2.ia = ti_trows(ati);
-                spn2.ib = ti_tcols(ati);
+                base.node_set_ib((e as u64), ti_tcols(ati));   // S4 §0.14.7 SoA：取代 `spn2.ib`（下方 slice_set 回写生效）
                 spn2.lc = ti_tflavor(ati);
                 slice_set(base.nodes, e, spn2);
                 return ti_scalar("i64");
@@ -7694,7 +7696,7 @@ pub fn infer_expr_body(e: i64) i64 {
             // ⚠ 只能用 ib：array_lit 的 ia 在 sema 之后会被抹回 -1（实测），
             // 标记若挂在 ia 上，codegen 侧读到 -1 → 落到 UNSUPPORTED/裸数组路径。
             var nn: Node = base.nodes[e];
-            nn.ib = ti_to_td_base(vc);
+            base.node_set_ib((e as u64), ti_to_td_base(vc));   // S4 §0.14.7 SoA：取代 `nn.ib`（下方 slice_set 回写生效）
             slice_set(base.nodes, e, nn);
             return vc;
         }
@@ -7760,7 +7762,7 @@ pub fn infer_expr_body(e: i64) i64 {
                 rk = rchild.next;
             }
             var nnt: Node = base.nodes[e];
-            nnt.ib = ti_to_td_base(tc0);
+            base.node_set_ib((e as u64), ti_to_td_base(tc0));   // S4 §0.14.7 SoA：取代 `nnt.ib`（下方 slice_set 回写生效）
             slice_set(base.nodes, e, nnt);
             return tc0;
         }
@@ -7842,7 +7844,7 @@ pub fn infer_expr_body(e: i64) i64 {
         // 前导点 `.{...}`：省略类型名，类型由上下文（g_lead_expect）提供的具名结构体推断。
         // 接受 Struct 与 Named 两种 TI 种类——具名结构体注解经 resolve_ti 可能落为 Named，
         // 故统一按「期望类型名解析到 StructDecl」判定，避免漏判。
-        if (n.ib == 1 && n.sa == "") {
+        if (base.node_ib((e as u64)) == 1 && n.sa == "") {   // S4 §0.14.7 SoA：侧表读（原 n.ib）
             var ok: bool = false;
             if (g_lead_expect >= 0) {
                 var exp_name: string = tip_name(g_lead_expect);
@@ -7905,7 +7907,7 @@ pub fn infer_expr_body(e: i64) i64 {
         // 前导点嵌套：仅对「字段值是结构体字面量（struct_lit）」的字段，按字段类型回填
         // g_lead_expect 后就地推断，使嵌套 `.{...}` 拿到正确的结构体上下文（标量/标识符字段
         // 交由后端在发射期推断即可，避免重复推断）。
-        if (n.ib == 1 && fh >= 0) {
+        if (base.node_ib((e as u64)) == 1 && fh >= 0) {   // S4 §0.14.7 SoA：侧表读（原 n.ib）
             var c2: i64 = n.la;
             while (c2 >= 0) {
                 var fv: Node = base.nodes[base.kids[c2].val];
@@ -8833,7 +8835,7 @@ pub fn check_struct_decl(d: i64) void {
         var k: Child = base.kids[c];
         var f: Node = base.nodes[k.val];
         total = total + 1;
-        if (f.ib >= 1) { tag_count = tag_count + 1; }
+        if (base.node_ib((k.val as u64)) >= 1) { tag_count = tag_count + 1; }   // S4 §0.14.7 SoA：侧表读（原 f.ib）
         if (f.ia == -1) {
             resolve_ti(f.na);
         }
@@ -8856,12 +8858,13 @@ pub fn check_struct_decl(d: i64) void {
                 var q: i64 = base.kids[p].next;
                 while (q >= 0) {
                     var qf: Node = base.nodes[base.kids[q].val];
-                    if (pf.ib >= 1 && qf.ib == pf.ib) {
+                    var pf_ib: i64 = base__node_ib((base.kids[p].val as u64));   // S4 §0.14.7 SoA：侧表读（原 pf.ib）
+    if (pf_ib >= 1 && base__node_ib((base.kids[q].val as u64)) == pf_ib) {
                         var osb: StringBuilder = sb_new();
                         sb_append_str(osb, "struct '");
                         sb_append_str(osb, n.sa);
                         sb_append_str(osb, "': 字段 tagID 重复 @");
-                        sb_append_i64(osb, pf.ib);
+                        sb_append_i64(osb, pf_ib);
                         sb_append_str(osb, "（字段 '");
                         sb_append_str(osb, pf.sa);
                         sb_append_str(osb, "' 与 '");
@@ -8880,7 +8883,7 @@ pub fn check_struct_decl(d: i64) void {
             var cc: i64 = n.lb;
             while (cc >= 0) {
                 var ff: Node = base.nodes[base.kids[cc].val];
-                ff.ib = idx;
+                base.node_set_ib((base.kids[cc].val as u64), idx);   // S4 §0.14.7 SoA：取代 `ff.ib`（下方 slice_set 回写生效）
                 slice_set(base.nodes, base.kids[cc].val, ff);
                 idx = idx + 1;
                 cc = base.kids[cc].next;
@@ -8968,7 +8971,7 @@ pub fn check_flag_decl(d: i64) void {
         // S4 §0.14.7 SoA：侧表读（原 sl.bb）。⚠ 本函数内有局部 `var base: i64` 遮蔽 base 模块，
         // 故此处直呼降级名 `base__node_bb`，不能写 `base.node_bb`。
         if (base__node_bb((sl.id as u64))) {
-            start = sl.ib;
+            start = base__node_ib((sl.id as u64));   // S4 §0.14.7 SoA：侧表读（原 sl.ib）
         }
         var end: i64 = start + sl.ia;
 
@@ -13694,7 +13697,7 @@ pub fn fr_resolve_flag(d: i64) void {
         // S4 §0.14.7 SoA：侧表读（原 sl.bb）。⚠ 本函数内有局部 `var base: i64` 遮蔽 base 模块，
         // 故此处直呼降级名 `base__node_bb`，不能写 `base.node_bb`。
         if (base__node_bb((sl.id as u64))) {
-            start = sl.ib;
+            start = base__node_ib((sl.id as u64));   // S4 §0.14.7 SoA：侧表读（原 sl.ib）
         }
         var end: i64 = start + sl.ia;
 
@@ -14447,7 +14450,7 @@ pub fn resolve_type_desc(tn: i64) i64 {
     // 外层 alen 承载行，val 承载 flavor 码（0=hardware,1=simulate）。
     if (n.kind == "tile") {
         var trows: i64 = n.ia;
-        var tcols: i64 = n.ib;
+        var tcols: i64 = base__node_ib((tn as u64));   // S4 §0.14.7 SoA：侧表读（原 n.ib）
         var tfl: i64 = n.la;
         if (trows < 1) { trows = tile_fold_child(n.nb); }
         if (tcols < 1) { tcols = tile_fold_child(n.nc); }

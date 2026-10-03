@@ -1739,7 +1739,10 @@ pub struct Node {
     // S4 第二批（§0.14.7）：has_sa/has_sb/has_sc 已迁出为属性侧表 g_node_has_*，
     // 访问面走 node_has_X() / node_set_has_X()（存在性标志：X 语义是否为 null；默认 true）。
     ia: i64;
-    ib: i64;
+    // S4 第八批（§0.14.7）：ib 已迁出为属性侧表 g_node_ib，访问面走 node_ib()/node_set_ib()
+    // （默认 **-1** = 无标记；越界读也返 -1）。与第七批 nd 同属索引型侧表，复用 -1 哨兵范式。
+    // ⚠ ib 被 6 种 kind 复用（SL offset / tile 列数 / array_lit 的 TD 下标 / conpat·VC 载荷数 /
+    //   F 的 tagID / leading-dot 标记），完整清单见 node_ib 处注释。本批只做等价搬迁，未拆语义。
     ba: bool;
     // S4 第五批（§0.14.7）：bb / bc 已迁出为属性侧表 g_node_bb / g_node_bc，
     // 访问面走 node_bb()/node_set_bb() 与 node_bc()/node_set_bc()（默认 false）。
@@ -1850,6 +1853,7 @@ pub var g_node_bd: []i64;                  // nodes[i] 的 bd（默认 0 = false
 pub var g_node_bb: []i64;                  // nodes[i] 的 bb（默认 0 = false）
 pub var g_node_bc: []i64;                  // nodes[i] 的 bc（默认 0 = 非 pub）
 pub var g_node_nd: []i64;                  // nodes[i] 的 nd 子节点索引（默认 -1 = 无）
+pub var g_node_ib: []i64;                  // nodes[i] 的 ib 通用整数槽（默认 -1；见 node_ib 处语义清单）
 pub var g_node_sc: []string;               // S4 第六批：nodes[i] 的 sc 字符串载荷（默认 ""）
 
 // ── S3（§4.5）：侧表登记 + provenance 侧表读取面 ──────────────────────────────
@@ -1890,6 +1894,7 @@ pub fn sidetable_init() void {
     sidetable_register("node_bb", "S4");        // SoA：bool 载荷 is_let/编译期类型参数/显式 offset（第五批）
     sidetable_register("node_bc", "S4");        // SoA：`pub` 顶层可见性标记（第五批）
     sidetable_register("node_nd", "S4");        // SoA：nd 子节点索引（第七批，默认 -1）
+    sidetable_register("node_ib", "S4");        // SoA：ib 通用整数槽（第八批，默认 -1）
     sidetable_register("node_sc", "S4");        // SoA：字符串载荷（别名/bitpack 标量/lambda 标记/suite 路径；第六批）
 }
 pub fn node_mod(n: u64) string {
@@ -1982,7 +1987,8 @@ pub fn cst_dump(role: string, id: i64, depth: i64) void {
     var n_se = node_se((id as u64));
     if (str_len(n_se) > 0) { sb_append_str(g_cst_sb, " se=\""); sb_append_str(g_cst_sb, n_se); sb_append_char(g_cst_sb, 34); }
     if (n.ia != -1) { sb_append_str(g_cst_sb, " ia="); sb_append_i64(g_cst_sb, n.ia); }
-    if (n.ib != -1) { sb_append_str(g_cst_sb, " ib="); sb_append_i64(g_cst_sb, n.ib); }
+    var n_ib: i64 = node_ib((id as u64));   // S4 §0.14.7 SoA：侧表读（原 n.ib）
+    if (n_ib != -1) { sb_append_str(g_cst_sb, " ib="); sb_append_i64(g_cst_sb, n_ib); }
     if (n.ba) { sb_append_str(g_cst_sb, " ba"); }
     if (node_bb((id as u64))) { sb_append_str(g_cst_sb, " bb"); }   // S4 §0.14.7 SoA：侧表读（原 n.bb）
     if (node_bc((id as u64))) { sb_append_str(g_cst_sb, " bc"); }   // S4 §0.14.7 SoA：侧表读（原 n.bc）
@@ -2356,6 +2362,29 @@ pub fn node_set_nd(n: u64, v: i64) void {
     if (id < 0 || id >= slice_len(g_node_nd)) { return; }
     slice_set(g_node_nd, id, v);
 }
+// S4 第八批（§0.14.7）：通用整数槽 ib（默认 -1；越界读返 -1，与 node_new 旧默认值一致）。
+// 与 nd 同属「索引型侧表」，复用第七批验证过的 -1 哨兵范式。
+// ⚠ ib 按 kind **复用**于 6 种语义（只做等价搬迁，未拆语义）：
+//   ① SL（结构体字面量）的位域/flag 显式 offset（配合 bb 标志位使用）
+//   ② tile 节点折叠出的列数（ia=行，ib=列，la=flavor）
+//   ③ array_lit 被 sema 回填的 TD 下标（>=0 表示此字面量构造向量/瓦片，cat 查 tds[ib]）
+//      ⚠ 标记只能挂 ib：array_lit 的 ia 在 sema 之后会被抹回 -1（历史实测）。
+//   ④ conpat 的子模式个数 / VC（variant case）的载荷个数（多载荷 >=2）
+//   ⑤ F（结构体字段）的 tagID（>=1 显式 @N / 全自动顺序分配 1,2,3… / -1 未分配）
+//   ⑥ leading-dot 结构体字面量 `.{...}` 的标记（==1）
+// ⚠ 越界读必须返 -1（不是 0）：返 0 会把「无标记」读成「TD 下标 0」或「flag offset 0」，
+//   是**静默错误**（不崩不报，只在深层子树上产出错误结构）——索引型侧表独有的失败模式。
+pub fn node_ib(n: u64) i64 {
+    sidetable_init();
+    var id = nr_idx(n);
+    if (id < 0 || id >= slice_len(g_node_ib)) { return -1; }
+    return g_node_ib[id];
+}
+pub fn node_set_ib(n: u64, v: i64) void {
+    var id = nr_idx(n);
+    if (id < 0 || id >= slice_len(g_node_ib)) { return; }
+    slice_set(g_node_ib, id, v);
+}
 // S4 第六批（§0.14.7）：字符串载荷 sc（默认 ""）。**本批为 sa/sb/sc 字符串整族外置预演**
 // ——首个 `[]string` 类型侧表，验证「非标量侧表 + node_new 锁步 append」范式成立。
 //   sc 按 kind 复用 4 种语义（本次只做等价搬迁，未拆语义）：
@@ -2490,7 +2519,7 @@ pub fn node_new(kind: string) u64 {
     // S4 第六批（§0.14.7）：sc 已外置为侧表（默认空串，见下方 append）
     // S4 第二批（§0.14.7）：has_sa/has_sb/has_sc 已外置为侧表（默认 1=true，见下方 append）
     n.ia = -1;
-    n.ib = -1;
+    // S4 §0.14.7 SoA：ib 已外置为侧表（默认 -1，见下方 append）
     n.ba = false;
     // S4 第五批（§0.14.7）：bb/bc 已外置为侧表（默认 0=false，见下方 append）
     // S4 第四批（§0.14.7）：bd 已外置为侧表（默认 0=false，见下方 append）
@@ -2524,6 +2553,7 @@ pub fn node_new(kind: string) u64 {
     append(g_node_bb, 0);                                   // S4 §0.14.7 SoA：bb 默认 false
     append(g_node_bc, 0);                                   // S4 §0.14.7 SoA：bc 默认 false（非 pub）
     append(g_node_nd, -1);                                  // S4 §0.14.7 SoA：nd 默认 -1（无子节点）
+    append(g_node_ib, -1);                                  // S4 §0.14.7 SoA：ib 默认 -1（无标记）
     append(g_node_sc, "");                                  // S4 §0.14.7 SoA：sc 默认空串（第六批）
     var nref_tag: i64 = nk_of_kind(kind);
     if (nref_tag < 0) { nref_tag = 0; }   // 未注册 kind 暂归 tag=0（g_node_nref 当前无消费方，安全）
@@ -2921,7 +2951,7 @@ pub fn mk_SL(sa: string, ia: i64, ib: i64, bb: bool, la: i64, ti: i64) u64 {
     var n: Node = nodes[id];
     n.sa = sa;
     n.ia = ia;
-    n.ib = ib;
+    node_set_ib((id as u64), ib);   // S4 §0.14.7 SoA：取代 `n.ib = ib`（形参保留，调用点不变）
     node_set_bb((id as u64), bb);   // S4 §0.14.7 SoA：取代 `n.bb = bb`（形参保留，调用点不变）
     n.la = la;
     slice_set(nodes, id, n);
@@ -3727,7 +3757,7 @@ pub fn mk_tile(na: i64, nb: i64, nc: i64, nd: i64, ti: i64) u64 {
     n.nc = nc;
     node_set_nd((id as u64), nd);   // S4 §0.14.7 SoA：取代 `n.nd = nd`（形参保留，调用点不变）
     n.ia = -1;
-    n.ib = -1;
+    node_set_ib((id as u64), -1);   // S4 §0.14.7 SoA：取代 `n.ib = -1`
     n.la = -1;
     slice_set(nodes, id, n);
     if (ti >= 0) { node_at(id, ti); }
@@ -3762,7 +3792,7 @@ pub fn mk_conpat(sa: string, sb: string, la: i64, ib: i64, ti: i64) u64 {
     n.sa = sa;
     n.sb = sb;
     n.la = la;
-    n.ib = ib;
+    node_set_ib((id as u64), ib);   // S4 §0.14.7 SoA：取代 `n.ib = ib`（形参保留，调用点不变）
     slice_set(nodes, id, n);
     if (ti >= 0) { node_at(id, ti); }
         cst_register_RecConpat(sa, sb, la, ib); // S2 dual-write
