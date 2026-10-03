@@ -1604,7 +1604,7 @@ pub fn func_is_generic(d: i64) bool {
     if (n.kind != "FuncDecl") { return false; }
     var p: i64 = n.lb;
     while (p >= 0) {
-        if (base.nodes[base.kids[p].val].bb == true) { return true; }
+        if (base.node_bb((base.kids[p].val as u64)) == true) { return true; }   // S4 §0.14.7 SoA：侧表读
         p = base.kids[p].next;
     }
     return false;
@@ -1653,7 +1653,10 @@ pub fn clone_node(src: i64) i64 {
     base.node_set_has_sb((id as u64), base.node_has_sb((src as u64)));
     base.node_set_has_sc((id as u64), base.node_has_sc((src as u64)));
     nn.ia = sn.ia; nn.ib = sn.ib;
-    nn.ba = sn.ba; nn.bb = sn.bb; nn.bc = sn.bc;
+    nn.ba = sn.ba;
+    // S4 §0.14.7 SoA：bb/bc 已外置，跨节点传播走侧表访问器（取代 `nn.bb = sn.bb; nn.bc = sn.bc;`）
+    base.node_set_bb((id as u64), base.node_bb((src as u64)));
+    base.node_set_bc((id as u64), base.node_bc((src as u64)));
     // S4 §0.14.7 SoA：bd 已外置，跨节点传播走侧表访问器（取代 `nn.bd = sn.bd`）
     base.node_set_bd((id as u64), base.node_bd((src as u64)));
     nn.na = clone_node(sn.na);
@@ -1917,8 +1920,8 @@ pub fn rewrite_generic_callsite(e: i64, iname: string, k: i64) void {
     }
     var en: Node = base.nodes[e];
     en.la = nh;
-    en.bb = true;
     slice_set(base.nodes, e, en);
+    base.node_set_bb((e as u64), true);   // S4 §0.14.7 SoA：侧表写（原 en.bb = true）
 }
 
 // 单态化：返回实例 FuncDecl id（已 append decl_list + register）。
@@ -1959,7 +1962,7 @@ pub fn instantiate_generic(tmpl: i64, e: i64) i64 {
     while (cp >= 0) {
         var cpv: i64 = base.kids[cp].val;
         var cpn: Node = base.nodes[cpv];
-        if (cpn.bb == true) {
+        if (base.node_bb((cpv as u64)) == true) {   // S4 §0.14.7 SoA：侧表读（原 cpn.bb）
             append(cnames, cpn.sa);
             append(cnodes, cpv);
             append(cistype, meta_param_is_type(cpv));
@@ -2082,8 +2085,7 @@ pub fn instantiate_generic(tmpl: i64, e: i64) i64 {
     var newp_tail: i64 = -1;
     var pp3: i64 = inn.lb;
     while (pp3 >= 0) {
-        var ppn2: Node = base.nodes[base.kids[pp3].val];
-        if (ppn2.bb == false) {
+        if (base.node_bb((base.kids[pp3].val as u64)) == false) {   // S4 §0.14.7 SoA：侧表读（原 ppn2.bb）
             newp_tail = base.list_push(newp_head, newp_tail, base.kids[pp3].val);
             if (newp_head < 0) { newp_head = newp_tail; }
         }
@@ -2292,7 +2294,7 @@ pub fn register_decl(d: i64) void {
             var gp: i64 = n.lb;
             while (gp >= 0) {
                 var gpn: i64 = base.kids[gp].val;
-                if (base.nodes[gpn].bb == true && meta_param_is_type(gpn)) {
+                if (base.node_bb((gpn as u64)) == true && meta_param_is_type(gpn)) {   // S4 §0.14.7 SoA：侧表读
                     append(gt, base.nodes[gpn].sa);
                 }
                 gp = base.kids[gp].next;
@@ -6495,10 +6497,8 @@ pub fn infer_expr_body(e: i64) i64 {
         // （本诊断即由此坑倒逼补上：parse_lambda_expr 误写 `cur_i`，检查期 0 errors、
         //  LLVM 自举照常通过，直到 C 后端自举才在 tc.c:8610 炸出来。）
         // bb 标志保证 infer_expr 重入时只报一次。
-        if (n.bb == false) {
-            var lcap: Node = base.nodes[e];
-            lcap.bb = true;
-            slice_set(base.nodes, e, lcap);
+        if (base.node_bb((e as u64)) == false) {   // S4 §0.14.7 SoA：侧表读（原 n.bb）
+            base.node_set_bb((e as u64), true);   // S4 §0.14.7 SoA：侧表写（取代「取值→改 bb→回写整节点」）
             if (lex.g_in_lambda) {
                 // 合成函数体里的未解析名：捕获分析已在提升期扫过外层作用域，
                 // 走到这里说明外层同样没有该名字（拼写错 / 声明晚于字面量）。
@@ -6519,11 +6519,9 @@ pub fn infer_expr_body(e: i64) i64 {
         var m_res: i64 = -1;
         var m_irref: bool = false;
         var m_dead: bool = false;          // S4 臂不可达：此前已有不可反驳臂
-        var m_rep: bool = n.bb == false;   // 诊断只报一次（infer_expr 可能被重入）
+        var m_rep: bool = base.node_bb((e as u64)) == false;   // 诊断只报一次（infer_expr 可能被重入）
         if (m_rep) {
-            var m_self: Node = base.nodes[e];
-            m_self.bb = true;
-            slice_set(base.nodes, e, m_self);
+            base.node_set_bb((e as u64), true);   // S4 §0.14.7 SoA：侧表写（原 m_self.bb = true）
         }
         var m_c: i64 = n.la;
         while (m_c >= 0) {
@@ -7194,7 +7192,7 @@ pub fn infer_expr_body(e: i64) i64 {
                         if (fd.kind == "FuncDecl") {
                             // comptime 泛型：调用点按类型实参单态化（func_is_generic 门控，
                             // 仅对含 comptime 参数的函数触发；普通函数零影响）。
-                            if (func_is_generic(s2.decl) && base.nodes[e].bb == false) {
+                            if (func_is_generic(s2.decl) && base.node_bb((e as u64)) == false) {   // S4 §0.14.7 SoA：侧表读
                                 var inst: i64 = instantiate_generic(s2.decl, e);
                                 if (inst >= 0) {
                                     return infer_expr(e);
@@ -8962,7 +8960,9 @@ pub fn check_flag_decl(d: i64) void {
         var k: Child = base.kids[c];
         var sl: Node = base.nodes[k.val];
         var start: i64 = auto_off;
-        if (sl.bb) {
+        // S4 §0.14.7 SoA：侧表读（原 sl.bb）。⚠ 本函数内有局部 `var base: i64` 遮蔽 base 模块，
+        // 故此处直呼降级名 `base__node_bb`，不能写 `base.node_bb`。
+        if (base__node_bb((sl.id as u64))) {
             start = sl.ib;
         }
         var end: i64 = start + sl.ia;
@@ -10029,7 +10029,7 @@ pub fn handle_one_import(imp: i64) void {
     // pub 符号在本模块（g_cur_mod）再导出。登记到 g_reexport_*，待 collect_module_defs
     // 把所有模块符号收齐后，把 M 的 pub 符号并入本模块符号集，使下游 `本模块.符号` 可达。
     // g_cur_mod 在 load_module_file 进入模块时已置为该库别名，入口模块为 ""。
-    if (base__nodes[imp].bc) {
+    if (base__node_bc((imp as u64))) {   // S4 §0.14.7 SoA：侧表读（原 nodes[imp].bc）
         append(lex__g_reexport_owner, base__g_cur_mod);
         append(lex__g_reexport_imp, alias);
     }
@@ -10545,11 +10545,12 @@ pub fn collect_module_defs() void {
                 mod_attr_set(a, nd.sa);
             } else {
                 if (is_top_decl_kind(nd.kind)) {
-                    def_add(a, nd.sa, nd.bc);
-                    if (nd.bc) {
+                    // S4 §0.14.7 SoA：bc 侧表读（原 nd.bc）
+                    def_add(a, nd.sa, base__node_bc((d as u64)));
+                    if (base__node_bc((d as u64))) {
                         if (mod_has_export(a) == false) { append(lex__g_mod_has_export, a); }
                     }
-                    if (nd.kind == "VariantDecl") { collect_variant_helper_defs(d, a, nd.bc); }
+                    if (nd.kind == "VariantDecl") { collect_variant_helper_defs(d, a, base__node_bc((d as u64))); }
                 }
             }
         }
@@ -11075,7 +11076,7 @@ pub fn meta_eval(e: i64) i64 {
         var sfn: i64 = sym_lookup(global_scope, n.sa);
         if (sfn >= 0) {
             var syf: Sym = syms[sfn];
-            if (syf.decl >= 0 && base__nodes[syf.decl].kind == "FuncDecl" && base__nodes[syf.decl].bb == true) {
+            if (syf.decl >= 0 && base__nodes[syf.decl].kind == "FuncDecl" && base__node_bb((syf.decl as u64)) == true) {
                 return meta_fail("T-CLO-E781",
                     base__sb_cat3("`", n.sa, "` 是编译期函数，不能作为运行期函数值逃逸（其函数体仅存在于编译期）"), e);
             }
@@ -12142,7 +12143,7 @@ pub fn meta_eval_call(e: i64) i64 {
     if (fd.kind != "FuncDecl") {
         return meta_fail("T-MTA-E617", base__sb_cat3("`", cn.sa, "` 不是函数"), e);
     }
-    if (fd.bb == false) {
+    if (base__node_bb((sy.decl as u64)) == false) {   // S4 §0.14.7 SoA：侧表读（原 fd.bb）
         return meta_fail("T-MTA-E618",
             base__sb_cat3("`", cn.sa, "` 不是编译期函数；comptime 上下文中的调用要求被调方以 `comptime fn` 声明"), e);
     }
@@ -12633,7 +12634,7 @@ pub fn meta_pass() void {
     while (i < n1) {
         var d: i64 = lex__decl_list[i];
         var dn: Node = base__nodes[d];
-        if (dn.kind == "GlobalConstDecl" || (dn.kind == "GlobalVarDecl" && dn.bb)) {
+        if (dn.kind == "GlobalConstDecl" || (dn.kind == "GlobalVarDecl" && base__node_bb((d as u64)))) {   // S4 §0.14.7 SoA：侧表读（原 dn.bb）
             if (dn.nb >= 0) {
                 g_meta_err = false;
                 g_meta_quiet = true;
@@ -12656,7 +12657,7 @@ pub fn meta_pass() void {
         if (dn2.kind == "FuncDecl") {
             // meta fn 本体只在被调用时求值，此处不进入；
             // 泛型模板本体带未绑定类型参数，静默折叠（失败不报错，实例仍走运行期语义）。
-            if (dn2.bb == false && dn2.lc != -2) {
+            if (base__node_bb((d2 as u64)) == false && dn2.lc != -2) {   // S4 §0.14.7 SoA：侧表读（原 dn2.bb）
                 g_menv_top = g_menv_nglobal;
                 g_menv_base = g_menv_nglobal;
                 g_meta_quiet = func_is_generic(d2);
@@ -13685,7 +13686,9 @@ pub fn fr_resolve_flag(d: i64) void {
         var k: Child = base__kids[c];
         var sl: Node = base__nodes[k.val];
         var start: i64 = auto_off;
-        if (sl.bb) {
+        // S4 §0.14.7 SoA：侧表读（原 sl.bb）。⚠ 本函数内有局部 `var base: i64` 遮蔽 base 模块，
+        // 故此处直呼降级名 `base__node_bb`，不能写 `base.node_bb`。
+        if (base__node_bb((sl.id as u64))) {
             start = sl.ib;
         }
         var end: i64 = start + sl.ia;

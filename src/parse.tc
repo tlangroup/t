@@ -1153,7 +1153,7 @@ pub fn parse_local_var(is_const: bool, is_export: bool) i64 {
     var id: i64 = base.mk_var_decl(name, is_const, tn, init, ti);
     // 模块系统（M-Module）：pub 只能修饰顶层声明；局部/嵌套变量加 pub → T-MOD-E556
     if (is_export) {
-        base.nodes[id].bc = true;
+        base.node_set_bc((id as u64), true);   // S4 §0.14.7 SoA：取代 `nodes[id].bc = true`
         fc_err("T-MOD-E556", "pub 只能修饰顶层声明，不能修饰局部/嵌套变量", id);
     }
     return id;
@@ -1175,9 +1175,7 @@ pub fn parse_auto_stmt() i64 {
     var init: i64 = parse_expr();
     expect_tok("Semicolon");
     var aid: i64 = base.mk_var_decl(name, true, -1, init, ti);  // ba=true：动态常量不可变
-    var ann: Node = base.nodes[aid];
-    ann.bb = true;   // 标记 is_let（动态常量）；检查期从初始化器推断类型
-    slice_set(base.nodes, aid, ann);
+    base.node_set_bb((aid as u64), true);   // 标记 is_let（动态常量）；检查期从初始化器推断类型（S4 §0.14.7 SoA 侧表写）
     return aid;
 }
 
@@ -1336,9 +1334,7 @@ pub fn parse_const_stmt() i64 {
 // 复用 parse_local_var(is_const=true) 再置 is_let 标记（bb），避免改动其签名。
 pub fn parse_local_let(is_export: bool) i64 {
     var id: i64 = parse_local_var(true, is_export);
-    var n: Node = base.nodes[id];
-    n.bb = true;   // 标记 is_let（动态常量）
-    slice_set(base.nodes, id, n);
+    base.node_set_bb((id as u64), true);   // 标记 is_let（动态常量）（S4 §0.14.7 SoA 侧表写）
     return id;
 }
 
@@ -2078,7 +2074,7 @@ pub fn parse_func_decl(name: string, anns: i64, is_comptime: bool, is_kernel: bo
             pn.ba = pwild;
             pn.nb = plit;
             pn.nc = pguard;
-            if (pcomp) { pn.bb = true; }
+            if (pcomp) { base.node_set_bb((pid as u64), true); }   // S4 §0.14.7 SoA：侧表写（原 pn.bb）
             slice_set(base.nodes, pid, pn);
         }
         pt = base.list_push(ph, pt, pid);
@@ -2600,7 +2596,7 @@ pub fn parse_test_decl(anns: i64, is_export: bool) i64 {
     base.node_set_bd((fd as u64), true);   // 是测试（S4 §0.14.7 SoA：原 `fn_n.bd = true`）
     fn_n.sb = disp;             // 显示名
     fn_n.sc = g_suite_path;     // suite 路径
-    fn_n.bc = is_export;        // 模块可见性（`pub test "..." {}` 时为真）
+    base.node_set_bc((fd as u64), is_export);   // 模块可见性（`pub test "..." {}` 时为真；S4 §0.14.7 SoA 侧表写）
     slice_set(base.nodes, fd, fn_n);
     // 注意：入列由调用方负责（顶层经 parse_unit 的 append；suite 体内由
     // parse_suite_decl 的循环 append），此处**不再**自 append，否则会与
@@ -2801,9 +2797,7 @@ pub fn parse_declaration() i64 {
             if (dname == "import") {
                 var d: i64 = parse_at_import_decl();
                 if (is_export) {
-                    var dn: Node = base.nodes[d];
-                    dn.bc = true;
-                    slice_set(base.nodes, d, dn);
+                    base.node_set_bc((d as u64), true);   // S4 §0.14.7 SoA：取代「取值→改 bc→回写整节点」
                 }
                 return d;
             }
@@ -2817,19 +2811,19 @@ pub fn parse_declaration() i64 {
 
     if (lex.cur_t() == "KwVar") {
         var d: i64 = parse_global_var(false, is_comptime);
-        if (is_export) { base.nodes[d].bc = true; }
+        if (is_export) { base.node_set_bc((d as u64), true); }   // S4 §0.14.7 SoA
         return d;
     }
     if (lex.cur_t() == "KwConst") {
         var d: i64 = parse_global_var(true, is_comptime);
         base.node_set_const(d);
-        if (is_export) { base.nodes[d].bc = true; }
+        if (is_export) { base.node_set_bc((d as u64), true); }   // S4 §0.14.7 SoA
         return d;
     }
     if (lex.cur_t() == "KwLet") {
         // 全局 `let`：动态常量，复用 GlobalConstDecl（语义等同；is_let 区分留待 CTFE Phase B）
         var d: i64 = parse_global_var(true, is_comptime);
-        if (is_export) { base.nodes[d].bc = true; }
+        if (is_export) { base.node_set_bc((d as u64), true); }   // S4 §0.14.7 SoA
         return d;
     }
     if (lex.cur_t() == "KwImport") {
@@ -2862,7 +2856,7 @@ pub fn parse_declaration() i64 {
             fdn.ia = 1;
             slice_set(base.nodes, fd, fdn);
             base.node_at(fd, fni);
-            if (is_export) { base.nodes[fd].bc = true; }
+            if (is_export) { base.node_set_bc((fd as u64), true); }   // S4 §0.14.7 SoA
             if (ann_find(anns, "c_export") >= 0) {
                 base.node_set_be((fd as u64), true);   // S4 §0.14.7 SoA：取代 `base.nodes[fd].be = true`
                 base.node_set_se((fd as u64), fname);
@@ -2894,7 +2888,7 @@ pub fn parse_declaration() i64 {
             fdn.ia = 2;
             slice_set(base.nodes, fd, fdn);
             base.node_at(fd, fni);
-            if (is_export) { base.nodes[fd].bc = true; }
+            if (is_export) { base.node_set_bc((fd as u64), true); }   // S4 §0.14.7 SoA
             if (ann_find(anns, "c_export") >= 0) {
                 base.node_set_be((fd as u64), true);   // S4 §0.14.7 SoA：取代 `base.nodes[fd].be = true`
                 base.node_set_se((fd as u64), fname);
@@ -2918,7 +2912,7 @@ pub fn parse_declaration() i64 {
         var fd: i64 = parse_func_decl(fname, anns, is_comptime, is_kernel);
         if (fd >= 0) {
             base.node_at(fd, fni);
-            if (is_export) { base.nodes[fd].bc = true; }
+            if (is_export) { base.node_set_bc((fd as u64), true); }   // S4 §0.14.7 SoA
             if (ann_find(anns, "c_export") >= 0) {
                 base.node_set_be((fd as u64), true);   // S4 §0.14.7 SoA：取代 `base.nodes[fd].be = true`
                 base.node_set_se((fd as u64), fname);
@@ -2944,7 +2938,7 @@ pub fn parse_declaration() i64 {
         var ed: i64 = parse_enum_decl(ename, anns);
         if (ed >= 0) {
             base.node_at(ed, eni);
-            if (is_export) { base.nodes[ed].bc = true; }
+            if (is_export) { base.node_set_bc((ed as u64), true); }   // S4 §0.14.7 SoA
         }
         return ed;
     }
@@ -2973,7 +2967,7 @@ pub fn parse_declaration() i64 {
         var sd: i64 = parse_struct_decl(sname, anns, layout);
         if (sd >= 0) {
             base.node_at(sd, sni);
-            if (is_export) { base.nodes[sd].bc = true; }
+            if (is_export) { base.node_set_bc((sd as u64), true); }   // S4 §0.14.7 SoA
         }
         return sd;
     }
@@ -2991,7 +2985,7 @@ pub fn parse_declaration() i64 {
         lex.g_agent_anchor = uidx; lex.g_struct_exported = is_export;
         base.validate_decl_name(uname, uidx);
         var u_b: i64 = parse_union_decl(uname, anns);
-        if (u_b >= 0) { base.node_at(u_b, uidx); if (is_export) { base.nodes[u_b].bc = true; } }
+        if (u_b >= 0) { base.node_at(u_b, uidx); if (is_export) { base.node_set_bc((u_b as u64), true); } }   // S4 §0.14.7 SoA
         return u_b;
     }
     if (lex.cur_t() == "KwFlag") {
@@ -3002,7 +2996,7 @@ pub fn parse_declaration() i64 {
         lex.g_agent_anchor = fidx; lex.g_struct_exported = is_export;
         base.validate_decl_name(fname, fidx);
         var fl_b: i64 = parse_flag_decl(fname, anns);
-        if (fl_b >= 0) { base.node_at(fl_b, fidx); if (is_export) { base.nodes[fl_b].bc = true; } }
+        if (fl_b >= 0) { base.node_at(fl_b, fidx); if (is_export) { base.node_set_bc((fl_b as u64), true); } }   // S4 §0.14.7 SoA
         return fl_b;
     }
     if (lex.cur_t() == "KwVariant") {
@@ -3013,7 +3007,7 @@ pub fn parse_declaration() i64 {
         lex.g_agent_anchor = vidx; lex.g_struct_exported = is_export;
         base.validate_decl_name(vname, vidx);
         var v_b: i64 = parse_variant_decl(vname, anns);
-        if (v_b >= 0) { base.node_at(v_b, vidx); if (is_export) { base.nodes[v_b].bc = true; } }
+        if (v_b >= 0) { base.node_at(v_b, vidx); if (is_export) { base.node_set_bc((v_b as u64), true); } }   // S4 §0.14.7 SoA
         return v_b;
     }
     if (lex.cur_t() == "KwAgent") {
@@ -3024,7 +3018,7 @@ pub fn parse_declaration() i64 {
         lex.g_agent_anchor = aidx; lex.g_struct_exported = is_export;
         base.validate_decl_name(aname, aidx);
         var a_b: i64 = parse_agent_decl(aname, anns);
-        if (a_b >= 0) { base.node_at(a_b, aidx); if (is_export) { base.nodes[a_b].bc = true; } }
+        if (a_b >= 0) { base.node_at(a_b, aidx); if (is_export) { base.node_set_bc((a_b as u64), true); } }   // S4 §0.14.7 SoA
         return a_b;
     }
     // flag_set 是语境标识符（非关键字），作关键字领头桥：`flag_set Name {...}`
@@ -3036,7 +3030,7 @@ pub fn parse_declaration() i64 {
         lex.g_agent_anchor = fsidx; lex.g_struct_exported = is_export;
         base.validate_decl_name(fsname, fsidx);
         var fs_b: i64 = parse_flag_set_decl(fsname, anns);
-        if (fs_b >= 0) { base.node_at(fs_b, fsidx); if (is_export) { base.nodes[fs_b].bc = true; } }
+        if (fs_b >= 0) { base.node_at(fs_b, fsidx); if (is_export) { base.node_set_bc((fs_b as u64), true); } }   // S4 §0.14.7 SoA
         return fs_b;
     }
 
@@ -3075,7 +3069,7 @@ pub fn parse_declaration() i64 {
     var d: i64 = parse_decl_body(name, anns, is_comptime);
     if (d >= 0) {
         base.node_at(d, ni);
-        if (is_export) { base.nodes[d].bc = true; }
+        if (is_export) { base.node_set_bc((d as u64), true); }   // S4 §0.14.7 SoA
     }
     return d;
 }
@@ -3527,7 +3521,7 @@ pub fn fc_merge() void {
     base.node_set_span_id(mxn.id, base.node_span_id(g0.id));
     slice_set(base.nodes, mx, mxn);
     var body: i64 = base.list_push(-1, -1, base.mk_return(mx, -1));
-    var merged: i64 = base.mk_FuncDecl(g0.sa, false, g0.bb, g0.na, g0.la, ph, body, -1);
+    var merged: i64 = base.mk_FuncDecl(g0.sa, false, base.node_bb((g0.id as u64)), g0.na, g0.la, ph, body, -1);
     var mn: Node = base.nodes[merged];
     base.node_set_span_id(mn.id, base.node_span_id(g0.id));
     base.node_set_span_id(mn.id, base.node_span_id(g0.id));
@@ -5099,7 +5093,7 @@ pub fn parse_method_decl(structname: string, mname: string, anns: i64) i64 {
     var fd: i64 = parse_func_decl(mname, anns, false, false);
     var fdn: Node = base.nodes[fd];
     fdn.sa = base.sb_cat3(pascal_to_snake(structname), "_", mname);
-    fdn.bc = lex.g_struct_exported;
+    base.node_set_bc((fd as u64), lex.g_struct_exported);   // S4 §0.14.7 SoA：侧表写（原 fdn.bc）
     slice_set(base.nodes, fd, fdn);
     desugar_self_node(base.nodes[fd].na, structname);
     var pit: i64 = base.nodes[fd].lb;
