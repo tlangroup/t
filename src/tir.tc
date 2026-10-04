@@ -2127,7 +2127,7 @@ pub fn tir_lower_func(d: i64) void {
     // 闭包合成函数（M48）：仅 lambda 提升出的 FuncDecl（sc=="__lambda__"）且携带环境结构名
     // 时，前置 env 首参（与 TClosure ABI 一致）。普通函数（含 @__test_N 等）sc 非 __lambda__，
     // 即便 sb 被复用也不得加 env 形参，否则会向无关函数注入未被调用的 $__env 槽。
-    if (base.node_sc((d as u64)) == "__lambda__" && str_len(n.sb) > 0) {
+    if (base.node_sc((d as u64)) == "__lambda__" && str_len(base.node_sb((n.id as u64))) > 0) {
         var envst: string = "ptr<void>";
         var envslot: string = "$__env";
         append(g_cur_func.params, base.sb_cat4(envslot, ": ", envst, ""));
@@ -2287,7 +2287,7 @@ pub fn tir_emit_stmt(sid: i64) void {
     //   发射函数一律收 sid（本批 nc 迁移时定位，详见 §0.14.7 第九批「坑」）。
     if (kd == "for") { tir_emit_for(sid); return; }
     if (kd == "while") { tir_emit_while(n); return; }
-    if (kd == "for_each") { tir_emit_for_each(n); return; }
+    if (kd == "for_each") { tir_emit_for_each(sid); return; }
     if (kd == "block") {
         tir_blk_push();
         var c: i64 = n.la;
@@ -2359,20 +2359,23 @@ pub fn tir_emit_stmt(sid: i64) void {
         else { tir_cmt("continue outside loop"); }
         return;
     }
-    if (kd == "closure_capture") { tir_emit_closure_capture(n); return; }
+    if (kd == "closure_capture") { tir_emit_closure_capture(sid); return; }
     tir_cmt(base.sb_cat3("unsupported stmt: ", kd, ""));
 }
 
 // 闭包捕获（Stage 6）：从 lambda 首参 $__env（ptr<void>）按字段拷回被捕获量到本地 slot。
 // n.sa=变量名, n.sb=环境结构名(__env_N), n.na=类型 desc, n.ia=字段索引。
 // 镜像 codegen_ll.tc:4259 closure_capture（gep %st.<sb>, ptr %__env, 0, n.ia）。
-pub fn tir_emit_closure_capture(n: Node) void {
+// ⚠ 收**节点索引**而非 Node 值：Node 结构体值传参时末尾字段 `id` 不可读（批次 9 致命坑），
+//   而 sb 已外置为侧表、必须按 id 查 ⇒ 函数内自行取节点（与同文件的 `tir_emit_for(sid)` 同形）。
+pub fn tir_emit_closure_capture(sid: i64) void {
+    var n: Node = base.nodes[sid];
     var cctd: i64 = sema.resolve_type_desc(n.na);
     var ccst: string = "i64";
     if (cctd >= 0) { ccst = tir_st_of_td(cctd); }
     // 登记为本地 slot，使 lambda 体内对该变量的 ident 引用解析到本地（而非 @全局）
     var cvslot: string = tir_new_named_slot(cctd, ccst, n.sa);
-    var envty: string = base.sb_cat2("%", n.sb);
+    var envty: string = base.sb_cat2("%", base.node_sb((sid as u64)));   // S4 §0.14.7 SoA：侧表读（原 base.node_sb((n.id as u64))；第十二批）
     var eptr: string = tir_tmp();
     tir_emit(tir_emit_bitcast(base.sb_cat3("ptr<", envty, ">"), eptr, "$__env"));
     var faddr: string = tir_tmp();
@@ -2477,7 +2480,10 @@ pub fn tir_emit_while(n: Node) void {
 // for_each 降级（Stage 4）：slice / 定长数组迭代。
 // n.sa=循环变量名, n.sb=可选第二变量(map 双变量, 本期不覆盖), n.na=集合表达式, n.la=循环体。
 // slice 长度自 %TSlice 字段 1 读取（不依赖 tll_slice_len 运行时）；定长数组用编译期 N。
-pub fn tir_emit_for_each(n: Node) void {
+// ⚠ 收**节点索引**而非 Node 值（同 `tir_emit_for` / `tir_emit_closure_capture`）：
+//   Node 值传参时末尾字段 `id` 不可读，sb 侧表必须按 id 查 ⇒ 函数内自行取节点。
+pub fn tir_emit_for_each(sid: i64) void {
+    var n: Node = base.nodes[sid];
     if (g_term) { return; }
     var coll_td: i64 = tir_expr_td(n.na);
     // ⚠ member 基底（如 c.opts）：tir_expr_td 对 member 节点不可靠（node.td 缓存易污染，
@@ -2512,7 +2518,8 @@ pub fn tir_emit_for_each(n: Node) void {
         var iterr: TirEmitRes = tir_emit_expr(n.na); var iter: string = iterr.name;
         var lv: string = tir_new_named_slot(keytd, keyst, n.sa);
         var lvval: string = "";
-        if (has_val && str_len(n.sb) > 0) { lvval = tir_new_named_slot(valtd, valst, n.sb); }
+        var n_sb: string = base.node_sb((sid as u64));   // S4 §0.14.7 SoA：侧表读（原 base.node_sb((n.id as u64))；第十二批）
+        if (has_val && str_len(n_sb) > 0) { lvval = tir_new_named_slot(valtd, valst, n_sb); }
         var cnt: string = tir_tmp();
         tir_emit(tir_e_call("i64", cnt, "@tll_map_count", tir_cargs1(iter)));
         var idx: string = tir_new_named_slot(-1, "i64", "__fe_idx");
@@ -2547,7 +2554,7 @@ pub fn tir_emit_for_each(n: Node) void {
                 tir_emit(tir_emit_store(kv, lv));
             }
         }
-        if (has_val && str_len(n.sb) > 0) {
+        if (has_val && str_len(base.node_sb((sid as u64))) > 0) {   // S4 §0.14.7 SoA：侧表读（原 base.node_sb((n.id as u64))；第十二批）
             var vp: string = tir_tmp();
             tir_emit(tir_e_call(base.sb_cat3("ptr<", valst, ">"), vp, "@tll_map_val_at", tir_cargs2(iter, cidx)));
             var vv: string = tir_tmp();
@@ -3316,7 +3323,7 @@ pub fn tir_emit_deref(e: i64) TirEmitRes {
 // n.sa=合成 lambda 名(__lam_N), n.sb=环境结构名(__env_N), n.la=捕获量链(kids, 每节点 sa=变量名)。
 // 镜像 codegen_ll.tc:1627 closure_make（per-capture gep %st.<sb> + store；再 %TClosure {fnptr,envptr}）。
 pub fn tir_emit_closure_make(n: Node, e: i64) TirEmitRes {
-    var envty: string = base.sb_cat2("%", n.sb);
+    var envty: string = base.sb_cat2("%", base.node_sb((e as u64)));   // S4 §0.14.7 SoA：侧表读（原 n.sb；第十二批；e 已是本节点索引）
     // 环境按字段尺寸求和（tir_sizeof 对 %__env_N 未知类型兜底返 8，多字段环境会欠分配 → 必须逐字段加总）。
     // 闭包可逃逸出创建帧（如 make_adder 返回的闭包），环境必须**堆分配**（对齐 codegen_ll.tc:1630 的 t_alloc），
     // 否则 stack alloca 在创建帧返回后即悬垂 → use-after-free（add100(5) 段错误/垃圾）。
@@ -3868,8 +3875,8 @@ pub fn tir_emit_call(e: i64) TirEmitRes {
         // TD 标成 i8 的缓存污染）；否则回退 meta_type_of_expr 的向量返回类型 / tir_expr_td。
         var elemst: string = "i32";
         var N: i64 = 1;
-        if (arg0n >= 0 && base.nodes[arg0n].kind == "int" && str_len(base.nodes[arg0n].sb) > 0) {
-            elemst = base.nodes[arg0n].sb;
+        if (arg0n >= 0 && base.nodes[arg0n].kind == "int" && str_len(base.node_sb((arg0n as u64))) > 0) {
+            elemst = base.node_sb((arg0n as u64));
         } else {
             var rtd: i64 = sema.meta_type_of_expr(e);
             if (rtd >= 0 && rtd < slice_len(sema.tds) as i64 && sema.tds[rtd].cat == "vector") {
@@ -3924,8 +3931,8 @@ pub fn tir_emit_call(e: i64) TirEmitRes {
             }
         }
         var elemst: string = "i32";
-        if (arg0n >= 0 && base.nodes[arg0n].kind == "int" && str_len(base.nodes[arg0n].sb) > 0) {
-            elemst = base.nodes[arg0n].sb;
+        if (arg0n >= 0 && base.nodes[arg0n].kind == "int" && str_len(base.node_sb((arg0n as u64))) > 0) {
+            elemst = base.node_sb((arg0n as u64));
         } else {
             var rtd2: i64 = sema.meta_type_of_expr(e);
             if (rtd2 >= 0 && rtd2 < slice_len(sema.tds) as i64 && sema.tds[rtd2].cat == "tile") {
