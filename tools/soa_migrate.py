@@ -55,12 +55,23 @@ def outside_strings(s, pos):
     return not instr
 
 
-def find_all_outside(s, term):
-    """返回 term 在字符串外、且不在 // 注释之后的所有位置。"""
+def find_all_outside(s, term, word_boundary=False):
+    """返回 term 在字符串外、且不在 // 注释之后的所有位置。
+
+    word_boundary=True 时额外要求 term 之后**不能紧跟标识符字符**（[A-Za-z0-9_]）。
+    ⚠ 第十七批 `na` 的血案：不加这条，`d.name` / `d.names` 会被当成 `d.na` 命中
+      （na 是 name 的前缀），若接收者恰好是已映射的 Node 局部量，就会被**改坏**成
+      `node_na((idx as u64))me`。故自第十七批起默认开启（见下方调用点）。
+    """
     res = []
     p = s.find(term)
     while p >= 0:
         if outside_strings(s, p):
+            if word_boundary:
+                nxt = p + len(term)
+                if nxt < len(s) and (s[nxt].isalnum() or s[nxt] == "_"):
+                    p = s.find(term, p + 1)
+                    continue
             cpos = s.find('//')
             commented = False
             while cpos >= 0 and cpos < p:
@@ -228,6 +239,34 @@ def resolve(m, name, lineno):
     return best[2] if best else None
 
 
+def stale_inner(lines, field):
+    """⭐ 第十七批新坑自检：索引表达式自身含被迁字段（`var ini: Node = base.nodes[n.na];`）。
+    工具用**迁移前**的原文建立「接收者 → 索引表达式」映射，于是把 `ini.na` 译成
+    `base.node_na((n.na as u64))` —— 外层译了，内层的 `n.na` 是**未迁移的字段读**，
+    编译期表现为 T_UNKNOWN_FIELD。且二次扫描**发现不了**（该 `.na` 已落在访问器
+    实参位，读/写点识别都不再命中，PLAN 恒为 0）。故必须显式自检。
+    """
+    # 只看「本批产出的访问器所在行」：避免把 S2 per-kind record 的 `r.na = tbl_RecX_na[i];`
+    # （record 自己的 na 字段，与本批无关）当假阳性。
+    pat = re.compile(r'\.' + re.escape(field) + r'\b')
+    bad = []
+    for i, s in enumerate(lines):
+        if ('node_' + field + '(') not in s and ('node_set_' + field + '(') not in s:
+            continue
+        for m in pat.finditer(s):
+            pre = s[:m.start()]
+            # 紧邻前缀是 node_<field> / node_set_<field> / *_<field>（tbl_Rec 等）⇒ 不是字段访问
+            if re.search(r'(?:^|[^A-Za-z0-9_])node_' + re.escape(field) + r'$', pre):
+                continue
+            if re.search(r'(?:^|[^A-Za-z0-9_])node_set_' + re.escape(field) + r'$', pre):
+                continue
+            if re.search(r'_' + re.escape(field) + r'$', pre):
+                continue
+            bad.append((i + 1, s.strip()))
+            break
+    return bad
+
+
 def main():
     path = sys.argv[2]
     apply = '--apply' in sys.argv
@@ -248,7 +287,7 @@ def main():
     for i, s in enumerate(lines):
         if FIELD not in s:
             continue
-        pos_list = find_all_outside(s, '.' + FIELD)
+        pos_list = find_all_outside(s, '.' + FIELD, word_boundary=True)
         if not pos_list:
             continue
         if 'tbl_Rec' in s:
@@ -372,6 +411,15 @@ def main():
     print('==== UNMAPPED %s : %d ====' % (path, len(unmapped)))
     for ln, txt, why in unmapped:
         print('%5d | %s | %s' % (ln, why, txt))
+
+    # ⭐ 内层未递归迁移自检：对「产出的新行」查残留字段访问
+    out_preview = list(lines)
+    for ln, o, nw in changes:
+        out_preview[ln - 1] = nw
+    bad = stale_inner(out_preview, FIELD)
+    print('==== STALE-INNER %s : %d ====' % (path, len(bad)))
+    for ln, txt in bad[:40]:
+        print('%5d | %s' % (ln, txt[:110]))
 
     if apply and changes:
         out = list(lines)
