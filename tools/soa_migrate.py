@@ -186,6 +186,44 @@ def balanced_content(s, open_pos):
 
 
 NODE_PREFIXES = ('base__nodes[', 'base.nodes[', 'nodes[')   # 由长到短，供外部复用
+# S4 第十八批（§0.14.7）：**返回 Node 的函数**也要当接收者——codegen_dev 的哨兵读取
+# `var n: Node = dev_safe_node(tn);` / `dev_safe_node(s).kind` 走的不是下标而是函数调用。
+# 全仓普查（§0.14.7「批次 18」）确认：返回 Node 的函数**只有** dev_safe_node 一个。
+NODE_CALL_PREFIXES = ('base.dev_safe_node(', 'dev_safe_node(')
+
+
+def balanced_tail(s, open_pos):
+    """通用括号配对：open_pos 处是 '[' 或 '('，返回 (内层文本, 闭括号下标)。"""
+    if open_pos >= len(s) or s[open_pos] not in '[(':
+        return None
+    oc, cc = s[open_pos], (']' if s[open_pos] == '[' else ')')
+    depth = 0
+    i = open_pos
+    while i < len(s):
+        if s[i] == oc:
+            depth += 1
+        elif s[i] == cc:
+            depth -= 1
+            if depth == 0:
+                return (s[open_pos + 1:i], i)
+        i += 1
+    return None
+
+
+def call_idx_at_end(pre):
+    """pre 以 `...dev_safe_node(EXPR)` 结尾时返回 (起始下标, EXPR)，否则 None。"""
+    for pat in NODE_CALL_PREFIXES:
+        p = pre.rfind(pat)
+        if p < 0:
+            continue
+        r = balanced_tail(pre, p + len(pat) - 1)
+        if r is None:
+            continue
+        inner, close = r
+        if close != len(pre) - 1:
+            continue
+        return (p, inner)
+    return None
 
 
 def idx_at_end(pre):
@@ -203,7 +241,8 @@ def idx_at_end(pre):
         if close != len(pre) - 1:
             continue
         return (p, inner)
-    return None
+    # S4 第十八批（§0.14.7）：回落去匹配「返回 Node 的函数」（dev_safe_node）
+    return call_idx_at_end(pre)
 
 
 DECL_BASE = re.compile(r'var\s+base\b')
@@ -211,10 +250,21 @@ DECL_BASE = re.compile(r'var\s+base\b')
 # ⚠ 类型标注可能是 `Node` 也可能是 **`base.Node`**（批次 14 在 hir.tc 实测：该文件通篇
 #   写作 `var n: base.Node = base.nodes[d];`，漏统一的只能手改 6 处）。
 NODE_DECL_RE = re.compile(r'var\s+(\w+)\s*(?::\s*(?:base\.)?Node)?\s*=\s*(?:base__nodes|base\.nodes|nodes)\[')
+# S4 第十八批（§0.14.7）：**返回 Node 的函数**（dev_safe_node，见 NODE_CALL_PREFIXES 处普查）
+# 也是合法的 Node 局部量来源。若不认，codegen_dev 的全部站点都会掉进 UNMAPPED。
+NODE_DECL_CALL_RE = re.compile(r'var\s+(\w+)\s*(?::\s*(?:base\.)?Node)?\s*=\s*(?:base\.\s*)?dev_safe_node\(')
 
 
 def build_map(lines, start, end):
-    """返回有序 [(lineno, name, idx_expr)]，解析时取「最近前置」声明。"""
+    """返回有序 [(lineno, col, name, idx_expr)]，解析时取「最近前置」声明。
+
+    ⚠ 第十八批修订（同一行声明 + 同一行使用）：这里额外记下声明在行内的**起始列** `col`。
+    旧版只记行号、`resolve` 要求 `ln < lineno`（严格小于），于是形如
+        `if (mlen >= 0) { var mvn: Node = base.nodes[mlen]; if (mvn.kind == "int") ... }`
+    的**同行**站点看不见自己的声明，回落到函数里**更早**的同名声明 ⇒ 把 `mvn.kind` 译成
+    `node_kind((mrows as u64))`（前一个 `@tsplat` 分支的变量），产出未定义标识符。
+    ⇒ 改为按 **(行, 列) 序**取最近前置：同行且声明在左侧者也算「可见」。
+    """
     m = []
     for i in range(start, end + 1):
         s = lines[i]
@@ -226,17 +276,29 @@ def build_map(lines, start, end):
             inner, close = r
             rest = s[close + 1:].lstrip()
             if rest.startswith(';') or rest.startswith('.'):
-                m.append((i, mo.group(1), inner))
+                m.append((i, mo.start(1), mo.group(1), inner))
+        for mo in NODE_DECL_CALL_RE.finditer(s):
+            r = balanced_tail(s, mo.end() - 1)
+            if r is None:
+                continue
+            inner, close = r
+            rest = s[close + 1:].lstrip()
+            if rest.startswith(';') or rest.startswith('.'):
+                m.append((i, mo.start(1), mo.group(1), inner))
     return m
 
 
-def resolve(m, name, lineno):
+def resolve(m, name, lineno, col=1 << 30):
+    """按 (行, 列) 序取最近前置声明；`col` 缺省为行尾（等价旧行为的严格小于）。"""
     best = None
-    for (ln, nm, ex) in m:
-        if nm == name and ln < lineno:
-            if best is None or ln > best[0]:
-                best = (ln, nm, ex)
-    return best[2] if best else None
+    for (ln, cl, nm, ex) in m:
+        if nm != name:
+            continue
+        if (ln, cl) >= (lineno, col):
+            continue
+        if best is None or (ln, cl) > (best[0], best[1]):
+            best = (ln, cl, nm, ex)
+    return best[3] if best else None
 
 
 def stale_inner(lines, field):
@@ -267,13 +329,37 @@ def stale_inner(lines, field):
     return bad
 
 
+def load_lines_filter(spec_path, path):
+    """⭐ 第十八批新能力：**编译驱动模式**。
+
+    `--lines=<json>` 里的 json 形如 {"C:\\...\\src\\sema.tc": [12, 34, ...]}，由
+    `tc check` 的诊断输出提炼 —— 先把 `kind` 从 `Node` 里删掉，编译期 T_UNKNOWN_FIELD
+    会精确点名**每一个真实 Node.kind 站点**（不受 `t.kind`/`tr2.kind`/`p1.kind` 之类
+    同名 `.kind` 假阳性干扰）。本开关把迁移范围**收窄到这些行**，杜绝误伤非 Node 接收者。
+    """
+    import json as _json
+    d = _json.load(io.open(spec_path, encoding='utf-8'))
+    key = os.path.basename(path)
+    for k, v in d.items():
+        if os.path.basename(k) == key:
+            return set(v)
+    return set()
+
+
 def main():
     path = sys.argv[2]
     apply = '--apply' in sys.argv
+    lines_spec = None
+    for a in sys.argv[3:]:
+        if a.startswith('--lines='):
+            lines_spec = a.split('=', 1)[1]
+    allowed = load_lines_filter(lines_spec, path) if lines_spec else None
     own = os.path.basename(path) == 'base.tc'
     lines, terms = read_lines(path)
     if not apply:
         print('==== EOL %s : %s ====' % (path, eol_report(terms)))
+        if allowed is not None:
+            print('==== 编译驱动模式：只处理 %d 行（由 tc check 点名）====' % len(allowed))
     bounds = func_bounds(lines)
     changes = []      # (lineno, old, new)
     unmapped = []     # (lineno, text)
@@ -286,6 +372,8 @@ def main():
 
     for i, s in enumerate(lines):
         if FIELD not in s:
+            continue
+        if allowed is not None and (i + 1) not in allowed:
             continue
         pos_list = find_all_outside(s, '.' + FIELD, word_boundary=True)
         if not pos_list:
@@ -332,7 +420,8 @@ def main():
                 if name in ('nodes', 'base'):
                     unmapped.append((i + 1, s.strip(), 'recv=%s' % name))
                     continue
-                idx_expr = resolve(nmap, name, i)
+                # S4 第十八批：传**列**，让同行前置声明也参与「最近前置」竞争
+                idx_expr = resolve(nmap, name, i, m2.start(1))
                 if idx_expr is None:
                     if name not in nmap_names:
                         unmapped.append((i + 1, s.strip(), 'nomap:%s' % name))

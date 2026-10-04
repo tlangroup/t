@@ -60,7 +60,7 @@ pub fn comptime_call_is_variant(e: i64) bool {
     var na: i64 = base.node_na((e as u64));
     if (na < 0) { return false; }
     var cn: Node = base.nodes[na];
-    if (cn.kind != "ident") { return false; }
+    if (base.node_kind((na as u64)) != "ident") { return false; }
     return sema.meta_str_find(cn.sa, "_from_") >= 0
         || sema.meta_str_find(cn.sa, "_is_") >= 0
         || sema.meta_str_find(cn.sa, "_as_") >= 0;
@@ -72,12 +72,12 @@ pub fn comptime_has_runtime_ref(e: i64) bool {
     // 仅 ident/call 是「硬运行期引用」；index/array_lit/struct_lit 是可折
     // 容器，交由 meta_eval 内部递归处理（其子树若含 ident/call 会被下面的
     // 递归检查捕获并阻止）。P2 起不再把它们当运行期引用拒之门外。
-    if (n.kind == "ident") { return true; }
-    if (n.kind == "conpat") {
+    if (base.node_kind((e as u64)) == "ident") { return true; }
+    if (base.node_kind((e as u64)) == "conpat") {
         // 纯模式子树：绑定标识符 + 嵌套 conpat，绝不含运行期值引用
         return false;
     }
-    if (n.kind == "call") {
+    if (base.node_kind((e as u64)) == "call") {
         if (comptime_call_is_variant(e)) {
             return comptime_has_runtime_ref_list(base.node_la((e as u64)));
         }
@@ -99,7 +99,7 @@ pub fn comptime_rewrite_to_literal(e: i64, v: i64) void {
     if (e < 0 || v < 0) { return; }
     var src: Node = base.nodes[v];
     var dst: Node = base.nodes[e];
-    dst.kind = src.kind;
+    base.node_set_kind((e as u64), base.node_kind((v as u64)));
     dst.sa = src.sa;
     base.node_set_ia((e as u64), base.node_ia((v as u64)));
     base.node_set_ba((e as u64), base.node_ba((v as u64)));   // S4 §0.14.7 SoA：侧表访问器（原 .ba；第十批）
@@ -141,7 +141,7 @@ pub fn fold_enum_values() void {
         var i: i64 = 0;
         var total: i64 = slice_len(base.nodes) as i64;
         while (i < total) {
-            if (base.nodes[i].kind == "EnumDecl") {
+            if (base.node_kind((i as u64)) == "EnumDecl") {
                 if (fold_one_enum(i)) { changed = true; }
             }
             i = i + 1;
@@ -151,7 +151,7 @@ pub fn fold_enum_values() void {
     var i2: i64 = 0;
     var t2: i64 = slice_len(base.nodes) as i64;
     while (i2 < t2) {
-        if (base.nodes[i2].kind == "EnumDecl") { report_unfolded_enum(i2); }
+        if (base.node_kind((i2 as u64)) == "EnumDecl") { report_unfolded_enum(i2); }
         i2 = i2 + 1;
     }
     sema.g_meta_quiet = svq;
@@ -171,7 +171,7 @@ pub fn fold_one_enum(d: i64) bool {
         var v: Node = base.nodes[k.val];
         if (base.node_na((k.val as u64)) >= 0) {
             var vn: Node = base.nodes[base.node_na((k.val as u64))];
-            if (vn.kind == "int") {
+            if (base.node_kind((base.node_na((k.val as u64)) as u64)) == "int") {
                 // 已是字面量：登记其值（供其它成员引用）并续推 auto_val
                 var fv: i64 = sema.js_parse_int(vn.sa, base.node_ia((base.node_na((k.val as u64)) as u64)));
                 sema.enum_const_set(n.sa, v.sa, fv);
@@ -182,7 +182,7 @@ pub fn fold_one_enum(d: i64) bool {
             // 未折：尝试编译期求值
             var vv: i64 = sema.meta_eval(base.node_na((k.val as u64)));
             sema.g_meta_err = false; // 复位：避免不可折节点污染后续成员
-            if (vv >= 0 && base.nodes[vv].kind == "int") {
+            if (vv >= 0 && base.node_kind((vv as u64)) == "int") {
                 comptime_rewrite_to_literal(base.node_na((k.val as u64)), vv);
                 var fv: i64 = sema.js_parse_int(base.nodes[base.node_na((k.val as u64))].sa, base.node_ia((base.node_na((k.val as u64)) as u64)));
                 sema.enum_const_set(n.sa, v.sa, fv);
@@ -207,7 +207,7 @@ pub fn report_unfolded_enum(d: i64) void {
     while (c >= 0) {
         var k: Child = base.kids[c];
         var v: Node = base.nodes[k.val];
-        if (base.node_na((k.val as u64)) >= 0 && base.nodes[base.node_na((k.val as u64))].kind != "int") {
+        if (base.node_na((k.val as u64)) >= 0 && base.node_kind((base.node_na((k.val as u64)) as u64)) != "int") {
             var vv: i64 = sema.meta_eval(base.node_na((k.val as u64)));
             sema.g_meta_err = false;
             if (vv < 0) {
@@ -215,10 +215,10 @@ pub fn report_unfolded_enum(d: i64) void {
                     base.sb_cat6("enum '", n.sa, "' 成员 '", v.sa,
                         "' 的赋值必须是编译期常量（字面量 / 算术 / const / comptime fn / 枚举成员引用），无法在编译期求值", ""),
                     "", 1, 1, 1, 10);
-            } else if (base.nodes[vv].kind != "int") {
+            } else if (base.node_kind((vv as u64)) != "int") {
                 base.diag_new("T-SEM-E202", "error",
                     base.sb_cat6("enum '", n.sa, "' 成员 '", v.sa,
-                        "' 的编译期值必须是整数，得到 ", base.nodes[vv].kind),
+                        "' 的编译期值必须是整数，得到 ", base.node_kind((vv as u64))),
                     "", 1, 1, 1, 5);
             }
         }
@@ -246,7 +246,7 @@ pub fn comptime_fold_pass() void {
     var i: i64 = 0;
     var n: i64 = slice_len(base.nodes) as i64;
     while (i < n) {
-        var k: string = base.nodes[i].kind;
+        var k: string = base.node_kind((i as u64));
         // 已由 meta_pass 处理的 comptime 节点跳过，避免重复改写
         if (k == "comptime" || k == "comptime_block") {
             i = i + 1;
