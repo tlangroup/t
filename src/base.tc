@@ -1728,7 +1728,22 @@ pub var toks: []Tok;
 //   ba/bb       : 布尔载荷（isConst/isExtern/isComptime/isBitpack...）
 
 pub struct Node {
-    kind: string;
+    // S4 第十八批（§0.14.7）：kind 已迁出为属性侧表 g_node_kind，访问面走 node_kind()/
+    // node_set_kind()（默认 ""）。⚠ 这是 Node 里**语义最重**的字段 —— 它是全编译器 AST
+    //   派发的唯一依据（前端解糖、sema 分派、HIR lower、双后端发射全部按 kind 分派），
+    //   真实站点 920 行 / 1022 处，且**散布极广**（不像 na 那样集中分布在看
+    //   kids/子节点槽的少数模块里，而是每个模块的每个派发点都有一份）。
+    //   ⚠⚠ **本批最致命风险**：kind 一外置，**跨索引整体赋值就不再搬 kind** ⇒ sema 那 2 处
+    //      ADT 脱糖拷贝（§0.14.7「批次 16/17」）会直接改派发（e 本该从 variant_lit 变成 call，
+    //      漏同步 ⇒ 仍按 variant_lit 分派 ⇒ 递归到自身、无限脱糖）。故这两处**必须显式同步**
+    //      （`tools/wholescan.py` 已把 kind 纳入 SOAP 字段清单做台账）。
+    //   ⚠ 默认值论证：`node_new(kind)` 是**唯一**的新节点入口，且 kind 是它的**必填形参**
+    //      ⇒ 任何真实节点的 kind 都由调用方显式给出，不存在「漏给默认值」的情形；
+    //      越界读 / 零节点读一律返 **""**（与 `codegen_dev::dev_safe_node` 旧零节点
+    //      `n.kind = ""` 逐点一致）。
+    //   ✅ 已普查确认 **无哨兵值**（不像 lc/lb 的 -2）：kind 的取值全部是**语义字符串**
+    //      （"ident"/"call"/"FuncDecl"/…），不存在「默认之外的哨兵语义」。
+    //   外置只做等价搬迁，禁止顺手拆语义 / 改默认值 / 改写入时机。
     sa: string;
     // S4 第十二批（§0.14.7）：sb 已迁出为属性侧表 g_node_sb，访问面走 node_sb()/node_set_sb()
     // （默认 **空串**；越界读也返空串）。⚠ 该字段按 kind **复用**于 12 种语义（详见 node_sb 处
@@ -1929,6 +1944,8 @@ pub var g_node_nb: []i64;                  // S4 第十五批：nodes[i] 的 nb 
 pub var g_node_la: []i64;                  // S4 第十六批：nodes[i] 的 la 第一条 kids 链表头（默认 -1 = 空链）
                                            // ⚠ 与 lb/lc 同为 kids 链槽族（装的是**kids 池下标**，非节点 id），
                                            //   但**只有 -1 一个哨兵**（无 lb/lc 的 -2）⇒ 见 node_la 处普查判据。
+pub var g_node_kind: []string;                 // S4 第十八批：nodes[i] 的 AST 节点 kind 字符串（由 node_new 形参写入）
+                                               // ⚠ 无「默认 kind」概念：node_new(kind) 必填；越界读返 ""。
 pub var g_node_na: []i64;                  // S4 第十七批：nodes[i] 的 na 第一子节点槽（默认 -1 = 无）
                                            // ⚠ na/nb/nc/nd 索引槽族的**最后一槽**，也是 Node 里用量最大的
                                            //   索引槽（910 站）；按 kind 复用极多语义（见 node_na 处清单），
@@ -1984,6 +2001,7 @@ pub fn sidetable_init() void {
     sidetable_register("node_nb", "S4");        // SoA：nb 第二子节点槽（第十五批，默认 -1 = 无）
     sidetable_register("node_la", "S4");        // SoA：la kids 链表头（第十六批，默认 -1 = 空链；纯单哨兵，无 -2）
     sidetable_register("node_na", "S4");        // SoA：na 第一子节点槽（第十七批，默认 -1 = 无；纯单哨兵，无 -2）
+    sidetable_register("node_kind", "S4");      // SoA：kind AST 节点种类字符串（第十八批，默认 ""；无哨兵）
 }
 pub fn node_mod(n: u64) string {
     sidetable_init();
@@ -2056,7 +2074,7 @@ pub fn cst_dump(role: string, id: i64, depth: i64) void {
         sb_append_char(g_cst_sb, 58);        // 58 = ':'
     }
     var n: Node = nodes[id];
-    sb_append_str(g_cst_sb, n.kind);
+    sb_append_str(g_cst_sb, node_kind((id as u64)));   // S4 §0.14.7 SoA：侧表读（原 n.kind；第十八批）
     sb_append_str(g_cst_sb, " id=");
     sb_append_i64(g_cst_sb, id);
     var sp: Span = node_span_id(id);
@@ -2693,6 +2711,31 @@ pub fn node_set_na(n: u64, v: i64) void {
     if (id < 0 || id >= slice_len(g_node_na)) { return; }
     slice_set(g_node_na, id, v);
 }
+
+// S4 第十八批（§0.14.7）：kind —— AST 节点种类（原 Node 首字段，第三个 `[]string` 侧表，
+// 复用第六批 sc / 第十二批 sb 的「字符串侧表」范式）。
+// ⚠ **语义与风险（本批第一支柱）**：
+//   ① kind 是全编译器 AST **派发键**——前端解糖 / sema infer / HIR lower / tir / 双后端
+//      全部按 `X.kind == "<名字>"` 分派 ⇒ 任何一处读到错误的 kind 就是**静默错编**，
+//      不像数值槽那样常常表现为崩溃或越界。
+//   ② 不存在「默认 kind」：`node_new(kind)` 是唯一入口且 kind 为必填形参 ⇒ 真实节点恒有值；
+//      **越界读一律返 ""**（零节点 `dev_safe_node` 的旧语义也是 ""，见其处注释）。
+//   ③ ⚠⚠ **跨索引整体赋值不搬 kind**：`nodes[dst] = <来自别的索引的 Node>` 只搬结构体字段。
+//      sema::infer_expr_body 的两处 ADT 脱糖靠这行把 `e` 从 variant_lit 改写成 call
+//      ⇒ 本批在这两处显式 `node_set_kind(e, node_kind(call_id))`（wholescan 台账已收录）。
+//   ④ ✅ 已普查确认 **无哨兵值**（与 lc/lb 的 -2 无关）：取值全是语义字符串。
+//   ⇒ 迁移铁律：① 默认值 **""**；② 越界读返 **""**；③ 只搬存储，不得改动写入时机或取值。
+pub fn node_kind(n: u64) string {
+    sidetable_init();
+    var id = nr_idx(n);
+    if (id < 0 || id >= slice_len(g_node_kind)) { return ""; }
+    return g_node_kind[id];
+}
+pub fn node_set_kind(n: u64, v: string) void {
+    var id = nr_idx(n);
+    if (id < 0 || id >= slice_len(g_node_kind)) { return; }
+    slice_set(g_node_kind, id, v);
+}
 // S4 第六批（§0.14.7）：字符串载荷 sc（默认 ""）。**本批为 sa/sb/sc 字符串整族外置预演**
 // ——首个 `[]string` 类型侧表，验证「非标量侧表 + node_new 锁步 append」范式成立。
 //   sc 按 kind 复用 4 种语义（本次只做等价搬迁，未拆语义）：
@@ -2852,7 +2895,9 @@ pub fn g_conpat_bind_has(d: i64) bool {
 // 新建节点：全部字段置于"空"语义，返回索引
 pub fn node_new(kind: string) u64 {
     var n: Node;
-    n.kind = kind;
+    // S4 第十八批（§0.14.7）：kind 已外置为侧表 g_node_kind，见下方 `append(g_node_kind, kind)`。
+    //   ⚠ 与其余侧表不同：这里没有「默认初值」可谈——kind 是本函数的**必填形参**，逐字落到
+    //     侧表（旧代码是 `n.kind = kind;`，等号两边同为一处 ⇒ 严格等价）。
     n.sa = "";
     // S4 第十二批（§0.14.7）：sb 已外置为侧表（默认空串，见下方 append）
     // S4 第六批（§0.14.7）：sc 已外置为侧表（默认空串，见下方 append）
@@ -2906,6 +2951,7 @@ pub fn node_new(kind: string) u64 {
     append(g_node_nb, -1);                                  // S4 §0.14.7 SoA：nb 默认 -1（无子节点；第十五批；纯 -1 哨兵，无 -2）
     append(g_node_la, -1);                                  // S4 §0.14.7 SoA：la 默认 -1（空 kids 链；第十六批；纯 -1 哨兵，无 -2）
     append(g_node_na, -1);                                  // S4 §0.14.7 SoA：na 默认 -1（无子节点；第十七批；纯 -1 哨兵，无 -2）
+    append(g_node_kind, kind);                              // S4 §0.14.7 SoA：kind 由必填形参写入（第十八批，无默认/"哨兵"概念）
     var nref_tag: i64 = nk_of_kind(kind);
     if (nref_tag < 0) { nref_tag = 0; }   // 未注册 kind 暂归 tag=0（g_node_nref 当前无消费方，安全）
     append(g_node_nref, mk_noderef(nref_tag, (slice_len(nodes) as i64) - 1));   // S4：打包 tag|idx 存入侧表（供未来消费方）

@@ -34,7 +34,11 @@ pub var g_dv_a: []i64;
 // 任意索引越界访问都会崩；统一经此函数取节点，越界时回零节点（kind=""）避免崩溃。
 pub fn dev_safe_node(e: i64) Node {
     var n: Node;
-    n.kind = "";
+    // S4 §0.14.7 SoA：kind 已外置为侧表 g_node_kind（第十八批）。零 Node 无 id ⇒ 无法回写侧表；
+    //   而越界读 `node_kind` 返 **""**，与此处原 `n.kind = ""` **严格等价**（同第十六批 la /
+    //   第十四批 lb / 第九批 nc 的论证：零节点初值恰等于访问器越界返回值）。
+    //   ⚠ 前提：**本文件内已无任何** Node 消费方从 dev_safe_node 的返回值读 kind —— 全部
+    //     23 处站点已改为 `base.node_kind((X as u64))` 直通侧表（见 tc check 点名的报错清单）。
     n.sa = "";
     // S4 §0.14.7 SoA：ia 已外置为侧表 g_node_ia（第十三批）。原零节点写的是 `n.ia = 0`
     //   （而非全局默认 -1），故不能直接套用「越界读访问器返默认值即等价」的论证；此处经
@@ -143,7 +147,7 @@ pub fn dev_is_float(ty: string) bool {
 // 类型节点 → MLIR 类型（借 module 全局回传 as / elem）
 pub fn dev_type_of(tn: i64) string {
     var n: Node = dev_safe_node(tn);
-    if (n.kind == "pointer") {
+    if (base.node_kind((tn as u64)) == "pointer") {
         var em: string = dev_type_of(base.node_na((tn as u64)));
         // S4 §0.14.7 SoA：memspace 已外置（原 `n.memspace`；n 是 dev_safe_node(tn) 的拷贝）
         var as_ms: i64 = base.node_memspace((tn as u64));
@@ -152,7 +156,7 @@ pub fn dev_type_of(tn: i64) string {
         g_dt_elem = em;
         return g_dt_ty;
     }
-    if (n.kind == "scalar") {
+    if (base.node_kind((tn as u64)) == "scalar") {
         g_dt_ty = dev_scalar(n.sa);
         g_dt_as = 0;
         g_dt_elem = "";
@@ -197,10 +201,10 @@ pub fn dev_is_call_name(node: i64, name: string) bool {
     var nlen: i64 = slice_len(base.nodes) as i64;
     if (node < 0 || node >= nlen) { return false; }
     var n: Node = base.nodes[node];
-    if (n.kind != "call") { return false; }
+    if (base.node_kind((node as u64)) != "call") { return false; }
     if (base.node_na((node as u64)) < 0 || base.node_na((node as u64)) >= nlen) { return false; }
     var callee: Node = base.nodes[base.node_na((node as u64))];
-    return callee.kind == "ident" && callee.sa == name;
+    return base.node_kind((base.node_na((node as u64)) as u64)) == "ident" && callee.sa == name;
 }
 
 // emit-dev 跳过 sema，int 字面量的数值 .ia 未填充；此处从 .sa 文本本地解析（decimal，支持负号），
@@ -225,7 +229,7 @@ pub fn dev_parse_int(s: string) i64 {
 pub fn dev_dim_of(callNode: i64) i64 {
     var a0: i64 = dev_first_arg(callNode);
     var nlen: i64 = slice_len(base.nodes) as i64;
-    if (a0 >= 0 && a0 < nlen && base.nodes[a0].kind == "int") {
+    if (a0 >= 0 && a0 < nlen && base.node_kind((a0 as u64)) == "int") {
         return dev_parse_int(base.nodes[a0].sa);
     }
     return 0;
@@ -244,7 +248,7 @@ pub fn emit_device_module() string {
         var dn: Node = dev_safe_node(d);
         // S4 §0.14.7 SoA：bf 已外置（原 `dn.bf`；dev_safe_node 越界返默认 Node，
         // 其 bf 恒 false —— 与 node_bf 越界返 false 等价）
-        if (dn.kind == "FuncDecl" && base.node_bf((d as u64)) == true) {
+        if (base.node_kind((d as u64)) == "FuncDecl" && base.node_bf((d as u64)) == true) {
             emit_dev_kernel(d);
             found = true;
         }
@@ -322,14 +326,14 @@ pub fn emit_dev_kernel(d: i64) void {
 
 pub fn emit_dev_stmt(s: i64) void {
     dev_trace("[EMIT_DEV] stmt kind=");
-    dev_trace(dev_safe_node(s).kind);
+    dev_trace(base.node_kind((s as u64)));
     dev_trace(" nb=");
     dev_trace(base.i2s(base.node_nb((s as u64))));
     dev_trace(" nlen=");
     dev_trace(base.i2s(slice_len(base.nodes) as i64));
     dev_trace("\n");
     var n: Node = dev_safe_node(s);
-    if (n.kind == "var_decl") {
+    if (base.node_kind((s as u64)) == "var_decl") {
         // 共享内存分配：`var sh: shared[T] = shared_alloc(N)`
         if (base.node_nb((s as u64)) >= 0 && dev_is_call_name(base.node_nb((s as u64)), "shared_alloc")) {
             var mty: string = dev_type_of(base.node_na((s as u64)));    // !llvm.ptr<3>
@@ -349,15 +353,15 @@ pub fn emit_dev_stmt(s: i64) void {
         dev_bind(n.sa, "", "i32", "", 0);
         return;
     }
-    if (n.kind == "assign" || n.kind == "assignment") {
+    if (base.node_kind((s as u64)) == "assign" || base.node_kind((s as u64)) == "assignment") {
             emit_dev_assign(base.node_na((s as u64)), base.node_nb((s as u64)));
         return;
     }
-    if (n.kind == "return") {
+    if (base.node_kind((s as u64)) == "return") {
         dev_emit("  \"device.return\"() : () -> ()");
         return;
     }
-    if (n.kind == "expr") {
+    if (base.node_kind((s as u64)) == "expr") {
         emit_dev_expr(base.node_na((s as u64)));
         return;
     }
@@ -367,12 +371,12 @@ pub fn emit_dev_stmt(s: i64) void {
 // 赋值：ident 重绑；index 走 gep + store
 pub fn emit_dev_assign(lhs: i64, rhs: i64) void {
     var ln: Node = dev_safe_node(lhs);
-    if (ln.kind == "ident") {
+    if (base.node_kind((lhs as u64)) == "ident") {
         var v: string = emit_dev_expr(rhs);
         dev_bind(ln.sa, v, g_dev_rty, g_dev_elem, g_dev_asv);
         return;
     }
-    if (ln.kind == "index") {
+    if (base.node_kind((lhs as u64)) == "index") {
         var b: string = emit_dev_expr(base.node_na((lhs as u64)));
         var bas: i64 = g_dev_asv;
         var belem: string = g_dev_elem;
@@ -391,7 +395,7 @@ pub fn emit_dev_assign(lhs: i64, rhs: i64) void {
 // 取地址：&x 返回 x 的指针（GEP 结果），不 load。用于 atomic_add(&ptr[i], v) 等。
 pub fn emit_dev_addr(e: i64) string {
     var n: Node = dev_safe_node(e);
-    if (n.kind == "index") {
+    if (base.node_kind((e as u64)) == "index") {
         var b: string = emit_dev_expr(base.node_na((e as u64)));
         var bas: i64 = g_dev_asv;
         var belem: string = g_dev_elem;
@@ -409,11 +413,11 @@ pub fn emit_dev_addr(e: i64) string {
 
 pub fn emit_dev_expr(e: i64) string {
     var n: Node = dev_safe_node(e);
-    if (n.kind == "assign" || n.kind == "assignment") {
+    if (base.node_kind((e as u64)) == "assign" || base.node_kind((e as u64)) == "assignment") {
         emit_dev_assign(base.node_na((e as u64)), base.node_nb((e as u64)));
         return "";
     }
-    if (n.kind == "ident") {
+    if (base.node_kind((e as u64)) == "ident") {
         var idx: i64 = dev_lookup(n.sa);
         if (idx < 0) {
             g_dev_rty = "i32";
@@ -426,7 +430,7 @@ pub fn emit_dev_expr(e: i64) string {
         g_dev_asv = g_dv_a[idx];
         return g_dv_v[idx];
     }
-    if (n.kind == "int") {
+    if (base.node_kind((e as u64)) == "int") {
         var v: string = dev_next();
         g_dev_rty = "i32";
         g_dev_elem = "";
@@ -434,7 +438,7 @@ pub fn emit_dev_expr(e: i64) string {
         dev_emit(base.sb_cat7("  ", v, " = arith.constant ", n.sa, " : i32", "", ""));
         return v;
     }
-    if (n.kind == "float") {
+    if (base.node_kind((e as u64)) == "float") {
         var v: string = dev_next();
         g_dev_rty = "f32";
         g_dev_elem = "";
@@ -442,10 +446,10 @@ pub fn emit_dev_expr(e: i64) string {
         dev_emit(base.sb_cat7("  ", v, " = arith.constant ", n.sa, " : f32", "", ""));
         return v;
     }
-    if (n.kind == "paren") {
+    if (base.node_kind((e as u64)) == "paren") {
         return emit_dev_expr(base.node_na((e as u64)));
     }
-    if (n.kind == "binary") {
+    if (base.node_kind((e as u64)) == "binary") {
         var l: string = emit_dev_expr(base.node_na((e as u64)));
         var lt: string = g_dev_rty;
         var r: string = emit_dev_expr(base.node_nb((e as u64)));
@@ -465,12 +469,12 @@ pub fn emit_dev_expr(e: i64) string {
         g_dev_asv = 0;
         return v;
     }
-    if (n.kind == "amp") {
+    if (base.node_kind((e as u64)) == "amp") {
         // &x：取 x 的地址（GEP 指针），不 load。x 为 index 时发 GEP 返回 ptr<as>；
         // x 为指针型 ident 时其值已是 !llvm.ptr<as>，直接回传。
         return emit_dev_addr(base.node_na((e as u64)));
     }
-    if (n.kind == "index") {
+    if (base.node_kind((e as u64)) == "index") {
         // 读：gep + load（结果值，非指针）
         var b: string = emit_dev_expr(base.node_na((e as u64)));
         var bas: i64 = g_dev_asv;
@@ -485,7 +489,7 @@ pub fn emit_dev_expr(e: i64) string {
         g_dev_asv = 0;
         return ld;
     }
-    if (n.kind == "call") {
+    if (base.node_kind((e as u64)) == "call") {
         return emit_dev_call(e);
     }
     // 未识别表达式：回退未定义，避免崩溃
