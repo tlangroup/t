@@ -39,7 +39,11 @@ pub fn dev_safe_node(e: i64) Node {
     //   第十四批 lb / 第九批 nc 的论证：零节点初值恰等于访问器越界返回值）。
     //   ⚠ 前提：**本文件内已无任何** Node 消费方从 dev_safe_node 的返回值读 kind —— 全部
     //     23 处站点已改为 `base.node_kind((X as u64))` 直通侧表（见 tc check 点名的报错清单）。
-    n.sa = "";
+    // S4 §0.14.7 SoA：sa 已外置为侧表 g_node_sa（第十九批，Node 的最后一个真实载荷字段）。
+    //   论证完全同第十八批 kind：零 Node **无 id** ⇒ 无法回写侧表；而越界读 `node_sa` 返 **""**，
+    //   与此处原 `n.sa = ""` **严格等价**（零节点初值恰等于访问器越界返回值）。
+    //   ⚠ 前提：**本文件内已无任何**消费方从 dev_safe_node 的返回值读 sa —— 本文件由 tc check
+    //     点名的 21 处站点已全部改为 `base.node_sa((X as u64))` 直通侧表（不含本行）。
     // S4 §0.14.7 SoA：ia 已外置为侧表 g_node_ia（第十三批）。原零节点写的是 `n.ia = 0`
     //   （而非全局默认 -1），故不能直接套用「越界读访问器返默认值即等价」的论证；此处经
     //   **普查确认是死写**：本文件改造后**无任何** `Node` 消费方读 ia（唯一提及在
@@ -157,7 +161,7 @@ pub fn dev_type_of(tn: i64) string {
         return g_dt_ty;
     }
     if (base.node_kind((tn as u64)) == "scalar") {
-        g_dt_ty = dev_scalar(n.sa);
+        g_dt_ty = dev_scalar(base.node_sa((tn as u64)));
         g_dt_as = 0;
         g_dt_elem = "";
         return g_dt_ty;
@@ -204,7 +208,7 @@ pub fn dev_is_call_name(node: i64, name: string) bool {
     if (base.node_kind((node as u64)) != "call") { return false; }
     if (base.node_na((node as u64)) < 0 || base.node_na((node as u64)) >= nlen) { return false; }
     var callee: Node = base.nodes[base.node_na((node as u64))];
-    return base.node_kind((base.node_na((node as u64)) as u64)) == "ident" && callee.sa == name;
+    return base.node_kind((base.node_na((node as u64)) as u64)) == "ident" && base.node_sa((base.node_na((node as u64)) as u64)) == name;
 }
 
 // emit-dev 跳过 sema，int 字面量的数值 .ia 未填充；此处从 .sa 文本本地解析（decimal，支持负号），
@@ -230,7 +234,7 @@ pub fn dev_dim_of(callNode: i64) i64 {
     var a0: i64 = dev_first_arg(callNode);
     var nlen: i64 = slice_len(base.nodes) as i64;
     if (a0 >= 0 && a0 < nlen && base.node_kind((a0 as u64)) == "int") {
-        return dev_parse_int(base.nodes[a0].sa);
+        return dev_parse_int(base.node_sa((a0 as u64)));
     }
     return 0;
 }
@@ -262,7 +266,7 @@ pub fn emit_device_module() string {
 
 pub fn emit_dev_kernel(d: i64) void {
     dev_trace("[EMIT_DEV] kernel: ");
-    dev_trace(dev_safe_node(d).sa);
+    dev_trace(base.node_sa((d as u64)));
     dev_trace("\n");
     g_dev_ssa = 0;
     // 空切片字面量 `[]` 仅可作局部变量初始化器（LLVM 限制）；用局部临时中转后再赋给模块级 slice。
@@ -297,16 +301,16 @@ pub fn emit_dev_kernel(d: i64) void {
         }
         sb_append_str(psb, mty);
         sb_append_str(asb, "%");
-        sb_append_str(asb, p.sa);
+        sb_append_str(asb, base.node_sa((kval as u64)));
         sb_append_str(asb, " : ");
         sb_append_str(asb, mty);
-        dev_bind(p.sa, base.sb_cat2("%", p.sa), mty, elem, aspace);
+        dev_bind(base.node_sa((kval as u64)), base.sb_cat2("%", base.node_sa((kval as u64))), mty, elem, aspace);
         first = false;
         c = dev_kid_next(c);
     }
 
     dev_trace("[EMIT_DEV] before dev_emit kernel header\n");
-    dev_emit(base.sb_cat6("device.kernel_func @", dn.sa, " : (", sb_to_str(psb), ") -> () {", ""));
+    dev_emit(base.sb_cat6("device.kernel_func @", base.node_sa((d as u64)), " : (", sb_to_str(psb), ") -> () {", ""));
     dev_trace("[EMIT_DEV] after dev_emit kernel header\n");
     dev_emit(base.sb_cat3("^entry(", sb_to_str(asb), ") :"));
     dev_trace("[EMIT_DEV] after ^entry emit\n");
@@ -341,16 +345,16 @@ pub fn emit_dev_stmt(s: i64) void {
             var cnt: string = emit_dev_expr(dev_first_arg(base.node_nb((s as u64))));
             var v: string = dev_next();
             dev_emit(base.sb_cat8("  ", v, " = \"device.shared_alloc\"(", cnt, ") {elem = ", elem, "} : (i32) -> !llvm.ptr<3>", ""));
-            dev_bind(n.sa, v, "!llvm.ptr<3>", elem, 3);
+            dev_bind(base.node_sa((s as u64)), v, "!llvm.ptr<3>", elem, 3);
             return;
         }
         if (base.node_nb((s as u64)) >= 0) {
             var v: string = emit_dev_expr(base.node_nb((s as u64)));
-            dev_bind(n.sa, v, g_dev_rty, g_dev_elem, g_dev_asv);
+            dev_bind(base.node_sa((s as u64)), v, g_dev_rty, g_dev_elem, g_dev_asv);
             return;
         }
         // 无初始化声明：默认绑空，后续赋值覆盖
-        dev_bind(n.sa, "", "i32", "", 0);
+        dev_bind(base.node_sa((s as u64)), "", "i32", "", 0);
         return;
     }
     if (base.node_kind((s as u64)) == "assign" || base.node_kind((s as u64)) == "assignment") {
@@ -373,7 +377,7 @@ pub fn emit_dev_assign(lhs: i64, rhs: i64) void {
     var ln: Node = dev_safe_node(lhs);
     if (base.node_kind((lhs as u64)) == "ident") {
         var v: string = emit_dev_expr(rhs);
-        dev_bind(ln.sa, v, g_dev_rty, g_dev_elem, g_dev_asv);
+        dev_bind(base.node_sa((lhs as u64)), v, g_dev_rty, g_dev_elem, g_dev_asv);
         return;
     }
     if (base.node_kind((lhs as u64)) == "index") {
@@ -418,12 +422,12 @@ pub fn emit_dev_expr(e: i64) string {
         return "";
     }
     if (base.node_kind((e as u64)) == "ident") {
-        var idx: i64 = dev_lookup(n.sa);
+        var idx: i64 = dev_lookup(base.node_sa((e as u64)));
         if (idx < 0) {
             g_dev_rty = "i32";
             g_dev_elem = "";
             g_dev_asv = 0;
-            return base.sb_cat2("%undef_", n.sa);
+            return base.sb_cat2("%undef_", base.node_sa((e as u64)));
         }
         g_dev_rty = g_dv_t[idx];
         g_dev_elem = g_dv_e[idx];
@@ -435,7 +439,7 @@ pub fn emit_dev_expr(e: i64) string {
         g_dev_rty = "i32";
         g_dev_elem = "";
         g_dev_asv = 0;
-        dev_emit(base.sb_cat7("  ", v, " = arith.constant ", n.sa, " : i32", "", ""));
+        dev_emit(base.sb_cat7("  ", v, " = arith.constant ", base.node_sa((e as u64)), " : i32", "", ""));
         return v;
     }
     if (base.node_kind((e as u64)) == "float") {
@@ -443,7 +447,7 @@ pub fn emit_dev_expr(e: i64) string {
         g_dev_rty = "f32";
         g_dev_elem = "";
         g_dev_asv = 0;
-        dev_emit(base.sb_cat7("  ", v, " = arith.constant ", n.sa, " : f32", "", ""));
+        dev_emit(base.sb_cat7("  ", v, " = arith.constant ", base.node_sa((e as u64)), " : f32", "", ""));
         return v;
     }
     if (base.node_kind((e as u64)) == "paren") {
@@ -456,10 +460,10 @@ pub fn emit_dev_expr(e: i64) string {
         var rt: string = g_dev_rty;
         var isf: bool = dev_is_float(lt) || dev_is_float(rt);
         var op: string = "addi";
-        if (n.sa == "+") { op = "addi"; if (isf) { op = "addf"; } }
-        else if (n.sa == "-") { op = "subi"; if (isf) { op = "subi"; } if (isf) { op = "subf"; } }
-        else if (n.sa == "*") { op = "muli"; if (isf) { op = "mulf"; } }
-        else if (n.sa == "/") { op = "divsi"; if (isf) { op = "divf"; } }
+        if (base.node_sa((e as u64)) == "+") { op = "addi"; if (isf) { op = "addf"; } }
+        else if (base.node_sa((e as u64)) == "-") { op = "subi"; if (isf) { op = "subi"; } if (isf) { op = "subf"; } }
+        else if (base.node_sa((e as u64)) == "*") { op = "muli"; if (isf) { op = "mulf"; } }
+        else if (base.node_sa((e as u64)) == "/") { op = "divsi"; if (isf) { op = "divf"; } }
         var ty: string = "i32";
         if (isf) { ty = "f32"; }
         var v: string = dev_next();
@@ -507,7 +511,7 @@ pub fn emit_dev_call(n: i64) string {
     var name: string = "";
     if (cn >= 0 && cn < nlen) {
         var callee: Node = base.nodes[cn];
-        name = callee.sa;
+        name = base.node_sa((cn as u64));
     } else {
         g_dev_rty = "i32";
         g_dev_elem = "";
