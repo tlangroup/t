@@ -439,8 +439,8 @@ pub fn tile_resolve(tn: i64) i64 {
     var telem: i64 = resolve_ti(n.na);
     // 已折叠且已校验：直接重建 TI（resolve_ti 可能多次进入同一节点）
     var n_ib: i64 = base.node_ib((tn as u64));   // S4 §0.14.7 SoA：侧表读（原 n.ib）
-    if (base.node_ia((tn as u64)) >= 1 && n_ib >= 1 && n.la >= 0) {
-        return ti_tile(telem, base.node_ia((tn as u64)), n_ib, n.la);
+    if (base.node_ia((tn as u64)) >= 1 && n_ib >= 1 && base.node_la((tn as u64)) >= 0) {
+        return ti_tile(telem, base.node_ia((tn as u64)), n_ib, base.node_la((tn as u64)));
     }
     var first: bool = tile_checked_has(tn) == false;
     if (first) { append(g_tile_checked, tn); }
@@ -499,7 +499,7 @@ pub fn tile_resolve(tn: i64) i64 {
     var tn2: Node = base.nodes[tn];
     base.node_set_ia((tn as u64), rows);
     base.node_set_ib((tn as u64), cols);   // S4 §0.14.7 SoA：取代 `tn2.ib`（下方 slice_set 回写生效）
-    tn2.la = flavor;
+    base.node_set_la((tn as u64), flavor);
     slice_set(base.nodes, tn, tn2);
     return ti_tile(telem, rows, cols, flavor);
 }
@@ -1245,7 +1245,7 @@ pub fn check_call_args(e: i64, fti: i64, fname: string) void {
     }
     var want: i64 = tif_pcount[fti];
     var got: i64 = 0;
-    var c: i64 = n.la;
+    var c: i64 = base.node_la((e as u64));
     while (c >= 0) {
         var k: Child = base.kids[c];
         if (got < want) {
@@ -1516,7 +1516,7 @@ pub fn resolve_ti(tn: i64) i64 {
         // 嵌套函数类型会在递归里自行 append，直接边解析边 append 会打断本层参数区的连续性。
         var fret: i64 = resolve_ti(n.na);
         var fbuf: []i64;
-        var fk: i64 = n.la;
+        var fk: i64 = base.node_la((tn as u64));
         while (fk >= 0) {
             var fc: Child = base.kids[fk];
             append(fbuf, resolve_ti(fc.val));
@@ -1669,7 +1669,7 @@ pub fn clone_node(src: i64) i64 {
     base.node_set_nb((id as u64), clone_node(base.node_nb((src as u64))));
     base.node_set_nc((id as u64), clone_node(base.node_nc((src as u64))));   // S4 §0.14.7 SoA：侧表访问器（原 .nc；第九批）
     base.node_set_nd((id as u64), clone_node(base.node_nd((src as u64))));   // S4 §0.14.7 SoA：侧表访问器（原 .nd）
-    nn.la = clone_kids(sn.la);
+    base.node_set_la((id as u64), clone_kids(base.node_la((src as u64))));
     base.node_set_lb((id as u64), clone_kids(base.node_lb((src as u64))));
     base.node_set_lc((id as u64), clone_kids(base.node_lc((src as u64))));   // S4 §0.14.7 SoA：取代 `base.node_lc((nn.id as u64)) = clone_kids(base.node_lc((sn.id as u64)))`（第十一批）
     base.node_set_span_id(nn.id, base.node_span_id(sn.id)); base.node_set_span_id(nn.id, base.node_span_id(sn.id)); base.node_set_span_id(nn.id, base.node_span_id(sn.id));
@@ -1708,7 +1708,10 @@ pub fn subst_type_in_node(nd_id: i64, name: string, concrete: i64) i64 {
     if (n_nc >= 0) { base.node_set_nc((nd_id as u64), subst_type_in_node(n_nc, name, concrete)); }
     var n_nd: i64 = base.node_nd((nd_id as u64));
     if (n_nd >= 0) { base.node_set_nd((nd_id as u64), subst_type_in_node(n_nd, name, concrete)); }   // S4 §0.14.7 SoA：侧表访问器（原 .nd）
-    if (n.la >= 0) { n.la = subst_type_in_kids(n.la, name, concrete); }
+    // S4 §0.14.7 SoA：原单行 `if (n.la >= 0) { n.la = subst_type_in_kids(n.la, ...); }` ——
+    //   同行读写 + 花括号 ⇒ 自动迁移器 guard 拦截（第十六批，形态与第十五批 nb 一致）；
+    //   ⚠ 脚本对该行的处理是**半吊子**（只换了条件与 rhs 的读点，留下写点），此处手工收尾。
+    if (base.node_la((nd_id as u64)) >= 0) { base.node_set_la((nd_id as u64), subst_type_in_kids(base.node_la((nd_id as u64)), name, concrete)); }
     if (base.node_lb((nd_id as u64)) >= 0) { base.node_set_lb((nd_id as u64), subst_type_in_kids(base.node_lb((nd_id as u64)), name, concrete)); }
     var n_lc: i64 = base.node_lc((nd_id as u64));   // S4 §0.14.7 SoA：侧表读写（原 base.node_lc((n.id as u64))；第十一批）
     if (n_lc >= 0) { base.node_set_lc((nd_id as u64), subst_type_in_kids(n_lc, name, concrete)); }
@@ -1765,7 +1768,9 @@ pub fn meta_subst_val_node(nd_id: i64, name: string, lit: i64) i64 {
     if (n_nc >= 0) { base.node_set_nc((nd_id as u64), meta_subst_val_node(n_nc, name, lit)); }
     var n_nd: i64 = base.node_nd((nd_id as u64));
     if (n_nd >= 0) { base.node_set_nd((nd_id as u64), meta_subst_val_node(n_nd, name, lit)); }   // S4 §0.14.7 SoA：侧表访问器（原 .nd）
-    if (n.la >= 0) { n.la = meta_subst_val_kids(n.la, name, lit); }
+    // S4 §0.14.7 SoA：同上，原单行 `if (n.la >= 0) { n.la = meta_subst_val_kids(n.la, ...); }`；
+    //   自动迁移器只换了读点（留下写点），此处手工收尾（第十六批）。
+    if (base.node_la((nd_id as u64)) >= 0) { base.node_set_la((nd_id as u64), meta_subst_val_kids(base.node_la((nd_id as u64)), name, lit)); }
     if (base.node_lb((nd_id as u64)) >= 0) { base.node_set_lb((nd_id as u64), meta_subst_val_kids(base.node_lb((nd_id as u64)), name, lit)); }
     var n_lc: i64 = base.node_lc((nd_id as u64));   // S4 §0.14.7 SoA：侧表读写（原 base.node_lc((n.id as u64))；第十一批）
     if (n_lc >= 0) { base.node_set_lc((nd_id as u64), meta_subst_val_kids(n_lc, name, lit)); }
@@ -1807,7 +1812,9 @@ pub fn subst_type_ident_node(nd_id: i64, name: string, concrete: i64) i64 {
     if (n_nc >= 0) { base.node_set_nc((nd_id as u64), subst_type_ident_node(n_nc, name, concrete)); }
     var n_nd: i64 = base.node_nd((nd_id as u64));
     if (n_nd >= 0) { base.node_set_nd((nd_id as u64), subst_type_ident_node(n_nd, name, concrete)); }   // S4 §0.14.7 SoA：侧表访问器（原 .nd）
-    if (n.la >= 0) { n.la = subst_type_ident_kids(n.la, name, concrete); }
+    // S4 §0.14.7 SoA：同上，原单行 `if (n.la >= 0) { n.la = subst_type_ident_kids(n.la, ...); }`；
+    //   自动迁移器只换了读点（留下写点），此处手工收尾（第十六批）。
+    if (base.node_la((nd_id as u64)) >= 0) { base.node_set_la((nd_id as u64), subst_type_ident_kids(base.node_la((nd_id as u64)), name, concrete)); }
     if (base.node_lb((nd_id as u64)) >= 0) { base.node_set_lb((nd_id as u64), subst_type_ident_kids(base.node_lb((nd_id as u64)), name, concrete)); }
     var n_lc: i64 = base.node_lc((nd_id as u64));   // S4 §0.14.7 SoA：侧表读写（原 base.node_lc((n.id as u64))；第十一批）
     if (n_lc >= 0) { base.node_set_lc((nd_id as u64), subst_type_ident_kids(n_lc, name, concrete)); }
@@ -1933,7 +1940,7 @@ pub fn rewrite_generic_callsite(e: i64, iname: string, k: i64) void {
     slice_set(base.nodes, base.nodes[e].na, cal);
     var nh: i64 = -1;
     var nt: i64 = -1;
-    var ac2: i64 = base.nodes[e].la;
+    var ac2: i64 = base.node_la((e as u64));
     var skip: i64 = 0;
     while (ac2 >= 0) {
         if (skip < k) { skip = skip + 1; }
@@ -1944,7 +1951,7 @@ pub fn rewrite_generic_callsite(e: i64, iname: string, k: i64) void {
         ac2 = base.kids[ac2].next;
     }
     var en: Node = base.nodes[e];
-    en.la = nh;
+    base.node_set_la((e as u64), nh);
     slice_set(base.nodes, e, en);
     base.node_set_bb((e as u64), true);   // S4 §0.14.7 SoA：侧表写（原 en.bb = true）
 }
@@ -1997,7 +2004,7 @@ pub fn instantiate_generic(tmpl: i64, e: i64) i64 {
     var k: i64 = slice_len(cnames) as i64;
     // 从调用点读取前 k 个实参
     var cargs: []i64;
-    var ac0: i64 = base.nodes[e].la;
+    var ac0: i64 = base.node_la((e as u64));
     var i: i64 = 0;
     while (ac0 >= 0 && i < k) {
         append(cargs, base.kids[ac0].val);
@@ -2178,7 +2185,7 @@ pub fn ovl_arg_typename(ti: i64) string {
 pub fn ovl_dispatch_call(e: i64, gi: i64) i64 {
     var n: Node = base.nodes[e];
     var arg0: i64 = -1;
-    if (n.la >= 0) { arg0 = base.kids[n.la].val; }
+    if (base.node_la((e as u64)) >= 0) { arg0 = base.kids[base.node_la((e as u64))].val; }
     if (arg0 < 0) {
         parse.fc_err("T-OVL-E903",
             base.sb_cat3("type-group '", parse.g_ovl_tg_names[gi], "' 至少需要一个实参用于静态分派"), e);
@@ -2765,7 +2772,7 @@ pub fn enum_has_case(scr: i64, cname: string) bool {
 // 若写成别的 enum 的成员，会先被上面的 arm 模式类型检查拦下。
 pub fn match_covers_case(e: i64, cname: string) bool {
     var mn: Node = base.nodes[e];
-    var mc: i64 = mn.la;
+    var mc: i64 = base.node_la((e as u64));
     while (mc >= 0) {
         var mk: Child = base.kids[mc];
         var arm: Node = base.nodes[mk.val];
@@ -2819,7 +2826,7 @@ pub fn enum_all_cases_covered(e: i64, scr: i64) bool {
 // 差别只在模式形态——enum 成员是 `kind=="member"` + sa 存名，bool 字面量是 `kind=="bool"` + ba 存值。
 pub fn match_covers_bool(e: i64, want: bool) bool {
     var mn: Node = base.nodes[e];
-    var mc: i64 = mn.la;
+    var mc: i64 = base.node_la((e as u64));
     while (mc >= 0) {
         var mk: Child = base.kids[mc];
         var arm: Node = base.nodes[mk.val];
@@ -2968,12 +2975,12 @@ pub fn leading_dot_to_conpat(pat: i64, scr: i64) i64 {
         if (cn.kind == "member" && base.node_lb((pn.na as u64)) == 1 && cn.na < 0) {
             if (str_len(variant_name_of_case(cn.sa)) as i64 > 0) {
                 var argc: i64 = 0;
-                var hp: i64 = pn.la;
+                var hp: i64 = base.node_la((pat as u64));
                 while (hp >= 0) {
                     argc = argc + 1;
                     hp = base.kids[hp].next;
                 }
-                return base.mk_conpat(cn.sa, "", pn.la, argc, -1);
+                return base.mk_conpat(cn.sa, "", base.node_la((pat as u64)), argc, -1);
             }
         }
         return -1;
@@ -3010,7 +3017,7 @@ pub fn variant_case_list(d: i64) string {
 // 某 case 是否被一条**无守卫**的构造器模式臂覆盖（带守卫不计，同 enum 的 match_covers_case）。
 pub fn variant_covers_case(e: i64, cname: string) bool {
     var mn: Node = base.nodes[e];
-    var mc: i64 = mn.la;
+    var mc: i64 = base.node_la((e as u64));
     while (mc >= 0) {
         var mk: Child = base.kids[mc];
         var arm: Node = base.nodes[mk.val];
@@ -3137,7 +3144,7 @@ pub fn conpat_check(pat: i64, scr: i64, rep: bool) void {
         plist_head = base.node_lb((vc as u64));
     }
     var bi: i64 = 0;
-    var sc: i64 = pn.la;
+    var sc: i64 = base.node_la((pat as u64));
     while (sc >= 0) {
         var sk: Child = base.kids[sc];
         var spn: Node = base.nodes[sk.val];
@@ -3210,7 +3217,7 @@ pub fn struct_lit_pat_check(pat: i64, scr: i64, rep: bool) void {
         }
         return;
     }
-    var fvp: i64 = pn.la;
+    var fvp: i64 = base.node_la((pat as u64));
     var pos_idx: i64 = 0;   // 位置式（sa==""）字段按列表下标映射到结构第 i 个字段
     while (fvp >= 0) {
         var fv: Node = base.nodes[base.kids[fvp].val];
@@ -3771,7 +3778,7 @@ pub fn desugar_format_call(e: i64) i64 {
 
     // ── 2. 收集值实参并推断类型 ────────────────────────────
     var argc: i64 = 0;
-    var c0: i64 = n.la;
+    var c0: i64 = base.node_la((e as u64));
     if (c0 >= 0) {
         var k0: Child = base.kids[c0];
         c0 = k0.next;                      // 跳过模板串本身
@@ -4059,9 +4066,9 @@ pub fn desugar_format_call(e: i64) i64 {
     // ── 6. 就地改写调用点：format(tmpl, a, b) → __fmt_N(a, b) ──
     var nn: Node = base.nodes[e];
     nn.na = base.mk_ident(fn_name, -1);
-    if (nn.la >= 0) {
-        var fk: Child = base.kids[nn.la];
-        nn.la = fk.next;                   // 丢掉模板串实参
+    if (base.node_la((e as u64)) >= 0) {
+        var fk: Child = base.kids[base.node_la((e as u64))];
+        base.node_set_la((e as u64), fk.next);   // 丢掉模板串实参
     }
     slice_set(base.nodes, e, nn);
     return ti_mk("String");
@@ -4100,7 +4107,7 @@ pub fn fmt_scan_subtree(x: i64, lim: i64) void {
     fmt_scan_subtree(base.node_nb((x as u64)), lim);
     fmt_scan_subtree(base.node_nc((xn.id as u64)), lim);
     fmt_scan_subtree(base.node_nd((x as u64)), lim);   // S4 §0.14.7 SoA：侧表访问器（原 .nd）
-    fmt_scan_list(xn.la, lim);
+    fmt_scan_list(base.node_la((x as u64)), lim);
     fmt_scan_list(base.node_lb((x as u64)), lim);
     fmt_scan_list(base.node_lc((xn.id as u64)), lim);
 }
@@ -4169,14 +4176,14 @@ pub fn infer_scan_return(s: i64) i64 {
                 if (tip_kind(rt) != "Void" && tip_kind(rt) != "Unknown") { return rt; }
             }
         } else if (sn.kind == "block") {
-            var r2: i64 = infer_scan_return(sn.la);
+            var r2: i64 = infer_scan_return(base.node_la((st as u64)));
             if (r2 >= 0) { return r2; }
         } else if (sn.kind == "if") {
             // if/else 两枝都可能含 return
             if (sn.na >= 0) { var r2: i64 = infer_scan_return(sn.na); if (r2 >= 0) { return r2; } }
             if (base.node_nb((st as u64)) >= 0) { var r3: i64 = infer_scan_return(base.node_nb((st as u64))); if (r3 >= 0) { return r3; } }
         } else if (sn.kind == "for" || sn.kind == "while") {
-            var r2: i64 = infer_scan_return(sn.la);
+            var r2: i64 = infer_scan_return(base.node_la((st as u64)));
             if (r2 >= 0) { return r2; }
         }
         cur = k.next;
@@ -4649,7 +4656,7 @@ pub fn lower_pipe(e: i64) i64 {
         on.kind = "block";
         on.na = -1;
         base.node_set_nb((e as u64), -1);
-        on.la = bh;
+        base.node_set_la((e as u64), bh);
         slice_set(base.nodes, e, on);
         if (bad == true) {
             g_pipe_bad = true;
@@ -4660,7 +4667,7 @@ pub fn lower_pipe(e: i64) i64 {
     on.kind = "paren";
     on.na = cur_e;
     base.node_set_nb((e as u64), -1);
-    on.la = -1;
+    base.node_set_la((e as u64), -1);
     slice_set(base.nodes, e, on);
     if (bad == true) {
         g_pipe_bad = true;
@@ -4726,7 +4733,7 @@ pub fn validate_slice_pat(pat: i64, scr: i64, rep: bool) void {
     }
     var elem: i64 = -1;
     if (scr >= 0 && scr < (slice_len(tis) as i64)) { elem = tis[scr].elem; }
-    var ele: i64 = base.nodes[pat].la;
+    var ele: i64 = base.node_la((pat as u64));
     var pos: i64 = 0;
     while (ele >= 0) {
         var en: Node = base.nodes[base.kids[ele].val];
@@ -4970,7 +4977,7 @@ pub fn materialize_range(e: i64) i64 {
     on.kind = "paren";
     on.na = cl;
     base.node_set_nb((e as u64), -1);
-    on.la = -1;
+    base.node_set_la((e as u64), -1);
     base.node_set_ba((e as u64), false);   // S4 §0.14.7 SoA：侧表写（原 on.ba = false；第十批）
     slice_set(base.nodes, e, on);
     return out_ti;
@@ -5038,7 +5045,7 @@ pub fn lower_range_index(e: i64) i64 {
     on.kind = "paren";
     on.na = cl;
     base.node_set_nb((e as u64), -1);
-    on.la = -1;
+    base.node_set_la((e as u64), -1);
     slice_set(base.nodes, e, on);
     if (k == "String") { return ti_mk("String"); }
     if (k == "Bytes") { return ti_mk("Bytes"); }
@@ -5071,7 +5078,7 @@ pub fn lower_in_range(e: i64) i64 {
     on.sa = "";
     on.na = test;
     base.node_set_nb((e as u64), -1);
-    on.la = -1;
+    base.node_set_la((e as u64), -1);
     slice_set(base.nodes, e, on);
     infer_expr(test);
     return ti_scalar("bool");
@@ -5106,7 +5113,7 @@ pub fn lower_for_range(s: i64) void {
         if (base.node_ba((r.id as u64)) == true) { cop = "<="; }
         cond = base.mk_binary(cop, base.mk_ident(n.sa, -1), base.mk_ident(hname, -1), -1);
     }
-    var floop: i64 = base.mk_for(rng_i64_decl(n.sa, r.na), cond, rng_incr(n.sa), n.la, -1, -1);
+    var floop: i64 = base.mk_for(rng_i64_decl(n.sa, r.na), cond, rng_incr(n.sa), base.node_la((s as u64)), -1, -1);
     rng_anchor(floop, s);
     tail = base.list_push(head, tail, floop);
     if (head < 0) { head = tail; }
@@ -5117,7 +5124,7 @@ pub fn lower_for_range(s: i64) void {
     on.sa = "";
     base.node_set_sb((on.id as u64), "");
     on.na = -1;
-    on.la = head;
+    base.node_set_la((s as u64), head);
     slice_set(base.nodes, s, on);
 }
 
@@ -5157,7 +5164,7 @@ pub fn lower_for_array(s: i64) void {
     // 新循环体 = 元素声明 + 原 body
     var bhead: i64 = -1; var btail: i64 = -1;
     btail = base.list_push(bhead, btail, eldecl); if (bhead < 0) { bhead = btail; }
-    var bk: i64 = n.la;
+    var bk: i64 = base.node_la((s as u64));
     while (bk >= 0) {
         btail = base.list_push(bhead, btail, base.kids[bk].val);
         bk = base.kids[bk].next;
@@ -5177,7 +5184,7 @@ pub fn lower_for_array(s: i64) void {
     on.sa = "";
     base.node_set_sb((on.id as u64), "");
     on.na = -1;
-    on.la = head;
+    base.node_set_la((s as u64), head);
     slice_set(base.nodes, s, on);
 }
 
@@ -5188,7 +5195,7 @@ pub fn lower_for_array(s: i64) void {
 pub fn infer_device_call(e: i64, fname: string) i64 {
     var n: Node = base.nodes[e];
     // 实参类型推导（保证嵌套表达式被检查）
-    var c: i64 = n.la;
+    var c: i64 = base.node_la((e as u64));
     while (c >= 0) {
         infer_expr(base.kids[c].val);
         c = base.kids[c].next;
@@ -5259,7 +5266,7 @@ pub fn dev_callee_name(callNode: i64) string {
 
 pub fn dev_arg_count(callNode: i64) i64 {
     if (callNode < 0) { return 0; }
-    var h: i64 = base.nodes[callNode].la;
+    var h: i64 = base.node_la((callNode as u64));
     var c: i64 = h;
     var n: i64 = 0;
     var klen: i64 = slice_len(base.kids) as i64;
@@ -5324,7 +5331,7 @@ pub fn dev_check_node(e: i64, in_kernel: bool, cur: string, knames: []string) vo
     dev_check_node(base.node_nb((e as u64)), in_kernel, cur, knames);
     dev_check_node(base.node_nc((n.id as u64)), in_kernel, cur, knames);
     dev_check_node(base.node_nd((e as u64)), in_kernel, cur, knames);   // S4 §0.14.7 SoA：侧表访问器（原 .nd）
-    dev_check_list(n.la, in_kernel, cur, knames);
+    dev_check_list(base.node_la((e as u64)), in_kernel, cur, knames);
     dev_check_list(base.node_lb((e as u64)), in_kernel, cur, knames);
     dev_check_list(base.node_lc((n.id as u64)), in_kernel, cur, knames);
 }
@@ -5383,7 +5390,7 @@ pub fn tuple_lit_type_name(elem_tis: []i64) string {
             fnn.sa = base.sb_cat2("_", base.i2s(idx));
             fnn.na = elem_nodes[idx];   // 字段类型节点（元素类型，sema 期 resolve_ti 解析）
             base.node_set_ib((fid as u64), -1);   // S4 §0.14.7 SoA：取代 `fnn.ib`（下方 slice_set 回写生效）
-            fnn.la = -1;
+            base.node_set_la((fid as u64), -1);
             base.node_set_nb((fid as u64), -1);
             slice_set(base.nodes, fid, fnn);
             fht = base.list_push(fh, fht, fid);
@@ -5447,7 +5454,7 @@ pub fn sema_idecl_infer_idents(m: i64) void {
     } else if (mnd.kind == "cast") {
         if (mnd.na >= 0) { sema_idecl_infer_idents(mnd.na); }
     }
-    var c: i64 = mnd.la;
+    var c: i64 = base.node_la((m as u64));
     while (c >= 0) {
         sema_idecl_infer_idents(base.kids[c].val);
         c = base.kids[c].next;
@@ -5606,7 +5613,7 @@ pub fn infer_block_expr(e: i64) i64 {
     var n: Node = base.nodes[e];
     var prev: i64 = cur_scope;
     cur_scope = scope_new_at(prev, e);
-    var c: i64 = n.la;
+    var c: i64 = base.node_la((e as u64));
     var last: i64 = -1;
     while (c >= 0) {
         var k: Child = base.kids[c];
@@ -5671,7 +5678,7 @@ fn vl_is_checked(id: i64) bool {
 
 // 取 block_expr 的尾随表达式节点（与 parse.block_trailing_expr 同义）
 fn vl_trailing_expr(blk: i64) i64 {
-    var c: i64 = base.nodes[blk].la;
+    var c: i64 = base.node_la((blk as u64));
     var last: i64 = -1;
     while (c >= 0) {
         last = base.kids[c].val;
@@ -5708,17 +5715,17 @@ fn vl_collect_breaks(la: i64) void {
             append(g_vl_breaks, base.kids[c].val);
             append(g_vl_break_vals, s.na);
         } else if (s.kind == "if") {
-            vl_collect_breaks(s.la);
+            vl_collect_breaks(base.node_la((base.kids[c].val as u64)));
             if (base.node_lb((base.kids[c].val as u64)) > -2) { vl_collect_breaks(base.node_lb((base.kids[c].val as u64))); }
         } else if (s.kind == "block" || s.kind == "block_expr") {
-            vl_collect_breaks(s.la);
+            vl_collect_breaks(base.node_la((base.kids[c].val as u64)));
         } else if (s.kind == "match") {
-            var ac: i64 = s.la;
+            var ac: i64 = base.node_la((base.kids[c].val as u64));
             while (ac >= 0) {
                 var arm: Node = base.nodes[base.kids[ac].val];
                 if (base.node_nc((arm.id as u64)) >= 0) {
                     var an: Node = base.nodes[base.node_nc((arm.id as u64))];
-                    if (an.kind == "block_expr") { vl_collect_breaks(an.la); }
+                    if (an.kind == "block_expr") { vl_collect_breaks(base.node_la((base.node_nc((arm.id as u64)) as u64))); }
                 }
                 ac = base.kids[ac].next;
             }
@@ -5750,17 +5757,17 @@ fn vl_rewrite_breaks(la: i64, rname: string, dname: string) void {
             ch.val = blk;
             slice_set(base.kids, c, ch);
         } else if (s.kind == "if") {
-            vl_rewrite_breaks(s.la, rname, dname);
+            vl_rewrite_breaks(base.node_la((base.kids[c].val as u64)), rname, dname);
             if (base.node_lb((base.kids[c].val as u64)) > -2) { vl_rewrite_breaks(base.node_lb((base.kids[c].val as u64)), rname, dname); }
         } else if (s.kind == "block" || s.kind == "block_expr") {
-            vl_rewrite_breaks(s.la, rname, dname);
+            vl_rewrite_breaks(base.node_la((base.kids[c].val as u64)), rname, dname);
         } else if (s.kind == "match") {
-            var ac: i64 = s.la;
+            var ac: i64 = base.node_la((base.kids[c].val as u64));
             while (ac >= 0) {
                 var arm: Node = base.nodes[base.kids[ac].val];
                 if (base.node_nc((arm.id as u64)) >= 0) {
                     var an: Node = base.nodes[base.node_nc((arm.id as u64))];
-                    if (an.kind == "block_expr") { vl_rewrite_breaks(an.la, rname, dname); }
+                    if (an.kind == "block_expr") { vl_rewrite_breaks(base.node_la((base.node_nc((arm.id as u64)) as u64)), rname, dname); }
                 }
                 ac = base.kids[ac].next;
             }
@@ -5777,17 +5784,17 @@ fn vl_body_has_break_v(la: i64) bool {
         if (s.kind == "break") {
             if (s.na >= 0) { return true; }
         } else if (s.kind == "if") {
-            if (vl_body_has_break_v(s.la)) { return true; }
+            if (vl_body_has_break_v(base.node_la((base.kids[c].val as u64)))) { return true; }
             if (base.node_lb((base.kids[c].val as u64)) > -2 && vl_body_has_break_v(base.node_lb((base.kids[c].val as u64)))) { return true; }
         } else if (s.kind == "block" || s.kind == "block_expr") {
-            if (vl_body_has_break_v(s.la)) { return true; }
+            if (vl_body_has_break_v(base.node_la((base.kids[c].val as u64)))) { return true; }
         } else if (s.kind == "match") {
-            var ac: i64 = s.la;
+            var ac: i64 = base.node_la((base.kids[c].val as u64));
             while (ac >= 0) {
                 var arm: Node = base.nodes[base.kids[ac].val];
                 if (base.node_nc((arm.id as u64)) >= 0) {
                     var an: Node = base.nodes[base.node_nc((arm.id as u64))];
-                    if (an.kind == "block_expr" && vl_body_has_break_v(an.la)) { return true; }
+                    if (an.kind == "block_expr" && vl_body_has_break_v(base.node_la((base.node_nc((arm.id as u64)) as u64)))) { return true; }
                 }
                 ac = base.kids[ac].next;
             }
@@ -5807,7 +5814,7 @@ pub fn desugar_value_loop(L: i64) i64 {
     var dname: string = "__loop_delivered_" + base.i2s(L);
     g_vl_breaks = [];
     g_vl_break_vals = [];
-    vl_collect_breaks(n.la);
+    vl_collect_breaks(base.node_la((L as u64)));
     // 递归脱糖会重入本函数并重置 g_vl_breaks/g_vl_break_vals（全局），故先把本层收集到的
     // break 值快照存下，待体检查（期间会触发内层值循环脱糖并覆盖全局）结束后还原，
     // 否则外层会误用内层的 break 值去算自己的循环值类型（并以外层作用域解析 → 未定义标识符）。
@@ -5858,7 +5865,7 @@ pub fn desugar_value_loop(L: i64) i64 {
     var lvn: string = "";
     if (kind == "for" && n.na >= 0) { lvn = base.nodes[n.na].sa; }
     else if (kind == "for_each") { lvn = n.sa; }
-    var bc: i64 = n.la;
+    var bc: i64 = base.node_la((L as u64));
     while (bc >= 0) {
         check_stmt(base.kids[bc].val);
         bc = base.kids[bc].next;
@@ -5883,7 +5890,7 @@ pub fn desugar_value_loop(L: i64) i64 {
     else { T = widen_only_lub(tis_arr); }
     if (T < 0) { T = ti_mk("Void"); }
     // 改写 break
-    vl_rewrite_breaks(n.la, rname, dname);
+    vl_rewrite_breaks(base.node_la((L as u64)), rname, dname);
 
     // 构造 block_expr 体
     var h: i64 = -1; var t: i64 = -1;
@@ -5892,9 +5899,9 @@ pub fn desugar_value_loop(L: i64) i64 {
     var vr: i64 = base.mk_var_decl(rname, false, mk_type_node_from_ti(T), -1, -1);
     t = base.list_push(h, t, vr); if (h < 0) { h = t; }
     var inner: i64 = -1;
-    if (kind == "while") { inner = base.mk_while(n.na, n.la, -1, -1); }
-    else if (kind == "for") { inner = base.mk_for(n.na, base.node_nb((L as u64)), base.node_nc((n.id as u64)), n.la, -1, -1); }
-    else if (kind == "for_each") { inner = base.mk_for_each(n.sa, base.node_sb((n.id as u64)), n.na, n.la, -1, -1); }
+    if (kind == "while") { inner = base.mk_while(n.na, base.node_la((L as u64)), -1, -1); }
+    else if (kind == "for") { inner = base.mk_for(n.na, base.node_nb((L as u64)), base.node_nc((n.id as u64)), base.node_la((L as u64)), -1, -1); }
+    else if (kind == "for_each") { inner = base.mk_for_each(n.sa, base.node_sb((n.id as u64)), n.na, base.node_la((L as u64)), -1, -1); }
     append(g_vl_checked, inner);
     t = base.list_push(h, t, inner); if (h < 0) { h = t; }
     if (has_else) {
@@ -5911,7 +5918,7 @@ pub fn desugar_value_loop(L: i64) i64 {
     n.kind = "block_expr";
     n.na = -1; base.node_set_nb((L as u64), -1); base.node_set_lb((L as u64), -1); n.sa = ""; base.node_set_sb((n.id as u64), "");
     base.node_set_nc((L as u64), -1);   // S4 §0.14.7 SoA：侧表写（原 n.nc = -1；第九批）
-    n.la = h;
+    base.node_set_la((L as u64), h);
     slice_set(base.nodes, L, n);
     cur_scope = prev;
     hir.hir_invalidate(L);
@@ -5934,7 +5941,7 @@ fn vl_body_always_delivers(L: i64) bool {
     if (kind == "while") {
         var cond: i64 = n.na;
         if (cond >= 0 && base.nodes[cond].kind == "bool" && base.node_ba((cond as u64))) {
-            return !block_list_can_fall_through(n.la);
+            return !block_list_can_fall_through(base.node_la((L as u64)));
         }
         return false;
     }
@@ -5965,9 +5972,9 @@ fn stmt_can_fall_through(s: i64) bool {
         return true;
     }
     if (k == "var_decl" || k == "assign") { return true; }
-    if (k == "block") { return block_list_can_fall_through(base.nodes[s].la); }
+    if (k == "block") { return block_list_can_fall_through(base.node_la((s as u64))); }
     if (k == "if") {
-        var then_f: bool = block_list_can_fall_through(base.nodes[s].la);
+        var then_f: bool = block_list_can_fall_through(base.node_la((s as u64)));
         var else_f: bool = true;
         if (base.node_lb((s as u64)) >= 0) { else_f = block_list_can_fall_through(base.node_lb((s as u64))); }
         // lb == -2 表示无 else 分支 ⇒ 缺失分支必然落到末尾
@@ -6054,6 +6061,11 @@ pub fn infer_expr_body(e: i64) i64 {
         base.node_set_span_id(cn.id, base.node_span_id(n.id)); base.node_set_span_id(cn.id, base.node_span_id(n.id)); base.node_set_span_id(cn.id, base.node_span_id(n.id));
         slice_set(base.nodes, call_id, cn);
         base.nodes[e] = cn;
+        // ⚠ S4 §0.14.7 SoA（第十六批·la）：**整体 Node 结构体赋值不再搬运已外置字段**。
+        //   `nodes[e] = cn` 只搬 Node 里剩下的结构体字段；la 住在 `g_node_la` 侧表里，
+        //   必须显式同步。漏这一步 ⇒ 本节点脱糖出的 call 丢实参（`V { .Case(args) }` 的
+        //   实参 kids 链存在 call_id 的 la 槽，而 e 的侧表还是 variant_lit 的默认 -1）。
+        base.node_set_la((e as u64), base.node_la((call_id as u64)));
         return infer_expr(e);
     }
     // 模块值成员访问：`base.foo` / `@import("M").foo` → 改写为 ident(<key>__<foo>)。
@@ -6109,7 +6121,7 @@ pub fn infer_expr_body(e: i64) i64 {
     // 脱糖恒定产出 block_expr（不透明容器），双后端零改动由构造保证一致；改写后
     // 的节点 kind 已非循环，故后续不会二次触发本钩子。
     if (n.kind == "while" || n.kind == "for" || n.kind == "for_each") {
-        if (base.node_lb((e as u64)) >= 0 || vl_body_has_break_v(n.la)) {
+        if (base.node_lb((e as u64)) >= 0 || vl_body_has_break_v(base.node_la((e as u64)))) {
             desugar_value_loop(e);
             // 脱糖把 L 原地改写为 block_expr；与值 if 同构，必须再用 infer_block_expr
             // 走一次 CST 遍历来真正**取值 + 发射**（desugar_value_loop 已调 hir_invalidate，
@@ -6148,8 +6160,8 @@ pub fn infer_expr_body(e: i64) i64 {
             // 走到 check（说明这段代码真的会被编译）同样触发。死分支已由 mb_prune_if
             // 剪除，故 `if (@type_equal(...)) ... else @compile_error(...)` 不会误报。
             var mmsg: string = "编译期终止";
-            if (n.la >= 0) {
-                var man: Node = base.nodes[base.kids[n.la].val];
+            if (base.node_la((e as u64)) >= 0) {
+                var man: Node = base.nodes[base.kids[base.node_la((e as u64))].val];
                 if (man.kind == "string") { mmsg = man.sa; }
             }
             parse.fc_err("T-MTA-E604", mmsg, e);
@@ -6170,7 +6182,7 @@ pub fn infer_expr_body(e: i64) i64 {
         } else if (math_mbuiltin(n.sa)) {
             // @sin 等数学内建：编译期可折叠常量（见 meta_eval_math），运行期回落 libm / fdlibm
             //（见各后端 ll_call / emit_expr）。此处给实参加类型检查，避免把字符串当浮点发射。
-            var mc: i64 = n.la;
+            var mc: i64 = base.node_la((e as u64));
             while (mc >= 0) { ie_sub_in_v(ei, base.kids[mc].val); mc = base.kids[mc].next; }
             if (str_slice(n.sa, str_len(n.sa) - 1, str_len(n.sa)) == "f") { return ti_scalar("f32"); }
             return ti_scalar("f64");
@@ -6178,7 +6190,7 @@ pub fn infer_expr_body(e: i64) i64 {
             // @panic(msg) / @assert(cond, msg) / @assert_eq(a, b, msg)
             // ⚠ t 的 string 是独立 kind（"string"，非 Scalar）；bool/float/int 是 Scalar + name。
             if (n.sa == "panic") {
-                var tp_pc: i64 = n.la;
+                var tp_pc: i64 = base.node_la((e as u64));
                 if (tp_pc < 0) { parse.fc_err("T-SEM-E206", "@panic 需要 1 个字符串实参", e); return ti_mk("Void"); }
                 var tp_t: i64 = ie_sub_in(ei, base.kids[tp_pc].val);
                 if (tip_kind(tp_t) != "String") { parse.fc_err("T-SEM-E207", "@panic 的实参必须是 string", e); return ti_mk("Void"); }
@@ -6186,7 +6198,7 @@ pub fn infer_expr_body(e: i64) i64 {
                 return ti_mk("Never");
             }
             if (n.sa == "assert") {
-                var tp_ac: i64 = n.la;
+                var tp_ac: i64 = base.node_la((e as u64));
                 if (tp_ac < 0) { parse.fc_err("T-SEM-E206", "@assert 需要 2 个实参（条件, 消息）", e); return ti_mk("Void"); }
                 var tp_cond: i64 = ie_sub_in(ei, base.kids[tp_ac].val);
                 if (tip_kind(tp_cond) != "Scalar" || tip_name(tp_cond) != "bool") { parse.fc_err("T-SEM-E207", "@assert 的第一个实参必须是 bool 条件", e); return ti_mk("Void"); }
@@ -6197,7 +6209,7 @@ pub fn infer_expr_body(e: i64) i64 {
                 return ti_mk("Void");
             }
             // assert_eq(a, b, msg)
-            var tp_c2: i64 = n.la;
+            var tp_c2: i64 = base.node_la((e as u64));
             var tp_n: i64 = 0; var tp_a: i64 = -1; var tp_b: i64 = -1; var tp_m: i64 = -1;
             var tp_cur: i64 = tp_c2;
             while (tp_cur >= 0) {
@@ -6251,7 +6263,7 @@ pub fn infer_expr_body(e: i64) i64 {
             // 运行期向量内建：类型检查后返回对应 TI；发射见各后端 mbuiltin 分支。
             if (n.sa == "simd_lanes") {
                 // @simd_lanes(T) -> 本机向量寄存器可容纳的 T 的 lane 数（编译期常量值，运行期发射为字面量）
-                var c: i64 = n.la;
+                var c: i64 = base.node_la((e as u64));
                 if (c < 0) { parse.fc_err("T-VEC-E926", "`@simd_lanes` 需要 1 个类型实参", e); return ti_mk("Unknown"); }
                 var lti: i64 = resolve_ti(base.kids[c].val);
                 var lname: string = tip_name(lti);
@@ -6261,21 +6273,21 @@ pub fn infer_expr_body(e: i64) i64 {
                 return ti_scalar("i64");
             }
             if (n.sa == "cpu_has") {
-                var c: i64 = n.la;
+                var c: i64 = base.node_la((e as u64));
                 if (c < 0) { parse.fc_err("T-VEC-E926", "`@cpu_has` 需要 1 个字符串实参（特性名，如 \"avx\"）", e); return ti_mk("Unknown"); }
                 var an: Node = base.nodes[base.kids[c].val];
                 if (an.kind != "string") { parse.fc_err("T-VEC-E926", "`@cpu_has` 的实参必须是特性名字符串字面量", e); return ti_mk("Unknown"); }
                 return ti_scalar("bool");
             }
             if (n.sa == "vlen") {
-                var c: i64 = n.la;
+                var c: i64 = base.node_la((e as u64));
                 if (c < 0) { parse.fc_err("T-VEC-E926", "`@vlen` 需要 1 个向量实参", e); return ti_mk("Unknown"); }
                 var ati: i64 = ie_sub_in(ei, base.kids[c].val);
                 if (ti_is_vector(ati) == false) { parse.fc_err("T-VEC-E926", "`@vlen` 的实参必须是向量", e); return ti_mk("Unknown"); }
                 return ti_scalar("i64");
             }
             if (n.sa == "reduce_add" || n.sa == "reduce_max" || n.sa == "reduce_min") {
-                var c: i64 = n.la;
+                var c: i64 = base.node_la((e as u64));
                 if (c < 0) { parse.fc_err("T-VEC-E926", base.sb_cat2("`", n.sa), e); return ti_mk("Unknown"); }
                 var ati: i64 = ie_sub_in(ei, base.kids[c].val);
                 if (ti_is_vector(ati) == false) { parse.fc_err("T-VEC-E926", base.sb_cat3("`", n.sa, "` 的实参必须是向量"), e); return ti_mk("Unknown"); }
@@ -6284,7 +6296,7 @@ pub fn infer_expr_body(e: i64) i64 {
             if (n.sa == "tsplat") {
                 // @tsplat(scalar, rows, cols) -> @Tile(rows, cols, typeof(scalar), hardware)
                 var cnt: i64 = 0; var a0: i64 = -1; var a1: i64 = -1; var a2: i64 = -1;
-                var c2: i64 = n.la;
+                var c2: i64 = base.node_la((e as u64));
                 while (c2 >= 0) {
                     if (cnt == 0) { a0 = base.kids[c2].val; }
                     if (cnt == 1) { a1 = base.kids[c2].val; }
@@ -6310,7 +6322,7 @@ pub fn infer_expr_body(e: i64) i64 {
                 return ti_tile(sti, rows, cols, 0);
             }
             if (n.sa == "treduce_sum" || n.sa == "treduce_mul" || n.sa == "treduce_min" || n.sa == "treduce_max") {
-                var c: i64 = n.la;
+                var c: i64 = base.node_la((e as u64));
                 if (c < 0) { parse.fc_err("T-VEC-E926", base.sb_cat2("`", n.sa), e); return ti_mk("Unknown"); }
                 var ati: i64 = ie_sub_in(ei, base.kids[c].val);
                 if (ti_is_tile(ati) == false) { parse.fc_err("T-VEC-E926", base.sb_cat3("`", n.sa, "` 的实参必须是瓦片"), e); return ti_mk("Unknown"); }
@@ -6319,7 +6331,7 @@ pub fn infer_expr_body(e: i64) i64 {
                 return tis[rowti].elem;
             }
             if (n.sa == "tile_rows" || n.sa == "tile_cols" || n.sa == "tile_flavor") {
-                var c: i64 = n.la;
+                var c: i64 = base.node_la((e as u64));
                 if (c < 0) { parse.fc_err("T-VEC-E926", base.sb_cat2("`", n.sa), e); return ti_mk("Unknown"); }
                 var ati: i64 = ie_sub_in(ei, base.kids[c].val);
                 if (ti_is_tile(ati) == false) { parse.fc_err("T-VEC-E926", base.sb_cat3("`", n.sa, "` 的实参必须是瓦片类型或瓦片值"), e); return ti_mk("Unknown"); }
@@ -6335,7 +6347,7 @@ pub fn infer_expr_body(e: i64) i64 {
             }
             // @splat(scalar, len) -> @Vector(len, typeof(scalar))
             var cnt: i64 = 0; var a0: i64 = -1; var a1: i64 = -1;
-            var c2: i64 = n.la;
+            var c2: i64 = base.node_la((e as u64));
             while (c2 >= 0) {
                 if (cnt == 0) { a0 = base.kids[c2].val; }
                 if (cnt == 1) { a1 = base.kids[c2].val; }
@@ -6452,7 +6464,7 @@ pub fn infer_expr_body(e: i64) i64 {
     if (k == "bitstr") {
         var total: i64 = 0;
         var saw_rest: bool = false;
-        var c: i64 = n.la;
+        var c: i64 = base.node_la((e as u64));
         while (c >= 0) {
             var ch: Child = base.kids[c];
             var sn: Node = base.nodes[ch.val];
@@ -6549,7 +6561,7 @@ pub fn infer_expr_body(e: i64) i64 {
         if (m_rep) {
             base.node_set_bb((e as u64), true);   // S4 §0.14.7 SoA：侧表写（原 m_self.bb = true）
         }
-        var m_c: i64 = n.la;
+        var m_c: i64 = base.node_la((e as u64));
         while (m_c >= 0) {
             var m_k: Child = base.kids[m_c];
             var m_an: Node = base.nodes[m_k.val];
@@ -6697,7 +6709,7 @@ pub fn infer_expr_body(e: i64) i64 {
                             m_an.na);
                     }
                     var bsp: Node = base.nodes[m_an.na];
-                    var bseg: i64 = bsp.la;
+                    var bseg: i64 = base.node_la((m_an.na as u64));
                     var saw_rest: bool = false;
                     while (bseg >= 0) {
                         var bsn: Node = base.nodes[base.kids[bseg].val];
@@ -6713,7 +6725,7 @@ pub fn infer_expr_body(e: i64) i64 {
                         bseg = base.kids[bseg].next;
                     }
                     // 含 /bitstr 尾段（或全通配）的位串模式必然命中 → 算穷尽 + 后续臂不可达。
-                    if (base.node_nb((m_k.val as u64)) < 0 && (saw_rest || bsp.la < 0)) {
+                    if (base.node_nb((m_k.val as u64)) < 0 && (saw_rest || base.node_la((m_an.na as u64)) < 0)) {
                         m_irref = true;
                         m_dead = true;
                     }
@@ -7124,7 +7136,7 @@ pub fn infer_expr_body(e: i64) i64 {
     }
     if (k == "call") {
         // 实参不走通用遍历，嵌套其中的 format 只能在这里补扫（详见 fmt_scan_subtree）
-        if (parse.g_has_format) { fmt_scan_list(n.la, e); }
+        if (parse.g_has_format) { fmt_scan_list(base.node_la((e as u64)), e); }
         var cn: Node = base.nodes[n.na];
         // R3 类别格静态分派：若 callee 是类型组入口，按首实参静态类型选最具体子句改写 callee。
         // 改写后目标名（`__name__cK` 或单态实例名）不在类型组表里，重入 infer_expr 不会再分派，自然收敛。
@@ -7146,7 +7158,7 @@ pub fn infer_expr_body(e: i64) i64 {
                 var mfa_t: i64 = -1;
                 mfa_t = base.list_push(mfa_h, mfa_t, mfa_recv);
                 if (mfa_h < 0) { mfa_h = mfa_t; }
-                var mfa_c: i64 = n.la;
+                var mfa_c: i64 = base.node_la((e as u64));
                 while (mfa_c >= 0) {
                     var mfa_k: Child = base.kids[mfa_c];
                     mfa_t = base.list_push(mfa_h, mfa_t, mfa_k.val);
@@ -7155,7 +7167,7 @@ pub fn infer_expr_body(e: i64) i64 {
                 }
                 var mfa_n: Node = base.nodes[e];
                 mfa_n.na = base.mk_ident("format", -1);
-                mfa_n.la = mfa_h;
+                base.node_set_la((e as u64), mfa_h);
                 slice_set(base.nodes, e, mfa_n);
                 return desugar_format_call(e);
             }
@@ -7260,10 +7272,10 @@ pub fn infer_expr_body(e: i64) i64 {
             }
             // slice_sub(s, lo, hi) 的返回类型 = 首个实参的切片类型本身（子切片同型）。
             // 它是区间索引降解出来的内部内建，也允许直接写。
-            if (fname == "slice_sub" && n.la >= 0) {
-                var ssn: i64 = base.kids[n.la].val;
+            if (fname == "slice_sub" && base.node_la((e as u64)) >= 0) {
+                var ssn: i64 = base.kids[base.node_la((e as u64))].val;
                 var sst: i64 = ie_sub_in(ei, ssn);
-                var ssc: i64 = base.kids[n.la].next;
+                var ssc: i64 = base.kids[base.node_la((e as u64))].next;
                 while (ssc >= 0) {
                     ie_sub_in_v(ei, base.kids[ssc].val);
                     ssc = base.kids[ssc].next;
@@ -7276,8 +7288,8 @@ pub fn infer_expr_body(e: i64) i64 {
                 return ti_mk("Unknown");
             }
             // map_get(m, k) 的返回类型 = 映射的 V（需从首个实参的 map 类型反查）
-            if (fname == "map_get" && n.la >= 0) {
-                var mgn: i64 = base.kids[n.la].val;
+            if (fname == "map_get" && base.node_la((e as u64)) >= 0) {
+                var mgn: i64 = base.kids[base.node_la((e as u64))].val;
                 var mgt: i64 = ie_sub_in(ei, mgn);
                 if (tip_kind(mgt) == "Map") {
                     var mgti: TI = tis[mgt];
@@ -7288,7 +7300,7 @@ pub fn infer_expr_body(e: i64) i64 {
                 return ti_mk("Unknown");
             }
             // 可选类型内建：some(x)→Optional(实参类型)；unwrap(x)→Optional 元素类型；is_some/is_none(x)→bool。
-            if ((fname == "some" || fname == "unwrap" || fname == "is_some" || fname == "is_none") && n.la >= 0) {
+            if ((fname == "some" || fname == "unwrap" || fname == "is_some" || fname == "is_none") && base.node_la((e as u64)) >= 0) {
                 var oan: i64 = call_arg_node(e, 0);
                 var oat: i64 = ie_sub_in(ei, oan);
                 if (fname == "some") {
@@ -7312,8 +7324,8 @@ pub fn infer_expr_body(e: i64) i64 {
             // 当做 ptr 传给 @tll_print，导致 IR 校验失败（'i64' but expected 'ptr'）并使
             // `clang link failed`。这里在检查阶段给出清晰的类型错误。
             if (fname == "print" || fname == "println" || fname == "eprint") {
-                if (n.la >= 0) {
-                    var pan: i64 = base.kids[n.la].val;
+                if (base.node_la((e as u64)) >= 0) {
+                    var pan: i64 = base.kids[base.node_la((e as u64))].val;
                     var pat: i64 = ie_sub_in(ei, pan);
                     if (tip_kind(pat) != "String" && tip_kind(pat) != "Unknown") {
                         base.diag_new("T-SEM-E202", "error",
@@ -7334,8 +7346,8 @@ pub fn infer_expr_body(e: i64) i64 {
             // fid_error 的实参必须是 fid（与 serialize 脱糖的 fid 判定同款：kind==Scalar && name==fid）。
             // 传非 fid（如 i64）应报 T_FID_ERROR_ARG，而非退化成「未知内建」或静默按 i64 传递。
             if (fname == "fid_error") {
-                if (n.la >= 0) {
-                    var fean: i64 = base.kids[n.la].val;
+                if (base.node_la((e as u64)) >= 0) {
+                    var fean: i64 = base.kids[base.node_la((e as u64))].val;
                     var feat: i64 = ie_sub_in(ei, fean);
                     var feok: bool = (tip_kind(feat) == "Scalar" && tip_name(feat) == "fid") || tip_kind(feat) == "Unknown";
                     if (!feok) {
@@ -7347,8 +7359,8 @@ pub fn infer_expr_body(e: i64) i64 {
             }
             // fid_eof 同理：探针只对句柄有意义，传 i64 必须拦下而不是让运行时兜底。
             if (fname == "fid_eof") {
-                if (n.la >= 0) {
-                    var feon: i64 = base.kids[n.la].val;
+                if (base.node_la((e as u64)) >= 0) {
+                    var feon: i64 = base.kids[base.node_la((e as u64))].val;
                     var feot: i64 = ie_sub_in(ei, feon);
                     var feook: bool = (tip_kind(feot) == "Scalar" && tip_name(feot) == "fid") || tip_kind(feot) == "Unknown";
                     if (!feook) {
@@ -7361,8 +7373,8 @@ pub fn infer_expr_body(e: i64) i64 {
             // fseek/ftell 的首个实参必须是 fid；fseek 的偏移必须是整型标量。
             // fid 与 i64 不隐式互转，写反参数顺序（fseek(0, f)）必须在检查期就拦下。
             if (fname == "fseek" || fname == "ftell") {
-                if (n.la >= 0) {
-                    var skn: i64 = base.kids[n.la].val;
+                if (base.node_la((e as u64)) >= 0) {
+                    var skn: i64 = base.kids[base.node_la((e as u64))].val;
                     var skt: i64 = ie_sub_in(ei, skn);
                     var skok: bool = (tip_kind(skt) == "Scalar" && tip_name(skt) == "fid") || tip_kind(skt) == "Unknown";
                     if (!skok) {
@@ -7514,7 +7526,7 @@ pub fn infer_expr_body(e: i64) i64 {
             // 于是**嵌套在内建实参里的用户函数调用**会整个逃过检查：
             // `println(int_to_str(add3(1, 2)))` 里的少参调用曾静默通过。
             // 重复推导由 diag_new 的去重兜住，不会产生成对报错。
-            var bsc: i64 = n.la;
+            var bsc: i64 = base.node_la((e as u64));
             while (bsc >= 0) {
                 var bsk: Child = base.kids[bsc];
                 ie_sub_in_v(ei, bsk.val);
@@ -7577,6 +7589,10 @@ pub fn infer_expr_body(e: i64) i64 {
                         base.node_set_span_id(cln.id, base.node_span_id(n.id)); base.node_set_span_id(cln.id, base.node_span_id(n.id)); base.node_set_span_id(cln.id, base.node_span_id(n.id));
                         slice_set(base.nodes, call_id, cln);
                         base.nodes[e] = cln;
+                        // 同上（第十六批·la 外置）：整体结构体赋值不搬侧表 ⇒ 显式同步 la。
+                        // 此处 `.Case`（无 payload）构造器实参恒为空链（-1），与旧代码经
+                        // `nodes[e] = cln` 结构体复制写入的 -1 严格等价。
+                        base.node_set_la((e as u64), base.node_la((call_id as u64)));
                         return infer_expr(e);
                     }
                 }
@@ -7683,7 +7699,7 @@ pub fn infer_expr_body(e: i64) i64 {
             var vc: i64 = g_vec_expect;
             var vln: i64 = tis[vc].alen;
             var velem: i64 = tis[vc].elem;
-            var cnt: i64 = parse.list_count(n.la);
+            var cnt: i64 = parse.list_count(base.node_la((e as u64)));
             if (cnt != vln) {
                 parse.fc_err("T-VEC-E924",
                     base.sb_cat6("向量字面量 `[...]` 的元素个数必须等于 lane 数 ", base.i2s(vln),
@@ -7692,7 +7708,7 @@ pub fn infer_expr_body(e: i64) i64 {
                 return ti_mk("Unknown");
             }
             var ci: i64 = 0;
-            var cc: i64 = n.la;
+            var cc: i64 = base.node_la((e as u64));
             while (cc >= 0) {
                 var ckv: Child = base.kids[cc];
                 // 清期望：lane 元素自身若也是 `[...]`（如 @Vector(4, @Vector(2,i32))），
@@ -7730,7 +7746,7 @@ pub fn infer_expr_body(e: i64) i64 {
             var tcols: i64 = ti_tcols(tc0);
             var trow: i64 = tis[tc0].elem;          // 内层行数组 TI（[cols x T]）
             var tele: i64 = tis[trow].elem;          // 元素类型 T
-            var rcnt: i64 = parse.list_count(n.la);
+            var rcnt: i64 = parse.list_count(base.node_la((e as u64)));
             if (rcnt != trows) {
                 var sbte1: StringBuilder = sb_new();
                 sb_append_str(sbte1, "瓦片字面量 `[[...]]` 的行数必须等于 ");
@@ -7742,7 +7758,7 @@ pub fn infer_expr_body(e: i64) i64 {
                 return ti_mk("Unknown");
             }
             var ri: i64 = 0;
-            var rk: i64 = n.la;
+            var rk: i64 = base.node_la((e as u64));
             while (rk >= 0) {
                 var rchild: Child = base.kids[rk];
                 var rnode: Node = base.nodes[rchild.val];
@@ -7751,7 +7767,7 @@ pub fn infer_expr_body(e: i64) i64 {
                         "瓦片字面量的每个元素必须是行数组字面量 `[...]`（形如 `[[a,b],[c,d]]`）", rchild.val);
                     return ti_mk("Unknown");
                 }
-                var ccol: i64 = parse.list_count(rnode.la);
+                var ccol: i64 = parse.list_count(base.node_la((rchild.val as u64)));
                 if (ccol != tcols) {
                     var sbte2: StringBuilder = sb_new();
                     sb_append_str(sbte2, "瓦片第 ");
@@ -7763,7 +7779,7 @@ pub fn infer_expr_body(e: i64) i64 {
                     parse.fc_err("T-VEC-E945", sb_to_str(sbte2), rchild.val);
                     return ti_mk("Unknown");
                 }
-                var ck2: i64 = rnode.la;
+                var ck2: i64 = base.node_la((rchild.val as u64));
                 while (ck2 >= 0) {
                     var cchild: Child = base.kids[ck2];
                     var saved_te5: i64 = g_tile_expect;
@@ -7785,9 +7801,9 @@ pub fn infer_expr_body(e: i64) i64 {
             slice_set(base.nodes, e, nnt);
             return tc0;
         }
-        var cnt: i64 = parse.list_count(n.la);
+        var cnt: i64 = parse.list_count(base.node_la((e as u64)));
         if (cnt > 0) {
-            var k2: Child = base.kids[n.la];
+            var k2: Child = base.kids[base.node_la((e as u64))];
             var et: i64 = ie_sub_in(ei, k2.val);
             // 数组字面量的整型元素按「默认 int」提升为 i64（与多数语言一致，
             // 避免 [1,2,3] 被推成 []u8）；其余类型（bool/f64/struct…）保持不变。
@@ -7804,8 +7820,8 @@ pub fn infer_expr_body(e: i64) i64 {
         return ti_elem_of("Array", ti_mk("Unknown"));
     }
     if (k == "map_lit") {
-        if (n.la >= 0) {
-            var k3: Child = base.kids[n.la];
+        if (base.node_la((e as u64)) >= 0) {
+            var k3: Child = base.kids[base.node_la((e as u64))];
             var en: Node = base.nodes[k3.val];
             var kt: i64 = ie_sub_in(ie_inst(k3.val), en.na);
             var vt: i64 = ie_sub_in(ie_inst(k3.val), base.node_nb((k3.val as u64)));
@@ -7847,7 +7863,7 @@ pub fn infer_expr_body(e: i64) i64 {
             // 而非 TI），收集 TI 列表后合成（或复用）位置字段具名 struct 类型名。
             // ⚠ infer_expr 用局部 ei=ie_inst(node)，递归调用不会破坏外层环境，安全。
             var etis: []i64;
-            var p: i64 = n.la;
+            var p: i64 = base.node_la((e as u64));
             while (p >= 0) {
                 var kv: i64 = base.kids[p].val;
                 var fv: Node = base.nodes[kv];
@@ -7891,7 +7907,7 @@ pub fn infer_expr_body(e: i64) i64 {
         var fh: i64 = find_struct_fields(sname);
         if (fh >= 0) {
             var present: []string;
-            var p: i64 = n.la;
+            var p: i64 = base.node_la((e as u64));
             while (p >= 0) {
                 var pv: Node = base.nodes[base.kids[p].val];
                 append(present, pv.sa);
@@ -7910,12 +7926,12 @@ pub fn infer_expr_body(e: i64) i64 {
                     }
                     if (found == false) {
                         var fvid: i64 = base.mk_FV(f.sa, base.node_nb((base.kids[c].val as u64)), -1);
-                        if (n.la < 0) {
-                            n.la = base.list_push(-1, -1, fvid);
+                        if (base.node_la((e as u64)) < 0) {
+                            base.node_set_la((e as u64), base.list_push(-1, -1, fvid));
                         } else {
-                            var tail: i64 = n.la;
+                            var tail: i64 = base.node_la((e as u64));
                             while (base.kids[tail].next >= 0) { tail = base.kids[tail].next; }
-                            base.list_push(n.la, tail, fvid);
+                            base.list_push(base.node_la((e as u64)), tail, fvid);
                         }
                     }
                 }
@@ -7927,7 +7943,7 @@ pub fn infer_expr_body(e: i64) i64 {
         // g_lead_expect 后就地推断，使嵌套 `.{...}` 拿到正确的结构体上下文（标量/标识符字段
         // 交由后端在发射期推断即可，避免重复推断）。
         if (base.node_ib((e as u64)) == 1 && fh >= 0) {   // S4 §0.14.7 SoA：侧表读（原 n.ib）
-            var c2: i64 = n.la;
+            var c2: i64 = base.node_la((e as u64));
             while (c2 >= 0) {
                 var fv: Node = base.nodes[base.kids[c2].val];
                 var fvna: i64 = fv.na;
@@ -7953,7 +7969,7 @@ pub fn infer_expr_body(e: i64) i64 {
         // 嵌套 struct_lit 字段值由上方 g_lead_expect 上下文块处理，此处递归会自动覆盖其
         // 内部标识符（其自身 struct_lit 分支会再补调本兜底，故不漏）。
         // 注意：fv3.na 才是字段「值节点」；fv3（FV 节点）本身无子节点可遍历，必须传 .na。
-        var c3: i64 = n.la;
+        var c3: i64 = base.node_la((e as u64));
         while (c3 >= 0) {
             var fv3: Node = base.nodes[base.kids[c3].val];
             if (fv3.na >= 0) { sema_idecl_infer_idents(fv3.na); }
@@ -7994,7 +8010,7 @@ pub fn stmt_returns(s: i64) bool {
     }
     if (n.kind == "if") {
         if (base.node_lb((s as u64)) != -2) {
-            if (all_paths_return(n.la)) {
+            if (all_paths_return(base.node_la((s as u64)))) {
                 return all_paths_return(base.node_lb((s as u64)));
             }
             return false;
@@ -8002,7 +8018,7 @@ pub fn stmt_returns(s: i64) bool {
         return false;
     }
     if (n.kind == "block") {
-        return all_paths_return(n.la);
+        return all_paths_return(base.node_la((s as u64)));
     }
     return false;
 }
@@ -8026,7 +8042,7 @@ pub fn check_stmt(s: i64) void {
     // P3：值循环（带 `else` 或含 `break v`）出现在语句位置 → 脱糖为值块后回落 CST。
     // 脱糖已调 hir_invalidate，故 hir_of_node 归 -1，直接走 check_stmt_cst 的 block_expr 分支。
     var sn: Node = base.nodes[s];
-    if ((sn.kind == "while" || sn.kind == "for" || sn.kind == "for_each") && (base.node_lb((s as u64)) >= 0 || vl_body_has_break_v(sn.la))) {
+    if ((sn.kind == "while" || sn.kind == "for" || sn.kind == "for_each") && (base.node_lb((s as u64)) >= 0 || vl_body_has_break_v(base.node_la((s as u64))))) {
         desugar_value_loop(s);
         check_stmt_cst(s);
         return;
@@ -8060,7 +8076,7 @@ pub fn cs_block_inst(bi: i64) void {
 pub fn cs_block_node(s: i64) void {
     var prev: i64 = cur_scope;
     cur_scope = scope_new_at(prev, s);
-    var c: i64 = base.nodes[s].la;
+    var c: i64 = base.node_la((s as u64));
     while (c >= 0) {
         var k: Child = base.kids[c];
         check_stmt(k.val);
@@ -8328,7 +8344,7 @@ pub fn cs_expr_stmt(s: i64, ei: i64) void {
         base.node_set_sb((n.id as u64), "");
         n.na = -1;
         base.node_set_nb((s as u64), -1);
-        n.la = blk.la;
+        base.node_set_la((s as u64), base.node_la((n.na as u64)));
         slice_set(base.nodes, s, n);
         cs_block_node(s);
         return;
@@ -8467,7 +8483,7 @@ pub fn check_stmt_cst(s: i64) void {
         }
         var prev: i64 = cur_scope;
         cur_scope = scope_new_at(prev, s);
-        var c: i64 = n.la;
+        var c: i64 = base.node_la((s as u64));
         while (c >= 0) {
             var k: Child = base.kids[c];
             check_stmt(k.val);
@@ -8509,7 +8525,7 @@ pub fn check_stmt_cst(s: i64) void {
                     "", 1, 1, 1, 5);
             }
         }
-        var c3: i64 = n.la;
+        var c3: i64 = base.node_la((s as u64));
         while (c3 >= 0) {
             var k3: Child = base.kids[c3];
             check_stmt(k3.val);
@@ -8571,7 +8587,7 @@ pub fn check_stmt_cst(s: i64) void {
             }
             sym_define(cur_scope, base.node_sb((n.id as u64)), "var", vt5, -1);
         }
-        var c4: i64 = n.la;
+        var c4: i64 = base.node_la((s as u64));
         while (c4 >= 0) {
             var k4: Child = base.kids[c4];
             check_stmt(k4.val);
@@ -8705,9 +8721,9 @@ pub fn check_stmt_cst(s: i64) void {
             base.node_set_sb((n.id as u64), "");
             n.na = -1;
             base.node_set_nb((s as u64), -1);
-            n.la = blk.la;
+            base.node_set_la((s as u64), base.node_la((n.na as u64)));
             slice_set(base.nodes, s, n);
-            var cb: i64 = n.la;
+            var cb: i64 = base.node_la((s as u64));
             while (cb >= 0) {
                 var ckb: Child = base.kids[cb];
                 check_stmt(ckb.val);
@@ -8729,7 +8745,7 @@ pub fn check_stmt_cst(s: i64) void {
     if (n.kind == "block" || n.kind == "block_expr" || n.kind == "defer" || n.kind == "comptime_block") {
         var prev4: i64 = cur_scope;
         cur_scope = scope_new_at(prev4, s);
-        var c5: i64 = n.la;
+        var c5: i64 = base.node_la((s as u64));
         while (c5 >= 0) {
             var k5: Child = base.kids[c5];
             check_stmt(k5.val);
@@ -9685,7 +9701,7 @@ pub fn is_import_call(expr_idx: i64) string {
 // 从 import call 节点提取路径参数字符串
 pub fn import_path_arg(call_idx: i64) string {
     var n: Node = base.nodes[call_idx];
-    var c: i64 = n.la;
+    var c: i64 = base.node_la((call_idx as u64));
     if (c < 0) { return ""; }
     var k: Child = base.kids[c];
     var arg: Node = base.nodes[k.val];
@@ -9843,14 +9859,14 @@ pub fn desugar_stmts(stmt_head: i64, file_for_diag: string) void {
         }
         // 递归 if/while/for/block 体
         if (s.kind == "if") {
-            desugar_stmts(s.la, file_for_diag);
+            desugar_stmts(base.node_la((k.val as u64)), file_for_diag);
             if (base.node_lb((k.val as u64)) > -2) { desugar_stmts(base.node_lb((k.val as u64)), file_for_diag); }
         }
         if (s.kind == "while" || s.kind == "block") {
-            desugar_stmts(s.la, file_for_diag);
+            desugar_stmts(base.node_la((k.val as u64)), file_for_diag);
         }
         if (s.kind == "for") {
-            desugar_stmts(s.la, file_for_diag);
+            desugar_stmts(base.node_la((k.val as u64)), file_for_diag);
         }
         c = k.next;
     }
@@ -11201,7 +11217,7 @@ pub fn meta_val_copy(v: i64) i64 {
     if (n.kind != "array_lit") { return v; }
     var h: i64 = -1;
     var t: i64 = -1;
-    var c: i64 = n.la;
+    var c: i64 = base.node_la((v as u64));
     while (c >= 0) {
         var ev: i64 = meta_val_copy(base__kids[c].val);
         t = base__list_push(h, t, ev);
@@ -11215,7 +11231,7 @@ pub fn meta_eval_array_lit(e: i64) i64 {
     var n: Node = base__nodes[e];
     var h: i64 = -1;
     var t: i64 = -1;
-    var c: i64 = n.la;
+    var c: i64 = base.node_la((e as u64));
     while (c >= 0) {
         var ev: i64 = meta_eval(base__kids[c].val);
         if (ev < 0) { return -1; }
@@ -11238,7 +11254,7 @@ pub fn meta_eval_closure_make(e: i64) i64 {
     var n: Node = base.nodes[e];
     var h: i64 = -1;
     var t: i64 = -1;
-    var c: i64 = n.la;
+    var c: i64 = base.node_la((e as u64));
     while (c >= 0) {
         var capn: Node = base__nodes[base__kids[c].val];
         var capname: string = capn.sa;          // 环境字段名（须保留给 emit 写 env->field）
@@ -11273,7 +11289,7 @@ pub fn meta_eval_index(e: i64) i64 {
     if (bn.kind != "array_lit") {
         return meta_fail("T-MTA-E617", "编译期下标访问的对象须是数组或字符串", e);
     }
-    var ci: i64 = meta_kid_at(bn.la, idx);
+    var ci: i64 = meta_kid_at(base.node_la((b as u64)), idx);
     if (ci < 0) {
         return meta_fail("T-MTA-E602", "编译期数组下标越界", e);
     }
@@ -11287,7 +11303,7 @@ pub fn meta_eval_struct_lit(e: i64) i64 {
     var n: Node = base__nodes[e];
     var h: i64 = -1;
     var t: i64 = -1;
-    var c: i64 = n.la;
+    var c: i64 = base.node_la((e as u64));
     while (c >= 0) {
         var fv: Node = base__nodes[base__kids[c].val];
         if (fv.kind != "FV") {
@@ -11330,7 +11346,7 @@ pub fn meta_bytes_to_str(e: i64, av: i64, lv: i64) i64 {
     }
     var sb: StringBuilder = sb_new();
     var i: i64 = 0;
-    var c: i64 = an.la;
+    var c: i64 = base.node_la((av as u64));
     while (i < ln) {
         if (c < 0) {
             return meta_fail("T-MTA-E602", "编译期字节转字符串的长度超出缓冲区", e);
@@ -11786,7 +11802,7 @@ pub fn ct_dispatch(op: string, a: f64, b: f64) f64 {
 pub fn meta_eval_math(e: i64, name: string) i64 {
     var n: Node = base__nodes[e];
     var argv: []i64;
-    var ac: i64 = n.la;
+    var ac: i64 = base.node_la((e as u64));
     while (ac >= 0) {
         var av: i64 = meta_eval(base__kids[ac].val);
         if (av < 0) { return -1; }
@@ -11838,7 +11854,7 @@ pub fn meta_eval_builtin(e: i64, name: string) i64 {
     }
     var n: Node = base__nodes[e];
     var argv: []i64;
-    var ac: i64 = n.la;
+    var ac: i64 = base.node_la((e as u64));
     while (ac >= 0) {
         var av: i64 = meta_eval(base__kids[ac].val);
         if (av < 0) { return -1; }
@@ -11968,7 +11984,7 @@ pub fn meta_eval_variant_call(e: i64, name: string) i64 {
         var n: Node = base__nodes[e];
         var h: i64 = -1;
         var t: i64 = -1;
-        var ac: i64 = n.la;
+        var ac: i64 = base.node_la((e as u64));
         while (ac >= 0) {
             var pv: i64 = meta_eval(base__kids[ac].val);
             if (pv < 0) { return -1; }
@@ -11990,7 +12006,7 @@ pub fn meta_eval_variant_call(e: i64, name: string) i64 {
         if (vc < 0) { return -2; }
         var n: Node = base__nodes[e];
         var sv: i64 = -1;
-        if (n.la >= 0) { sv = meta_eval(base__kids[n.la].val); }
+        if (base.node_la((e as u64)) >= 0) { sv = meta_eval(base__kids[base.node_la((e as u64))].val); }
         if (sv < 0) { return -1; }
         if (base__nodes[sv].kind != "vval") {
             return meta_fail("T-MTA-E617", "编译期 `is` 的被匹配值须是编译期变体值", e);
@@ -12021,7 +12037,7 @@ pub fn meta_eval_variant_call(e: i64, name: string) i64 {
         if (vc < 0) { return -2; }
         var n: Node = base__nodes[e];
         var sv: i64 = -1;
-        if (n.la >= 0) { sv = meta_eval(base__kids[n.la].val); }
+        if (base.node_la((e as u64)) >= 0) { sv = meta_eval(base__kids[base.node_la((e as u64))].val); }
         if (sv < 0) { return -1; }
         if (base.nodes[sv].kind != "vval") {
             return meta_fail("T-MTA-E617", "编译期 `as` 的被匹配值须是编译期变体值", e);
@@ -12031,7 +12047,7 @@ pub fn meta_eval_variant_call(e: i64, name: string) i64 {
                 base__sb_cat5("编译期 `as` 类型不匹配：实际是 `", base.node_sb((sv as u64)), "` 而非 `", cn0, "`"), e);
         }
         if (fk >= 0) {
-            var c: i64 = base__nodes[sv].la;
+            var c: i64 = base.node_la((sv as u64));
             var idx: i64 = 0;
             while (c >= 0) {
                 if (idx == fk) { return base__kids[c].val; }
@@ -12040,7 +12056,7 @@ pub fn meta_eval_variant_call(e: i64, name: string) i64 {
             }
             return meta_fail("T-MTA-E617", "编译期 `as` 载荷下标越界", e);
         }
-        if (base__nodes[sv].la >= 0) { return base__kids[base__nodes[sv].la].val; }
+        if (base.node_la((sv as u64)) >= 0) { return base__kids[base.node_la((sv as u64))].val; }
         return meta_fail("T-MTA-E617", "编译期 `as` 的 case 无载荷可取（单元 case）", e);
     }
     return -2;
@@ -12070,7 +12086,7 @@ pub fn meta_bind_conpat(pats: i64, vals: i64) bool {
         } else if (pn.kind == "conpat") {
             if (base__nodes[pv].kind == "vval") {
                 if (base.node_sb((pv as u64)) != pn.sa) { return false; }
-                if (meta_bind_conpat(pn.la, base__nodes[pv].la) == false) { return false; }
+                if (meta_bind_conpat(base.node_la((base__kids[pc].val as u64)), base.node_la((pv as u64))) == false) { return false; }
             } else { return false; }
         }
         // `_` 通配 / 其他：跳过绑定
@@ -12085,7 +12101,7 @@ pub fn meta_eval_match(e: i64) i64 {
     var n: Node = base__nodes[e];
     var scr: i64 = meta_eval(n.na);
     if (scr < 0) { return -1; }
-    var mc: i64 = n.la;
+    var mc: i64 = base.node_la((e as u64));
     while (mc >= 0) {
         var arm: Node = base__nodes[base__kids[mc].val];
         var pat: i64 = arm.na;
@@ -12104,7 +12120,7 @@ pub fn meta_eval_match(e: i64) i64 {
         } else if (pat >= 0 && base__nodes[pat].kind == "conpat") {
             if (base__nodes[pat].sa == "") {
                 // 纯绑定 conpat（罕见）：把 la 里的 ident 绑定到整个 scrutinee
-                var bpi: i64 = base__nodes[pat].la;
+                var bpi: i64 = base.node_la((pat as u64));
                 while (bpi >= 0) {
                     var bp: Node = base__nodes[base__kids[bpi].val];
                     if (bp.kind == "ident") { menv_push(bp.sa, scr); }
@@ -12113,7 +12129,7 @@ pub fn meta_eval_match(e: i64) i64 {
                 matched = true;
             } else if (base__nodes[scr].kind == "vval") {
                 if (base.node_sb((scr as u64)) == base__nodes[pat].sa) {
-                    matched = meta_bind_conpat(base__nodes[pat].la, base__nodes[scr].la);
+                    matched = meta_bind_conpat(base.node_la((pat as u64)), base.node_la((scr as u64)));
                 }
             }
         } else if (pat >= 0 && base__nodes[pat].kind == "ident") {
@@ -12192,7 +12208,7 @@ pub fn meta_eval_call(e: i64) i64 {
     var argv: []i64;
     var argt: []i64;
     var ai: i64 = 0;
-    var ac: i64 = n.la;
+    var ac: i64 = base.node_la((e as u64));
     while (ac >= 0) {
         if (ai < np1 && pistype[ai]) {
             var atn: i64 = meta_type_arg_node(base__kids[ac].val);
@@ -12457,7 +12473,7 @@ pub fn meta_exec(head: i64) i64 {
             var mk1: i64 = g_menv_top;
             var r1: i64 = 0;
             if (base.node_ba((cvn.id as u64))) {
-                r1 = meta_exec(s.la);
+                r1 = meta_exec(base.node_la((k.val as u64)));
             } else {
                 if (base.node_lb((k.val as u64)) > -2) { r1 = meta_exec(base.node_lb((k.val as u64))); }
             }
@@ -12481,7 +12497,7 @@ pub fn meta_exec(head: i64) i64 {
                 }
                 if (base.node_ba((wcn.id as u64)) == false) { break; }
                 var mk2: i64 = g_menv_top;
-                var r2: i64 = meta_exec(s.la);
+                var r2: i64 = meta_exec(base.node_la((k.val as u64)));
                 g_menv_top = mk2;
                 if (g_meta_err) { return 0; }
                 if (r2 == 1) { return 1; }
@@ -12489,7 +12505,7 @@ pub fn meta_exec(head: i64) i64 {
             }
         } else if (s.kind == "block" || s.kind == "comptime_block") {
             var mk3: i64 = g_menv_top;
-            var r3: i64 = meta_exec(s.la);
+            var r3: i64 = meta_exec(base.node_la((k.val as u64)));
             g_menv_top = mk3;
             if (g_meta_err) { return 0; }
             if (r3 != 0) { return r3; }
@@ -12531,7 +12547,7 @@ pub fn meta_do_assign(a: i64) bool {
         }
         var ixv: i64 = meta_eval(base__node_nb((an.na as u64)));
         if (ixv < 0) { return false; }
-        var ci2: i64 = meta_kid_at(bn2.la, mv_get_int(ixv));
+        var ci2: i64 = meta_kid_at(base__node_la((base as u64)), mv_get_int(ixv));
         if (ci2 < 0) {
             meta_fail("T-MTA-E602", "编译期数组下标越界", a);
             return false;
@@ -12580,7 +12596,7 @@ pub fn meta_fold_expr(e: i64) void {
     base.node_set_nb((e as u64), base.node_nb((v as u64)));
     base__node_set_nc((e as u64), base__node_nc((v as u64)));   // S4 §0.14.7 SoA：侧表访问器（原 .nc；第九批）
     base__node_set_nd((e as u64), base__node_nd((v as u64)));   // S4 §0.14.7 SoA：侧表访问器（原 .nd）
-    dst.la = src.la;   // array_lit 的元素链（其余字面量此处均为 -1）
+    base.node_set_la((e as u64), base.node_la((v as u64)));   // array_lit 的元素链（其余字面量此处均为 -1）
     base.node_set_lb((e as u64), base.node_lb((v as u64)));
     base__node_set_lc((e as u64), base__node_lc((v as u64)));   // S4 §0.14.7 SoA：侧表访问器（原 .lc；第十一批）
     slice_set(base__nodes, e, dst);
@@ -12591,7 +12607,7 @@ pub fn meta_run_block(b: i64) void {
     g_meta_err = false;
     var bn: Node = base__nodes[b];
     var mk4: i64 = g_menv_top;
-    var st: i64 = meta_exec(bn.la);
+    var st: i64 = meta_exec(base.node_la((b as u64)));
     g_menv_top = mk4;
     if (g_meta_err) { return; }
     if (st == 1) {
@@ -12601,7 +12617,7 @@ pub fn meta_run_block(b: i64) void {
         return;
     }
     var bn2: Node = base__nodes[b];
-    bn2.la = -1;
+    base.node_set_la((b as u64), -1);
     slice_set(base__nodes, b, bn2);
 }
 
@@ -12633,7 +12649,7 @@ pub fn meta_walk(e: i64) void {
     meta_walk(base.node_nb((e as u64)));
     meta_walk(base.node_nc((n.id as u64)));
     meta_walk(base.node_nd((e as u64)));   // S4 §0.14.7 SoA：侧表访问器（原 .nd）
-    meta_walk_list(n.la);
+    meta_walk_list(base.node_la((e as u64)));
     meta_walk_list(base.node_lb((e as u64)));
     meta_walk_list(base.node_lc((n.id as u64)));
 }
@@ -12995,15 +13011,15 @@ pub fn mb_zero_value(tn0: i64, depth: i64) i64 {
 pub fn mb_fold(e: i64) i64 {
     var n: Node = base__nodes[e];
     if (n.sa == "zeroed") {
-        if (n.la < 0) { return -1; }
-        if (base__kids[n.la].next >= 0) { return -1; }
-        return mb_zero_value(base__kids[n.la].val, 0);
+        if (base.node_la((e as u64)) < 0) { return -1; }
+        if (base__kids[base.node_la((e as u64))].next >= 0) { return -1; }
+        return mb_zero_value(base__kids[base.node_la((e as u64))].val, 0);
     }
     if (mb_is_type_query(n.sa) == false) { return -1; }
     var a0: i64 = -1;
     var a1: i64 = -1;
     var cnt: i64 = 0;
-    var c: i64 = n.la;
+    var c: i64 = base.node_la((e as u64));
     while (c >= 0) {
         if (cnt == 0) { a0 = base__kids[c].val; }
         if (cnt == 1) { a1 = base__kids[c].val; }
@@ -13045,7 +13061,7 @@ pub fn mb_fold_inplace(e: i64) void {
     base.node_set_nb((e as u64), -1);
     base__node_set_nc((e as u64), -1);   // S4 §0.14.7 SoA：侧表访问器（原 .nc；第九批）
     base__node_set_nd((e as u64), -1);   // S4 §0.14.7 SoA：侧表访问器（原 .nd）
-    dst.la = src.la;   // @zeroed 折出来的是 array_lit，元素链在 la
+    base.node_set_la((e as u64), base.node_la((v as u64)));   // @zeroed 折出来的是 array_lit，元素链在 la
     slice_set(base__nodes, e, dst);
 }
 
@@ -13059,7 +13075,7 @@ pub fn mb_prune_if(c: i64, v: i64) void {
     var cn: Node = base__nodes[vn.na];
     if (cn.kind != "bool") { return; }
     var take: i64 = base.node_lb((v as u64));
-    if (base.node_ba((cn.id as u64))) { take = vn.la; }
+    if (base.node_ba((cn.id as u64))) { take = base.node_la((v as u64)); }
     if (take < 0) { take = -1; }
     var b: i64 = base__mk_block(take, -1);
     var k: Child = base__kids[c];
@@ -13088,7 +13104,7 @@ pub fn mb_walk(e: i64) void {
     if (e < 0) { return; }
     var n: Node = base__nodes[e];
     if (n.kind == "mbuiltin") {
-        mb_walk_list(n.la);          // 实参里可以再套 `@type_size(...)`
+        mb_walk_list(base.node_la((e as u64)));          // 实参里可以再套 `@type_size(...)`
         mb_fold_inplace(e);
         return;
     }
@@ -13096,7 +13112,7 @@ pub fn mb_walk(e: i64) void {
     mb_walk(base.node_nb((e as u64)));
     mb_walk(base.node_nc((n.id as u64)));
     mb_walk(base.node_nd((e as u64)));   // S4 §0.14.7 SoA：侧表访问器（原 .nd）
-    mb_walk_list(n.la);
+    mb_walk_list(base.node_la((e as u64)));
     mb_walk_list(base.node_lb((e as u64)));
     mb_walk_list(base.node_lc((n.id as u64)));
 }
@@ -13199,7 +13215,7 @@ pub fn meta_eval_mbuiltin(e: i64) i64 {
     // P4 值→类型查询：`@type_of(e)` 在编译期把 e 的静态类型折成类型节点（类型即值）。
     if (n.sa == "type_of") {
         var a0: i64 = -1;
-        var c: i64 = n.la;
+        var c: i64 = base.node_la((e as u64));
         if (c >= 0) { a0 = base__kids[c].val; }
         if (a0 < 0) {
             return meta_fail("T-MTA-E611", "`@type_of` 需要 1 个实参（表达式）", e);
@@ -13215,7 +13231,7 @@ pub fn meta_eval_mbuiltin(e: i64) i64 {
     if (n.sa == "type_val") {
         var cnt: i64 = 0;
         var a0: i64 = -1;
-        var c: i64 = n.la;
+        var c: i64 = base.node_la((e as u64));
         while (c >= 0) {
             if (cnt == 0) { a0 = base__kids[c].val; }
             cnt = cnt + 1;
@@ -13235,7 +13251,7 @@ pub fn meta_eval_mbuiltin(e: i64) i64 {
     // 编译期常量：`@simd_lanes(T)` = 本机向量寄存器可容纳的 T 的 lane 数 = g_simd_bytes / sizeof(T)。
     // 用于 `@Vector(@simd_lanes(i32), i32)` 这类「按本机宽度自适应」的可移植向量声明。
     if (n.sa == "simd_lanes") {
-        var sc: i64 = n.la;
+        var sc: i64 = base.node_la((e as u64));
         if (sc < 0) { return meta_fail("T-VEC-E926", "`@simd_lanes` 需要 1 个类型实参", e); }
         var sargn: i64 = base__kids[sc].val;
         var slti: i64 = resolve_ti(sargn);
@@ -13248,7 +13264,7 @@ pub fn meta_eval_mbuiltin(e: i64) i64 {
     if (n.sa == "compile_error") {
         var cnt: i64 = 0;
         var a0: i64 = -1;
-        var c: i64 = n.la;
+        var c: i64 = base.node_la((e as u64));
         while (c >= 0) {
             if (cnt == 0) { a0 = base__kids[c].val; }
             cnt = cnt + 1;
@@ -13277,7 +13293,7 @@ pub fn meta_eval_mbuiltin(e: i64) i64 {
         var s0: i64 = -1;
         var s1: i64 = -1;
         var sc: i64 = 0;
-        var sk: i64 = n.la;
+        var sk: i64 = base.node_la((e as u64));
         while (sk >= 0) {
             if (sc == 0) { s0 = base__kids[sk].val; }
             if (sc == 1) { s1 = base__kids[sk].val; }
@@ -13313,8 +13329,8 @@ pub fn ali_fix(tn: i64, init: i64, stmt: i64) void {
     var sub_init: i64 = -1;
     if (init >= 0) {
         var in0: Node = base.nodes[init];
-        if (in0.kind == "array_lit" && in0.la >= 0) {
-            var c0: Child = base.kids[in0.la];
+        if (in0.kind == "array_lit" && base.node_la((init as u64)) >= 0) {
+            var c0: Child = base.kids[base.node_la((init as u64))];
             sub_init = c0.val;
         }
     }
@@ -13323,7 +13339,7 @@ pub fn ali_fix(tn: i64, init: i64, stmt: i64) void {
     var cnt: i64 = -1;
     if (init >= 0) {
         var i2: Node = base.nodes[init];
-        if (i2.kind == "array_lit") { cnt = parse.list_count(i2.la); }
+        if (i2.kind == "array_lit") { cnt = parse.list_count(base.node_la((init as u64))); }
     }
     if (cnt < 0) {
         parse.fc_err("T-SEM-E215",
@@ -13955,12 +13971,12 @@ pub fn vv_cfg() void {
 // derive/allow/warn/deny 的 trait/warning 项遍历校验
 pub fn ann_check_items(ai: i64, is_derive: bool, l: i64, c: i64) void {
     var an: Node = base__nodes[ai];
-    var c1: i64 = an.la;
+    var c1: i64 = base.node_la((ai as u64));
     while (c1 >= 0) {
         var k: Child = base__kids[c1];
         var arg: Node = base__nodes[k.val];
         if (arg.kind == "list") {
-            var c2: i64 = arg.la;
+            var c2: i64 = base.node_la((k.val as u64));
             while (c2 >= 0) {
                 var k2: Child = base__kids[c2];
                 var m: Node = base__nodes[k2.val];
@@ -14055,7 +14071,7 @@ pub fn ann_validate(ai: i64, target: string) void {
     }
 
     // ── validateArgs ──
-    var argc: i64 = parse__list_count(an.la);
+    var argc: i64 = parse__list_count(base.node_la((ai as u64)));
 
     if (def.spec == "none") {
         if (argc > 0) {
@@ -14068,7 +14084,7 @@ pub fn ann_validate(ai: i64, target: string) void {
     if (def.spec == "string") {
         var bad: bool = argc != 1;
         if (bad == false) {
-            var k0: Child = base__kids[an.la];
+            var k0: Child = base__kids[base.node_la((ai as u64))];
             var a0: Node = base__nodes[k0.val];
             bad = a0.kind != "string";
         }
@@ -14087,7 +14103,7 @@ pub fn ann_validate(ai: i64, target: string) void {
         var a0k: string = "";
         var a0v: string = "";
         if (argc >= 1) {
-            var k1: Child = base__kids[an.la];
+            var k1: Child = base__kids[base.node_la((ai as u64))];
             var a1: Node = base__nodes[k1.val];
             a0k = a1.kind;
             a0v = a1.sa;
@@ -14129,7 +14145,7 @@ pub fn ann_validate(ai: i64, target: string) void {
     if (def.spec == "number") {
         var bad3: bool = argc != 1;
         if (bad3 == false) {
-            var k2: Child = base__kids[an.la];
+            var k2: Child = base__kids[base.node_la((ai as u64))];
             var a2: Node = base__nodes[k2.val];
             bad3 = a2.kind != "number";
         }
@@ -14181,7 +14197,7 @@ pub fn ann_pass() void {
         var d: i64 = lex__decl_list[i];
         var nd: Node = base__nodes[d];
         var target: string = decl_target(nd.kind);
-        var c: i64 = nd.la;
+        var c: i64 = base.node_la((d as u64));
         while (c >= 0) {
             var k: Child = base__kids[c];
             ann_validate(k.val, target);
@@ -14256,7 +14272,7 @@ pub fn call_arg_node(cid: i64, ix: i64) i64 {
         return -1;
     }
     var cn9: Node = base__nodes[cid];
-    var c9: i64 = cn9.la;
+    var c9: i64 = base.node_la((cid as u64));
     var j9: i64 = 0;
     while (c9 >= 0) {
         var ck9: Child = base__kids[c9];
@@ -14470,7 +14486,7 @@ pub fn resolve_type_desc(tn: i64) i64 {
     if (n.kind == "tile") {
         var trows: i64 = base.node_ia((tn as u64));
         var tcols: i64 = base__node_ib((tn as u64));   // S4 §0.14.7 SoA：侧表读（原 n.ib）
-        var tfl: i64 = n.la;
+        var tfl: i64 = base.node_la((tn as u64));
         if (trows < 1) { trows = tile_fold_child(base.node_nb((tn as u64))); }
         if (tcols < 1) { tcols = tile_fold_child(base.node_nc((n.id as u64))); }
         if (trows < 1) { trows = 1; }
@@ -14553,7 +14569,7 @@ pub fn resolve_type_desc(tn: i64) i64 {
         // 与 resolve_ti 同理：先收进局部表再整段搬入，保证参数区连续。
         var fret: i64 = resolve_type_desc(n.na);
         var fbuf: []i64;
-        var fk: i64 = n.la;
+        var fk: i64 = base.node_la((tn as u64));
         while (fk >= 0) {
             var fc: Child = base__kids[fk];
             append(fbuf, resolve_type_desc(fc.val));
