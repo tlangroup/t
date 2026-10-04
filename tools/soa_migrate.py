@@ -1,0 +1,343 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+S4 SoA 通用字段外置迁移器（批次 13 从 mig13.py 泛化而来）。
+
+用法：
+    python tools/soa_migrate.py ia src/sema.tc              # dry run，输出计划 + 未映射清单
+    python tools/soa_migrate.py ia src/sema.tc --apply      # 落盘
+
+前置（调用方职责）：被迁字段的访问器必须已按下述约定命名
+    getter = node_<field>()            setter = node_set_<field>()
+且已一并加入 base.tc 的 sidetable_init 登记与 node_new 的锁步 append。
+本脚本只负责把调用方站点改成访问器，不负责定义侧表。
+
+策略（沿用批次 10/11/12）：
+  * 先按函数体建立 Node 局部量 → 索引表达式 的映射
+        var X: Node = base.nodes[IDX];   /  var X = nodes[IDX];
+  * 读点 `X.ia`      → `<mod>node_ia((IDX as u64))`
+  * 写点 `X.ia = V;` → `<mod>node_set_ia((IDX as u64), V);`
+  * `<expr>.ia` 其中 expr 为 `base.nodes[IDX]` / `nodes[IDX]` 形式者直接改写
+  * 模块限定符：base.tc 自身无限定；其余 `base.`；函数内出现 `var base` 遮蔽 → `base__`
+  * 跳过：纯注释行、字符串字面量内的命中、tbl_Rec*（S2 per-kind record）
+
+★★★ 行尾红线（批次 13 血的教训，见 topics/impl-rules.md）：
+本仓库**逐文件**使用不同行尾（`mir/tmir/codegen_wasm/codegen_riscv` 为 CRLF，其余多为 LF）。
+Python 文本模式读（`newline=None`）会把 `\r\n` 整体折叠成 `\n`，写回后整文件行尾被改写，
+`git diff --stat` 会虚增到几千行、淹没真实改动。故本脚本**全程二进制读写 + 逐行记录原终结符**，
+按原形态写回；收尾必须用 `git diff --stat` 与 `git diff -w --stat` 对照确认无漂移。
+"""
+import sys, os, io, re
+
+if len(sys.argv) < 2:
+    print('usage: python tools/soa_migrate.py <field> <file> [--apply]')
+    sys.exit(1)
+FIELD = sys.argv[1]
+GET = 'node_' + FIELD
+SET = 'node_set_' + FIELD
+
+
+def outside_strings(s, pos):
+    instr = False
+    i = 0
+    while i < pos:
+        c = s[i]
+        if not instr:
+            if c == '"':
+                instr = True
+        else:
+            if c == '\\':
+                i += 2
+                continue
+            if c == '"':
+                instr = False
+        i += 1
+    return not instr
+
+
+def find_all_outside(s, term):
+    """返回 term 在字符串外、且不在 // 注释之后的所有位置。"""
+    res = []
+    p = s.find(term)
+    while p >= 0:
+        if outside_strings(s, p):
+            cpos = s.find('//')
+            commented = False
+            while cpos >= 0 and cpos < p:
+                if outside_strings(s, cpos):
+                    commented = True
+                    break
+                cpos = s.find('//', cpos + 1)
+            if not commented:
+                res.append(p)
+        p = s.find(term, p + 1)
+    return res
+
+
+def func_bounds(lines):
+    """返回 [(start, end)]，每个为 indent-0 顶层函数的行区间（0-based，含端点）。"""
+    out = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        if re.match(r'(pub\s+)?fn\s+\w+\s*\(', lines[i]):
+            j = i
+            # 找到签名结束的 `{`
+            while j < n and '{' not in lines[j]:
+                j += 1
+            # 找收尾 `}`（indent 0）
+            k = j
+            while k < n and lines[k].rstrip() != '}':
+                k += 1
+            out.append((i, k))
+            i = k + 1
+        else:
+            i += 1
+    return out
+
+
+NODE_LOCAL = re.compile(r'var\s+(\w+)\s*(?::\s*Node)?\s*=\s*(?:base__nodes|base\.nodes|nodes)\[([^\]]+)\]\s*;')
+
+
+def read_lines(path):
+    """二进制读入，返回 (lines, terms)：lines 为不含终结符的行内容，terms 为逐行原终结符。
+    保证写回时行尾形态与源文件逐字节一致（CRLF / LF / 混用均可）。"""
+    data = io.open(path, 'rb').read()
+    txt = data.decode('utf-8', errors='replace')
+    lines, terms = [], []
+    start, n = 0, len(txt)
+    while start < n:
+        j = txt.find('\n', start)
+        if j < 0:
+            lines.append(txt[start:])
+            terms.append('')
+            break
+        if j > start and txt[j - 1] == '\r':
+            lines.append(txt[start:j - 1])
+            terms.append('\r\n')
+        else:
+            lines.append(txt[start:j])
+            terms.append('\n')
+        start = j + 1
+    return lines, terms
+
+
+def eol_report(terms):
+    crlf = sum(1 for t in terms if t == '\r\n')
+    lf = sum(1 for t in terms if t == '\n')
+    if crlf and not lf:
+        return 'CRLF (%d 行)' % crlf
+    if lf and not crlf:
+        return 'LF (%d 行)' % lf
+    return 'MIXED: CRLF %d / LF %d / 其他 %d' % (crlf, lf, len(terms) - crlf - lf)
+
+
+def write_lines(path, lines, terms):
+    out = ''.join(c + t for c, t in zip(lines, terms))
+    io.open(path, 'wb').write(out.encode('utf-8'))
+def balanced_content(s, open_pos):
+    """s[open_pos] 必须是 '['，返回 (内层文本, 闭括号下标)；不配平返回 None。
+    支持嵌套下标（如 `nodes[g_fc_d[i]]`），批次 14 因此多了 3 处自动站点。"""
+    if open_pos >= len(s) or s[open_pos] != '[':
+        return None
+    depth = 0
+    i = open_pos
+    while i < len(s):
+        if s[i] == '[':
+            depth += 1
+        elif s[i] == ']':
+            depth -= 1
+            if depth == 0:
+                return (s[open_pos + 1:i], i)
+        i += 1
+    return None
+
+
+NODE_PREFIXES = ('base__nodes[', 'base.nodes[', 'nodes[')
+
+
+def idx_at_end(pre):
+    """pre 以 `...nodes[EXPR]` 结尾时返回 (起始下标, EXPR)，否则 None。"""
+    best = None
+    for pat in NODE_PREFIXES:
+        p = pre.rfind(pat)
+        if p >= 0 and (best is None or p > best[0]):
+            best = (p, p + len(pat) - 1)
+    if best is None:
+        return None
+    open_pos = best[1]
+    r = balanced_content(pre, open_pos)
+    if r is None:
+        return None
+    inner, close = r
+    if close != len(pre) - 1:
+        return None
+    return (best[0], inner)
+
+
+DECL_BASE = re.compile(r'var\s+base\b')
+
+NODE_DECL_RE = re.compile(r'var\s+(\w+)\s*(?::\s*Node)?\s*=\s*(?:base__nodes|base\.nodes|nodes)\[')
+
+
+def build_map(lines, start, end):
+    """返回有序 [(lineno, name, idx_expr)]，解析时取「最近前置」声明。"""
+    m = []
+    for i in range(start, end + 1):
+        s = lines[i]
+        for mo in NODE_DECL_RE.finditer(s):
+            open_pos = mo.end() - 1
+            r = balanced_content(s, open_pos)
+            if r is None:
+                continue
+            inner, close = r
+            rest = s[close + 1:].lstrip()
+            if rest.startswith(';') or rest.startswith('.'):
+                m.append((i, mo.group(1), inner))
+    return m
+
+
+def resolve(m, name, lineno):
+    best = None
+    for (ln, nm, ex) in m:
+        if nm == name and ln < lineno:
+            if best is None or ln > best[0]:
+                best = (ln, nm, ex)
+    return best[2] if best else None
+
+
+def main():
+    path = sys.argv[2]
+    apply = '--apply' in sys.argv
+    own = os.path.basename(path) == 'base.tc'
+    lines, terms = read_lines(path)
+    if not apply:
+        print('==== EOL %s : %s ====' % (path, eol_report(terms)))
+    bounds = func_bounds(lines)
+    changes = []      # (lineno, old, new)
+    unmapped = []     # (lineno, text)
+
+    def owner_of(lineno):
+        for (s, e) in bounds:
+            if s <= lineno <= e:
+                return (s, e)
+        return None
+
+    for i, s in enumerate(lines):
+        if FIELD not in s:
+            continue
+        pos_list = find_all_outside(s, '.' + FIELD)
+        if not pos_list:
+            continue
+        if 'tbl_Rec' in s:
+            continue
+        fb = owner_of(i)
+        if fb is None:
+            unmapped.append((i + 1, s.strip(), 'no-func'))
+            continue
+        # 是否遮蔽 base
+        shadow = False
+        for k in range(fb[0], fb[1] + 1):
+            if DECL_BASE.search(lines[k]) and 'base__' not in lines[k]:
+                shadow = True
+                break
+        if own:
+            qual = ''
+        elif shadow:
+            qual = 'base__'
+        else:
+            qual = 'base.'
+        nmap = build_map(lines, fb[0], fb[1])
+        nmap_names = set(x[1] for x in nmap)
+
+        newline = s
+        for p in sorted(pos_list, reverse=True):
+            # 取接收者表达式：向前找标识符 / 下标链
+            pre = newline[:p]
+            mo = re.search(r'([A-Za-z_]\w*)\[\]$', pre)
+            recv = None
+            idx_expr = None
+            # 情况 1：recv = nodes[EXPR] 形式（支持嵌套下标，如 base.nodes[g_fc_d[i]]）
+            r = idx_at_end(pre)
+            if r is not None:
+                idx_expr = r[1]
+                rep_from = r[0]
+            else:
+                m2 = re.search(r'([A-Za-z_]\w*)$', pre)
+                if not m2:
+                    unmapped.append((i + 1, s.strip(), 'norecv'))
+                    continue
+                name = m2.group(1)
+                if name in ('nodes', 'base'):
+                    unmapped.append((i + 1, s.strip(), 'recv=%s' % name))
+                    continue
+                idx_expr = resolve(nmap, name, i)
+                if idx_expr is None:
+                    if name not in nmap_names:
+                        unmapped.append((i + 1, s.strip(), 'nomap:%s' % name))
+                    else:
+                        unmapped.append((i + 1, s.strip(), 'predecl:%s' % name))
+                    continue
+                rep_from = m2.start(1)
+            # 读 or 写：`X.ia` 后紧跟 = 且不是 ==
+            after = newline[p + len(FIELD) + 1:]
+            is_write = False
+            rhs = None
+            if len(after) > 0 and after.lstrip().startswith('=') and not after.lstrip().startswith('=='):
+                is_write = True
+                rhs = after.lstrip()[1:].strip()
+            if is_write:
+                # 行尾注释（字符串外的 //）要保留在改写之后
+                rhs_body = rhs
+                tailcmt = ''
+                ci = 0
+                instr = False
+                while ci < len(rhs_body):
+                    ch = rhs_body[ci]
+                    if not instr:
+                        if ch == '"':
+                            instr = True
+                        elif ch == '/' and ci + 1 < len(rhs_body) and rhs_body[ci + 1] == '/':
+                            tailcmt = rhs_body[ci:]
+                            rhs_body = rhs_body[:ci]
+                            break
+                    else:
+                        if ch == '\\':
+                            ci += 2
+                            continue
+                        if ch == '"':
+                            instr = False
+                    ci += 1
+                rhs_body = rhs_body.strip()
+                if rhs_body.endswith(';'):
+                    rhs_body = rhs_body[:-1]
+                new_tail = '%s%s((%s as u64), %s);' % (qual, SET, idx_expr, rhs_body)
+                if tailcmt:
+                    new_tail = new_tail + '   ' + tailcmt
+                newline = newline[:rep_from] + new_tail
+            else:
+                newline = newline[:rep_from] + '%s%s((%s as u64))' % (qual, GET, idx_expr) + newline[p + len(FIELD) + 1:]
+        if newline != s:
+            changes.append((i + 1, s, newline))
+
+    print('==== PLAN %s : %d changes ====' % (path, len(changes)))
+    for ln, o, nw in changes:
+        print('%5d - %s' % (ln, o.strip()))
+        print('%5d + %s' % (ln, nw.strip()))
+    print('==== UNMAPPED %s : %d ====' % (path, len(unmapped)))
+    for ln, txt, why in unmapped:
+        print('%5d | %s | %s' % (ln, why, txt))
+
+    if apply and changes:
+        out = list(lines)
+        for ln, o, nw in changes:
+            out[ln - 1] = nw
+        write_lines(path, out, terms)
+        # 写回自检：行尾形态必须与读入时完全一致
+        _, terms2 = read_lines(path)
+        same = (terms2 == terms)
+        print('APPLIED %s (%d lines) | EOL %s | 行尾%s' % (
+            path, len(changes), eol_report(terms2), '一致 ✓' if same else '漂移 ✗ 须回滚'))
+
+
+main()
