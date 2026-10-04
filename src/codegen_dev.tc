@@ -41,7 +41,10 @@ pub fn dev_safe_node(e: i64) Node {
     //   **普查确认是死写**：本文件改造后**无任何** `Node` 消费方读 ia（唯一提及在
     //   `dev_parse_int` 的注释里），越界零节点的 ia 永不被观测 ⇒ 删除不改变行为。
     n.na = -1;
-    n.nb = -1;
+    // S4 §0.14.7 SoA：nb 已外置为侧表（第十五批）。零 Node 无 id ⇒ 无法回写侧表；
+    //   越界读 node_nb 返 -1，与此处原 n.nb = -1 **等价**（同第十四批 lb / 第九批 nc 的论证）。
+    //   ⚠ 与第十三批 ia 的**结论不同**：ia 零节点初值是 0 而全局默认 -1，故只能按死写删除；
+    //     nb 的零节点初值恰为 -1，等价成立，可照 lb 句式处理。
     // S4 §0.14.7 SoA：nc 已外置为侧表（零 Node 无 id，越界读 node_nc 返 -1，等价原 n.nc = -1）
     // S4 §0.14.7 SoA：nd 已外置为侧表；越界读 node_nd 返 -1，与此处原 n.nd = -1 等价
     n.la = -1;
@@ -316,24 +319,24 @@ pub fn emit_dev_stmt(s: i64) void {
     dev_trace("[EMIT_DEV] stmt kind=");
     dev_trace(dev_safe_node(s).kind);
     dev_trace(" nb=");
-    dev_trace(base.i2s(base.nodes[s].nb));
+    dev_trace(base.i2s(base.node_nb((s as u64))));
     dev_trace(" nlen=");
     dev_trace(base.i2s(slice_len(base.nodes) as i64));
     dev_trace("\n");
     var n: Node = dev_safe_node(s);
     if (n.kind == "var_decl") {
         // 共享内存分配：`var sh: shared[T] = shared_alloc(N)`
-        if (n.nb >= 0 && dev_is_call_name(n.nb, "shared_alloc")) {
+        if (base.node_nb((s as u64)) >= 0 && dev_is_call_name(base.node_nb((s as u64)), "shared_alloc")) {
             var mty: string = dev_type_of(n.na);    // !llvm.ptr<3>
             var elem: string = g_dt_elem;           // f32 / i32
-            var cnt: string = emit_dev_expr(dev_first_arg(n.nb));
+            var cnt: string = emit_dev_expr(dev_first_arg(base.node_nb((s as u64))));
             var v: string = dev_next();
             dev_emit(base.sb_cat8("  ", v, " = \"device.shared_alloc\"(", cnt, ") {elem = ", elem, "} : (i32) -> !llvm.ptr<3>", ""));
             dev_bind(n.sa, v, "!llvm.ptr<3>", elem, 3);
             return;
         }
-        if (n.nb >= 0) {
-            var v: string = emit_dev_expr(n.nb);
+        if (base.node_nb((s as u64)) >= 0) {
+            var v: string = emit_dev_expr(base.node_nb((s as u64)));
             dev_bind(n.sa, v, g_dev_rty, g_dev_elem, g_dev_asv);
             return;
         }
@@ -342,7 +345,7 @@ pub fn emit_dev_stmt(s: i64) void {
         return;
     }
     if (n.kind == "assign" || n.kind == "assignment") {
-        emit_dev_assign(n.na, n.nb);
+        emit_dev_assign(n.na, base.node_nb((s as u64)));
         return;
     }
     if (n.kind == "return") {
@@ -368,7 +371,7 @@ pub fn emit_dev_assign(lhs: i64, rhs: i64) void {
         var b: string = emit_dev_expr(ln.na);
         var bas: i64 = g_dev_asv;
         var belem: string = g_dev_elem;
-        var i: string = emit_dev_expr(ln.nb);
+        var i: string = emit_dev_expr(base.node_nb((lhs as u64)));
         var val: string = emit_dev_expr(rhs);
         var vty: string = g_dev_rty;
         var gep: string = dev_next();
@@ -387,7 +390,7 @@ pub fn emit_dev_addr(e: i64) string {
         var b: string = emit_dev_expr(n.na);
         var bas: i64 = g_dev_asv;
         var belem: string = g_dev_elem;
-        var i: string = emit_dev_expr(n.nb);
+        var i: string = emit_dev_expr(base.node_nb((e as u64)));
         var gep: string = dev_next();
         dev_emit(base.sb_cat13("  ", gep, " = llvm.getelementptr ", b, "[", i, "] : (!llvm.ptr<", base.i2s(bas), ">, i32) -> !llvm.ptr<", base.i2s(bas), ">, ", belem, ""));
         g_dev_rty = base.sb_cat4("!llvm.ptr<", base.i2s(bas), ">", "");
@@ -402,7 +405,7 @@ pub fn emit_dev_addr(e: i64) string {
 pub fn emit_dev_expr(e: i64) string {
     var n: Node = dev_safe_node(e);
     if (n.kind == "assign" || n.kind == "assignment") {
-        emit_dev_assign(n.na, n.nb);
+        emit_dev_assign(n.na, base.node_nb((e as u64)));
         return "";
     }
     if (n.kind == "ident") {
@@ -440,7 +443,7 @@ pub fn emit_dev_expr(e: i64) string {
     if (n.kind == "binary") {
         var l: string = emit_dev_expr(n.na);
         var lt: string = g_dev_rty;
-        var r: string = emit_dev_expr(n.nb);
+        var r: string = emit_dev_expr(base.node_nb((e as u64)));
         var rt: string = g_dev_rty;
         var isf: bool = dev_is_float(lt) || dev_is_float(rt);
         var op: string = "addi";
@@ -467,7 +470,7 @@ pub fn emit_dev_expr(e: i64) string {
         var b: string = emit_dev_expr(n.na);
         var bas: i64 = g_dev_asv;
         var belem: string = g_dev_elem;
-        var i: string = emit_dev_expr(n.nb);
+        var i: string = emit_dev_expr(base.node_nb((e as u64)));
         var gep: string = dev_next();
         dev_emit(base.sb_cat13("  ", gep, " = llvm.getelementptr ", b, "[", i, "] : (!llvm.ptr<", base.i2s(bas), ">, i32) -> !llvm.ptr<", base.i2s(bas), ">, ", belem, ""));
         var ld: string = dev_next();

@@ -1778,7 +1778,13 @@ pub struct Node {
     //   be = C 互操作导出：该声明是否标记 `@c_export`（生成 C ABI 平铺入口）
     //   bf = Device 子系统：该声明是否为 `kernel fn`（host 双后端跳过，codegen_dev 处理）
     na: i64;
-    nb: i64;
+    // S4 第十五批（§0.14.7）：nb 已迁出为属性侧表 g_node_nb，访问面走 node_nb()/node_set_nb()
+    // （默认 **-1** = 无该子节点；越界读也返 -1）。na/nb/nc/nd 四槽的迁移顺序是「先小后大」：
+    //   nd（第七批，22 站）→ nc（第九批）→ **nb（本批，429 站，四槽里最大）** → na（留最后）。
+    // ⚠ `nb` 名义是「第二子节点槽」，实际按 kind **复用多样语义**（详见 node_nb 处清单）；
+    //   个别kind 甚至**不是节点索引**：`mk_slice_pat` 的 nb = **children 总数（计数）**，
+    //   `bitstr_seg` 的 nb = 位宽表达式节点但 `-1` 表示「变长尾段」。
+    //   外置只做等价搬迁，禁止顺手拆语义 / 改默认值 / 改哨兵。
     // S4 第九批（§0.14.7）：nc 已迁出为属性侧表 g_node_nc，访问面走 node_nc()/node_set_nc()
     // （默认 **-1** = 无该子节点；越界读也返 -1）。与第七批 nd 同族，直接复用 -1 哨兵范式。
     // S4 第七批（§0.14.7）：nd 已迁出为属性侧表 g_node_nd，访问面走 node_nd()/node_set_nd()
@@ -1895,6 +1901,10 @@ pub var g_node_lb: []i64;                  // S4 第十四批：nodes[i] 的 lb 
                                            // ⚠ 与 lc 同族，**同样带 -2 哨兵**（见 node_lb 处注释）
 pub var g_node_ia: []i64;                  // S4 第十三批：nodes[i] 的 ia 通用整数槽（默认 -1 = 无标记）
                                            // ⚠ 与 ib 同族但复用 13 种语义（见 node_ia 处注释）
+pub var g_node_nb: []i64;                  // S4 第十五批：nodes[i] 的 nb 第二子节点槽（默认 -1 = 无）
+                                           // ⚠ 按 kind 复用多种语义，含**非索引值**（slice_pat 计数，
+                                           //   见 node_nb 处清单）；与 nc/nd 同为「索引型侧表」，
+                                           //   复用第七/九批验证过的 -1 哨兵范式（无 -2 之类第二哨兵）。
 
 // ── S3（§4.5）：侧表登记 + provenance 侧表读取面 ──────────────────────────────
 // 跨切面属性统一登记 SideTable{name,owner,dirty}，PassManager 据 name 建拓扑与置脏。
@@ -1942,6 +1952,7 @@ pub fn sidetable_init() void {
     sidetable_register("node_lc", "S4");        // SoA：lc kids 链表头（第十一批，默认 -1）
     sidetable_register("node_ia", "S4");        // SoA：ia 通用整数槽（第十三批，默认 -1）
     sidetable_register("node_lb", "S4");        // SoA：lb kids 链表头（第十四批，默认 -1；另有 -2 哨兵）
+    sidetable_register("node_nb", "S4");        // SoA：nb 第二子节点槽（第十五批，默认 -1 = 无）
 }
 pub fn node_mod(n: u64) string {
     sidetable_init();
@@ -2055,7 +2066,7 @@ pub fn cst_dump(role: string, id: i64, depth: i64) void {
     }
     // 子节点：先名字子节点（role 标注），再 kids 池（la/lb/lc 三条链，无 role）
     if (n.na >= 0) { cst_dump("na", n.na, depth + 1); }
-    if (n.nb >= 0) { cst_dump("nb", n.nb, depth + 1); }
+    if (node_nb((id as u64)) >= 0) { cst_dump("nb", node_nb((id as u64)), depth + 1); }
     var n_nc: i64 = node_nc((id as u64));   // S4 §0.14.7 SoA：侧表读（原 n.nc；第九批）
     if (n_nc >= 0) { cst_dump("nc", n_nc, depth + 1); }
     var n_nd: i64 = node_nd((id as u64));   // S4 §0.14.7 SoA：侧表读（原 n.nd）
@@ -2557,6 +2568,39 @@ pub fn node_set_ia(n: u64, v: i64) void {
     if (id < 0 || id >= slice_len(g_node_ia)) { return; }
     slice_set(g_node_ia, id, v);
 }
+// S4 第十五批（§0.14.7）：第二子节点槽 nb（默认 **-1** = 无该子节点；越界读返 -1，
+// 与 node_new 旧初值 `n.nb = -1` 逐点一致）。这是 na/nb/nc/nd 四槽里**量级最大**的一个
+// （真站点 429，其中 21 处 `tbl_Rec*_nb` 是 S2 per-kind record 假阳性），故排在 nd/nc 之后。
+// ⚠ 判据普查（本批开工）：全仓对 nb 的比较只剩 `>= 0`（66）、`< 0`（33）、`== 1`（1，
+//   slice_pat 的 children 计数）三种，**没有 `> -2` / `!= -2` 这类第二哨兵** ⇒ 与 lc/lb
+//   不同，本槽是纯 `-1` 哨兵的索引型侧表，迁移时无需保留任何 -2 判据。
+// ⚠ `nb` 按 kind **复用**于多种语义（本批只做等价搬迁，未拆语义）：
+//   ① binary / assignment / assign：na = 左操作数，**nb = 右操作数**
+//   ② index：`n.na[n.nb]` 形式的**下标表达式**
+//   ③ cast：**nb = 目标类型节点**（na = 待转换表达式）
+//   ④ array / map / vector / tile 类型节点：**nb = 第二类型参数/长度/rows 表达式**
+//      （`array = @[N]T` 的长度、`map = key→value` 的 value 类型、`vector` 的 lane 数表达式）
+//   ⑤ range 字面量：na = 起点（-1 = 省略），**nb = 终点**（-1 = 省略）
+//   ⑥ for：na = init，**nb = cond**（nc = upd，la = body，lb = else）
+//   ⑦ arm（match）：na = 等值模式表达式（-1 = 通配），**nb = when 守卫**（-1 = 无守卫）
+//   ⑧ pipe_map/filter/apply：na = 左操作数，**nb = 右侧一元函数值**
+//   ⑨ bitstr_seg：na = 值表达式，**nb = 位宽表达式**（-1 = **变长尾段**）
+//   ⑩ GlobalConstDecl / GlobalVarDecl / var_decl：na = 类型节点，**nb = 初始化表达式**
+//   ⑪ EN（map 字面量条目）：na = key 表达式，**nb = value 表达式**
+//   ⚠ **非索引值**：`slice_pat` 的 nb = **children 总数（计数）**，不是节点索引。
+// ⇒ 迁移铁律：① 侧表默认值 **-1**；② 越界读返 **-1**（返 0 会把「无子节点」读成「子节点 0」，
+//    是**静默错误**，同 nd 第七批论证）；③ 只搬存储，不得改动上述任一语义的取值或写入时机。
+pub fn node_nb(n: u64) i64 {
+    sidetable_init();
+    var id = nr_idx(n);
+    if (id < 0 || id >= slice_len(g_node_nb)) { return -1; }
+    return g_node_nb[id];
+}
+pub fn node_set_nb(n: u64, v: i64) void {
+    var id = nr_idx(n);
+    if (id < 0 || id >= slice_len(g_node_nb)) { return; }
+    slice_set(g_node_nb, id, v);
+}
 // S4 第六批（§0.14.7）：字符串载荷 sc（默认 ""）。**本批为 sa/sb/sc 字符串整族外置预演**
 // ——首个 `[]string` 类型侧表，验证「非标量侧表 + node_new 锁步 append」范式成立。
 //   sc 按 kind 复用 4 种语义（本次只做等价搬迁，未拆语义）：
@@ -2728,7 +2772,7 @@ pub fn node_new(kind: string) u64 {
     // S4 第四批（§0.14.7）：bd 已外置为侧表（默认 0=false，见下方 append）
     // S4 第三批（§0.14.7）：be/bf 已外置为侧表（默认 0=false，见下方 append）
     n.na = -1;
-    n.nb = -1;
+    // S4 第十五批（§0.14.7）：nb 已外置为侧表 g_node_nb（默认 -1 = 无子节点，见下方 append）
     // S4 §0.14.7 SoA：nc 已外置为侧表（下方 append(-1) 锁步；第九批）
     // S4 §0.14.7 SoA：nd 已外置为侧表（下方 append(-1) 锁步）
     // S4 第四批（§0.14.7）：memspace 已外置为侧表（默认 0=host，见下方 append）
@@ -2765,6 +2809,7 @@ pub fn node_new(kind: string) u64 {
     append(g_node_lc, -1);                                  // S4 §0.14.7 SoA：lc 默认 -1（空 kids 链；第十一批）
     append(g_node_lb, -1);                                  // S4 §0.14.7 SoA：lb 默认 -1（空 kids 链；第十四批；-2 只由调用方经构造器实参写入）
     append(g_node_ia, -1);                                  // S4 §0.14.7 SoA：ia 默认 -1（无标记；第十三批）
+    append(g_node_nb, -1);                                  // S4 §0.14.7 SoA：nb 默认 -1（无子节点；第十五批；纯 -1 哨兵，无 -2）
     var nref_tag: i64 = nk_of_kind(kind);
     if (nref_tag < 0) { nref_tag = 0; }   // 未注册 kind 暂归 tag=0（g_node_nref 当前无消费方，安全）
     append(g_node_nref, mk_noderef(nref_tag, (slice_len(nodes) as i64) - 1));   // S4：打包 tag|idx 存入侧表（供未来消费方）
@@ -2898,7 +2943,7 @@ pub fn mk_EN(na: i64, nb: i64, ti: i64) u64 {
     var id: i64 = node_new("EN");
     var n: Node = nodes[id];
     n.na = na;
-    n.nb = nb;
+    node_set_nb((id as u64), nb);
     slice_set(nodes, id, n);
     if (ti >= 0) { node_at(id, ti); }
         cst_register_RecEN(na, nb); // S2 dual-write
@@ -3068,7 +3113,7 @@ pub fn mk_GlobalConstDecl(sa: string, bb: bool, na: i64, nb: i64, la: i64, ti: i
     n.sa = sa;
     node_set_bb((id as u64), bb);   // S4 §0.14.7 SoA：取代 `n.bb = bb`（形参保留，调用点不变）
     n.na = na;
-    n.nb = nb;
+    node_set_nb((id as u64), nb);
     n.la = la;
     slice_set(nodes, id, n);
     if (ti >= 0) { node_at(id, ti); }
@@ -3082,7 +3127,7 @@ pub fn mk_GlobalVarDecl(sa: string, bb: bool, na: i64, nb: i64, la: i64, ti: i64
     n.sa = sa;
     node_set_bb((id as u64), bb);   // S4 §0.14.7 SoA：取代 `n.bb = bb`（形参保留，调用点不变）
     n.na = na;
-    n.nb = nb;
+    node_set_nb((id as u64), nb);
     n.la = la;
     slice_set(nodes, id, n);
     if (ti >= 0) { node_at(id, ti); }
@@ -3266,7 +3311,7 @@ pub fn mk_array(na: i64, nb: i64, ti: i64) u64 {
     var id: i64 = node_new("array");
     var n: Node = nodes[id];
     n.na = na;
-    n.nb = nb;
+    node_set_nb((id as u64), nb);
     slice_set(nodes, id, n);
     if (ti >= 0) { node_at(id, ti); }
         cst_register_RecArray(na, nb); // S2 dual-write
@@ -3288,7 +3333,7 @@ pub fn mk_assign(sa: string, na: i64, nb: i64, ti: i64) u64 {
     var n: Node = nodes[id];
     n.sa = sa;
     n.na = na;
-    n.nb = nb;
+    node_set_nb((id as u64), nb);
     slice_set(nodes, id, n);
     if (ti >= 0) { node_at(id, ti); }
         cst_register_RecAssign(sa, na, nb); // S2 dual-write
@@ -3300,7 +3345,7 @@ pub fn mk_assignment(sa: string, na: i64, nb: i64, ti: i64) u64 {
     var n: Node = nodes[id];
     n.sa = sa;
     n.na = na;
-    n.nb = nb;
+    node_set_nb((id as u64), nb);
     slice_set(nodes, id, n);
     if (ti >= 0) { node_at(id, ti); }
         cst_register_RecAssignment(sa, na, nb); // S2 dual-write
@@ -3312,7 +3357,7 @@ pub fn mk_binary(sa: string, na: i64, nb: i64, ti: i64) u64 {
     var n: Node = nodes[id];
     n.sa = sa;
     n.na = na;
-    n.nb = nb;
+    node_set_nb((id as u64), nb);
     slice_set(nodes, id, n);
     if (ti >= 0) { node_at(id, ti); }
         cst_register_RecBinary(sa, na, nb); // S2 dual-write
@@ -3324,7 +3369,7 @@ pub fn mk_bitstr_seg(na: i64, nb: i64, sa: string, rest: bool, ti: i64) u64 {
     var id: i64 = node_new("bitstr_seg");
     var n: Node = nodes[id];
     n.na = na;
-    n.nb = nb;
+    node_set_nb((id as u64), nb);
     n.sa = sa;
     node_set_ba((id as u64), rest);   // S4 §0.14.7 SoA：取代 `n.ba = rest`
     slice_set(nodes, id, n);
@@ -3417,7 +3462,7 @@ pub fn mk_cast(na: i64, nb: i64, ti: i64) u64 {
     var id: i64 = node_new("cast");
     var n: Node = nodes[id];
     n.na = na;
-    n.nb = nb;
+    node_set_nb((id as u64), nb);
     slice_set(nodes, id, n);
     if (ti >= 0) { node_at(id, ti); }
         cst_register_RecCast(na, nb); // S2 dual-write
@@ -3502,7 +3547,7 @@ pub fn mk_for(na: i64, nb: i64, nc: i64, la: i64, lb: i64, ti: i64) u64 {
     var id: i64 = node_new("for");
     var n: Node = nodes[id];
     n.na = na;
-    n.nb = nb;
+    node_set_nb((id as u64), nb);
     node_set_nc((id as u64), nc);   // S4 §0.14.7 SoA：取代 `n.nc = nc`（形参保留，调用点不变）
     n.la = la;
     node_set_lb((id as u64), lb);
@@ -3557,7 +3602,7 @@ pub fn mk_arm(sa: string, ba: bool, na: i64, nb: i64, nc: i64, ti: i64) u64 {
     n.sa = sa;
     node_set_ba((id as u64), ba);   // S4 §0.14.7 SoA：取代 `n.ba = ba`（形参保留，调用点不变）
     n.na = na;
-    n.nb = nb;
+    node_set_nb((id as u64), nb);
     node_set_nc((id as u64), nc);   // S4 §0.14.7 SoA：取代 `n.nc = nc`（形参保留，调用点不变）
     slice_set(nodes, id, n);
     if (ti >= 0) { node_at(id, ti); }
@@ -3581,7 +3626,7 @@ pub fn mk_index(na: i64, nb: i64, ti: i64) u64 {
     var id: i64 = node_new("index");
     var n: Node = nodes[id];
     n.na = na;
-    n.nb = nb;
+    node_set_nb((id as u64), nb);
     slice_set(nodes, id, n);
     if (ti >= 0) { node_at(id, ti); }
         cst_register_RecIndex(na, nb); // S2 dual-write
@@ -3613,7 +3658,7 @@ pub fn mk_map(na: i64, nb: i64, ti: i64) u64 {
     var id: i64 = node_new("map");
     var n: Node = nodes[id];
     n.na = na;
-    n.nb = nb;
+    node_set_nb((id as u64), nb);
     slice_set(nodes, id, n);
     if (ti >= 0) { node_at(id, ti); }
         cst_register_RecMap(na, nb); // S2 dual-write
@@ -3695,7 +3740,7 @@ pub fn mk_pipe_map(na: i64, nb: i64, ti: i64) u64 {
     var id: i64 = node_new("pipe_map");
     var n: Node = nodes[id];
     n.na = na;
-    n.nb = nb;
+    node_set_nb((id as u64), nb);
     slice_set(nodes, id, n);
     if (ti >= 0) { node_at(id, ti); }
         cst_register_RecPipeMap(na, nb); // S2 dual-write
@@ -3706,7 +3751,7 @@ pub fn mk_pipe_filter(na: i64, nb: i64, ti: i64) u64 {
     var id: i64 = node_new("pipe_filter");
     var n: Node = nodes[id];
     n.na = na;
-    n.nb = nb;
+    node_set_nb((id as u64), nb);
     slice_set(nodes, id, n);
     if (ti >= 0) { node_at(id, ti); }
         cst_register_RecPipeFilter(na, nb); // S2 dual-write
@@ -3717,7 +3762,7 @@ pub fn mk_pipe_apply(na: i64, nb: i64, ti: i64) u64 {
     var id: i64 = node_new("pipe_apply");
     var n: Node = nodes[id];
     n.na = na;
-    n.nb = nb;
+    node_set_nb((id as u64), nb);
     slice_set(nodes, id, n);
     if (ti >= 0) { node_at(id, ti); }
         cst_register_RecPipeApply(na, nb); // S2 dual-write
@@ -3775,7 +3820,7 @@ pub fn mk_range(na: i64, nb: i64, ba: bool, ti: i64) u64 {
     var id: i64 = node_new("range");
     var n: Node = nodes[id];
     n.na = na;
-    n.nb = nb;
+    node_set_nb((id as u64), nb);
     node_set_ba((id as u64), ba);   // S4 §0.14.7 SoA：取代 `n.ba = ba`
     slice_set(nodes, id, n);
     if (ti >= 0) { node_at(id, ti); }
@@ -3791,7 +3836,7 @@ pub fn mk_slice_pat(la: i64, rest: i64, count: i64, ti: i64) u64 {
     var n: Node = nodes[id];
     n.la = la;
     n.na = rest;
-    n.nb = count;
+    node_set_nb((id as u64), count);
     slice_set(nodes, id, n);
     if (ti >= 0) { node_at(id, ti); }
         cst_register_RecSlicePat(la, rest, count); // S2 dual-write
@@ -3819,10 +3864,10 @@ pub fn mk_range_test(subj_a: i64, subj_b: i64, r: i64) u64 {
     var lo_t: i64 = -1;
     var hi_t: i64 = -1;
     if (rn.na >= 0) { lo_t = mk_binary(">=", subj_a, rn.na, -1); }
-    if (rn.nb >= 0) {
+    if (node_nb((r as u64)) >= 0) {
         var hop: string = "<";
         if (node_ba((r as u64)) == true) { hop = "<="; }   // S4 §0.14.7 SoA：侧表读（原 rn.ba；rn = nodes[r]）
-        hi_t = mk_binary(hop, subj_b, rn.nb, -1);
+        hi_t = mk_binary(hop, subj_b, node_nb((r as u64)), -1);
     }
     if (lo_t < 0) {
         if (hi_t < 0) { return mk_bool(true, -1); }
@@ -3912,7 +3957,7 @@ pub fn mk_var_decl(sa: string, ba: bool, na: i64, nb: i64, ti: i64) u64 {
     n.sa = sa;
     node_set_ba((id as u64), ba);   // S4 §0.14.7 SoA：取代 `n.ba = ba`
     n.na = na;
-    n.nb = nb;
+    node_set_nb((id as u64), nb);
     slice_set(nodes, id, n);
     if (ti >= 0) { node_at(id, ti); }
         cst_register_RecVarDecl(sa, ba, na, nb); // S2 dual-write
@@ -3947,7 +3992,7 @@ pub fn mk_vector(na: i64, nb: i64, ti: i64) u64 {
     var id: i64 = node_new("vector");
     var n: Node = nodes[id];
     n.na = na;
-    n.nb = nb;
+    node_set_nb((id as u64), nb);
     node_set_ia((id as u64), -1);   // S4 §0.14.7 SoA：取代 `n.ia = -1`（第十三批）
     slice_set(nodes, id, n);
     if (ti >= 0) { node_at(id, ti); }
@@ -3963,7 +4008,7 @@ pub fn mk_tile(na: i64, nb: i64, nc: i64, nd: i64, ti: i64) u64 {
     var id: i64 = node_new("tile");
     var n: Node = nodes[id];
     n.na = na;
-    n.nb = nb;
+    node_set_nb((id as u64), nb);
     node_set_nc((id as u64), nc);   // S4 §0.14.7 SoA：取代 `n.nc = nc`（形参保留，调用点不变）
     node_set_nd((id as u64), nd);   // S4 §0.14.7 SoA：取代 `n.nd = nd`（形参保留，调用点不变）
     node_set_ia((id as u64), -1);   // S4 §0.14.7 SoA：取代 `n.ia = -1`（第十三批）
