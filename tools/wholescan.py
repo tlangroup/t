@@ -38,6 +38,7 @@ SOA_FIELDS = [
     "se", "has_sa", "has_sb", "has_sc", "be", "bf", "memspace", "bd", "bb", "bc",
     "nd", "ib", "sc", "sb", "nc", "ba", "lc", "ia", "lb", "nb", "la", "na",
     "kind",   # S4 第十八批（§0.14.7）
+    "sa",     # S4 第十九批（§0.14.7）：Node 里最后一个真实载荷字段（string，默认 ""）
 ]
 LOOKAHEAD = 6
 
