@@ -1730,7 +1730,14 @@ pub var toks: []Tok;
 pub struct Node {
     kind: string;
     sa: string;
-    sb: string;
+    // S4 第十二批（§0.14.7）：sb 已迁出为属性侧表 g_node_sb，访问面走 node_sb()/node_set_sb()
+    // （默认 **空串**；越界读也返空串）。⚠ 该字段按 kind **复用**于 12 种语义（详见 node_sb 处
+    //   注释）：EnumDecl/FlagDecl 的底层整型名、ImportDecl/ImportModDecl 的模块路径、
+    //   StructDecl 的 `"soa"` 布局标记、Vval/variant_lit 的 case 名、ForEach 的第二变量名、
+    //   ImportItem 的目标符号名、Conpat 的构造器限定符、int/bool 字面量的数值后缀、
+    //   named 的类型限定符（`"?"` = 未知）、closure_capture/closure_make 的环境结构名、
+    //   mbuiltin 的元素标量类型名、测试 FuncDecl 的显示名。本批只做等价搬迁，未拆语义。
+    //   ✅ 已普查确认 **无额外哨兵**（不像第十一批 `lc` 的 `-2`），默认与越界读一律 `""`。
     // S4 第六批（§0.14.7）：sc 已迁出为属性侧表 g_node_sc，访问面走 node_sc()/node_set_sc()
     // （默认 ""）。⚠ 该字段按 kind **复用**于 5 种语义（详见 node_sc 处注释）：ImportDecl/
     // ImportModDecl 的用户别名、StructDecl 的 @bitpack 标量成员类型名、FuncDecl 的
@@ -1862,6 +1869,7 @@ pub var g_node_bc: []i64;                  // nodes[i] 的 bc（默认 0 = 非 p
 pub var g_node_nd: []i64;                  // nodes[i] 的 nd 子节点索引（默认 -1 = 无）
 pub var g_node_ib: []i64;                  // nodes[i] 的 ib 通用整数槽（默认 -1；见 node_ib 处语义清单）
 pub var g_node_sc: []string;               // S4 第六批：nodes[i] 的 sc 字符串载荷（默认 ""）
+pub var g_node_sb: []string;               // S4 第十二批：nodes[i] 的 sb 字符串载荷（默认 ""）
 pub var g_node_nc: []i64;                  // S4 第九批：nodes[i] 的 nc 子节点索引（默认 -1 = 无）
 pub var g_node_ba: []i64;                  // S4 第十批：nodes[i] 的 ba 通用 bool 载荷（默认 0 = false）
                                            // ⚠ 该槽按 kind **复用**于多种语义（见 node_ba 处注释）
@@ -1908,6 +1916,7 @@ pub fn sidetable_init() void {
     sidetable_register("node_nd", "S4");        // SoA：nd 子节点索引（第七批，默认 -1）
     sidetable_register("node_ib", "S4");        // SoA：ib 通用整数槽（第八批，默认 -1）
     sidetable_register("node_sc", "S4");        // SoA：字符串载荷（别名/bitpack 标量/lambda 标记/suite 路径；第六批）
+    sidetable_register("node_sb", "S4");        // SoA：字符串载荷（底层整型名/模块路径/环境结构名/字面量后缀…；第十二批）
     sidetable_register("node_nc", "S4");        // SoA：nc 子节点索引（第九批，默认 -1）
     sidetable_register("node_ba", "S4");        // SoA：ba 通用 bool 载荷（第十批，默认 false）
     sidetable_register("node_lc", "S4");        // SoA：lc kids 链表头（第十一批，默认 -1）
@@ -1996,7 +2005,8 @@ pub fn cst_dump(role: string, id: i64, depth: i64) void {
         sb_append_i64(g_cst_sb, sp.end_col);
     }
     if (str_len(n.sa) > 0) { sb_append_str(g_cst_sb, " sa=\""); sb_append_str(g_cst_sb, n.sa); sb_append_char(g_cst_sb, 34); }
-    if (str_len(n.sb) > 0) { sb_append_str(g_cst_sb, " sb=\""); sb_append_str(g_cst_sb, n.sb); sb_append_char(g_cst_sb, 34); }
+    var n_sb = node_sb((id as u64));   // S4 §0.14.7 SoA：侧表读（原 n.sb；第十二批）
+    if (str_len(n_sb) > 0) { sb_append_str(g_cst_sb, " sb=\""); sb_append_str(g_cst_sb, n_sb); sb_append_char(g_cst_sb, 34); }
     var n_sc = node_sc((id as u64));
     if (str_len(n_sc) > 0) { sb_append_str(g_cst_sb, " sc=\""); sb_append_str(g_cst_sb, n_sc); sb_append_char(g_cst_sb, 34); }
     var n_se = node_se((id as u64));
@@ -2489,6 +2499,37 @@ pub fn node_set_sc(n: u64, v: string) void {
     if (id < 0 || id >= slice_len(g_node_sc)) { return; }
     slice_set(g_node_sc, id, v);
 }
+// S4 第十二批（§0.14.7）：字符串载荷 sb（默认 ""；越界读也返 ""，与 node_new 旧初值 `n.sb = ""`
+// 逐点一致）。第二个 `[]string` 侧表，直接复用第六批 sc 的范式。
+// ⚠ **经普查确认 sb 没有第二个哨兵值**：`""` 之外出现的是 `"?"`（named 的未知限定符，与 `""`
+//   同义处理，见 `parse::type_node_mangle` 的 `n.sb != "" && n.sb != "?"`）、`"soa"` /
+//   `"i64"/"u64"/"f64"/"f32"/"b"/"s"` 等**语义值**；不存在 `lc` 那种「默认之外的哨兵语义」
+//   ⇒ 默认与越界读一律 `""`，无静默错误风险。
+//   sb 按 kind 复用 12 种语义（本批只做等价搬迁，未拆语义）：
+//     ① EnumDecl / FlagDecl：底层整型名（`is_int_name` / `scalar_to_c` / `mb_scalar_size`）
+//     ② ImportDecl / ImportModDecl：模块路径（C 后端 `#include "<sb>"`）
+//     ③ StructDecl：布局标记 `"soa"`（`@soa` 结构体）
+//     ④ Vval / variant_lit：case 名（`"Nil"` / `"One"`）
+//     ⑤ ForEach：`for (k, v in m)` 的第二（值）变量名
+//     ⑥ ImportItem：选择性导入的目标符号名
+//     ⑦ Conpat：构造器模式限定符（与 sa 的 case 名配对查声明）
+//     ⑧ int / bool 字面量：数值后缀（`i64`/`u64`/`f64`/`f32`/`b`/`s`，供 `c_bitint_suffix`）
+//     ⑨ named：类型限定符（`"<sb>.<sa>"` 的模块前缀；`"?"` = 未知）
+//     ⑩ closure_capture / closure_make：环境结构名 `__env_N`
+//     ⑪ mbuiltin（`@tsplat` / `@splat`）：元素标量类型名
+//     ⑫ FuncDecl（测试）：显示名 `disp`
+//   写点 = 9 个 mk_* 构造器（形参保留，调用点不变）+ parse 9 + sema 13。
+pub fn node_sb(n: u64) string {
+    sidetable_init();
+    var id = nr_idx(n);
+    if (id < 0 || id >= slice_len(g_node_sb)) { return ""; }
+    return g_node_sb[id];
+}
+pub fn node_set_sb(n: u64, v: string) void {
+    var id = nr_idx(n);
+    if (id < 0 || id >= slice_len(g_node_sb)) { return; }
+    slice_set(g_node_sb, id, v);
+}
 
 pub struct Child {
     val: i64;
@@ -2598,7 +2639,7 @@ pub fn node_new(kind: string) u64 {
     var n: Node;
     n.kind = kind;
     n.sa = "";
-    n.sb = "";
+    // S4 第十二批（§0.14.7）：sb 已外置为侧表（默认空串，见下方 append）
     // S4 第六批（§0.14.7）：sc 已外置为侧表（默认空串，见下方 append）
     // S4 第二批（§0.14.7）：has_sa/has_sb/has_sc 已外置为侧表（默认 1=true，见下方 append）
     n.ia = -1;
@@ -2638,6 +2679,7 @@ pub fn node_new(kind: string) u64 {
     append(g_node_nd, -1);                                  // S4 §0.14.7 SoA：nd 默认 -1（无子节点）
     append(g_node_ib, -1);                                  // S4 §0.14.7 SoA：ib 默认 -1（无标记）
     append(g_node_sc, "");                                  // S4 §0.14.7 SoA：sc 默认空串（第六批）
+    append(g_node_sb, "");                                  // S4 §0.14.7 SoA：sb 默认空串（第十二批）
     append(g_node_nc, -1);                                  // S4 §0.14.7 SoA：nc 默认 -1（无子节点；第九批）
     append(g_node_ba, 0);                                   // S4 §0.14.7 SoA：ba 默认 false（第十批）
     append(g_node_lc, -1);                                  // S4 §0.14.7 SoA：lc 默认 -1（空 kids 链；第十一批）
@@ -2785,7 +2827,7 @@ pub fn mk_EnumDecl(sa: string, sb: string, la: i64, lb: i64, ti: i64) u64 {
     var id: i64 = node_new("EnumDecl");
     var n: Node = nodes[id];
     n.sa = sa;
-    n.sb = sb;
+    node_set_sb((id as u64), sb);
     n.la = la;
     n.lb = lb;
     slice_set(nodes, id, n);
@@ -2822,7 +2864,7 @@ pub fn mk_FlagDecl(sa: string, sb: string, la: i64, lb: i64, ti: i64) u64 {
     var id: i64 = node_new("FlagDecl");
     var n: Node = nodes[id];
     n.sa = sa;
-    n.sb = sb;
+    node_set_sb((id as u64), sb);
     n.la = la;
     n.lb = lb;
     slice_set(nodes, id, n);
@@ -2969,7 +3011,7 @@ pub fn mk_GlobalVarDecl(sa: string, bb: bool, na: i64, nb: i64, la: i64, ti: i64
 pub fn mk_ImportDecl(sb: string, sc: string, has_sa: bool, has_sc: bool, la: i64, ti: i64) u64 {
     var id: i64 = node_new("ImportDecl");
     var n: Node = nodes[id];
-    n.sb = sb;
+    node_set_sb((id as u64), sb);
     node_set_sc((id as u64), sc);   // S4 §0.14.7 SoA：取代 `n.sc = sc`（形参保留，调用点不变）
     node_set_has_sa((id as u64), has_sa);   // S4 §0.14.7 SoA：取代 `n.has_sa = has_sa`
     node_set_has_sc((id as u64), has_sc);
@@ -2985,7 +3027,7 @@ pub fn mk_ImportDecl(sb: string, sc: string, has_sa: bool, has_sc: bool, la: i64
 pub fn mk_ImportModDecl(sb: string, sc: string, has_sc: bool, is_lib_path: bool, la: i64, ti: i64) u64 {
     var id: i64 = node_new("ImportModDecl");
     var n: Node = nodes[id];
-    n.sb = sb;
+    node_set_sb((id as u64), sb);
     node_set_sc((id as u64), sc);   // S4 §0.14.7 SoA：取代 `n.sc = sc`（形参保留，调用点不变）
     node_set_has_sc((id as u64), has_sc);   // S4 §0.14.7 SoA：取代 `n.has_sc = has_sc`
     node_set_bd((id as u64), is_lib_path);   // S4 §0.14.7 SoA：取代 `n.bd = is_lib_path`（true = 走库搜索路径）
@@ -3050,7 +3092,7 @@ pub fn mk_StructDecl(sa: string, sb: string, sc: string, has_sc: bool, ba: bool,
     var id: i64 = node_new("StructDecl");
     var n: Node = nodes[id];
     n.sa = sa;
-    n.sb = sb;
+    node_set_sb((id as u64), sb);
     node_set_sc((id as u64), sc);   // S4 §0.14.7 SoA：取代 `n.sc = sc`（形参保留，调用点不变）
     node_set_has_sc((id as u64), has_sc);   // S4 §0.14.7 SoA：取代 `n.has_sc = has_sc`
     node_set_ba((id as u64), ba);   // S4 §0.14.7 SoA：取代 `n.ba = ba`（形参保留，调用点不变）
@@ -3118,7 +3160,7 @@ pub fn mk_VVal(sa: string, ia: i64, sb: string, la: i64, ti: i64) u64 {
     var n: Node = nodes[id];
     n.sa = sa;
     n.ia = ia;
-    n.sb = sb;
+    node_set_sb((id as u64), sb);
     n.la = la;
     slice_set(nodes, id, n);
     if (ti >= 0) { node_at(id, ti); }
@@ -3393,7 +3435,7 @@ pub fn mk_for_each(sa: string, sb: string, na: i64, la: i64, lb: i64, ti: i64) u
     var id: i64 = node_new("for_each");
     var n: Node = nodes[id];
     n.sa = sa;
-    n.sb = sb;
+    node_set_sb((id as u64), sb);
     n.na = na;
     n.la = la;
     n.lb = lb;
@@ -3858,7 +3900,7 @@ pub fn mk_ImportItem(sa: string, sb: string, wild: bool, ti: i64) u64 {
     var id: i64 = node_new("ImportItem");
     var n: Node = nodes[id];
     n.sa = sa;
-    n.sb = sb;
+    node_set_sb((id as u64), sb);
     node_set_ba((id as u64), wild);   // S4 §0.14.7 SoA：取代 `n.ba = wild`
     slice_set(nodes, id, n);
     if (ti >= 0) { node_at(id, ti); }
@@ -3876,7 +3918,7 @@ pub fn mk_conpat(sa: string, sb: string, la: i64, ib: i64, ti: i64) u64 {
     var id: i64 = node_new("conpat");
     var n: Node = nodes[id];
     n.sa = sa;
-    n.sb = sb;
+    node_set_sb((id as u64), sb);
     n.la = la;
     node_set_ib((id as u64), ib);   // S4 §0.14.7 SoA：取代 `n.ib = ib`（形参保留，调用点不变）
     slice_set(nodes, id, n);
