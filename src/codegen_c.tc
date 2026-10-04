@@ -463,7 +463,7 @@ pub fn emit_ctype(tn: i64) string {
         return "TMap*";
     }
     if (n.kind == "sym") {
-        if (n.ia == 16) { return "uint16_t"; }
+        if (base.node_ia((tn as u64)) == 16) { return "uint16_t"; }
         return "uint32_t";
     }
     if (n.kind == "pointer") {
@@ -488,7 +488,7 @@ pub fn emit_ctype(tn: i64) string {
     // 直接对应 CPU 向量寄存器（SSE/AVX/AVX-512）。lane 数取自 ia（sema resolve 期已折叠）。
     if (n.kind == "vector") {
         var lane: string = emit_ctype(n.na);
-        var vlen: i64 = n.ia;
+        var vlen: i64 = base.node_ia((tn as u64));
         if (vlen < 1) { vlen = sema.vec_fold_len(tn); }
         if (vlen < 1) { vlen = 1; }
         var bytes: i64 = vlen * c_scalar_sizeof(lane);
@@ -517,7 +517,7 @@ pub fn c_scalar_sizeof(name: string) i64 {
 
 // 由向量类型节点（na=lane 类型, ia=lane 数）取 lane 数（ia 优先，否则折叠）。
 pub fn c_vec_len(tn: i64) i64 {
-    var v: i64 = base.nodes[tn].ia;
+    var v: i64 = base.node_ia((tn as u64));
     if (v < 1) { v = sema.vec_fold_len(tn); }
     if (v < 1) { v = 1; }
     return v;
@@ -711,10 +711,10 @@ pub fn expr_type_desc(e: i64) i64 {
             // @splat(scalar, len) -> @Vector(len, typeof(scalar))
             // 首选 sema 回填的 lane 类型名 / lane 数（见 sema.infer_expr 的 splat 分支）：
             // 生成区的字面量规则一律给 i64，拿不到 `0i32` 的位宽后缀。
-            if (str_len(base.node_sb((n.id as u64))) > 0 && n.ia > 0) {
+            if (str_len(base.node_sb((n.id as u64))) > 0 && base.node_ia((e as u64)) > 0) {
                 var avt: i64 = sema.td_elem_mk("vector", sema.td_named_mk("scalar", base.node_sb((n.id as u64))));
                 var avd: TD = sema.tds[avt];
-                avd.alen = n.ia;
+                avd.alen = base.node_ia((e as u64));
                 slice_set(sema.tds, avt, avd);
                 return avt;
             }
@@ -746,7 +746,7 @@ pub fn expr_type_desc(e: i64) i64 {
             // @tsplat(scalar, rows, cols) -> @Tile(rows, cols, typeof(scalar), hardware)
             // sema 的 tsplat 分支已回填 n.sb（元素标量类型名）/ n.ia（行）/ n.ib（列）。
             var n_ib: i64 = base.node_ib((e as u64));   // S4 §0.14.7 SoA：侧表读（原 n.ib）
-    if (str_len(base.node_sb((n.id as u64))) > 0 && n.ia > 0 && n_ib > 0) {
+    if (str_len(base.node_sb((n.id as u64))) > 0 && base.node_ia((e as u64)) > 0 && n_ib > 0) {
                 var tzsc: i64 = sema.td_named_mk("scalar", base.node_sb((n.id as u64)));
                 var tzrow: i64 = sema.td_elem_mk("array", tzsc);
                 var tzrowd: TD = sema.tds[tzrow];
@@ -754,7 +754,7 @@ pub fn expr_type_desc(e: i64) i64 {
                 slice_set(sema.tds, tzrow, tzrowd);
                 var tztil: i64 = sema.td_elem_mk("tile", tzrow);
                 var tztiled: TD = sema.tds[tztil];
-                tztiled.alen = n.ia;
+                tztiled.alen = base.node_ia((e as u64));
                 slice_set(sema.tds, tztil, tztiled);
                 return tztil;
             }
@@ -1717,7 +1717,7 @@ pub fn match_chain_from(c: i64, rname: string, sname: string) i64 {
                         bp_td = sema.td_named_mk("scalar", "i64");
                         bp_tnode = base.mk_scalar("i64", -1);
                         var bp_wn: Node = base.nodes[bp_sn.nb];
-                        var bp_bits: i64 = sema.parse_int_len(bp_wn.sa, bp_wn.ia);
+                        var bp_bits: i64 = sema.parse_int_len(bp_wn.sa, base.node_ia((bp_sn.nb as u64)));
                         var bp_little: i64 = 0;
                         if (bp_sn.sa == "little") { bp_little = 1; }
                         var bp_ahead: i64 = base.list_push(-1, -1, base.mk_ident(sname, -1));
@@ -1734,7 +1734,7 @@ pub fn match_chain_from(c: i64, rname: string, sname: string) i64 {
                 }
                 if (base.node_ba((bp_sn.id as u64)) == false) {
                     var bp_wn2: Node = base.nodes[bp_sn.nb];
-                    if (bp_wn2.kind == "int") { bp_off = bp_off + sema.parse_int_len(bp_wn2.sa, bp_wn2.ia); }
+                    if (bp_wn2.kind == "int") { bp_off = bp_off + sema.parse_int_len(bp_wn2.sa, base.node_ia((bp_sn.nb as u64))); }
                 }
                 bp_seg = base.kids[bp_seg].next;
             }
@@ -2137,7 +2137,7 @@ pub fn emit_expr(e: i64) string {
     }
 
     if (n.kind == "int") {
-        var r: i64 = n.ia;
+        var r: i64 = base.node_ia((e as u64));
         if (r < 2) { r = 10; }
         var s: string = n.sa;
         if (r == 2) {
@@ -2167,12 +2167,15 @@ pub fn emit_expr(e: i64) string {
         return s;
     }
     if (n.kind == "atom") {
-        if (n.ia <= 0) { n.ia = sema.atom_intern(n.sa); slice_set(base.nodes, e, n); }
-        return base.i2s(n.ia);
+        if (base.node_ia((e as u64)) <= 0) {   // S4 §0.14.7 SoA：侧表读写（原 `n.ia`；第十三批）
+            base.node_set_ia((e as u64), sema.atom_intern(n.sa));
+            slice_set(base.nodes, e, n);   // 保留原回写体（幂等写回未变的 n，行为逐点等价）
+        }
+        return base.i2s(base.node_ia((e as u64)));
     }
     // 内建 fid 常量（M51）：编译期常量 0/1/2，无运行时查找
     if (n.kind == "fidconst") {
-        return base.i2s(n.ia);
+        return base.i2s(base.node_ia((e as u64)));
     }
     // 序列化操作符（M51）：t_ser_* 一律**返回目标 fid**，故链式 `f < a < b`
     // 直接落成嵌套调用 t_ser_x(t_ser_y(f, a), b)，无需临时量。
@@ -2233,7 +2236,7 @@ pub fn emit_expr(e: i64) string {
         while (c >= 0) {
             var seg: Node = base.nodes[base.kids[c].val];
             if (base.node_ba((seg.id as u64))) { has_rest = true; }
-            else { var wn: Node = base.nodes[seg.nb]; fixed_bits = fixed_bits + sema.parse_int_len(wn.sa, wn.ia); }
+            else { var wn: Node = base.nodes[seg.nb]; fixed_bits = fixed_bits + sema.parse_int_len(wn.sa, base.node_ia((seg.nb as u64))); }
             c = base.kids[c].next;
         }
         var fixed_bytes: i64 = (fixed_bits + 7) / 8;
@@ -2254,7 +2257,7 @@ pub fn emit_expr(e: i64) string {
                 sb_append_str(sb, emit_expr(seg.na));
                 sb_append_str(sb, "), ");
                 var wn: Node = base.nodes[seg.nb];
-                sb_append_i64(sb, sema.parse_int_len(wn.sa, wn.ia));
+                sb_append_i64(sb, sema.parse_int_len(wn.sa, base.node_ia((seg.nb as u64))));
                 sb_append_str(sb, ", ");
                 sb_append_i64(sb, little);
                 sb_append_str(sb, "); ");
@@ -2758,7 +2761,7 @@ pub fn emit_expr(e: i64) string {
         }
         if (n.sa == "tile_rows" || n.sa == "tile_cols" || n.sa == "tile_flavor") {
             var tztvd: i64 = -1;
-            if (n.sa == "tile_rows") { tztvd = n.ia; }
+            if (n.sa == "tile_rows") { tztvd = base.node_ia((e as u64)); }
             else if (n.sa == "tile_cols") { tztvd = base.node_ib((e as u64)); }   // S4 §0.14.7 SoA：侧表读（原 n.ib）
             else { tztvd = base.node_lc((n.id as u64)); }
             return base.i2s(tztvd);
@@ -3871,10 +3874,10 @@ pub fn fr_layout(d: i64) i64 {
         if (base__node_bb((sl.id as u64))) {
             start = base__node_ib((sl.id as u64));   // S4 §0.14.7 SoA：侧表读（原 sl.ib）
         }
-        var end: i64 = start + sl.ia;
+        var end: i64 = start + base__node_ia((k.val as u64));
         append(fl_names, sl.sa);
         append(fl_starts, start);
-        append(fl_lens, sl.ia);
+        append(fl_lens, base__node_ia((k.val as u64)));
         append(fl_ends, end);
         auto_off = end;
         c = k.next;
@@ -3891,7 +3894,7 @@ pub fn c_flag_slot_len(d: i64, slot: string) i64 {
         var k: Child = base.kids[c];
         var sl: Node = base.nodes[k.val];
         if (sl.sa == slot) {
-            return sl.ia;
+            return base.node_ia((k.val as u64));
         }
         c = k.next;
     }
@@ -3947,7 +3950,7 @@ pub fn collect_fields(d: i64) i64 {
         while (c >= 0) {
             var k: Child = base.kids[c];
             var f: Node = base.nodes[k.val];
-            if (f.ia < 0) {
+            if (base__node_ia((k.val as u64)) < 0) {
                 append(df_names, f.sa);
                 append(df_anns, f.la);
             }
@@ -4247,7 +4250,7 @@ pub fn emit_struct_decl(d: i64) void {
             sb_append_str(fsb, " ");
             sb_append_str(fsb, f.sa);
             sb_append_str(fsb, " : ");
-            sb_append_i64(fsb, f.ia);
+            sb_append_i64(fsb, base.node_ia((k.val as u64)));
             sb_append_str(fsb, ";");
             hpush(sb_to_str(fsb));
             c = k.next;
@@ -4266,7 +4269,7 @@ pub fn emit_struct_decl(d: i64) void {
         while (c2 >= 0) {
             var k2: Child = base.kids[c2];
             var f2: Node = base.nodes[k2.val];
-            if (f2.ia < 0) {
+            if (base.node_ia((k2.val as u64)) < 0) {
                 var fattrs: string = emit_attributes(f2.la);
                 if (fattrs != "") {
                     hpush(base.sb_cat2("    ", fattrs));
@@ -4294,7 +4297,7 @@ pub fn emit_enum_decl(d: i64) void {
             hpush(base.sb_cat6("#define ", n.sa, "_", v.sa, " ", emit_expr(v.na)));
             var vn: Node = base.nodes[v.na];
             if (vn.kind == "int") {
-                auto_val = sema.js_parse_int(vn.sa, vn.ia) + 1;
+                auto_val = sema.js_parse_int(vn.sa, base.node_ia((v.na as u64))) + 1;
             }
         } else {
             hpush(base.sb_cat6("#define ", n.sa, "_", v.sa, " ", base.i2s(auto_val)));
@@ -4505,7 +4508,7 @@ pub fn emit_variant_decl(d: i64) void {
                 sb_append_str(us, emit_ctype(vc.na));
             }
             sb_append_str(us, " _u");
-            sb_append_i64(us, vc.ia);
+            sb_append_i64(us, base.node_ia((k.val as u64)));
             sb_append_str(us, ";");
             hpush(sb_to_str(us));
         }
@@ -4555,7 +4558,7 @@ pub fn emit_variant_decl(d: i64) void {
         hpush(base.sb_cat3("    ", n.sa, " _s;"));
         var tsb: StringBuilder = sb_new();
         sb_append_str(tsb, "    _s._tag = ");
-        sb_append_i64(tsb, vc2.ia);
+        sb_append_i64(tsb, base.node_ia((k2.val as u64)));
         sb_append_str(tsb, ";");
         hpush(sb_to_str(tsb));
         if (vc2.lb >= 0) {
@@ -4566,7 +4569,7 @@ pub fn emit_variant_decl(d: i64) void {
             while (t2 >= 0) {
                 var asb: StringBuilder = sb_new();
                 sb_append_str(asb, "    _s._u._u");
-                sb_append_i64(asb, vc2.ia);
+                sb_append_i64(asb, base.node_ia((k2.val as u64)));
                 sb_append_str(asb, "._f");
                 sb_append_i64(asb, fi2);
                 sb_append_str(asb, " = v");
@@ -4579,7 +4582,7 @@ pub fn emit_variant_decl(d: i64) void {
         } else if (vc2.na >= 0) {
             var asb: StringBuilder = sb_new();
             sb_append_str(asb, "    _s._u._u");
-            sb_append_i64(asb, vc2.ia);
+            sb_append_i64(asb, base.node_ia((k2.val as u64)));
             sb_append_str(asb, " = v;");
             hpush(sb_to_str(asb));
         }
@@ -4597,7 +4600,7 @@ pub fn emit_variant_decl(d: i64) void {
         hpush(sb_to_str(isb));
         var isb2: StringBuilder = sb_new();
         sb_append_str(isb2, "    return self._tag == ");
-        sb_append_i64(isb2, vc2.ia);
+        sb_append_i64(isb2, base.node_ia((k2.val as u64)));
         sb_append_str(isb2, ";");
         hpush(sb_to_str(isb2));
         hpush("}");
@@ -4621,7 +4624,7 @@ pub fn emit_variant_decl(d: i64) void {
                 hpush(sb_to_str(asb2));
                 var asb3: StringBuilder = sb_new();
                 sb_append_str(asb3, "    return self._u._u");
-                sb_append_i64(asb3, vc2.ia);
+                sb_append_i64(asb3, base.node_ia((k2.val as u64)));
                 sb_append_str(asb3, "._f");
                 sb_append_i64(asb3, fi);
                 sb_append_str(asb3, ";");
@@ -4644,7 +4647,7 @@ pub fn emit_variant_decl(d: i64) void {
             hpush(sb_to_str(asb2));
             var asb3: StringBuilder = sb_new();
             sb_append_str(asb3, "    return self._u._u");
-            sb_append_i64(asb3, vc2.ia);
+            sb_append_i64(asb3, base.node_ia((k2.val as u64)));
             sb_append_str(asb3, ";");
             hpush(sb_to_str(asb3));
             hpush("}");
@@ -5227,7 +5230,7 @@ pub fn emit_type_info_c(tname: string) string {
     while (c >= 0) {
         var k: Child = base.kids[c];
         var f: Node = base.nodes[k.val];
-        if (f.ia < 0) {
+        if (base.node_ia((k.val as u64)) < 0) {
             if (n > 0) { sb_append_str(fsb, ", "); }
             var ftd: i64 = sema.resolve_type_desc(f.na);
             var cty: string = emit_ctype(f.na);

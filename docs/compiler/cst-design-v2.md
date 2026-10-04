@@ -833,9 +833,49 @@ if (n.td > 0) { n.td = -1; }          // ← 写在副本上：从未写回 node
 - 验证：`tc check` **0 error**（531 warning 全为既有命名风格告警 `T-NAM-W401/W402`/`T-MOD-W561`，与批次 9/10/11 完全一致，无一条与 sb 相关）；g1 自举 1m57s；IR 快照 **3 DIFF / 0 NEW / 0 GONE（仅 `src/tc.tc::{c,h,ll}`）** ⇒ `--update` 重录基线（117 targets / 354 entries，273.3s）。
 - ✅ **gate L2 = 25 passed / 0 failed（2806.3s）**，含四代自举不动点 `g2 == g3 == g4`（`自举一代 147.3s` / `产物快照比对 458.8s` / `conformance 112.2s` / `不动点 g2==g3 342.8s` / `run_examples 423.2s` / `双轨对拍 180.1s` / `四代不动点 160.1s` / `MIR differential 150.4s` / `C 后端自举 282.0s` / `rls 快速通道 384.1s`）。种子已同步（`g4 → out/dbg/tc.exe`、`gr → out/rls/tc.exe`），同步后 `tc check` 复检仍 **0 error / 531 warning**。
 
+**批次 13：`ia`（通用整数槽，剩余字段里的最低一档；2026-10-04）**
+- 选组：批次 12 迁移建议的直接落地 —— `ia 153` 是当时剩余 7 个字段里的最低一档，且属**索引型 `-1` 哨兵**（批次 7 的 `nd` / 批次 8 的 `ib` 已两度验证该范式）。与 `sb`（string）/`ba`（bool）/`lc`（带 `-2` 哨兵的索引）合起来，至此**四种侧表形态全部跑通**。
+- 普查：140 处 `.ia` 原始命中（含 `base.tc.s2pilot.bak` 之外的全部 `src/*.tc`）里 **17 处假阳性** ——
+  ① **9 处 `tbl_Rec{F,ClosureCapture,SL,VC,Vval,Int,Sym,Vector,Tile}_ia`**：S2 已 SoA 化的 per-kind record（`r.ia = tbl_RecX_ia[i]`，从不从 `nodes[]` 取值），沿用批次 6/12 的剔除规则；
+  ② **8 处纯注释**（`codegen_c:747`、`codegen_dev:191`、`tir:2367/2368/3903/3904/3905/5071`）。其中 `tir:3904` 行内含 `base.i2s(n.ia)` 形式的 **反引号字符串**、`codegen_c` 的注释里也有 `"//"` 类误判面（批次 12 的 `codegen_c:4305` 教训）⇒ 故本批的分类脚本 `tools/cls.py` 做成**引号/转义状态机**（不再按「遇 `//` 即截断」的朴素启发）：先做字符串感知、再判注释位置。
+  ⇒ **真实站点 123 行**（写 35 / 读 88）。
+- ✅ **哨兵普查结论：`ia` 只有 `-1` 一个哨兵，没有 `lc` 那种 `-2`**。判据：写负值处只有 `node_new` / `mk_vector` / `mk_tile` 的 `-1`；全部 `-2` 命中要么属于 `lc`/`lb`（`base.node_lc(...) != -2`、`n.lb != -2`、`mk_FuncDecl(..., -2, ...)` 的位置实参），要么是局部量（`spec == -2`、`vcall != -2`、`bir != -2`）。⇒ 默认与越界读一律 `-1`，无「把普通节点读成特殊状态」的静默错误面。
+- ✅ **Node 值形参普查（批次 10 起的固定前置）**：`tools/nvf.py` 扫出 2 个含 `Node` 值形参且读写 `.ia` 的函数 —— `tir::tir_match_pattern_cond(arm: Node, …)`（`p.ia`，`p = base.nodes[arm.na]`）与 `tir::tir_emit_match(n: Node, …)`（`bwn2.ia`，`bwn2 = base.nodes[bsn2.nb]`）。二者**都不需要用 `.id`**：各自作用域已提供裸索引 ⇒ **本批 0 处签名改造**（与批次 12 的 4 处改造形成对比，属批次 9 隐患的「无害形状」）。`.id` 读点普查：**本次新增调用全部用显式索引，无 `(V.id as u64)` 形态**。
+- 存储：`g_node_ia: []i64`（默认 **`-1`**；越界读也返 `-1`）+ `node_ia()` / `node_set_ia()` + `sidetable_register("node_ia","S4")` + `node_new` 锁步 `append(-1)`。7 个构造器（`mk_F` / `mk_closure_capture` / `mk_SL` / `mk_VC` / `mk_VVal` / `mk_int` / `mk_sym`）**保留 `ia` 形参**，只把 `n.ia = ia` 换成 `node_set_ia((id as u64), ia)` ⇒ 调用点与 `cst_register_Rec*` 的 S2 dual-write 签名全不动；`mk_vector` / `mk_tile` 的 `n.ia = -1`（冗余置位，但为严格等价保留）同步改为 setter。
+- ⚠ **有效写判定**（批次 7 铁律）：**25 个非构造器写点逐个核过，全部有精确 `slice_set(nodes, <idx>, <var>)` 回写** ⇒ 可安全机械升级为 setter。
+
+  | 分布 | 数量 | 代表站点 |
+  |---|---|---|
+  | `parse` | 7 | 元组标记（`844`）、overload 角色码 1/2（`2857/2889`）、单子句还原 `ia=0`（`3577/3626`）、fidconst 值（`4702`）、F 位宽成员（`5054`）|
+  | `sema` | 14 | vector lane 回填（`350`）、tile rows（`500`）、vval/comptime 传播（`12567/13032`）、atom intern（`6378`）、overload 实例 `ia=0`（`2233`）、P 模式回填 VC 下标（`3116`）、`mbuiltin` 回填（`6297/6320/6348`）|
+  | `codegen_c` / `tir` | 各 1 | atom 的「读≤0 则 intern」同行读写（均原位保留 `slice_set` 回写体，见下）|
+  | `comptime_fold` | 1 | `comptime_rewrite_to_literal` 跨节点传播 |
+  | `base` | 2 | `mk_vector` / `mk_tile` 的显式 `-1` 置位 |
+
+  ⚠ **两处特殊的「同行读+写」**（`codegen_c::emit_expr` 的 atom 分支、`tir::tir_emit_expr` 的 atom 分支）：原代码是 `if (n.ia <= 0) { n.ia = sema.atom_intern(n.sa); slice_set(base.nodes, e, n); }`。迁移后 `node_set_ia` 自身已落盘 ⇒ `slice_set` 退化为「写回一个未变的 `n`」的**幂等体**；按「严格等价搬迁」纪律**原位保留**（而不是顺手删），避免把「整理代码」混进本批归因。
+  ⚠ **`tir::tir_match_pattern_cond` 的 atom 分支（`4886-4887`）是既有的无效写**：`aid = atom_intern(p.sa)` 之后 `slice_set` 写回的 `p` 里 **`p.ia` 从未被赋值**（历史如此），故该分支的回写本就是空操作。本批**照原样保留**（`node_ia` 读 + 原 `slice_set`），**不把它升级成 setter**（批次 7 铁律：不得偷偷把无效写变成有效写）。
+  ⚠ **`codegen_dev::dev_safe_node` 的 `n.ia = 0` 是死写**：它与前几批不同 —— 零节点的 ia 初值是 **`0` 而非全局默认 `-1`**，故不能直接套用「越界读访问器返默认值即等价」的论证。经普查确认 **本文件改造后无任何 `Node` 消费方读 `ia`**（唯一提及在 `dev_parse_int` 的注释里）⇒ 删除后行为逐点不变，理由已写入该处注释。
+- ⚠ **`base` 局部遮蔽**：`codegen_c`（`emit_flag_decl` / `fr_layout` 等 6 处 `var base`）、`sema`（`8973` / `13699` / `12515` 附近）内的限定名由脚本按函数区间自动切到降级名 `base__node_ia(...)`；最终分布 `base.node_ia` × 95 / `base__node_ia` × 5，由 `tc check` 0 error 兜住。
+- 迁移结果：**落成 123 行访问器调用（写 33 / 读 90）**。与原始 123 行的差值可**精确归因**：−2 写（`node_new` 初值由 `append(g_node_ia, -1)` 取代、`codegen_dev` 零节点死写删除）、+2 读（`codegen_c:2170` / `tir:3031` 两处「同行既读又写」被拆成 `if` 行 + setter 行）。定义侧：`pub var g_node_ia`、`node_ia`/`node_set_ia`、`sidetable_register("node_ia","S4")`、`node_new` append。
+- ✅ **`nodes` 唯一增长点复查**：全仓只有 `base.tc:2707`（`node_new` 内）一处 `append(nodes, n)`，无别处直接构造 `Node{}` 或整体重排 ⇒ 侧表与 `nodes` 的**下标锁步不变量**成立，不存在「侧表比 nodes 短」的越界读面。
+- ✅ 覆盖证据（`ia` 的 13 种语义**全部有语料**，且 IR 快照对**全部 115 个 examples 的 `.ll` 与 `.c`** 逐字节比对 ⇒ 非默认分支已由黄金语料打到）：
+  ① `@Vector` lane 数 —— `vector_demo`；② `@Tile` rows —— `tile_demo`；③ `mbuiltin`（`@splat`/`@tsplat`/`tile_rows`）lane/行 —— `vector_demo` / `tile_demo`；
+  ④ `int`/`bool` 字面量 radix —— 全部示例（`mv_int` 恒写 10）；⑤ `sym` 位宽 —— `sym_demo` / `sym_global` + conformance `p16_sym_ok` / `f15_sym_cross_pool` / `f16_sym_needs_string`；⑥ `atom` intern id —— `atom.tc`；⑦ `fidconst` 描述符值 —— `fid_demo` / `fid_read_demo`；
+  ⑧ `struct_lit` 元组标记 — `tuple_demo` / `tuple_after_local` / `tuple_match_demo` / `tuple_pospattern_demo`（golden）；⑨ `FuncDecl` overload 角色码 0/1/2 —— `overload_demo` / `overload_type` / `overload_catchall` / `overload_cross_a`；⑩ `F` 位宽成员 `sfield_ia` —— `bitflags.tc`（`readable: 1; level: 4; owner_id: 8;`）；
+  ⑪ `VC` case tag + ⑬ `P` 模式回填 —— `adt_shape` / `adt_list` / `adt_multi` / `match_ext`；⑫ `vval` case 下标 —— comptime 变体（`meta_eval` 路径，由 `src/tc.tc` 自编译覆盖）。
+- 验证：`tc check` **0 error / 531 warning**（warning 全为既有命名风格告警，无一条与 ia 相关）；g1 自举 **1m56s**；**`src/tc.tc` 自身 seed vs g1 逐字节 IDENTICAL**（`.c` 2,479,641 B md5 `41c7bb7b…` / `.h` 130,389 B md5 `c015e273…`）；IR 快照 **3 DIFF / 0 NEW / 0 GONE（仅 `src/tc.tc::{c,h,ll}`）** ⇒ `--update` 重录基线（117 targets / 354 entries，233.2s）。
+- ✅ **gate L2 = 25 passed / 0 failed（2564.1s）**：教员的三关全过——「产物快照比对（ll + c 双后端）
+  365.3s PASS」（基线已重录，故**不再**出现改 src 后首跑的陈基线假 FAIL）、
+  **「自举不动点 g2 == g3」302.9s PASS**、**「自举四代不动点 g2 == g3 == g4」167.0s PASS**；
+  `run_examples dbg（双后端，并行）466.7s PASS`、`conformance 106.7s PASS`、
+  `双轨对拍 219.6s PASS`、`C 后端自举 208.7s PASS`、`rls 快速通道 285.6s PASS`。
+  收口：安装 `g4 → out/dbg/tc.exe`、`gr → out/rls/tc.exe`，复检 `tc check` 仍是 0 error / 531 warning。
+
 **剩余字段实测使用量（`.F` 命中数；泛型名字段含非 Node 假阳性，仅作排序参考）**
-`ia 153 / lb 218 / nb 461 / la 500 / na 1071 / kind 1187 / sa 1268`（`id` 为 S5 step2 过渡字段，随 `Node` 一并消失，不单列迁移）（✅ 已迁：`se`、`has_sa`、`has_sb`、`has_sc`、`be`、`bf`、`memspace`、`bd`、`bb`、`bc`、`sc`、`nd`、`ib`、`nc`、`ba`、`lc`、`sb` —— 共 17 个字段）。
-> 迁移至此，`Node` 的**全部 bool 载荷已清空**（批次 10 的 `ba` 是最后一个 bool），`la/lb/lc` kids 链槽族已外置其一（`lc`，批次 11），`na/nb/nc/nd` 四槽已外置其二（`nd`、`nc`），字符串族 `sa/sb/sc` 已外置其二（`sc`、`sb`）。三类侧表范式（bool / **string ×2** / 索引）**全部验证成立**，且**带哨兵的索引型**（`lc` 的 `-2`）也已安全通过 ⇒ 后续外置只剩工作量、无范式风险。剩余 7 个字段里 `ia 153` 为最低一档，`lb 218` 次之；`sa 1268` / `kind 1187` / `na 1071` 是量级最大的三座高峰（各自宜单独成批或按语义切分）。下一档建议 **`ia 153`**（索引型 `-1` 哨兵，批次 7/8 已验证；且 `sb` 迁完后 sloppy 的假阳性面随之收敛）或 **`lb 218`**（`lc` 已迁完，kids 链表头同族、写法内聚，可复用第十三批脚本的 `base` 遮蔽识别逻辑）。越往后站点越多、单批风险越高，后续宜**继续小组合 + 组内独立验证**；每批**开工后必须普查 `node_X((V.id as u64))` 是否落在 `Node` 形参上**（批次 9 致命坑的系统性防线；批次 12 已跑到 **248 处 / 0 命中**，且批次 12 自身暴露出 4 个 Node 值形参函数并已显式改造为收索引，说明**该普查是必要的、而非走过场**），收尾时**必须核对 examples 是否 0 DIFF**（批次 9 的方法论收获）。
+`lb 218 / nb 461 / la 500 / na 1071 / kind 1187 / sa 1268`（`id` 为 S5 step2 过渡字段，随 `Node` 一并消失，不单列迁移）（✅ 已迁：`se`、`has_sa`、`has_sb`、`has_sc`、`be`、`bf`、`memspace`、`bd`、`bb`、`bc`、`sc`、`nd`、`ib`、`nc`、`ba`、`lc`、`sb`、`ia` —— 共 **18 个字段**）。
+> 迁移至此，`Node` 的**全部 bool 载荷已清空**（批次 10）、`la/lb/lc` kids 链槽族外置其一（`lc`，批次 11）、`na/nb/nc/nd` 四槽外置其二（`nd`、`nc`）、字符串族外置其二（`sc`、`sb`）、**通用整数槽 `ia`/`ib` 两槽全部清空**（批次 8 / 批次 13）。四类侧表形态（bool / string ×2 / 索引 `-1` / 带 `-2` 哨兵的索引）**全部验证成立** ⇒ 后续外置只剩工作量、无范式风险。剩余 6 个字段里 `lb 218` 最低（`lc` 已迁完，kids 链表头同族、写法内聚，可直接复用批次 13 的 `tools/soa_migrate.py` 映射内核），其次 `nb 461`；`sa 1268` / `kind 1187` / `na 1071` / `la 500` 是量级最大的四座高峰（各自宜单独成批或按语义切分）。越往后站点越多、单批风险越高，后续宜**继续小组合 + 组内独立验证**；每批**开工后必须普查 ① Node 值形参、② `node_X((V.id as u64))` 是否落在形参上、③ 是否有 `-1` 之外的哨兵**（批次 9/11 致命坑的系统性防线），收尾时**必须核对 examples 是否 0 DIFF**（批次 9 的方法论收获）。
+> ⚠ **工具复用提示（批次 13 新增）**：`tools/soa_migrate.py` 的「Node 局部量 → 索引」映射内核（取**最近前置**声明、函数区间内识别 `var base` 遮蔽 → 切降级名、行尾注释剥离）与 `tools/cls.py`（字符串感知注释判别）、`tools/nvf.py`（Node 值形参普查）可直接复用于后续批次：抽取内核已抽象成 `tools/soa_migrate.py`（字段由首个命令行参数给出，如 `python tools/soa_migrate.py lb src/sema.tc`），不再需要改动脚本内的常量。
+> ⚠ **行尾红线（批次 13 实测）**：上述 Python 脚本以文本模式读写会把 **CRLF 文件整体转成 LF**（本批把 `src/tir.tc` 全文件 5653 行行尾改写，`git diff --stat` 一度虚增到 11309 行）。**必须**以二进制读写（`open(p,'rb')` / `newline=''` 保留原终结符）或事后按原文件形态还原；收尾时用 `git diff --stat` 与 `git diff -w --stat` 对照校验（二者应一致）。
 
 **后续批次（待做，按使用量升序、每组独立绿）**全部完成后删 `pub struct Node` + `nodes[]` + `node_new` 的 Node 构造 + 全部 `slice_set(nodes, …)`，`id` 字段随 `Node` 一并消失（届时裸索引即句柄），S4 方真正收口（随后补 `node_to_hir` 桥改造 + 删 re-export 垫片，见 §4.14.4）。
 
