@@ -114,10 +114,66 @@ def _is_slice_set(line, name, decl_idx):
     return bool(m) and m.group(1).strip() == decl_idx
 
 
+def idx_vars(idx_expr):
+    """从索引表达式里抽出「可能被重新赋值的变量」名。
+
+    过滤规则：紧跟在 `.` 之后的标识符是成员名/函数名（val / node_na / …），跳过；
+    `base` / `nodes` / `kids` 这类容器名跳过。剩下的才是需要在区间内查赋值的变量。
+    """
+    out = []
+    for m in re.finditer(r'[A-Za-z_][A-Za-z_0-9]*', idx_expr):
+        name = m.group(0)
+        prev = idx_expr[m.start() - 1] if m.start() > 0 else ''
+        nxt = idx_expr[m.end():m.end() + 1]
+        if prev == '.':
+            continue                      # 成员名 / 模块函数名
+        if name in ('base', 'nodes', 'kids') and nxt in ('.', '['):
+            continue                      # 容器名
+        out.append(name)
+    return out
+
+
+def nodes_index(s):
+    """抽取 `nodes[...]` 里的索引表达式（**方括号配对感知**）。
+
+    ⚠⚠ 不能用 `nodes\\[(.*?)\\]`：非贪婪在**嵌套下标**（`nodes[fields[fi]]`）处会停在
+      第一个 `]` ⇒ 抽成 `fields[fi`（丢掉外层 `]`）⇒ R3 替换产出
+      `base.node_span_id(fields[fi)` 这类**语法错误**。
+      批次 20-B2 实测：src/hir.tc:372 报 `T-PAR-E101 期待 RBracket，实际读到 )`。
+    """
+    m = re.search(r'(?:base\.)?nodes\s*\[', s)
+    if not m:
+        return None
+    i = m.end() - 1              # 指向 '['
+    depth = 0
+    for k in range(i, len(s)):
+        if s[k] == '[':
+            depth += 1
+        elif s[k] == ']':
+            depth -= 1
+            if depth == 0:
+                return s[i + 1:k].strip()
+    return None
+
+
+def assigned_between(code, start, end, names):
+    """在 (start, end) 开区间内，names 里是否有变量被重新赋值/重声明。"""
+    if not names:
+        return False
+    for j in range(start + 1, end):
+        cj = code[j]
+        for nm in names:
+            if re.match(r'^\s*' + re.escape(nm) + r'\s*(=[^=]|\+=|-=|\*=|/=)', cj):
+                return True
+            if re.match(r'^\s*(?:var|let)\s+' + re.escape(nm) + r'\b', cj):
+                return True
+    return False
+
+
 def scan(path, apply=False, safe_only=False):
     lines = read_lines(path)
     code = [strip_code(l) for l in lines]
-    drop, rewrite, keep = [], [], []
+    drop, rewrite, keep, r3_skipped = [], [], [], []
     for i, l in enumerate(code):
         m = DECL_RE.match(l)
         if not m:
@@ -141,8 +197,7 @@ def scan(path, apply=False, safe_only=False):
                 reassigned = True
             if pat.search(cj):
                 use_lines.append(j)
-        m_idx = IDX_RE.search(l)
-        decl_idx = m_idx.group(1).strip() if m_idx else None
+        decl_idx = nodes_index(l)
         if not use_lines:
             drop.append((i, name, 'R1 死声明'))
         elif (not reassigned) and decl_idx and all(_is_slice_set(code[j], name, decl_idx) for j in use_lines):
@@ -152,9 +207,17 @@ def scan(path, apply=False, safe_only=False):
         elif (not reassigned) and decl_idx and (not safe_only) and all(
                 not pat.search(idpat.sub('', code[j])) for j in use_lines):
             # 规则3：所有出现都是 `name.id` ⇒ 就地替换为索引表达式后删声明
-            for j in use_lines:
-                rewrite.append((j, name, decl_idx))
-            drop.append((i, name, 'R3 id 反查'))
+            # ⚠ 追加防线：索引表达式里的变量若在「声明行 → 使用行」之间被改过，
+            #   则 `n.id`（旧值）≠ 替换后的索引（新值）⇒ 该处替换会静默取错节点，必须 SKIP。
+            names = idx_vars(decl_idx)
+            risky = [j for j in use_lines if assigned_between(code, i, j, names)]
+            if risky:
+                keep.append((i, name, len(risky)))
+                r3_skipped.append((i, name, decl_idx, len(risky)))
+            else:
+                for j in use_lines:
+                    rewrite.append((j, name, decl_idx))
+                drop.append((i, name, 'R3 id 反查'))
         else:
             keep.append((i, name, len(use_lines)))
     if apply:
@@ -164,7 +227,7 @@ def scan(path, apply=False, safe_only=False):
         idxs = set(i for i, _, _ in drop)
         lines = [l for i, l in enumerate(lines) if i not in idxs]
         write_lines(path, lines)
-    return len(drop), len(rewrite), keep
+    return len(drop), len(rewrite), keep, r3_skipped
 
 
 def idpat_sub(line, name, idx):
@@ -179,8 +242,10 @@ def main():
     files = args if args else sorted(glob.glob('src/*.tc'))
     td = tr = 0
     all_keep = []
+    all_r3s = []
     for f in files:
-        d, r, k = scan(f, apply, safe_only)
+        d, r, k, r3s = scan(f, apply, safe_only)
+        all_r3s.extend((f, i + 1, nm, ix, c) for (i, nm, ix, c) in r3s)
         td += d; tr += r
         for (i, name, used) in k:
             all_keep.append((f, i + 1, name, used))
@@ -190,6 +255,10 @@ def main():
         print("   %s:%d  %s  (声明后仍出现 %d 次)" % (f, ln, name, used))
     if len(all_keep) > 25:
         print("   ... 其余 %d 处省略" % (len(all_keep) - 25))
+    if all_r3s:
+        print("R3-SKIP(索引变量在声明后、使用行前被改过 ⇒ 替换会取错节点): %d" % len(all_r3s))
+        for (f, ln, nm, ix, c) in all_r3s[:20]:
+            print("   %s:%d  %s = nodes[%s]  (risky uses=%d)" % (f, ln, nm, ix, c))
     print("MODE: %s" % ('APPLY' if apply else 'DRY-RUN'))
 
 
