@@ -1312,6 +1312,31 @@ if (n.td > 0) { n.td = -1; }          // ← 写在副本上：从未写回 node
 - **落成**：**11 个 src 文件、757 行删除、0 行插入**（`git diff --stat` 为纯 `-`）；`nodes` 真站点 880 → **260**；
   `tc check` **0 error / 530 warning**（较批次 19 的 531 少 1，正是被删死声明自带的那条告警）。
 
+**批次 20-B1：拆掉 4 处跨索引整体拷贝（⭐ 认知修正：Node 只剩 `id` ⇒ 整体拷贝只搬 `id`；2026-10-05）**
+- ⭐ **认知修正（推翻批次 20-A 的一处保守判断）**：批次 20-A 曾判断「这 4 处还在搬 span/td/trivia 等
+  未同步字段、不能贸然删」。**该判断是错的** —— span/td/trivia/mod/file 早在 S3/S5 就已外置成独立侧表，
+  **根本不在 `Node` 结构体里**；`Node` 现在只剩 `id` ⇒ `base.nodes[e] = cn;` **只搬 `id` 一个字段**。
+- **4 处逐个定性**（`sema::infer_expr_body` / 同函数族内）：
+  · `nodes[e] = cn;`（cn = `nodes[call_id]`）与 `nodes[e] = cln;`（cln = `nodes[call_id]`）—— **真拷贝**，
+    把**源节点 call_id 写进 e 槽** ⇒ 这是 `nodes[i].id == i` 不变量的**唯一破坏源**；
+  · `nodes[e] = n;`（n = `nodes[e]`）与 `nodes[na(e)] = cn;`（cn = `nodes[na(e)]`）—— **恒等赋值**
+    （写回同槽同值，连 `id` 都不变）⇒ **删除严格等价、零风险**。
+- **真语义不被牵连**：把 e 由 variant_lit 改写成 call 的语义，早已由紧随其后的
+  `node_set_kind/na/la/sa` **显式同步**承载（批次 16/17/18/19 逐批补上的），删除整体拷贝不动这四行。
+- ⚠ **为什么可以删「真拷贝」那 2 处**：搬过去的 `id` 唯一的消费者就是 `X.id` 形式的反查
+  （即 R3 要消除的 123 处候选）；而 R3 候选中**落在污染源所在巨型函数内的只有 2 处，且与 `e` 无关**
+  ⇒ 该函数内无人读 `nodes[e].id`。跨函数的消费者由**验证链**兜底（见下）。
+- **落成**：4 处整体拷贝全删（留论证注释），`tools/wholescan.py` 口径下**残留整体拷贝站点 = 0**；
+  再跑 `drop_node_decl.py --safe-only` ⇒ 新增可删 **0**（`cn`/`cln`/`n` 仍被 `.id` 使用，符合预期）。
+- **验证（关键：本批是**可能改变运行时行为**的一批，必须靠 examples 兜底）**：
+  · `tc check` **0 error / 530 warning**；seed vs g1 逐字节 IDENTICAL（`.c` `90f8e90b…` / `.h` `b548f3f5…`）；
+  · IR 快照 **2 DIFF（`::c`/`::ll`）、0 NEW / 0 GONE、`examples` 零 DIFF**；
+  · ⭐ **旁路对照 diff 是决定性证据**：HEAD 版 vs 当前版的 `.c` 共 **12 删 / 8 增** —— 其中 4 行删除
+    正是这 4 处整体拷贝本身（`(*(base__Node*)t_slice_at(base__nodes, e)) = cn;` 等），**没有任何其它逻辑行
+    变化**，其余 8+8 行是局部槽号位移的标识符改名。
+  · ⚠ 该 diff 只能证明「生成代码无连带改变」，**不能**证明运行时 `nodes[e].id` 变化无人消费
+    ⇒ 最终判据是 **gate L2 的 run_examples（47 例双后端）+ conformance + 双轨对拍 + 四代不动点全绿**。
+
 **剩余字段实测使用量（`.F` 命中数；泛型名字段含非 Node 假阳性，仅作排序参考）**
 （✅ 已迁 `se`、`has_sa`、`has_sb`、`has_sc`、`be`、`bf`、`memspace`、`bd`、`bb`、`bc`、`sc`、`nd`、`ib`、`nc`、`ba`、`lc`、`sb`、`ia`、`lb`、`nb`、`la`、`na`、`kind`、**`sa`** —— 共 **24 个字段**）。
 > 迁移至此，`Node` 里**只剩过渡字段 `id`**（S5 step2，随 `Node` 一并消失），**真实载荷字段全部清空**
