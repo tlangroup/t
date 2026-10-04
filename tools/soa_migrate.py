@@ -135,6 +135,27 @@ def eol_report(terms):
 def write_lines(path, lines, terms):
     out = ''.join(c + t for c, t in zip(lines, terms))
     io.open(path, 'wb').write(out.encode('utf-8'))
+def first_semi(s):
+    """返回首个**字符串外**的 `;` 下标，没有则 -1。"""
+    i = 0
+    instr = False
+    while i < len(s):
+        c = s[i]
+        if not instr:
+            if c == '"':
+                instr = True
+            elif c == ';':
+                return i
+        else:
+            if c == '\\':
+                i += 2
+                continue
+            if c == '"':
+                instr = False
+        i += 1
+    return -1
+
+
 def balanced_content(s, open_pos):
     """s[open_pos] 必须是 '['，返回 (内层文本, 闭括号下标)；不配平返回 None。
     支持嵌套下标（如 `nodes[g_fc_d[i]]`），批次 14 因此多了 3 处自动站点。"""
@@ -153,31 +174,32 @@ def balanced_content(s, open_pos):
     return None
 
 
-NODE_PREFIXES = ('base__nodes[', 'base.nodes[', 'nodes[')
+NODE_PREFIXES = ('base__nodes[', 'base.nodes[', 'nodes[')   # 由长到短，供外部复用
 
 
 def idx_at_end(pre):
-    """pre 以 `...nodes[EXPR]` 结尾时返回 (起始下标, EXPR)，否则 None。"""
-    best = None
-    for pat in NODE_PREFIXES:
+    """pre 以 `...nodes[EXPR]` 结尾时返回 (起始下标, EXPR)，否则 None。
+    ⚠ 必须由**长到短**匹配前缀：否则 `base.nodes[d]` 会命中较短的 `nodes[`，
+    把替换起点算到 `base.` 之后 ⇒ 产出 `base.base.node_lb(...)` 这种双限定（批次 14 实测）。"""
+    for pat in NODE_PREFIXES:   # 已按「由长到短」排好，直接顺序匹配
         p = pre.rfind(pat)
-        if p >= 0 and (best is None or p > best[0]):
-            best = (p, p + len(pat) - 1)
-    if best is None:
-        return None
-    open_pos = best[1]
-    r = balanced_content(pre, open_pos)
-    if r is None:
-        return None
-    inner, close = r
-    if close != len(pre) - 1:
-        return None
-    return (best[0], inner)
+        if p < 0:
+            continue
+        r = balanced_content(pre, p + len(pat) - 1)
+        if r is None:
+            continue
+        inner, close = r
+        if close != len(pre) - 1:
+            continue
+        return (p, inner)
+    return None
 
 
 DECL_BASE = re.compile(r'var\s+base\b')
 
-NODE_DECL_RE = re.compile(r'var\s+(\w+)\s*(?::\s*Node)?\s*=\s*(?:base__nodes|base\.nodes|nodes)\[')
+# ⚠ 类型标注可能是 `Node` 也可能是 **`base.Node`**（批次 14 在 hir.tc 实测：该文件通篇
+#   写作 `var n: base.Node = base.nodes[d];`，漏统一的只能手改 6 处）。
+NODE_DECL_RE = re.compile(r'var\s+(\w+)\s*(?::\s*(?:base\.)?Node)?\s*=\s*(?:base__nodes|base\.nodes|nodes)\[')
 
 
 def build_map(lines, start, end):
@@ -287,6 +309,29 @@ def main():
                 is_write = True
                 rhs = after.lstrip()[1:].strip()
             if is_write:
+                tail = after.lstrip()[1:]
+                # ★★ 护栏（批次 14 实测踩坑）：**写点必须独占整条语句**才可自动改写。
+                #   此前会把 `=` 之后的**全部剩余文本**当 rhs，于是：
+                #     ① 单行 `if (c) { X.lb = f(...); }` ⇒ 吞掉结尾 `}`，产出括号不闭合；
+                #     ② 同行多语句 `n.na = -1; n.lb = -1; n.sa = "";` ⇒ 吞掉后续整串语句。
+                #   ⇒ 以下任一情形一律判 UNMAPPED 交手工：找不到 `;` / 首个 `;` 之前含
+                #      `{` 或 `}` / 首个 `;` **之后**仍有非空非注释内容。
+                sc = first_semi(tail)
+                bad = None
+                if sc < 0:
+                    bad = 'no-semi'
+                elif '{' in tail[:sc] or '}' in tail[:sc]:
+                    bad = 'brace-inside'
+                else:
+                    rest = tail[sc + 1:]
+                    ci = rest.find('//')
+                    if ci >= 0 and outside_strings(rest, ci):
+                        rest = rest[:ci]
+                    if rest.strip():
+                        bad = 'multi-stmt'
+                if bad:
+                    unmapped.append((i + 1, s.strip(), 'guard:%s' % bad))
+                    continue
                 # 行尾注释（字符串外的 //）要保留在改写之后
                 rhs_body = rhs
                 tailcmt = ''
