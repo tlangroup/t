@@ -40,7 +40,9 @@ pub fn dev_safe_node(e: i64) Node {
     //   （而非全局默认 -1），故不能直接套用「越界读访问器返默认值即等价」的论证；此处经
     //   **普查确认是死写**：本文件改造后**无任何** `Node` 消费方读 ia（唯一提及在
     //   `dev_parse_int` 的注释里），越界零节点的 ia 永不被观测 ⇒ 删除不改变行为。
-    n.na = -1;
+    // S4 §0.14.7 SoA：na 已外置为侧表 g_node_na（第十七批）。零 Node 无 id ⇒ 无法回写侧表；
+    //   越界读 node_na 返 -1，与此处原 `n.na = -1` **等价**（同第十六批 la / 第十四批 lb /
+    //   第九批 nc 的论证：零节点初值恰为 -1，与全局默认一致）。
     // S4 §0.14.7 SoA：nb 已外置为侧表（第十五批）。零 Node 无 id ⇒ 无法回写侧表；
     //   越界读 node_nb 返 -1，与此处原 n.nb = -1 **等价**（同第十四批 lb / 第九批 nc 的论证）。
     //   ⚠ 与第十三批 ia 的**结论不同**：ia 零节点初值是 0 而全局默认 -1，故只能按死写删除；
@@ -142,7 +144,7 @@ pub fn dev_is_float(ty: string) bool {
 pub fn dev_type_of(tn: i64) string {
     var n: Node = dev_safe_node(tn);
     if (n.kind == "pointer") {
-        var em: string = dev_type_of(n.na);
+        var em: string = dev_type_of(base.node_na((tn as u64)));
         // S4 §0.14.7 SoA：memspace 已外置（原 `n.memspace`；n 是 dev_safe_node(tn) 的拷贝）
         var as_ms: i64 = base.node_memspace((tn as u64));
         g_dt_ty = base.sb_cat4("!llvm.ptr<", base.i2s(as_ms), ">", "");
@@ -196,8 +198,8 @@ pub fn dev_is_call_name(node: i64, name: string) bool {
     if (node < 0 || node >= nlen) { return false; }
     var n: Node = base.nodes[node];
     if (n.kind != "call") { return false; }
-    if (n.na < 0 || n.na >= nlen) { return false; }
-    var callee: Node = base.nodes[n.na];
+    if (base.node_na((node as u64)) < 0 || base.node_na((node as u64)) >= nlen) { return false; }
+    var callee: Node = base.nodes[base.node_na((node as u64))];
     return callee.kind == "ident" && callee.sa == name;
 }
 
@@ -279,7 +281,7 @@ pub fn emit_dev_kernel(d: i64) void {
         dev_trace(base.i2s(kval));
         dev_trace("\n");
         var p: Node = dev_safe_node(kval);
-        var mty: string = dev_type_of(p.na);
+        var mty: string = dev_type_of(base.node_na((kval as u64)));
         dev_trace("[EMIT_DEV] param type=");
         dev_trace(mty);
         dev_trace("\n");
@@ -330,7 +332,7 @@ pub fn emit_dev_stmt(s: i64) void {
     if (n.kind == "var_decl") {
         // 共享内存分配：`var sh: shared[T] = shared_alloc(N)`
         if (base.node_nb((s as u64)) >= 0 && dev_is_call_name(base.node_nb((s as u64)), "shared_alloc")) {
-            var mty: string = dev_type_of(n.na);    // !llvm.ptr<3>
+            var mty: string = dev_type_of(base.node_na((s as u64)));    // !llvm.ptr<3>
             var elem: string = g_dt_elem;           // f32 / i32
             var cnt: string = emit_dev_expr(dev_first_arg(base.node_nb((s as u64))));
             var v: string = dev_next();
@@ -348,7 +350,7 @@ pub fn emit_dev_stmt(s: i64) void {
         return;
     }
     if (n.kind == "assign" || n.kind == "assignment") {
-        emit_dev_assign(n.na, base.node_nb((s as u64)));
+            emit_dev_assign(base.node_na((s as u64)), base.node_nb((s as u64)));
         return;
     }
     if (n.kind == "return") {
@@ -356,7 +358,7 @@ pub fn emit_dev_stmt(s: i64) void {
         return;
     }
     if (n.kind == "expr") {
-        emit_dev_expr(n.na);
+        emit_dev_expr(base.node_na((s as u64)));
         return;
     }
     // if / while / for 等控制在垂直切片里暂不展开（straight-line；bounds guard 由 launch 端保证）
@@ -371,7 +373,7 @@ pub fn emit_dev_assign(lhs: i64, rhs: i64) void {
         return;
     }
     if (ln.kind == "index") {
-        var b: string = emit_dev_expr(ln.na);
+        var b: string = emit_dev_expr(base.node_na((lhs as u64)));
         var bas: i64 = g_dev_asv;
         var belem: string = g_dev_elem;
         var i: string = emit_dev_expr(base.node_nb((lhs as u64)));
@@ -390,7 +392,7 @@ pub fn emit_dev_assign(lhs: i64, rhs: i64) void {
 pub fn emit_dev_addr(e: i64) string {
     var n: Node = dev_safe_node(e);
     if (n.kind == "index") {
-        var b: string = emit_dev_expr(n.na);
+        var b: string = emit_dev_expr(base.node_na((e as u64)));
         var bas: i64 = g_dev_asv;
         var belem: string = g_dev_elem;
         var i: string = emit_dev_expr(base.node_nb((e as u64)));
@@ -408,7 +410,7 @@ pub fn emit_dev_addr(e: i64) string {
 pub fn emit_dev_expr(e: i64) string {
     var n: Node = dev_safe_node(e);
     if (n.kind == "assign" || n.kind == "assignment") {
-        emit_dev_assign(n.na, base.node_nb((e as u64)));
+        emit_dev_assign(base.node_na((e as u64)), base.node_nb((e as u64)));
         return "";
     }
     if (n.kind == "ident") {
@@ -441,10 +443,10 @@ pub fn emit_dev_expr(e: i64) string {
         return v;
     }
     if (n.kind == "paren") {
-        return emit_dev_expr(n.na);
+        return emit_dev_expr(base.node_na((e as u64)));
     }
     if (n.kind == "binary") {
-        var l: string = emit_dev_expr(n.na);
+        var l: string = emit_dev_expr(base.node_na((e as u64)));
         var lt: string = g_dev_rty;
         var r: string = emit_dev_expr(base.node_nb((e as u64)));
         var rt: string = g_dev_rty;
@@ -466,11 +468,11 @@ pub fn emit_dev_expr(e: i64) string {
     if (n.kind == "amp") {
         // &x：取 x 的地址（GEP 指针），不 load。x 为 index 时发 GEP 返回 ptr<as>；
         // x 为指针型 ident 时其值已是 !llvm.ptr<as>，直接回传。
-        return emit_dev_addr(n.na);
+        return emit_dev_addr(base.node_na((e as u64)));
     }
     if (n.kind == "index") {
         // 读：gep + load（结果值，非指针）
-        var b: string = emit_dev_expr(n.na);
+        var b: string = emit_dev_expr(base.node_na((e as u64)));
         var bas: i64 = g_dev_asv;
         var belem: string = g_dev_elem;
         var i: string = emit_dev_expr(base.node_nb((e as u64)));
@@ -495,7 +497,7 @@ pub fn emit_dev_expr(e: i64) string {
 
 pub fn emit_dev_call(n: i64) string {
     var nn: Node = dev_safe_node(n);
-    var cn: i64 = nn.na;
+    var cn: i64 = base.node_na((n as u64));
     var nlen: i64 = slice_len(base.nodes) as i64;
     // emit-dev 路径下 base.nodes 可能未完整填充；越界访问 callee 会崩，故先判界。
     var name: string = "";

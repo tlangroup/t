@@ -1136,13 +1136,80 @@ if (n.td > 0) { n.td = -1; }          // ← 写在副本上：从未写回 node
   ⇒ 三者全 PASS（本批改了测试内建，若有闪失，`conformance` 会先变红）。
   收口：安装 `g4 → out/dbg/tc.exe`、`gr → out/rls/tc.exe`，复检 `tc check` 仍是 **0 error / 531 warning**。
 
+**批次 17：`na`（`na`/`nb`/`nc`/`nd` 索引槽族的最后一槽，⚠ `na` 是 `name` 的前缀；2026-10-04）**
+- **选组**：`na 1071` 是剩余字段里用量最低者，也是索引槽族的最后一槽（`nd` 批次 7 / `nc` 批次 9 / `nb` 批次 15
+  已外置）。它是 `Node` 里用量最大的索引槽（binary/assign 左操作数、call/mbuiltin callee、member/index 基、
+  FuncDecl 返回类型、arm 等值模式、for 的 init、if/match 的 cond、range 起点…… 语义复用清单已完整写进
+  `base.tc::node_na` 上方注释）。
+- **普查**：含 `.na` 的行 **998** → 剔除 50 行 `tbl_Rec*_na`（S2 per-kind record）+ 38 行纯注释 ⇒ **真实站点 910 行**；
+  分布 `sema 377 / codegen_c 192 / tir 159 / base 54 / hir 52 / parse 47 / codegen_dev 16 / comptime_fold 12 /
+  tir_to_ll 1`（⭐ `src/tir_to_ll.tc` 是本 epic 里**首次**出现的文件）。落成 **966 处 `node_na` 读 +
+  106 处 `node_set_na` 写**（多处同行 ⇒ 访问器数 > 站点行数，归因差值正常）。
+- ⚠ **本批独有的迁移器陷阱：`na` 是 `name` 的**前缀****。`d.name` 会被 `.na` 命中；若接收者恰是已映射的
+  Node 局部量就会被**改坏**。已给 `tools/soa_migrate.py::find_all_outside` 加 `word_boundary=True` 护栏
+  （要求 `.F` 后不紧跟 `[A-Za-z0-9_]`）。修复前后：base.tc 的 UNMAPPED 由 2（`nomap:d | d.name = rname;`）
+  降为 0；回归验证 `la` 仍是 0 changes，确认护栏无副作用。
+- **哨兵普查**：**纯 `-1` 单哨兵** —— `>= 0` 126 / `< 0` 26；`>0` / `==0` / `==1` / `==2` / `==-1` / `!= -1` /
+  `>-1` / `>-2` / `!= -2` / `== -2` **全部为 0**，且 `n.na = -2` 的写入点 **0 处** ⇒ 默认 `-1`、越界读返 `-1`
+  即严格等价（`node_new` 旧初值也确为 `-1`）。
+- **Node 值形参（`tools/nvf.py na`）5 个，三类处置本批全部用上**：
+  ① **类一（调用方有裸索引，签名改收索引）**：`tir_member_addr(mnode: Node)` → `(e: i64)`（三处调用点分别传
+     `base.node_na((sid as u64))` / `e` / `e`）；`tir_match_pattern_cond(arm: Node, …)` → `(armId: i64, …)`
+     （调用点传 `armIds[i]`）。
+  ② **类三（Node 值形参与宿主的 `base.nodes[e]` 恒等 ⇒ **直接删冗余值形参**）**：`tir_emit_amp(n: Node, est)`
+     → `(e: i64, est)`、`tir_emit_unary(n: Node)` → `(e: i64)`、`comptime_fold::comptime_call_is_variant(n: Node)`
+     → `(e: i64)`。三者唯一调用方分别是 `tir_emit_expr(e)`×2 与 `comptime_has_runtime_ref(e)`，且 `n` 均来自
+     `base.nodes[e]`。⚠ 后两个函数体仍读 `n.sa`（`sa` 未外置），故**函数内保留 `var n: Node = base.nodes[e];`**，
+     只有 `na` 走侧表访问器 —— 不能为了「干净」把整个 Node 局部量删掉。
+- **跨索引整体拷贝（普查 ④）**：`tools/wholescan.py --only=na` 报告 **2 处**（同索引回写 214 处，无害）——
+  仍是批次 16 击穿的那两处 `sema::infer_expr_body` 的 ADT 脱糖。⚠ **本批 `na` 是必须同步的**（与 `la` 不同的根因）：
+  `mk_call(na, la, ti)` 把 **callee** 放进 `call_id` 的 `na` 槽、把实参 kids 链放进 `la` 槽；而 `e` 原本是
+  variant_lit，其 `na` 存的是**实参链**。漏同步 ⇒ `e` 变成 call 后 `infer_expr` 会把实参链当 callee 解析。
+  已补 `base.node_set_na((e as u64), base.node_na((call_id as u64)));`。
+  ⚠ 工具侧：`wholescan.py` 的 `LOOKAHEAD=6` 只认拷贝后 6 行内的同步 ⇒ **两个 setter 必须紧随拷贝行**，
+  长注释要后置（本批第一版把 `node_set_na` 写在 6 行注释之后，工具误报「未同步」）。
+- ⭐ **本批最严重的新坑：索引表达式自身含被迁字段 ⇒ 内层未递归迁移（31 处）**。
+  形如 `var ini: Node = base.nodes[n.na];` 的声明，工具用**迁移前**的原文建立「接收者 → 索引表达式」映射，
+  于是把下游的 `ini.na` 译成 `base.node_na((n.na as u64))` —— **外层译了，内层的 `n.na` 是未迁移的字段读**。
+  三个工具都看不见：`soa_migrate.py` 二次扫描 PLAN 恒为 **0**（该 `.na` 已落在访问器实参位，读/写点识别
+  都不再命中）、`cls.py` 只做分类统计、`wholescan.py` 只看整体拷贝。
+  **唯一可靠捕获手段是 `tc check`**：31 处 `T_UNKNOWN_FIELD`（`sema 14 / codegen_c 10 / tir 4 / hir 2 / parse 1`）。
+  修法：逐行回溯接收者的 `var X: Node = base.nodes[IDX];`，把内层也换成访问器
+  （`base.node_na((base.node_na((IDX as u64)) as u64))`）；并**先验证接收者在区间内未被重声明/重赋值**
+  （本批 11 组区间全部 CLEAN）。
+  ⇒ 已给 `tools/soa_migrate.py` 加 **`==== STALE-INNER ====` 自检**（只看含访问器的行，避开 `tbl_Rec*_na`
+  与注释里的反引号引用两类假阳性），以后每批 dry-run 即可见。
+- ⚠ **另一个复现的旧坑**：`sema.tc:12564` 那行是 `var base: i64 = meta_eval(...)` —— **局部 `base` 遮蔽 base 模块**，
+  插入 `base.node_na` 必须写成降级名 `base__node_na`（该作用域既有 53 处 `base__` 用法可佐证）。已写专条扫描脚本，
+  全仓扫过确认无第二处。
+- **行尾**：`src/tir.tc`（`-text` 字节保真）**一度被我自己的脚本毁掉**（Python 默认 universal-newlines 读取
+  把 5698 行 CRLF 整体转成 LF，`git diff --stat` 虚增到 11416 行），已按原形态整体还原，
+  `git diff --stat` 与 `-w --stat` 复验一致（358 行）。
+- **完工四次复核**：① 改动行括号平衡 —— 仅 4 处「可疑」，全是新访问器 `node_na`/`node_set_na` 的函数头 `{`
+  与配对 `}`，属预期；② `cls.py .na` —— `.na` 字段访问**全清**（全仓枚举 `\.[A-Za-z_]\w*na\b` 只剩
+  `node_na` 938 / `node_set_na` 53，合法假阳性为 50 处 `tbl_Rec*_na` 与 `.name` 前缀）；
+  ③ 写点回写 —— 扫出 7 个「无回写」候选，逐个人工确认后归零（4 处是真有回写，只是回写用**降级名**
+  `base__nodes` 导致首版脚本漏配；2 处是 `node_new` / 零节点初值，按等价论证处理；1 处是注释）；
+  ④ `wholescan.py --only=na` 两处已同步。
+- **验证**：`tc check` **0 error / 531 warning**（与批次 16 基线同）；g1 自举 **2m20s**；
+  **`src/tc.tc` 自身 seed vs g1 逐字节 IDENTICAL**（`.c` md5 `80e8c4c755a4dcf57560bab466e29e19` /
+  `.h` md5 `c8cf5565ff2119c3e1cb6c2008f3b675`）；IR 快照 **3 DIFF / 0 NEW / 0 GONE（仅 `src/tc.tc::{c,h,ll}`）**，
+  且 `::c` 新值 `80e8c4c7…` 与 seed/g1 差分对拍的 `.c` md5 **完全一致**（两个独立测量互证）。
+  本批**没有**出现 examples DIFF ⇒ 未触发批次 9 的硬信号（对比批次 16 的 6 个 examples DIFF，
+  说明跨索引同步补在自举之前起了作用）。
+
 **剩余字段实测使用量（`.F` 命中数；泛型名字段含非 Node 假阳性，仅作排序参考）**
-`na 1071 / kind 1187 / sa 1268`（`id` 为 S5 step2 过渡字段，随 `Node` 一并消失，不单列迁移）（✅ 已迁：`se`、`has_sa`、`has_sb`、`has_sc`、`be`、`bf`、`memspace`、`bd`、`bb`、`bc`、`sc`、`nd`、`ib`、`nc`、`ba`、`lc`、`sb`、`ia`、`lb`、`nb`、`la` —— 共 **21 个字段**）。
+`kind 1187 / sa 1268`（`id` 为 S5 step2 过渡字段，随 `Node` 一并消失，不单列迁移）（✅ 已迁：`se`、`has_sa`、`has_sb`、`has_sc`、`be`、`bf`、`memspace`、`bd`、`bb`、`bc`、`sc`、`nd`、`ib`、`nc`、`ba`、`lc`、`sb`、`ia`、`lb`、`nb`、`la`、`na` —— 共 **22 个字段**）。
 > 迁移至此，`Node` 的**全部 bool 载荷已清空**（批次 10）、**`la`/`lb`/`lc` kids 链槽族三槽全部清空**
-> （`lc` 批次 11、`lb` 批次 14、**`la` 批次 16**；⦁注意三者**哨兵并不一致**：`lc`/`lb` 带 `-2`，`la` 纯 `-1`）、
-> `na/nb/nc/nd` 四槽**已外置其三**（`nd`、`nc`、`nb`，剩 `na 1071` 是四槽里最大者）、字符串族外置其二（`sc`、`sb`）、
-> **通用整数槽 `ia`/`ib` 两槽全部清空**（批次 8 / 批次 13）。四类侧表形态（bool / string ×2 / 索引 `-1` / 带 `-2` 哨兵的索引）**全部验证成立** ⇒ 后续外置只剩工作量、无范式风险。**下一档建议 `na 1071`**（索引槽族的最后一座，亦
-> 是本 epic 里首个四位数高峰，建议先按 kind 切片试点再全量），其后 `kind 1187` / `sa 1268`。越往后站点越多、单批风险越高，后续宜**继续小组合 + 组内独立验证**；每批**开工后必须普查 ① Node 值形参、② `node_X((V.id as u64))` 是否落在形参上、③ 是否有 `-1` 之外的哨兵**（批次 9/11 致命坑的系统性防线），收尾时**必须核对 examples 是否 0 DIFF**（批次 9 的方法论收获）。
+> （`lc` 批次 11、`lb` 批次 14、`la` 批次 16；⦁注意三者**哨兵并不一致**：`lc`/`lb` 带 `-2`，`la` 纯 `-1`）、
+> **`na/nb/nc/nd` 索引槽族四槽全部清空**（`nd` 批次 7 / `nc` 批次 9 / `nb` 批次 15 / **`na` 批次 17**，
+> 四槽**均为纯 `-1` 单哨兵**）、字符串族外置其二（`sc`、`sb`）、**通用整数槽 `ia`/`ib` 两槽全部清空**
+> （批次 8 / 批次 13）。四类侧表形态（bool / string ×2 / 索引 `-1` / 带 `-2` 哨兵的索引）**全部验证成立**
+> ⇒ 后续外置只剩工作量、无范式风险。**下一档建议 `kind 1187`**（⚠ **本 epic 风险最高的一档**：
+> `kind` 一旦外置，**跨索引整体赋值不再搬 `kind`** ⇒ 那 2 处拷贝会直接改派发，且 `n.kind == "…"` 的
+> 900+ 比较点全部要改访问器；**务必先用 `wholescan.py` 兜住 2 处跨索引拷贝**，并建议按 kind 切片试点），
+> 其后 `sa 1268`（⚠ `sa` 同理是 `sb`/`sc` 的同族但**是字符串型**，且 `sa` 是 `sappend`/`safe` 等标识符的前缀，
+> 复用批次 17 的 `word_boundary` 护栏）。越往后站点越多、单批风险越高，后续宜**继续小组合 + 组内独立验证**；每批**开工后必须普查 ① Node 值形参、② `node_X((V.id as u64))` 是否落在形参上、③ 是否有 `-1` 之外的哨兵**（批次 9/11 致命坑的系统性防线），收尾时**必须核对 examples 是否 0 DIFF**（批次 9 的方法论收获）。
 > ⚠ **工具复用提示（批次 13 新增）**：`tools/soa_migrate.py` 的「Node 局部量 → 索引」映射内核（取**最近前置**声明、函数区间内识别 `var base` 遮蔽 → 切降级名、行尾注释剥离）与 `tools/cls.py`（字符串感知注释判别）、`tools/nvf.py`（Node 值形参普查）可直接复用于后续批次：抽取内核已抽象成 `tools/soa_migrate.py`（字段由首个命令行参数给出，如 `python tools/soa_migrate.py lb src/sema.tc`），不再需要改动脚本内的常量。
 > ⚠ **自动迁移 ≠ 免检（批次 14 三条硬性收尾动作 + 批次 16 新增第④条）**：
 >   ① **完工后必做机械兜底** —— 对所有改动行做「忽略字符串的 `()` / `{}` 平衡 + 无 `;;`」检查。
@@ -1158,6 +1225,11 @@ if (n.td > 0) { n.td = -1; }          // ← 写在副本上：从未写回 node
 >      `sema` 2 处跨索引整体拷贝未同步 `la`，导致 6 个 ADT/match examples 的合成构造器丢实参
 >      （`List_from_One(42)` → `List_from_One()`）。同站点还有 214 处**同索引回写**天然无害，
 >      脚本会自动区分二者，不必人工筛。
+>   ⑤ **每批必看 dry-run 输出的 `==== STALE-INNER ====`（批次 17 新增，已内建进 `soa_migrate.py`）** ——
+>      当接收者的索引表达式自身含被迁字段（`var ini: Node = base.nodes[n.na];`）时，工具会用**迁移前**
+>      的原文建映射，产出 `base.node_na((n.na as u64))` 这种「外层译了、内层是未迁字段读」的半吊子。
+>      ⚠ **二次扫描发现不了**（PLAN 恒为 0），只有 `tc check` 的 `T_UNKNOWN_FIELD` 能兜住 ——
+>      批次 17 就是这样一次性冒出 **31 处**。收尾判据：`STALE-INNER` 除注释里的反引号引用外须为 0。
 > ⚠ **行尾红线（批次 13 实测）**：上述 Python 脚本以文本模式读写会把 **CRLF 文件整体转成 LF**（本批把 `src/tir.tc` 全文件 5653 行行尾改写，`git diff --stat` 一度虚增到 11309 行）。**必须**以二进制读写（`open(p,'rb')` / `newline=''` 保留原终结符）或事后按原文件形态还原；收尾时用 `git diff --stat` 与 `git diff -w --stat` 对照校验（二者应一致）。
 
 **后续批次（待做，按使用量升序、每组独立绿）**全部完成后删 `pub struct Node` + `nodes[]` + `node_new` 的 Node 构造 + 全部 `slice_set(nodes, …)`，`id` 字段随 `Node` 一并消失（届时裸索引即句柄），S4 方真正收口（随后补 `node_to_hir` 桥改造 + 删 re-export 垫片，见 §4.14.4）。

@@ -36,7 +36,7 @@ import sys
 
 SOA_FIELDS = [
     "se", "has_sa", "has_sb", "has_sc", "be", "bf", "memspace", "bd", "bb", "bc",
-    "nd", "ib", "sc", "sb", "nc", "ba", "lc", "ia", "lb", "nb", "la",
+    "nd", "ib", "sc", "sb", "nc", "ba", "lc", "ia", "lb", "nb", "la", "na",
 ]
 LOOKAHEAD = 6
 

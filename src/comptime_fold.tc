@@ -52,9 +52,14 @@ pub fn comptime_has_runtime_ref_list(head: i64) bool {
 // 该 call 是否为变体编译期辅助调用（Name_from_Case / Name_is_Case /
 // Name_as_Case[_fK]）。是则放行（仅递归检查实参，不允许整棵被当运行期引用拒掉），
 // 让 meta_eval 内部的变体值求值接管；否（普通运行期调用）仍为硬运行期引用。
-pub fn comptime_call_is_variant(n: Node) bool {
-    if (n.na < 0) { return false; }
-    var cn: Node = base.nodes[n.na];
+// S4 §0.14.7 SoA（第十七批·na）：原签名 `comptime_call_is_variant(n: Node)`。
+//   唯一调用方 `comptime_has_runtime_ref(e: i64)` 传入的 `n` 与 `base.nodes[e]` **恒等**
+//   ⇒ 属「Node 值形参第三类」：**直接删冗余 Node 值形参**、改收索引 e。
+//   ⚠ 收索引而非读 `.id`：结构体值传参会丢末尾字段，侧表会读到错误节点。
+pub fn comptime_call_is_variant(e: i64) bool {
+    var na: i64 = base.node_na((e as u64));
+    if (na < 0) { return false; }
+    var cn: Node = base.nodes[na];
     if (cn.kind != "ident") { return false; }
     return sema.meta_str_find(cn.sa, "_from_") >= 0
         || sema.meta_str_find(cn.sa, "_is_") >= 0
@@ -73,12 +78,12 @@ pub fn comptime_has_runtime_ref(e: i64) bool {
         return false;
     }
     if (n.kind == "call") {
-        if (comptime_call_is_variant(n)) {
+        if (comptime_call_is_variant(e)) {
             return comptime_has_runtime_ref_list(base.node_la((e as u64)));
         }
         return true;
     }
-    if (comptime_has_runtime_ref(n.na)) { return true; }
+    if (comptime_has_runtime_ref(base.node_na((e as u64)))) { return true; }
     if (comptime_has_runtime_ref(base.node_nb((e as u64)))) { return true; }
     if (comptime_has_runtime_ref(base.node_nc((n.id as u64)))) { return true; }
     if (comptime_has_runtime_ref(base.node_nd((e as u64)))) { return true; }   // S4 §0.14.7 SoA：侧表访问器（原 .nd）
@@ -98,7 +103,8 @@ pub fn comptime_rewrite_to_literal(e: i64, v: i64) void {
     dst.sa = src.sa;
     base.node_set_ia((e as u64), base.node_ia((v as u64)));
     base.node_set_ba((e as u64), base.node_ba((v as u64)));   // S4 §0.14.7 SoA：侧表访问器（原 .ba；第十批）
-    dst.na = -1; base.node_set_nb((e as u64), -1);
+    base.node_set_na((e as u64), -1);   // S4 §0.14.7 SoA：侧表写（原 `dst.na = -1`；第十七批）
+    base.node_set_nb((e as u64), -1);
     base.node_set_nc((e as u64), -1);   // S4 §0.14.7 SoA：侧表写（原 dst.nc = -1；第九批）
     base.node_set_nd((e as u64), -1);   // S4 §0.14.7 SoA：侧表访问器（原 .nd）
     base.node_set_la((e as u64), base.node_la((v as u64)));
@@ -163,22 +169,22 @@ pub fn fold_one_enum(d: i64) bool {
     while (c >= 0) {
         var k: Child = base.kids[c];
         var v: Node = base.nodes[k.val];
-        if (v.na >= 0) {
-            var vn: Node = base.nodes[v.na];
+        if (base.node_na((k.val as u64)) >= 0) {
+            var vn: Node = base.nodes[base.node_na((k.val as u64))];
             if (vn.kind == "int") {
                 // 已是字面量：登记其值（供其它成员引用）并续推 auto_val
-                var fv: i64 = sema.js_parse_int(vn.sa, base.node_ia((v.na as u64)));
+                var fv: i64 = sema.js_parse_int(vn.sa, base.node_ia((base.node_na((k.val as u64)) as u64)));
                 sema.enum_const_set(n.sa, v.sa, fv);
                 auto_val = fv + 1;
                 c = k.next;
                 continue;
             }
             // 未折：尝试编译期求值
-            var vv: i64 = sema.meta_eval(v.na);
+            var vv: i64 = sema.meta_eval(base.node_na((k.val as u64)));
             sema.g_meta_err = false; // 复位：避免不可折节点污染后续成员
             if (vv >= 0 && base.nodes[vv].kind == "int") {
-                comptime_rewrite_to_literal(v.na, vv);
-                var fv: i64 = sema.js_parse_int(base.nodes[v.na].sa, base.node_ia((v.na as u64)));
+                comptime_rewrite_to_literal(base.node_na((k.val as u64)), vv);
+                var fv: i64 = sema.js_parse_int(base.nodes[base.node_na((k.val as u64))].sa, base.node_ia((base.node_na((k.val as u64)) as u64)));
                 sema.enum_const_set(n.sa, v.sa, fv);
                 auto_val = fv + 1;
                 changed = true;
@@ -201,8 +207,8 @@ pub fn report_unfolded_enum(d: i64) void {
     while (c >= 0) {
         var k: Child = base.kids[c];
         var v: Node = base.nodes[k.val];
-        if (v.na >= 0 && base.nodes[v.na].kind != "int") {
-            var vv: i64 = sema.meta_eval(v.na);
+        if (base.node_na((k.val as u64)) >= 0 && base.nodes[base.node_na((k.val as u64))].kind != "int") {
+            var vv: i64 = sema.meta_eval(base.node_na((k.val as u64)));
             sema.g_meta_err = false;
             if (vv < 0) {
                 base.diag_new("T-SEM-E202", "error",
