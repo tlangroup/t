@@ -38,7 +38,12 @@ import re, sys, glob
 
 DECL_RE = re.compile(r'^\s*(var|let)\s+([A-Za-z_][A-Za-z_0-9]*)\s*:\s*(?:base\.)?Node\s*=')
 FN_RE = re.compile(r'^\s*(?:pub\s+)?fn\s+')
-IDX_RE = re.compile(r'(?:base\.)?nodes\s*\[(.*?)\]')
+# ⭐ `nodes` 的三种写法：`nodes` / `base.nodes` / **`base__nodes`**。
+#   第三种出现在「局部 `var base: …` 遮蔽了 base 模块」的作用域 —— t 要求跨模块访问用全名，
+#   被遮蔽时只能写降级名 `base__nodes[...]`（见 MEMORY.md「降级名规则」）。
+#   批次 20-D：正则漏掉它 ⇒ 8 处 SKIP 纯属拼写卡点（不是语义风险）。
+NODES = r'(?:base(?:\.|__))?nodes'
+IDX_RE = re.compile(NODES + r'\s*\[(.*?)\]')
 
 
 def strip_comment(line):
@@ -110,7 +115,7 @@ def func_end(lines, start):
 
 
 def _is_slice_set(line, name, decl_idx):
-    m = re.match(r'^\s*slice_set\s*\(\s*(?:base\.)?nodes\s*,\s*(.+?)\s*,\s*' + re.escape(name) + r'\s*\)\s*;', line)
+    m = re.match(r'^\s*slice_set\s*\(\s*' + NODES + r'\s*,\s*(.+?)\s*,\s*' + re.escape(name) + r'\s*\)\s*;', line)
     return bool(m) and m.group(1).strip() == decl_idx
 
 
@@ -141,7 +146,7 @@ def nodes_index(s):
       `base.node_span_id(fields[fi)` 这类**语法错误**。
       批次 20-B2 实测：src/hir.tc:372 报 `T-PAR-E101 期待 RBracket，实际读到 )`。
     """
-    m = re.search(r'(?:base\.)?nodes\s*\[', s)
+    m = re.search(NODES + r'\s*\[', s)
     if not m:
         return None
     i = m.end() - 1              # 指向 '['

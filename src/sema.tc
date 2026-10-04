@@ -953,19 +953,15 @@ pub fn intlit_overflow_warn(e: i64, target: i64) void {
     if (tname == "bool") { return; }                  // bool 走独立标量语义，不算有界整数窄化
     if (is_int_name(tname) == false) { return; }
     var lit_id: i64 = e;
-    var nn: Node = base.nodes[e];
     if (base.node_kind((e as u64)) == "paren") {                         // 透传括号
         var inner: i64 = base.node_na((e as u64));
-        nn = base.nodes[inner];
         lit_id = inner;
     }
     var neg: bool = false;
     if (base.node_kind((e as u64)) == "unary" && base.node_sa((e as u64)) == "-") {         // -257 → unary("-", int 257)
         var opid: i64 = base.node_na((e as u64));
-        var op: Node = base.nodes[opid];
         if (base.node_kind((opid as u64)) == "int") {
             neg = true;
-            nn = op;
             lit_id = opid;
         } else {
             return;                                    // -x 不是字面量，无法静态定界
@@ -4010,20 +4006,18 @@ pub fn fmt_scan_list(h: i64, lim: i64) void {
 
 pub fn fmt_scan_subtree(x: i64, lim: i64) void {
     if (x < 0 || x >= lim) { return; }
-    var xn: Node = base.nodes[x];
     if (base.node_kind((x as u64)) == "call" && base.node_na((x as u64)) >= 0) {
         if (base.node_sa((base.node_na((x as u64)) as u64)) == "format" && (base.node_kind((base.node_na((x as u64)) as u64)) == "ident" || base.node_kind((base.node_na((x as u64)) as u64)) == "member")) {
             infer_expr(x);          // 就地改写成 __fmt_N(...)，幂等
-            xn = base.nodes[x];          // 重读：na/la 已被改写
         }
     }
     fmt_scan_subtree(base.node_na((x as u64)), lim);
     fmt_scan_subtree(base.node_nb((x as u64)), lim);
-    fmt_scan_subtree(base.node_nc((xn.id as u64)), lim);
+    fmt_scan_subtree(base.node_nc((x as u64)), lim);
     fmt_scan_subtree(base.node_nd((x as u64)), lim);   // S4 §0.14.7 SoA：侧表访问器（原 .nd）
     fmt_scan_list(base.node_la((x as u64)), lim);
     fmt_scan_list(base.node_lb((x as u64)), lim);
-    fmt_scan_list(base.node_lc((xn.id as u64)), lim);
+    fmt_scan_list(base.node_lc((x as u64)), lim);
 }
 
 // ── 管道算子降解（reference.md §3.15）──────────────────────────
@@ -6964,7 +6958,7 @@ pub fn infer_expr_body(e: i64) i64 {
     if (k == "call") {
         // 实参不走通用遍历，嵌套其中的 format 只能在这里补扫（详见 fmt_scan_subtree）
         if (parse.g_has_format) { fmt_scan_list(base.node_la((e as u64)), e); }
-        var cn: Node = base.nodes[base.node_na((e as u64))];
+        var cn_id: i64 = base.node_na((e as u64));   // S4 批次 20-D：Node 局部量 → 裸索引局部量
         // R3 类别格静态分派：若 callee 是类型组入口，按首实参静态类型选最具体子句改写 callee。
         // 改写后目标名（`__name__cK` 或单态实例名）不在类型组表里，重入 infer_expr 不会再分派，自然收敛。
         if (base.node_kind((base.node_na((e as u64)) as u64)) == "ident") {
@@ -7019,11 +7013,10 @@ pub fn infer_expr_body(e: i64) i64 {
             if (str_len(vname) as i64 > 0) {
                 var ctor_name: string = base.sb_cat3(vname, "_from_", base.node_sa((base.node_na((e as u64)) as u64)));
                 var ctor_id: i64 = base.mk_ident(ctor_name, -1);
-                base.node_set_span_id(ctor_id, base.node_span_id(cn.id)); base.node_set_span_id(ctor_id, base.node_span_id(cn.id)); base.node_set_span_id(ctor_id, base.node_span_id(cn.id));
+                base.node_set_span_id(ctor_id, base.node_span_id(cn_id)); base.node_set_span_id(ctor_id, base.node_span_id(cn_id)); base.node_set_span_id(ctor_id, base.node_span_id(cn_id));
                 base.node_set_na((e as u64), ctor_id);
                 // S4 批次 20-B：删除 `base.nodes[e] = n;` —— `n` 就是 `base.nodes[e]` 自身，
                 //   **恒等赋值**（写回同槽同值，连 id 都不变）⇒ 删除严格等价、零风险。
-                cn = base.nodes[base.node_na((e as u64))];
             }
         }
         if (base.node_kind((base.node_na((e as u64)) as u64)) == "ident") {
@@ -10524,7 +10517,6 @@ pub fn mangle_modules() void {
     // 否则模块内写 `B.T` 会被 Pass 2 当成本模块的 T 误重整）。
     var i: i64 = 0;
     while (i < tot) {
-        var nd: Node = base__nodes[i];
         if (base.node_kind((i as u64)) == "member" && base.node_na((i as u64)) >= 0) {
             if (base.node_kind((base.node_na((i as u64)) as u64)) == "ident" && in_mod_aliases(base.node_sa((base.node_na((i as u64)) as u64)))) {
                 var di: i64 = def_lookup(base.node_sa((base.node_na((i as u64)) as u64)), base.node_sa((i as u64)));
@@ -10538,34 +10530,31 @@ pub fn mangle_modules() void {
                     base.node_set_sa((i as u64), mangled_name(real_alias, base.node_sa((i as u64))));
                     base.node_set_kind((i as u64), "ident");
                     base.node_set_na((i as u64), -1);   // 丢弃对象（模块名）子节点
-                    slice_set(base__nodes, i, nd);
                 }
                 // 未命中则保持 member 不变：同名局部/字段访问不受影响（由后续检查兜底）
             }
-        } else if (base.node_kind((i as u64)) == "named" && base.node_sb((nd.id as u64)) != "") {
-            var di2: i64 = def_lookup(base.node_sb((nd.id as u64)), base.node_sa((i as u64)));
-            if (di2 < 0) { di2 = reexport_lookup(base.node_sb((nd.id as u64)), base.node_sa((i as u64))); }
+        } else if (base.node_kind((i as u64)) == "named" && base.node_sb((i as u64)) != "") {
+            var di2: i64 = def_lookup(base.node_sb((i as u64)), base.node_sa((i as u64)));
+            if (di2 < 0) { di2 = reexport_lookup(base.node_sb((i as u64)), base.node_sa((i as u64))); }
             if (di2 >= 0) {
                 var real_alias2: string = lex__g_def_alias[di2];
                 check_mod_visible(real_alias2, base.node_sa((i as u64)), di2, i);
                 base.node_set_sa((i as u64), mangled_name(real_alias2, base.node_sa((i as u64))));
             } else {
-                err_no_symbol(base.node_sb((nd.id as u64)), base.node_sa((i as u64)), i);
+                err_no_symbol(base.node_sb((i as u64)), base.node_sa((i as u64)), i);
             }
-            base.node_set_sb((nd.id as u64), "");
-            slice_set(base__nodes, i, nd);
-        } else if (base.node_kind((i as u64)) == "struct_lit" && base.node_sb((nd.id as u64)) != "") {
-            var di3: i64 = def_lookup(base.node_sb((nd.id as u64)), base.node_sa((i as u64)));
-            if (di3 < 0) { di3 = reexport_lookup(base.node_sb((nd.id as u64)), base.node_sa((i as u64))); }
+            base.node_set_sb((i as u64), "");
+        } else if (base.node_kind((i as u64)) == "struct_lit" && base.node_sb((i as u64)) != "") {
+            var di3: i64 = def_lookup(base.node_sb((i as u64)), base.node_sa((i as u64)));
+            if (di3 < 0) { di3 = reexport_lookup(base.node_sb((i as u64)), base.node_sa((i as u64))); }
             if (di3 >= 0) {
                 var real_alias3: string = lex__g_def_alias[di3];
                 check_mod_visible(real_alias3, base.node_sa((i as u64)), di3, i);
                 base.node_set_sa((i as u64), mangled_name(real_alias3, base.node_sa((i as u64))));
             } else {
-                err_no_symbol(base.node_sb((nd.id as u64)), base.node_sa((i as u64)), i);
+                err_no_symbol(base.node_sb((i as u64)), base.node_sa((i as u64)), i);
             }
-            base.node_set_sb((nd.id as u64), "");
-            slice_set(base__nodes, i, nd);
+            base.node_set_sb((i as u64), "");
         }
         i = i + 1;
     }
@@ -10577,7 +10566,6 @@ pub fn mangle_modules() void {
         while (j < tot) {
             var m: string = base.node_mod(j);
             if (m != "") {
-                var n2: Node = base__nodes[j];
                 var k: string = base.node_kind((j as u64));
                 var hit: bool = false;
                 if (k == "ident" || k == "named" || k == "struct_lit") { hit = true; }
@@ -10586,7 +10574,6 @@ pub fn mangle_modules() void {
                 if (hit) {
                     if (def_lookup(m, base.node_sa((j as u64))) >= 0) {
                         base.node_set_sa((j as u64), mangled_name(m, base.node_sa((j as u64))));
-                        slice_set(base__nodes, j, n2);
                     }
                 }
             }
@@ -10603,7 +10590,6 @@ pub fn mangle_modules() void {
         sel_validate();
         var p: i64 = 0;
         while (p < tot) {
-            var n3: Node = base__nodes[p];
             var k3: string = base.node_kind((p as u64));
             var hit3: bool = false;
             if (k3 == "ident" || k3 == "named" || k3 == "struct_lit") { hit3 = true; }
@@ -10615,7 +10601,7 @@ pub fn mangle_modules() void {
                     // 仅对 src 治理范围内、真实 anchor 的标识符/命名类型/结构体字面量生效；
                     // 合成节点（ln==0，误归因到行 1 的 phantom）一律跳过，避免噪声。
                     var owner: string = lex__g_sel_mod[si];
-                    if (base.node_span_id(n3.id).line > 0
+                    if (base.node_span_id(p).line > 0
                         && (k3 == "ident" || k3 == "named" || k3 == "struct_lit")
                         && is_src_mod(base.node_mod(p))
                         && owner != base.node_mod(p)
@@ -10623,7 +10609,7 @@ pub fn mangle_modules() void {
                         var repl: string = mangled_name(owner, base.node_sa((p as u64)));
                         var sl: i64 = parse.n_line(p);
                         var sc: i64 = parse.n_col(p);
-                        var ec: i64 = sc + ((base.node_span_id(n3.id).end_col - base.node_span_id(n3.id).col) as i64);
+                        var ec: i64 = sc + ((base.node_span_id(p).end_col - base.node_span_id(p).col) as i64);
                         var di: i64 = base__diag_new("T-MOD-W561", "warning",
                             "跨模块访问必须使用模块限定名 " + repl + "，不能用裸名 " + base.node_sa((p as u64)),
                             parse.n_file(p), sl, sc, sl, ec);
@@ -10632,7 +10618,6 @@ pub fn mangle_modules() void {
                         base__diag_set_fs(di, fx);
                     }
                     base.node_set_sa((p as u64), mangled_name(lex__g_sel_mod[si], lex__g_sel_orig[si]));
-                    slice_set(base__nodes, p, n3);
                 }
             }
             p = p + 1;
@@ -11005,9 +10990,7 @@ pub fn meta_eval_closure_make(e: i64) i64 {
         c = base__kids[c].next;
     }
     var cm: i64 = base__mk_closure_make(base.node_sa((e as u64)), h, -1);
-    var cmn: Node = base__nodes[cm];
-    base.node_set_sb((cmn.id as u64), base.node_sb((e as u64)));
-    slice_set(base__nodes, cm, cmn);
+    base.node_set_sb((cm as u64), base.node_sb((e as u64)));
     return cm;
 }
 
@@ -12280,10 +12263,9 @@ pub fn meta_fold_expr(e: i64) void {
     // 指令（COMPTIME 等）即失效，必须断开映射，否则后续 infer 会按**折叠前**的
     // 语义标签分派（实测：`int -> comptime` → 读 n.na = -1 → 越界崩溃）。
     hir.hir_invalidate(e);
-    var dst: Node = base__nodes[e];
     base.node_set_kind((e as u64), base.node_kind((v as u64)));
     base.node_set_sa((e as u64), base.node_sa((v as u64)));
-    base.node_set_sb((dst.id as u64), base.node_sb((v as u64)));
+    base.node_set_sb((e as u64), base.node_sb((v as u64)));
     base.node_set_ia((e as u64), base.node_ia((v as u64)));
     base__node_set_ba((e as u64), base__node_ba((v as u64)));   // S4 §0.14.7 SoA：侧表访问器（原 .ba；第十批）
     base.node_set_na((e as u64), base.node_na((v as u64)));
@@ -12293,7 +12275,6 @@ pub fn meta_fold_expr(e: i64) void {
     base.node_set_la((e as u64), base.node_la((v as u64)));   // array_lit 的元素链（其余字面量此处均为 -1）
     base.node_set_lb((e as u64), base.node_lb((v as u64)));
     base__node_set_lc((e as u64), base__node_lc((v as u64)));   // S4 §0.14.7 SoA：侧表访问器（原 .lc；第十一批）
-    slice_set(base__nodes, e, dst);
 }
 
 // `meta { ... }` → 编译期执行，随后清空语句表（不产生任何运行期代码）
@@ -12309,9 +12290,7 @@ pub fn meta_run_block(b: i64) void {
         }
         return;
     }
-    var bn2: Node = base__nodes[b];
     base.node_set_la((b as u64), -1);
-    slice_set(base__nodes, b, bn2);
 }
 
 // 通用子树遍历：只认 na/nb/nc/nd + la/lb/lc 七个槽（未用槽一律 -1），
@@ -12723,7 +12702,6 @@ pub fn mb_fold_inplace(e: i64) void {
     if (v < 0) { return; }
     // 同 meta_fold_expr：就地改写 kind ⇒ 原 HIR 指令（MBUILTIN 等）失效。
     hir.hir_invalidate(e);
-    var dst: Node = base__nodes[e];
     base.node_set_kind((e as u64), base.node_kind((v as u64)));
     base.node_set_sa((e as u64), base.node_sa((v as u64)));
     base.node_set_ia((e as u64), base.node_ia((v as u64)));
@@ -12733,7 +12711,6 @@ pub fn mb_fold_inplace(e: i64) void {
     base__node_set_nc((e as u64), -1);   // S4 §0.14.7 SoA：侧表访问器（原 .nc；第九批）
     base__node_set_nd((e as u64), -1);   // S4 §0.14.7 SoA：侧表访问器（原 .nd）
     base.node_set_la((e as u64), base.node_la((v as u64)));   // @zeroed 折出来的是 array_lit，元素链在 la
-    slice_set(base__nodes, e, dst);
 }
 
 // `if (@type_equal(...)) A else B` —— 条件折成 bool 字面量后剪掉未取分支。
@@ -13321,12 +13298,10 @@ pub fn mark_call_callees() void {
     var i: i64 = 0;
     while (i < tot) {
         if (base.node_kind((i as u64)) == "call" && base.node_na((i as u64)) >= 0) {
-            var ce: Node = base__nodes[base.node_na((i as u64))];
             if (base.node_kind((base.node_na((i as u64)) as u64)) == "member") {
                 // S4 §0.14.7 SoA：bd 已外置（原 `ce.bd = true` + 整节点回写）。
                 // 注意 bd 字段此处是**第二种语义**：member 节点 = 某 call 的 callee。
                 base.node_set_bd((base.node_na((i as u64)) as u64), true);
-                slice_set(base__nodes, base.node_na((i as u64)), ce);
             }
         }
         i = i + 1;

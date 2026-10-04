@@ -1397,6 +1397,49 @@ if (n.td > 0) { n.td = -1; }          // ← 写在副本上：从未写回 node
   · ⭐⭐ **gate L2 25/0（2876.2s）+ run_examples 双后端 512.6s 全绿** —— 这是「删掉 64 条回写
     **运行时无人消费**」的**决定性证据**（生成代码的 diff 证明不了运行时值的去向）。
 
+**批次 20-D：降级名解锁 + 剩余 SKIP 人工裁决（⭐ `.id` 真站点 21 → 2；2026-10-05）**
+- ⭐ **坑四（工具拼写盲区）：`nodes` 有三种写法**。除 `nodes` / `base.nodes` 之外，还有 **`base__nodes`**
+  —— 局部 `var base: …` 遮蔽 base 模块的作用域里，跨模块访问必须写**降级名**（`mod.foo` → `mod__foo`）。
+  工具正则只认前两种 ⇒ 8 处 SKIP **纯属拼写卡点、无任何语义风险**。修法：抽出
+  `NODES = r'(?:base(?:\.|__))?nodes'` 供 `nodes_index` / `_is_slice_set` 共用 ⇒ 立刻解锁
+  **18 删 / 14 重写**（`slice_set(base__nodes, …)` 同理）。
+- ⭐⭐ **`assigned_between` 只查「变量被重新赋值」，不查「侧表被写入」** —— 本批最重要的新教训：
+  · 反例 `sema::infer_expr_body` 的 `cn`：`var cn: Node = nodes[node_na(e)];` … `node_set_na((e…), …)`
+    （6994 行**改了 `na(e)`**）… 才到 `cn.id` 读点 ⇒ **不能**内联成 `node_na((e as u64))`
+    （旧值 ≠ 新值）。⇒ 改法：**Node 局部量 → 裸索引局部量**（`var cn_id: i64 = node_na(e);`），
+    读点改 `cn_id`。这是「索引表达式含侧表 getter」时**唯一安全**的等价形态。
+  · 正例 `tir::tir_match_pattern_cond` 的 `p`：区间内无 `node_set_na` ⇒ 可直接内联。
+- **人工裁决的 6 处（逐处论证）**：
+  · `sema::fmt_scan_subtree` 的 `xn`：两处赋值都是 `nodes[x]` ⇒ `xn.id` **恒等于 `x`**
+    （na/la 被改写也不影响 id）⇒ 内联为 `x`，声明与「重读」赋值一并删。
+  · `sema` 950 段的 `nn` / `op`：**只写不读**（`nn` 仅被 `=` 赋值、`op` 只用于给 `nn` 赋值）
+    ⇒ 连同声明共 4 行一并删（`lit_id` 才是真语义载体）。
+  · `tir::tir_emit_call` 的 `n` / `callee`：`callee` 只写不读（其原读点 `callee.na` 已在第十七批
+    改走侧表）⇒ 删 3 行；`n.id` 内联为 `e`。
+  · `tir::tir_match_pattern_cond` 的 `p`：内联为 `node_na(armId)`；行内嵌的
+    `slice_set(base.nodes, node_na(armId), p);` **只删该子语句**（`_is_slice_set` 要求行首匹配，
+    故工具看不见这种「嵌在 `if (…) { …; slice_set(…); }` 里」的回写）。
+  · `codegen_dev` 的 `dn`：**保留** —— 初值是 `dev_safe_node(d)`（不是 `nodes[…]`），
+    `dn.id` 在 d 越界时是零节点的 id ≠ `d` ⇒ 不能内联，留待「`dev_safe_node` 改返索引」时一并处理。
+- **落成**：`src/sema.tc` + `src/tir.tc`，**50 删 / 21 增**；
+  `.id` 真站点 21 → **2**（只剩 `node_new` 的写入点与 `codegen_dev` 的 `dn.id`）、
+  `nodes` 真站点 89 → **60**、`slice_set(nodes, …)` → **0**、SKIP 16 → **1**。
+- **验证链（全绿，commit `?`）**：
+  · `tc check src/tc.tc` = **0 error / 530 warning**（warning 与基线逐条一致，无新增）。
+  · 自举 g1 2m13s → **seed vs g1 逐字节 IDENTICAL**（`.c` 2 528 771 B / `e2931ea0…`、
+    `.h` 130 903 B / `d5bf239b…`）。
+  · IR 快照：**2 DIFF（`src/tc.tc::c` / `::ll`）、0 NEW / 0 GONE、examples 零 DIFF**
+    ⇒ 符合「仅表示漂移」的正常形态（见致命坑：examples 若 DIFF 即行为变更，必须追到底）。
+  · **旁路对照**（旧 seed 与新 g1 分别对 `src/tc.tc` 编译后对拍 `.c`）：**61 删 / 31 增**，
+    删行分类 = 15 死声明 + 11 空回写 + 21 含 `.id` 旧行 + 14 槽位改名行（合计恰 61，无第四类）；
+    两侧 `{`/`}` 净差同为 **+3**、`(`/`)` 净差同为 **0**；增行里的 `name__NNNNN` 槽位改名
+    **100% 与删行配对**、**0 个新增名** ⇒ 判定**语义中立**。
+  · `--update` 重录基线（117 targets / 354 entries，282.2s）→ **gate L2 25 passed / 0 failed
+    （2934.1s）**，其中 run_examples 双后端 532.3s 全绿、自举四代不动点 `g2==g3==g4` PASS
+    ⇒ 11 条被删的 `slice_set` 回写与 4 条「只写不读」赋值链**运行时确无消费者**。
+  · 收口：安装 `g4 → out/dbg/tc.exe`、`gr → out/rls/tc.exe`，复检仍为 **0 error / 530 warning**；
+    清理 `out/_p20d`、`out/_c*.json`；`src/tir.tc`（`-text`）**CRLF 5608 行全程保真**未漂移。
+
 
 **剩余字段实测使用量（`.F` 命中数；泛型名字段含非 Node 假阳性，仅作排序参考）**
 （✅ 已迁 `se`、`has_sa`、`has_sb`、`has_sc`、`be`、`bf`、`memspace`、`bd`、`bb`、`bc`、`sc`、`nd`、`ib`、`nc`、`ba`、`lc`、`sb`、`ia`、`lb`、`nb`、`la`、`na`、`kind`、**`sa`** —— 共 **24 个字段**）。
