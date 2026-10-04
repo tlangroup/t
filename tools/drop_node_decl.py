@@ -198,26 +198,36 @@ def scan(path, apply=False, safe_only=False):
             if pat.search(cj):
                 use_lines.append(j)
         decl_idx = nodes_index(l)
+        ss_lines = [j for j in use_lines if _is_slice_set(code[j], name, decl_idx)]
+        # R3 候选行：该行里 name 的所有出现都是 `name.id`（可安全内联成索引表达式）
+        id_lines = [j for j in use_lines
+                    if not _is_slice_set(code[j], name, decl_idx)
+                    and not pat.search(idpat.sub('', code[j]))]
+        # 剩下的就是「既不是配对回写、也不是纯 .id 使用」的脏行 ⇒ 任何规则都够不着
+        dirty = [j for j in use_lines if j not in ss_lines and j not in id_lines]
         if not use_lines:
             drop.append((i, name, 'R1 死声明'))
-        elif (not reassigned) and decl_idx and all(_is_slice_set(code[j], name, decl_idx) for j in use_lines):
+        elif (not reassigned) and decl_idx and len(ss_lines) == len(use_lines):
             drop.append((i, name, 'R2 成对回写'))
             for j in use_lines:
                 drop.append((j, name, 'R2 成对回写(slice_set)'))
-        elif (not reassigned) and decl_idx and (not safe_only) and all(
-                not pat.search(idpat.sub('', code[j])) for j in use_lines):
-            # 规则3：所有出现都是 `name.id` ⇒ 就地替换为索引表达式后删声明
+        elif (not reassigned) and decl_idx and (not safe_only) and not dirty and id_lines:
+            # 规则3/4：把 `name.id` 就地换成索引表达式，然后删声明；
+            #   规则4 额外允许「尾部配对回写」 `slice_set(nodes, IDX, name)` —— 载荷已全部走侧表，
+            #   该回写只把 `id` 写回同槽（nodes[i].id == i）⇒ **无操作**，可与声明一起删。
             # ⚠ 追加防线：索引表达式里的变量若在「声明行 → 使用行」之间被改过，
             #   则 `n.id`（旧值）≠ 替换后的索引（新值）⇒ 该处替换会静默取错节点，必须 SKIP。
             names = idx_vars(decl_idx)
-            risky = [j for j in use_lines if assigned_between(code, i, j, names)]
+            risky = [j for j in id_lines if assigned_between(code, i, j, names)]
             if risky:
                 keep.append((i, name, len(risky)))
                 r3_skipped.append((i, name, decl_idx, len(risky)))
             else:
-                for j in use_lines:
+                for j in id_lines:
                     rewrite.append((j, name, decl_idx))
-                drop.append((i, name, 'R3 id 反查'))
+                for j in ss_lines:
+                    drop.append((j, name, 'R4 删配对回写(slice_set)'))
+                drop.append((i, name, 'R4 id 反查+回写' if ss_lines else 'R3 id 反查'))
         else:
             keep.append((i, name, len(use_lines)))
     if apply:
