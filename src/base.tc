@@ -1788,7 +1788,12 @@ pub struct Node {
     // node_memspace()/node_set_memspace()（默认 0）。Device 指针地址空间
     // （0=host；1=global/dev_ptr；3=shared；5=local），仅 pointer 类型节点使用。
     la: i64;
-    lb: i64;
+    // S4 第十四批（§0.14.7）：lb 已迁出为属性侧表 g_node_lb，访问面走 node_lb()/node_set_lb()
+    // （默认 **-1** = 空 kids 链；⚠ 与第十一批的 `lc` 同族，同样带 **-2** 哨兵，但语义不同：
+    //   `lc` 的 -2 = 「本体已由别处消费的合成声明」；`lb` 的 -2 = 「**该列表不存在**」，
+    //   典型是 `if` 无 else 分支（`lb == -2`，sema 5963 / tir 2395）与「空参数列表」
+    //   （sema 9651 明写：用 -2 表示空，因为 -1 会被当作 null 链表头处理）。
+    //   判据遍布 `if (n.lb > -2)` / `if (n.lb != -2)`，详见 node_lb 处注释。）
     // S4 第十一批（§0.14.7）：lc 已迁出为属性侧表 g_node_lc，访问面走 node_lc()/node_set_lc()
     // （默认 **-1** = 空 kids 链；⚠ 另有特殊哨兵 **-2** = 本体已由别处消费的合成声明，
     //   判据遍布 `if (n.lc > -2)` / `if (n.lc != -2)` / `if (n.lc == -2)`，详见 node_lc 处注释）。
@@ -1886,6 +1891,8 @@ pub var g_node_ba: []i64;                  // S4 第十批：nodes[i] 的 ba 通
                                            // ⚠ 该槽按 kind **复用**于多种语义（见 node_ba 处注释）
 pub var g_node_lc: []i64;                  // S4 第十一批：nodes[i] 的 lc kids 链表头（默认 -1 = 空链）
                                            // ⚠ 另含特殊哨兵 **-2**（见 node_lc 处注释）
+pub var g_node_lb: []i64;                  // S4 第十四批：nodes[i] 的 lb kids 链表头（默认 -1 = 空链）
+                                           // ⚠ 与 lc 同族，**同样带 -2 哨兵**（见 node_lb 处注释）
 pub var g_node_ia: []i64;                  // S4 第十三批：nodes[i] 的 ia 通用整数槽（默认 -1 = 无标记）
                                            // ⚠ 与 ib 同族但复用 13 种语义（见 node_ia 处注释）
 
@@ -1934,6 +1941,7 @@ pub fn sidetable_init() void {
     sidetable_register("node_ba", "S4");        // SoA：ba 通用 bool 载荷（第十批，默认 false）
     sidetable_register("node_lc", "S4");        // SoA：lc kids 链表头（第十一批，默认 -1）
     sidetable_register("node_ia", "S4");        // SoA：ia 通用整数槽（第十三批，默认 -1）
+    sidetable_register("node_lb", "S4");        // SoA：lb kids 链表头（第十四批，默认 -1；另有 -2 哨兵）
 }
 pub fn node_mod(n: u64) string {
     sidetable_init();
@@ -2053,7 +2061,7 @@ pub fn cst_dump(role: string, id: i64, depth: i64) void {
     var n_nd: i64 = node_nd((id as u64));   // S4 §0.14.7 SoA：侧表读（原 n.nd）
     if (n_nd >= 0) { cst_dump("nd", n_nd, depth + 1); }
     var c: i64 = n.la; while (c >= 0) { cst_dump("", kids[c].val, depth + 1); c = kids[c].next; }
-    c = n.lb; while (c >= 0) { cst_dump("", kids[c].val, depth + 1); c = kids[c].next; }
+    c = node_lb((id as u64)); while (c >= 0) { cst_dump("", kids[c].val, depth + 1); c = kids[c].next; }
     c = node_lc((id as u64)); while (c >= 0) { cst_dump("", kids[c].val, depth + 1); c = kids[c].next; }   // S4 §0.14.7 SoA：侧表读（原 n.lc；第十一批）
     sb_append_char(g_cst_sb, 41);            // 41 = ')'
 }
@@ -2493,6 +2501,30 @@ pub fn node_set_lc(n: u64, v: i64) void {
     if (id < 0 || id >= slice_len(g_node_lc)) { return; }
     slice_set(g_node_lc, id, v);
 }
+// S4 第十四批（§0.14.7）：kids 链表头 lb（默认 **-1** = 空链；越界读返 -1，逐点等价于
+// node_new 旧初值 `n.lb = -1`）。`la`/`lb`/`lc` 三槽同源（见 Node 结构体处注释：
+// `-1` = null 列表，`-2` = **该列表不存在**），本槽与第十一批的 `lc` 一样带着 `-2` 哨兵：
+//   · 语义①「无该分支列表」—— `sema::check_if`（5963）：`lb == -2` 表示**无 else 分支**；
+//     `tir::tir_emit_if`（2395）：`var has_else: bool = n.lb > -2;`
+//   · 语义②「空参数列表」—— `sema`（9651）：参数列表用 `-2` 表示空
+//     （写明「-1 会被当作 null 链表头处理」，故二者不可合并）。
+//   · 判据遍布：`> -2`（parse 1682/1797 的 cap_bind_stmts / envm_stmts；sema 5702/5744/5771
+//     的 vl_collect_breaks / vl_rewrite_breaks / vl_body_has_break_v；sema 9837 desugar_stmts；
+//     sema 12452 meta_exec；codegen_c 1102/3706）、`!= -2`（sema 7986/8466）。
+// ⇒ 迁移铁律（与 `lc` 全同）：① 侧表默认值 **-1**（不是 -2，见 node_new）；
+//   ② 越界读返 **-1**（返 -2 会让「越界节点」被误判成「无 else 分支 / 空参数列表」，
+//      是**静默错误**）；③ 所有 `> -2` / `!= -2` 判据**逐字保留**，不得改写成 `>= 0` 之类。
+pub fn node_lb(n: u64) i64 {
+    sidetable_init();
+    var id = nr_idx(n);
+    if (id < 0 || id >= slice_len(g_node_lb)) { return -1; }
+    return g_node_lb[id];
+}
+pub fn node_set_lb(n: u64, v: i64) void {
+    var id = nr_idx(n);
+    if (id < 0 || id >= slice_len(g_node_lb)) { return; }
+    slice_set(g_node_lb, id, v);
+}
 // S4 第十三批（§0.14.7）：通用整数槽 ia（默认 **-1** = 无标记；越界读返 -1，与 node_new
 // 旧初值 `n.ia = -1` 逐点一致）。ib 已先跑了第八批，本批是第二个「索引型整数槽」，
 // 直接复用 -1 哨兵范式（⚠ 越界读必须返 -1 而非 0：返 0 会把「无标记」读成「radix 0」
@@ -2701,7 +2733,8 @@ pub fn node_new(kind: string) u64 {
     // S4 §0.14.7 SoA：nd 已外置为侧表（下方 append(-1) 锁步）
     // S4 第四批（§0.14.7）：memspace 已外置为侧表（默认 0=host，见下方 append）
     n.la = -1;
-    n.lb = -1;
+    // S4 第十四批（§0.14.7）：lb 已外置为侧表 g_node_lb（默认 -1 = 空链，见下方 append）
+    //   ⚠ 注意：此处旧初值是 **-1**（node_new 从未写过 -2），-2 只在**调用方**经构造器实参写入。
     // S4 第十一批（§0.14.7）：lc 已外置为侧表 g_node_lc（默认 -1 = 空链，见下方 append）
     n.id = slice_len(nodes);   // S5 step2：裸索引（append 后恰为该节点下标），供 node_span_id 机械读方迁移
     append(nodes, n);
@@ -2730,6 +2763,7 @@ pub fn node_new(kind: string) u64 {
     append(g_node_nc, -1);                                  // S4 §0.14.7 SoA：nc 默认 -1（无子节点；第九批）
     append(g_node_ba, 0);                                   // S4 §0.14.7 SoA：ba 默认 false（第十批）
     append(g_node_lc, -1);                                  // S4 §0.14.7 SoA：lc 默认 -1（空 kids 链；第十一批）
+    append(g_node_lb, -1);                                  // S4 §0.14.7 SoA：lb 默认 -1（空 kids 链；第十四批；-2 只由调用方经构造器实参写入）
     append(g_node_ia, -1);                                  // S4 §0.14.7 SoA：ia 默认 -1（无标记；第十三批）
     var nref_tag: i64 = nk_of_kind(kind);
     if (nref_tag < 0) { nref_tag = 0; }   // 未注册 kind 暂归 tag=0（g_node_nref 当前无消费方，安全）
@@ -2877,7 +2911,7 @@ pub fn mk_EnumDecl(sa: string, sb: string, la: i64, lb: i64, ti: i64) u64 {
     n.sa = sa;
     node_set_sb((id as u64), sb);
     n.la = la;
-    n.lb = lb;
+    node_set_lb((id as u64), lb);
     slice_set(nodes, id, n);
     if (ti >= 0) { node_at(id, ti); }
         cst_register_RecEnumDecl(sa, sb, la, lb); // S2 dual-write
@@ -2914,7 +2948,7 @@ pub fn mk_FlagDecl(sa: string, sb: string, la: i64, lb: i64, ti: i64) u64 {
     n.sa = sa;
     node_set_sb((id as u64), sb);
     n.la = la;
-    n.lb = lb;
+    node_set_lb((id as u64), lb);
     slice_set(nodes, id, n);
     if (ti >= 0) { node_at(id, ti); }
         cst_register_RecFlagDecl(sa, sb, la, lb); // S2 dual-write
@@ -2926,7 +2960,7 @@ pub fn mk_FlagSetDecl(sa: string, la: i64, lb: i64, ti: i64) u64 {
     var n: Node = nodes[id];
     n.sa = sa;
     n.la = la;
-    n.lb = lb;
+    node_set_lb((id as u64), lb);
     slice_set(nodes, id, n);
     if (ti >= 0) { node_at(id, ti); }
         cst_register_RecFlagSetDecl(sa, la, lb); // S2 dual-write
@@ -2941,7 +2975,7 @@ pub fn mk_FuncDecl(sa: string, ba: bool, bb: bool, na: i64, la: i64, lb: i64, lc
     node_set_bb((id as u64), bb);   // S4 §0.14.7 SoA：取代 `n.bb = bb`（形参保留，调用点不变）
     n.na = na;
     n.la = la;
-    n.lb = lb;
+    node_set_lb((id as u64), lb);
     node_set_lc((id as u64), lc);   // S4 §0.14.7 SoA：取代 `n.lc = lc`（形参保留，调用点不变；第十一批）
     slice_set(nodes, id, n);
     if (ti >= 0) { node_at(id, ti); }
@@ -2968,7 +3002,7 @@ pub fn mk_lambda(sa: string, na: i64, la: i64, lb: i64, lc: i64, ti: i64) u64 {
     n.sa = sa;
     n.na = na;
     n.la = la;
-    n.lb = lb;
+    node_set_lb((id as u64), lb);
     node_set_lc((id as u64), lc);   // S4 §0.14.7 SoA：取代 `n.lc = lc`（形参保留，调用点不变；第十一批）
     slice_set(nodes, id, n);
     if (ti >= 0) { node_at(id, ti); }
@@ -3145,7 +3179,7 @@ pub fn mk_StructDecl(sa: string, sb: string, sc: string, has_sc: bool, ba: bool,
     node_set_has_sc((id as u64), has_sc);   // S4 §0.14.7 SoA：取代 `n.has_sc = has_sc`
     node_set_ba((id as u64), ba);   // S4 §0.14.7 SoA：取代 `n.ba = ba`（形参保留，调用点不变）
     n.la = la;
-    n.lb = lb;
+    node_set_lb((id as u64), lb);
     slice_set(nodes, id, n);
     if (ti >= 0) { node_at(id, ti); }
         cst_register_RecStructDecl(sa, sb, sc, has_sc, ba, la, lb); // S2 dual-write
@@ -3169,7 +3203,7 @@ pub fn mk_UnionDecl(sa: string, la: i64, lb: i64, ti: i64) u64 {
     var n: Node = nodes[id];
     n.sa = sa;
     n.la = la;
-    n.lb = lb;
+    node_set_lb((id as u64), lb);
     slice_set(nodes, id, n);
     if (ti >= 0) { node_at(id, ti); }
         cst_register_RecUnionDecl(sa, la, lb); // S2 dual-write
@@ -3221,7 +3255,7 @@ pub fn mk_VariantDecl(sa: string, la: i64, lb: i64, ti: i64) u64 {
     var n: Node = nodes[id];
     n.sa = sa;
     n.la = la;
-    n.lb = lb;
+    node_set_lb((id as u64), lb);
     slice_set(nodes, id, n);
     if (ti >= 0) { node_at(id, ti); }
         cst_register_RecVariantDecl(sa, la, lb); // S2 dual-write
@@ -3471,7 +3505,7 @@ pub fn mk_for(na: i64, nb: i64, nc: i64, la: i64, lb: i64, ti: i64) u64 {
     n.nb = nb;
     node_set_nc((id as u64), nc);   // S4 §0.14.7 SoA：取代 `n.nc = nc`（形参保留，调用点不变）
     n.la = la;
-    n.lb = lb;
+    node_set_lb((id as u64), lb);
     slice_set(nodes, id, n);
     if (ti >= 0) { node_at(id, ti); }
         cst_register_RecFor(na, nb, nc, la, lb); // S2 dual-write
@@ -3486,7 +3520,7 @@ pub fn mk_for_each(sa: string, sb: string, na: i64, la: i64, lb: i64, ti: i64) u
     node_set_sb((id as u64), sb);
     n.na = na;
     n.la = la;
-    n.lb = lb;
+    node_set_lb((id as u64), lb);
     slice_set(nodes, id, n);
     if (ti >= 0) { node_at(id, ti); }
         cst_register_RecForEach(sa, sb, na, la, lb); // S2 dual-write
@@ -3536,7 +3570,7 @@ pub fn mk_if(na: i64, la: i64, lb: i64, ti: i64) u64 {
     var n: Node = nodes[id];
     n.na = na;
     n.la = la;
-    n.lb = lb;
+    node_set_lb((id as u64), lb);
     slice_set(nodes, id, n);
     if (ti >= 0) { node_at(id, ti); }
         cst_register_RecIf(na, la, lb); // S2 dual-write
@@ -3898,7 +3932,7 @@ pub fn mk_while(na: i64, la: i64, lb: i64, ti: i64) u64 {
     var n: Node = nodes[id];
     n.na = na;
     n.la = la;
-    n.lb = lb;
+    node_set_lb((id as u64), lb);
     slice_set(nodes, id, n);
     if (ti >= 0) { node_at(id, ti); }
         cst_register_RecWhile(na, la, lb); // S2 dual-write

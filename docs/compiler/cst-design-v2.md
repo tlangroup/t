@@ -871,10 +871,82 @@ if (n.td > 0) { n.td = -1; }          // ← 写在副本上：从未写回 node
   `双轨对拍 219.6s PASS`、`C 后端自举 208.7s PASS`、`rls 快速通道 285.6s PASS`。
   收口：安装 `g4 → out/dbg/tc.exe`、`gr → out/rls/tc.exe`，复检 `tc check` 仍是 0 error / 531 warning。
 
+**批次 14：`lb`（kids 链表头，⚠ 与 `lc` 同族的**双哨兵** `-1` / `-2`，2026-10-04）**
+
+- **选组**：`lb 218` 是剩余字段里用量最低者，且与批次 11 已迁的 `lc` 同为 kids 链表头 ⇒ 模板、哨兵范式、
+  失败模式全部现成（`la`/`lb`/`lc` 三槽同源，`base.tc:1725` 明写 `-1` = null 列表、`-2` = 该列表不存在）。
+- **普查（批次 13 门禁等待期完成，只读）**：`.lb` 原始 218 → `tools/cls.py` 分出 REAL 193 / COMMENT 8 /
+  STRLIT 0；再剔除 12 处 S2 `tbl_Rec{EnumDecl,FlagDecl,FlagSetDecl,FuncDecl,Lambda,StructDecl,UnionDecl,
+  VariantDecl,For,ForEach,If,While}_lb` ⇒ **真实站点 181**。分布：sema 74 / codegen_c 33 / parse 28 /
+  tir 15 / base 14 / hir 6 / comptime_fold 3 / codegen_dev 2 / tir_to_ll 1。
+- ⚠⚠ **哨兵普查结论（本批最重要的一条）**：`lb` **有 `-2`**，与批次 11 的 `lc` 同族，但**语义不同**——
+  `lc` 的 `-2` = 「本体已由别处消费的合成声明」；`lb` 的 `-2` = 「**该列表不存在**」，典型是
+  `if` 无 else 分支（`sema:5963`「lb == -2 表示无 else 分支」、`tir:2395` `var has_else: bool = n.lb > -2;`）
+  与「空参数列表」（`sema:9651` 明写：用 `-2` 表示空，**-1 会被当作 null 链表头处理**，故二者不可合并）。
+  判据遍布 `> -2`（parse 1682/1797、sema 5702/5744/5771/9837/12452、codegen_c 1102/3706）
+  与 `!= -2`（sema 7986/8466）⇒ 迁移时三条铁律：① 侧表默认值 **-1**（`node_new:2704` 旧初值就是 `-1`，
+  `-2` **只由调用方经构造器实参**写入）；② 越界读返 **-1**（返 `-2` 会让「越界节点」被误判成
+  「无 else 分支 / 空参数列表」——**静默错误**）；③ 所有 `> -2` / `!= -2` 判据**逐字保留**。
+- **Node 值形参普查**（`tools/nvf.py`，修订后）：**只有 1 处需改签名** —— `tir.tc:2391
+  tir_emit_if(n: Node)` 直接读 `n.lb`（2395/2411），迁移后要按 `.id` 查侧表，而 Node 值传参丢末尾 `id`
+  字段（批次 9 致命坑）。唯一调用点 `tir.tc:2284` 的 `tir_emit_stmt` **已有 `sid`** 可用
+  （隔壁 `tir_emit_for(sid)` / `tir_emit_for_each(sid)` 正是同批改造的先例）⇒ 改 `tir_emit_if(sid: i64)`
+  + 函数内 `var n: Node = base.nodes[sid];`。另两个候选 `tir_match_pattern_cond` / `tir_emit_match`
+  读的是局部 Node（`dvn`），作用域有裸索引 ⇒ **不动签名**。
+- **存储**：`g_node_lb: []i64` + `node_lb()` / `node_set_lb()` + `sidetable_register("node_lb","S4")`
+  + `node_new` 锁步 `append(g_node_lb, -1)`；`Node` 结构体的 `lb: i64;` 删除，改为上述三条铁律的注释。
+  12 个构造器（`mk_EnumDecl` / `mk_FlagDecl` / `mk_FlagSetDecl` / `mk_FuncDecl` / `mk_lambda` /
+  `mk_StructDecl` / `mk_UnionDecl` / `mk_VariantDecl` / `mk_for` / `mk_for_each` / `mk_if` / `mk_While`）
+  **保留 `lb` 形参**，只把函数体 `n.lb = lb;` 改为 `node_set_lb((id as u64), lb);`（调用点不变）。
+- **`cst_dump`**：本函数本身就收索引 `id`（非 Node 值），读点改 `c = node_lb((id as u64));`。
+- **结果**：**172 行访问器调用**（读 155 / 写 17），分布 base 13 / parse 28 / sema 79 / tir 15 /
+  hir 6 / codegen_c 33 / comptime_fold 3 / tir_to_ll 1；加上 `tir_emit_if` 签名改造与 `codegen_dev`
+  两处手工站点。与 181 个真实站点的差值归因：`node_new` 初值由 append 取代（−1 写）、
+  `codegen_dev::dev_safe_node` 的零节点写删除（−1 写）、`clone_node` 等**传播型**站点一读一写同行（−若干）。
+
+- ⚠ **`codegen_dev` 两处站点需要人工判定（批次 13 的同场景，结论相反）**：
+  ① `dev_safe_node` 的 `n.lb = -1;` —— 零 Node 无 id，迁移后是**死写**还是**可等价消去**取决于默认值是否一致：
+  本例零节点初值恰为 `-1`，与 `node_lb` 越界读返回值 `-1` **一致** ⇒ 与第十一批 `lc` 同样处理（删除 + 论证注释）。
+  ⚠ 这与第十三批 `ia` 的结论**相反**：那里零节点写的是 `0` 而访问器越界返 `-1`，套不上「返默认值即等价」，
+  且经普查确认无消费方 ⇒ 按**死写**处理并删除。**同文件同形态的两处，判定可以完全相反，务必逐字段回看。**
+  ② `dev_trace_*` 里的 `var c: i64 = dn.lb;` → `base.node_lb((d as u64))`（`dn = dev_safe_node(d)`）。
+- ⚠ **`nodes` 唯一增长点复查**：全仓仍只有 `base.tc` 一处 `append(nodes, n)` ⇒ 侧表与 `nodes` 下标锁步成立。
+
+- **本批踩到并修掉的 3 个迁移工具 bug**（均为「自动改写产出错误代码」，靠完工后的机械兜底检查才发现 2 个）：
+
+| # | 现象 | 根因 | 处置 |
+|---|---|---|---|
+| 1 | `base.base.node_lb((d as u64))` 双限定 | `base.nodes[` 里优先命中了较短的 `nodes[`，替换起点算到 `base.` 之后 | `idx_at_end` 改为**由长到短**匹配前缀 |
+| 2 | 单行 `if (c) { X.lb = f(...); }` 产出括号不闭合；同行多语句 `n.na=-1; n.lb=-1; n.sa="";` 吞掉后续语句 | 写分支把 `=` 之后的**全部剩余文本**当 rhs | 加**护栏**：写点必须独占整条语句，否则判 UNMAPPED 交手工 |
+| 3 | `hir.tc` 6 处全部 nomap | 该文件通篇写 `var n: **base.**Node = base.nodes[d];`（类型标注带模块限定），识别正则只认裸 `Node` | `NODE_DECL_RE` 支持 `(?:base\.)?Node` |
+
+  ⇒ 由此得到一个**不依赖工具正确性的机械兜底**：对所有改动行做「括号/花括号平衡 + 无 `;;`」检查
+  （本批据此一次性扫出 4 行语法损坏）。**建议每批完工都跑一遍**（脚本做法：`git diff -U0` 取新行 →
+  逐行忽略字符串后计 `()` / `{}` 深度，负值或末尾非零即异常；跨行 `if (...) {` 开块是正常的 `+1`）。
+
+- 验证：`tc check` **0 error / 531 warning**（warning 全为既有命名风格告警）；g1 自举 **2m01s**；
+  **`src/tc.tc` 自身 seed vs g1 逐字节 IDENTICAL**（`.c` md5 `85c83578…` / `.h` md5 `702c1083…`）；
+  IR 快照 **3 DIFF / 0 NEW / 0 GONE（仅 `src/tc.tc::{c,h,ll}`）**，且 `::c` 的新值 `85c83578…` 与上面
+  seed/G1 差分对拍产出的 `.c` md5 **完全一致**（两个独立测量互相印证 ⇒ 漂移只来自源码自身变更）
+- ✅ **gate L2 = 25 passed / 0 failed（2536.7s）**：「产物快照比对（ll + c 双后端）347.3s PASS」（基线已重录，
+  不出现陈基线假 FAIL）、**「自举不动点 g2 == g3」253.5s PASS**、**「自举四代不动点 g2 == g3 == g4」152.3s PASS**；
+  `run_examples dbg（双后端，并行）421.7s PASS`、`conformance 99.5s PASS`、`双轨对拍 225.5s PASS`、
+  `C 后端自举 227.5s PASS`、`rls 快速通道 344.4s PASS`；本批动过 `hir.tc`，故特别关注
+  **「HIR AstGen 验证（emit-hir + 二进制往返）29.9s PASS」**与「HIR 解释器验证 3.3s PASS」。
+  收口：安装 `g4 → out/dbg/tc.exe`、`gr → out/rls/tc.exe`，复检 `tc check` 仍是 0 error / 531 warning。
+
 **剩余字段实测使用量（`.F` 命中数；泛型名字段含非 Node 假阳性，仅作排序参考）**
-`lb 218 / nb 461 / la 500 / na 1071 / kind 1187 / sa 1268`（`id` 为 S5 step2 过渡字段，随 `Node` 一并消失，不单列迁移）（✅ 已迁：`se`、`has_sa`、`has_sb`、`has_sc`、`be`、`bf`、`memspace`、`bd`、`bb`、`bc`、`sc`、`nd`、`ib`、`nc`、`ba`、`lc`、`sb`、`ia` —— 共 **18 个字段**）。
-> 迁移至此，`Node` 的**全部 bool 载荷已清空**（批次 10）、`la/lb/lc` kids 链槽族外置其一（`lc`，批次 11）、`na/nb/nc/nd` 四槽外置其二（`nd`、`nc`）、字符串族外置其二（`sc`、`sb`）、**通用整数槽 `ia`/`ib` 两槽全部清空**（批次 8 / 批次 13）。四类侧表形态（bool / string ×2 / 索引 `-1` / 带 `-2` 哨兵的索引）**全部验证成立** ⇒ 后续外置只剩工作量、无范式风险。剩余 6 个字段里 `lb 218` 最低（`lc` 已迁完，kids 链表头同族、写法内聚，可直接复用批次 13 的 `tools/soa_migrate.py` 映射内核），其次 `nb 461`；`sa 1268` / `kind 1187` / `na 1071` / `la 500` 是量级最大的四座高峰（各自宜单独成批或按语义切分）。越往后站点越多、单批风险越高，后续宜**继续小组合 + 组内独立验证**；每批**开工后必须普查 ① Node 值形参、② `node_X((V.id as u64))` 是否落在形参上、③ 是否有 `-1` 之外的哨兵**（批次 9/11 致命坑的系统性防线），收尾时**必须核对 examples 是否 0 DIFF**（批次 9 的方法论收获）。
+`nb 461 / la 500 / na 1071 / kind 1187 / sa 1268`（`id` 为 S5 step2 过渡字段，随 `Node` 一并消失，不单列迁移）（✅ 已迁：`se`、`has_sa`、`has_sb`、`has_sc`、`be`、`bf`、`memspace`、`bd`、`bb`、`bc`、`sc`、`nd`、`ib`、`nc`、`ba`、`lc`、`sb`、`ia`、`lb` —— 共 **19 个字段**）。
+> 迁移至此，`Node` 的**全部 bool 载荷已清空**（批次 10）、`la/lb/lc` kids 链槽族外置其二（`lc` 批次 11、`lb` 批次 14；剩 `la 500` 同族可原样套模板）、`na/nb/nc/nd` 四槽外置其二（`nd`、`nc`）、字符串族外置其二（`sc`、`sb`）、**通用整数槽 `ia`/`ib` 两槽全部清空**（批次 8 / 批次 13）。四类侧表形态（bool / string ×2 / 索引 `-1` / 带 `-2` 哨兵的索引）**全部验证成立** ⇒ 后续外置只剩工作量、无范式风险。剩余 5 个字段里 `nb 461` 最低（与已迁的 `nd`/`nc` 同为 na/nb/nc/nd 索引槽族），其次 `la 500`（kids 链第三槽）；`sa 1268` / `kind 1187` / `na 1071` 是量级最大的三座高峰（各自宜单独成批或按语义切分）。越往后站点越多、单批风险越高，后续宜**继续小组合 + 组内独立验证**；每批**开工后必须普查 ① Node 值形参、② `node_X((V.id as u64))` 是否落在形参上、③ 是否有 `-1` 之外的哨兵**（批次 9/11 致命坑的系统性防线），收尾时**必须核对 examples 是否 0 DIFF**（批次 9 的方法论收获）。
 > ⚠ **工具复用提示（批次 13 新增）**：`tools/soa_migrate.py` 的「Node 局部量 → 索引」映射内核（取**最近前置**声明、函数区间内识别 `var base` 遮蔽 → 切降级名、行尾注释剥离）与 `tools/cls.py`（字符串感知注释判别）、`tools/nvf.py`（Node 值形参普查）可直接复用于后续批次：抽取内核已抽象成 `tools/soa_migrate.py`（字段由首个命令行参数给出，如 `python tools/soa_migrate.py lb src/sema.tc`），不再需要改动脚本内的常量。
+> ⚠ **自动迁移 ≠ 免检（批次 14 三条硬性收尾动作）**：
+>   ① **完工后必做机械兜底** —— 对所有改动行做「忽略字符串的 `()` / `{}` 平衡 + 无 `;;`」检查。
+>      本批据此一次性扫出 4 行语法损坏（详见上方「本批踩到并修掉的 3 个迁移工具 bug」表），
+>      而 `tc check` 之外没有任何别的手段能在跑门禁前发现它们。
+>   ② **迁完再跑一次 `tools/cls.py .<field>`** —— 必须确认「REAL 站点」只剩已剔除的 `tbl_Rec*_X`；
+>      本批正是靠这一步才发现 **迁移清单漏了 `src/hir.tc` 的 6 处**（普查清单里有，执行清单里没有）。
+>   ③ **写点逐个确认有 `slice_set` 回写** —— 否则原本是 Node 值拷贝上的**无效写**，被升级成 setter
+>      会偷偷改变语义（铁律，见 impl-rules）。注意回写可能用**另一个变量名**（如 dst），需人工确认。
 > ⚠ **行尾红线（批次 13 实测）**：上述 Python 脚本以文本模式读写会把 **CRLF 文件整体转成 LF**（本批把 `src/tir.tc` 全文件 5653 行行尾改写，`git diff --stat` 一度虚增到 11309 行）。**必须**以二进制读写（`open(p,'rb')` / `newline=''` 保留原终结符）或事后按原文件形态还原；收尾时用 `git diff --stat` 与 `git diff -w --stat` 对照校验（二者应一致）。
 
 **后续批次（待做，按使用量升序、每组独立绿）**全部完成后删 `pub struct Node` + `nodes[]` + `node_new` 的 Node 构造 + 全部 `slice_set(nodes, …)`，`id` 字段随 `Node` 一并消失（届时裸索引即句柄），S4 方真正收口（随后补 `node_to_hir` 桥改造 + 删 re-export 垫片，见 §4.14.4）。
