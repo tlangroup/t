@@ -2936,6 +2936,17 @@ pub fn g_conpat_bind_has(d: i64) bool {
 // const 声明成员判定已迁 node_const[] 侧表（见上方 node_const()/node_set_const()）。
 // 旧 g_const_decl_ids 平行数组 + g_const_decl_has 线性扫描已删除（§4.5 per-node 标志，O(1)）。
 
+// S4 批次 20-E（§0.14.7 删 Node 收口）：节点池长度访问器。
+//   全仓 29 处 `slice_len(nodes)` / `slice_len(base.nodes)` / `slice_len(base__nodes)` 收敛于此，
+//   为下一批（20-F）删掉 `pub var nodes: []Node;` 铺路 —— 届时**只改本函数体一行**
+//   （改读与之锁步的 `g_node_kind`），29 个调用点**全部不动**。
+// ⚠ 本批函数体就写 `slice_len(nodes)` ⇒ 与替换前**逐字等价**（纯重命名，零语义风险）。
+// ⚠ 锁步性已证：全仓仅 `node_new` 里 1 处 `append(nodes, n)`，而 `g_node_kind` 在同一函数里
+//   逐节点 append ⇒ `slice_len(nodes) == slice_len(g_node_kind)` 恒成立（20-F 依赖此条）。
+pub fn node_count() i64 {
+    return slice_len(nodes) as i64;
+}
+
 // 新建节点：全部字段置于"空"语义，返回索引
 pub fn node_new(kind: string) u64 {
     var n: Node;
@@ -2963,7 +2974,7 @@ pub fn node_new(kind: string) u64 {
     // S4 第十四批（§0.14.7）：lb 已外置为侧表 g_node_lb（默认 -1 = 空链，见下方 append）
     //   ⚠ 注意：此处旧初值是 **-1**（node_new 从未写过 -2），-2 只在**调用方**经构造器实参写入。
     // S4 第十一批（§0.14.7）：lc 已外置为侧表 g_node_lc（默认 -1 = 空链，见下方 append）
-    n.id = slice_len(nodes);   // S5 step2：裸索引（append 后恰为该节点下标），供 node_span_id 机械读方迁移
+    n.id = node_count();   // S5 step2：裸索引（append 后恰为该节点下标），供 node_span_id 机械读方迁移
     append(nodes, n);
     append(g_node_mod, g_cur_mod);   // provenance：记录本节点所属模块别名（"" = 入口）
     append(g_node_file, g_file);      // provenance：记录本节点所属源文件（load_module_file 内 g_file 已切到该模块文件）
@@ -2999,12 +3010,12 @@ pub fn node_new(kind: string) u64 {
     append(g_node_sa, "");                                  // S4 §0.14.7 SoA：sa 默认空串（第十九批）
     var nref_tag: i64 = nk_of_kind(kind);
     if (nref_tag < 0) { nref_tag = 0; }   // 未注册 kind 暂归 tag=0（g_node_nref 当前无消费方，安全）
-    append(g_node_nref, mk_noderef(nref_tag, (slice_len(nodes) as i64) - 1));   // S4：打包 tag|idx 存入侧表（供未来消费方）
+    append(g_node_nref, mk_noderef(nref_tag, (node_count()) - 1));   // S4：打包 tag|idx 存入侧表（供未来消费方）
     // 注意：此处返回的是**裸索引**（仅静态类型提升为 u64），而非打包后的 NodeRef。
     // 既有代码在 mk_* 体内/调用点大量以 `nodes[nid]` / `slice_set(nodes, nid, ...)` 直接把返回值当
     // 数组下标使用；t 的 u64→i64 收窄在下标处**不会**解包 tag，若返回打包值会越界。tag 仅存于
     // g_node_nref 侧表，访问器经 nr_idx(nid) 取裸索引，与此处返回裸索引逐位一致。
-    return (slice_len(nodes) as i64) - 1;
+    return (node_count()) - 1;
 }
 
 // 给节点打 anchor token（诊断定位用），tok 索引 → line/col/text
@@ -3030,7 +3041,7 @@ pub fn node_trivia(n: u64) Trivia {
 // 合成节点（span 0,0,0）跳过，避免抢走前导 trivia。多行锚定节点以「起始 line」近似。
 // 纯工具函数，编译发射路径不调用；仅 dump-ast / S8 fmt 驱动。
 pub fn assign_trivia() void {
-    var nn = slice_len(nodes);
+    var nn = node_count();
     if (nn == 0) { return; }
     // 仅纳入源码锚定节点
     var order: []i64 = [];

@@ -39,10 +39,16 @@ PAT_PLAIN = re.compile(r'slice_len\(\s*' + NODES + r'\s*\)')
 
 
 def call_for(matched: str, in_base: bool):
-    """按匹配到的写法产出对应的访问器调用名。"""
+    """按匹配到的写法产出对应的访问器调用名。
+
+    ⚠ 判据必须是 **匹配原文里含哪种 `nodes` 写法**，不能用 `matched.startswith('base__')`
+      —— `m.group(0)` 是以 `slice_len(` 开头的整段匹配，不是索引表达式本身
+      （实测在这里踩过：`slice_len(base__nodes)` 被误产成 `base.node_count()`，
+       而那些作用域里有 `var base` 局部遮蔽 ⇒ 会解析到局部变量上）。
+    """
     if in_base:
         return 'node_count()'
-    if matched.startswith('base__'):
+    if 'base__nodes' in matched:
         return 'base__node_count()'
     return 'base.node_count()'
 

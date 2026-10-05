@@ -1440,6 +1440,32 @@ if (n.td > 0) { n.td = -1; }          // ← 写在副本上：从未写回 node
   · 收口：安装 `g4 → out/dbg/tc.exe`、`gr → out/rls/tc.exe`，复检仍为 **0 error / 530 warning**；
     清理 `out/_p20d`、`out/_c*.json`；`src/tir.tc`（`-text`）**CRLF 5608 行全程保真**未漂移。
 
+**批次 20-E：`slice_len(*nodes)` → `node_count()`（删 `nodes[]` 的最后一块硬阻塞；2026-10-05）**
+- **动机**：S4 收口的终点是删掉 `pub var nodes: []Node;`，但全仓有 **29 处**在量节点池长度：
+  `slice_len(nodes)` 4（`base.tc`）/ `slice_len(base.nodes)` 21 / `slice_len(base__nodes)` 4，
+  分布于 `base` 4 · `codegen_dev` 7 · `comptime_fold` 3 · `hir` 2 · `sema` 11 · `tir` 2。
+  （⚠ 先前估的「25 处」偏低，以本次普查的 **29** 为准。）
+- **做法**：新增访问器 `pub fn node_count() i64`，**本批函数体就写 `return slice_len(nodes) as i64;`**
+  ⇒ 与替换前**逐字等价**，本批是**纯重命名、零语义风险**；下一批（20-F）删 `nodes` 时
+  **只改这一行函数体**（改读锁步的 `g_node_kind`），29 个调用点**全部不动**。
+- ⭐ **锁步性已证**：全仓仅 `node_new` 里 **1 处** `append(nodes, n)`（`base.tc:2967`），
+  而 `g_node_kind` 在同一函数里逐节点 append ⇒ `slice_len(nodes) == slice_len(g_node_kind)` 恒成立。
+- ⭐ **坑五（新脚本 `tools/node_count_migrate.py` 的判据写错）**：`call_for()` 原本判
+  `matched.startswith('base__')`，但 `m.group(0)` 是以 **`slice_len(` 开头**的整段匹配、不是索引表达式
+  ⇒ 4 处 `slice_len(base__nodes)` 被误产成 `base.node_count()`，而那些作用域里**有 `var base` 局部遮蔽**
+  （降级名正是因此才存在）⇒ 会解析到局部变量上。修法：判据改为 **`'base__nodes' in matched`**。
+- **落成**：6 个 src 文件 **29 处改写 + 新增 `node_count()` 定义 8 行**（`git diff` 40 增 / 29 删）。
+- **验证链**：`tc check` **0 error / 530 warning**；自举 g1 **2m21s**；
+  seed vs g1 **逐字节 IDENTICAL**（`.c` 2 528 416 B `d1d33166…` / `.h` 130 935 B `76c9e4b4…`）；
+  IR 快照 **3 DIFF（`::c` / `::h` / `::ll`）、0 NEW / 0 GONE、examples 零 DIFF**
+  （⚠ `::h` 这次也变是**预期内**的合理偏离：新增了 `base__node_count` 的**函数声明**，
+  与旁路对照 `.h` **+1 行**逐条对账；硬信号是 **examples 零 DIFF**，满足）；
+  旁路对照 **`.c` 37 删 / 41 增** = 29 处调用点改写 + 4 行新增 `base__node_count()` 定义
+  + 8 行局部槽位改名（`idv__222613→222544`、`v__228941→228872`，**Δ 恒为 −69** 且 100% 配对），
+  **无第四类** ⇒ 语义中立；`--update` 重录基线（117 targets / 354 entries，268.6s）；
+  **gate L2 = 25 passed / 0 failed（2635.2s）**，四代不动点 `g2==g3==g4` PASS（137.0s）、
+  run_examples 双后端 462.2s 全绿、产物快照比对 410.6s、双轨对拍 244.3s、rls 快速通道 287.0s。
+
 
 **剩余字段实测使用量（`.F` 命中数；泛型名字段含非 Node 假阳性，仅作排序参考）**
 （✅ 已迁 `se`、`has_sa`、`has_sb`、`has_sc`、`be`、`bf`、`memspace`、`bd`、`bb`、`bc`、`sc`、`nd`、`ib`、`nc`、`ba`、`lc`、`sb`、`ia`、`lb`、`nb`、`la`、`na`、`kind`、**`sa`** —— 共 **24 个字段**）。
