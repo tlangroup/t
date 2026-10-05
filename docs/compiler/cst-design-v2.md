@@ -1974,6 +1974,69 @@ if (n.td > 0) { n.td = -1; }          // ← 写在副本上：从未写回 node
   `bytes.count(b'\r\n')` 才知 `base.tc` / `hir.tc` 实为**纯 LF**。
   ⇒ 判行尾**一律用 Python 数字节**，不要用 grep/shell 转义。
 
+**批次 20-N：Phase 3 第二批 —— `tir_to_ll`（1 站）+ `test.tc`（2 站）换用 `kids_chain`（2026-10-05）**
+> 按 20-M 排期，从个位数站点继续。`test.tc` 的 `tt_strip_main` 属形态 ①（改链：摘 `@main` 要
+> unlink + 重接 `next`）⇒ **跳过**，只换 `tt_has_tag` 的两条链。改完 `tir_to_ll` / `test.tc` 的
+> 循环级站点均**归零**（`test.tc` 余下的 1 处 `tt_strip_main` 是形态 ① 的保留项）。
+
+**⦁ ⚠ 覆盖缺口：`tc test` 不在 gate L2 也不在 nightly 覆盖内**
+- 查证：`tools/gate.mjs` 与 `.github/workflows/nightly.yml` 均**不含** `tc test`
+  （nightly 只跑 conformance / hir / hir_eval / repl）⇒ 改 `tt_has_tag` 若只看「零 DIFF」，
+  是「**没测到**」而非「等价」。沿用批次 20-J 的判据，**必须自建探针**。
+- **探针** `out/_20n/p_tag.tc`（3 个 test，分别带 `@tag("fast")` / `@tag("fast","edge")` / 无 tag），
+  跑四组并逐字节比对「变更前 seed」与「新 g1」的输出：
+
+  | 命令 | 预期 | seed 输出 | g1 输出 |
+  |---|---|---|---|
+  | `--tag fast` | 命中 alpha + beta | 2 passed | **IDENTICAL** |
+  | `--tag edge` | 仅 beta（命中**第二实参**）| 1 passed | **IDENTICAL** |
+  | 无过滤 | 全部 | 3 passed | **IDENTICAL** |
+  | `--tag nope` | 过滤未命中报错 | `error: 过滤条件未命中…` | **IDENTICAL** |
+
+  ⇒ 四组全 IDENTICAL，覆盖「单实参 / 多实参第二位 / 无 tag 声明 / 负例」四条分支。
+- ⦁ **探针踩坑（已写进源码注释，属既有行为、本批不改）**：`@tag` 的实参必须是
+  **字符串字面量**（`@tag("fast")`）；写裸 ident（`@tag(fast)`）时实参节点不是 string 字面量，
+  `node_sa` 取不到 ⇒ 过滤不命中。首版探针用裸 ident，得到「多实参两个 tag 都命中 0」的假象，
+  一度误判成 `tt_has_tag` 的多实参 bug —— 换成字符串字面量后行为正常。
+
+**⦁ 改动清单**
+| 文件 | 站点 | 改法 |
+|---|---|---|
+| `src/tir_to_ll.tc` | `ll_struct_type` 的字段收集（lb 链）| `kids_chain(node_lb(d))` 物化 + 下标循环；`fi` 仍只对被采纳字段自增 |
+| `src/test.tc` | `tt_has_tag` 的**注解链 + tag 实参链**两条 | 两条都改 `kids_chain`；短路 `return true` 时机不变 |
+
+**⦁ 验证**
+① `tc check` **0 error / 528 warning**；② `cstgen --check` OK；③ 自举 g1 **2m19s**；
+④ seed vs g1 **逐字节 IDENTICAL**：`.c` 2 529 485 B md5 `d102f52f…` / `.h` 131 005 B md5 `c15bb4ed…`；
+⑤ **`tc test` 探针四组全 IDENTICAL**（上表）；
+⑥ **旁路对照**（回退 `tir_to_ll`/`test` 到 HEAD 重编对拍 → 还原）：
+   ⦁ 回退版产物 md5 **`f9c0be81…` / `c15bb4ed…` 精确复现 20-M 基线** ⇒ 回退确实回到 20-M 源码，
+     provenance 自证（比「人工确认没回退错」更硬）；
+   ⦁ `.h` **零差异**（本批没有新增函数声明，`kids_chain` 的声明 20-M 已加）；
+   ⦁ `.c` 50 行差异剔除 `__N` 后**只剩两组预期改写**（`k.val→fv` / `c.val→av` / `pc.val→args[pi]` 的
+     一一对应），逻辑行无增删改；
+⑦ IR 快照 **2 DIFF（`src/tc.tc::{c,ll}`）/ 0 NEW / 0 GONE、examples 零 DIFF**；
+   `--update` 重录 **117 targets / 354 entries**（269.4s）；
+⑧ gate L2 = **25 passed / 0 failed（2627.1s）**：自举一代 159.0s / **产物快照比对 410.4s** /
+   conformance 113.0s / 自举不动点 g2==g3 273.1s / **run_examples dbg 453.0s** / HIR AstGen 35.6s /
+   HIR 解释器 3.4s / 代际对拍 8.3s / 双轨对拍 191.4s / REPL 16.7s / **四代不动点 143.1s** /
+   MIR differential 148.8s / C 后端自举 237.0s / tc0 对拍 52.2s / rls 快速通道 345.8s /
+   tote 2.3s / lint 16.2s —— 一次跑过、无沙箱拦截；⑨ dbg/rls 双种子复检 **0/528**；提交 `e3127ff`。
+- ⦁ 收尾核对的一个**假警报**：`git diff --stat` 与 `-w --stat` 在 `src/test.tc` 上不一致
+  （16+/10− vs 18+/12−），一度疑似行尾漂移。实查：HEAD 版与当前版**均为纯 LF**
+  （344 / 350 行，CRLF=0）、`git diff --check` 无告警 ⇒ 多出的 2 行是 **`-w` 做空白不敏感比较时
+  花括号配对歧义**的产物（缩进被忽略后，两级 `}` 无法区分归属）。
+  ⇒ 判行尾漂移的**决定性判据是字节级 LF/CRLF 计数 + `git diff --check`**，`--stat` 行数差只是线索。
+
+**⦁ 沉淀**
+- ⭐ **IR 快照的 DIFF 数可以是 2 而不是 3**：常规形态是 `::{c,h,ll}` 三处齐变，
+  本批因**没有新增函数声明**（`kids_chain` 的声明由 20-M 加入）⇒ `::h` 不变。
+  ⇒ **判据不是「必须 3 DIFF」，而是「快照 DIFF 与旁路对照的 `.h`/`.c` 差异自洽」**
+  （本批旁路对照 `.h` 零差异 ↔ 快照 `::h` 不在 DIFF 列表，两者互证）。
+- ⭐ **旁路对照新增一条自证：回退版产物哈希应精确复现上一批基线**。若复现不了，
+  说明「回退」这一步就没回对（沙箱 git 写不可靠的老坑），后面所有对拍都是假的。
+  成本为零、结论极硬，后续每批都做。
+
 **剩余字段实测使用量（`.F` 命中数；泛型名字段含非 Node 假阳性，仅作排序参考）**
 （✅ 已迁 `se`、`has_sa`、`has_sb`、`has_sc`、`be`、`bf`、`memspace`、`bd`、`bb`、`bc`、`sc`、`nd`、`ib`、`nc`、`ba`、`lc`、`sb`、`ia`、`lb`、`nb`、`la`、`na`、`kind`、**`sa`** —— 共 **24 个字段**）。
 > 迁移至此，`Node` 里**只剩过渡字段 `id`**（S5 step2，随 `Node` 一并消失），**真实载荷字段全部清空**
