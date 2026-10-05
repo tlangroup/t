@@ -1747,6 +1747,52 @@ if (n.td > 0) { n.td = -1; }          // ← 写在副本上：从未写回 node
     第二个臂的同名 `x` 会被 `g_seen_has` 命中而重整成 `x__N`。两版产物亦 IDENTICAL ✓
   ⇒ 两条路径（写+读）都被显式证明等价，而非依赖「没报警」。
 
+**批次 20-K：`node_to_hir` 桥入参侧切 `u64` NodeRef（§4.14.4 四项 deferred 之三；2026-10-05）**
+- **动机**：§4.10.3 / §0.14.4 四项 deferred 里，前两项（删 `base.Node`、删 re-export 垫片）已由
+  20-F / 20-H 闭合，第三项是「`node_to_hir` 桥切 `NodeRef`」。step④ 已把 `HirInst.nd` 升为 `u64`
+  且 `hir_inst_node` 内部 `as i64` 收窄（注释明写「迁移期 NodeRef==裸索引，逐位等价」），
+  ⇒ 桥的**入参侧**仍是裸 `i64`，与 step②/③/④ 的 `u64` 化不一致。本批补齐入参侧。
+- ⚠ **刻意只做入参侧，返回值侧（`hir_inst_node → u64`）留作独立步**，理由是三条实测风险：
+  · sema 里 15+ 处形如 `var d: i64 = hir.hir_inst_node(di);`，返回值还参与 `!= e` / `== fb` 比较；
+  · 改成 `u64` 后 C 后端会生成**无符号比较**，`-1` 哨兵的比较语义随之改变（`-1` 变 `0xFFFF…FFFF`）；
+  · `sema.tc:13255` 有 `if (hir.hir_of_node(pd) < 0)` 这类**判据依赖有符号性**，一旦返回侧被 u64 化
+    就恒为真 ⇒ 静默改语义。故按「最小可验证增量」原则拆开，本批不动返回侧。
+- ⭐⭐ **负 id 不逐位等价（本批最关键的一条认知）**：「NodeRef == 裸索引，逐位等价」**只对非负索引成立**。
+  `nr_idx(n)` = `((n << 32) >> 32) as i64` —— 低 32 位**零扩展**后再转 `i64`，故
+  `nr_idx(((-1) as u64))` = **4294967295**，不是 `-1`。
+  ⇒ 原函数首行 `if (n < 0) return` 的哨兵语义**不能**靠 `as u64` 后的 `n < 0` 承接（u64 恒非负），
+  必须靠既有的**越界分支**兜住：`id >= slice_len(g_hir.node_to_hir)` ⇒ 返 `-1` / 静默 return。
+  这与全仓 `node_*` 访问器的范式（`id < 0 || id >= slice_len(...)` 返默认）完全一致。
+- **落成**：2 文件 **29 增 / 27 删**（`hir.tc` 18 行：两个签名 + 两个函数体改走 `base.nr_idx`；
+  `sema.tc` 38 行：15 处 `hir_invalidate` + 4 处 `hir_of_node` 调用点加 `(x as u64)`）。
+  新脚本 **`tools/hir_bridge_noderef.py`**（S4 工具箱第十一件）。
+- ⚠ **脚本首版踩到行号偏移 bug（已修）**：op 表分 `RANGE`（整段替换）与 `SUB`（单行）两类，
+  首版**先施加全部 RANGE 再施加 SUB** —— 而 `RANGE 162-164` 由 3 行变 4 行，使后续 170/171
+  整体下移一位 ⇒ `hir_invalidate` 的签名与函数体改到错位。
+  **修法**：把 RANGE 与 SUB **合并后统一按起始行号降序**施加（大行号先改，小行号不受影响）。
+- **验证链**：
+  ① `tc check` **0 error / 528 warning**；
+  ② 完整性复核：全仓 `hir_of_node(` / `hir_invalidate(` 只剩 2 处定义 + 19 处调用点，**全部已改**、无遗漏；
+  ③ 自举 g1 **2m21s**；seed vs g1 **逐字节 IDENTICAL**（`.c` 2 528 734 B `9db3e2e1…` / `.h` 130 925 B `eea739ca…`）；
+  ④ **旁路对照**（产物与 20-J 基线不同，必做）：`.h` diff **仅 4 行**（两个签名 `int64_t → uint64_t`）；
+     `.c` diff **72 行**，剔除 `__N` 临时量编号漂移后**只剩三类** —— 签名、`n → id` 的 `nr_idx` 解包、
+     sema 19 处 `((uint64_t)x)` 转换。**无超出预期的改动**。
+  ⑤ IR 快照 **3 DIFF（`src/tc.tc::{c,h,ll}`）/ 0 NEW / 0 GONE，examples 零 DIFF**（246.6s）；
+  ⑥ `--update` 重录基线 → **117 targets / 354 entries**（256.2s）；
+  ⑦ **gate L2 = 25 passed / 0 failed（2508.3s）**，自举四代不动点 **146.8s**（`g2 == g3 == g4`）。
+     分步耗时（关键项）：工具链断言 0.8s / 诊断注册表 0.2s / `cstgen --check` 0.2s /
+     静态检查 1.1s / 预编译 std 9.2s / **自举一代 145.0s** / IR 静态审计 1.4s /
+     LLVM IR verifier 1.3s / **产物快照比对 372.3s** / conformance 94.5s /
+     自举不动点 291.7s / **run_examples dbg 399.2s** / HIR AstGen 28.8s / HIR 解释器 3.0s /
+     difftest 代际对拍 7.1s / 双轨对拍 189.1s / REPL 冒烟 17.0s / **MIR differential 149.4s** /
+     C 后端自举 239.7s / difftest tc0 49.7s / **rls 快速通道 340.2s** / tote 2.4s / lint 17.9s。
+     一次跑过、无沙箱拦截。
+  ⑧ 提交 `a20f301` → FF 推送 `s2-noderef:main`，远端 `main == a20f301`。
+- ⭐ **为什么本批不必像 20-J 那样补 probe**：20-J 的问题是「mangle 路径在**任何**语料里都没有
+  运行时足迹」，而本批两条路径是 sema 的核心桥 —— 在编译器自身 2.53MB 语料上有 **16 + 5 处调用点**，
+  且 base vs seed 的 diff 已逐条分类为预期改动；examples 侧的 0 DIFF 是「**新 g1 vs 20-J 旧基线**」的
+  前后对比，不是同版本自比。⇒ 覆盖充分（判据：先反查是否有足迹，有则 diff 分类即为等价证据）。
+
 **剩余字段实测使用量（`.F` 命中数；泛型名字段含非 Node 假阳性，仅作排序参考）**
 （✅ 已迁 `se`、`has_sa`、`has_sb`、`has_sc`、`be`、`bf`、`memspace`、`bd`、`bb`、`bc`、`sc`、`nd`、`ib`、`nc`、`ba`、`lc`、`sb`、`ia`、`lb`、`nb`、`la`、`na`、`kind`、**`sa`** —— 共 **24 个字段**）。
 > 迁移至此，`Node` 里**只剩过渡字段 `id`**（S5 step2，随 `Node` 一并消失），**真实载荷字段全部清空**
