@@ -2863,6 +2863,38 @@ pub fn ast_transform(n: NodeRef, f: Transform) NodeRef {
 
 > 这直接消除「新增 AST kind 必须同步 hir_lower_expr / sema / codegen / hir_eval / tir / dagcheck」的致命坑（工作记忆）。
 
+**⚠ 实施形态修订（2026-10-05，批次 20-K 之后的 Phase 1 调研结论）**
+
+上面的骨架是 **S4 早期（仍有 `base.Node` + typed tables 作为主表示）** 写的设计。经实测普查，
+其中**两条前提已不成立**，若照原样实现会是倒退。修订如下（目标不变：消费者逐步换用访问者）：
+
+| §4.6 原设计前提 | 现状（20-F/20-J 之后） | 结论 |
+|---|---|---|
+| 遍历靠 `tbl_binary[nr_idx(n)]` 等 **per-kind typed tables** | 20-F 已删 `base.Node`，主表示是**通用侧表** `g_node_*`（36 张侧表，`base.tc:1867-1898` 登记册） | ⦁ 不必重建 per-kind 结构体视图去遍历 |
+| 需要 `cstgen` 生成 105 个 kind 分支的 `match` 保证穷尽性 | 孩子关系**只经由 7 个通用槽**（见下方完备性证明），与 kind 数量解耦 | ⦁ **无需代码生成**，新增 kind 天然不会漏遍历 |
+
+- ⭐ **完备性证明（遍历不会漏子树的依据）**：`node_na/nb/nc/nd`（单子孫槽）+ `node_la/lb/lc`
+  （kids 链表头，`Child{val,next}`）覆盖**全部**孩子关系。逐条排除其他候选：
+  · `node_ia` —— 语义清单 13 项（lane 数 / radix / 位宽 / atom id / fd 常量 / 元组标记 /
+    overload 角色码 / 布局 / case 下标…，**`base.tc:2488-2501`**）**无一为子节点索引**；
+  · `node_ib` —— 通用整数槽，同为标记/索引语义，非子节点；
+  · `node_resolve/type/const/scope/provenance/span` —— 指向符号/类型/scope ** id**，非 CST 节点；
+  · `-1` / `-2` 哨兵（`lb`/`lc` 的 -2）在遍历入口用 `>= 0` 判断天然排除。
+- ⭐ **`node_visit` 的原型已经存在于代码里**：`base.tc:2010-2018` 的 `cst_dump` 精确按上述
+  7 槽递归（先 `na/nb/nc/nd`，再沿 `la/lb/lc` 三条链逐 `next`）。⇒ 访问者不必从零写。
+- ⚠⚠ **回调形态不可行（硬约束）**：`src/sema.tc:13055` 已实测记录「t 的 LLVM 后端不支持
+  **调用存于结构体字段的 fn 值**」（与脱糖注册表同坑，Pass 框架因此改用 `name` 字符串分派）。
+  ⇒ §4.6 的 `v.visit_binary(b)`（Visitor 对象）与 §4.11 的 `run: fn(NodeRef) NodeRef` 都
+  **不能照搬**。本轮一律采用**无回调**形态：遍历物化为孩子列表。
+- **修订后的落地形态（Phase 2，待实施）**：
+  ```t
+  // 返回 n 的全部子节点 id，顺序与 cst_dump 一致（na, nb, nc, nd, la链, lb链, lc链）
+  pub fn node_children(n: u64) []i64 { … }
+  ```
+  Phase 2 只做两件事：新增 `node_children`；**把 `cst_dump` 改为复用它**。
+  ⦁ 验收预期：纯内部重构 ⇒ **IR 快照 0 DIFF**（与 20-G / 20-I 同为「首跑即 0 DIFF」的最强自证）。
+  Phase 3 起再逐个让消费方换用（按 §4.10.3 初衷，每次一个后端 + gate）。
+
 ### 4.7 Span / 溯源 / 诊断
 
 ```c
