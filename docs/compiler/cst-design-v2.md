@@ -2113,6 +2113,73 @@ if (n.td > 0) { n.td = -1; }          // ← 写在副本上：从未写回 node
   （记忆/手抄可能错），**直接对齐 IR 快照的 `was` 值更硬** —— 快照基线由工具维护、不会抄错，
   且把「回退对不对」与「差异从哪来」两件事闭环到同一个哈希。
 
+**批次 20-P：Phase 3 第四批 —— `parse`（24 站）换用 `kids_chain`（2026-10-05）**
+> 按 20-O 重扫排期，`base` 5 处经探明**全部是保留项**（`node_kids_list` 三链 1973/75/77 +
+> `kids_chain` 本体 1997 + `list_last` 4036 属形态 ②）⇒ **base 可改 0 处**；
+> `codegen_dev`(1) 同属形态 ② ⇒ 本批直接进 `parse`。
+
+**⦁ 改动清单（26 处里 24 站换用，2 处跳过）**
+| 站点（行号为本批开工前） | 改法 |
+|---|---|
+| `block_trailing_expr`(1241) / `ann_find`(1335) / `cap_scan_list`(1669) / `lam_find_list`(1793) | 物化 + 下标循环；`ann_find` 的短路 `return` 时机不变 |
+| `cap_bind_stmts`(1640) / `envm_stmts`(1751) | 长循环体整体物化，`k.val → kv` |
+| `cap_scan` lambda 形参链(1690) / `lift_one_lambda` 形参链(1826) / `desugar_lambdas` 形参链(1936) | `kids_chain(node_lb(x))` |
+| `clone_type_list`(2135) / agent spawn 形参链(2195) / `clone_ann_list`(2488) / f-string 实参链(3952) | 物化；循环体只往**新建链**（初值 −1）追加 |
+| `fc_clause_is_bare`(3167) / 入口包装形参链(3545) + 实参链(3555) / `pp_is_pattern` 扫描(3631) | 物化；形参链建 `wh` 后实参链才物化 `wh`（顺序不变） |
+| `desugar_self_node`(4955/57/59) / `parse_method_decl` 形参链(4972) + 函数体链(4980) / `flush_struct_methods`(4991) / `list_count`(5290) | 物化 |
+
+> ⏭ **跳过的 2 处（形态 ②，物化会丢边界语义）**：
+> ① 1285 `while (base.kids[lc].next >= 0) { lc = base.kids[lc].next; }` —— 走到链尾；
+> ② 3234 `if (n == idx) { return k.val; }` —— 按 idx 取第 n 个。
+
+**⦁ 等价前提（逐个核实，不是想当然）**
+- 循环体**只改别的节点 / 全局表**：`cap_push` / `envm_add` / `lam_find` / `append(decl_list)` /
+  `desugar_self_node`（只 `node_set_sa`）；
+- 循环体**只往新建链追加**：`clone_type_list` / agent spawn / `clone_ann_list` / f-string /
+  入口包装 —— 各 `head/tail` 初值均为 `-1`，与被遍历的入参链无关；
+- ⦁ `base.list_push` 会 **append 到 `kids` 池**，但只**新增**元素、不改动已有链元的
+  `val` / `next` ⇒ 物化（先读完整条链）与边读边 append 遍历集合恒等。
+
+**⦁ 覆盖反查：`tc test` 仍不在 gate/nightly 内**
+`clone_ann_list`（suite 注解下沉）只有 `tc test` 走得到。自建探针 `out/_20p/p_suite.tc`
+（**suite 级** `@tag` 下沉 + 嵌套 suite + 值块 `{ 1; }`），四组对比「变更前 seed」与「新 g1」：
+
+| 命令 | 预期 | seed | g1 |
+|---|---|---|---|
+| 无过滤 | 3 passed（含嵌套路径 `外层 / 内层 / 用例二`）| 3 passed | **IDENTICAL** |
+| `--tag fast` | suite 注解下沉 ⇒ 3 个全命中 | 3 passed | **IDENTICAL** |
+| `--tag edge` | 仅嵌套 suite 内 1 个 | 1 passed | **IDENTICAL** |
+| `--tag nope` | 负例报错 | `error: 过滤条件未命中…` | **IDENTICAL** |
+
+> ⦁ `--tag fast` 命中全部 3 个，正是 **suite 级注解下沉生效**的正面证据 ⇒ 路径确认走过。
+
+**⦁ 验证**
+① `tc check` **0 error / 528 warning**；② `cstgen --check` OK；③ 自举 g1 **2m19s**；
+④ seed vs g1 对 `src/tc.tc` **逐字节 IDENTICAL**（`.c` md5 `bc090062…` / `.h` md5 `c15bb4ed…`）；
+⑤ **suite 探针四组全 IDENTICAL**（上表）；
+⑥ **旁路对照**（回退 `parse.tc` 到 HEAD 重编 → 还原）：
+   ⦁ 回退版 `.c` = **`79ab5ca6…`** = IR 快照 **`was` 值** ⇒ provenance 自证；`.h` `c15bb4ed…` 零差异；
+   ⦁ `.c` 差异 166/178 行：**剔除 `__N` 临时量改名后 328 行全部落在 `parse` 函数体内**，
+     无任何他模块的逻辑行变化（`tir_to_ll` 的 5 个 hunk 逐行确认 100% 是改名，位移 +129）；
+⑦ IR 快照 **2 DIFF（`src/tc.tc::{c,ll}`）/ 0 NEW / 0 GONE、examples 零 DIFF**；
+   `--update` 重录 **117 targets / 354 entries**（251.9s）；
+⑧ gate L2 = **25 passed / 0 failed（2800.3s）**：自举一代 134.0s / **产物快照比对 366.6s** /
+  conformance 101.7s / 自举不动点 g2==g3 277.3s / **run_examples dbg 458.4s** / HIR AstGen 31.3s /
+  HIR 解释器 3.2s / 代际对拍 8.0s / 双轨对拍 217.7s / REPL 17.6s / **四代不动点 140.2s** /
+  MIR differential 165.5s / C 后端自举 228.7s / tc0 对拍 79.2s / rls 快速通道 523.2s /
+  tote 4.3s / lint 27.5s —— 一次跑过、无沙箱拦截；⑨ dbg/rls 双种子复检 **0/528**；提交 `fbe6e40`。
+
+**⦁ 沉淀**
+- ⭐ **`list_push` 与「边遍历边写 kids」不是一回事**：判断形态 ① 的标准是「循环体是否
+  **回写被遍历的那条链**」，而不是「是否写 `kids` 池」。往**新建链**追加完全安全
+  （本批 5 处均属此列）。
+- ⦁ **临时量位移会让他模块出现 hunk，别急着判回归**：本批新增局部变量 ⇒ 全局槽号位移 +129，
+  `tir_to_ll` 出现 5 个 hunk。判据是 **hunk 内容逐行看是否为纯改名**（`__222699 → __222828`），
+  或用 `grep -vE '__[0-9]+'` 剔除后检查是否只剩本批模块的改写。
+- ⦁ **探针要打到「真正调用目标函数」的写法**：首版把 `@tag` 挂在 **test** 上，`--tag fast` 只命中 1
+  ⇒ 根本没走 `clone_ann_list`；改挂到 **suite** 上（下沉给成员）才命中 3 个。
+  ⇒ 与 20-N「探针结果与直觉不符先怀疑探针」同源，但这里是**探针覆盖不到**而非写错。
+
 **剩余字段实测使用量（`.F` 命中数；泛型名字段含非 Node 假阳性，仅作排序参考）**
 （✅ 已迁 `se`、`has_sa`、`has_sb`、`has_sc`、`be`、`bf`、`memspace`、`bd`、`bb`、`bc`、`sc`、`nd`、`ib`、`nc`、`ba`、`lc`、`sb`、`ia`、`lb`、`nb`、`la`、`na`、`kind`、**`sa`** —— 共 **24 个字段**）。
 > 迁移至此，`Node` 里**只剩过渡字段 `id`**（S5 step2，随 `Node` 一并消失），**真实载荷字段全部清空**
