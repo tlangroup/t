@@ -1614,8 +1614,15 @@ if (n.td > 0) { n.td = -1; }          // ← 写在副本上：从未写回 node
   ⑥ IR 快照 **1 DIFF（`src/tc.tc::c`）/ 0 NEW / 0 GONE**，examples **零 DIFF**（296.2s）：
      差异正是 ④ 的 `.c`（`was 4ce5d77d… → now 3493b215…`），内容 = 50 行临时量改名；
      ⚠ 判据：**examples 零 DIFF ⇒ 非行为变化**（见 impl-rules「examples 出现 DIFF 是硬信号」）。
-  ⑦ `--update` 重录基线；
-  ⑧ **gate L2 = 25 passed / 0 failed**。
+  ⑦ `--update` 重录基线（117 targets / 354 entries，337.6s）；
+  ⑧ **gate L2 = 25 passed / 0 failed（3481.1s）**：自举一代 g1 171.6s、产物快照比对 486.4s、
+     conformance 149.0s、自举不动点 g2==g3 321.4s、run_examples dbg 双后端 653.3s、
+     HIR AstGen 45.4s、HIR 解释器 4.7s、difftest 代际对拍 12.4s、双轨对拍 373.8s、
+     REPL 冒烟 28.5s、**四代不动点 g2==g3==g4 183.4s**、MIR differential 239.0s、
+     C 后端自举 288.5s、tc0 对拍 81.6s、rls 389.7s、tote 3.8s、lint 27.1s。
+     另有工具链断言 1.3s / 诊断注册表 0.3s / cstgen 0.3s / 静态检查(catn+shadow+dag) 1.7s /
+     预编译 std .tlib 13.4s / IR 静态审计 2.1s / LLVM verifier 2.0s / UNSUPPORTED 计数 0.4s。
+  ⇒ 安装四代种子（`g4 → out/dbg/tc.exe`、`gr → out/rls/tc.exe`）后双种子复检均 **0/528**。
 
 
 **剩余字段实测使用量（`.F` 命中数；泛型名字段含非 Node 假阳性，仅作排序参考）**
