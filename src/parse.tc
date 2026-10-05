@@ -1237,10 +1237,11 @@ fn block_trailing_expr(head: i64) i64 {
         return -1;
     }
     var last: i64 = -1;
-    var c: i64 = head;
-    while (c >= 0) {
-        last = base.kids[c].val;
-        c = base.kids[c].next;
+    var ks: []i64 = base.kids_chain(head);
+    var ki: i64 = 0;
+    while (ki < slice_len(ks) as i64) {
+        last = ks[ki];
+        ki = ki + 1;
     }
     if (last < 0) { return -1; }
     if (base.node_kind((last as u64)) != "expr") { return -1; }
@@ -1331,13 +1332,15 @@ pub fn parse_let_stmt() i64 {
 
 // 在注解链中查找名为 name 的第一个注解，返回节点下标或 -1
 pub fn ann_find(head: i64, name: string) i64 {
-    var it: i64 = head;
-    while (it >= 0) {
-        var c: Child = base.kids[it];
-        if (base.node_sa((c.val as u64)) == name) {
-            return c.val;
+    // S4 §4.6 Phase 3：注解链先物化再遍历 —— 短路 return 时机不变
+    var ks: []i64 = base.kids_chain(head);
+    var ki: i64 = 0;
+    while (ki < slice_len(ks) as i64) {
+        var av: i64 = ks[ki];
+        if (base.node_sa((av as u64)) == name) {
+            return av;
         }
-        it = c.next;
+        ki = ki + 1;
     }
     return -1;
 }
@@ -1636,40 +1639,43 @@ pub fn cap_free_add(nm: string) void {
 
 // 语句链里直接引入的绑定名（**不**下钻嵌套 lambda 体：那是独立作用域）
 pub fn cap_bind_stmts(head: i64) void {
-    var c: i64 = head;
-    while (c >= 0) {
-        var k: Child = base.kids[c];
-        if (base.node_kind((k.val as u64)) == "var_decl") { cap_push(base.node_sa((k.val as u64))); }
-        if (base.node_kind((k.val as u64)) == "closure_capture") { cap_push(base.node_sa((k.val as u64))); }
-        if (base.node_kind((k.val as u64)) == "for") {
-            if (base.node_na((k.val as u64)) >= 0) {
-                if (base.node_kind((base.node_na((k.val as u64)) as u64)) == "var_decl") { cap_push(base.node_sa((base.node_na((k.val as u64)) as u64))); }
+    // S4 §4.6 Phase 3：链先物化再遍历 —— 纯读取循环，与原手写链遍历逐点同序
+    var ks: []i64 = base.kids_chain(head);
+    var ki: i64 = 0;
+    while (ki < slice_len(ks) as i64) {
+        var kv: i64 = ks[ki];
+        if (base.node_kind((kv as u64)) == "var_decl") { cap_push(base.node_sa((kv as u64))); }
+        if (base.node_kind((kv as u64)) == "closure_capture") { cap_push(base.node_sa((kv as u64))); }
+        if (base.node_kind((kv as u64)) == "for") {
+            if (base.node_na((kv as u64)) >= 0) {
+                if (base.node_kind((base.node_na((kv as u64)) as u64)) == "var_decl") { cap_push(base.node_sa((base.node_na((kv as u64)) as u64))); }
             }
-            cap_bind_stmts(base.node_la((k.val as u64)));
+            cap_bind_stmts(base.node_la((kv as u64)));
         }
-        if (base.node_kind((k.val as u64)) == "for_each") {
-            cap_push(base.node_sa((k.val as u64)));
-            if (str_len(base.node_sb((k.val as u64))) > 0) { cap_push(base.node_sb((k.val as u64))); }
-            cap_bind_stmts(base.node_la((k.val as u64)));
+        if (base.node_kind((kv as u64)) == "for_each") {
+            cap_push(base.node_sa((kv as u64)));
+            if (str_len(base.node_sb((kv as u64))) > 0) { cap_push(base.node_sb((kv as u64))); }
+            cap_bind_stmts(base.node_la((kv as u64)));
         }
-        if (base.node_kind((k.val as u64)) == "if") {
-            cap_bind_stmts(base.node_la((k.val as u64)));
-            if (base.node_lb((k.val as u64)) > -2) { cap_bind_stmts(base.node_lb((k.val as u64))); }
+        if (base.node_kind((kv as u64)) == "if") {
+            cap_bind_stmts(base.node_la((kv as u64)));
+            if (base.node_lb((kv as u64)) > -2) { cap_bind_stmts(base.node_lb((kv as u64))); }
         }
-        if (base.node_kind((k.val as u64)) == "while" || base.node_kind((k.val as u64)) == "block" || base.node_kind((k.val as u64)) == "defer") {
-            cap_bind_stmts(base.node_la((k.val as u64)));
+        if (base.node_kind((kv as u64)) == "while" || base.node_kind((kv as u64)) == "block" || base.node_kind((kv as u64)) == "defer") {
+            cap_bind_stmts(base.node_la((kv as u64)));
         }
-        if (base.node_kind((k.val as u64)) == "comptime_block") { cap_bind_stmts(base.node_la((k.val as u64))); }
-        c = k.next;
+        if (base.node_kind((kv as u64)) == "comptime_block") { cap_bind_stmts(base.node_la((kv as u64))); }
+        ki = ki + 1;
     }
 }
 
 pub fn cap_scan_list(head: i64) void {
-    var c: i64 = head;
-    while (c >= 0) {
-        var k: Child = base.kids[c];
-        cap_scan(k.val);
-        c = k.next;
+    // S4 §4.6 Phase 3：链先物化再遍历 —— 纯读取循环，与原手写链遍历逐点同序
+    var ks: []i64 = base.kids_chain(head);
+    var ki: i64 = 0;
+    while (ki < slice_len(ks) as i64) {
+        cap_scan(ks[ki]);
+        ki = ki + 1;
     }
 }
 
@@ -1686,11 +1692,12 @@ pub fn cap_scan(e: i64) void {
     if (base.node_kind((e as u64)) == "lambda") {
         // 嵌套 lambda 自成作用域，但其未绑定的自由名对本层依然自由
         var sv: i64 = cap_bnd_n;
-        var p: i64 = base.node_lb((e as u64));
-        while (p >= 0) {
-            var pk: Child = base.kids[p];
-            cap_push(base.node_sa((pk.val as u64)));
-            p = pk.next;
+        // S4 §4.6 Phase 3：lambda 形参链先物化再遍历
+        var ksp: []i64 = base.kids_chain(base.node_lb((e as u64)));
+        var kip: i64 = 0;
+        while (kip < slice_len(ksp) as i64) {
+            cap_push(base.node_sa((ksp[kip] as u64)));
+            kip = kip + 1;
         }
         cap_bind_stmts(base.node_lc((e as u64)));
         cap_scan_list(base.node_lc((e as u64)));
@@ -1747,31 +1754,33 @@ pub fn envm_find(nm: string) i64 {
 }
 
 pub fn envm_stmts(head: i64) void {
-    var c: i64 = head;
-    while (c >= 0) {
-        var k: Child = base.kids[c];
-        if (base.node_kind((k.val as u64)) == "var_decl") { envm_add(base.node_sa((k.val as u64)), base.node_na((k.val as u64))); }
-        if (base.node_kind((k.val as u64)) == "closure_capture") { envm_add(base.node_sa((k.val as u64)), base.node_na((k.val as u64))); }
-        if (base.node_kind((k.val as u64)) == "for") {
-            if (base.node_na((k.val as u64)) >= 0) {
-                if (base.node_kind((base.node_na((k.val as u64)) as u64)) == "var_decl") { envm_add(base.node_sa((base.node_na((k.val as u64)) as u64)), base.node_na((base.node_na((k.val as u64)) as u64))); }
+    // S4 §4.6 Phase 3：链先物化再遍历 —— 纯读取循环，与原手写链遍历逐点同序
+    var ks: []i64 = base.kids_chain(head);
+    var ki: i64 = 0;
+    while (ki < slice_len(ks) as i64) {
+        var kv: i64 = ks[ki];
+        if (base.node_kind((kv as u64)) == "var_decl") { envm_add(base.node_sa((kv as u64)), base.node_na((kv as u64))); }
+        if (base.node_kind((kv as u64)) == "closure_capture") { envm_add(base.node_sa((kv as u64)), base.node_na((kv as u64))); }
+        if (base.node_kind((kv as u64)) == "for") {
+            if (base.node_na((kv as u64)) >= 0) {
+                if (base.node_kind((base.node_na((kv as u64)) as u64)) == "var_decl") { envm_add(base.node_sa((base.node_na((kv as u64)) as u64)), base.node_na((base.node_na((kv as u64)) as u64))); }
             }
-            envm_stmts(base.node_la((k.val as u64)));
+            envm_stmts(base.node_la((kv as u64)));
         }
-        if (base.node_kind((k.val as u64)) == "for_each") {
-            envm_add(base.node_sa((k.val as u64)), -1);
-            if (str_len(base.node_sb((k.val as u64))) > 0) { envm_add(base.node_sb((k.val as u64)), -1); }
-            envm_stmts(base.node_la((k.val as u64)));
+        if (base.node_kind((kv as u64)) == "for_each") {
+            envm_add(base.node_sa((kv as u64)), -1);
+            if (str_len(base.node_sb((kv as u64))) > 0) { envm_add(base.node_sb((kv as u64)), -1); }
+            envm_stmts(base.node_la((kv as u64)));
         }
-        if (base.node_kind((k.val as u64)) == "if") {
-            envm_stmts(base.node_la((k.val as u64)));
-            if (base.node_lb((k.val as u64)) > -2) { envm_stmts(base.node_lb((k.val as u64))); }
+        if (base.node_kind((kv as u64)) == "if") {
+            envm_stmts(base.node_la((kv as u64)));
+            if (base.node_lb((kv as u64)) > -2) { envm_stmts(base.node_lb((kv as u64))); }
         }
-        if (base.node_kind((k.val as u64)) == "while" || base.node_kind((k.val as u64)) == "block" || base.node_kind((k.val as u64)) == "defer") {
-            envm_stmts(base.node_la((k.val as u64)));
+        if (base.node_kind((kv as u64)) == "while" || base.node_kind((kv as u64)) == "block" || base.node_kind((kv as u64)) == "defer") {
+            envm_stmts(base.node_la((kv as u64)));
         }
-        if (base.node_kind((k.val as u64)) == "comptime_block") { envm_stmts(base.node_la((k.val as u64))); }
-        c = k.next;
+        if (base.node_kind((kv as u64)) == "comptime_block") { envm_stmts(base.node_la((kv as u64))); }
+        ki = ki + 1;
     }
 }
 
@@ -1789,11 +1798,12 @@ pub fn lam_hit_add(id: i64) void {
 }
 
 pub fn lam_find_list(head: i64) void {
-    var c: i64 = head;
-    while (c >= 0) {
-        var k: Child = base.kids[c];
-        lam_find(k.val);
-        c = k.next;
+    // S4 §4.6 Phase 3：链先物化再遍历 —— 纯读取循环，与原手写链遍历逐点同序
+    var ks: []i64 = base.kids_chain(head);
+    var ki: i64 = 0;
+    while (ki < slice_len(ks) as i64) {
+        lam_find(ks[ki]);
+        ki = ki + 1;
     }
 }
 
@@ -1822,11 +1832,12 @@ pub fn lift_one_lambda(lid: i64) void {
 
     cap_bnd_n = 0;
     cap_free_n = 0;
-    var p0: i64 = base.node_lb((lid as u64));
-    while (p0 >= 0) {
-        var pk0: Child = base.kids[p0];
-        cap_push(base.node_sa((pk0.val as u64)));
-        p0 = pk0.next;
+    // S4 §4.6 Phase 3：链先物化再遍历 —— 纯读取循环，与原手写链遍历逐点同序
+    var ks: []i64 = base.kids_chain(base.node_lb((lid as u64)));
+    var ki: i64 = 0;
+    while (ki < slice_len(ks) as i64) {
+        cap_push(base.node_sa((ks[ki] as u64)));
+        ki = ki + 1;
     }
     cap_bind_stmts(base.node_lc((lid as u64)));
     cap_scan_list(base.node_lc((lid as u64)));
@@ -1932,11 +1943,13 @@ pub fn desugar_lambdas() void {
         if (base.node_kind((d as u64)) == "FuncDecl") {
             if (base.node_lc((d as u64)) > -2) {
                 envm_c = 0;
-                var p: i64 = base.node_lb((d as u64));
-                while (p >= 0) {
-                    var pk: Child = base.kids[p];
-                    envm_add(base.node_sa((pk.val as u64)), base.node_na((pk.val as u64)));
-                    p = pk.next;
+                // S4 §4.6 Phase 3：形参链先物化再遍历
+                var ks: []i64 = base.kids_chain(base.node_lb((d as u64)));
+                var ki: i64 = 0;
+                while (ki < slice_len(ks) as i64) {
+                    var pv: i64 = ks[ki];
+                    envm_add(base.node_sa((pv as u64)), base.node_na((pv as u64)));
+                    ki = ki + 1;
                 }
                 envm_stmts(base.node_lc((d as u64)));
                 lam_hit_n = 0;
@@ -2131,12 +2144,15 @@ pub fn clone_type_node(n: i64) i64 {
 pub fn clone_type_list(l: i64) i64 {
     var head: i64 = -1;
     var tail: i64 = -1;
-    var c: i64 = l;
-    while (c >= 0) {
-        var v: i64 = clone_type_node(base.kids[c].val);
+    // S4 §4.6 Phase 3：链先物化再遍历 —— 纯读取循环，与原手写链遍历逐点同序
+    // ⦁ 循环体只往**新建链**（head/tail，初值 -1）追加，不回写被遍历的 `l` 链 ⇒ 遍历集合恒等
+    var ks: []i64 = base.kids_chain(l);
+    var ki: i64 = 0;
+    while (ki < slice_len(ks) as i64) {
+        var v: i64 = clone_type_node(ks[ki]);
         tail = base.list_push(head, tail, v);
         if (head < 0) { head = tail; }
-        c = base.kids[c].next;
+        ki = ki + 1;
     }
     return head;
 }
@@ -2191,9 +2207,12 @@ pub fn parse_agent_decl(name: string, anns: i64) i64 {
     var pt: i64 = -1;
     var fv_head: i64 = -1;
     var fv_tail: i64 = -1;
-    var c: i64 = field_head;
-    while (c >= 0) {
-        var f: i64 = base.kids[c].val;
+    // S4 §4.6 Phase 3：链先物化再遍历 —— 纯读取循环，与原手写链遍历逐点同序
+    // ⦁ 循环体只往**新建链**（ph/pt、fv_head/fv_tail，初值 -1）追加，不回写 field_head 链
+    var ks: []i64 = base.kids_chain(field_head);
+    var ki: i64 = 0;
+    while (ki < slice_len(ks) as i64) {
+        var f: i64 = ks[ki];
         var pname: string = base.node_sa((f as u64));
         // 形参（类型节点深拷贝，避免与 struct 字段共享同一份被 check 期改写而越界）
         var pid: i64 = base.mk_P(pname, clone_type_node(base.node_na((f as u64))), -1, -1);
@@ -2203,7 +2222,7 @@ pub fn parse_agent_decl(name: string, anns: i64) i64 {
         var vid: i64 = base.mk_FV(pname, base.mk_ident(pname, -1), -1);
         fv_tail = base.list_push(fv_head, fv_tail, vid);
         if (fv_head < 0) { fv_head = fv_tail; }
-        c = base.kids[c].next;
+        ki = ki + 1;
     }
     var lit: i64 = base.mk_struct_lit(state_name, fv_head, lex.g_agent_anchor);
     var ret: i64 = base.mk_return(lit, lex.g_agent_anchor);
@@ -2484,9 +2503,12 @@ pub var g_suite_path: string = "";  // 当前 suite 嵌套路径，形如 "math 
 pub fn clone_ann_list(head: i64) i64 {
     var nh: i64 = -1;
     var nt: i64 = -1;
-    var c: i64 = head;
-    while (c >= 0) {
-        var a: i64 = base.kids[c].val;
+    // S4 §4.6 Phase 3：链先物化再遍历 —— 纯读取循环，与原手写链遍历逐点同序
+    // ⦁ 循环体只往**新建链**（nh/nt，初值 -1）追加，不回写被遍历的 `head` 链
+    var ks: []i64 = base.kids_chain(head);
+    var ki: i64 = 0;
+    while (ki < slice_len(ks) as i64) {
+        var a: i64 = ks[ki];
         var cp: i64 = base.mk_A(base.node_sa((a as u64)), base.node_la((a as u64)), -1);
         base.node_set_span_id(cp, base.node_span_id(a));
         base.node_set_span_id(cp, base.node_span_id(a));
@@ -2495,7 +2517,7 @@ pub fn clone_ann_list(head: i64) i64 {
         if (nh < 0) {
             nh = nt;
         }
-        c = base.kids[c].next;
+        ki = ki + 1;
     }
     return nh;
 }
@@ -3163,11 +3185,13 @@ pub fn ovl_specificity(a: string, c: string) i64 {
 
 // 子句是否纯裸绑定（无模式、无守卫、所有形参均无模式/守卫）→ 归为类型组分派。
 pub fn fc_clause_is_bare(cd: i64) bool {
-    var pl: i64 = base.node_lb((cd as u64));
-    while (pl >= 0) {
-        var pp: i64 = base.kids[pl].val;
+    // S4 §4.6 Phase 3：链先物化再遍历 —— 纯读取循环，与原手写链遍历逐点同序
+    var ks: []i64 = base.kids_chain(base.node_lb((cd as u64)));
+    var ki: i64 = 0;
+    while (ki < slice_len(ks) as i64) {
+        var pp: i64 = ks[ki];
         if (base.node_nb((pp as u64)) >= 0 || base.node_nc((pp as u64)) >= 0) { return false; }
-        pl = base.kids[pl].next;
+        ki = ki + 1;
     }
     return true;
 }
@@ -3541,23 +3565,28 @@ pub fn fc_merge_type() void {
     var entry_name: string = base.sb_cat3("__", base_name, base.sb_cat2("__c", base.i2s(entry)));
     var wh: i64 = -1;
     var wt: i64 = -1;
-    var pl: i64 = base.node_lb((ed as u64));
-    while (pl >= 0) {
-        var pp: i64 = base.kids[pl].val;
+    // S4 §4.6 Phase 3：链先物化再遍历 —— 纯读取循环，与原手写链遍历逐点同序
+    // ⦁ 循环体只往**新建链**（wh/wt，初值 -1）追加，不回写 ed 的 lb 链
+    var ks1: []i64 = base.kids_chain(base.node_lb((ed as u64)));
+    var ki1: i64 = 0;
+    while (ki1 < slice_len(ks1) as i64) {
+        var pp: i64 = ks1[ki1];
         var np: i64 = base.mk_P(base.node_sa((pp as u64)), base.node_na((pp as u64)), -1, -1);
         wt = base.list_push(wh, wt, np);
         if (wh < 0) { wh = wt; }
-        pl = base.kids[pl].next;
+        ki1 = ki1 + 1;
     }
     var ah: i64 = -1;
     var at: i64 = -1;
-    var pl2: i64 = wh;
-    while (pl2 >= 0) {
-        var pp2: i64 = base.kids[pl2].val;
+    // S4 §4.6 Phase 3：实参链先物化再遍历（该链由上一循环刚建成，物化点在其后 ⇒ 完整）
+    var ks2: []i64 = base.kids_chain(wh);
+    var ki2: i64 = 0;
+    while (ki2 < slice_len(ks2) as i64) {
+        var pp2: i64 = ks2[ki2];
         var argid: i64 = base.mk_ident(base.node_sa((pp2 as u64)), -1);
         at = base.list_push(ah, at, argid);
         if (ah < 0) { ah = at; }
-        pl2 = base.kids[pl2].next;
+        ki2 = ki2 + 1;
     }
     var callnode: i64 = base.mk_call(base.mk_ident(entry_name, -1), ah, -1);
     var retnode: i64 = base.mk_return(callnode, -1);
@@ -3627,11 +3656,12 @@ pub fn desugar_func_clauses() void {
                 // （便于 match 的穷尽性检查统一兜底，无需第二套诊断）
                 var need: bool = g_fc_n > 1;
                 if (need == false) {
-                    var pc: i64 = base.node_lb((d as u64));
-                    while (pc >= 0) {
-                        var pk: Child = base.kids[pc];
-                        if (pp_is_pattern(pk.val)) { need = true; }
-                        pc = pk.next;
+                    // S4 §4.6 Phase 3：形参链先物化再遍历
+                    var ks: []i64 = base.kids_chain(base.node_lb((d as u64)));
+                    var ki: i64 = 0;
+                    while (ki < slice_len(ks) as i64) {
+                        if (pp_is_pattern(ks[ki])) { need = true; }
+                        ki = ki + 1;
                     }
                 }
                 if (need) {
@@ -3948,12 +3978,14 @@ pub fn parse_fstring(ti: i64) i64 {
     var f_tail: i64 = -1;
     f_tail = base.list_push(f_head, f_tail, base.mk_string(tmpl, ti));
     if (f_head < 0) { f_head = f_tail; }
-    var ac: i64 = a_head;
-    while (ac >= 0) {
-        var ak: Child = base.kids[ac];
-        f_tail = base.list_push(f_head, f_tail, ak.val);
+    // S4 §4.6 Phase 3：链先物化再遍历 —— 纯读取循环，与原手写链遍历逐点同序
+    // ⦁ 循环体只往**新建链**（f_head/f_tail）追加，不回写 a_head 链
+    var ks: []i64 = base.kids_chain(a_head);
+    var ki: i64 = 0;
+    while (ki < slice_len(ks) as i64) {
+        f_tail = base.list_push(f_head, f_tail, ks[ki]);
         if (f_head < 0) { f_head = f_tail; }
-        ac = ak.next;
+        ki = ki + 1;
     }
     g_has_format = true;
     return base.mk_call(base.mk_ident("format", ti), f_head, ti);
@@ -4951,12 +4983,17 @@ pub fn desugar_self_node(nid: i64, sn: string) void {
     desugar_self_node(base.node_nb((nid as u64)), sn);
     desugar_self_node(base.node_nc((nid as u64)), sn);
     desugar_self_node(base.node_nd((nid as u64)), sn);   // S4 §0.14.7 SoA：侧表访问器（原 .nd）
-    var it: i64 = base.node_la((nid as u64));
-    while (it >= 0) { var ca: Child = base.kids[it]; desugar_self_node(ca.val, sn); it = ca.next; }
-    it = base.node_lb((nid as u64));
-    while (it >= 0) { var cb: Child = base.kids[it]; desugar_self_node(cb.val, sn); it = cb.next; }
-    it = base.node_lc((nid as u64));
-    while (it >= 0) { var cc: Child = base.kids[it]; desugar_self_node(cc.val, sn); it = cc.next; }
+    // S4 §4.6 Phase 3：la/lb/lc 三链各自物化后遍历 —— `desugar_self_node` 只改节点的 sa，
+    // 不写 kids 链 ⇒ 遍历集合恒等。
+    var ksa: []i64 = base.kids_chain(base.node_la((nid as u64)));
+    var kia: i64 = 0;
+    while (kia < slice_len(ksa) as i64) { desugar_self_node(ksa[kia], sn); kia = kia + 1; }
+    var ksb: []i64 = base.kids_chain(base.node_lb((nid as u64)));
+    var kib: i64 = 0;
+    while (kib < slice_len(ksb) as i64) { desugar_self_node(ksb[kib], sn); kib = kib + 1; }
+    var ksc: []i64 = base.kids_chain(base.node_lc((nid as u64)));
+    var kic: i64 = 0;
+    while (kic < slice_len(ksc) as i64) { desugar_self_node(ksc[kic], sn); kic = kic + 1; }
 }
 
 // 解析 struct 体内的方法声明，脱糖为顶层自由函数：
@@ -4968,30 +5005,34 @@ pub fn parse_method_decl(structname: string, mname: string, anns: i64) i64 {
     base.node_set_sa((fd as u64), base.sb_cat3(pascal_to_snake(structname), "_", mname));
     base.node_set_bc((fd as u64), lex.g_struct_exported);   // S4 §0.14.7 SoA：侧表写（原 fdn.bc）
     desugar_self_node(base.node_na((fd as u64)), structname);
-    var pit: i64 = base.node_lb((fd as u64));
-    while (pit >= 0) {
-        var pc: Child = base.kids[pit];
-        desugar_self_node(base.node_na((pc.val as u64)), structname);
-        pit = pc.next;
+    // S4 §4.6 Phase 3：链先物化再遍历 —— 纯读取循环，与原手写链遍历逐点同序
+    var ks1: []i64 = base.kids_chain(base.node_lb((fd as u64)));
+    var ki1: i64 = 0;
+    while (ki1 < slice_len(ks1) as i64) {
+        var pcv: i64 = ks1[ki1];
+        desugar_self_node(base.node_na((pcv as u64)), structname);
+        ki1 = ki1 + 1;
     }
     // 函数体：FuncDecl.lc 是语句链表头（kids 下标），必须按链表逐条下钻，
     // 不可当作节点 id 直接传（否则读到随机 Child，函数体内的 `Self` 全漏改写）。
-    var bit: i64 = base.node_lc((fd as u64));
-    while (bit >= 0) {
-        var bch: Child = base.kids[bit];
-        desugar_self_node(bch.val, structname);
-        bit = bch.next;
+    // S4 §4.6 Phase 3：链先物化再遍历 —— 纯读取循环，与原手写链遍历逐点同序
+    var ks2: []i64 = base.kids_chain(base.node_lc((fd as u64)));
+    var ki2: i64 = 0;
+    while (ki2 < slice_len(ks2) as i64) {
+        desugar_self_node(ks2[ki2], structname);
+        ki2 = ki2 + 1;
     }
     return fd;
 }
 
 // 把当前 struct 累积的方法 FuncDecl 链表追加进 decl_list（保证 struct 在前、方法在后）。
 pub fn flush_struct_methods() void {
-    var it: i64 = lex.g_method_head;
-    while (it >= 0) {
-        var c: Child = base.kids[it];
-        append(lex.decl_list, c.val);
-        it = c.next;
+    // S4 §4.6 Phase 3：链先物化再遍历 —— 纯读取循环，与原手写链遍历逐点同序
+    var ks: []i64 = base.kids_chain(lex.g_method_head);
+    var ki: i64 = 0;
+    while (ki < slice_len(ks) as i64) {
+        append(lex.decl_list, ks[ki]);
+        ki = ki + 1;
     }
     lex.g_method_head = -1;
     lex.g_method_tail = -1;
@@ -5285,12 +5326,13 @@ pub fn n_file(ni: i64) string {
 
 
 pub fn list_count(head: i64) i64 {
-    var c: i64 = head;
+    // S4 §4.6 Phase 3：链先物化再遍历 —— 纯读取循环，与原手写链遍历逐点同序
     var n: i64 = 0;
-    while (c >= 0) {
-        var k: Child = base.kids[c];
+    var ks: []i64 = base.kids_chain(head);
+    var ki: i64 = 0;
+    while (ki < slice_len(ks) as i64) {
         n = n + 1;
-        c = k.next;
+        ki = ki + 1;
     }
     return n;
 }
