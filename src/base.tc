@@ -1958,6 +1958,26 @@ pub fn cst_trivia_one(idx: i64) void {
     }
     sb_append_char(g_cst_sb, 93);  // ']'
 }
+// ── S4 访问者第一步：kids 链扁平化（§4.6 实施形态修订，见设计文档）────────────
+// 把节点在 `la`/`lb`/`lc` 三条 kids 链上的**全部孩子节点 id**按 cst_dump 的既有顺序
+// （先 la 链、再 lb 链、再 lc 链，链内依 next 顺序）物化为一个 `[]i64`。
+// ⦁ 为什么是「产出列表」而不是「回调访问者」：t 的 LLVM 后端不支持调用存于结构体字段的
+//   fn 值（实测见 `sema.tc:13055`，Pass 框架因此也改用 name 字符串分派）⇒ 回调式 Visitor
+//   对象不可行。遍历一律物化为列表，由消费方自己循环。
+// ⦁ 完备性：孩子关系只经由 na/nb/nc/nd 四个单槽 + la/lb/lc 三条链（node_ia/node_ib 的语义
+//   清单里没有一项是子节点，node_resolve/type/const/scope 指向的是符号/scope id，非 CST 节点）。
+// ⦁ 哨兵：`-1`（空链）与 `lb`/`lc` 的 `-2`（该列表不存在 / 本体已由别处消费）经 `>= 0` 天然排除。
+pub fn node_kids_list(n: u64) []i64 {
+    var out: []i64 = [];
+    var c: i64 = node_la(n);
+    while (c >= 0) { append(out, kids[c].val); c = kids[c].next; }
+    c = node_lb(n);
+    while (c >= 0) { append(out, kids[c].val); c = kids[c].next; }
+    c = node_lc(n);
+    while (c >= 0) { append(out, kids[c].val); c = kids[c].next; }
+    return out;
+}
+
 pub fn cst_dump(role: string, id: i64, depth: i64) void {
     if (id < 0) { return; }
     sb_append_char(g_cst_sb, 10);            // 10 = '\n'
@@ -2013,9 +2033,9 @@ pub fn cst_dump(role: string, id: i64, depth: i64) void {
     if (n_nc >= 0) { cst_dump("nc", n_nc, depth + 1); }
     var n_nd: i64 = node_nd((id as u64));   // S4 §0.14.7 SoA：侧表读（原 n.nd）
     if (n_nd >= 0) { cst_dump("nd", n_nd, depth + 1); }
-    var c: i64 = node_la((id as u64)); while (c >= 0) { cst_dump("", kids[c].val, depth + 1); c = kids[c].next; }
-    c = node_lb((id as u64)); while (c >= 0) { cst_dump("", kids[c].val, depth + 1); c = kids[c].next; }
-    c = node_lc((id as u64)); while (c >= 0) { cst_dump("", kids[c].val, depth + 1); c = kids[c].next; }   // S4 §0.14.7 SoA：侧表读（原 n.lc；第十一批）
+    var klist: []i64 = node_kids_list((id as u64));   // S4 访问者第一步：复用 node_kids_list（输出顺序与原先逐链遍历逐点相同）
+    var ki: i64 = 0;
+    while (ki < slice_len(klist) as i64) { cst_dump("", klist[ki], depth + 1); ki = ki + 1; }
     sb_append_char(g_cst_sb, 41);            // 41 = ')'
 }
 pub fn cst_to_ast_str(roots: []i64) string {
