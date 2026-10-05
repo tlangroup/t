@@ -1725,7 +1725,15 @@ if (n.td > 0) { n.td = -1; }          // ← 写在副本上：从未写回 node
      **无超出预期的改动**。
   ⑤ IR 快照 **3 DIFF（`src/tc.tc::{c,h,ll}`）/ 0 NEW / 0 GONE，examples 零 DIFF**（242.6s）；
   ⑥ `--update` 重录基线 → **117 targets / 354 entries**（253.2s）；
-  ⑦ gate L2 = 25 passed / 0 failed。
+  ⑦ **gate L2 = 25 passed / 0 failed（2543.5s）**，自举四代不动点 **148.2s**（`g2 == g3 == g4`）。
+     分步耗时（关键项）：工具链断言 0.8s / 诊断注册表 0.3s / `cstgen --check` 0.3s /
+     静态检查 1.1s / 预编译 std 9.3s / **自举一代 142.3s** / IR 静态审计 1.6s /
+     LLVM IR verifier 1.5s / **产物快照比对 388.8s** / conformance 91.7s /
+     自举不动点 287.5s / **run_examples dbg 413.2s** / HIR AstGen 30.9s / HIR 解释器 3.1s /
+     difftest 代际对拍 7.4s / 双轨对拍 191.4s / REPL 冒烟 17.5s / **MIR differential 150.3s** /
+     C 后端自举 238.0s / difftest tc0 50.3s / **rls 快速通道 347.1s** / tote 2.4s / lint 18.4s。
+     一次跑过、无沙箱拦截（20-I 那次的环境噪声未复现）。
+  ⑧ 提交 `25814e0` → FF 推送 `s2-noderef:main`，远端 `main == 25814e0`。
 - ⭐⭐ **为什么「examples 零 DIFF」不够，必须另做覆盖证明**（本批最重要的方法论收获）：
   按 impl-rules「examples 出现 DIFF 是硬信号」，零 DIFF 通常可判定非行为变化。但本批
   **反查发现 mangle 路径在快照里根本没被触发** —— 编译器自身产物里能匹配 `[A-Za-z_]\w*__\d+`
