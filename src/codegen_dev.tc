@@ -30,46 +30,18 @@ pub var g_dv_t: []string;
 pub var g_dv_e: []string;
 pub var g_dv_a: []i64;
 
-// 越界安全的节点读取：emit-dev 路径下 base.nodes/base.kids 可能未完整填充，
-// 任意索引越界访问都会崩；统一经此函数取节点，越界时回零节点（kind=""）避免崩溃。
-pub fn dev_safe_node(e: i64) Node {
-    var n: Node;
-    // S4 §0.14.7 SoA：kind 已外置为侧表 g_node_kind（第十八批）。零 Node 无 id ⇒ 无法回写侧表；
-    //   而越界读 `node_kind` 返 **""**，与此处原 `n.kind = ""` **严格等价**（同第十六批 la /
-    //   第十四批 lb / 第九批 nc 的论证：零节点初值恰等于访问器越界返回值）。
-    //   ⚠ 前提：**本文件内已无任何** Node 消费方从 dev_safe_node 的返回值读 kind —— 全部
-    //     23 处站点已改为 `base.node_kind((X as u64))` 直通侧表（见 tc check 点名的报错清单）。
-    // S4 §0.14.7 SoA：sa 已外置为侧表 g_node_sa（第十九批，Node 的最后一个真实载荷字段）。
-    //   论证完全同第十八批 kind：零 Node **无 id** ⇒ 无法回写侧表；而越界读 `node_sa` 返 **""**，
-    //   与此处原 `n.sa = ""` **严格等价**（零节点初值恰等于访问器越界返回值）。
-    //   ⚠ 前提：**本文件内已无任何**消费方从 dev_safe_node 的返回值读 sa —— 本文件由 tc check
-    //     点名的 21 处站点已全部改为 `base.node_sa((X as u64))` 直通侧表（不含本行）。
-    // S4 §0.14.7 SoA：ia 已外置为侧表 g_node_ia（第十三批）。原零节点写的是 `n.ia = 0`
-    //   （而非全局默认 -1），故不能直接套用「越界读访问器返默认值即等价」的论证；此处经
-    //   **普查确认是死写**：本文件改造后**无任何** `Node` 消费方读 ia（唯一提及在
-    //   `dev_parse_int` 的注释里），越界零节点的 ia 永不被观测 ⇒ 删除不改变行为。
-    // S4 §0.14.7 SoA：na 已外置为侧表 g_node_na（第十七批）。零 Node 无 id ⇒ 无法回写侧表；
-    //   越界读 node_na 返 -1，与此处原 `n.na = -1` **等价**（同第十六批 la / 第十四批 lb /
-    //   第九批 nc 的论证：零节点初值恰为 -1，与全局默认一致）。
-    // S4 §0.14.7 SoA：nb 已外置为侧表（第十五批）。零 Node 无 id ⇒ 无法回写侧表；
-    //   越界读 node_nb 返 -1，与此处原 n.nb = -1 **等价**（同第十四批 lb / 第九批 nc 的论证）。
-    //   ⚠ 与第十三批 ia 的**结论不同**：ia 零节点初值是 0 而全局默认 -1，故只能按死写删除；
-    //     nb 的零节点初值恰为 -1，等价成立，可照 lb 句式处理。
-    // S4 §0.14.7 SoA：nc 已外置为侧表（零 Node 无 id，越界读 node_nc 返 -1，等价原 n.nc = -1）
-    // S4 §0.14.7 SoA：nd 已外置为侧表；越界读 node_nd 返 -1，与此处原 n.nd = -1 等价
-    // S4 §0.14.7 SoA：la 已外置为侧表（第十六批）。零 Node 无 id ⇒ 无法回写侧表；
-    //   越界读 node_la 返 -1，与此处原 `n.la = -1` **等价**（同第十四批 lb / 第九批 nc 的论证）。
-    //   ⚠ la 与 lb/lc 同为 kids 链槽族，且同样**零节点初值恰为 -1** ⇒ 等价成立。
-    //   ⚠ 但注意本槽**没有 -2**（本批普查结论），故无需考虑「越界读被误判成 -2 语义」的风险。
-    // S4 §0.14.7 SoA：lb 已外置为侧表；越界读 node_lb 返 -1，与此处原 n.lb = -1 等价
-    //   （第十四批。⚠ 与第十三批 ia 的**结论相反**：ia 的零节点初值是 0 而非全局默认 -1，
-    //    那里套不上这条论证（属死写删除）；lb 的零节点初值恰为 -1，故等价成立。
-    //    另外注意：lb 还有 -2 哨兵，但 -2 只由**调用方经构造器实参**写入，node_new /
-    //    零节点都只写 -1，故「越界 ⇒ 返 -1」不会被误读成「-2 无该列表」。）
-    // S4 §0.14.7 SoA：lc 已外置为侧表；越界读 node_lc 返 -1，与此处原 n.lc = -1 等价（第十一批）
-    var nlen: i64 = base.node_count();
-    if (e >= 0 && e < nlen) { n = base.nodes[e]; }
-    return n;
+// 越界安全的节点索引：emit-dev 路径下节点池可能未完整填充，任意索引越界访问都会崩；
+// 统一经此函数把索引夹回合法区间后再交给侧表访问器（越界读一律返该字段的默认值）。
+// S4 批次 20-F：返回类型由 `Node` 改为 **i64（节点索引）**。
+//   ⚠ 越界时返 **0**（不是 -1）：本函数唯一调用点的旧语义是「读零 Node 的字段」，而零 Node
+//     的 `id` 由 `var n: Node;` 零初始化为 **0** ⇒ 越界等价于按索引 0 读侧表。返 -1 会落到
+//     访问器的越界分支返默认值，二者在 node 0 的该字段非默认值时**不相等** ⇒ 必须返 0。
+//   ⚠ 随 `pub struct Node` 一并删除后，原逐字段「零节点初值 == 访问器越界返回值」的论证
+//     （批次 13–19 的 24 个字段）已无处依附，完整版本见
+//     docs/compiler/cst-design-v2.md §0.14.7 各批次小节与 git 历史。
+pub fn dev_safe_node(e: i64) i64 {
+    if (e >= 0 && e < base.node_count()) { return e; }
+    return 0;
 }
 
 pub fn dev_kid_val(c: i64) i64 {
@@ -246,7 +218,7 @@ pub fn emit_device_module() string {
     var found: bool = false;
     while (i < n) {
         var d: i64 = lex.decl_list[i];
-        // S4 §0.14.7 SoA：bf 已外置（原 `dn.bf`；dev_safe_node 越界返默认 Node，
+        // S4 §0.14.7 SoA：bf 已外置（原 `dn.bf`；dev_safe_node 越界返零节点索引 0，
         // 其 bf 恒 false —— 与 node_bf 越界返 false 等价）
         if (base.node_kind((d as u64)) == "FuncDecl" && base.node_bf((d as u64)) == true) {
             emit_dev_kernel(d);
@@ -271,7 +243,6 @@ pub fn emit_dev_kernel(d: i64) void {
     var e_t: []string = []; g_dv_t = e_t;
     var e_e: []string = []; g_dv_e = e_e;
     var e_a: []i64 = []; g_dv_a = e_a;
-    var dn: Node = dev_safe_node(d);
 
     // 形参类型签名 + 块参数
     var psb: StringBuilder = sb_new();
@@ -310,7 +281,7 @@ pub fn emit_dev_kernel(d: i64) void {
     dev_emit(base.sb_cat3("^entry(", sb_to_str(asb), ") :"));
     dev_trace("[EMIT_DEV] after ^entry emit\n");
 
-    var b: i64 = base.node_lc((dn.id as u64));
+    var b: i64 = base.node_lc((dev_safe_node(d) as u64));
     while (b >= 0) {
         var bkval: i64 = dev_kid_val(b);
         if (bkval < 0) { break; }

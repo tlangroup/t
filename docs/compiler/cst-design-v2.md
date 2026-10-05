@@ -1466,6 +1466,38 @@ if (n.td > 0) { n.td = -1; }          // ← 写在副本上：从未写回 node
   **gate L2 = 25 passed / 0 failed（2635.2s）**，四代不动点 `g2==g3==g4` PASS（137.0s）、
   run_examples 双后端 462.2s 全绿、产物快照比对 410.6s、双轨对拍 244.3s、rls 快速通道 287.0s。
 
+**批次 20-F：删 `pub struct Node` + `pub var nodes`（⭐ S4 epic 终点；2026-10-05）**
+- **四组动作**：① `dev_safe_node` 改返**索引** → 消掉最后 1 处 `.id` 读点；
+  ② 删 4 处「只声明不读」的 `Node` 局部量（`codegen_c` 的 `wn`、`sema` 的 `mvn`/`mvn2` ×3）；
+  ③ 删 `pub struct Node`（132 行，含 24 字段的逐批历史注释）与 `pub var nodes: []Node;`；
+  ④ `node_count()` 函数体改读**锁步的 `g_node_kind`**。
+- ⭐⭐ **`dev_safe_node` 越界必须返 `0`，不能返 `-1`**（本批唯一的语义判断点）：
+  唯一调用点的旧语义是「读**零 Node** 的字段」，而零 Node 的 `id` 由 `var n: Node;` 零初始化为
+  **0** ⇒ 越界等价于**按索引 0 读侧表**。返 `-1` 会落到访问器的越界分支返**字段默认值**，
+  与「node 0 的该字段值」在 node 0 非默认时**不相等** ⇒ 只有返 `0` 才严格等价。
+  （直觉上的「安全索引 = -1」在这里是错的，已在函数注释里写明。）
+- ⚠ **坑六（新脚本 `tools/drop_node_struct.py`）**：`range`/`del` 的行号是**原文件**的，
+  但前一条删除会让后续下标整体前移 ⇒ **必须按行号降序施加**（升序会把后面每个 op 打偏）。
+  脚本已修，并在 dry-run 里打印每条 op 的首行预览供人工对账。
+- **落成**：4 个 src 文件 **28 增 / 190 删**（净 −162，绝大部分是被删的 struct 注释）；
+  `Node` / `nodes` 的**代码站点全部归零**（残留 `\bNode\b` 与 `nodes[` 全在注释里），
+  `.id` 读点 **0**，`slice_set(nodes,…)` **0**。
+- **验证链**：`tc check` **0 error / 530 warning**；自举 g1 **2m23s**；
+  seed vs g1 **逐字节 IDENTICAL**（`.c` 2 527 662 B `33953ae4…` / `.h` 130 831 B `1ad485ed…`）；
+  旁路对照 **`.c` 32 删 / 21 增**、**`.h` 6 删 / 1 增**，分类 = 意图内改动（`.c` 16 删 / 5 增：
+  删 `base__nodes` 数组、`node_count` 体改读 `g_node_kind`、`node_new` 的 `n={0}`/`n.id`/`append`
+  3 行、3 处 `mvn/mvn2`、`dev_safe_node` 5→3 行、`dn` 声明、`dn.id`→`dev_safe_node(d)`、`wn` 声明）
+  + 4 组局部槽位改名（16 行，**分两组恒定位移**：`cp__26380→26359` 与 `id__36630→36609`
+  Δ=**−21**；`idv__222544→222475` 与 `v__228872→228803` Δ=**−69**；100% 配对）。
+  ⚠ 位移分两组不是异常：位移量随「删除发生在哪个模块」累加（早段已删 ⇒ Δ 小，晚段再删 ⇒ Δ 大）；
+  **clang 链接 g1 无重名冲突即证明无槽位碰撞**。
+  IR 快照 **3 DIFF（`::c`/`::h`/`::ll`）、0 NEW / 0 GONE、examples 零 DIFF**；
+  `--update` 重录基线（117 targets / 354 entries，277.7s）；
+  **gate L2 = 25 passed / 0 failed（2652.4s）**：四代不动点 `g2==g3==g4` PASS（148.6s）、
+  run_examples 双后端 446.1s 全绿、产物快照比对 395.7s、自举不动点 g2==g3 306.8s、
+  双轨对拍 197.9s、MIR differential 154.6s、C 后端自举 239.8s、rls 快速通道 333.6s。
+  ⇒ **产物 `.c` / `.h` 里 `base__nodes` 与 `base__Node` 计数均为 0**（已 grep 核实）。
+
 
 **剩余字段实测使用量（`.F` 命中数；泛型名字段含非 Node 假阳性，仅作排序参考）**
 （✅ 已迁 `se`、`has_sa`、`has_sb`、`has_sc`、`be`、`bf`、`memspace`、`bd`、`bb`、`bc`、`sc`、`nd`、`ib`、`nc`、`ba`、`lc`、`sb`、`ia`、`lb`、`nb`、`la`、`na`、`kind`、**`sa`** —— 共 **24 个字段**）。

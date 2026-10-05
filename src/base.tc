@@ -1727,138 +1727,11 @@ pub var toks: []Tok;
 //   ia/ib       : 整型载荷（radix / bitWidth / offset），-1 = null
 //   ba/bb       : 布尔载荷（isConst/isExtern/isComptime/isBitpack...）
 
-pub struct Node {
-    // S4 第十八批（§0.14.7）：kind 已迁出为属性侧表 g_node_kind，访问面走 node_kind()/
-    // node_set_kind()（默认 ""）。⚠ 这是 Node 里**语义最重**的字段 —— 它是全编译器 AST
-    //   派发的唯一依据（前端解糖、sema 分派、HIR lower、双后端发射全部按 kind 分派），
-    //   真实站点 920 行 / 1022 处，且**散布极广**（不像 na 那样集中分布在看
-    //   kids/子节点槽的少数模块里，而是每个模块的每个派发点都有一份）。
-    //   ⚠⚠ **本批最致命风险**：kind 一外置，**跨索引整体赋值就不再搬 kind** ⇒ sema 那 2 处
-    //      ADT 脱糖拷贝（§0.14.7「批次 16/17」）会直接改派发（e 本该从 variant_lit 变成 call，
-    //      漏同步 ⇒ 仍按 variant_lit 分派 ⇒ 递归到自身、无限脱糖）。故这两处**必须显式同步**
-    //      （`tools/wholescan.py` 已把 kind 纳入 SOAP 字段清单做台账）。
-    //   ⚠ 默认值论证：`node_new(kind)` 是**唯一**的新节点入口，且 kind 是它的**必填形参**
-    //      ⇒ 任何真实节点的 kind 都由调用方显式给出，不存在「漏给默认值」的情形；
-    //      越界读 / 零节点读一律返 **""**（与 `codegen_dev::dev_safe_node` 旧零节点
-    //      `n.kind = ""` 逐点一致）。
-    //   ✅ 已普查确认 **无哨兵值**（不像 lc/lb 的 -2）：kind 的取值全部是**语义字符串**
-    //      （"ident"/"call"/"FuncDecl"/…），不存在「默认之外的哨兵语义」。
-    //   外置只做等价搬迁，禁止顺手拆语义 / 改默认值 / 改写入时机。
-    // S4 第十九批（§0.14.7）：sa 已迁出为属性侧表 g_node_sa，访问面走 node_sa()/node_set_sa()
-    // （默认 **空串**；越界读也返空串）。至此 Node 里**最后一个真实载荷字段**完成外置 ——
-    //   剩余仅 `id`（S5 step2 过渡字段，随 Node 一并删除）。
-    // ⚠ sa 是 Node 里**用量最大**的字符串载荷（真站点清单见 cst-design-v2.md「批次 19」），
-    //   且按 kind **复用极多语义**：ident/arm/vcon 的名字、int/float/string/sym/number 的
-    //   字面量文本、named/struct_lit/struct_decl 的类型名、member 的成员名、binary/unary/assign
-    //   的运算符串、mbuiltin 的内建名、lambda/closure_make 的合成名、ForEach 的循环变量名、
-    //   bitstr_seg 的段名/字节序、ModuleDecl/FuncDecl/VarDecl 的声明名…
-    //   本批只做等价搬迁，未拆语义。
-    // ⚠ 与 has_sa 的耦合：`has_sa == false` 表示「sa 语义为 null」（区别于空串）；
-    //   has_sa 早在第二批已外置，本批**不新增耦合**——两表各自按 id 对齐即可。
-    // ✅ 普查确认 **默认 "" 且无额外哨兵**：node_new 旧初值即 `n.sa = ""`；全仓写点全为字符串值
-    //   （46 处构造器 `n.sa = sa` 形参直传 + 若干常量串），**无数值哨兵 / 无负值 / 无 -2 第二哨兵**
-    //   ⇒ 直接复用第六批 sc、第十二批 sb 验证过的「string 单哨兵空串」范式。
-    // S4 第十二批（§0.14.7）：sb 已迁出为属性侧表 g_node_sb，访问面走 node_sb()/node_set_sb()
-    // （默认 **空串**；越界读也返空串）。⚠ 该字段按 kind **复用**于 12 种语义（详见 node_sb 处
-    //   注释）：EnumDecl/FlagDecl 的底层整型名、ImportDecl/ImportModDecl 的模块路径、
-    //   StructDecl 的 `"soa"` 布局标记、Vval/variant_lit 的 case 名、ForEach 的第二变量名、
-    //   ImportItem 的目标符号名、Conpat 的构造器限定符、int/bool 字面量的数值后缀、
-    //   named 的类型限定符（`"?"` = 未知）、closure_capture/closure_make 的环境结构名、
-    //   mbuiltin 的元素标量类型名、测试 FuncDecl 的显示名。本批只做等价搬迁，未拆语义。
-    //   ✅ 已普查确认 **无额外哨兵**（不像第十一批 `lc` 的 `-2`），默认与越界读一律 `""`。
-    // S4 第六批（§0.14.7）：sc 已迁出为属性侧表 g_node_sc，访问面走 node_sc()/node_set_sc()
-    // （默认 ""）。⚠ 该字段按 kind **复用**于 5 种语义（详见 node_sc 处注释）：ImportDecl/
-    // ImportModDecl 的用户别名、StructDecl 的 @bitpack 标量成员类型名、FuncDecl 的
-    // "__lambda__" Lambda 脱糖标记、FuncDecl 的 suite 测试路径、P Param 暂存的 owner 类型名。
-    // 本批只做等价搬迁，未拆语义（拆语义属独立变更，会让本轮验证指标无法归因）。
-    // S4 第二批（§0.14.7）：has_sa/has_sb/has_sc 已迁出为属性侧表 g_node_has_*，
-    // 访问面走 node_has_X() / node_set_has_X()（存在性标志：X 语义是否为 null；默认 true）。
-    ia: i64;
-    // S4 第十三批（§0.14.7）：ia 已迁出为属性侧表 g_node_ia，访问面走 node_ia()/node_set_ia()
-    // （默认 **-1** = 无标记；越界读也返 -1，与 node_new 旧初值 `n.ia = -1` 逐点一致）。
-    // ⚠ 与 ib 同属「通用整数槽」，但复用面更广（13 种语义，完整清单见 node_ia 处注释）：
-    //   vector/@Vector 的 lane 数、tile/@Tile 的行数、mbuiltin(splat/tsplat/tile_*) 的
-    //   lane/行、int 与 bool 字面量的**进制 radix**（不是值！mv_int 恒写 10）、sym 的位宽、
-    //   atom 的 intern id、fidconst 的文件描述符值、struct_lit 的元组标记（==1）、
-    //   FuncDecl 的 overload 角色码（0 普通 / 1 overload / 2 extend overload）、
-    //   F 结构体字段的 sfield_ia 位宽、VC 变体 case 的 tag、vval 的 case 下标、
-    //   P 模式回填自 VC 的 case 下标。本批只做等价搬迁，未拆语义。
-    //   ✅ 已普查确认 **无额外哨兵**（不像第十一批 `lc` 的 `-2`）：写负值的站点只有
-    //      node_new/mk_vector/mk_tile 的 `-1`；`-2` 全部属于 lc/lb 或同名局部变量。
-    // S4 第八批（§0.14.7）：ib 已迁出为属性侧表 g_node_ib，访问面走 node_ib()/node_set_ib()
-    // （默认 **-1** = 无标记；越界读也返 -1）。与第七批 nd 同属索引型侧表，复用 -1 哨兵范式。
-    // ⚠ ib 被 6 种 kind 复用（SL offset / tile 列数 / array_lit 的 TD 下标 / conpat·VC 载荷数 /
-    //   F 的 tagID / leading-dot 标记），完整清单见 node_ib 处注释。本批只做等价搬迁，未拆语义。
-    // S4 第十批（§0.14.7）：ba 已迁出为属性侧表 g_node_ba，访问面走 node_ba()/node_set_ba()
-    // （默认 **false**）。⚠ 该槽按 kind 复用 8 种语义（bool 字面量真值 / var_decl const /
-    //   arm·P 通配 / range 闭合 `..=` / bitstr_seg 变长尾 / ImportItem 通配 / StructDecl /
-    //   VariantDecl 抽象变体），完整清单见 node_ba 处注释。本批只做等价搬迁，未拆语义。
-    // S4 第五批（§0.14.7）：bb / bc 已迁出为属性侧表 g_node_bb / g_node_bc，
-    // 访问面走 node_bb()/node_set_bb() 与 node_bc()/node_set_bc()（默认 false）。
-    //   bb = bool 载荷（按 kind 复用：is_let / 编译期类型参数 / SL 显式 offset / 捕获标记）
-    //   bc = 模块系统：该声明是否被 `pub` 修饰（顶层跨模块可见性）
-    // S4 第四批（§0.14.7）：bd 已迁出为属性侧表 g_node_bd，访问面走 node_bd()/node_set_bd()
-    // （默认 false）。⚠ 该字段被**复用**于两种语义：① import 是否走库搜索路径
-    // （true=lib/依赖库，false=src 源码根；见 parse_at_import_decl / handle_one_import）；
-    // ② member 节点是否是某个 call 的 callee（sema::mark_call_callees 置位）。
-    // S4 第三批（§0.14.7）：be/bf 已迁出为属性侧表 g_node_be / g_node_bf，
-    // 访问面走 node_be()/node_set_be() 与 node_bf()/node_set_bf()（默认 false）。
-    //   be = C 互操作导出：该声明是否标记 `@c_export`（生成 C ABI 平铺入口）
-    //   bf = Device 子系统：该声明是否为 `kernel fn`（host 双后端跳过，codegen_dev 处理）
-    // S4 第十七批（§0.14.7）：na 已迁出为属性侧表 g_node_na，访问面走 node_na()/node_set_na()
-    // （默认 **-1** = 无该子节点；越界读也返 -1，与 node_new 旧初值 `n.na = -1` 逐点一致）。
-    // na/nb/nc/nd 四槽至此**全部外置**（nd 第七批 → nc 第九批 → nb 第十五批 → na 本批收官）。
-    // ⚠ `na` 名义是「第一子节点槽」，是 Node 里**用量最大**的索引槽（真实站点 910 行），
-    //   且按 kind **复用极多语义**（完整清单见 node_na 处注释）：binary/assign 的左操作数、
-    //   call/mbuiltin 的 callee、member/index 的基、FuncDecl 的返回类型、arm 的等值模式、
-    //   cast/break/expr/paren/pointer 的操作数、M/P/V/VC 的值、map/array/tile 的第一类型参数…
-    //   ⚠ 与 nb 的 slice_pat 计数不同：**全仓普查确认 `na` 恒为节点索引**（唯一的非索引写法
-    //      是各处 `n.na = -1` 的清空），故按纯索引型 `-1` 单哨兵范式外置即可。
-    //   ✅ 已普查确认 **无额外哨兵**：全仓对 na 的比较只剩 `>= 0`（126）与 `< 0`（26），
-    //      `> -2` / `!= -2` / `== -2` / `== -1` / `== 0` / `> 0` **命中全部为 0**；
-    //      且 `n.na = -2` 的写入点为 0 ⇒ 与 lc/lb 的双哨兵不同，不得套用。
-    //   外置只做等价搬迁，禁止顺手拆语义 / 改默认值 / 改哨兵。
-    // S4 第十五批（§0.14.7）：nb 已迁出为属性侧表 g_node_nb，访问面走 node_nb()/node_set_nb()
-    // （默认 **-1** = 无该子节点；越界读也返 -1）。na/nb/nc/nd 四槽的迁移顺序是「先小后大」：
-    //   nd（第七批，22 站）→ nc（第九批）→ **nb（本批，429 站，四槽里最大）** → na（留最后）。
-    // ⚠ `nb` 名义是「第二子节点槽」，实际按 kind **复用多样语义**（详见 node_nb 处清单）；
-    //   个别kind 甚至**不是节点索引**：`mk_slice_pat` 的 nb = **children 总数（计数）**，
-    //   `bitstr_seg` 的 nb = 位宽表达式节点但 `-1` 表示「变长尾段」。
-    //   外置只做等价搬迁，禁止顺手拆语义 / 改默认值 / 改哨兵。
-    // S4 第九批（§0.14.7）：nc 已迁出为属性侧表 g_node_nc，访问面走 node_nc()/node_set_nc()
-    // （默认 **-1** = 无该子节点；越界读也返 -1）。与第七批 nd 同族，直接复用 -1 哨兵范式。
-    // S4 第七批（§0.14.7）：nd 已迁出为属性侧表 g_node_nd，访问面走 node_nd()/node_set_nd()
-    // （默认 **-1** = 无该子节点；越界读也返 -1）。na/nb/nc/nd 四槽里 nd 量级最低（真站点 22），
-    // 先迁它以验证「索引型（非 bool / 非 string）侧表」范式，再动 na/nb/nc。
-    // S4 第四批（§0.14.7）：memspace 已迁出为属性侧表 g_node_memspace，访问面走
-    // node_memspace()/node_set_memspace()（默认 0）。Device 指针地址空间
-    // （0=host；1=global/dev_ptr；3=shared；5=local），仅 pointer 类型节点使用。
-    // S4 第十六批（§0.14.7）：la 已迁出为属性侧表 g_node_la，访问面走 node_la()/node_set_la()
-    // （默认 **-1** = 空 kids 链；越界读也返 -1，与 node_new 旧初值 `n.la = -1` 逐点一致）。
-    // ⚠ 与第十一批 `lc`、第十四批 `lb` 同为 kids 链表头槽族，但 **`la` 没有 `-2` 第二哨兵**
-    //   ——本批开工普查确认：全仓对 la 的比较只剩 `>= 0`（35）与 `< 0`（9），
-    //   `> -2` / `!= -2` / `== -2` **命中均为 0**（命令见 cst-design-v2.md「批次 16」小节）。
-    //   ⇒ **同族不等于同哨兵**：lc/lb 的 `-2` 语义（合成声明已消费 / 该列表不存在）**不得**
-    //   套用到 la 上，本批侧表只有 `-1` 一个哨兵值。
-    // ⚠ `la` 是第一条 kids 链（其余见 lb/lc），装的是 **kids 池里的链表头下标**（不是节点 id！），
-    //   下钻必须走 `var k: Child = base.kids[c]; ... base.kids[c].val / .next`。
-    //   外置只做等价搬迁，禁止顺手拆语义 / 改默认值 / 改哨兵。
-    // S4 第十四批（§0.14.7）：lb 已迁出为属性侧表 g_node_lb，访问面走 node_lb()/node_set_lb()
-    // （默认 **-1** = 空 kids 链；⚠ 与第十一批的 `lc` 同族，同样带 **-2** 哨兵，但语义不同：
-    //   `lc` 的 -2 = 「本体已由别处消费的合成声明」；`lb` 的 -2 = 「**该列表不存在**」，
-    //   典型是 `if` 无 else 分支（`lb == -2`，sema 5963 / tir 2395）与「空参数列表」
-    //   （sema 9651 明写：用 -2 表示空，因为 -1 会被当作 null 链表头处理）。
-    //   判据遍布 `if (n.lb > -2)` / `if (n.lb != -2)`，详见 node_lb 处注释。）
-    // S4 第十一批（§0.14.7）：lc 已迁出为属性侧表 g_node_lc，访问面走 node_lc()/node_set_lc()
-    // （默认 **-1** = 空 kids 链；⚠ 另有特殊哨兵 **-2** = 本体已由别处消费的合成声明，
-    //   判据遍布 `if (n.lc > -2)` / `if (n.lc != -2)` / `if (n.lc == -2)`，详见 node_lc 处注释）。
-    // `la`/`lb`/`lc` 同族：都是 **kids 链表头下标**而非节点 id，务必走 `*_kids`/`*_list` 链表下钻。
-    // S3（§4.5）：原 `td`（HIR 类型槽）已迁出为属性侧表 `g_node_td`，访问面走
-    // `node_type()` / `node_set_type()`。语法树不再携带类型——跨切面属性改由侧表
-    // 以节点 id 为键持有，降低 Node 布局与下游阶段的耦合（替换前：`td: i64`）。
-    id: i64;    // S5 step2 过渡：节点裸索引（== nodes 下标），供 X.ln → node_span_id(X.id) 机械迁移读方；
-                // 待退役字段，S4 epic 删 base.Node 时一并移除（NodeRef 即句柄，无需自存 id）
-}
+// S4 批次 20-F（§0.14.7 收口）：`pub struct Node` 已删除 —— 24 个载荷字段在批次 1–19 全部外置为
+// 平行侧表（逐字段的默认值 / 哨兵论证见 docs/compiler/cst-design-v2.md §0.14.7 各批次小节，
+// 以及 git 历史里 20-F 之前的本文件版本），最后的过渡字段 `id` 随本批一并移除。
+// ⇒ **节点句柄从此就是裸索引**（`node_new` 的返回值），侧表访问面统一走 `node_xxx()` / `node_set_xxx()`。
+// ⚠ `nodes[]` 数组同时删除（其长度语义由 `node_count()` 承载，实现改读锁步的 `g_node_kind`）。
 
 // S5（§4.10.3 / §4.8）：源码区间 Span（取代 `ln/cl/tv` 三字段的结构化表示）。
 // step1 建侧表（node_new 初始化零区间 + node_at 绑定）；step2 读方迁 node_span_id(X.id)；
@@ -1870,7 +1743,6 @@ pub struct Span {
     end_col: u64;  // 终止列 = col + len(tv)（独占上界）
 }
 
-pub var nodes: []Node;
 
 // ── 命名空间隔离（外部库真正落地）──────────────────────────────
 // provenance：每个 AST 节点记录它是在哪个模块（别名）里被解析出来的。
@@ -2937,19 +2809,16 @@ pub fn g_conpat_bind_has(d: i64) bool {
 // 旧 g_const_decl_ids 平行数组 + g_const_decl_has 线性扫描已删除（§4.5 per-node 标志，O(1)）。
 
 // S4 批次 20-E（§0.14.7 删 Node 收口）：节点池长度访问器。
-//   全仓 29 处 `slice_len(nodes)` / `slice_len(base.nodes)` / `slice_len(base__nodes)` 收敛于此，
-//   为下一批（20-F）删掉 `pub var nodes: []Node;` 铺路 —— 届时**只改本函数体一行**
-//   （改读与之锁步的 `g_node_kind`），29 个调用点**全部不动**。
-// ⚠ 本批函数体就写 `slice_len(nodes)` ⇒ 与替换前**逐字等价**（纯重命名，零语义风险）。
-// ⚠ 锁步性已证：全仓仅 `node_new` 里 1 处 `append(nodes, n)`，而 `g_node_kind` 在同一函数里
-//   逐节点 append ⇒ `slice_len(nodes) == slice_len(g_node_kind)` 恒成立（20-F 依赖此条）。
+//   全仓 29 处 `slice_len(nodes)` / `slice_len(base.nodes)` / `slice_len(base__nodes)` 收敛于此。
+// S4 批次 20-F：`nodes[]` 已删除 ⇒ 函数体改读 **与之锁步的 `g_node_kind`**。
+//   ⚠ 锁步性：`node_new` 是**唯一**的节点创建入口，逐节点 `append(g_node_kind, kind)`，
+//   故 `slice_len(g_node_kind)` == 旧 `slice_len(nodes)`（20-F 前实测两者恒等）。
 pub fn node_count() i64 {
-    return slice_len(nodes) as i64;
+    return slice_len(g_node_kind) as i64;
 }
 
 // 新建节点：全部字段置于"空"语义，返回索引
 pub fn node_new(kind: string) u64 {
-    var n: Node;
     // S4 第十八批（§0.14.7）：kind 已外置为侧表 g_node_kind，见下方 `append(g_node_kind, kind)`。
     //   ⚠ 与其余侧表不同：这里没有「默认初值」可谈——kind 是本函数的**必填形参**，逐字落到
     //     侧表（旧代码是 `n.kind = kind;`，等号两边同为一处 ⇒ 严格等价）。
@@ -2974,8 +2843,6 @@ pub fn node_new(kind: string) u64 {
     // S4 第十四批（§0.14.7）：lb 已外置为侧表 g_node_lb（默认 -1 = 空链，见下方 append）
     //   ⚠ 注意：此处旧初值是 **-1**（node_new 从未写过 -2），-2 只在**调用方**经构造器实参写入。
     // S4 第十一批（§0.14.7）：lc 已外置为侧表 g_node_lc（默认 -1 = 空链，见下方 append）
-    n.id = node_count();   // S5 step2：裸索引（append 后恰为该节点下标），供 node_span_id 机械读方迁移
-    append(nodes, n);
     append(g_node_mod, g_cur_mod);   // provenance：记录本节点所属模块别名（"" = 入口）
     append(g_node_file, g_file);      // provenance：记录本节点所属源文件（load_module_file 内 g_file 已切到该模块文件）
     append(g_node_td, 0);             // S3 §4.5 node_type 侧表：默认未定型（0），由 sema/tir 经 node_set_type 写入
