@@ -1897,15 +1897,82 @@ if (n.td > 0) { n.td = -1; }          // ← 写在副本上：从未写回 node
   参数表 / 语句体 / else 分支 / case 列表 …），把三槽合并喂进去会**改变语义**。
   ⇒ 「三链合并遍历」的真实用例只有 `cst_dump` 一处（它本来就是这么写的，故 Phase 2 零行为变化成立）。
   ⦁ 结论：`node_kids_list` 定位为 **`cst_dump` 专用形态**，不是通用访问者 API，**不推广**。
-  ⦁ Phase 3 的正确粒度是**单链扁平化**：
-    ```t
-    pub fn node_kids_chain(n: u64, slot: i64) []i64   // slot: 0=la / 1=lb / 2=lc
-    ```
-    候选适配面（`.next` 链遍历站点数）：`sema` 141 / `codegen_c` 81 / `tir` 62 /
+  ⦁ **Phase 3 粒度定为「单链扁平化」**（原设想 `(n, slot)` 数值槽号版已由 20-M 推翻，见下）。
+  ⦁ 候选适配面（`.next` 链遍历站点数）：`sema` 141 / `codegen_c` 81 / `tir` 62 /
     `parse` 32 / `test` 5 / `comptime_fold` 4 / `hir` 2 / `codegen_dev` 2 / `tir_to_ll` 1。
-    按「每次一个后端 + gate」纪律，**从 `test.tc` / `comptime_fold.tc`（个位数站点）起步**，
+    按「每次一个后端 + gate」纪律，**从 `hir` / `test` / `comptime_fold`（个位数站点）起步**，
     逐步向 `parse` → `codegen_c` / `tir` → `sema` 推进。
   ⦁ ⚠ 每处改写前必须确认「该循环遍历的是**哪一条**链」，不得用三链合并版顶替单链循环。
+  ⦁ 形态分三类，**只有第三类适用于扁平化**：① **改动链本身**（`test.tc::tt_strip_main` 摘 `@main`
+    要 unlink 并重接 `next`）⇒ 必须保留裸下标；② **按下标提前退出 / 做边界算术**
+    （`codegen_dev.tc::dev_arg` 走 `idx` 步 + `c >= klen` 提前 return）⇒ 物化会丢掉「走到第 idx 个」
+    的语义与越界判据；③ **单纯按链序读完**（绝大多数）⇒ 可直接换。
+
+**批次 20-M：抽出 `base.kids_chain`（单链扁平化 primitive）+ `hir` 后端换用（2026-10-05）**
+> Phase 3 第一步：`hir.tc` 的两处链遍历**全部**改走新 API，本文件直接归零。
+
+**⦁ API 形态相对 20-L 设想的偏离（幅度最小、目标不变）**
+- 20-L 普查原设想 `pub fn node_kids_chain(n: u64, slot: i64) []i64`（`slot: 0=la/1=lb/2=lc`）；
+  实际落地为 **`pub fn kids_chain(head: i64) []i64`**（收链头索引）。三条例由：
+  ① **零额外表达式** —— 消费方本来就是先取 head（`base.node_la((n as u64))`）再进循环，
+     把 head 直接传入即可，无需再包一层槽号选择器；
+  ② **消掉魔法数** —— 数值槽号写错会**静默改语义**（三槽语义完全不同：实参表 / 语句体 /
+     else 分支…），而 head 形态下槽位由调用点**显式**写出，编译器层面不可能传错；
+  ③ **粒度更基础** —— `kids_chain` 是**池级** primitive，不只服务节点三槽，
+     顺带能承接既有 `hir.tc::hir_list(head)`（签名与语义完全同构）⇒ 本批消掉一处重复实现。
+- ⇒ 仍是「单链扁平化」，目标与约束不变，只改参数形态。
+- ⦁ `node_kids_list`（三链合并）**没有**改用它：t 的 `append` 只有**逐元素**形态
+  （emit 成 `t_slice_append`），无 slice 拼接内建，硬改反而要多造两个临时 slice。
+
+**⦁ 改动清单**
+| `src/base.tc` | +23（含注释 12）| 新增 `kids_chain` primitive |
+| `src/hir.tc` | −9 / +4 | `hir_list(head)` → `return base.kids_chain(head);`（删掉重复实现的 9 行循环） |
+| `src/hir.tc` | 循环改写 | `hir_lower_expr` 的 slice_pat 元素循环：原 `sp_e` 手写链遍历 → `kids_chain` 物化 + 下标循环 |
+
+**⦁ 等价性论证**
+- `kids_chain` 与手写 `while (c >= 0) { …kids[c].val…; c = kids[c].next; }` **逐点同序**；
+  `-1`（空链）与 `-2`（列表不存在）由 `>= 0` 天然排除；**刻意不加**越界保护，与原循环
+  （直接下标读）保持一致 —— 严格等价搬迁，不引入新语义。
+- slice_pat 循环体（`hir_lower_any`）**不会改动本节点的 la 链**：grep 确认 `src/hir.tc`
+  全文件**零** `node_set_la` / `kids[...] =` 写入，且 hir 在模块 DAG 上早于
+  sema / parse / comptime_fold（三者才有 la 写入点）⇒ 物化前后遍历集合恒等。
+- ⭐ **覆盖反查（沿用批次 20-J「零 DIFF ≠ 等价」判据）**：slice 模式路径由
+  `examples/match_slice.tc` 覆盖 —— 含 `[a,b]` / `[first,..,last]` / `[a,..]` / `[..,last]` /
+  `[]` / `[x]` / `[x,y]` / `[..]` / 字面量元素等 8 个 match 函数、`main` 内 40+ 断言，
+  且被 run_examples **双后端实跑** ⇒ 路径确被走过，不是「没测到所以零 DIFF」。
+
+**⦁ 验证**
+① `tc check` **0 error / 528 warning**（与基线一致）；② `cstgen --check` **OK**（未触碰 GEN 区间）；
+③ 自举 g1 **2m27s**；
+④ seed vs g1 **逐字节 IDENTICAL**：`.c` 2 529 348 B md5 `f9c0be81…` / `.h` 131 005 B md5 `c15bb4ed…`；
+⑤ **旁路对照**（`git cat-file blob HEAD:src/{base,hir}.tc` 回退 → seed 重编 → 对拍 → 还原）：
+  `.h` **仅 +1 行**（`TSlice base__kids_chain(int64_t head);`）；`.c` 87 行差异剔除 `__N` 后
+  **只剩三组预期改动** —— 新增 `base__kids_chain` 函数体 10 行、`hir__hir_list` 体收缩为
+  单行 `return base__kids_chain(head);`、`hir_lower_expr` 的 slice_pat 循环改写；
+  其余**全部**是临时量改名（`cp__26465→26498`、`id__36715→36748`、`idv__222672→222685`、
+  `v__229000→229013`，**Δ 恒 +13**、100% 配对）⇒ 语义中立；
+⑥ IR 快照 **3 DIFF（`src/tc.tc::{c,h,ll}`）/ 0 NEW / 0 GONE、examples 零 DIFF**；
+   `--update` 重录 **117 targets / 354 entries**（299.5s）；
+⑦ gate L2 = **25 passed / 0 failed（2880.0s）**：自举一代 172.5s / **产物快照比对 429.3s** /
+  conformance 103.6s / 自举不动点 g2==g3 312.3s / **run_examples dbg 476.6s** / HIR AstGen 32.7s /
+  HIR 解释器 3.3s / 代际对拍 8.2s / 双轨对拍 239.2s / REPL 19.3s / **四代不动点 g2==g3==g4 141.9s** /
+  MIR differential 181.6s / C 后端自举 278.8s / tc0 对拍 59.7s / rls 快速通道 377.4s / tote 2.9s /
+  lint 22.2s —— 一次跑过、无沙箱拦截；
+⑧ dbg/rls 双种子复检 **0/528**；提交 `d3d129e`。
+
+**⦁ 沉淀**
+- ⭐ **形态三分法**（写入 impl-rules 与本节）：链遍历循环按「① 改链本身 / ② 下标提前退出
+  或做边界算术 / ③ 纯按链序读完」分类，**只有第 ③ 类可扁平化**。① 必须保留裸下标
+  （`test.tc::tt_strip_main` 要 unlink 并重接 `next`）；② 物化会丢掉「走到第 idx 个」的语义
+  与越界判据（`codegen_dev.tc::dev_arg`）。后续每处改写先过这条准入判据。
+- ⭐ **普查口径升级**：把「`.next` 出现次数」换为**循环级**口径 —— 「`while` 条件含 `>= 0`
+  且循环体内同时出现 `kids[` 与 `.next`」⇒ 得 `sema` 108 / `codegen_c` 62 / `tir` 36 /
+  `parse` 22 / `test` 3 / `comptime_fold` 2 / `base` 3 / `codegen_dev` 1 / `tir_to_ll` 1；
+  **`hir` 已归零**（本批两处全部换用）。这是 Phase 3 后续分批的排期依据。
+- ⚠ **行尾误判一次**：本次先用 `grep -c $'\r'` 判行尾，得「全 CRLF」的**错误结论**
+  （ANSI 转义使该计数不可信），按 CRLF 写的锚点匹配为 0；改用 Python 直接数
+  `bytes.count(b'\r\n')` 才知 `base.tc` / `hir.tc` 实为**纯 LF**。
+  ⇒ 判行尾**一律用 Python 数字节**，不要用 grep/shell 转义。
 
 **剩余字段实测使用量（`.F` 命中数；泛型名字段含非 Node 假阳性，仅作排序参考）**
 （✅ 已迁 `se`、`has_sa`、`has_sb`、`has_sc`、`be`、`bf`、`memspace`、`bd`、`bb`、`bc`、`sc`、`nd`、`ib`、`nc`、`ba`、`lc`、`sb`、`ia`、`lb`、`nb`、`la`、`na`、`kind`、**`sa`** —— 共 **24 个字段**）。
