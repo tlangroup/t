@@ -1497,7 +1497,7 @@ pub fn conpat_walk(p: i64, subj: i64) void {
         if (base.node_kind((cpi as u64)) == "ident") {
             if (base.node_sa((cpi as u64)) != "_") {
                 var cp_vd: i64 = base.mk_var_decl(base.node_sa((cpi as u64)), false, base.node_na((cpi as u64)), cp_ext, -1);
-                append(base.g_conpat_binds, cp_vd);
+                base.node_set_conpat((cp_vd as u64), true);   // 20-J：S3 遗留全局数组 → per-node bool 侧表
                 cp_acc_emit(cp_vd);
             }
         } else {
@@ -1548,7 +1548,7 @@ pub fn match_chain_from(c: i64, rname: string, sname: string) i64 {
             // struct 无内建整体 ==，且整体比较会被 LLVM 后端发射成「对两个 ptr 做 icmp eq i64」
             // 而类型错配（KI-002）。改为逐字段等值比较 AND 链：sname.x == pat.x && …。
             // 字段绑定（Pt{ x: a, y: b }）：ident 值不进比较链，改为在 body 前置 `auto a = sname.x;`
-            // 声明（与 slice_pat / bitstr_pat 的 g_conpat_binds 机制同构）。纯绑定臂（无字面量字段）
+            // 声明（与 slice_pat / bitstr_pat 的 node_conpat 侧表机制同构）。纯绑定臂（无字面量字段）
             // mc_cond 保持 -1 → 该臂无条件命中（绑定即匹配任意该结构值）。
             var slp: i64 = base.node_la((base.node_na((mc_k.val as u64)) as u64));
             var sl_first: bool = true;
@@ -1583,7 +1583,7 @@ pub fn match_chain_from(c: i64, rname: string, sname: string) i64 {
                     }
                     var sl_init: i64 = base.mk_member(sl_eff, base.mk_ident(sname, -1), -1);
                     var sl_vd: i64 = base.mk_var_decl(base.node_sa((sl_rhs as u64)), false, c_td_to_tnode(sl_ftd), sl_init, -1);
-                    append(base.g_conpat_binds, sl_vd);
+                    base.node_set_conpat((sl_vd as u64), true);   // 20-J：同上
                     fs_set(em_cur_fn, base.node_sa((sl_rhs as u64)), sl_ftd);
                     sl_pre_tail = base.list_push(sl_pre, sl_pre_tail, sl_vd);
                     if (sl_pre < 0) { sl_pre = sl_pre_tail; }
@@ -1637,7 +1637,7 @@ pub fn match_chain_from(c: i64, rname: string, sname: string) i64 {
                 if (base.node_kind((base.kids[sp_e].val as u64)) == "ident" && base.node_sa((base.kids[sp_e].val as u64)) != "_") {
                     // 元素绑定：声明为真实局部变量（与 conpat 载荷绑定同机制，不进 mb 栈）。
                     var sp_vd: i64 = base.mk_var_decl(base.node_sa((base.kids[sp_e].val as u64)), false, c_td_to_tnode(sp_elem), sp_acc, -1);
-                    append(base.g_conpat_binds, sp_vd);
+                    base.node_set_conpat((sp_vd as u64), true);   // 20-J：同上
                     fs_set(em_cur_fn, base.node_sa((base.kids[sp_e].val as u64)), sp_elem);
                     sp_pre_tail = base.list_push(sp_pre, sp_pre_tail, sp_vd);
                     if (sp_pre < 0) { sp_pre = sp_pre_tail; }
@@ -1694,7 +1694,7 @@ pub fn match_chain_from(c: i64, rname: string, sname: string) i64 {
                         bp_init = base.mk_call(base.mk_ident("t_bitstr_extract", -1), bp_ahead, -1);
                     }
                     var bp_vd: i64 = base.mk_var_decl(bp_name, false, bp_tnode, bp_init, -1);
-                    append(base.g_conpat_binds, bp_vd);
+                    base.node_set_conpat((bp_vd as u64), true);   // 20-J：同上
                     fs_set(em_cur_fn, bp_name, bp_td);
                     bp_pre_tail = base.list_push(bp_pre, bp_pre_tail, bp_vd);
                     if (bp_pre < 0) { bp_pre = bp_pre_tail; }
@@ -2248,7 +2248,7 @@ pub fn emit_expr(e: i64) string {
         // 同函数内重名局部（shadowing）：反查该标识符解析到的声明节点，发射唯一化后的名字。
         if (em_in_fn) {
             var vdcl: i64 = base.node_resolve(e);
-            if (vdcl >= 0 && base.g_local_has(vdcl)) {
+            if (vdcl >= 0 && base.node_mangled((vdcl as u64))) {
                 return base.sb_cat3(base.node_sa((e as u64)), "__", base.i2s(vdcl));
             }
         }
@@ -3438,9 +3438,9 @@ pub fn emit_stmt(sid: i64, indent: i64) void {
         if (em_in_fn) {
             var cname: string = base.node_sa((sid as u64));
             var lkey: string = base.sb_cat3(em_cur_fn, "::", base.node_sa((sid as u64)));
-            if (base.g_conpat_bind_has(sid) == false && base.g_seen_has(lkey)) {
+            if (base.node_conpat((sid as u64)) == false && base.g_seen_has(lkey)) {
                 cname = base.sb_cat3(base.node_sa((sid as u64)), "__", base.i2s(sid));
-                append(base.g_local_decls, sid);
+                base.node_set_mangled((sid as u64), true);   // 20-J：S3 遗留全局数组 → per-node bool 侧表
             }
             base.g_seen_add(lkey);
             // S4 §0.14.7 SoA（第十九批·sa）：⚠ **本批唯一需要论证的写点**。

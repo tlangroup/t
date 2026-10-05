@@ -1673,6 +1673,72 @@ if (n.td > 0) { n.td = -1; }          // ← 写在副本上：从未写回 node
   「单独跑过」代替门禁结论。
 
 
+**批次 20-J：S3 遗留的两个全局平行数组 → per-node bool 侧表（§0.14.5 第 4b 项收口；2026-10-05）**
+- **动机**：§0.13.8 第 3 项与 §0.14.5 第 4b 项都记着同一笔账 —— S3 的要求是「删 `Node.td`
+  **与全局平行数组**」，`Node.td` 已删，但 `g_local_decls` / `g_conpat_binds` 两个全局平行数组
+  一直没清，**S3 因此只能记为 partial**。本批清掉它们，**S3 的这项遗留闭合**。
+- **对象与改名**：
+  | 原 | 语义 | 20-J 后 |
+  |---|---|---|
+  | `g_local_decls` + `g_local_has(dcl)` | 「已唯一化重整（mangle 成 `name__<sid>`）的声明节点」**集合**，线性扫 O(n) | `g_node_mangled` + `node_mangled()` / `node_set_mangled()` |
+  | `g_conpat_binds` + `g_conpat_bind_has(d)` | 「conpat 载荷绑定（发射期现场合成的 var_decl）」**集合**，用于**禁止**对其重整 | `g_node_conpat` + `node_conpat()` / `node_set_conpat()` |
+  ⦁ `node_conpat` 这个名字是 §4.10.3 **原文预定**的（「待 `node_conpat` 侧表化后清理」），
+  不是本批新造；`node_mangled` 取自 `g_local_decls` 注释里的既有术语「唯一化重整 / mangle」。
+  ⦁ 二者是「**已登记 id 的集合**」而非「id → 值」的映射，但语义上**完全等价于节点上的一个
+  bool 标记** ⇒ 换侧表后 O(1)，并与 S4 已迁的 19 个字段同一范式。
+- ⭐⭐ **动手前先证的四条等价性**（本批的验收核心，逐条已证，**不是**事后补的）：
+  ① **越界写会被丢弃 = 行为差异吗？** —— 不会。`node_set_xxx` 越界是静默 `return`
+     （范式见 `node_set_bc`，`base.tc:2344`）。写入侧只有两类 id：`mk_var_decl` 的返回值
+     （该函数**首行即 `node_new`**，返回 `node_count()-1`，侧表已 append ⇒ 恒在界内）
+     与源码已有声明节点 id（恒 `< node_count()`）。⇒ 不存在「写了却被丢弃」。
+  ② **原集合允许重复 append，bool 标记幂等** —— 集合成员关系 ⟺ 标记为 true，
+     重复 append / 重复写 true 都不改变判定结果 ⇒ 恒等价。
+  ③ **有无「清空 / 重置」语义？** —— 无。grep 全仓「给 `g_node_kind` / `g_local_decls` /
+     `g_conpat_binds` 赋空数组」的写法结果为空 ⇒ 旧数组与侧表都从不重置；侧表随 `node_new`
+     增长、默认 false（= 不在集合）。
+  ④ **负 id / 越界读**：旧线性扫返回 false；新访问器 `id < 0 || id >= slice_len(...)`
+     返回 false ⇒ 一致。
+- ⚠ **三个不能踩的点**（照抄时最容易漏）：
+  · 访问器范式是 `sidetable_init(); var id = nr_idx(n); …`（`node_bc`，`base.tc:2338-2347`），
+    **读函数首行必须有 `sidetable_init();`**，setter 不需要。
+  · 新侧表必须在 `sidetable_init()` 里 **登记**（`sidetable_register("node_xxx", "S3")`）——
+    它是**侧表登记簿**（供 IDE / 调试枚举），**不是**扩容逻辑。本批两张归 `"S3"`（收的是 S3 遗留）。
+  · `node_new` 里必须 append 默认值，否则侧表与节点池不等长 ⇒ 越界读全返 false（**静默**错）。
+    ⦁ 复核：`grep -n 'append(g_node_' src/base.tc` 的 37 处**全部落在 `node_new` 内**
+    ⇒ append 点唯一，无第二处需要同步。
+- **新脚本 `tools/s3_globals_to_sidetable.py`（S4 工具箱第十件）**：op 表支持三种
+  `sub` / `ins` / `range`（整段替换），全部 **按行号降序施加**（改大行号不影响小行号，
+  插入与改行数都不会打偏）；二进制读写保行尾 + 写回自检 + 幂等跳过 + 行号漂移只告警。
+- **落成**：2 文件 **35 增 / 24 删**（`base.tc` 43 行、`codegen_c.tc` 16 行）。
+  旧名残留只剩 **6 处注释**（「原 `g_local_has` / S3 遗留 `g_local_decls` 侧表化」等
+  历史沿革表述），按批次 20-G 的 **C 组口径保留**。
+- **验证链**：
+  ① `tc check` **0 error / 528 warning**（与 20-H/20-I 一致）；
+  ② 三项机械复核：改动行括号/花括号平衡（忽略字符串）、`node_new` 已 append 两张新侧表、
+     `sidetable_init` 已登记两张 —— 全过；
+  ③ 自举 g1 **2m18s**；seed vs g1 **逐字节 IDENTICAL**（`.c` `4249021a…` / `.h` `554a7db3…`）；
+  ④ **旁路对照**（产物哈希与 20-I 基线不同，必做）：回退 2 文件到 HEAD → seed 编译取基线 →
+     还原（`diff -r -q` 自检 OK）。`.h` diff **14 行**、`.c` diff **151 行**，逐条分类为四类
+     —— ① `sidetable_register` 新增 2 行；② 全局变量改名 + 线性扫函数 → 侧表访问器；
+     ③ `node_new` 新增 2 行 append；④ 4 处调用点改写 —— 其余全是 `__N` 临时量编号漂移
+     （`cp__26360→26436`、`id__36610→36686`、`idv__222477→222574`、`v__228805→228902`）。
+     **无超出预期的改动**。
+  ⑤ IR 快照 **3 DIFF（`src/tc.tc::{c,h,ll}`）/ 0 NEW / 0 GONE，examples 零 DIFF**（242.6s）；
+  ⑥ `--update` 重录基线 → **117 targets / 354 entries**（253.2s）；
+  ⑦ gate L2 = 25 passed / 0 failed。
+- ⭐⭐ **为什么「examples 零 DIFF」不够，必须另做覆盖证明**（本批最重要的方法论收获）：
+  按 impl-rules「examples 出现 DIFF 是硬信号」，零 DIFF 通常可判定非行为变化。但本批
+  **反查发现 mangle 路径在快照里根本没被触发** —— 编译器自身产物里能匹配 `[A-Za-z_]\w*__\d+`
+  的只有 4 个临时量名（`cp__`/`id__`/`idv__`/`v__`），**没有一个是 mangle 产生的 `name__<sid>`**；
+  adt_list 等示例的产物里同样为 0。⇒ 若就此收工，「零 DIFF」只是**没覆盖**，不是等价。
+  故按「变更前种子 vs 新 g1 差分对拍同一 probe」补了两个显式 probe：
+  · **`p_mangle.tc`**（同函数内 `var x` 声明两次）⇒ 产物出现 **`x__6`**（2 次），
+    seed(20-I) 与 g1(20-J) 产物 **逐字节 IDENTICAL**，两版足迹同为 `x__6` ✓
+  · **`p_conpat.tc`**（`match` 两个臂各绑定同名 `x`）⇒ 产物里 **没有** `x__N`
+    —— 这正是 conpat 豁免应有的结果；**反证**：若 `node_conpat` 的写或读失效，
+    第二个臂的同名 `x` 会被 `g_seen_has` 命中而重整成 `x__N`。两版产物亦 IDENTICAL ✓
+  ⇒ 两条路径（写+读）都被显式证明等价，而非依赖「没报警」。
+
 **剩余字段实测使用量（`.F` 命中数；泛型名字段含非 Node 假阳性，仅作排序参考）**
 （✅ 已迁 `se`、`has_sa`、`has_sb`、`has_sc`、`be`、`bf`、`memspace`、`bd`、`bb`、`bc`、`sc`、`nd`、`ib`、`nc`、`ba`、`lc`、`sb`、`ia`、`lb`、`nb`、`la`、`na`、`kind`、**`sa`** —— 共 **24 个字段**）。
 > 迁移至此，`Node` 里**只剩过渡字段 `id`**（S5 step2，随 `Node` 一并消失），**真实载荷字段全部清空**
