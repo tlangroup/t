@@ -2039,7 +2039,7 @@ pub fn instantiate_generic(tmpl: i64, e: i64) i64 {
     var si0: i64 = sym_lookup(global_scope, iname);
     if (si0 >= 0) {
         // ⚠ 命中缓存也**必须**改写调用点。Phase A 这里直接 return，callee 仍是模板名、
-        // comptime 实参也还在 → 回到 infer_expr 后 `nodes[e].bb == false` 依旧成立，
+        // comptime 实参也还在 → 回到 infer_expr 后 `base.node_bb(e) == false` 依旧成立，
         // 于是再次 instantiate → 再次命中 → 无限递归，编译器直接崩（exit 127）。
         // Phase A 的示例每个泛型每种实参只调一次，恰好绕过了这条路径。
         rewrite_generic_callsite(e, iname, k);
@@ -5234,7 +5234,7 @@ pub fn run_device_check() void {
 // 故同构元组（无论是类型标注还是字面量推导）都落到同一 struct 声明，互操作无缝。
 pub fn tuple_lit_type_name(elem_tis: []i64) string {
     // 元素 TI → 类型 AST 节点 → mangle（须与 parse.synth_tuple_type_name 永远一致）
-    // ⚠ 局部变量禁用 `nodes`（会与 `base.nodes` 跨模块裸名冲突触发 T-MOD-W561），改用 elem_nodes。
+    // ⚠ 局部变量曾禁用 `nodes`（会与 `base.nodes` 跨模块裸名冲突触发 T-MOD-W561）⇒ 故名 `elem_nodes`；20-F 已删 `base.nodes`，该冲突不复存在，名字沿用不动。
     var elem_nodes: []i64;
     var i: i64 = 0;
     while (i < slice_len(elem_tis) as i64) {
@@ -5377,7 +5377,7 @@ pub fn ie_mis(ei: i64, fb: i64) void {
 // 调用前就把标记清零），导致真环检测失效、self-host 编译自身大源时无限递归栈溢出
 // （exit 127 / 0xC00000FD）。故**禁用 defer**，改用 `infer_expr` 包装层在 body 返回后显式
 // 清零（语义等价于正确实现的 defer）。标记存于全局切片 `g_infer_on`（与 C 后端一致，已验证
-// 正确）；首入一次性预扩到 base.nodes 长度 + 8M 余量，递归中不再 realloc，避免切片重分配
+// 正确）；首入一次性预扩到节点池长度（`base.node_count()`）+ 8M 余量，递归中不再 realloc，避免切片重分配
 // 造成已置位标记丢失（LLVM 后端对全局切片重分配敏感）。
 var g_infer_on: []i64;
 var g_rec_depth: i64 = 0;
@@ -5856,9 +5856,9 @@ pub fn infer_expr(e: i64) i64 {
     // t 的 LLVM 后端对递归函数内的 defer 发射错误（清理被提前执行），会导致标记在子递归前
     // 被清零、真环检测失效、self-host 时无限递归栈溢出（exit 127 / 0xC00000FD）。
     if (e < 0) { return ti_mk("Unknown"); }
-    // 首入（g_infer_on 尚空）时一次性预扩标记切片（base.nodes 长度 + 8M 余量覆盖脱糖新增
+    // 首入（g_infer_on 尚空）时一次性预扩标记切片（节点池长度 `base.node_count()` + 8M 余量覆盖脱糖新增
     // 节点），之后不再 append/realloc，避免切片底层数据指针重分配造成已置位标记丢失。
-    // 注意：用 `== 0` 门控而非每入重查 base.nodes——base.nodes 在推理中会随脱糖增长，
+    // 注意：用 `== 0` 门控而非每入重查节点池长度——节点池在推理中会随脱糖增长，
     // 若每入重查会触发递归中 realloc，丢失已置位标记。
     if (slice_len(g_infer_on) == 0) {
         var cap: i64 = base.node_count() + 8000000;
@@ -6465,7 +6465,7 @@ pub fn infer_expr_body(e: i64) i64 {
             // conpat_check 解构路径）。仅当 scrutinee 是 Variant 且模式为「前导点 member/call」时触发；
             // 裸大写名（已被上方 C2 改写）或 enum 模式不受影响。
             // 仅当本臂确有模式节点（na>=0）时才尝试前导点变体改写；
-            // `_` 通配臂与裸单元 case（na=-1）无模式节点，base.nodes[-1] 会越界。
+            // `_` 通配臂与裸单元 case（na=-1）无模式节点，按索引 -1 读侧表会越界。
             if (base.node_na((m_k.val as u64)) >= 0 && tip_kind(m_scr) == "Variant") {
                 var ld_cp: i64 = leading_dot_to_conpat(base.node_na((m_k.val as u64)), m_scr);
                 if (ld_cp >= 0) {
