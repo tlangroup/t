@@ -41,10 +41,12 @@ pub fn comptime_is_candidate(k: string) bool {
 // 子树是否含运行期引用（ident/call/index/array_lit）。
 // 命中则禁止 meta_eval，避免 meta_fail 塞入伪诊断错误。
 pub fn comptime_has_runtime_ref_list(head: i64) bool {
-    var c: i64 = head;
-    while (c >= 0) {
-        if (comptime_has_runtime_ref(base.kids[c].val)) { return true; }
-        c = base.kids[c].next;
+    // S4 §4.6 Phase 3：链先物化再遍历 —— 纯读取循环，短路 `return true` 的时机不变
+    var vs: []i64 = base.kids_chain(head);
+    var vi: i64 = 0;
+    while (vi < slice_len(vs) as i64) {
+        if (comptime_has_runtime_ref(vs[vi])) { return true; }
+        vi = vi + 1;
     }
     return false;
 }
@@ -159,60 +161,67 @@ pub fn fold_enum_values() void {
 pub fn fold_one_enum(d: i64) bool {
     var changed: bool = false;
     var auto_val: i64 = 0;
-    var c: i64 = base.node_lb((d as u64));
-    while (c >= 0) {
-        var k: Child = base.kids[c];
-        if (base.node_na((k.val as u64)) >= 0) {
-            if (base.node_kind((base.node_na((k.val as u64)) as u64)) == "int") {
+    // S4 §4.6 Phase 3：lb 单链（enum 成员）先物化再遍历 —— 纯读取循环，
+    // 与原手写链遍历逐点同序；`continue` 分支的推进语义不变（先自增再 continue）。
+    // ⦁ 等价前提：循环体只改**别的**节点（成员的值节点），不回写 d 的 lb 链
+    //   （comptime_fold 全文件零 `node_set_lb` / `kids[...] =` 写入）。
+    var ms: []i64 = base.kids_chain(base.node_lb((d as u64)));
+    var mi: i64 = 0;
+    while (mi < slice_len(ms) as i64) {
+        var mv: i64 = ms[mi];
+        if (base.node_na((mv as u64)) >= 0) {
+            if (base.node_kind((base.node_na((mv as u64)) as u64)) == "int") {
                 // 已是字面量：登记其值（供其它成员引用）并续推 auto_val
-                var fv: i64 = sema.js_parse_int(base.node_sa((base.node_na((k.val as u64)) as u64)), base.node_ia((base.node_na((k.val as u64)) as u64)));
-                sema.enum_const_set(base.node_sa((d as u64)), base.node_sa((k.val as u64)), fv);
+                var fv: i64 = sema.js_parse_int(base.node_sa((base.node_na((mv as u64)) as u64)), base.node_ia((base.node_na((mv as u64)) as u64)));
+                sema.enum_const_set(base.node_sa((d as u64)), base.node_sa((mv as u64)), fv);
                 auto_val = fv + 1;
-                c = k.next;
+                mi = mi + 1;
                 continue;
             }
             // 未折：尝试编译期求值
-            var vv: i64 = sema.meta_eval(base.node_na((k.val as u64)));
+            var vv: i64 = sema.meta_eval(base.node_na((mv as u64)));
             sema.g_meta_err = false; // 复位：避免不可折节点污染后续成员
             if (vv >= 0 && base.node_kind((vv as u64)) == "int") {
-                comptime_rewrite_to_literal(base.node_na((k.val as u64)), vv);
-                var fv: i64 = sema.js_parse_int(base.node_sa((base.node_na((k.val as u64)) as u64)), base.node_ia((base.node_na((k.val as u64)) as u64)));
-                sema.enum_const_set(base.node_sa((d as u64)), base.node_sa((k.val as u64)), fv);
+                comptime_rewrite_to_literal(base.node_na((mv as u64)), vv);
+                var fv: i64 = sema.js_parse_int(base.node_sa((base.node_na((mv as u64)) as u64)), base.node_ia((base.node_na((mv as u64)) as u64)));
+                sema.enum_const_set(base.node_sa((d as u64)), base.node_sa((mv as u64)), fv);
                 auto_val = fv + 1;
                 changed = true;
             }
             // 否则留待下轮（被引用的成员可能本轮回填）
         } else {
             // 自动编号成员：值 = 当前 auto_val，登记供其它成员引用（不改写 v.na）
-            sema.enum_const_set(base.node_sa((d as u64)), base.node_sa((k.val as u64)), auto_val);
+            sema.enum_const_set(base.node_sa((d as u64)), base.node_sa((mv as u64)), auto_val);
             auto_val = auto_val + 1;
         }
-        c = k.next;
+        mi = mi + 1;
     }
     return changed;
 }
 
 // 定点后仍未折出的显式值成员 → 非编译期常量，复用 T-SEM-E202 报错。
 pub fn report_unfolded_enum(d: i64) void {
-    var c: i64 = base.node_lb((d as u64));
-    while (c >= 0) {
-        var k: Child = base.kids[c];
-        if (base.node_na((k.val as u64)) >= 0 && base.node_kind((base.node_na((k.val as u64)) as u64)) != "int") {
-            var vv: i64 = sema.meta_eval(base.node_na((k.val as u64)));
+    // S4 §4.6 Phase 3：lb 单链先物化再遍历 —— 纯读取循环（同 comptime_fold_enum）
+    var ms: []i64 = base.kids_chain(base.node_lb((d as u64)));
+    var mi: i64 = 0;
+    while (mi < slice_len(ms) as i64) {
+        var mv: i64 = ms[mi];
+        if (base.node_na((mv as u64)) >= 0 && base.node_kind((base.node_na((mv as u64)) as u64)) != "int") {
+            var vv: i64 = sema.meta_eval(base.node_na((mv as u64)));
             sema.g_meta_err = false;
             if (vv < 0) {
                 base.diag_new("T-SEM-E202", "error",
-                    base.sb_cat6("enum '", base.node_sa((d as u64)), "' 成员 '", base.node_sa((k.val as u64)),
+                    base.sb_cat6("enum '", base.node_sa((d as u64)), "' 成员 '", base.node_sa((mv as u64)),
                         "' 的赋值必须是编译期常量（字面量 / 算术 / const / comptime fn / 枚举成员引用），无法在编译期求值", ""),
                     "", 1, 1, 1, 10);
             } else if (base.node_kind((vv as u64)) != "int") {
                 base.diag_new("T-SEM-E202", "error",
-                    base.sb_cat6("enum '", base.node_sa((d as u64)), "' 成员 '", base.node_sa((k.val as u64)),
+                    base.sb_cat6("enum '", base.node_sa((d as u64)), "' 成员 '", base.node_sa((mv as u64)),
                         "' 的编译期值必须是整数，得到 ", base.node_kind((vv as u64))),
                     "", 1, 1, 1, 5);
             }
         }
-        c = k.next;
+        mi = mi + 1;
     }
 }
 
