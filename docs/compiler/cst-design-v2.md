@@ -1553,6 +1553,70 @@ if (n.td > 0) { n.td = -1; }          // ← 写在副本上：从未写回 node
      C 后端自举 238.4s、tc0 对拍 65.2s、rls 353.9s、tote 3.2s、lint 24.5s。
   ⇒ 本批是 S4 里**唯一一个首跑 IR 即 0 DIFF** 的批次（前 19 批都要先 `--update` 才拿真绿）。
 
+**批次 20-H：删 re-export 垫片 `pub @import("std.rc.cst" :: *)`（§4.14.4 deferred ②；2026-10-05）**
+- **动机**：S0 把 kind 注册表 / 关键字表迁进库模块 `std.rc.cst` 时，为「引用点零改动」在
+  `src/base.tc:23` 与 `src/lex.tc:12` 各留了一个 **`pub @import("std.rc.cst" :: *)` 通配重导出垫片**。
+  §4.14.4 把「删 re-export 垫片」列为 S4 四项 deferred 之一，且它与「删 `base.Node`」
+  （批次 20-F 已完成）**共同构成 `@desugar` / `@pass` 插件化的硬前置** —— 否则 S8 的插件 API
+  会同时暴露「经 base/lex 转发」与「直连 std.rc.cst」两套入口。
+  ⇒ **本批落地后，S8 的硬前置全部兑现。**
+- ⭐ **真实规模远小于预估**：垫片只被 **3 处代码 + 2 处模块内裸名** 用到（全仓去注释精确普查，
+  正则排除 `g_vf_nodes` / `elem_nodes` / `cnodes` 等假阳性）：
+  | 站点 | 原写法 | 20-H 后 |
+  |---|---|---|
+  | `base.tc:2878` | `nk_of_kind(kind)`（`:: *` 提供的裸名） | `cst.nk_of_kind(kind)` |
+  | `lex.tc:780` | `kw_lookup(text)`（裸名） | `cst.kw_lookup(text)` |
+  | `hir.tc:711` | `base.lower_policy_of(k) == base.LOWER_OPAQUE` | `cst.lower_policy_of(k) == cst.LOWER_OPAQUE` |
+  | `tc.tc:103` | `lex.init_keywords();` | `cst.init_keywords();` |
+  | `tc.tc:104` | `base.init_node_kinds();` | `cst.init_node_kinds();` |
+- ⭐⭐ **形态三易其稿（本批唯一的实质判断点，完整记录避免后人重走）**：
+  | 趟 | 形态 | `tc check` 结果 | 判定 |
+  |---|---|---|---|
+  | 一 | 去 `pub` + 收窄为**选择性导入** `@import("std.rc.cst" :: nk_of_kind)`，调用点用**裸名** | 0 error / **532** warning | ✗ 裸名跨模块访问新增 4 条 `T-MOD-W561`（UNQUALIFIED_XMOD） |
+  | 二 | 改**模块别名表达式** `const cst = @import("std.rc.cst")` + `cst.` 限定调用 | 0 error / **532** warning | ✗ 消掉 4 条 W561，但 `const cst` 非 UPPER_SNAKE 又新增 4 条 `T-NAM-W402`（CONST_UPPER）——净零 |
+  | 三 | **声明式** `@import("std.rc.cst");`（别名 = `last_segment` = `cst`），调用点不变 | 0 error / **528** warning | ✅ 最终形态 |
+  - 第三趟的依据不是猜测，是两条**文档/测试实证**：
+    ① `lib/std/rc/cst.tc:23` 官方用法第二条就写着 `@import("std.rc.cst" as cst)`；
+    ② conformance **`p42_std_import.tc`** 用的正是声明式 `@import("std.math")` + `math.max(...)`。
+  - ⭐ 为什么声明式能消 W402：`validate_const_name`（`base.tc:4555`，由 `parse.tc:1132/2244` 调用）
+    对**所有** `const` 生效，全仓 30+ 个 `const base = @import("src.base")` 同样吃 W402
+    （基线 62 条里绝大多数是它）；声明式 `@import` **不产生 const 声明** ⇒ W402 回到基线 62。
+  - **负向测试**（证明确实解析、不是被静默放过）：把 `cst.nk_of_kind` 故意写成
+    `cst.nk_of_kind_TYPO` ⇒ `tc check` **报 1 error**；还原后回到 0/528。
+- **告警偏离的最终账（净 −2，且减掉的是真问题）**：
+  `530（20-F/20-G 基线） = 464 W401 + 62 W402 + 4 W561`
+  → `528（20-H） = 464 W401 + 62 W402 + 2 W561`。
+  ⇒ W401/W402 **分毫未动**；**W561 4 → 2**，减掉的正是**垫片自身**（两条 `:: *` 通配导入）
+  触发的跨模块裸名告警。剩余 2 条是 `sema.tc:4661` 的既有告警，与本批无关。
+- **新脚本 `tools/drop_shim_import.py`（S4 工具箱第九件）**：三趟 op 表（`PHASE1_SUBS` / `SUBS` /
+  `PHASE3_SUBS`）+ 二进制读写保行尾 + 写回自检。
+  ⚠ **行号驱动批量编辑必须「先 sub、后 ins（ins 之间降序）」** —— op 表行号以**原文件**为基准，
+  先 ins 会让后续 sub 整体下移打偏（首跑实测踩到 `AssertionError: 插入后行号漂移 hir.tc:711`）。
+  ⚠ 三趟的行号是**各趟当时**的行号（每趟插行/扩注释会让后续行下移），整表重跑必然对不上 ⇒
+  脚本对「old 不在且 new 也不在」只**告警不中断**，定位为「改动台账复核器」而非一次性迁移器。
+- **落成**：4 文件 **18 增 / 13 删**（`base.tc` 13、`lex.tc` 10、`tc.tc` 5、`hir.tc` 3；含注释改写）。
+- **验证链**：
+  ① `tc check` **0 error / 528 warning**（见上账）；
+  ② 自举 g1 **2m15s**；
+  ③ seed vs g1 **逐字节 IDENTICAL**：`.c` 2 527 662 B `3493b215…` / `.h` 130 831 B `3d82401b…`；
+  ④ ⭐ **旁路对照**（本批**必须**做，因为产物哈希与 20-G 基线不同）：回退 4 文件到 HEAD 版 →
+     用 seed 编译取 20-G 基线产物 → 还原（`diff -r -q` 自检 OK）。`.h` 与基线 **IDENTICAL**；
+     `.c` diff **仅 50 行**，且 `grep -vE '__[0-9]+'` **结果为空** ⇒ **100% 是 `__N` 临时量改名**
+     （`cp__26359→26360`、`id__36609→36610`、`idv__222475→222477`、`v__228803→228805`），
+     由新增/改写的 AST 声明节点数量变化引起，**零语义影响**（字节数仍 2 527 662 完全不变）。
+  ⑤ ⭐ **脚本里预设的两个待实测点，实测结论**：
+     · 「选择性导入是否会改变哪些 cst 全局被发射」—— **不会**：`cst__g_kw_text` / `g_kw_kind` /
+       `g_kw_tier` / `node_kind_names` 等在两个版本里**一个都不少** ⇒ 发射面按**模块**而非按选择器；
+     · 「`pub @import` 是否额外发射转发包装函数」—— **不会**：`lex__init_keywords` /
+       `base__init_node_kinds` 在 **20-G 与 20-H 两版里都是 0 次出现** ⇒ 垫片从未产生转发函数，
+       调用点本来就直发 `cst__init_keywords` / `cst__init_node_kinds`。
+       ⇒ 这解释了为什么删垫片**只**带来临时量编号漂移，而没有符号名变化。
+  ⑥ IR 快照 **1 DIFF（`src/tc.tc::c`）/ 0 NEW / 0 GONE**，examples **零 DIFF**（296.2s）：
+     差异正是 ④ 的 `.c`（`was 4ce5d77d… → now 3493b215…`），内容 = 50 行临时量改名；
+     ⚠ 判据：**examples 零 DIFF ⇒ 非行为变化**（见 impl-rules「examples 出现 DIFF 是硬信号」）。
+  ⑦ `--update` 重录基线；
+  ⑧ **gate L2 = 25 passed / 0 failed**。
+
 
 **剩余字段实测使用量（`.F` 命中数；泛型名字段含非 Node 假阳性，仅作排序参考）**
 （✅ 已迁 `se`、`has_sa`、`has_sb`、`has_sc`、`be`、`bf`、`memspace`、`bd`、`bb`、`bc`、`sc`、`nd`、`ib`、`nc`、`ba`、`lc`、`sb`、`ia`、`lb`、`nb`、`la`、`na`、`kind`、**`sa`** —— 共 **24 个字段**）。
