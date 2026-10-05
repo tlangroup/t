@@ -1966,9 +1966,10 @@ if (n.td > 0) { n.td = -1; }          // ← 写在副本上：从未写回 node
   （`test.tc::tt_strip_main` 要 unlink 并重接 `next`）；② 物化会丢掉「走到第 idx 个」的语义
   与越界判据（`codegen_dev.tc::dev_arg`）。后续每处改写先过这条准入判据。
 - ⭐ **普查口径升级**：把「`.next` 出现次数」换为**循环级**口径 —— 「`while` 条件含 `>= 0`
-  且循环体内同时出现 `kids[` 与 `.next`」⇒ 得 `sema` 108 / `codegen_c` 62 / `tir` 36 /
-  `parse` 22 / `test` 3 / `comptime_fold` 2 / `base` 3 / `codegen_dev` 1 / `tir_to_ll` 1；
-  **`hir` 已归零**（本批两处全部换用）。这是 Phase 3 后续分批的排期依据。
+  且循环体内同时出现 `kids[` 与 `.next`」；**`hir` 已归零**（本批两处全部换用）。
+  ⚠ **本行初版数字偏低，已被批次 20-O 的花括号配对全量重扫更正**（见下），
+  Phase 3 排期**以 20-O 的重扫表为准**：初版用「`while` 后 14 行窗口」判循环体，
+  会漏计循环体较长处（实测漏了 `comptime_fold.tc` 第 3 站，其 `.next` 在 17 行之后）。
 - ⚠ **行尾误判一次**：本次先用 `grep -c $'\r'` 判行尾，得「全 CRLF」的**错误结论**
   （ANSI 转义使该计数不可信），按 CRLF 写的锚点匹配为 0；改用 Python 直接数
   `bytes.count(b'\r\n')` 才知 `base.tc` / `hir.tc` 实为**纯 LF**。
@@ -2036,6 +2037,81 @@ if (n.td > 0) { n.td = -1; }          // ← 写在副本上：从未写回 node
 - ⭐ **旁路对照新增一条自证：回退版产物哈希应精确复现上一批基线**。若复现不了，
   说明「回退」这一步就没回对（沙箱 git 写不可靠的老坑），后面所有对拍都是假的。
   成本为零、结论极硬，后续每批都做。
+
+**批次 20-O：Phase 3 第三批 —— `comptime_fold`（3 站）换用 `kids_chain`（2026-10-05）**
+> 按 20-M 排期从个位数站点继续。⚠ 开工前用**花括号配对**口径重扫全仓（见下方「排期重扫」），
+> 发现 `comptime_fold` 实为 **3 站**而非 2 站 —— 原循环级口径用「`while` 后 14 行」判循环体，
+> 漏了 `report_unfolded_enum`（其 `.next` 在 `while` 之后 17 行）。
+
+**⦁ 排期重扫（花括号配对口径，替代 20-M 初版）**
+扫描口径：剥注释 + 清空字符串字面量 → 对每个 `while` 用**括号/花括号配对**定出条件与循环体
+（不再用固定行窗口）→ 「条件含 `>= 0` 且循环体含 `.next`」计数。20-N 末态源码实测：
+
+| 文件 | 循环级（含 `.next`）| 其中 `kids[` 池链 |
+|---|---|---|
+| `sema.tc` | 132 | 132 |
+| `codegen_c.tc` | 76 | 76 |
+| `tir.tc` | 54 | 54 |
+| `parse.tc` | 26 | 26 |
+| `base.tc` | 9 | 5 |
+| `comptime_fold.tc` | 3 | 3 |
+| `codegen_dev.tc` | 1 | 1 |
+| `test.tc` | 1 | 1 |
+| **TOTAL** | **302** | **298** |
+
+> `base` 的 4 处「含 `.next` 但不含 `kids[`」是 `kids` 池之外的链，不属本 epic。
+> `test.tc` 余下的 1 处是 `tt_strip_main`（形态 ①）、`codegen_dev.tc` 的 1 处是 `dev_arg`（形态 ②）
+> —— **两者均须跳过**；`base` 的 5 处里 `node_kids_list`（la/lb/lc 三链合并）按 20-L 结论保持手写。
+
+**⦁ 改动清单**
+| 文件 | 站点 | 改法 |
+|---|---|---|
+| `src/comptime_fold.tc` | `comptime_has_runtime_ref_list`（head 链）| `kids_chain(head)` 物化 + 下标循环；短路 `return true` 时机不变 |
+| `src/comptime_fold.tc` | `fold_one_enum`（lb 成员链）| `kids_chain(node_lb(d))` 物化；`continue` 分支由 `c = k.next; continue;` 改为 `mi = mi + 1; continue;` |
+| `src/comptime_fold.tc` | `report_unfolded_enum`（lb 成员链）| 同上物化，`k.val → mv` |
+
+**⦁ 等价前提（已 `grep` 核实）**：`src/comptime_fold.tc` 全文件**零** `node_set_lb` / `kids[...] =`
+写入（lb 写入方只在 `base` / `parse` / `sema`）⇒ 物化前后遍历集合恒等，不存在「边遍历边改链」。
+
+**⦁ ⚠ 覆盖缺口：`src/tc.tc` 里没有 enum**
+- `grep -c 'enum' src/tc.tc` = **0** ⇒ seed-vs-g1 对 `src/tc.tc` 的对拍**覆盖不到** enum 折叠的后两站，
+  只看「零 DIFF」等于「没测到」。沿用 20-J 判据，另取两个 enum 探针，
+  先取**变更前 seed 基线**，再用新 g1 复跑对拍：
+
+  | 探针 | 变更前 seed `.c` md5 | 新 g1 结果 |
+  |---|---|---|
+  | `examples/enum_constval.tc` | `312cda2d…` | **IDENTICAL**（`.c` + `.h`）|
+  | `examples/enum_match_dispatch.tc` | `b5ec7a6e…` | **IDENTICAL**（`.c` + `.h`）|
+
+**⦁ 验证**
+① `tc check` **0 error / 528 warning**；② `cstgen --check` OK；③ 自举 g1 **2m2s**；
+④ seed vs g1 对 `src/tc.tc` **逐字节 IDENTICAL**（`.c` md5 `79ab5ca6…` / `.h` md5 `c15bb4ed…`）；
+⑤ **enum 双探针 IDENTICAL**（上表）；
+⑥ **旁路对照**（回退 `comptime_fold.tc` 到 HEAD 重编 → 还原）：
+   ⦁ 回退版 `.c` = **`d102f52f…`**、`.h` = **`c15bb4ed…`** —— `.c` 正是 IR 快照的 **`was` 值**
+     ⇒ provenance 自证（回退确实回到 20-N 末态源码）；
+   ⦁ `.c` 差异 **34/37 行，全部落在 3 个 `comptime_fold` 函数体内**（`c` / `k.val` → `vs[vi]` / `ms[mi]`
+     一一对应），无任何其它模块受影响；`.h` 零差异（无签名变化）；
+⑦ IR 快照 **2 DIFF（`src/tc.tc::{c,ll}`）/ 0 NEW / 0 GONE、examples 零 DIFF**；
+   `--update` 重录 **117 targets / 354 entries**（268.4s）；
+⑧ gate L2 = **25 passed / 0 failed（2592.0s）**：自举一代 137.6s / **产物快照比对 350.4s** /
+  conformance 96.3s / 自举不动点 g2==g3 258.7s / **run_examples dbg 454.1s** / HIR AstGen 31.6s /
+  HIR 解释器 3.4s / 代际对拍 8.5s / 双轨对拍 236.5s / REPL 19.7s / **四代不动点 145.4s** /
+  MIR differential 189.6s / C 后端自举 234.7s / tc0 对拍 62.4s / rls 快速通道 326.9s /
+  tote 2.9s / lint 20.1s —— 一次跑过、无沙箱拦截；⑨ dbg/rls 双种子复检 **0/528**；提交 `ccab332`。
+
+**⦁ 沉淀**
+- ⭐ **循环级普查不能用固定行窗口**：20-M 的「`while` 后 14 行」会漏计长循环体
+  （本批漏了 `comptime_fold` 第 3 站）。**改用括号/花括号配对定循环体**，并同时输出
+  「循环级（含 `.next`）」与「其中 `kids[`」两列，便于区分 `kids` 池链与其它链。
+- ⭐ **`.c` 有差异 ≠ 不等价 —— 判据是「差异是否局部化」**：自举产物 `tc.c` 里**包含编译器自身源码**
+  （`comptime_fold` 是 `src/tc.tc` 的模块）⇒ 改哪个模块，该模块的函数体**必然**出现在 `.c` diff 里，
+  这是「源码文本进了产物」而非「行为漂移」。⇒ 看「md5 是否相同」是错的；应看
+  **diff 是否只落在本批改动的函数体内**，真正的等价性判据仍是
+  **seed vs g1 用同一份（新）源码对拍**（本批 IDENTICAL）。
+- ⦁ **旁路对照的 provenance 自证再升级**：回退版哈希不必只对齐「上一批文档里记的基线」
+  （记忆/手抄可能错），**直接对齐 IR 快照的 `was` 值更硬** —— 快照基线由工具维护、不会抄错，
+  且把「回退对不对」与「差异从哪来」两件事闭环到同一个哈希。
 
 **剩余字段实测使用量（`.F` 命中数；泛型名字段含非 Node 假阳性，仅作排序参考）**
 （✅ 已迁 `se`、`has_sa`、`has_sb`、`has_sc`、`be`、`bf`、`memspace`、`bd`、`bb`、`bc`、`sc`、`nd`、`ib`、`nc`、`ba`、`lc`、`sb`、`ia`、`lb`、`nb`、`la`、`na`、`kind`、**`sa`** —— 共 **24 个字段**）。
