@@ -1655,8 +1655,22 @@ if (n.td > 0) { n.td = -1; }          // ← 写在副本上：从未写回 node
      **无需**再回退旧 src 重做一次对拍（判据见 impl-rules「纯注释批次的最强自证」）；
   ⑤ IR 快照 **0 DIFF / 0 NEW / 0 GONE**；
   ⑥ **无需 `--update`**（0 DIFF ⇒ 基线本就正确）；
-  ⑦ gate L2 = 25 passed / 0 failed。
+  ⑦ **gate L2 = 25 passed / 0 failed（2843.5s）**：自举一代 g1 139.5s、产物快照比对 418.5s、
+     conformance 126.6s、自举不动点 g2==g3 321.6s、run_examples dbg 双后端 484.1s、
+     双轨对拍 211.1s、**四代不动点 g2==g3==g4 152.2s**、MIR differential 153.4s、
+     C 后端自举 244.4s、tc0 对拍 52.4s、rls 349.1s、tote 2.8s、lint 20.0s；
+     安装四代种子后 dbg / rls 双种子复检均 **0/528**。
   ⇒ 与 20-G 同为「首跑 IR 即 0 DIFF、无需重录基线」的纯注释批次。
+- ⚠ **记录一次非回归的门禁失败（诚实记录）**：首次跑 gate L2 只跑了 729.3s 就
+  **8 passed / 1 failed**，失败在「产物快照比对」步，stdout 只有半截路径
+  `…\irsnap.23948\c__examples__colony_wave\colony_wave.c`，真正的根因在 stderr：
+  `[sandbox] 命令被沙箱拦截` —— 拒绝 `out/dbg/irsnap.*` 下两个 `.c` 的
+  **file-read** 与 **file-delete** ⇒ Node 进程崩。
+  判据（为什么认定不是回归）：① 失败信息里**没有任何产物差异内容**，只有路径碎片；
+  ② 同一项检查单独跑 `ir_snapshot.mjs --compiler out/dbg/g1.exe` 是 **OK / 0 DIFF**；
+  ③ 按 20-H 成功时的调用形态（`dangerouslyDisableSandbox`，**不显式传 `timeout`**）
+  重跑即 **25/0**。⇒ 属**环境噪声**，非代码回归；但**必须重跑拿到真绿**，不能用
+  「单独跑过」代替门禁结论。
 
 
 **剩余字段实测使用量（`.F` 命中数；泛型名字段含非 Node 假阳性，仅作排序参考）**
