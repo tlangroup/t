@@ -1890,6 +1890,22 @@ if (n.td > 0) { n.td = -1; }          // ← 写在副本上：从未写回 node
      C 后端自举 272.1s / difftest tc0 55.3s / **rls 快速通道 377.8s** / tote 3.2s / lint 21.7s。
      一次跑过、无沙箱拦截。
   ⑦ dbg/rls 双种子复检 **0/528**；提交 `484ddc0` → FF 推送，远端 `main == 484ddc0`。
+- ⭐⭐ **Phase 3 开工普查：粒度必须改小（2026-10-05）**。普查发现
+  `node_kids_list`（三链**合并**）**几乎没有第二个消费者** —— 实测各文件中 `la`/`lb`/`lc`
+  的读取次数与语义**完全不对等**（`sema.tc` la=175 / lb=73 / lc=34，`codegen_c.tc` 77/33/5，
+  `tir.tc` 52/15/3，`parse.tc` 18/23/17），消费方绝大多数是**按槽分别遍历**（三槽语义不同：
+  参数表 / 语句体 / else 分支 / case 列表 …），把三槽合并喂进去会**改变语义**。
+  ⇒ 「三链合并遍历」的真实用例只有 `cst_dump` 一处（它本来就是这么写的，故 Phase 2 零行为变化成立）。
+  ⦁ 结论：`node_kids_list` 定位为 **`cst_dump` 专用形态**，不是通用访问者 API，**不推广**。
+  ⦁ Phase 3 的正确粒度是**单链扁平化**：
+    ```t
+    pub fn node_kids_chain(n: u64, slot: i64) []i64   // slot: 0=la / 1=lb / 2=lc
+    ```
+    候选适配面（`.next` 链遍历站点数）：`sema` 141 / `codegen_c` 81 / `tir` 62 /
+    `parse` 32 / `test` 5 / `comptime_fold` 4 / `hir` 2 / `codegen_dev` 2 / `tir_to_ll` 1。
+    按「每次一个后端 + gate」纪律，**从 `test.tc` / `comptime_fold.tc`（个位数站点）起步**，
+    逐步向 `parse` → `codegen_c` / `tir` → `sema` 推进。
+  ⦁ ⚠ 每处改写前必须确认「该循环遍历的是**哪一条**链」，不得用三链合并版顶替单链循环。
 
 **剩余字段实测使用量（`.F` 命中数；泛型名字段含非 Node 假阳性，仅作排序参考）**
 （✅ 已迁 `se`、`has_sa`、`has_sb`、`has_sc`、`be`、`bf`、`memspace`、`bd`、`bb`、`bc`、`sc`、`nd`、`ib`、`nc`、`ba`、`lc`、`sb`、`ia`、`lb`、`nb`、`la`、`na`、`kind`、**`sa`** —— 共 **24 个字段**）。
