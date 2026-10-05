@@ -1838,6 +1838,59 @@ if (n.td > 0) { n.td = -1; }          // ← 写在副本上：从未写回 node
   ⇒ 结论：**「`node_to_hir` 桥切 NodeRef」在类型层已闭合**（入参侧 `u64` + `HirInst.nd` `u64` +
   返回侧在桥内一次性收窄）；剩余真问题并入独立 epic「sema 节点 id 整体 `u64` 化」（待第 4c 项前置就绪）。
 
+**批次 20-L：`node_visit` 访问者化 —— Phase 1 调研 + Phase 2 落地（`src/base.tc`；2026-10-05）**
+
+> 这是四项 deferred 的**最后一项**。它不是一次性迁移，而是按 §4.6 修订形态分阶段落地：
+> **Phase 1 调研（已完成）→ Phase 2 抽出遍历 API（本批）→ Phase 3 逐个消费方换用。**
+
+- **Phase 1 调研的三条结论**（详见 §4.6「实施形态修订」块，本段只记结论）：
+  ① **§4.6 原设计的两条前提已不成立** —— 主表示不再是 per-kind typed tables（20-F 删了
+     `base.Node`，现在是 36 张通用侧表），且孩子关系**只经由 7 个通用槽** ⇒ 遍历与 kind
+     数量解耦，**不需要 `cstgen` 生成 105 个 kind 分支**去保证穷尽性。
+  ② **遍历原型已经存在于代码里** —— `base.tc` 的 `cst_dump` 精确按 7 槽递归（先 `na/nb/nc/nd`，
+     再沿 `la/lb/lc` 三条 kids 链逐 `next`）⇒ 访问者不必从零写。
+  ③ ⚠ **回调式 Visitor 不可行（硬约束）** —— `sema.tc:13055` 实测记录「t 的 LLVM 后端不支持
+     调用**存于结构体字段的 fn 值**」（Pass 框架因此改用 `name` 字符串分派）
+     ⇒ §4.6 的 `v.visit_binary(b)` 形态照搬不了；一律改为**遍历物化为列表**。
+- **为什么不直接做 `node_children(n) []i64`（含 na/nb/nc/nd）**：`cst_dump` 给 `na/nb/nc/nd`
+  打印的是**带 role 前缀**（`"na:"` …），而 kids 链的 role 恒为空。若用扁平列表，role 信息丢失
+  ⇒ dump 文本会变 ⇒ 不是零行为变化。故本批先做 **role 天然一致的那部分**：`la/lb/lc` 三条链。
+  ⦁ 留待后续：完整的 `node_children`（含四个单槽）待有**不需要 role** 的真实消费方时再做。
+- **落成**：`src/base.tc` **23 增 / 3 删** —— 新增
+  ```t
+  pub fn node_kids_list(n: u64) []i64 {   // la/lb/lc 三条链上的全部孩子 id，顺序同 cst_dump
+      var out: []i64 = [];
+      var c: i64 = node_la(n);
+      while (c >= 0) { append(out, kids[c].val); c = kids[c].next; }
+      c = node_lb(n); while (c >= 0) { append(out, kids[c].val); c = kids[c].next; }
+      c = node_lc(n); while (c >= 0) { append(out, kids[c].val); c = kids[c].next; }
+      return out;
+  }
+  ```
+  并把 `cst_dump` 里原来的三条 `while (c >= 0) { … kids[c].next; }` 整段替换为
+  `node_kids_list` + 一个 `while (ki < slice_len(klist))` 循环。
+- **等价性四条（动手前逐一确认）**：① 三条链的**顺序**（la→lb→lc，链内依 `next`）与原来逐点相同；
+  ② `-1` / `-2` 哨兵仍在 `>= 0` 处天然排除（`-2` 是 `lb`/`lc` 的「列表不存在 / 本体已被别处消费」）；
+  ③ 取的孩子值同为 `kids[c].val`；④ 负 `val` 时 `cst_dump` 首行 `if (id < 0) return` 仍在**追加换行之前**
+  ⇒ 跳过行为一致（新版只是先把负值 append 进列表，再被同一行跳过）。
+- **验证链**：
+  ① `tc check` **0 error / 528 warning**；
+  ② 自举 g1；seed vs g1 **逐字节 IDENTICAL**（`.c` `996fdda2…` / `.h` `ac62c721…`）；
+  ③ **旁路对照**：`.h` **仅 +1 行**（`TSlice base__node_kids_list(uint64_t n);` 声明）；
+     `.c` diff 69 行，剔除 `__N` 临时量编号漂移后**只剩 39 行**且全为预期 ——
+     新增函数体 22 行 + `cst_dump` 三链删 11 行 / 改 6 行。**无超出预期的改动**；
+  ④ IR 快照 **3 DIFF（`src/tc.tc::{c,h,ll}`）/ 0 NEW / 0 GONE，examples 零 DIFF**；
+  ⑤ `--update` 重录基线 → **117 targets / 354 entries**（267.7s）；
+  ⑥ **gate L2 = 25 passed / 0 failed（2765.4s）**，自举四代不动点 **158.7s**（`g2 == g3 == g4`）。
+     分步耗时（关键项）：工具链断言 1.0s / 诊断注册表 0.3s / `cstgen --check` 0.3s /
+     静态检查 1.3s / 预编译 std 10.6s / **自举一代 139.2s** / IR 静态审计 1.8s /
+     LLVM IR verifier 1.7s / **产物快照比对 397.4s** / conformance 117.3s /
+     自举不动点 284.7s / **run_examples dbg 470.2s** / HIR AstGen 36.2s / HIR 解释器 3.4s /
+     difftest 代际对拍 8.1s / 双轨对拍 211.9s / REPL 冒烟 18.3s / **MIR differential 172.7s** /
+     C 后端自举 272.1s / difftest tc0 55.3s / **rls 快速通道 377.8s** / tote 3.2s / lint 21.7s。
+     一次跑过、无沙箱拦截。
+  ⑦ dbg/rls 双种子复检 **0/528**；提交 `484ddc0` → FF 推送，远端 `main == 484ddc0`。
+
 **剩余字段实测使用量（`.F` 命中数；泛型名字段含非 Node 假阳性，仅作排序参考）**
 （✅ 已迁 `se`、`has_sa`、`has_sb`、`has_sc`、`be`、`bf`、`memspace`、`bd`、`bb`、`bc`、`sc`、`nd`、`ib`、`nc`、`ba`、`lc`、`sb`、`ia`、`lb`、`nb`、`la`、`na`、`kind`、**`sa`** —— 共 **24 个字段**）。
 > 迁移至此，`Node` 里**只剩过渡字段 `id`**（S5 step2，随 `Node` 一并消失），**真实载荷字段全部清空**
@@ -2891,8 +2944,12 @@ pub fn ast_transform(n: NodeRef, f: Transform) NodeRef {
   // 返回 n 的全部子节点 id，顺序与 cst_dump 一致（na, nb, nc, nd, la链, lb链, lc链）
   pub fn node_children(n: u64) []i64 { … }
   ```
-  Phase 2 只做两件事：新增 `node_children`；**把 `cst_dump` 改为复用它**。
-  ⦁ 验收预期：纯内部重构 ⇒ **IR 快照 0 DIFF**（与 20-G / 20-I 同为「首跑即 0 DIFF」的最强自证）。
+  Phase 2 只做两件事：新增 `node_kids_list`；**把 `cst_dump` 的 kids 链部分改为复用它**。
+  ⦁ ⚠ **验收预期（2026-10-05 更正，原写「0 DIFF」有误）**：新增公开函数会打进产物
+    ⇒ `src/tc.tc::{c,h,ll}` 必有 DIFF（多一个符号 + 局部变量重编号漂移），
+    **不是 0 DIFF**；真正的判据是 **examples 零 DIFF / 0 NEW / 0 GONE** +
+    旁路对照里除「新函数体 + 调用点改写」外无其他改动（实测 `.h` 仅 +1 行声明、
+    `.c` 剔除临时量后仅 39 行，全为预期）。
   Phase 3 起再逐个让消费方换用（按 §4.10.3 初衷，每次一个后端 + gate）。
 
 ### 4.7 Span / 溯源 / 诊断
