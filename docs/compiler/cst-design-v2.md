@@ -1624,6 +1624,40 @@ if (n.td > 0) { n.td = -1; }          // ← 写在副本上：从未写回 node
      预编译 std .tlib 13.4s / IR 静态审计 2.1s / LLVM verifier 2.0s / UNSUPPORTED 计数 0.4s。
   ⇒ 安装四代种子（`g4 → out/dbg/tc.exe`、`gr → out/rls/tc.exe`）后双种子复检均 **0/528**。
 
+**批次 20-I：修 `GEN:node-structs` 区间内已失效的 `nodes[]` 注释（20-G 遗留小步，生成器侧；2026-10-05）**
+- **动机**：批次 20-G 清理了 52 处注释，但**有意跳过** `base.tc` 里位于
+  **`GEN:node-structs` 生成区间（绝对行 29–1698）内**的一句：
+  「旧 `nodes[]` 仍是真相源，本区为其 SoA 镜像」。
+  该句在 20-F 删掉 `nodes[]` 后已是**事实错误**（现在节点句柄就是裸索引、侧表是唯一真相源），
+  但它**不能手改**（区间由 `tools/cstgen.mjs --emit` 整段重写、`--check` 逐字节比对，
+  手改会被下次生成覆盖且立即让 `cstgen --check` FAIL）⇒ 必须由**生成器侧**改。
+- **改动**：只动 `tools/cstgen.mjs` 里生成该行注释的那一条 `NL.push(...)`：
+  「旧 `nodes[]` 仍是真相源，本区为其 SoA 镜像。」
+  → 「**侧表 `g_node_*` 是唯一真相源，本区是其按 kind 的 SoA 镜像。**」
+  然后 `node tools/cstgen.mjs --emit` 重新生成 + `--check` 复核。
+- ⭐ **改动面自证**：`--emit` 同时重写了 `GEN:kinds`（`lib/std/rc/cst.tc`，105 kind）与
+  `GEN:node-structs`（`src/base.tc`，91 pilot kind）两个区间，但
+  `git status` 只有 **`src/base.tc` 一个文件变更、diff = 1 insertion / 1 deletion**
+  ⇒ 生成器与清单本来就同步（`--check` 事前事后均 OK），本次**只**改了目标注释那一行。
+- ⏭ **有意跳过**：`tools/cstgen.mjs` 自身「S2 落地说明」块里也有一句「当前仅建立与
+  `nodes[]` 按 id 对齐的平行 NodeRef 数组 `g_node_nref`」—— 该块含
+  「S1b 种子编译器 / 延后到 S2b」等**历史沿革标记**，按批次 20-G 的 **C 组口径保留**
+  （它说明的是「为什么这么生成」，改成新说法会丢掉理由）。
+  ⚠ 判据与 20-G 完全一致：**注释里有没有时间标记** —— 有则保留，无则改。
+- **落成**：2 文件（`tools/cstgen.mjs` 3 增 / 0 删 的注释说明 + 1 行生成串改写；
+  `src/base.tc` **1 增 / 1 删**，由 `--emit` 产出、非手写）。
+- **验证链（纯注释 ⇒ 走 20-G 确立的最强自证路径）**：
+  ① `cstgen --check` **OK**（105 kind / 91 pilot，事前事后均 OK）；
+  ② `tc check` **0 error / 528 warning**（与 20-H 完全一致）；
+  ③ 自举 g1 **2m18s**；
+  ④ seed vs g1 **逐字节 IDENTICAL**，且 `.c` md5 `3493b215…` / `.h` md5 `3d82401b…`
+     —— **与 20-H 基线（改注释前的产物）完全相同** ⇒ 这一条**同时兼作旁路对照**，
+     **无需**再回退旧 src 重做一次对拍（判据见 impl-rules「纯注释批次的最强自证」）；
+  ⑤ IR 快照 **0 DIFF / 0 NEW / 0 GONE**；
+  ⑥ **无需 `--update`**（0 DIFF ⇒ 基线本就正确）；
+  ⑦ gate L2 = 25 passed / 0 failed。
+  ⇒ 与 20-G 同为「首跑 IR 即 0 DIFF、无需重录基线」的纯注释批次。
+
 
 **剩余字段实测使用量（`.F` 命中数；泛型名字段含非 Node 假阳性，仅作排序参考）**
 （✅ 已迁 `se`、`has_sa`、`has_sb`、`has_sc`、`be`、`bf`、`memspace`、`bd`、`bb`、`bc`、`sc`、`nd`、`ib`、`nc`、`ba`、`lc`、`sb`、`ia`、`lb`、`nb`、`la`、`na`、`kind`、**`sa`** —— 共 **24 个字段**）。

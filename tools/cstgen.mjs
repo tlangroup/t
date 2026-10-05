@@ -134,7 +134,10 @@ NL.push(`// ── S2：按 kind 分表（struct-of-arrays）的运行时子集 
 NL.push(`// 由 tools/cstgen.mjs 依据 tools/cst_nodes.json 生成：每个 kind 一组`);
 NL.push(`// 逐字段独立 typed 全局切片 tbl_<RecK>_<field> + Rec<K> 结构 + cst_register_<RecK> 双写登记`);
 NL.push(`// + cst_get_<RecK> 读取。运行时可变全局刻意落在主程序模块 base.tc（§4.14.7：库模块`);
-NL.push(`// 跳过 t__ginit，可变全局会被静默清零）。旧 nodes[] 仍是真相源，本区为其 SoA 镜像。`);
+// ⚠ 20-I：`nodes[]` 已于批次 20-F 删除（节点句柄即裸索引），原句「旧 nodes[] 仍是真相源」
+//   是**事实错误**且位于生成区间内不可手改 ⇒ 由生成器侧改为「侧表是唯一真相源」。
+//   （同批的「S2 落地说明」块含 S1b/S2b 历史沿革标记，按批次 20-G 的 C 组口径保留不动。）
+NL.push(`// 跳过 t__ginit，可变全局会被静默清零）。侧表 g_node_* 是唯一真相源，本区是其按 kind 的 SoA 镜像。`);
 NL.push(``);
 NL.push(`// 平行 NodeRef 数组 g_node_nref（默认 0 = 未登记），node_new 双写保证正确。`);
 NL.push(`pub var g_node_nref: []u64;`);
