@@ -2456,6 +2456,36 @@ C 后端自举 195.8s / 双轨对拍 63.0s / 四代不动点 139.0s / MIR differ
 > 残留裸 `while(V>=0)` 循环均为 form①/②（改链本身 / 游标·索引算术 / 非 kids 索引）或传递改链风险，属**设计上不可物化**；
 > `kids_chain` 已是遍历 kids 链的标准原语。后续若需进一步收敛 sema 的 42 个灰色地带，须走「逐循环探针验证」专项（见上）。
 
+**批次 20-T：`sema` 灰区 72 站换用 `kids_chain_idx`（Phase 3 收口续；2026-10-06 晚）**
+> 20-S 收口后 `sema` 仍 56 个裸 `while(V>=0)` 保留（13 form① + 42 传递改链 + 1 嵌套外层）。其中 42 个「传递改链」循环调用的 `infer_expr`/`resolve_ti` 等改的多是**类型/约束链**，与被迭代的 **AST 子链通常不是同一链** ⇒ 多数实际可安全物化。
+> 接力验证：先对保留集做**运行时探针**（504 文件语料遍历期间零碰撞），确认「被迭代链在该循环体内（含传递调用）不被追加/改拓扑」⇒ 解除 72 站。
+
+**⦁ 原语选择（与 20-S 的关键区别）**
+- 20-S 的 39 站循环体只经 `.val` 取 node id 传函数、**从不用 `c` 作 entry 索引** ⇒ 用 `kids_chain`（返回 node id 序列）足够。
+- 20-T 的 72 站循环体需以 `c` 作 **entry 索引** 直接操作池（`base.kids[c]` / `node_xxx((c as u64))` / `slice_set(base.kids, c, …)`）⇒ **必须用 `kids_chain_idx`**（返回 entry 索引序列 `[]i64`），绝不可用 `kids_chain` 把 node id 当索引。
+
+**⦁ 决定性根因（真回归 #1：`emit-ll index_out_of_bounds`）**
+- 初版物化器误用 `kids_chain`（返回 node id）替换 `c`，使 `base.kids[c]` / `node_xxx((c as u64))` 把 **node id 当 entry 索引用** ⇒ 越界（`emit-ll` 在 `index_out_of_bounds` 处崩）。
+- **修复**：`c` 必须来自 `kids_chain_idx`（entry 索引）。修复后 `emit-ll/c src/tc.tc`、`src/tote.tc` EXIT=0、0 越界。
+
+**⦁ 第二根因（真回归 #2：`arena: out of memory`）**
+- 现象：full 72 物化版 `emit-ll` 在 `examples/tuple_match_demo.tc` / `tuple_pospattern_demo.tc` 报 `arena: out of memory`；仅小体积 tuple 示例触发，非纯内存体积。
+- 定位（经验二分）：A(36) OOM → A1(前18) OOM → **A1a(前9) EXIT=0** ⇒ 元凶在 A1b；再拆 A1b-b={3202,3616,4063,4140} OOM ⇒ 锁定 `struct_lit_pat_check`(L3202)。
+- 根因（物化器 bug，非语义）：该循环有**两条** `fvp = base.kids[fvp].next` 推进——一条在 `if (ftnode<0){ …; continue; }` 分支（L3227），一条在正常路径末尾（L3244）。物化器 `re.match` 命中第一条即 `break`，**只改第一条**，第二条保留为活 `fvp = base.kids[fvp].next` ⇒ **正常路径快照游标 `mq_ki` 永不被 +1** → `while (mq_ki < slice_len(KS))` 永不终止 → 每轮分配（`sym_define`/`infer_expr`/`resolve_ti`）→ arena OOM。单推进语句的循环（如 `clone_kids`）无此问题 ⇒ A1a 安然无恙。
+- **修复**（`out/_42_apply_np.py`）：多行分支收集**全部** `V = …next` 行（`adv_lines`），逐条改写为 `mq_ki = mq_ki+1`（footer 不再单独 +1）；单行分支本就全局删推进 + footer 单次 +1，不受影响。验证：`struct_lit_pat_check` 两条推进均变 `mq_ki3202 = mq_ki3202+1`（3234/3253）；A1b-b 修复版两 tuple 示例 **EXIT=0、0 OOM**；full 72 物化版 `tc check` 0/528、tuple 示例 0 OOM。
+
+**⦁ 等价前提与验证**
+- 等价前提是「被迭代链在该循环体内（含传递调用）不被追加/改拓扑」——已用 504 文件语料运行时探针（零碰撞）坐实，而非靠静态判读。
+- 验证链：① `tc check` 0/528；② `emit-ll/c src/tc.tc`、`src/tote.tc` EXIT=0、0 越界、0 OOM；③ 自举 g1 成功；④ `产物快照比对`：**3 DIFF 全在 `src/tc.tc::{c,h,ll}` 自编译（0 NEW/0 GONE）**，其余 351/354 份产物逐字节相同。
+- **内容级确认良性**：以 `g0base`（从 HEAD 源码构建的基线等价编译器，其 `src/tc.tc` 三后端 md5 与基线 `was` 逐字节相同，证明 == 基线编译器）对拍 `src/tc.tc` 自编译产物。前缀归一化（digit-suffixed 临时/SSA 名 → alpha 前缀 `#`）后，`.c` 与 `.ll` **0 行差、0 新增/消失标识符前缀**（407↔407 / 600↔600），仅后端临时变量重编号 ⇒ 纯良性陈基线，**非行为变更**。
+- **处置**：`ir_snapshot.mjs --update --compiler out/dbg/g1.exe` 重录基线（srcHash `42e923f10dbbf19d`，354 entries）；gate L2 全量复跑。
+
+**⦁ 沉淀**
+- ⭐⭐ **物化器铁律（最高优先级）**：凡循环体含**多条** `V = …next` 推进（典型：`continue` 分支自带推进），**全部**改写为 `mq_ki++`，绝不只改第一条；否则未改路径不退快照游标 → 死循环 → OOM。
+- ⚠ **静态探测「零 `.next` 改写」会误判安全**：该探测只证「不写 `.next`」，证不了「推进语句是否被全部物化」；OOM 类回归须靠**经验二分 + 真实 `emit-ll` 跑嫌疑示例**兜底，不能只信静态判读。
+- ⭐ **原语对位铁律**：循环体需 `c` 作 entry 索引 → `kids_chain_idx`；只需 `.val` 取 node id → `kids_chain`。混用前者当后者 ⇒ `index_out_of_bounds`。
+- 本轮后 `sema` Phase 3 累计物化 **111 站（39×20-S `kids_chain` + 72×20-T `kids_chain_idx`）**；残留裸 `while(V>=0)` 为 form①/② 或仍带传递改链风险的设计上不可物化项。
+
 ### 0.13.9 `node_scope` 设计（经批判修订；原"统一作用域基础设施"方案已降级）
 
 > **已落地（commit `1d6f431`，2026-10-01）**：工作 A 已按本设计实现并通过 gate L2 24/0。下文为设计依据与边界；实现细节与验证见 §0.13.8 第 1 项。工作 B（sema 统一词法树 / 增量 / IDE / 相位 CTFE walker）仍为独立 R&D epic，未启动。
