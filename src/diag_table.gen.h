@@ -106,6 +106,7 @@ static const DiagDef DIAG_DEFS[] = {
   { "T-MTA-E618", "error", "MTA", "T_META_NOT_META_FN", "NOT_META_FN", "target is not a meta function" },
   { "T-MTA-E619", "error", "MTA", "T_META_NOT_TYPE", "NOT_TYPE", "expected a type" },
   { "T-MTA-E620", "error", "MTA", "T_META_READ_RUNTIME", "READ_RUNTIME", "read of runtime value in meta" },
+  { "T-NAM-E405", "error", "NAM", "", "DUP_TOP_DEF", "duplicate top-level definition in this module" },
   { "T-NAM-W400", "warning", "NAM", "T_NAME_TYPE_CAMEL", "TYPE_CAMEL", "type name should be PascalCase" },
   { "T-NAM-W401", "warning", "NAM", "T_NAME_VAR_SNAKE", "VAR_SNAKE", "variable name should be snake_case" },
   { "T-NAM-W402", "warning", "NAM", "T_NAME_CONST_UPPER", "CONST_UPPER", "constant name should be UPPER_SNAKE_CASE" },
@@ -173,7 +174,7 @@ static const DiagDef DIAG_DEFS[] = {
   { "T-VEC-W927", "warning", "VEC", "T_VECTOR_WIDER_THAN_NATIVE", "VECTOR_WIDER_THAN_NATIVE", "vector is wider than the native SIMD register and will be split" },
   { "T-VEC-W947", "warning", "VEC", "T_TILE_WIDER_THAN_NATIVE", "TILE_WIDER_THAN_NATIVE", "hardware tile is wider than the native SIMD register and will fall back to scalar loops" },
 };
-#define DIAG_COUNT 160
+#define DIAG_COUNT 161
 
 /* legacy (old semantic name) -> machine code alias table */
 static const struct { const char* legacy; const char* code; } DIAG_LEGACY[] = {
