@@ -2315,6 +2315,82 @@ conformance 52.0s / 自举不动点 g2==g3 285.3s / run_examples dbg 143.1s / �
 
 **后续批次（待做，按使用量升序、每组独立绿）**全部完成后删 `pub struct Node` + `nodes[]` + `node_new` 的 Node 构造 + 全部 `slice_set(nodes, …)`，`id` 字段随 `Node` 一并消失（届时裸索引即句柄），S4 方真正收口（随后补 `node_to_hir` 桥改造 + 删 re-export 垫片，见 §4.14.4）。
 
+**批次 20-R：Phase 3 第六批 —— `codegen_c`（73 站）换用 `kids_chain`（2026-10-06）**
+> 按 20-O 重扫排期，`codegen_c` 76 处仅次于 `sema`(132)；按「从小到大」顺序本批落到 `codegen_c`。
+> ⚠ **开工普查修正**：原扫描器混入 2 个 `di` 索引循环假阳性（L3726/4656，`g_defer` 数组索引，非 kids 链），
+> 漏 2 个嵌套 `dbb` 循环（L3731/4660）→ 递归 kids 链感知扫描器（`out/_20r_scan.py`）得**权威 74 站点**
+> （`out/_20r_sites2.txt`）；等价前提普查 16 处 `base.list_push`（仅 `conpat_walk`×1、`match_chain_from`×14，
+> 均建独立辅助链）⇒ 遍历链 head 零冲突、**RISK=0**；形态三分法 **73 形态③ / 1 形态②（L2080 `be_c`，`be_k.next<0` 末元素探测）**。
+
+**⦁ 改动清单（74 处里 73 站换用，1 处跳过）**
+| 站点（行号为本批开工前） | 改法 |
+|---|---|
+| 全 73 个 kids 链循环（含嵌套 `dbb`@3731/4660、`sl_fc2`@1579、`while` 体内 `break` 等） | 物化为 `var <V>_ks: []i64 = base.kids_chain(<head>)` + `for <V>_ki in 0..len(<V>_ks) { <V> = <V>_ks[<V>_ki]; … }` |
+| 2 处 count-only 循环（`L3233` 计 `cnt` / `L4487` 按计数器 `fi2` 逐元发射） | 物化但**省略 `V_kv`**（V 仅用于 advance，循环体从不读 `.val`） |
+> ⏭ **跳过 1 处（形态 ②，物化会丢末元素语义）**：`be_c`(L2080) —— 用 `be_k.next < 0` 探测链尾末元素，
+> 须保留裸游标下标。
+> 收尾重扫：`while(V>=0){` **79 → 6**（73 转 + 1 跳过 + 5 非 kids 索引循环 `i`/`di`），`kids_chain(` **0 → 73**。
+
+**⦁ 等价前提（实测，不是想当然）**
+- `src/codegen_c.tc` 对 kids 链**零写入**：无 `kids[..] =`、无 `node_set_la/lb/lc`；
+- 16 处 `base.list_push` 全部建**独立辅助链**（不追加到任何被遍历的 `kids` 链），遍历链 head 与 `list_push` head **零交集**
+  ⇒ 等价前提是「遍历链不被 list_push 追加」而非「零 kids 写入」（与 20-Q 的判据同构、措辞替换）；
+- 2 处 count-only 循环的 V 仅出现在 advance，从未读 `.val`，物化不改变计数语义（已人工核验）。
+
+**⦁ 变换工具：`out/_20r_apply.py`**
+复用 20-Q 框架（花括号配对定循环体 + 六条不变量自检 + 按函数切段「声明先于使用」校验），按 **LF** 锚点二进制读写
+（**`src/codegen_c.tc` 是纯 LF、非 `-text` 字节保真文件**：249946 字节，CRLF=0 / LF 全量）。
+⚠ **4 个 GEN 区间红线**：`scalar_ctype`(382–428) / `td_expr1`(688–694) / `td_expr2`(865–872) / `td_calls`(907–972)
+内**不得手改**；74 站点已确认无落入。
+
+**⦁ 覆盖反查**
+`emit-ll`（LLVM 后端）走 `src/codegen_c.tc` 之外的路径、对照不到本批改动 ⇒ 须额外对** C 后端**做等价证明：
+
+| 手段 | 结果 |
+|---|---|
+| 115/115 examples seed↔g1 `emit-ll` 全量对拍 | **IDENTICAL=115 / DIFF=0 / FAIL=0** |
+| 115/115 examples seed↔g1 `compile`(C 后端) 全量对拍 | **IDENTICAL=115 / DIFF=0 / FAIL=0** |
+
+**⦁ 验证**
+① `tc check` **0 error / 528 warning**；② `cstgen --check` OK（105 kinds / 91 node-structs，4 个 GEN 区间无落入、未被触碰）；
+③ 自举 g1 成功（clang 22.1.8，2m19s）；④ seed vs g1 双后端 115/115 **逐字节 IDENTICAL**；
+⑤ IR 快照 **2 DIFF（`src/tc.tc::{c,ll}`）/ 0 NEW / 0 GONE**（`--update` 重录 117 targets / 354 entries），
+属预期基线漂移（编译器自身含改动后的循环体）；⑥ gate L2 **25 passed / 0 failed（1676.1s）**
+—— 自举一代 132.4s / 产物快照比对 265.1s / 自举不动点 g2==g3 276.9s / run_examples dbg 132.1s /
+C 后端自举 195.8s / 双轨对拍 63.0s / 四代不动点 139.0s / MIR differential 45.4s / tc0 对拍 20.0s / rls 快速通道 332.8s；
+⑦ dbg/rls 双种子复检 **0/528**；提交 `78b598e`，FF 推 `origin/main`（远端 main 同 = `78b598e`）。
+
+**⦁ 沉淀**
+- ⭐ **C 后端自举变量名碰撞（本批头号坑）**：初版把 `c_ks`/`c_ki`/`c_kv` 提到循环外层作用域；
+  `codegen_c.tc` 中大量**兄弟循环共用同一 head `c`**（如 `emit_expr` 对同一节点两次遍历），
+  导致 `c_ks`/`c_kv` 在同一函数作用域**重定义** ⇒ clang 报 `redefinition of 'c_ks'`（4 error），
+  gate L2 的 `C 后端自举` 步 FAIL。
+  ⚠ **修复**：辅助变量名改为**每循环唯一**（行号后缀 `ks<line>`/`ki<line>`/`kv<line>`，并加全文件唯一性兜底），
+  语义变换本身正确、仅改名消除冲突；修复后重出 `tc.c` + clang 编译 **0 error**（旧碰撞点现用 `ks2196`/`kv2196`
+  与 `ks2206`/`kv2206` 互不冲突）。**此坑对后续 `sema`(132) 同样适用**——其兄弟循环共用 head 的频率更高。
+- ⦁ **count-only 循环可安全物化**：`no-val-use` 守卫初版误报 2 处（L3233/L4487），
+  因其循环体从不读 `.val`、只计数 ⇒ 物化时**省略 `V_kv`**、仅保留 `V_ks`/`V_ki` 即可，语义不变。
+- ⦁ **GEN 区间红线再次验证有效**：本批纯 LF 文件 + 4 个 `cstgen --emit` 重写区间，
+  站点清单确认无落入 ⇒ `cstgen --check` 全程 OK，未触发 `--check` FAIL。
+- ⦁ **双后端对拍判据**：`emit-ll` 不覆盖 `codegen_c.tc`（LLVM 后端），故改 C 后端必须**额外对 C 后端 `compile` 做 seed↔g1 对拍**；
+  而 `compile` 产物的辅助变量名差异**不是**等价判据（命名本就按循环变化），权威证据是 gate 的 `run_examples` 输出 + `cself` conformance + `difftest`。
+
+**⦁ 进度（截至批次 20-R，2026-10-06）**
+
+| 文件 | 原始 | 现状（形态②保留） | 批次 |
+|---|---|---|---|
+| `comptime_fold` | 3 | **0** | 20-O |
+| `parse` | 26 | **2** | 20-P |
+| `tir` | 54 | **3** | 20-Q |
+| `test` | 1 | 1（形态① 永久保留） | 20-N |
+| `base` | 5 | 5（全保留项） | — |
+| `codegen_dev` | 1 | 1（形态② 保留） | — |
+| **`codegen_c`** | 76 | **3**（1 跳过 + 2 非 kids 索引循环） | **20-R** |
+| **`sema`** | 132 | 待做 | 20-S |
+
+⚠ 形态②判据（20-M）：① 改链本身 / ② 游标或索引算术（走到链尾·按 idx 取第 n 个·读 next 判链尾）→ 保留裸下标；
+③ 纯按链序读完 → 可物化。
+
 ### 0.13.9 `node_scope` 设计（经批判修订；原"统一作用域基础设施"方案已降级）
 
 > **已落地（commit `1d6f431`，2026-10-01）**：工作 A 已按本设计实现并通过 gate L2 24/0。下文为设计依据与边界；实现细节与验证见 §0.13.8 第 1 项。工作 B（sema 统一词法树 / 增量 / IDE / 相位 CTFE walker）仍为独立 R&D epic，未启动。
