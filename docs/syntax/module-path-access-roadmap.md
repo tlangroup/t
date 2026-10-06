@@ -88,13 +88,15 @@
 | 登记新诊断码 `T-NAM-E405`（`tools/diag_defs.json` → `gen_diag.mjs` → `gen_diag_t.mjs`） | ✅ 161 条 |
 | 实现 `err_dup_top_def` + `check_entry_redefs`（`sema.tc`，入口模块、fn 豁免） | ✅ |
 | 挂载：`mangle_modules()` 中 `collect_module_defs()` 之后 | ✅ |
-| 负向测试 `f132`–`f135`（const / var / struct / import 绑定） | ✅ conformance **320 / 0**（316→320） |
+| 负向测试 `f148`–`f151`（const / var / struct / import 绑定） | ✅ conformance **320 / 0**（316→320） |
 | 零误报验证：`g1 check src/tc.tc` = **0 errors / 528 warnings**（与基线一致） | ✅ |
 | 自举一代 → 四代不动点（`g2 == g3 == g4`，`.ll` md5 全同） | ✅ |
 | gate L2 首次 | ✅ **24 passed / 1 failed**（唯一失败＝陈基线，预期） |
 | IR 快照漂移范围 | ✅ **3 处差异 / 0 NEW / 0 GONE**，且**全部**为 `src/tc.tc::{c,h,ll}` |
 | `--update` 重录基线（117 targets / 354 entries，g1 录制） | ✅ |
-| gate L2 复跑 | 🔄 跑中 |
+| gate L2 复跑 | ✅ **25 passed / 0 failed**（2887s） |
+| 安装四代种子 + dbg/rls 双复检（check 均 0 errors / 528 warnings） | ✅ |
+| 提交 + FF 推送 main（`9dbf99c`） | ✅ |
 
 > ⭐ **漂移证据（决定性）**：348 个 examples/tests entry **一个都没变**，
 > 变化的只有编译器自身的 3 个自举 entry ⇒ 新检查对既有代码**零语义影响**。
