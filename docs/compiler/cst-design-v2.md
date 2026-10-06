@@ -2062,6 +2062,10 @@ if (n.td > 0) { n.td = -1; }          // ← 写在副本上：从未写回 node
 > `base` 的 4 处「含 `.next` 但不含 `kids[`」是 `kids` 池之外的链，不属本 epic。
 > `test.tc` 余下的 1 处是 `tt_strip_main`（形态 ①）、`codegen_dev.tc` 的 1 处是 `dev_arg`（形态 ②）
 > —— **两者均须跳过**；`base` 的 5 处里 `node_kids_list`（la/lb/lc 三链合并）按 20-L 结论保持手写。
+>
+> **⦁ 进度（截至批次 20-Q，2026-10-06）**：`comptime_fold` 3 → **0**（20-O）、
+> `parse` 26 → **2**（20-P）、`tir` 54 → **3**（20-Q，剩余全是形态 ②）；
+> `test` 1 / `base` 5 / `codegen_dev` 1 为**永久保留项**。⇒ 剩余可改：**`codegen_c` 76 + `sema` 132**。
 
 **⦁ 改动清单**
 | 文件 | 站点 | 改法 |
@@ -2179,6 +2183,76 @@ if (n.td > 0) { n.td = -1; }          // ← 写在副本上：从未写回 node
 - ⦁ **探针要打到「真正调用目标函数」的写法**：首版把 `@tag` 挂在 **test** 上，`--tag fast` 只命中 1
   ⇒ 根本没走 `clone_ann_list`；改挂到 **suite** 上（下沉给成员）才命中 3 个。
   ⇒ 与 20-N「探针结果与直觉不符先怀疑探针」同源，但这里是**探针覆盖不到**而非写错。
+
+**批次 20-Q：Phase 3 第五批 —— `tir`（51 站）换用 `kids_chain`（2026-10-06）**
+> 按 20-O 重扫排期，`tir` 54 处仅次于 `sema`(132) / `codegen_c`(76)；按「从小到大」顺序本批落到 `tir`。
+
+**⦁ 改动清单（54 处里 51 站换用，3 处跳过）**
+| 站点（行号为本批开工前） | 改法 |
+|---|---|
+| `tir_verify_field_count`(550) / `tir_verify_has_field`(560) / `tir_verify_inst`(608) | 物化 + 下标循环；短路 `return` 时机不变 |
+| `t_variant_name_of_case`(938) / `tir_field_st`(1339) / `tir_field_td`(1357) / `tir_field_index`(1373) / `tir_add_struct_tt`(1433) | 物化 |
+| `lower_unit`(1584/1591/1689) | ⦁ 1584 体内含**嵌套**的 1591 循环 ⇒ 分析须剥离嵌套 `while` 块（各自负责自己的 `.next`） |
+| `tir_emit_extern`(2036) / `tir_ann_has`(2060) / `tir_lower_func`(2110/2126) | 物化 |
+| `tir_emit_stmt`(2260/2270) / `tir_emit_if`(2370/2380) / `tir_emit_while`(2440) | 物化 |
+| `tir_emit_for_each`(2534/2602/2679) | 物化；`continue` 分支由 `c = k.next` 改 `ki = ki + 1` |
+| `tir_emit_expr`(2940/2948) / `tir_emit_closure_make`(3309/3321) | ⦁ 3309 体内**同时**有未使用的 `Child` 局部量与 inline `.val` ⇒ kv 声明判据须按「是否已声明」而非「有没有 Child」 |
+| `tir_emit_call`(3563/3642/3967) | 物化；3563 为**单行** `while (…) { … }` 形态 |
+| `tir_emit_struct_lit`(4278/4322) / `tir_emit_array_lit`(4382) / `tir_flush_defer`(4493) / `tir_flag_mask_lookup`(4581) / `tir_emit_map_lit`(4706) | 物化 |
+| `tir_match_pattern_cond`(4936/4989/5057/5086) / `tir_emit_match`(5130/5170/5222/5240/5257/5278/5359/5400/5431/5457) | 物化；4989 双 advance + `continue`、5057 `break` 保下标语义 |
+
+> ⏭ **跳过的 3 处（形态 ②，物化会丢边界语义）**：
+> ① `tir_expr_td`(1096) —— 走到链尾取末元；② `tir_callee_param_td`(1285) —— 按 idx 取第 n 个；
+> ③ `tir_emit_expr`(2899) —— 读 `next` 判链尾。
+> 收尾重扫：循环级含 `.next` **54 → 3**（恰为上列三站）。
+
+**⦁ 等价前提（实测，不是想当然）**
+- `src/tir.tc` 对 kids 链**零写入**：无 `kids[..] =`、无 `node_set_la/lb/lc`、无 `list_push`/`list_append`/`list_insert` 调用；
+- 全仓唯一建链入口是 `base.list_push`（`base.tc:4009`），`tir` 未触达 ⇒ **发射期不会改写任何链**；
+- ⦁ 文件里另有 20 处**非循环级**裸下标（`.la` 链头 / `.next` 逐位取第 n 个实参）——
+  它们**本来就不在**循环级清单内，属形态 ② 的「按位置取元」，保留。
+
+**⦁ 变换工具：`out/_20q_apply.py`**
+花括号配对定循环体（不用固定窗口）× 六条不变量自检（`next` 只读于 advance / 有 advance /
+有 val 使用 / 循环后不读游标 / 无嵌套 `while` 干扰 / 声明先于使用）。产出 **+425/−237**，
+纯 CRLF 字节保真（**5796 CRLF / 5796 LF**，`src/tir.tc` 是 `-text` 字节保真文件；
+⦁ `tir.tc` 内**无 GEN 区间**，全文件可手改）。
+
+**⦁ 覆盖反查**
+`src/tc.tc` 对拍**覆盖不到** bitstr / variant / map_lit / slice_pat / 闭包 / `T_TIR_VERIFY`：
+
+| 手段 | 结果 |
+|---|---|
+| 115/115 examples seed↔g1 `emit-ll` 全量对拍 | **IDENTICAL=115 / DIFF=0 / FAIL=0** |
+| `T_TIR_VERIFY=1` 探针（15 个 ADT/match/闭包/bitstr/map 示例） | `.ll` 全 IDENTICAL；stderr 剔除输出路径后**净差异 0** |
+
+**⦁ 验证**
+① `tc check` **0 error / 528 warning**；② `cstgen --check` OK；③ 自举 g1 成功；
+④ seed vs g1 对 `src/tc.tc` 的 `.ll`(48 MB) / `.c` / `.h` **逐字节 IDENTICAL**
+（`.h` md5 `c15bb4ed…` 正是 IR 快照基线的 `was` 值 ⇒ provenance 自证）；
+⑤ 115/115 examples 全 IDENTICAL；⑥ `T_TIR_VERIFY` 探针净差异 0；
+⑦ **旁路对照**（回退 `tir.tc` 到 HEAD、用 `g1` 跑快照）：`srcHash` 精确复现 **`e9bedbee…`**、
+**354 份产物与基线逐字节相同**（ll + c + dev 全后端）⇒ 2 处 DIFF 纯来自输入源码变更，**非回归**；
+⑧ IR 快照 **2 DIFF（`src/tc.tc::{c,ll}`）/ 0 NEW / 0 GONE**，`--update` 重录 117 targets / 354 entries；
+⑨ gate L2 **25 passed / 0 failed（1738.9s）** —— 自举一代 175.1s / 产物快照比对 242.8s /
+conformance 52.0s / 自举不动点 g2==g3 285.3s / run_examples dbg 143.1s / 双轨对拍 75.8s /
+四代不动点 152.9s / MIR differential 52.2s / C 后端自举 180.8s / tc0 对拍 42.7s / rls 快速通道 298.5s；
+⑩ dbg/rls 双种子复检 **0/528**；提交 `f4ba97b`。
+
+**⦁ 沉淀**
+- ⭐ **内联 kv 声明必须插到循环体首行**：首版插到第 2 行，而第 1 行就用它 ⇒ 「声明先于使用」违规。
+  收尾必须按**函数段**逐行校验每个 `*_kv/_ks/_ki` 的使用点之前有同名声明（本批 593 个引用点、最终 0 违规）。
+  ⚠ 校验本身也会写错：跨函数比较同名变量会假报，必须**按函数切段**。
+- ⚠ **单行 `while (…) { … }` 形态要单独处理**：闭合 `}` 与循环体同行，多行分支的「补 `}`」逻辑
+  对它不适用 ⇒ 首版因此 **1704 `{` vs 1657 `}`**（差 47）。
+- ⚠ **分析用原始行表、改写用更新后行表，不可混用**：用改写后的表做分析，会因
+  `base.kids_chain(c)` 里含 `c` 而误判「循环后读游标」（本批 2260/2534/3642 三处误报）；
+  用原始表做改写则会锚点漂移 ⇒ 走 `shifts` 位移表把 orig 索引映射回当前索引。
+- ⦁ **`.ll` 手跑 md5 与 IR 快照不可直接对齐**：**输出路径会进产物**（手跑 `8e71886a` vs 快照 `e400cfa9`），
+  属方法学噪声。旁路对照必须**同编译器 + 同工具调用**（`g1` + `ir_snapshot.mjs`）做 apples-to-apples，
+  不能拿 seed 手跑的产物去比。
+- ⦁ **形态 ① 判据在本批再度成立**：`tir` 一个发射后端里**零 kids 写入**，
+  故「纯按链序读完」的判据只需确认「没有 `list_push` 调用」这一条即可放行 51 处。
 
 **剩余字段实测使用量（`.F` 命中数；泛型名字段含非 Node 假阳性，仅作排序参考）**
 （✅ 已迁 `se`、`has_sa`、`has_sb`、`has_sc`、`be`、`bf`、`memspace`、`bd`、`bb`、`bc`、`sc`、`nd`、`ib`、`nc`、`ba`、`lc`、`sb`、`ia`、`lb`、`nb`、`la`、`na`、`kind`、**`sa`** —— 共 **24 个字段**）。
