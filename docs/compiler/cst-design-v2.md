@@ -594,7 +594,7 @@ if (n.td > 0) { n.td = -1; }          // ← 写在副本上：从未写回 node
 
 > **研判结论（2026-10-01）**：推荐**方案 A**（S4 在 step④ 收口，删 `base.Node` 单结构体降为 deferred 未来 epic）。理由见「推荐 A 的理由」与下方三维度权衡；方案 B 的 SoA 重构在当前无真实消费者，孤立推进风险/收益比不划算，应留待模块系统搬迁（base.tc→`std.rc.cst`）或工作 B 启动时借势。
 
-**现状盘点（决定性数据）**
+**现状盘点（决定性数据，⚠ 2026-10-01 决策时状态，现已过时——见上方更正）**
 - `pub struct Node`（base.tc:1729-1760）仍持有约 30 个核心 AST 字段：`kind/sa/sb/sc/se/has_sa..has_sc/ia/ib/ba..bf/na/nb/nc/nd/memspace/la/lb/lc/ln/cl/tv`。
 - 已迁出的侧表**仅覆盖跨切面属性**：`g_node_td/mod/file/resolve/const/scope/nref`（7 个）；**核心 AST 字段（na/nb/nc/nd/kind/sa/ia/la/lc 等）尚无对应侧表**。
 - `pub var nodes: []Node`（base.tc:1762）仍在存储 Node 值本身。
@@ -631,9 +631,15 @@ if (n.td > 0) { n.td = -1; }          // ← 写在副本上：从未写回 node
 3. 方案 B 的 SoA 收益（性能/模块化/增量）在当前阶段无法兑现，却要付 ~6 小时门禁 + 750 处高风险机械改动；等工作 B（sema 统一词法树/增量/IDE）或模块系统真正需要时再启动，可与其合并、一次性借势。
 4. 保留 `nodes[]` 并存不阻塞任何已规划工作；base.tc→`std.rc.cst` 搬迁才是删垫片/删 Node 的真正时机，那是一个更大的独立迁移 epic。
 
-**⚠ S4「收口」的真实语义 = PARTIAL（务必按此理解，勿当作阶段已完成）**
+**⚠ 本节为 2026-10-01 决策记录（方案 A：删 `base.Node` 当时被定为 deferred）。下方"现状盘点"描述的是该决策时（20-F 之前）的代码状态，已过时。**
 
-按 §4.10.3 阶段表，S4 原列四项：「消费者换访问者 `node_visit`/`transform」+「删旧 `base.Node` 字段」+「删 re-export 垫片」+「`node_to_hir` 桥切 `NodeRef`」。**实际只交付了「消费方切 `u64 NodeRef`」的类型层**（step②/③/④），上述四项**全部 deferred**。故 S4 应记为 **partial**，不是 done。
+> **更正（2026-10-06 核对代码事实）**：S4「收口」epic **已于 2026-10-05 实际落地，不再是 deferred / PARTIAL**：
+> - 批次 1–19 将 `pub struct Node` 的全部 ~24 个载荷字段外置为 `g_node_*` 平行侧表 + `node_X`/`node_set_X` 访问器；
+> - 批次 20-F 删除 `pub struct Node` + `pub var nodes[]`（节点句柄从此为裸索引）；20-H 删 re-export 垫片；
+> - 批次 20-J 将 S3 遗留的 `g_local_decls`/`g_conpat_binds` 侧表化为 `g_node_mangled`/`g_node_conpat`；
+> - 批次 20-K 将 `node_to_hir` 桥入参切 `u64 NodeRef`；批次 20-S 完成 `sema` 的 `node_visit` 访问者化 Phase 3（§4.6）。
+> - 终态验证：`tc check` 0 error；gate L2 **25 passed / 0 failed**；`base.nodes[...]` 全仓零代码引用。
+> 故 S4 应记为 **done**（含 §4.6 访问者化）。原"全部 deferred / partial"判定作废。S8 硬前置约束（删 Node 必须在 S8 之前）**已自然满足**。
 
 - **硬前置约束（承接 §4.10.3 依赖图注释，不得随 S4 降格而丢失）**：原文「**工程上应先完成 S4（删旧 `base.Node` 字段），否则 S8 的插件 API 会同时暴露新旧两套节点表示**」。该项现已 deferred，因此其约束**顺延为：删 `base.Node` 字段 + 删 re-export 垫片必须在 S8 之前完成**。S5/S6/S7 不依赖它（S6 依赖 S3、S7 依赖 S6、S5 可并行），故推迟不阻塞后继阶段；但进入 S8 前必须回来收口，否则新旧两套表示同时暴露给插件 API。
 - **验收判据同步说明**：§4.10.3 给 S4 的验收是「`hir_test` 穷尽性守住（`node_visit` 分支数 == `NK_*` 数）」——因 `node_visit`/`transform` 未建，该判据**当前不适用**；S4-partial 的实际验收退化为「不动点 A 绿 + gate L2 24/0 + 基线 B 已按预期重录」（§4.10.0）。
@@ -2526,8 +2532,8 @@ S8   e33ed23 / b47210c             step1：tc fmt trivia 感知再发射（忠�
 |---|---|---|---|
 | 1 | S0 `.tlib` 预编译库模块 | 暂缓（`build_std.mjs` 只做点分路径预留） | ✅ **非偏离** —— §4.14.7.1 实测两个硬阻点，§4.10.3 S0 行已内化该暂缓 |
 | 2 | S1 是否新增 `Node.tag` | 延后到 S2/S4 | ✅ **非偏离** —— §0.10.3 已裁定并同步修正 §4.10.3 措辞 |
-| 3 | S3「删 `Node.td` **与全局平行数组**」 | 删了 `Node.td`/`g_idecl_*`/`g_seen`；**`g_local_decls`+`g_conpat_binds` 仍在**（base.tc:1893/1952，被 `codegen_c.tc` 使用） | ⚠ **未闭合** ⇒ S3 亦应记为 **partial** |
-| 4 | S4 四项（访问者 / 删 `base.Node` 字段 / 删 re-export 垫片 / `node_to_hir` 桥切 NodeRef） | 只交付「消费方切 `u64 NodeRef`」类型层 | ⚠ **偏离（partial）** —— 论证见 §0.14.6（方案 A），**硬前置已顺延，见 §0.14.6 末** |
+| 3 | S3「删 `Node.td` **与全局平行数组**」 | `Node.td`/`g_idecl_*`/`g_seen` 已删；`g_local_decls`+`g_conpat_binds` 已在**批次 20-J（2026-10-05）侧表化**为 `g_node_mangled`/`g_node_conpat`（登记 `"S3"`），旧全局数组已不存在 | ✅ **已闭合** ⇒ S3 记为 **done**（详见 §0.14.5 第 4b 项） |
+| 4 | S4 四项（访问者 / 删 `base.Node` 字段 / 删 re-export 垫片 / `node_to_hir` 桥切 NodeRef） | 全部落地：批次 20-A…20-F 外置 24 字段 + 删 `pub struct Node`+`nodes[]`；20-H 删 re-export 垫片；20-K `node_to_hir` 桥切 u64；20-S `sema` 访问者化 Phase 3（§4.6）；gate L2 **25/0** | ✅ **已闭合** ⇒ S4 记为 **done**（§0.14.6 原"方案 A deferred"判定已作废，见 §0.14.6 更正段） |
 | 5 | 工作 B「**待真实消费者触发** + 另立 sign-off」（§0.13.9） | 由**用户裁定**启动（`work-b-design.md` 第 4 行自述） | ⚠ **偏离** —— 证明与边界见下 |
 | 6 | S8 依赖 S4 硬前置（删 `base.Node` 字段 + 删 re-export 垫片，§4.14.6 / §0.14.6） | S8 step1 `tc fmt` 在 **`base.Node` 仍存在** 下落地（§0.16.11，gate L2 24/0） | ⚠ **偏离（合理）** —— S8 fmt 在 G7 架构下只消费 CST + trivia，不依赖不可变 AST / 删 Node；证明见下 |
 
@@ -2537,7 +2543,7 @@ S8   e33ed23 / b47210c             step1：tc fmt trivia 感知再发射（忠�
 - **正确性证明（为何可接受）**：实际落地被严格约束在**零行为变化子集**内。支柱 1 step1–4 仅为 ①`scope_owner` 数据模型扩展、②`scope_new_at` 把语义作用域锚定到 CST 节点、③`verify_scope_tree`（调试标志默认关闭）。门禁事实（如实记录，勿夸写）：**step1 / step2 各自跑满完整 gate L2 = 24 passed / 0 failed**；**step3+4 未跑满 24 步**——其 gate 首跑在「产物快照比对」报 3 DIFF（仅 `src/tc.tc::{c,h,ll}`，0 NEW/0 GONE）后 fail-fast 中止，前置 8 步（工具链/诊断/CST 清单/静态检查/预编译 std/自举一代/IR 审计/LLVM verifier）全绿；`--update` 重录基线后复跑只读快照 = **354 份产物逐字节相同（0 DIFF）**。因 `src` 未再变更，其余步骤沿用既有绿灯。而 §0.13.9 真正设防的对象——**「解析器重构」（`sym_lookup` 上溯从 `scope_parents` 链迁到 `node_scope` 树）**——即支柱 1 **step5，已 DEFERRED，未执行**。换言之：启动的是窄化到零风险的地基基建，被门槛保护的部分一根未碰。
 - **边界约束（继续有效，不因本次启动而解除）**：**step5 及支柱 2/3 仍受 §0.13.9「真实消费者触发」门槛约束**；在 IDE / 增量编译出现明确需求前，不得推进 step5。
 
-**偏离 4 的处置**：已在 §0.14.6 论证（方案 A）+ 本轮补记「S4 = PARTIAL」与「删 Node/删垫片必须在 **S8 之前**完成」的硬前置，防止该项随 S4 标"完成"而丢失。
+**偏离 4 的处置（已失效）**：原 §0.14.6 方案 A 将 S4 收口定为 deferred，并设「删 Node/删垫片必须在 S8 之前完成」硬前置。**2026-10-05 该 epic 经批次 20-A…20-K/20-S 实际落地（gate L2 25/0），硬前置已自然满足**，本节"PARTIAL"判定随 §0.14.6 更正段一并作废。
 
 **偏离 6 的处置（S8 与 S4 epic 解耦）**：原 §4.14.6 / §4.10.3 把「删 `base.Node` 字段 + 删 re-export 垫片」列为 S8 的硬前置。本轮在 **`base.Node` 仍存在** 下落地 S8 step1 `tc fmt`（§0.16.11），理由与证明：
 - **架构解耦**：G7 架构下 `fmt` 只消费 CST + trivia（`cst_format_tokens` 归并 `toks` 与 `g_trivia_toks`），不读取 `base.Node` 载荷、不依赖不可变 AST、不需要删 Node。故 S8 step1 与 S4 收口 epic（§0.14.7）**无硬依赖关系**。
@@ -2553,13 +2559,13 @@ S8   e33ed23 / b47210c             step1：tc fmt trivia 感知再发射（忠�
 
 **关键路径现状与下一步建议**
 
-- 已完成：`S0 → S1 → S2 → S3(partial) → S4(partial,SoA epic 启动 pilot se) → S6 → S7 → S5(step1–5) → S8 step1(tc fmt 忠实还原) → S8 step2(规范化重排) → S8 step3(tc lint)`（S6/S7 全绿 gate L2 24/0；S5 step1/2/3 见 §0.16.5–§0.16.7；S5 step4 `.ast` 序列化 + `tc dump-ast` 纯加法已 gate L2 24/0（§0.16.8）；S5 step5 trivia 侧表 + `assign_trivia` 已 gate L2 24/0（§0.16.9）；S8 step1 见 §0.16.11（gate L2 24/0）；step2 见 §0.16.12（gate L2 24/0，2909.2s）；step3 见 §0.16.13（gate L2 **25/0**：新增 `lint_smoke` 步，见 §0.16.13「门禁新增一步」）。
+- 已完成：`S0 → S1 → S2 → S3(done,20-J) → S4(done,20-A…20-K/20-S) → S6 → S7 → S5(step1–5) → S8 step1(tc fmt 忠实还原) → S8 step2(规范化重排) → S8 step3(tc lint)`（S6/S7 全绿 gate L2 24/0；S5 step1/2/3 见 §0.16.5–§0.16.7；S5 step4 `.ast` 序列化 + `tc dump-ast` 纯加法已 gate L2 24/0（§0.16.8）；S5 step5 trivia 侧表 + `assign_trivia` 已 gate L2 24/0（§0.16.9）；S8 step1 见 §0.16.11（gate L2 24/0）；step2 见 §0.16.12（gate L2 24/0，2909.2s）；step3 见 §0.16.13（gate L2 **25/0**：新增 `lint_smoke` 步，见 §0.16.13「门禁新增一步」）。
   - ⚠ **门禁步数变更**：step3 起 L2 由 24 步变 **25 步**（新增 `lint_smoke`）；后续引用「gate L2 24/0」处需按此更新。
 - 进行中 / 尚未启动：
-  - **S4 收口 epic（删 `base.Node` 字段 = 节点载荷 SoA 外置）**：用户 2026-10-02 裁定**启动**，采用 staged bootstrap（§0.14.7）。Pilot `se` 已完成（`tc check` 0 err + g1 自举 + c_interop `@c_export` 运行验证 + IR 快照 0 NEW/0 GONE）；剩余 ~23 字段按使用量升序逐组外置，每组独立验证，全部完成后删 `Node`+`nodes[]`。（本轮主线转向 S8 step1，epic 阶段性暂停，未废弃。）
+  - **S4 收口 epic（删 `base.Node` 字段 = 节点载荷 SoA 外置）**：**已于 2026-10-05 全部落地**（批次 1–19 外置 24 字段 + 20-F 删结构/池 + 20-H 删垫片 + 20-J S3 全局侧表化 + 20-K 桥切 u64 + 20-S `sema` 访问者化；gate L2 25/0）。**epic 已收口，非暂停。**
   - **S8**（`@desugar`/`@pass` + fmt/lint）：**step1 `tc fmt` 忠实还原（§0.16.11）+ step2 规范化重排（§0.16.12）+ step3 `tc lint`（§0.16.13）均已落地并 gate L2 全绿**——三步都在 `base.Node` 仍存在下实现，与 S4 epic 解耦（§0.15 偏离 6 合理）：fmt 吃词法流 + trivia、lint 吃 HIR，都不碰 `Node` 载荷。剩余 `@desugar`/`@pass` 用户扩展原语**仍受 S4 硬前置约束**（§4.10.3：插件 API 不得同时暴露新旧两套节点表示），并另受 `ModuleRef` 不存在、LLVM 后端不支持结构体字段 fn 值调用两项阻塞。S5 已在 S8 前完成（step1–5 全绿），trivia 注释保留前提就绪。
   - 工作 B 支柱 1 step5 + 支柱 2/3：仍受 §0.13.9「真实消费者触发」门槛约束（DEFERRED）。
-- 当前主线位置：**S8 step1 `tc fmt` 已收口（§0.16.11，gate L2 24/0）；S4 收口 epic 阶段性暂停于 pilot `se`（§0.14.7），可随时接续**；S5 已收口。
+- 当前主线位置：**S8 step1 `tc fmt` 已收口（§0.16.11，gate L2 24/0）；S4 收口 epic 已于 2026-10-05 全部落地（20-A…20-K/20-S，gate L2 25/0），S3/S4 均记为 done**；S5 已收口。
 - ⚠ **路线一致性**：S6→S7→S5 严格沿 §4.10.3 阶段表推进（S4 之后 S6，并可并行 S5），无偏离；S4 收口 epic 是 §0.14.6 已裁定 deferred 项在当前 S8 临近下的重启，属「保持偏离合理性」框架内的合理推进，非新偏离。
 
 ---
