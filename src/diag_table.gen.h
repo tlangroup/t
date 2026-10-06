@@ -85,6 +85,7 @@ static const DiagDef DIAG_DEFS[] = {
   { "T-MOD-E558", "error", "MOD", "T_MODULE_PRIVATE", "PRIVATE", "symbol is private" },
   { "T-MOD-E559", "error", "MOD", "T_IMPORT_BAD_PATH", "IMPORT_BAD_PATH", "import path is malformed" },
   { "T-MOD-E560", "error", "MOD", "T_IMPORT_CONFLICT", "IMPORT_CONFLICT", "import symbol conflict" },
+  { "T-MOD-E562", "error", "MOD", "", "IMPORT_ALIAS_CLASH", "two modules share the same last path segment and cannot be imported together" },
   { "T-MOD-W561", "warning", "MOD", "T_MOD_UNQUALIFIED", "UNQUALIFIED_XMOD", "cross-module access must use qualified name" },
   { "T-MTA-E600", "error", "MTA", "T_META_VALUE_PARAM_TYPE", "VALUE_PARAM_TYPE", "meta value parameter type error" },
   { "T-MTA-E601", "error", "MTA", "T_META_ARG_TYPE", "ARG_TYPE", "meta argument type error" },
@@ -174,7 +175,7 @@ static const DiagDef DIAG_DEFS[] = {
   { "T-VEC-W927", "warning", "VEC", "T_VECTOR_WIDER_THAN_NATIVE", "VECTOR_WIDER_THAN_NATIVE", "vector is wider than the native SIMD register and will be split" },
   { "T-VEC-W947", "warning", "VEC", "T_TILE_WIDER_THAN_NATIVE", "TILE_WIDER_THAN_NATIVE", "hardware tile is wider than the native SIMD register and will fall back to scalar loops" },
 };
-#define DIAG_COUNT 161
+#define DIAG_COUNT 162
 
 /* legacy (old semantic name) -> machine code alias table */
 static const struct { const char* legacy; const char* code; } DIAG_LEGACY[] = {
