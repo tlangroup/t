@@ -10740,6 +10740,59 @@ pub fn entry_has_top(name: string) bool {
     return false;
 }
 
+// 入口模块顶层符号重定义诊断。
+pub fn err_dup_top_def(name: string, at: i64) void {
+    var sb: StringBuilder = sb_new();
+    sb_append_str(sb, "顶层符号 '");
+    sb_append_str(sb, name);
+    sb_append_str(sb, "' 在本模块中重复定义（fn 的 clause 与重载不算重复）");
+    parse__fc_err("T-NAM-E405", sb_to_str(sb), at);
+}
+
+// 入口模块（provenance ""）的顶层符号重定义检查。
+//
+// ⚠ fn 必须豁免：clause（fn f(0) / fn f(_) / fn f(n when n > 0)）与重载都以**多个同名
+// FuncDecl 节点**存在于 decl_list，是合法形态（见 parse.tc 的 function clause group 校验）。
+//
+// 历史背景：本检查此前完全缺失，实测后果分三类且互不一致 ——
+//   ① 重复 const / var  → 0 error，链接期 `duplicate symbol`；
+//   ② 重复 struct / enum → 0 error，静默取**先**声明者；
+//   ③ 重复 fn（同签名）  → 0 error，静默取**先**声明者。
+// 全仓 521 个 .tc 文件实测：非 fn 顶层同名 = **0** ⇒ 本检查零存量误报。
+//
+// ⦁ 范围：仅入口模块（node_mod == ""）。被导入模块的符号走 def_add 去重（另一条路径，见 M1.2）。
+pub fn check_entry_redefs() void {
+    var n: i64 = slice_len(lex__decl_list) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        var di: i64 = lex__decl_list[i];
+        if (base.node_mod(di) == "") {
+            var ki: string = base.node_kind((di as u64));
+            if (ki != "FuncDecl") {
+                if (is_top_decl_kind(ki)) {
+                    var nm: string = base.node_sa((di as u64));
+                    var j: i64 = i + 1;
+                    while (j < n) {
+                        var dj: i64 = lex__decl_list[j];
+                        if (base.node_mod(dj) == "") {
+                            var kj: string = base.node_kind((dj as u64));
+                            if (kj != "FuncDecl") {
+                                if (is_top_decl_kind(kj)) {
+                                    if (base.node_sa((dj as u64)) == nm) {
+                                        err_dup_top_def(nm, dj);
+                                    }
+                                }
+                            }
+                        }
+                        j = j + 1;
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+}
+
 // 把 `:: *` 通配项展开成逐个具名项。模块若含任一 export，则只展开 export 符号；
 // 否则展开其全部顶层符号（与 check_mod_visible 的可见性口径一致）。
 pub fn sel_expand_wildcards() void {
@@ -10841,6 +10894,7 @@ pub fn sel_validate() void {
 
 pub fn mangle_modules() void {
     collect_module_defs();
+    check_entry_redefs();
     var ndef: i64 = slice_len(lex__g_def_orig) as i64;
     var tot: i64 = base__node_count();
 
