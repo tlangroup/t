@@ -27,7 +27,7 @@ t 语言的设计宪法要求「同一逻辑仅一种标准写法」（L-04）�
 | **模块导入** | `@import("Path")`／`@import("Path" as M)`／`@import("Path" :: a, b as c)` | `import(Path)`／`import x;`／`import @x;`（→ `T-PAR-E102`） | 路径为**字符串字面量**；旧括号/裸名形式已删 |
 | **库模块头** | `@module(pub)`（导出库）／`@module(internal)`（默认私有） | — | 入口文件用 `@main`，不用 `@module` |
 | **可见性** | `pub fn/struct/enum ...`（配合 `@module(pub)`） | `export fn ...`（`export` 关键字已删） | 最终可见性 = 「模块属性 ∧ 声明 `pub`」合取 |
-| **跨模块访问** | `mod.name`／`mod.Type`／`mod.Type{ f: v }` **全限定**（同包也要路径限定） | 裸名跨模块访问 | 强制路径限定（`T-MOD-W561` 建议）；引用外部类型/字面量必须带模块前缀 |
+| **跨模块访问** | `mod.name`／`mod.Type`／`mod.Type{ f: v }` **全限定**（同包也要路径限定） | 裸名跨模块访问 | 强制路径限定（`T-MOD-E561` 错误）；引用外部类型/字面量必须带模块前缀 |
 | **程序入口** | `@main fn main() i32 { ... }` | `fn main()` 无 `@main`／`export fn main` | 入口须 `@main` 注解 |
 | **多路分支** | `match (scrutinee) { pat => expr, ... }` + `when` 守卫 + `_` 通配 | `switch/case/default`（已删除 → `T-PAR-E101`） | `match` 是唯一表达式级分发；穷尽性必查（`T-MATCH_NONEXHAUSTIVE`） |
 | **enum 定义（整型枚举）** | `enum Color : u8 { Red = 1, Green = 2 }`（**名字在 `enum` 之后**；成员为具名编译期整型常量） | `Color enum : u8 { ... }`（→ `T-PAR-E102`） | 整型枚举：**无载荷**；tag 类型（如 `: u8`）可选，默认 `i32`；成员必须 `Color.Red` 限定引用。带载荷的和类型请用 `variant`（见下） |

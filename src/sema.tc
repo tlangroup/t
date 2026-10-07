@@ -5389,7 +5389,7 @@ pub fn run_device_check() void {
 // 故同构元组（无论是类型标注还是字面量推导）都落到同一 struct 声明，互操作无缝。
 pub fn tuple_lit_type_name(elem_tis: []i64) string {
     // 元素 TI → 类型 AST 节点 → mangle（须与 parse.synth_tuple_type_name 永远一致）
-    // ⚠ 局部变量曾禁用 `nodes`（会与 `base.nodes` 跨模块裸名冲突触发 T-MOD-W561）⇒ 故名 `elem_nodes`；20-F 已删 `base.nodes`，该冲突不复存在，名字沿用不动。
+    // ⚠ 局部变量曾禁用 `nodes`（会与 `base.nodes` 跨模块裸名冲突触发 T-MOD-E561）⇒ 故名 `elem_nodes`；20-F 已删 `base.nodes`，该冲突不复存在，名字沿用不动。
     var elem_nodes: []i64;
     var i: i64 = 0;
     while (i < slice_len(elem_tis) as i64) {
@@ -10567,7 +10567,7 @@ pub fn modval_load(mname: string, at: i64) void {
     base.node_set_lb((imp as u64), items);   // M3.1：携带选择性项 → handle_one_import 经 sel_register 登记；空则跳过
     handle_one_import(imp, at);
     // 仅当未写 `::` 时退化通配：把模块按 `:: *` 登记，使本模块内对 M 符号的裸引用在
-    // mangle_modules Pass 3 被改写为 `M__sym`（与 `:: *` 等价），并触发 T-MOD-W561 提示改用 `M.sym`。
+    // mangle_modules Pass 3 被改写为 `M__sym`（与 `:: *` 等价），并触发 T-MOD-E561 提示改用 `M.sym`。
     // 写了 `:: a,b` 则只登记这些项（选择性可见，裸引用其它符号不再可见）。
     if (items < 0) {
         var alias: string = last_segment(rest);
@@ -10667,26 +10667,10 @@ pub fn def_lookup(alias: string, name: string) i64 {
 // lib 模块（repl / std 等）不在范围内，其裸跨模块名不被本诊断约束。
 pub fn is_src_mod(a: string) bool {
     if (a == "") { return true; }        // 入口模块（tc.tc）属 src
-    // M2：模块身份取完整路径，故治理范围按完整路径匹配（末段别名保留以防旧调用）。
-    if (a == "src.base") { return true; }
-    if (a == "src.lex") { return true; }
-    if (a == "src.parse") { return true; }
-    if (a == "src.sema") { return true; }
-    if (a == "src.comptime_fold") { return true; }
-    if (a == "src.codegen_c") { return true; }
-    if (a == "src.test") { return true; }
-    if (a == "src.tote") { return true; }
-    if (a == "src.totter") { return true; }
-    if (a == "base") { return true; }
-    if (a == "lex") { return true; }
-    if (a == "parse") { return true; }
-    if (a == "sema") { return true; }
-    if (a == "comptime_fold") { return true; }
-    if (a == "codegen_c") { return true; }
-    if (a == "test") { return true; }
-    if (a == "tote") { return true; }
-    if (a == "totter") { return true; }
-    return false;
+    // M4.1：去掉硬编码 9 模块白名单。src 包内模块路径均以 "src." 开头
+    // （根目录 src/ 下各模块：base/lex/parse/hir/sema/tir/mir/...），据此判定治理范围，
+    // 无白名单/黑名单概念（见用户裁定：当前 package 里的文件都是 src 开头）。
+    return starts_with(a, "src.");
 }
 
 // 模块重导出回退（M-Reexport）：模块 X 经 `pub @import(M)` 重导出了 M 的 pub 符号时，
@@ -11029,7 +11013,7 @@ pub fn sel_validate() void {
                         if (lex__g_sel_mod[j] != lex__g_sel_mod[i] || lex__g_sel_orig[j] != lex__g_sel_orig[i]) {
                             // M2：两条都源自 `:: *` 通配（含 const X = @import("M") 的兼容通配）
                             // 且分属不同模块 ⇒ 不报撞名。通配同名经限定访问（X.DEEP）消歧或裸名
-                            // 取首匹配（T-MOD-W561 已提示改限定名），非真歧义（见 f153）。
+                            // 取首匹配（T-MOD-E561 已提示改限定名），非真歧义（见 f153）。
                             if (lex__g_sel_from_wild[j] == false || lex__g_sel_from_wild[i] == false) {
                                 err_sel_conflict(lex__g_sel_local[i], "另一条选择性导入", lex__g_sel_at[i]);
                                 j = i;   // 同一项只报一次
@@ -11042,6 +11026,106 @@ pub fn sel_validate() void {
         }
         i = i + 1;
     }
+}
+
+// ── W561 修复（M4.2 前置）：排除「指向本函数局部变量/形参的裸名」误报 ──
+// 背景：W561 旨在提示「跨模块裸名须改模块限定名」。但函数内局部变量/形参与被导入的
+// 跨模块名可能重名（如 sema.tc:4811 的局部 `pos` 与 `lex.pos`）。在 mangle_modules 阶段
+// （早于 hir_build/infer_expr：node_resolve 尚未填充、AST 无父指针侧表）无法靠符号表区分。
+// 故在此构建一次性父指针侧表，向上找到所有包含该 ident 的函数/闭包，扫描其局部变量与形参；
+// 若任一作用域存在同名局部/形参 ⇒ 该裸名指向局部（非跨模块引用）⇒ 跳过 W561。
+pub var g_w561_parent: []i64;   // 与节点池等长：节点 → 父节点 id（默认 -1）
+
+// AST 子节点分布在多槽（na/nb 单槽 + la/lb/lc 链表），须全部纳入父指针侧表，否则
+// 父链断裂导致向上找不到包含函数、子树扫描漏掉局部声明。
+pub fn w561_build_parents() void {
+    var tot: i64 = base__node_count();
+    g_w561_parent = [];
+    var i: i64 = 0;
+    while (i < tot) {
+        append(g_w561_parent, -1);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < tot) {
+        if (base.node_na((i as u64)) >= 0) { var ch: i64 = base.node_na((i as u64)); if (ch < tot) { slice_set(g_w561_parent, ch, i); } }
+        if (base.node_nb((i as u64)) >= 0) { var ch: i64 = base.node_nb((i as u64)); if (ch < tot) { slice_set(g_w561_parent, ch, i); } }
+        var c: i64 = base.node_la((i as u64));
+        while (c >= 0) { var ch: i64 = base__kids[c].val; if (ch < tot) { slice_set(g_w561_parent, ch, i); } c = base__kids[c].next; }
+        c = base.node_lb((i as u64));
+        while (c >= 0) { var ch: i64 = base__kids[c].val; if (ch < tot) { slice_set(g_w561_parent, ch, i); } c = base__kids[c].next; }
+        c = base.node_lc((i as u64));
+        while (c >= 0) { var ch: i64 = base__kids[c].val; if (ch < tot) { slice_set(g_w561_parent, ch, i); } c = base__kids[c].next; }
+        i = i + 1;
+    }
+}
+
+pub fn w561_parent(n: i64) i64 {
+    var tot: i64 = base__node_count();
+    if (n < 0 || n >= tot) { return -1; }
+    return g_w561_parent[n];
+}
+
+// 名字是否已含 `__`（模块限定分隔符）⇒ 已是模块限定形式，非裸跨模块引用。
+pub fn w561_is_qualified(name: string) bool {
+    var i: i64 = 0;
+    var n: i64 = str_len(name);
+    while (i + 1 < n) {
+        if (name[i] == '_' && name[i + 1] == '_') { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+// 该 ident 是否指向某个包含它的函数/闭包作用域内的局部变量或形参（⇒ 不是跨模块裸名）。
+pub fn w561_is_local_ref(p: i64, name: string) bool {
+    var r: bool = false;
+    var cur: i64 = w561_parent(p);
+    var fns: i64 = 0;
+    while (cur >= 0) {
+        var k: string = base.node_kind((cur as u64));
+        if (k == "FuncDecl" || k == "lambda") {
+            fns = fns + 1;
+            // 扫描该函数/闭包体直接子节点（不下钻嵌套函数体），命中同名局部/形参即视为局部引用。
+            if (w561_func_has_local(cur, name)) { r = true; break; }
+        }
+        cur = w561_parent(cur);
+    }
+    return r;
+}
+
+// 扫描函数/闭包节点 func 的直接子节点，逐个调用 w561_has_local_in_subtree（后者遇嵌套 FuncDecl/lambda 即停，不下钻）。
+// 仅作为 w561_is_local_ref 的入口；根 func 自身不判局部，避免 w561_has_local_in_subtree 对 FuncDecl 直接 return false 而漏扫函数体。
+pub fn w561_func_has_local(func: i64, name: string) bool {
+    if (base.node_na((func as u64)) >= 0) { if (w561_has_local_in_subtree(base.node_na((func as u64)), name)) { return true; } }
+    if (base.node_nb((func as u64)) >= 0) { if (w561_has_local_in_subtree(base.node_nb((func as u64)), name)) { return true; } }
+    var c: i64 = base.node_la((func as u64));
+    while (c >= 0) { if (w561_has_local_in_subtree(base__kids[c].val, name)) { return true; } c = base__kids[c].next; }
+    c = base.node_lb((func as u64));
+    while (c >= 0) { if (w561_has_local_in_subtree(base__kids[c].val, name)) { return true; } c = base__kids[c].next; }
+    c = base.node_lc((func as u64));
+    while (c >= 0) { if (w561_has_local_in_subtree(base__kids[c].val, name)) { return true; } c = base__kids[c].next; }
+    return false;
+}
+
+// 扫描 n 子树中的局部变量(var_decl)/形参(P)；不进入嵌套函数/闭包体（其局部属独立作用域，
+// 不绑定外层 p）。命中同名即返回 true。递归遍历全部子槽（na/nb/la/lb/lc）。
+// 注意：n 自身若为 FuncDecl/lambda（嵌套函数边界）直接返回 false，不下钻。根函数由 w561_func_has_local 单独扫描直接子节点。
+pub fn w561_has_local_in_subtree(n: i64, name: string) bool {
+    var k: string = base.node_kind((n as u64));
+    if (k == "var_decl" || k == "P") {
+        if (base.node_sa((n as u64)) == name) { return true; }
+    }
+    if (k == "FuncDecl" || k == "lambda") { return false; }   // 不进入嵌套函数体
+    if (base.node_na((n as u64)) >= 0) { if (w561_has_local_in_subtree(base.node_na((n as u64)), name)) { return true; } }
+    if (base.node_nb((n as u64)) >= 0) { if (w561_has_local_in_subtree(base.node_nb((n as u64)), name)) { return true; } }
+    var c: i64 = base.node_la((n as u64));
+    while (c >= 0) { if (w561_has_local_in_subtree(base__kids[c].val, name)) { return true; } c = base__kids[c].next; }
+    c = base.node_lb((n as u64));
+    while (c >= 0) { if (w561_has_local_in_subtree(base__kids[c].val, name)) { return true; } c = base__kids[c].next; }
+    c = base.node_lc((n as u64));
+    while (c >= 0) { if (w561_has_local_in_subtree(base__kids[c].val, name)) { return true; } c = base__kids[c].next; }
+    return false;
 }
 
 pub fn mangle_modules() void {
@@ -11127,38 +11211,51 @@ pub fn mangle_modules() void {
     // 注意与 Pass 2 互不重叠：Pass 2 只改「导入方自己定义了该名字」的情形，而那恰是
     // sel_validate 判定的冲突，正常路径下两趟不会碰同一个节点。
     if ((slice_len(lex__g_sel_local) as i64) > 0) {
+        w561_build_parents();
         sel_expand_wildcards();
         sel_validate();
         var p: i64 = 0;
-        while (p < tot) {
-            var k3: string = base.node_kind((p as u64));
-            var hit3: bool = false;
+    while (p < tot) {
+        var k3: string = base.node_kind((p as u64));
+        var hit3: bool = false;
             if (k3 == "ident" || k3 == "named" || k3 == "struct_lit") { hit3 = true; }
-            if (k3 == "var_decl" || k3 == "P") { hit3 = true; }
+            // 注意：var_decl / P（局部变量声明、形参）不属于「跨模块引用」，不在 Pass 3 改写。
+            // 它们若撞名导入方，由 Pass 2（自身定义 def_lookup>=0）或 sel_validate 处理；
+            // 函数内局部绑定更绝不可改写成 `模块__原名`，否则局部变量被误改名（W561 根因）。
             if (hit3) {
                 var si: i64 = sel_lookup(base.node_mod(p), base.node_sa((p as u64)));
                 if (si >= 0) {
                     // 强制路径访问（Task A 落地）：裸跨模块引用必须改为模块限定名。
                     // 仅对 src 治理范围内、真实 anchor 的标识符/命名类型/结构体字面量生效；
                     // 合成节点（ln==0，误归因到行 1 的 phantom）一律跳过，避免噪声。
-                    var owner: string = lex__g_sel_mod[si];
-                    if (base.node_span_id(p).line > 0
-                        && (k3 == "ident" || k3 == "named" || k3 == "struct_lit")
-                        && is_src_mod(base.node_mod(p))
-                        && owner != base.node_mod(p)
-                        && def_lookup(base.node_mod(p), base.node_sa((p as u64))) < 0) {
+                var owner: string = lex__g_sel_mod[si];
+                var w561_name: string = base.node_sa((p as u64));
+                if (base.node_span_id(p).line > 0
+                    && (k3 == "ident" || k3 == "named" || k3 == "struct_lit")
+                    && is_src_mod(base.node_mod(p))
+                    && owner != base.node_mod(p)
+                    && def_lookup(base.node_mod(p), w561_name) < 0
+                    // 已含 `__` 的限定名（tir__TIR_OP_NE 等）本就是模块限定形式 ⇒ 非裸引用，跳过。
+                    && !w561_is_qualified(w561_name)
+                    // M4.2 前置修复：局部变量/形参与跨模块名重名时，裸名指向局部 ⇒ 非跨模块引用，跳过。
+                    && (k3 != "ident" || !w561_is_local_ref(p, w561_name))) {
                         var repl: string = mangled_name(owner, base.node_sa((p as u64)));
                         var sl: i64 = parse.n_line(p);
                         var sc: i64 = parse.n_col(p);
                         var ec: i64 = sc + ((base.node_span_id(p).end_col - base.node_span_id(p).col) as i64);
-                        var di: i64 = base__diag_new("T-MOD-W561", "warning",
+                        var di: i64 = base__diag_new("T-MOD-E561", "error",
                             "跨模块访问必须使用模块限定名 " + repl + "，不能用裸名 " + base.node_sa((p as u64)),
                             parse.n_file(p), sl, sc, sl, ec);
                         var fx: i64 = base__fix_one("改用 " + repl,
                             parse.n_file(p), sl, sc, sl, ec, repl);
                         base__diag_set_fs(di, fx);
                     }
-                    base.node_set_sa((p as u64), mangled_name(lex__g_sel_mod[si], lex__g_sel_orig[si]));
+                    // 修复（W561 根因）：仅对真正的跨模块引用改写。已限定名 / 指向局部绑定的 ident 用法
+                    // （局部变量/形参与导入名重名）一律不改写，否则函数内局部 `var pos` 会被误
+                    // 改名为 `lex__pos`，与同作用域用法错位；声明侧已由 hit3 排除。
+                    if (!w561_is_qualified(w561_name) && !(k3 == "ident" && w561_is_local_ref(p, w561_name))) {
+                        base.node_set_sa((p as u64), mangled_name(lex__g_sel_mod[si], lex__g_sel_orig[si]));
+                    }
                 }
             }
             p = p + 1;
