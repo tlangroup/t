@@ -246,6 +246,17 @@
 `docs/syntax/type-namespace-review.md` 与 `docs/syntax/product-type-unification-design.md`。
 **不塞进本 epic**（否则边界失控）。
 
+### 7.1 已修：前导点变体 `variant_name_of_case` 全局反查无视 `g_lead_expect`（P0 静默错编）
+- **根因**：`sema.tc::variant_name_of_case` 扫描 `lex__decl_list` 取**首个**含该 case 的 variant，
+  完全无视上下文注入的期望变体类型 `g_lead_expect`。同名 case 跨多个 variant 时取错构造器
+  （如 `A { .X }` 误脱糖成 `B_from_X`）→ 静默错编（或类型错）。
+  `sema.tc:7609` 对 Enum/Union 已优先用 `g_lead_expect`，但 Variant 分支漏了 —— 形成不对称。
+- **修复**：当 `g_lead_expect` 是含该 case 的 Variant 时优先返回其名；否则（期望变体不含该 case）
+  `break` 走全局兜底，与旧行为一致。改动仅影响歧义场景，编译器自身 IR 字节级不变（自举不动点
+  `g2.ll==g3.ll==g4.ll` 与 M4 基线同 md5 `4d701937…`）。
+- **回归测试**：`tests/conformance/pass/p_variant_lead_expect.tc`（两 variant 共享 case 名 `X`，
+  `B` 先于 `A` 声明，验证 `.X` 在 `A { .X }` 中按上下文消歧为 `A_from_X`）。
+
 ---
 
 ## 8. 横切事项
