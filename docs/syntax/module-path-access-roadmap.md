@@ -131,25 +131,65 @@
 
 **目标**：模块身份从末段切到完整路径。
 
-### M2.1 四处**同时**切换（缺一即符号名与查找键不一致）
+### M2.1 符号身份切完整路径（含蓝图偏差修正）
 
-| # | 位置 | 改动 |
+> ⚠ **蓝图偏差（须记录）**：蓝图原写「四处同时切换」基于旧代码；当前代码（M1.2 已落 + S3 SoA 迁移后）
+> 模块身份与别名**强耦合**——`handle_one_import` 里 `alias`(末段) 同时是 `g_cur_mod`(模块身份) 与
+> 名字重整命名空间，且 `modval_load` 对 `src.` 前缀做 **strip** 后传给它（10265
+> `load_module_file(chosen, alias)`；10499-10507 `rest = strip(src.)`）。故 M2 实际须：
+> ① 把「模块身份（完整路径）」与「文件定位路径（去 `src.`）」**解耦**；② 新增
+> **别名(末段)→完整路径身份**映射表，支撑声明式 `base.foo` 的 Pass 1 解析
+> （`def_lookup` 须用身份而非末段别名）；③ `mangled_name` **扁平化**（`.`→`_`）使 C 后端符号合法；
+> ④ 退化 `T-MOD-E562`（末段同名模块符号已区分，不再静默合并）；⑤ `is_src_mod` 比较集增补完整路径；
+> ⑥ 改写 `f152`/`f153`（两末段同名模块现可共存，须用 `as` 区分才能无二义引用）。
+> **目标与约束不变**，改动点从 4 处扩至 **11 处 + 1 新表**。
+
+> ⚠ **验证期两处关键修正（2026-10-07，必须记录）**：
+> **① 重整名策略改为「碰撞感知」，非蓝图原写的「全路径 always」**。
+> 蓝图 M2.1⑤ 写 `mangled_name` 扁平化（`.`→`_`）即「模块身份完整路径直接进符号名」
+> （`base`→`src_base__kids`）。但这会让编译器自身源码约 748 处硬编码重整名字面量
+> （`src/*.tc` 里的 `base__kids`/`lex__decl_list`/…，**mangler 不触碰**）在旧种子编译新源码时
+> 全部「未定义」（旧种子只认 `base__kids`）⇒ **gate boot1（旧种子→g1）自举断裂**。
+> 先试过把 748 处改成 `src_base__X`，新编译器链（g1→g4）通过但旧种子编译新源码失败，证实此路不通。
+> **正解**：`mangled_name` 改为**碰撞感知**——仅当某末段别名在全局「同末段多模块」冲突时才升完整路径
+> （`src.d.e`/`src.x.e` 都末段 `e` ⇒ `src_d_e__DEEP`/`src_x_e__DEEP` 消歧，满足 f152/f153）；
+> 编译器自身 9 模块末段均唯一 ⇒ 仍发旧名 `base__kids`（与新/旧编译器都一致，**自举不动点成立**）。
+> 实现：新增 `g_mod_fullpaths`（已加载模块完整路径清单，resolve_modules 期登记）+ `mod_lastseg_count`。
+> **② const 形态双模块导入的 E560 误报**：`const EA=@import("src.d.e"); const EB=@import("src.x.e")`
+> 经 `modval_load` 的「兼容通配 `:: *`」把 `DEEP` 注册进入口作用域，两模块通配同名触发 T-MOD-E560。
+> 但二者模块身份已是完整路径（`src.d.e`≠`src.x.e`），通配同名经限定访问 `EA.DEEP` 可消歧，非真歧义。
+> 修正：选择性导入项加 `g_sel_from_wild` 标记，`sel_validate` 冲突判定仅当**两条都非通配**时才报 E560
+> （通配×通配、分属不同模块 ⇒ 豁免）。显式 `:: a as x` 撞名（f131）仍正确报错。
+
+| # | 位置（当前行号） | 改动 |
 |---|---|---|
-| 1 | `sema.tc:9247` `g_modval_set` | 存**完整路径**而非 `last_segment(path)` |
-| 2 | `sema.tc:10518` `def_lookup` | 按完整路径查，命中即唯一 |
-| 3 | `sema.tc:10509` `mangled_name` | 重整名扁平化为 `src_d_e__deep` |
-| 4 | `sema.tc:6127` `infer_expr_body` | 脱糖取完整路径作 key |
+| 1 | `modval_load`(10499) | 不再 strip `src.`，`mk_ImportModDecl` 传**完整路径**；定位去 `src.` 交给 `handle_one_import` |
+| 2 | `handle_one_import`(10163) | 拆 `idn`(完整身份)=nm / `loc`(定位)=去 `src.` 版本；`g_cur_mod=idn`；`alias`(末段) 仍用于 `mod_alias_add` + `imp_alias_register` |
+| 3 | `load_module_file`(10114) | 第二参传 `idn`（完整），`base__g_cur_mod=alias` 自然为完整身份 |
+| 4 | `mod_alias_add`(10090) | 维护 `g_alias_full[alias]=idn`；新增 `g_alias_full` 表与 `alias_full(a)` 解析 |
+| 5 | `mangled_name`(10554) | alias 扁平化 `dots_to_underscores`（点→下划线） |
+| 6 | `g_modval_set`(9247) | key = 完整路径（去 `last_segment`） |
+| 7 | `infer_expr_body`(6132) | `mkey = import_expr.sa`（完整路径，去 `last_segment`） |
+| 8 | `mangle_modules` Pass 1(10952/10967/10978) | `def_lookup` 第一参用 `alias_full(receiver)` |
+| 9 | `is_src_mod`(10577) | 比较集增补 `src.base`/`src.lex`/`src.parse`/`src.sema`/… 完整路径 |
+| 10 | `imp_alias_register`(10074) | 退化：末段同名不同路径**不再报 E562**（菱形同路径仍去重）；`err_import_alias_clash` 保留函数不再调用 |
+| 11 | `tests/conformance/fail/f152`·`f153` | 两末段同名模块共存，改用 `as` de/xe 区分，期望 pass + 返回值正确 |
 
 ### M2.2 验证链（固化，不得跳步）
 
 `tc check` → `cstgen --check` → 自举 g1 → **seed vs g1 逐字节 IDENTICAL** → 覆盖反查
 → 旁路对照 → IR 快照 → `--update` 重录 → gate L2 → 四代种子 + dbg/rls 双复检 → commit + FF 推送。
 
-- ⚠ **快照失去等价性判据能力**（354 个 md5 全变）⇒ 等价性**必须**改用
-  「变更前 seed vs 新 g1 同源码对拍」证明；快照只能防回归。
-- ⚠ 改 `src/` 后首跑 gate L2 的快照步必 FAIL（陈基线），属**预期失败**；
-  判据是 **0 NEW / 0 GONE**。基线**必须由 g1 录制**。
-- **验收**：gate L2 25/0；`tc.ll` / `tc.c` 中符号名由 `base__x` 变为 `src_base__x`；体积 +5~10%（已知代价）。
+- ⚠ **快照等价性判据（碰撞感知下比 detour 更强）**：编译器自身 9 模块末段均唯一 ⇒ 发射符号仍为
+  `base__x`，与 pre-M2 逐字节一致，故 `src/tc.tc` 相关条目**未漂移**，快照可直接作证等价；
+  仅 f152/f153 等「同末段多模块冲突」的 fixture 升 `src_d_e__x`/`src_x_e__x` 新名 ⇒ 这些条目
+  必然漂移，须 `--update` 重录。等价性补充证据：**g2==g3==g4** 不动点 + `seed(tc.exe)` 编译新源码
+  成功（boot1 不断）+ 全量 conformance 326/0。
+- ⚠ 改 `src/` 后首跑 gate L2 的快照步旧基线含 `src_base__x`（detour 残留）必 FAIL，属**预期失败**；
+  须先 `ir_snapshot.mjs --update --compiler out/dbg/g1.exe` 重录再复跑。基线**必须由 g1 录制**。
+- **验收**：gate L2 25/0；`tc.ll` / `tc.c` 中**编译器自身符号名仍为 `base__x`**（碰撞感知：
+  末段唯一 ⇒ 旧名，自举不动点成立），仅「同末段多模块冲突」的用户代码升完整路径
+  `src_d_e__x`（如 f152/f153）；旧种子 `tc.exe` 可编译新源码（boot1 不再断）。
 
 ### 里程碑 M2 ✅ = gate L2 全绿且四代自举不动点成立。
 
