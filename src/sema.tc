@@ -10566,22 +10566,35 @@ pub fn modval_load(mname: string, at: i64) void {
         is_lib = false;
         rest = str_slice(mname, 4, str_len(mname));
     }
+    // M3.1：从 `const/var X = @import("M" :: a,b)` 声明取出表达式位的 `::` 选择性导入项。
+    // 兼容 `const X = @import("M").foo`（member 包裹 import_expr）与无 `::` 两种情形。
+    var items: i64 = -1;
+    if (base.node_kind((at as u64)) == "GlobalConstDecl" || base.node_kind((at as u64)) == "GlobalVarDecl") {
+        var ie: i64 = base.node_nb((at as u64));
+        if (ie >= 0) {
+            if (base.node_kind((ie as u64)) == "member") { ie = base.node_na((ie as u64)); }
+            if (base.node_kind((ie as u64)) == "import_expr") { items = base.node_lb((ie as u64)); }
+        }
+    }
     var imp: i64 = base.mk_ImportModDecl(rest, "", false, is_lib, -1, -1);
+    base.node_set_lb((imp as u64), items);   // M3.1：携带选择性项 → handle_one_import 经 sel_register 登记；空则跳过
     handle_one_import(imp, at);
-    // 临时兼容：把模块按通配导入登记，使本模块内对 M 符号的裸引用在 mangle_modules
-    // Pass 3 被改写为 `M__sym`（与 `:: *` 等价），并触发 T-MOD-W561 提示改用 `M.sym`。
-    // 这让 const 导入既显式（绑定 X）又兼容既有裸引用；后续会把裸引用全部改为 `X.sym`。
-    var alias: string = last_segment(rest);
-    // M2：g_sel_mod 记完整路径身份（src 导入 "src." + rest；库导入 rest 已完整）。
-    var idn: string = rest;
-    if (is_lib == false) { idn = "src." + rest; }
-    append(lex__g_sel_owner, base__g_cur_mod);
-    append(lex__g_sel_local, "");
-    append(lex__g_sel_mod, idn);
-    append(lex__g_sel_orig, "");
-    append(lex__g_sel_wild, true);
-    append(lex__g_sel_at, -1);
-    append(lex__g_sel_from_wild, true);   // M2：modval_load 的兼容通配，记 from_wild
+    // 仅当未写 `::` 时退化通配：把模块按 `:: *` 登记，使本模块内对 M 符号的裸引用在
+    // mangle_modules Pass 3 被改写为 `M__sym`（与 `:: *` 等价），并触发 T-MOD-W561 提示改用 `M.sym`。
+    // 写了 `:: a,b` 则只登记这些项（选择性可见，裸引用其它符号不再可见）。
+    if (items < 0) {
+        var alias: string = last_segment(rest);
+        // M2：g_sel_mod 记完整路径身份（src 导入 "src." + rest；库导入 rest 已完整）。
+        var idn: string = rest;
+        if (is_lib == false) { idn = "src." + rest; }
+        append(lex__g_sel_owner, base__g_cur_mod);
+        append(lex__g_sel_local, "");
+        append(lex__g_sel_mod, idn);
+        append(lex__g_sel_orig, "");
+        append(lex__g_sel_wild, true);
+        append(lex__g_sel_at, -1);
+        append(lex__g_sel_from_wild, true);   // M2：modval_load 的兼容通配，记 from_wild
+    }
 }
 
 // ── 模块命名空间隔离（名字重整 / mangling）─────────────────────

@@ -203,6 +203,12 @@
 | M3.2 | 61 处声明式 → `const` 迁移（调用点 0 改动） | M3.1 |
 | M3.3 | 删除声明式 `@import` 与 `as` 语法；清理 `pub @import` 死代码（`lex.tc:913`、`sema.tc:10137/10151/10546`） | M3.2 |
 
+> **M3.1 进度（2026-10-07）**：✅ 已完成并通过验证。
+> - 改动面（实测远小于蓝图「17 处」）：`parse.tc` 表达式位 `parse_import_expr` 支持 `:: a, b as c`（存 `import_expr.lb`）；`sema.tc` `modval_load` 从 const/var 声明的 `import_expr` 取 `::` 项写入 `ImportModDecl.lb`，经 `handle_one_import → sel_register` 登记选择性可见性；仅无 `::` 时退化通配（与 M2 前行为一致）。库模块内 const 选择性导入的 owner 经 `node_mod(imp)` = 当时 `g_cur_mod`，与通配分支一致。
+> - 新增正向用例 `tests/conformance/pass/p_m3_const_selective/`（`const e = @import("src.d.e" :: deep)` → `e.deep(10)`=110；模块另含未导入的 `other` 验证选择性）。
+> - 验证：旧种子 `tc.exe` 编译 M3.1 源码 EXIT=0（自举不断）；`g1 check src/tc.tc` = 0 errors；conformance **328/0**（增 2，新用例通过，无回归）；gate L2 24/1（唯一 FAIL = 产物快照比对，因 M3.1 改 `parse.tc`/`sema.tc` 致 `src/tc.tc::{c,ll}` 2 entry 必漂移，属 §8 合法基线陈旧，`0 新增/0 缺失` 且未波及 348 用户 entry）；重录基线后复跑预期 25/0。
+> - ⚠ 蓝图「17 处选择性导入」是高估：实际只在「表达式位解析」+「`modval_load` 消费」两处打通，声明式 `parse_at_import_decl` 此前已支持 `:: items`，无需再改。
+
 - **验收**：全仓零声明式 `@import`；`tc check` 0 error；gate L2 全绿（零漂移）。
 - ⚠ 6 个测试需同步改写：`f123` / `f54` / `f55` / `f56` / `f_export_on_import` / `p42_std_import`。
 
