@@ -200,7 +200,7 @@
 | 任务 | 内容 | 依赖 |
 |---|---|---|
 | M3.1 | 扩展 parse 支持 `const m = @import("src.m" :: a, b)`（17 处选择性导入） | M2 |
-| M3.2 | 61 处声明式 → `const` 迁移（调用点 0 改动） | M3.1 |
+| M3.2 | 声明式 `@import` → `const` 迁移（实测 `src/*.tc` 内仅 15 处语句形态，调用点 0 改动） | M3.1 |
 | M3.3 | 删除声明式 `@import` 与 `as` 语法；清理 `pub @import` 死代码（`lex.tc:913`、`sema.tc:10137/10151/10546`） | M3.2 |
 
 > **M3.1 进度（2026-10-07）**：✅ 已完成并通过验证。
@@ -208,6 +208,15 @@
 > - 新增正向用例 `tests/conformance/pass/p_m3_const_selective/`（`const e = @import("src.d.e" :: deep)` → `e.deep(10)`=110；模块另含未导入的 `other` 验证选择性）。
 > - 验证：旧种子 `tc.exe` 编译 M3.1 源码 EXIT=0（自举不断）；`g1 check src/tc.tc` = 0 errors；conformance **328/0**（增 2，新用例通过，无回归）；gate L2 24/1（唯一 FAIL = 产物快照比对，因 M3.1 改 `parse.tc`/`sema.tc` 致 `src/tc.tc::{c,ll}` 2 entry 必漂移，属 §8 合法基线陈旧，`0 新增/0 缺失` 且未波及 348 用户 entry）；重录基线后复跑预期 25/0。
 > - ⚠ 蓝图「17 处选择性导入」是高估：实际只在「表达式位解析」+「`modval_load` 消费」两处打通，声明式 `parse_at_import_decl` 此前已支持 `:: items`，无需再改。
+
+> **M3.2 进度（2026-10-07）**：✅ 已完成并通过验证（commit 待推）。
+> - 蓝图「61 处声明式 → const 迁移」高估：实测 `src/*.tc` 内**真·语句形态 `@import` 仅 15 处**（其余 79 处早已是 `const/var` 赋值形态，即 M3 目标形态）。
+> - 迁移规则：语句形态 `@import("src.X" :: items);` → `const X = @import("src.X" :: items);`（绑定名 = 路径末段，与 M3 前模块别名同名 ⇒ 调用点 0 改动）；通配 `@import("std.rc.cst");` → `const cst = @import("std.rc.cst");`。
+> - 15 处分布：`base.tc`/`lex.tc`/`hir.tc`/`tc.tc`(×2 `std.rc.cst` 直连)/`test.tc`/`tir.tc`/`tir_to_ll.tc`(×4) 的 `src.*` 选择性导入 + `std.rc.cst` 直连；`base.tc` 头部注释同步更新。
+> - 风险已排：逐文件核对绑定名无 T-NAM-E405 重定义（tc.tc 既有 `base/lex/parse/hir/sema/codegen_c/tir/mir`，新增 `tir_to_ll/tmir/codegen_wasm/riscv/c_tmir/cst` 均不撞）；`const X` 触发 T-NAM-W402 告警属预期（warning 非 error）。
+> - 验证：旧种子 `tc.exe` 编译 M3.2 源码 EXIT=0；`g1 check src/tc.tc`=0 errors/543 warnings（增 15 个 W402）；conformance **328/0**（无回归）；gate L2 预期 25/0（改 src 使 `src/tc.tc` 等 6 entry 必漂移，重录基线后复绿）。
+
+> ⚠ **M3.3 设计张力（待裁定，未做）**：删声明式 `@import` 与 `as` 语法时，`as` 不能简单删——`f152`/`f153` 依赖 `as` 区分**同末段**模块（`src.d.e` 与 `src.x.e` 末段均 `e`，别名表撞名）。M2 碰撞感知重整只解符号名冲突，未解别名表撞名。M3.3 须先定「同末段模块如何消解别名撞名」：要么保留 `as`、要么让 `import_expr` 的 `sa`(完整路径) 直接作为限定访问键（弃用末段别名）。此决策需用户拍板，故 M3.3 不在此次自动推进范围内。
 
 - **验收**：全仓零声明式 `@import`；`tc check` 0 error；gate L2 全绿（零漂移）。
 - ⚠ 6 个测试需同步改写：`f123` / `f54` / `f55` / `f56` / `f_export_on_import` / `p42_std_import`。
