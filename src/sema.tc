@@ -6129,7 +6129,8 @@ pub fn infer_expr_body(e: i64) i64 {
     if (base.node_kind((e as u64)) == "member" && base.node_na((e as u64)) >= 0) {
         var mkey: string = "";
         if (base.node_kind((base.node_na((e as u64)) as u64)) == "import_expr") {
-            mkey = last_segment(base.node_sa((base.node_na((e as u64)) as u64)));
+            // M2：import_expr.sa 存完整路径（"src.base"），直接作为 mkey（不再取末段）。
+            mkey = base.node_sa((base.node_na((e as u64)) as u64));
         } else if (base.node_kind((base.node_na((e as u64)) as u64)) == "ident" && str_len(g_modval_get(base.node_sa((base.node_na((e as u64)) as u64)))) as i64 > 0) {
             mkey = g_modval_get(base.node_sa((base.node_na((e as u64)) as u64)));
         }
@@ -9244,7 +9245,8 @@ pub fn check_global_const_decl(d: i64) void {
     // 模块值别名：const x = @import("M") —— 登记 x → 模块 key，不按普通值做类型检查
     // （模块值不是可运算的值，只在 `.field` 接收者位被 sema 解析成 <key>__<field>）。
     if (base.node_nb((d as u64)) >= 0 && base.node_kind((base.node_nb((d as u64)) as u64)) == "import_expr") {
-        g_modval_set(base.node_sa((d as u64)), last_segment(base.node_sa((base.node_nb((d as u64)) as u64))));
+        // M2：const 名 → 模块完整路径身份（import_expr.sa 已是 "src.d.e"，不再取末段）。
+        g_modval_set(base.node_sa((d as u64)), base.node_sa((base.node_nb((d as u64)) as u64)));
         return;
     }
     if (base.node_nb((d as u64)) >= 0) {
@@ -10070,16 +10072,15 @@ pub fn err_import_alias_clash(alias: string, first: string, second: string, at: 
     parse__fc_err("T-MOD-E562", sb_to_str(sb), at);
 }
 
-// 登记 (别名 → 模块路径)；已登记且路径不同即报错。
+// 登记 (别名 → 模块路径)。M2 前：末段同名不同路径会静默合并 ⇒ 报 E562。
+// M2 后：模块身份取完整路径，末段同名模块符号已天然区分（d_e__DEEP vs
+// x_e__DEEP），不再静默合并，故 E562 退化（仅保留菱形同路径去重，不再报错）。
 pub fn imp_alias_register(alias: string, nm: string, at: i64) void {
     var i: i64 = 0;
     var n: i64 = slice_len(g_imp_alias) as i64;
     while (i < n) {
         if (g_imp_alias[i] == alias) {
-            if (g_imp_path[i] != nm) {
-                err_import_alias_clash(alias, g_imp_path[i], nm, at);
-            }
-            return;
+            return;   // 同别名（菱形同路径或末段同名）只登记一次，不再报错
         }
         i = i + 1;
     }
@@ -10157,6 +10158,8 @@ pub fn sel_register(imp: i64, alias: string) void {
         append(lex__g_sel_orig, base.node_sa((k.val as u64)));
         append(lex__g_sel_wild, base.node_ba((k.val as u64)));
         append(lex__g_sel_at, k.val);
+        // M2：通配项（node_ba=true，如 `:: *` / `const X = @import("M")` 的兼容通配）记 from_wild。
+        append(lex__g_sel_from_wild, base.node_ba((k.val as u64)));
         mq_ki9929 = mq_ki9929 + 1;
         c = -1;
     }
@@ -10179,7 +10182,22 @@ pub fn handle_one_import(imp: i64, at: i64) void {
     // 用户显式 as 优先。该别名同时是名字重整（mangling）的命名空间。
     var alias: string = user_alias;
     if (alias == "") { alias = last_segment(nm); }
+    // M2：模块身份（g_cur_mod / 重整命名空间 / def 表键）取**完整路径**。
+    // 解析器对 src 导入剥离了首段 "src."（ImportModDecl.sb=rest），故此处重建：
+    // src 导入 idn = "src." + rest；库导入（bd=true）nm 已是完整路径（"repl"/"std.math"）。
+    var idn: string = nm;
+    if (base.node_bd((imp as u64)) == false) { idn = "src." + nm; }
+    // M2 碰撞感知重整：登记已加载模块完整路径（去重），供 mangled_name 判同末段冲突。
+    var mfp_seen: bool = false;
+    var mfp_n: i64 = slice_len(g_mod_fullpaths) as i64;
+    var mfp_i: i64 = 0;
+    while (mfp_i < mfp_n) {
+        if (g_mod_fullpaths[mfp_i] == idn) { mfp_seen = true; mfp_i = mfp_n; }
+        else { mfp_i = mfp_i + 1; }
+    }
+    if (mfp_seen == false) { append(g_mod_fullpaths, idn); }
     mod_alias_add(nm, alias);
+    alias_full_register(alias, idn);
     // M1.2：同一别名已被**另一个**模块路径占用 ⇒ 静默合并，明确报错（详见 g_imp_alias 注释）。
     imp_alias_register(alias, nm, at);
     // 模块重导出（M-Reexport）：`pub @import(...)` / `export import(...)` 把被导入模块 M 的
@@ -10188,7 +10206,7 @@ pub fn handle_one_import(imp: i64, at: i64) void {
     // g_cur_mod 在 load_module_file 进入模块时已置为该库别名，入口模块为 ""。
     if (base__node_bc((imp as u64))) {   // S4 §0.14.7 SoA：侧表读（原 nodes[imp].bc）
         append(lex__g_reexport_owner, base__g_cur_mod);
-        append(lex__g_reexport_imp, alias);
+        append(lex__g_reexport_imp, idn);
     }
 
     // 库导入（路径首段非 src）：走库搜索路径（入口/lib、工程根/lib、out/lib 预编译缓存），
@@ -10219,11 +10237,13 @@ pub fn handle_one_import(imp: i64, at: i64) void {
     }
     // 选择性导入（`:: a, b as c` / `:: *`）登记。必须在钻石去重 return 之前：
     // 同一模块被多处导入时，每个导入点的 `::` 绑定都要生效。
-    sel_register(imp, alias);
+    // M2：g_sel_mod 记完整路径身份（供 Pass 3 mangled_name / def_lookup / reexport 一致）。
+    sel_register(imp, idn);
     // 把模块别名登记为「模块值」，使 `X.sym` 限定成员访问（见 infer_expr 的模块值分支）
     // 在声明式 import（含选择性 `:: sel`）下也能解析到 `<X>__<sym>`。const 形式的模块值
     // 在 resolve 处已 g_modval_set；此处补齐声明式路径，二者幂等（g_modval_get 取首个）。
-    if (str_len(g_modval_get(alias)) as i64 == 0) { g_modval_set(alias, alias); }
+    // M2：g_modval 键须为完整路径身份 idn（源码写末段别名 X，infer 经 g_modval_get 得 idn）。
+    if (str_len(g_modval_get(alias)) as i64 == 0) { g_modval_set(alias, idn); }
     // 环检测：chosen 已在活跃加载栈 → 循环依赖（import 不能成环）。
     var ci: i64 = mod_stack_index(chosen);
     if (ci >= 0) {
@@ -10260,9 +10280,9 @@ pub fn handle_one_import(imp: i64, at: i64) void {
         return;
     }
     append(lex__g_mod_visited, chosen);
-    mod_stack_push(chosen, alias);            // 进入：压栈
-    mod_attr_add(alias, base.node_bd((imp as u64)));       // 登记：bd=true ⇒ 来自库（跨包）；S4 §0.14.7 SoA
-    load_module_file(chosen, alias);
+    mod_stack_push(chosen, alias);            // 进入：压栈（alias 仅作环显示用）
+    mod_attr_add(idn, base.node_bd((imp as u64)));       // 登记：bd=true ⇒ 来自库（跨包）；键用完整路径身份 idn
+    load_module_file(chosen, idn);            // g_cur_mod = idn（完整路径身份）
     lex__g_mod_stack = slice_pop_str(lex__g_mod_stack);          // 离开：弹栈
     lex__g_mod_stack_alias = slice_pop_str(lex__g_mod_stack_alias);
     if (ar != "") {
@@ -10362,6 +10382,31 @@ pub var g_src_roots: []string;
 pub var g_imp_alias: []string;
 pub var g_imp_path: []string;
 
+// M2：别名(末段) → 完整路径身份 映射表（如 "base" -> "src.base" / "math" -> "std.math"）。
+// 声明式 `base.foo` / 类型 `base.T` 的 receiver 在源码层是末段别名，mangling 与 def 查表
+// 须用完整路径身份，故 Pass 1 经 alias_full 把末段别名解析成完整路径。
+pub var g_alias_full: []string;
+pub var g_alias_full_idn: []string;
+pub fn alias_full_register(a: string, idn: string) void {
+    var i: i64 = 0;
+    var n: i64 = slice_len(g_alias_full) as i64;
+    while (i < n) {
+        if (g_alias_full[i] == a) { return; }
+        i = i + 1;
+    }
+    append(g_alias_full, a);
+    append(g_alias_full_idn, idn);
+}
+pub fn alias_full(a: string) string {
+    var i: i64 = 0;
+    var n: i64 = slice_len(g_alias_full) as i64;
+    while (i < n) {
+        if (g_alias_full[i] == a) { return g_alias_full_idn[i]; }
+        i = i + 1;
+    }
+    return a;   // 已是完整路径 / 入口 ""：原样返回
+}
+
 // 计算候选源码根：
 //  1) 入口文件所在目录（兜底，等同旧的「相对导入方」，保证扁平/示例/老项目可用）；
 //  2) 从入口目录向上遍历祖先目录，凡是含 tote.toml 者，其 src 子目录即候选源码根
@@ -10421,6 +10466,21 @@ pub fn dots_to_slashes(s: string) string {
     while (i < n) {
         var c: u8 = s[i];
         if (c == 46) { sb_append_char(sb, 47); }
+        else { sb_append_char(sb, c); }
+        i = i + 1;
+    }
+    return sb_to_str(sb);
+}
+
+// 模块名中的 '.' 转为 '_'：src.base -> src_base（C 后端标识符仅 [A-Za-z0-9_]，
+// 点号非法；LLVM 后端虽接受点号，但双后端须统一，故一律扁平化供 mangled_name）。
+pub fn dots_to_underscores(s: string) string {
+    var n: u64 = str_len(s);
+    var sb: StringBuilder = sb_new();
+    var i: u64 = 0;
+    while (i < n) {
+        var c: u8 = s[i];
+        if (c == 46) { sb_append_char(sb, 95); }
         else { sb_append_char(sb, c); }
         i = i + 1;
     }
@@ -10512,12 +10572,16 @@ pub fn modval_load(mname: string, at: i64) void {
     // Pass 3 被改写为 `M__sym`（与 `:: *` 等价），并触发 T-MOD-W561 提示改用 `M.sym`。
     // 这让 const 导入既显式（绑定 X）又兼容既有裸引用；后续会把裸引用全部改为 `X.sym`。
     var alias: string = last_segment(rest);
+    // M2：g_sel_mod 记完整路径身份（src 导入 "src." + rest；库导入 rest 已完整）。
+    var idn: string = rest;
+    if (is_lib == false) { idn = "src." + rest; }
     append(lex__g_sel_owner, base__g_cur_mod);
     append(lex__g_sel_local, "");
-    append(lex__g_sel_mod, alias);
+    append(lex__g_sel_mod, idn);
     append(lex__g_sel_orig, "");
     append(lex__g_sel_wild, true);
     append(lex__g_sel_at, -1);
+    append(lex__g_sel_from_wild, true);   // M2：modval_load 的兼容通配，记 from_wild
 }
 
 // ── 模块命名空间隔离（名字重整 / mangling）─────────────────────
@@ -10551,9 +10615,36 @@ pub fn is_top_decl_kind(k: string) bool {
 }
 
 // 重整名：A + "__" + name（LLVM 后端不支持 sb_cat2..6，故走 StringBuilder）。
+// M2：alias 为完整路径身份（如 "src.base"），须扁平化（'.' -> '_'）使 C 后端符号合法。
+// M2 自举兼容：已加载模块的「完整路径」清单（handle_one_import 期登记，含传递依赖）。
+// 供 mangled_name 判定某末段别名是否全局不唯一（同末段多模块），仅此时升完整路径。
+// 入口模块（""）不入表。
+pub var g_mod_fullpaths: []string;
+
+// 末段别名 s 在全部已加载模块中出现的次数（用于碰撞感知重整）。
+pub fn mod_lastseg_count(s: string) i64 {
+    var n: i64 = slice_len(g_mod_fullpaths) as i64;
+    var c: i64 = 0;
+    var i: i64 = 0;
+    while (i < n) {
+        if (last_segment(g_mod_fullpaths[i]) == s) { c = c + 1; }
+        i = i + 1;
+    }
+    return c;
+}
+
 pub fn mangled_name(alias: string, name: string) string {
+    // M2 碰撞感知：模块末段别名全局唯一 ⇒ 用末段（与旧编译器符号名一致，保证自举不动点：
+    // 编译器自身 9 模块末段均唯一 ⇒ 仍发 base__kids，旧种子可编译新源码）；
+    // 仅当同末段多模块冲突（如 src.d.e / src.x.e 都末段 e）才升完整路径 src_d_e__DEEP，
+    // 使冲突模块的符号可消歧（f152/f153）。入口模块（alias=""）保持空前缀（顶层符号）。
+    var emit: string = alias;
+    if (alias != "") {
+        if (mod_lastseg_count(last_segment(alias)) > 1) { emit = alias; }
+        else { emit = last_segment(alias); }
+    }
     var sb: StringBuilder = sb_new();
-    sb_append_str(sb, alias);
+    sb_append_str(sb, dots_to_underscores(emit));
     sb_append_str(sb, "__");
     sb_append_str(sb, name);
     return sb_to_str(sb);
@@ -10576,6 +10667,16 @@ pub fn def_lookup(alias: string, name: string) i64 {
 // lib 模块（repl / std 等）不在范围内，其裸跨模块名不被本诊断约束。
 pub fn is_src_mod(a: string) bool {
     if (a == "") { return true; }        // 入口模块（tc.tc）属 src
+    // M2：模块身份取完整路径，故治理范围按完整路径匹配（末段别名保留以防旧调用）。
+    if (a == "src.base") { return true; }
+    if (a == "src.lex") { return true; }
+    if (a == "src.parse") { return true; }
+    if (a == "src.sema") { return true; }
+    if (a == "src.comptime_fold") { return true; }
+    if (a == "src.codegen_c") { return true; }
+    if (a == "src.test") { return true; }
+    if (a == "src.tote") { return true; }
+    if (a == "src.totter") { return true; }
     if (a == "base") { return true; }
     if (a == "lex") { return true; }
     if (a == "parse") { return true; }
@@ -10864,6 +10965,7 @@ pub fn sel_expand_wildcards() void {
                     append(lex__g_sel_orig, lex__g_def_orig[d]);
                     append(lex__g_sel_wild, false);
                     append(lex__g_sel_at, lex__g_sel_at[s]);
+                    append(lex__g_sel_from_wild, true);   // M2：通配展开项，记 from_wild
                 }
                 d = d + 1;
             }
@@ -10925,8 +11027,13 @@ pub fn sel_validate() void {
                     if (lex__g_sel_wild[j] == false && lex__g_sel_owner[j] == lex__g_sel_owner[i]
                         && lex__g_sel_local[j] == lex__g_sel_local[i]) {
                         if (lex__g_sel_mod[j] != lex__g_sel_mod[i] || lex__g_sel_orig[j] != lex__g_sel_orig[i]) {
-                            err_sel_conflict(lex__g_sel_local[i], "另一条选择性导入", lex__g_sel_at[i]);
-                            j = i;   // 同一项只报一次
+                            // M2：两条都源自 `:: *` 通配（含 const X = @import("M") 的兼容通配）
+                            // 且分属不同模块 ⇒ 不报撞名。通配同名经限定访问（X.DEEP）消歧或裸名
+                            // 取首匹配（T-MOD-W561 已提示改限定名），非真歧义（见 f153）。
+                            if (lex__g_sel_from_wild[j] == false || lex__g_sel_from_wild[i] == false) {
+                                err_sel_conflict(lex__g_sel_local[i], "另一条选择性导入", lex__g_sel_at[i]);
+                                j = i;   // 同一项只报一次
+                            }
                         }
                     }
                     j = j + 1;
@@ -10949,10 +11056,12 @@ pub fn mangle_modules() void {
     while (i < tot) {
         if (base.node_kind((i as u64)) == "member" && base.node_na((i as u64)) >= 0) {
             if (base.node_kind((base.node_na((i as u64)) as u64)) == "ident" && in_mod_aliases(base.node_sa((base.node_na((i as u64)) as u64)))) {
-                var di: i64 = def_lookup(base.node_sa((base.node_na((i as u64)) as u64)), base.node_sa((i as u64)));
+                // M2：receiver 是末段别名，经 alias_full 解析成完整路径身份再查 def 表。
+                var rcv: string = alias_full(base.node_sa((base.node_na((i as u64)) as u64)));
+                var di: i64 = def_lookup(rcv, base.node_sa((i as u64)));
                 // 模块重导出（M-Reexport）：X 重导出了 M 时，`X.name` 回退到 `M.name`
                 // （重定向到 M 的真实定义 M__name）。仅命中 M 的导出符号。
-                if (di < 0) { di = reexport_lookup(base.node_sa((base.node_na((i as u64)) as u64)), base.node_sa((i as u64))); }
+                if (di < 0) { di = reexport_lookup(rcv, base.node_sa((i as u64))); }
                 if (di >= 0) {
                     // 真实归属模块 = g_def_alias[di]（重导出时为被重导出的 M，并非 X 本身）
                     var real_alias: string = lex__g_def_alias[di];
@@ -10964,8 +11073,9 @@ pub fn mangle_modules() void {
                 // 未命中则保持 member 不变：同名局部/字段访问不受影响（由后续检查兜底）
             }
         } else if (base.node_kind((i as u64)) == "named" && base.node_sb((i as u64)) != "") {
-            var di2: i64 = def_lookup(base.node_sb((i as u64)), base.node_sa((i as u64)));
-            if (di2 < 0) { di2 = reexport_lookup(base.node_sb((i as u64)), base.node_sa((i as u64))); }
+            var rcv2: string = alias_full(base.node_sb((i as u64)));
+            var di2: i64 = def_lookup(rcv2, base.node_sa((i as u64)));
+            if (di2 < 0) { di2 = reexport_lookup(rcv2, base.node_sa((i as u64))); }
             if (di2 >= 0) {
                 var real_alias2: string = lex__g_def_alias[di2];
                 check_mod_visible(real_alias2, base.node_sa((i as u64)), di2, i);
@@ -10975,8 +11085,9 @@ pub fn mangle_modules() void {
             }
             base.node_set_sb((i as u64), "");
         } else if (base.node_kind((i as u64)) == "struct_lit" && base.node_sb((i as u64)) != "") {
-            var di3: i64 = def_lookup(base.node_sb((i as u64)), base.node_sa((i as u64)));
-            if (di3 < 0) { di3 = reexport_lookup(base.node_sb((i as u64)), base.node_sa((i as u64))); }
+            var rcv3: string = alias_full(base.node_sb((i as u64)));
+            var di3: i64 = def_lookup(rcv3, base.node_sa((i as u64)));
+            if (di3 < 0) { di3 = reexport_lookup(rcv3, base.node_sa((i as u64))); }
             if (di3 >= 0) {
                 var real_alias3: string = lex__g_def_alias[di3];
                 check_mod_visible(real_alias3, base.node_sa((i as u64)), di3, i);
