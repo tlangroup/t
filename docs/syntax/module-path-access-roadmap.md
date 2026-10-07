@@ -201,7 +201,7 @@
 |---|---|---|
 | M3.1 | 扩展 parse 支持 `const m = @import("src.m" :: a, b)`（17 处选择性导入） | M2 |
 | M3.2 | 声明式 `@import` → `const` 迁移（实测 `src/*.tc` 内仅 15 处语句形态，调用点 0 改动） | M3.1 |
-| M3.3 | 删除声明式 `@import` 与 `as` 语法；清理 `pub @import` 死代码（`lex.tc:913`、`sema.tc:10137/10151/10546`） | M3.2 |
+| M3.3 | 删 `as` 语法（项级 `a as c` + 导入级 `as 别名`）；别名表 `imp_alias_register` 键改完整路径 idn；清死代码 `err_import_alias_clash`；声明式 `@import("X"`（无 `as`）保留 | M3.2 |
 
 > **M3.1 进度（2026-10-07）**：✅ 已完成并通过验证。
 > - 改动面（实测远小于蓝图「17 处」）：`parse.tc` 表达式位 `parse_import_expr` 支持 `:: a, b as c`（存 `import_expr.lb`）；`sema.tc` `modval_load` 从 const/var 声明的 `import_expr` 取 `::` 项写入 `ImportModDecl.lb`，经 `handle_one_import → sel_register` 登记选择性可见性；仅无 `::` 时退化通配（与 M2 前行为一致）。库模块内 const 选择性导入的 owner 经 `node_mod(imp)` = 当时 `g_cur_mod`，与通配分支一致。
@@ -216,10 +216,15 @@
 > - 风险已排：逐文件核对绑定名无 T-NAM-E405 重定义（tc.tc 既有 `base/lex/parse/hir/sema/codegen_c/tir/mir`，新增 `tir_to_ll/tmir/codegen_wasm/riscv/c_tmir/cst` 均不撞）；`const X` 触发 T-NAM-W402 告警属预期（warning 非 error）。
 > - 验证：旧种子 `tc.exe` 编译 M3.2 源码 EXIT=0；`g1 check src/tc.tc`=0 errors/543 warnings（增 15 个 W402）；conformance **328/0**（无回归）；gate L2 预期 25/0（改 src 使 `src/tc.tc` 等 6 entry 必漂移，重录基线后复绿）。
 
-> ⚠ **M3.3 设计张力（待裁定，未做）**：删声明式 `@import` 与 `as` 语法时，`as` 不能简单删——`f152`/`f153` 依赖 `as` 区分**同末段**模块（`src.d.e` 与 `src.x.e` 末段均 `e`，别名表撞名）。M2 碰撞感知重整只解符号名冲突，未解别名表撞名。M3.3 须先定「同末段模块如何消解别名撞名」：要么保留 `as`、要么让 `import_expr` 的 `sa`(完整路径) 直接作为限定访问键（弃用末段别名）。此决策需用户拍板，故 M3.3 不在此次自动推进范围内。
+> **M3.3 进度（2026-10-07）**：✅ 已完成并通过验证（用户裁定 B：删 `as` + 别名表键改完整路径）。
+> - 改动面：`parse.tc` 删除项级 `a as c`（`parse_import_items`）与导入级 `as 别名`（`parse_at_import_decl`）；类型转换 `x as T`（`parse_post_cast`）保留。
+>   `sema.tc`：`imp_alias_register` 注册表键由末段 `alias` 改为完整路径 `idn`（src.d.e ≠ src.x.e 自然不撞，与 M2 idn 重整一致）；删除死代码 `err_import_alias_clash`（E562 退化后已无调用点）。
+> - ⭐ **同末段模块消歧改用 const 绑定名**：`f152` 由 `@import("src.d.e" as de)` 改为 `const de = @import("src.d.e")`，`de`/`xe` 为 distinct const 绑定，经模块值机制（const 绑定即模块身份）解析各自符号，无需 `as`。`f153`（`const EA/EB`）不变。
+> - `f131`：原测 `:: fa as x, fb as x` 选择性重命名冲突 E560，该重命名随 `as` 移除 ⇒ 改为测「`as` 已删除」：`@import("src.mod_a" as x)` 预期 `T-PAR-E101`。
+> - 验证：旧种子 `tc.exe` 编译 M3.3 源码 EXIT=0；`g1 check src/tc.tc`=0 errors/543 warnings；conformance **328/0**（f131→E101、f152/f153→0 errors，无回归）；gate L2 预期 25/0（改 src 使 `src/tc.tc` 等 6 entry 必漂移，重录基线后复绿）。
+> - 声明式 `@import("X"`（无 `as`）保留：M3.3 仅删 `as`，未删声明式导入语句形态；故 f123/f54/f55/f56/f_export_on_import/p42_std_import 等仍有效，无需改写。
 
-- **验收**：全仓零声明式 `@import`；`tc check` 0 error；gate L2 全绿（零漂移）。
-- ⚠ 6 个测试需同步改写：`f123` / `f54` / `f55` / `f56` / `f_export_on_import` / `p42_std_import`。
+- **验收**：全仓零 `as` 导入语法；`tc check` 0 error；gate L2 全绿（零漂移）。
 
 ---
 
