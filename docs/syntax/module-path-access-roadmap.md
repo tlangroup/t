@@ -27,7 +27,7 @@
 | 1 | **M1 补重定义诊断** | 消除「同名绑定静默错编」 | **0** | 阶段 0 | 中 | 低（🔄 M1.2 gate 跑中） |
 | 2 | **M2 完整路径身份** | 模块身份切完整路径（原 P0） | ⚠ **全量** | M1 | 大 | **高** |
 | 3 | **M3 语法收敛** | 导入语法唯一化 | 0 | M2 | 中 | 中 |
-| 4 | **M4 治理收尾** | 去硬编码白名单、W561 裁定 | 0 | M3 | 小 | 低 |
+| 4 | **M4 治理收尾** | 去硬编码白名单、W561 升 error + 清理 720 裸引用 | ✅ | M3 | 小 | 低 |
 | 5 | **M5 类型级命名空间** | `a.Point.O` 等（独立 epic） | 待评估 | M4 | 大 | 中 |
 
 > ⚠ **阶段 2 是全路线唯一产生 IR 漂移的阶段**，必须放在所有零漂移步骤之后——
@@ -209,19 +209,19 @@
 > - 验证：旧种子 `tc.exe` 编译 M3.1 源码 EXIT=0（自举不断）；`g1 check src/tc.tc` = 0 errors；conformance **328/0**（增 2，新用例通过，无回归）；gate L2 24/1（唯一 FAIL = 产物快照比对，因 M3.1 改 `parse.tc`/`sema.tc` 致 `src/tc.tc::{c,ll}` 2 entry 必漂移，属 §8 合法基线陈旧，`0 新增/0 缺失` 且未波及 348 用户 entry）；重录基线后复跑预期 25/0。
 > - ⚠ 蓝图「17 处选择性导入」是高估：实际只在「表达式位解析」+「`modval_load` 消费」两处打通，声明式 `parse_at_import_decl` 此前已支持 `:: items`，无需再改。
 
-> **M3.2 进度（2026-10-07）**：✅ 已完成并通过验证（commit 待推）。
+> **M3.2 进度（2026-10-07）**：✅ 已完成并推 main（commit `8249697`）。
 > - 蓝图「61 处声明式 → const 迁移」高估：实测 `src/*.tc` 内**真·语句形态 `@import` 仅 15 处**（其余 79 处早已是 `const/var` 赋值形态，即 M3 目标形态）。
 > - 迁移规则：语句形态 `@import("src.X" :: items);` → `const X = @import("src.X" :: items);`（绑定名 = 路径末段，与 M3 前模块别名同名 ⇒ 调用点 0 改动）；通配 `@import("std.rc.cst");` → `const cst = @import("std.rc.cst");`。
 > - 15 处分布：`base.tc`/`lex.tc`/`hir.tc`/`tc.tc`(×2 `std.rc.cst` 直连)/`test.tc`/`tir.tc`/`tir_to_ll.tc`(×4) 的 `src.*` 选择性导入 + `std.rc.cst` 直连；`base.tc` 头部注释同步更新。
 > - 风险已排：逐文件核对绑定名无 T-NAM-E405 重定义（tc.tc 既有 `base/lex/parse/hir/sema/codegen_c/tir/mir`，新增 `tir_to_ll/tmir/codegen_wasm/riscv/c_tmir/cst` 均不撞）；`const X` 触发 T-NAM-W402 告警属预期（warning 非 error）。
 > - 验证：旧种子 `tc.exe` 编译 M3.2 源码 EXIT=0；`g1 check src/tc.tc`=0 errors/543 warnings（增 15 个 W402）；conformance **328/0**（无回归）；gate L2 预期 25/0（改 src 使 `src/tc.tc` 等 6 entry 必漂移，重录基线后复绿）。
 
-> **M3.3 进度（2026-10-07）**：✅ 已完成并通过验证（用户裁定 B：删 `as` + 别名表键改完整路径）。
+> **M3.3 进度（2026-10-07）**：✅ 已完成并推 main（commit `5b3852f`，用户裁定 B：删 `as` + 别名表键改完整路径）。
 > - 改动面：`parse.tc` 删除项级 `a as c`（`parse_import_items`）与导入级 `as 别名`（`parse_at_import_decl`）；类型转换 `x as T`（`parse_post_cast`）保留。
 >   `sema.tc`：`imp_alias_register` 注册表键由末段 `alias` 改为完整路径 `idn`（src.d.e ≠ src.x.e 自然不撞，与 M2 idn 重整一致）；删除死代码 `err_import_alias_clash`（E562 退化后已无调用点）。
 > - ⭐ **同末段模块消歧改用 const 绑定名**：`f152` 由 `@import("src.d.e" as de)` 改为 `const de = @import("src.d.e")`，`de`/`xe` 为 distinct const 绑定，经模块值机制（const 绑定即模块身份）解析各自符号，无需 `as`。`f153`（`const EA/EB`）不变。
 > - `f131`：原测 `:: fa as x, fb as x` 选择性重命名冲突 E560，该重命名随 `as` 移除 ⇒ 改为测「`as` 已删除」：`@import("src.mod_a" as x)` 预期 `T-PAR-E101`。
-> - 验证：旧种子 `tc.exe` 编译 M3.3 源码 EXIT=0；`g1 check src/tc.tc`=0 errors/543 warnings；conformance **328/0**（f131→E101、f152/f153→0 errors，无回归）；gate L2 预期 25/0（改 src 使 `src/tc.tc` 等 6 entry 必漂移，重录基线后复绿）。
+> - 验证：旧种子 `tc.exe` 编译 M3.3 源码 EXIT=0；`g1 check src/tc.tc`=0 errors/543 warnings；conformance **328/0**（f131→E101、f152/f153→0 errors，无回归）；gate L2 已验证 **25/0**（2561.7s，改 src 使 `src/tc.tc` 等 6 entry 必漂移，已重录基线后复绿）。
 > - 声明式 `@import("X"`（无 `as`）保留：M3.3 仅删 `as`，未删声明式导入语句形态；故 f123/f54/f55/f56/f_export_on_import/p42_std_import 等仍有效，无需改写。
 
 - **验收**：全仓零 `as` 导入语法；`tc check` 0 error；gate L2 全绿（零漂移）。
@@ -230,8 +230,13 @@
 
 ## 6. 阶段 4 — M4 治理收尾
 
-- M4.1 `is_src_mod`（`sema.tc:10532`）去硬编码 9 模块白名单。
-- M4.2 W561 裁定：升级 error 还是保持 advisory（遗留 2 条）。
+- M4.1 `is_src_mod`（`sema.tc:10532`）去硬编码 9 模块白名单 ✅（commit 见阶段 3 末）。
+- M4.2 W561 裁定 ✅（2026-10-07 完成）：
+  - **根因修复**：`mangle_modules` Pass 3 曾把函数内局部变量/形参（与通配导入的跨模块名重名，如 `validate_slice_pat` 的局部 `pos` 撞 `lex.pos`）误改名为 `lex__pos`；新增父指针侧表 + 「局部引用跳过改写」守卫 + 「已限定名 `__` 跳过」守卫，仅对真正跨模块引用（`ident`/`named`/`struct_lit`）改写。
+  - **清理 720**：用 `g1 check` 诊断的精确 (file,line,col,col) 跨度，对 9 个 `src.*` 文件 720 处真实裸引用做**跨度精确替换**为 `module__name`（规避盲替换双重限定 `lex__lex__decl_list`），归零全部裸名跨模块访问。
+  - **升 error**：`T-MOD-W561`(warning) → `T-MOD-E561`(error)，同步 `tools/diag_defs.json` / `src/diag_table.gen.h` / `src/base.tc` GEN 块（g_dcode[74]、g_dsev[74]）/ `src/sema.tc` 发射点。验证：`g1 check src/tc.tc` 0 errors / 0 T-MOD-E561。
+  - 因 W561 受 `is_src_mod` 守卫仅作用于 `src.*` 模块，tests/examples 不受影响。
+  - 后续：跑 gate L2 + 重录 IR 基线（src/tc.tc、src/tote.tc 这 6 entry 预期漂移）后提交 FF 推 main。
 
 ---
 
