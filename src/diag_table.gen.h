@@ -39,6 +39,7 @@ static const DiagDef DIAG_DEFS[] = {
   { "T-FID-E662", "error", "FID", "T_FID_FORMAT_NOT_LITERAL", "FORMAT_NOT_LITERAL", "fid format must be a literal" },
   { "T-FLG-E850", "error", "FLG", "T_FLAG_OFFSET_CONFLICT", "OFFSET_CONFLICT", "flag bit offset conflict" },
   { "T-FLG-E851", "error", "FLG", "T_FLAG_OVERFLOW", "OVERFLOW", "flag bit overflow" },
+  { "T-FLG-W852", "warning", "FLG", "T_FLAG_DEPRECATED", "DEPRECATED", "`flag` keyword is deprecated; use `packed struct` instead" },
   { "T-FST-E300", "error", "FST", "T_FMT_BAD_SPEC", "BAD_SPEC", "invalid format specifier" },
   { "T-FST-E301", "error", "FST", "T_FMT_BAD_CONVERSION", "BAD_CONVERSION", "invalid conversion tag (e.g. !z)" },
   { "T-FST-E302", "error", "FST", "", "MULTI_CONV", "multiple conversion specifiers in interpolation" },
@@ -176,7 +177,7 @@ static const DiagDef DIAG_DEFS[] = {
   { "T-VEC-W927", "warning", "VEC", "T_VECTOR_WIDER_THAN_NATIVE", "VECTOR_WIDER_THAN_NATIVE", "vector is wider than the native SIMD register and will be split" },
   { "T-VEC-W947", "warning", "VEC", "T_TILE_WIDER_THAN_NATIVE", "TILE_WIDER_THAN_NATIVE", "hardware tile is wider than the native SIMD register and will fall back to scalar loops" },
 };
-#define DIAG_COUNT 163
+#define DIAG_COUNT 164
 
 /* legacy (old semantic name) -> machine code alias table */
 static const struct { const char* legacy; const char* code; } DIAG_LEGACY[] = {
@@ -202,6 +203,7 @@ static const struct { const char* legacy; const char* code; } DIAG_LEGACY[] = {
   { "T_FID_FORMAT_NOT_LITERAL", "T-FID-E662" },
   { "T_FLAG_OFFSET_CONFLICT", "T-FLG-E850" },
   { "T_FLAG_OVERFLOW", "T-FLG-E851" },
+  { "T_FLAG_DEPRECATED", "T-FLG-W852" },
   { "T_FMT_BAD_SPEC", "T-FST-E300" },
   { "T_FMT_BAD_CONVERSION", "T-FST-E301" },
   { "T_FMT_NO_TEMPLATE", "T-FST-E303" },
@@ -332,7 +334,7 @@ static const struct { const char* legacy; const char* code; } DIAG_LEGACY[] = {
   { "T_VECTOR_WIDER_THAN_NATIVE", "T-VEC-W927" },
   { "T_TILE_WIDER_THAN_NATIVE", "T-VEC-W947" },
 };
-#define DIAG_LEGACY_COUNT 151
+#define DIAG_LEGACY_COUNT 152
 
 const DiagDef* diag_find(const char* code);        /* exact machine-code lookup */
 const DiagDef* diag_find_any(const char* id);      /* machine code OR legacy name */

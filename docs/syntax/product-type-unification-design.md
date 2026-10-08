@@ -11,7 +11,7 @@
    - ⚠ `packed` 是**编译器内置的结构体修饰关键词**（仅在 struct 声明位置被识别），**不是**全局保留关键字。
    - 所有积类型归并为**单一 `struct` kind**（AST 与 TI 同源）。
 2. **TI 层深度统一（决策 #3，2026-10-09）**：TI `kind` 不再保留 `Flag` / `FlagSet`，统一为 `Struct` + 属性（`@packed` / 位域布局）。语义最干净；所有按 `tip_kind()=="Flag"` 派发处（sema 布局、双后端发射、位域访问内建）需重写。
-3. **位域能力保留（决策 #1）**：`flag` 的位域打包价值由 `packed struct` 承载，能力不丢；位宽字段的具体语法（如 `@bits(N)` / `@packed(uN)`）仍待裁定（见 §5 #1）。
+3. **位域能力保留（决策 #1）**：`flag` 的位域打包价值由 `packed struct` 承载，能力不丢；**位宽字段语法裁定为字段类型 `u1`~`u65535`**（数字后缀即位宽，如 `readable: u1` = 1 位、`level: u4` = 4 位），无需 `@bits` 注解（见 §5 #1）。
 4. **`flag_set` / `flag_get` 动态位域能力保留（决策 #2）**：即使零存量也不删；二者作为内建作用于 `packed struct` 的底层整数值。
 5. **`@derive` 的 8 个 trait 能力保留（决策 #4）**：Clone / Copy / Eq / Hash / ToString / FromString / DebugPrint / BinarySerde 以更干净的形式重建（旧 `process_derive` 已删，注解暂为 no-op），非彻底废弃。
 6. **`@derive` 注解保留为 no-op**：C 后端存量 `@derive` 代码零破坏、照常编译（见 §2.2）。
@@ -89,12 +89,12 @@ flag_get(p, Perm.readable)          // Perm.readable = 位偏移
 
 ```t
 packed struct Perm {            // packed 为内置结构体修饰关键词（非保留关键字）
-    readable: u16 @bits(1);     // 位宽字段语法待裁定（@bits / @packed(uN) 等）
-    level:    u16 @bits(4);
+    readable: u1;               // 位宽 = 字段类型 u1..u65535 的数字后缀（1 位）
+    level:    u4;               // 4 位；位域宽度由字段类型直接编码，无需 @bits 注解
 }
 ```
 
-⚠ 字段级注解现已校验（风险一已修复，未知注解报 `T-ANN-E450`），故未实现的 `@bits` 会直接报错；`@bits(1)` 是否真正受支持取决于位域设计是否落地——属于待裁定项，而非「静默 0 error」。
+⚠ 字段级注解现已校验（风险一已修复，未知注解报 `T-ANN-E450`）；位域宽度由字段类型 `u1`~`u65535` 直接编码（见 §5 #1），不再需要 `@bits` 注解——若仍写 `@bits` 视为未知注解报错。
 
 ---
 
@@ -123,7 +123,7 @@ packed struct Perm {            // packed 为内置结构体修饰关键词（�
 
 ## 5. 待裁定项
 
-1. ✅ **位域能力保留**（2026-10-09）：`flag` 的位域打包价值由 `packed struct` 承载；位宽字段具体语法（`@bits(N)` / `@packed(uN)` 等）仍待裁定（见 §3 风险二）。
+1. ✅ **位域能力保留**（2026-10-09）：`flag` 的位域打包价值由 `packed struct` 承载；**位宽字段语法裁定为字段类型 `u1`~`u65535`**（数字后缀即位数，如 `readable: u1`），无需 `@bits` 注解（见 §3 风险二）。
 2. ✅ **`flag_set` / `flag_get` 动态位域能力保留**（2026-10-09）：零存量也不删，内建作用于 `packed struct` 底层整数值。
 3. ✅ **TI 层深度统一**（2026-10-09）：`kind` 归 `Struct`，不再保留 `Flag`/`FlagSet`（见 §1 #2 / §4 第 2 点）。
 4. ✅ **`@derive` 8 个 trait 能力保留**（2026-10-09）：以更干净形式重建，非彻底废弃（旧 `process_derive` 已删，注解暂 no-op）。
@@ -137,8 +137,8 @@ packed struct Perm {            // packed 为内置结构体修饰关键词（�
 # flag 声明关键字 —— 2026-10-09 裁定废弃，改用 packed struct（见 §1 #1）
 # 旧：flag Perm[u16] { readable: 1; level: 4; }
 packed struct Perm {                 # packed = 内置结构体修饰关键词（非保留关键字）
-    readable: u16 @bits(1);          # 位宽字段语法待裁定
-    level:    u16 @bits(4);
+    readable: u1;                    # 位宽 = 类型数字后缀：u1 = 1 位
+    level:    u4;                    # u4 = 4 位；无需 @bits 注解
 }
 fn main_fn() i32 @main { var p: Perm = 0; flag_set(p, Perm.readable, 1);
     println(i2s(flag_get(p, Perm.readable) as i64)); return 0; }   # → 1

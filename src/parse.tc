@@ -2892,6 +2892,34 @@ pub fn parse_declaration() i64 {
         }
         return ed;
     }
+    // ── `packed` 内置结构体修饰关键词（非全局保留关键字）──
+    // 语境识别：仅声明头、紧跟 `struct` 前才识别；其余语境 `packed` 仍是普通标识符。
+    // 积类型统一 epic P1：用 `packed struct X{...}` 取代 `flag`（位域打包）。layout 走
+    // 现有 layout 传参链（parse_struct_decl → mk_StructDecl sb=layout → 下游 node_sb 消费），
+    // 该 layout 值 `"packed"` 在 P4/P5 前对 codegen 等同默认布局（零 IR 漂移）。
+    if (lex.cur_t() == "Identifier" && lex.cur_v() == "packed") {
+        var pkw_i: i64 = lex.pos;   // 指向 `packed` token（用于错误定位）
+        lex.advance_i();   // 吃掉 `packed`
+        if (lex.cur_t() != "KwStruct") {
+            parse_fatal_at("T-PAR-E102", "expected 'struct' after 'packed'", pkw_i);
+        }
+        lex.advance_i();   // 吃掉 `struct`
+        var layout_p: string = "packed";
+        if (lex.cur_t() != "Identifier") {
+            parse_fatal("expected struct name after 'struct' in struct declaration");
+        }
+        var sni_p: i64 = lex.advance_i();
+        var sname_p: string = lex.tk_v(sni_p);
+        lex.g_agent_anchor = sni_p;
+        lex.g_struct_exported = is_export;
+        base.validate_decl_name(sname_p, sni_p);
+        var sd_p: i64 = parse_struct_decl(sname_p, anns, layout_p);
+        if (sd_p >= 0) {
+            base.node_at(sd_p, sni_p);
+            if (is_export) { base.node_set_bc((sd_p as u64), true); }   // S4 §0.14.7 SoA
+        }
+        return sd_p;
+    }
     if (lex.cur_t() == "KwStruct") {
         lex.advance_i();   // 吃掉 `struct`
         // layout 注解 #soa/#aos：name-first 文法在 parse_decl_body 检测；
@@ -2939,12 +2967,15 @@ pub fn parse_declaration() i64 {
         return u_b;
     }
     if (lex.cur_t() == "KwFlag") {
+        var flag_kw_i: i64 = lex.pos;   // `flag` 关键字 token（用于 deprecated 告警定位）
         lex.advance_i();
         if (lex.cur_t() != "Identifier") { parse_fatal("expected flag name after 'flag' in flag declaration"); }
         var fname: string = lex.cur_v();
         var fidx: i64 = lex.pos;
         lex.g_agent_anchor = fidx; lex.g_struct_exported = is_export;
         base.validate_decl_name(fname, fidx);
+        // 积类型统一 epic P1：flag 关键字废弃，改用 `packed struct`；保留解析以兼容存量至 P7。
+        base.warn_name("T-FLG-W852", "`flag` keyword is deprecated; use `packed struct` instead", flag_kw_i, str_len("flag") as i64);
         var fl_b: i64 = parse_flag_decl(fname, anns);
         if (fl_b >= 0) { base.node_at(fl_b, fidx); if (is_export) { base.node_set_bc((fl_b as u64), true); } }   // S4 §0.14.7 SoA
         return fl_b;
