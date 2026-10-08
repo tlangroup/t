@@ -270,6 +270,18 @@
   `f_variant_member_unknown.tc`；pass 反向守卫 `p_member_names_valid.tc`（防误报）。
 - 细节与论证见 `docs/syntax/type-namespace-review.md` §7.1。
 
+### 7.3 已修：变体**字面量**构造 `V { .Case }` 的 case 名不校验（P1 收尾静默错编）
+- **根因**：P1 只覆盖了 `X.Y` 成员访问路径（`Shape.NotExist(1.0)`），但变体字面量是**独立节点
+  `variant_lit`**（非 `struct_lit`），在 `infer_expr_body` 里**先于类型推断**就被脱糖成
+  `<V>_from_<Case>(args)` 调用（`sema.tc:6143`）。脱糖前从不校验 `.Case` 是否存在 ⇒
+  `Shape { .NotExist(1.0) }` 静默落 `Unknown`（与 P1 同性质，只是走字面量路径）。
+  ⚠ 初版误把校验写进 `struct_lit` 分支（死代码，探针全程 0 error 才暴露）；正确落点是
+  `variant_lit` 脱糖点，case 名在 `node_sb(e)`、类型名在 `node_sa(e)`。
+- **修复**：在 `variant_lit` 脱糖前调用 `member_exists_in_type(ti_named("Struct", sa), sb)` 校验，
+  不存在即报 **`T-SEM-E216`**（复用 P1 诊断码，对称）；仍照常脱糖保持节点结构一致（下游按 call 处理）。
+- **回归测试**：fail `f_variant_literal_unknown.tc`（`Shape { .NotExist(1.0) }` + `Shape { .Bogus }`）；
+  pass 守卫 `p_member_names_valid.tc` 补 `Shape { .Circle(1.0) }` / `Shape { .Empty }` 字面量合法形态。
+
 ---
 
 ## 8. 横切事项
