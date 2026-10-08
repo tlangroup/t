@@ -3037,6 +3037,7 @@ pub fn parse_unit() void {
         // struct 体内方法脱糖出的顶层自由函数：紧跟宿主 struct 之后入列，
         // 保证 register 阶段先见 struct 再见方法。非 struct 声明时为空操作。
         flush_struct_methods();
+        flush_struct_consts();
     }
     // 注意：子句合并（desugar_func_clauses）与 lambda 提升（desugar_lambdas）
     // 现在改在 run_check 里、模块内联（resolve_modules）完成之后统一跑一遍，
@@ -5038,6 +5039,19 @@ pub fn flush_struct_methods() void {
     lex.g_method_tail = -1;
 }
 
+// P3a：把结构体内收集到的关联常量 GlobalConstDecl 链表追加进 decl_list（类比 flush_struct_methods），
+// 保证 register 阶段先见 struct 再见关联常量。非 struct 声明时为空操作。
+pub fn flush_struct_consts() void {
+    var ks: []i64 = base.kids_chain(lex.g_const_head);
+    var ki: i64 = 0;
+    while (ki < slice_len(ks) as i64) {
+        append(lex.decl_list, ks[ki]);
+        ki = ki + 1;
+    }
+    lex.g_const_head = -1;
+    lex.g_const_tail = -1;
+}
+
 pub fn parse_struct_decl(name: string, anns: i64, layout: string) i64 {
     // 关键字 `struct` 已由调用方消费（dispatch 或 `struct Name` 桥）；layout 亦由调用方处理。
     var r_anns: i64 = parse_annotations();
@@ -5047,6 +5061,8 @@ pub fn parse_struct_decl(name: string, anns: i64, layout: string) i64 {
     var r_idx: i64 = 0;   // 位置字段元组（struct T { T1, T2 }）的自动字段名计数 `_0`/`_1`/...
     lex.g_method_head = -1;
     lex.g_method_tail = -1;
+    lex.g_const_head = -1;   // P3a：重置关联常量收集链（每次进入新 struct 清空）
+    lex.g_const_tail = -1;
     while (lex.cur_t() != "RBrace" && lex.cur_t() != "Eof") {
         if (lex.cur_t() == "KwFunc") {
             // 新文法：`fn mname(params) Ret {...}`（关键字领头，LL(1) 友好）
@@ -5057,6 +5073,28 @@ pub fn parse_struct_decl(name: string, anns: i64, layout: string) i64 {
                 lex.g_method_tail = base.list_push(lex.g_method_head, lex.g_method_tail, mfd);
                 if (lex.g_method_head < 0) { lex.g_method_head = lex.g_method_tail; }
             }
+        } else if (lex.cur_t() == "KwConst") {
+            // P3a：结构体关联常量 `const Name = ...`（重命名为 `<struct>_Name` 的全局常量，
+            // 与方法 `point_origin` 同构：顶层自由符号 + sema member 解析改写 ident 发射）。
+            lex.advance_i();   // 消费 `const`
+            var cname: string = expect_tok("Identifier");
+            var cti: i64 = lex.pos - 1;
+            var ctn: i64 = -1;
+            if (lex.cur_t() == "Colon") {
+                lex.advance_i();
+                ctn = parse_type();
+            }
+            var cinit: i64 = -1;
+            if (lex.cur_t() == "Assign") {
+                lex.advance_i();
+                cinit = parse_expr();
+            }
+            expect_tok("Semicolon");
+            base.validate_const_name(cname, cti);
+            var cfull: string = base.sb_cat3(name, "_", cname);
+            var cfd: i64 = base.mk_GlobalConstDecl(cfull, false, ctn, cinit, -1, cti);
+            lex.g_const_tail = base.list_push(lex.g_const_head, lex.g_const_tail, cfd);
+            if (lex.g_const_head < 0) { lex.g_const_head = lex.g_const_tail; }
         } else if (lex.cur_t() == "Identifier" && lex.peek_t(1) == "KwFunc") {
             // 方言统一（Stage 2）：`mname fn(...)` 结构体方法旧文法已废弃，统一为 `fn mname(...)`。
             // 转换器已把整树结构体方法迁到 `fn mname`，此处直接报迁移错误而非误当成字段解析。
