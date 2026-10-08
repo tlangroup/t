@@ -257,6 +257,19 @@
 - **回归测试**：`tests/conformance/pass/p_variant_lead_expect.tc`（两 variant 共享 case 名 `X`，
   `B` 先于 `A` 声明，验证 `.X` 在 `A { .X }` 中按上下文消歧为 `A_from_X`）。
 
+### 7.2 已修：enum / variant / flag 成员名不校验（P1 静默错编）
+- **根因**：成员解析处 `if (obk == "Enum") { return obt; }` / `if (obk == "Flag") { return obt; }`
+  只返回类型、**从不校验成员名是否存在**；Variant 更是直接落到 `Unknown`，与 Unknown 的全兼容
+  `can_cast` 叠加 ⇒ 编译期零诊断、后端产出非法 IR（对 enum 发 GEP）。
+- **修复**：新增 `member_exists_in_type()` + 新诊断码 **`T-SEM-E216`**（`UNKNOWN_MEMBER`）。
+  ⚠ 诊断码选型踩坑：`E209` 已被 `TAGID_DUP` 占用、数字 `212` 已被 `T-SEM-W212`(warning)
+  占用 —— 该编号空间按**数字本体**排序，只看 `E` 前缀会漏判。
+  ⚠ Variant 分支**不加 `bd` 豁免**（它没有方法，构造器本就以 callee 形书写，豁免会让最常见的
+  构造写法逃过校验）；Enum/Flag 保留 struct 同款豁免口径。
+- **回归测试**：fail 三件套 `f_enum_member_unknown.tc` / `f_flag_member_unknown.tc` /
+  `f_variant_member_unknown.tc`；pass 反向守卫 `p_member_names_valid.tc`（防误报）。
+- 细节与论证见 `docs/syntax/type-namespace-review.md` §7.1。
+
 ---
 
 ## 8. 横切事项
