@@ -14339,7 +14339,7 @@ pub struct AnnDef {
 pub var g_ad_count: i64 = 39;
 pub var g_ad_name: [39]string = ["test", "test_skip", "test_only", "expect_fail", "test_group", "skip", "only", "should_fail", "tag", "derive", "cfg", "cfg_attr", "allow", "warn", "deny", "deprecated", "repr", "no_padding", "align", "bitpack", "offset", "binary_offset", "binary_skip", "soa", "aos", "inline", "no_inline", "must_use", "const_fn", "unsafe", "main", "export_symbol", "link_name", "c_export", "panic_handler", "doc", "doc_file", "export", "auto_convert"];
 pub var g_ad_spec: [39]string = ["none", "none", "none", "none", "string", "mixed", "none", "none", "ident_list", "ident_list", "ident", "mixed", "ident_list", "ident_list", "ident_list", "string", "ident", "none", "number", "ident", "number", "number", "none", "none", "none", "none", "none", "none", "none", "none", "none", "string", "string", "none", "none", "string", "string", "mixed", "none"];
-pub var g_ad_targets: [39]string = ["func", "func", "func", "func", "func", "func", "func", "func", "func", "struct, enum, flag, flag_set, union", "global, func, struct, enum, var, const", "global, func, struct, enum", "global, func, struct, var, const", "global, func, struct, var, const", "global, func, struct, var, const", "global, func, struct, enum, var, const", "struct, enum, union", "struct, flag", "struct, union", "struct", "flag_slot", "field", "field", "struct", "struct", "func", "func", "func", "func", "func", "func", "func", "func", "func", "func", "global", "func, struct, enum", "field, func, var, const", "struct, enum"];
+pub var g_ad_targets: [39]string = ["func", "func", "func", "func", "func", "func", "func", "func", "func", "struct, enum, flag, flag_set, union", "global, func, struct, enum, var, const", "global, func, struct, enum", "global, func, struct, var, const", "global, func, struct, var, const", "global, func, struct, var, const", "global, func, struct, enum, var, const", "struct, enum, union", "struct, flag", "struct, union", "struct", "flag_slot", "field", "field", "struct", "struct", "func", "func", "func", "func", "func", "func", "func", "func", "func", "func", "global, func, struct, enum, var, const, field", "func, struct, enum", "field, func, var, const", "struct, enum"];
 pub var g_ad_depr: [39]bool = [true, true, true, true, true, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, true];
 pub var g_ad_repl: [39]string = ["a `test \"name\" { ... }` declaration", "@skip", "@only", "@should_fail", "a `suite \"name\" { ... }` block", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "@derive(FromString)"];
 
@@ -14721,6 +14721,39 @@ pub fn ann_pass() void {
             ann_validate(k.val, target);
             mq_ki13952 = mq_ki13952 + 1;
             c = -1;
+        }
+        // 字段级注解校验（修复设计文档"风险一"）：原 ann_pass 仅校验声明级注解，
+        // 字段级注解（struct/union 字段 node_la）被静默忽略，拼错即 0 error 退化。
+        // 此处遍历字段链，对每个字段的注解按 target="field" 复用 ann_validate，
+        // 未知字段注解将报 T-ANN-E450（与声明级一致）。
+        // node_la 默认 -1（node_new 锁步），kids_chain_idx(-1) 返回空链，故无注解字段安全跳过。
+        if (target == "struct" || target == "union") {
+            // 字段级注解校验（修复设计文档"风险一"）：原 ann_pass 仅校验声明级注解，
+            // 字段级注解（struct/union 字段 node_la）被静默忽略，拼错即 0 error 退化。
+            // 此处遍历字段链，对每个字段的注解按 target="field" 复用 ann_validate，
+            // 未知字段注解将报 T-ANN-E450（与声明级一致）。
+            // ⚠ 关键：kids_chain_idx 返回的是 kids 池「entry 索引」，其 .val 才是节点 id。
+            //   node_la 接收「节点 id」，故必须先用 base__kids[f].val 取出字段节点 id，
+            //   再把该 id 传入 node_la —— 与上方声明级循环（base__kids[c].val）完全一致。
+            //   若直接把 entry 索引当节点 id 传入 node_la，会误读 g_node_la[entry] 拿到
+            //   无关链头，沿 .next 跨函数体误校验（曾触发 84× T-ANN-E450）。
+            // node_la 默认 -1（node_new 锁步），kids_chain_idx(-1) 返回空链，无注解字段安全跳过。
+            var mq_fc: i64 = base.node_lb((d as u64));
+            var mq_fks: []i64 = base.kids_chain_idx(mq_fc);
+            var mq_fki: i64 = 0;
+            while (mq_fki < slice_len(mq_fks) as i64) {
+                var f: i64 = mq_fks[mq_fki];
+                var f_id: i64 = base__kids[f].val;
+                var mq_fla: i64 = base.node_la((f_id as u64));
+                var mq_fks2: []i64 = base.kids_chain_idx(mq_fla);
+                var mq_fki2: i64 = 0;
+                while (mq_fki2 < slice_len(mq_fks2) as i64) {
+                    var fk: i64 = mq_fks2[mq_fki2];
+                    ann_validate(base__kids[fk].val, "field");
+                    mq_fki2 = mq_fki2 + 1;
+                }
+                mq_fki = mq_fki + 1;
+            }
         }
         i = i + 1;
     }
