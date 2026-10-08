@@ -254,8 +254,9 @@ flag_get(p, Perm.readable)                  // Perm.readable 是位偏移
 |---|---|---|---|---|
 | **P0** | 前导点变体按期望类型消歧 | `sema.tc:7620` | 低（局部） | ✅ **已完成** — M5.7.1，commit `7dde61f`，回归 `tests/conformance/pass/p_variant_lead_expect.tc` |
 | **P1** | enum/variant/flag 成员名校验 | `sema.tc` 成员解析 Enum/Flag/Variant 三分支 + 新诊断码 `T-SEM-E216` | 低；**会使既有错误代码开始报错**，需扫描 `src/` `tests/` `examples/` 确认零误报 | ✅ **已完成** — 见 §7.1，全仓零误报已通过 |
-| **P2** | union 字面量类型身份 | 待定位（union 字面量 TI 创建处） | 中 | 未完成（下一轮）|
-| — | struct 关联常量 / 关联函数 | parse + sema + 双后端 + 重整名 | 高，**建议单独立项** | 未完成（独立 epic）|
+| **P2** | union 字面量类型身份 | `sema.tc` `struct_lit` 按声明种类返回 Union/Struct TI | 中 | ✅ **已完成** — M5/P2，commit `aedee5e`；⚠ LLVM 后端 union 占位桩（`%U = type { i8 }`）为独立后端 epic，C 后端可用 |
+| **P3a** | struct 关联常量 | `parse_struct_decl` KwConst 分支 + `flush_struct_consts()` + sema member 补查 `<struct>_<Name>` | 高，**已单独立项** | ✅ **已完成** — M5/P3a，commit `478f9c4` |
+| **P3b** | struct 关联函数/方法成员调用脱糖 | sema call 分支 member→`<struct>_<Name>` ident 改写 + 方法前置 receiver | 高 | ✅ **已完成** — M5/P3b，commit `1c23296`；conformance 339/0、gate L2 25/0 |
 
 ### 7.1 P1 已落地：成员名校验（新诊断码 `T-SEM-E216`）
 
