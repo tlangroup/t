@@ -7302,6 +7302,75 @@ pub fn infer_expr_body(e: i64) i64 {
                 //   **恒等赋值**（写回同槽同值，连 id 都不变）⇒ 删除严格等价、零风险。
             }
         }
+        // P3b：struct 关联函数 / 方法 成员调用 `T.fn()` / `v.fn()` 脱糖为全局 `<类型>_<fn>`。
+        // callee = parse.member(recv, fn)（recv 是类型名 Point 或值 p）。若 `<类型名>_<fn>` 是
+        // 已注册 Func（flush_struct_methods 已把 `fn Point.origin` 重命名为 `point_origin`），
+        // 则改写 callee 为裸 ident 并（方法首参 self）前置 receiver 为第 0 实参，随后走下方
+        // ident 分支正常解析（含实参校验 / 返回类型）。类型级 `Point.create()` 与值级 `p.origin()`
+        // 同构处理。幂等：改写后 callee 是 ident，二次进入不再走本分支。
+        if (base.node_kind((base.node_na((e as u64)) as u64)) == "member" && base.node_na((base.node_na((e as u64)) as u64)) >= 0) {
+            var afm: i64 = base.node_na((e as u64));
+            var afrecv: i64 = base.node_na((afm as u64));
+            var afname: string = base.node_sa((afm as u64));
+            var afti: i64 = infer_expr(afrecv);
+            var afk: string = tip_kind(afti);
+            var afstruct: string = "";
+            if (afk == "Struct" || afk == "Union" || afk == "Named") { afstruct = tip_name(afti); }
+            if (str_len(afstruct) as i64 > 0) {
+                // ⚠ 方法/关联函数重命名用 pascal_to_snake(structname) 前缀（见 parse_method_decl），
+                // 故 target 必须用 pascal_to_snake(afstruct) 而非原文（"Point"→"point"），否则大小写不符找不到符号。
+                var aftarget: string = base.sb_cat3(parse.pascal_to_snake(afstruct), "_", afname);
+                var afi: i64 = sym_lookup(global_scope, aftarget);
+                if (afi < 0) { afi = sym_lookup(cur_scope, aftarget); }
+                if (afi >= 0 && tip_kind(syms[afi].ti) == "Func") {
+                    // 方法 vs 关联函数：按 receiver 性质判定（不依赖参数名，避免 self 脱糖 / 节点 id 漂移干扰）。
+                    // receiver 是「类型名」（ident 且解析为 type 声明）→ 类型级关联函数，不前置 receiver；
+                    // 否则 receiver 是「值」（变量 / 字段 / 调用结果 …）→ 值级方法，前置 receiver 为实参 0。
+                    var af_is_method: bool = true;
+                    if (base.node_kind((afrecv as u64)) == "ident") {
+                        var arn: string = base.node_sa((afrecv as u64));
+                        var arsym: i64 = sym_lookup(global_scope, arn);
+                        if (arsym < 0) { arsym = sym_lookup(cur_scope, arn); }
+                        if (arsym >= 0 && syms[arsym].kind == "type") { af_is_method = false; }
+                    }
+                    var afctor: i64 = base.mk_ident(aftarget, -1);
+                    base.node_set_span_id(afctor, base.node_span_id(cn_id));
+                    base.node_set_na((e as u64), afctor);
+                    if (af_is_method) {
+                        // 构建新实参链：receiver 在前，原实参在后。
+                        var nafh: i64 = -1;
+                        var naft: i64 = -1;
+                        // ⚠ list_push(head, tail, val) 返回**新 tail**；head 仅在首次（为空）时
+                        // 同步为 tail，否则 head 指针被尾节点覆盖会破坏实参链（receiver 丢失）。
+                        naft = base.list_push(nafh, naft, afrecv);
+                        if (nafh < 0) { nafh = naft; }
+                        var afold: i64 = base.node_la((e as u64));
+                        if (afold >= 0) {
+                            var afks: []i64 = base.kids_chain_idx(afold);
+                            var afki: i64 = 0;
+                            while (afki < slice_len(afks) as i64) {
+                                var afc: i64 = afks[afki];
+                                naft = base.list_push(nafh, naft, base.kids[afc].val);
+                                if (nafh < 0) { nafh = naft; }
+                                afki = afki + 1;
+                            }
+                        }
+                        base.node_set_la((e as u64), nafh);
+                    }
+                    // 改写 callee 为裸 ident 后**直接 fall through** 到下方 ident 分支
+                    // （与变体构造器脱糖 7294 同构，不重入 infer_expr，避免闭包值误解析）。
+                } else {
+                    // 接收者类型已知（struct/union/named）但 `<类型>_<fn>` 未注册为函数：
+                    // 若 `<fn>` 是结构体的**函数类型字段**（字段持有函数值），则走下方间接调用兜底，
+                    // 不在此报错；否则是「不存在的关联函数/方法」，明确报错，避免静默错编。
+                    var affld: i64 = struct_field_ti(afstruct, afname);
+                    if (affld < 0) {
+                        parse.fc_err("T-SEM-E208",
+                            base.sb_cat4("类型 ", afstruct, " 没有关联函数/方法 ", afname), e);
+                    }
+                }
+            }
+        }
         if (base.node_kind((base.node_na((e as u64)) as u64)) == "ident") {
             var fname: string = base.node_sa((base.node_na((e as u64)) as u64));
             var si2: i64 = sym_lookup(global_scope, fname);
