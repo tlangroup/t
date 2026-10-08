@@ -5,10 +5,16 @@
 
 ---
 
-## 1. 裁定内容（用户 2026-10-07）
+## 1. 裁定内容（用户 2026-10-07，2026-10-09 修订）
 
-1. **积类型统一到 `struct`**：`flag` / `flag_set` 关键字**废弃**，改由**修饰关键词**区分不同类型的 struct。
-2. **`@derive(Clone, Copy, ...)`（Rust 风格派生）废弃**：删除其代码生成，注解保留为 no-op（⚠ 原裁定依据「@derive 从未生效 / 死代码」失真——实为实装代码生成，见 §2.2 勘误；本任务按裁定执行删除）。
+1. **积类型统一到 `struct`**：废弃 `flag` **声明关键字**，改用 `packed struct X { ... }` 表达位域结构体。
+   - ⚠ `packed` 是**编译器内置的结构体修饰关键词**（仅在 struct 声明位置被识别），**不是**全局保留关键字。
+   - 所有积类型归并为**单一 `struct` kind**（AST 与 TI 同源）。
+2. **TI 层深度统一（决策 #3，2026-10-09）**：TI `kind` 不再保留 `Flag` / `FlagSet`，统一为 `Struct` + 属性（`@packed` / 位域布局）。语义最干净；所有按 `tip_kind()=="Flag"` 派发处（sema 布局、双后端发射、位域访问内建）需重写。
+3. **位域能力保留（决策 #1）**：`flag` 的位域打包价值由 `packed struct` 承载，能力不丢；位宽字段的具体语法（如 `@bits(N)` / `@packed(uN)`）仍待裁定（见 §5 #1）。
+4. **`flag_set` / `flag_get` 动态位域能力保留（决策 #2）**：即使零存量也不删；二者作为内建作用于 `packed struct` 的底层整数值。
+5. **`@derive` 的 8 个 trait 能力保留（决策 #4）**：Clone / Copy / Eq / Hash / ToString / FromString / DebugPrint / BinarySerde 以更干净的形式重建（旧 `process_derive` 已删，注解暂为 no-op），非彻底废弃。
+6. **`@derive` 注解保留为 no-op**：C 后端存量 `@derive` 代码零破坏、照常编译（见 §2.2）。
 
 ⚠ 本裁定**推翻 `decl-data-design.md` §1.1（`@derive`）与 §1.5（`flag` / `flag_set`）**——那份文档把三者均列为受支持特性。该文档对应章节需作废或改写。
 
@@ -82,8 +88,8 @@ flag_get(p, Perm.readable)          // Perm.readable = 位偏移
 ⇒ 位域能力（flag 唯一真正的价值）**不能靠沿用 `名字: 数字` 搬到 struct**，必须另定位宽语法，例如：
 
 ```t
-struct Perm @packed(u16) {
-    readable: u16 @bits(1);
+packed struct Perm {            // packed 为内置结构体修饰关键词（非保留关键字）
+    readable: u16 @bits(1);     // 位宽字段语法待裁定（@bits / @packed(uN) 等）
     level:    u16 @bits(4);
 }
 ```
@@ -97,7 +103,7 @@ struct Perm @packed(u16) {
 | # | 议题 | 建议 |
 |---|---|---|
 | 1 | 旧属性清单 | 明确「区分 struct 类型」的属性全集：`@packed(N)`（位域）、`@bitpack(N)`（已存在，需参数）、`@soa`、… |
-| 2 | TI 层类型身份 | **关键抉择**：属性化后 TI 的 `kind` 是否仍保留 `Flag`/`FlagSet`？若保留 ⇒ 只是语法糖，改动小；若统一为 `Struct` + 属性 ⇒ 布局计算、位域发射、`flag_set` 动态位域表示**全要改** |
+| 2 | TI 层类型身份 | **已决（2026-10-09）：深层** —— TI `kind` 统一为 `Struct`，不再保留 `Flag`/`FlagSet`；类型身份完全由属性承载。布局计算、位域发射、`flag_set` 动态位域表示**全需重写**（代价大但语义最干净）。 |
 | 3 | 位宽字段语法 | 见 §3 风险二 |
 | 4 | 属性互斥与组合 | `struct X @packed @soa {}` 冲突如何诊断？需显式规则 |
 | 5 | `@derive` 代码生成删除（保留注解 no-op） | `codegen_c.tc` 原 `process_derive`（4018–4290 行，8 个 trait 生成，原为**实装代码**非死代码）已删除；`g_ad_name` 仍含 `"derive"`，trait 名校验（`T_DERIVE_UNSUPPORTED`）保留。⚠ `sema.tc` 的 `mark_call_callees`（原误列于此）**非死代码**——它是 P3b struct 关联函数脱糖的成员 callee 标记，必须保留，已从本清单移除 |
@@ -111,25 +117,29 @@ struct Perm @packed(u16) {
 - **浅层（推荐先做）**：语法层废弃 `flag` 关键字、改用 `struct X @packed`，但 **TI 层 `kind` 不变**（仍是 `Flag`）。⇒ 下游零改动，仅 parse + 注解识别。
 - **深层**：TI 层也统一为 `Struct`，类型身份完全由属性承载。⇒ 语义最干净，但所有按 `tip_kind()=="Flag"` 派发处（sema 布局、双后端发射、位域访问内建）都要重写。
 
-建议先浅后深，与模块 path-access 的「方案 A → C 两段式」同构。
+⚠ **2026-10-09 决策 = 深层**（见 §1 #2 / §5 #3）。不再「先浅后深」，直接按深层落地：`flag` 关键字废弃、`packed struct` 取而代之、TI `kind` 归 `Struct`。
 
 ---
 
 ## 5. 待裁定项
 
-1. **位域（flag 的能力）是否保留**？若保留，位宽字段语法定为哪种？
-2. **`flag_set` 的动态位域能力**是否保留（零存量，可直接删）？
-3. **TI 层是否同步统一**（浅层 vs 深层，§4 第 2 点）？
-4. **`@derive` 的 8 个 trait 能力是否以别的形式重建**（Clone/Copy/Eq/Hash/ToString…）？还是彻底不要、改由用户手写方法？
-5. 本 epic 与模块 path-access epic 的**先后次序**？
+1. ✅ **位域能力保留**（2026-10-09）：`flag` 的位域打包价值由 `packed struct` 承载；位宽字段具体语法（`@bits(N)` / `@packed(uN)` 等）仍待裁定（见 §3 风险二）。
+2. ✅ **`flag_set` / `flag_get` 动态位域能力保留**（2026-10-09）：零存量也不删，内建作用于 `packed struct` 底层整数值。
+3. ✅ **TI 层深度统一**（2026-10-09）：`kind` 归 `Struct`，不再保留 `Flag`/`FlagSet`（见 §1 #2 / §4 第 2 点）。
+4. ✅ **`@derive` 8 个 trait 能力保留**（2026-10-09）：以更干净形式重建，非彻底废弃（旧 `process_derive` 已删，注解暂 no-op）。
+5. ✅ **先后次序（2026-10-09 裁定）：先收尾模块 path-access epic，再启动本积类型统一 epic。** path-access 主线（M1–M4 + M5 成员名校验）基本完成，收尾剩余项后切换主线。
 
 ---
 
 ## 附：复现命令
 
 ```bash
-# flag 真实用法（可用）
-flag Perm[u16] { readable: 1; level: 4; }
+# flag 声明关键字 —— 2026-10-09 裁定废弃，改用 packed struct（见 §1 #1）
+# 旧：flag Perm[u16] { readable: 1; level: 4; }
+packed struct Perm {                 # packed = 内置结构体修饰关键词（非保留关键字）
+    readable: u16 @bits(1);          # 位宽字段语法待裁定
+    level:    u16 @bits(4);
+}
 fn main_fn() i32 @main { var p: Perm = 0; flag_set(p, Perm.readable, 1);
     println(i2s(flag_get(p, Perm.readable) as i64)); return 0; }   # → 1
 
