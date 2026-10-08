@@ -85,8 +85,8 @@ static const DiagDef DIAG_DEFS[] = {
   { "T-MOD-E558", "error", "MOD", "T_MODULE_PRIVATE", "PRIVATE", "symbol is private" },
   { "T-MOD-E559", "error", "MOD", "T_IMPORT_BAD_PATH", "IMPORT_BAD_PATH", "import path is malformed" },
   { "T-MOD-E560", "error", "MOD", "T_IMPORT_CONFLICT", "IMPORT_CONFLICT", "import symbol conflict" },
-  { "T-MOD-E562", "error", "MOD", "", "IMPORT_ALIAS_CLASH", "two modules share the same last path segment and cannot be imported together" },
   { "T-MOD-E561", "error", "MOD", "T_MOD_UNQUALIFIED", "UNQUALIFIED_XMOD", "cross-module access must use qualified name" },
+  { "T-MOD-E562", "error", "MOD", "", "IMPORT_ALIAS_CLASH", "two modules share the same last path segment and cannot be imported together" },
   { "T-MTA-E600", "error", "MTA", "T_META_VALUE_PARAM_TYPE", "VALUE_PARAM_TYPE", "meta value parameter type error" },
   { "T-MTA-E601", "error", "MTA", "T_META_ARG_TYPE", "ARG_TYPE", "meta argument type error" },
   { "T-MTA-E602", "error", "MTA", "T_META_RANGE", "RANGE", "meta range error" },
@@ -150,6 +150,7 @@ static const DiagDef DIAG_DEFS[] = {
   { "T-SEM-E213", "error", "SEM", "T_VARIANT_RECURSIVE_VALUE", "VARIANT_RECURSIVE_VALUE", "variant case payload references its own type by value" },
   { "T-SEM-E214", "error", "SEM", "T_LAMBDA_PARAM_UNINFERABLE", "LAMBDA_PARAM_UNINFERABLE", "lambda parameter type cannot be inferred" },
   { "T-SEM-E215", "error", "SEM", "T_ARRAY_LEN_UNINFERABLE", "ARRAY_LEN_UNINFERABLE", "array length placeholder `[_]` cannot be inferred here" },
+  { "T-SEM-E216", "error", "SEM", "T_UNKNOWN_MEMBER", "UNKNOWN_MEMBER", "unknown member" },
   { "T-SEM-E280", "error", "SEM", "T_VALUE_LOOP_BREAK_NEEDS_ELSE", "VALUE_LOOP_BREAK_NEEDS_ELSE", "value-loop `break <expr>` requires a matching loop `else` clause to supply the no-break value" },
   { "T-SEM-E281", "error", "SEM", "T_VALUE_LOOP_PLAIN_BREAK", "VALUE_LOOP_PLAIN_BREAK", "plain `break` (without value) is not allowed in a value loop; use `break <expr>`" },
   { "T-SEM-E282", "error", "SEM", "T_NON_VALUE_LOOP_IN_EXPR", "NON_VALUE_LOOP_IN_EXPR", "a loop used as an expression must be a value loop (with `else` clause or `break <value>` in body)" },
@@ -175,7 +176,7 @@ static const DiagDef DIAG_DEFS[] = {
   { "T-VEC-W927", "warning", "VEC", "T_VECTOR_WIDER_THAN_NATIVE", "VECTOR_WIDER_THAN_NATIVE", "vector is wider than the native SIMD register and will be split" },
   { "T-VEC-W947", "warning", "VEC", "T_TILE_WIDER_THAN_NATIVE", "TILE_WIDER_THAN_NATIVE", "hardware tile is wider than the native SIMD register and will fall back to scalar loops" },
 };
-#define DIAG_COUNT 162
+#define DIAG_COUNT 163
 
 /* legacy (old semantic name) -> machine code alias table */
 static const struct { const char* legacy; const char* code; } DIAG_LEGACY[] = {
@@ -305,6 +306,7 @@ static const struct { const char* legacy; const char* code; } DIAG_LEGACY[] = {
   { "T_VARIANT_RECURSIVE_VALUE", "T-SEM-E213" },
   { "T_LAMBDA_PARAM_UNINFERABLE", "T-SEM-E214" },
   { "T_ARRAY_LEN_UNINFERABLE", "T-SEM-E215" },
+  { "T_UNKNOWN_MEMBER", "T-SEM-E216" },
   { "T_VALUE_LOOP_BREAK_NEEDS_ELSE", "T-SEM-E280" },
   { "T_VALUE_LOOP_PLAIN_BREAK", "T-SEM-E281" },
   { "T_NON_VALUE_LOOP_IN_EXPR", "T-SEM-E282" },
@@ -330,7 +332,7 @@ static const struct { const char* legacy; const char* code; } DIAG_LEGACY[] = {
   { "T_VECTOR_WIDER_THAN_NATIVE", "T-VEC-W927" },
   { "T_TILE_WIDER_THAN_NATIVE", "T-VEC-W947" },
 };
-#define DIAG_LEGACY_COUNT 150
+#define DIAG_LEGACY_COUNT 151
 
 const DiagDef* diag_find(const char* code);        /* exact machine-code lookup */
 const DiagDef* diag_find_any(const char* id);      /* machine code OR legacy name */

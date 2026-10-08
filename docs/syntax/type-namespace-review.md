@@ -250,14 +250,43 @@ flag_get(p, Perm.readable)                  // Perm.readable 是位偏移
 
 ## 7. 建议实施路径
 
-| 优先级 | 项目 | 改动点 | 风险 |
-|---|---|---|---|
-| **P0** | 前导点变体按期望类型消歧 | `sema.tc:7620` | 低（局部） |
-| **P1** | enum/variant/flag 成员名校验 | `sema.tc:7703/7710` + 新诊断码 | 低；**会使既有错误代码开始报错**，需扫描 `src/` `tests/` `examples/` 确认零误报 |
-| **P2** | union 字面量类型身份 | 待定位（union 字面量 TI 创建处） | 中 |
-| — | struct 关联常量 / 关联函数 | parse + sema + 双后端 + 重整名 | 高，**建议单独立项** |
+| 优先级 | 项目 | 改动点 | 风险 | 状态 |
+|---|---|---|---|---|
+| **P0** | 前导点变体按期望类型消歧 | `sema.tc:7620` | 低（局部） | ✅ **已完成** — M5.7.1，commit `7dde61f`，回归 `tests/conformance/pass/p_variant_lead_expect.tc` |
+| **P1** | enum/variant/flag 成员名校验 | `sema.tc` 成员解析 Enum/Flag/Variant 三分支 + 新诊断码 `T-SEM-E216` | 低；**会使既有错误代码开始报错**，需扫描 `src/` `tests/` `examples/` 确认零误报 | ✅ **已完成** — 见 §7.1，全仓零误报已通过 |
+| **P2** | union 字面量类型身份 | 待定位（union 字面量 TI 创建处） | 中 | 未完成（下一轮）|
+| — | struct 关联常量 / 关联函数 | parse + sema + 双后端 + 重整名 | 高，**建议单独立项** | 未完成（独立 epic）|
 
-⚠ P1 落地前必须做一次全仓扫描：若现有代码里有 `Color.Xxx` 拼错却因不校验而一直「编译通过」，修复后会突然报错——那些其实是**早已错编但没暴露的代码**，报错是好事，但需预先识别以免误判为回归。
+### 7.1 P1 已落地：成员名校验（新诊断码 `T-SEM-E216`）
+
+**诊断码选型**：文档早前的建议「如 `T-SEM-E209`」**不可行** —— E209 已被 `TAGID_DUP` 占用
+（`sema.tc` 发射点）；数字 212 也被 `T-SEM-W212`（`OVERFLOW_LITERAL`, warning）占用。
+⚠ 该编号空间按**数字本体**排序（…E211 / **W212** / E213…），只看 `E` 前缀会漏判占用。
+最终取 **`T-SEM-E216` = `UNKNOWN_MEMBER`**（紧邻 `E208 UNKNOWN_FIELD` 语义族，编号接续 E215）。
+
+**实现**：新增 `member_exists_in_type(obt, mname)`（置于 `variant_find_case` 之后），
+沿用 `node_lb(decl)` 取头 + `kids_chain` 物化 + 比对 `node_sa` 的既有范式；
+仅当**确实查到声明且确实没有该成员**时才报错，符号/声明缺失或 kind 不属于
+`EnumDecl`/`VariantDecl`/`FlagDecl` 一律放行，避免在解析不全的路径上误报。
+
+**⚠ 关键差异：Variant 分支不加 `bd`（callee）豁免**。struct 的 `bd` 豁免是为
+`p.clone()` 这类**方法调用**（成员名不是字段）而设；而 variant **没有方法**，且其构造器
+本就以「成员访问充当 callee」的形式书写（`Shape.Circle(1.0)`）。套用豁免会让**最常见的
+构造形态连同拼错的 case 名一起逃过校验**（即本文档 case 15）。故仅 Variant 不豁免，
+Enum/Flag 仍保留豁免口径。
+
+**验证**：10 个探针全通过（合法成员 0 error 无误报；enum/flag/variant 缺失成员均命中 E216，
+含 `Shape.NotExist(1.0)` call 形与 `Shape.Bogus` 裸成员两种写法）；`src/tc.tc` 扫描 **0 误报**。
+
+**回归夹具**：
+- fail：`f_enum_member_unknown.tc` / `f_flag_member_unknown.tc` / `f_variant_member_unknown.tc`
+- pass（反向守卫，防误报）：`p_member_names_valid.tc`
+
+**已知未覆盖**：变体**字面量构造** `Shape { .NotExist(1.0) }` 仍静默通过——它走前导点
+的另一条路径（非成员解析处），不属本次 P1 改动范围，留待后续。
+
+⚠ ~~P1 落地前必须做一次全仓扫描~~ → **已执行并通过**：`src/tc.tc` + conformance + examples
+扫描结果为零误报（既存代码中没有「拼错却一直编译通过」的成员名）。
 
 ---
 

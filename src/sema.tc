@@ -2967,6 +2967,32 @@ pub fn variant_find_case(d: i64, cname: string) i64 {
     return -1;
 }
 
+// M5 / P1 静默错编治理：枚举 / 变体 / 位域类型的**成员名存在性**校验。
+// 背景：此前 `Color.NotExistAtAll` 与 `Color.Red` 走同一条路径、返回同一类型且零诊断，
+// 后端把它当结构体字段访问发射（对 enum 发 GEP 必然非法），报错形态与真实病因（成员名拼错）
+// 完全无关，极难定位。与 struct 的 T-SEM-E208 对齐，此处报 T-SEM-E216。
+//
+// 返回 true = 成员存在，或**无法判定**（类型符号/声明节点缺失、kind 非三类之一）⇒ 一律放行，
+// 以免在解析不全的路径上产生误报。仅当「确实查到了声明且确实没有该成员」时才返回 false。
+pub fn member_exists_in_type(obt: i64, mname: string) bool {
+    var msi: i64 = sym_lookup(global_scope, tip_name(obt));
+    if (msi < 0) { return true; }
+    var msy: Sym = syms[msi];
+    if (msy.decl < 0) { return true; }
+    var mdk: string = base.node_kind((msy.decl as u64));
+    if (mdk != "EnumDecl" && mdk != "VariantDecl" && mdk != "FlagDecl") { return true; }
+    // S4 §4.6 Phase 3：链先物化再遍历 —— 纯读取循环。用 kids_chain（取 node id 比对
+    // node_sa），不用 kids_chain_idx（本循环不把游标当 kids entry 索引使用）。
+    var ks7730: []i64 = base.kids_chain(base.node_lb((msy.decl as u64)));
+    var ki7730: i64 = 0;
+    while (ki7730 < slice_len(ks7730) as i64) {
+        var kv7730: i64 = ks7730[ki7730];
+        if (base.node_sa((kv7730 as u64)) == mname) { return true; }
+        ki7730 = ki7730 + 1;
+    }
+    return false;
+}
+
 // 反向查表：case 名 → 它所属 variant 的类型名（如 Circle → Shape）。
 // 扫描 decl_list 找含该 case 的 VariantDecl；找不到返回 ""。供 variant 构造器裸名
 // 脱糖用（Circle(5) → Shape_from_Circle(5)）。同名 case 跨 variant 时取首个匹配。
@@ -7724,6 +7750,15 @@ pub fn infer_expr_body(e: i64) i64 {
             }
         }
         if (obk == "Enum") {
+            // M5 / P1：补成员名存在性校验。此前 `Color.Red` 与 `Color.NotExist` 走同一路径、
+            // 返回同一类型且零诊断（后端发非法 GEP）。bd 豁免口径与 struct 的 E208 一致。
+            if (base.node_bd((e as u64)) == false) {
+                if (member_exists_in_type(obt, base.node_sa((e as u64))) == false) {
+                    parse.fc_err("T-SEM-E216",
+                        base.sb_cat4("枚举 `", tip_name(obt), "` 没有成员 `",
+                            base.sb_cat2(base.node_sa((e as u64)), "`：请检查拼写")), e);
+                }
+            }
             return obt;
         }
         // Flag 槽位常量：`PF.encrypted` 取值为该槽的掩码，类型即 flag 本身
@@ -7731,7 +7766,30 @@ pub fn infer_expr_body(e: i64) i64 {
         // 两个后端都把它当左值取地址，LLVM 发 `load i64, ptr null`、C 发非法的
         // `PF.encrypted` —— 静默错编，与 Enum 同批治理。
         if (obk == "Flag") {
+            // M5 / P1：同上，补槽位名存在性校验（此前不存在的槽位名也照样通过检查）。
+            if (base.node_bd((e as u64)) == false) {
+                if (member_exists_in_type(obt, base.node_sa((e as u64))) == false) {
+                    parse.fc_err("T-SEM-E216",
+                        base.sb_cat4("位域 `", tip_name(obt), "` 没有槽位 `",
+                            base.sb_cat2(base.node_sa((e as u64)), "`：请检查拼写")), e);
+                }
+            }
             return obt;
+        }
+        if (obk == "Variant") {
+            // M5 / P1：Variant 成员访问（如 `Shape.Circle`）此前无任何成员名校验。
+            // ⚠ 与 Enum/Flag 两分支不同：此处**不加 bd（callee）豁免**。
+            //    variant 的构造器本就以「成员访问充当 callee」的形式书写（`Shape.Circle(1.0)`），
+            //    加豁免会让最常见的构造形态连同拼错的 case 名一起逃过校验（设计文档 case 15）。
+            //    struct 的 bd 豁免是为 `p.clone()` 这类**方法调用**（成员名不是字段）而设的，
+            //    variant 没有方法，不存在该合法情形；安全性由全仓零误报扫描兜底。
+            // 返回值维持 Unknown 不变 —— 构造器具名形的发射走 call 分支，此处改返回值会牵动后端。
+            if (member_exists_in_type(obt, base.node_sa((e as u64))) == false) {
+                parse.fc_err("T-SEM-E216",
+                    base.sb_cat4("变体 `", tip_name(obt), "` 没有 case `",
+                        base.sb_cat2(base.node_sa((e as u64)), "`：请检查拼写")), e);
+            }
+            return ti_mk("Unknown");
         }
         return ti_mk("Unknown");
     }
