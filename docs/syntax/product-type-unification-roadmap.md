@@ -49,6 +49,11 @@
 - **裁定（2026-10-09）**：位宽不靠注解，而由字段的整型类型直接编码——`packed struct` 的字段类型为 `uN`（N=1..65535）即表示该字段占 N 位。例：`readable: u1` = 1 位，`level: u4` = 4 位。
 - **交付物**：`u1`~`u65535` 作为合法字段类型被接受（前置：类型系统须识别任意宽度 uint 的 `uN` 后缀并取其数字为宽度；若当前仅 `u8/u16/u32/u64`，需扩展类型解析）；`packed struct` 非 `uN` 字段按普通宽度布局；非 packed struct 上 `uN` 窄于宿主宽度仍合法（普通窄整型，不强约束）。
 - **前置依赖**：确认/扩展类型系统对 `u1`~`u65535` 的识别（P1 研究阶段一并查清）。
+- **✅ 前置调研结论（2026-10-09）**：无需扩展类型解析——**AWI 任意位宽整数设施已存在**（`base.awi_bits` / `codegen_c` 的 `_BitInt(N)` / LLVM `iN`），`u2`~`u65535` 早已合法。唯一缺口是下限 `awi_min_bits() = 2` 把 `u1` 挡在门外。故 P2 = 把下限按符号性分派（`u` → 1，`i` → 2）：
+  - `u1` 放开：`unsigned _BitInt(1)` 在 C23 合法（实测 clang 接受），是位域基本单元。
+  - `i1` 保持拒绝：C23 signed `_BitInt` 需 ≥ 2 位，clang 实测报 `signed _BitInt must have a bit size of at least 2`；LLVM `i1` 虽合法，但双后端对拍要求合法类型两边都发得出去。
+  - 连带：`tests/conformance/fail/f89_lex_bad_num_suffix.tc` 原以 `1u1` 为非法样例，改为 `1i1`（仍非法）；新增 `f_awi_zero_bits.tc` 覆盖 `u0` / `u65536` 越界。
+  - 真正的按位打包（`packed` 语义落地）在 **P4**，P2 只保证 `uN` 字段类型被接受。
 
 ### P3 TI 深度统一
 - **交付物**：消除 `Flag`/`FlagSet` TI kind；`packed struct` 在 TI 层即 `Struct` + 属性（含位域布局描述）。所有按 `tip_kind()=="Flag"` 派发处（sema 布局、双后端发射、`flag_set`/`flag_get` 内建）改为按 `Struct`+属性派发。
