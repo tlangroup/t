@@ -9,7 +9,7 @@
 | 项 | 现状 | 终态 |
 |---|---|---|
 | `flag` 关键字 | 保留可用（1 处 `examples/bitflags.tc`） | **废弃**（语法层不再识别；过渡期可发 deprecated 诊断，P7 迁移后彻底移除） |
-| 位域表达 | `flag X[uN] { f: 位宽; }` | `packed struct X { f: uN @bits(位宽); }` |
+| 位域表达 | `flag X[uN] { f: 位宽; }` | `packed struct X { f: uN; }`（字段类型 `uN` 的数字后缀即位宽） |
 | `packed` | 无 | **内置结构体修饰关键词**（仅在 struct 声明位置被识别，**非全局保留关键字**） |
 | 积类型 AST / TI `kind` | `Struct` / `Flag` / `FlagSet` 并存 | **单一 `Struct`**（AST 与 TI 同源） |
 | `flag_set` / `flag_get` | 作用于 `flag` 底层整数 | **保留**，作用于 `packed struct` 底层整数值 |
@@ -24,7 +24,7 @@
 | # | 阶段 | 目标 | IR 漂移 | 依赖 | 风险 |
 |---|---|---|---|---|---|
 | P1 | **语法层**：去 `flag` 关键字 + 识别 `packed` 修饰 | parser 不再吃 `flag` 声明；`struct` 前可加 `packed` 修饰；`flag` 关键字发 deprecated 诊断（保留过渡期） | **0** | — | 中 |
-| P2 | **位域字段语法落地** `@bits(N)` | sema 校验 `@bits` 参数（位宽 ≤ 宿主整数位宽、非负）；与 `@packed` 协同 | **0** | P1 | 低 |
+| P2 | **位域字段语法落地**（字段类型 `u1`~`u65535`） | `packed struct` 字段类型为 `uN`（N=位宽，1..65535）即位域；sema 校验 N 合法、字段按 `uN` 宽度打包 | **0** | P1 | 低 |
 | P3 | **TI 深度统一**：`Flag`/`FlagSet` → `Struct` | `tip_kind()` 不再有 `Flag`/`FlagSet`；类型身份完全由属性承载 | ⚠ **全量** | P1/P2 | **高** |
 | P4 | **Sema 位域布局** | `packed struct` 字段按 `@bits` 打包；`offset`/掩码计算 | 0 | P3 | 中 |
 | P5 | **双后端发射** | C + LLVM 发 packed 布局；`flag_set`/`flag_get` 内建改写 | ⚠（随 P3） | P4 | 高 |
@@ -45,9 +45,10 @@
 - **不破坏自举**：编译器 `src/*.tc` 自身不使用 `flag`，故去 `flag` 关键字不影响自举链路。
 - **验收**：① `tc check src/tc.tc` → 0 errors；② `packed struct X {...}` 被识别、`flag X[uN]{...}` 报 deprecated（或 error）；③ conformance 全绿；④ gate L2 25/0（零漂移，无需重录）。
 
-### P2 位域字段语法
-- **待裁定细节**：位宽字段标注用 `@bits(N)`（默认，沿用设计文档示例）或 `@packed(uN)`；本路线图默认 `@bits(N)`。
-- **交付物**：`@bits` 进入注解注册表（`g_ad_name` 增补），`ann_validate` 校验参数（正整数、≤ 宿主宽度）；与 `packed` 协同（非 packed struct 上用 `@bits` 报错）。
+### P2 位域字段语法（字段类型 `u1`~`u65535`）
+- **裁定（2026-10-09）**：位宽不靠注解，而由字段的整型类型直接编码——`packed struct` 的字段类型为 `uN`（N=1..65535）即表示该字段占 N 位。例：`readable: u1` = 1 位，`level: u4` = 4 位。
+- **交付物**：`u1`~`u65535` 作为合法字段类型被接受（前置：类型系统须识别任意宽度 uint 的 `uN` 后缀并取其数字为宽度；若当前仅 `u8/u16/u32/u64`，需扩展类型解析）；`packed struct` 非 `uN` 字段按普通宽度布局；非 packed struct 上 `uN` 窄于宿主宽度仍合法（普通窄整型，不强约束）。
+- **前置依赖**：确认/扩展类型系统对 `u1`~`u65535` 的识别（P1 研究阶段一并查清）。
 
 ### P3 TI 深度统一
 - **交付物**：消除 `Flag`/`FlagSet` TI kind；`packed struct` 在 TI 层即 `Struct` + 属性（含位域布局描述）。所有按 `tip_kind()=="Flag"` 派发处（sema 布局、双后端发射、`flag_set`/`flag_get` 内建）改为按 `Struct`+属性派发。
