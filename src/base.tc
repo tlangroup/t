@@ -4915,7 +4915,16 @@ pub fn is_digit(c: u8) bool {
 
 
 // ══════════════════════════════════════════════════════════════════
-// 任意位宽整数类型名 `i<N>` / `u<N>`（N ∈ [2, 65535]）
+// 任意位宽整数类型名 `i<N>` / `u<N>`
+//   · 无符号 `u<N>`：N ∈ [1, 65535]
+//   · 有符号 `i<N>`：N ∈ [2, 65535]
+//
+// 下限按符号性区分，是 C 后端约束倒逼的结果（不是随手定的）：
+//   · `unsigned _BitInt(1)` 合法 —— 1 个值位，取值 {0,1}，正是位域的基本单元。
+//   ·  signed  `_BitInt(1)` 只有符号位、没有值位，C23 直接拒，clang 报
+//     `signed _BitInt must have a bit size of at least 2`。LLVM 的 `i1` 无此限制，
+//     但双后端对拍要求「合法类型在两个后端都发得出去」，故 `i1` 不开放。
+// 积类型统一 epic 的位域语法（`packed struct X { f: u1; }`）正是靠 `u1` 落地的。
 //
 // 既有的 i8/i16/i32/i64、u8/u16/u32/u64 是这套命名在 N = 8/16/32/64 上的实例，
 // 表示与运算路径一律不变 —— 本设施只放宽「哪些 N 合法」。既有 8/16/32/64 的
@@ -4926,8 +4935,11 @@ pub fn is_digit(c: u8) bool {
 // 不破坏 DAG 的位置。
 // ══════════════════════════════════════════════════════════════════
 
-pub fn awi_min_bits() i64 {
-    return 2;
+// 最小合法位宽，按下名的符号性区分（理由见本段头部注释）。
+// 传完整类型名（如 "u1" / "i4"）；空串按有符号处理，返回 2。
+pub fn awi_min_bits(name: string) i64 {
+    if (str_len(name) > 0 && name[0] == 117) { return 1; }   // 'u' == 117 → 无符号，1 位合法
+    return 2;                                                // 'i' → 有符号，C23 要求 ≥ 2
 }
 
 pub fn awi_max_bits() i64 {
@@ -4937,6 +4949,7 @@ pub fn awi_max_bits() i64 {
 // 解析 `i<N>` / `u<N>` 的位宽 N；不是该形态、越界或有前导零一律返回 -1。
 // 空串 / 单字符亦可安全调用。前导零被拒（`i07` 非法），否则同一个宽度会
 // 有两个拼写，类型同一性判定将被绕过。
+// ⚠ 下限不对称：`u1` 合法（位域基本单元），`i1` 非法（C23 signed _BitInt 需 ≥2 位）。
 pub fn awi_bits(name: string) i64 {
     var n: u64 = str_len(name);
     if (n < 2) { return -1; }
@@ -4952,7 +4965,7 @@ pub fn awi_bits(name: string) i64 {
         if (acc > 65535) { return -1; }               // 早退，杜绝溢出
         i = i + 1;
     }
-    if (acc < awi_min_bits()) { return -1; }
+    if (acc < awi_min_bits(name)) { return -1; }
     if (acc > awi_max_bits()) { return -1; }
     return acc;
 }
