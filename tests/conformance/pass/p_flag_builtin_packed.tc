@@ -1,0 +1,39 @@
+// EXPECT: pass
+// 积类型统一 epic P8：flag_set / flag_get 内建可直接作用于 packed struct 的
+// 「底层宿主整型」——这是 `flag` 关键字移除后保留下来的动态位域能力（用户裁定 #2）。
+//
+// 单掩码编码：mask = 位段掩码，shift = mask 的尾零位数；语义与 runtime
+// t_runtime.c 的 t_flag_set / t_flag_get 一致，双后端共用同一真相源
+// （LLVM 轨调 t_flag_set；C 轨由 t_runtime.h 的宏委托到同一函数）。
+//
+// ⚠ 回归防线：P8 之前 LLVM 轨把 packed struct 聚合体整体按值传给签名是
+// (int64, int64, int64) 的 t_flag_set → ABI 错配；写回又把 i64 结果整块 store 进
+// 1 字节的 %Perm（宿主 u8/u16）→ 写穿栈 → 运行时段错误，而类型检查却 0 error 静默放过。
+// 本夹具锁定「必须能通过类型检查」；运行期正确性由 examples/bitflags.tc 双后端覆盖。
+
+packed struct Perm {
+    readable: u1;
+    writable: u1;
+    level:    u4;
+    owner_id: u8;
+}
+
+fn main() i32 @main {
+    var p: Perm = Perm{ readable: 0, writable: 0, level: 0, owner_id: 0 };
+
+    // 动态位域：按掩码读写位段（60 = level 位段 bits2..5；16320 = owner_id bits6..13）
+    flag_set(p, 60, 5);
+    flag_set(p, 16320, 7);
+    var lv: u32 = flag_get(p, 60);
+    var ow: u32 = flag_get(p, 16320);
+
+    // 具名字段读写仍可用；两者操作同一份宿主整型
+    p.readable = 1;
+
+    if (lv == 5 && ow == 7 && p.level == 5 && p.readable == 1) {
+        println("p8 dyn bitfield OK");
+        return 0;
+    }
+    println("p8 dyn bitfield WRONG");
+    return 1;
+}
