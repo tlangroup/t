@@ -3403,7 +3403,15 @@ pub fn tir_addr_of(e: i64) TirEmitRes {
         if (idx >= 0) {
             var st: string = tir_expr_st(e);
             var d: string = tir_tmp();
-            tir_emit(TIRInst{ op: TIR_OP_ADDR_OF, st: tir_st_from_str(st), dst: tir_op(d), args: tir_a1(tir_os(g_local_slots[idx], tir_st_from_str(st))), is_comment: false, line: g_cur_line, cmt: "" });
+            // P5/P8：packed struct 的宿主整型可能 < 8 字节（%Perm = type { i8 }，1 字节），
+            // ADDR_OF 的目标临时槽若按值类型(%Perm)分配，会被 8 字节指针写穿 → 栈破坏 →
+            // 运行时段错误。故 packed 结构把 ADDR_OF 的槽类型改成指针宽度 ptr<%Perm>（8 字节）。
+            // 与 tir_member_addr 的 P5 修复同源同宽度；非 packed 保持原样。
+            // ⚠ 安全性：src/ 与 lib/ 内 packed struct 真实声明数为 0，故此改动对编译器自身
+            // 自举产物零语义影响（pk_find_struct 对编译器自身所有类型恒返回 -1）。
+            var ao_st: string = st;
+            if (sema.pk_find_struct(tir_strip_pct(st)) >= 0) { ao_st = base.sb_cat3("ptr<", st, ">"); }
+            tir_emit(TIRInst{ op: TIR_OP_ADDR_OF, st: tir_st_from_str(ao_st), dst: tir_op(d), args: tir_a1(tir_os(g_local_slots[idx], tir_st_from_str(st))), is_comment: false, line: g_cur_line, cmt: "" });
             return TirEmitRes{ name: d, st: tir_st_from_str(tir_expr_st(e)) };
         }
         return TirEmitRes{ name: base.sb_cat2("@", lname), st: tir_st_from_str(tir_expr_st(e)) };   // 全局符号即地址
@@ -3632,6 +3640,16 @@ pub fn tir_emit_unary(e: i64) TirEmitRes {
     }
     tir_cmt(base.sb_cat3("unsupported unary: ", base.node_sa((e as u64)), ""));
     return TirEmitRes{ name: d, st: tir_st_from_str(st) };
+}
+
+// packed struct 底层宿主整型名（sema.packed_host_name 的 u8/u16/u32/u64）→ LLVM 标量类型名。
+// P8：flag_set/flag_get 首参为 packed struct 时，读写都必须按「宿主宽度」进行，并把 i64
+// 结果截断回宿主宽度再写回。若整块按 i64 store 进 %Perm（宿主 u8 时仅 1 字节）会写穿栈 → 段错误。
+pub fn tir_pk_host_st(under: string) string {
+    if (under == "u8") { return "i8"; }
+    if (under == "u16") { return "i16"; }
+    if (under == "u32") { return "i32"; }
+    return "i64";
 }
 
 pub fn tir_emit_call(e: i64) TirEmitRes {
@@ -4195,6 +4213,35 @@ pub fn tir_emit_call(e: i64) TirEmitRes {
                 }
             }
         }
+        // ── P8：flag_set/flag_get 首参为 packed struct → 降级到宿主整型传参 ─────────
+        // 运行时签名 int64_t t_flag_set/get(int64_t flags, int64_t mask, ...)。packed struct
+        // 在 LLVM 侧是单字段聚合体（%Perm = type { i8 }）：若整体按值传入，① call 的 declare
+        // 会被推导成 (%Perm, i64, i64)，与运行时 int64 ABI 错配；② 写回处又会把 i64 结果整块
+        // store 进 1 字节的 %Perm → 写穿栈 → 段错误。故此处取「宿主字段」的值并 zext 到 i64，
+        // declare 随之对齐成正确的 (i64, i64, i64)。
+        if (argi == 0 && (cname == "flag_set" || cname == "flag_get")) {
+            var fsty: string = tir_expr_st(ac_kv);
+            var fpi: i64 = sema.pk_find_struct(tir_strip_pct(fsty));
+            if (fpi >= 0 && fpi < slice_len(sema.pk_struct_under) as i64) {
+                var fhst: string = tir_pk_host_st(sema.pk_struct_under[fpi]);
+                // ⚠ aslot 在通用实参路径上可能是「已加载的值寄存器」（直接 GEP 会多一层索引
+                // → invalid getelementptr indices），故统一先取地址得到指针再 GEP（与 tir_member_addr
+                // 同一写法：addr_of → gep [0, fidx]）。
+                var fptr: TirEmitRes = tir_addr_of(ac_kv);
+                var fg1: []string = [];
+                append(fg1, "0");
+                append(fg1, "0");
+                var fhptr: string = tir_tmp();
+                tir_emit(tir_emit_gep(fhst, fhptr, fptr.name, fg1));
+                var fhv: string = tir_tmp();
+                tir_emit(tir_emit_load(fhst, fhv, fhptr));
+                // 宿主整型一律无符号（u8/u16/u32/u64），故显式 ZEXT（tir_cast_slot 认 "i8" 为
+                // 有符号会发 sext，宿主高位为 1 时会符号扩展成负数）。
+                var fz8: string = tir_tmp();
+                tir_emit(TIRInst{ op: TIR_OP_ZEXT, st: tir_st_from_str("i64"), dst: tir_op(fz8), args: tir_a1(fhv), is_comment: false, line: g_cur_line, cmt: "" });
+                aslot = fz8;
+            }
+        }
         if (first == false) { sb_append_str(sb, " "); }
         sb_append_str(sb, aslot);
         append(cargs, aslot);
@@ -4263,7 +4310,23 @@ pub fn tir_emit_call(e: i64) TirEmitRes {
         if (base.node_la((e as u64)) >= 0) { a0n = base.kids[base.node_la((e as u64))].val; }
         if (a0n >= 0) {
             var addrr: TirEmitRes = tir_addr_of(a0n);
-            tir_emit(tir_emit_store(d, addrr.name));
+            // P8：首参为 packed struct 时，写回必须落到「宿主字段」并截断回宿主宽度。
+            // 原逻辑把 i64 结果整块 store 进 %Perm（宿主 u8 时仅 1 字节）→ 写穿栈 → 段错误。
+            var wsty: string = tir_expr_st(a0n);
+            var wpi: i64 = sema.pk_find_struct(tir_strip_pct(wsty));
+            if (wpi >= 0 && wpi < slice_len(sema.pk_struct_under) as i64) {
+                var whst: string = tir_pk_host_st(sema.pk_struct_under[wpi]);
+                var wg1: []string = [];
+                append(wg1, "0");
+                append(wg1, "0");
+                var whptr: string = tir_tmp();
+                tir_emit(tir_emit_gep(whst, whptr, addrr.name, wg1));
+                var whv: string = tir_tmp();
+                tir_emit(TIRInst{ op: TIR_OP_TRUNC, st: tir_st_from_str(whst), dst: tir_op(whv), args: tir_a1(d), is_comment: false, line: g_cur_line, cmt: "" });
+                tir_emit(tir_emit_store(whv, whptr));
+            } else {
+                tir_emit(tir_emit_store(d, addrr.name));
+            }
         }
     }
     return TirEmitRes{ name: d, st: tir_st_from_str(retst) };
