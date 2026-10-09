@@ -1,0 +1,705 @@
+// src/derive_gen.tc — @derive 8 trait 代码生成（源码级注入，双后端共享前端）
+//
+// 设计（product-type-unification P6）：消费 @derive(Clone, Copy, ...) 注解，为每个 struct / union
+// 合成 8 个 trait 的方法源码，追加到编译单元末尾。生成的方法以自由函数形式写出，命名为
+// `<pascal_to_snake(T)>_<method>`，与 `fn T.method` 脱糖命名一致，故 `v.clone()` /
+// `T.from_string(s)` / `v.serialize()` 等调用均可解析。
+//
+// 仅当源码含 `@derive` 子串时才临时解析提取（编译器自身 src 不含 @derive ⇒ 零自举成本）；
+// 提取后把生成的合法 t 源码拼回 src，交给外层统一 tokenize + parse，故双后端（C / LLVM）
+// 天然共享同一套生成逻辑。
+
+const base = @import("src.base");
+const parse = @import("src.parse");
+
+// ── 字段收集缓冲（复刻旧 collect_fields 的全局并行数组范式）──────
+pub var g_df_names: []string;
+pub var g_df_types: []string;
+pub var g_df_need_find: bool = false;   // 任一 decl 生成 FromString 时置 true（驱动注入 __derive_str_find 辅助函数）
+
+// 类型判断
+pub fn derive_is_numeric(t: string) bool {
+    if (t == "") { return false; }
+    var c0: u8 = t[0];
+    if (c0 != 105 && c0 != 117) { return false; }   // 'i' / 'u'
+    var i: i64 = 1;
+    while (i < str_len(t)) {
+        var c: u8 = t[i];
+        if (c < 48 || c > 57) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+pub fn derive_is_bool(t: string) bool { return t == "bool"; }
+pub fn derive_is_string(t: string) bool { return t == "string"; }
+
+// 手写子串判定（t 无 str_find 内建；编译器构建自身与用户程序均不可用）。
+// 用 str_len + 索引（二者为真实内建）实现，避免对缺失运行时符号 t_str_find 的依赖。
+pub fn derive_contains(haystack: string, needle: string) bool {
+    var hl: i64 = str_len(haystack);
+    var nl: i64 = str_len(needle);
+    if (nl == 0) { return true; }
+    if (nl > hl) { return false; }
+    var i: i64 = 0;
+    while (i + nl <= hl) {
+        var j: i64 = 0;
+        var ok: bool = true;
+        while (j < nl) {
+            if (haystack[i + j] != needle[j]) { ok = false; break; }
+            j = j + 1;
+        }
+        if (ok) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+// 注入到用户程序的子串查找辅助函数源码（供 FromString 解析字段用）。
+// 同样只用 str_len + 索引，无任何缺失内建。
+pub fn __derive_str_find_helper() string {
+    return "fn __derive_str_find(h: string, n: string) i64 {\n    var hl: i64 = str_len(h);\n    var nl: i64 = str_len(n);\n    if (nl == 0) { return 0; }\n    if (nl > hl) { return -1; }\n    var i: i64 = 0;\n    while (i + nl <= hl) {\n        var j: i64 = 0;\n        var matched: bool = true;\n        while (j < nl) {\n            if (h[i + j] != n[j]) { matched = false; break; }\n            j = j + 1;\n        }\n        if (matched) { return i; }\n        i = i + 1;\n    }\n    return -1;\n}\n";
+}
+
+// 提取某 decl 的 @derive 注解里的 trait 名列表
+pub fn derive_traits_of(d: i64) []string {
+    var out: []string;
+    var la: i64 = base.node_la((d as u64));
+    var ai: i64 = parse.ann_find(la, "derive");
+    if (ai < 0) { return out; }
+    var c: i64 = base.node_la((ai as u64));
+    var ks: []i64 = base.kids_chain(c);
+    var ki: i64 = 0;
+    while (ki < slice_len(ks) as i64) {
+        var av: i64 = ks[ki];
+        var kk: string = base.node_kind((av as u64));
+        if (kk == "ident") {
+            append(out, base.node_sa((av as u64)));
+        } else if (kk == "list") {
+            var c2: i64 = base.node_la((av as u64));
+            var ks2: []i64 = base.kids_chain(c2);
+            var ki2: i64 = 0;
+            while (ki2 < slice_len(ks2) as i64) {
+                var av2: i64 = ks2[ki2];
+                if (base.node_kind((av2 as u64)) == "ident") {
+                    append(out, base.node_sa((av2 as u64)));
+                }
+                ki2 = ki2 + 1;
+            }
+        }
+        ki = ki + 1;
+    }
+    return out;
+}
+
+// 提取 struct / union 的字段名 + 类型名（写入 g_df_names / g_df_types）
+pub fn derive_fields_of(d: i64) void {
+    var c: i64 = base.node_lb((d as u64));
+    var ks: []i64 = base.kids_chain(c);
+    var ki: i64 = 0;
+    while (ki < slice_len(ks) as i64) {
+        var f: i64 = ks[ki];
+        if (base.node_ia((f as u64)) < 0) {   // 字段（非方法 / 常量，ia<0 区分）
+            append(g_df_names, base.node_sa((f as u64)));
+            var tn: i64 = base.node_na((f as u64));
+            // 类型节点名统一存于 sa：scalar(i64/bool/string/…)/named(结构体)/ident 均如此。
+            if (tn >= 0) {
+                append(g_df_types, base.node_sa((tn as u64)));
+            } else {
+                append(g_df_types, "");
+            }
+        }
+        ki = ki + 1;
+    }
+}
+
+// ── 各 trait 方法体生成 ────────────────────────────────────────
+
+pub fn derive_clone(name: string, prefix: string, nf: i64) string {
+    var sb: StringBuilder = sb_new();
+    sb_append_str(sb, "// @derive(Clone) — auto-generated\n");
+    sb_append_str(sb, "fn ");
+    sb_append_str(sb, prefix);
+    sb_append_str(sb, "_clone(self: ");
+    sb_append_str(sb, name);
+    sb_append_str(sb, ") ");
+    sb_append_str(sb, name);
+    sb_append_str(sb, " {\n");
+    if (nf == 0) {
+        sb_append_str(sb, "    return ");
+        sb_append_str(sb, name);
+        sb_append_str(sb, " { };\n");
+    } else {
+        sb_append_str(sb, "    return ");
+        sb_append_str(sb, name);
+        sb_append_str(sb, " { ");
+        var k: i64 = 0;
+        while (k < nf) {
+            if (k > 0) { sb_append_str(sb, ", "); }
+            sb_append_str(sb, g_df_names[k]);
+            sb_append_str(sb, ": self.");
+            sb_append_str(sb, g_df_names[k]);
+            k = k + 1;
+        }
+        sb_append_str(sb, " };\n");
+    }
+    sb_append_str(sb, "}\n");
+    return sb_to_str(sb);
+}
+
+pub fn derive_eq(name: string, prefix: string, nf: i64) string {
+    var sb: StringBuilder = sb_new();
+    sb_append_str(sb, "// @derive(Eq) — auto-generated\n");
+    sb_append_str(sb, "fn ");
+    sb_append_str(sb, prefix);
+    sb_append_str(sb, "_eq(self: ");
+    sb_append_str(sb, name);
+    sb_append_str(sb, ", o: ");
+    sb_append_str(sb, name);
+    sb_append_str(sb, ") bool {\n");
+    if (nf == 0) {
+        sb_append_str(sb, "    return true;\n");
+    } else {
+        sb_append_str(sb, "    return ");
+        var k: i64 = 0;
+        while (k < nf) {
+            if (k > 0) { sb_append_str(sb, " && "); }
+            sb_append_str(sb, "self.");
+            sb_append_str(sb, g_df_names[k]);
+            sb_append_str(sb, " == o.");
+            sb_append_str(sb, g_df_names[k]);
+            k = k + 1;
+        }
+        sb_append_str(sb, ";\n");
+    }
+    sb_append_str(sb, "}\n");
+    return sb_to_str(sb);
+}
+
+pub fn derive_hash(name: string, prefix: string, nf: i64) string {
+    var sb: StringBuilder = sb_new();
+    sb_append_str(sb, "// @derive(Hash) — auto-generated\n");
+    sb_append_str(sb, "fn ");
+    sb_append_str(sb, prefix);
+    sb_append_str(sb, "_hash(self: ");
+    sb_append_str(sb, name);
+    sb_append_str(sb, ") u64 {\n");
+    sb_append_str(sb, "    var h: u64 = 14695981039346656037;\n");
+    var k: i64 = 0;
+    while (k < nf) {
+        var ft: string = g_df_types[k];
+        if (derive_is_string(ft)) {
+            sb_append_str(sb, "    var k");
+            sb_append_i64(sb, k);
+            sb_append_str(sb, ": i64 = 0;\n");
+            sb_append_str(sb, "    while (k");
+            sb_append_i64(sb, k);
+            sb_append_str(sb, " < str_len(self.");
+            sb_append_str(sb, g_df_names[k]);
+            sb_append_str(sb, ")) {\n");
+            sb_append_str(sb, "        h = h * (1099511628211 as u64);\n");
+            sb_append_str(sb, "        h = h ^ (self.");
+            sb_append_str(sb, g_df_names[k]);
+            sb_append_str(sb, "[k");
+            sb_append_i64(sb, k);
+            sb_append_str(sb, "] as u64);\n");
+            sb_append_str(sb, "        k");
+            sb_append_i64(sb, k);
+            sb_append_str(sb, " = k");
+            sb_append_i64(sb, k);
+            sb_append_str(sb, " + 1;\n");
+            sb_append_str(sb, "    }\n");
+        } else if (derive_is_numeric(ft) || derive_is_bool(ft)) {
+            sb_append_str(sb, "    h = h * (1099511628211 as u64);\n");
+            sb_append_str(sb, "    h = h ^ (self.");
+            sb_append_str(sb, g_df_names[k]);
+            sb_append_str(sb, " as u64);\n");
+        }
+        k = k + 1;
+    }
+    sb_append_str(sb, "    return h;\n");
+    sb_append_str(sb, "}\n");
+    return sb_to_str(sb);
+}
+
+pub fn derive_to_string(name: string, prefix: string, nf: i64) string {
+    var sb: StringBuilder = sb_new();
+    sb_append_str(sb, "// @derive(ToString) — auto-generated\n");
+    sb_append_str(sb, "fn ");
+    sb_append_str(sb, prefix);
+    sb_append_str(sb, "_to_string(self: ");
+    sb_append_str(sb, name);
+    sb_append_str(sb, ") string {\n");
+    sb_append_str(sb, "    return format(\"");
+    sb_append_str(sb, name);
+    sb_append_str(sb, "( ");
+    var k: i64 = 0;
+    while (k < nf) {
+        if (k > 0) { sb_append_str(sb, ", "); }
+        sb_append_str(sb, g_df_names[k]);
+        sb_append_str(sb, "={}");
+        k = k + 1;
+    }
+    sb_append_str(sb, " )\", ");
+    var j: i64 = 0;
+    while (j < nf) {
+        if (j > 0) { sb_append_str(sb, ", "); }
+        var ft: string = g_df_types[j];
+        if (derive_is_numeric(ft)) {
+            sb_append_str(sb, "self.");
+            sb_append_str(sb, g_df_names[j]);
+            sb_append_str(sb, " as u64");
+        } else {
+            sb_append_str(sb, "self.");
+            sb_append_str(sb, g_df_names[j]);
+        }
+        j = j + 1;
+    }
+    sb_append_str(sb, ");\n");
+    sb_append_str(sb, "}\n");
+    return sb_to_str(sb);
+}
+
+pub fn derive_debug_print(name: string, prefix: string, nf: i64) string {
+    var sb: StringBuilder = sb_new();
+    sb_append_str(sb, "// @derive(DebugPrint) — auto-generated\n");
+    sb_append_str(sb, "fn ");
+    sb_append_str(sb, prefix);
+    sb_append_str(sb, "_debug_print(self: ");
+    sb_append_str(sb, name);
+    sb_append_str(sb, ") string {\n");
+    sb_append_str(sb, "    return format(\"");
+    sb_append_str(sb, name);
+    sb_append_str(sb, "( ");
+    var k: i64 = 0;
+    while (k < nf) {
+        if (k > 0) { sb_append_str(sb, ", "); }
+        sb_append_str(sb, g_df_names[k]);
+        sb_append_str(sb, ": {}");
+        k = k + 1;
+    }
+    sb_append_str(sb, " )\", ");
+    var j: i64 = 0;
+    while (j < nf) {
+        if (j > 0) { sb_append_str(sb, ", "); }
+        var ft: string = g_df_types[j];
+        if (derive_is_numeric(ft)) {
+            sb_append_str(sb, "self.");
+            sb_append_str(sb, g_df_names[j]);
+            sb_append_str(sb, " as u64");
+        } else {
+            sb_append_str(sb, "self.");
+            sb_append_str(sb, g_df_names[j]);
+        }
+        j = j + 1;
+    }
+    sb_append_str(sb, ");\n");
+    sb_append_str(sb, "}\n");
+    return sb_to_str(sb);
+}
+
+// FromString：解析 ToString 对称输出 `Name{ f0=val, f1=val }`
+pub fn derive_from_string(name: string, prefix: string, nf: i64) string {
+    g_df_need_find = true;
+    var sb: StringBuilder = sb_new();
+    sb_append_str(sb, "// @derive(FromString) — auto-generated\n");
+    sb_append_str(sb, "fn ");
+    sb_append_str(sb, prefix);
+    sb_append_str(sb, "_from_string(s: string) ");
+    sb_append_str(sb, name);
+    sb_append_str(sb, " {\n");
+    // 逐字段局部变量声明
+    var k: i64 = 0;
+    while (k < nf) {
+        sb_append_str(sb, "    var v");
+        sb_append_i64(sb, k);
+        sb_append_str(sb, ": ");
+        sb_append_str(sb, g_df_types[k]);
+        sb_append_str(sb, ";\n");
+        k = k + 1;
+    }
+    // 逐字段解析
+    k = 0;
+    while (k < nf) {
+        var ft: string = g_df_types[k];
+        var flen: i64 = str_len(g_df_names[k]) + 1;   // 偏移 "f0="
+        sb_append_str(sb, "    {\n");
+        sb_append_str(sb, "        var p");
+        sb_append_i64(sb, k);
+        sb_append_str(sb, ": i64 = __derive_str_find(s, \"");
+        sb_append_str(sb, g_df_names[k]);
+        sb_append_str(sb, "=\");\n");
+        sb_append_str(sb, "        if (p");
+        sb_append_i64(sb, k);
+        sb_append_str(sb, " >= 0) {\n");
+        sb_append_str(sb, "            p");
+        sb_append_i64(sb, k);
+        sb_append_str(sb, " = p");
+        sb_append_i64(sb, k);
+        sb_append_str(sb, " + ");
+        sb_append_i64(sb, flen);
+        sb_append_str(sb, ";\n");
+        sb_append_str(sb, "            var e");
+        sb_append_i64(sb, k);
+        sb_append_str(sb, ": i64 = p");
+        sb_append_i64(sb, k);
+        sb_append_str(sb, ";\n");
+        sb_append_str(sb, "            while (e");
+        sb_append_i64(sb, k);
+        sb_append_str(sb, " < str_len(s) && s[e");
+        sb_append_i64(sb, k);
+        sb_append_str(sb, "] != 44 && s[e");
+        sb_append_i64(sb, k);
+        sb_append_str(sb, "] != 125 && s[e");
+        sb_append_i64(sb, k);
+        sb_append_str(sb, "] != 41) { e");
+        sb_append_i64(sb, k);
+        sb_append_str(sb, " = e");
+        sb_append_i64(sb, k);
+        sb_append_str(sb, " + 1; }\n");
+        if (derive_is_string(ft)) {
+            // 裁剪首尾空白（to_string 格式 `name={} )` 在闭合定界符前留有空格，
+            // 否则会把空格吃进字符串值，导致 round-trip 失败）。
+            sb_append_str(sb, "            while (p");
+            sb_append_i64(sb, k);
+            sb_append_str(sb, " < e");
+            sb_append_i64(sb, k);
+            sb_append_str(sb, " && (s[p");
+            sb_append_i64(sb, k);
+            sb_append_str(sb, "] == 32 || s[p");
+            sb_append_i64(sb, k);
+            sb_append_str(sb, "] == 9 || s[p");
+            sb_append_i64(sb, k);
+            sb_append_str(sb, "] == 13 || s[p");
+            sb_append_i64(sb, k);
+            sb_append_str(sb, "] == 10)) { p");
+            sb_append_i64(sb, k);
+            sb_append_str(sb, " = p");
+            sb_append_i64(sb, k);
+            sb_append_str(sb, " + 1; }\n");
+            sb_append_str(sb, "            while (e");
+            sb_append_i64(sb, k);
+            sb_append_str(sb, " > p");
+            sb_append_i64(sb, k);
+            sb_append_str(sb, " && (s[e");
+            sb_append_i64(sb, k);
+            sb_append_str(sb, " - 1] == 32 || s[e");
+            sb_append_i64(sb, k);
+            sb_append_str(sb, " - 1] == 9 || s[e");
+            sb_append_i64(sb, k);
+            sb_append_str(sb, " - 1] == 13 || s[e");
+            sb_append_i64(sb, k);
+            sb_append_str(sb, " - 1] == 10)) { e");
+            sb_append_i64(sb, k);
+            sb_append_str(sb, " = e");
+            sb_append_i64(sb, k);
+            sb_append_str(sb, " - 1; }\n");
+            sb_append_str(sb, "            v");
+            sb_append_i64(sb, k);
+            sb_append_str(sb, " = str_slice(s, p");
+            sb_append_i64(sb, k);
+            sb_append_str(sb, ", e");
+            sb_append_i64(sb, k);
+            sb_append_str(sb, ");\n");
+        } else {
+            sb_append_str(sb, "            var i");
+            sb_append_i64(sb, k);
+            sb_append_str(sb, ": i64 = p");
+            sb_append_i64(sb, k);
+            sb_append_str(sb, ";\n");
+            sb_append_str(sb, "            var acc");
+            sb_append_i64(sb, k);
+            sb_append_str(sb, ": i64 = 0;\n");
+            sb_append_str(sb, "            while (i");
+            sb_append_i64(sb, k);
+            sb_append_str(sb, " < e");
+            sb_append_i64(sb, k);
+            sb_append_str(sb, ") { var c");
+            sb_append_i64(sb, k);
+            sb_append_str(sb, ": u8 = s[i");
+            sb_append_i64(sb, k);
+            sb_append_str(sb, "]; if (c");
+            sb_append_i64(sb, k);
+            sb_append_str(sb, " >= 48 && c");
+            sb_append_i64(sb, k);
+            sb_append_str(sb, " <= 57) { acc");
+            sb_append_i64(sb, k);
+            sb_append_str(sb, " = acc");
+            sb_append_i64(sb, k);
+            sb_append_str(sb, " * 10 + (c");
+            sb_append_i64(sb, k);
+            sb_append_str(sb, " as i64) - 48; } i");
+            sb_append_i64(sb, k);
+            sb_append_str(sb, " = i");
+            sb_append_i64(sb, k);
+            sb_append_str(sb, " + 1; }\n");
+            if (derive_is_bool(ft)) {
+                sb_append_str(sb, "            v");
+                sb_append_i64(sb, k);
+                sb_append_str(sb, " = (str_slice(s, p");
+                sb_append_i64(sb, k);
+                sb_append_str(sb, ", e");
+                sb_append_i64(sb, k);
+                sb_append_str(sb, ") == \"true\");\n");
+            } else if (derive_is_numeric(ft)) {
+                sb_append_str(sb, "            v");
+                sb_append_i64(sb, k);
+                sb_append_str(sb, " = acc");
+                sb_append_i64(sb, k);
+                sb_append_str(sb, " as ");
+                sb_append_str(sb, ft);
+                sb_append_str(sb, ";\n");
+            } else {
+                // 未知类型：留零值
+            }
+        }
+        sb_append_str(sb, "        }\n");
+        sb_append_str(sb, "    }\n");
+        k = k + 1;
+    }
+    // 构造返回
+    sb_append_str(sb, "    return ");
+    sb_append_str(sb, name);
+    sb_append_str(sb, " { ");
+    k = 0;
+    while (k < nf) {
+        if (k > 0) { sb_append_str(sb, ", "); }
+        sb_append_str(sb, g_df_names[k]);
+        sb_append_str(sb, ": v");
+        sb_append_i64(sb, k);
+        k = k + 1;
+    }
+    sb_append_str(sb, " };\n");
+    sb_append_str(sb, "}\n");
+    return sb_to_str(sb);
+}
+
+// BinarySerde：序列化 / 反序列化（仅处理数值 / bool 字段；其余字段忽略）
+pub fn derive_serialize(name: string, prefix: string, nf: i64) string {
+    var sb: StringBuilder = sb_new();
+    sb_append_str(sb, "// @derive(BinarySerde) — auto-generated\n");
+    sb_append_str(sb, "fn ");
+    sb_append_str(sb, prefix);
+    sb_append_str(sb, "_serialize(self: ");
+    sb_append_str(sb, name);
+    sb_append_str(sb, ") []u8 {\n");
+    sb_append_str(sb, "    var buf: []u8 = [];\n");
+    var k: i64 = 0;
+    while (k < nf) {
+        var ft: string = g_df_types[k];
+        if (derive_is_bool(ft)) {
+            sb_append_str(sb, "    append(buf, (self.");
+            sb_append_str(sb, g_df_names[k]);
+            sb_append_str(sb, " as u8));\n");
+        } else if (derive_is_numeric(ft)) {
+            sb_append_str(sb, "    append(buf, (self.");
+            sb_append_str(sb, g_df_names[k]);
+            sb_append_str(sb, " >> 0) as u8);\n");
+            sb_append_str(sb, "    append(buf, (self.");
+            sb_append_str(sb, g_df_names[k]);
+            sb_append_str(sb, " >> 8) as u8);\n");
+            sb_append_str(sb, "    append(buf, (self.");
+            sb_append_str(sb, g_df_names[k]);
+            sb_append_str(sb, " >> 16) as u8);\n");
+            sb_append_str(sb, "    append(buf, (self.");
+            sb_append_str(sb, g_df_names[k]);
+            sb_append_str(sb, " >> 24) as u8);\n");
+            sb_append_str(sb, "    append(buf, (self.");
+            sb_append_str(sb, g_df_names[k]);
+            sb_append_str(sb, " >> 32) as u8);\n");
+            sb_append_str(sb, "    append(buf, (self.");
+            sb_append_str(sb, g_df_names[k]);
+            sb_append_str(sb, " >> 40) as u8);\n");
+            sb_append_str(sb, "    append(buf, (self.");
+            sb_append_str(sb, g_df_names[k]);
+            sb_append_str(sb, " >> 48) as u8);\n");
+            sb_append_str(sb, "    append(buf, (self.");
+            sb_append_str(sb, g_df_names[k]);
+            sb_append_str(sb, " >> 56) as u8);\n");
+        }
+        k = k + 1;
+    }
+    sb_append_str(sb, "    return buf;\n");
+    sb_append_str(sb, "}\n");
+    return sb_to_str(sb);
+}
+
+pub fn derive_deserialize(name: string, prefix: string, nf: i64) string {
+    var sb: StringBuilder = sb_new();
+    sb_append_str(sb, "// @derive(BinarySerde) — auto-generated\n");
+    sb_append_str(sb, "fn ");
+    sb_append_str(sb, prefix);
+    sb_append_str(sb, "_deserialize(data: []u8) ");
+    sb_append_str(sb, name);
+    sb_append_str(sb, " {\n");
+    var k: i64 = 0;
+    while (k < nf) {
+        var ft: string = g_df_types[k];
+        sb_append_str(sb, "    var v");
+        sb_append_i64(sb, k);
+        sb_append_str(sb, ": ");
+        sb_append_str(sb, ft);
+        sb_append_str(sb, ";\n");
+        k = k + 1;
+    }
+    // 逐字节偏移累加
+    sb_append_str(sb, "    var o: i64 = 0;\n");
+    k = 0;
+    while (k < nf) {
+        var ft: string = g_df_types[k];
+        if (derive_is_bool(ft)) {
+            sb_append_str(sb, "    v");
+            sb_append_i64(sb, k);
+            sb_append_str(sb, " = (data[o] != 0); o = o + 1;\n");
+        } else if (derive_is_numeric(ft)) {
+            sb_append_str(sb, "    v");
+            sb_append_i64(sb, k);
+            sb_append_str(sb, " = ((data[o] as u64) | ((data[o + 1] as u64) << 8) | ((data[o + 2] as u64) << 16) | ((data[o + 3] as u64) << 24) | ((data[o + 4] as u64) << 32) | ((data[o + 5] as u64) << 40) | ((data[o + 6] as u64) << 48) | ((data[o + 7] as u64) << 56)) as ");
+            sb_append_str(sb, ft);
+            sb_append_str(sb, ";\n");
+            sb_append_str(sb, "    o = o + 8;\n");
+        }
+        k = k + 1;
+    }
+    sb_append_str(sb, "    return ");
+    sb_append_str(sb, name);
+    sb_append_str(sb, " { ");
+    k = 0;
+    while (k < nf) {
+        if (k > 0) { sb_append_str(sb, ", "); }
+        sb_append_str(sb, g_df_names[k]);
+        sb_append_str(sb, ": v");
+        sb_append_i64(sb, k);
+        k = k + 1;
+    }
+    sb_append_str(sb, " };\n");
+    sb_append_str(sb, "}\n");
+    return sb_to_str(sb);
+}
+
+// 为单个 decl 生成所有请求 trait 的方法源码
+pub fn derive_gen_decl(d: i64) string {
+    var sb: StringBuilder = sb_new();
+    var name: string = base.node_sa((d as u64));
+    var prefix: string = parse.pascal_to_snake(name);
+    var traits: []string = derive_traits_of(d);
+    g_df_names = [];
+    g_df_types = [];
+    derive_fields_of(d);
+    var nf: i64 = slice_len(g_df_names) as i64;
+    var i: i64 = 0;
+    while (i < slice_len(traits) as i64) {
+        var tr: string = traits[i];
+        if (tr == "Clone") { sb_append_str(sb, derive_clone(name, prefix, nf)); }
+        else if (tr == "Copy") { /* marker：t 值语义，无需方法 */ }
+        else if (tr == "Eq") { sb_append_str(sb, derive_eq(name, prefix, nf)); }
+        else if (tr == "Hash") { sb_append_str(sb, derive_hash(name, prefix, nf)); }
+        else if (tr == "ToString") { sb_append_str(sb, derive_to_string(name, prefix, nf)); }
+        else if (tr == "FromString") { sb_append_str(sb, derive_from_string(name, prefix, nf)); }
+        else if (tr == "DebugPrint") { sb_append_str(sb, derive_debug_print(name, prefix, nf)); }
+        else if (tr == "BinarySerde") {
+            sb_append_str(sb, derive_serialize(name, prefix, nf));
+            sb_append_str(sb, derive_deserialize(name, prefix, nf));
+        }
+        i = i + 1;
+    }
+    return sb_to_str(sb);
+}
+
+// 计算第 line 行（1-based）起始字节偏移。
+pub fn derive_line_start(haystack: string, line: i64) i64 {
+    var off: i64 = 0;
+    var cur: i64 = 1;
+    var i: i64 = 0;
+    while (i < str_len(haystack)) {
+        if (cur == line) { return off; }
+        if (haystack[i] == 10) { cur = cur + 1; }
+        off = off + 1;
+        i = i + 1;
+    }
+    return off;
+}
+
+// 从 start 起找到配平的第一个 '{' 对应的 '}' 之后的位置（结构体内若嵌套 {} 也能配平）。
+pub fn derive_struct_end(src: string, start: i64) i64 {
+    var i: i64 = start;
+    var depth: i64 = 0;
+    var started: bool = false;
+    while (i < str_len(src)) {
+        var ch: u8 = src[i];
+        if (ch == 123) { depth = depth + 1; started = true; }   // '{'
+        else if (ch == 125) {                                    // '}'
+            if (started) {
+                depth = depth - 1;
+                if (depth == 0) { return i + 1; }
+            }
+        }
+        i = i + 1;
+    }
+    return str_len(src);
+}
+
+// 入口：扫描源码中的 @derive，为每个 struct/union 在其声明「之后」生成方法源码并就地插入。
+// 必须插在宿主声明之后（t 的方法式调用 `v.clone()` 脱糖为急切查找 `<类型>_clone`，
+// 要求该方法在调用点之前已注册；编译器自身 src 不含 @derive ⇒ 直接原样返回，零自举成本）。
+// 提取信息后重置 decl_list，交给外层统一 tokenize + parse_unit 重解析。
+pub fn derive_inject(src: string) string {
+    if (derive_contains(src, "@derive") == false) { return src; }
+    lex.tokenize(src);
+    if (sema.has_errors()) { return src; }
+    lex.pos = 0;
+    sema.init_anndefs();
+    parse.parse_unit();
+    if (sema.has_errors()) { return src; }
+    g_df_need_find = false;
+    var ins_off: []i64;
+    var ins_txt: []string;
+    var nl: i64 = slice_len(lex.decl_list) as i64;
+    var i: i64 = 0;
+    while (i < nl) {
+        var d: i64 = lex.decl_list[i];
+        var k: string = base.node_kind((d as u64));
+        if (k == "StructDecl" || k == "UnionDecl") {
+            var tr: []string = derive_traits_of(d);
+            if (slice_len(tr) as i64 > 0) {
+                var m: string = derive_gen_decl(d);
+                if (m != "") {
+                    var sp = base.node_span_id((d as u64));
+                    var so: i64 = derive_line_start(src, (sp.line as i64)) + (sp.col as i64) - 1;
+                    var eo: i64 = derive_struct_end(src, so);
+                    append(ins_off, eo);
+                    append(ins_txt, m);
+                }
+            }
+        }
+        i = i + 1;
+    }
+    // 重置 decl_list，交给外层统一重新解析（decl_list 会由外层 parse_unit 重新填充）
+    lex.decl_list = [];
+    // ⚠ 关键修复：lex.tokenize 是 append-only 且在末尾追加 Eof。derive_inject 已对原始
+    // 源码 tokenize + parse 做过提取，base.toks / base.g_trivia_toks 里已积压原始 tokens
+    // （含尾部 Eof）。若不在此清空，外层 tc_load_src 的 lex.tokenize(injected) 会把注入
+    // tokens 追加到「原始 tokens + Eof」之后，外层 parse_unit 遇首个 Eof 即止 ⇒ 只解析到
+    // 原始源码，派生的 8 个方法永不注册（表现为 9×T-SEM-E208 且诊断坐标停在原始行）。
+    // 清空后，外层 tokenize 成为唯一 token 源，注入源码被完整重解析并注册派生的自由函数。
+    base.toks = [];
+    base.g_trivia_toks = [];
+    if (slice_len(ins_off) as i64 == 0) { return src; }
+    // FromString 生成了 ⇒ 把 __derive_str_find 辅助函数源码贴到首个插入点之前（保证在所有调用之前）
+    if (g_df_need_find) {
+        ins_txt[0] = base.sb_cat3(__derive_str_find_helper(), "\n", ins_txt[0]);
+    }
+    // decl_list 按源码顺序遍历 ⇒ 插入点偏移天然升序，直接前向拼装
+    var out: StringBuilder = sb_new();
+    var pos: i64 = 0;
+    var ii: i64 = 0;
+    while (ii < slice_len(ins_off) as i64) {
+        sb_append_str(out, str_slice(src, pos, ins_off[ii]));
+        sb_append_str(out, "\n");
+        sb_append_str(out, ins_txt[ii]);
+        pos = ins_off[ii];
+        ii = ii + 1;
+    }
+    sb_append_str(out, str_slice(src, pos, str_len(src)));
+    return sb_to_str(out);
+}
