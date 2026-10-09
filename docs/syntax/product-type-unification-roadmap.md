@@ -26,7 +26,7 @@
 | P1 | **语法层**：去 `flag` 关键字 + 识别 `packed` 修饰 | parser 不再吃 `flag` 声明；`struct` 前可加 `packed` 修饰；`flag` 关键字发 deprecated 诊断（保留过渡期） | **0** | — | 中 |
 | P2 | **位域字段语法落地**（字段类型 `u1`~`u65535`） | `packed struct` 字段类型为 `uN`（N=位宽，1..65535）即位域；sema 校验 N 合法、字段按 `uN` 宽度打包 | **0** | P1 | 低 |
 | P3 | **TI 深度统一**：`Flag`/`FlagSet` → `Struct` | `tip_kind()` 不再有 `Flag`/`FlagSet`；类型身份完全由属性承载 | ⚠ 见下（实测 **非全量**） | P1/P2 | **高** |
-| P4 | **Sema 位域布局** | `packed struct` 字段按 `@bits` 打包；`offset`/掩码计算 | 0 | P3 | 中 |
+| P4 | **Sema 位域布局** | `packed struct` 字段按 `uN` 顺序打包；算出 `offset`/掩码并校验 | 0 | P3 | 中 |
 | P5 | **双后端发射** | C + LLVM 发 packed 布局；`flag_set`/`flag_get` 内建改写 | ⚠（随 P3） | P4 | 高 |
 | P6 | **`@derive` 8 trait 重建** | 干净实现 8 个 trait（旧 `process_derive` 已删，注解暂 no-op） | ⚠ | P3 | 高 |
 | P7 | **存量迁移** | `examples/bitflags.tc` → `packed struct`；14 处 `@derive` 注解随 P6 能力重建 | 0 | P5/P6 | 低 |
@@ -69,8 +69,22 @@
   - `member_exists_in_type` 按 **AST node kind** 派发，P3 无需改。
 - **验证**：自举不动点 `g2.ll==g3.ll==g4.ll`（md5 `9b200480…`）；**IR 基线仅 `src/tc.tc` 3 entry（c/h/ll）漂移、0 NEW/0 GONE，348 用户 entry 逐字节不变**；conformance 344/0（含 `p04_flag_slots` 位域全语义、`f_flag_member_unknown` 仍报 E216）；`examples/bitflags.tc` LLVM 运行正确输出 `bitflags OK`；gate L2 25/0。
 
-### P4 / P5 / P6 / P7
+### P4 Sema 位域布局 — ✅ 已完成并推 main（2026-10-09）
+- **交付物**：`packed struct` 的字段沿比特流顺序打包，算出每槽 `start`/`len` 与底层整型；并校验「成员只能是整型」「总位宽 ≤ 64」。
+- **✅ 实施要点（2026-10-09）**：
+  - **复古布局算法，不新增类型机制**：字段位宽直接取 `get_bw(类型名)` —— 它已覆盖 `u<N>`/`i<N>`（`awi_bits`）与 8/16/32/64/`rune`，P2 放开 `u1` 后无需再动。`bool` 显式取 1 位（位集合里的布尔就是单比特）。
+  - **底层整型按总宽自动推导**：向上取整到 8/16/32/64（`packed_host_bits`/`packed_host_name`）。旧 `flag` 要手写 `flag X[u32]`，`packed struct` 无底层类型语法 ⇒ 必须推导，否则 P5 无法发射。
+  - **上限 64 位的理由不是洁癖，而是双后端一致的前提**：位集合要落进单个宿主整型，两个后端才能用同一套 shift/mask 实现读写；超过就得铺开成多字，是另一套布局，本轮直接诊断拒绝（`T-SEM-E218`）。
+  - ⚠ **幂等保护必需**：`check_struct_decl` 会对同一 decl 多次进入（前置引用/递归），布局池必须先按 struct 名查重再 append，否则表无限增长且同一错误报 N 次。
+  - ⚠ **`flag` 是保留关键字，不能作字段名**：`packed struct { flag: bool }` 报 `T-PAR-E101 expected type`（P1 保留了 `flag` 关键字做 deprecated 告警，语义未去）。写位域时避开该名即可。
+  - **P4 刻意不动后端**：只算布局 + 发诊断 ⇒ 零行为变更，packed struct 此刻仍按普通 struct 布局发射。后端改造集中在 P5 一次做完，避免半套布局被发射。
+  - 夹具：`fail/f_packed_field_not_int`（`string` 字段）、`fail/f_packed_too_wide`（32+32+8=72）、`pass/p_packed_layout_edge64`（bool+u4+u12+u47 恰好 64，边界合法侧）。
+  - ⚠ **验证技巧**：conformance runner 只比对 diagnostic **code**、不比对 message，故布局算术不能靠夹具断言。改用临时探针读诊断消息里的总位宽数字实测（65 → 报 65；u32+u32=64 → 0 error），这才是布局真的算对了的证据。
+
+### P5 / P6 / P7
 - 顺序执行，每步 gate L2 + 不动点 + conformance 全绿；P6 重建 `@derive` 8 trait 时复用 `ann_validate` 的 trait 名校验（`T_DERIVE_UNSUPPORTED`）确保不退化。
+- **P5 是后端真正按位打包的一步**：消费 P4 布好的 `pk_*` 池，把 `packed struct` 从「普通 struct 布局发射」改成「单个宿主整型 + shift/mask 读写」，并让 `flag_set`/`flag_get` 作用于其底层整型值。**这也是 epic 全程首个真正的行为变更** —— 在此之前 packed struct 与 P1 之前别无二致（多了纪律，不多能力）。
+- P7 存量迁移随之可把 `examples/bitflags.tc` 从 `flag X[u32]` 改写为 `packed struct X`。
 
 ---
 
