@@ -152,6 +152,8 @@ static const DiagDef DIAG_DEFS[] = {
   { "T-SEM-E214", "error", "SEM", "T_LAMBDA_PARAM_UNINFERABLE", "LAMBDA_PARAM_UNINFERABLE", "lambda parameter type cannot be inferred" },
   { "T-SEM-E215", "error", "SEM", "T_ARRAY_LEN_UNINFERABLE", "ARRAY_LEN_UNINFERABLE", "array length placeholder `[_]` cannot be inferred here" },
   { "T-SEM-E216", "error", "SEM", "T_UNKNOWN_MEMBER", "UNKNOWN_MEMBER", "unknown member" },
+  { "T-SEM-E217", "error", "SEM", "", "PACKED_FIELD_NOT_INT", "packed struct field must be an integer type" },
+  { "T-SEM-E218", "error", "SEM", "", "PACKED_TOO_WIDE", "packed struct exceeds its underlying integer width" },
   { "T-SEM-E280", "error", "SEM", "T_VALUE_LOOP_BREAK_NEEDS_ELSE", "VALUE_LOOP_BREAK_NEEDS_ELSE", "value-loop `break <expr>` requires a matching loop `else` clause to supply the no-break value" },
   { "T-SEM-E281", "error", "SEM", "T_VALUE_LOOP_PLAIN_BREAK", "VALUE_LOOP_PLAIN_BREAK", "plain `break` (without value) is not allowed in a value loop; use `break <expr>`" },
   { "T-SEM-E282", "error", "SEM", "T_NON_VALUE_LOOP_IN_EXPR", "NON_VALUE_LOOP_IN_EXPR", "a loop used as an expression must be a value loop (with `else` clause or `break <value>` in body)" },
@@ -177,7 +179,7 @@ static const DiagDef DIAG_DEFS[] = {
   { "T-VEC-W927", "warning", "VEC", "T_VECTOR_WIDER_THAN_NATIVE", "VECTOR_WIDER_THAN_NATIVE", "vector is wider than the native SIMD register and will be split" },
   { "T-VEC-W947", "warning", "VEC", "T_TILE_WIDER_THAN_NATIVE", "TILE_WIDER_THAN_NATIVE", "hardware tile is wider than the native SIMD register and will fall back to scalar loops" },
 };
-#define DIAG_COUNT 164
+#define DIAG_COUNT 166
 
 /* legacy (old semantic name) -> machine code alias table */
 static const struct { const char* legacy; const char* code; } DIAG_LEGACY[] = {

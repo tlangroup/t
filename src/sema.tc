@@ -9172,6 +9172,11 @@ pub fn check_func_decl_ex(d: i64, di: i64) void {
 }
 
 pub fn check_struct_decl(d: i64) void {
+    // 积类型统一 P4：`packed struct` 走位域布局（顺序打包 + 成员只能是整型）。
+    // P4 只算布局发诊断，不改后端发射 ⇒ 此后仍照普通 struct 流程走完 TypeID 校验。
+    if (base.node_sb((d as u64)) == "packed") {
+        check_packed_layout(d);
+    }
     var c: i64 = base.node_lb((d as u64));
     var total: i64 = 0;
     var tag_count: i64 = 0;
@@ -9259,6 +9264,118 @@ pub fn check_struct_decl(d: i64) void {
         }
         c = k.next;
     }
+}
+
+// ── packed struct 位域布局（积类型统一 P4）─────────────────────
+//
+// `packed struct X { a: u1; b: u4; c: u12; }`：字段沿比特流**顺序打包**，
+// 每个字段的位宽 = 其整型类型的数字后缀（`readable: u1` = 1 位），
+// 与旧 `flag X[u32] { a: 1; b: 4; }` 逐位同构 —— flag 用「槽名: 位宽」，
+// packed struct 把位宽挪进了字段类型（`u1` 本身就说自己是 1 位）。
+//
+// P4 只算布局并校验，**不改写任何后端发射**（后端改造在 P5）。
+// ⇒ 本步零行为变更：packed struct 此刻仍按普通 struct 布局发射，
+//    新引入的只有诊断 + 一张待消费的布局表。
+//
+// 上限 64 位的理由不是语言设计洁癖，而是**双后端一致的前提**：位集合要
+// 落在单个宿主整型里，两个后端才能用同一套 shift/mask 语义实现读写。
+// 超过 64 位就得铺开成多字/数组，那是另一套布局，另行设计（本轮直接诊断拒绝）。
+//
+// 布局落在扁平池里按 struct 名查（同 fd_ / fl_ 模式），P5 的发射器按名取值。
+pub var pk_struct_names: []string;   // 每个 packed struct 一条：类型名
+pub var pk_struct_under: []string;   // 推导出的底层整型名（u8/u16/u32/u64）
+pub var pk_struct_total: []i64;      // 总位宽
+pub var pk_slot_owner: []string;     // 每个槽一条：所属 packed struct 名
+pub var pk_slot_names: []string;     // 槽字段名
+pub var pk_slot_starts: []i64;       // 起始位
+pub var pk_slot_lens: []i64;         // 位宽
+
+// 总位宽向上取整到最小可容纳的宿主整型宽度（8 / 16 / 32 / 64）。
+pub fn packed_host_bits(total: i64) i64 {
+    if (total <= 8) { return 8; }
+    if (total <= 16) { return 16; }
+    if (total <= 32) { return 32; }
+    return 64;
+}
+
+pub fn packed_host_name(bits: i64) string {
+    if (bits == 8) { return "u8"; }
+    if (bits == 16) { return "u16"; }
+    if (bits == 32) { return "u32"; }
+    return "u64";
+}
+
+// 字段类型的名字（仅用于诊断消息；解析不到给占位，不影响错字之外的行为）。
+pub fn packed_field_tyname(f: i64) string {
+    var tn: i64 = base.node_na((f as u64));
+    if (tn < 0) { return "<unknown>"; }
+    var ti: i64 = resolve_ti(tn);
+    if (ti < 0) { return "<unknown>"; }
+    return tip_name(ti);
+}
+
+// 字段在 packed struct 中的位宽；非整型（或类型无法解析）返回 -1。
+// bool 取 1 位 —— 位集合里布尔就是单比特，且 get_bw("bool") 本来就给 1。
+pub fn packed_field_bits(f: i64) i64 {
+    var tn: i64 = base.node_na((f as u64));
+    if (tn < 0) { return -1; }
+    var ti: i64 = resolve_ti(tn);
+    if (ti < 0) { return -1; }
+    if (tip_kind(ti) != "Scalar") { return -1; }
+    var nm: string = tip_name(ti);
+    if (nm == "bool") { return 1; }
+    if (is_int_name(nm) == false) { return -1; }
+    return get_bw(nm);
+}
+
+// `packed struct` 的位布局：顺序打包 + 两项校验。
+// ⚠ 幂等：同一 decl 会被 check 多遍（前置声明/递归引用），池里已有同名则直接返回，
+// 否则重复 append 会无限增长，且同一错误报 N 次。
+pub fn check_packed_layout(d: i64) void {
+    var sname: string = base.node_sa((d as u64));
+    var ei: i64 = 0;
+    var etot: i64 = slice_len(pk_struct_names) as i64;
+    while (ei < etot) {
+        if (pk_struct_names[ei] == sname) { return; }
+        ei = ei + 1;
+    }
+    var total: i64 = 0;
+    var c: i64 = base.node_lb((d as u64));
+    // S4 §4.6 Phase 3：链先物化再遍历 —— 纯读取循环
+    var ks9230: []i64 = base.kids_chain_idx(c);
+    var ki9230: i64 = 0;
+    while (ki9230 < slice_len(ks9230) as i64) {
+        var kv9230: i64 = ks9230[ki9230];
+        var fv: i64 = base.kids[kv9230].val;
+        var bw: i64 = packed_field_bits(fv);
+        if (bw <= 0) {
+            base.diag_new("T-SEM-E217", "error",
+                base.sb_cat5("packed struct '", sname, "' 的字段 '",
+                    base.sb_cat2(base.node_sa((fv as u64)), "' 必须是整型（bool 或 uN/iN，N 即位宽），实际是 '"),
+                    base.sb_cat2(packed_field_tyname(fv), "'")),
+                parse.n_file(fv), parse.n_line(fv), parse.n_col(fv), parse.n_line(fv), parse.n_col(fv) + 1);
+        } else {
+            append(pk_slot_owner, sname);
+            append(pk_slot_names, base.node_sa((fv as u64)));
+            append(pk_slot_starts, total);
+            append(pk_slot_lens, bw);
+            total = total + bw;
+        }
+        ki9230 = ki9230 + 1;
+    }
+    if (total > 64) {
+        var wsb: StringBuilder = sb_new();
+        sb_append_str(wsb, "packed struct '");
+        sb_append_str(wsb, sname);
+        sb_append_str(wsb, "' 总位宽 ");
+        sb_append_i64(wsb, total);
+        sb_append_str(wsb, " 超过底层整型上限 64 位，无法打包进单个整型：请拆分");
+        base.diag_new("T-SEM-E218", "error", sb_to_str(wsb),
+            parse.n_file(d), parse.n_line(d), parse.n_col(d), parse.n_line(d), parse.n_col(d) + 4);
+    }
+    append(pk_struct_names, sname);
+    append(pk_struct_under, packed_host_name(packed_host_bits(total)));
+    append(pk_struct_total, total);
 }
 
 pub fn check_enum_decl(d: i64) void {
