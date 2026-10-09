@@ -433,6 +433,47 @@ pub fn scalar_to_c(name: string) string {
 }
 // <<< GEN:scalar_ctype <<<
 
+// ── P5：packed struct 发射辅助 ─────────────────────────────────
+// 取 member 基底对象（e.na）的类型名；用于 packed struct 判定。
+// 递归 member/index，终点是 ident 的声明类型名（与 LLVM tir_member_base_st 同语义）。
+pub fn c_member_base_typename(e: i64) string {
+    var obj: i64 = base.node_na((e as u64));
+    if (obj < 0) { return ""; }
+    var kd: string = base.node_kind((obj as u64));
+    if (kd == "member") { return c_member_base_typename(obj); }
+    if (kd == "index") {
+        var ot: i64 = expr_type_desc(obj);
+        if (ot >= 0) {
+            var t = sema.tds[ot];
+            if (t.cat == "slice" || t.cat == "array") {
+                if (t.elem >= 0) { return sema.tds[t.elem].name; }
+            }
+            if (t.cat == "named") { return t.name; }
+        }
+        return "";
+    }
+    var td: i64 = expr_type_desc(obj);
+    if (td >= 0) { return sema.tds[td].name; }
+    return "";
+}
+
+// 2^n（i64，n < 63）用于位域掩码计算（与 tir.tc tir_pow2_i64 同源）。
+pub fn c_pow2_i64(n: i64) i64 {
+    var r: i64 = 1;
+    var i: i64 = 0;
+    while (i < n) { r = r * 2; i = i + 1; }
+    return r;
+}
+
+// 位域掩码 = ((2^len - 1) << start)，用循环避免 t 源码的 << 运算符依赖。
+// 调用方须保证 start + len < 64（否则应省去掩码，字段已占满宿主整型）。
+pub fn c_field_mask(len: i64, start: i64) i64 {
+    var m: i64 = c_pow2_i64(len) - 1;
+    var i: i64 = 0;
+    while (i < start) { m = m * 2; i = i + 1; }
+    return m;
+}
+
 // ── emitType（复刻 emitter.ts emitType；tn = 类型节点索引）─────
 
 pub fn emit_ctype(tn: i64) string {
@@ -2104,6 +2145,46 @@ pub fn c_bitint_suffix(sid: i64) string {
 // （C 复合字面量 vs LLVM alloca+GEP），契约（构造语义/值类别）一致。
 // ⚠ 发射文本与原内联分支逐字节相同（行为保持），仅做路由收口。
 pub fn c_emit_struct_new(tname: string, la: i64) string {
+    var pkidx: i64 = sema.pk_find_struct(tname);
+    if (pkidx >= 0) {
+        // P5：packed struct 字面量 → 单宿主整型；字段按 ((host)val << start) & mask 累积 OR。
+        var hostc: string = scalar_to_c(sema.pk_struct_under[pkidx]);
+        var sb: StringBuilder = sb_new();
+        sb_append_char(sb, 40);
+        sb_append_str(sb, hostc);
+        sb_append_str(sb, ")(");
+        var c: i64 = la;
+        var first: bool = true;
+        // S4 §4.6 Phase 3：链先物化再遍历 —— 纯读取循环
+        var ks: []i64 = base.kids_chain(c);
+        var ki: i64 = 0;
+        while (ki < slice_len(ks) as i64) {
+            var kv: i64 = ks[ki];
+            var fld: string = base.node_sa((kv as u64));
+            var sl: i64 = sema.pk_find_slot(tname, fld);
+            if (sl >= 0) {
+                var startv: i64 = sema.pk_slot_starts[sl];
+                var lenv: i64 = sema.pk_slot_lens[sl];
+                if (!first) { sb_append_str(sb, " | "); }
+                sb_append_str(sb, "(((");
+                sb_append_str(sb, hostc);
+                sb_append_str(sb, ")(");
+                sb_append_str(sb, emit_expr(base.node_na((kv as u64))));
+                sb_append_str(sb, ") << ");
+                sb_append_i64(sb, startv);
+                sb_append_str(sb, ")");
+                if (startv + lenv < 64) {
+                    sb_append_str(sb, " & ");
+                    sb_append_i64(sb, c_field_mask(lenv, startv));
+                }
+                sb_append_char(sb, 41);
+                first = false;
+            }
+            ki = ki + 1;
+        }
+        sb_append_char(sb, 41);
+        return sb_to_str(sb);
+    }
     var sb: StringBuilder = sb_new();
     sb_append_char(sb, 40);
     sb_append_str(sb, tname);
@@ -2580,6 +2661,51 @@ pub fn emit_expr(e: i64) string {
                     var tagl: string = base.sb_cat3("TSTR_LIT(\"", esc_c(stg.name), "\")");
                     var intr: string = base.sb_cat6("t_sym_intern(", tagl, ", ", emit_expr(base.node_nb((e as u64))), ", ", base.sb_cat2(base.i2s(stg.alen), ")"));
                     return base.sb_cat5("(", emit_expr(base.node_na((e as u64))), " = ", intr, ")");
+                }
+            }
+        }
+        // P5：packed struct 成员写 → 宿主整型 read-modify-write。
+        // `(OBJ = ((OBJ & ~MASK) | ((VAL << START) & MASK)))`，掩码按位域预计算。
+        if (base.node_sa((e as u64)) == "=") {
+            var nal: i64 = base.node_na((e as u64));
+            if (base.node_kind((nal as u64)) == "member") {
+                var cwt: string = c_member_base_typename(nal);
+                var cwpk: i64 = sema.pk_find_struct(cwt);
+                if (cwpk >= 0) {
+                    var cwsl: i64 = sema.pk_find_slot(cwt, base.node_sa((nal as u64)));
+                    if (cwsl >= 0) {
+                        var cws: i64 = sema.pk_slot_starts[cwsl];
+                        var cwl: i64 = sema.pk_slot_lens[cwsl];
+                        var hostc: string = scalar_to_c(sema.pk_struct_under[cwpk]);
+                        var objc: string = emit_expr(base.node_na((nal as u64)));
+                        var valc: string = emit_expr(base.node_nb((e as u64)));
+                        var masklit: i64;
+                        if (cws + cwl < 64) { masklit = c_field_mask(cwl, cws); } else { masklit = -1; }
+                        var sbw: StringBuilder = sb_new();
+                        sb_append_char(sbw, 40);
+                        sb_append_str(sbw, objc);
+                        sb_append_str(sbw, " = ((");
+                        sb_append_str(sbw, objc);
+                        sb_append_str(sbw, " & ((");
+                        sb_append_str(sbw, hostc);
+                        sb_append_str(sbw, ")(~(");
+                        sb_append_str(sbw, hostc);
+                        sb_append_str(sbw, ")");
+                        sb_append_i64(sbw, masklit);
+                        sb_append_str(sbw, "))) | (((");
+                        sb_append_str(sbw, hostc);
+                        sb_append_str(sbw, ")(");
+                        sb_append_str(sbw, valc);
+                        sb_append_str(sbw, ") << ");
+                        sb_append_i64(sbw, cws);
+                        sb_append_str(sbw, ") & (");
+                        sb_append_str(sbw, hostc);
+                        sb_append_str(sbw, ")");
+                        sb_append_i64(sbw, masklit);
+                        sb_append_str(sbw, ")))");
+                        sb_append_char(sbw, 41);
+                        return sb_to_str(sbw);
+                    }
                 }
             }
         }
@@ -3165,6 +3291,29 @@ pub fn emit_expr(e: i64) string {
                     }
                     return base.sb_cat4(base.node_sa((base.node_na((e as u64)) as u64)), "_", base.node_sa((e as u64)), "_MASK");
                 }
+            }
+        }
+        // P5：packed struct 字段值访问 → 宿主整型 shift/mask 抽取。
+        var obj_tn: string = c_member_base_typename(e);
+        var pkidx: i64 = sema.pk_find_struct(obj_tn);
+        if (pkidx >= 0) {
+            var sl: i64 = sema.pk_find_slot(obj_tn, base.node_sa((e as u64)));
+            if (sl >= 0) {
+                var startv: i64 = sema.pk_slot_starts[sl];
+                var lenv: i64 = sema.pk_slot_lens[sl];
+                var objc: string = emit_expr(base.node_na((e as u64)));
+                var sbm: StringBuilder = sb_new();
+                sb_append_char(sbm, 40);
+                sb_append_str(sbm, objc);
+                sb_append_str(sbm, " >> ");
+                sb_append_i64(sbm, startv);
+                sb_append_str(sbm, ")");
+                if (startv + lenv < 64) {
+                    // ⚠ mask 须为「抽取后」低 len 位（不左移）；shift 已把字段落到 bit0。
+                    sb_append_str(sbm, " & ");
+                    sb_append_i64(sbm, c_pow2_i64(lenv) - 1);
+                }
+                return sb_to_str(sbm);
             }
         }
         return base.sb_cat3(emit_expr(base.node_na((e as u64))), ".", base.node_sa((e as u64)));
@@ -4078,6 +4227,17 @@ pub fn emit_attributes(head: i64) string {
 
 pub fn emit_struct_decl(d: i64) void {
     var attrs: string = emit_attributes(base.node_la((d as u64)));
+
+    // P5：packed struct → 单个宿主整型（u8/u16/u32/u64）的 typedef，而非聚合。
+    // 字段位域读写由 shift/mask 在成员访问点展开（见 emit_expr 的 member / assign 分支），
+    // 故这里只发 `typedef <host> Name;`，不展开字段。
+    if (base.node_sb((d as u64)) == "packed") {
+        var pidx: i64 = sema.pk_find_struct(base.node_sa((d as u64)));
+        if (pidx >= 0) {
+            hpush(base.sb_cat6("typedef ", scalar_to_c(sema.pk_struct_under[pidx]), " ", base.node_sa((d as u64)), ";", ""));
+            return;
+        }
+    }
 
     if (base.node_ba((d as u64)) && base.node_has_sc((d as u64))) {   // S4 §0.14.7 SoA：取代 `n.has_sc`
         var n_sc: string = base.node_sc((d as u64));   // S4 §0.14.7 SoA：侧表读（原 n.sc）

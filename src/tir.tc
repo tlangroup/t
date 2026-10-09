@@ -1345,6 +1345,9 @@ pub fn tir_add_std_types() void {
 
 // 字段 ST：尽力从字段类型节点解析（非标量退化为 i64；TT 可读性为主，顺序才关键）
 pub fn tir_field_st(structname: string, fieldname: string) string {
+    // P5：packed struct 的「字段」是宿主整型本身（单 host 字段，索引恒 0）。
+    var pk: i64 = sema.pk_find_struct(structname);
+    if (pk >= 0) { return sema.pk_host_st(sema.pk_struct_under[pk]); }
     var fh: i64 = sema.find_struct_fields(structname);
     if (fh < 0) { return "i64"; }
     var c: i64 = fh;
@@ -1384,6 +1387,8 @@ pub fn tir_field_td(structname: string, fieldname: string) i64 {
 }
 
 pub fn tir_field_index(structname: string, fieldname: string) i64 {
+    // P5：packed struct 的字段全部落在宿主整型（单 host 字段，索引恒 0）。
+    if (sema.pk_find_struct(structname) >= 0) { return 0; }
     var fh: i64 = sema.find_struct_fields(structname);
     if (fh < 0) { return 0; }
     var c: i64 = fh;
@@ -1444,6 +1449,17 @@ var g_ssz_depth: i64 = 0;          // 递归守卫（自引用结构体）
 pub var g_var_names: []string;     // 变体名（"Shape"），与 g_var_sizes 并行
 pub var g_var_sizes: []i64;        // 变体真实字节尺寸 = 8 + mx
 pub fn tir_add_struct_tt(name: string, field_head: i64) void {
+    // P5：packed struct → 单宿主整型（%Name = type { i32 }，即一个 host 字段的聚合）。
+    // 字段位域经 shift/mask 在成员访问点抽取（见 tir_member_read / tir_emit_assign），
+    // 故 TT 只登记一个 host 字段；g_ssz 也按单 host 字段计尺寸。
+    var pidx: i64 = sema.pk_find_struct(name);
+    if (pidx >= 0) {
+        var hostst: string = sema.pk_host_st(sema.pk_struct_under[pidx]);
+        append(g_mod.types, TIRType{ name: base.sb_cat2("%", name), body: hostst });
+        append(g_ssz_name, base.sb_cat2("%", name));
+        append(g_ssz_fields, [hostst]);
+        return;
+    }
     var sb: StringBuilder = sb_new();
     var fsts: []string = [];
     // T1 cut2：字段类型经 sema.struct_field_tds 单一解析源（与 C 后端 emit_ctype 同源到 resolve_type_desc）。
@@ -2865,6 +2881,60 @@ pub fn tir_emit_assign(sid: i64, est: i64) TirEmitRes {
                 return TirEmitRes{ name: rhs, st: est };
             }
         } else if (base.node_kind((base.node_na((sid as u64)) as u64)) == "member") {
+            // P5：packed struct 成员写 → 宿主整型 read-modify-write。
+            var pmnode: i64 = base.node_na((sid as u64));
+            var pmbase: string = tir_member_base_st(pmnode);
+            var mpk: i64 = sema.pk_find_struct(tir_strip_pct(pmbase));
+            if (mpk >= 0) {
+                var msl: i64 = sema.pk_find_slot(tir_strip_pct(pmbase), base.node_sa((pmnode as u64)));
+                if (msl >= 0) {
+                    var mstart: i64 = sema.pk_slot_starts[msl];
+                    var mlen: i64 = sema.pk_slot_lens[msl];
+                    var hostst: string = sema.pk_host_st(sema.pk_struct_under[mpk]);
+                    // 对象地址 = 宿主整型（packed 单 host 字段，field_index 恒 0 → GEP[0]）
+                    var pfaddr: string = tir_member_addr(pmnode);
+                    // load 宿主整型
+                    var pld: string = tir_tmp();
+                    tir_emit(TIRInst{ op: TIR_OP_LOAD, st: tir_st_from_str(hostst), dst: tir_op(pld), args: tir_a1(tir_os(pfaddr, tir_st_from_str(base.sb_cat3("ptr<", hostst, ">")))), is_comment: false, line: g_cur_line, cmt: "" });
+                    // 右值（cast 到 hostst 位宽）
+                    var pvr: TirEmitRes = tir_emit_expr(base.node_nb((sid as u64)));
+                    var pvname: string = pvr.name;
+                    var pvrst: string = tir_st_to_str(pvr.st);
+                    var pvbits: i64 = base.ll_bits(pvrst);
+                    var hostbits: i64 = base.ll_bits(hostst);
+                    if (pvbits > hostbits) {
+                        pvname = tir_tmp();
+                        tir_emit(TIRInst{ op: TIR_OP_TRUNC, st: tir_st_from_str(hostst), dst: tir_op(pvname), args: tir_a1(pvr.name), is_comment: false, line: g_cur_line, cmt: "" });
+                    } else if (pvbits < hostbits) {
+                        pvname = tir_tmp();
+                        tir_emit(TIRInst{ op: TIR_OP_ZEXT, st: tir_st_from_str(hostst), dst: tir_op(pvname), args: tir_a1(pvr.name), is_comment: false, line: g_cur_line, cmt: "" });
+                    }
+                    // shift left by start
+                    var pshl: string = tir_tmp();
+                    tir_emit(TIRInst{ op: TIR_OP_SHL, st: tir_st_from_str(hostst), dst: tir_op(pshl), args: tir_a2(pvname, base.i2s(mstart)), is_comment: false, line: g_cur_line, cmt: "" });
+                    // mask = (2^mlen - 1) << mstart（全宽字段用 all-ones）
+                    var pmv: i64; if (mlen < 64) { pmv = tir_pow2_i64(mlen) - 1; } else { pmv = -1; }
+                    var pmc: string = tir_tmp();
+                    tir_emit(TIRInst{ op: TIR_OP_CONST, st: tir_st_from_str(hostst), dst: tir_op(pmc), args: tir_a1(base.i2s(pmv)), is_comment: false, line: g_cur_line, cmt: "" });
+                    var psm: string = tir_tmp();
+                    tir_emit(TIRInst{ op: TIR_OP_SHL, st: tir_st_from_str(hostst), dst: tir_op(psm), args: tir_a2(pmc, base.i2s(mstart)), is_comment: false, line: g_cur_line, cmt: "" });
+                    // field bits = (val << start) & mask
+                    var pvand: string = tir_tmp();
+                    tir_emit(TIRInst{ op: TIR_OP_AND, st: tir_st_from_str(hostst), dst: tir_op(pvand), args: tir_a2(pshl, psm), is_comment: false, line: g_cur_line, cmt: "" });
+                    // ~mask = mask ^ allones
+                    var pall: string = tir_tmp();
+                    tir_emit(TIRInst{ op: TIR_OP_CONST, st: tir_st_from_str(hostst), dst: tir_op(pall), args: tir_a1("-1"), is_comment: false, line: g_cur_line, cmt: "" });
+                    var pnotm: string = tir_tmp();
+                    tir_emit(TIRInst{ op: TIR_OP_XOR, st: tir_st_from_str(hostst), dst: tir_op(pnotm), args: tir_a2(psm, pall), is_comment: false, line: g_cur_line, cmt: "" });
+                    // new = (old & ~mask) | field
+                    var pland: string = tir_tmp();
+                    tir_emit(TIRInst{ op: TIR_OP_AND, st: tir_st_from_str(hostst), dst: tir_op(pland), args: tir_a2(pld, pnotm), is_comment: false, line: g_cur_line, cmt: "" });
+                    var plor: string = tir_tmp();
+                    tir_emit(TIRInst{ op: TIR_OP_OR, st: tir_st_from_str(hostst), dst: tir_op(plor), args: tir_a2(pland, pvand), is_comment: false, line: g_cur_line, cmt: "" });
+                    tir_emit(TIRInst{ op: TIR_OP_STORE, st: ST_NONE, dst: tir_op(pfaddr), args: tir_a1(plor), is_comment: false, line: g_cur_line, cmt: "" });
+                    return TirEmitRes{ name: plor, st: est };
+                }
+            }
             var faddr: string = tir_member_addr(base.node_na((sid as u64)));
             if (faddr != "") {
                 tir_emit(TIRInst{ op: TIR_OP_STORE, st: ST_NONE, dst: tir_op(faddr), args: tir_a1(rhs), is_comment: false, line: g_cur_line, cmt: "" });
@@ -4420,6 +4490,52 @@ pub fn tir_emit_struct_lit(e: i64) TirEmitRes {
         append(fvalsts, fst);
         fc_ki = fc_ki + 1;
     }
+    // P5：packed struct 字面量 → 单宿主整型，字段按 (val << start) & mask 累积 OR。
+    var pslit: i64 = sema.pk_find_struct(base.node_sa((e as u64)));
+    if (pslit >= 0) {
+        var hostst: string = sema.pk_host_st(sema.pk_struct_under[pslit]);
+        var acc: string = tir_tmp();
+        tir_emit(TIRInst{ op: TIR_OP_CONST, st: tir_st_from_str(hostst), dst: tir_op(acc), args: tir_a1("0"), is_comment: false, line: g_cur_line, cmt: "" });
+        var pfi: i64 = 0;
+        while (pfi < slice_len(fnames) as i64) {
+            var psl: i64 = sema.pk_find_slot(base.node_sa((e as u64)), fnames[pfi]);
+            if (psl >= 0) {
+                var pstart: i64 = sema.pk_slot_starts[psl];
+                var plen: i64 = sema.pk_slot_lens[psl];
+                var pvname: string = fvals[pfi];
+                var pvbits: i64 = base.ll_bits(tir_st_to_str(fvalsts[pfi]));
+                var hostbits: i64 = base.ll_bits(hostst);
+                if (pvbits > hostbits) {
+                    pvname = tir_tmp();
+                    tir_emit(TIRInst{ op: TIR_OP_TRUNC, st: tir_st_from_str(hostst), dst: tir_op(pvname), args: tir_a1(fvals[pfi]), is_comment: false, line: g_cur_line, cmt: "" });
+                } else if (pvbits < hostbits) {
+                    pvname = tir_tmp();
+                    tir_emit(TIRInst{ op: TIR_OP_ZEXT, st: tir_st_from_str(hostst), dst: tir_op(pvname), args: tir_a1(fvals[pfi]), is_comment: false, line: g_cur_line, cmt: "" });
+                }
+                var pshl: string = tir_tmp();
+                tir_emit(TIRInst{ op: TIR_OP_SHL, st: tir_st_from_str(hostst), dst: tir_op(pshl), args: tir_a2(pvname, base.i2s(pstart)), is_comment: false, line: g_cur_line, cmt: "" });
+                var pmv: i64; if (plen < 64) { pmv = tir_pow2_i64(plen) - 1; } else { pmv = -1; }
+                var pmc: string = tir_tmp();
+                tir_emit(TIRInst{ op: TIR_OP_CONST, st: tir_st_from_str(hostst), dst: tir_op(pmc), args: tir_a1(base.i2s(pmv)), is_comment: false, line: g_cur_line, cmt: "" });
+                var psm: string = tir_tmp();
+                tir_emit(TIRInst{ op: TIR_OP_SHL, st: tir_st_from_str(hostst), dst: tir_op(psm), args: tir_a2(pmc, base.i2s(pstart)), is_comment: false, line: g_cur_line, cmt: "" });
+                var pvand: string = tir_tmp();
+                tir_emit(TIRInst{ op: TIR_OP_AND, st: tir_st_from_str(hostst), dst: tir_op(pvand), args: tir_a2(pshl, psm), is_comment: false, line: g_cur_line, cmt: "" });
+                var pnacc: string = tir_tmp();
+                tir_emit(TIRInst{ op: TIR_OP_OR, st: tir_st_from_str(hostst), dst: tir_op(pnacc), args: tir_a2(acc, pvand), is_comment: false, line: g_cur_line, cmt: "" });
+                acc = pnacc;
+            }
+            pfi = pfi + 1;
+        }
+        // 把 hostst 值裹成 %Name 聚合（单 host 字段）→ 与变量槽类型一致，供下游 STORE。
+        // ⚠ args 是 []TirOperand：tir_op_st 已返回单个 TirOperand，须直接 append 入切片，
+        // 不可套 tir_a1（tir_a1 入参是 string，套上会把 TirOperand 当 string 传 → IRV003 类型不符）。
+        var d: string = tir_tmp();
+        var __pk_args: []TirOperand = [];
+        append(__pk_args, tir_op_st(acc, tir_st_from_str(hostst)));
+        tir_emit(TIRInst{ op: TIR_OP_STRUCT_NEW, st: tir_st_from_str(target_st), dst: tir_op(d), args: __pk_args, is_comment: false, line: g_cur_line, cmt: "" });
+        return TirEmitRes{ name: d, st: tir_st_from_str(target_st) };
+    }
     var fh: i64 = -1;
     if (str_len(base.node_sa((e as u64))) > 0) { fh = sema.find_struct_fields(base.node_sa((e as u64))); }
     if (fh >= 0) {
@@ -4627,6 +4743,10 @@ pub fn tir_member_base_st(e: i64) string {
         var bst: string = tir_member_base_st(base.node_na((e as u64)));
         if (str_len(bst) > 0 && bst[0] == '%') {
             var sname: string = str_slice(bst, 1, str_len(bst));
+            // P5：packed struct 整体是单宿主整型聚合，成员访问不应退化为 hostst，
+            // 否则 tir_member_read 拿不到结构名、无法判定 packed 做 shift/mask，
+            // 且 GEP 物理字段类型与 %Name = type { hostst } 冲突。
+            if (sema.pk_find_struct(sname) >= 0) { return base.sb_cat2("%", sname); }
             return tir_field_st(sname, base.node_sa((e as u64)));
         }
         return "i64";
@@ -4669,7 +4789,14 @@ pub fn tir_member_addr(e: i64) string {
     var base_st: string = tir_member_base_st(base.node_na((e as u64)));   // 嵌套 member 权威基底类型（字符串路径，绕开 TD 越界回退 i64）
     g_membase_st = base_st;
     var addr: string = tir_tmp();
-    tir_emit(TIRInst{ op: TIR_OP_ADDR_OF, st: tir_st_from_str(base_st), dst: tir_op(addr), args: tir_a1(base_slot), is_comment: false, line: g_cur_line, cmt: "" });
+    // P5 修复（LLVM segfault 139 根因）：packed struct 宿主整型可能 < 8 字节（如 u32 host
+    // → %Perm = type { i32 }，4 字节），其 ADDR_OF 临时槽若按值类型(%Perm)分配会被 8 字节指针写穿
+    // → 栈破坏 → 运行时段错误。故仅对「packed 结构」把槽类型改指针宽度(ptr<%Perm> → 经 st_to_ll
+    // 映射成不透明 ptr，8 字节)；非 packed 结构(≥8 字节，编译器自身成员访问均属此类)保持原行为不变，
+    // 避免动到编译器自身的成员访问（否则会破坏自举链：g2 编译 g3 时原生段错误）。
+    var addr_st: string = base_st;
+    if (sema.pk_find_struct(tir_strip_pct(base_st)) >= 0) { addr_st = base.sb_cat3("ptr<", base_st, ">"); }
+    tir_emit(TIRInst{ op: TIR_OP_ADDR_OF, st: tir_st_from_str(addr_st), dst: tir_op(addr), args: tir_a1(base_slot), is_comment: false, line: g_cur_line, cmt: "" });
     var sname: string = tir_strip_pct(base_st);
     var fidx: i64 = tir_field_index(sname, base.node_sa((e as u64)));
     var fldst: string = tir_field_st(sname, base.node_sa((e as u64)));
@@ -4745,6 +4872,27 @@ pub fn tir_member_read(e: i64) TirEmitRes {
     var fldst: string = tir_field_st(sname, base.node_sa((e as u64)));
     var ld: string = tir_tmp();
     tir_emit(TIRInst{ op: TIR_OP_LOAD, st: tir_st_from_str(fldst), dst: tir_op(ld), args: tir_a1(tir_os(faddr, tir_st_from_str(base.sb_cat3("ptr<", fldst, ">")))), is_comment: false, line: g_cur_line, cmt: "" });
+    // P5：packed struct 字段值访问 → 宿主整型 shift/mask 抽取。
+    var pk: i64 = sema.pk_find_struct(sname);
+    if (pk >= 0) {
+        var sl: i64 = sema.pk_find_slot(sname, base.node_sa((e as u64)));
+        if (sl >= 0) {
+            var startv: i64 = sema.pk_slot_starts[sl];
+            var lenv: i64 = sema.pk_slot_lens[sl];
+            var hostst: string = sema.pk_host_st(sema.pk_struct_under[pk]);
+            // shr = ld >> start（lshr：无符号零填充右移，正合位域抽取）
+            var shr: string = tir_tmp();
+            tir_emit(TIRInst{ op: TIR_OP_LSHR, st: tir_st_from_str(hostst), dst: tir_op(shr), args: tir_a2(ld, base.i2s(startv)), is_comment: false, line: g_cur_line, cmt: "" });
+            // mask = (2^len - 1)（低 len 位）；shift 已把字段落到 bit0，故直接 & 不左移。
+            var mv: i64; if (lenv < 64) { mv = tir_pow2_i64(lenv) - 1; } else { mv = -1; }
+            var mc: string = tir_tmp();
+            tir_emit(TIRInst{ op: TIR_OP_CONST, st: tir_st_from_str(hostst), dst: tir_op(mc), args: tir_a1(base.i2s(mv)), is_comment: false, line: g_cur_line, cmt: "" });
+            // and
+            var ar: string = tir_tmp();
+            tir_emit(TIRInst{ op: TIR_OP_AND, st: tir_st_from_str(hostst), dst: tir_op(ar), args: tir_a2(shr, mc), is_comment: false, line: g_cur_line, cmt: "" });
+            return TirEmitRes{ name: ar, st: tir_st_from_str(hostst) };
+        }
+    }
     return TirEmitRes{ name: ld, st: tir_st_from_str(fldst) };
 }
 
