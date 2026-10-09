@@ -112,7 +112,7 @@ packed struct Perm {            // packed 为内置结构体修饰关键词（�
 | # | 议题 | 建议 |
 |---|---|---|
 | 1 | 旧属性清单 | 明确「区分 struct 类型」的属性全集：`@packed(N)`（位域）、`@bitpack(N)`（已存在，需参数）、`@soa`、… |
-| 2 | TI 层类型身份 | **已决（2026-10-09）：深层** —— TI `kind` 统一为 `Struct`，不再保留 `Flag`/`FlagSet`；类型身份完全由属性承载。布局计算、位域发射、`flag_set` 动态位域表示**全需重写**（代价大但语义最干净）。 |
+| 2 | TI 层类型身份 | **已决并已落地（2026-10-09，P3）** —— TI `kind` 统一为 `Struct`，不再保留 `Flag`/`FlagSet`；位域身份由属性 `und`（底层整型名，非空即为位域）承载，判别入口 `sema.tip_is_flag()`。实测**未产生全量 IR 漂移**（仅编译器自身 3 entry、0 NEW/0 GONE，348 用户 entry 逐字节不变），详见路线图 P3 段。 |
 | 3 | 位宽字段语法 | 见 §3 风险二 |
 | 4 | 属性互斥与组合 | `struct X @packed @soa {}` 冲突如何诊断？需显式规则 |
 | 5 | `@derive` 代码生成删除（保留注解 no-op） | `codegen_c.tc` 原 `process_derive`（4018–4290 行，8 个 trait 生成，原为**实装代码**非死代码）已删除；`g_ad_name` 仍含 `"derive"`，trait 名校验（`T_DERIVE_UNSUPPORTED`）保留。⚠ `sema.tc` 的 `mark_call_callees`（原误列于此）**非死代码**——它是 P3b struct 关联函数脱糖的成员 callee 标记，必须保留，已从本清单移除 |
@@ -134,7 +134,7 @@ packed struct Perm {            // packed 为内置结构体修饰关键词（�
 
 1. ✅ **位域能力保留**（2026-10-09）：`flag` 的位域打包价值由 `packed struct` 承载；**位宽字段语法裁定为字段类型 `u1`~`u65535`**（数字后缀即位数，如 `readable: u1`），无需 `@bits` 注解（见 §3 风险二）。
 2. ✅ **`flag_set` / `flag_get` 动态位域能力保留**（2026-10-09）：零存量也不删，内建作用于 `packed struct` 底层整数值。
-3. ✅ **TI 层深度统一**（2026-10-09）：`kind` 归 `Struct`，不再保留 `Flag`/`FlagSet`（见 §1 #2 / §4 第 2 点）。
+3. ✅ **TI 层深度统一**（2026-10-09，**P3 已完成**）：`kind` 归 `Struct`，不再保留 `Flag`/`FlagSet`（见 §1 #2 / §4 第 2 点）。身份属性 = `und`（底层整型名，非空即位域），判别入口 `sema.tip_is_flag()`。
 4. ✅ **`@derive` 8 个 trait 能力保留**（2026-10-09）：以更干净形式重建，非彻底废弃（旧 `process_derive` 已删，注解暂 no-op）。
 5. ✅ **先后次序（2026-10-09 裁定）：先收尾模块 path-access epic，再启动本积类型统一 epic。** path-access 主线（M1–M4 + M5 成员名校验）基本完成，收尾剩余项后切换主线。
 

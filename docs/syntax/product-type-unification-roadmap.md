@@ -25,14 +25,18 @@
 |---|---|---|---|---|---|
 | P1 | **语法层**：去 `flag` 关键字 + 识别 `packed` 修饰 | parser 不再吃 `flag` 声明；`struct` 前可加 `packed` 修饰；`flag` 关键字发 deprecated 诊断（保留过渡期） | **0** | — | 中 |
 | P2 | **位域字段语法落地**（字段类型 `u1`~`u65535`） | `packed struct` 字段类型为 `uN`（N=位宽，1..65535）即位域；sema 校验 N 合法、字段按 `uN` 宽度打包 | **0** | P1 | 低 |
-| P3 | **TI 深度统一**：`Flag`/`FlagSet` → `Struct` | `tip_kind()` 不再有 `Flag`/`FlagSet`；类型身份完全由属性承载 | ⚠ **全量** | P1/P2 | **高** |
+| P3 | **TI 深度统一**：`Flag`/`FlagSet` → `Struct` | `tip_kind()` 不再有 `Flag`/`FlagSet`；类型身份完全由属性承载 | ⚠ 见下（实测 **非全量**） | P1/P2 | **高** |
 | P4 | **Sema 位域布局** | `packed struct` 字段按 `@bits` 打包；`offset`/掩码计算 | 0 | P3 | 中 |
 | P5 | **双后端发射** | C + LLVM 发 packed 布局；`flag_set`/`flag_get` 内建改写 | ⚠（随 P3） | P4 | 高 |
 | P6 | **`@derive` 8 trait 重建** | 干净实现 8 个 trait（旧 `process_derive` 已删，注解暂 no-op） | ⚠ | P3 | 高 |
 | P7 | **存量迁移** | `examples/bitflags.tc` → `packed struct`；14 处 `@derive` 注解随 P6 能力重建 | 0 | P5/P6 | 低 |
 
-> ⚠ **P3 是唯一产生 IR 漂移的阶段**，必须放在所有零漂移步骤（P1/P2/P4/P7）之后——
-> 一旦漂移发生，IR 快照基线（`tests/ir_baseline.json`，354 entry）失去等价性判据，此后再改无法用 diff 证明「只改了该改的」。
+> ⚠ 原判「P3 是唯一产生**全量** IR 漂移的阶段」——**经实测证伪（2026-10-09）**。
+> 实际结果：IR 快照仅 `src/tc.tc` 自身 3 个 entry（c/h/ll）漂移，**0 NEW / 0 GONE**，
+> 348 个用户 entry **逐字节不变**。原因：TI kind 只是 sema 内部的派发标签，
+> 只要「按属性判别」与「按 kind 判别」在每处派发点上等价，后端发射就完全不变。
+> ⇒ **IR 快照的等价性判据在 P3 之后依然有效**，后续阶段仍可用 diff 证明「只改了该改的」。
+> （这与 P2 的「需扩展类型解析」同属路线图的高估预判，均以实测为准。）
 
 ---
 
@@ -55,9 +59,15 @@
   - 连带：`tests/conformance/fail/f89_lex_bad_num_suffix.tc` 原以 `1u1` 为非法样例，改为 `1i1`（仍非法）；新增 `f_awi_zero_bits.tc` 覆盖 `u0` / `u65536` 越界。
   - 真正的按位打包（`packed` 语义落地）在 **P4**，P2 只保证 `uN` 字段类型被接受。
 
-### P3 TI 深度统一
-- **交付物**：消除 `Flag`/`FlagSet` TI kind；`packed struct` 在 TI 层即 `Struct` + 属性（含位域布局描述）。所有按 `tip_kind()=="Flag"` 派发处（sema 布局、双后端发射、`flag_set`/`flag_get` 内建）改为按 `Struct`+属性派发。
-- **验证**：自举不动点 `g2.ll==g3.ll==g4.ll`；IR 基线仅 `src/tc.tc`/`src/tote.tc` 6 entry 漂移（合法），348 用户 entry 不变。
+### P3 TI 深度统一 — ✅ 已完成并推 main（2026-10-09）
+- **交付物**：消除 `Flag`/`FlagSet` TI kind；位域在 TI 层即 `Struct` + 属性（含底层整型）。所有按 `tip_kind()=="Flag"` 派发处改为按 `Struct`+属性派发。
+- **✅ 实施要点（2026-10-09）**：
+  - **身份属性 = `und`（底层整型名）**：新增 `tip_is_flag(ti)` = `kind=="Struct" && und != ""`。选 `und` 而非新增字段的理由：它本就是给 Enum/Flag 存底层整型的字段、**此前只写不读**（死数据），复用零成本且不牵动 `ti_mk` 与所有 TI 构造点；且 `ti_with_und("Struct",…)` 只产生于 flag 声明/类型位两处，不会与普通 struct 混淆。判别式必须连带 `kind=="Struct"`（Enum 也有 `und`，但语义是枚举常量不是位槽）。
+  - **改动面只有 `src/sema.tc`**：TI kind `Flag`/`FlagSet` 的消费点全在 sema（后端一律按 **AST node kind** `FlagDecl`/`FlagSetDecl` 派发，无需改）。4 处构造点（`resolve_ti` 的 flag/flag_set 类型位、`register_decl` 的 FlagDecl/FlagSetDecl）+ 5 处派发点（`is_user_named_kind`、成员访问、`int_to_fe` ×2、f-string `!j`、前导点 `.field`）。
+  - ⚠⭐ **成员访问必须把位域分支前移到通用 struct 字段分支之前**：统一后 `obk=="Struct"` 会命中位域，若让它走进「按字段名查 StructDecl 字段表」的路径，查不到就报 E208。原顺序靠 kind 不同天然隔开，统一后须显式隔开。
+  - ⚠ **保守守卫**：f-string `!j`（按字段展开成 JSON 对象）与前导点 `.field`（隐式 self 字段）两处须加 `tip_is_flag(...)==false` 排除，否则位域会进入 P3 前本不会进入的分支。
+  - `member_exists_in_type` 按 **AST node kind** 派发，P3 无需改。
+- **验证**：自举不动点 `g2.ll==g3.ll==g4.ll`（md5 `9b200480…`）；**IR 基线仅 `src/tc.tc` 3 entry（c/h/ll）漂移、0 NEW/0 GONE，348 用户 entry 逐字节不变**；conformance 344/0（含 `p04_flag_slots` 位域全语义、`f_flag_member_unknown` 仍报 E216）；`examples/bitflags.tc` LLVM 运行正确输出 `bitflags OK`；gate L2 25/0。
 
 ### P4 / P5 / P6 / P7
 - 顺序执行，每步 gate L2 + 不动点 + conformance 全绿；P6 重建 `@derive` 8 trait 时复用 `ann_validate` 的 trait 名校验（`T_DERIVE_UNSUPPORTED`）确保不退化。

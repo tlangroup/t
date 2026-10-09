@@ -46,12 +46,16 @@ pub var tdf_params: []i64;   // 参数类型 TD 索引扁平区
 
 // ── TypeInfo 扁平池（复刻 types.ts TypeInfo）──────────────────
 // kind: Scalar/Void/String/StringBuilder/Array/Slice/Map/Pointer/
-//       Optional/Struct/Enum/Flag/FlagSet/Union/Variant/Func/Named/Unknown
+//       Optional/Struct/Enum/Union/Variant/Func/Named/Unknown
+//
+// ⚠ P3（积类型统一 epic，2026-10-09）：`Flag` / `FlagSet` 两个 kind **已废除**，
+// 位域在 TI 层就是 `Struct`，身份由 `und`（底层整型名，非空 = 位域）承载 —— 见 `tip_is_flag`。
+// 不得再新增按 `kind == "Flag"` 派发的分支；判别一律走 `tip_is_flag()`。
 
 pub struct TI {
     kind: string;
-    name: string;   // Scalar/Struct/Enum/Flag/FlagSet/Union/Func/Named
-    und: string;    // Enum/Flag underlying
+    name: string;   // Scalar/Struct/Enum/Union/Func/Named
+    und: string;    // Enum underlying / 位域（flag）底层整型 —— 位域身份的判别属性
     bw: i64;        // Scalar bitWidth
     elem: i64;      // Array/Slice/Pointer/Optional 子类型（TI 索引）
     key: i64;       // Map key
@@ -561,6 +565,34 @@ pub fn tip_name(i: i64) string {
     return t.name;
 }
 
+pub fn tip_und(i: i64) string {
+    var t: TI = tis[i];
+    return t.und;
+}
+
+// ══════════════════════════════════════════════════════════════════
+// 位域（flag）类型身份判别 —— 积类型统一 epic P3
+//
+// TI 层已不再有 `Flag` / `FlagSet` 两个 kind：所有积类型统一为 `Struct`，
+// 位域身份改由**属性**承载 —— `und`（底层整型名）非空即表示「该 struct 是
+// 以整数为底层存储的位域」。
+//
+// 为什么用 `und` 而不是新增字段：
+//   · `und` 原本就是给 Enum/Flag 存底层整型的字段，语义天然契合；
+//   · 它此前是**只写不读**的死数据，复用它零成本、不新增 TI 字段（不必
+//     改动 ti_mk 与所有 TI 构造点）；
+//   · `ti_with_und("Struct", ...)` 只在本文件的 flag 声明/类型位两处产生，
+//     不会与普通 struct 混淆 —— 普通 struct 一律走 `ti_named`，`und` 恒空。
+//
+// ⚠ 判别式必须连带 `kind == "Struct"`：Enum 也有 `und`，但它是 Enum 语义
+// （成员是枚举常量而非位槽），不能混为一谈。
+// ══════════════════════════════════════════════════════════════════
+pub fn tip_is_flag(i: i64) bool {
+    if (i < 0) { return false; }
+    var t: TI = tis[i];
+    return t.kind == "Struct" && t.und != "";
+}
+
 // 条件位置（if / while / for 的条件，match 的 `when` 守卫）只接受 bool。
 // Unknown 一律放行：该表达式多半已有诊断，再报一次只会级联噪声。
 //
@@ -597,11 +629,13 @@ pub fn is_float_ti(i: i64) bool {
 
 // typesEqual（递归）
 // 用户具名类型（struct / enum / flag / union / variant）的已解析种类
+// P3：`Flag` / `FlagSet` 已并入 `Struct`，故列表里不再出现这两个 kind ——
+// 位域（FlagDecl）与 flag_set（FlagSetDecl）都产出 `Struct`，由本谓词覆盖。
 pub fn is_user_named_kind(k: string) bool {
-    if (k == "Struct" || k == "Enum" || k == "Flag") {
+    if (k == "Struct" || k == "Enum") {
         return true;
     }
-    return k == "FlagSet" || k == "Union" || k == "Variant";
+    return k == "Union" || k == "Variant";
 }
 
 pub fn ti_equal(ai: i64, bi: i64) bool {
@@ -1469,11 +1503,12 @@ pub fn resolve_ti(tn: i64) i64 {
     if (base.node_kind((tn as u64)) == "variant") {
         return ti_mk("Variant");
     }
+    // P3：位域在 TI 层即 `Struct`，底层整型落在 `und`（`tip_is_flag` 的判别依据）。
     if (base.node_kind((tn as u64)) == "flag") {
-        return ti_with_und("Flag", "<anonymous>", base.node_sa((tn as u64)));
+        return ti_with_und("Struct", "<anonymous>", base.node_sa((tn as u64)));
     }
     if (base.node_kind((tn as u64)) == "flag_set") {
-        return ti_named("FlagSet", "<anonymous>");
+        return ti_named("Struct", "<anonymous>");
     }
     if (base.node_kind((tn as u64)) == "pointer") {
         return ti_elem_of("Pointer", resolve_ti(base.node_na((tn as u64))));
@@ -2300,12 +2335,14 @@ pub fn register_decl(d: i64) void {
         sym_define(global_scope, base.node_sa((d as u64)), "type", ti_with_und("Enum", base.node_sa((d as u64)), base.node_sb((d as u64))), d);
         return;
     }
+    // P3（积类型统一 epic）：位域在 TI 层即 `Struct`，底层整型落在 `und`。
+    // （本块的生成器 tools/totter.tc 已随模块重拆分移除，现为手维护冻结区。）
     if (base.node_kind((d as u64)) == "FlagDecl") {
-        sym_define(global_scope, base.node_sa((d as u64)), "type", ti_with_und("Flag", base.node_sa((d as u64)), base.node_sb((d as u64))), d);
+        sym_define(global_scope, base.node_sa((d as u64)), "type", ti_with_und("Struct", base.node_sa((d as u64)), base.node_sb((d as u64))), d);
         return;
     }
     if (base.node_kind((d as u64)) == "FlagSetDecl") {
-        sym_define(global_scope, base.node_sa((d as u64)), "type", ti_named("FlagSet", base.node_sa((d as u64))), d);
+        sym_define(global_scope, base.node_sa((d as u64)), "type", ti_named("Struct", base.node_sa((d as u64))), d);
         return;
     }
     if (base.node_kind((d as u64)) == "UnionDecl") {
@@ -3714,7 +3751,9 @@ pub fn fmt_gen_json(head: i64, tail: i64, val: i64, ti: i64) i64 {
         return fmt_push_stmt(head, tail,
             fmt_jstmt3(fmt_append_fn(kind), base.mk_ident("__fb", -1), base.mk_string("", -1), val));
     }
-    if (k == "Struct") {
+    // P3：位域 TI kind 已归 `Struct`，但 f-string `!j` 对位域走的是标量/整型输出，
+    // 不是「按字段展开成 JSON 对象」。显式排除以保持与 P3 前（kind=="Flag"）逐位一致。
+    if (k == "Struct" && tip_is_flag(ti) == false) {
         tail = fmt_push_stmt(head, tail, fmt_jstmt2("sb_append_str", base.mk_ident("__fb", -1), base.mk_string("{", -1)));
         var m: i64 = g_fmt_jsym; g_fmt_jsym = g_fmt_jsym + 1;
         var ff: string = base.sb_cat2("__ff", base.i2s(m));
@@ -7721,7 +7760,9 @@ pub fn infer_expr_body(e: i64) i64 {
             if (si_self >= 0) {
                 var sti: i64 = syms[si_self].ti;
                 var stk: string = tip_kind(sti);
-                if (stk == "Struct" || stk == "Named") {
+                // P3：同上，位域（`tip_is_flag`）此前 kind 不是 Struct，不进本分支；
+                // 统一后须显式排除，否则 `.readable` 前导点会被当成结构体字段解析。
+                if ((stk == "Struct" || stk == "Named") && tip_is_flag(sti) == false) {
                     var ft: i64 = struct_field_ti(tip_name(sti), msa);
                     if (ft >= 0) {
                         var self_id: i64 = base.mk_ident("self", -1);
@@ -7793,6 +7834,22 @@ pub fn infer_expr_body(e: i64) i64 {
         }
         var obt: i64 = ie_sub(ei, 0, base.node_na((e as u64)));
         var obk: string = tip_kind(obt);
+        // ── 位域（flag）槽位常量 ──────────────────────────────────
+        // P3：位域的 TI kind 已是 `Struct`，但其语义仍是「`PF.encrypted` 取该槽的掩码、
+        // 类型即位域本身」，**不是**结构体字段读。故必须**先于**下方通用 struct 字段
+        // 分支派发 —— 顺序颠倒会让位域走进「按字段名查 StructDecl 字段表」的路径，
+        // 查不到就报 E208（此前 kind 不同、天然不会误入，统一后必须显式隔开）。
+        if (tip_is_flag(obt)) {
+            // M5 / P1：补槽位名存在性校验（此前不存在的槽位名也照样通过检查）。
+            if (base.node_bd((e as u64)) == false) {
+                if (member_exists_in_type(obt, base.node_sa((e as u64))) == false) {
+                    parse.fc_err("T-SEM-E216",
+                        base.sb_cat4("位域 `", tip_name(obt), "` 没有槽位 `",
+                            base.sb_cat2(base.node_sa((e as u64)), "`：请检查拼写")), e);
+                }
+            }
+            return obt;
+        }
         if (obk == "Struct" || obk == "Named") {
             var si3: i64 = sym_lookup(global_scope, tip_name(obt));
             if (si3 >= 0) {
@@ -7853,21 +7910,10 @@ pub fn infer_expr_body(e: i64) i64 {
             }
             return obt;
         }
-        // Flag 槽位常量：`PF.encrypted` 取值为该槽的掩码，类型即 flag 本身
-        // （1bit 布尔位允许直接位运算，见 reference §6）。此前落到 Unknown ⇒
-        // 两个后端都把它当左值取地址，LLVM 发 `load i64, ptr null`、C 发非法的
-        // `PF.encrypted` —— 静默错编，与 Enum 同批治理。
-        if (obk == "Flag") {
-            // M5 / P1：同上，补槽位名存在性校验（此前不存在的槽位名也照样通过检查）。
-            if (base.node_bd((e as u64)) == false) {
-                if (member_exists_in_type(obt, base.node_sa((e as u64))) == false) {
-                    parse.fc_err("T-SEM-E216",
-                        base.sb_cat4("位域 `", tip_name(obt), "` 没有槽位 `",
-                            base.sb_cat2(base.node_sa((e as u64)), "`：请检查拼写")), e);
-                }
-            }
-            return obt;
-        }
+        // （位域分支已上移到 struct 分支之前 —— 见上方 `tip_is_flag` 处注释。
+        //  历史说明：`PF.encrypted` 此前落到 Unknown ⇒ 两个后端都把它当左值取地址，
+        //  LLVM 发 `load i64, ptr null`、C 发非法的 `PF.encrypted` —— 静默错编，
+        //  与 Enum 同批治理。）
         if (obk == "Variant") {
             // M5 / P1：Variant 成员访问（如 `Shape.Circle`）此前无任何成员名校验。
             // ⚠ 与 Enum/Flag 两分支不同：此处**不加 bd（callee）豁免**。
@@ -8377,7 +8423,8 @@ pub fn cs_var_decl(s: i64, init_i: i64) void {
         intlit_overflow_warn(base.node_nb((s as u64)), vt);
         if (tip_kind(it) != "Unknown" && ti_equal(it, vt) == false) {
             var vk: string = tip_kind(vt);
-            var int_to_fe: bool = (vk == "Flag" || vk == "Enum") && is_int_ti(it);
+            // P3：位域 TI kind 已归 `Struct`，按 `tip_is_flag`（und 非空）判别。
+            var int_to_fe: bool = (tip_is_flag(vt) || vk == "Enum") && is_int_ti(it);
             var str_to_sym: bool = vk == "Sym" && tip_kind(it) == "String";
             if (int_to_fe == false && str_to_sym == false && can_cast(it, vt) == false) {
                 err_type_mismatch(base.node_nb((s as u64)), vt, it);
@@ -8701,7 +8748,8 @@ pub fn check_stmt_cst(s: i64) void {
             intlit_overflow_warn(base.node_nb((s as u64)), vt);
             if (tip_kind(it) != "Unknown" && ti_equal(it, vt) == false) {
                 var vk: string = tip_kind(vt);
-                var int_to_fe: bool = (vk == "Flag" || vk == "Enum") && is_int_ti(it);
+                // P3：同上，位域按 `tip_is_flag` 判别（见 8422 处注释）。
+                var int_to_fe: bool = (tip_is_flag(vt) || vk == "Enum") && is_int_ti(it);
                 // Sym 字段允许由字符串赋值（自动 intern → id）
                 var str_to_sym: bool = vk == "Sym" && tip_kind(it) == "String";
                 if (int_to_fe == false && str_to_sym == false && can_cast(it, vt) == false) {
