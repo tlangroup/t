@@ -4880,33 +4880,6 @@ pub fn tir_pow2_i64(n: i64) i64 {
     return r;
 }
 
-// flag 槽位掩码：flag F { slot: len; ... } 中 slot 的掩码 = (2^len - 1) << start。
-// 显式 offset 用 sl.bb/sl.ib，否则沿 auto_off 顺序累加（与 sema.fr_resolve_flag 一致）。
-pub fn tir_flag_mask_lookup(fname: string, sname: string) i64 {
-    var si: i64 = sema.sym_lookup(sema.global_scope, fname);
-    if (si < 0) { return -1; }
-    var decl: i64 = sema.syms[si].decl;
-    if (decl < 0) { return -1; }
-    if (base.node_kind((decl as u64)) != "FlagDecl") { return -1; }
-    var auto_off: i64 = 0;
-    var c: i64 = base.node_lb((decl as u64));
-    // S4 §4.6 Phase 3：链先物化再遍历 —— 纯读取循环，与原手写链遍历逐点同序
-    var c_ks: []i64 = base.kids_chain(c);
-    var c_ki: i64 = 0;
-    while (c_ki < slice_len(c_ks) as i64) {
-        var c_kv: i64 = c_ks[c_ki];
-        var start: i64 = auto_off;
-        if (base.node_bb((c_kv as u64))) { start = base.node_ib((c_kv as u64)); }   // S4 §0.14.7 SoA：侧表读（原 sl.bb / sl.ib）
-        var len: i64 = base.node_ia((c_kv as u64));
-        if (base.node_sa((c_kv as u64)) == sname) {
-            return (tir_pow2_i64(len) - 1) * tir_pow2_i64(start);
-        }
-        auto_off = start + len;
-        c_ki = c_ki + 1;
-    }
-    return -1;
-}
-
 pub fn tir_member_read(e: i64) TirEmitRes {
     // 枚举用例常量：Color.Red → const.i64 <val>（枚举被擦除为整数，用例值即编译期整型）。
     // 此前误走结构体字段路径（addr_of @Color + gep + load），把类型名当值，生成非法 `store ptr Color`。
@@ -4918,15 +4891,6 @@ pub fn tir_member_read(e: i64) TirEmitRes {
             var d: string = tir_tmp();
             tir_emit(TIRInst{ op: TIR_OP_CONST, st: tir_st_from_str("i64"), dst: tir_op(d), args: tir_a1(base.i2s(cval)), is_comment: false, line: g_cur_line, cmt: "" });
             return TirEmitRes{ name: d, st: tir_st_from_str(tir_expr_st(e)) };
-        }
-        // flag 槽位常量：Perm.readable → const.i64 <mask>（与 emit-ll flag_get 同一公式）。
-        // 此前未处理此分支，误走结构体字段路径（addr_of @Perm + gep + load），把类型名当值、
-        // 且从不声明 @Perm 全局，导致 emit-tir-ll 生成非法 `store ptr @Perm`（@Perm 未定义）。
-        var fmask: i64 = tir_flag_mask_lookup(base.node_sa((base.node_na((e as u64)) as u64)), base.node_sa((e as u64)));
-        if (fmask >= 0) {
-            var d2: string = tir_tmp();
-            tir_emit(TIRInst{ op: TIR_OP_CONST, st: tir_st_from_str("i64"), dst: tir_op(d2), args: tir_a1(base.i2s(fmask)), is_comment: false, line: g_cur_line, cmt: "" });
-            return TirEmitRes{ name: d2, st: tir_st_from_str(tir_expr_st(e)) };
         }
     }
     var faddr: string = tir_member_addr(e);
