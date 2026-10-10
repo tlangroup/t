@@ -14,7 +14,8 @@
 - `comptime Block`：`ComptimeStatement` 为 **partial**（节点已定义，表达式级语义 spec-only）。
 - `comptime fn`：函数级 `isComptime` 标记已接入（`parser.tc` / `checker.tc`）。
 - `type_info(T)` + `ti_*`/`fi_*`：编译期类型自省（**已实装** ✅）。
-- 缺少：`@compile_log` / `@compile_error` / 类型相等判定 / 编译期字符串构造 / 值型编译期参数 / 表达式级 `meta expr`。
+- 缺少：编译期字符串构造 / 值型编译期参数 / 表达式级 `meta expr`。
+- 已补（2026-10-11）：`@compile_log` / `@compile_error` / 类型相等判定 `@type_equal`；并新增 `@compile_warning`（不定长，发 `T-MTA-W621` 诊断）——**注意**：本文 §5 表内原写作 `@compile_warn`，实现按用户口径取名 **`compile_warning`**；`print` 系列已裁定为运行期函数，编译期输出一律用 `@compile_log`。
 
 用户希望新增元编程关键字 `meta`，并给出用例 `examples/meta.tc`（原稿为 Zig 风格语法，几乎全部不符合 `t` 文法）。本设计在**不破坏现有门禁**的前提下，定义 `meta` 的完整语义，并将 `comptime` 收敛为 `meta` 的弃用别名。
 

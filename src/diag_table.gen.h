@@ -105,6 +105,7 @@ static const DiagDef DIAG_DEFS[] = {
   { "T-MTA-E618", "error", "MTA", "T_META_NOT_META_FN", "NOT_META_FN", "target is not a meta function" },
   { "T-MTA-E619", "error", "MTA", "T_META_NOT_TYPE", "NOT_TYPE", "expected a type" },
   { "T-MTA-E620", "error", "MTA", "T_META_READ_RUNTIME", "READ_RUNTIME", "read of runtime value in meta" },
+  { "T-MTA-W621", "warning", "MTA", "T_META_COMPILE_WARNING", "COMPILE_WARNING", "compile-time warning" },
   { "T-NAM-E405", "error", "NAM", "", "DUP_TOP_DEF", "duplicate top-level definition in this module" },
   { "T-NAM-W400", "warning", "NAM", "T_NAME_TYPE_CAMEL", "TYPE_CAMEL", "type name should be PascalCase" },
   { "T-NAM-W401", "warning", "NAM", "T_NAME_VAR_SNAKE", "VAR_SNAKE", "variable name should be snake_case" },
@@ -176,7 +177,7 @@ static const DiagDef DIAG_DEFS[] = {
   { "T-VEC-W927", "warning", "VEC", "T_VECTOR_WIDER_THAN_NATIVE", "VECTOR_WIDER_THAN_NATIVE", "vector is wider than the native SIMD register and will be split" },
   { "T-VEC-W947", "warning", "VEC", "T_TILE_WIDER_THAN_NATIVE", "TILE_WIDER_THAN_NATIVE", "hardware tile is wider than the native SIMD register and will fall back to scalar loops" },
 };
-#define DIAG_COUNT 163
+#define DIAG_COUNT 164
 
 /* legacy (old semantic name) -> machine code alias table */
 static const struct { const char* legacy; const char* code; } DIAG_LEGACY[] = {
@@ -262,6 +263,7 @@ static const struct { const char* legacy; const char* code; } DIAG_LEGACY[] = {
   { "T_META_NOT_META_FN", "T-MTA-E618" },
   { "T_META_NOT_TYPE", "T-MTA-E619" },
   { "T_META_READ_RUNTIME", "T-MTA-E620" },
+  { "T_META_COMPILE_WARNING", "T-MTA-W621" },
   { "T_NAME_TYPE_CAMEL", "T-NAM-W400" },
   { "T_NAME_VAR_SNAKE", "T-NAM-W401" },
   { "T_NAME_CONST_UPPER", "T-NAM-W402" },
@@ -330,7 +332,7 @@ static const struct { const char* legacy; const char* code; } DIAG_LEGACY[] = {
   { "T_VECTOR_WIDER_THAN_NATIVE", "T-VEC-W927" },
   { "T_TILE_WIDER_THAN_NATIVE", "T-VEC-W947" },
 };
-#define DIAG_LEGACY_COUNT 149
+#define DIAG_LEGACY_COUNT 150
 
 const DiagDef* diag_find(const char* code);        /* exact machine-code lookup */
 const DiagDef* diag_find_any(const char* id);      /* machine code OR legacy name */

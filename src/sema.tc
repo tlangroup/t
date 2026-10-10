@@ -11582,6 +11582,20 @@ pub fn gen_tparam_has(name: string) bool {
 pub fn mv_int(v: i64) i64 { return base__mk_int(base__i2s(v), 10, -1); }
 pub fn mv_bool(b: bool) i64 { return base__mk_bool(b, -1); }
 
+// 编译期值 → 显示字符串（`@compile_log` / `@compile_warning` 拼消息用）。
+// 对齐 docs/compiler/meta_design.md §2.2 的用法 `@compile_log("meta k = ", k)`
+// （该内建本身列于同文件 §5）：实参可以是任意**标量**编译期值
+// （string / int / float / bool），非标量由调用方报 T-MTA-E601。
+pub fn mv_to_str(v: i64) string {
+    var k: string = base.node_kind((v as u64));
+    if (k == "string" || k == "int" || k == "float") { return base.node_sa((v as u64)); }
+    if (k == "bool") {
+        if (base.node_ba((v as u64))) { return "true"; }
+        return "false";
+    }
+    return "";
+}
+
 // 字面量节点 → i64（bool 视作 0/1）
 pub fn mv_get_int(id: i64) i64 {
     if (base.node_kind((id as u64)) == "bool") {
@@ -12476,7 +12490,9 @@ pub fn meta_eval_builtin(e: i64, name: string) i64 {
     // 数学内建：编译期折叠（常数实参 → 字面量）
     if (math_mbuiltin(name)) { return meta_eval_math(e, name); }
     var isb: bool = false;
-    if (name == "print" || name == "eprint") { isb = true; }
+    // ⚠ print / eprint / println **不是**编译期内建（用户裁定：print 系列为运行期函数）。
+    // 故此处不再登记；编译期上下文里出现它们会落到下面的 impure / -2 分支而报错，
+    // 编译期输出请改用 `@compile_log(...)`。
     if (name == "int_to_str" || name == "i2s") { isb = true; }
     if (name == "str_len" || name == "str_at") { isb = true; }
     if (name == "sym_intern") { isb = true; }
@@ -12507,17 +12523,6 @@ pub fn meta_eval_builtin(e: i64, name: string) i64 {
             return meta_fail("T-MTA-E611", "编译期 `sym_intern` 需要 2 个实参（缓冲区, 长度）", e);
         }
         return meta_bytes_to_str(e, argv[0], argv[1]);
-    }
-    if (name == "print" || name == "eprint") {
-        if (an != 1) {
-            return meta_fail("T-MTA-E611", base__sb_cat3("编译期 `", name, "` 需要 1 个实参"), e);
-        }
-        if (base.node_kind((argv[0] as u64)) != "string") {
-            return meta_fail("T-MTA-E617",
-                base__sb_cat3("编译期 `", name, "` 的实参须是字符串字面量"), e);
-        }
-        eprint(base.node_sa((argv[0] as u64)));
-        return mv_int(0);
     }
     if (name == "int_to_str" || name == "i2s") {
         if (an != 1) {
@@ -13366,6 +13371,8 @@ pub fn mb_is_type_query(name: string) bool {
 // 漏到 check ⇒ 运行期上下文误用 ⇒ T_META_RUNTIME_CTX。
 pub fn mb_is_ctfe_only(name: string) bool {
     if (name == "str_from_bytes") { return true; }
+    // 编译期诊断/日志内建：只能在 CTFE 求值，漏到运行期 ⇒ T-MTA-E605
+    if (name == "compile_log" || name == "compile_warning") { return true; }
     return false;
 }
 
@@ -13373,9 +13380,31 @@ pub fn mb_is_known(name: string) bool {
     if (mb_is_type_query(name)) { return true; }
     if (mb_is_ctfe_only(name)) { return true; }
     if (name == "compile_error" || name == "zeroed") { return true; }
+    if (name == "compile_log" || name == "compile_warning") { return true; }
     if (name == "type_val") { return true; }   // P4：类型即值 —— 把类型名字符串还原为类型节点
     if (name == "type_of") { return true; }    // P4：值→类型查询
     return false;
+}
+
+// ══════════════════════════════════════════════════════════════
+// D4：内建签名注册表 —— 每个 `@`-内建的「首类声明」元数据
+// （最少/最多实参个数 + 是否不定长）。D3 的 rest 语义以 `mb_variadic` 为真
+// 的内建为消费方：末位（此处即全部位置）吸收余参，绑为编译期聚合后逐个求值。
+// 返回 -1 表示「不限上界」。
+// ══════════════════════════════════════════════════════════════
+pub fn mb_variadic(name: string) bool {
+    if (name == "compile_log" || name == "compile_warning") { return true; }
+    return false;
+}
+
+pub fn mb_arity_min(name: string) i64 {
+    if (mb_variadic(name)) { return 1; }
+    return -1;   // -1 = 未登记（沿用各分支自带的精确元数检查）
+}
+
+pub fn mb_arity_max(name: string) i64 {
+    if (mb_variadic(name)) { return -1; }   // -1 = 不定长（无上界）
+    return -1;
 }
 
 
@@ -13935,6 +13964,56 @@ pub fn meta_eval_mbuiltin(e: i64) i64 {
         var r: i64 = base.node_new("typeinfo");
         base.node_set_sa(r, meta_type_to_str(tnode));
         return r;
+    }
+    // 不定长元函数（D3 首个真实消费方）：逐个求值实参并拼成一条消息。
+    // 当前不定长集合 = { compile_log, compile_warning }（见 mb_variadic）：
+    //   compile_log    → 写 stderr
+    //   compile_warning → 发 T-MTA-W621 告警诊断
+    // ⚠ 新增不定长内建时**必须在此显式分流**：下面的 else 分支是按「非 log 即 warning」
+    //    处理的，直接加进 mb_variadic 而不分流会被误当成 warning 发射。
+    // 二者均为编译期副作用内建，返回 unit（静态类型 Void，见 infer_expr）。
+    if (mb_variadic(base.node_sa((e as u64)))) {
+        var cname: string = base.node_sa((e as u64));
+        var msg: string = "";
+        var ncnt: i64 = 0;
+        var cc: i64 = -1;
+        var mq_ks13046: []i64 = base.kids_chain_idx(base.node_la((e as u64)));
+        var mq_ki13046: i64 = 0;
+        while (mq_ki13046 < slice_len(mq_ks13046) as i64) {
+            cc = mq_ks13046[mq_ki13046];
+            var cv: i64 = meta_eval(base__kids[cc].val);
+            if (cv < 0) { return -1; }
+            var ckind: string = base.node_kind((cv as u64));
+            if (ckind != "string" && ckind != "int" && ckind != "bool" && ckind != "float") {
+                return meta_fail("T-MTA-E601",
+                    base.sb_cat5("`@", cname, "` 第 ", base.i2s(ncnt + 1),
+                        " 个实参须求值为标量（string / int / bool / float）"), e);
+            }
+            msg = msg + mv_to_str(cv);
+            ncnt = ncnt + 1;
+            mq_ki13046 = mq_ki13046 + 1;
+            cc = -1;
+        }
+        // 元数检查走签名注册表（D4）：下界由 mb_arity_min 给出，上界 -1 = 不定长。
+        var amin: i64 = mb_arity_min(cname);
+        var amax: i64 = mb_arity_max(cname);
+        if (ncnt < amin) {
+            return meta_fail("T-MTA-E611",
+                base.sb_cat5("`@", cname, "` 至少需要 ", base.i2s(amin), " 个实参"), e);
+        }
+        if (amax >= 0 && ncnt > amax) {
+            return meta_fail("T-MTA-E611",
+                base.sb_cat5("`@", cname, "` 最多接受 ", base.i2s(amax), " 个实参"), e);
+        }
+        if (cname == "compile_log") {
+            eprint(msg);
+        } else {
+            var wl: i64 = parse.n_line(e);
+            var wc: i64 = parse.n_col(e);
+            base.diag_new("T-MTA-W621", "warning", msg,
+                parse.n_file(e), wl, wc, wl, wc + 4);
+        }
+        return mv_int(0);
     }
     return meta_fail("T-MTA-E607",
         base__sb_cat3("未知的编译期内建 `@", base.node_sa((e as u64)), "`"), e);
