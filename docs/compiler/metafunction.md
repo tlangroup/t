@@ -159,10 +159,17 @@ const s = comptime type_of(some_value)   // 运行普通 type_of，但在编译�
 
 > ⚠ 当前实现：元函数调用仍强制**精确元数**（`na1 != np1` → `T-MTA-E611`，`ARITY`）。
 >
-> ⚠ **落地前置依赖（2026-10-10 实证）**：rest 形参需要一个**声明位置**来挂 `...` 标记，但当前两处都**不存在**——
-> ① 元函数按 v3 只能是编译器内建，**没有 t 层声明语法**（内建由 `meta_eval_mbuiltin` 按名分发，全仓无内建签名/元数注册表，仅设备内建有 `dev_builtin_arity` 特例）；
+> ⚠ **落地前置依赖（2026-10-10 实证，2026-10-11 更新）**：rest 形参需要一个**声明位置**来挂 `...` 标记，但当前两处都**不存在**——
+> ① 元函数按 v3 只能是编译器内建，**没有 t 层声明语法**（内建由 `meta_eval_mbuiltin` 按名分发）；
 > ② **用户 `fn` 也不支持 `...` 变长形参**（parse/sema 无 rest 机制）。
 > ⇒ **D3 依赖 D4**：必须先有「内建的首类声明 + 形参表」（D4），rest 才有可标记的形参表。§11 原顺序「先 D3 后 D4」**颠倒**，应为 **D4 → D3**。
+
+> ✅ **内建签名注册表已建立（2026-10-11，D4 部分落地 + D3 内建侧落地）**：
+> `src/sema.tc` 新增 `mb_variadic(name)` / `mb_arity_min(name)` / `mb_arity_max(name)`（`mb_arity_max = -1` 表示无上界），
+> 构成内建的**首类签名元数据**（此前全仓仅设备内建有 `dev_builtin_arity` 特例）。
+> 首个真实消费方是不定长内建 `@compile_log(args...)` / `@compile_warning(args...)`：
+> 最少 1 个实参、无上界，末位（即全部位置）吸收余参，逐个 `meta_eval` 求值后拼接成一条消息。
+> ② 仍成立 —— **用户 `fn` 的 `...` rest 形参仍未支持**，故 D3 目前只落地「内建侧」。
 
 - **声明**（以内建形态示意）：末位形参带 rest 标记，收集调用点剩余实参：
 
@@ -194,8 +201,10 @@ const s = comptime type_of(some_value)   // 运行普通 type_of，但在编译�
 | `@zeroed(T)` | 编译期构造 | 零初始化定长数组值 → `[N]T` | ✅ 折叠（array_lit） |
 | `@str_from_bytes(buf, len)` | CTFE-only | 由字节构造 `string` | ❌ 仅编译期（`T_META_RUNTIME_CTX`） |
 | `@compile_error(msg)` | CTFE-only | 编译期硬错误，终止编译（noreturn） | ❌ 仅编译期 |
+| `@compile_log(args...)` | CTFE-only · **不定长** | 编译期写 **stderr**（stdout 留给 JSON/IR）；≥1 个标量实参（string/int/bool/float）依次拼接；返回 unit | ❌ 仅编译期（`T-MTA-E605`） |
+| `@compile_warning(args...)` | CTFE-only · **不定长** | 同上拼接，但以**诊断**形式发出 `T-MTA-W621` 告警（携带行列）；返回 unit | ❌ 仅编译期（`T-MTA-E605`） |
 | `@sin` / `@sinf` / … | 数学 | 常数实参折叠为字面量；运行期回落 libm/fdlibm | ✅ 常数实参折叠 |
-| `print` / `eprint` | CTFE 日志 | 编译期写 **stderr**（stdout 留给 JSON/IR） | —（仅编译期副作用） |
+| `print` / `eprint` / `println` | **运行期函数** | 写 stdout / stderr | —（**不可**在编译期上下文调用；`comptime { print(...) }` 报 `T-MTA-E617 未定义的编译期函数`，改用 `@compile_log`） |
 | `int_to_str` / `i2s` / `str_len` / `str_at` | CTFE 纯查询 | 字符串处理 | —（仅编译期） |
 | `sym_intern(buf, len)` | CTFE 符号构造 | 由字节驻留 `Sym` | —（仅编译期） |
 | `@module(attr, ...)` | **模块系统内建** | **设置当前模块的可见性**（`pub` / `internal`）；返回 unit | —（编译期副作用） |
@@ -290,10 +299,10 @@ v3 厘清两个经常被混为一谈的概念：
 - **D2 — `@module` / `@import` 名分统一（`✅ 机制已落地，2026-10-10 核实关闭`）**：原描述称二者「仍是文件级声明指令、未重分类」。**实证**：表达式位 `@import("M")` 已返回模块对象（`parse.tc:4484` 直接产 `import_expr`；`const m=@import("M")` 绑定模块值；`m.foo` 脱糖为 `M__foo`）；声明位与表达式位**已共用同一判定** `is_modval_import_decl`（`sema.tc:10798`，用于 `10385/10783`），且 `modval_load`（`sema.tc:10819`）正是「为模块值别名构造等价 `ImportModDecl` 并内联加载」——即 §3.2 工作项① 所述统一**已实现**。
   - **剩余差异（有意保留，非缺陷）**：声明位 `@import("...")` 仍产 `ImportModDecl`、`@module(...)` 仍产 `ModuleDecl`——因为它们在**声明位**，语义是文件级指令（`@module` 设置可见性是副作用内建），本就不该是表达式值调用；表达式位才是值调用并返回模块对象。二者是**同一内建的两种位置形态**，§6 已如此记载。
   - **不做的工作项②**：`meta_eval_mbuiltin` 加 `if name=="import"` 分支——因 `@import` 解析期即转 `import_expr`、**永不进入 `mbuiltin`**，该分支将是死代码，故不添加（与「不新增死代码」原则一致）。
-- **D3 — 不定长未接线（`⚠ 被 D4 阻塞，顺序应为 D4 → D3`）**：`meta_eval_call` 仍强制 `na1 != np1 → T-MTA-E611` 精确元数（§5.3）。需放松为「末位 rest 形参吸收余参」，但 rest 标记**无处可挂**（元函数无 t 层声明、用户 fn 无 `...` 语法）——见 §5.3 前置依赖说明。须待 D4 建立内建首类声明与形参表后才可落地。
-- **D4 — 内建仍按名分发（`⚠ 高风险重构，且是 D3 的前置）**：`@`-内建目前由 `meta_eval_*` 按名字符串分发，未各自身为首类函数声明。规范统一归为内建（见 §11 路线 5）。
-  - **规模评估（2026-10-10）**：需为 §6 全部约 15 个内建建立首类声明（含形参表与返回类型），并把 `meta_eval_mbuiltin` 的按名分发替换为声明查表；牵涉 parse（注册内建声明）、sema（派发与类型推断）、可能及 codegen。
-  - **风险**：这是对**已自举成功、gate L2 25/0 全绿**的编译器的**纯结构性重构**，无任何功能增益，却触及全仓 `@`-调用路径；每轮验证需完整自举不动点（g1→g4）＋ gate L2（约 40 分钟）。建议在有明确收益（如确实要落地 D3 不定长）时再做，不宜为「对齐措辞」单独推进。
+- **D3 — 不定长（`✅ 内建侧已落地，2026-10-11；用户 fn 侧待语法）**：随 D4 的签名注册表落地，**内建侧不定长已接线**：`mb_variadic` 为真的内建（`compile_log` / `compile_warning`）在 `meta_eval_mbuiltin` 中走「末位吸收余参 → 逐个 `meta_eval` → 拼消息」路径，不再受 §5.3 的精确元数检查约束；元数不足报 `T-MTA-E611`，实参非标量报 `T-MTA-E601`。**仍缺**：用户 `fn` 的 `...` rest 形参（parse/sema 无 rest 机制），`meta_eval_call` 对**用户函数**仍强制 `na1 != np1 → T-MTA-E611` 精确元数（§5.3）。
+- **D4 — 内建签名注册表（`🟡 部分落地，2026-10-11）**：`src/sema.tc` 已建立内建的**首类签名元数据** `mb_variadic` / `mb_arity_min` / `mb_arity_max`（`mb_arity_max = -1` = 无上界），此前全仓无内建元数注册表（仅设备内建有 `dev_builtin_arity` 特例）。**未做**：把 `meta_eval_mbuiltin` 的按名字符串分发整体替换为「声明查表」式派发。
+  - **已完成部分（2026-10-11）**：签名**元数据**层（元数上下界 + 不定长标志）已建并已被 D3 真实消费；`compile_log` / `compile_warning` 同时入 `mb_is_known` / `mb_is_ctfe_only`（漏到运行期上下文 → `T-MTA-E605`）。
+  - **未做部分与理由**：把 §6 全部约 15 个内建逐个改写为**真正的首类声明**（含形参表与返回类型）、并把 `meta_eval_mbuiltin` 的按名分发整体替换为声明查表——牵涉 parse（注册内建声明）、sema（派发与类型推断）、可能及 codegen。这是对**已自举成功、gate L2 全绿**的编译器的**纯结构性重构**，无任何功能增益，却触及全仓 `@`-调用路径；每轮验证需完整自举不动点（g1→g4）＋ gate L2（约 40 分钟）。**裁定**：元数据的收益已在 D3 上兑现，剩余改写不宜为「对齐措辞」单独推进，维持延后。
 - **D5 — `@derive` 维持注解身份**：按用户口径，`@derive` 是类型/声明位注解（源码级 trait 注入），**不**计入元函数调用形式；类型位 `@Vector` / `@Tile` 同理为类型构造原语；`@desugar` / `@pass` 为插件注解（见 `desugar_pass.md`）。
 - **D6 — 变体辅助 fn：不计入元函数，但**不是**遗留、不得清理（`⚠ 原判断已证伪`）**：原描述称 `Name_from_Case` / `Name_is_Case` / `Name_as_Case[_fK]` 与 `meta_eval_variant_call` 是「历史遗留、应被清理」。**2026-10-10 代码实证推翻该判断**：它们是编译器为每个 `variant` 合成的、当前仍在用的活组件——`sema.tc:2473-2540` 合成、`11044-11046` 注册可见符号、`6178/7320/7408/7774` 把变体构造脱糖为 `<V>_from_<C>(...)`、`codegen_c.tc:4388+` 发射运行期版本、`comptime_fold.tc:61` `comptime_call_is_variant` 显式放行编译期、`meta_eval_variant_call` 提供 CTFE 对应实现；`tests/conformance/pass/p08_variant.tc` 明确以它们为验证对象。**结论**：它们不以 `@name(...)` 调用 → 确实**不计入元函数**（此点维持）；但**删除该路径会打断变体功能**，故「清理」动作撤销，D6 关闭（无代码改动）。
 

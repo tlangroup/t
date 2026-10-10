@@ -134,8 +134,35 @@ using m;                          // 引入该模块符号
 | M4 | 自举不动点：`build src/tc.tc --output out/dbg/g1` → g2==g3==g4 | `g2.ll==g3.ll==g4.ll` md5 `bab49f2cd7eff67b6d5d960d0ad83ee4` | ✅ |
 | M5 | conformance 344/0（`--compiler out/dbg/g1.exe`，含新增 `p_meta_type_info.tc`） | 0 failed，无回归 | ✅ |
 | M6 | IR 快照重录（`ir_snapshot --update --compiler out/dbg/g1.exe`）、提交 | baseline 已更新 119/360；已提交 `9649842` 并推送 | ✅ |
+| M7 | 编译期诊断内建（§4-bis）：`T-MTA-W621` + `@compile_log` / `@compile_warning` + `print` 归为运行期 | `tc check src/tc.tc` 0 error；自举不动点 g1==g2==g3==g4 md5 `ffcbad4c2677ca2ca18dd8629a36008d`；conformance **345/0**（含新增 `p64_compile_log_ok.tc`）；IR 快照 0 新增 / 0 缺失（3 处 `src/tc.tc` 自身产物漂移，合法） | ✅ |
 
 > ⚠ 任一 M 步失败即回退该步改动（保持 `node_bb` 门禁/移除的分支），不污染自举链。
+
+## 4-bis. 编译期诊断内建：`@compile_log` / `@compile_warning`，以及 `print` 归位（2026-10-11）
+
+**用户裁定**：新增 `@compile_log` / `@compile_warning`，保留 `@compile_error`；`print` / `eprint` / `println` 一律为**运行期函数**。
+
+### 4-bis.1 为什么必须新增
+`print` 原先被登记为编译期内建（`meta_eval_builtin` 里有 `print`/`eprint` 分支，编译期写 stderr）。裁定后编译期上下文不再有输出手段，故补三个专用元函数（规范 §6 已列表）。
+
+### 4-bis.2 实现要点
+
+| 改动 | 位置 | 说明 |
+|---|---|---|
+| 新增诊断码 `T-MTA-W621`（warning，legacy `T_META_COMPILE_WARNING`，名 `COMPILE_WARNING`） | `tools/diag_defs.json` → `gen_diag.mjs` → `src/diag_table.gen.h` → `gen_diag_t.mjs` → `src/base.tc` | 走**单一真源**链路，defs 163→164；`base.tc` 的 `g_dcount` 与 `[]string` 数组同步为 164 |
+| 内建签名注册表 | `src/sema.tc` `mb_variadic` / `mb_arity_min` / `mb_arity_max` | `mb_arity_max = -1` = 不定长无上界；`mb_arity_min` 对不定长内建返回 1。**D4 部分落地、D3 内建侧落地**。⚠ 三者必须**真实被消费**（否则即死代码）：`meta_eval_mbuiltin` 以 `mb_variadic(name)` 派发不定长分支，元数上下界由 `mb_arity_min` / `mb_arity_max` 给出（`amax >= 0` 才检查上界） |
+| 登记为已知 / CTFE-only | `mb_is_known` / `mb_is_ctfe_only` | 漏到运行期上下文 → `T-MTA-E605`（与 `@str_from_bytes` 同一档） |
+| 求值分支 | `meta_eval_mbuiltin`（`T-MTA-E607` 兜底之前） | 逐实参 `meta_eval`，非标量（string/int/bool/float 之外）报 `T-MTA-E601`；不足 1 个报 `T-MTA-E611`；log 写 `eprint`，warning 发 `T-MTA-W621`（带行列）；返回 `mv_int(0)` |
+| 值转字符串助手 | `mv_to_str` | 对齐 `meta_design.md` §2.2 的用法 `@compile_log("meta k = ", k)`：实参可以是任意**标量**编译期值 |
+| **移除** `print`/`eprint` 的编译期登记与其 CTFE 分支 | `meta_eval_builtin` | 编译期上下文出现 `print(...)` → `T-MTA-E617 未定义的编译期函数` |
+
+**不定长的接线形态**：`mb_variadic` 为真的内建不走精确元数检查，而是「末位（此处即全部位置）吸收余参 → 逐个求值 → 拼成一条消息」。这是规范 §5.3 的第一个真实消费方。
+
+**上下文约束（有意设计）**：三者都是纯编译期内建，只能活在 `comptime { }` 块里。`@compile_error` 额外允许出现在 `comptime fn` 体的**未取分支**（`mb_prune_if` 剪除，不误报）；而 `@compile_log` / `@compile_warning` 若写进 `comptime fn` 体会在 `check` 期命中 `T-MTA-E605` —— 因为 `check` 会遍历 `comptime fn` 体（p40 的 `get_width` 注释已实证）。
+
+### 4-bis.3 测试
+- 迁移：`p38_meta_ctfe_ok.tc:53` 与 `p40_meta_builtin_ok.tc:113` 里编译期上下文的 `print(...)` → `@compile_log(...)`。
+- 新增：`tests/conformance/pass/p64_compile_log_ok.tc` —— 覆盖字符串/int/bool 混合不定长拼接、`@compile_warning` 多实参拼接、`@compile_error` 在未取分支被剪除。
 
 ## 5. 回滚
 - D1 单点：把删除的 `node_bb` 门禁块复原即可。
