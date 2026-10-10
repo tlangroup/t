@@ -13,7 +13,7 @@
 | `@`-内置经 `mbuiltin` 节点 → `meta_eval_mbuiltin` 派发 | `src/sema.tc:11820` |
 | 运行期 `call` 在编译期上下文 → `meta_eval_call` | `src/sema.tc:11819` |
 | `meta_eval_mbuiltin` 已处理 `@type_of`/`@type_val`/`@simd_lanes`/`@compile_error`/类型查询(`@type_size`…)/`@zeroed`/`@str_from_bytes`；未知 → `T-MTA-E607` | `src/sema.tc:13816` |
-| `meta_eval_call` 仍强制 `node_bb`(comptime fn) 门禁 → `T-MTA-E618`（**D1 待清**） | `src/sema.tc:12813` |
+| `meta_eval_call` 的 `node_bb`(comptime fn) 门禁**已移除**（**D1 已清**，`comptime name(...)` 对任意双栖 fn 可用） | `src/sema.tc:12813` |
 | `comptime fn` 语法仍被 parser 接受（`mk_FuncDecl(is_comptime)`），`bb` 侧表多处置位 | `src/parse.tc:2059`, `src/base.tc:1753` |
 | `@import("X")` 表达式位已产出 `import_expr` 节点（sa=模块路径），`const m=@import("X")` 绑定模块值，`m.foo` 经 sema 脱糖为 `M__foo` | `src/parse.tc:4645`, `src/sema.tc:6208/9521/10796+` |
 | `@module(...)`/`@import("...")` 声明位仍被 `parse_module_decl` 拦截为 `ImportModDecl`/`ModuleDecl` | `src/parse.tc:2314/2354` |
@@ -132,8 +132,8 @@ using m;                          // 引入该模块符号
 | M2 | `@type_info` 解析期脱糖（§2.2） | `tc run scratch_metafn_test.tc` 退出 0；IR 折出 `@__ti_Point` | ✅ |
 | M3 | `@import` 名分统一（§3.2） | 机制已落地，仅文档/名分统一（可选低风险） | ⏸ 文档级 |
 | M4 | 自举不动点：`build src/tc.tc --output out/dbg/g1` → g2==g3==g4 | `g2.ll==g3.ll==g4.ll` md5 `bab49f2cd7eff67b6d5d960d0ad83ee4` | ✅ |
-| M5 | conformance 343/0（`--compiler out/dbg/g1.exe`） | 0 failed，无回归 | ✅ |
-| M6 | IR 快照重录（`ir_snapshot --update --compiler out/dbg/g1.exe`）、提交 | baseline 已更新 119/360、`git` 推送 | ✅ / 待推送 |
+| M5 | conformance 344/0（`--compiler out/dbg/g1.exe`，含新增 `p_meta_type_info.tc`） | 0 failed，无回归 | ✅ |
+| M6 | IR 快照重录（`ir_snapshot --update --compiler out/dbg/g1.exe`）、提交 | baseline 已更新 119/360；已提交 `9649842` 并推送 | ✅ |
 
 > ⚠ 任一 M 步失败即回退该步改动（保持 `node_bb` 门禁/移除的分支），不污染自举链。
 
