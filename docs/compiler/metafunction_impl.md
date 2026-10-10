@@ -130,7 +130,7 @@ using m;                          // 引入该模块符号
 |---|---|---|---|
 | M1 | D1：移除 `meta_eval_call` 的 `node_bb` 门禁 | `tc.exe check src/tc.tc` 无 `T-*-E` | ✅ |
 | M2 | `@type_info` 解析期脱糖（§2.2） | `tc run scratch_metafn_test.tc` 退出 0；IR 折出 `@__ti_Point` | ✅ |
-| M3 | `@import` 名分统一（§3.2） | 机制已落地，仅文档/名分统一（可选低风险） | ⏸ 文档级 |
+| M3 | `@import` 名分统一（§3.2） | 工作项① 已实现（共用 `is_modval_import_decl` + `modval_load` 内联）；工作项② 因 `@import` 永不进 `mbuiltin`，添加即死代码 → 不做 | ✅ 已核实关闭 |
 | M4 | 自举不动点：`build src/tc.tc --output out/dbg/g1` → g2==g3==g4 | `g2.ll==g3.ll==g4.ll` md5 `bab49f2cd7eff67b6d5d960d0ad83ee4` | ✅ |
 | M5 | conformance 344/0（`--compiler out/dbg/g1.exe`，含新增 `p_meta_type_info.tc`） | 0 failed，无回归 | ✅ |
 | M6 | IR 快照重录（`ir_snapshot --update --compiler out/dbg/g1.exe`）、提交 | baseline 已更新 119/360；已提交 `9649842` 并推送 | ✅ |

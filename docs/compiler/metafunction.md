@@ -41,7 +41,7 @@
 
 > ⚠ **普通函数经 `@` 调用是非法的**（v3 更正）：`@` 仅供内建；若 `@name` 不是已知内建 → `T-MTA-E607` 未知内建。普通函数要编译期执行，必须走 `comptime name(...)`，见 §7。
 
-> ⚠ 变体辅助 fn 是历史遗留：`Name_from_Case` 等由 `meta_eval_variant_call` 分发的辅助 fn 属历史遗留；变体值构造现统一通过匿名结构体字面量完成，不计入元函数，当前 `meta_eval_variant_call` 是要被清掉的遗留路径（见 §10 D6）。
+> ⚠ 变体辅助 fn **不是元函数，但也不是遗留死代码**（v3.1 实证更正）：`Name_from_Case` / `Name_is_Case` / `Name_as_Case[_fK]` 是编译器为每个 `variant` **合成的辅助函数** —— `sema.tc:2473-2540` 合成、`11044-11046` 注册为可见符号、`6178/7320/7408/7774` 把变体构造脱糖为 `<V>_from_<C>(...)` 调用、`codegen_c.tc:4388+` 发射运行期版本、`comptime_fold.tc:61` 显式放行编译期、`meta_eval_variant_call`（`sema.tc:12606`）提供其 CTFE 对应实现。它们不以 `@name(...)` 调用，**不计入元函数**；同时是变体机制的活组件，**不得清理**（原 §10 D6「待清理」的判断已被证伪，见 §10 D6）。
 
 > ⚠ 实现现状：内建目前仍以「按名分发的编译期内建」实现（`meta_eval_mbuiltin` / `meta_eval_builtin`）；`@module`/`@import` 目前仍以文件级声明指令实现（见 §10 D2）。规范将它们统一归为「编译期内建」，未来实现路线见 §10/§11。
 
@@ -157,7 +157,12 @@ const s = comptime type_of(some_value)   // 运行普通 type_of，但在编译�
 
 ### 5.3 不定长形参的声明与体内形态（规范）
 
-> ⚠ 当前实现：元函数调用仍强制**精确元数**（`na1 != np1` → `T-MTA-E611`，`ARITY`）。不定长绑定是下一实现步，IR 已结构性允许，规范如下供落地。
+> ⚠ 当前实现：元函数调用仍强制**精确元数**（`na1 != np1` → `T-MTA-E611`，`ARITY`）。
+>
+> ⚠ **落地前置依赖（2026-10-10 实证）**：rest 形参需要一个**声明位置**来挂 `...` 标记，但当前两处都**不存在**——
+> ① 元函数按 v3 只能是编译器内建，**没有 t 层声明语法**（内建由 `meta_eval_mbuiltin` 按名分发，全仓无内建签名/元数注册表，仅设备内建有 `dev_builtin_arity` 特例）；
+> ② **用户 `fn` 也不支持 `...` 变长形参**（parse/sema 无 rest 机制）。
+> ⇒ **D3 依赖 D4**：必须先有「内建的首类声明 + 形参表」（D4），rest 才有可标记的形参表。§11 原顺序「先 D3 后 D4」**颠倒**，应为 **D4 → D3**。
 
 - **声明**（以内建形态示意）：末位形参带 rest 标记，收集调用点剩余实参：
 
@@ -196,7 +201,7 @@ const s = comptime type_of(some_value)   // 运行普通 type_of，但在编译�
 | `@module(attr, ...)` | **模块系统内建** | **设置当前模块的可见性**（`pub` / `internal`）；返回 unit | —（编译期副作用） |
 | `@import("M" [:: items])` | **模块系统内建** | **导入模块 M，返回一个模块对象**；支持 `const m = @import("M")` 绑定与 `m.foo` 成员访问 | —（编译期，返回模块对象） |
 
-> 旁支：`@derive(Clone, Copy, …)`（P6 已重建 8 trait）与类型位 `@Vector` / `@Tile` 是**类型 / 声明位**的编译期注解或类型构造原语，**不是 `@name(...)` 表达式值调用**，故不计入元函数。此外，变体辅助 fn（`Name_from_Case` 等）属**历史遗留**，变体值构造现统一通过匿名结构体字面量完成，同样不计入元函数。`@desugar` / `@pass` 是编译期插件**注解**（见 `desugar_pass.md`），同样非 `@name(...)` 值调用。
+> 旁支：`@derive(Clone, Copy, …)`（P6 已重建 8 trait）与类型位 `@Vector` / `@Tile` 是**类型 / 声明位**的编译期注解或类型构造原语，**不是 `@name(...)` 表达式值调用**，故不计入元函数。此外，变体辅助 fn（`Name_from_Case` 等）是编译器为每个 variant 合成的辅助函数（活组件，非遗留），同样不以 `@name(...)` 调用，故不计入元函数。`@desugar` / `@pass` 是编译期插件**注解**（见 `desugar_pass.md`），同样非 `@name(...)` 值调用。
 
 > **普通函数的编译期执行（`comptime name(...)`）不在此表**——它是普通双栖函数的强制 CTFE，机制见 §7，非内建元函数。
 
@@ -267,7 +272,8 @@ v3 厘清两个经常被混为一谈的概念：
 | `@module` 可见性回填 / 判定 | `src/sema.tc` `set_mod_attr`（≈10980）、`check_mod_visible`（≈11084） |
 | `@import` 模块对象 / 成员访问 | `src/sema.tc` 模块值别名表（≈6104）、`handle_one_import`（≈10525）、`X.foo` → `M__foo` 改写（≈6207） |
 | CTFE 求值器 | `src/sema.tc` `meta_eval`（≈11735）/`meta_exec`/`meta_eval_call`（12788） |
-| `@` 内建分发 | `src/sema.tc` `meta_eval_mbuiltin`/`meta_eval_builtin`（≈12475）；`meta_eval_variant_call`（≈12606）为**历史遗留**分发路径，待按 §10 D6 清理 |
+| `@` 内建分发 | `src/sema.tc` `meta_eval_mbuiltin`/`meta_eval_builtin`（≈12475） |
+| 变体辅助 fn（非元函数） | `src/sema.tc` `meta_eval_variant_call`（≈12606）——变体辅助 fn 的 CTFE 实现，**活组件非遗留**（见 §10 D6）；配套 `comptime_fold.tc:61` `comptime_call_is_variant` |
 | 数学内建 | `src/sema.tc` `math_mbuiltin`/`meta_eval_math` |
 | `comptime` 节点 / 全量折叠 | `src/base.tc` `mk_comptime`（≈3447）/ `mk_comptime_block`（≈3455）；`src/comptime_fold.tc`（`comptime_has_runtime_ref` / `comptime_rewrite_to_literal` / `g_comptime_full`） |
 | 代码生成对 `comptime` | `src/codegen_c.tc`（Phase A 透明降级为内层运行期求值；全量折叠开启后改写为字面量） |
@@ -281,23 +287,27 @@ v3 厘清两个经常被混为一谈的概念：
 本规范描述的是**目标模型**。当前编译器实现与规范存在以下差距，需在对齐实现时逐项消除：
 
 - **D1 — `meta_eval_call` 的 `bb`/`is_comptime` 门禁（`✅ 已落实`）**：已移除 `meta_eval_call`（`src/sema.tc:12813`）对被调 `FuncDecl` 的 `bb` 位门禁——非 `comptime fn` 不再报 `T-MTA-E618`，`comptime name(...)` 对任意双栖 `fn` 可用（v3 模型）。`@` 仍只解析内建（`@name` 未定义 → `T-MTA-E607`）。`comptime fn` 语法标记暂保留为无害冗余。
-- **D2 — `@module` / `@import` 仍是文件级声明指令，未重分类为内建 `@name(...)`**：当前 `@module(...)` / `@import("...")` 在 `parse_declaration` 被拦截为 `ModuleDecl` / `ImportModDecl`，不进入 `@name(...)` 表达式值调用路径。规范目标：重分类为内建元函数调用；`@import` 返回模块对象（`const m = @import("M")` 的模块值别名机制已部分就绪）、`@module` 作为设置当前模块可见性的副作用内建。
-- **D3 — 不定长未接线**：`meta_eval_call` 仍强制 `na1 != np1 → T-MTA-E611` 精确元数（§5.3）。需放松为「末位 rest 形参吸收余参」。
-- **D4 — 内建仍按名分发**：`@`-内建目前由 `meta_eval_*` 按名字符串分发，未各自身为首类函数声明。规范统一归为内建（见 §11 路线 5）。
+- **D2 — `@module` / `@import` 名分统一（`✅ 机制已落地，2026-10-10 核实关闭`）**：原描述称二者「仍是文件级声明指令、未重分类」。**实证**：表达式位 `@import("M")` 已返回模块对象（`parse.tc:4484` 直接产 `import_expr`；`const m=@import("M")` 绑定模块值；`m.foo` 脱糖为 `M__foo`）；声明位与表达式位**已共用同一判定** `is_modval_import_decl`（`sema.tc:10798`，用于 `10385/10783`），且 `modval_load`（`sema.tc:10819`）正是「为模块值别名构造等价 `ImportModDecl` 并内联加载」——即 §3.2 工作项① 所述统一**已实现**。
+  - **剩余差异（有意保留，非缺陷）**：声明位 `@import("...")` 仍产 `ImportModDecl`、`@module(...)` 仍产 `ModuleDecl`——因为它们在**声明位**，语义是文件级指令（`@module` 设置可见性是副作用内建），本就不该是表达式值调用；表达式位才是值调用并返回模块对象。二者是**同一内建的两种位置形态**，§6 已如此记载。
+  - **不做的工作项②**：`meta_eval_mbuiltin` 加 `if name=="import"` 分支——因 `@import` 解析期即转 `import_expr`、**永不进入 `mbuiltin`**，该分支将是死代码，故不添加（与「不新增死代码」原则一致）。
+- **D3 — 不定长未接线（`⚠ 被 D4 阻塞，顺序应为 D4 → D3`）**：`meta_eval_call` 仍强制 `na1 != np1 → T-MTA-E611` 精确元数（§5.3）。需放松为「末位 rest 形参吸收余参」，但 rest 标记**无处可挂**（元函数无 t 层声明、用户 fn 无 `...` 语法）——见 §5.3 前置依赖说明。须待 D4 建立内建首类声明与形参表后才可落地。
+- **D4 — 内建仍按名分发（`⚠ 高风险重构，且是 D3 的前置）**：`@`-内建目前由 `meta_eval_*` 按名字符串分发，未各自身为首类函数声明。规范统一归为内建（见 §11 路线 5）。
+  - **规模评估（2026-10-10）**：需为 §6 全部约 15 个内建建立首类声明（含形参表与返回类型），并把 `meta_eval_mbuiltin` 的按名分发替换为声明查表；牵涉 parse（注册内建声明）、sema（派发与类型推断）、可能及 codegen。
+  - **风险**：这是对**已自举成功、gate L2 25/0 全绿**的编译器的**纯结构性重构**，无任何功能增益，却触及全仓 `@`-调用路径；每轮验证需完整自举不动点（g1→g4）＋ gate L2（约 40 分钟）。建议在有明确收益（如确实要落地 D3 不定长）时再做，不宜为「对齐措辞」单独推进。
 - **D5 — `@derive` 维持注解身份**：按用户口径，`@derive` 是类型/声明位注解（源码级 trait 注入），**不**计入元函数调用形式；类型位 `@Vector` / `@Tile` 同理为类型构造原语；`@desugar` / `@pass` 为插件注解（见 `desugar_pass.md`）。
-- **D6 — 变体辅助 fn 属历史遗留**：`Name_from_Case` / `Name_is_Case` / `Name_as_Case[_fK]` 由 `meta_eval_variant_call` 分发的路径是历史遗留；变体值构造现统一走**匿名结构体字面量**，该分发路径应被清理，不纳入元函数体系。
+- **D6 — 变体辅助 fn：不计入元函数，但**不是**遗留、不得清理（`⚠ 原判断已证伪`）**：原描述称 `Name_from_Case` / `Name_is_Case` / `Name_as_Case[_fK]` 与 `meta_eval_variant_call` 是「历史遗留、应被清理」。**2026-10-10 代码实证推翻该判断**：它们是编译器为每个 `variant` 合成的、当前仍在用的活组件——`sema.tc:2473-2540` 合成、`11044-11046` 注册可见符号、`6178/7320/7408/7774` 把变体构造脱糖为 `<V>_from_<C>(...)`、`codegen_c.tc:4388+` 发射运行期版本、`comptime_fold.tc:61` `comptime_call_is_variant` 显式放行编译期、`meta_eval_variant_call` 提供 CTFE 对应实现；`tests/conformance/pass/p08_variant.tc` 明确以它们为验证对象。**结论**：它们不以 `@name(...)` 调用 → 确实**不计入元函数**（此点维持）；但**删除该路径会打断变体功能**，故「清理」动作撤销，D6 关闭（无代码改动）。
 
 ---
 
 ## 11. 开放问题与路线图
 
 1. **`@` 调用门禁重定（D1，`✅ 已落实`）**：`meta_eval_call` 已去掉「用户 `fn` 须 `comptime` 标记才能 `@` 调用」的旧逻辑；`@` 只解析内建（`@name` 未定义 → `T-MTA-E607`），普通函数 CTFE 改走 `comptime name(...)` 路径。
-2. **模块系统内建重分类（D2）**：把 `@module` / `@import` 从文件级指令改写为内建 `@name(...)` 表达式值调用；`@import` 返回模块对象（或等价的可成员访问的模块值），`const m = @import("M")` 走统一绑定。
-3. **不定长参数落地（D3，§5.3）**：放松精确元数检查，末位 rest 收集编译期聚合；`na1 != np1` 判定改为「末位 rest 吸收余参」。
-4. **rest 承载类型与遍历 API（D3 续）**：明确 rest 在体内的类型（编译期 `[]T` / 列表）及 `len` / 下标 / `for` 遍历语义。
-5. **首类内建声明（D4）**：把 `@`-内建逐个改写为真正的首类声明，让「看起来是函数」成为字面事实，取代按名分发。
+2. **模块系统内建重分类（D2，`✅ 已核实关闭`）**：机制与共用判定均已落地（见 §10 D2）。声明位保留文件级指令形态是**有意设计**（`@module` 副作用内建、声明位非值调用位）；表达式位 `@import` 已是返回模块对象的值调用。无需进一步改动。
+3. **首类内建声明（D4）** —— **前置项，应先做**：把 `@`-内建逐个改写为真正的首类声明（含形参表），让「看起来是函数」成为字面事实，取代按名分发。这是 D3 的前提：rest 需要可标记的形参表。规模与风险见 §10 D4。
+4. **不定长参数落地（D3，§5.3）** —— **依赖 D4**：在 D4 的形参表基础上，放松精确元数检查，末位 rest 收集编译期聚合；`na1 != np1` 判定改为「末位 rest 吸收余参」。
+5. **rest 承载类型与遍历 API（D3 续）** —— 依赖 D4：明确 rest 在体内的类型（编译期 `[]T` / 列表）及 `len` / 下标 / `for` 遍历语义。
 6. **与 M8 `@desugar` / `@pass` 用户插件 API 的关系**：见专门设计文档 `desugar_pass.md`。`@desugar`/`@pass` 是**注解身份**（与 `@derive` 一致），其执行复用「双栖 `fn` + `comptime` 强制编译期执行」载体；编译器只实现一种**通用 `Macro` 捕获**（`IDENT '!' (...|{...}|[...])`），不为任何具体用户语法做适配。
-7. **清理变体辅助 fn 遗留（D6）**：移除 `meta_eval_variant_call` 分发与 `Name_from_Case` 等生成逻辑，变体值构造统一收敛到匿名结构体字面量；该路径不进入首类元函数体系。
+7. **变体辅助 fn 定性（D6，`⚠ 已证伪并关闭`）**：原计划「清理 `meta_eval_variant_call` 与 `Name_from_Case` 等生成逻辑」**已撤销**——实证它们是变体机制的活组件（见 §10 D6）。保留结论仅为「它们不以 `@name(...)` 调用，故不计入元函数体系」，无清理动作。
 
 ---
 
