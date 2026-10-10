@@ -1504,12 +1504,6 @@ pub fn resolve_ti(tn: i64) i64 {
         return ti_mk("Variant");
     }
     // P3：位域在 TI 层即 `Struct`，底层整型落在 `und`（`tip_is_flag` 的判别依据）。
-    if (base.node_kind((tn as u64)) == "flag") {
-        return ti_with_und("Struct", "<anonymous>", base.node_sa((tn as u64)));
-    }
-    if (base.node_kind((tn as u64)) == "flag_set") {
-        return ti_named("Struct", "<anonymous>");
-    }
     if (base.node_kind((tn as u64)) == "pointer") {
         return ti_elem_of("Pointer", resolve_ti(base.node_na((tn as u64))));
     }
@@ -2335,16 +2329,6 @@ pub fn register_decl(d: i64) void {
         sym_define(global_scope, base.node_sa((d as u64)), "type", ti_with_und("Enum", base.node_sa((d as u64)), base.node_sb((d as u64))), d);
         return;
     }
-    // P3（积类型统一 epic）：位域在 TI 层即 `Struct`，底层整型落在 `und`。
-    // （本块的生成器 tools/totter.tc 已随模块重拆分移除，现为手维护冻结区。）
-    if (base.node_kind((d as u64)) == "FlagDecl") {
-        sym_define(global_scope, base.node_sa((d as u64)), "type", ti_with_und("Struct", base.node_sa((d as u64)), base.node_sb((d as u64))), d);
-        return;
-    }
-    if (base.node_kind((d as u64)) == "FlagSetDecl") {
-        sym_define(global_scope, base.node_sa((d as u64)), "type", ti_named("Struct", base.node_sa((d as u64))), d);
-        return;
-    }
     if (base.node_kind((d as u64)) == "UnionDecl") {
         sym_define(global_scope, base.node_sa((d as u64)), "type", ti_named("Union", base.node_sa((d as u64))), d);
         return;
@@ -3017,7 +3001,7 @@ pub fn member_exists_in_type(obt: i64, mname: string) bool {
     var msy: Sym = syms[msi];
     if (msy.decl < 0) { return true; }
     var mdk: string = base.node_kind((msy.decl as u64));
-    if (mdk != "EnumDecl" && mdk != "VariantDecl" && mdk != "FlagDecl") { return true; }
+    if (mdk != "EnumDecl" && mdk != "VariantDecl") { return true; }
     // S4 §4.6 Phase 3：链先物化再遍历 —— 纯读取循环。用 kids_chain（取 node id 比对
     // node_sa），不用 kids_chain_idx（本循环不把游标当 kids entry 索引使用）。
     var ks7730: []i64 = base.kids_chain(base.node_lb((msy.decl as u64)));
@@ -9447,95 +9431,6 @@ pub fn check_enum_decl(d: i64) void {
     }
 }
 
-// flag decl 检查用的 usedBits 暂存池（append-only，按 base 划分）
-pub var fd_names: []string;
-pub var fd_starts: []i64;
-pub var fd_ends: []i64;
-
-pub fn check_flag_decl(d: i64) void {
-    var is_flag: bool = base__node_kind((d as u64)) == "FlagDecl";
-    if (is_flag && is_int_name(base__node_sb((d as u64))) == false) {
-        var di: i64 = base.diag_new("T-SEM-E202", "error",
-            base.sb_cat5("flag '", base__node_sa((d as u64)), "' underlying type must be an integer type, got '", base__node_sb((d as u64)), "'"),
-            "", 1, 1, 1, 10);
-        base.slb_begin();
-        base.slb_add("u8");
-        base.slb_add("u16");
-        base.slb_add("u32");
-        base.slb_add("u64");
-        base.diag_set_vv(di, base.slb_head);
-    }
-
-    var auto_off: i64 = 0;
-    var base: i64 = slice_len(fd_names) as i64;
-
-    var c: i64 = base__node_lb((d as u64));
-    // S4 §4.6 Phase 3：链先物化再遍历 —— 纯读取循环
-    var ks8772: []i64 = base.kids_chain(c);
-    var ki8772: i64 = 0;
-    while (ki8772 < slice_len(ks8772) as i64) {
-        var kv8772: i64 = ks8772[ki8772];
-        var start: i64 = auto_off;
-        // S4 §0.14.7 SoA：侧表读（原 sl.bb）。⚠ 本函数内有局部 `var base: i64` 遮蔽 base 模块，
-        // 故此处直呼降级名 `base__node_bb`，不能写 `base.node_bb`。
-        if (base__node_bb((kv8772 as u64))) {
-            start = base__node_ib((kv8772 as u64));   // S4 §0.14.7 SoA：侧表读（原 sl.ib）
-        }
-        var end: i64 = start + base__node_ia((kv8772 as u64));
-        var i: i64 = base;
-        var total: i64 = slice_len(fd_names) as i64;
-        while (i < total) {
-            var us: i64 = fd_starts[i];
-            var ue: i64 = fd_ends[i];
-            if (start < ue && end > us) {
-                var msb: StringBuilder = sb_new();
-                sb_append_str(msb, "flag slot '");
-                sb_append_str(msb, base__node_sa((kv8772 as u64)));
-                sb_append_str(msb, "' (bits ");
-                sb_append_i64(msb, start);
-                sb_append_str(msb, "-");
-                sb_append_i64(msb, end - 1);
-                sb_append_str(msb, ") overlaps with '");
-                sb_append_str(msb, fd_names[i]);
-                sb_append_str(msb, "' (bits ");
-                sb_append_i64(msb, us);
-                sb_append_str(msb, "-");
-                sb_append_i64(msb, ue - 1);
-                sb_append_str(msb, ")");
-                base.diag_new("T-FLG-E850", "error", sb_to_str(msb), "", 1, 1, 1, 10);
-            }
-            i = i + 1;
-        }
-        append(fd_names, base__node_sa((kv8772 as u64)));
-        append(fd_starts, start);
-        append(fd_ends, end);
-        if (is_flag) {
-            var tw: i64 = get_bw(base__node_sb((d as u64)));
-            if (tw > 0 && end > tw) {
-                var osb: StringBuilder = sb_new();
-                sb_append_str(osb, "flag '");
-                sb_append_str(osb, base__node_sa((d as u64)));
-                sb_append_str(osb, "' slot '");
-                sb_append_str(osb, base__node_sa((kv8772 as u64)));
-                sb_append_str(osb, "' exceeds ");
-                sb_append_str(osb, base__node_sb((d as u64)));
-                sb_append_str(osb, " (");
-                sb_append_i64(osb, tw);
-                sb_append_str(osb, " bits): uses bits ");
-                sb_append_i64(osb, start);
-                sb_append_str(osb, "-");
-                sb_append_i64(osb, end - 1);
-                var di2: i64 = base.diag_new("T-FLG-E851", "error", sb_to_str(osb), "", 1, 1, 1, 10);
-                base.slb_begin();
-                base.slb_add(base.sb_cat3("0-", base.i2s(tw - 1), " bits"));
-                base.diag_set_vv(di2, base.slb_head);
-            }
-        }
-        auto_off = end;
-        ki8772 = ki8772 + 1;
-    }
-}
-
 pub fn check_decl(d: i64) void {
     if (base.node_kind((d as u64)) == "FuncDecl") {
         // Device 入口 `kernel fn`：设备体不在 host 阶段做类型检查（设备安全子集属 M4 未来工作，
@@ -9551,10 +9446,6 @@ pub fn check_decl(d: i64) void {
     }
     if (base.node_kind((d as u64)) == "EnumDecl") {
         check_enum_decl(d);
-        return;
-    }
-    if (base.node_kind((d as u64)) == "FlagDecl" || base.node_kind((d as u64)) == "FlagSetDecl") {
-        check_flag_decl(d);
         return;
     }
     if (base.node_kind((d as u64)) == "GlobalVarDecl") {
@@ -9675,8 +9566,6 @@ pub fn check_decl_hir(di: i64) void {
     }
     if (op == hir.HIR_OP_STRUCT_DECL) { check_struct_decl(d); return; }
     if (op == hir.HIR_OP_ENUM_DECL) { check_enum_decl(d); return; }
-    if (op == hir.HIR_OP_FLAG_DECL) { check_flag_decl(d); return; }
-    if (op == hir.HIR_OP_FLAGSET_DECL) { check_flag_decl(d); return; }
     if (op == hir.HIR_OP_GLOBAL_DECL) {
         var k: string = base.node_kind((d as u64));
         if (k == "GlobalVarDecl") { check_global_var_decl(d); return; }
@@ -9691,8 +9580,6 @@ pub fn check_decl_hir(di: i64) void {
 pub fn hir_decl_is_type_op(op: i64) bool {
     if (op == hir.HIR_OP_STRUCT_DECL) { return true; }
     if (op == hir.HIR_OP_ENUM_DECL) { return true; }
-    if (op == hir.HIR_OP_FLAG_DECL) { return true; }
-    if (op == hir.HIR_OP_FLAGSET_DECL) { return true; }
     if (op == hir.HIR_OP_UNION_DECL) { return true; }
     if (op == hir.HIR_OP_VARIANT_DECL) { return true; }
     return false;
@@ -10983,15 +10870,15 @@ pub fn modval_load(mname: string, at: i64) void {
 pub fn is_type_decl_node(d: i64) bool {
     if (d < 0) { return false; }
     var k: string = base.node_kind((d as u64));
-    if (k == "StructDecl" || k == "EnumDecl" || k == "FlagDecl") { return true; }
-    if (k == "FlagSetDecl" || k == "UnionDecl" || k == "VariantDecl") { return true; }
+    if (k == "StructDecl" || k == "EnumDecl") { return true; }
+    if (k == "UnionDecl" || k == "VariantDecl") { return true; }
     return false;
 }
 
 // 顶层可重整的声明 kind。
 pub fn is_top_decl_kind(k: string) bool {
     if (k == "FuncDecl" || k == "StructDecl" || k == "EnumDecl") { return true; }
-    if (k == "FlagDecl" || k == "FlagSetDecl" || k == "UnionDecl") { return true; }
+    if (k == "UnionDecl") { return true; }
     if (k == "VariantDecl" || k == "GlobalVarDecl") { return true; }
     if (k == "GlobalConstDecl" || k == "TypeAliasDecl") { return true; }
     return false;
@@ -13503,7 +13390,6 @@ pub fn mb_type_decl(name: string) i64 {
         if (base.node_sa((d as u64)) == name) {
             var k: string = base.node_kind((d as u64));
             if (k == "StructDecl" || k == "EnumDecl" || k == "TypeAliasDecl") { return d; }
-            if (k == "FlagDecl" || k == "FlagSetDecl") { return d; }
             if (k == "UnionDecl" || k == "VariantDecl") { return d; }
         }
         i = i + 1;
@@ -14167,7 +14053,7 @@ pub fn passes_find(name: string) Pass {
 pub fn passes_has(name: string) bool { return passes_find(name).name != ""; }
 // 注册全部真实处理节点，构成完整管线图（依赖边见各 Pass 的 requires）：
 //   run_check 内自动调度（auto_run=true）： mark_call_callees → mb_pass → meta_pass
-//   run_check 外由 src/tc.tc 显式调度（auto_run=false）：comptime_fold_pass → flag_pass → ann_pass
+//   run_check 外由 src/tc.tc 显式调度（auto_run=false）：comptime_fold_pass → ann_pass
 // 顺序与 run_check / src/tc.tc 原硬编码逐点相同 ⇒ 行为等价（run_passes 只跑 auto_run 子集）。
 pub fn passes_init() void {
     g_passes = [];
@@ -14180,14 +14066,13 @@ pub fn passes_init() void {
     var reqC: []string = []; append(reqC, "meta_pass");
     var p4: Pass; p4.name = "comptime_fold_pass"; p4.stage = 1; p4.kind = PASS_TRANSFORM; p4.requires = reqC; p4.auto_run = false; register_pass(p4);
     var reqD: []string = []; append(reqD, "comptime_fold_pass");
-    var p5: Pass; p5.name = "flag_pass";          p5.stage = 1; p5.kind = PASS_ANALYSIS;  p5.requires = reqD; p5.auto_run = false; register_pass(p5);
-    var reqE: []string = []; append(reqE, "flag_pass");
+    var reqE: []string = []; append(reqE, "comptime_fold_pass");
     var p6: Pass; p6.name = "ann_pass";           p6.stage = 1; p6.kind = PASS_TRANSFORM; p6.requires = reqE; p6.auto_run = false; register_pass(p6);
 }
 // 统一执行入口：仅调度 auto_run==true 的 Pass（run_check 内三趟），按注册序、name 直查分发（LLVM 安全）。
 // 顺序约束（务必保持）：mark_call_callees 先建调用图；mb_pass（Phase D）须在 check_decl 之前；
 // meta_pass（Phase B：CTFE）须紧随 mb_pass、且在 check_decl 之前（见 meta_design.md §9 Phase B）。
-// ⚠ comptime_fold_pass / flag_pass / ann_pass 由 src/tc.tc 在 run_check 外显式调用（auto_run=false），
+// ⚠ comptime_fold_pass / ann_pass 由 src/tc.tc 在 run_check 外显式调用（auto_run=false），
 //   此处不调度，避免改动顶层管线结构与双后端发射行为。
 pub fn run_passes() void {
     var i: i64 = 0;
@@ -14414,111 +14299,6 @@ pub fn scan_fid_format_atoms() void {
                     return;
                 }
             }
-        }
-        i = i + 1;
-    }
-}
-
-// ── Flag Resolver（复刻 tc0/flag/bitfield.ts resolve）─────────
-// 注意：与 checker.checkFlagDecl 不同——overflow 先检、overlap 后检；
-// FlagSetDecl 不产生诊断。
-
-pub var fr_names: []string;
-pub var fr_starts: []i64;
-pub var fr_ends: []i64;
-
-pub fn fr_resolve_flag(d: i64) void {
-    var tw: i64 = get_bw(base__node_sb((d as u64)));
-    if (tw < 0) {
-        tw = 32;
-    }
-    var auto_off: i64 = 0;
-    var base: i64 = slice_len(fr_names) as i64;
-
-    var c: i64 = base__node_lb((d as u64));
-    var mq_ks13489: []i64 = base.kids_chain_idx(base__node_lb((d as u64)));
-    var mq_ki13489: i64 = 0;
-    while (mq_ki13489 < slice_len(mq_ks13489) as i64) {
-        c = mq_ks13489[mq_ki13489];
-        var k: Child = base__kids[c];
-        var start: i64 = auto_off;
-        // S4 §0.14.7 SoA：侧表读（原 sl.bb）。⚠ 本函数内有局部 `var base: i64` 遮蔽 base 模块，
-        // 故此处直呼降级名 `base__node_bb`，不能写 `base.node_bb`。
-        if (base__node_bb((k.val as u64))) {
-            start = base__node_ib((k.val as u64));   // S4 §0.14.7 SoA：侧表读（原 sl.ib）
-        }
-        var end: i64 = start + base__node_ia((k.val as u64));
-
-        if (end > tw) {
-            var osb: StringBuilder = sb_new();
-            sb_append_str(osb, "flag '");
-            sb_append_str(osb, base__node_sa((d as u64)));
-            sb_append_str(osb, "' slot '");
-            sb_append_str(osb, base__node_sa((k.val as u64)));
-            sb_append_str(osb, "' exceeds ");
-            sb_append_str(osb, base__node_sb((d as u64)));
-            sb_append_str(osb, " capacity: uses bits ");
-            sb_append_i64(osb, start);
-            sb_append_str(osb, "-");
-            sb_append_i64(osb, end - 1);
-            sb_append_str(osb, ", but ");
-            sb_append_str(osb, base__node_sb((d as u64)));
-            sb_append_str(osb, " only has ");
-            sb_append_i64(osb, tw);
-            sb_append_str(osb, " bits");
-            var di: i64 = base__diag_new("T-FLG-E851", "error", sb_to_str(osb), "", 0, 0, 0, 0);
-            base__slb_begin();
-            base__slb_add(base__sb_cat2("0-", base__i2s(tw - 1)));
-            base__diag_set_vv(di, base__slb_head);
-            var fx: i64 = base__fix_one("reduce bit width or use larger underlying type (u64)", "", 0, 0, 0, 0, "flag[u64]");
-            base__diag_set_fs(di, fx);
-        }
-
-        var i: i64 = base;
-        var total: i64 = slice_len(fr_names) as i64;
-        while (i < total) {
-            var us: i64 = fr_starts[i];
-            var ue: i64 = fr_ends[i];
-            if (start < ue && end > us) {
-                var msb: StringBuilder = sb_new();
-                sb_append_str(msb, "flag slot '");
-                sb_append_str(msb, base__node_sa((k.val as u64)));
-                sb_append_str(msb, "' (bits ");
-                sb_append_i64(msb, start);
-                sb_append_str(msb, "-");
-                sb_append_i64(msb, end - 1);
-                sb_append_str(msb, ") overlaps with '");
-                sb_append_str(msb, fr_names[i]);
-                sb_append_str(msb, "' (bits ");
-                sb_append_i64(msb, us);
-                sb_append_str(msb, "-");
-                sb_append_i64(msb, ue - 1);
-                sb_append_str(msb, ")");
-                base__diag_new("T-FLG-E850", "error", sb_to_str(msb), "", 0, 0, 0, 0);
-            }
-            i = i + 1;
-        }
-
-        append(fr_names, base__node_sa((k.val as u64)));
-        append(fr_starts, start);
-        append(fr_ends, end);
-        auto_off = end;
-        mq_ki13489 = mq_ki13489 + 1;
-        c = -1;
-    }
-}
-
-pub fn flag_pass() void {
-    // 复刻 index.ts compilePipeline：每个 FlagDecl 被 resolve 两次——
-    // 一次经 typeInfoProvider.registerDecl（内部调 flagResolver.resolve），
-    // 一次为管线中的直接 flagResolver.resolve(decl)。诊断因此重复两遍。
-    var n: i64 = slice_len(lex__decl_list) as i64;
-    var i: i64 = 0;
-    while (i < n) {
-        var d: i64 = lex__decl_list[i];
-        if (base.node_kind((d as u64)) == "FlagDecl") {
-            fr_resolve_flag(d);
-            fr_resolve_flag(d);
         }
         i = i + 1;
     }
@@ -14880,12 +14660,6 @@ pub fn decl_target(kind: string) string {
     if (kind == "EnumDecl") {
         return "enum";
     }
-    if (kind == "FlagDecl") {
-        return "flag";
-    }
-    if (kind == "FlagSetDecl") {
-        return "flag_set";
-    }
     if (kind == "UnionDecl") {
         return "union";
     }
@@ -15166,7 +14940,7 @@ pub fn deser_rhs_is_value(nb: i64) bool {
     var k: string = base.node_kind((nb as u64));
     if (k == "paren") { return deser_rhs_is_value(base.node_na((nb as u64))); }
     if (k == "int" || k == "float" || k == "string" || k == "bool") { return true; }
-    if (k == "null" || k == "number" || k == "flag" || k == "flag_set") { return true; }
+    if (k == "null" || k == "number") { return true; }
     if (k == "call" || k == "binary" || k == "unary" || k == "cast") { return true; }
     if (k == "index" || k == "member") { return true; }
     if (k == "array_lit" || k == "map_lit" || k == "struct_lit") { return true; }
@@ -15604,7 +15378,7 @@ pub fn td_sname(td: i64) string {
             return "";
         }
         var k: string = llt_kinds[i];
-        if (k == "enum" || k == "flag") {
+        if (k == "enum") {
             return llt_unders[i];
         }
         if (k == "alias") {

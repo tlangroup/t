@@ -516,12 +516,6 @@ pub fn emit_ctype(tn: i64) string {
     if (base.node_kind((tn as u64)) == "optional") {
         return base.sb_cat2(emit_ctype(base.node_na((tn as u64))), "*");
     }
-    if (base.node_kind((tn as u64)) == "flag") {
-        return base.node_sa((tn as u64));
-    }
-    if (base.node_kind((tn as u64)) == "flag_set") {
-        return "void*";
-    }
     if (base.node_kind((tn as u64)) == "variant") {
         return "void*";
     }
@@ -1103,7 +1097,7 @@ pub fn expr_type_desc(e: i64) i64 {
         if (base.node_kind((base.node_na((e as u64)) as u64)) == "ident") {
             var mdi0: i64 = sema.mb_type_decl(base.node_sa((base.node_na((e as u64)) as u64)));
             if (mdi0 >= 0) {
-                if (base.node_kind((mdi0 as u64)) == "EnumDecl" || base.node_kind((mdi0 as u64)) == "FlagDecl") {
+                if (base.node_kind((mdi0 as u64)) == "EnumDecl") {
                     return sema.td_named_mk("scalar", base.node_sb((mdi0 as u64)));
                 }
             }
@@ -3290,12 +3284,6 @@ pub fn emit_expr(e: i64) string {
                 if (base.node_kind((mdi1 as u64)) == "EnumDecl") {
                     return base.sb_cat3(base.node_sa((base.node_na((e as u64)) as u64)), "_", base.node_sa((e as u64)));
                 }
-                if (base.node_kind((mdi1 as u64)) == "FlagDecl") {
-                    if (c_flag_slot_len(mdi1, base.node_sa((e as u64))) == 1) {
-                        return base.sb_cat3(base.node_sa((base.node_na((e as u64)) as u64)), "_", base.node_sa((e as u64)));
-                    }
-                    return base.sb_cat4(base.node_sa((base.node_na((e as u64)) as u64)), "_", base.node_sa((e as u64)), "_MASK");
-                }
             }
         }
         // P5：packed struct 字段值访问 → 宿主整型 shift/mask 抽取。
@@ -4126,58 +4114,6 @@ pub fn js_max_val(bw: i64) i64 {
     return v - 1;
 }
 
-// ── Flag 槽布局池（复刻 bitfield.ts resolve 的布局部分，无诊断；
-//    growing pool + base 偏移，同 fr_names 模式）──────────────────
-
-pub var fl_names: []string;
-pub var fl_starts: []i64;
-pub var fl_lens: []i64;
-pub var fl_ends: []i64;
-
-pub fn fr_layout(d: i64) i64 {
-    var base: i64 = slice_len(fl_names) as i64;
-    var auto_off: i64 = 0;
-    var c: i64 = base__node_lb((d as u64));
-    // S4 §4.6 Phase 3：链先物化再遍历 —— 纯读取循环，与原手写链遍历逐点同序
-    var ks3816: []i64 = base.kids_chain(c);
-    var ki3816: i64 = 0;
-    while (ki3816 < slice_len(ks3816) as i64) {
-        var kv3816: i64 = ks3816[ki3816];
-        var start: i64 = auto_off;
-        // S4 §0.14.7 SoA：侧表读（原 sl.bb）。⚠ 本函数内有局部 `var base: i64` 遮蔽 base 模块，
-        // 故此处直呼降级名 `base__node_bb`，不能写 `base.node_bb`。
-        if (base__node_bb((kv3816 as u64))) {
-            start = base__node_ib((kv3816 as u64));   // S4 §0.14.7 SoA：侧表读（原 sl.ib）
-        }
-        var end: i64 = start + base__node_ia((kv3816 as u64));
-        append(fl_names, base__node_sa((kv3816 as u64)));
-        append(fl_starts, start);
-        append(fl_lens, base__node_ia((kv3816 as u64)));
-        append(fl_ends, end);
-        auto_off = end;
-        ki3816 = ki3816 + 1;
-    }
-    return base;
-}
-
-// FlagDecl 节点 d 上槽位 slot 的比特宽度（-1 = 无此槽）。
-// emit_expr 用它区分 `PF_x`（1bit，宏值即掩码）与 `PF_x_MASK`（≥2bit）。
-pub fn c_flag_slot_len(d: i64, slot: string) i64 {
-    var c: i64 = base.node_lb((d as u64));
-    // S4 §4.6 Phase 3：链先物化再遍历 —— 纯读取循环，与原手写链遍历逐点同序
-    var ks3839: []i64 = base.kids_chain(c);
-    var ki3839: i64 = 0;
-    while (ki3839 < slice_len(ks3839) as i64) {
-        var kv3839: i64 = ks3839[ki3839];
-        if (base.node_sa((kv3839 as u64)) == slot) {
-            return base.node_ia((kv3839 as u64));
-        }
-        ki3839 = ki3839 + 1;
-    }
-    return -1;
-}
-
-
 // ── emitAttributes（复刻 emitter.ts emitAttributes）────────────
 
 pub fn emit_attributes(head: i64) string {
@@ -4324,110 +4260,6 @@ pub fn emit_enum_decl(d: i64) void {
             auto_val = auto_val + 1;
         }
         ki4223 = ki4223 + 1;
-    }
-}
-
-pub fn emit_flag_decl(d: i64) void {
-    hpush(base.sb_cat4("// flag[", base__node_sb((d as u64)), "] ", base__node_sa((d as u64))));
-    hpush(base.sb_cat6("typedef ", scalar_to_c(base__node_sb((d as u64))), " ", base__node_sa((d as u64)), ";", ""));
-    hpush("");
-
-    var base: i64 = fr_layout(d);
-    var total: i64 = slice_len(fl_names) as i64;
-    var i: i64 = base;
-    while (i < total) {
-        if (fl_lens[i] == 1) {
-            var ssb: StringBuilder = sb_new();
-            sb_append_str(ssb, "#define ");
-            sb_append_str(ssb, base__node_sa((d as u64)));
-            sb_append_str(ssb, "_");
-            sb_append_str(ssb, fl_names[i]);
-            sb_append_str(ssb, " (1u << ");
-            sb_append_i64(ssb, fl_starts[i]);
-            sb_append_str(ssb, ")");
-            hpush(sb_to_str(ssb));
-        } else {
-            var csb: StringBuilder = sb_new();
-            sb_append_str(csb, "// ");
-            sb_append_str(csb, fl_names[i]);
-            sb_append_str(csb, ": bits ");
-            sb_append_i64(csb, fl_starts[i]);
-            sb_append_str(csb, "-");
-            sb_append_i64(csb, fl_ends[i] - 1);
-            sb_append_str(csb, " (");
-            sb_append_i64(csb, fl_lens[i]);
-            sb_append_str(csb, " bits, max=");
-            sb_append_i64(csb, js_max_val(fl_lens[i]));
-            sb_append_str(csb, ")");
-            hpush(sb_to_str(csb));
-            var hsb: StringBuilder = sb_new();
-            sb_append_str(hsb, "#define ");
-            sb_append_str(hsb, base__node_sa((d as u64)));
-            sb_append_str(hsb, "_");
-            sb_append_str(hsb, fl_names[i]);
-            sb_append_str(hsb, "_SHIFT ");
-            sb_append_i64(hsb, fl_starts[i]);
-            hpush(sb_to_str(hsb));
-            var msb: StringBuilder = sb_new();
-            sb_append_str(msb, "#define ");
-            sb_append_str(msb, base__node_sa((d as u64)));
-            sb_append_str(msb, "_");
-            sb_append_str(msb, fl_names[i]);
-            sb_append_str(msb, "_MASK (((1u << ");
-            sb_append_i64(msb, fl_lens[i]);
-            sb_append_str(msb, ") - 1) << ");
-            sb_append_i64(msb, fl_starts[i]);
-            sb_append_str(msb, ")");
-            hpush(sb_to_str(msb));
-        }
-        i = i + 1;
-    }
-}
-
-pub fn emit_flag_set_decl(d: i64) void {
-    hpush(base.sb_cat3("// flag_set ", base__node_sa((d as u64)), " (dynamic length bitfield)"));
-    hpush(base.sb_cat3("typedef struct ", base__node_sa((d as u64)), " {"));
-    hpush("    uint8_t* data;");
-    hpush("    size_t bit_count;");
-    hpush("    size_t byte_count;");
-    hpush(base.sb_cat3("} ", base__node_sa((d as u64)), ";"));
-    hpush("");
-
-    var base: i64 = fr_layout(d);
-    var total: i64 = slice_len(fl_names) as i64;
-    var i: i64 = base;
-    while (i < total) {
-        var csb: StringBuilder = sb_new();
-        sb_append_str(csb, "// ");
-        sb_append_str(csb, fl_names[i]);
-        sb_append_str(csb, ": bits ");
-        sb_append_i64(csb, fl_starts[i]);
-        sb_append_str(csb, "-");
-        sb_append_i64(csb, fl_ends[i] - 1);
-        sb_append_str(csb, " (");
-        sb_append_i64(csb, fl_lens[i]);
-        sb_append_str(csb, " bits)");
-        hpush(sb_to_str(csb));
-        var hsb: StringBuilder = sb_new();
-        sb_append_str(hsb, "#define ");
-        sb_append_str(hsb, base__node_sa((d as u64)));
-        sb_append_str(hsb, "_");
-        sb_append_str(hsb, fl_names[i]);
-        sb_append_str(hsb, "_SHIFT ");
-        sb_append_i64(hsb, fl_starts[i]);
-        hpush(sb_to_str(hsb));
-        var msb: StringBuilder = sb_new();
-        sb_append_str(msb, "#define ");
-        sb_append_str(msb, base__node_sa((d as u64)));
-        sb_append_str(msb, "_");
-        sb_append_str(msb, fl_names[i]);
-        sb_append_str(msb, "_MASK (((1u << ");
-        sb_append_i64(msb, fl_lens[i]);
-        sb_append_str(msb, ") - 1) << ");
-        sb_append_i64(msb, fl_starts[i]);
-        sb_append_str(msb, ")");
-        hpush(sb_to_str(msb));
-        i = i + 1;
     }
 }
 
@@ -4927,14 +4759,6 @@ pub fn emit_decl(d: i64) void {
     }
     if (base.node_kind((d as u64)) == "EnumDecl") {
         emit_enum_decl(d);
-        return;
-    }
-    if (base.node_kind((d as u64)) == "FlagDecl") {
-        emit_flag_decl(d);
-        return;
-    }
-    if (base.node_kind((d as u64)) == "FlagSetDecl") {
-        emit_flag_set_decl(d);
         return;
     }
     if (base.node_kind((d as u64)) == "UnionDecl") {
