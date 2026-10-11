@@ -1092,6 +1092,17 @@ pub fn expr_type_desc(e: i64) i64 {
             }
         }
         var od2: i64 = expr_type_desc(base.node_na((e as u64)));
+        // ⚠ A-fix：conpat 载荷绑定（如 TypeInfo 的 `Struct(m) => m.field_count`）是
+        // `*TypeMeta` **指针**接收者，emit_expr 的成员分支（见 `msep` 判定）据此发 `m->field`。
+        // 这里做类型回溯时必须同样剥一层指针，才能找到被指结构体声明并查到字段 TD；
+        // 剥之前 `od2.cat=="pointer"` 落不进下面的 `named` 分支 ⇒ 返回 unknown ⇒
+        // match 结果临时槽 `_tmrN` 被声明成 `void*`（随后 `_tmrN = m->field_count` 虽能
+        // 赋值，但 `int64_t n = _tmr1;` 会触发 void*→int64_t 隐式转换告警/错）。
+        // 仅在判别为 pointer 时剥一层，其余形态完全不触发（既有用例零影响）。
+        if (od2 >= 0 && sema.tds[od2].cat == "pointer") {
+            var pel: i64 = sema.tds[od2].elem;
+            if (pel >= 0) { od2 = pel; }
+        }
         var ot2: TD = sema.tds[od2];
         if (ot2.cat == "named" && ot2.name != "") {
             var fd: i64 = sf_get(ot2.name, base.node_sa((e as u64)));
@@ -5149,6 +5160,24 @@ pub fn c_ti_emit_support() void {
     // ── .h：类型定义（须位于 __ti_<T> 前向声明之前，emit_type_info_c 随后 push 前向声明）──
     hpush("typedef struct { TStr name; int64_t size; int64_t kind; int64_t field_count; TSlice fields; } TypeMeta;");
     hpush("typedef struct { TStr name; int64_t offset; TStr type_name; int64_t type_size; int8_t is_ptr; int64_t tag; } FieldInfo;");
+    // ⚠ A-fix：这两个结构体由本函数**合成进 .h**，用户 TU 没有对应 StructDecl，且 sema 刻意
+    // 不把它们加进 lex.decl_list（理由见 ensure_reflection_builtins 注释）⇒ build_type_map
+    // 扫不到 ⇒ sf_* 里没有它们的字段表 ⇒ expr_type_desc 对 `m.field_count`（m: *TypeMeta）
+    // 返回 unknown ⇒ match 结果槽 `_tmrN` 被声明成 `void*`。
+    // 这里按上方 typedef 的**逐字布局**补登记（顺序/类型与 .h 声明严格一致，勿单边改），
+    // 使 conpat 载荷上的字段投影具备完整类型信息。仅在用到 type_info 时登记（本函数已被
+    // g_ti_support_emitted 守卫），不用反射的程序完全不触发。
+    sf_set("TypeMeta", "name", sema.td_mk("string"));
+    sf_set("TypeMeta", "size", sema.td_named_mk("scalar", "i64"));
+    sf_set("TypeMeta", "kind", sema.td_named_mk("scalar", "i64"));
+    sf_set("TypeMeta", "field_count", sema.td_named_mk("scalar", "i64"));
+    sf_set("TypeMeta", "fields", sema.td_elem_mk("slice", sema.td_named_mk("named", "FieldInfo")));
+    sf_set("FieldInfo", "name", sema.td_mk("string"));
+    sf_set("FieldInfo", "offset", sema.td_named_mk("scalar", "i64"));
+    sf_set("FieldInfo", "type_name", sema.td_mk("string"));
+    sf_set("FieldInfo", "type_size", sema.td_named_mk("scalar", "i64"));
+    sf_set("FieldInfo", "is_ptr", sema.td_named_mk("scalar", "i8"));
+    sf_set("FieldInfo", "tag", sema.td_named_mk("scalar", "i64"));
     hpush("typedef struct { int64_t _tag; TypeMeta* _meta; } TypeInfo;");
     // ── .c：构造器 + 访问子（static inline 避免未使用告警）──
     var ss: StringBuilder = sb_new();
@@ -5163,6 +5192,49 @@ pub fn c_ti_emit_support() void {
     sb_append_str(ss, "static inline TypeInfo TypeInfo_from_Enum(TypeMeta* m){ TypeInfo v; v._tag=8; v._meta=m; return v; }\n");
     sb_append_str(ss, "static inline TypeInfo TypeInfo_from_Trait(TypeMeta* m){ TypeInfo v; v._tag=9; v._meta=m; return v; }\n");
     sb_append_str(ss, "static inline TypeInfo TypeInfo_from_Union(TypeMeta* m){ TypeInfo v; v._tag=10; v._meta=m; return v; }\n");
+    // ⚠ A-fix：TypeInfo 是**注入合成**的反射变体（sema.ensure_reflection_builtins 登记在
+    // global_scope，**刻意不入 lex.decl_list**，否则用户 TU 会重复定义 %TypeInfo），
+    // 所以 emit_variant_decl 扫不到它的 VariantDecl，**不会**为它生成判别器 / 载荷取值器；
+    // 而 match 的 C 后端脱糖（见 cp_acc_and 的 `<V>_is_<C>` / `<V>_as_<C>` 调用）恰恰依赖
+    // 这两个访问器。缺它们 ⇒ 生成的 .c 引用未声明符号 ⇒ clang 报错 undeclared identifier。
+    // 这里按与 c_ti_kind_num 严格同源的 arm 表补齐（tag 取自同一函数，杜绝两处漂移）；
+    // Bool arm 无载荷（from_ 里 v._meta=0），故不生成 as_ 访问器——与 emit_variant_decl
+    // 对「无载荷 arm 不发 _as_」的既有约定一致。
+    // ⚠ append 在 t 里是**原地追加的语句**（不返回结果），不可写成 `x = append(x, v)`。
+    var ti_arms: []string = [];
+    append(ti_arms, "Int");
+    append(ti_arms, "Float");
+    append(ti_arms, "Bool");
+    append(ti_arms, "Ptr");
+    append(ti_arms, "Slice");
+    append(ti_arms, "Array");
+    append(ti_arms, "Fn");
+    append(ti_arms, "Struct");
+    append(ti_arms, "Enum");
+    append(ti_arms, "Trait");
+    append(ti_arms, "Union");
+    var ti_ai: i64 = 0;
+    while (ti_ai < slice_len(ti_arms) as i64) {
+        var ti_an: string = ti_arms[ti_ai];
+        var ti_tag: i64 = c_ti_kind_num(ti_an);
+        // 判别器：`static inline bool TypeInfo_is_Struct(TypeInfo self){ return self._tag == 7; }`
+        var tisb: StringBuilder = sb_new();
+        sb_append_str(tisb, "static inline bool TypeInfo_is_");
+        sb_append_str(tisb, ti_an);
+        sb_append_str(tisb, "(TypeInfo self){ return self._tag == ");
+        sb_append_i64(tisb, ti_tag);
+        sb_append_str(tisb, "; }\n");
+        sb_append_str(ss, sb_to_str(tisb));
+        if (ti_an != "Bool") {
+            // 取值器：arm 载荷恒为 `*TypeMeta`（TypeInfo 的 payload 是 meta 指针而非内联字节）。
+            var tasb: StringBuilder = sb_new();
+            sb_append_str(tasb, "static inline TypeMeta* TypeInfo_as_");
+            sb_append_str(tasb, ti_an);
+            sb_append_str(tasb, "(TypeInfo self){ return self._meta; }\n");
+            sb_append_str(ss, sb_to_str(tasb));
+        }
+        ti_ai = ti_ai + 1;
+    }
     sb_append_str(ss, "static inline TStr ti_name(TypeInfo ti){ return ((TypeMeta*)ti._meta)->name; }\n");
     sb_append_str(ss, "static inline int64_t ti_size(TypeInfo ti){ return ((TypeMeta*)ti._meta)->size; }\n");
     sb_append_str(ss, "static inline int64_t ti_kind(TypeInfo ti){ return ((TypeMeta*)ti._meta)->kind; }\n");
