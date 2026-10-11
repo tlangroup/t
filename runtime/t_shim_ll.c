@@ -28,21 +28,6 @@ void    tll_assert_eq_f32(float a, float b, TStr* msg)      { t_assert_eq_f32(a,
 void    tll_assert_eq_b(int8_t a, int8_t b, TStr* msg)      { t_assert_eq_b(a, b, *msg); }
 void    tll_assert_eq_s(TStr* a, TStr* b, TStr* msg)        { t_assert_eq_s(*a, *b, *msg); }
 
-// ── type_info(T) accessor shim（M36）──
-// 约定：返回聚合（string）用 out-pointer，且 out 排在末位——与
-//       tll_file_read_all / tll_str_slice / tll_sb_to_str 一致，顺序不可颠倒；
-//       返回标量/指针直接返回（与 str_len / slice_at 一致）。
-void       tll_ti_name(TTypeInfo* ti, TStr* out)      { *out = t_ti_name(ti); }
-int64_t    tll_ti_size(TTypeInfo* ti)                 { return t_ti_size(ti); }
-int64_t    tll_ti_kind(TTypeInfo* ti)                 { return t_ti_kind(ti); }
-int64_t    tll_ti_field_count(TTypeInfo* ti)          { return t_ti_field_count(ti); }
-TFieldInfo* tll_ti_field(TTypeInfo* ti, int64_t i)    { return t_ti_field(ti, i); }
-void       tll_fi_name(TFieldInfo* fi, TStr* out)     { *out = t_fi_name(fi); }
-int64_t    tll_fi_offset(TFieldInfo* fi)              { return t_fi_offset(fi); }
-void       tll_fi_type_name(TFieldInfo* fi, TStr* out){ *out = t_fi_type_name(fi); }
-int64_t    tll_fi_type_size(TFieldInfo* fi)           { return t_fi_type_size(fi); }
-int64_t    tll_fi_is_ptr(TFieldInfo* fi)              { return (int64_t)t_fi_is_ptr(fi); }
-int64_t    tll_fi_tag(TFieldInfo* fi)                { return t_fi_tag(fi); }
 int64_t tll_str_len(TStr* s)                { return t_str_len(*s); }
 int64_t tll_str_at(TStr* s, int64_t i)      { return (int64_t)t_str_byte_at(*s, i); }
 int32_t tll_str_eq(TStr* a, TStr* b)        { return t_str_eq(*a, *b) ? 1 : 0; }
@@ -107,6 +92,9 @@ int64_t tll_parse_time(TStr* spec, TStr* s, int64_t use_local) { return t_parse_
 // ── 通用堆分配（定长数组槽用；栈 alloca 在数组地址流入逃逸 TSlice 并返回时会悬空，
 //     故改走持久堆，堆是栈的超集，对全部用例安全。基于 t_alloc（持久 malloc，非 arena）──
 void*   tll_alloc(int64_t size)                             { return t_alloc((size_t)size); }
+// 通用字节拷贝（变体全局常量：构造器在 t.__ginit 栈上物化 %V，需拷到堆以跨 ginit 栈帧持久化；
+// payload 自身已堆分配，故整体浅拷贝即安全）。
+void    tll_memcpy(void* dst, const void* src, int64_t n)   { if (n > 0) memcpy(dst, src, (size_t)n); }
 
 // ── slice ──────────────────────────────────────────────────────
 void    tll_slice_new(int64_t esz, TSlice* out)              { *out = t_slice_new(esz); }
