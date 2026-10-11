@@ -1,0 +1,37 @@
+// v2 @type_info 反射 —— match 构造器分发 + 载荷字段投影
+//
+// 对照 docs/compiler/typeinfo-design.md §4：`type_info(T)` 在编译期折成 TypeInfo 值，
+// TypeInfo 在用户代码里就是一个普通的、可 match 的 variant。本示例演示：
+//   ① 构造器分发（Int / Struct / `_` 兜底），由运行时 tag 决定、非无条件命中首臂；
+//   ② 命中臂里对 `*TypeMeta` 载荷做字段投影 —— 指针接收者自动解引用，
+//      故 `m.field_count` 等价于 C 的 `m->field_count`（`(*m).field_count`）。
+// 双后端（C / LLVM）语义一致。遗留 API（ti_*/fi_*）见 examples/typeinfo_v2.tc。
+
+struct Point {
+    x: i64 @ 1;
+    y: i64 @ 2 = 42;
+    z: i64 @ 3;
+    label: string @ 4;
+}
+
+@main
+fn main() i64 {
+    var ti: TypeInfo = type_info(Point);
+
+    // ① 字段投影：Struct 臂命中，m: *TypeMeta ⇒ m.field_count == Point 的字段数
+    var n: i64 = match (ti) { Struct(m) => m.field_count  _ => -1 };
+    println(int_to_str(n));              // 4
+
+    // ② 同一载荷的多字段投影：kind（类型种类）/ size（字节宽）
+    var kind: i64 = match (ti) { Struct(m) => m.kind  _ => -1 };
+    var size: i64 = match (ti) { Struct(m) => m.size  _ => -1 };
+    println(int_to_str(kind));           // 7  (Struct)
+    println(int_to_str(size));           // 40 (sizeof(Point))
+
+    // ③ 分发：基本类型 i64 走 Int 臂（tag=0），Struct 臂不得命中
+    var ti2: TypeInfo = type_info(i64);
+    var k: i64 = match (ti2) { Int(_) => 100  Struct(_) => 200  _ => -2 };
+    println(int_to_str(k));              // 100
+
+    return n;                            // 4
+}

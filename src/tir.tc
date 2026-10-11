@@ -886,13 +886,38 @@ pub fn tir_scalar_st(name: string) string {
 }
 
 // TD → ST 映射（tir-design.md §7，对齐 ll_td 但输出 TIR 记号）
+// A-fix：识别「注入合成的反射变体」（当前仅 TypeInfo）。
+// 背景：ensure_reflection_builtins 把 TypeInfo 登记在 **global_scope 的 sym** 上，刻意不放进
+// lex.decl_list（放进去会与反射支持硬编码的 `%TypeInfo = type { i64, ptr }` 重复定义，
+// 见 sema.ensure_reflection_builtins 注释）。于是所有「按名字回查 decl_list」的判定
+// （t_td_is_variant / t_variant_decl_of_name）对它恒假 ⇒ tir_emit_match 认不出 scrutinee 是
+// 变体 ⇒ **整条模式条件链被跳过** ⇒ 入口退化成 `br label <首臂>`，任何 TypeInfo 的 match
+// 都无条件命中第一个 arm（即使运行时 tag 不同）。此处按 sym 的 decl 节点回退判定。
+pub fn tir_is_reflection_variant(td: i64) bool {
+    if (td < 0) { return false; }
+    if (td >= slice_len(sema.tds) as i64) { return false; }
+    if (sema.tds[td].name != "TypeInfo") { return false; }
+    var rsi: i64 = sema.sym_lookup(sema.global_scope, "TypeInfo");
+    if (rsi < 0) { return false; }
+    var rsd: i64 = sema.syms[rsi].decl;
+    if (rsd < 0) { return false; }
+    return base.node_kind((rsd as u64)) == "VariantDecl";
+}
+
 // 判断 TD 是否为变体类型。注意：sema.tip_kind 读 tis[]（TypeInfo 索引），而此处 td 是
 // sema.tds[]（TypeDef 索引），二者不可混用；故直接扫 decl_list 的 VariantDecl 判定。
+// ⚠ A-fix：除手写 VariantDecl 外，还须覆盖「注入合成的反射变体」（tir_is_reflection_variant）。
+// 这是**唯一真相源**——下游 8 个调用点（tir_st_of_td / tir_st_value_of_td / 变体全局初始化 /
+// 构造器 sret / 实参 ABI / match 条件链）全部依赖本判定。漏掉 TypeInfo 会让
+// tir_st_of_td 回落 `t.cat=="named"` 分支返回 `%TypeInfo`（值槽），而 type_info(T) 的
+// TIR_OP_TYPEINFO 返回的是**指向 variant 数据的指针** ⇒ 变量槽存的是地址，后续
+// `load i64` 读到地址本身去和 tag 常量比较 ⇒ 条件恒假、全部落 `_` 兜底臂。
 pub fn t_td_is_variant(td: i64) bool {
     if (td < 0) { return false; }
     if (td >= slice_len(sema.tds) as i64) { return false; }
     var t: TD = sema.tds[td];
     if (t.cat != "named") { return false; }
+    if (tir_is_reflection_variant(td)) { return true; }
     var n: i64 = slice_len(lex.decl_list) as i64;
     var i: i64 = 0;
     while (i < n) {
@@ -902,6 +927,20 @@ pub fn t_td_is_variant(td: i64) bool {
     }
     return false;
 }
+
+// A-fix：变体 case 所在的 VariantDecl 反查，覆盖「注入合成变体」（decl_list 回退，见上）。
+pub fn t_variant_decl_of_name_ex(vname: string) i64 {
+    var dv: i64 = t_variant_decl_of_name(vname);
+    if (dv >= 0) { return dv; }
+    if (vname == "TypeInfo") {
+        var esi: i64 = sema.sym_lookup(sema.global_scope, "TypeInfo");
+        if (esi >= 0 && sema.syms[esi].decl >= 0 && base.node_kind((sema.syms[esi].decl as u64)) == "VariantDecl") {
+            return sema.syms[esi].decl;
+        }
+    }
+    return -1;
+}
+
 // 判断 TD 是否为枚举类型。⚠ 与 t_td_is_variant 同构：引擎对「用户具名类型」一律登记
 // cat=="named"（cat=="enum" 只出现在极少数字面 TD 上），故仅判 cat=="enum" 恒为假——
 // 这正是「enum scrutinee 的 match 恒命中首臂」的根因：模式条件返回空串 → 整条条件链被跳过
@@ -4829,6 +4868,19 @@ pub fn tir_member_base_st(e: i64) string {
         }
         return "i64";
     }
+    // A-fix：解引用 `*r` 作 member 基底 —— deref 节点的 TD 即「被指类型」
+    // （见 tir_emit_deref 注释：「meta_type_of_expr 对 *r 解析为被指类型」），据此还原 `%Struct` 名。
+    // ⚠ 此前 deref 基底直接落到末尾 return tir_expr_st(e)，拿不到结构名（退化成 i64）
+    // → tir_field_index 查不到结构 → fidx 恒 0；且 ADDR_OF 槽按 i64 分配却被塞入指针
+    // → 生成 `getelementptr i64, ptr %x, i32 0`，静默读到字段 0（如 `(*q).y` 实际读到 x）。
+    if (base.node_kind((e as u64)) == "deref") {
+        var dbtd: i64 = tir_expr_td(e);
+        if (dbtd >= 0) {
+            var dbn: string = sema.tds[dbtd].name;
+            if (sema.find_struct_fields(dbn) >= 0) { return base.sb_cat2("%", dbn); }
+        }
+        return tir_expr_st(e);
+    }
     if (base.node_kind((e as u64)) == "index") {
         // ⚠ 切片/数组/向量下标作 member 基底：`s[i].field` 的基底类型 = 元素类型。
         // 优先用 tir_emit_index_addr 已算好的权威元素类型 g_idx_elem_st（与 slice_at 同源，
@@ -4851,20 +4903,39 @@ pub fn tir_member_base_st(e: i64) string {
 //   给索引 ⇒ 改收索引 e（第一类：调用方有裸索引）。⚠ 函数体仍读 `mnode.sa`（sa 未外置），
 //   故保留本地取值。
 pub fn tir_member_addr(e: i64) string {
+    var bn: i64 = base.node_na((e as u64));   // member 基底节点；A-fix 下指针接收者会被换成合成 deref
+    // A-fix：指针型接收者**单级自动解引用** —— 语义 `ptrVar.field` ≡ `(*ptrVar).field`，
+    // 对齐 C 后端 emit_member 的既有约定：「指针型接收者（如 variant arm 的 *TypeMeta 载荷）
+    // 须发 `->`」（codegen_c.tc）。此前 TIR 侧缺失此步 → 接收者槽仍是「指针变量的地址」
+    // (ptr-to-ptr)，字段查找拿不到结构名 → fidx 恒 0、GEP 基落在 &ptrVar
+    // → 静默把指针值本身当字段 0 读出。触发场景：TypeInfo 反射 `Struct(m) => m.field_count`。
+    // 守卫：仅在被指对象确为可查字段的结构体时接管，避免误伤其它 ptr 基底。
+    var mbn_auto: string = "";   // A-fix：命中自动解引用时的「被指结构体名」（"" = 未命中）
+    if (base.node_kind((bn as u64)) != "index" && base.node_kind((bn as u64)) != "deref") {
+        var mbtd: i64 = tir_expr_td(bn);
+        if (mbtd >= 0 && sema.tds[mbtd].cat == "pointer" && sema.tds[mbtd].elem >= 0) {
+            var mbn: string = sema.tds[sema.tds[mbtd].elem].name;
+            if (sema.find_struct_fields(mbn) >= 0) { bn = base.mk_deref(bn, -1); mbn_auto = mbn; }
+        }
+    }
     var base_slot: string = "";
-    if (base.node_kind((base.node_na((e as u64)) as u64)) == "index") {
+    if (base.node_kind((bn as u64)) == "index") {
         // 切片/数组下标作 member 基底：必须取「元素地址」（tir_emit_index_addr）。
         // 不能走 tir_emit_expr —— 它内部是 index_read，会 load 出元素「值」，
         // 随后 ADDR_OF 把值物化成临时副本再取址，于是 `s[i].f = v` 只改了副本、
         // 且没有 slice_set 写回 → 写入静默丢失。编译器自身因此永远设不上
         // `nodes[d].bc = true`（pub 标记），跨模块可见性恒假 → src/tc.tc 报
         // 17956 条 T-MOD-E558。判据：examples/_slicefield.tc。
-        base_slot = tir_emit_index_addr(base.node_na((e as u64)));
+        base_slot = tir_emit_index_addr(bn);
     } else {
-        var base_slotr: TirEmitRes = tir_emit_expr(base.node_na((e as u64)));
+        var base_slotr: TirEmitRes = tir_emit_expr(bn);
         base_slot = base_slotr.name;
     }
-    var base_st: string = tir_member_base_st(base.node_na((e as u64)));   // 嵌套 member 权威基底类型（字符串路径，绕开 TD 越界回退 i64）
+    var base_st: string = tir_member_base_st(bn);   // 嵌套 member 权威基底类型（字符串路径，绕开 TD 越界回退 i64）
+    // ⚠ 合成 deref 节点没有 ti（sema 已跑完，新建节点无类型缓存）→ tir_member_base_st 对它取不到
+    // 结构名而退化成 "i64"，导致 sname="i64" → fidx 恒 0、GEP 基类型错。此处按已知被指结构名
+    // 直接覆盖，绕开对合成节点做类型推断。
+    if (str_len(mbn_auto) > 0) { base_st = base.sb_cat2("%", mbn_auto); }
     g_membase_st = base_st;
     var addr: string = tir_tmp();
     // P5 修复（LLVM segfault 139 根因）：packed struct 宿主整型可能 < 8 字节（如 u32 host
@@ -5376,7 +5447,7 @@ pub fn tir_match_pattern_cond(armId: i64, scr: string, scr_base: string, scr_st:
                 return cond;
             }
         } else if (t_td_is_variant(scr_td)) {
-            var vd: i64 = t_variant_decl_of_name(scr_vname);
+            var vd: i64 = t_variant_decl_of_name_ex(scr_vname);
             var ci: i64 = sema.variant_find_case(vd, cname);
             if (ci >= 0) {
                 var idx: i64 = 0;
@@ -5391,6 +5462,10 @@ pub fn tir_match_pattern_cond(armId: i64, scr: string, scr_base: string, scr_st:
                     cc_ki = cc_ki + 1;
                 }
                 var tagp: string = tir_tmp();
+                // ⚠ 索引形态必須跟 base 的「指针/值」属性一致：条件链启用后 scrutinee 走的是
+                // 指针基（ptr<%TypeInfo>，与 Shape 等普通变体同路径）⇒ 必须给满 [解引用0, 字段0]；
+                // 只给单个 "0" 会漏掉字段下标 → `getelementptr %TypeInfo, ptr %x, i32 0`
+                // （把指针值本身当 tag 读 → 条件恒假 → 全部落到 `_` 兜底臂）。
                 tir_emit(TIRInst{ op: TIR_OP_GEP, st: tir_st_from_str("i64"), dst: tir_op(tagp), args: tir_a3(scr_base, "0", "0"), is_comment: false, line: g_cur_line, cmt: "" });
                 var tagv: string = tir_tmp();
                 tir_emit(TIRInst{ op: TIR_OP_LOAD, st: tir_st_from_str("i64"), dst: tir_op(tagv), args: tir_a1(tagp), is_comment: false, line: g_cur_line, cmt: "" });
@@ -5408,7 +5483,7 @@ pub fn tir_match_pattern_cond(armId: i64, scr: string, scr_base: string, scr_st:
     if (base.node_kind((base.node_na((armId as u64)) as u64)) == "conpat") {
         if (t_td_is_variant(scr_td)) {
             // B1 修复：scr_td 是 TypeId 索引，variant_decl_of 期望 TypeInfo 索引 → 必用 vname 反查
-            var vd2: i64 = t_variant_decl_of_name(scr_vname);
+            var vd2: i64 = t_variant_decl_of_name_ex(scr_vname);
             var cname2: string = base.node_sa((base.node_na((armId as u64)) as u64));
             var ci2: i64 = sema.variant_find_case(vd2, cname2);
             if (ci2 >= 0) {
@@ -5545,6 +5620,21 @@ pub fn tir_emit_match(sid: i64, as_stmt: bool, est: i64) TirEmitRes {
         scr_base = tir_tmp();
         var scr_ptrst: string = base.sb_cat3("ptr<%", scr_vname, ">");
         tir_emit(TIRInst{ op: TIR_OP_ADDR_OF, st: tir_st_from_str(scr_ptrst), dst: tir_op(scr_base), args: tir_a1(scr), is_comment: false, line: g_cur_line, cmt: "" });
+    }
+    // ⚠ TypeInfo scrutinee 基底「显式物化」（A-fix）：
+    // TypeInfo 局部槽在**后端**登记的类型有可能被降级成裸 `ptr` —— 实测触发路径是把该变量
+    // 先传给遗留 ti_* 函数（`println(int_to_str(ti_kind(ti)))` 出现在 match 之前），此时
+    // GEP 会拿 `ptr`（**标量**）当基类型、却仍收到两级下标 ⇒
+    // `getelementptr inbounds ptr, ptr %ti, i32 0, i32 0` → clang `invalid getelementptr indices`，
+    // 连 IR 都通不过。（注意：降级发生在后端 llname 注册表，非 TIR 的 g_local_sts，
+    // 故无法在前端用「检查 slot st」的方式先验地命中。）
+    // 修法：无条件先把「指向变体数据的指针」load 到 st=ptr<%TypeInfo> 的临时槽，再以其为 GEP 基，
+    // 使后端永远按「指针基」约定行事（add_deref0=false，前端给满 [解引用0, 字段k]）。
+    // 已实测：这与未被污染时后端自行产出的指令完全一致，不会引入额外 IR 差异。
+    if (scr_vname == "TypeInfo") {
+        var sbfix: string = tir_tmp();
+        tir_emit(TIRInst{ op: TIR_OP_LOAD, st: tir_st_from_str("ptr<%TypeInfo>"), dst: tir_op(sbfix), args: tir_a1(scr), is_comment: false, line: g_cur_line, cmt: "" });
+        scr_base = sbfix;
     }
     // 预声明绑定名 slot（match entry）：使守卫/体都引用局部 slot，且声明早于使用
     var i: i64 = 0;
@@ -5738,9 +5828,32 @@ pub fn tir_emit_match(sid: i64, as_stmt: bool, est: i64) TirEmitRes {
                     off3 = tir_round8(off3);
                     var aoff3: i64 = off3;   // payload 内偏移（与构造器载荷布局逐字节一致）
                     var fpi3: string = tir_tmp();
-                    tir_emit(TIRInst{ op: TIR_OP_GEP, st: tir_st_from_str("i8"), dst: tir_op(fpi3), args: tir_a4(scr_base, "0", "1", base.i2s(aoff3)), is_comment: false, line: g_cur_line, cmt: "" });
+                    // ⚠ TypeInfo 的 arm 载荷是 `*TypeMeta`（指针值），不是内联字节 blob，
+                    // 因此取出的必须是「指针值」本身，需要**两次**解引用：
+                    //   &payload(GEP) → *( TypeMeta** )&payload → meta 指针
+                    // 后端 TIR_OP_LOAD 的穿透解引用仅在 `pst(源槽) == "ptr<" + st + ">"` 时触发；
+                    // 本切片 fst3 解析为 `%TypeMeta`（不含 ptr 前缀）⇒ 落进「按值直读」分支，
+                    // 从 `&payload` 起连读 72 字节 ⇒ 首 8 字节是 meta 指针、其余是相邻垃圾
+                    // （症状：m.field_count 恒 0 / tag 比较后走错分支）。
+                    // 令本臂的 LOAD st 为 "ptr"，使源槽 st("ptr<ptr>") == "ptr<ptr>" 成立，
+                    // 即得到 *(&payload) = meta 指针；后续 `m.field` 由指针接收者自动解引用承接。
+                    var pld3: string = fst3;
+                    var is_ti3: bool = (scr_vname == "TypeInfo" || (scr_td >= 0 && sema.tds[scr_td].name == "TypeInfo"));
+                    if (is_ti3) { pld3 = "ptr"; }
+                    if (is_ti3) {
+                        // TypeInfo 是扁平布局 { i64 tag, ptr meta }：每个 arm 的载荷都是 field 1 的
+                        // *TypeMeta（非字节 blob）。故直接 GEP 到 field 1 取出 meta 指针，禁止再拖 aoff3
+                        // 字节偏移（那会多一层 i32 0 索引去解引用标量 ptr 字段 → verifier 报非法 GEP）。
+                        // ⚠ scr_vname 经 t_td_is_variant 查 lex.decl_list 取不到（TypeInfo 是注入合成
+                        // 变体，仅存在于 global_scope，不在 decl_list），故此处回退按 TD 名判定。
+                        // ⚠ 同上：条件链启用后 scrutinee 是**指针基**（后端不再补 i32 0），
+                        // 故必须显式给满 [解引用0, 字段1]；只给 "1" 会漏掉解引用 → 索引层数错位。
+                        tir_emit(TIRInst{ op: TIR_OP_GEP, st: tir_st_from_str("ptr"), dst: tir_op(fpi3), args: tir_a3(scr_base, "0", "1"), is_comment: false, line: g_cur_line, cmt: "" });
+                    } else {
+                        tir_emit(TIRInst{ op: TIR_OP_GEP, st: tir_st_from_str("i8"), dst: tir_op(fpi3), args: tir_a4(scr_base, "0", "1", base.i2s(aoff3)), is_comment: false, line: g_cur_line, cmt: "" });
+                    }
                     var vi3: string = tir_tmp();
-                    tir_emit(TIRInst{ op: TIR_OP_LOAD, st: tir_st_from_str(fst3), dst: tir_op(vi3), args: tir_a1(fpi3), is_comment: false, line: g_cur_line, cmt: "" });
+                    tir_emit(TIRInst{ op: TIR_OP_LOAD, st: tir_st_from_str(pld3), dst: tir_op(vi3), args: tir_a1(fpi3), is_comment: false, line: g_cur_line, cmt: "" });
                     var bidx3: i64 = tir_find_local_idx(base.node_sa((bk3_kv as u64)));
                     if (bidx3 >= 0) {
                         var bslot3: string = g_local_slots[bidx3];

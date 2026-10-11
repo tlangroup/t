@@ -1396,6 +1396,81 @@ pub fn parse_int_len(v: string, radix: i64) i64 {
 
 // ── 类型解析 resolveType（复刻 checker.ts:134）────────────────
 
+// ── 反射内建类型（TypeInfo / TypeMeta / FieldInfo）在用户代码里的可 match 化 ──
+// 背景：base.tc 将三者声明为 t-native variant/struct，但用户/示例编译单元不导入 base.tc，
+// 故 `TypeInfo` 经 resolve_ti 解析为合成描述符（kind="TypeInfo"），匹配器不认作 variant。
+// 此处惰性构造「合成声明」并 sym_define 进 global_scope，使 TypeInfo 在用户代码里成为可
+// match 的 variant（与 base.tc 内部一致；后端 desugar / 布局知识已就绪，无需改动）。
+// 仅当用户代码未自行声明这些名字时（即非编译 base.tc 自身）才注入，避免与真实声明冲突。
+pub var g_refl_builtins_done: bool = false;
+pub var g_ti_TypeInfo_ti: i64 = -1;
+pub var g_ti_TypeMeta_ti: i64 = -1;
+pub var g_ti_FieldInfo_ti: i64 = -1;
+
+pub fn ensure_reflection_builtins() void {
+    if (g_refl_builtins_done) { return; }
+    g_refl_builtins_done = true;
+
+    // TypeMeta：name:string, size:i64, kind:i64, field_count:i64, fields:[]FieldInfo
+    // 字段顺序须与后端硬编码布局（c_ti_emit_support / tir_to_ll 的 @__ti_<T>_meta）严格一致。
+    var tmf: i64 = -1; var tmt: i64 = -1;
+    tmt = base.list_push(tmf, tmt, base.mk_member("name", base.mk_named("string", -1), -1)); if (tmf < 0) { tmf = tmt; }
+    tmt = base.list_push(tmf, tmt, base.mk_member("size", base.mk_scalar("i64", -1), -1)); if (tmf < 0) { tmf = tmt; }
+    tmt = base.list_push(tmf, tmt, base.mk_member("kind", base.mk_scalar("i64", -1), -1)); if (tmf < 0) { tmf = tmt; }
+    tmt = base.list_push(tmf, tmt, base.mk_member("field_count", base.mk_scalar("i64", -1), -1)); if (tmf < 0) { tmf = tmt; }
+    tmt = base.list_push(tmf, tmt, base.mk_member("fields", base.mk_slice(base.mk_named("FieldInfo", -1), -1), -1)); if (tmf < 0) { tmf = tmt; }
+    if (sym_lookup(global_scope, "TypeMeta") < 0) {
+        var tm_decl: i64 = base.mk_StructDecl("TypeMeta", "", "", false, false, -1, tmf, -1);
+        g_ti_TypeMeta_ti = ti_named("Struct", "TypeMeta");
+        sym_define(global_scope, "TypeMeta", "type", g_ti_TypeMeta_ti, tm_decl);
+        // ⚠ 刻意**不**把 TypeMeta/FieldInfo 加进 decl_list：它们的 string 字段由
+        // base.mk_named("string") 合成，一旦进 decl_list 会被 sema 的结构字段检查轮
+        // 走到并按具名类型解析 → T-SEM-E200 UNKNOWN_TYPE `string`（string 是标量，
+        // 只有 scalar kind 才走得通）。二者靠 global_scope 的 sym 已足够：
+        // find_struct_fields 正是按 global_scope 查 SymbolDecl 取字段链（已验证可用）。
+        // 真正需要 decl_list 的只有 variant 检测，见下方 TypeInfo。
+    }
+
+    // FieldInfo：name:string, offset:i64, type_name:string, type_size:i64, is_ptr:bool, tag:i64
+    var fif: i64 = -1; var fit: i64 = -1;
+    fit = base.list_push(fif, fit, base.mk_member("name", base.mk_named("string", -1), -1)); if (fif < 0) { fif = fit; }
+    fit = base.list_push(fif, fit, base.mk_member("offset", base.mk_scalar("i64", -1), -1)); if (fif < 0) { fif = fit; }
+    fit = base.list_push(fif, fit, base.mk_member("type_name", base.mk_named("string", -1), -1)); if (fif < 0) { fif = fit; }
+    fit = base.list_push(fif, fit, base.mk_member("type_size", base.mk_scalar("i64", -1), -1)); if (fif < 0) { fif = fit; }
+    fit = base.list_push(fif, fit, base.mk_member("is_ptr", base.mk_scalar("bool", -1), -1)); if (fif < 0) { fif = fit; }
+    fit = base.list_push(fif, fit, base.mk_member("tag", base.mk_scalar("i64", -1), -1)); if (fif < 0) { fif = fit; }
+    if (sym_lookup(global_scope, "FieldInfo") < 0) {
+        var fi_decl: i64 = base.mk_StructDecl("FieldInfo", "", "", false, false, -1, fif, -1);
+        g_ti_FieldInfo_ti = ti_named("Struct", "FieldInfo");
+        sym_define(global_scope, "FieldInfo", "type", g_ti_FieldInfo_ti, fi_decl);
+    }
+
+    // TypeInfo variant arms：Int=0 … Union=10（顺序对齐 base.tc:5580），单载荷 *TypeMeta（Bool 无载荷）
+    var ptr_tm: i64 = base.mk_pointer(base.mk_named("TypeMeta", -1), -1);
+    var vcs: i64 = -1; var vct: i64 = -1;
+    vct = base.list_push(vcs, vct, base.mk_VC("Int", 0, ptr_tm, -1, -1)); if (vcs < 0) { vcs = vct; }
+    vct = base.list_push(vcs, vct, base.mk_VC("Float", 1, ptr_tm, -1, -1)); if (vcs < 0) { vcs = vct; }
+    vct = base.list_push(vcs, vct, base.mk_VC("Bool", 2, -1, -1, -1)); if (vcs < 0) { vcs = vct; }
+    vct = base.list_push(vcs, vct, base.mk_VC("Ptr", 3, ptr_tm, -1, -1)); if (vcs < 0) { vcs = vct; }
+    vct = base.list_push(vcs, vct, base.mk_VC("Slice", 4, ptr_tm, -1, -1)); if (vcs < 0) { vcs = vct; }
+    vct = base.list_push(vcs, vct, base.mk_VC("Array", 5, ptr_tm, -1, -1)); if (vcs < 0) { vcs = vct; }
+    vct = base.list_push(vcs, vct, base.mk_VC("Fn", 6, ptr_tm, -1, -1)); if (vcs < 0) { vcs = vct; }
+    vct = base.list_push(vcs, vct, base.mk_VC("Struct", 7, ptr_tm, -1, -1)); if (vcs < 0) { vcs = vct; }
+    vct = base.list_push(vcs, vct, base.mk_VC("Enum", 8, ptr_tm, -1, -1)); if (vcs < 0) { vcs = vct; }
+    vct = base.list_push(vcs, vct, base.mk_VC("Trait", 9, ptr_tm, -1, -1)); if (vcs < 0) { vcs = vct; }
+    vct = base.list_push(vcs, vct, base.mk_VC("Union", 10, ptr_tm, -1, -1)); if (vcs < 0) { vcs = vct; }
+    if (sym_lookup(global_scope, "TypeInfo") < 0) {
+        var ti_decl: i64 = base.mk_VariantDecl("TypeInfo", -1, vcs, -1);
+        g_ti_TypeInfo_ti = ti_named("Variant", "TypeInfo");
+        sym_define(global_scope, "TypeInfo", "type", g_ti_TypeInfo_ti, ti_decl);
+        // ⚠ 刻意**不**进 decl_list：TypeInfo 一旦进 decl_list，generic variant emitter 会
+        // 按 `{ i64, [N x i8] }` 再发一份 `%TypeInfo`，与反射支持硬编码的 `%TypeInfo = type
+        // { i64, ptr }`（tir_to_ll.tc:5216）重复定义 → clang `redefinition of type`。
+        // 变体判定改由 tir.tc 的 tir_is_reflection_variant / t_variant_decl_of_name_ex
+        // 回退按 global_scope 的 sym decl 识别（见其注释）。
+    }
+}
+
 pub fn resolve_ti(tn: i64) i64 {
     if (tn < 0) {
         return ti_mk("Unknown");
@@ -1472,10 +1547,19 @@ pub fn resolve_ti(tn: i64) i64 {
         return syi;
     }
     if (base.node_kind((tn as u64)) == "named") {
-        if (base.node_sa((tn as u64)) == "TypeInfo") { return ti_mk("TypeInfo"); }
-        if (base.node_sa((tn as u64)) == "FieldInfo") { return ti_mk("FieldInfo"); }
+        var rnm: string = base.node_sa((tn as u64));
+        // 反射内建类型：若用户已自行声明（如编译 base.tc 自身）则走真实声明，
+        // 否则惰性注入合成 VariantDecl/StructDecl，使 TypeInfo 在用户代码里可 match。
+        if (rnm == "TypeInfo" || rnm == "TypeMeta" || rnm == "FieldInfo") {
+            var rsi: i64 = sym_lookup(global_scope, rnm);
+            if (rsi >= 0 && syms[rsi].decl >= 0) { return syms[rsi].ti; }
+            ensure_reflection_builtins();
+            if (rnm == "TypeInfo") { return g_ti_TypeInfo_ti; }
+            if (rnm == "TypeMeta") { return g_ti_TypeMeta_ti; }
+            return g_ti_FieldInfo_ti;
+        }
         // 位串基元类型 `bitstr`（§15）：值级 (ptr u8, bit_len, cap)，与 []u8 同构。
-        if (base.node_sa((tn as u64)) == "bitstr") { return ti_mk("BitStr"); }
+        if (rnm == "bitstr") { return ti_mk("BitStr"); }
         var si: i64 = sym_lookup(global_scope, base.node_sa((tn as u64)));
         if (si < 0) { si = sym_lookup(cur_scope, base.node_sa((tn as u64))); }
         if (si >= 0) {
@@ -2601,7 +2685,7 @@ pub fn builtin_ret(name: string) i64 {
     if (name == "ti_size") { return ti_scalar("i64"); }
     if (name == "ti_kind") { return ti_scalar("i64"); }
     if (name == "ti_field_count") { return ti_scalar("i64"); }
-    if (name == "ti_field") { return ti_mk("FieldInfo"); }
+    if (name == "ti_field") { ensure_reflection_builtins(); return g_ti_FieldInfo_ti; }
     if (name == "fi_name") { return ti_mk("String"); }
     if (name == "fi_offset") { return ti_scalar("i64"); }
     if (name == "fi_type_name") { return ti_mk("String"); }
@@ -6629,7 +6713,8 @@ pub fn infer_expr_body(e: i64) i64 {
         return ti_mk("BitStr");
     }
     if (k == "typeinfo") {
-        return ti_mk("TypeInfo");
+        ensure_reflection_builtins();
+        return g_ti_TypeInfo_ti;
     }
     // 闭包构造点（M48）：值类型 = 合成函数的函数类型（env 首参对用户不可见）
     if (k == "closure_make") {
@@ -13972,10 +14057,11 @@ pub fn meta_eval_mbuiltin(e: i64) i64 {
         }
         var r: i64 = base.node_new("typeinfo");
         base.node_set_sa(r, meta_type_to_str(tnode));
-        // 返回编译期内建 TypeInfo（与 resolve_ti 的 named 分支一致：ti_mk("TypeInfo")，
-        // 即 LLVM %TypeInfo / C TypeInfo 变体；ti_field 返回 ti_mk("FieldInfo") 同理）。
+        // 返回编译期内建 TypeInfo（与 resolve_ti 的 named 分支一致：ti_named("Variant","TypeInfo")，
+        // 即 LLVM %TypeInfo / C TypeInfo 变体；ti_field 返回 ti_named("Struct","FieldInfo") 同理）。
         // 不再走 base.tc 的 base__TypeInfo，避免两套类型冲突导致 E202。
-        base.node_set_type(r, ti_mk("TypeInfo"));
+        ensure_reflection_builtins();
+        base.node_set_type(r, g_ti_TypeInfo_ti);
         return r;
     }
     // 不定长元函数（D3 首个真实消费方）：逐个求值实参并拼成一条消息。
@@ -15408,6 +15494,12 @@ pub fn ti_to_td_base(ti: i64) i64 {
         return rs;
     }
     if (t.kind == "Named") { return td_named_mk("named", t.name); }
+    // 反射内建类型（A-fix）：用户代码里 TypeInfo/FieldInfo/TypeMeta 经 resolve_ti 解析为
+    // ti_named("Variant"/"Struct", name)，按名字回退到具名 TD（与 resolve_type_desc 的
+    // named 分支一致的布局），避免落入 unknown。
+    if (t.kind == "Variant" && t.name == "TypeInfo") { return td_named_mk("named", "TypeInfo"); }
+    if (t.kind == "Struct" && t.name == "FieldInfo") { return td_named_mk("named", "FieldInfo"); }
+    if (t.kind == "Struct" && t.name == "TypeMeta") { return td_named_mk("named", "TypeMeta"); }
     if (t.kind == "Pointer") { return td_elem_mk("pointer", ti_to_td_base(t.elem)); }
     if (t.kind == "Optional") { return td_elem_mk("optional", ti_to_td_base(t.elem)); }
     // 向量：LLVM 侧 `<N x T>`，C 侧 `vector_size` typedef。宽度存 alen。
