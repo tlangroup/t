@@ -26,6 +26,13 @@ pub var g_spush_to_ginit: bool = false;
 // type_info(T) 编译期常量合成（M36）：去重表 + 模块级常量定义缓冲
 pub var ti_lines: []string;
 pub var ti_done: []string;
+// type_info 反射支撑声明（TypeInfo_from_<Kind> 构造器 + ti_*/fi_* 访问子）的 .c 函数定义缓冲：
+// 必须在文件作用域落地（C 不允许函数定义出现在函数体内），故 emit_type_info_c 在 emit_decl
+// 内触发时不能直接 spush，改为缓存到此，统一在 emit_unit 主循环后刷出。
+pub var g_ti_support_lines: []string;
+// C 后端反射支撑声明（TypeMeta/FieldInfo/TypeInfo typedef + TypeInfo_from_<Kind> 构造器 + ti_*/fi_* 访问子）
+// 是否已发射：type_info 按需发射一次，保证编译产物自包含（对齐 LLVM 后端 ll_emit_ti_ctor_def + builtin 内联）。
+pub var g_ti_support_emitted: bool = false;
 
 // ── P1 Stage 1b：捕获式发射缓冲 ──────────────────────────────
 // 值块 `{ s1; ...; sn; e; }` 在 C 里用 GNU 语句表达式 `({ ...; e; })` 表达，
@@ -489,12 +496,10 @@ pub fn emit_ctype(tn: i64) string {
         return scalar_to_c(base.node_sa((tn as u64)));
     }
     if (base.node_kind((tn as u64)) == "named") {
-        // type_info 自省类型：C 后端一律按指针（与 LLVM 后端的 ptr 一致），
-        // 因为运行时 t_ti_*/t_fi_* 接收 TTypeInfo*/TFieldInfo*。
-        if (base.node_sa((tn as u64)) == "TypeInfo") { return "TTypeInfo*"; }
-        if (base.node_sa((tn as u64)) == "FieldInfo") { return "TFieldInfo*"; }
         // 位串基元类型 `bitstr`：值级 (ptr u8, bit_len, cap) ⇒ C 侧 TBitStr（§15）。
         if (base.node_sa((tn as u64)) == "bitstr") { return "TBitStr"; }
+        // TypeInfo / FieldInfo 现在是 base.tc 里的真实 variant / struct，
+        // 走下方 base.node_sa 兜底返回其 C 类型名（variant/struct typedef）。
         return base.node_sa((tn as u64));
     }
     if (base.node_kind((tn as u64)) == "array") {
@@ -630,8 +635,6 @@ pub fn desc_to_c(td: i64) string {
     var t: TD = sema.tds[td];
     if (t.cat == "string") { return "TStr"; }
     if (t.cat == "bytes") { return "TStr"; }
-    if (t.cat == "typeinfo") { return "TTypeInfo*"; }
-    if (t.cat == "fieldinfo") { return "TFieldInfo*"; }
     if (t.cat == "slice") { return "TSlice"; }
     if (t.cat == "bitstr") { return "TBitStr"; }
     if (t.cat == "array") { return c_ptr_to(t.elem); }
@@ -842,9 +845,6 @@ pub fn expr_type_desc(e: i64) i64 {
     if (base.node_kind((e as u64)) == "fidconst") { return sema.td_named_mk("scalar", "fid"); }
     if (base.node_kind((e as u64)) == "serialize") { return sema.td_named_mk("scalar", "fid"); }
     if (base.node_kind((e as u64)) == "deserialize") { return sema.deser_type_of(base.node_nb((e as u64))); }
-    if (base.node_kind((e as u64)) == "typeinfo") {
-        return sema.td_named_mk("typeinfo", base.node_sa((e as u64)));
-    }
     // P1 Stage 1b：多语句值块的类型 = **尾随表达式**的类型。
     // 缺这一支会让「首臂/首分支体为值块」时 mq_rtd 退化 unknown，进而把 match 结果
     // 临时量 _tmrN 声明成 void*（与 struct_lit 那支同源的问题，见 L-09）。
@@ -982,17 +982,6 @@ pub fn expr_type_desc(e: i64) i64 {
             if (cn == "map_len") { return sema.td_named_mk("scalar", "i64"); }
             if (cn == "map_set") { return sema.td_mk("void"); }
             if (cn == "map_new") { return sema.td_mk("map"); }
-            if (cn == "ti_name") { return sema.td_mk("string"); }
-            if (cn == "fi_name") { return sema.td_mk("string"); }
-            if (cn == "fi_type_name") { return sema.td_mk("string"); }
-            if (cn == "ti_size") { return sema.td_named_mk("scalar", "i64"); }
-            if (cn == "ti_kind") { return sema.td_named_mk("scalar", "i64"); }
-            if (cn == "ti_field_count") { return sema.td_named_mk("scalar", "i64"); }
-            if (cn == "fi_offset") { return sema.td_named_mk("scalar", "i64"); }
-            if (cn == "fi_tag") { return sema.td_named_mk("scalar", "i64"); }
-            if (cn == "fi_type_size") { return sema.td_named_mk("scalar", "i64"); }
-            if (cn == "ti_field") { return sema.td_named_mk("fieldinfo", "FieldInfo"); }
-            if (cn == "fi_is_ptr") { return sema.td_named_mk("scalar", "bool"); }
             if (cn == "sym_str") { return sema.td_mk("string"); }
             if (cn == "sym_release") { return sema.td_mk("void"); }
             if (cn == "sym_release_all") { return sema.td_mk("void"); }
@@ -2052,21 +2041,24 @@ pub fn builtin_ret_td(cn: string) i64 {
     if (cn == "map_del") { return sema.td_named_mk("scalar", "bool"); }
     if (cn == "map_len") { return sema.td_named_mk("scalar", "i64"); }
     if (cn == "map_set") { return sema.td_mk("void"); }
+    // 反射访问子（M36/A-fix）：返回编译期内建 TypeInfo / FieldInfo 的子字段。
+    // 返回类型与 builtin_ret 保持一致；cat 为 "TypeInfo"/"FieldInfo"，由后端映射为
+    // LLVM %TypeInfo / %FieldInfo 与 C 的 TypeInfo / FieldInfo 变体。
+    if (cn == "ti_name") { return sema.td_mk("string"); }
+    if (cn == "ti_size") { return sema.td_named_mk("scalar", "i64"); }
+    if (cn == "ti_kind") { return sema.td_named_mk("scalar", "i64"); }
+    if (cn == "ti_field_count") { return sema.td_named_mk("scalar", "i64"); }
+    if (cn == "ti_field") { return sema.td_mk("FieldInfo"); }
+    if (cn == "fi_name") { return sema.td_mk("string"); }
+    if (cn == "fi_offset") { return sema.td_named_mk("scalar", "i64"); }
+    if (cn == "fi_type_name") { return sema.td_mk("string"); }
+    if (cn == "fi_type_size") { return sema.td_named_mk("scalar", "i64"); }
+    if (cn == "fi_is_ptr") { return sema.td_named_mk("scalar", "bool"); }
+    if (cn == "fi_tag") { return sema.td_named_mk("scalar", "i64"); }
     // ⚠ map_new 返回类型依赖实参（被 new 的 map 变量的 key/val 类型），不可在此返回空壳 sema.td_mk("map")：
     // 空壳 td 的 key/val == -1，map_new 分支会访问 sema.tds[mt.key]→sema.tds[-1] 越界 panic（maps 崩溃同型）。
     // 返回 -1 让其回退到 tir_expr_td 的 meta_type_of_expr（拿到真实 map td），与基线行为一致。
     if (cn == "map_new") { return -1; }
-    if (cn == "ti_name") { return sema.td_mk("string"); }
-    if (cn == "fi_name") { return sema.td_mk("string"); }
-    if (cn == "fi_type_name") { return sema.td_mk("string"); }
-    if (cn == "ti_size") { return sema.td_named_mk("scalar", "i64"); }
-    if (cn == "ti_kind") { return sema.td_named_mk("scalar", "i64"); }
-    if (cn == "ti_field_count") { return sema.td_named_mk("scalar", "i64"); }
-    if (cn == "fi_offset") { return sema.td_named_mk("scalar", "i64"); }
-    if (cn == "fi_tag") { return sema.td_named_mk("scalar", "i64"); }
-    if (cn == "fi_type_size") { return sema.td_named_mk("scalar", "i64"); }
-    if (cn == "ti_field") { return sema.td_named_mk("fieldinfo", "FieldInfo"); }
-    if (cn == "fi_is_ptr") { return sema.td_named_mk("scalar", "bool"); }
     if (cn == "sym_str") { return sema.td_mk("string"); }
     if (cn == "sym_release") { return sema.td_mk("void"); }
     if (cn == "sym_release_all") { return sema.td_mk("void"); }
@@ -3004,9 +2996,6 @@ pub fn emit_expr(e: i64) string {
             if (cn == "args") { return "t_args()"; }
             if (cn == "read_line") { return "t_read_line()"; }
             if (cn == "stdin_eof") { return "t_stdin_eof()"; }
-            if (cn == "ti_name" || cn == "ti_size" || cn == "ti_kind" || cn == "ti_field_count" || cn == "ti_field" || cn == "fi_name" || cn == "fi_offset" || cn == "fi_type_name" || cn == "fi_type_size" || cn == "fi_is_ptr" || cn == "fi_tag") {
-                return c_emit_accessor_call(cn, av);
-            }
             if (cn == "exit") { return base.sb_cat3("t_exit(", av[0], ")"); }
             if (cn == "sys_run") { return base.sb_cat3("sys_run(", av[0], ")"); }
             if (cn == "print") { return base.sb_cat3("t_print(", av[0], ")"); }
@@ -3315,7 +3304,11 @@ pub fn emit_expr(e: i64) string {
                 return sb_to_str(sbm);
             }
         }
-        return base.sb_cat3(emit_expr(base.node_na((e as u64))), ".", base.node_sa((e as u64)));
+        // 指针型接收者（如 variant arm 的 *TypeMeta 载荷）须发 `->`，否则发 `.` 是非法 C。
+        var otd2: i64 = expr_type_desc(base.node_na((e as u64)));
+        var msep: string = ".";
+        if (otd2 >= 0 && sema.tds[otd2].cat == "pointer") { msep = "->"; }
+        return base.sb_cat3(emit_expr(base.node_na((e as u64))), msep, base.node_sa((e as u64)));
     }
     if (base.node_kind((e as u64)) == "index") {
         var od: i64 = expr_type_desc(base.node_na((e as u64)));
@@ -4914,6 +4907,10 @@ pub fn c_dev_has_kernels() bool {
 }
 
 pub fn emit_unit(mod: string) void {
+    g_ti_support_emitted = false;   // 每模块重置：反射支撑声明按需发射一次
+    ti_lines = [];                  // 每模块重置：避免跨模块污染
+    ti_done = [];
+    g_ti_support_lines = [];
     var guard: string = base.sb_cat3("TC_", to_upper(mod), "_H");
     hpush(base.sb_cat2("#ifndef ", guard));
     hpush(base.sb_cat2("#define ", guard));
@@ -4923,8 +4920,9 @@ pub fn emit_unit(mod: string) void {
     hpush("#include <stddef.h>");
     hpush("#include \"t_runtime.h\"");
     hpush("");
-    // type_info(T) 常量结构（M36）：TTypeInfo/TFieldInfo 由 t_runtime.h 提供，
-    // 此处不再重复 typedef（否则与 t_runtime.h 重定义冲突）。
+    // type_info(T) 常量结构：TypeMeta / FieldInfo 为 base.tc 内 t-native struct，
+    // 由通用 struct 路径发射，此处 emit_type_info_c 仅合成 @__ti_<T>_meta 全局并
+    // 调用生成的 TypeInfo_from_<Kind> 构造器（不再依赖 t_runtime.h 的魔法 typedef）。
 
     spush(base.sb_cat3("#include \"", mod, ".h\""));
     spush("#include <stdio.h>");
@@ -4932,6 +4930,21 @@ pub fn emit_unit(mod: string) void {
     spush("#include <string.h>");
     spush("#include \"t_runtime.h\"");
     spush("");
+
+    // 反射支撑（type_info 消费者）：TypeInfo_from_<Kind> 构造器 + ti_*/fi_* 访问子。
+    // ⚠ 必须在文件作用域、所有函数（含 main）之前落地，否则 C99 报隐式声明。
+    // typedef 入 .h（跨 TU 相同 typedef 合法），函数定义留 .c 避免跨模块重定义。
+    // 早期（仅 lazy）在 emit_decl 内 spush 会落入函数体；缓冲到 g_ti_support_lines
+    // 再于此处（文件作用域顶部）统一刷出，规避该问题且保证前向可见。
+    c_ti_emit_support();
+    {
+        var ssi: i64 = 0;
+        while (ssi < slice_len(g_ti_support_lines) as i64) {
+            spush(g_ti_support_lines[ssi]);
+            ssi = ssi + 1;
+        }
+        g_ti_support_lines = [];   // 已刷出，避免主循环后再 flush 造成重复定义
+    }
 
     // Device 子系统 M3：本模块含 `kernel fn` 时，把 Device Dialect 文本内嵌为 C 全局常量，
     // 供 tll_gpu_launch 读取（docs/compiler/device-design.md §6）。定义在文件顶（函数体之前），
@@ -5070,72 +5083,178 @@ pub fn c_emit_accessor_call(cn: string, av: []string) string {
 }
 
 
+// type_info(T) 常量合成（TypeInfo 现在是真正的 t variant）：
+// 双后端均经 __ti_<T>_meta 合成 TypeMeta 全局常量，再用生成的
+// TypeInfo_from_<Kind> 构造器包成 variant 值返回。支持所有类型种类
+// （struct/union 带字段数组；标量/指针/切片/数组/函数等 field_count=0）。
+pub fn c_ti_kind_num(arm: string) i64 {
+    if (arm == "Int") { return 0; }
+    if (arm == "Float") { return 1; }
+    if (arm == "Bool") { return 2; }
+    if (arm == "Ptr") { return 3; }
+    if (arm == "Slice") { return 4; }
+    if (arm == "Array") { return 5; }
+    if (arm == "Fn") { return 6; }
+    if (arm == "Struct") { return 7; }
+    if (arm == "Enum") { return 8; }
+    if (arm == "Trait") { return 9; }
+    if (arm == "Union") { return 10; }
+    return 7;
+}
+
+// 由类型名回查其声明节点种类（TD 仅有 cat，named 类型的真实 kind 在 decl 节点上）。
+pub fn c_ti_decl_kind(tname: string) string {
+    var n: i64 = slice_len(lex.decl_list) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        var d: i64 = lex.decl_list[i];
+        var k: string = base.node_kind((d as u64));
+        if (base.node_sa((d as u64)) == tname) {
+            if (k == "StructDecl") { return "Struct"; }
+            if (k == "UnionDecl") { return "Union"; }
+            if (k == "EnumDecl") { return "Enum"; }
+            if (k == "VariantDecl") { return "Union"; }
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+pub fn c_ti_arm(tname: string) string {
+    // ⚠ 原实现误用 sema.mb_type_decl(tname)（返回声明节点 id）当 TD 索引索引 sema.tds，
+    // 导致 named 类型被错判成 scalar → arm="Int"。改为先查声明节点种类（最可靠来源），
+    // 再按类型名判定标量/复合类型。
+    var dk: string = c_ti_decl_kind(tname);
+    if (dk == "Struct") { return "Struct"; }
+    if (dk == "Union") { return "Union"; }
+    if (dk == "Enum") { return "Enum"; }
+    if (tname == "bool") { return "Bool"; }
+    if (tname == "f32" || tname == "f64") { return "Float"; }
+    if (sema.is_int_name(tname)) { return "Int"; }
+    return "Struct";
+}
+
+// 合成 type_info(T) 的构造器调用。Bool arm 无载荷，构造器形如 TypeInfo_from_Bool()；
+// 其余 arm 形如 TypeInfo_from_<Kind>(&__ti_<T>)（单载荷 ptr TypeMeta；__ti_<T> 即 emit_type_info_c 合成的 TypeMeta 全局）。
+pub fn c_ti_call(arm: string, tname: string) string {
+    if (arm == "Bool") { return "TypeInfo_from_Bool()"; }
+    return base.sb_cat3("TypeInfo_from_", arm, base.sb_cat3("(&__ti_", tname, ")"));
+}
+
+// 反射支撑声明（C 后端自包含，对齐 LLVM 后端 ll_emit_ti_ctor_def + builtin 内联）：
+// TypeMeta/FieldInfo/TypeInfo 类型定义 + TypeInfo_from_<Kind> 构造器 + ti_*/fi_* 访问子。
+// 仅当模块使用 type_info 时发射一次（g_ti_support_emitted 守卫），使 /* unsupported */ 之外
+// 的 type_info 产物在 C 后端自洽（双后端一致）。
+pub fn c_ti_emit_support() void {
+    // ── .h：类型定义（须位于 __ti_<T> 前向声明之前，emit_type_info_c 随后 push 前向声明）──
+    hpush("typedef struct { TStr name; int64_t size; int64_t kind; int64_t field_count; TSlice fields; } TypeMeta;");
+    hpush("typedef struct { TStr name; int64_t offset; TStr type_name; int64_t type_size; int8_t is_ptr; int64_t tag; } FieldInfo;");
+    hpush("typedef struct { int64_t _tag; TypeMeta* _meta; } TypeInfo;");
+    // ── .c：构造器 + 访问子（static inline 避免未使用告警）──
+    var ss: StringBuilder = sb_new();
+    sb_append_str(ss, "static inline TypeInfo TypeInfo_from_Int(TypeMeta* m){ TypeInfo v; v._tag=0; v._meta=m; return v; }\n");
+    sb_append_str(ss, "static inline TypeInfo TypeInfo_from_Float(TypeMeta* m){ TypeInfo v; v._tag=1; v._meta=m; return v; }\n");
+    sb_append_str(ss, "static inline TypeInfo TypeInfo_from_Bool(void){ TypeInfo v; v._tag=2; v._meta=0; return v; }\n");
+    sb_append_str(ss, "static inline TypeInfo TypeInfo_from_Ptr(TypeMeta* m){ TypeInfo v; v._tag=3; v._meta=m; return v; }\n");
+    sb_append_str(ss, "static inline TypeInfo TypeInfo_from_Slice(TypeMeta* m){ TypeInfo v; v._tag=4; v._meta=m; return v; }\n");
+    sb_append_str(ss, "static inline TypeInfo TypeInfo_from_Array(TypeMeta* m){ TypeInfo v; v._tag=5; v._meta=m; return v; }\n");
+    sb_append_str(ss, "static inline TypeInfo TypeInfo_from_Fn(TypeMeta* m){ TypeInfo v; v._tag=6; v._meta=m; return v; }\n");
+    sb_append_str(ss, "static inline TypeInfo TypeInfo_from_Struct(TypeMeta* m){ TypeInfo v; v._tag=7; v._meta=m; return v; }\n");
+    sb_append_str(ss, "static inline TypeInfo TypeInfo_from_Enum(TypeMeta* m){ TypeInfo v; v._tag=8; v._meta=m; return v; }\n");
+    sb_append_str(ss, "static inline TypeInfo TypeInfo_from_Trait(TypeMeta* m){ TypeInfo v; v._tag=9; v._meta=m; return v; }\n");
+    sb_append_str(ss, "static inline TypeInfo TypeInfo_from_Union(TypeMeta* m){ TypeInfo v; v._tag=10; v._meta=m; return v; }\n");
+    sb_append_str(ss, "static inline TStr ti_name(TypeInfo ti){ return ((TypeMeta*)ti._meta)->name; }\n");
+    sb_append_str(ss, "static inline int64_t ti_size(TypeInfo ti){ return ((TypeMeta*)ti._meta)->size; }\n");
+    sb_append_str(ss, "static inline int64_t ti_kind(TypeInfo ti){ return ((TypeMeta*)ti._meta)->kind; }\n");
+    sb_append_str(ss, "static inline int64_t ti_field_count(TypeInfo ti){ return ((TypeMeta*)ti._meta)->field_count; }\n");
+    sb_append_str(ss, "static inline FieldInfo ti_field(TypeInfo ti, int64_t i){ return ((FieldInfo*)((TypeMeta*)ti._meta)->fields.ptr)[i]; }\n");
+    sb_append_str(ss, "static inline TStr fi_name(FieldInfo f){ return f.name; }\n");
+    sb_append_str(ss, "static inline int64_t fi_offset(FieldInfo f){ return f.offset; }\n");
+    sb_append_str(ss, "static inline TStr fi_type_name(FieldInfo f){ return f.type_name; }\n");
+    sb_append_str(ss, "static inline int64_t fi_type_size(FieldInfo f){ return f.type_size; }\n");
+    sb_append_str(ss, "static inline int8_t fi_is_ptr(FieldInfo f){ return f.is_ptr; }\n");
+    sb_append_str(ss, "static inline int64_t fi_tag(FieldInfo f){ return f.tag; }\n");
+    // ⚠ 缓存到模块级缓冲：emit_type_info_c 在 emit_decl 内触发，此时 spush 会落入函数体，
+    // 而 C 不允许函数定义出现在函数体内。由 emit_unit 主循环后统一刷出到文件作用域。
+    append(g_ti_support_lines, sb_to_str(ss));
+    g_ti_support_emitted = true;
+}
+
 pub fn emit_type_info_c(tname: string) string {
-    var gref: string = base.sb_cat2("&__ti_", tname);
+    if (g_ti_support_emitted == false) { c_ti_emit_support(); }
+    var arm: string = c_ti_arm(tname);
     var di: i64 = 0;
     var dn2: i64 = slice_len(ti_done) as i64;
     while (di < dn2) {
-        if (ti_done[di] == tname) { return gref; }
+        if (ti_done[di] == tname) { return c_ti_call(arm, tname); }
         di = di + 1;
     }
+    var kindn: i64 = c_ti_kind_num(arm);
     var d: i64 = ti_struct_decl(tname);
-    if (d < 0) {
-        base.diag_new("T-CDE-E910", "error", base.sb_cat2("type_info: '", base.sb_cat2(tname, "' 不是 struct 类型（当前仅支持 struct）")), "", 1, 1, 1, 10);
-        return "0";
-    }
-    append(ti_done, tname);
     // C 后端：type_info 常量定义在 t_entry_main 之后（emit 期才合成），
     // 但 C 的 static 先用后定义在同 TU 非法；故在 .h 内放前向声明。
-    // （Point 等 struct 已落在 .h，故 .c 顶部 include 后即可见。）
-    hpush(base.sb_cat3("static TTypeInfo __ti_", tname, ";"));
-    hpush(base.sb_cat3("static TFieldInfo __ti_", tname, "_f[];"));
-
-    var fsb: StringBuilder = sb_new();
-    sb_append_str(fsb, "static TFieldInfo __ti_");
-    sb_append_str(fsb, tname);
-    sb_append_str(fsb, "_f[] = { ");
+    hpush(base.sb_cat3("static TypeMeta __ti_", tname, ";"));
     var n: i64 = 0;
-    var c: i64 = base.node_lb((d as u64));
-    // S4 §4.6 Phase 3：链先物化再遍历 —— 纯读取循环，与原手写链遍历逐点同序
-    var ks5137: []i64 = base.kids_chain(c);
-    var ki5137: i64 = 0;
-    while (ki5137 < slice_len(ks5137) as i64) {
-        var kv5137: i64 = ks5137[ki5137];
-        if (base.node_ia((kv5137 as u64)) < 0) {
-            if (n > 0) { sb_append_str(fsb, ", "); }
-            var ftd: i64 = sema.resolve_type_desc(base.node_na((kv5137 as u64)));
-            var cty: string = emit_ctype(base.node_na((kv5137 as u64)));
-            var isp: i64 = 0;
-            if (is_ref_type(ftd)) { isp = 1; }
-            sb_append_str(fsb, base.sb_cat3("{ TSTR_LIT(\"", esc_c(base.node_sa((kv5137 as u64))), "\"), "));
-            sb_append_str(fsb, base.sb_cat5("offsetof(", tname, ", ", base.node_sa((kv5137 as u64)), "), "));
-            sb_append_str(fsb, base.sb_cat3("TSTR_LIT(\"", esc_c(sema.td_readable(ftd)), "\"), "));
-            sb_append_str(fsb, base.sb_cat3("sizeof(", cty, "), "));
-            sb_append_i64(fsb, isp);
-            sb_append_str(fsb, ", ");
-            sb_append_i64(fsb, base.node_ib((kv5137 as u64)));   // S4 §0.14.7 SoA：侧表读（原 f.ib，字段 tagID）
-            sb_append_str(fsb, " }");
-            n = n + 1;
+    if (d >= 0) {
+        hpush(base.sb_cat3("static FieldInfo __ti_", tname, "_f[];"));
+        var fsb: StringBuilder = sb_new();
+        sb_append_str(fsb, "static FieldInfo __ti_");
+        sb_append_str(fsb, tname);
+        sb_append_str(fsb, "_f[] = { ");
+        var c: i64 = base.node_lb((d as u64));
+        // S4 §4.6 Phase 3：链先物化再遍历 —— 纯读取循环，与原手写链遍历逐点同序
+        var ks: []i64 = base.kids_chain(c);
+        var ki: i64 = 0;
+        while (ki < slice_len(ks) as i64) {
+            var kv: i64 = ks[ki];
+            if (base.node_ia((kv as u64)) < 0) {
+                if (n > 0) { sb_append_str(fsb, ", "); }
+                var ftd: i64 = sema.resolve_type_desc(base.node_na((kv as u64)));
+                var cty: string = emit_ctype(base.node_na((kv as u64)));
+                var isp: i64 = 0;
+                if (is_ref_type(ftd)) { isp = 1; }
+                sb_append_str(fsb, base.sb_cat3("{ TSTR_LIT(\"", esc_c(base.node_sa((kv as u64))), "\"), "));
+                sb_append_str(fsb, base.sb_cat5("offsetof(", tname, ", ", base.node_sa((kv as u64)), "), "));
+                sb_append_str(fsb, base.sb_cat3("TSTR_LIT(\"", esc_c(sema.td_readable(ftd)), "\"), "));
+                sb_append_str(fsb, base.sb_cat3("sizeof(", cty, "), "));
+                sb_append_i64(fsb, isp);
+                sb_append_str(fsb, ", ");
+                sb_append_i64(fsb, base.node_ib((kv as u64)));   // S4 §0.14.7 SoA：侧表读（原 f.ib，字段 tagID）
+                sb_append_str(fsb, " }");
+                n = n + 1;
+            }
+            ki = ki + 1;
         }
-        ki5137 = ki5137 + 1;
+        sb_append_str(fsb, " };");
+        append(ti_lines, sb_to_str(fsb));
     }
-    sb_append_str(fsb, " };");
-
     var tsb: StringBuilder = sb_new();
-    sb_append_str(tsb, "static TTypeInfo __ti_");
+    sb_append_str(tsb, "static TypeMeta __ti_");
     sb_append_str(tsb, tname);
-    sb_append_str(tsb, base.sb_cat3(" = { TSTR_LIT(\"", esc_c(tname), "\"), "));
-    sb_append_str(tsb, base.sb_cat3("sizeof(", tname, "), 0, "));
-    sb_append_i64(tsb, n);
-    sb_append_str(tsb, base.sb_cat3(", { __ti_", tname, "_f, "));
-    sb_append_i64(tsb, n);
-    sb_append_str(tsb, ", ");
-    sb_append_i64(tsb, n);
-    sb_append_str(tsb, ", (int64_t)sizeof(TFieldInfo) } };");
-    // 字段数组必须先于 TTypeInfo 输出（后者引用前者）
-    append(ti_lines, sb_to_str(fsb));
+    if (d >= 0) {
+        sb_append_str(tsb, base.sb_cat3(" = { TSTR_LIT(\"", esc_c(tname), "\"), "));
+        sb_append_str(tsb, base.sb_cat3("sizeof(", tname, "), "));
+        sb_append_i64(tsb, kindn);
+        sb_append_str(tsb, ", ");
+        sb_append_i64(tsb, n);
+        sb_append_str(tsb, base.sb_cat3(", { __ti_", tname, "_f, "));
+        sb_append_i64(tsb, n);
+        sb_append_str(tsb, ", ");
+        sb_append_i64(tsb, n);
+        sb_append_str(tsb, ", (int64_t)sizeof(FieldInfo) } };");
+    } else {
+        var td: i64 = sema.mb_type_decl(tname);
+        var csz: string = "0";
+        if (td >= 0) { csz = base.sb_cat3("sizeof(", desc_to_c(td), ")"); }
+        sb_append_str(tsb, base.sb_cat3(" = { TSTR_LIT(\"", esc_c(tname), "\"), "));
+        sb_append_str(tsb, csz);
+        sb_append_str(tsb, ", ");
+        sb_append_i64(tsb, kindn);
+        sb_append_str(tsb, ", 0, { 0, 0, 0, (int64_t)sizeof(FieldInfo) } };");
+    }
     append(ti_lines, sb_to_str(tsb));
-    return gref;
+    append(ti_done, tname);
+    return c_ti_call(arm, tname);
 }
 
 
@@ -5156,7 +5275,7 @@ pub fn ti_struct_decl(tname: string) i64 {
     var i: i64 = 0;
     while (i < n) {
         var d: i64 = lex.decl_list[i];
-        if (base.node_kind((d as u64)) == "StructDecl" && base.node_sa((d as u64)) == tname) { return d; }
+        if ((base.node_kind((d as u64)) == "StructDecl" || base.node_kind((d as u64)) == "UnionDecl") && base.node_sa((d as u64)) == tname) { return d; }
         i = i + 1;
     }
     return -1;

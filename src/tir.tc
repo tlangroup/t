@@ -1002,7 +1002,6 @@ pub fn tir_st_of_td(td: i64) string {
         if (t.alen == 64) { return "u64"; }
         return "u32";
     }
-    if (t.cat == "typeinfo" || t.cat == "fieldinfo") { return "ptr<void>"; }
     if (t.cat == "func") { return "ptr<void>"; }
     if (t.cat == "void") { return "void"; }
     if (t.cat == "scalar") {
@@ -2065,6 +2064,22 @@ pub fn tir_emit_ginit() void {
                     // 负数字面量（折叠关闭时 `-1` 仍是 unary）：按表达式发射再 store。
                     var urr: TirEmitRes = tir_emit_expr(nb); var uslot: string = urr.name;
                     tir_emit(tir_emit_store(uslot, base.sb_cat2("@", nm)));
+                } else if (t_td_is_variant(tir_expr_td(nb))) {
+                    // 变体全局常量（如 `const X: V = V{ .A(7) }`）：sema 脱糖后 init 是
+                    // `@V_from_A(7)` 调用。构造器运行期 tll_alloc 堆上 16B payload 并填 tag，
+                    // 但变体 %V 聚合本身由调用方提供的 dest（指针）承载。tir_emit_expr(nb) 会在
+                    // t.__ginit 栈上物化该 %V、把其地址存入 @nm；ginit 返回后栈帧销毁 → @nm 悬空。
+                    // 故把栈上 %V 浅拷贝到堆（payload 自身已堆分配，24B 拷贝即持久化）再写回 @nm。
+                    // C 后端走 #define 宏展开、不消费本分支（其全局即值、无 ginit store）。
+                    var vr: TirEmitRes = tir_emit_expr(nb);          // vr.name = ptr 栈上 %V（即将失效）
+                    var vtd: i64 = tir_expr_td(nb);
+                    var vnn: string = sema.tds[vtd].name;
+                    var sz: i64 = 8 + tir_variant_mx(vnn);           // %V = { i64 tag, [16 x i8] payload } = 24B
+                    var hp: string = tir_tmp();
+                    tir_emit(tir_e_call("ptr", hp, "@tll_alloc", tir_cargs1(base.i2s(sz))));
+                    var md: string = tir_tmp();
+                    tir_emit(tir_e_call("void", md, "@tll_memcpy", tir_cargs3(hp, vr.name, base.i2s(sz))));
+                    tir_emit(tir_emit_store(hp, base.sb_cat2("@", nm)));
                 }
             }
         }
