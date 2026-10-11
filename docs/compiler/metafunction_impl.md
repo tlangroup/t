@@ -134,7 +134,8 @@ using m;                          // 引入该模块符号
 | M4 | 自举不动点：`build src/tc.tc --output out/dbg/g1` → g2==g3==g4 | `g2.ll==g3.ll==g4.ll` md5 `bab49f2cd7eff67b6d5d960d0ad83ee4` | ✅ |
 | M5 | conformance 344/0（`--compiler out/dbg/g1.exe`，含新增 `p_meta_type_info.tc`） | 0 failed，无回归 | ✅ |
 | M6 | IR 快照重录（`ir_snapshot --update --compiler out/dbg/g1.exe`）、提交 | baseline 已更新 119/360；已提交 `9649842` 并推送 | ✅ |
-| M7 | 编译期诊断内建（§4-bis）：`T-MTA-W621` + `@compile_log` / `@compile_warning` + `print` 归为运行期 | `tc check src/tc.tc` 0 error；自举不动点 g1==g2==g3==g4 md5 `ffcbad4c2677ca2ca18dd8629a36008d`；conformance **345/0**（含新增 `p64_compile_log_ok.tc`）；IR 快照 0 新增 / 0 缺失（3 处 `src/tc.tc` 自身产物漂移，合法） | ✅ |
+| M7 | 编译期诊断内建（§4-bis）：`T-MTA-W621` + `@compile_log` / `@compile_warning` + `print` 归为运行期 | `tc check src/tc.tc` 0 error；自举不动点 g1==g2==g3==g4 md5 `ffcbad4c2677ca2ca18dd8629a36008d`（hir_eval 对齐前）；conformance **345/0**（含新增 `p64_compile_log_ok.tc`）；IR 快照 0 新增 / 0 缺失（3 处 `src/tc.tc` 自身产物漂移，合法） | ✅ |
+| M8 | HIR 解释器对齐（§4-bis 末端）：移除 `src/hir_eval.tc` 中 `print`/`eprint` 的 CTFE 内建特判，使 `tc comptime-eval` 与 sema 侧一致（编译期上下文 print → 未注册编译期函数） | `tc check` 0 error；自举不动点 g1==g2==g3==g4 md5 `8b1d2aff86d1a23e8c084a5cccedc992`；`hir_eval_test.mjs` 26/26 + fact.tc 双轨全绿；conformance 345/0；IR 快照重录（src/tc.tc 自身产物漂移，0 新增 / 0 缺失） | ✅ |
 
 > ⚠ 任一 M 步失败即回退该步改动（保持 `node_bb` 门禁/移除的分支），不污染自举链。
 
@@ -155,6 +156,7 @@ using m;                          // 引入该模块符号
 | 求值分支 | `meta_eval_mbuiltin`（`T-MTA-E607` 兜底之前） | 逐实参 `meta_eval`，非标量（string/int/bool/float 之外）报 `T-MTA-E601`；不足 1 个报 `T-MTA-E611`；log 写 `eprint`，warning 发 `T-MTA-W621`（带行列）；返回 `mv_int(0)` |
 | 值转字符串助手 | `mv_to_str` | 对齐 `meta_design.md` §2.2 的用法 `@compile_log("meta k = ", k)`：实参可以是任意**标量**编译期值 |
 | **移除** `print`/`eprint` 的编译期登记与其 CTFE 分支 | `meta_eval_builtin` | 编译期上下文出现 `print(...)` → `T-MTA-E617 未定义的编译期函数` |
+| **移除** `print`/`eprint` 的 HIR 解释器内建特判 | `src/hir_eval.tc` `hv_call_builtin` / `hv_eval_call` | `tc comptime-eval` 路径下 print 不再被当作内建；编译期上下文出现 print → `hv_fn_lookup` 报「调用未注册的编译期函数: print」，与 sema 侧对齐（HIR 解释器是 `comptime-eval` 子命令的实现，已被 gate L2 的 `hireval` 项护栏覆盖） |
 
 **不定长的接线形态**：`mb_variadic` 为真的内建不走精确元数检查，而是「末位（此处即全部位置）吸收余参 → 逐个求值 → 拼成一条消息」。这是规范 §5.3 的第一个真实消费方。
 

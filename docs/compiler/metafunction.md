@@ -204,7 +204,7 @@ const s = comptime type_of(some_value)   // 运行普通 type_of，但在编译�
 | `@compile_log(args...)` | CTFE-only · **不定长** | 编译期写 **stderr**（stdout 留给 JSON/IR）；≥1 个标量实参（string/int/bool/float）依次拼接；返回 unit | ❌ 仅编译期（`T-MTA-E605`） |
 | `@compile_warning(args...)` | CTFE-only · **不定长** | 同上拼接，但以**诊断**形式发出 `T-MTA-W621` 告警（携带行列）；返回 unit | ❌ 仅编译期（`T-MTA-E605`） |
 | `@sin` / `@sinf` / … | 数学 | 常数实参折叠为字面量；运行期回落 libm/fdlibm | ✅ 常数实参折叠 |
-| `print` / `eprint` / `println` | **运行期函数** | 写 stdout / stderr | —（**不可**在编译期上下文调用；`comptime { print(...) }` 报 `T-MTA-E617 未定义的编译期函数`，改用 `@compile_log`） |
+| `print` / `eprint` / `println` | **运行期函数** | 写 stdout / stderr | —（**不可**在编译期上下文调用；`comptime { print(...) }` 报 `T-MTA-E617 未定义的编译期函数`，改用 `@compile_log`；HIR 解释器 `tc comptime-eval` 同样不再把 print 当内建，编译期上下文出现 print → 报「未注册的编译期函数」） |
 | `int_to_str` / `i2s` / `str_len` / `str_at` | CTFE 纯查询 | 字符串处理 | —（仅编译期） |
 | `sym_intern(buf, len)` | CTFE 符号构造 | 由字节驻留 `Sym` | —（仅编译期） |
 | `@module(attr, ...)` | **模块系统内建** | **设置当前模块的可见性**（`pub` / `internal`）；返回 unit | —（编译期副作用） |
