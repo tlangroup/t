@@ -137,12 +137,14 @@ inline for (iterable) |elem, idx|   { body }   // idx: 编译期索引 i64
 
 ## 6. 子步骤拆分（提交粒度，独立可验证）
 
-- **S1 裸类型名即值**：sema 在 comptime 上下文把 `is_type_name` 的 ident 路由为 comptime 值（§2.2）。探针 1 通过；`tc check src/tc.tc` 0 error。
-- **S2 type 值 `==`/`!=`**：`meta_eval_binary` 增补 type 值比较分支（§2.3）。探针 1/2 通过。
-- **S3 `var x: type` 持有 + 代码期擦除**：sema 接受 `type` 标注；双后端不分配槽；逃逸检查（§2.4）。探针 3 通过；双后端 golden 一致。
+- **S1 裸类型名即值** ✅（已落地，commit 见主设计文档 §8）：sema 在 comptime 上下文把 `is_type_name` 的 ident 路由为 comptime 值（§2.2）。验证：探针 1 `comptime { var same=i64==i64; var diff=i64==u32; if (same && !diff){} }` 经新编译器 `check`/`run` 0 error；`g2 check src/tc.tc` 0 error；自举不动点 g2≡g3≡g4（LLVM IR md5 一致）；`run_examples` 110/110 双后端通过。
+- **S2 type 值 `==`/`!=`** ✅（与 S1 同 commit）：`meta_eval_binary` 增补 type 值比较分支（§2.3，`meta_node_is_type` 辅助，按 `node_sa` 规范名比较返回 bool 字面量）；meta 折叠 `i64 == i64` → `true`。探针 1 通过。
+- **S3 `var x: type` 持有 + 代码期擦除**：sema 接受 `type` 标注；双后端不分配槽；逃逸检查（§2.4）。探针 3 通过；双后端 golden 一致。⬅ 下一步。
 - **S4 `inline for` 解析 + 编译期展开**：先支持 `[]i64`/`[]string` 等普通 comptime 数组，再支持 `[]type`（§3）。探针 4 通过。
 - **S5 `@type_info` 返 comptime `TypeInfo` variant + `field_types: []type`**（阶段 2）。探针 5 通过。
 - **S6 示例 + run_examples + 不动点 + IR 基线 + gate L2**（阶段 3–4）。
+
+> 注：S1/S2 实测发现 `infer_expr` 的 `==`/`!=` 分支（sema.tc:7272）本就对任意操作数类型直接返回 `bool`，故 check 侧无需额外改动；仅 meta 折叠侧（S2）需补 type 值比较。comptime fn 体暂未纳入 `g_in_comptime`（探针仅用 comptime 块），列为 S1 后续补全项。
 
 > 每步独立提交；任一步 `tc check src/tc.tc` 失败即回退该步，不污染后续。
 
