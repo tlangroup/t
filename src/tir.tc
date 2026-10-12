@@ -1424,6 +1424,69 @@ pub fn tir_field_td(structname: string, fieldname: string) i64 {
     return -1;
 }
 
+// A-fix 0c：member 表达式（含 `s[i].f` 链）的**字段 TD**，供「发射前必须先知道类型」的
+// 场景（match 结果槽 __mres）使用。返回 -1 表示无法判定，调用方回落原逻辑。
+//
+// ⚠ 为何不能复用 tir_member_base_st：它对 index 基底返回全局 `g_idx_elem_st`，而那是
+// **上一次索引发射**留下的值 —— TD 推断发生在发射之前，读到的是脏数据。故此处沿
+// member 链自己递归解析，不碰该全局。
+// ⚠ 指针接收者（如 TypeInfo arm 载荷 `*TypeMeta`）须剥一层 `ptr<…>`，与
+// tir_member_addr 的自动解引用约定保持一致。
+// A-fix 0c：取「变体 arm 的载荷 TD」（如 TypeInfo.Struct 的 `*TypeMeta`）。
+// 用于 conpat 载荷绑定的槽尚未创建时，为 member 链提供根类型。
+pub fn tir_conpat_payload_root_td(scr_td: i64, armId: i64) i64 {
+    if (scr_td < 0 || scr_td >= slice_len(sema.tds) as i64) { return -1; }
+    if (t_td_is_variant(scr_td) == false) { return -1; }
+    if (armId < 0) { return -1; }
+    if (base.node_na((armId as u64)) < 0) { return -1; }
+    if (base.node_kind((base.node_na((armId as u64)) as u64)) != "conpat") { return -1; }
+    var vd: i64 = t_variant_decl_of_name_ex(sema.tds[scr_td].name);
+    if (vd < 0) { return -1; }
+    var cname: string = base.node_sa((base.node_na((armId as u64)) as u64));
+    var vc: i64 = sema.variant_find_case(vd, cname);
+    if (vc < 0) { return -1; }
+    if (base.node_na((vc as u64)) < 0) { return -1; }
+    var ptd: i64 = sema.resolve_type_desc(base.node_na((vc as u64)));
+    if (ptd < 0 || ptd >= slice_len(sema.tds) as i64) { return -1; }
+    return ptd;
+}
+
+pub fn tir_member_expr_td(e: i64) i64 {
+    return tir_member_expr_td2(e, -1);
+}
+pub fn tir_member_expr_td2(e: i64, root_td: i64) i64 {
+    if (e < 0) { return -1; }
+    if (base.node_kind((e as u64)) != "member") { return -1; }
+    var bn: i64 = base.node_na((e as u64));
+    var btd: i64 = -1;
+    if (base.node_kind((bn as u64)) == "index") {
+        // s[i].f：元素类型 = 切片/数组基底的 elem（基底本身可能又是一条 member 链）
+        btd = tir_member_expr_td2(base.node_na((bn as u64)), root_td);
+        if (btd < 0) { btd = tir_expr_td(base.node_na((bn as u64))); }
+        if (btd < 0 || btd >= slice_len(sema.tds) as i64) { return -1; }
+        var bcat: string = sema.tds[btd].cat;
+        if (bcat != "slice" && bcat != "array") { return -1; }
+        btd = sema.tds[btd].elem;
+    } else if (base.node_kind((bn as u64)) == "member") {
+        btd = tir_member_expr_td2(bn, root_td);
+    } else {
+        btd = tir_expr_td(bn);
+        // ⚠ 链根是 **conpat 载荷绑定**（如 `Struct(m)` 的 m）时，其槽由后文 5700 行的
+        // 预声明循环创建，**晚于** match 结果槽 __mres 的分配 ⇒ 此处 tir_expr_td 拿不到
+        // （-1 或 unknown）。故由调用方把「该 arm 的载荷 TD」作为 root_td 传进来兜底。
+        var btd_bad: bool = (btd < 0 || btd >= slice_len(sema.tds) as i64);
+        if (btd_bad == false) { if (sema.tds[btd].cat == "unknown") { btd_bad = true; } }
+        if (btd_bad && root_td >= 0) { btd = root_td; }
+    }
+    if (btd < 0 || btd >= slice_len(sema.tds) as i64) { return -1; }
+    var bst: string = tir_st_of_td(btd);
+    if (str_len(bst) > 4 && str_slice(bst, 0, 4) == "ptr<") {
+        bst = str_slice(bst, 4, str_len(bst) - 1);
+    }
+    if (str_len(bst) == 0 || bst[0] != '%') { return -1; }
+    return tir_field_td(str_slice(bst, 1, str_len(bst)), base.node_sa((e as u64)));
+}
+
 pub fn tir_field_index(structname: string, fieldname: string) i64 {
     // P5：packed struct 的字段全部落在宿主整型（单 host 字段，索引恒 0）。
     if (sema.pk_find_struct(structname) >= 0) { return 0; }
@@ -5130,6 +5193,16 @@ pub fn tir_emit_index_addr(ine: i64) string {
         var mbtd: i64 = tir_expr_td(base.node_na((base.node_na((ine as u64)) as u64)));
         if (mbtd >= 0) {
             var mbst: string = tir_st_of_td(mbtd);
+            // ⚠ A-fix 0c（TypeInfo 载荷切片索引）：指针接收者的 st 形如 "ptr<%TypeMeta>"，
+            // 不以 '%' 开头 ⇒ 原校正整段被跳过 ⇒ 只能退回 `tir_expr_td(m.fields)`，而该函数
+            // 对 member 节点本就不可靠（同上注）⇒ base_td 落到 i64/unknown ⇒ 末尾走 else 分支
+            // 返回**常量 0 当元素地址**，再 `load` 出来 ⇒ `m.fields[0].name` 静默得到空串、
+            // `.offset` 得到 0，**不报错**（最危险的失败形态）。触发场景：
+            // `match (ti) { Struct(m) => m.fields[0].name … }`——载荷 m 的类型正是 *TypeMeta。
+            // 故先剥一层 "ptr<…>" 再做结构名判定（与 tir_member_addr 的指针自动解引用同构）。
+            if (str_len(mbst) > 4 && str_slice(mbst, 0, 4) == "ptr<") {
+                mbst = str_slice(mbst, 4, str_len(mbst) - 1);
+            }
             if (str_len(mbst) > 0 && mbst[0] == '%') {
                 var ftd: i64 = tir_field_td(str_slice(mbst, 1, str_len(mbst)), base.node_sa((base.node_na((ine as u64)) as u64)));
                 if (ftd >= 0) { base_td = ftd; }
@@ -5566,6 +5639,25 @@ pub fn tir_emit_match(sid: i64, as_stmt: bool, est: i64) TirEmitRes {
             var est_st: string = tir_st_to_str(est);
             if (est_st != "" && est_st != "ptr") { rst = est_st; }
             if (rtd < 0) { rtd = scr_td; }
+        }
+        // ⚠ A-fix 0c：首臂 body 是 **member 表达式** 时，tir_expr_st 对 member 不可靠
+        // （member 节点的 .td 缓存常被污染成 i64；tir_emit_index_addr 处有同构注释）
+        // ⇒ __mres 槽按 i64 分配，却被臂内 `store %TStr`（16 字节）**写穿** ⇒
+        // `match (ti) { Struct(m) => m.fields[i].name … }` 静默返回空串（不报错）。
+        // 补偿：按 member 链的「权威字段类型」重取。仅在已退化为 i64 时介入，
+        // 正常形态（body 为字面量/ident/call 等）零影响。
+        if ((rst == "i64" || rst == "" || rst == "ptr") && nArm > 0) {
+            var b0: i64 = base.node_nc((armIds[0] as u64));
+            if (b0 >= 0 && base.node_kind((b0 as u64)) == "member") {
+                // 首臂体若以 conpat 载荷绑定为根（`Struct(m) => m.…`），该绑定的槽此刻
+                // 尚未创建 ⇒ 把「该 arm 的载荷 TD」作为根类型提示传下去。
+                var root_td2: i64 = tir_conpat_payload_root_td(scr_td, armIds[0]);
+                var mtd2: i64 = tir_member_expr_td2(b0, root_td2);
+                if (mtd2 >= 0 && mtd2 < slice_len(sema.tds) as i64) {
+                    var mst2: string = tir_st_of_td(mtd2);
+                    if (mst2 != "" && mst2 != "i64" && mst2 != "ptr") { rst = mst2; rtd = mtd2; }
+                }
+            }
         }
         if (rst == "" || rst == "ptr") { rst = "i64"; }
         res = tir_new_named_slot(rtd, rst, "__mres");
