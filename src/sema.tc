@@ -1419,6 +1419,8 @@ pub fn ensure_reflection_builtins() void {
     tmt = base.list_push(tmf, tmt, base.mk_member("kind", base.mk_scalar("i64", -1), -1)); if (tmf < 0) { tmf = tmt; }
     tmt = base.list_push(tmf, tmt, base.mk_member("field_count", base.mk_scalar("i64", -1), -1)); if (tmf < 0) { tmf = tmt; }
     tmt = base.list_push(tmf, tmt, base.mk_member("fields", base.mk_slice(base.mk_named("FieldInfo", -1), -1), -1)); if (tmf < 0) { tmf = tmt; }
+    // 阶段1 S5：field_types: []type（comptime 合成的 type 值数组，与运行时 field_type_names 字符串数组区分）。
+    tmt = base.list_push(tmf, tmt, base.mk_member("field_types", base.mk_slice(base.mk_named("type", -1), -1), -1)); if (tmf < 0) { tmf = tmt; }
     if (sym_lookup(global_scope, "TypeMeta") < 0) {
         var tm_decl: i64 = base.mk_StructDecl("TypeMeta", "", "", false, false, -1, tmf, -1);
         g_ti_TypeMeta_ti = ti_named("Struct", "TypeMeta");
@@ -11937,25 +11939,54 @@ pub fn enum_const_set(ename: string, mname: string, val: i64) void {
 
 // 编译期解析 `Enum.Member`：对象须是枚举类型，且成员已折出编译期整型值。
 pub fn meta_eval_member(e: i64) i64 {
-    if (base.node_na((e as u64)) < 0) {
+    var obj_e: i64 = base.node_na((e as u64));
+    if (obj_e < 0) {
         return meta_fail("T-MTA-E617", "编译期成员访问缺少对象", e);
     }
-    if (base.node_kind((base.node_na((e as u64)) as u64)) != "ident") {
+    // 通用 comptime 值：先试 struct_lit（结构体值）/ ct_variant（变体值）
+    var obj: i64 = meta_eval(obj_e);
+    if (obj < 0) { return -1; }
+    var ok: string = base.node_kind((obj as u64));
+    if (ok == "struct_lit") {
+        // 字段查找：在 FV 链按 sa 匹配
+        var fnm: string = base.node_sa((e as u64));
+        var ks: []i64 = base.kids_chain_idx(base.node_la((obj as u64)));
+        var ki: i64 = 0;
+        while (ki < slice_len(ks) as i64) {
+            var fv: i64 = base__kids[ks[ki]].val;
+            if (base.node_kind((fv as u64)) == "FV" && base.node_sa((fv as u64)) == fnm) {
+                return base.node_na((fv as u64));   // 字段值
+            }
+            ki = ki + 1;
+        }
+        return meta_fail("T-MTA-E617", base__sb_cat3("编译期结构体无此字段 `", fnm, "`"), e);
+    }
+    if (ok == "ct_variant") {
+        // 变体 case 提取：e.sa 须等于 variant tag（sb）
+        if (base.node_sa((e as u64)) == base.node_sb((obj as u64))) {
+            return base.node_na((obj as u64));   // 载荷
+        }
+        return meta_fail("T-MTA-E617",
+            base__sb_cat5("编译期变体 case 不匹配：期望 `", base.node_sb((obj as u64)),
+                "`，得到 `", base.node_sa((e as u64)), "`"), e);
+    }
+    // 退回：Enum.Member（原有逻辑）
+    if (base.node_kind((obj_e as u64)) != "ident") {
         return meta_fail("T-MTA-E617", "编译期成员访问的对象须是具名类型", e);
     }
-    var si: i64 = sym_lookup(global_scope, base.node_sa((base.node_na((e as u64)) as u64)));
+    var si: i64 = sym_lookup(global_scope, base.node_sa((obj_e as u64)));
     if (si < 0) {
-        return meta_fail("T-MTA-E617", base__sb_cat3("未定义的类型 `", base.node_sa((base.node_na((e as u64)) as u64)), "`"), e);
+        return meta_fail("T-MTA-E617", base__sb_cat3("未定义的类型 `", base.node_sa((obj_e as u64)), "`"), e);
     }
     var sy: Sym = syms[si];
     if (sy.decl < 0 || base.node_kind((sy.decl as u64)) != "EnumDecl") {
         return meta_fail("T-MTA-E617",
-            base__sb_cat3("编译期成员访问仅支持枚举常量（`", base.node_sa((base.node_na((e as u64)) as u64)), "` 不是枚举）"), e);
+            base__sb_cat3("编译期成员访问仅支持枚举常量（`", base.node_sa((obj_e as u64)), "` 不是枚举）"), e);
     }
-    var cv: i64 = enum_const_lookup(base.node_sa((base.node_na((e as u64)) as u64)), base.node_sa((e as u64)));
+    var cv: i64 = enum_const_lookup(base.node_sa((obj_e as u64)), base.node_sa((e as u64)));
     if (cv < 0) {
         return meta_fail("T-MTA-E617",
-            base__sb_cat5("枚举 `", base.node_sa((base.node_na((e as u64)) as u64)), "` 的成员 `", base.node_sa((e as u64)),
+            base__sb_cat5("枚举 `", base.node_sa((obj_e as u64)), "` 的成员 `", base.node_sa((e as u64)),
                 "` 尚无编译期值（成员须先定义，且为编译期常量）"), e);
     }
     return cv;
@@ -12056,6 +12087,21 @@ pub fn meta_eval(e: i64) i64 {
     if (base.node_kind((e as u64)) == "index") { return meta_eval_index(e); }
     if (base.node_kind((e as u64)) == "struct_lit") { return meta_eval_struct_lit(e); }
     if (base.node_kind((e as u64)) == "match") { return meta_eval_match(e); }
+    if (base.node_kind((e as u64)) == "typeinfo") {
+        // @type_info(T) / type_info(T) 在编译期返回 TypeInfo variant 值（通用 comptime 值模型，阶段1 S5）。
+        // typeinfo 节点的 sa 即类型名；构造 ct_variant{ "TypeInfo", <arm>, payload }，
+        // payload 为 TypeMeta 结构体值（含 field_types: []type），使
+        // `@type_info(Point).Struct.field_types[0] == i64` 与 `inline for (...field_types) |F|` 成立。
+        // 与运行时 TIR_OP_TYPEINFO 发射路径互不干扰（meta_eval 只在 comptime 上下文被调用）。
+        var tname: string = base.node_sa((e as u64));
+        var tnode: i64 = type_node_from_ident(tname);
+        var arm: string = ti_arm_of(tnode);
+        ensure_reflection_builtins();
+        var payload: i64 = build_typemeta_value(tnode, arm);
+        var r: i64 = base.mk_ct_variant("TypeInfo", arm, payload);
+        base.node_set_type(r, g_ti_TypeInfo_ti);
+        return r;
+    }
     return meta_fail("T-MTA-E617",
         base__sb_cat3("表达式 `", base.node_kind((e as u64)), "` 不可编译期求值"), e);
 }
@@ -12085,7 +12131,28 @@ pub fn meta_kid_at(head: i64, idx: i64) i64 {
 // 否则 `b[0] = x` 会顺带改掉 a。标量字面量不可变，原样返回。
 pub fn meta_val_copy(v: i64) i64 {
     if (v < 0) { return -1; }
-    if (base.node_kind((v as u64)) != "array_lit") { return v; }
+    var k: string = base.node_kind((v as u64));
+    if (k == "struct_lit") {
+        // 递归拷贝字段值（FV 链）
+        var h: i64 = -1;
+        var t: i64 = -1;
+        var ks: []i64 = base.kids_chain_idx(base.node_la((v as u64)));
+        var ki: i64 = 0;
+        while (ki < slice_len(ks) as i64) {
+            var fv: i64 = base__kids[ks[ki]].val;
+            var cv: i64 = base__mk_FV(base.node_sa((fv as u64)), meta_val_copy(base.node_na((fv as u64))), -1);
+            t = base__list_push(h, t, cv);
+            if (h < 0) { h = t; }
+            ki = ki + 1;
+        }
+        return base__mk_struct_lit(base.node_sa((v as u64)), h, -1);
+    }
+    if (k == "ct_variant") {
+        var pl: i64 = -1;
+        if (base.node_na((v as u64)) >= 0) { pl = meta_val_copy(base.node_na((v as u64))); }
+        return base.mk_ct_variant(base.node_sa((v as u64)), base.node_sb((v as u64)), pl);
+    }
+    if (k != "array_lit") { return v; }
     var h: i64 = -1;
     var t: i64 = -1;
     var c: i64 = base.node_la((v as u64));
@@ -12717,6 +12784,83 @@ pub fn meta_eval_math(e: i64, name: string) i64 {
     }
     var r: f64 = ct_dispatch(op, v0, v1);
     return base.mk_float(meta_f64_to_str(r), -1);
+}
+
+// ── @type_info 的 comptime 值构造（阶段1 S5，通用 comptime 值模型）─────────────
+// arm 名 → TypeInfo variant tag code（与 codegen_c.c_ti_arm_code 对齐；sema 不能反向依赖 codegen_c，故内联）。
+pub fn ti_arm_code(arm: string) i64 {
+    if (arm == "Int") { return 0; }
+    if (arm == "Float") { return 1; }
+    if (arm == "Bool") { return 2; }
+    if (arm == "Ptr") { return 3; }
+    if (arm == "Slice") { return 4; }
+    if (arm == "Array") { return 5; }
+    if (arm == "Fn") { return 6; }
+    if (arm == "Struct") { return 7; }
+    if (arm == "Enum") { return 8; }
+    if (arm == "Trait") { return 9; }
+    if (arm == "Union") { return 10; }
+    return 7;
+}
+
+// 类型节点 → TypeInfo variant arm 名（复用 codegen_c.c_ti_arm 的判定逻辑，避免反向依赖）。
+pub fn ti_arm_of(tnode: i64) string {
+    var tname: string = meta_type_to_str(tnode);
+    var si: i64 = sym_lookup(global_scope, tname);
+    if (si >= 0 && syms[si].decl >= 0) {
+        var dk: string = base.node_kind((syms[si].decl as u64));
+        if (dk == "StructDecl") { return "Struct"; }
+        if (dk == "UnionDecl") { return "Union"; }
+        if (dk == "EnumDecl") { return "Enum"; }
+        if (dk == "VariantDecl") { return "Union"; }
+    }
+    if (tname == "bool") { return "Bool"; }
+    if (tname == "f32" || tname == "f64") { return "Float"; }
+    if (is_int_name(tname)) { return "Int"; }
+    return "Struct";
+}
+
+// 构造 comptime TypeMeta 结构体值（struct_lit）：name/size/kind/field_count/fields/field_types。
+// Struct 类型填充 field_types: []type（各元素为真实 comptime type 值），其余 kind 留空数组。
+pub fn build_typemeta_value(tnode: i64, arm: string) i64 {
+    var tname: string = meta_type_to_str(tnode);
+    var fh: i64 = -1;
+    var ft: i64 = -1;
+    var f_name: i64 = base__mk_FV("name", base.mk_string(tname, -1), -1);
+    ft = base__list_push(fh, ft, f_name); if (fh < 0) { fh = ft; }
+    var f_size: i64 = base__mk_FV("size", mv_int(0), -1);
+    ft = base__list_push(fh, ft, f_size);
+    var f_kind: i64 = base__mk_FV("kind", mv_int(ti_arm_code(arm)), -1);
+    ft = base__list_push(fh, ft, f_kind);
+    // field_types：Struct 类型由各字段类型合成 type 值数组
+    var fth: i64 = -1;
+    var ftt: i64 = -1;
+    var nfields: i64 = 0;
+    if (arm == "Struct") {
+        var fld: i64 = find_struct_fields(tname);
+        if (fld >= 0) {
+            var ks: []i64 = base.kids_chain(fld);
+            var ki: i64 = 0;
+            while (ki < slice_len(ks) as i64) {
+                var fv_node: i64 = ks[ki];
+                var ftype: i64 = base.node_na((fv_node as u64));
+                var ftname: string = meta_type_to_str(ftype);
+                var tyval: i64 = type_node_from_ident(ftname);   // 真实 comptime type 值
+                ftt = base__list_push(fth, ftt, tyval);
+                if (fth < 0) { fth = ftt; }
+                nfields = nfields + 1;
+                ki = ki + 1;
+            }
+        }
+    }
+    var arr: i64 = base.mk_array_lit(fth, -1);
+    var f_fc: i64 = base__mk_FV("field_count", mv_int(nfields), -1);
+    ft = base__list_push(fh, ft, f_fc);
+    var f_fields: i64 = base__mk_FV("fields", base.mk_array_lit(-1, -1), -1);   // 占位空数组
+    ft = base__list_push(fh, ft, f_fields);
+    var f_ft: i64 = base__mk_FV("field_types", arr, -1);
+    ft = base__list_push(fh, ft, f_ft);
+    return base__mk_struct_lit("TypeMeta", fh, -1);
 }
 
 // 返回 -2 = 非内建（交回具名 meta fn 查找）；-1 = 已报错；>=0 = 结果字面量节点
@@ -14232,28 +14376,6 @@ pub fn meta_eval_mbuiltin(e: i64) i64 {
         var lv2: i64 = meta_eval(s1);
         if (lv2 < 0) { return -1; }
         return meta_bytes_to_str(e, bv2, lv2);
-    }
-    // 元函数 @type_info(T)：编译期把类型 T 折成 TypeInfo 值（与既有的 type_info(T)
-    // 类型位内建同构：返回 typeinfo 节点，sa=类型名；后端经 @__ti_<T> 合成常量）。
-    if (base.node_sa((e as u64)) == "type_info") {
-        var a0: i64 = -1;
-        var c: i64 = base.node_la((e as u64));
-        if (c >= 0) { a0 = base__kids[c].val; }
-        if (a0 < 0) {
-            return meta_fail("T-MTA-E611", "`@type_info` 需要 1 个类型实参", e);
-        }
-        var tnode: i64 = meta_type_arg_node(a0);
-        if (tnode < 0) {
-            return meta_fail("T-MTA-E619", "`@type_info` 的实参须是类型名", e);
-        }
-        var r: i64 = base.node_new("typeinfo");
-        base.node_set_sa(r, meta_type_to_str(tnode));
-        // 返回编译期内建 TypeInfo（与 resolve_ti 的 named 分支一致：ti_named("Variant","TypeInfo")，
-        // 即 LLVM %TypeInfo / C TypeInfo 变体；ti_field 返回 ti_named("Struct","FieldInfo") 同理）。
-        // 不再走 base.tc 的 base__TypeInfo，避免两套类型冲突导致 E202。
-        ensure_reflection_builtins();
-        base.node_set_type(r, g_ti_TypeInfo_ti);
-        return r;
     }
     // 不定长元函数（D3 首个真实消费方）：逐个求值实参并拼成一条消息。
     // 当前不定长集合 = { compile_log, compile_warning }（见 mb_variadic）：
