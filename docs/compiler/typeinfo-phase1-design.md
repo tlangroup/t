@@ -88,17 +88,18 @@ inline for (iterable) |elem, idx|   { body }   // idx: 编译期索引 i64
 
 1. 编译期对 `iterable` 求值（`meta_eval`）→ comptime 数组值（`array_lit` 节点，元素为字面量 / type 值）。
 2. 对每个元素 `i`：
-   - **克隆** body 子树（参考 `meta_val_copy` 的克隆策略，避免复用节点污染模板）；
-   - 将 `elem` 绑定到元素值（`menv_push`）；`idx` 绑定到 `i`（`mv_int`）；
-   - 执行 body（`meta_exec`）。
-3. 展开产物：body 实例序列 **在 AST 上原地替换** `inline for` 节点，后端照常发射（无运行期循环）。
-4. `iterable` 非 comptime-known → 报 `T-MTA-E6xx`「inline for 的 iterable 必须是编译期已知集合」。
+   - **克隆** body 语句链（参考 `meta_val_copy` / `clone_kids` 的克隆策略，避免复用节点污染模板）；
+   - 将 `elem` 绑定到元素值（`menv_push`）；`idx`（若提供）绑定到 `i`（`mv_int`）；
+   - 在编译期 meta 解释器内执行 body（`meta_exec`）。
+3. 展开方式（S4 实装）：body 的**编译期副作用**（`@compile_log` / comptime 计算 / 类型分派）在编译期落定，`inline for` 节点本身**不产生运行期循环代码**。这正好覆盖 Q1「编译期类型分派 / 编译期日志」场景——`inline for (@type_info(T).field_types) |F| { if (F == i64) {...} }` 的每个 `F` 都是真实 type 值，在编译期完成判别。
+   - ⚠ 限制（Q1 范围内可接受，留待后续）：若 body 含需发射为运行期代码的语句（如 `println(x)`），当前实现会在**编译期**执行之而非 unrolling 为运行期展开代码。运行期体 unrolling（AST 原地替换）按需补全。
+4. `iterable` 非 comptime-known → 报 `T-MTA-E622`「inline for 的 iterable 必须是编译期已知数组」。
 
 ### 3.3 实现位置
 
-- `parse.tc`：新增 `inline_for` 节点（子槽：`iterable` / `pat_elem` / `pat_idx` / `body`）。
-- `sema.tc`：comptime 上下文内对 `inline_for` 调 `meta_run_inline_for`（新增），展开为语句序列；非 comptime 上下文 → 报错（与 `@type_val` 的 `T-MTA-E605` 同款门禁）。
-- 复用 `meta_eval`（数组求值）+ `meta_exec`（body 执行），与 `meta_run_block` 同框架；`idx` 默认不绑定。
+- `parse.tc`：新增 `inline_for` 节点（`base.mk_inline_for`，子槽 `sa`=元素名 / `sb`=索引名 / `na`=iterable 表达式 / `la`=语句链 head，与 `for`/`for_each`/`comptime_block` 同构）；`parse_statement` 在 `KwComptime` 之后分流 `inline for`（即 `inline` ident 后跟 `KwFor`）。
+- `sema.tc`：`meta_exec` 内 `inline_for` 分支调 `meta_run_inline_for`（新增）——对 `na` 求值、逐元素 `clone_kids(la)` 克隆体语句链、`menv_push` 绑定 elem/idx、`meta_exec` 执行；`break`/`continue`/`return` 由 `meta_exec` 既有协议消费（`return` 向上传播，其余终止/跳过本次展开）。`meta_walk` 对 `inline_for` 直接 return（体在展开期才求值，避免 elem 未绑定时误折叠）。仅允许出现在 comptime 上下文（`meta_pass`/`meta_walk_list` 展开 comptime 块时才会触达 `meta_exec` 的 `inline_for` 分支；运行期上下文的 `inline_for` 节点对后端是未知节点 → 自然报错）。
+- 复用 `meta_eval`（数组求值）+ `meta_exec`（body 执行）+ `clone_kids`（体克隆），与既有 comptime 框架一致；`idx` 默认不绑定。
 
 ### 3.4 与 type 值的协同
 
@@ -129,7 +130,7 @@ inline for (iterable) |elem, idx|   { body }   // idx: 编译期索引 i64
 1. `comptime { var b: bool = i64 == i64; println(int_to_str(b)); }` → 输出 `1`
 2. `comptime fn first_ty(comptime T: type, comptime U: type) type { return T; }` + `first_ty(i64, u32) == i64` → `1`
 3. `var t: type = i64;`（在 comptime 上下文持有）→ 不分配运行时槽，可被 `==`/内建消费
-4. `inline for ([i64, u32, bool]) |F| { /* F == i64 分支 */ }` → 展开为 3 段 body
+4. `inline for ([i64, u32, bool]) |F| { /* F == i64 分支 */ }` → 展开为 3 段 body ✅（输出 `got i64 / got u32 / got bool`）
 5. `inline for (@type_info(Point).Struct.field_types) |F| { if (F == i64) {...} }` → 按字段类型分发
 
 ---
@@ -139,7 +140,7 @@ inline for (iterable) |elem, idx|   { body }   // idx: 编译期索引 i64
 - **S1 裸类型名即值** ✅（已落地，commit 见主设计文档 §8）：sema 在 comptime 上下文把 `is_type_name` 的 ident 路由为 comptime 值（§2.2）。验证：探针 1 `comptime { var same=i64==i64; var diff=i64==u32; if (same && !diff){} }` 经新编译器 `check`/`run` 0 error；`g2 check src/tc.tc` 0 error；自举不动点 g2≡g3≡g4（LLVM IR md5 一致）；`run_examples` 110/110 双后端通过。
 - **S2 type 值 `==`/`!=`** ✅（与 S1 同 commit）：`meta_eval_binary` 增补 type 值比较分支（§2.3，`meta_node_is_type` 辅助，按 `node_sa` 规范名比较返回 bool 字面量）；meta 折叠 `i64 == i64` → `true`。探针 1 通过。
 - **S3 `var x: type` 持有 + 代码期擦除** ✅（commit 见本文件 §8 / 主设计文档）：`cs_var_decl` 对 `type` 标注变量编译期求值初始化器并登记 `g_cvar`/`g_skip_var`；`meta_pass` 以 `meta_register_cvars_of` 预扫描函数体解决管线顺序（comptime 块早于 cs_var_decl）；`infer_expr`/`meta_eval` ident 分支经 `cvar_find` 解析；C/LLVM 双后端 `skip_var_has` 擦除槽位（§2.4）。验证：`examples/var_type_comptime.tc` 经新编译器 `check` 0 error、comptime 块正确解析运行期 `var t: type` 并打印两条 `@compile_log`；双后端 smoke 对拍通过；`g2 check src/tc.tc` 0 error；自举不动点 g2≡g3≡g4（LLVM IR md5 一致 `d3d8e84…`）；`run_examples` 110/110 双后端通过。逃逸缺口（`var t: type` 在运行期作用域直接引用）仍报 `T-SEM-E201`，符合预期。
-- **S4 `inline for` 解析 + 编译期展开**：先支持 `[]i64`/`[]string` 等普通 comptime 数组，再支持 `[]type`（§3）。探针 4 通过。
+- **S4 `inline for` 解析 + 编译期展开** ✅（commit 见本文件 §8 / 主设计文档）：parser 新增 `inline_for` 节点（`mk_inline_for` + `parse_inline_for_stmt`，`|` 分隔 elem/idx，`|e,i|` 支持可选索引）；`meta_run_inline_for` 对 comptime 数组逐元素 `clone_kids` 克隆体语句链、`menv_push` 绑定 elem（/`idx`）、`meta_exec` 执行；`meta_exec` 内 `inline_for` 分支接入、`meta_walk` 跳过其体；iterable 非数组值报 `T-MTA-E622`（§3）。验证：`examples/inline_for_comptime.tc`（值数组 + 类型数组两场景）经新编译器双后端 smoke 对拍通过；`_t_s4_i64.tc` 输出 `elem=1 idx=0 / elem=2 idx=1 / elem=3 idx=2`，`_t_s4_type.tc` 输出 `got i64 / got u32 / got bool`；`g1.exe check src/tc.tc` 0 error（529 warn）；自举不动点 g2.ll≡g3.ll≡g4.ll（LLVM IR md5 一致 `9faf35fe…`）；`run_examples` 112/112 双后端全绿。根因修正：`inline_for.la` 是「语句链 entry 头」而非节点，故须用 `clone_kids` 克隆链——首版误用 `clone_node(entry)` 导致 `meta_exec(-1)` 空转、体永不执行（已修）。
 - **S5 `@type_info` 返 comptime `TypeInfo` variant + `field_types: []type`**（阶段 2）。探针 5 通过。
 - **S6 示例 + run_examples + 不动点 + IR 基线 + gate L2**（阶段 3–4）。
 
