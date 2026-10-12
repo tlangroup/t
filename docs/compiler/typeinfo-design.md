@@ -342,7 +342,7 @@ scrutinee 变量的登记类型退化为裸 `ptr`（丢掉 `ptr<%TypeInfo>` 内�
 
 ## 7. 开放问题 / 决策点
 
-- **Q1（关键门槛）**：t 的 comptime `type` 一等值如何表示与比较？需 comptime 系统能持有一"类型"作为值（类似 Zig 的 `type`），并在 `inline for` / `match`（`.Struct(s)` 等 variant arm）中分发。→ 决定阶段 1 的实现形态。
+- **Q1（关键门槛）**：t 的 comptime `type` 一等值如何表示与比较？需 comptime 系统能持有一"类型"作为值（类似 Zig 的 `type`），并在 `inline for` / `match`（`.Struct(s)` 等 variant arm）中分发。→ 决定阶段 1 的实现形态。**→ 实现方案已落定：`docs/compiler/typeinfo-phase1-design.md`（§2 Q1 落地，待评审后落码）**。
 - **Q2**：`inline for` 语义——是否要求切片长度 comptime-known？`field_types` 长度由类型决定、天然 comptime-known，满足。
 - **Q3**：是否保留 `type_info(T)`（运行时）作为 `@type_info(T)`（comptime）的别名/孪生？建议：`@type_info` 为 comptime 主入口，`type_info` 保留为运行时派生层入口（v1 行为），二者共用 `@__ti_<T>` 物化。
 - **Q4**：是否扩展 `type_info` 到 enum / union / slice 聚合？→ v2+，不在本次（诊断 `T-CDE-E910 "type_info supports struct only (codegen)"` 保留）。
