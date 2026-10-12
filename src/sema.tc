@@ -6755,6 +6755,13 @@ pub fn infer_expr_body(e: i64) i64 {
         if (base.node_sa((e as u64)) == "true" || base.node_sa((e as u64)) == "false") {
             return ti_scalar("bool");
         }
+        // S1/Q1：comptime 上下文中裸类型名即「type 值」（如 `i64` / `Point` 当值）。
+        // 路由到 meta_eval 内部已存在的 type 值表示（type_node_from_ident），静态类型记为 Any
+        // （与 @type_val / @type_of 的返回类型一致）；运行期上下文仍按未定义标识符报错。
+        // 配套的 comptime 上下文标记（g_in_comptime）在 check_stmt 进入 comptime_block / comptime fn 体时 +1/-1。
+        if (g_in_comptime > 0 && is_type_name(base.node_sa((e as u64)))) {
+            return ti_mk("Any");
+        }
         // 未解析的标识符。静默退化成 Unknown 属**静默错编**：C 后端会一路漏到
         // 生成的 .c 里才报「未声明标识符」，LLVM 后端更糟——直接产出读 0 的垃圾值。
         // （本诊断即由此坑倒逼补上：parse_lambda_expr 误写 `cur_i`，检查期 0 errors、
@@ -8772,7 +8779,9 @@ pub fn check_stmt_hir(si: i64) void {
         if (base.node_kind((s as u64)) == "comptime_block") {
             var prevc: i64 = cur_scope;
             cur_scope = scope_new_at(prevc, s);
+            g_in_comptime = g_in_comptime + 1;
             cs_stmts_hir(hir.hir_arg(si, 0));
+            g_in_comptime = g_in_comptime - 1;
             cur_scope = prevc;
         }
         return;
@@ -9133,6 +9142,7 @@ pub fn check_stmt_cst(s: i64) void {
     if (base.node_kind((s as u64)) == "block" || base.node_kind((s as u64)) == "block_expr" || base.node_kind((s as u64)) == "defer" || base.node_kind((s as u64)) == "comptime_block") {
         var prev4: i64 = cur_scope;
         cur_scope = scope_new_at(prev4, s);
+        g_in_comptime = g_in_comptime + 1;
         var c5: i64 = base.node_la((s as u64));
         var mq_ks8657: []i64 = base.kids_chain_idx(base.node_la((s as u64)));
         var mq_ki8657: i64 = 0;
@@ -9144,6 +9154,7 @@ pub fn check_stmt_cst(s: i64) void {
             c5 = -1;
         }
         cur_scope = prev4;
+        g_in_comptime = g_in_comptime - 1;
         return;
     }
 }
@@ -11662,6 +11673,7 @@ pub var g_menv_top: i64;         // 逻辑栈顶（只增不缩，复用底层�
 pub var g_menv_base: i64;        // 当前调用帧底：查找不跨帧（禁止看到调用方局部）
 pub var g_menv_nglobal: i64;     // 全局编译期常量区大小 [0, nglobal)
 pub var g_meta_depth: i64;       // meta 调用深度
+pub var g_in_comptime: i64;       // S1/Q1：当前处于 comptime 上下文的嵌套层数（comptime 块/函数体），>0 时裸类型名即 type 值
 pub var g_meta_steps: i64;       // 步数预算，防不终止的 meta 循环 / 递归
 pub var g_meta_ret: i64;         // return 携带值（字面量节点 id）
 pub var g_meta_err: bool;        // 本轮求值是否已失败（错误已报，避免刷屏）
@@ -12228,6 +12240,15 @@ pub fn meta_f64_to_str(v: f64) string {
     return format_float(".17g", v);
 }
 
+// S1/Q1：meta 值节点是否表示一个「类型值」（scalar/named 且名字是已声明类型）。
+// 仅 type_node_from_ident 产出的 scalar/named 节点满足；其它 named 值（如 struct/enum 实值）不会误判。
+pub fn meta_node_is_type(e: i64) bool {
+    if (e < 0) { return false; }
+    var k: string = base.node_kind((e as u64));
+    if (k != "scalar" && k != "named") { return false; }
+    return is_type_name(base.node_sa((e as u64)));
+}
+
 pub fn meta_eval_binary(e: i64) i64 {
     var op: string = base.node_sa((e as u64));
     // 短路算子：右操作数按需求值（与运行期语义一致）
@@ -12312,6 +12333,13 @@ pub fn meta_eval_binary(e: i64) i64 {
         if (op == ">") { return mv_bool(fa > fb); }
         if (op == ">=") { return mv_bool(fa >= fb); }
         return meta_fail("T-MTA-E617", base__sb_cat3("编译期不支持浮点算子 `", op, "`"), e);
+    }
+    // S1/Q1：type 值间 == / != 按规范名比较（Zig 式 type 一等值）。
+    // 须排在最后的 int 兜底之前：两操作数均为 type 值节点时走此分支，互不干扰既有标量/字符串/浮点规则。
+    if (meta_node_is_type(lv) && meta_node_is_type(rv)) {
+        if (op == "==") { return mv_bool(base.node_sa((lv as u64)) == base.node_sa((rv as u64))); }
+        if (op == "!=") { return mv_bool(base.node_sa((lv as u64)) != base.node_sa((rv as u64))); }
+        return meta_fail("T-MTA-E617", base__sb_cat3("type 值不支持编译期算子 `", op, "`"), e);
     }
     if (base.node_kind((lv as u64)) != "int" || base.node_kind((rv as u64)) != "int") {
         return meta_fail("T-MTA-E617", "编译期二元运算的操作数类型不一致", e);
