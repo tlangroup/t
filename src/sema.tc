@@ -3147,28 +3147,27 @@ pub fn variant_name_of_case(cname: string) string {
 pub fn leading_dot_to_conpat(pat: i64, scr: i64) i64 {
     if (pat < 0) { return -1; }
     if (tip_kind(scr) != "Variant") { return -1; }
+    // 变体 scrutinee 上的前导点 `.X` 一律当作 case 模式：无论 X 是否为合法 case，都生成 conpat
+    // 交给 conpat_check 验证（未知 case → T_MATCH_UNKNOWN_CASE；arity 错 → T_MATCH_PATTERN_ARITY）。
+    // 不在此处用 variant_find_case 预筛——否则未知 case（如拼错的 `.Circl(r)`）会漏过 conpat_check
+    // 而误报 T-DOT-E102；注入变体 TypeInfo 的 case 也不在 lex__decl_list，预筛同样取不到名。
     // 无 payload：`.Empty` → member{sa, na=-1, lb=1}
     if (base.node_kind((pat as u64)) == "member" && base.node_lb((pat as u64)) == 1 && base.node_na((pat as u64)) < 0) {
-        if (str_len(variant_name_of_case(base.node_sa((pat as u64)))) as i64 > 0) {
-            return base.mk_conpat(base.node_sa((pat as u64)), "", -1, 0, -1);
-        }
-        return -1;
+        return base.mk_conpat(base.node_sa((pat as u64)), "", -1, 0, -1);
     }
     // 带 payload：`.Circle(r)` → call{na=parse.member(.Circle), la=[r]}
     if (base.node_kind((pat as u64)) == "call") {
         if (base.node_kind((base.node_na((pat as u64)) as u64)) == "member" && base.node_lb((base.node_na((pat as u64)) as u64)) == 1 && base.node_na((base.node_na((pat as u64)) as u64)) < 0) {
-            if (str_len(variant_name_of_case(base.node_sa((base.node_na((pat as u64)) as u64)))) as i64 > 0) {
-                var argc: i64 = 0;
-                var hp: i64 = base.node_la((pat as u64));
-                // S4 §4.6 Phase 3：链先物化再遍历 —— 纯读取循环
-                var ks2910: []i64 = base.kids_chain(hp);
-                var ki2910: i64 = 0;
-                while (ki2910 < slice_len(ks2910) as i64) {
-                    argc = argc + 1;
-                    ki2910 = ki2910 + 1;
-                }
-                return base.mk_conpat(base.node_sa((base.node_na((pat as u64)) as u64)), "", base.node_la((pat as u64)), argc, -1);
+            var argc: i64 = 0;
+            var hp: i64 = base.node_la((pat as u64));
+            // S4 §4.6 Phase 3：链先物化再遍历 —— 纯读取循环
+            var ks2910: []i64 = base.kids_chain(hp);
+            var ki2910: i64 = 0;
+            while (ki2910 < slice_len(ks2910) as i64) {
+                argc = argc + 1;
+                ki2910 = ki2910 + 1;
             }
+            return base.mk_conpat(base.node_sa((base.node_na((pat as u64)) as u64)), "", base.node_la((pat as u64)), argc, -1);
         }
         return -1;
     }
@@ -6808,10 +6807,18 @@ pub fn infer_expr_body(e: i64) i64 {
             if (str_len(base.node_sa((m_k.val as u64))) > 0 && base.node_na((m_k.val as u64)) < 0 && base.node_ba((m_k.val as u64)) == false && starts_upper(base.node_sa((m_k.val as u64)))) {
                 var cs_vd: i64 = variant_decl_of(m_scr);
                 if (cs_vd >= 0) {
+                    // A-fix 阶段 0c 后续：裸变体单元 case（无前导点）已废弃，必须写 `.Case`。
+                    // 仍改写成 conpat 让覆盖分析不崩溃（错误已记录，构建因 error 失败）。
+                    var cs_l: i64 = parse.n_line(m_k.val);
+                    var cs_c: i64 = parse.n_col(m_k.val);
+                    var cs_sa: string = base.node_sa((m_k.val as u64));
+                    var cs_msg: string = "bare variant pattern `" + cs_sa + "` is deprecated; use leading-dot form `." + cs_sa + "`";
+                    base.diag_new("T-MAT-E751", "error", cs_msg,
+                        parse.n_file(m_k.val), cs_l, cs_c, cs_l, cs_c + (str_len(cs_sa) as i64));
                     // ADT：variant 的裸大写名 = **单元 case** 构造器模式（`Empty` ⇔ `Empty()`）。
                     // 统一改写成 conpat，让覆盖分析与双后端脱糖只认一种形态（L-04）。
                     // 名字拼错不在此处报错——交给 conpat_check 报 T_MATCH_UNKNOWN_CASE 并列出合法 case。
-                    var cs_cp: i64 = base.mk_conpat(base.node_sa((m_k.val as u64)), "", -1, 0, -1);
+                    var cs_cp: i64 = base.mk_conpat(cs_sa, "", -1, 0, -1);
                     base.node_set_span_id(cs_cp, base.node_span_id(m_k.val));
                     base.node_set_span_id(cs_cp, base.node_span_id(m_k.val));
                     base.node_set_span_id(cs_cp, base.node_span_id(m_k.val));
@@ -6856,8 +6863,13 @@ pub fn infer_expr_body(e: i64) i64 {
             if (base.node_na((m_k.val as u64)) >= 0 && tip_kind(m_scr) == "Variant") {
                 var ld_cp: i64 = leading_dot_to_conpat(base.node_na((m_k.val as u64)), m_scr);
                 if (ld_cp >= 0) {
+                    // as-模式 `x @ .Pat`：arm.sa 存整体绑定 x，必须保留；不得清空。
+                    // 仅当本臂无 as-绑定（arm.sa 已为 ""）时无需动作。
+                    var ld_had_as: bool = str_len(base.node_sa((m_k.val as u64))) > 0;
                     base.node_set_na((m_k.val as u64), ld_cp);
-                    base.node_set_sa((m_k.val as u64), "");
+                    if (ld_had_as == false) {
+                        base.node_set_sa((m_k.val as u64), "");
+                    }
                 }
             }
             var m_prev: i64 = cur_scope;

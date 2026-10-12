@@ -31,7 +31,7 @@ Pattern:        Literal | ConstructorPat | Ident | "_"     // 递归：支持嵌
 
 - **多载荷 case（新增）**：`parse_case` 当前仅接受单个 `Type`（`parse.tc` L3719–L3723），需扩展为循环 `parse_type()` 收集 `TypeList`。例：`Rect(f64, f64)` 此前无法解析，本次纳入。
 - **单元 case**：`Empty;` 无 `()`，载荷为空，构造器为 `Shape_from_Empty()`。
-- **构造器模式**：`Circle(r)` / `Rect(w, h)` / `Empty`（无参单元 case 写裸名）/ `Shape.Circle(r)`（限定写法，与 enum 一致）。嵌套：`Tree(Leaf(x))` / `Node(l, Node(Leaf(y), r))`。
+- **构造器模式**：`.Circle(r)` / `.Rect(w, h)` / `.Empty`（单元 case 写前导点）/ `Shape.Circle(r)`（限定写法，与 enum 一致）。裸名 `Circle(r)` 已废弃并报 `T-MAT-E751`。嵌套：`Tree(.Leaf(x))` / `Node(l, Node(.Leaf(y), r))`。
 - **`_` 与 `when`** 沿用 match.md：通配不绑定；守卫须 `bool`（白名单）。
 
 ---
@@ -68,7 +68,7 @@ Shape variant {
 
 area fn(s: Shape) -> f64 {
     return match (s) {
-        Circle(r)   => 3.14159 * r * r
+        .Circle(r)   => 3.14159 * r * r
         Rect(w, h)  => w * h
         Empty       => 0.0
     };
@@ -143,7 +143,7 @@ handle fn(c: StatusCode) -> string {
 每个构造器臂脱糖为「按 `_tag` 分支 + 载荷绑定」：
 
 ```c
-// match (s) { Circle(r) => BODY; Rect(w,h) => ...; Empty => ...; _ => ... }
+// match (s) { .Circle(r) => BODY; .Rect(w,h) => ...; .Empty => ...; _ => ... }
 if (s._tag == 0) { f64 r = s._u._u0; /* BODY */ }
 else if (s._tag == 1) { f64 w = s._u._u1.f0; f64 h = s._u._u1.f1; /* BODY */ }
 else if (s._tag == 2) { /* Empty: 无载荷 */ /* BODY */ }
