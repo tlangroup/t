@@ -58,12 +58,11 @@
 
 ### 2.4 变量持有 type（`var x: type = ...`）
 
-- `sema` 接受 `type` 作为类型标注，语义为「该变量持有 type 值」，静态类型记为 `Type`。
-- **代码期擦除（核心）**：持有 type 值的变量在两端 backend **不分配运行时槽**（type 零运行时表示），仅存在于编译期环境 `menv`：
-  - **C 后端**：`emit_decl`/`emit_expr` 遇到该变量跳过声明与读写（不 emit 对应 `typedef`/局部变量）。
-  - **LLVM 后端**：不 emit `alloca`；其引用一律在编译期被 `meta_eval` 折叠消费，不会流入运行期 IR。
-  - **判据**：变量静态类型为 `Type` 且未被运行期实体引用（见 §2.4 逃逸检查）。
-- **逃逸检查**：若 type 值被传给运行期函数实参、存入运行期结构、或用于需要运行时表示的场合 → 报 `T-MTA-E6xx`「type 无运行时表示，不能用于运行期上下文」。
+- `sema` 接受 `type` 作为类型标注，语义为「该变量持有 type 值」，静态类型记为 `Any`（与 `@type_val`/`@type_of` 返回类型一致，type 值无独立运行时类型）。
+- **编译期绑定 + 代码期擦除（核心）**：`cs_var_decl` 在 `check` 阶段对「标注节点 kind == `type`」的局部变量，于编译期用 `meta_eval` 求值其初始化器（须为编译期已知类型，否则 `T-MTA-E617`）得到 type 值节点，登记进 `g_cvar`（平栈：`g_cvar_name`/`g_cvar_val`/`g_cvar_n`，显式计数器避免 `len()`→`t_len` 链接坑）与 `g_skip_var`（擦除集合）。引用处（`infer_expr` / `meta_eval` ident 分支）命中 `cvar_find` 即返回该 type 值节点（静态 `Any`）。
+  - **管线顺序关键点**：`meta_pass` 执行 comptime 块的时机早于 `check` 阶段语句遍历（`cs_var_decl` 注册 var）。故 `meta_pass` 进入 `meta_walk_list` 前，先以 `meta_register_cvars_of` 预扫描函数体、把运行期作用域的 `var x: type` 预注册进 `g_cvar`（与 `cs_var_decl` 同款求值逻辑），求值结束后回弹 `g_cvar_n` 避免跨函数泄漏。否则 comptime 块内引用运行期 `var t: type` 会报 `T-MTA-E620`。
+  - **双后端擦除**：C 后端 `emit_stmt` var_decl 分支、LLVM 后端 `tir_emit_stmt` var_decl 分支，均以 `sema.skip_var_has(sid)` 拦截，跳过该变量槽位分配（type 零运行时表示）。
+- **逃逸检查**：若 type 值被运行期上下文直接使用（裸引用在 comptime 之外，如 `if (t == i64)` 写在函数运行期作用域）→ `infer_expr` 走普通未解析分支报 `T-SEM-E201`（裸类型名逃逸），属预期运行时逃逸缺口（type 无运行时表示）。comptime 上下文内引用则始终解析到编译期 type 值。
 
 ### 2.5 与现有 comptime 机制衔接
 
@@ -139,7 +138,7 @@ inline for (iterable) |elem, idx|   { body }   // idx: 编译期索引 i64
 
 - **S1 裸类型名即值** ✅（已落地，commit 见主设计文档 §8）：sema 在 comptime 上下文把 `is_type_name` 的 ident 路由为 comptime 值（§2.2）。验证：探针 1 `comptime { var same=i64==i64; var diff=i64==u32; if (same && !diff){} }` 经新编译器 `check`/`run` 0 error；`g2 check src/tc.tc` 0 error；自举不动点 g2≡g3≡g4（LLVM IR md5 一致）；`run_examples` 110/110 双后端通过。
 - **S2 type 值 `==`/`!=`** ✅（与 S1 同 commit）：`meta_eval_binary` 增补 type 值比较分支（§2.3，`meta_node_is_type` 辅助，按 `node_sa` 规范名比较返回 bool 字面量）；meta 折叠 `i64 == i64` → `true`。探针 1 通过。
-- **S3 `var x: type` 持有 + 代码期擦除**：sema 接受 `type` 标注；双后端不分配槽；逃逸检查（§2.4）。探针 3 通过；双后端 golden 一致。⬅ 下一步。
+- **S3 `var x: type` 持有 + 代码期擦除** ✅（commit 见本文件 §8 / 主设计文档）：`cs_var_decl` 对 `type` 标注变量编译期求值初始化器并登记 `g_cvar`/`g_skip_var`；`meta_pass` 以 `meta_register_cvars_of` 预扫描函数体解决管线顺序（comptime 块早于 cs_var_decl）；`infer_expr`/`meta_eval` ident 分支经 `cvar_find` 解析；C/LLVM 双后端 `skip_var_has` 擦除槽位（§2.4）。验证：`examples/var_type_comptime.tc` 经新编译器 `check` 0 error、comptime 块正确解析运行期 `var t: type` 并打印两条 `@compile_log`；双后端 smoke 对拍通过；`g2 check src/tc.tc` 0 error；自举不动点 g2≡g3≡g4（LLVM IR md5 一致 `d3d8e84…`）；`run_examples` 110/110 双后端通过。逃逸缺口（`var t: type` 在运行期作用域直接引用）仍报 `T-SEM-E201`，符合预期。
 - **S4 `inline for` 解析 + 编译期展开**：先支持 `[]i64`/`[]string` 等普通 comptime 数组，再支持 `[]type`（§3）。探针 4 通过。
 - **S5 `@type_info` 返 comptime `TypeInfo` variant + `field_types: []type`**（阶段 2）。探针 5 通过。
 - **S6 示例 + run_examples + 不动点 + IR 基线 + gate L2**（阶段 3–4）。

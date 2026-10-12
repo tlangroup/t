@@ -6762,6 +6762,12 @@ pub fn infer_expr_body(e: i64) i64 {
         if (g_in_comptime > 0 && is_type_name(base.node_sa((e as u64)))) {
             return ti_mk("Any");
         }
+        // S3/Q1：引用「持有 type 值的局部变量」→ 静态类型记 Any（type 值）。
+        // 编译期上下文下由 meta_eval 解析为具体 type 值节点；运行期引用属逃逸（代码期擦除，无运行期表示）。
+        var cvi: i64 = cvar_find(base.node_sa((e as u64)));
+        if (cvi >= 0) {
+            return ti_mk("Any");
+        }
         // 未解析的标识符。静默退化成 Unknown 属**静默错编**：C 后端会一路漏到
         // 生成的 .c 里才报「未声明标识符」，LLVM 后端更糟——直接产出读 0 的垃圾值。
         // （本诊断即由此坑倒逼补上：parse_lambda_expr 误写 `cur_i`，检查期 0 errors、
@@ -8482,6 +8488,29 @@ pub fn cs_block_node(s: i64) void {
 
 // 局部变量声明（var/const/let 统一路径）
 pub fn cs_var_decl(s: i64, init_i: i64) void {
+    // S3/Q1：持有 type 值的局部变量（var x: type = ...）→ 编译期绑定，代码期擦除（无运行期槽位）。
+    // 初始化器须是编译期已知的类型值（裸类型名 / @type_val(...) 等）；变量本身登记进 g_cvar 表，
+    // 供 comptime 上下文引用时由 meta_eval 解析为 type 值节点；双后端在 emit 时跳过其槽位分配。
+    if (base.node_na((s as u64)) >= 0 && base.node_kind((base.node_na((s as u64)) as u64)) == "type") {
+        var civ: i64 = -1;
+        if (base.node_nb((s as u64)) >= 0) {
+            g_meta_err = false;
+            if (g_meta_steps < 200000) { g_meta_steps = 200000; }
+            civ = meta_eval(base.node_nb((s as u64)));
+        }
+        if (civ < 0 || meta_node_is_type(civ) == false) {
+            parse.fc_err("T-MTA-E617",
+                base__sb_cat3("持有 type 值的变量 `", base.node_sa((s as u64)),
+                    "` 的初始化器必须是编译期已知的类型（如 `i64` / `Point`）"), s);
+            return;
+        }
+        cvar_push(base.node_sa((s as u64)), civ);
+        append(g_skip_var, s);
+        g_skip_n = g_skip_n + 1;
+        sym_define(cur_scope, base.node_sa((s as u64)), "var", ti_mk("Any"), s);
+        if (base.node_const(s) != 0) { check_const_ref(s); }
+        return;
+    }
     var vt: i64 = -1;
     // 管道许可上下文之一：初始化器（reference.md §3.15.6）
     if (base.node_nb((s as u64)) >= 0) { pipe_mark(base.node_nb((s as u64))); }
@@ -11675,6 +11704,12 @@ pub var g_menv_nglobal: i64;     // 全局编译期常量区大小 [0, nglobal)
 pub var g_meta_depth: i64;       // meta 调用深度
 pub var g_in_comptime: i64;       // S1/Q1：当前处于 comptime 上下文的嵌套层数（comptime 块/函数体），>0 时裸类型名即 type 值
 pub var g_meta_steps: i64;       // 步数预算，防不终止的 meta 循环 / 递归
+// S3/Q1：持有 type 值的局部变量（var x: type = ...）→ 编译期绑定，代码期擦除（无运行期槽位）
+pub var g_cvar_name: []string;   // 名字（平栈，最近作用域在末尾）
+pub var g_cvar_val:  []i64;      // 对应的 type 值节点 id（scalar / named 类型描述符）
+pub var g_cvar_n:    i64;        // g_cvar_name/val 的当前长度（避免 len() 依赖 t_len）
+pub var g_skip_var:  []i64;      // 需在双后端跳过槽位分配的 var_decl 节点 id
+pub var g_skip_n:    i64;        // g_skip_var 的当前长度
 pub var g_meta_ret: i64;         // return 携带值（字面量节点 id）
 pub var g_meta_err: bool;        // 本轮求值是否已失败（错误已报，避免刷屏）
 pub var g_meta_quiet: bool;      // 静默：泛型模板内求值失败不报错（模板本体不发射）
@@ -11764,6 +11799,65 @@ pub fn menv_find(name: string) i64 {
         if (g_menv_name[j] == name) { return j; }
     }
     return -1;
+}
+
+// S3/Q1：查找「持有 type 值的局部变量」绑定（最近作用域优先）
+pub fn cvar_find(name: string) i64 {
+    var i: i64 = g_cvar_n - 1;
+    while (i >= 0) {
+        if (g_cvar_name[i] == name) { return i; }
+        i = i - 1;
+    }
+    return -1;
+}
+pub fn cvar_push(name: string, node: i64) void {
+    append(g_cvar_name, name);
+    append(g_cvar_val, node);
+    g_cvar_n = g_cvar_n + 1;
+}
+pub fn skip_var_has(s: i64) bool {
+    var i: i64 = 0;
+    while (i < g_skip_n) { if (g_skip_var[i] == s) { return true; } i = i + 1; }
+    return false;
+}
+
+// S3/Q1：预扫描函数体，把「持有 type 值的局部变量」（var x: type = ...）登记进 g_cvar 表。
+// 根因：meta_pass 执行 comptime 块的时机早于 check 阶段的语句遍历（cs_var_decl 注册 var x: type）。
+// 若 comptime 块引用了函数运行期作用域的 `var x: type`，需在 comptime 块求值前让 cvar 表就绪，
+// 否则 meta_eval 解析不到该 type 值（T-MTA-E620）。本函数在 meta_pass 进入 meta_walk_list 前调用，
+// 与 cs_var_decl 同款求值逻辑（g_meta_err 复位 + 步数预算），登记项挂在 g_cvar 平栈上；调用方负责
+// 在函数求值结束后回弹 g_cvar_n，避免跨函数泄漏。
+// 遍历同 meta_walk：单子用 node_na/nb/nc/nd（节点 id），语句/实参链表用 node_la/lb/lc（kids 池 entry
+// 头索引），经 base__kids[c].next 链表推进——绝不可把节点 id 当 kids 池下标喂给 kids_chain_idx。
+pub fn meta_register_cvars_of_list(head: i64) void {
+    var c: i64 = head;
+    while (c >= 0) {
+        var ch: Child = base__kids[c];
+        meta_register_cvars_of(ch.val);
+        c = base__kids[c].next;
+    }
+}
+pub fn meta_register_cvars_of(e: i64) void {
+    if (e < 0) { return; }
+    var k: string = base.node_kind((e as u64));
+    if (k == "var_decl" && base.node_na((e as u64)) >= 0 && base.node_kind((base.node_na((e as u64)) as u64)) == "type") {
+        var civ: i64 = -1;
+        if (base.node_nb((e as u64)) >= 0) {
+            g_meta_err = false;
+            if (g_meta_steps < 200000) { g_meta_steps = 200000; }
+            civ = meta_eval(base.node_nb((e as u64)));
+        }
+        if (civ >= 0 && meta_node_is_type(civ)) {
+            cvar_push(base.node_sa((e as u64)), civ);
+        }
+    }
+    meta_register_cvars_of(base.node_na((e as u64)));
+    meta_register_cvars_of(base.node_nb((e as u64)));
+    meta_register_cvars_of(base.node_nc((e as u64)));
+    meta_register_cvars_of(base.node_nd((e as u64)));
+    meta_register_cvars_of_list(base.node_la((e as u64)));
+    meta_register_cvars_of_list(base.node_lb((e as u64)));
+    meta_register_cvars_of_list(base.node_lc((e as u64)));
 }
 
 // ── 诊断 ────────────────────────────────────────────────────
@@ -11887,6 +11981,9 @@ pub fn meta_eval(e: i64) i64 {
             if (is_type_name(base.node_sa((e as u64)))) {
                 return type_node_from_ident(base.node_sa((e as u64)));
             }
+            // S3/Q1：引用「持有 type 值的局部变量」（var x: type = ...）→ 返回其编译期 type 值节点
+            var cvi2: i64 = cvar_find(base.node_sa((e as u64)));
+            if (cvi2 >= 0) { return g_cvar_val[cvi2]; }
         // T-CLO-E781：逃逸 meta fn 自身实体到运行期（如 `meta pure` 取函数本身而非返回值）
         // 应被明确拒绝，而非误报「读运行期变量」。
         var sfn: i64 = sym_lookup(global_scope, base.node_sa((e as u64)));
@@ -13464,9 +13561,13 @@ pub fn meta_pass() void {
             if (base__node_bb((d2 as u64)) == false && base.node_lc((d2 as u64)) != -2) {   // S4 §0.14.7 SoA：侧表读（原 dn2.bb）
                 g_menv_top = g_menv_nglobal;
                 g_menv_base = g_menv_nglobal;
-                g_meta_quiet = func_is_generic(d2);
+                g_meta_quiet = func_is_generic(d2);   // 模板体内求值失败静默（实例仍走运行期语义）
+                var cvn0: i64 = g_cvar_n;   // S3/Q1：保存 cvar 栈深，函数级 cvar 求值后回弹，避免跨函数泄漏
+                meta_register_cvars_of_list(base.node_lc((d2 as u64)));   // S3/Q1：预注册函数体内「持有 type 值的局部变量」
+                g_meta_err = false;   // S3/Q1：预扫描求值失败不污染后续 comptime 块折叠
                 meta_walk_list(base.node_lc((d2 as u64)));
                 g_meta_quiet = false;
+                g_cvar_n = cvn0;   // S3/Q1：回弹 cvar 栈（预注册项仅服务于本函数 comptime 块求值）
             }
         } else {
             g_menv_top = g_menv_nglobal;
