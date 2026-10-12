@@ -179,7 +179,7 @@
   VariantPat: CaseName "(" (MatchPat ("," MatchPat)*)? ")"   // 载荷按位置绑定
   ```
 - **语义**：scrutinee 为某 `variant`；`CaseName` 必须是该 variant 的成员；载荷按位置依次匹配/绑定。enum（无载荷）的 `CaseName` 维持现状（圆括号可选/禁止）。穷尽性复用 S9 + enum 全 case 分析。
-- **脱糖**：emit 生成 `Name_is_Case(s) && (a = Name_as_Case(s).field0; b = Name_as_Case(s).field1; ...)`；C2 改写把 `CaseName` 收敛为 member 路径，双后端零改动。嵌套（`Circle(Point{x,y})`）递归展开子模式。
+- **脱糖**：emit 生成 `Name_is_Case(s) && (a = Name_as_Case(s).field0; b = Name_as_Case(s).field1; ...)`；C2 改写把 `CaseName` 收敛为 member 路径，双后端零改动。嵌套（`.Circle(.Point{x,y})`）递归展开子模式。
 - **难度**：难。前向依赖 variant 值构造；涉及 sema 成员归属校验、载荷位置绑定、嵌套展开、emit 三处（判别 + 取载荷 + 绑定）。是本次扩展的核心交付。
 - **连带**：S5（大写裸标识符收敛）随本步统一收紧为 error。
 
