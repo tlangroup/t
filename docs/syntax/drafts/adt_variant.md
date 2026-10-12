@@ -45,7 +45,7 @@ Pattern:        Literal | ConstructorPat | Ident | "_"     // 递归：支持嵌
 - **构造器函数（沿用既有生成）**：为每个 case 生成 `Name_from_Case(...)`（构造）、`Name_is_Case(self)`（判别）、`Name_as_Case(self)`（取载荷）。多载荷时 `from_Case` 形参为各载荷类型；`as_Case` 取载荷——**单载荷**返回该载荷类型，**多载荷**逐字段 `Name_as_Case_fK(self)`（K 从 0 起、位置序），脱糖目标即此。
 - **`match` 构造器解构（核心新增）**：
   - 仅当 **scrutinee 静态类型为 `Variant`** 时，模式位的**首字母大写标识符**按构造器解析（C2 约定从 enum 推广到 variant；裸 `Circle` ⇔ `Shape.Circle`，拼写错报 `T_MATCH_UNKNOWN_CASE` 指名合法 case）。
-  - 带 `(` 即构造器模式，参数按声明序绑定到该 case 载荷（位置式）：`Rect(w, h)` 绑定第 0/1 载荷；数量不符报 `T_MATCH_PATTERN_ARITY`。
+  - 带 `(` 即构造器模式，参数按声明序绑定到该 case 载荷（位置式）：`.Rect(w, h)` 绑定第 0/1 载荷；数量不符报 `T_MATCH_PATTERN_ARITY`。
   - **嵌套 / 守卫**：`Pattern` 递归允许构造器嵌套；`when` 守卫 `bool` 白名单（沿用 match.md）。
 - **穷尽性（A1 推广到 variant）**：variant 所有 case 各被一条**无守卫**臂覆盖 ⇒ 穷尽；否则须有 `_` / 裸绑定兜底臂；否则报 `T_MATCH_NONEXHAUSTIVE` 并**指名列出未覆盖的 case**（如 `unhandled case(s) Shape.Rect, Shape.Empty`）。带守卫臂不计覆盖。新增 case 即触发所有旧 `match` 编译期报错——穷尽性检查的核心价值。**抽象 variant 豁免此约束（见下）。**
 - **抽象 variant（非穷尽 / open）**：variant 声明末位写 `_`（如 `StatusCode variant { Ok; Fail; _ }`）即声明为**抽象 / 开放和类型**。`_` 是类型级标记、**不是真实 case**（无构造器、不占 tag）。语义后果：① `match` 于抽象 variant 上**不强制穷尽性**，不报 `T_MATCH_NONEXHAUSTIVE`；② 未覆盖的具名 case 与「未知 tag」统一由 `_` 兜底臂吸收，无 `_` 臂则运行期落到确定性 `t_panic`（L-09 零 UB，不读垃圾值）；③ 抽象 variant 仍为其具名 case 生成 `from_Case` / `is_Case` / `as_Case`。典型用途：错误码 / 状态码等「调用方只知道部分 case、其余兜底」的开放集合。闭 variant（无 `_`）与抽象 variant（末位 `_`）构成 closed/open 双轴。
@@ -181,7 +181,7 @@ else { /* _ 兜底 */ }
 **裁定：本期留接口、不实现**。`variant` 仅支持具体类型；`comptime T: any` 泛型 + 递归类型单态化列为后续里程碑，避免范围膨胀。
 
 ### 7.4 多载荷 case 形态（本草稿裁定）
-**裁定：位置式多载荷** `Case(T1, T2, ...)`，匹配 `Rect(w, h)` 位置绑定。命名字段式 `Case { w: f64; h: f64 }` 更 ergonomic 但需每 case 字段名表，列为后续扩展，本期不做。
+**裁定：位置式多载荷** `Case(T1, T2, ...)`，匹配 `.Rect(w, h)` 位置绑定。命名字段式 `Case { w: f64; h: f64 }` 更 ergonomic 但需每 case 字段名表，列为后续扩展，本期不做。
 
 ### 7.5 穷尽性判据（A1 推广）
 **裁定：variant 全 case 无守卫覆盖即穷尽**，`_` 变可选。与 match.md §7.3 对 enum 的裁定一致——新增 case 强制回访所有 `match`，指名未覆盖 case。
