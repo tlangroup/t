@@ -27,9 +27,9 @@
     %t0 = load %vt.Shape, ptr 0
   ```
 - **根因假设**：直接字面量 `Circle(5)` 在 LLVM 发射阶段被错误处理为「从空指针 `ptr 0` 加载」，而非（1）在栈/常量区构造具名变体值（tag + 载荷）并（2）取其地址后 load。空指针被 clang 判为 `integer constant`，类型不符报错。
-- **影响范围**：所有「和类型 + 直接字面量 + match 解构」端到端运行路径，含 `variant` 单/多载荷变体（`Circle(r)` / `Rect(w, h)` / 单元 `Empty`）。
+- **影响范围**：所有「和类型 + 直接字面量 + match 解构」端到端运行路径，含 `variant` 单/多载荷变体（`.Circle(r)` / `.Rect(w, h)` / 单元 `.Empty`）。
 - **用户侧临时绕过**（见 `code-style-guide.md §1`）：改用兼容构造器 `Shape_from_Circle(5)`（仍被 `tc check` 与 `tc run` 同时接受）。该构造器由 `tests/variant_smoke/main.tc` 冒烟覆盖。
-- **修复方向**：LLVM 后端对 variant 直接字面量节点，按「构造变体值 → 取地址」发射，与 `Shape_from_*` 构造器复用同一 IR 生成路径；match 解构侧不变（其绑定 `Circle(r) => r` 已正确）。
+- **修复方向**：LLVM 后端对 variant 直接字面量节点，按「构造变体值 → 取地址」发射，与 `Shape_from_*` 构造器复用同一 IR 生成路径；match 解构侧不变（其绑定 `.Circle(r) => r` 已正确）。
 - **验收标准**：`tc run tests/known-issues/KI-001_variant_anon_literal.tc` 退出 0、无 LLVM IR 报错、stdout 含 `5`。
 - **✅ 已修复（2026-09-05 02:19 构建，提交 `fb6eeaf`）**：`out/dbg/tc.exe run tests/known-issues/KI-001_variant_anon_literal.tc` → 退出 0、无 IR 报错、stdout 输出 `5`。前导点 variant 构造器 `.Circle(5)` 亦于同提交 `T-DOT-E102` 解除后可用。复现用例保留为回归测试，**不再需要**兼容构造器 `Shape_from_Circle` 绕过。状态 → `closed`。
 

@@ -153,11 +153,12 @@ pub variant TypeInfo {
 }
 ```
 
+
 > 选用 **variant**（而非 v1 的 struct `{kind, meta}`）以精确对齐 Zig 0.16 的 tagged-union 形态（t 的 `variant` 即其对应构造）。
 >
-> ⚠ **语法更正（2026-10-11 实测）**：t 的 variant arm 在 `match` 里用**裸名**，前导点形式 `.Circle(v)` 只用于**构造字面量** `Shape { .Circle(5) }`。  
-> 故本设计的 Zig 写法 `match (info) { .Struct(s) => … }` 落到 t 应写成 `match (info) { Struct(m) => … }`。  
-> 依据：`examples/adt_shape.tc`（`Circle(r) => 3 * r * r` vs `Shape { .Circle(5) }`）。
+> ⚠ **语法更正（2026-10-12 实测，覆盖 2026-10-11 旧注）**：t 的 variant arm 在 `match` 里**必须**用**前导点**形式 `.Circle(v)` / `.Struct(m)`，**裸名** `Circle(v)` / `Struct(m)` 已被 `T-MAT-E751` 废弃并报错（见 §6 阶段 0c'）。前导点 `.Circle(5)` 也用于**构造字面量** `Shape { .Circle(5) }`——两者同形、一致。  
+> 故本设计的 Zig 写法 `match (info) { .Struct(s) => … }` 落到 t 即 `match (info) { .Struct(m) => … }`。  
+> 依据：`examples/adt_shape.tc`（`.Circle(r) => 3 * r * r` vs `Shape { .Circle(5) }`）——构造与解构统一用前导点。
 
 ### 4.2 `StructInfo`：并行数组（⭐ 对齐 Zig 0.16 的核心）
 
@@ -220,7 +221,7 @@ fn dumpRT(info: TypeInfo) void {
 ```
 
 > ⚠ **as-built（2026-10-11 校正）**：上面两组是**目标形态**；`field_types: []type` / comptime `type` 一等值 / `inline for` **尚未支持**（§4.4 门槛）。  
-> **当前实际可用**的是 §4.7 的 as-built 形态：`Struct(m)` 载荷为 `*TypeMeta`，可对 `m.name` / `m.size` / `m.kind` / `m.field_count` 做字段投影。
+> **当前实际可用**的是 §4.7 的 as-built 形态：`.Struct(m)` 载荷为 `*TypeMeta`，可对 `m.name` / `m.size` / `m.kind` / `m.field_count` 做字段投影。
 
 ### 4.4 t 需要的语言能力前置（本改版的关键门槛）
 
@@ -238,7 +239,6 @@ fn dumpRT(info: TypeInfo) void {
 - 新增的字段投影 + `inline for` 路径与 `ti_*`/`fi_*` **并行共存**：用户既可继续调用旧函数（过渡期兼容），也可直接用 `info.Struct.field_names` / `inline for (field_types)`。
 - 后端对废弃 `ti_*`/`fi_*` 的内联/定义分支（`tir_to_ll.tc:1915/2020`、`codegen_c.tc` `c_ti_emit_support`）**维持现状、暂不动**；待新 API 稳定后，作为**独立清理任务**再移除。
 
-
 ### 4.6 Bool / 非聚合的 comptime 处理
 
 `Bool` arm 无 payload（`variant TypeInfo { Bool; … }`），`match` 直接命中、无需 meta。`Enum`/`Union` 同理携带各自的并行数组（`Enum`: `field_names`+`field_values`；`Union`: `field_names`+`field_types`+`field_attrs`）。运行期仅聚合类型暴露 `field_*` 数组，非聚合在 `match` 的 `_` 分支处理。
@@ -255,25 +255,25 @@ fn dumpRT(info: TypeInfo) void {
 struct Point { x: i64 @ 1; y: i64 @ 2 = 42; z: i64 @ 3; label: string @ 4; }
 
 var ti: TypeInfo = type_info(Point);                  // 无 `@`，是运行期内建，非 @type_info
-var n:    i64 = match (ti) { Struct(m) => m.field_count  _ => -1 };   // 4
-var kind: i64 = match (ti) { Struct(m) => m.kind         _ => -1 };   // 7  (Struct)
-var size: i64 = match (ti) { Struct(m) => m.size         _ => -1 };   // 40 (sizeof(Point))
-var k:    i64 = match (type_info(i64)) { Int(_) => 100  Struct(_) => 200  _ => -2 }; // 100
+var n:    i64 = match (ti) { .Struct(m) => m.field_count  _ => -1 };   // 4
+var kind: i64 = match (ti) { .Struct(m) => m.kind         _ => -1 };   // 7  (Struct)
+var size: i64 = match (ti) { .Struct(m) => m.size         _ => -1 };   // 40 (sizeof(Point))
+var k:    i64 = match (type_info(i64)) { .Int(_) => 100  .Struct(_) => 200  _ => -2 }; // 100
 
 // ④ 载荷顶层 string 字段
-var tname: string = match (ti) { Struct(m) => m.name  _ => "?" };     // Point
+var tname: string = match (ti) { .Struct(m) => m.name  _ => "?" };     // Point
 
 // ⑤ 切片载荷 + 元素字段投影（[]FieldInfo 遍历）
 var i: i64 = 0;
 while (i < n) {
-    var fname: string = match (ti) { Struct(m) => m.fields[i].name       _ => "?" };  // x/y/z/label
-    var ftag:  i64    = match (ti) { Struct(m) => m.fields[i].tag        _ => -1 };   // 1/2/3/4
-    var ftn:   string = match (ti) { Struct(m) => m.fields[i].type_name  _ => "?" };  // i64…/string
+    var fname: string = match (ti) { .Struct(m) => m.fields[i].name       _ => "?" };  // x/y/z/label
+    var ftag:  i64    = match (ti) { .Struct(m) => m.fields[i].tag        _ => -1 };   // 1/2/3/4
+    var ftn:   string = match (ti) { .Struct(m) => m.fields[i].type_name  _ => "?" };  // i64…/string
     i = i + 1;
 }
 ```
 
-- **arm 名是裸名**（`Struct(m)`），不是 Zig 的 `.Struct(s)`——见 §4.1 语法更正。
+- **arm 名用前导点**（`.Struct(m)`），与 Zig 的 `.Struct(s)` 同形；裸名 `Struct(m)` 已被 `T-MAT-E751` 废弃并报错——见 §4.1 语法更正、§6 阶段 0c'。
 - **载荷 `m` 的类型是 `*TypeMeta`**，不是 §4.2 的 `StructInfo`。可用字段：  
   `name: string`、`size: i64`、`kind: i64`、`field_count: i64`、`fields: []FieldInfo`。
 - `FieldInfo`：`name: string`、`offset: i64`、`type_name: string`、`type_size: i64`、`is_ptr: i8`、`tag: i64`。
@@ -297,18 +297,6 @@ while (i < n) {
 | `t_td_is_variant`（`src/tir.tc`）         | 只扫 `decl_list` 认不出注入变体 ⇒ `tir_st_of_td` 回落 `%TypeInfo` 值槽，而 `TIR_OP_TYPEINFO` 返回的是**指向 variant 数据的指针** ⇒ 变量槽存地址，后续 `load i64` 拿地址去比 tag ⇒ 条件恒假、全落 `_` 臂              | 在**唯一真相源** `t_td_is_variant` 里前置 `tir_is_reflection_variant(td)` 判定（下游 8 个调用点全部继承）                               |
 | conpat 载荷 LOAD（`src/tir.tc`）            | arm 载荷是 `*TypeMeta`（**指针值**）而非内联 blob ⇒ 需**两次**解引用；后端 `TIR_OP_LOAD` 的穿透解引用仅在 `pst(源槽) == "ptr<" + st + ">"` 时触发                                                      | TypeInfo臂的 LOAD `st` 令为 `"ptr"`，使源槽 `st("ptr<ptr>")` 匹配成立 ⇒ 得到 `*(&payload)` = meta 指针                           |
 | `c_ti_emit_support`（`src/codegen_c.tc`） | 用户 TU 无 `TypeInfo` 的 `VariantDecl` ⇒ `emit_variant_decl` **不会**生成 `<V>_is_<C>` / `<V>_as_<C>`；且 `build_type_map` 扫不到 `TypeMeta` ⇒ `sf_*` 无其字段表 ⇒ match 结果槽退化 `void*` | 合成 11 个 `is_` + 10 个 `as_`（`Bool` 无载荷故不生成 `as_`），并按 `.h` typedef **逐字**向 `sf_*` 补登记 `TypeMeta`/`FieldInfo` 字段 TD |
-
-**阶段 0c（2026-10-12）追加三处——让 `fields: []FieldInfo` 的元素投影真正可用**：
-
-| 位置                                    | 缺什么                                                                                                                                          | 修法                                                                              |
-| ------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
-| `tir_emit_index_addr`（`src/tir.tc`）     | 对 member 基底的校正要求 `st[0] == '%'`，而载荷 `m` 是 `*TypeMeta` ⇒ `ptr<%TypeMeta>` 被整段跳过 ⇒ 退回不可靠的 `tir_expr_td(m.fields)` ⇒ 走 else 分支**返回常量 0 当元素地址** | 校正前先剥一层 `ptr<…>`（与 `tir_member_addr` 的指针自动解引用同构）                                 |
-| `ensure_reflection_builtins`（`src/sema.tc`） | string 字段用 `mk_named("string")` 合成 ⇒ `resolve_type_desc` 落 unknown ⇒ `tir_field_st` 回落 `i64` ⇒ `m.fields[i].name` 只 `load` 前 8 字节（TStr 的 ptr），`len` 恒 0  | 改用 **`mk_scalar("string")`**（string 在 t 里就是 scalar kind），得 `td_mk("string")` → `%TStr` |
-| match 结果槽 `__mres`（`src/tir.tc`）       | `__mres` 槽的分配**早于** conpat 载荷绑定的预声明循环 ⇒ 首臂体 `m.…` 的根 ident 此刻无 TD ⇒ `tir_expr_st` 退化 `i64` ⇒ 16 字节 `%TStr` 写进 8 字节槽（**写穿**）       | 仅在已退化为 `i64` 时介入：`tir_conpat_payload_root_td`（从 VariantDecl 的 case 取 arm 载荷 TD）作根类型提示，沿 member 链重解 |
-
-> ⚠ 这三处的共同特征：**都不报错**——元素地址恒为 0 / 只读半截 TStr / 写穿邻槽，症状一律是
-> 「静默得到空串或 0」。定位手段是**直接读 LLVM IR**（`out/dbg/<name>.exe.ll`）看 GEP 索引与 `load` 类型，
-> 而不是看运行输出。
 
 #### 4.7.3 与遗留 API 的组合
 
@@ -340,8 +328,8 @@ scrutinee 变量的登记类型退化为裸 `ptr`（丢掉 `ptr<%TypeInfo>` 内�
 | 阶段               | 内容                                                                                                                           | 验证判据                                                                                           | 状态                  |            |               |
 | ---------------- | ---------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- | ------------------- | ---------- | ------------- |
 | **0**            | v1 A-fix 运行时反射落地（C 后端自包含发射 + 双后端一致）                                                                                          | 四代不动点；`run_examples` **91/91**                                                                 | ✅ 已完成（提交 `e89e2eb`） |            |               |
-| **0b**           | **TypeInfo 成为真正可 match 的内建变体**：`Struct(m) => m.field_count` 字段投影；C 后端合成 `is_`/`as_` 访问器 + `sf_*` 补登记；遗留 `ti_*` 与 `match` 可混用 | `examples/typeinfo_proj` 双后端均 `4/7/40/100`（exit 4）；`run_examples` **93/93**；四代不动点 `g2==g3==g4` | ✅ 已完成（见 §4.7）       |            |               |
-| **0c**           | **切片载荷的元素投影**：`m.fields[i].name/offset/tag/type_name` + 载荷顶层 `m.name`；修索引基底 ptr 剥离、string 字段 `mk_scalar`、`__mres` 槽宽 | `examples/typeinfo_proj` 双后端均追加 `Point` 与四组 `name/tag/type_name`；`run_examples` **93/93**；四代不动点 `g2==g3==g4` | ✅ 已完成（见 §4.7） |  |  |
+| **0b**           | **TypeInfo 成为真正可 match 的内建变体**：`.Struct(m) => m.field_count` 字段投影；C 后端合成 `is_`/`as_` 访问器 + `sf_*` 补登记；遗留 `ti_*` 与 `match` 可混用 | `examples/typeinfo_proj` 双后端均 `4/7/40/100`（exit 4）；`run_examples` **93/93**；四代不动点 `g2==g3==g4` | ✅ 已完成（见 §4.7）       |            |               |
+| **0c'**          | **variant match 模式强制前导点**：裸 `Struct(m)`/`Circle(r)`/`Empty` 改 `T-MAT-E751` 报错；`leading_dot_to_conpat` 改用 scrutinee 变体声明查 case（修复注入变体 `TypeInfo` 的 `.Struct(m)` 误报 `T-DOT-E102`），并保留 as-模式 `c @ .Pat` 的绑定 | 全仓 `src/examples/tests` 裸模式清零；`run_examples` **93/93**；`base.tc` 反射 match 迁移为 `.Int(m)`/`.Struct(m)`/`.Bool` | ✅ 已完成（见 §4.1、§6 注） |            |               |
 | **1**            | **语言能力前置**：引入 comptime `type` 一等值 + `inline for`                                                                             | comptime 单测：\`inline for (s.field_types)                                                       | Ft                  | \` 可展开并实例化 | ⬜ 待做（本改版核心门槛） |
 | **2**            | `@type_info(T)` 返回 comptime `TypeInfo` variant（§4.1）；`StructInfo` 带 `field_types: []type` + 运行时派生数组（§4.2）                    | 编译期 `@type_info(Point).Struct.field_types[0] == i64` 成立                                        | ⬜ 待做                |            |               |
 | **3**            | 示例：comptime `inline for` 用例 + runtime 派生数组用例；`ti_*`/`fi_*` **仍保留**                                                           | 双后端逐字节一致                                                                                       | ⬜ 待做                |            |               |

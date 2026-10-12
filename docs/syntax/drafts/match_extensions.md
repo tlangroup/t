@@ -305,7 +305,7 @@ S1/S2/S3/S4/S5/S6 已脱离「设计就绪」状态，进入实装 + 门禁覆�
 
 **S3 触发的根因修复（值得记一笔）**：`match` 作为 `return` 值时，`infer_expr` 不把结果类型写回 `match_node.td`，而 `meta_eval_match` 对运行期 scrutinee 直接返回 `-1`；于是 `tir_emit_match` 退而用 `ST_NONE → i64` 作为 `__mres` 结果槽宽。当 match 返回 `string`/`struct` 时，链接期报 `defined with type 'i64' but expected '%TStr'`。`match_node.td` 方案不可行——t 的 TD 表 0 号是 `string`，`tir_expr_td` 的 `cached_td > 0` 缓存判据把 0 当作「未设置」而漏判。最终解法是 `return` 处理器在发射返回表达式前把函数返回 ST 写入全局 `g_expect_st`，`tir_emit_expr` 取 `est` 时优先消费该值并立即清零——既不污染子表达式、也不依赖 TD 索引。
 
-**as-模式 variant 载荷绑定坑**：`c @ Circle(r)` 同时有绑定名 `sa="c"` 与子模式 `conpat`；原 conpat 载荷槽预声明写在 `else if (arm.sa != "")` 分支里，被 `sa != ""` 短路跳过，导致 `r` 的本地槽缺失、body 提取 `tir_find_local_idx("r")` 返回 -1 而静默不写 → `r` 恒为 0。改为与绑定名分支**独立**的 `if`（非 `else if`）即修复，并补 `tests/conformance/pass/p_as_variant_pat.tc` 锁定该场景。
+**as-模式 variant 载荷绑定坑**：`c @ .Circle(r)` 同时有绑定名 `sa="c"` 与子模式 `conpat`；原 conpat 载荷槽预声明写在 `else if (arm.sa != "")` 分支里，被 `sa != ""` 短路跳过，导致 `r` 的本地槽缺失、body 提取 `tir_find_local_idx("r")` 返回 -1 而静默不写 → `r` 恒为 0。改为与绑定名分支**独立**的 `if`（非 `else if`）即修复，并补 `tests/conformance/pass/p_as_variant_pat.tc` 锁定该场景。（注：`leading_dot_to_conpat` 改写后须保留 `arm.sa` 绑定，否则 `c` 整体绑定丢失、报 T-SEM-E201——见 `T-MAT-E751` 废弃裸模式后的回归保护。）
 
 **S6 两处根因（值得记一笔）**：
 1. **parse_postfix 防贪婪漏 `LBracket`**：match 臂 body 解析时，`parse_postfix` 原有的防贪婪收手只处理前导 `.X`（`.X =>` 是下一臂模式，非 body 字段），漏掉了 `[...]`。于是 `[] => "zero" [x] => "one"` 这类「上一臂 body 后紧跟切片模式臂」会被贪成上一臂 body 的下标访问，下一臂的 `=>` 被孤立 → `T-PAR-E101 unexpected token in expression: =>`。修复为在 match-body 上下文对 `LBracket` 也做 `lbracket_is_next_arm_pattern()` 探测（扫描到配平 `]` 后紧跟 `=>`/`when` 即判定为下一臂切片模式，提前 `break`），与 `dot_is_next_arm_pattern` 完全同构。
