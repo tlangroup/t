@@ -15,12 +15,12 @@
 
 | ID | 标题 | 类别 | 构建版本 | 状态 | 严重度 | 复现用例 | 期望 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| **KI-001** | variant 直接字面量 `Circle(5)` LLVM 代码生成缺陷 | codegen（variant） | 2026-09-03 | **closed** | 高 | `tests/known-issues/KI-001_variant_anon_literal.tc` | `tc run` 输出 `5` |
+| **KI-001** | variant 直接字面量 `.Circle(5)` LLVM 代码生成缺陷 | codegen（variant） | 2026-09-03 | **closed** | 高 | `tests/known-issues/KI-001_variant_anon_literal.tc` | `tc run` 输出 `5` |
 - **KI-002**：struct / 元组字面量模式 `Pt{ x: 0, y: 0 }` / `.{1i64, "a"}` 在 LLVM 轨条件被丢弃 → **恒命中首臂**（静默错编；C 轨正确） | codegen（LLVM 轨 match 解构） | 2026-09-03 登记，`fb6eeaf` 误记已修 | ✅ **closed**（2026-09-26 元组特性一并修复） | 高 | `tests/known-issues/KI-002_struct_literal_pat.tc` | `tc run` 输出 `0`（C 轨 `0`，LLVM 轨原 `1` → 修复后 `0`） |
 
 ## 2. KI-001 · variant 直接字面量（匿名字段字面量）代码生成缺陷
 
-- **现象**：`variant Shape { Circle(i64); ... }` 定义后，使用**直接字面量** `let s = Circle(5);` 或 `area(Circle(5))` 经 `tc check` 通过，但 `tc run`（LLVM 后端）失败。
+- **现象**：`variant Shape { Circle(i64); ... }` 定义后，使用**直接字面量** `.Circle(5)`（原登记时为裸 `Circle(5)`，修复后两种写法 `tc run` 均通过）经 `tc check` 通过，但 `tc run`（LLVM 后端）失败。
 - **精确报错**（`out/dbg/KI-001_variant_anon_literal.ll:209:29`）：
   ```
   error: integer constant must have integer type
