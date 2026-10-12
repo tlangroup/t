@@ -12094,8 +12094,13 @@ pub fn meta_eval(e: i64) i64 {
         // payload 为 TypeMeta 结构体值（含 field_types: []type），使
         // `@type_info(Point).Struct.field_types[0] == i64` 与 `inline for (...field_types) |F|` 成立。
         // 与运行时 TIR_OP_TYPEINFO 发射路径互不干扰（meta_eval 只在 comptime 上下文被调用）。
-        var tname: string = base.node_sa((e as u64));
-        var tnode: i64 = type_node_from_ident(tname);
+        // 优先用 parser 存于 na 的完整类型节点（覆盖 pointer/slice/array/func/optional 等
+        // 合成类型，其 sa 为空无法仅凭名字分类）；na 缺失时回落 sa → type_node_from_ident。
+        var tnode: i64 = base.node_na((e as u64));
+        if (tnode < 0) {
+            var tname: string = base.node_sa((e as u64));
+            tnode = type_node_from_ident(tname);
+        }
         var arm: string = ti_arm_of(tnode);
         ensure_reflection_builtins();
         var payload: i64 = build_typemeta_value(tnode, arm);
@@ -12804,32 +12809,71 @@ pub fn ti_arm_code(arm: string) i64 {
     return 7;
 }
 
-// 类型节点 → TypeInfo variant arm 名（复用 codegen_c.c_ti_arm 的判定逻辑，避免反向依赖）。
-pub fn ti_arm_of(tnode: i64) string {
-    var tname: string = meta_type_to_str(tnode);
-    var si: i64 = sym_lookup(global_scope, tname);
-    if (si >= 0 && syms[si].decl >= 0) {
-        var dk: string = base.node_kind((syms[si].decl as u64));
-        if (dk == "StructDecl") { return "Struct"; }
-        if (dk == "UnionDecl") { return "Union"; }
-        if (dk == "EnumDecl") { return "Enum"; }
-        if (dk == "VariantDecl") { return "Union"; }
+// 类型节点 → 可读类型名（递归，供 TypeMeta.name 字段；comptime 路径不进运行时布局）。
+pub fn ti_type_name(tn: i64) string {
+    if (tn < 0) { return "?"; }
+    var k: string = base.node_kind((tn as u64));
+    if (k == "scalar" || k == "named") { return base.node_sa((tn as u64)); }
+    if (k == "pointer") { return base__sb_cat2(ti_type_name(base.node_na((tn as u64))), "*"); }
+    if (k == "slice") { return base__sb_cat2("[]", ti_type_name(base.node_na((tn as u64)))); }
+    if (k == "optional") { return base__sb_cat2("?", ti_type_name(base.node_na((tn as u64)))); }
+    if (k == "array") {
+        // array 类型节点的 nb 直接存长度整数（见 base.mk_array / parse.tc type_node_mangle），
+        // 不是 int 节点，故直接用 i2s(node_nb)；切勿把整数当节点 id 解引用。
+        var len: string = base.i2s(base.node_nb((tn as u64)));
+        return base__sb_cat2(base__sb_cat3("[", len, "]"), ti_type_name(base.node_na((tn as u64))));
     }
-    if (tname == "bool") { return "Bool"; }
-    if (tname == "f32" || tname == "f64") { return "Float"; }
-    if (is_int_name(tname)) { return "Int"; }
+    if (k == "fn") { return "fn"; }
+    return k;
+}
+
+// 类型节点 → TypeInfo variant arm 名（阶段1 S5+，通用 comptime 值模型）。
+// 优先按节点 kind 分类合成类型（pointer/slice/array/fn/optional），再按名字判定
+// 标量与具名类型；与 codegen_c.c_ti_arm 的 arm 词表（Int/Float/Bool/Ptr/Slice/Array/
+// Fn/Struct/Enum/Trait/Union）保持一致。无对应 arm 的类型（string/void 等）回落 Struct
+// 以与运行时 c_ti_arm 默认行为对齐（comptime 与 runtime 为两条独立路径，互不干扰）。
+pub fn ti_arm_of(tnode: i64) string {
+    var k: string = base.node_kind((tnode as u64));
+    if (k == "pointer") { return "Ptr"; }
+    if (k == "slice") { return "Slice"; }
+    if (k == "array") { return "Array"; }
+    if (k == "fn" || k == "func_type") { return "Fn"; }
+    if (k == "trait") { return "Trait"; }
+    if (k == "scalar") {
+        var sn: string = base.node_sa((tnode as u64));
+        if (sn == "bool") { return "Bool"; }
+        if (sn == "f32" || sn == "f64") { return "Float"; }
+        if (parse.is_scalar_name(sn)) { return "Int"; }
+        return "Struct";   // string / void / StringBuilder 等无对应 arm
+    }
+    if (k == "named") {
+        var tname: string = base.node_sa((tnode as u64));
+        var si: i64 = sym_lookup(global_scope, tname);
+        if (si >= 0 && syms[si].decl >= 0) {
+            var dk: string = base.node_kind((syms[si].decl as u64));
+            if (dk == "StructDecl") { return "Struct"; }
+            if (dk == "UnionDecl") { return "Union"; }
+            if (dk == "EnumDecl") { return "Enum"; }
+            if (dk == "VariantDecl") { return "Union"; }
+        }
+        return "Struct";
+    }
     return "Struct";
 }
 
 // 构造 comptime TypeMeta 结构体值（struct_lit）：name/size/kind/field_count/fields/field_types。
 // Struct 类型填充 field_types: []type（各元素为真实 comptime type 值），其余 kind 留空数组。
+// 所有 kind 均填充 name（可读类型名）/ size（mb_size_of 编译期尺寸）/ kind（arm code），
+// 使 @type_info(T) 对任意类型在编译期可用（按 arm 分派 + 读 name/size）。
 pub fn build_typemeta_value(tnode: i64, arm: string) i64 {
-    var tname: string = meta_type_to_str(tnode);
+    var tname: string = ti_type_name(tnode);
     var fh: i64 = -1;
     var ft: i64 = -1;
     var f_name: i64 = base__mk_FV("name", base.mk_string(tname, -1), -1);
     ft = base__list_push(fh, ft, f_name); if (fh < 0) { fh = ft; }
-    var f_size: i64 = base__mk_FV("size", mv_int(0), -1);
+    var sz: i64 = mb_size_of(tnode, 0);
+    if (sz < 0) { sz = 0; }
+    var f_size: i64 = base__mk_FV("size", mv_int(sz), -1);
     ft = base__list_push(fh, ft, f_size);
     var f_kind: i64 = base__mk_FV("kind", mv_int(ti_arm_code(arm)), -1);
     ft = base__list_push(fh, ft, f_kind);
@@ -14014,13 +14058,14 @@ pub fn mb_size_of(tn0: i64, depth: i64) i64 {
     if (base.node_kind((tn as u64)) == "pointer") { return 8; }
     if (base.node_kind((tn as u64)) == "slice") { return 32; }        // TSlice { ptr, len, cap, elem_size }
     if (base.node_kind((tn as u64)) == "array") {
+        // array 类型节点的 nb 直接存长度整数（非 int 节点），见 base.mk_array / parse.tc mangle。
         var es: i64 = mb_size_of(base.node_na((tn as u64)), depth + 1);
         var ea: i64 = mb_align_of(base.node_na((tn as u64)), depth + 1);
         if (es < 0) { return -1; }
         if (ea < 0) { return -1; }
-        if (base.node_nb((tn as u64)) < 0) { return -1; }
-        if (base.node_kind((base.node_nb((tn as u64)) as u64)) != "int") { return -1; }
-        return mb_round_up(es, ea) * parse_int_len(base.node_sa((base.node_nb((tn as u64)) as u64)), base.node_ia((base.node_nb((tn as u64)) as u64)));
+        var n: i64 = base.node_nb((tn as u64));
+        if (n <= 0) { return -1; }
+        return mb_round_up(es, ea) * n;
     }
     if (base.node_kind((tn as u64)) == "named") {
         var d: i64 = mb_type_decl(base.node_sa((tn as u64)));
