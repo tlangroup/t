@@ -185,11 +185,11 @@ pub struct StructInfo {
 
 ```t
 // ⚠ 目标形态：**尚未可用**（依赖 §4.4 的 comptime `type` 一等值 + `inline for`）
-// arm 名按 t 语法写成裸名 `Struct(s)`（见 §4.1 语法更正）
+// arm 名按 t 语法写成前导点 `.Struct(s)`（见 §4.1 语法更正：裸名 `Struct(s)` 已废弃并报 T-MAT-E751）
 fn printStruct(comptime T: type) void {
     const info = @type_info(T);
     match (info) {
-        Struct(s) => {
+        .Struct(s) => {
             inline for (s.field_names, s.field_types) |name: string, Ft: type| {
                 if (comptime Ft == string) { /* 字符串分支，编译期定死 */ }
             }
@@ -206,7 +206,7 @@ fn printStruct(comptime T: type) void {
 // 当前 as-built 载荷是 `*TypeMeta`，实测可用写法见 §4.7。
 fn dumpRT(info: TypeInfo) void {
     match (info) {
-        Struct(s) => {
+        .Struct(s) => {
             var i: i64 = 0;
             while (i < s.field_count) {
                 println(s.field_names[i]);

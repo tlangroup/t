@@ -69,8 +69,8 @@ Shape variant {
 area fn(s: Shape) -> f64 {
     return match (s) {
         .Circle(r)   => 3.14159 * r * r
-        Rect(w, h)  => w * h
-        Empty       => 0.0
+        .Rect(w, h)  => w * h
+        .Empty       => 0.0
     };
 }
 
@@ -81,9 +81,9 @@ MaybeInt variant {
 }
 is_positive fn(m: MaybeInt) -> bool {
     return match (m) {
-        Some(x) when x > 0 => true
-        Some(_)            => false
-        None               => false
+        .Some(x) when x > 0 => true
+        .Some(_)            => false
+        .None               => false
     };
 }
 
@@ -94,8 +94,8 @@ List variant {
 }
 sum fn(xs: List) -> i64 {
     return match (xs) {
-        Nil        => 0
-        Cons(h, t) => h + sum(t)
+        .Nil        => 0
+        .Cons(h, t) => h + sum(t)
     };
 }
 
@@ -113,8 +113,8 @@ StatusCode variant {
 }
 handle fn(c: StatusCode) -> string {
     return match (c) {
-        Ok  => "ok"
-        Fail => "fail"
+        .Ok  => "ok"
+        .Fail => "fail"
         // 无需覆盖全部；其余（含未来新增 tag）由 _ 兜底，不报 NONEXHAUSTIVE
         _   => "unknown"
     };
