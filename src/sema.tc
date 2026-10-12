@@ -13293,6 +13293,46 @@ pub fn meta_trace_flush() void {
 }
 
 // ── 语句执行：0=顺序结束 1=return 2=break 3=continue ──────────
+// 阶段1 S4（Q1）：inline for 编译期展开。
+// 迭代 iterable（须为编译期已知数组值 array_lit），对每个元素克隆体块、把 elem 绑定到元素值、
+// 可选 idx 绑定到元素下标（i64 字面量），执行体。break 仅终止本次展开（消费，返回 0），
+// continue 跳到下一元素（返回 0），return 向上传播（返回 1）。展开完全在编译期，不产生运行期循环。
+pub fn meta_run_inline_for(s: i64) i64 {
+    var arr: i64 = -1;
+    if (base.node_na((s as u64)) >= 0) {
+        g_meta_err = false;
+        if (g_meta_steps < 200000) { g_meta_steps = 200000; }
+        arr = meta_eval(base.node_na((s as u64)));
+    }
+    if (arr < 0 || base.node_kind((arr as u64)) != "array_lit") {
+        meta_fail("T-MTA-E622",
+            "inline for 的 iterable 必须是编译期已知数组（comptime 数组字面量 / @type_info(...).field_types 等）", s);
+        return 0;
+    }
+    var elem_name: string = base.node_sa((s as u64));
+    var idx_name: string = base.node_sb((s as u64));
+    var ks: []i64 = base.kids_chain_idx(base.node_la((arr as u64)));   // 元素子节点链（各 .val 为元素值节点）
+    var ki: i64 = 0;
+    while (ki < slice_len(ks) as i64) {
+        var ev: i64 = base__kids[ks[ki]].val;
+        var mk: i64 = g_menv_top;
+        menv_push(elem_name, meta_val_copy(ev));
+        if (str_len(idx_name) > 0) { menv_push(idx_name, mv_int(ki)); }
+        // 克隆体语句链（避免逐元素执行污染模板），执行其语句链表。
+        // 注意：inline_for 的 la 是「语句链 entry 头」（与 for/for_each/comptime_block 同构），
+        // 不是单节点，故须用 clone_kids 克隆链，而非 clone_node（后者会把 entry 头当节点 id 误克隆）。
+        var body_clone: i64 = clone_kids(base.node_la((s as u64)));
+        var r: i64 = meta_exec(body_clone);
+        g_menv_top = mk;   // 回弹本元素作用域（含 elem/idx 与体内部 var）
+        if (g_meta_err) { return 0; }
+        if (r == 1) { return 1; }   // return 向上传播
+        if (r == 2) { return 0; }   // break 终止展开（消费）
+        // r == 3 (continue) 或 0 → 进入下一元素
+        ki = ki + 1;
+    }
+    return 0;
+}
+
 pub fn meta_exec(head: i64) i64 {
     var c: i64 = head;
     var mq_ks12256: []i64 = base.kids_chain_idx(head);
@@ -13374,6 +13414,12 @@ pub fn meta_exec(head: i64) i64 {
             g_menv_top = mk3;
             if (g_meta_err) { return 0; }
             if (r3 != 0) { return r3; }
+        } else if (base.node_kind((k.val as u64)) == "inline_for") {
+            // 阶段1 S4（Q1）：编译期展开。break/continue 由 meta_run_inline_for 消费（返回 0），
+            // 仅 return（返回 1）向上传播。
+            var r4: i64 = meta_run_inline_for(k.val);
+            if (g_meta_err) { return 0; }
+            if (r4 != 0) { return r4; }
         } else if (base.node_kind((k.val as u64)) == "return") {
             if (base.node_na((k.val as u64)) < 0) {
                 g_meta_ret = -1;
@@ -13496,6 +13542,7 @@ pub fn meta_walk_list(head: i64) void {
 pub fn meta_walk(e: i64) void {
     if (e < 0) { return; }
     if (base.node_kind((e as u64)) == "FuncDecl" || base.node_kind((e as u64)) == "lambda") { return; }
+    if (base.node_kind((e as u64)) == "inline_for") { return; }   // 阶段1 S4：体在 meta_exec 展开期才求值，散列/折叠期不递归其体（避免 elem 未绑定时误折叠）
     if (base.node_kind((e as u64)) == "comptime") {
         meta_walk(base.node_na((e as u64)));          // 先折叠内层，再求值本层
         meta_fold_expr(e);
