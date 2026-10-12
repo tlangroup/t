@@ -5666,6 +5666,41 @@ pub fn tir_emit_match(sid: i64, as_stmt: bool, est: i64) TirEmitRes {
                     if (mst2 != "" && mst2 != "i64" && mst2 != "ptr") { rst = mst2; rtd = mtd2; }
                 }
             }
+            else if (b0 >= 0 && base.node_kind((b0 as u64)) == "ident") {
+                // ⚠ A-fix 0c'：首臂体为 conpat 载荷绑定 ident（`Struct(mt) => mt`）时，该 ident 的
+                // TD 此刻尚未登记（bind slot 在 5740+ 才预声明；C 后端另有 match_conpat_binds_register
+                // 预登类型表，LLVM 后端没有 ⇒ tir_expr_st 退化为 i64/ptr ⇒ __mres 按 i64 分配 ⇒
+                // `var m: *TypeMeta = match (ti) { .Struct(mt) => mt, _ => null }` 在 LLVM 后端静默
+                // 拿不到指针（mp 退化 i64、后续 GEP 越界）→ 字段访问崩溃、输出为空。
+                // 补偿：仅当该 ident 确为本 match 首臂的 conpat 载荷绑定，按绑定声明的权威 TD 重取
+                // （与 5740+ 预声明同源 sema.resolve_type_desc）。仅介入退化形态，正常形态零影响。
+                var cn2: i64 = base.node_na((armIds[0] as u64));
+                if (cn2 >= 0 && base.node_kind((cn2 as u64)) == "conpat") {
+                    var hit: bool = false;
+                    var bks: []i64 = base.kids_chain(base.node_la((cn2 as u64)));
+                    var bki: i64 = 0;
+                    while (bki < slice_len(bks) as i64) {
+                        if (base.node_kind((bks[bki] as u64)) == "ident"
+                            && base.node_sa((bks[bki] as u64)) == base.node_sa((b0 as u64))) {
+                            hit = true; break;
+                        }
+                        bki = bki + 1;
+                    }
+                    if (hit) {
+                        // 从 conpat 载荷绑定 ident（与 5740+ 预声明同源）取权威 TD；
+                        // 注意须用遍历到的 bind ident（bks[bki]），其 na 已链到 var_decl，
+                        // 臂体引用 ident（b0）此刻尚未链，resolve 会落空。
+                        var mtd2: i64 = sema.resolve_type_desc(base.node_na((bks[bki] as u64)));
+                        if (mtd2 < 0 || mtd2 >= slice_len(sema.tds) as i64) {
+                            mtd2 = sema.resolve_type_desc(base.node_na((b0 as u64)));
+                        }
+                        if (mtd2 >= 0 && mtd2 < slice_len(sema.tds) as i64) {
+                            var mst2: string = tir_st_of_td(mtd2);
+                            if (mst2 != "" && mst2 != "i64" && mst2 != "ptr") { rst = mst2; rtd = mtd2; }
+                        }
+                    }
+                }
+            }
         }
         if (rst == "" || rst == "ptr") { rst = "i64"; }
         res = tir_new_named_slot(rtd, rst, "__mres");
