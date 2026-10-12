@@ -981,7 +981,7 @@ VariantCase:
   - `Name_from_Case(...)` 构造器——**多载荷**时形参为各载荷类型，单元 case 无参；
   - `Name_is_Case(self)` 判别器（返回 `bool`，按 `_tag` 比较）；
   - `Name_as_Case(self)` 取载荷——**单载荷**返回该载荷类型；**多载荷**逐字段 `Name_as_Case_fK(self)`（K 从 0 起、位置序）。
-- **match 构造器解构（✅ tc）**：scrutinee 静态类型为 variant 时，模式位首字母大写标识符按构造器解析；带 `(` 即构造器模式，参数**位置式**按声明序绑定到该 case 载荷（数量不符报 `T_MATCH_PATTERN_ARITY`）；支持**嵌套**（`Tree(Leaf(x))` / `Node(l, Node(Leaf(y), r))`）。各臂表达式须推断为同一结果类型（沿用 `T_MATCH_ARM_TYPE`）。
+- **match 构造器解构（✅ tc）**：scrutinee 静态类型为 variant 时，模式位首字母大写标识符按构造器解析；带 `(` 即构造器模式，参数**位置式**按声明序绑定到该 case 载荷（数量不符报 `T_MATCH_PATTERN_ARITY`）；支持**嵌套**（`.Tree(.Leaf(x))` / `.Node(l, .Node(.Leaf(y), r))`）。各臂表达式须推断为同一结果类型（沿用 `T_MATCH_ARM_TYPE`）。
 - **穷尽性（✅ tc，A1 推广）**：variant 所有具名 case 须被**无守卫**臂全覆盖，否则须有 `_` 通配臂兜底，否则报 `T_MATCH_NONEXHAUSTIVE` 并指名未覆盖 case（如 `unhandled case(s) Shape.Rect, Shape.Empty`）。带 `when` 守卫的臂不计覆盖。
 - **抽象 variant（✅ tc）**：variant 声明末位写 `_` 即标记为抽象（open/非穷尽），`match` 对该类型**豁免穷尽性**（可只覆盖部分 case、无需 `_` 兜底臂）；非末位的 `_` 报 `T_VARIANT_ABSTRACT_MARKER`。抽象 variant 与封闭 variant 共用同一套 `from`/`is`/`as` 生成。
 - **递归 variant（✅ tc）**：case 载荷可**指针形态**自引用 `List variant { Nil; Cons(i64, *List) }`（前向引用按名解析，双后端 `Nil→0` 跑通）。**值形态**自引用（裸 `Self` 或 `[N]Self`）报 `T_VARIANT_RECURSIVE_VALUE`（避免无限大小 struct 静默错编，L-09 零 UB）。
