@@ -1,0 +1,67 @@
+// KI-007 · `[]u64` 全局切片（与其它元素类型的全局切片混排、经 pub 访问器跨模块读写）
+//        在真实自托管路径下 codegen 错编：写入的标志位读不回。
+//
+// 本目录不被 conformance/difftest 自动扫描，仅作为已知缺陷复现/修复回归用例手动运行。
+//
+// 期望输出（正确行为）：
+//   flags_a=7 bc_a=0 flags_b=15 bc_b=1
+//
+// 现象（2026-10-13 首次触发，`g_node_flags: []u64` 版 src/base.tc）：
+//   真实自托管编译器把「已置位」的标志一律读成默认 ⇒ `bc`(pub) 恒 false ⇒
+//   全部声明被判私有 ⇒ `tc check src/tc.tc` 雪崩 14211 条 T-MOD-E558。
+//   改回 `[]i64`（全仓其余 23 个侧表同款）后 0 error ⇒ 缺陷与元素类型强相关。
+//
+// ⚠ 已知缺口：本**单文件玩具用例**尚未复现（双后端均输出期望值）。真实触发路径
+//   需「自托管规模的全局切片数量 + 跨模块 pub 访问器」。见
+//   docs/compiler/known-issues.md §8 的定位路线。
+//
+// 修复验收：① 本用例双后端逐字节一致；② 把 src/base.tc 的 `g_node_flags` 改回 `[]u64`
+//   重建编译器，`tc check src/tc.tc` 0 error（不再是 14211 条 E558）。
+
+pub var g_flags: []u64;          // 被测：u64 元素全局切片
+pub var g_kind: []i64;           // 混排：i64 元素全局切片（真实侧表同款）
+pub var g_sa: []i64;
+pub var g_sb: []i64;
+
+var F_BC: u64 = 8;               // bit3 = pub
+var F_INIT: u64 = 7;             // bit0..2 默认置位
+
+pub fn node_new() i64 {
+    append(g_flags, F_INIT);
+    append(g_kind, 0);
+    append(g_sa, 0);
+    append(g_sb, 0);
+    return slice_len(g_flags) - 1;
+}
+
+pub fn node_flags(id: i64) u64 {
+    if (id < 0 || id >= slice_len(g_flags)) { return 0; }
+    return g_flags[id];
+}
+
+pub fn node_bc(id: i64) bool {
+    if (id < 0 || id >= slice_len(g_flags)) { return false; }
+    return (g_flags[id] & F_BC) != 0;
+}
+
+pub fn node_set_bc(id: i64, v: bool) void {
+    if (id < 0 || id >= slice_len(g_flags)) { return; }
+    if (v) { slice_set(g_flags, id, g_flags[id] | F_BC); }
+    else { slice_set(g_flags, id, g_flags[id] & (~F_BC)); }
+}
+
+fn main() i64 @main {
+    var a: i64 = node_new();
+    var b: i64 = node_new();
+    node_set_bc(b, true);
+
+    print("flags_a=");
+    print(int_to_str(node_flags(a) as i64));
+    print(" bc_a=");
+    print(int_to_str(node_bc(a) as i64));
+    print(" flags_b=");
+    print(int_to_str(node_flags(b) as i64));
+    print(" bc_b=");
+    println(int_to_str(node_bc(b) as i64));
+    return 0;
+}

@@ -5,7 +5,7 @@
 
 ## 0. 约定
 
-- **状态**：`open`（待修）/ `fixing`（进行中）/ `closed`（已修并回归通过）。
+- **状态**：`open`（待修）/ `fixing`（进行中）/ `closed`（已修并回归通过）/ `unreproducible`（有历史现象、当前复现不出，**不**排修复工时）/ `refuted`（历史现象仍在，但**原归因已被证伪**，保留证据防回潮）。
 - **构建版本**：缺陷以 `out/rls/tc.exe`（2026-09-03 构建）复现；**已修复验证基准为 `out/dbg/tc.exe`（2026-09-05 02:19 构建，含 `fb6eeaf`）**——该构建下 KI-001/KI-002 复现用例 `tc run` 均通过。
 - **复现用例位置**：`tests/known-issues/`（本目录**不被** `conformance`/`difftest`/`ir_snapshot` 自动扫描，避免污染自举不动点与 IR 基线；仅作手动修复回归）。
 - **验收命令**：`tc run tests/known-issues/<file>.tc` 应正常退出且无 LLVM IR 报错，输出与「期望」一致。
@@ -16,7 +16,12 @@
 | ID | 标题 | 类别 | 构建版本 | 状态 | 严重度 | 复现用例 | 期望 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | **KI-001** | variant 直接字面量 `.Circle(5)` LLVM 代码生成缺陷 | codegen（variant） | 2026-09-03 | **closed** | 高 | `tests/known-issues/KI-001_variant_anon_literal.tc` | `tc run` 输出 `5` |
-- **KI-002**：struct / 元组字面量模式 `Pt{ x: 0, y: 0 }` / `.{1i64, "a"}` 在 LLVM 轨条件被丢弃 → **恒命中首臂**（静默错编；C 轨正确） | codegen（LLVM 轨 match 解构） | 2026-09-03 登记，`fb6eeaf` 误记已修 | ✅ **closed**（2026-09-26 元组特性一并修复） | 高 | `tests/known-issues/KI-002_struct_literal_pat.tc` | `tc run` 输出 `0`（C 轨 `0`，LLVM 轨原 `1` → 修复后 `0`） |
+- **KI-002**：struct / 元组字面量模式 `Pt{ x: 0, y: 0 }` / `.{1i64, "a"}` 在 LLVM 轨条件被丢弃 → **恒命中首臂**（静默错编；C 轨正确） | codegen（LLVM 轨 match 解构） | 2026-09-03 登记，`fb6eeaf` 误记已修 | ✅ **closed**（2026-09-26 元组特性一并修复） | 高 | `tests/known-issues/KI-002_struct_literal_pat.tc` | `tc run` 输出 `0`（C 轨 `0`，LLVM 轨原 `1` → 修复后 `0`）
+- **KI-003**：packed struct 位域（P7 起取代 `flag`）运行期读写 —— 原 `flag` 位域因 runtime 缺 `t_flag_get/t_flag_set` 链接失败，改 `packed struct` 后双后端可链接可运行 | runtime / codegen（位域） | 2026-09 | ✅ **closed** | 中 | `tests/known-issues/KI-003_flag_bitfield_runtime.tc` | 输出 `r=1 w=0 level=5 owner=7`
+- **KI-004**：f-string `!j`（JSON）在 LLVM 后端对**切片字段之后**的 f64/bool 取值错编（偏移量算错） | codegen（LLVM 轨 struct 布局） | 2026-09-28 | ✅ **closed**（已从 `SMOKE_SKIP` 移除） | 高 | `tests/known-issues/KI-004_fstring_json_llvm.tc` | 双后端逐字节一致（`score` 1.5 / `ok` true）
+- **KI-005**：device 示例端到端对拍失败（LLVM 后端缺 device 发射 + cpu-emu 解释器 3 处解析 bug） | codegen（device 子系统） | 2026-09-28 | ✅ **closed**（子系统本体） | 高 | `examples/_cpuemu_check.tc` / `examples/vecadd_device_full.tc` | 内核执行 rc=0、不再 segfault
+- **KI-006**：LLVM 后端 f32（窄元素）堆数组元素运行期索引 `store` 不落盘（序言预扫描把 `GEP_IDX` 结果槽按**元素类型**分配，实际承载 8B 指针 → 写穿） | codegen（LLVM 轨槽宽） | 2026-09-28 | ✅ **closed**（device 示例 LLVM 单后端已过；C 后端 device 运行时仍待修，两示例保留 `SMOKE_SKIP`） | 高 | 见 `KI-006_f32_heap_array_store.md` | `ha[k]=k` 循环后读回正确
+- **KI-007**：`[]u64` 全局切片（侧表形态）跨模块 codegen 缺陷 —— 历史现象为 `g_node_flags: []u64` 时 `check src/tc.tc` 爆 14211 条 `T-MOD-E558`；**2026-10-14 已证伪**：两版只差元素类型的编译器对同一输入的 IR **逐字节相同**，u64 版自举两轮全绿 | 归因错误（非 codegen） | 2026-10-13 登记 | ✅ **refuted**（原归因证伪，**不**排修复工时） | 中 | `tests/known-issues/KI-007_u64_global_slice.md`（证据 + 一键复现脚本）+ `.tc`（玩具用例） | 见 §5.2 三条铁证 |
 
 ## 2. KI-001 · variant 直接字面量（匿名字段字面量）代码生成缺陷
 
@@ -77,11 +82,93 @@
 ## 4. 修复排期建议
 
 - **优先级**：KI-001 **closed**（`fb6eeaf` 构建，`KI-001_variant_anon_literal.tc` `tc run` 输出 `5`）；**KI-002 ⚠ reopen** —— 2026-09-25 双后端对拍确认 LLVM 轨仍错编（详见 §3.1）。二者均为高优先：KI-002 属**静默错编**（不报错、结果错），比链接失败更危险，建议排到 KI-001 之前。复现用例保留于 `tests/known-issues/`，并建议同步进 `examples/` 常规门禁。
+- **KI-003 ~ KI-006 已闭环**（详见 §1 速览表）：KI-003 位域随 P7 `packed struct` 一并修复；KI-004 `!j` 切片字段后偏移错编已修、已从 `SMOKE_SKIP` 移除；KI-005 device 子系统本体（LLVM 发射 + cpu-emu 解释器）已修；KI-006 LLVM 轨 `GEP_IDX` 结果槽宽已修。仅 KI-005/006 的两条 device 示例因**C 后端 device 运行时**仍 segfault 而保留 `SMOKE_SKIP`。
+- **KI-007 不排期**：状态 `refuted`（§5）—— 原归因「`[]u64` 切片 codegen 缺陷」已被三条独立证据证伪（自举两轮全绿 / IR 层无 u64/i64 之分 / 两版编译器产物逐字节相同）。**不要**为了验证这个不存在的缺陷去改 `src/base.tc`。若将来真出现「标志位读回恒为默认」类雪崩，去查打包时的**伴随改动**（访问器改写 / 常量类型 / append 初值传播），而非元素类型。
 - **前置（修复时已完成）**：修复落在「双后端一致」约束内——C 后端（`codegen_c`）须同步验证；`tc run` 验收即双后端一致证据。后续若改动相关 codegen 路径，复跑 `node tools/gate.mjs L2` 保自举不动点，并视情况将两用例纳入 `tests/variant_smoke` 自动回归。
 - **关联待办（非本次范围）**：struct match 绑定模式 `Pt{ x: a, y: b }` 的 sema 支持（当前 `T-SEM-E201`）仍开放，建议单独排期评估放开。
 
-## 5. 变更记录
+## 5. KI-007 · `[]u64` 全局切片（侧表形态）跨模块 codegen 缺陷 —— ✅ **已证伪（refuted）**
+
+> 完整记录与一键复现脚本见 `tests/known-issues/KI-007_u64_global_slice.md`；玩具用例
+> `tests/known-issues/KI-007_u64_global_slice.tc`（`pub` 全局 `[]u64` 与 `[]i64` 混排 +
+> `pub` 访问器读写位掩码）。本节只留结论与判据。
+
+### 5.1 历史现象（2026-10-13）
+
+节点侧表位打包（提交 `1693168`）首次引入 `pub var g_node_flags: []u64`，gate L2 跑出
+**19/6**：`check src/tc.tc` 爆 **14211 条 `T-MOD-E558`**。现象上「已置位」的标志全部
+读回默认值 ⇒ `bc`(pub) 恒 false ⇒ 全部声明被判私有 ⇒ 雪崩。当时逐项排除的玩具用例
+（`append`/`slice_set`/索引/`slice_len`/位运算/大索引）**全部正确**，唯独真实自托管
+路径失败，遂归因为「编译器 `[]u64` 切片 codegen 缺陷」，并以改回 `[]i64` 规避。
+
+### 5.2 证伪实验（2026-10-14，HEAD `1693168`）
+
+按当时形态精确还原 u64 版 `src/base.tc`（`[]u64` 切片 + 12 个 `var F_*: u64` +
+`append(...,7)` + `(g_flags[id] & F_X) != 0`），与 i64 版做**同种子对照**：
+
+**① 运行级 —— u64 版自托管链全绿**
+
+| # | 命令 | 历史期望 | 实测 |
+|---|---|---|---|
+| 1 | `out/dbg/tc.exe check src/tc.tc`（种子编译 u64 版源码） | — | **0 error** |
+| 2 | `out/dbg/tc.exe build src/tc.tc --output out/dbg/g1u` | — | 成功（md5 `fc56a55f…`） |
+| 3 | `g1u.exe check src/tc.tc`（**历史失败点**） | 14211 条 E558 | **0 error，0 条 E558** |
+| 4 | `g1u.exe build src/tc.tc --output out/dbg/g2u` | — | 成功（md5 `37b428df…`） |
+| 5 | `g2u.exe check src/tc.tc` | — | **0 error** |
+
+玩具用例双后端（LLVM `tc run` / C `--emit-c` + clang）逐字节一致且为期望值
+`flags_a=7 bc_a=0 flags_b=15 bc_b=1`。
+
+**② 原理级 —— LLVM IR 里 `u64` 与 `i64` 本就无差别**
+
+切片读写**不走**直接 GEP/load/store，而是全部经 runtime 函数：
+
+```
+call ptr @tll_slice_at(ptr @g_flags, i64 %idx)      ; 取元素地址
+call i64  @tll_slice_len(ptr @g_flags)               ; 长度
+call void @tll_slice_set(ptr @g_flags, i64 %i, ptr %v) ; 写入
+```
+
+且 LLVM 的整数类型**不区分有/无符号**——`u64` 与 `i64` 都落成 `i64`，差异只在
+`udiv/sdiv`、`lshr/ashr` 这类指令上体现，而位掩码访问器只用到 `and`/`or`/`xor`，
+两条路径**生成完全相同的 IR**。
+
+**③ 产物级 —— 两个只差元素类型的编译器，IR 逐字节相同（决定性）**
+
+用**同一种子** `tc.exe` 分别构建 i64 版 `g1i`（md5 `867397f0…`）与 u64 版 `g1u`
+（md5 `fc56a55f…`），再让它们编译**同一份**输入：
+
+| 被编译输入 | `g1u.exe emit-ll` 产物 md5 | `g1i.exe emit-ll` 产物 md5 | diff |
+|---|---|---|---|
+| `tests/known-issues/KI-007_u64_global_slice.tc` | `df4219d2…` | `df4219d2…` | **0 行** |
+| `src/tc.tc`（真实自托管规模，4 万+ 节点） | `8a010ea3…` | `8a010ea3…` | **0 行** |
+
+编译器自身侧表是 `u64` 还是 `i64`，**对它产出的 IR 一个字节都没有影响**。
+
+### 5.3 结论（已证伪）
+
+**原归因「编译器 `[]u64` 切片 codegen 缺陷」不成立。** 「把 u64 改成 i64 程序就通过了」
+是**把相关性误判为因果**：`u64 → i64` 的回退同时带走了真正的病灶（打包时一起落地的
+访问器改写 / 常量类型 / `append` 初值传播路径中的某处），元素类型本身是清白的。
+
+三条证据互相独立且一致：u64 版自举两轮全绿（运行级）／IR 层无 u64/i64 之分（原理级）／
+两版编译器产物逐字节相同（产物级）。
+
+**处置**：状态 `refuted`，**不**排修复工时；生产代码维持 `[]i64`（内存收益相同，
+无动机改回）；本条保留的目的是**防止后来者再去 codegen 里挖这个不存在的缺陷**。
+若将来真出现「标志位读回恒为默认」类雪崩，应去查打包时的**伴随改动**，而非元素类型。
+
+### 5.4 ⚠ 复现时的两个坑（本次踩过）
+
+1. **`src/base.tc` 是 CRLF 文件**（不是 LF）：Python 改写必须 `newline=''` 读 + 原样写回；
+   用 `newline='\n'` 读会让 `^…;$` 类正则失配，表现为「改了 0 处」却不报错。
+2. **缺陷不在 `check` 步暴露**：用正确的种子编译器 `check` u64 版源码是 **0 error**，
+   必须**用 u64 版源码构建出的 `g1u`** 再 `check` 才是历史失败点（第 3 步）。
+   只看第 1 步会得出"没问题"的假阴性。
+
+## 6. 变更记录
 
 - 2026-09-04（续 10）：由 `docs/code-style-guide.md` §1 后端状态注记中披露的两处 codegen 缺陷，登记为本文件 KI-001 / KI-002，附 `tests/known-issues/` 复现用例与验收标准。
 - 2026-09-04（续 11 · 前导点语法）：前导点提交 `9224f06`(`.{...}` 匿名结构体字面量)/`898de07`(`.Red` match 臂) 落地后，复用 `out/dbg/tc.exe` 23:38 构建**复核 KI-001/KI-002 仍 open**（报错一致，未随前导点提交修复）；同时确认前导点语法仅覆盖 struct `.{...}` 与 enum `.Red`，**variant 构造器前导点 `.Circle(5)` 报 `T-DOT-E102` 尚不支持**——已同步写入 `code-style-guide.md §1`。
 - 2026-09-05（续 12 · KI-001/KI-002 修复闭环）：用户确认「001、002 具名结构体已通过、匿名结构体字面量也通过」。复用最新 `out/dbg/tc.exe` 02:19 构建（含 `fb6eeaf` fix(variant): 前导点变体构造器在 match 臂与值位的正确脱糖）复跑复现用例：`KI-001_variant_anon_literal.tc` → stdout `5`、无 IR 报错；`KI-002_struct_literal_pat.tc` → stdout `0`、无 IR 报错。两缺陷状态置 `closed`；前导点 variant 构造器 `.Circle(5)` 同提交解除 `T-DOT-E102` 后可用。`code-style-guide.md §1/§5/后端注记` 同步去除 KI 绕过写法、`docs/INDEX.md` 追加续 12 变更日志。
+- 2026-10-14（台账补全 + KI-007 立项）：补齐此前只存在于 `tests/known-issues/` 而**未登记进本文**的 KI-003（packed struct 位域）/ KI-004（f-string `!j` 切片字段后偏移）/ KI-005（device 子系统）/ KI-006（LLVM `GEP_IDX` 结果槽宽），状态一并核对；新增 §0 的 `unreproducible` 状态位与 §5 KI-007 —— 用户裁定「`[]u64` 全局切片跨模块 codegen 缺陷应另立项修复，未来任何 `[]u64` 侧表用法都会触发它」。立项后跑了三组对照，最终**证伪**原归因：① 运行级——还原 u64 版 `src/base.tc` 后自举两轮全绿、历史失败点 `g1u check src/tc.tc` = 0 error（历史为 14211 条 E558）；② 原理级——切片读写全走 runtime 函数（`tll_slice_at/len/set`），且 LLVM 整数不区分有/无符号，`u64`/`i64` 同为 `i64`；③ 产物级（决定性）——同种子构建的 `g1u`（md5 `fc56a55f…`）与 `g1i`（md5 `867397f0…`）编译**同一份** `src/tc.tc`，IR 逐字节相同（md5 `8a010ea3…`，diff 0 行）。结论：「把 u64 改成 i64 程序就通过了」是**相关性误判为因果**，回退时顺带带走了打包的其它伴随改动。状态 `refuted`，不排修复工时。原 §5 变更记录顺延为 §6。
