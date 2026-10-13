@@ -1693,7 +1693,20 @@ pub var g_node_mod: []string;           // 与节点池等长、按 id 索引：
 pub var g_node_file: []string;          // 与节点池等长、按 id 索引：节点 i 所属源文件（多模块编译单元下诊断定位用）
 pub var g_node_td: []i64;               // S3 §4.5 node_type 侧表：节点 i 的 HIR 类型槽 TD 索引（0 = 未定型；-1 = 已丢弃）
 pub var g_node_resolve: []i64;          // S3 §4.5 node_resolve 侧表：ident 节点 i 解析到的声明节点（替代 g_idecl_* 反向扫描，O(1)）
-pub var g_node_const: []i64;             // S3 §4.5 node_const 侧表：节点 i 是否为 const 声明（1 = 是；0 = 否；替代 g_const_decl_ids 列表 + 线性扫描）
+pub var g_node_flags: []i64;     // 12 布尔标志位掩码：bit0 has_sa / bit1 has_sb / bit2 has_sc / bit3 be / bit4 bf / bit5 bd / bit6 bb / bit7 bc / bit8 ba / bit9 const / bit10 mangled / bit11 conpat
+var F_HAS_SA: i64 = 1;
+var F_HAS_SB: i64 = 2;
+var F_HAS_SC: i64 = 4;
+var F_BE: i64 = 8;
+var F_BF: i64 = 16;
+var F_BD: i64 = 32;
+var F_BB: i64 = 64;
+var F_BC: i64 = 128;
+var F_BA: i64 = 256;
+var F_CONST: i64 = 512;
+var F_MANGLED: i64 = 1024;
+var F_CONPAT: i64 = 2048;
+             // S3 §4.5 node_const 侧表：节点 i 是否为 const 声明（1 = 是；0 = 否；替代 g_const_decl_ids 列表 + 线性扫描）
 pub var g_node_span: []Span;              // S5 §4.8 node_span 側表：节点 i 的源码区间 Span（取代 ln/cl/tv 的结构化表示）
 
 // ── S5 §4.8 trivia（span 间隙表示）─────────────────────────────
@@ -1720,16 +1733,16 @@ pub var g_node_se: []string;               // 与节点池等长、按 id 索引
 // S4 第二批（§0.14.7）：存在性标志位组 has_sa/has_sb/has_sc（has_X == 0 表示 X 语义为 null）。
 // 沿用 g_node_const 的 []i64 先例（1=是 / 0=否）而非 []bool，与既有侧表切片类型保持一致。
 // ⚠ 初值必须与旧 Node 字段默认值一致：node_new 旧代码写 `n.has_sa = true`，故此处默认 **1（true）**。
-pub var g_node_has_sa: []i64;              // 节点 i 的 has_sa（默认 1）
-pub var g_node_has_sb: []i64;              // 节点 i 的 has_sb（默认 1）
-pub var g_node_has_sc: []i64;              // 节点 i 的 has_sc（默认 1）
+// (packed into g_node_flags)              // 节点 i 的 has_sa（默认 1）
+// (packed into g_node_flags)              // 节点 i 的 has_sb（默认 1）
+// (packed into g_node_flags)              // 节点 i 的 has_sc（默认 1）
 // S4 第三批（§0.14.7）：声明级 bool 标记组 be / bf。
 // ⚠ 与上一批方向相反：旧 node_new 写 `n.be = false; n.bf = false;` ⇒ 此处默认 **0（false）**，
 //   访问器越界返回 false（按字段默认值对齐）。搬迁时勿照抄 has_* 的「默认 true」写法。
 //   - be：C 互操作导出 —— 该声明是否标记 `@c_export`（生成 C ABI 平铺入口）
 //   - bf：Device 子系统 —— 该声明是否为 `kernel fn`（设备入口；host 双后端跳过，codegen_dev 处理）
-pub var g_node_be: []i64;                  // 节点 i 的 be（默认 0 = 非 @c_export）
-pub var g_node_bf: []i64;                  // 节点 i 的 bf（默认 0 = 非 kernel fn）
+// (packed into g_node_flags)                  // 节点 i 的 be（默认 0 = 非 @c_export）
+// (packed into g_node_flags)                  // 节点 i 的 bf（默认 0 = 非 kernel fn）
 // S4 第四批（§0.14.7）：Device 地址空间 memspace（i64，值域 0=host / 1=global / 3=shared /
 // 5=local；仅 `pointer` 类型节点使用；默认 0）+ 模块系统 import 库路径标志 bd（bool，默认 false）。
 // ⚠ 普查提示：`memspace` 的 13 处命中里**多数是同名假阳性** —— `tbl_RecPointer_memspace`
@@ -1739,7 +1752,7 @@ pub var g_node_bf: []i64;                  // 节点 i 的 bf（默认 0 = 非 k
 //   ② member 节点 = 是否是某个 call 的 callee（sema::mark_call_callees 置位，
 //   infer_expr_body 据此跳过「字段不存在」误报）。外置只做等价搬迁，勿擅自拆分语义。
 pub var g_node_memspace: []i64;            // 节点 i 的 memspace（默认 0 = host）
-pub var g_node_bd: []i64;                  // 节点 i 的 bd（默认 0 = false）
+// (packed into g_node_flags)                  // 节点 i 的 bd（默认 0 = false）
 // S4 第五批（§0.14.7）：bool 载荷组 bb / bc（默认 false，与 be/bf/bd 同向）。
 //   - bb：多语义 bool 载荷 —— 按 kind 复用：FuncDecl/GlobalConstDecl/GlobalVarDecl = is_let
 //     （动态常量，类型由初始化器推断）；P = 编译期类型参数；SL = 显式 offset 标志；
@@ -1748,8 +1761,8 @@ pub var g_node_bd: []i64;                  // 节点 i 的 bd（默认 0 = false
 // ⚠ 与 bb 相关的 `mk_FuncDecl/mk_GlobalConstDecl/mk_GlobalVarDecl/mk_SL` 仍保留 `bb` 形参
 //   （构造参数不变 ⇒ 15+ 调用点与 cst_register_Rec* S2 dual-write 签名不动），
 //   仅函数体内由 `n.bb = bb` 改为 `node_set_bb(id, bb)`。
-pub var g_node_bb: []i64;                  // 节点 i 的 bb（默认 0 = false）
-pub var g_node_bc: []i64;                  // 节点 i 的 bc（默认 0 = 非 pub）
+// (packed into g_node_flags)                  // 节点 i 的 bb（默认 0 = false）
+// (packed into g_node_flags)                  // 节点 i 的 bc（默认 0 = 非 pub）
 pub var g_node_nd: []i64;                  // 节点 i 的 nd 子节点索引（默认 -1 = 无）
 pub var g_node_ib: []i64;                  // 节点 i 的 ib 通用整数槽（默认 -1；见 node_ib 处语义清单）
 pub var g_node_sc: []string;               // S4 第六批：节点 i 的 sc 字符串载荷（默认 ""）
@@ -1758,7 +1771,7 @@ pub var g_node_sa: []string;               // S4 第十九批：节点 i 的 sa 
                                            // ⚠ Node 里用量最大的字符串槽，按 kind 复用极多语义
                                            //   （清单见 node_sa 处注释）；默认与越界读一律 ""。
 pub var g_node_nc: []i64;                  // S4 第九批：节点 i 的 nc 子节点索引（默认 -1 = 无）
-pub var g_node_ba: []i64;                  // S4 第十批：节点 i 的 ba 通用 bool 载荷（默认 0 = false）
+// (packed into g_node_flags)                  // S4 第十批：节点 i 的 ba 通用 bool 载荷（默认 0 = false）
                                            // ⚠ 该槽按 kind **复用**于多种语义（见 node_ba 处注释）
 pub var g_node_lc: []i64;                  // S4 第十一批：节点 i 的 lc kids 链表头（默认 -1 = 空链）
                                            // ⚠ 另含特殊哨兵 **-2**（见 node_lc 处注释）
@@ -2200,13 +2213,14 @@ pub fn node_set_resolve(n: u64, decl: i64) void {
 pub fn node_const(n: u64) i64 {
     sidetable_init();
     var id = nr_idx(n);
-    if (id < 0 || id >= slice_len(g_node_const)) { return 0; }
-    return g_node_const[id];
+    if (id < 0 || id >= slice_len(g_node_flags)) { return 0; }
+    if ((g_node_flags[id] & F_CONST) != 0) { return 1; }
+    return 0;
 }
 pub fn node_set_const(n: u64) void {
     var id = nr_idx(n);
-    if (id < 0 || id >= slice_len(g_node_const)) { return; }
-    slice_set(g_node_const, id, 1);
+    if (id < 0 || id >= slice_len(g_node_flags)) { return; }
+    slice_set(g_node_flags, id, g_node_flags[id] | F_CONST);
 }
 
 // S4（§0.14.6 / §4.10.3）SoA：Node.se（C 互操作导出 ABI 符号名，clean name；"" = 未导出）侧表访问面。
@@ -2231,35 +2245,35 @@ pub fn node_set_se(n: u64, v: string) void {
 pub fn node_has_sa(n: u64) bool {
     sidetable_init();
     var id = nr_idx(n);
-    if (id < 0 || id >= slice_len(g_node_has_sa)) { return true; }
-    return g_node_has_sa[id] != 0;
+    if (id < 0 || id >= slice_len(g_node_flags)) { return true; }
+    return (g_node_flags[id] & F_HAS_SA) != 0;
 }
 pub fn node_set_has_sa(n: u64, v: bool) void {
     var id = nr_idx(n);
-    if (id < 0 || id >= slice_len(g_node_has_sa)) { return; }
-    if (v) { slice_set(g_node_has_sa, id, 1); } else { slice_set(g_node_has_sa, id, 0); }
+    if (id < 0 || id >= slice_len(g_node_flags)) { return; }
+    if (v) { slice_set(g_node_flags, id, g_node_flags[id] | F_HAS_SA); } else { slice_set(g_node_flags, id, g_node_flags[id] & (~F_HAS_SA)); }
 }
 pub fn node_has_sb(n: u64) bool {
     sidetable_init();
     var id = nr_idx(n);
-    if (id < 0 || id >= slice_len(g_node_has_sb)) { return true; }
-    return g_node_has_sb[id] != 0;
+    if (id < 0 || id >= slice_len(g_node_flags)) { return true; }
+    return (g_node_flags[id] & F_HAS_SB) != 0;
 }
 pub fn node_set_has_sb(n: u64, v: bool) void {
     var id = nr_idx(n);
-    if (id < 0 || id >= slice_len(g_node_has_sb)) { return; }
-    if (v) { slice_set(g_node_has_sb, id, 1); } else { slice_set(g_node_has_sb, id, 0); }
+    if (id < 0 || id >= slice_len(g_node_flags)) { return; }
+    if (v) { slice_set(g_node_flags, id, g_node_flags[id] | F_HAS_SB); } else { slice_set(g_node_flags, id, g_node_flags[id] & (~F_HAS_SB)); }
 }
 pub fn node_has_sc(n: u64) bool {
     sidetable_init();
     var id = nr_idx(n);
-    if (id < 0 || id >= slice_len(g_node_has_sc)) { return true; }
-    return g_node_has_sc[id] != 0;
+    if (id < 0 || id >= slice_len(g_node_flags)) { return true; }
+    return (g_node_flags[id] & F_HAS_SC) != 0;
 }
 pub fn node_set_has_sc(n: u64, v: bool) void {
     var id = nr_idx(n);
-    if (id < 0 || id >= slice_len(g_node_has_sc)) { return; }
-    if (v) { slice_set(g_node_has_sc, id, 1); } else { slice_set(g_node_has_sc, id, 0); }
+    if (id < 0 || id >= slice_len(g_node_flags)) { return; }
+    if (v) { slice_set(g_node_flags, id, g_node_flags[id] | F_HAS_SC); } else { slice_set(g_node_flags, id, g_node_flags[id] & (~F_HAS_SC)); }
 }
 
 // S4 第三批（§0.14.7）SoA：Node.be / Node.bf 声明级标记侧表访问面。
@@ -2272,24 +2286,24 @@ pub fn node_set_has_sc(n: u64, v: bool) void {
 pub fn node_be(n: u64) bool {
     sidetable_init();
     var id = nr_idx(n);
-    if (id < 0 || id >= slice_len(g_node_be)) { return false; }
-    return g_node_be[id] != 0;
+    if (id < 0 || id >= slice_len(g_node_flags)) { return false; }
+    return (g_node_flags[id] & F_BE) != 0;
 }
 pub fn node_set_be(n: u64, v: bool) void {
     var id = nr_idx(n);
-    if (id < 0 || id >= slice_len(g_node_be)) { return; }
-    if (v) { slice_set(g_node_be, id, 1); } else { slice_set(g_node_be, id, 0); }
+    if (id < 0 || id >= slice_len(g_node_flags)) { return; }
+    if (v) { slice_set(g_node_flags, id, g_node_flags[id] | F_BE); } else { slice_set(g_node_flags, id, g_node_flags[id] & (~F_BE)); }
 }
 pub fn node_bf(n: u64) bool {
     sidetable_init();
     var id = nr_idx(n);
-    if (id < 0 || id >= slice_len(g_node_bf)) { return false; }
-    return g_node_bf[id] != 0;
+    if (id < 0 || id >= slice_len(g_node_flags)) { return false; }
+    return (g_node_flags[id] & F_BF) != 0;
 }
 pub fn node_set_bf(n: u64, v: bool) void {
     var id = nr_idx(n);
-    if (id < 0 || id >= slice_len(g_node_bf)) { return; }
-    if (v) { slice_set(g_node_bf, id, 1); } else { slice_set(g_node_bf, id, 0); }
+    if (id < 0 || id >= slice_len(g_node_flags)) { return; }
+    if (v) { slice_set(g_node_flags, id, g_node_flags[id] | F_BF); } else { slice_set(g_node_flags, id, g_node_flags[id] & (~F_BF)); }
 }
 
 // S4 第四批（§0.14.7）SoA：Node.memspace（i64，默认 0=host）/ Node.bd（bool，默认 false）。
@@ -2312,37 +2326,37 @@ pub fn node_set_memspace(n: u64, v: i64) void {
 pub fn node_bd(n: u64) bool {
     sidetable_init();
     var id = nr_idx(n);
-    if (id < 0 || id >= slice_len(g_node_bd)) { return false; }
-    return g_node_bd[id] != 0;
+    if (id < 0 || id >= slice_len(g_node_flags)) { return false; }
+    return (g_node_flags[id] & F_BD) != 0;
 }
 pub fn node_set_bd(n: u64, v: bool) void {
     var id = nr_idx(n);
-    if (id < 0 || id >= slice_len(g_node_bd)) { return; }
-    if (v) { slice_set(g_node_bd, id, 1); } else { slice_set(g_node_bd, id, 0); }
+    if (id < 0 || id >= slice_len(g_node_flags)) { return; }
+    if (v) { slice_set(g_node_flags, id, g_node_flags[id] | F_BD); } else { slice_set(g_node_flags, id, g_node_flags[id] & (~F_BD)); }
 }
 // S4 第五批（§0.14.7）：bool 载荷 bb（默认 0 = false）。
 pub fn node_bb(n: u64) bool {
     sidetable_init();
     var id = nr_idx(n);
-    if (id < 0 || id >= slice_len(g_node_bb)) { return false; }
-    return g_node_bb[id] != 0;
+    if (id < 0 || id >= slice_len(g_node_flags)) { return false; }
+    return (g_node_flags[id] & F_BB) != 0;
 }
 pub fn node_set_bb(n: u64, v: bool) void {
     var id = nr_idx(n);
-    if (id < 0 || id >= slice_len(g_node_bb)) { return; }
-    if (v) { slice_set(g_node_bb, id, 1); } else { slice_set(g_node_bb, id, 0); }
+    if (id < 0 || id >= slice_len(g_node_flags)) { return; }
+    if (v) { slice_set(g_node_flags, id, g_node_flags[id] | F_BB); } else { slice_set(g_node_flags, id, g_node_flags[id] & (~F_BB)); }
 }
 // S4 第五批（§0.14.7）：`pub` 顶层可见性 bc（默认 0 = 非 pub）。
 pub fn node_bc(n: u64) bool {
     sidetable_init();
     var id = nr_idx(n);
-    if (id < 0 || id >= slice_len(g_node_bc)) { return false; }
-    return g_node_bc[id] != 0;
+    if (id < 0 || id >= slice_len(g_node_flags)) { return false; }
+    return (g_node_flags[id] & F_BC) != 0;
 }
 pub fn node_set_bc(n: u64, v: bool) void {
     var id = nr_idx(n);
-    if (id < 0 || id >= slice_len(g_node_bc)) { return; }
-    if (v) { slice_set(g_node_bc, id, 1); } else { slice_set(g_node_bc, id, 0); }
+    if (id < 0 || id >= slice_len(g_node_flags)) { return; }
+    if (v) { slice_set(g_node_flags, id, g_node_flags[id] | F_BC); } else { slice_set(g_node_flags, id, g_node_flags[id] & (~F_BC)); }
 }
 // S4 第七批（§0.14.7）：子节点索引 nd（默认 -1 = 无该子节点；越界读返 -1，与 node_new
 // 旧默认值逐点一致）。na/nb/nc/nd 是 Node 的四个「具名子节点槽」，本批先迁量级最低的 nd
@@ -2419,13 +2433,13 @@ pub fn node_set_nc(n: u64, v: i64) void {
 pub fn node_ba(n: u64) bool {
     sidetable_init();
     var id = nr_idx(n);
-    if (id < 0 || id >= slice_len(g_node_ba)) { return false; }
-    return g_node_ba[id] != 0;
+    if (id < 0 || id >= slice_len(g_node_flags)) { return false; }
+    return (g_node_flags[id] & F_BA) != 0;
 }
 pub fn node_set_ba(n: u64, v: bool) void {
     var id = nr_idx(n);
-    if (id < 0 || id >= slice_len(g_node_ba)) { return; }
-    if (v) { slice_set(g_node_ba, id, 1); } else { slice_set(g_node_ba, id, 0); }
+    if (id < 0 || id >= slice_len(g_node_flags)) { return; }
+    if (v) { slice_set(g_node_flags, id, g_node_flags[id] | F_BA); } else { slice_set(g_node_flags, id, g_node_flags[id] & (~F_BA)); }
 }
 // S4 第十一批（§0.14.7）：kids 链表头 lc（默认 **-1 = 空链**，等价旧 `n.lc = -1`）。
 // `la`/`lb`/`lc` 同族，都是「子节点/语句在 kids 池里的链表头下标」而非节点 id
@@ -2736,7 +2750,7 @@ pub var g_frame_starts: []i64;     // 每帧起始下标（并行于 g_frame_own
 pub var g_frame_owners: []i64;     // 每帧归属节点 id（块节点）
 pub var g_frame_sp:     i64 = 0;   // 逻辑栈深（pop 仅自减此标量）
 pub var g_node_scope:   []i64;     // 与节点池等长、按 id 索引：节点→所属 scope id（默认 -1）  ← S3 侧表
-pub var g_node_mangled: []i64;     // 与节点池等长、按 id 索引：该声明已被唯一化重整（mangle 成 name__<sid>）  ← 20-J
+// (packed into g_node_flags)     // 与节点池等长、按 id 索引：该声明已被唯一化重整（mangle 成 name__<sid>）  ← 20-J
 
 pub fn node_scope(n: u64) i64 {
     var id = nr_idx(n);
@@ -2786,31 +2800,31 @@ pub fn g_seen_add(key: string) void {
 pub fn node_mangled(n: u64) bool {
     sidetable_init();
     var id = nr_idx(n);
-    if (id < 0 || id >= slice_len(g_node_mangled)) { return false; }
-    return g_node_mangled[id] != 0;
+    if (id < 0 || id >= slice_len(g_node_flags)) { return false; }
+    return (g_node_flags[id] & F_MANGLED) != 0;
 }
 pub fn node_set_mangled(n: u64, v: bool) void {
     var id = nr_idx(n);
-    if (id < 0 || id >= slice_len(g_node_mangled)) { return; }
-    if (v) { slice_set(g_node_mangled, id, 1); } else { slice_set(g_node_mangled, id, 0); }
+    if (id < 0 || id >= slice_len(g_node_flags)) { return; }
+    if (v) { slice_set(g_node_flags, id, g_node_flags[id] | F_MANGLED); } else { slice_set(g_node_flags, id, g_node_flags[id] & (~F_MANGLED)); }
 }
 
 // conpat 载荷绑定（match 构造器模式解构出的 `x`）由后端发射期现场合成 var_decl。
 // 它们身处 match 各臂的**独立代码块**（不同 if 分支），C/LLVM 块作用域天然隔离，
 // 名字不会冲突 —— 故禁止对其做唯一化重整（否则合成的声明节点与标识符反查的声明
 // 节点不一致，导致「绑定存到 x__N、读取却是裸 x」的静默错编：见 adt_list / adt_status）。
-pub var g_node_conpat:  []i64;     // 与节点池等长、按 id 索引：该节点是 conpat 载荷绑定（禁止唯一化重整）  ← 20-J
+// (packed into g_node_flags)     // 与节点池等长、按 id 索引：该节点是 conpat 载荷绑定（禁止唯一化重整）  ← 20-J
 // 20-J：原 `g_conpat_bind_has(d)`（线性扫 g_conpat_binds 集合）→ per-node bool 侧表。
 pub fn node_conpat(n: u64) bool {
     sidetable_init();
     var id = nr_idx(n);
-    if (id < 0 || id >= slice_len(g_node_conpat)) { return false; }
-    return g_node_conpat[id] != 0;
+    if (id < 0 || id >= slice_len(g_node_flags)) { return false; }
+    return (g_node_flags[id] & F_CONPAT) != 0;
 }
 pub fn node_set_conpat(n: u64, v: bool) void {
     var id = nr_idx(n);
-    if (id < 0 || id >= slice_len(g_node_conpat)) { return; }
-    if (v) { slice_set(g_node_conpat, id, 1); } else { slice_set(g_node_conpat, id, 0); }
+    if (id < 0 || id >= slice_len(g_node_flags)) { return; }
+    if (v) { slice_set(g_node_flags, id, g_node_flags[id] | F_CONPAT); } else { slice_set(g_node_flags, id, g_node_flags[id] & (~F_CONPAT)); }
 }
 
 // const 声明成员判定已迁 node_const[] 侧表（见上方 node_const()/node_set_const()）。
@@ -2855,26 +2869,26 @@ pub fn node_new(kind: string) u64 {
     append(g_node_file, g_file);      // provenance：记录本节点所属源文件（load_module_file 内 g_file 已切到该模块文件）
     append(g_node_td, 0);             // S3 §4.5 node_type 侧表：默认未定型（0），由 sema/tir 经 node_set_type 写入
     append(g_node_resolve, -1);       // S3 §4.5 node_resolve 侧表：默认 -1（未解析到声明）
-    append(g_node_const, 0);           // S3 §4.5 node_const 侧表：默认 0（非 const 声明）
+    // (packed into g_node_flags)           // S3 §4.5 node_const 侧表：默认 0（非 const 声明）
     append(g_node_scope, -1);          // S3 §0.13.9 node_scope 侧表：默认 -1（未归属任何作用域帧）
     append(g_node_span, Span{ line: 0, col: 0, end_col: 0 });   // S5 §4.8 node_span 侧表：默认零区间（与 ln/cl/tv 初始化 0 对齐）
     append(g_node_trivia, Trivia{ leading: [], trailing: [] });  // S5 §4.8 trivia 侧表：默认无间隙 trivia（assign_trivia 后填充）
     append(g_node_se, "");                                  // S4 §0.14.6 SoA：se（C ABI 导出符号名）侧表默认空
-    append(g_node_has_sa, 1);                               // S4 §0.14.7 SoA：has_sa 默认 **true**（等价旧 `n.has_sa = true`）
-    append(g_node_has_sb, 1);                               // S4 §0.14.7 SoA：has_sb 默认 true
-    append(g_node_has_sc, 1);                               // S4 §0.14.7 SoA：has_sc 默认 true
-    append(g_node_be, 0);                                   // S4 §0.14.7 SoA：be 默认 **false**（等价旧 `n.be = false`）
-    append(g_node_bf, 0);                                   // S4 §0.14.7 SoA：bf 默认 false
+    append(g_node_flags, 7);   // 12 布尔标志位掩码（默认 has_sa/sb/sc = true）   // 12 布尔标志位掩码（默认 has_sa/sb/sc = true）                               // S4 §0.14.7 SoA：has_sa 默认 **true**（等价旧 `n.has_sa = true`）
+    // (packed into g_node_flags)                               // S4 §0.14.7 SoA：has_sb 默认 true
+    // (packed into g_node_flags)                               // S4 §0.14.7 SoA：has_sc 默认 true
+    // (packed into g_node_flags)                                   // S4 §0.14.7 SoA：be 默认 **false**（等价旧 `n.be = false`）
+    // (packed into g_node_flags)                                   // S4 §0.14.7 SoA：bf 默认 false
     append(g_node_memspace, 0);                             // S4 §0.14.7 SoA：memspace 默认 0（host，等价旧 `n.memspace = 0`）
-    append(g_node_bd, 0);                                   // S4 §0.14.7 SoA：bd 默认 false
-    append(g_node_bb, 0);                                   // S4 §0.14.7 SoA：bb 默认 false
-    append(g_node_bc, 0);                                   // S4 §0.14.7 SoA：bc 默认 false（非 pub）
+    // (packed into g_node_flags)                                   // S4 §0.14.7 SoA：bd 默认 false
+    // (packed into g_node_flags)                                   // S4 §0.14.7 SoA：bb 默认 false
+    // (packed into g_node_flags)                                   // S4 §0.14.7 SoA：bc 默认 false（非 pub）
     append(g_node_nd, -1);                                  // S4 §0.14.7 SoA：nd 默认 -1（无子节点）
     append(g_node_ib, -1);                                  // S4 §0.14.7 SoA：ib 默认 -1（无标记）
     append(g_node_sc, "");                                  // S4 §0.14.7 SoA：sc 默认空串（第六批）
     append(g_node_sb, "");                                  // S4 §0.14.7 SoA：sb 默认空串（第十二批）
     append(g_node_nc, -1);                                  // S4 §0.14.7 SoA：nc 默认 -1（无子节点；第九批）
-    append(g_node_ba, 0);                                   // S4 §0.14.7 SoA：ba 默认 false（第十批）
+    // (packed into g_node_flags)                                   // S4 §0.14.7 SoA：ba 默认 false（第十批）
     append(g_node_lc, -1);                                  // S4 §0.14.7 SoA：lc 默认 -1（空 kids 链；第十一批）
     append(g_node_lb, -1);                                  // S4 §0.14.7 SoA：lb 默认 -1（空 kids 链；第十四批；-2 只由调用方经构造器实参写入）
     append(g_node_ia, -1);                                  // S4 §0.14.7 SoA：ia 默认 -1（无标记；第十三批）
@@ -2883,8 +2897,8 @@ pub fn node_new(kind: string) u64 {
     append(g_node_na, -1);                                  // S4 §0.14.7 SoA：na 默认 -1（无子节点；第十七批；纯 -1 哨兵，无 -2）
     append(g_node_kind, kind);                              // S4 §0.14.7 SoA：kind 由必填形参写入（第十八批，无默认/"哨兵"概念）
     append(g_node_sa, "");                                  // S4 §0.14.7 SoA：sa 默认空串（第十九批）
-    append(g_node_mangled, 0);                              // 20-J：mangled 默认 false（未重整；S3 遗留 g_local_decls 侧表化）
-    append(g_node_conpat, 0);                               // 20-J：conpat 默认 false（非绑定；S3 遗留 g_conpat_binds 侧表化）
+    // (packed into g_node_flags)                              // 20-J：mangled 默认 false（未重整；S3 遗留 g_local_decls 侧表化）
+    // (packed into g_node_flags)                               // 20-J：conpat 默认 false（非绑定；S3 遗留 g_conpat_binds 侧表化）
     var nref_tag: i64 = cst.nk_of_kind(kind);
     if (nref_tag < 0) { nref_tag = 0; }   // 未注册 kind 暂归 tag=0（g_node_nref 当前无消费方，安全）
     append(g_node_nref, mk_noderef(nref_tag, (node_count()) - 1));   // S4：打包 tag|idx 存入侧表（供未来消费方）
