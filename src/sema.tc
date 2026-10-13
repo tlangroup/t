@@ -2398,7 +2398,15 @@ pub fn ovl_instantiate(gi: i64, best: i64, a: string) string {
     g_meta_err = false;
     g_menv_top = st2;
     g_menv_base = sb2;
-    if (base.node_lc((inst as u64)) != -2) { check_func_decl(inst); }
+    if (base.node_lc((inst as u64)) != -2) {
+        // comptime fn 的泛型实例体须处于 comptime 上下文检查：
+        // 体内 @compile_log / @type_info 等仅 CTFE 内建属合法（与 comptime { } 块一致），
+        // 否则会误报 T-MTA-E605（运行期回退）。
+        var saved_ct_ovl: i64 = g_in_comptime;
+        if (base.node_bb((tmpl as u64))) { g_in_comptime = g_in_comptime + 1; }
+        check_func_decl(inst);
+        g_in_comptime = saved_ct_ovl;
+    }
     return iname;
 }
 
@@ -2651,6 +2659,22 @@ pub fn list_last_val(head: i64) i64 {
         ki2458 = ki2458 + 1;
     }
     return last;
+}
+
+// 返回链中 `last` 的前驱节点 id（-1 表示无前驱）。供 all_paths_return 在值块占位符
+// 场景下回落到真正的末条语句。
+pub fn list_prev_val(head: i64, last: i64) i64 {
+    if (head < 0 || last < 0) { return -1; }
+    var prev: i64 = -1;
+    var ks: []i64 = base.kids_chain(head);
+    var ki: i64 = 0;
+    while (ki < slice_len(ks) as i64) {
+        var kv: i64 = ks[ki];
+        if (kv == last) { break; }
+        prev = kv;
+        ki = ki + 1;
+    }
+    return prev;
 }
 
 
@@ -6398,11 +6422,17 @@ pub fn infer_expr_body(e: i64) i64 {
                 if (base.node_kind((base.kids[base.node_la((e as u64))].val as u64)) == "string") { mmsg = base.node_sa((base.kids[base.node_la((e as u64))].val as u64)); }
             }
             parse.fc_err("T-MTA-E604", mmsg, e);
-        } else if (mb_is_ctfe_only(base.node_sa((e as u64)))) {
-            // 不带 meta 形参的 `meta fn` 同时可运行期调用，故其函数体必须是合法运行期代码。
+        } else if (mb_is_ctfe_only(base.node_sa((e as u64))) && g_in_comptime <= 0) {
+            // 仅当不在 comptime 上下文（g_in_comptime>0）才报运行期误用：comptime 块 / comptime fn 体
+            // 定义期检查会遇到未折叠的 ctfe-only 内建，它们将在调用点 meta_pass 折叠，故豁免；
+            // `meta fn`（可运行期调用、g_in_comptime==0）体仍须为合法运行期代码。
             parse.fc_err("T-MTA-E605",
                 base.sb_cat3("`@", base.node_sa((e as u64)),
                     "` 只能在纯编译期上下文求值：请放进 `comptime { }` 块，或放进带 `comptime` 形参的 `comptime fn`"), e);
+        } else if (mb_is_ctfe_only(base.node_sa((e as u64))) && g_in_comptime > 0) {
+            // comptime 上下文内 ctfe-only 内建（@compile_log / @compile_warning / str_from_bytes）合法：
+            // 它们将在调用点 meta_pass 折叠执行，此处仅给类型（Void），不报未知内建（否则误报 E607）。
+            return ti_mk("Void");
         } else if (mb_is_type_query(base.node_sa((e as u64))) || base.node_sa((e as u64)) == "zeroed") {
             parse.fc_err("T-MTA-E606",
                 base.sb_cat3("`@", base.node_sa((e as u64)), "` 的类型实参在编译期不可解析"), e);
@@ -8410,12 +8440,23 @@ pub fn all_paths_return(head: i64) bool {
     if (last < 0) {
         return false;
     }
+    // P1 fix：值块（block_expr）以 `return` 收尾时，parse_block_expr 会额外追加一个
+    // `unit_lit` 占位作「尾随表达式值」，致使 list_last_val 落到占位符而非真正的 return。
+    // 此时回落到倒数第二条语句（真正的 return）判定全路径返回。
+    if (base.node_kind((last as u64)) == "expr" && base.node_kind((base.node_na((last as u64)) as u64)) == "unit_lit") {
+        var pv: i64 = list_prev_val(head, last);
+        if (pv >= 0) { last = pv; }
+    }
     return stmt_returns(last);
 }
 
 pub fn stmt_returns(s: i64) bool {
     if (base.node_kind((s as u64)) == "return") {
         return true;
+    }
+    if (base.node_kind((s as u64)) == "expr") {
+        // 末条语句是表达式语句（如 `match (...) {...}` 落在 expr 语句里）⇒ 拆到内部表达式再判。
+        return stmt_returns(base.node_na((s as u64)));
     }
     if (base.node_kind((s as u64)) == "if") {
         if (base.node_lb((s as u64)) != -2) {
@@ -8426,8 +8467,20 @@ pub fn stmt_returns(s: i64) bool {
         }
         return false;
     }
-    if (base.node_kind((s as u64)) == "block") {
+    if (base.node_kind((s as u64)) == "block" || base.node_kind((s as u64)) == "block_expr") {
         return all_paths_return(base.node_la((s as u64)));
+    }
+    if (base.node_kind((s as u64)) == "match") {
+        // match 全臂返回 ⇒ 整体返回（comptime fn 体末条为 match 且各臂 return 的情形）。
+        var mc: i64 = base.node_la((s as u64));
+        var mq_ks: []i64 = base.kids_chain_idx(base.node_la((s as u64)));
+        var ki: i64 = 0;
+        while (ki < slice_len(mq_ks) as i64) {
+            mc = mq_ks[ki];
+            if (stmt_returns(base.node_nc((base__kids[mc].val as u64))) == false) { return false; }
+            ki = ki + 1;
+        }
+        return true;
     }
     return false;
 }
@@ -9207,6 +9260,22 @@ pub fn check_func_decl(d: i64) void {
     check_func_decl_ex(d, -1);
 }
 
+// 判断 comptime fn 是否为「编译期专用」（只能编译期调用）：存在任一 comptime/type 形参即视为专用。
+// 专用 comptime fn 体只会在调用点（comptime 上下文）折叠，故其体可按 comptime 上下文检查、
+// ctfe-only 内建豁免 T-MTA-E605；非专用 comptime fn（无 comptime 形参）仍可运行期调用，其体
+// 须为合法运行期代码，必须按运行期上下文检查（ctfe-only 内建误用须报 T-MTA-E605）。
+pub fn comptime_fn_has_ct_param(d: i64) bool {
+    var ps: i64 = base.node_lb((d as u64));
+    var ks: []i64 = base.kids_chain_idx(ps);
+    var ki: i64 = 0;
+    while (ki < slice_len(ks) as i64) {
+        var p: i64 = base__kids[ks[ki]].val;
+        if (base.node_bb((p as u64))) { return true; }
+        ki = ki + 1;
+    }
+    return false;
+}
+
 // HIR 入口：形参取 PARAM_DECL 指令、函数体取末位 BLOCK 指令
 pub fn check_func_decl_hir(di: i64) void {
     check_func_decl_ex(hir.hir_inst_node(di), di);
@@ -9280,7 +9349,10 @@ pub fn check_func_decl_ex(d: i64, di: i64) void {
     // @type_info 等编译期能力在 comptime fn 体内可用（与 comptime { } 块一致）。
     // 用 save/restore 而非裸 +1/-1，避免嵌套 comptime 上下文被破坏。
     var saved_in_ct: i64 = g_in_comptime;
-    if (base.node_bb((d as u64))) { g_in_comptime = g_in_comptime + 1; }
+    // 仅对「编译期专用」comptime fn（带 comptime/type 形参、只能编译期调用）进入 comptime 上下文；
+    // 不带 comptime 形参的 comptime fn 仍可运行期调用，其体须为合法运行期代码，故按运行期上下文
+    // 检查（ctfe-only 内建误用须报 T-MTA-E605，而非被 comptime 豁免吞掉）——修复 f75 回归。
+    if (base.node_bb((d as u64)) && comptime_fn_has_ct_param(d)) { g_in_comptime = g_in_comptime + 1; }
     if (di >= 0) {
         var bi: i64 = hir.hir_arg(di, hir.hir_arg_count(di) - 1);
         if (bi >= 0) { check_stmt_hir(bi); }
@@ -13268,7 +13340,18 @@ pub fn meta_eval_match(e: i64) i64 {
             if (base.node_kind((gv as u64)) != "bool" || base.node_ba((gv as u64)) == false) { matched = false; }
         }
         if (matched) {
-            var rv: i64 = meta_eval(body);
+            // 臂体为 block_expr（多语句臂，如 `{ @compile_log(...); return v; }`）时，
+            // 不能走 meta_eval（其不处理 block_expr 节点 → 误报 T-MTA-E617「运行期回退」），
+            // 须改用 meta_exec 执行语句列表；return 的值落在 g_meta_ret（meta_exec 返回 1）。
+            // 单表达式臂（裸 expr，无大括号）仍走 meta_eval。
+            var rv: i64 = -1;
+            if (base.node_kind((body as u64)) == "block_expr") {
+                var rblk: i64 = meta_exec(base.node_la((body as u64)));
+                if (rblk == 1) { rv = g_meta_ret; }
+                else { rv = 0; }
+            } else {
+                rv = meta_eval(body);
+            }
             g_menv_top = sv_top;
             g_menv_base = sv_base;
             return rv;
@@ -13476,7 +13559,7 @@ pub fn meta_eval_call(e: i64) i64 {
     g_meta_ret = sv_ret;
     g_meta_depth = g_meta_depth - 1;
     if (g_meta_err) { return -1; }
-    if (st != 1 || rv2 < 0) {
+    if (st == 0 || rv2 < 0) {
         return meta_fail("T-MTA-E616",
             base__sb_cat3("编译期函数 `", base.node_sa((base.node_na((e as u64)) as u64)), "` 在本次求值路径上未返回值"), e);
     }
@@ -13592,6 +13675,7 @@ pub fn meta_run_inline_for(s: i64) i64 {
 
 pub fn meta_exec(head: i64) i64 {
     var c: i64 = head;
+    var last_expr_val: i64 = -1;
     var mq_ks12256: []i64 = base.kids_chain_idx(head);
     var mq_ki12256: i64 = 0;
     while (mq_ki12256 < slice_len(mq_ks12256) as i64) {
@@ -13625,6 +13709,7 @@ pub fn meta_exec(head: i64) i64 {
             } else {
                 var dv: i64 = meta_eval(inner);
                 if (dv < 0) { return 0; }
+                last_expr_val = dv;
             }
         } else if (base.node_kind((k.val as u64)) == "if") {
             var cv: i64 = meta_eval(base.node_na((k.val as u64)));
@@ -13634,6 +13719,7 @@ pub fn meta_exec(head: i64) i64 {
                 return 0;
             }
             var mk1: i64 = g_menv_top;
+            var sv_ret_if: i64 = g_meta_ret;
             var r1: i64 = 0;
             if (base.node_ba((cv as u64))) {
                 r1 = meta_exec(base.node_la((k.val as u64)));
@@ -13641,6 +13727,10 @@ pub fn meta_exec(head: i64) i64 {
                 if (base.node_lb((k.val as u64)) > -2) { r1 = meta_exec(base.node_lb((k.val as u64))); }
             }
             g_menv_top = mk1;
+            // 仅在子块未返回/中断时回弹 g_meta_ret；子块内 return/break/continue 已写入的值须保留。
+            // 注意：rN != 0 须原样向上传播（return=1 / break=2 / continue=3），
+            // 不可收窄成 rN == 1，否则 if/block 内的 break/continue 会被吞掉导致循环不终止。
+            if (r1 == 0) { g_meta_ret = sv_ret_if; }
             if (g_meta_err) { return 0; }
             if (r1 != 0) { return r1; }
         } else if (base.node_kind((k.val as u64)) == "while") {
@@ -13659,22 +13749,28 @@ pub fn meta_exec(head: i64) i64 {
                 }
                 if (base.node_ba((wc as u64)) == false) { break; }
                 var mk2: i64 = g_menv_top;
+                var sv_ret_wh: i64 = g_meta_ret;
                 var r2: i64 = meta_exec(base.node_la((k.val as u64)));
                 g_menv_top = mk2;
+                if (r2 == 0) { g_meta_ret = sv_ret_wh; }
                 if (g_meta_err) { return 0; }
                 if (r2 == 1) { return 1; }
                 if (r2 == 2) { break; }
             }
         } else if (base.node_kind((k.val as u64)) == "block" || base.node_kind((k.val as u64)) == "comptime_block") {
             var mk3: i64 = g_menv_top;
+            var sv_ret_bl: i64 = g_meta_ret;
             var r3: i64 = meta_exec(base.node_la((k.val as u64)));
             g_menv_top = mk3;
+            if (r3 == 0) { g_meta_ret = sv_ret_bl; }
             if (g_meta_err) { return 0; }
             if (r3 != 0) { return r3; }
         } else if (base.node_kind((k.val as u64)) == "inline_for") {
             // 阶段1 S4（Q1）：编译期展开。break/continue 由 meta_run_inline_for 消费（返回 0），
             // 仅 return（返回 1）向上传播。
+            var sv_ret_ifo: i64 = g_meta_ret;
             var r4: i64 = meta_run_inline_for(k.val);
+            if (r4 == 0) { g_meta_ret = sv_ret_ifo; }
             if (g_meta_err) { return 0; }
             if (r4 != 0) { return r4; }
         } else if (base.node_kind((k.val as u64)) == "return") {
@@ -13698,6 +13794,7 @@ pub fn meta_exec(head: i64) i64 {
         mq_ki12256 = mq_ki12256 + 1;
         c = -1;
     }
+    if (last_expr_val >= 0) { g_meta_ret = last_expr_val; return last_expr_val; }
     return 0;
 }
 
