@@ -1450,7 +1450,7 @@ pub fn ensure_reflection_builtins() void {
         sym_define(global_scope, "FieldInfo", "type", g_ti_FieldInfo_ti, fi_decl);
     }
 
-    // TypeInfo variant arms：Int=0 … Union=10（顺序对齐 base.tc:5580），单载荷 *TypeMeta（Bool 无载荷）
+    // TypeInfo variant arms：Int=0 … Union=10，Module=11（顺序对齐 base.tc:5606），单载荷 *TypeMeta（Bool 无载荷）
     var ptr_tm: i64 = base.mk_pointer(base.mk_named("TypeMeta", -1), -1);
     var vcs: i64 = -1; var vct: i64 = -1;
     vct = base.list_push(vcs, vct, base.mk_VC("Int", 0, ptr_tm, -1, -1)); if (vcs < 0) { vcs = vct; }
@@ -1464,6 +1464,8 @@ pub fn ensure_reflection_builtins() void {
     vct = base.list_push(vcs, vct, base.mk_VC("Enum", 8, ptr_tm, -1, -1)); if (vcs < 0) { vcs = vct; }
     vct = base.list_push(vcs, vct, base.mk_VC("Trait", 9, ptr_tm, -1, -1)); if (vcs < 0) { vcs = vct; }
     vct = base.list_push(vcs, vct, base.mk_VC("Union", 10, ptr_tm, -1, -1)); if (vcs < 0) { vcs = vct; }
+    // Module arm（=11）：@import("M") 绑定的模块类型；单载荷 *TypeMeta，与 Struct/Enum 同构。
+    vct = base.list_push(vcs, vct, base.mk_VC("Module", 11, ptr_tm, -1, -1)); if (vcs < 0) { vcs = vct; }
     if (sym_lookup(global_scope, "TypeInfo") < 0) {
         var ti_decl: i64 = base.mk_VariantDecl("TypeInfo", -1, vcs, -1);
         g_ti_TypeInfo_ti = ti_named("Variant", "TypeInfo");
@@ -6198,6 +6200,23 @@ pub fn g_modval_get(name: string) string {
     return "";
 }
 
+// 模块类型名注册表：const X = @import("M") 把 X 与模块 key 都登记为「模块类型名」，
+// 供双后端 type_info 合成（c_ti_arm / ll_ti_arm）据类型名识别 Module arm。comptime 路径
+// 走 sym 表的 Module ti 判定，不依赖此表；此表仅服务「类型名 → Module」的运行时发射分流。
+pub var g_module_type_names: []string;
+pub fn is_module_type_name(tn: string) bool {
+    var i: i64 = 0;
+    var n: i64 = slice_len(g_module_type_names) as i64;
+    while (i < n) {
+        if (g_module_type_names[i] == tn) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+pub fn reg_module_type_name(tn: string) void {
+    if (is_module_type_name(tn) == false) { append(g_module_type_names, tn); }
+}
+
 
 pub fn infer_expr(e: i64) i64 {
     // S2b 循环断路器（LLVM 后端安全版，关键修复见 g_infer_on 声明处注释）。
@@ -9661,7 +9680,14 @@ pub fn check_global_const_decl(d: i64) void {
     // （模块值不是可运算的值，只在 `.field` 接收者位被 sema 解析成 <key>__<field>）。
     if (base.node_nb((d as u64)) >= 0 && base.node_kind((base.node_nb((d as u64)) as u64)) == "import_expr") {
         // M2：const 名 → 模块完整路径身份（import_expr.sa 已是 "src.d.e"，不再取末段）。
-        g_modval_set(base.node_sa((d as u64)), base.node_sa((base.node_nb((d as u64)) as u64)));
+        var mkey: string = base.node_sa((base.node_nb((d as u64)) as u64));
+        g_modval_set(base.node_sa((d as u64)), mkey);
+        // (A) 模块类型绑定：const X = @import("M") 同时把 X 登记为 Module(mkey) 类型，
+        // 使 type_info(X) 反射 / 当 comptime 参数传成立（Zig 忠实版：@import 返回一等类型）。
+        // 保留 g_modval：成员访问 X.foo 仍走 <key>__<field> 改写，与类型绑定互不冲突。
+        reg_module_type_name(base.node_sa((d as u64)));
+        reg_module_type_name(mkey);
+        sym_define(global_scope, base.node_sa((d as u64)), "type", ti_named("Module", mkey), base.node_nb((d as u64)));
         return;
     }
     if (base.node_nb((d as u64)) >= 0) {
@@ -10984,6 +11010,23 @@ pub fn modval_load(mname: string, at: i64) void {
     var imp: i64 = base.mk_ImportModDecl(rest, "", false, is_lib, -1, -1);
     base.node_set_lb((imp as u64), items);   // M3.1：携带选择性项 → handle_one_import 经 sel_register 登记；空则跳过
     handle_one_import(imp, at);
+    // (A) 模块类型绑定：const X = @import("M") / import X from "M" 把别名与模块 key 登记为
+    // Module 类型名，使 @type_info(X) 反射 / 当 comptime 参数传成立（Zig 忠实版：@import 返回一等类型）。
+    // 注意：登记须放此处（modval_load），因模块预加载在 check_top_decl 之前完成，
+    // check_global_const_decl 的 import_expr 分支对示例顶层 const 不会被命中。
+    var m_alias: string = last_segment(rest);
+    var m_idn: string = rest;
+    if (is_lib == false) { m_idn = "src." + rest; }
+    reg_module_type_name(m_alias);
+    reg_module_type_name(m_idn);
+    var msi: i64 = sym_lookup(global_scope, m_alias);
+    if (msi >= 0) {
+        var msym: Sym = syms[msi];
+        msym.ti = ti_named("Module", m_idn);
+        syms[msi] = msym;
+    } else {
+        sym_define(global_scope, m_alias, "type", ti_named("Module", m_idn), at);
+    }
     // 仅当未写 `::` 时退化通配：把模块按 `:: *` 登记，使本模块内对 M 符号的裸引用在
     // mangle_modules Pass 3 被改写为 `M__sym`（与 `:: *` 等价），并触发 T-MOD-E561 提示改用 `M.sym`。
     // 写了 `:: a,b` 则只登记这些项（选择性可见，裸引用其它符号不再可见）。
@@ -12802,6 +12845,7 @@ pub fn ti_arm_code(arm: string) i64 {
     if (arm == "Enum") { return 8; }
     if (arm == "Trait") { return 9; }
     if (arm == "Union") { return 10; }
+    if (arm == "Module") { return 11; }
     return 7;
 }
 
@@ -12844,6 +12888,9 @@ pub fn ti_arm_of(tnode: i64) string {
     }
     if (k == "named") {
         var tname: string = base.node_sa((tnode as u64));
+        // (A) 模块类型：const X = @import("M") 把 X 与模块 key 登记为模块类型名；
+        // 优先用注册表判定（不依赖 sym.ti 是否被同名预定义覆盖，sym_define 对同名不重写）。
+        if (is_module_type_name(tname)) { return "Module"; }
         var si: i64 = sym_lookup(global_scope, tname);
         if (si >= 0 && syms[si].decl >= 0) {
             var dk: string = base.node_kind((syms[si].decl as u64));
@@ -12851,6 +12898,7 @@ pub fn ti_arm_of(tnode: i64) string {
             if (dk == "UnionDecl") { return "Union"; }
             if (dk == "EnumDecl") { return "Enum"; }
             if (dk == "VariantDecl") { return "Union"; }
+            if (tis[syms[si].ti].kind == "Module") { return "Module"; }
         }
         return "Struct";
     }
@@ -13181,6 +13229,30 @@ pub fn meta_eval_match(e: i64) i64 {
             } else if (base.node_kind((scr as u64)) == "vval") {
                 if (base.node_sb((scr as u64)) == base.node_sa((pat as u64))) {
                     matched = meta_bind_conpat(base.node_la((pat as u64)), base.node_la((scr as u64)));
+                }
+            } else if (base.node_kind((scr as u64)) == "ct_variant") {
+                // (A) 编译期变体值（@type_info 等 mk_ct_variant 产物）：payload 存于 na；
+                // 单载荷变体 .Arm(x) 把 x 绑定到整个 payload 节点（与 vval 取 la 不同）。
+                if (base.node_sb((scr as u64)) == base.node_sa((pat as u64))) {
+                    var cph: i64 = base.node_la((pat as u64));
+                    if (cph >= 0 && base.node_kind((base__kids[cph].val as u64)) == "ident") {
+                        menv_push(base.node_sa((base__kids[cph].val as u64)), base.node_na((scr as u64)));
+                        matched = true;
+                    }
+                }
+            }
+        } else if (pat >= 0 && base.node_kind((pat as u64)) == "call") {
+            // 变体构造器模式（如 .Module(m) 解析为 call 节点：sa 为空，被调方名在 na 的 ident；
+            // la=绑定实参链表）。scr 为 ct_variant / vval 变体值时按 tag 匹配，把首个 ident 绑定到 payload 节点。
+            var pcallee: string = "";
+            if (base.node_na((pat as u64)) >= 0) { pcallee = base.node_sa((base.node_na((pat as u64)) as u64)); }
+            if (pcallee == base.node_sb((scr as u64))) {
+                var cph: i64 = base.node_la((pat as u64));
+                if (cph >= 0 && base.node_kind((base__kids[cph].val as u64)) == "ident") {
+                    var pl: i64 = -1;
+                    if (base.node_kind((scr as u64)) == "ct_variant") { pl = base.node_na((scr as u64)); }
+                    else if (base.node_kind((scr as u64)) == "vval") { pl = base.node_la((scr as u64)); }
+                    if (pl >= 0) { menv_push(base.node_sa((base__kids[cph].val as u64)), pl); matched = true; }
                 }
             }
         } else if (pat >= 0 && base.node_kind((pat as u64)) == "ident") {
