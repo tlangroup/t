@@ -14263,6 +14263,79 @@ pub fn mb_struct_field_offset(sdecl: i64, fname: string) i64 {
     return -1;
 }
 
+// ── `.auto` 优化布局重排（§6.4）──
+// 对 node_sb == "auto" 的 StructDecl，按字段（对齐↓、尺寸↓、声明序↑）重排其 node_lb 子链，
+// 使字段打包、填充最小（标准 struct packing）。单一真相源 node_lb 只改写一次；
+// C 后端（按名字访问）与 LLVM 后端（按位置索引）都从同一条重排链读序，故两后端布局必然一致。
+// 在 mb_pass 开头调用 —— run_check 已完成类型注册/解析，尚未有任何偏移/尺寸消费。
+pub fn mb_struct_layout_pass() void {
+    var n: i64 = slice_len(lex__decl_list) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        var d: i64 = lex__decl_list[i];
+        if (base.node_kind((d as u64)) == "StructDecl" && base.node_sb((d as u64)) == "auto") {
+            mb_struct_reorder(d);
+        }
+        i = i + 1;
+    }
+}
+
+pub fn mb_struct_reorder(sdecl: i64) void {
+    if (sdecl < 0) { return; }
+    var ks: []i64 = base.kids_chain_idx(base.node_lb((sdecl as u64)));
+    var nf: i64 = slice_len(ks) as i64;
+    if (nf <= 1) { return; }
+    // 收集每个字段的（F 节点 id、对齐、尺寸），稳定选择排序得出新顺序 order[]。
+    var fids: []i64 = [];
+    var faln: []i64 = [];
+    var fsiz: []i64 = [];
+    var ki: i64 = 0;
+    while (ki < nf) {
+        var fnode: i64 = base__kids[ks[ki]].val;
+        var ft: i64 = base.node_na((fnode as u64));
+        var fs: i64 = mb_size_of(ft, 0);
+        var fa: i64 = mb_align_of(ft, 0);
+        if (fs < 0) { fs = 0; }
+        if (fa < 0) { fa = 1; }
+        append(fids, fnode);
+        append(faln, fa);
+        append(fsiz, fs);
+        ki = ki + 1;
+    }
+    // 稳定选择排序：对齐大者优先；对齐相同则尺寸大者优先；再相同保持声明序（严格 > 不交换）。
+    var order: []i64 = [];
+    var oi: i64 = 0;
+    while (oi < nf) { append(order, oi); oi = oi + 1; }
+    var a: i64 = 0;
+    while (a < nf) {
+        var best: i64 = a;
+        var b: i64 = a + 1;
+        while (b < nf) {
+            var better: bool = false;
+            if (faln[order[b]] > faln[order[a]]) { better = true; }
+            else if (faln[order[b]] == faln[order[a]] && fsiz[order[b]] > fsiz[order[a]]) { better = true; }
+            if (better) { best = b; }
+            b = b + 1;
+        }
+        if (best != a) {
+            var tmp: i64 = order[a];
+            order[a] = order[best];
+            order[best] = tmp;
+        }
+        a = a + 1;
+    }
+    // 按 order 重建 node_lb 子链（复用 F 节点 id，仅改链接顺序）。
+    var head: i64 = -1;
+    var tail: i64 = -1;
+    var x: i64 = 0;
+    while (x < nf) {
+        tail = base.list_push(head, tail, fids[order[x]]);
+        if (head < 0) { head = tail; }
+        x = x + 1;
+    }
+    base.node_set_lb((sdecl as u64), head);
+}
+
 pub fn mb_align_of(tn0: i64, depth: i64) i64 {
     if (tn0 < 0) { return -1; }
     if (depth > 16) { return -1; }
@@ -14307,7 +14380,12 @@ pub fn mb_size_of(tn0: i64, depth: i64) i64 {
     }
     if (base.node_kind((tn as u64)) == "named") {
         var d: i64 = mb_type_decl(base.node_sa((tn as u64)));
-        if (d < 0) { return -1; }
+        if (d < 0) {
+            // 具名标量类型（u8/i64/…）：mb_type_decl 只认聚合类型，scalar 名直接查 scalar 尺寸表。
+            var z: i64 = mb_scalar_size(base.node_sa((tn as u64)));
+            if (z >= 0) { return z; }
+            return -1;
+        }
         if (base.node_kind((d as u64)) == "TypeAliasDecl") { return mb_size_of(base.node_na((d as u64)), depth + 1); }
         if (base.node_kind((d as u64)) == "EnumDecl") { return mb_scalar_size(base.node_sb((d as u64))); }
         if (base.node_kind((d as u64)) == "StructDecl") { return mb_struct_size(d, depth + 1); }
@@ -14533,6 +14611,7 @@ pub fn mb_walk(e: i64) void {
 // 与 meta_pass 不同，这里连 `meta fn` 体和泛型模板一起走：类型查询是纯查询，
 // 不读环境、不产生副作用，提前折叠永远安全；查不动的原样留着即可。
 pub fn mb_pass() void {
+    mb_struct_layout_pass();   // §6.4：`.auto` 结构体优化重排（run_check 后、折叠/发射前，单一真相源 node_lb 改一次）
     var n: i64 = slice_len(lex__decl_list) as i64;
     var i: i64 = 0;
     while (i < n) {
