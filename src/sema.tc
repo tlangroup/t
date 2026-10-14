@@ -6445,6 +6445,21 @@ pub fn infer_expr_body(e: i64) i64 {
             // 见 resolve_ti 对 kind=="type" 的处理），真正的类型节点在 CTFE
             // （meta_eval_mbuiltin 的 type_val / type_of 分支）期产出并流入单态化。
             return ti_mk("Any");
+        } else if (base.node_sa((e as u64)) == "as" || base.node_sa((e as u64)) == "bit_cast") {
+            // P3：@as(T, v) / @bit_cast(T, v) 的静态类型即目标类型 T。
+            // 真正的取值在 CTFE（meta_eval_mbuiltin 的 as / bit_cast 分支）折叠。
+            // ⚠ 不可在此以 g_in_comptime<=0 报运行期错误：comptime fn **体**的类型推断跑在
+            //   该标志为 0 的趟里（真正求值在随后的 meta_pass），过早报错会把合法的编译期
+            //   用法一并打死。运行期误用会以「下发非法 IR → clang 链接失败」的形式
+            //   响亮失败（非静默错编），后续拟在 sema 里脱糖成既有 cast 节点以支持运行期。
+            var pc0: i64 = base.node_la((e as u64));
+            if (pc0 >= 0) {
+                var pn0: i64 = base.kids[pc0].next;
+                if (pn0 >= 0) { ie_sub_in_v(ei, base.kids[pn0].val); }
+                var ptn: i64 = mb_as_type_node(base.kids[pc0].val);
+                if (ptn >= 0) { return resolve_ti(ptn); }
+            }
+            return ti_mk("Unknown");
         } else if (math_mbuiltin(base.node_sa((e as u64)))) {
             // @sin 等数学内建：编译期可折叠常量（见 meta_eval_math），运行期回落 libm / fdlibm
             //（见各后端 ll_call / emit_expr）。此处给实参加类型检查，避免把字符串当浮点发射。
@@ -15116,6 +15131,55 @@ pub fn meta_eval_mbuiltin(e: i64) i64 {
     if (base.node_sa((e as u64)) == "enum_literal") {
         var tag: string = mb_tag_arg(mb_arg_at(e, 0));
         return base__mk_string(tag, -1);
+    }
+    // P3：@as(T, v) —— 数值强制。语义沿用既有 cast 分支的效率/回绕约定
+    // （meta_int_wrap 负责位宽截断 + 符号重解释），故整数族、浮点、bool 三族互转都支持。
+    if (base.node_sa((e as u64)) == "as") {
+        var atn0: i64 = mb_as_type_node(mb_arg_at(e, 0));
+        if (atn0 < 0) { return meta_fail("T-MTA-E606", "`@as` 的目标类型在编译期不可解析", e); }
+        var aname: string = mb_type_name_of(atn0);
+        var avv: i64 = meta_eval(mb_arg_at(e, 1));
+        if (avv < 0) { return -1; }
+        var avk: string = base.node_kind((avv as u64));
+        if (meta_is_int_type(aname)) {
+            if (avk == "int" || avk == "bool") { return mv_int(meta_int_wrap(mv_get_int(avv), aname)); }
+            if (avk == "float") {
+                return mv_int(meta_int_wrap(meta_f64_to_int(meta_f64_from_str(base.node_sa((avv as u64)))), aname));
+            }
+            return meta_fail("T-MTA-E617",
+                base.sb_cat3("`@as` 暂不支持把 `", avk, "` 值转换为整数类型"), e);
+        }
+        if (aname == "f64" || aname == "f32") {
+            if (avk == "int" || avk == "bool") { return base__mk_float(meta_f64_to_str(mv_get_int(avv) as f64), -1); }
+            if (avk == "float") { return avv; }
+            return meta_fail("T-MTA-E617",
+                base.sb_cat3("`@as` 暂不支持把 `", avk, "` 值转换为浮点类型"), e);
+        }
+        if (aname == "bool") {
+            if (avk == "int") { return mv_bool(mv_get_int(avv) != 0); }
+            if (avk == "bool") { return avv; }
+            return meta_fail("T-MTA-E617", "`@as` 的 bool 目标只接受整数 / 布尔源值", e);
+        }
+        return meta_fail("T-MTA-E617", base.sb_cat3("`@as` 暂不支持目标类型 `", aname, "`"), e);
+    }
+    // P3：@bit_cast(T, v) —— 按位重解释。整数域内即「按目标位宽截断 + 目标符号性重解释」。
+    // ⚠ 刻意**不**支持 float ↔ int：那需要 IEEE-754 位级转换原语，当前缺失；宁可明确报错也不静默错编。
+    if (base.node_sa((e as u64)) == "bit_cast") {
+        var btn0: i64 = mb_as_type_node(mb_arg_at(e, 0));
+        if (btn0 < 0) { return meta_fail("T-MTA-E606", "`@bit_cast` 的目标类型在编译期不可解析", e); }
+        var bname: string = mb_type_name_of(btn0);
+        var bvv: i64 = meta_eval(mb_arg_at(e, 1));
+        if (bvv < 0) { return -1; }
+        var bvk: string = base.node_kind((bvv as u64));
+        if (meta_is_int_type(bname) && (bvk == "int" || bvk == "bool")) {
+            return mv_int(meta_int_wrap(mv_get_int(bvv), bname));
+        }
+        if (bname == "f64" || bname == "f32") {
+            return meta_fail("T-MTA-E617",
+                "`@bit_cast` 尚不支持浮点目标（缺 IEEE-754 位级原语）；同一的目标请改用 `@as`", e);
+        }
+        return meta_fail("T-MTA-E617",
+            base.sb_cat3("`@bit_cast` 暂不支持重解释为 `", bname, "`"), e);
     }
     if (base.node_sa((e as u64)) == "variant") {
         var backing: string = mb_type_name_of(mb_arg_at(e, 0));
