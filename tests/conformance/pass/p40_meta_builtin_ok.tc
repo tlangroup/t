@@ -8,6 +8,10 @@ MyInt i64;
 enum Color : u8 { Red; Green; }
 // P1 反射测试用：含对齐敏感字段的结构体（C-ABI 默认布局）
 struct Mixed { a: i8; b: i32; c: i64; }
+// P2 `.auto` 优化重排布局（§6.4）：mixed 对齐字段，优化后 16B（i@0/b@8/c@9），运行时回读两后端一致。
+struct #auto AutoMixed { b: u8; i: i64; c: u8; }
+// P2 `#extern` 显式 C-ABI 声明序（与 default 同语义）：24B，i@8。
+struct #extern ExtMixed { b: u8; i: i64; c: u8; }
 
 // ① 类型查询用在运行期位置：折叠后就是常量
 fn p40_names() bool {
@@ -64,6 +68,30 @@ fn p40_align_bit() bool {
 
 // ② `comptime T: type` 形参 + @type_equal 分支：docs/compiler/meta_design.md §6 的 get_width 模式。
 //    未取分支里的 @compile_error 被 mb_prune_if 剪掉，不误报。
+
+// ⑥ P2 `.auto` 优化重排布局 / `#extern` 显式 C-ABI（§6.4）。
+//    `.auto` 结构体在 mb_pass 期按（对齐↓、尺寸↓、声明序↑）重排 node_lb，两后端同源读取，
+//    故 C 后端（按名）与 LLVM 后端（按位置）布局必然一致；运行时字段访问回读亦一致。
+//    `#extern` 语义等同 default（声明序），仅作显式标注。
+fn p40_layout() bool {
+    // #auto 优化重排：对齐大者优先
+    if (@size_of(AutoMixed) != 16) { return false; }
+    if (@offset_of(AutoMixed, "i") != 0) { return false; }
+    if (@offset_of(AutoMixed, "b") != 8) { return false; }
+    if (@offset_of(AutoMixed, "c") != 9) { return false; }
+    // #extern 保持声明序（C-ABI）
+    if (@size_of(ExtMixed) != 24) { return false; }
+    if (@offset_of(ExtMixed, "i") != 8) { return false; }
+    // 运行时字段访问：赋值后回读，验证两后端内存布局一致（C 按名 / LLVM 按位置，同源 node_lb）
+    var m: AutoMixed;
+    m.i = 123456789012345;
+    m.b = 170;
+    m.c = 187;
+    if (m.i != 123456789012345) { return false; }
+    if (m.b != 170) { return false; }
+    if (m.c != 187) { return false; }
+    return true;
+}
 
 // ⑤ P1 反射：@has_field / @offset_of / @has_decl。
 //    均在 CTFE 之前折成 bool / int 字面量，两个后端零改动、零 IR 漂移。
@@ -154,6 +182,7 @@ fn main() i32 {
     if (p40_equal() == false) { return 3; }
     if (p40_align_bit() == false) { return 11; }
     if (p40_reflect() == false) { return 14; }
+    if (p40_layout() == false) { return 16; }
     if (comptime off_of(Point) != 4) { return 15; }
 
     const W32: u32 = comptime get_width(u32);
