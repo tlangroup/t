@@ -6642,7 +6642,7 @@ pub fn infer_expr_body(e: i64) i64 {
         } else if (base.node_sa((e as u64)) == "int" || base.node_sa((e as u64)) == "pointer"
                 || base.node_sa((e as u64)) == "tuple" || base.node_sa((e as u64)) == "struct"
                 || base.node_sa((e as u64)) == "enum" || base.node_sa((e as u64)) == "fn"
-                || base.node_sa((e as u64)) == "enum_literal") {
+                || base.node_sa((e as u64)) == "enum_literal" || base.node_sa((e as u64)) == "variant") {
             // P2b 类型构造元函数：返回 comptime 类型值（类型即值），静态类型记 Any，
             // 真正类型节点在 CTFE（meta_eval_mbuiltin）期产出并流入单态化。
             return ti_mk("Any");
@@ -14433,6 +14433,36 @@ pub fn mb_size_of(tn0: i64, depth: i64) i64 {
         if (base.node_kind((d as u64)) == "TypeAliasDecl") { return mb_size_of(base.node_na((d as u64)), depth + 1); }
         if (base.node_kind((d as u64)) == "EnumDecl") { return mb_scalar_size(base.node_sb((d as u64))); }
         if (base.node_kind((d as u64)) == "StructDecl") { return mb_struct_size(d, depth + 1); }
+        if (base.node_kind((d as u64)) == "VariantDecl") {
+            // 变体布局：uint32_t _tag（4B）+ 最大载荷，按 4 字节对齐。
+            var tag: i64 = 4;
+            var maxpay: i64 = 0;
+            var mc: i64 = base.node_lb((d as u64));
+            var mks: []i64 = base.kids_chain_idx(mc);
+            var mki: i64 = 0;
+            while (mki < slice_len(mks) as i64) {
+                var vc: i64 = base__kids[mks[mki]].val;
+                var psz: i64 = 0;
+                if (base.node_na((vc as u64)) >= 0) {
+                    var psv: i64 = mb_size_of(base.node_na((vc as u64)), depth + 1);
+                    if (psv > 0) { psz = psv; }
+                } else if (base.node_lb((vc as u64)) >= 0) {
+                    var fk: []i64 = base.kids_chain_idx(base.node_lb((vc as u64)));
+                    var fki: i64 = 0;
+                    while (fki < slice_len(fk) as i64) {
+                        var fsv: i64 = mb_size_of(base__kids[fk[fki]].val, depth + 1);
+                        if (fsv > 0) { psz = psz + fsv; }
+                        fki = fki + 1;
+                    }
+                }
+                if (psz > maxpay) { maxpay = psz; }
+                mki = mki + 1;
+            }
+            var total: i64 = tag + maxpay;
+            var al: i64 = 4;
+            if (total % al != 0) { total = (total / al + 1) * al; }
+            return total;
+        }
         return -1;
     }
     return -1;
@@ -14784,6 +14814,59 @@ pub fn mb_make_enum(backing: string, names: []string) i64 {
     return base.mk_named(sname, -1);
 }
 
+// 构造具名 synthetic variant（和类型）并返回 named 类型节点。
+// backing: 判别子类型名（advisory；t 的 tag 固定为 uint32_t，见 emit_variant_decl）。
+// names/types: 各 case 的名字与（单）载荷类型；多载荷用 tuple 类型表达。
+// 节点布局对齐 parse_variant_decl：VariantDecl.lb = VC 链，VC.ia = tag 下标、VC.na = 载荷类型。
+// 把可能是 ident 的类型实参规范化成真正的类型节点（scalar / named）。
+// mb_type_nodes_from_array 对标量名返回 ident（mb_as_type_node 原样返回类型名），
+// 而 mb_size_of / register_variant_helpers 认的是 scalar/named 类型节点，故须在此归一。
+pub fn mb_norm_type_node(tn: i64) i64 {
+    if (tn < 0) { return -1; }
+    if (base.node_kind((tn as u64)) == "ident") {
+        return type_node_from_ident(base.node_sa((tn as u64)));
+    }
+    return tn;
+}
+
+pub fn mb_make_variant(backing: string, names: []string, types: []i64) i64 {
+    var n: i64 = slice_len(names) as i64;
+    if (n != slice_len(types) as i64) { return -1; }
+    if (n == 0) { return -1; }
+    g_synth_counter = g_synth_counter + 1;
+    var sname: string = base.sb_cat2("__synth_v", base.i2s(g_synth_counter));
+    var ch: i64 = -1; var cht: i64 = -1;
+    var i: i64 = 0;
+    while (i < n) {
+        var tn: i64 = mb_norm_type_node(types[i]);
+        var vid: i64;
+        if (tn >= 0 && base.node_kind((tn as u64)) == "array_lit") {
+            // 多载荷 case：把每个元素类型求值后串成 la 链（na 留 -1）。
+            var mp: i64 = -1; var mpt: i64 = -1;
+            var ks: []i64 = base.kids_chain_idx(base.node_la((tn as u64)));
+            var ki: i64 = 0;
+            while (ki < slice_len(ks) as i64) {
+                var elt: i64 = mb_norm_type_node(base__kids[ks[ki]].val);
+                if (elt >= 0) {
+                    mpt = base.list_push(mp, mpt, elt);
+                    if (mp < 0) { mp = mpt; }
+                }
+                ki = ki + 1;
+            }
+            vid = base.mk_VC(names[i], i, -1, mp, -1);
+        } else {
+            vid = base.mk_VC(names[i], i, tn, -1, -1);
+        }
+        cht = base.list_push(ch, cht, vid);
+        if (ch < 0) { ch = cht; }
+        i = i + 1;
+    }
+    var vd: i64 = base.mk_VariantDecl(sname, -1, ch, -1);
+    append(lex.decl_list, vd);
+    sym_define(global_scope, sname, "type", ti_named("Variant", sname), vd);
+    return base.mk_named(sname, -1);
+}
+
 // 构造元组类型（复用 tuple_lit_type_name 的去重 / 注册机制）。
 pub fn mb_make_tuple(elem_types: []i64) i64 {
     var tis: []i64;
@@ -15033,6 +15116,23 @@ pub fn meta_eval_mbuiltin(e: i64) i64 {
     if (base.node_sa((e as u64)) == "enum_literal") {
         var tag: string = mb_tag_arg(mb_arg_at(e, 0));
         return base__mk_string(tag, -1);
+    }
+    if (base.node_sa((e as u64)) == "variant") {
+        var backing: string = mb_type_name_of(mb_arg_at(e, 0));
+        var names: []string = mb_strings_from_array(meta_eval(mb_arg_at(e, 1)));
+        // ⚠ 刻意**不**先 meta_eval 整个类型数组：`meta_eval_array_lit` 会把元素逐个求值，
+        // 外层再 meta_eval 一次时嵌套数组（多载荷 `[f64, f64]`）的元素已是类型节点，
+        // meta_eval 不认 scalar/named ⇒ 误报 T-MTA-E617「表达式 `scalar` 不可编译期求值」。
+        // 直接把原始 array_lit 交给 mb_type_nodes_from_array（内部按元素 mb_as_type_node），
+        // 再由 mb_norm_type_node 把 ident 归一成真正的类型节点。
+        var types: []i64 = mb_type_nodes_from_array(mb_arg_at(e, 2));
+        if (slice_len(names) as i64 != slice_len(types) as i64) {
+            return meta_fail("T-MTA-E606", "`@variant` 字段名数与类型数不一致", e);
+        }
+        if (slice_len(names) as i64 == 0) {
+            return meta_fail("T-MTA-E606", "`@variant` 至少需要 1 个 case", e);
+        }
+        return mb_make_variant(backing, names, types);
     }
     // 编译期常量：`@simd_lanes(T)` = 本机向量寄存器可容纳的 T 的 lane 数 = g_simd_bytes / sizeof(T)。
     // 用于 `@Vector(@simd_lanes(i32), i32)` 这类「按本机宽度自适应」的可移植向量声明。
