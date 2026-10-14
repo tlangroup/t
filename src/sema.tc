@@ -14002,6 +14002,11 @@ pub fn meta_pass() void {
 
 pub fn mb_is_type_query(name: string) bool {
     if (name == "type_name" || name == "type_size" || name == "type_equal") { return true; }
+    // 对齐 Zig 的 @sizeOf / @alignOf / @bitSizeOf（P0 只读内省）。
+    // @size_of 与既有 @type_size 同义；@align_of / @bit_size_of 为新增。
+    if (name == "size_of" || name == "align_of" || name == "bit_size_of") { return true; }
+    // P1 反射：结构体字段查询，第 0 形参是类型。
+    if (name == "has_field" || name == "offset_of") { return true; }
     return false;
 }
 
@@ -14190,6 +14195,74 @@ pub fn mb_struct_size(d: i64, depth: i64) i64 {
     return mb_round_up(off, maxa);
 }
 
+// ── P1 反射：结构体字段查询 ─────────────────────────────────────
+// 复用 mb_struct_size 的 C-ABI 布局算法（字段偏移向上取整到字段对齐，整体再取整到
+// 最大字段对齐），逐个字段累加偏移，命中字段名即返回当前偏移。这样 @offset_of 与
+// 代码实际内存布局、@size_of 三者严格自洽（已用 Point{x:i64,y:i64}=16 ⇒ x@0 / y@8 校验）。
+
+// 从类型节点解出 StructDecl 节点（decl_list 扫描，mb_pass 期可用）；非命名结构体返回 -1。
+pub fn mb_struct_decl_of(tn: i64) i64 {
+    if (tn < 0) { return -1; }
+    var bt: i64 = mb_bound_type(tn);
+    if (base.node_kind((bt as u64)) == "named") {
+        return mb_type_decl(base.node_sa((bt as u64)));
+    }
+    return -1;
+}
+
+// 取字段名参数：string 字面量直接读 sa；否则尝试 CTFE 求值（comptime 字符串值）。
+// 返回 "" = 折叠期无可解析字符串（交后续阶段处理）。
+pub fn mb_read_str_arg(a: i64) string {
+    if (a < 0) { return ""; }
+    if (base.node_kind((a as u64)) == "string") { return base.node_sa((a as u64)); }
+    var mv: i64 = meta_eval(a);
+    if (mv >= 0 && base.node_kind((mv as u64)) == "string") { return base.node_sa((mv as u64)); }
+    return "";
+}
+
+// 结构体是否含某字段名（仅统计普通字段，跳过位域等 node_ia>=0 的成员，与布局算法一致）。
+pub fn mb_struct_has_field(sdecl: i64, fname: string) bool {
+    if (sdecl < 0 || fname == "") { return false; }
+    var c: i64 = -1;
+    var ks: []i64 = base.kids_chain_idx(base.node_lb((sdecl as u64)));
+    var ki: i64 = 0;
+    while (ki < slice_len(ks) as i64) {
+        c = ks[ki];
+        var k: Child = base__kids[c];
+        if (base.node_ia((k.val as u64)) < 0) {
+            if (base.node_sa((k.val as u64)) == fname) { return true; }
+        }
+        ki = ki + 1;
+        c = -1;
+    }
+    return false;
+}
+
+// 字段在结构体中的字节偏移；未找到或非结构体返回 -1。
+pub fn mb_struct_field_offset(sdecl: i64, fname: string) i64 {
+    if (sdecl < 0 || fname == "") { return -1; }
+    var off: i64 = 0;
+    var c: i64 = -1;
+    var ks: []i64 = base.kids_chain_idx(base.node_lb((sdecl as u64)));
+    var ki: i64 = 0;
+    while (ki < slice_len(ks) as i64) {
+        c = ks[ki];
+        var k: Child = base__kids[c];
+        if (base.node_ia((k.val as u64)) < 0) {
+            var fs: i64 = mb_size_of(base.node_na((k.val as u64)), 0);
+            var fa: i64 = mb_align_of(base.node_na((k.val as u64)), 0);
+            if (fs < 0) { return -1; }
+            if (fa < 0) { return -1; }
+            var aligned: i64 = mb_round_up(off, fa);
+            if (base.node_sa((k.val as u64)) == fname) { return aligned; }
+            off = aligned + fs;
+        }
+        ki = ki + 1;
+        c = -1;
+    }
+    return -1;
+}
+
 pub fn mb_align_of(tn0: i64, depth: i64) i64 {
     if (tn0 < 0) { return -1; }
     if (depth > 16) { return -1; }
@@ -14288,7 +14361,7 @@ pub fn mb_fold(e: i64) i64 {
         if (base__kids[base.node_la((e as u64))].next >= 0) { return -1; }
         return mb_zero_value(base__kids[base.node_la((e as u64))].val, 0);
     }
-    if (mb_is_type_query(base.node_sa((e as u64))) == false) { return -1; }
+    if (mb_is_type_query(base.node_sa((e as u64))) == false && base.node_sa((e as u64)) != "has_decl") { return -1; }
     var a0: i64 = -1;
     var a1: i64 = -1;
     var cnt: i64 = 0;
@@ -14311,12 +14384,77 @@ pub fn mb_fold(e: i64) i64 {
         if (k2 == "") { return -1; }
         return mv_bool(k1 == k2);
     }
+    // P1 反射：结构体字段查询（第 0 形参类型，第 1 形参字段名 string）。
+    if (base.node_sa((e as u64)) == "has_field") {
+        if (cnt != 2) { return -1; }
+        var sd: i64 = mb_struct_decl_of(a0);
+        var fnm: string = mb_read_str_arg(a1);
+        if (fnm == "") { return -1; }
+        return mv_bool(mb_struct_has_field(sd, fnm));
+    }
+    if (base.node_sa((e as u64)) == "offset_of") {
+        if (cnt != 2) { return -1; }
+        var sd: i64 = mb_struct_decl_of(a0);
+        var fnm: string = mb_read_str_arg(a1);
+        if (fnm == "") { return -1; }
+        var off: i64 = mb_struct_field_offset(sd, fnm);
+        if (off < 0) { return -1; }
+        return mv_int(off);
+    }
     if (cnt != 1) { return -1; }
-    if (base.node_sa((e as u64)) == "type_name") {
+    var nm: string = base.node_sa((e as u64));
+    if (nm == "type_name") {
         var k3: string = mb_type_key(a0, 0);
         if (k3 == "") { return -1; }
         return base__mk_string(k3, -1);
     }
+    // 对齐 Zig 的 @sizeOf / @alignOf / @bitSizeOf。
+    // t 原有 @type_size 与 @size_of 同义；@align_of / @bit_size_of 为新增。
+    // 三者均在 CTFE 前折成 int 字面量，两个后端零改动、零 IR 漂移。
+    if (nm == "size_of" || nm == "type_size") {
+        var sz: i64 = mb_size_of(a0, 0);
+        if (sz < 0) { return -1; }
+        return mv_int(sz);
+    }
+    if (nm == "align_of") {
+        var al: i64 = mb_align_of(a0, 0);
+        if (al < 0) { return -1; }
+        return mv_int(al);
+    }
+    if (nm == "bit_size_of") {
+        var tn: i64 = mb_bound_type(a0);
+        if (base.node_kind((tn as u64)) == "scalar") {
+            if (base.node_sa((tn as u64)) == "bool") { return mv_int(1); }   // Zig: @bitSizeOf(bool) == 1
+            var bz: i64 = mb_scalar_size(base.node_sa((tn as u64)));
+            if (bz < 0) { return -1; }
+            return mv_int(bz * 8);
+        }
+        // 复合 / 指针 / slice / 数组：位宽 = 8 * 字节尺寸
+        var szc: i64 = mb_size_of(a0, 0);
+        if (szc < 0) { return -1; }
+        return mv_int(szc * 8);
+    }
+    // P1 反射：@has_decl(name) —— 编译期查询本编译单元顶层是否存在名为 name 的声明
+    // （FuncDecl / StructDecl / EnumDecl / UnionDecl / VariantDecl / VarDecl / ConstDecl /
+    // TypeAliasDecl）。扫描 decl_list（mb_pass 期即可用），与 @type_size 的解析路径同源。
+    if (nm == "has_decl") {
+        if (cnt != 1) { return -1; }
+        var dn: string = mb_read_str_arg(a0);
+        if (dn == "") { return -1; }
+        var hit: bool = false;
+        var n: i64 = slice_len(lex__decl_list) as i64;
+        var i: i64 = 0;
+        while (i < n) {
+            var d: i64 = lex__decl_list[i];
+            if (base.node_sa((d as u64)) == dn) {
+                var k: string = base.node_kind((d as u64));
+                if (k == "FuncDecl" || k == "StructDecl" || k == "EnumDecl" || k == "UnionDecl" || k == "VariantDecl" || k == "VarDecl" || k == "ConstDecl" || k == "TypeAliasDecl") { hit = true; }
+            }
+            i = i + 1;
+        }
+        return mv_bool(hit);
+    }
+    // 兜底（原 @type_size 行为）：其余 type query 名字按 size_of 折
     var sz: i64 = mb_size_of(a0, 0);
     if (sz < 0) { return -1; }
     return mv_int(sz);
