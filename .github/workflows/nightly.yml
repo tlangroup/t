@@ -8,8 +8,11 @@
 #
 # 触发时机：
 #   ① schedule：每日 UTC 18:00（北京时间次日 02:00，避开白天开发高峰）。
-#      注意 GitHub 定时任务在高负载时会延迟甚至跳过；需要立即验证时用 ②。
-#   ② workflow_dispatch：手动触发，可选只跑 dbg / rls。
+#      注意 GitHub 定时任务在高负载时会延迟甚至跳过；需要立即验证时用 ③。
+#      自上次成功的 nightly 运行以来「没有新提交」时自动跳过（省资源，
+#      避免每天空跑一遍全量测试）。判定见 guard 作业。
+#   ② workflow_dispatch：手动触发，可选只跑 dbg / rls。手动触发永远执行，
+#      不受「无新提交」跳过逻辑影响（显式触发即代表要跑）。
 #
 # 覆盖范围：
 #   全部测试（4 套 runner）
@@ -33,6 +36,7 @@
 #    conformance / run_examples 步骤取同一代。）
 #
 # 引导编译器（seed）：out/ 被 gitignore，故 ci/seed/tc.exe 随仓库提交。
+#   刷新种子：本地 `node tools/refresh_seed.mjs` 后提交（脚本写入前后各校验一次）。
 # ─────────────────────────────────────────────────────────────
 
 name: Nightly (all tests + all examples)
@@ -51,8 +55,10 @@ on:
         options: [all, dbg, rls]
 
 # 仅读权限；本流程只验证代码，不推送。
+# actions: read 用于 guard 作业查询上次成功运行的 head SHA。
 permissions:
   contents: read
+  actions: read
 
 # 与 ci.yml 用不同的 group：合并门禁与每日全量可并存，互不取消。
 concurrency:
@@ -60,8 +66,41 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # guard：仅在定时触发时运行。判断「自上次成功的 nightly 运行以来有无新提交」，
+  # 没有则置 skip=true，使 nightly 作业被整体跳过。手动触发时本作业不运行，
+  # nightly 作业凭 `event_name != schedule` 直接放行。
+  guard:
+    name: guard (skip if no new commits)
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.check.outputs.skip }}
+    steps:
+      - name: Check for new commits since last successful nightly
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          LAST_SHA=$(gh run list --repo "$REPO" --workflow nightly.yml \
+            --status success --limit 1 --json headSha --jq '.[0].headSha // empty')
+          CUR_SHA="${{ github.sha }}"
+          echo "Last successful nightly head SHA: ${LAST_SHA:-<none>}"
+          echo "Current head SHA:                 ${CUR_SHA}"
+          if [ -n "$LAST_SHA" ] && [ "$LAST_SHA" = "$CUR_SHA" ]; then
+            echo "No new commits since last nightly run -> skipping full run."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "New commits detected (or first run) -> proceeding with full run."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
   nightly:
     name: nightly full (${{ github.event.inputs.mode || 'all' }})
+    needs: guard
+    # 手动触发永远执行；定时触发仅当 guard 判定「有新提交」时执行。
+    if: >-
+      github.event_name != 'schedule' || needs.guard.outputs.skip != 'true'
     runs-on: windows-latest
     # 自举 ~3min + conformance ~2min + 示例两轮各 ~10min，留足余量。
     timeout-minutes: 240
@@ -112,6 +151,11 @@ jobs:
           mkdir -p out/dbg
           cp ci/seed/tc.exe out/dbg/tc.exe
           ls -la out/dbg/tc.exe
+
+      # 种子体检（与 ci.yml 同源）：种子过期时把「自举 0.2s FAIL」前置成一句人话。
+      - name: Seed freshness precheck
+        shell: bash
+        run: node tools/refresh_seed.mjs --check
 
       # 自举出当前源码的编译器 g1 —— 后续所有测试与示例都以它为被测对象。
       - name: Bootstrap g1 from seed
