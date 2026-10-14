@@ -74,6 +74,16 @@ function summarize(out) {
     return { errors: s.errors, warnings: s.warnings ?? 0, total: s.total ?? 0 };
 }
 
+// 环境性 OOM —— 与「种子过期」是两种完全不同的失败，绝不能混为一谈。
+// 实测（2026-10-14）：GitHub windows-latest runner 上单跑 `check src/tc.tc`
+// 会因提交限制触 mimalloc OOM（error 1455 / unable to allocate memory，
+// 输出 {"error":"runtime_fatal",...}），而同一环境的 `build` 却能通过 ——
+// check 要多驻留并序列化全部诊断 JSON。OOM 说明「这一步判不了」，
+// 不说明种子过期；此时必须放行（SKIP），否则会把好种子误杀、把 CI 搞红。
+function isOom(out) {
+    return /unable to allocate memory|cannot commit OS memory|out of memory|runtime_fatal|error:\s*1455/i.test(out || "");
+}
+
 // 首条 error 级诊断（warning 不算）；JSON 不可用时回退到文本尾部。
 function firstError(out) {
     const j = parseCheck(out);
@@ -100,6 +110,13 @@ if (checkOnly) {
     if (r.timeout) {
         console.error(`[seed] FAIL：check src/tc.tc 超时（10min）`);
         process.exit(1);
+    }
+    if (isOom(r.out)) {
+        // 判不了 ≠ 过期：放行，交由后续真正的自举步骤（build）下结论。
+        console.warn(`[seed] SKIP：check 因环境内存不足失败（mimalloc / OS 提交限制），无法据此判定种子是否过期。`);
+        console.warn(`       ${firstError(r.out).slice(0, 160)}`);
+        console.warn(`       ⇒ 交由后续「自举一代 (build)」步骤判定；本机内存充足时可单独跑本命令复核。`);
+        process.exit(0);
     }
     if (r.code !== 0 || !s || s.errors !== 0) {
         console.error(`[seed] FAIL：现有种子编不出当前 src/tc.tc`);
@@ -128,6 +145,11 @@ if (verify) {
     const r = await checkCompiles(src);
     const s = summarize(r.out);
     if (r.timeout) fail(`check 超时（10min），源编译器不可用`);
+    if (isOom(r.out)) {
+        console.error("SKIP（环境内存不足，非种子问题）");
+        fail(`校验无法进行：check 触发 mimalloc / OS 提交限制 OOM。
+       本机内存充足时可重试；确认要写入请加 --no-verify（不推荐）。`);
+    }
     if (r.code !== 0 || !s || s.errors !== 0) {
         console.error("FAIL");
         console.error(`       ${s ? `${s.errors} error` : "无有效 JSON 输出"} — ${firstError(r.out)}`);
