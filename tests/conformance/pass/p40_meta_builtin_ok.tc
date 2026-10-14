@@ -13,6 +13,18 @@ struct #auto AutoMixed { b: u8; i: i64; c: u8; }
 // P2 `#extern` 显式 C-ABI 声明序（与 default 同语义）：24B，i@8。
 struct #extern ExtMixed { b: u8; i: i64; c: u8; }
 
+// ── P2b：类型构造元函数（comptime 合成新类型，type-as-value，对齐 Zig）──
+//    每个都返回「类型值节点」，可像真实类型一样喂给 @size_of / @offset_of /
+//    @has_field / @type_name（这些查询在 CTFE 期解析 synthetic 类型名）。
+//    注意：const 名须 UPPER_SNAKE_CASE（W402 命名约定）。
+const I32_T = @int("signed", 32);
+const U8_T = @int("unsigned", 8);
+const PTR_T = @pointer(i32);
+const TUP_T = @tuple([i32, bool, string]);
+const DYP_T = @struct("auto", "none", ["x", "y"], [i32, i32]);
+const COL_T = @enum(i32, ["red", "green", "blue"]);
+const FN_T = @fn(i32, [i32, i32], "ccc", "none");
+
 // ① 类型查询用在运行期位置：折叠后就是常量
 fn p40_names() bool {
     if (@type_name(i64) != "i64") { return false; }
@@ -115,6 +127,32 @@ fn p40_reflect() bool {
     return true;
 }
 
+// P2b：类型构造元函数在 CTFE 期合成类型值，并能被类型查询元函数解析。
+// 注意：synthetic 类型存在 const 里（type-as-value），@size_of 等查询须走 CTFE
+// 解析路径（与 Zig 一致：comptime 才解析 const 绑定的类型值），故用 comptime fn。
+comptime fn p40_p2b() bool {
+    // @int → 标量
+    if (@type_name(I32_T) != "i32") { return false; }
+    if (@size_of(I32_T) != 4) { return false; }
+    if (@type_name(U8_T) != "u8") { return false; }
+    if (@size_of(U8_T) != 1) { return false; }
+    // @pointer → 指针宽度（8）
+    if (@size_of(PTR_T) != 8) { return false; }
+    // @struct（auto 重排对两个 i32 字段无影响）
+    if (@size_of(DYP_T) != 8) { return false; }
+    if (@has_field(DYP_T, "x") != true) { return false; }
+    if (@has_field(DYP_T, "y") != true) { return false; }
+    if (@offset_of(DYP_T, "x") != 0) { return false; }
+    if (@offset_of(DYP_T, "y") != 4) { return false; }
+    // @enum（i32 backing）
+    if (@size_of(COL_T) != 4) { return false; }
+    // @tuple：合成类型值可解析、尺寸 > 0
+    if (@size_of(TUP_T) <= 0) { return false; }
+    // @fn：函数类型无字节尺寸（Zig: @sizeOf(fn) 非法），仅验证其可解析为类型值
+    if (@type_name(FN_T) == "") { return false; }
+    return true;
+}
+
 // P1：@offset_of 在 comptime 类型形参上的 CTFE 路径
 comptime fn off_of(comptime T: type) i64 {
     return @offset_of(T, "y");
@@ -183,6 +221,7 @@ fn main() i32 {
     if (p40_align_bit() == false) { return 11; }
     if (p40_reflect() == false) { return 14; }
     if (p40_layout() == false) { return 16; }
+    if (comptime p40_p2b() == false) { return 17; }
     if (comptime off_of(Point) != 4) { return 15; }
 
     const W32: u32 = comptime get_width(u32);
