@@ -6657,7 +6657,8 @@ pub fn infer_expr_body(e: i64) i64 {
         } else if (base.node_sa((e as u64)) == "int" || base.node_sa((e as u64)) == "pointer"
                 || base.node_sa((e as u64)) == "tuple" || base.node_sa((e as u64)) == "struct"
                 || base.node_sa((e as u64)) == "enum" || base.node_sa((e as u64)) == "fn"
-                || base.node_sa((e as u64)) == "enum_literal" || base.node_sa((e as u64)) == "variant") {
+                || base.node_sa((e as u64)) == "enum_literal" || base.node_sa((e as u64)) == "variant"
+                || base.node_sa((e as u64)) == "field" || base.node_sa((e as u64)) == "call") {
             // P2b 类型构造元函数：返回 comptime 类型值（类型即值），静态类型记 Any，
             // 真正类型节点在 CTFE（meta_eval_mbuiltin）期产出并流入单态化。
             return ti_mk("Any");
@@ -15131,6 +15132,43 @@ pub fn meta_eval_mbuiltin(e: i64) i64 {
     if (base.node_sa((e as u64)) == "enum_literal") {
         var tag: string = mb_tag_arg(mb_arg_at(e, 0));
         return base__mk_string(tag, -1);
+    }
+    // P4：@field(v, "name") —— 编译期按名取结构体值的字段值。
+    // 编译期结构体值是 struct_lit 节点，字段挂在 la 的 FV 链上（sa=字段名，na=字段值）。
+    if (base.node_sa((e as u64)) == "field") {
+        var fv0: i64 = meta_eval(mb_arg_at(e, 0));
+        if (fv0 < 0) { return -1; }
+        var fname: string = mb_read_str_arg(mb_arg_at(e, 1));
+        if (fname == "") { return meta_fail("T-MTA-E606", "`@field` 的字段名须是编译期字符串", e); }
+        if (base.node_kind((fv0 as u64)) != "struct_lit") {
+            return meta_fail("T-MTA-E617", "`@field` 目前只支持编译期结构体值（struct 字面量）", e);
+        }
+        var fks: []i64 = base.kids_chain_idx(base.node_la((fv0 as u64)));
+        var fki: i64 = 0;
+        while (fki < slice_len(fks) as i64) {
+            var fvnode: i64 = base__kids[fks[fki]].val;
+            if (base.node_sa((fvnode as u64)) == fname) {
+                return base.node_na((fvnode as u64));
+            }
+            fki = fki + 1;
+        }
+        return meta_fail("T-MTA-E617", base.sb_cat3("`@field` 在结构体值里找不到字段 `", fname, "`"), e);
+    }
+    // P4：@call(f, args...) —— 编译期按值调用函数。第 0 实参是被调函数，其余为实参；
+    // 就地造一个 call 节点复用既有 meta_eval_call（含内置 / 用户 comptime fn 两条路径）。
+    if (base.node_sa((e as u64)) == "call") {
+        var fnnode: i64 = mb_arg_at(e, 0);
+        if (fnnode < 0) { return meta_fail("T-MTA-E606", "`@call` 需要 1 个被调函数实参", e); }
+        var cks: []i64 = base.kids_chain_idx(base.node_la((e as u64)));
+        var cki: i64 = 1;          // 跳过第 0 个（被调函数）
+        var cah: i64 = -1; var cat: i64 = -1;
+        while (cki < slice_len(cks) as i64) {
+            cat = base.list_push(cah, cat, base__kids[cks[cki]].val);
+            if (cah < 0) { cah = cat; }
+            cki = cki + 1;
+        }
+        var cl: i64 = base.mk_call(fnnode, cah, -1);
+        return meta_eval(cl);
     }
     // P3：@as(T, v) —— 数值强制。语义沿用既有 cast 分支的效率/回绕约定
     // （meta_int_wrap 负责位宽截断 + 符号重解释），故整数族、浮点、bool 三族互转都支持。
