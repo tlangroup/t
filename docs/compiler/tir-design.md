@@ -5,6 +5,8 @@
 > 关联：`docs/compiler/device-design.md`、`tools/ir_snapshot.mjs`、`tests/ir_baseline.json`、`src/codegen_c.tc`、`src/codegen_ll.tc`、`src/sema.tc`
 > **对位说明（必读）**：TIR 的三个定语（无类型 / 文件级 / 线性）逐字撞了 Zig **ZIR** 的定义，但两者位置相反、职责无关——ZIR 是**未定型**（sema 之前，类型还没算），TIR 是**已擦除**（sema/mir 之后，类型算完丢掉）。TIR 真正对应的是 **Zig 缺失的那一层**（AIR 之后、各后端之前的共享桥）。完整对位表、命名裁定与由此暴露的反向缺口见 `docs/compiler/ir-taxonomy.md`。裁定后的精确表述为「**类型擦除的线性后端桥 IR**」。
 
+> ⚠ **历史注记（2026-10-15）**：`tote` 包管理器/构建系统已于本日从本仓库抽出为独立项目 `C:/seesaw/codebuddy/tote`（仓库外 `../tote`）。原 `src/tote.tc` 现位于该独立项目的 `tote.tc`；本仓库快照目标与 gate L2 均已不再含 tote（见 §12.2 末注）。
+
 ---
 
 ## 1. 动机与问题
@@ -492,7 +494,7 @@ text --parse--> mem --emit_bin--> .tirb --parse_bin--> mem' --emit_text--> text'
 这条断言把"两套序列化器语义一致"变成**可自动化验证的机械判据**，而不是靠人工审查——正是 TIR 引入本身要解决的那类问题（同一语义写两遍必漂移）在序列化层的复现与防御。实现为 `tools/tir_roundtrip.mjs`，挂进 gate 的 TIR 步。
 
 ### 12.2 快照（取代/增强 `ir_snapshot.mjs`）
-- 新增 `tools/tir_snapshot.mjs`：对每个 `examples/*.tc` + `src/tc.tc` + `src/tote.tc` 产 `emit-tir` → `.tir` 文本的 md5，写入 `tests/tir_baseline.json`。
+- 新增 `tools/tir_snapshot.mjs`：对每个 `examples/*.tc` + `src/tc.tc` 产 `emit-tir` → `.tir` 文本的 md5，写入 `tests/tir_baseline.json`。（注：`tote` 已于 2026-10-15 抽出为独立项目 `../tote`，不再作为本仓库快照目标。）
 - 因为 TIR 后端无关，**一个 TIR md5 同时覆盖两个后端**——不再需要分别比对 `.ll` 与 `.c` 来证明等价。
 - `ir_snapshot.mjs` 现有的 `.ll`/`.c` md5 作为**端到端安全网**保留（验证逻辑：TIR 正确 ⇒ 两后端一致 ⇒ 文本一致）。
 
