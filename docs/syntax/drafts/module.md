@@ -105,7 +105,7 @@ export fn run() -> i32 {
 ## 8. 开放问题 / 迁移
 
 - **`.tlib`/`.tlibd` 格式（已定主体）**：单文件自描述容器 = 内嵌接口块（§10，确定性可读的 `export` 签名区，后端无关）+ 双后端代码块（C 的 `.c`+`.h` / LLVM 的 `.ll`）。不另产 `xxx.li`。剩余开放：**代码块在单文件内的具体编码**（文本分段？二进制容器？各后端代码如何共存/索引？），待与 `tote` 一并设计。
-- **`tote.toml`（见 §12）**：模块声明、搜索路径、源 vs 发布、插件来源（本工程 / 外部注册表）、双后端与变体、C 导出开关等配置落点；`import xxx` 的来源解析由其驱动。已拟 schema（`[package]`/`[build]`/`[dependencies]`/`[modules]`/`[interop.c]`），与现有 `src/tote.tc` 的 `name`/`entry`/`deps` 兼容。
+- **`tote.toml`（见 §12）**：模块声明、搜索路径、源 vs 发布、插件来源（本工程 / 外部注册表）、双后端与变体、C 导出开关等配置落点；`import xxx` 的来源解析由其驱动。已拟 schema（`[package]`/`[build]`/`[dependencies]`/`[modules]`/`[interop.c]`），与独立项目 `tote`（仓库外 `../tote`，原本仓库 `src/tote.tc`）的 `name`/`entry`/`deps` 兼容。
 - **选择性导入**：本次未采纳 `import { foo, bar } from xxx;`（用户选命名空间别名）。保留为未来扩展。
 - **循环依赖粒度**：首版按模块级无环；更细的符号级互相引用暂不支持。
 - **未 export 的 `var` 初始化顺序**：跨模块 `var` 初始化仅由 `main` 所在模块触发，私有 `var` 不误拉取；需在 check 明确语义。
@@ -145,7 +145,7 @@ export fn run() -> i32 {
 
 ## 12. 包清单 `tote.toml` 设计 [建议 schema]
 
-> 现状：`src/tote.tc` 当前仅认 `[package]` 的 `name`/`entry`/`deps`（扁平字符串数组），parser 是行扫描级别。本 schema 在其上扩展，保留 `name`/`entry`/`deps` 兼容，新增 `[build]`/`[dependencies]`/`[modules]`/`[interop]` 子表；实现需 `tote` 升级为真正的 TOML 子表解析（建议引入小型 TOML 解析器，或复用 `tc` 的解析能力）。
+> 现状：独立项目 `tote`（仓库外 `../tote`，原本仓库 `src/tote.tc`）当前仅认 `[package]` 的 `name`/`entry`/`deps`（扁平字符串数组），parser 是行扫描级别。本 schema 在其上扩展，保留 `name`/`entry`/`deps` 兼容，新增 `[build]`/`[dependencies]`/`[modules]`/`[interop]` 子表；实现需 `tote` 升级为真正的 TOML 子表解析（建议引入小型 TOML 解析器，或复用 `tc` 的解析能力）。
 
 ### 12.1 字段
 
@@ -198,7 +198,7 @@ expected_suffix = ".expected.txt"
 
 ### 12.3 与现有 parser 兼容
 
-当前 `src/tote.tc` 仅识别 `entry` 与 `deps`（`deps = []` 扁平数组）。升级路径：保留 `deps` 作为 `[dependencies]` 的简写（数组元素视为 `{ name = "..." }`），新增子表解析；`entry`/`name` 语义不变。
+当前 `tote`（仓库外 `../tote`，原本仓库 `src/tote.tc`）仅识别 `entry` 与 `deps`（`deps = []` 扁平数组）。升级路径：保留 `deps` 作为 `[dependencies]` 的简写（数组元素视为 `{ name = "..." }`），新增子表解析；`entry`/`name` 语义不变。
 
 ### 12.4 设计要点
 

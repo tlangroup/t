@@ -6,7 +6,7 @@
 
 工具链分工（M38 起重构）：
 - **`tc`** — 纯粹的**编译器**：负责 `lex / check / compile / emit-ll / build / run` 与链接（LLVM 或 C 后端）。入口 `src/tc.tc`，本体按编译步骤拆分为 `src/{base,lex,parse,sema,codegen_c,codegen_ll}.tc`（见「编译器源码结构」），二进制 `out/<mode>/tc.exe`。
-- **`tote`** — **包管理器与构建系统**：自身不实现编译器，而是把编译/链接委托给 `tc`；并负责包清单 `tote.toml`、`init` 脚手架与依赖登记（`install`）。源码 `src/tote.tc`，二进制 `out/<mode>/tote.exe`。
+- **`tote`** — **包管理器与构建系统（已迁出为独立项目，位于 `../tote`）**：自身不实现编译器，而是把编译/链接委托给 `tc`；并负责包清单 `tote.toml`、`init` 脚手架与依赖登记（`install`）。源码现为 `../tote/tote.tc`（原 `src/tote.tc`），二进制 `out/<mode>/tote.exe` 由该独立项目构建。
 - **`totter`**（数据驱动生成器）— **已删除（abandoned）**：原 `src/totter.tc` 与冻结快照 `gen/tc.tc` 已于 2026-09-28 移除；其 `GEN:` 区间已冻结于 `src/tc.tc` 手写维护，不再重跑、不再维护。
 
 ## 实现
@@ -14,11 +14,11 @@
 | 实现 | 位置 | 状态 |
 |------|------|------|
 | **tc（编译器）** | `src/tc.tc` + 6 个分层模块（t 语言编写，自宿主） | **活跃开发** — 一切语言演进发生在这里 |
-| **tote（包管理器/构建系统）** | `src/tote.tc`（t 语言编写，自宿主） | **活跃开发** — 编译委托 tc，负责包与构建编排 |
+| **tote（包管理器/构建系统）** | `../tote/tote.tc`（独立项目，t 语言编写，自宿主） | **活跃开发** — 编译委托 tc，负责包与构建编排；仓库见 `../tote` |
 | totter（数据驱动生成器） | （已删除） | **已删除** — 2026-09-28 移除，不再参与构建流水线 |
 | tc0（种子） | `seed/tc0/`（TypeScript，冻结副本）；`tc0/`（工作副本，frozen） | **冻结** — 仅作参照实现与灾难恢复信任根，不再演进 |
 
-稳定版：编译器 `out/rls/tc.exe`（发布优化）/ `out/dbg/tc.exe`（调试，由 `src/tc.tc` 编译而来）；包管理器/构建系统 `out/dbg/tote.exe`（由 `src/tote.tc` 编译而来，内部调用 `tc`）。
+稳定版：编译器 `out/rls/tc.exe`（发布优化）/ `out/dbg/tc.exe`（调试，由 `src/tc.tc` 编译而来）；包管理器/构建系统 `tote` 已迁出为独立项目（`../tote`），其二进制由该项目自行构建（内部调用 `tc`）。
 
 ## 编译器源码结构
 
@@ -135,9 +135,8 @@ node tools/build_runtime.mjs                 # → out/{dbg,rls}/deps/t_runtime.
 # 用上一稳定版（旧 tc）自举出新的 tc；随后全部用 tc 自身
 out/dbg/tc.exe build src/tc.tc --output out/dbg/tc          # 调试版编译器 tc
 out/dbg/tc.exe build src/tc.tc --mode rls --output out/rls/tc   # 发布版编译器 tc
-# 包管理器/构建系统 tote：编译委托 tc
-out/dbg/tc.exe build src/tote.tc --output out/dbg/tote      # 调试版 tote
-out/dbg/tc.exe build src/tote.tc --mode rls --output out/rls/tote  # 发布版 tote
+# 包管理器/构建系统 tote 已迁出为独立项目（../tote），其构建见该项目 README；
+# 在该项目目录内执行：out/<mode>/tc.exe build tote.tc --output out/<mode>/tote
 # （totter 已删除：历史上曾执行 out/dbg/tc.exe build src/totter.tc 与 cp gen/tc.tc src/tc.tc，现已移除）
 ```
 
@@ -168,7 +167,7 @@ node tools/run_examples.mjs --compiler out/rls/tc.exe --mode rls
 
 ## Stage 3 自迭代开发规则（版本晋升）
 
-1. 任何语言新特性：先改 `docs/spec.md` → 补符合性测试 → 再改 `src/tc.tc`（编译器）或 `src/tote.tc`（构建/包），三步缺一不可。
+1. 任何语言新特性：先改 `docs/spec.md` → 补符合性测试 → 再改 `src/tc.tc`（编译器）；包管理/构建相关改动在独立项目 `../tote` 进行，三步缺一不可。
 2. 修改 `src/tc.tc` 后：用当前稳定版 tc 编译出新版 → 跑符合性套件 + difftest → 不动点复验 → 通过后晋升为稳定版。
 3. `seed/` 目录与 `tc0/` 冻结不动；`tests/conformance/` 只增不删（旧 `totter` 生成器与 `gen/tc.tc` 冻结快照已于 2026-09-28 移除）。
 

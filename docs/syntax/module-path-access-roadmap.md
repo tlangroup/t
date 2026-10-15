@@ -236,7 +236,7 @@
   - **清理 720**：用 `g1 check` 诊断的精确 (file,line,col,col) 跨度，对 9 个 `src.*` 文件 720 处真实裸引用做**跨度精确替换**为 `module__name`（规避盲替换双重限定 `lex__lex__decl_list`），归零全部裸名跨模块访问。
   - **升 error**：`T-MOD-W561`(warning) → `T-MOD-E561`(error)，同步 `tools/diag_defs.json` / `src/diag_table.gen.h` / `src/base.tc` GEN 块（g_dcode[74]、g_dsev[74]）/ `src/sema.tc` 发射点。验证：`g1 check src/tc.tc` 0 errors / 0 T-MOD-E561。
   - 因 W561 受 `is_src_mod` 守卫仅作用于 `src.*` 模块，tests/examples 不受影响。
-  - 后续：跑 gate L2 + 重录 IR 基线（src/tc.tc、src/tote.tc 这 6 entry 预期漂移）后提交 FF 推 main。
+  - 后续：跑 gate L2 + 重录 IR 基线（`src/tc.tc` 这 3 entry 预期漂移）后提交 FF 推 main。（注：`tote` 已于 2026-10-15 抽出为独立项目 `../tote`，不再作为本仓库快照/门禁目标，故编译器自身基线仅 `src/tc.tc` 的 c/h/ll 三项。）
 
 ---
 
@@ -288,11 +288,11 @@
 
 - **每步红线**：改 `src/` 后 → `tc build src/tc.tc` → gate L2 → 必要时 `--update` 重录 → commit → FF 推送。
 - ⚠ **「零漂移」的精确含义**（易误解，务必按此判读）：
-  `tests/ir_baseline.json` 共 **354 entry**，其中 **6 个是编译器自身**（`src/tc.tc`、`src/tote.tc` 各 c/h/ll），
-  其余 **348 个是 examples/tests 的用户代码**。
+  `tests/ir_baseline.json` 中，**编译器自身仅 `src/tc.tc`（c/h/ll 共 3 entry）**（`tote` 已于 2026-10-15 抽出为独立项目 `../tote`，不再作为本仓库快照目标），
+  其余均为 examples/tests 的用户代码。
   改 `src/*.tc` ⇒ 编译 `src/tc.tc` 的产物**必然**变化（编译器源码进了自己的产物），
-  故**这 6 个 entry 必然漂移、基线必须重录**；但 **348 个用户代码 entry 必须完全不变**。
-  ⇒ 真正的判据是：**漂移是否局限在 `src/tc.tc` / `src/tote.tc` 这 6 个 entry**。
+  故**这 3 个 entry 必然漂移、基线必须重录**；但 **用户代码 entry 必须完全不变**。
+  ⇒ 真正的判据是：**漂移是否局限在 `src/tc.tc` 这 3 个 entry**。
   若 examples/tests 的 entry 也变了，说明行为被意外改变，须回查。
 - **已知代价**：完整路径化使 `tc.ll` +8.6% / `tc.h` +9.8% / `tc.c` +5.2%（符号名占 `tc.ll` 44.7% 字节）。
 - **已知漏洞**：库搜索路径导入（如 `const repl = @import("repl")`）的身份是**单段**，
