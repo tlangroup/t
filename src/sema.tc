@@ -6368,6 +6368,60 @@ pub fn infer_expr_body(e: i64) i64 {
             return infer_expr(e);
         }
     }
+    // P4b：@field_parent_ptr(Parent, child_ptr, "field") —— 运行期 container_of。
+    // 由成员指针反推容器指针（Zig 忠实语义 @fieldParentPtr）。脱糖成
+    //   cast(*Parent, binary("-", cast(i64, child_ptr), int(@offset_of(Parent, field))))
+    // 复用两后端既有 ptrtoint/inttoptr 发射（LLVM 自然发；C 后端 (T)(x) 同构）。
+    // ⚠ 必须 hir_invalidate：本节点是源码里的 mbuiltin，建了 HIR 指令，否则重入
+    //   hir_tag 仍按旧 mbuiltin 分派 → 命中 E607（与 member 脱糖同一陷阱）。
+    if (base.node_kind((e as u64)) == "mbuiltin" && base.node_sa((e as u64)) == "field_parent_ptr") {
+        var fpp_a0: i64 = mb_arg_at(e, 0);   // Parent 类型
+        var fpp_a1: i64 = mb_arg_at(e, 1);   // child_ptr
+        var fpp_a2: i64 = mb_arg_at(e, 2);   // 字段名
+        if (fpp_a0 < 0 || fpp_a1 < 0 || fpp_a2 < 0) {
+            parse.fc_err("T-SEM-E206", "`@field_parent_ptr` 需要 3 个实参（Parent 类型, 成员指针, 字段名）", e);
+            return ti_mk("Unknown");
+        }
+        var fpp_ptn: i64 = mb_as_type_node(fpp_a0);
+        if (fpp_ptn < 0) {
+            parse.fc_err("T-MTA-E606", "`@field_parent_ptr` 的 Parent 类型实参不可解析", e);
+            return ti_mk("Unknown");
+        }
+        var fpp_fname: string = mb_read_str_arg(fpp_a2);
+        if (fpp_fname == "") {
+            parse.fc_err("T-MTA-E606", "`@field_parent_ptr` 的字段名须是编译期字符串", e);
+            return ti_mk("Unknown");
+        }
+        // 取结构体声明与字段偏移（仅支持命名结构体，与 @offset_of 同约束）
+        var fpp_sd: i64 = mb_struct_decl_of(fpp_ptn);
+        if (fpp_sd < 0) {
+            parse.fc_err("T-MTA-E606", "`@field_parent_ptr` 的 Parent 必须是命名结构体", e);
+            return ti_mk("Unknown");
+        }
+        var fpp_off: i64 = mb_struct_field_offset(fpp_sd, fpp_fname);
+        if (fpp_off < 0) {
+            parse.fc_err("T-SEM-E216",
+                base.sb_cat4("`@field_parent_ptr`：结构体 `", base.node_sa((fpp_sd as u64)),
+                    "` 没有字段 `", base.sb_cat2(fpp_fname, "`")), e);
+            return ti_mk("Unknown");
+        }
+        // 构造脱糖树：cast(*Parent, (u8*)child_ptr - offset)
+        //   —— 字节指针 GEP：provenance 安全，且二进制减法经后端 GEP 按字节缩放（元素 u8），
+        //      与 C/LLVM 指针算术语义一致；不依赖 cast(ptr,i64)（那会破坏 slice/array 的指针字段布局）。
+        var fpp_byteptr: i64 = base.mk_cast(fpp_a1, base.mk_pointer(base.mk_scalar("u8", -1), -1), -1);
+        var fpp_intoff: i64 = base.mk_int(base.i2s(fpp_off), -1, -1);
+        var fpp_sub: i64 = base.mk_binary("-", fpp_byteptr, fpp_intoff, -1);
+        var fpp_pptr: i64 = base.mk_pointer(fpp_ptn, -1);
+        var fpp_root: i64 = base.mk_cast(fpp_sub, fpp_pptr, -1);
+        // 把 e 原地改写成 cast 节点（复用 variant_lit / member 脱糖模式）
+        base.node_set_kind((e as u64), "cast");
+        base.node_set_na((e as u64), base.node_na((fpp_root as u64)));
+        base.node_set_nb((e as u64), base.node_nb((fpp_root as u64)));
+        base.node_set_la((e as u64), base.node_la((fpp_root as u64)));
+        base.node_set_sa((e as u64), base.node_sa((fpp_root as u64)));
+        hir.hir_invalidate((e as u64));
+        return infer_expr(e);
+    }
     var k: string = hir_tag(e);
     var ei: i64 = ie_inst(e);
     // P1 Stage 1b：多语句值块在表达式位置出现（含值 if 的多语句分支、match 的多语句臂）。
