@@ -11065,6 +11065,19 @@ pub fn dots_to_underscores(s: string) string {
 
 // 输出模块依赖图（JSON）：每条 import 边（父 -> 子）一行，供 tote deps / 工具消费。
 // 环检测已先行；若存在循环依赖，边中会包含回边，可一眼看出环。
+//
+// ── extend 边（REQ-EXT-1，供 tote 增量缓存）────────────────────────────
+// 除 import 边（kind:"import"）外，额外输出 kind:"extend" 的边：
+//   ia==2 = `extend overload fn`（扩展者）；ia==1 = `overload fn` 组（被扩展者）。
+//   两者 node_file 不同 ⇒ 该 extend 跨单元 ⇒ {from: 扩展者单元, to: 被扩展单元, kind:"extend"}。
+// 单元名取源文件名 stem（base_no_tc），与 import 边用模块别名的口径一致，tote 据此
+// 把「被扩展单元 + 扩展闭包」拼成同一编译单元（跨单元 extend 必须同单元，否则 T-OVL-E980）。
+// ⚠ 边是在 desugar_func_clauses【子句合并之前】登记的，不是这里扫 decl_list 得到的：
+//   fc_merge 会把首个子句节点整体替换（slice_set），ia==2 标记随即丢失，事后扫不到。
+//
+// ⚠ 只输出「结构事实」，不要求 extend 语义已解析成功：跨单元 extend 在未拼装时会报
+//   T-OVL-E980，但 emit_deps 位于 run_check 之后、且早于「有错则返回」分支，JSON 照常
+//   输出（tote 侧 sys_capture 忽略退出码、只读 stdout）。
 pub fn emit_deps() void {
     var out: StringBuilder = sb_new();
     sb_append_str(out, "{\"entry\":\"");
@@ -11080,9 +11093,64 @@ pub fn emit_deps() void {
         base__json_escape_into(out, lex__g_dep_from[e]);
         sb_append_str(out, "\",\"to\":\"");
         base__json_escape_into(out, lex__g_dep_to[e]);
-        sb_append_char(out, 34);
+        sb_append_str(out, "\",\"kind\":\"import\"");
         sb_append_char(out, 125);
         e = e + 1;
+    }
+    // extend 边：desugar 期登记的「扩展意图」在此解析归属。
+    // 此刻 desugar_imports（order 4，模块加载）已跑完，被扩展组的 decl 已在 decl_list 中。
+    // ⚠ 名称匹配的两条实证约束（--emit-deps dump 实测，勿凭直觉改）：
+    //   ① 扩展者侧 sa 是裸名（"op"），且 desugar 之后其 ia 已被重置（不再是 2）
+    //      —— 所以只能靠 desugar 期登记的「意图」，事后扫 ia==2 找不到；
+    //   ② 被扩展者若来自别的模块，其 sa 会被重整为 "<模块>__<名>"（如 "foo__op"），ia 也不是 1。
+    //   故判定用「裸名相等 或 以 "__<名>" 结尾」，单元归属一律取 node_file 的 stem。
+    var dl: i64 = slice_len(lex__decl_list) as i64;
+    var seen: []string;
+    var nx: i64 = slice_len(lex__g_extend_name) as i64;
+    var x: i64 = 0;
+    while (x < nx) {
+        var nm: string = lex__g_extend_name[x];
+        var ef: string = lex__g_extend_file[x];
+        var suff: string = "__" + nm;
+        var j: i64 = 0;
+        var done: bool = false;
+        while (j < dl && done == false) {
+            var g2: i64 = lex__decl_list[j];
+            if (base__node_kind((g2 as u64)) == "FuncDecl") {
+                var sa2: string = base__node_sa((g2 as u64));
+                var hit: bool = false;
+                if (sa2 == nm) { hit = true; }
+                if (hit == false && str_len(sa2) > str_len(suff)) {
+                    if (str_slice(sa2, str_len(sa2) - str_len(suff), str_len(sa2)) == suff) { hit = true; }
+                }
+                if (hit) {
+                    var et: string = base__base_no_tc(base__node_file((g2 as u64)));
+                    // 命中扩展者自己那条（同单元）不算边，继续找跨单元的归属
+                    if (str_len(ef) > 0 && str_len(et) > 0 && ef != et) {
+                        var key: string = ef + ">" + et;
+                    var dup: bool = false;
+                    var si: u64 = 0;
+                    while (si < slice_len(seen)) {
+                        if (seen[si] == key) { dup = true; break; }
+                        si = si + 1;
+                    }
+                    if (dup == false) {
+                        append(seen, key);
+                        if (first == false) { sb_append_str(out, ","); }
+                        first = false;
+                        sb_append_str(out, "{\"from\":\"");
+                        base__json_escape_into(out, ef);
+                        sb_append_str(out, "\",\"to\":\"");
+                        base__json_escape_into(out, et);
+                        sb_append_str(out, "\",\"kind\":\"extend\"");
+                        sb_append_char(out, 125);
+                    }
+                }
+            }
+            }
+            j = j + 1;
+        }
+        x = x + 1;
     }
     sb_append_str(out, "]}\n");
     print(sb_to_str(out));
