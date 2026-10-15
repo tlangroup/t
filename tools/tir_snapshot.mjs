@@ -93,7 +93,7 @@ const targets = [];
 for (const f of readdirSync(join(ROOT, "examples")).sort()) {
     if (f.endsWith(".tc")) targets.push(`examples/${f}`);
 }
-for (const s of ["src/tc.tc", "src/tote.tc"]) {
+for (const s of ["src/tc.tc"]) {
     if (existsSync(join(ROOT, s))) targets.push(s);
 }
 
