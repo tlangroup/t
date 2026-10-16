@@ -2989,6 +2989,27 @@ pub fn parse_declaration() i64 {
         parse_fatal_at("T-PAR-E102", "expected 'struct' after 'extern'", xkw_i);
     }
 
+    // ── `concept` 约束类型声明（不可实例化，函数+字段约束，泛型边界）──
+    // 复用 StructDecl 节点（node_sb="concept" 标记）；成员即约束：字段约束存 node.lb、
+    // 方法约束（以 `;` 结尾的 extern 前向声明形态）存 node.la（concept 不发射，故此槽
+    // 复用为方法约束链，与注解槽互不冲突）。语义由 sema 注册为 kind="concept" 并禁止实例化；
+    // 泛型边界 `T:HasName` 由 Task #4b 处理。
+    if (lex.cur_t() == "Identifier" && lex.cur_v() == "concept") {
+        var cn_i: i64 = lex.advance_i();   // 吃掉 `concept`
+        if (lex.cur_t() != "Identifier") {
+            parse_fatal_at("T-PAR-E102", "expected concept name after 'concept'", cn_i);
+        }
+        var cni: i64 = lex.advance_i();
+        var cname: string = lex.tk_v(cni);
+        base.validate_decl_name(cname, cni);
+        var cd: i64 = parse_struct_decl(cname, anns, "concept");
+        if (cd >= 0) {
+            base.node_at(cd, cni);
+            if (is_export) { base.node_set_bc((cd as u64), true); }
+        }
+        return cd;
+    }
+
     if (lex.cur_t() == "KwStruct") {
         lex.advance_i();   // 吃掉 `struct`
         // layout 注解 #soa/#aos：name-first 文法在 parse_decl_body 检测；
@@ -5179,6 +5200,9 @@ pub fn parse_struct_decl(name: string, anns: i64, layout: string) i64 {
     var r_sfield: i64 = -1;
     var r_sfield_t: i64 = -1;
     var r_idx: i64 = 0;   // 位置字段元组（struct T { T1, T2 }）的自动字段名计数 `_0`/`_1`/...
+    var is_concept: bool = (layout == "concept");
+    var r_method: i64 = -1;   // concept 模式：方法约束链（最终存 node.la，concept 不发射）
+    var r_method_t: i64 = -1;
     lex.g_method_head = -1;
     lex.g_method_tail = -1;
     lex.g_const_head = -1;   // P3a：重置关联常量收集链（每次进入新 struct 清空）
@@ -5190,8 +5214,14 @@ pub fn parse_struct_decl(name: string, anns: i64, layout: string) i64 {
             var mname: string = expect_tok("Identifier");
             var mfd: i64 = parse_method_decl(name, mname, r_anns);
             if (mfd >= 0) {
-                lex.g_method_tail = base.list_push(lex.g_method_head, lex.g_method_tail, mfd);
-                if (lex.g_method_head < 0) { lex.g_method_head = lex.g_method_tail; }
+                if (is_concept) {
+                    // concept 方法约束：存本地链（最终进 node.la），不刷入 decl_list（非真实方法）。
+                    r_method_t = base.list_push(r_method, r_method_t, mfd);
+                    if (r_method < 0) { r_method = r_method_t; }
+                } else {
+                    lex.g_method_tail = base.list_push(lex.g_method_head, lex.g_method_tail, mfd);
+                    if (lex.g_method_head < 0) { lex.g_method_head = lex.g_method_tail; }
+                }
             }
         } else if (lex.cur_t() == "KwConst") {
             // P3a：结构体关联常量 `const Name = ...`（重命名为 `<struct>_Name` 的全局常量，
@@ -5213,8 +5243,10 @@ pub fn parse_struct_decl(name: string, anns: i64, layout: string) i64 {
             base.validate_const_name(cname, cti);
             var cfull: string = base.sb_cat3(name, "_", cname);
             var cfd: i64 = base.mk_GlobalConstDecl(cfull, false, ctn, cinit, -1, cti);
-            lex.g_const_tail = base.list_push(lex.g_const_head, lex.g_const_tail, cfd);
-            if (lex.g_const_head < 0) { lex.g_const_head = lex.g_const_tail; }
+            if (!is_concept) {
+                lex.g_const_tail = base.list_push(lex.g_const_head, lex.g_const_tail, cfd);
+                if (lex.g_const_head < 0) { lex.g_const_head = lex.g_const_tail; }
+            }
         } else if (lex.cur_t() == "Identifier" && lex.peek_t(1) == "KwFunc") {
             // 方言统一（Stage 2）：`mname fn(...)` 结构体方法旧文法已废弃，统一为 `fn mname(...)`。
             // 转换器已把整树结构体方法迁到 `fn mname`，此处直接报迁移错误而非误当成字段解析。
@@ -5250,7 +5282,14 @@ pub fn parse_struct_decl(name: string, anns: i64, layout: string) i64 {
         }
     }
     expect_tok("RBrace");
-    var __id: i64 = base.mk_StructDecl(name, layout, bp_type2(anns, r_anns), bp_has_type2(anns, r_anns), bp_is2(anns, r_anns), list_concat(anns, r_anns), r_sfield, -1);
+    // concept 方法约束链存全局表（lex.g_concept_method_*），避开 StructDecl.node.la 注解槽
+    // （否则 ann_validate 会把方法名当注解名误报 unknown annotation）。字段约束仍在 node.lb。
+    if (is_concept && r_method >= 0) {
+        append(lex.g_concept_method_names, name);
+        append(lex.g_concept_method_heads, r_method);
+    }
+    var r_la: i64 = list_concat(anns, r_anns);
+    var __id: i64 = base.mk_StructDecl(name, layout, bp_type2(anns, r_anns), bp_has_type2(anns, r_anns), bp_is2(anns, r_anns), r_la, r_sfield, -1);
     return __id;
 }
 
