@@ -11116,7 +11116,10 @@ pub fn emit_deps() void {
         var done: bool = false;
         while (j < dl && done == false) {
             var g2: i64 = lex__decl_list[j];
-            if (base__node_kind((g2 as u64)) == "FuncDecl") {
+            // REQ-EXT-1：FuncDecl（extend overload fn）与 StructDecl（overload struct 组，ia==1）
+            // 都可作为被扩展者，按裸名或 "<模块>__<名>" 后缀匹配。
+            if (base__node_kind((g2 as u64)) == "FuncDecl"
+                || (base__node_kind((g2 as u64)) == "StructDecl" && base__node_ia((g2 as u64)) == 1)) {
                 var sa2: string = base__node_sa((g2 as u64));
                 var hit: bool = false;
                 if (sa2 == nm) { hit = true; }
@@ -14353,6 +14356,78 @@ pub fn mb_struct_align(d: i64, depth: i64) i64 {
     return maxa;
 }
 
+// ── 开放维度：overload struct + extend overload struct 合并（struct-modifiers 设计 §2.1/§2.2）──
+// 在 hir_build 之前运行：把 `extend overload struct X`（ia==2）的字段链追加到同名
+// `overload struct X`（ia==1）字段链尾部，再把 ia==2 节点从 decl_list 移除（避免重复类型注册 /
+// 重复发射）。跨文件但同编译单元（二者都在 decl_list）同样合并；单独编译（base 不在 decl_list）
+// 或 base 非 overload 组 ⇒ T-OVL-E980（复用函数 overload 的报错码）。
+// ⚠ 合并只搬字段；struct 内联方法在 parse 期已脱糖为顶层自由函数（flush_struct_methods），
+//   与 StructDecl 节点解耦，故无需在此处理。
+pub fn mb_struct_extend_merge() void {
+    // 收集 extend 追加（ia==2）的 StructDecl
+    var exts: []i64 = [];
+    var n: i64 = slice_len(lex__decl_list) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        var d: i64 = lex__decl_list[i];
+        if (base__node_kind((d as u64)) == "StructDecl" && base__node_ia((d as u64)) == 2) {
+            append(exts, d);
+        }
+        i = i + 1;
+    }
+    if (slice_len(exts) == 0) { return; }
+    // 合并：把 ext 字段链接到 base 字段链尾部
+    var ki: i64 = 0;
+    while (ki < slice_len(exts) as i64) {
+        var ext: i64 = exts[ki];
+        var ename: string = base__node_sa((ext as u64));
+        var base0: i64 = -1;
+        var j: i64 = 0;
+        while (j < n) {
+            var d2: i64 = lex__decl_list[j];
+            if (base__node_kind((d2 as u64)) == "StructDecl" && base__node_ia((d2 as u64)) == 1) {
+                var bsa: string = base__node_sa((d2 as u64));
+                var hit: bool = false;
+                if (bsa == ename) { hit = true; }
+                if (hit == false && str_len(bsa) > str_len(ename)) {
+                    if (str_slice(bsa, str_len(bsa) - str_len(ename), str_len(bsa)) == "__" + ename) { hit = true; }
+                }
+                if (hit) { base0 = d2; break; }
+            }
+            j = j + 1;
+        }
+        if (base0 < 0) {
+            parse.fc_err("T-OVL-E980",
+                base.sb_cat4("extend overload '", ename, "' has no matching 'overload struct ", base.sb_cat2(ename, "' group in this file")),
+                ext);
+        } else {
+            var base_head: i64 = base__node_lb((base0 as u64));
+            var ext_head: i64 = base__node_lb((ext as u64));
+            if (ext_head >= 0) {
+                if (base_head >= 0) {
+                    var bt: i64 = base.list_last(base_head);
+                    base.list_link(bt, ext_head);
+                } else {
+                    base.node_set_lb((base0 as u64), ext_head);
+                }
+            }
+        }
+        ki = ki + 1;
+    }
+    // 从 decl_list 移除已合并的 ext 节点
+    var kept: []i64 = [];
+    var m: i64 = 0;
+    while (m < n) {
+        var d3: i64 = lex__decl_list[m];
+        var is_ext: bool = false;
+        var q: i64 = 0;
+        while (q < slice_len(exts) as i64) { if (exts[q] == d3) { is_ext = true; break; } q = q + 1; }
+        if (is_ext == false) { append(kept, d3); }
+        m = m + 1;
+    }
+    lex.decl_list = kept;
+}
+
 pub fn mb_struct_size(d: i64, depth: i64) i64 {
     // packed struct：位域顺序打包，尺寸 = 容纳总位宽的最小宿主整型（u8/u16/u32/u64）。
     // 直接由字段位宽求和推导，不依赖 check_packed_layout 的 pk_* 扁平池（避免 meta 折叠期
@@ -15715,6 +15790,11 @@ pub fn run_check() void {
     // 再做命名空间重整（`hello.add` → `hello__add`，模块顶层符号加 `别名__` 前缀）。
     // 单文件程序（无 import）零影响：无模块符号 ⇒ 无任何改写。
     resolve_modules();
+    // 开放维度：overload struct + extend overload struct 合并（struct-modifiers 设计 §2.1/§2.2）。
+    // 必须在 mangle_modules（内含 check_entry_redefs 重名检查）之前运行：把 extend 字段并入
+    // overload 组、并移除 ext 节点，避免同文件两个同名 StructDecl 被误报 T-NAM-E405；同时保证
+    // 跨文件同编译单元（resolve_modules 已把模块声明并入 decl_list）也能在此合并。
+    mb_struct_extend_merge();
     mangle_modules();
 
     // S6（§4.11.3）：模块级脱糖改由注册表驱动（func_clauses(1)+lambdas(2)+

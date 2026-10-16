@@ -2773,8 +2773,36 @@ pub fn parse_declaration() i64 {
     // `desugar_func_clauses` 按名脱糖为单一函数 + match 臂。跨文件合并见 Route 2。
     if (lex.cur_v() == "overload") {
         lex.advance_i();   // 吃掉 `overload`
+        if (lex.cur_t() == "KwStruct") {
+            // ── overload struct（开放可扩展组，ia=1）──（struct-modifiers 设计 §2.1/§2.2）
+            // 编译器合成尾部 `_` 扩展锚点；`extend overload struct` 追加字段/方法（同编译单元）。
+            lex.advance_i();   // 吃掉 `struct`
+            if (lex.cur_t() != "Identifier") {
+                parse_fatal("expected struct name after 'struct' in overload struct declaration");
+            }
+            var sni_o: i64 = lex.advance_i();
+            var sname_o: string = lex.tk_v(sni_o);
+            lex.g_agent_anchor = sni_o;
+            lex.g_struct_exported = is_export;
+            base.validate_decl_name(sname_o, sni_o);
+            var sd_o: i64 = parse_struct_decl(sname_o, anns, "auto");
+            if (sd_o >= 0) {
+                base.node_set_ia((sd_o as u64), 1);   // 1 = overload 组
+                base.node_at(sd_o, sni_o);
+                if (is_export) { base.node_set_bc((sd_o as u64), true); }   // S4 §0.14.7 SoA
+            }
+            return sd_o;
+        }
         if (lex.cur_t() != "KwFunc") {
-            parse_fatal_at("T-PAR-E102", "expected 'fn' after 'overload'", lex.pos);
+            // 与布局修饰互斥：`overload extern struct` / `overload packed struct` 不允许
+            // （D9：extern 不支持 overload；packed 不开放扩展）。
+            if (lex.cur_t() == "Identifier" && (lex.cur_v() == "extern" || lex.cur_v() == "packed")) {
+                parse_fatal_at("T-PAR-E102",
+                    base.sb_cat3("'overload' and layout modifier '", lex.cur_v(),
+                        "' are mutually exclusive (overload struct does not support packed/extern layout)"),
+                    lex.pos);
+            }
+            parse_fatal_at("T-PAR-E102", "expected 'fn' or 'struct' after 'overload'", lex.pos);
         }
         lex.advance_i();   // 吃掉 `fn`
         if (lex.cur_t() != "Identifier") {
@@ -2803,6 +2831,29 @@ pub fn parse_declaration() i64 {
             parse_fatal_at("T-PAR-E102", "expected 'overload' after 'extend'", lex.pos);
         }
         lex.advance_i();   // 吃掉 `overload`
+        if (lex.cur_t() == "KwStruct") {
+            // ── extend overload struct（跨模块追加字段+方法，ia=2）──（struct-modifiers 设计 §2.1/§2.2）
+            // 复用函数 overload 的 extend 边机制（lex.g_extend_name/g_extend_file + emit_deps）。
+            lex.advance_i();   // 吃掉 `struct`
+            if (lex.cur_t() != "Identifier") {
+                parse_fatal("expected struct name after 'struct' in extend overload struct declaration");
+            }
+            var sni_e: i64 = lex.advance_i();
+            var sname_e: string = lex.tk_v(sni_e);
+            lex.g_agent_anchor = sni_e;
+            lex.g_struct_exported = is_export;
+            base.validate_decl_name(sname_e, sni_e);
+            var sd_e: i64 = parse_struct_decl(sname_e, anns, "auto");
+            if (sd_e >= 0) {
+                base.node_set_ia((sd_e as u64), 2);   // 2 = extend 追加
+                base.node_at(sd_e, sni_e);
+                if (is_export) { base.node_set_bc((sd_e as u64), true); }   // S4 §0.14.7 SoA
+                // REQ-EXT-1：登记 extend 意图（组名 + 扩展者单元名），供 emit_deps 输出 extend 边。
+                append(lex.g_extend_name, base.node_sa((sd_e as u64)));
+                append(lex.g_extend_file, base.base_no_tc(base.node_file((sd_e as u64))));
+            }
+            return sd_e;
+        }
         if (lex.cur_t() != "KwFunc") {
             parse_fatal_at("T-PAR-E102", "expected 'fn' after 'extend overload'", lex.pos);
         }
@@ -2908,25 +2959,34 @@ pub fn parse_declaration() i64 {
     // `extern` 在词法上仍是普通标识符（非保留关键字，与 `packed` 同构），仅在声明头、紧跟
     // `struct` 前被识别为布局修饰；其余语境（含 `#extern` 注解）仍是普通标识符。peek 守卫
     // 确保只对 `extern struct X` 生效，避免误吞 `extern` 作为普通标识符的用法。
-    if (lex.cur_t() == "Identifier" && lex.cur_v() == "extern" && lex.peek_t(1) == "KwStruct") {
+    if (lex.cur_t() == "Identifier" && lex.cur_v() == "extern") {
         var xkw_i: i64 = lex.pos;   // 指向 `extern` token（用于错误定位）
         lex.advance_i();   // 吃掉 `extern`
-        lex.advance_i();   // 吃掉 `struct`（peek 已确认）
-        var layout_x: string = "extern";
-        if (lex.cur_t() != "Identifier") {
-            parse_fatal("expected struct name after 'struct' in extern struct declaration");
+        if (lex.cur_t() == "KwStruct") {
+            lex.advance_i();   // 吃掉 `struct`
+            var layout_x: string = "extern";
+            if (lex.cur_t() != "Identifier") {
+                parse_fatal("expected struct name after 'struct' in extern struct declaration");
+            }
+            var sni_x: i64 = lex.advance_i();
+            var sname_x: string = lex.tk_v(sni_x);
+            lex.g_agent_anchor = sni_x;
+            lex.g_struct_exported = is_export;
+            base.validate_decl_name(sname_x, sni_x);
+            var sd_x: i64 = parse_struct_decl(sname_x, anns, layout_x);
+            if (sd_x >= 0) {
+                base.node_at(sd_x, sni_x);
+                if (is_export) { base.node_set_bc((sd_x as u64), true); }   // S4 §0.14.7 SoA
+            }
+            return sd_x;
         }
-        var sni_x: i64 = lex.advance_i();
-        var sname_x: string = lex.tk_v(sni_x);
-        lex.g_agent_anchor = sni_x;
-        lex.g_struct_exported = is_export;
-        base.validate_decl_name(sname_x, sni_x);
-        var sd_x: i64 = parse_struct_decl(sname_x, anns, layout_x);
-        if (sd_x >= 0) {
-            base.node_at(sd_x, sni_x);
-            if (is_export) { base.node_set_bc((sd_x as u64), true); }   // S4 §0.14.7 SoA
+        // D9：`extern` 与 `overload` 互斥（extern 专用于 C 兼容、布局须稳定，不支持 overload/extend）。
+        if (lex.cur_v() == "overload") {
+            parse_fatal_at("T-PAR-E102",
+                "'extern' and 'overload' are mutually exclusive (extern does not support overload/extend)",
+                xkw_i);
         }
-        return sd_x;
+        parse_fatal_at("T-PAR-E102", "expected 'struct' after 'extern'", xkw_i);
     }
 
     if (lex.cur_t() == "KwStruct") {
@@ -5165,6 +5225,11 @@ pub fn parse_struct_decl(name: string, anns: i64, layout: string) i64 {
             var __it: i64 = parse_sfield();
             r_sfield_t = base.list_push(r_sfield, r_sfield_t, __it);
             if (r_sfield < 0) { r_sfield = r_sfield_t; }
+        } else if (lex.cur_t() == "Identifier" && lex.cur_v() == "_" && lex.peek_t(1) == "Semicolon") {
+            // 扩展锚点 `_`：`overload struct` 的尾部占位标记（struct-modifiers 设计 §2.1），
+            // 纯语法、不生成字段；extend overload 追加字段接在其后（合并期处理）。
+            lex.advance_i();   // 吃掉 `_`
+            if (lex.cur_t() == "Semicolon") { lex.advance_i(); }
         } else {
             // 位置字段元组语法：`struct T { T1, T2, ... }` —— 字段自动命名 `_0`/`_1`/...。
             // 任意「类型起始 token」（标识符类型、类型关键字 string/void/map/unit、
