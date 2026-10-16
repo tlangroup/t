@@ -2909,10 +2909,14 @@ pub fn parse_declaration() i64 {
         if (lex.cur_t() == "Hash") {
             lex.advance_i();
             var li: i64 = lex.advance_i();
-            if (lex.tk_t(li) == "Identifier") {
+            // 布局注解值：`soa`/`aos` 是普通标识符；`auto`/`extern` 是保留关键字（KwAuto/KwExtern），
+            // 其 token 类型是关键字而非 Identifier，故此处置或条件放行，否则 #auto/#extern 会被跳过。
+            if (lex.tk_t(li) == "Identifier" || lex.tk_t(li) == "KwAuto" || lex.tk_t(li) == "KwExtern") {
                 var lv: string = lex.tk_v(li);
                 if (lv == "soa") { layout = "soa"; }
                 else if (lv == "aos") { layout = "aos"; }
+                else if (lv == "auto") { layout = "auto"; }      // §6.4：优化重排布局（sema 重排 node_lb）
+                else if (lv == "extern") { layout = "extern"; }  // §6.4：C-ABI 声明序（与 default 同语义，显式标注）
             }
         }
         if (lex.cur_t() != "Identifier") {
@@ -3583,6 +3587,14 @@ pub fn desugar_func_clauses() void {
     while (k < n) {
         var ek: i64 = lex.decl_list[k];
         if (base.node_kind((ek as u64)) == "FuncDecl" && base.node_ia((ek as u64)) == 2) {
+            // REQ-EXT-1：登记 extend 意图（组名 + 扩展者单元名）。必须在此处、即子句合并
+            // 【之前】登记：随后 fc_merge 会把首个子句节点整体替换（slice_set），ia==2 标记
+            // 随即丢失，事后扫 decl_list 找不到（实测踩坑）。
+            // 「被扩展者归属」刻意不在此解析：模块加载发生在 desugar_imports（order 4），
+            // 晚于本 pass（order 1），此刻对方模块的组尚未进 decl_list（故跨模块 extend 仍报
+            // T-OVL-E980）。归属留到 emit_deps（模块已加载完、且其组 decl 的 ia 仍为 1）再解析。
+            append(lex.g_extend_name, base.node_sa((ek as u64)));
+            append(lex.g_extend_file, base.base_no_tc(base.node_file((ek as u64))));
             var found: bool = false;
             var m: i64 = 0;
             while (m < n) {
@@ -4520,7 +4532,7 @@ pub fn parse_primary() i64 {
     if (t == "At" && lex.peek_t(1) == "KwImport") {
         return parse_import_expr();
     }
-    if (t == "At" && lex.peek_t(1) == "Identifier") {
+    if (t == "At" && (lex.peek_t(1) == "Identifier" || lex.peek_t(1) == "KwStruct" || lex.peek_t(1) == "KwEnum" || lex.peek_t(1) == "KwFunc" || lex.peek_t(1) == "KwVariant" || lex.peek_t(1) == "KwAs")) {
         return parse_meta_builtin();
     }
     // comptime 表达式前缀：编译期求值（CTFE 在后续阶段落地）；
@@ -5352,7 +5364,18 @@ pub fn n_line(ni: i64) i64 {
 
 pub fn parse_meta_builtin() i64 {
     var ti_at: i64 = lex.advance_i();               // '@'
-    var nm: string = expect_tok("Identifier");
+    // P2b：允许 @struct / @enum / @fn 这些关键字作为内建名（否则关键字 token 被 Identifier 期望拒绝）。
+    // token 值即关键字文本（"struct" / "enum" / "fn"），与 mbuiltin 节点的 sa 对齐。
+    var nm: string = "";
+    if (lex.cur_t() == "Identifier") {
+        nm = expect_tok("Identifier");
+    } else if (lex.cur_t() == "KwStruct" || lex.cur_t() == "KwEnum" || lex.cur_t() == "KwFunc" || lex.cur_t() == "KwVariant"
+            || lex.cur_t() == "KwAs") {
+        nm = lex.tk_v(lex.advance_i());
+    } else {
+        parse_fatal(base.sb_cat2("语法错误：@ 后须接内建名，实际读到 ", lex.cur_v()));
+        return -1;
+    }
     expect_tok("LParen");
     var head: i64 = -1;
     var tail: i64 = -1;
@@ -5404,11 +5427,22 @@ pub fn parse_meta_builtin() i64 {
 
 // 该形参位收类型还是表达式 —— 解析期就必须定死（`[1024]u8` 不是合法表达式）
 pub fn mb_arg_is_type(name: string, idx: i64) bool {
-    if (name == "type_name" || name == "type_size" || name == "zeroed") { return idx == 0; }
+    // 对齐 Zig 的 @sizeOf / @alignOf / @bitSizeOf（P0 只读内省）。
+    // @size_of 与既有 @type_size 同义；@align_of / @bit_size_of 为新增。三者第 0 形参均收类型。
+    if (name == "type_name" || name == "type_size" || name == "size_of" || name == "align_of" || name == "bit_size_of" || name == "zeroed" || name == "has_field" || name == "offset_of") { return idx == 0; }
     if (name == "type_equal") { return idx < 2; }
     // `@simd_lanes(T)`：第 0 个形参是**类型**（i64 等），不是表达式
     if (name == "simd_lanes") { return idx == 0; }
     // `@type_info(T)`：第 0 个形参是**类型**，不是表达式（与 type_info 类型位内建同构）
     if (name == "type_info") { return idx == 0; }
+    // P2b 类型构造元函数：@pointer / @enum / @fn 第 0 形参是类型，其余按表达式解析。
+    if (name == "pointer" || name == "enum" || name == "fn") { return idx == 0; }
+    // @variant(backing, names, types)：第 0 形参 backing（判别子类型）是类型，names/types 按表达式解析。
+    if (name == "variant") { return idx == 0; }
+    // P3：@as(T, v) / @bit_cast(T, v) 第 0 形参是目标类型，第 1 形参按表达式解析。
+    if (name == "as" || name == "bit_cast") { return idx == 0; }
+    // P4b：@field_parent_ptr(Parent, child_ptr, "field") 第 0 形参是容器类型，其余按表达式解析。
+    if (name == "field_parent_ptr") { return idx == 0; }
+    // @int / @tuple / @struct / @enum_literal：全部实参按表达式解析（类型以类型值传入）。
     return false;
 }
