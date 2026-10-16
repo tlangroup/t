@@ -1,0 +1,110 @@
+// struct-modifiers 综合示例（Task #6 搬运自 docs/design/struct-modifiers/EXAMPLES.tc）
+// 覆盖三个维度：
+//   ① 布局：用户可见关键字仅 packed / extern；不写 = 默认布局（内部标签 auto）
+//   ② 约束：concept —— 编译期约束、结构化满足、不可实例化
+//   ③ 修饰词：#<id> 须先经 `#modifier <id>` 注册，编译器仅登记不解释语义
+// 由 run_examples 做 LLVM / C 双后端 golden 比对（.expected.txt）。
+
+// ── ① 布局维度 ──────────────────────────────────────────────
+
+// 默认布局（不写任何修饰）：声明序即内存序，内部标签 "auto"。
+struct Vec3 {
+    x: f64;
+    y: f64;
+    z: f64;
+}
+
+// packed：位域顺序打包；`_:u2` 占位字段保留 2 位（统一字段语法 name:Type，名字写 `_`）。
+packed struct Perm {
+    readable: u1;
+    _:u2;                // 占位字段：保留 2 位，不可按名访问
+    writable: u1;
+    level:    u4;
+    owner_id: u8;
+}
+
+// extern：严格标准 C 规范（声明序 = 内存序、标准 C 对齐/填充，C FFI 兼容），仍有字段体、可实例化。
+extern struct CStat {
+    dev:  i32;
+    ino:  u64;
+    size: i64;
+}
+
+// ── ② 约束维度（concept）────────────────────────────────────
+
+// concept 仅作编译期边界：无 vtable、无运行时值、无动态派发。
+concept HasName {
+    fn name(self) string;     // 方法约束（无函数体）
+    age: i64;                 // 字段约束（无初值）
+}
+
+// 结构化满足：Person / Robot 各自拥有 name 方法 + age 字段即可，无需 impl 声明。
+// 注：方法接收者须显式标注类型（`self: Person`），否则子句组无法推断参数类型。
+struct Person {
+    name_val: string;
+    age:      i64;
+    fn name(self: Person) string { return self.name_val; }
+}
+
+struct Robot {
+    serial: string;
+    age:    i64;
+    fn name(self: Robot) string { return self.serial; }
+}
+
+// 泛型边界：类型参数前置 `T:HasName`，其后值参数 x: T 引用之。
+fn greet(T:HasName, x: T) string {
+    return "hi " + x.name() + " age=" + int_to_str(x.age);
+}
+
+// ── ③ 自定义修饰词（#id）────────────────────────────────────
+
+// 注册后才可应用；未注册的 id 会报 T-ANN-E453。
+#modifier serde
+
+#serde struct Config {
+    host: string;
+    port: u16;
+}
+
+// 断言 helper：把布尔判定转成可直接打印的结果串（避免依赖 bool→i64 转换语义）。
+fn b2s(ok: bool) string {
+    if (ok) { return "1"; }
+    return "0";
+}
+
+@main fn main() i32 {
+    var bad: i64 = 0;
+
+    // ① 布局
+    var v: Vec3 = Vec3 { x: 1.0, y: 2.0, z: 3.0 };
+    var layout_ok: bool = (v.x == 1.0) && (v.y == 2.0) && (v.z == 3.0);
+    println("vec3 ok=" + b2s(layout_ok));
+    if (layout_ok == false) { bad = bad + 1; }
+
+    var c: CStat = CStat { dev: 1, ino: 2, size: 3 };
+    var cstat_ok: bool = (c.dev == 1) && (c.ino == 2) && (c.size == 3);
+    println("cstat ok=" + b2s(cstat_ok));
+    if (cstat_ok == false) { bad = bad + 1; }
+
+    var pm: Perm = Perm { readable: 1, writable: 1, level: 5, owner_id: 200 };
+    var perm_ok: bool = (pm.readable as i64) == 1 && (pm.writable as i64) == 1
+                     && (pm.level as i64) == 5 && (pm.owner_id as i64) == 200;
+    println("perm ok=" + b2s(perm_ok));
+    if (perm_ok == false) { bad = bad + 1; }
+
+    // ② concept 结构化满足
+    var p: Person = Person { name_val: "alice", age: 30 };
+    var r: Robot  = Robot  { serial: "R2", age: 2 };
+    println(greet(p));
+    println(greet(r));
+    if (greet(p) != "hi alice age=30") { bad = bad + 1; }
+    if (greet(r) != "hi R2 age=2")     { bad = bad + 1; }
+
+    // ③ #id 修饰的 struct 语义不变（编译器只登记"被 serde 修饰"）
+    var cfg: Config = Config { host: "localhost", port: 8080 };
+    println("cfg port=" + int_to_str(cfg.port as i64));
+    if (cfg.host != "localhost" || (cfg.port as i64) != 8080) { bad = bad + 1; }
+
+    return bad;
+}

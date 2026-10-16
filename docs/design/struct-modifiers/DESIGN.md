@@ -146,7 +146,12 @@ struct Config { ... }
 
 ## 7. 示例与测试代码评审（设计审查件）
 
-> 以下文件为**设计审查件（aspirational）**：当前 t 编译器尚未实现 `concept` / `overload struct` / `extend overload struct` / `extern` 关键字 / `#id` 注册表，故示例暂不可被现有编译器接受。实现完成后将搬入 `examples/` 并补 `.expected.txt` 接入 `run_examples`，测试矩阵转为 `tests/` 用例。
+> 以下文件为**设计审查件（aspirational）**：写于实现之前，供 owner 审查理解，语法细节未必与实现完全对齐。
+> **2026-10-17 Task #6 已完成搬运**（design 目录下的原件作为审查记录保留）：
+> - `EXAMPLES.tc` → `examples/struct_modifiers.tc`（+ `.expected.txt`，接入 `run_examples` 双后端 golden 比对）
+> - `EXAMPLES_extend_a.tc` / `_b.tc` → `examples/struct_extend_a.tc` + `examples/cross/struct_extend_b.tc`（跨文件对，跑法见 `_a` 头部注释）；其等价单文件版 `examples/struct_modifiers_extend.tc`（+ golden）承担运行时验证
+> - `TESTS.md` 矩阵 T1–T14 → `tests/conformance/{pass,fail}/` 用例（缺的 T1b/T4/T9 于本轮补齐，见 §8 偏离记录）
+> 搬入时的文法适配（接收者须显式标注类型、`#serde` 须先 `#modifier` 注册等）记录在 §8。
 
 - **`EXAMPLES.tc`** —— 单文件 happy-path：布局（默认[内部标签 auto]/packed+占位`_:uN`/extern）+ `concept`（约束/泛型边界/不可实例化）+ `#id`（已注册）。
 - **`EXAMPLES_extend_a.tc` / `EXAMPLES_extend_b.tc`** —— `overload struct` + `extend overload struct` 跨文件同单元合并（镜像 `examples/cross/overload_cross_a.tc`/`_b.tc`）。
@@ -188,3 +193,7 @@ struct Config { ... }
 | 约束维度（2026-10-17，Task #5） | 旧 `#extern` 由「静默忽略（走默认布局）」改为**报错 + 迁移提示**（`T-ANN-E454`）；未知 id 由「静默忽略」改为**强制报错**（`T-ANN-E453`）。 | 设计 T12 / T14 明确要求非静默忽略；此前 `parse.tc` 两处 `#` 分支只认 `soa`/`aos`、其余一律吞掉（实测 `struct #frobnicate` 与 `struct #extern` 均为 errors=0）。 | 已实施；`f_modifier_unregistered.tc`（E453）/ `f_modifier_extern_obsolete.tc`（E454）验证。 |
 | 约束维度（2026-10-17，Task #5） | 注册表落点：新增 `lex.g_modifier_names`（动态 `[]string`）+ `modifier_known` / `modifier_register`；内建 `soa`/`aos` **隐式预注册**（不入表，避免依赖全局初始化时机）；`#modifier <id>` 为独立指令，不产生声明（`parse_declaration` 返回 -1，由调用方 `if (d >= 0)` 跳过）。 | 设计 §2.2 要求「修饰词注册表 + 语义钩子」；D7「不预新增侧表」指不新增**节点**侧表，注册表本身是设计明确要求。 | 已实施（src/lex.tc 注册表 + src/parse.tc `#modifier` 分支）。 |
 | 约束维度（2026-10-17，Task #5） | IR 基线漂移 **5 条**（非惯常 3 条）：除 `src/tc.tc::{c,h,ll}`（编译器源码变更致自身发射漂移）外，`examples/import_module_type.tc::{c,ll}` 亦变。 | 该示例 `@import("src.base")`，而新增两个诊断码使 `base.tc` 的 `g_dcode` 由 165 增至 167 ⇒ 该常量表随 base 模块进入其发射产物。已实证：其 `.ll` 含 `T-ANN-E453`，而不导入 base 的 `hello.tc` 为 0 次 ⇒ 纯常量表增长，非语义回归。 | 已重录基线（`--update`）；漂移合法。 |
+| 全维度（2026-10-17，Task #6） | 三个设计审查件（`EXAMPLES.tc` / `EXAMPLES_extend_a.tc` / `_b.tc`）搬入 `examples/` **时不作原样复制**：① `EXAMPLES.tc` 的 `#serde` 未注册即使用（Task #5 后未知 id 强制报错 `T-ANN-E453`），故补 `#modifier serde` 前置注册；② struct 方法的接收者须显式标注类型（`fn name(self: Person)`），裸 `self` 会让子句组参数类型无法推断，报 `T-FUN-E812` + `T-CON-E101`（与已通过的 `p41_generic_concept_ok.tc` 写法对齐）。 | 审查件写于实现前，属 aspirational；搬入后必须可被现有编译器接受并进入 golden 比对。两处均为使示例成立的最小文法适配，不改变任何设计语义（`serde` 仍先注册后应用；接收者类型标注是 t 既有方法文法要求，非新约束）。 | 已适配并验证：`examples/struct_modifiers.tc` check errors=0，双后端 golden PASS。 |
+| 全维度（2026-10-17，Task #6） | 跨文件 `extend overload struct` 对的文件落点照搬既有 `overload_cross_*` 惯例：`_a`（含 `overload struct` 组 + `@main`）置于 `examples/` 根，`_b`（`extend` 片段）置于 `examples/cross/`。 | `ir_snapshot` / `run_examples` 只扫 `examples/` 顶层：`_a` 在根可获得 IR 快照覆盖（且单独编译 errors=0，可作独立目标）；`_b` 在子目录可避免被单文件扫描误当独立目标（`_b` 单独编译必然报 `T-OVL-E980`，属 T7 预期行为）。 | 已落 `examples/struct_extend_a.tc` + `examples/cross/struct_extend_b.tc`；单跑 / 合并跑均 exit=0。 |
+| 全维度（2026-10-17，Task #6） | 跨文件 `_a` 的 `@main` **不引用** `_b` 追加的字段/方法，只打印 base 部分；extend 的运行时验证改由单文件 golden 示例 `examples/struct_modifiers_extend.tc` 承担。 | 函数 overload 的 miss 由兜底臂优雅降级（既有 `overload_cross_a.tc` 单跑时 `classify(-1)` 落 default 臂、exit 0），但 struct **字段**缺员无法降级 —— 若 `_a` 引用 `e.tag`，单独编译即 `T-SEM-E2xx`，会破坏其作为 IR 快照目标的合法性。 | 已实施；golden 示例已断言 `e.tag` / `e.describe()` 可用，双后端比对通过。 |
+| 全维度（2026-10-17，Task #6） | 测试矩阵 T1b / T4 / T9 补齐为 conformance fail 用例，期望码取**实现实际发出的码**，而非设计占位：T1b `auto struct`→`T-PAR-E101`、`default struct`→`T-PAR-E102`；T4 `packed extern` / `extern packed`→`T-PAR-E102`；T9 concept 不满足→`T-CON-E101`。 | 三处的互斥/非关键字约束已在 parse 层由「期待 `struct` 而不得」自然报错，行为符合 T1b/T4/T9 的「必须编译失败」判据；为此新增专用诊断码属无收益改动（且不触及设计裁定）。 | 已补 `f_layout_auto_kw` / `f_layout_default_kw` / `f_layout_packed_extern` / `f_layout_extern_packed` / `f_concept_not_satisfied`；每个均 exit=1 且期望码精确命中。 |
