@@ -1855,6 +1855,13 @@ pub fn meta_param_is_type(p: i64) bool {
     if (base.node_na((p as u64)) < 0) { return true; }          // 无标注：保守当类型参数
     if (base.node_kind((base.node_na((p as u64)) as u64)) == "any") { return true; }
     if (base.node_kind((base.node_na((p as u64)) as u64)) == "type") { return true; }
+    // 概念约束形参（T:HasName）：na 是 named{concept} —— 视作类型参数。
+    // 符号表在单态化（调用点）时已就绪，可直接查 concept 身份。
+    if (base.node_kind((base.node_na((p as u64)) as u64)) == "named") {
+        var rn: string = base.node_sa((base.node_na((p as u64)) as u64));
+        var rsi: i64 = sym_lookup(global_scope, rn);
+        if (rsi >= 0 && syms[rsi].kind == "concept") { return true; }
+    }
     return false;
 }
 
@@ -2296,6 +2303,337 @@ pub fn instantiate_generic(tmpl: i64, e: i64) i64 {
         check_func_decl(inst);
     }
     return inst;
+}
+
+// ══════════════════════════════════════════════════════════════
+// #4b 泛型函数语法：`fn f(T:HasName, x: T)` / `fn f(T, x: T)`
+// 隐式类型参数（调用点不传类型实参，按值实参类型推断 T）+ 结构化满足检查。
+// 复用既有 instantiate_generic（comptime 单态化）后端：把隐式类型参数
+// 归一为「前置的 comptime 形参」（bb=true, bc=true 标记），并在调用点
+// 推断出 T 后前置注入为 comptime 实参，其余逻辑不变。
+// ══════════════════════════════════════════════════════════════
+var g_generic_resolved: []i64;   // 已归一化的泛型 FuncDecl id（防重入）
+// 类型参数 → 约束 concept 名（并行数组，按参数节点 id 索引）。na 已被置 type 占位，
+// 约束不能放 nb/nc（parse.pp_is_pattern 查 nb/nc，会把类型参数误判为模式参数 → 触发
+// 子句组合并 / T-MAT-E742），故用侧表。
+var g_gpc_pid: []i64;
+var g_gpc_name: []string;
+
+// 查类型参数 pid 的约束 concept 名（无约束返回 ""）
+pub fn generic_param_constraint(pid: i64) string {
+    var i: i64 = 0;
+    while (i < slice_len(g_gpc_pid) as i64) {
+        if (g_gpc_pid[i] == pid) { return g_gpc_name[i]; }
+        i = i + 1;
+    }
+    return "";
+}
+
+// 类型节点是否引用名为 name 的类型参数（递归 descend na/nb/nc/nd）
+pub fn generic_tn_refs_name(tn: i64, name: string) bool {
+    if (tn < 0) { return false; }
+    var k: string = base.node_kind((tn as u64));
+    if (k == "named" && base.node_sa((tn as u64)) == name) { return true; }
+    if (generic_tn_refs_name(base.node_na((tn as u64)), name)) { return true; }
+    if (generic_tn_refs_name(base.node_nb((tn as u64)), name)) { return true; }
+    if (generic_tn_refs_name(base.node_nc((tn as u64)), name)) { return true; }
+    if (generic_tn_refs_name(base.node_nd((tn as u64)), name)) { return true; }
+    return false;
+}
+
+// 名字是否为 concept：use_scope=true 走全局符号表（脱糖后，符号已注册），
+// 否则扫描同模块 decl_list（StructDecl && node_sb=="concept"）——脱糖期符号表尚未就绪。
+pub fn is_concept_name(name: string, use_scope: bool) bool {
+    if (use_scope) {
+        var si: i64 = sym_lookup(global_scope, name);
+        if (si >= 0 && syms[si].kind == "concept") { return true; }
+        return false;
+    }
+    var n: i64 = slice_len(lex.decl_list) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        var d: i64 = lex.decl_list[i];
+        if (base.node_kind((d as u64)) == "StructDecl" && base.node_sb((d as u64)) == "concept"
+                && base.node_sa((d as u64)) == name) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// 收集函数签名里「被当成类型引用」的名字集合（各形参类型节点 + 返回类型节点中的
+// named 名字）：用于判定裸标识符形参是否「被当作类型使用」→ 隐式（无约束）类型参数。
+pub fn generic_signature_type_names(d: i64) []string {
+    var out: []string;
+    var ks: []i64 = base.kids_chain(base.node_lb((d as u64)));
+    var ki: i64 = 0;
+    while (ki < slice_len(ks) as i64) {
+        var pv: i64 = ks[ki];
+        var pna: i64 = base.node_na((pv as u64));
+        if (pna >= 0 && base.node_kind((pna as u64)) == "named") {
+            append(out, base.node_sa((pna as u64)));
+        }
+        ki = ki + 1;
+    }
+    var rna: i64 = base.node_na((d as u64));
+    if (rna >= 0 && base.node_kind((rna as u64)) == "named") {
+        append(out, base.node_sa((rna as u64)));
+    }
+    return out;
+}
+
+// 一次性归一化：把隐式类型参数标记为 comptime 形参（bb=true, bc=true）并排到最前；
+// 裸标识符补 na=type 节点（避免被当作模式参数触发子句组合并 / func_clauses 误判）。
+// use_scope：是否可走全局符号表判 concept（脱糖期 false，脱糖后 true）。
+// ⚠ 须在 desugar_func_clauses（子句组合并）之前跑——裸标识符一旦被当作模式参数即报
+// T-FUN-E812；也须在 check_decl 之前跑——泛型模板体须被 func_is_generic 跳过。
+pub fn generic_normalize_func(d: i64, use_scope: bool) void {
+    if (base.node_kind((d as u64)) != "FuncDecl") { return; }
+    var ri: i64 = 0;
+    while (ri < slice_len(g_generic_resolved) as i64) {
+        if (g_generic_resolved[ri] == d) { return; }
+        ri = ri + 1;
+    }
+    append(g_generic_resolved, d);
+    var tnames: []string = generic_signature_type_names(d);
+    var tps: []i64;   // 隐式类型参数（裸 / concept-约束两类）
+    var rest: []i64;  // 其余形参（保留原顺序）
+    var ks: []i64 = base.kids_chain(base.node_lb((d as u64)));
+    var ki: i64 = 0;
+    while (ki < slice_len(ks) as i64) {
+        var pv: i64 = ks[ki];
+        var is_tp: bool = false;
+        if (base.node_bb((pv as u64)) == true) {
+            append(rest, pv);   // 显式 comptime 形参：保留原语义，置后
+            ki = ki + 1;
+            continue;
+        }
+        if (base.node_na((pv as u64)) < 0) {
+            // 裸标识符：仅当「名字被当成类型使用」才算隐式类型参数
+            var nm: string = base.node_sa((pv as u64));
+            var ti2: i64 = 0;
+            while (ti2 < slice_len(tnames) as i64) {
+                if (tnames[ti2] == nm) { is_tp = true; }
+                ti2 = ti2 + 1;
+            }
+        } else if (base.node_kind((base.node_na((pv as u64)) as u64)) == "named") {
+            // RHS 为 concept 名 → 隐式「受约束类型参数」。约束名存侧表 g_gpc_*
+            // （不能用 nb/nc：pp_is_pattern 查 nb/nc 会把类型参数误判为模式参数 →
+            // 触发子句组合并 / T-MAT-E742）；na 置 type 占位，避免 resolve_ti 把
+            // concept 当值类型实例化 → T-CON-E100。
+            var rn: string = base.node_sa((base.node_na((pv as u64)) as u64));
+            if (is_concept_name(rn, use_scope)) {
+                base.node_set_na((pv as u64), base.node_new("type"));
+                append(g_gpc_pid, pv);
+                append(g_gpc_name, rn);
+                is_tp = true;
+            }
+        }
+        if (is_tp) {
+            base.node_set_bb((pv as u64), true);
+            base.node_set_bc((pv as u64), true);
+            if (base.node_na((pv as u64)) < 0) { base.node_set_na((pv as u64), base.node_new("type")); }
+            append(tps, pv);
+        } else {
+            append(rest, pv);
+        }
+        ki = ki + 1;
+    }
+    if (slice_len(tps) as i64 == 0) { return; }
+    // 重排：类型参数排到最前（instantiate_generic 按位置取前 k 个 comptime 形参）
+    var nh: i64 = -1;
+    var nt: i64 = -1;
+    var mi: i64 = 0;
+    while (mi < slice_len(tps) as i64) {
+        nt = base.list_push(nh, nt, tps[mi]);
+        if (nh < 0) { nh = nt; }
+        mi = mi + 1;
+    }
+    mi = 0;
+    while (mi < slice_len(rest) as i64) {
+        nt = base.list_push(nh, nt, rest[mi]);
+        if (nh < 0) { nh = nt; }
+        mi = mi + 1;
+    }
+    base.node_set_lb((d as u64), nh);
+}
+
+// 全模块归一化（脱糖 pass：func_clauses 之前跑，防止裸标识符被当作模式参数）
+pub fn generic_normalize_all() void {
+    var n: i64 = slice_len(lex.decl_list) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        generic_normalize_func(lex.decl_list[i], false);
+        i = i + 1;
+    }
+}
+
+// 概念 cname 对类型 ati 的结构化满足检查（字段 + 方法 + 返回类型）；不满足则报错返回 false。
+pub fn concept_satisfied(cname: string, ati: i64, loc: i64) bool {
+    var si: i64 = sym_lookup(global_scope, cname);
+    if (si < 0) { return false; }
+    var cd: i64 = syms[si].decl;
+    if (cd < 0) { return false; }
+    if (is_user_named_kind(tip_kind(ati)) == false) {
+        parse.fc_err("T-CON-E101",
+            base.sb_cat6("类型 `", ti_str(ati), "` 不满足概念 `", cname, "`：不是具名类型", ""), loc);
+        return false;
+    }
+    var tname: string = tip_name(ati);
+    var tsi: i64 = sym_lookup(global_scope, tname);
+    var tsd: i64 = -1;
+    if (tsi >= 0) { tsd = syms[tsi].decl; }
+    // 字段约束：概念 node.lb（字段链）
+    var cfs: []i64 = base.kids_chain(base.node_lb((cd as u64)));
+    var cfi: i64 = 0;
+    while (cfi < slice_len(cfs) as i64) {
+        var cfv: i64 = cfs[cfi];
+        var fnm: string = base.node_sa((cfv as u64));
+        var cft: i64 = resolve_ti(base.node_na((cfv as u64)));
+        var found: bool = false;
+        if (tsd >= 0) {
+            var tfs: []i64 = base.kids_chain(base.node_lb((tsd as u64)));
+            var tfi: i64 = 0;
+            while (tfi < slice_len(tfs) as i64) {
+                var tfv: i64 = tfs[tfi];
+                if (base.node_sa((tfv as u64)) == fnm) {
+                    var tft: i64 = resolve_ti(base.node_na((tfv as u64)));
+                    if (ti_equal(cft, tft)) { found = true; }
+                    tfi = slice_len(tfs) as i64;
+                }
+                tfi = tfi + 1;
+            }
+        }
+        if (found == false) {
+            parse.fc_err("T-CON-E101",
+                base.sb_cat6("类型 `", tname, "` 不满足概念 `", cname, "`：缺少字段 `", fnm), loc);
+            return false;
+        }
+        cfi = cfi + 1;
+    }
+    // 方法约束：全局表 g_concept_method_names/heads 中属于 cname 的（方法声明链）
+    var mi2: i64 = 0;
+    while (mi2 < slice_len(lex.g_concept_method_names) as i64) {
+        if (lex.g_concept_method_names[mi2] == cname) {
+            var ms: []i64 = base.kids_chain(lex.g_concept_method_heads[mi2]);
+            var msi: i64 = 0;
+            while (msi < slice_len(ms) as i64) {
+                var mv: i64 = ms[msi];
+                // 概念方法名已按 concept 名 mangle（如 has_name_name）；概念方法约束在
+                // parse 期用逻辑名（name），故 mnm 已是逻辑方法名。实现结构体方法按
+                // pascal_to_snake(tname) 前缀拼回（person_name），才能与符号表对齐。
+                var mnm: string = base.node_sa((mv as u64));
+                var full: string = base.sb_cat3(parse.pascal_to_snake(tname), "_", mnm);
+                var msi2: i64 = sym_lookup(global_scope, full);
+                if (msi2 < 0) {
+                    parse.fc_err("T-CON-E101",
+                        base.sb_cat6("类型 `", tname, "` 不满足概念 `", cname, "`：缺少方法 `", mnm), loc);
+                    return false;
+                }
+                // 返回类型一致性（精确签名匹配为后续增强）
+                var mdecl: i64 = syms[msi2].decl;
+                if (mdecl >= 0) {
+                    var cret: i64 = resolve_ti(base.node_na((mv as u64)));
+                    var mret: i64 = resolve_ti(base.node_na((mdecl as u64)));
+                    if (ti_equal(cret, mret) == false) {
+                        parse.fc_err("T-CON-E101",
+                            base.sb_cat8("类型 `", tname, "` 不满足概念 `", cname,
+                                "`：方法 `", mnm, "` 返回类型不匹配", ""), loc);
+                        return false;
+                    }
+                }
+                msi = msi + 1;
+            }
+        }
+        mi2 = mi2 + 1;
+    }
+    return true;
+}
+
+// 调用点：推断出隐式类型参数并前置注入为 comptime 实参；返回 false 表示推断/满足检查失败。
+pub fn generic_prepend_inferred_types(tmpl: i64, e: i64) bool {
+    var ks: []i64 = base.kids_chain(base.node_lb((tmpl as u64)));
+    // 隐式类型参数（bb && bc，按形参表顺序）
+    var tps: []i64;
+    var vps: []i64;
+    var ki: i64 = 0;
+    while (ki < slice_len(ks) as i64) {
+        var pv: i64 = ks[ki];
+        if (base.node_bb((pv as u64)) == true && base.node_bc((pv as u64)) == true) {
+            append(tps, pv);
+        } else if (base.node_bb((pv as u64)) == false) {
+            append(vps, pv);
+        }
+        ki = ki + 1;
+    }
+    var n: i64 = slice_len(tps) as i64;
+    if (n == 0) { return true; }   // 无隐式类型参数（纯显式 comptime）：不注入
+    var num_value: i64 = slice_len(vps) as i64;
+    var total_args: i64 = 0;
+    var argcnt: i64 = base.node_la((e as u64));
+    while (argcnt >= 0) { total_args = total_args + 1; argcnt = base.kids[argcnt].next; }
+    var inferred: []i64;
+    var ti_idx: i64 = 0;
+    while (ti_idx < n) {
+        var tpn: string = base.node_sa((tps[ti_idx] as u64));
+        var src: i64 = -1;
+        var vpi: i64 = 0;
+        while (vpi < num_value) {
+            var vpv: i64 = vps[vpi];
+            if (base.node_na((vpv as u64)) >= 0 && generic_tn_refs_name(base.node_na((vpv as u64)), tpn)) {
+                src = vpi;
+                vpi = num_value;
+            }
+            vpi = vpi + 1;
+        }
+        if (src < 0) {
+            parse.fc_err("T-CON-E102",
+                base.sb_cat3("无法推断类型参数 `", tpn, "`：没有值形参引用它"), e);
+            return false;
+        }
+        // 值形参 src 对应调用实参（值实参是调用实参的最后 num_value 个）
+        var aidx: i64 = total_args - num_value + src;
+        var argn: i64 = base.node_la((e as u64));
+        var ai: i64 = 0;
+        while (ai < aidx && argn >= 0) {
+            argn = base.kids[argn].next;
+            ai = ai + 1;
+        }
+        if (argn < 0) {
+            parse.fc_err("T-CON-E102",
+                base.sb_cat3("无法推断类型参数 `", tpn, "`：调用实参不足"), e);
+            return false;
+        }
+        var ati: i64 = infer_expr(base.kids[argn].val);
+        // 约束检查：约束存侧表 g_gpc_*（na 已是 type 占位，不能放 nb/nc）
+        var cnm: string = generic_param_constraint(tps[ti_idx]);
+        if (str_len(cnm) > 0) {
+            var csi: i64 = sym_lookup(global_scope, cnm);
+            if (csi >= 0 && syms[csi].kind == "concept") {
+                if (concept_satisfied(cnm, ati, e) == false) { return false; }
+            }
+        }
+        append(inferred, mk_type_node_from_ti(ati));
+        ti_idx = ti_idx + 1;
+    }
+    // 前置注入：新实参链 = inferred ++ 原实参
+    var nh: i64 = -1;
+    var nt: i64 = -1;
+    var ii: i64 = 0;
+    while (ii < n) {
+        nt = base.list_push(nh, nt, inferred[ii]);
+        if (nh < 0) { nh = nt; }
+        ii = ii + 1;
+    }
+    var old: i64 = base.node_la((e as u64));
+    while (old >= 0) {
+        nt = base.list_push(nh, nt, base.kids[old].val);
+        if (nh < 0) { nh = nt; }
+        old = base.kids[old].next;
+    }
+    base.node_set_la((e as u64), nh);
+    return true;
 }
 
 // ── R3 类型组分派（类别格静态分派）──────────────────────────────
@@ -7666,9 +8004,13 @@ pub fn infer_expr_body(e: i64) i64 {
                 if (tip_kind(s2.ti) == "Func") {
                     if (s2.decl >= 0) {
                         if (base.node_kind((s2.decl as u64)) == "FuncDecl") {
-                            // comptime 泛型：调用点按类型实参单态化（func_is_generic 门控，
-                            // 仅对含 comptime 参数的函数触发；普通函数零影响）。
+                            // #4b：先归一化隐式类型参数（标记 bb + 前置重排），使 func_is_generic 门控生效。
+                            // 脱糖期已按 decl_list 扫描跑过一遍（use_scope=false）；此处 use_scope=true 兜底
+                            // 处理跨模块 concept 约束（符号表此刻已就绪），幂等（g_generic_resolved 防重入）。
+                            generic_normalize_func(s2.decl, true);
+                            // comptime / 隐式泛型：调用点按类型实参单态化（func_is_generic 门控）
                             if (func_is_generic(s2.decl) && base.node_bb((e as u64)) == false) {   // S4 §0.14.7 SoA：侧表读
+                                if (generic_prepend_inferred_types(s2.decl, e) == false) { return ti_mk("Unknown"); }
                                 var inst: i64 = instantiate_generic(s2.decl, e);
                                 if (inst >= 0) {
                                     return infer_expr(e);
@@ -15667,7 +16009,8 @@ pub fn desugar_run_range(lo: i64, hi: i64) void {
     while (i < slice_len(g_desugar_passes) as i64) {
         var p: DesugarPass = g_desugar_passes[i];
         if (lo < p.order && p.order <= hi) {
-            if (p.order == 1) { parse__desugar_func_clauses(); }
+            if (p.order == 0) { generic_normalize_all(); }   // #4b：隐式类型参数归一化（须在 func_clauses 之前）
+            else if (p.order == 1) { parse__desugar_func_clauses(); }
             else if (p.order == 2) { parse__desugar_lambdas(); }
             else if (p.order == 3) { lower_array_len_infer(); }
             else if (p.order == 4) { desugar_imports(); }
@@ -15678,6 +16021,7 @@ pub fn desugar_run_range(lo: i64, hi: i64) void {
 // 注册 4 个模块级脱糖 Pass（与 run_check 原硬编码顺序一致）。
 pub fn desugar_init() void {
     g_desugar_passes = [];
+    var p0: DesugarPass; p0.name = "generic_params";  p0.order = 0; p0.raw_impact = 0; register_desugar(p0);
     var p1: DesugarPass; p1.name = "func_clauses";    p1.order = 1; p1.raw_impact = 0; register_desugar(p1);
     var p2: DesugarPass; p2.name = "lambdas";         p2.order = 2; p2.raw_impact = 0; register_desugar(p2);
     var p3: DesugarPass; p3.name = "array_len_infer"; p3.order = 3; p3.raw_impact = 0; register_desugar(p3);
