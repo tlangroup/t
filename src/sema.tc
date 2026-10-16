@@ -14354,6 +14354,21 @@ pub fn mb_struct_align(d: i64, depth: i64) i64 {
 }
 
 pub fn mb_struct_size(d: i64, depth: i64) i64 {
+    // packed struct：位域顺序打包，尺寸 = 容纳总位宽的最小宿主整型（u8/u16/u32/u64）。
+    // 直接由字段位宽求和推导，不依赖 check_packed_layout 的 pk_* 扁平池（避免 meta 折叠期
+    // 与声明检查期之间的遍历序耦合）；packed_field_bits 从字段类型名（uN/iN）读出位宽。
+    if (base.node_sb((d as u64)) == "packed") {
+        var total: i64 = 0;
+        var ks: []i64 = base.kids_chain_idx(base.node_lb((d as u64)));
+        var ki: i64 = 0;
+        while (ki < slice_len(ks) as i64) {
+            var bw: i64 = packed_field_bits(base__kids[ks[ki]].val);
+            if (bw <= 0) { return -1; }
+            total = total + bw;
+            ki = ki + 1;
+        }
+        return mb_scalar_size(packed_host_name(packed_host_bits(total)));
+    }
     var off: i64 = 0;
     var maxa: i64 = 0;
     var c: i64 = base.node_lb((d as u64));
@@ -14423,6 +14438,9 @@ pub fn mb_struct_has_field(sdecl: i64, fname: string) bool {
 // 字段在结构体中的字节偏移；未找到或非结构体返回 -1。
 pub fn mb_struct_field_offset(sdecl: i64, fname: string) i64 {
     if (sdecl < 0 || fname == "") { return -1; }
+    // packed struct：所有字段按位打包进同一个宿主整型，字节偏移统一为 0
+    // （位域访问走 shift/mask，不使用字节偏移）；@offset_of 折成 0 而非报错。
+    if (base.node_sb((sdecl as u64)) == "packed") { return 0; }
     var off: i64 = 0;
     var c: i64 = -1;
     var ks: []i64 = base.kids_chain_idx(base.node_lb((sdecl as u64)));
@@ -14455,7 +14473,10 @@ pub fn mb_struct_layout_pass() void {
     var i: i64 = 0;
     while (i < n) {
         var d: i64 = lex__decl_list[i];
-        if (base.node_kind((d as u64)) == "StructDecl" && base.node_sb((d as u64)) == "auto") {
+        // 默认布局（node_sb=="auto"）不再自动重排：旧 `#auto` 用户重排已废弃（升级为关键字、无重排语义），
+        // 故此处仅对显式 "reorder" 标签生效（当前无产生点，等价于禁用用户结构体自动重排；
+        // synthetic 结构体仍按 mb_make_struct 内的 layout=="auto" 重排，属内部优化，不受影响）。
+        if (base.node_kind((d as u64)) == "StructDecl" && base.node_sb((d as u64)) == "reorder") {
             mb_struct_reorder(d);
         }
         i = i + 1;

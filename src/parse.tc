@@ -1903,7 +1903,7 @@ pub fn lift_one_lambda(lid: i64) void {
         ci = ci + 1;
     }
 
-    var sd: i64 = base.mk_StructDecl(ename, "default", "", false, false, -1, fh, -1);
+    var sd: i64 = base.mk_StructDecl(ename, "auto", "", false, false, -1, fh, -1);
     base.node_set_span_id(sd, base.node_span_id(lid));
     base.node_set_span_id(sd, base.node_span_id(lid));
     base.node_set_span_id(sd, base.node_span_id(lid));
@@ -2186,7 +2186,7 @@ pub fn parse_agent_decl(name: string, anns: i64) i64 {
     var state_name: string = base.sb_cat2(name, "State");
 
     // 1) state struct：复用字段节点（含 @tag / =default），完全继承
-    var sdecl: i64 = base.mk_StructDecl(state_name, "default", "", false, false, anns, field_head, lex.g_agent_anchor);
+    var sdecl: i64 = base.mk_StructDecl(state_name, "auto", "", false, false, anns, field_head, lex.g_agent_anchor);
 
     // 2) spawn 构造器：一参一字段（按声明顺序），body = return State{ f: f, ... }
     var spawn_name: string = base.sb_cat2(pascal_to_snake(name), "_spawn");
@@ -2388,7 +2388,7 @@ pub fn parse_at_import_decl() i64 {
 // parse_type_alias 已由 GEN:parser 区间生成（见下方标记区）
 
 pub fn parse_decl_body(name: string, anns: i64, is_comptime: bool) i64 {
-    var layout: string = "default";
+    var layout: string = "auto";   // 默认布局内部标签（非关键字；不写修饰即默认）
     if (lex.cur_t() == "Hash") {
         lex.advance_i();
         var li: i64 = lex.advance_i();
@@ -2901,22 +2901,48 @@ pub fn parse_declaration() i64 {
         }
         return sd_p;
     }
+
+    // ── `extern` 结构体修饰关键词（C-API 严格 C 规范，关键字领头，镜像 packed）──
+    // C-API 严格 C 规范：声明序 = 内存序、标准 C 对齐/填充、C 兼容；专用于 capi / C FFI；
+    // 不支持 overload/extend（与 OpenMod 互斥，待 overload 落地后由 sema 校验）。
+    // `extern` 在词法上仍是普通标识符（非保留关键字，与 `packed` 同构），仅在声明头、紧跟
+    // `struct` 前被识别为布局修饰；其余语境（含 `#extern` 注解）仍是普通标识符。peek 守卫
+    // 确保只对 `extern struct X` 生效，避免误吞 `extern` 作为普通标识符的用法。
+    if (lex.cur_t() == "Identifier" && lex.cur_v() == "extern" && lex.peek_t(1) == "KwStruct") {
+        var xkw_i: i64 = lex.pos;   // 指向 `extern` token（用于错误定位）
+        lex.advance_i();   // 吃掉 `extern`
+        lex.advance_i();   // 吃掉 `struct`（peek 已确认）
+        var layout_x: string = "extern";
+        if (lex.cur_t() != "Identifier") {
+            parse_fatal("expected struct name after 'struct' in extern struct declaration");
+        }
+        var sni_x: i64 = lex.advance_i();
+        var sname_x: string = lex.tk_v(sni_x);
+        lex.g_agent_anchor = sni_x;
+        lex.g_struct_exported = is_export;
+        base.validate_decl_name(sname_x, sni_x);
+        var sd_x: i64 = parse_struct_decl(sname_x, anns, layout_x);
+        if (sd_x >= 0) {
+            base.node_at(sd_x, sni_x);
+            if (is_export) { base.node_set_bc((sd_x as u64), true); }   // S4 §0.14.7 SoA
+        }
+        return sd_x;
+    }
+
     if (lex.cur_t() == "KwStruct") {
         lex.advance_i();   // 吃掉 `struct`
         // layout 注解 #soa/#aos：name-first 文法在 parse_decl_body 检测；
         // 关键字领头文法里它出现在 struct 之后、名字之前，此处等价检测。
-        var layout: string = "default";
+        var layout: string = "auto";   // 默认布局内部标签（非关键字；不写修饰即默认）
         if (lex.cur_t() == "Hash") {
             lex.advance_i();
             var li: i64 = lex.advance_i();
-            // 布局注解值：`soa`/`aos` 是普通标识符；`auto`/`extern` 是保留关键字（KwAuto/KwExtern），
-            // 其 token 类型是关键字而非 Identifier，故此处置或条件放行，否则 #auto/#extern 会被跳过。
-            if (lex.tk_t(li) == "Identifier" || lex.tk_t(li) == "KwAuto" || lex.tk_t(li) == "KwExtern") {
+            // 布局注解值：`soa`/`aos` 是普通标识符（容器布局轴，与成员布局正交，保留）。
+            // `#auto`/`#extern` 已升级为关键字（默认 / extern），此处不再接受；见到即忽略（走默认布局）。
+            if (lex.tk_t(li) == "Identifier") {
                 var lv: string = lex.tk_v(li);
                 if (lv == "soa") { layout = "soa"; }
                 else if (lv == "aos") { layout = "aos"; }
-                else if (lv == "auto") { layout = "auto"; }      // §6.4：优化重排布局（sema 重排 node_lb）
-                else if (lv == "extern") { layout = "extern"; }  // §6.4：C-ABI 声明序（与 default 同语义，显式标注）
             }
         }
         if (lex.cur_t() != "Identifier") {
