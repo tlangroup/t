@@ -2394,6 +2394,15 @@ pub fn parse_decl_body(name: string, anns: i64, is_comptime: bool) i64 {
         var li: i64 = lex.advance_i();
         if (lex.tk_t(li) == "Identifier") {
             var lv: string = lex.tk_v(li);
+            // `#<id>` 修饰词注册表校验（struct-modifiers 设计 §2.2 CapMod）：
+            // 未知 id 强制报错（T-ANN-E453，非静默忽略）；旧 `#extern` 已由 `extern`
+            // 关键字取代，给迁移提示（T-ANN-E454）。
+            if (lv == "extern") {
+                parse_fatal_at("T-ANN-E454", "modifier '#extern' is obsolete; use the `extern` keyword instead", li);
+            }
+            if (lex.modifier_known(lv) == false) {
+                parse_fatal_at("T-ANN-E453", base.sb_cat3("modifier '#", lv, "' is not registered"), li);
+            }
             if (lv == "soa") {
                 layout = "soa";
             } else {
@@ -2740,6 +2749,38 @@ pub fn parse_declaration() i64 {
     }
     var anns: i64 = parse_annotations();
 
+    // ── `#<id>` 修饰词（struct-modifiers 设计 §2.2 CapMod）：前置写法 ──
+    // 设计 T13 的写法是 `#id struct Name`（修饰词位于类型关键字之前）；实现另支持
+    // 后置 `struct #id Name`（既有文法，保留兼容）。二者共用同一注册表校验。
+    var capmod: string = "";
+    if (lex.cur_t() == "Hash") {
+        var cm_h: i64 = lex.pos;
+        lex.advance_i();   // 吃掉 `#`
+        if (lex.cur_t() != "Identifier") {
+            parse_fatal_at("T-PAR-E101", "expected modifier name after '#'", cm_h);
+        }
+        var cm_i: i64 = lex.advance_i();
+        var cm_id: string = lex.tk_v(cm_i);
+        if (cm_id == "modifier") {
+            // `#modifier <id>`：注册自定义修饰词（设计 §2.2 注册途径之一）。
+            // 纯指令、不产生声明；调用方 `if (d >= 0)` 会跳过本条。
+            if (lex.cur_t() != "Identifier") {
+                parse_fatal_at("T-PAR-E101", "expected modifier name after '#modifier'", cm_i);
+            }
+            var rid_i: i64 = lex.advance_i();
+            lex.modifier_register(lex.tk_v(rid_i));
+            if (lex.cur_t() == "Semicolon") { lex.advance_i(); }
+            return -1;
+        }
+        if (cm_id == "extern") {
+            parse_fatal_at("T-ANN-E454", "modifier '#extern' is obsolete; use the `extern` keyword instead", cm_i);
+        }
+        if (lex.modifier_known(cm_id) == false) {
+            parse_fatal_at("T-ANN-E453", base.sb_cat3("modifier '#", cm_id, "' is not registered"), cm_i);
+        }
+        capmod = cm_id;
+    }
+
     // 模块系统（M-Module）：顶层声明可用 `pub` 修饰，标记对外可见。
     // 旧 `export` 同位置修饰已删除（见 §3.13）；`pub` 与 `export` 曾等价置导出位，现统一仅 `pub`；
     // 真正的可见性判据是「文件 @module(pub) ∧ 声明 pub」，在 sema 侧合取。
@@ -3018,14 +3059,24 @@ pub fn parse_declaration() i64 {
         if (lex.cur_t() == "Hash") {
             lex.advance_i();
             var li: i64 = lex.advance_i();
-            // 布局注解值：`soa`/`aos` 是普通标识符（容器布局轴，与成员布局正交，保留）。
-            // `#auto`/`#extern` 已升级为关键字（默认 / extern），此处不再接受；见到即忽略（走默认布局）。
+            // 布局注解值：`soa`/`aos` 是内建修饰词（容器布局轴，与成员布局正交，D8 保留）。
+            // `#<id>` 统一走修饰词注册表校验（设计 §2.2）：未知 id 报错 T-ANN-E453；
+            // 旧 `#extern` 已由 `extern` 关键字取代，给迁移提示 T-ANN-E454（不再静默忽略）。
             if (lex.tk_t(li) == "Identifier") {
                 var lv: string = lex.tk_v(li);
+                if (lv == "extern") {
+                    parse_fatal_at("T-ANN-E454", "modifier '#extern' is obsolete; use the `extern` keyword instead", li);
+                }
+                if (lex.modifier_known(lv) == false) {
+                    parse_fatal_at("T-ANN-E453", base.sb_cat3("modifier '#", lv, "' is not registered"), li);
+                }
                 if (lv == "soa") { layout = "soa"; }
                 else if (lv == "aos") { layout = "aos"; }
             }
         }
+        // 前置 `#<id>`（设计 T13 写法 `#id struct Name`）：容器布局轴影响 layout。
+        if (capmod == "soa") { layout = "soa"; }
+        else if (capmod == "aos") { layout = "aos"; }
         if (lex.cur_t() != "Identifier") {
             parse_fatal("expected struct name after 'struct' in struct declaration");
         }
