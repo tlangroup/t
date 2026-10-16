@@ -2998,6 +2998,10 @@ pub fn ll_emit_inst(inst: TIRInst) void {
         var src_is_ptr: bool = llname.ll_starts(sgst, "ptr<") || sgst == "ptr" ||
                                 llname.ll_starts(sgst, "arr<") || llname.ll_starts(sgst, "vec<");
         var dstst_eff: string = dstst0;
+        // ⚠ 还原：源为指针、目标为标量时，改写成 `ptr<标量>`（provenance 保持的指针位重解释），
+        //   而非 ptrtoint。原因：t 的 slice/array 指针字段在 LLVM 中声明为 `ptr` 槽，若改成 i64，
+        //   后续 GEP 会误用槽地址当基址 → 读错字节（fstring_json/mini/pipeline_demo 等 7 例命中）。
+        //   @field_parent_ptr 不依赖 `cast(ptr,i64)`，改用字节指针 GEP（见 sema.tc），故还原此启发式安全。
         if (src_is_ptr && llname.ll_starts(dstst0, "ptr<") == false && llname.ll_starts(dstst0, "%") == false && ll_is_scalar_st(dstst0)) {
             dstst_eff = base.sb_cat3("ptr<", dstst0, ">");
         }
@@ -3352,9 +3356,26 @@ pub fn ll_emit_inst(inst: TIRInst) void {
         var pst: string = llname.ll_get_st(p);
         var gtypename: string;
         var pv: string;
+        var g_base_inttoptr: bool = false;
         if (llname.ll_starts(pst, "ptr<")) {
             gtypename = ll_ptr_inner(pst);
             pv = ll_load(p, pst);
+        } else if (ll_llty_is_int(pst) || pst == "u64" || pst == "u32" || pst == "u8") {
+            // 基址是「以整数承载的指针」（如 ptrtoint 产物 / @field_parent_ptr 的 container_of
+            // 地址运算）。须先 inttoptr 还原为指针再 GEP；否则 GEP 会把「整数槽的 alloca 地址」
+            // 当基址 ⇒ 越界读垃圾（f-string / slice 索引 `cast(ptr, i64)` 后直接当 GEP 基址即此情形）。
+            var iv: string = ll_load(p, pst);
+            var itmp: string = ll_tmp();
+            sb_append_str(g_ll, "  ");
+            sb_append_str(g_ll, itmp);
+            sb_append_str(g_ll, " = inttoptr ");
+            sb_append_str(g_ll, llname.st_to_ll(pst));
+            sb_append_str(g_ll, " ");
+            sb_append_str(g_ll, iv);
+            sb_append_str(g_ll, " to ptr\n");
+            gtypename = tir.tir_st_to_str(inst.st);
+            pv = itmp;
+            g_base_inttoptr = true;
         } else {
             // ⚠ 基址 p 是结构体「值」（非 ptr< 指针）：GEP 基类型必须是「父结构体类型」，
             // 绝不能是字段类型 llname.st_to_ll(st)。若用字段类型当基（如 getelementptr %TStr, ... i32 K），
@@ -3397,7 +3418,12 @@ pub fn ll_emit_inst(inst: TIRInst) void {
     }
     sb_append_str(g_ll, "  ");
     sb_append_str(g_ll, r);
-        sb_append_str(g_ll, " = getelementptr inbounds ");
+        // 基址来自 inttoptr（无 provenance）：inbounds 对该基址是 UB，故降级为非 inbounds GEP。
+        if (g_base_inttoptr) {
+            sb_append_str(g_ll, " = getelementptr ");
+        } else {
+            sb_append_str(g_ll, " = getelementptr inbounds ");
+        }
         sb_append_str(g_ll, gtypename);
         sb_append_str(g_ll, ", ptr ");
         sb_append_str(g_ll, pv);
@@ -4364,6 +4390,42 @@ pub fn ll_emit_inst(inst: TIRInst) void {
     var d: string = inst.dst.name;
     var a: string = inst.args[0].name;
     var b: string = inst.args[1].name;
+    // 指针 ± 整数：GEP（按元素宽度缩放），provenance 安全。
+    //   container_of 用 `(u8*)child_ptr - offset`（元素 u8 ⇒ 字节偏移）；
+    //   数组指针算术（如 &arr[1] - 1）按元素宽度缩放，与 C 语义一致。
+    // ⚠ 仅当「恰一个操作数为指针、另一个为整数」时走此分支；ptr-ptr / 普通整数运算不受影响。
+    var a_lst: string = llname.ll_get_st(llname.ll_llname(a));
+    var b_lst: string = llname.ll_get_st(llname.ll_llname(b));
+    var a_ptr: bool = llname.ll_starts(a_lst, "ptr") || a_lst == "ptr";
+    var b_ptr: bool = llname.ll_starts(b_lst, "ptr") || b_lst == "ptr";
+    if ((a_ptr != b_ptr) && (o == tir__TIR_OP_ADD || o == tir__TIR_OP_SUB)) {
+        var base: string;
+        var off: string;
+        var neg: bool = false;
+        if (a_ptr) { base = a; off = b; if (o == tir__TIR_OP_SUB) { neg = true; } }
+        else { base = b; off = a; if (o == tir__TIR_OP_SUB) { neg = true; } }
+        var elem: string = "i8";
+        if (llname.ll_starts(st, "ptr<")) { elem = ll_ptr_inner(st); }
+        var bp: string = ll_load(base, llname.ll_get_st(llname.ll_llname(base)));
+        var ov: string = ll_load(off, llname.ll_get_st(llname.ll_llname(off)));
+        var idx: string = ov;
+        if (neg) {
+            var t0: string = ll_tmp();
+            sb_append_str(g_ll, "  "); sb_append_str(g_ll, t0);
+            sb_append_str(g_ll, " = sub i64 0, "); sb_append_str(g_ll, ov); sb_append_str(g_ll, "\n");
+            idx = t0;
+        }
+        var r: string = ll_tmp();
+        sb_append_str(g_ll, "  "); sb_append_str(g_ll, r);
+        sb_append_str(g_ll, " = getelementptr inbounds ");
+        sb_append_str(g_ll, elem);
+        sb_append_str(g_ll, ", ptr "); sb_append_str(g_ll, bp);
+        sb_append_str(g_ll, ", i64 "); sb_append_str(g_ll, idx); sb_append_str(g_ll, "\n");
+        // ⚠ GEP 结果永远是 opaque `ptr`（无论元素类型）；用 "ptr" 落槽，避免 st 推导为空导致
+        //   `store <空类型>` / `load ,` 非法 IR（elem 仅用于 GEP 元素宽度，不影响结果槽类型）。
+        ll_ensure_slot(d, "ptr"); llname.ll_set_st(d, "ptr"); ll_store(d, "ptr", r);
+        return;
+    }
     // 瓦片逐元素二元（arr<arr<elem x cols> x rows>）：嵌套 GEP 循环，逐元素 apply op。
     // 与旧轨 codegen_ll tile binop 分支对齐（值级输出一致即可；IR 不必逐字相同）。
     // binop 的 inst.st 常为 ptr（瓦片以指针存储），或操作数槽注册为 ptr<arr<arr<...>>；
@@ -4644,7 +4706,9 @@ pub fn ll_emit_string_globals() void {
         sb_append_str(g_ll, "\", align 1\n");
         sb_append_str(g_ll, "@.tirll_tstr");
         sb_append_i64(g_ll, i);
-        sb_append_str(g_ll, " = constant %TStr { ptr @.tirll_str");
+        // ⚠ 模块局部常量：必须 private，否则依赖库 .tlib 与主线各自从 0 编号发射 @.tirll_tstr<i>，
+        // 链接期同名 external 符号重定义（.tirll_tstr0 重复定义）。字节层 @.tirll_str<i> 已是 private，此处对齐。
+        sb_append_str(g_ll, " = private unnamed_addr constant %TStr { ptr @.tirll_str");
         sb_append_i64(g_ll, i);
         sb_append_str(g_ll, ", i64 ");
         sb_append_i64(g_ll, blen);
@@ -4931,7 +4995,8 @@ pub fn ll_emit_ti_strlit(s: string) string {
         sb_append_str(g_ti_defs, "\"\n");
     }
     sb_append_str(g_ti_defs, tn);
-    sb_append_str(g_ti_defs, " = constant %TStr { ptr ");
+    // ⚠ 模块局部常量：必须 private，避免依赖库 .tlib 与主线同名 @.tits<N> 链接重定义（字节层 @.tis<N> 已是 private）。
+    sb_append_str(g_ti_defs, " = private unnamed_addr constant %TStr { ptr ");
     sb_append_str(g_ti_defs, sn);
     sb_append_str(g_ti_defs, ", i64 ");
     sb_append_i64(g_ti_defs, L);

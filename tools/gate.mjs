@@ -510,22 +510,8 @@ const r = await node("ir_snapshot.mjs", "--compiler", `${G1}.exe`, "--jobs", "1"
             return { ok: smoke.code === 0, note: `IR 与 dbg 全同 (${a.slice(0, 8)}); 冒烟 ${lastLine(smoke.out)}` };
         },
     },
-    {
-        id: "tote", lv: 2, name: "tote 构建冒烟",
-        run: async () => {
-            // ⚠ note 必须带退出码：g4 崩溃（0xC0000005 / 139）时输出尾部停在
-            //   "TIR-VERIFY: 0 error(s)"，只看最后几行会被读成「0 错误却判红」——
-            //   这是门禁步骤自身的显示缺陷，曾掩盖了「g4 其实是旧产物、构建时崩溃」。
-            //   退出码是唯一能区分「崩溃」与「编译错误」的信号，故一律带上。
-            if (existsSync(join(ROOT, `${G4}.exe`)) === false) {
-                return { ok: false, note: "g4.exe 缺失：前置自举步骤未产出，本步无从判定" };
-            }
-            const b = await tc(`${G4}.exe`, "build", "src/tote.tc", "--output", join("out", "dbg", "gtote"));
-            if (b.code !== 0) return { ok: false, note: `build 退出码 ${b.code} | ${lastLine(b.out, 3)}` };
-            const h = await tc(join(ROOT, "out", "dbg", "gtote.exe"), "--help");
-            return { ok: h.code === 0, note: h.code === 0 ? "构建 + --help 正常" : `--help 退出码 ${h.code}` };
-        },
-    },
+    // 注：tote 包管理器已于 2026-10-15 迁出至 ../tote（独立项目），
+    //     其构建冒烟不再由本仓库门禁负责；门禁仅覆盖编译器自身与示例。
     {
         id: "lint_smoke", lv: 2, name: "tc lint 冒烟 (examples 零误报)",
         run: async () => {

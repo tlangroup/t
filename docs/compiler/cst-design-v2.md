@@ -5,6 +5,8 @@
 > 关联：`cst-design.md`（v0.1，现状）、`hir-design.md`、`tir-design.md`、`ir-taxonomy.md`、`src/base.tc`、`src/parse.tc`、`src/hir.tc`、`src/tir.tc`  
 > 约束：本规范是 **设计**，不强制一次性落地；§4.10 给出分阶段、保门禁、保自举不动点的迁移路径。
 
+> ⚠ **历史注记（2026-10-15）**：`tote` 包管理器/构建系统已于本日从本仓库抽出为独立项目 `C:/seesaw/codebuddy/tote`（仓库外 `../tote`）。原位于本仓库的 `src/tote.tc` 现位于该独立项目的 `tote.tc`；本仓库 `tools/gate.mjs` 的 L2 已移除「tote 构建冒烟」步骤，`tools/ir_snapshot.mjs` / `tools/tir_snapshot.mjs` 的快照目标亦不再含 tote，`tests/{ir,tir}_baseline.json` 已同步删除 tote 条目。下文凡以「本仓库内 `src/tote.tc`」论述之处，均指该独立项目内的对应文件；历史 changelog 条目按当时事实保留，未回溯改写。
+
 ---
 
 ## 0. TL;DR（结论先行）
