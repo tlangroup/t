@@ -411,6 +411,14 @@ pub fn parse_type_inner() i64 {
         return -1;
     }
 
+// 类型位 concept 多约束连词开关（`&&`）：仅形参类型解析期间为真，见 parse_type_concept。
+// ⚠ 2026-10-18 回归修复：此前 parse_type **无条件**吃 `&&`，于是 `expr as T && cond`
+//   这类「类型转换 + 值级逻辑与」被误读成 `as (T && cond)`（cond 被当成 concept 名解析，
+//   随后的 `[` / `(` 落进类型位 ⇒ T_PARSE_SYNTAX）。旧源码（含 10-13 的 main 顶端）大量
+//   使用该写法，直接导致自举种子编译旧版本源码失败（nightly Bootstrap g1 步）。
+//   限定在形参位后，值级 `&&` 一律回到 parse_and，两种语义不再互相污染。
+pub var g_type_and: bool = false;
+
 // `T?` 后缀可选类型糖（与 `?T` 前缀等价）：先解析基类型，尾部每个 `?` 再包一层 optional。
 // `?T` 前缀分支在 parse_type_inner 内已直接产出 optional 节点，不在此重复包装。
 pub fn parse_type() i64 {
@@ -421,14 +429,27 @@ pub fn parse_type() i64 {
     }
     // §set-ops 岔路 B：concept 多约束连词 `T: A && B`。`&&` 是 SET 交集 token
     // （区别于 bool 关键字 `and`）；约束位把多个 concept 名连成 binary("&&", ...)
-    // 节点，由 sema.generic_normalize_func 拆解成约束列表。此处只在「类型位」吃 `&&`，
-    // 值表达式位的 `&&` 仍走 parse_and（set 交集），两者不冲突。
-    while (lex.cur_t() == "And") {
+    // 节点，由 sema.generic_normalize_func 拆解成约束列表。
+    // ⚠ 只有 `g_type_and` 为真（形参类型位）时才吃 `&&`：其余类型位（`as T`、局部变量
+    //   标注、返回类型、字段类型…）后面的 `&&` 都是**值级**逻辑与，必须留给 parse_and，
+    //   否则 `x as i64 && y[i] > 0` 会被解析成类型 `i64 && y` 并在 `[` 处报语法错。
+    while (g_type_and and lex.cur_t() == "And") {
         var ti: i64 = lex.advance_i();
         var right: i64 = parse_type();
         t0 = base.mk_binary("&&", t0, right, ti);
     }
     return t0;
+}
+
+// 形参类型位解析：开 g_type_and 后调 parse_type（支持 `T: A && B` 多约束）。
+// 递归调 parse_type 时开关仍为真，故 `A && B && C` 的三约束连词同样成立（左结合）。
+// 返回前恢复外层值，避免泄漏到返回类型 / 函数体。
+pub fn parse_type_concept() i64 {
+    var sv_and: bool = g_type_and;
+    g_type_and = true;
+    var t: i64 = parse_type();
+    g_type_and = sv_and;
+    return t;
 }
 
 // ── 表达式解析（优先级爬升，逐层照抄 tc0）─────────────────────
@@ -1993,7 +2014,7 @@ pub fn parse_func_decl(name: string, anns: i64, is_comptime: bool, is_kernel: bo
             lex.advance_i();
             pname = expect_tok("Identifier");
             expect_tok("Colon");
-            ptn = parse_type();
+            ptn = parse_type_concept();     // 形参位：允许多约束连词 `T: A && B`
             pcomp = true;
         } else if (lex.cur_t() == "Identifier" and lex.cur_v() == "_") {
             lex.advance_i();
@@ -2001,13 +2022,13 @@ pub fn parse_func_decl(name: string, anns: i64, is_comptime: bool, is_kernel: bo
             pname = "_";                  // 保持与既有 `_: T` 形参写法一致
             if (lex.cur_t() == "Colon") {     // `_ : T` —— 通配但显式标注类型
                 lex.advance_i();
-                ptn = parse_type();
+                ptn = parse_type_concept();   // 形参位：允许多约束连词
             }
         } else {
             if (lex.cur_t() == "Identifier" and lex.peek_t(1) == "Colon") {
                 pname = expect_tok("Identifier");
                 expect_tok("Colon");
-                ptn = parse_type();
+                ptn = parse_type_concept();   // 形参位：允许多约束连词 `T: A && B`
             } else {
                 if (lex.cur_t() == "Identifier") {
                     // 结构字面量模式：`Ident { ... }` —— 含前导点形式 `Point{.x=0}` 与
