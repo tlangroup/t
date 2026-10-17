@@ -1903,7 +1903,7 @@ pub fn lift_one_lambda(lid: i64) void {
         ci = ci + 1;
     }
 
-    var sd: i64 = base.mk_StructDecl(ename, "default", "", false, false, -1, fh, -1);
+    var sd: i64 = base.mk_StructDecl(ename, "auto", "", false, false, -1, fh, -1);
     base.node_set_span_id(sd, base.node_span_id(lid));
     base.node_set_span_id(sd, base.node_span_id(lid));
     base.node_set_span_id(sd, base.node_span_id(lid));
@@ -2186,7 +2186,7 @@ pub fn parse_agent_decl(name: string, anns: i64) i64 {
     var state_name: string = base.sb_cat2(name, "State");
 
     // 1) state struct：复用字段节点（含 @tag / =default），完全继承
-    var sdecl: i64 = base.mk_StructDecl(state_name, "default", "", false, false, anns, field_head, lex.g_agent_anchor);
+    var sdecl: i64 = base.mk_StructDecl(state_name, "auto", "", false, false, anns, field_head, lex.g_agent_anchor);
 
     // 2) spawn 构造器：一参一字段（按声明顺序），body = return State{ f: f, ... }
     var spawn_name: string = base.sb_cat2(pascal_to_snake(name), "_spawn");
@@ -2388,12 +2388,21 @@ pub fn parse_at_import_decl() i64 {
 // parse_type_alias 已由 GEN:parser 区间生成（见下方标记区）
 
 pub fn parse_decl_body(name: string, anns: i64, is_comptime: bool) i64 {
-    var layout: string = "default";
+    var layout: string = "auto";   // 默认布局内部标签（非关键字；不写修饰即默认）
     if (lex.cur_t() == "Hash") {
         lex.advance_i();
         var li: i64 = lex.advance_i();
         if (lex.tk_t(li) == "Identifier") {
             var lv: string = lex.tk_v(li);
+            // `#<id>` 修饰词注册表校验（struct-modifiers 设计 §2.2 CapMod）：
+            // 未知 id 强制报错（T-ANN-E453，非静默忽略）；旧 `#extern` 已由 `extern`
+            // 关键字取代，给迁移提示（T-ANN-E454）。
+            if (lv == "extern") {
+                parse_fatal_at("T-ANN-E454", "modifier '#extern' is obsolete; use the `extern` keyword instead", li);
+            }
+            if (lex.modifier_known(lv) == false) {
+                parse_fatal_at("T-ANN-E453", base.sb_cat3("modifier '#", lv, "' is not registered"), li);
+            }
             if (lv == "soa") {
                 layout = "soa";
             } else {
@@ -2740,6 +2749,38 @@ pub fn parse_declaration() i64 {
     }
     var anns: i64 = parse_annotations();
 
+    // ── `#<id>` 修饰词（struct-modifiers 设计 §2.2 CapMod）：前置写法 ──
+    // 设计 T13 的写法是 `#id struct Name`（修饰词位于类型关键字之前）；实现另支持
+    // 后置 `struct #id Name`（既有文法，保留兼容）。二者共用同一注册表校验。
+    var capmod: string = "";
+    if (lex.cur_t() == "Hash") {
+        var cm_h: i64 = lex.pos;
+        lex.advance_i();   // 吃掉 `#`
+        if (lex.cur_t() != "Identifier") {
+            parse_fatal_at("T-PAR-E101", "expected modifier name after '#'", cm_h);
+        }
+        var cm_i: i64 = lex.advance_i();
+        var cm_id: string = lex.tk_v(cm_i);
+        if (cm_id == "modifier") {
+            // `#modifier <id>`：注册自定义修饰词（设计 §2.2 注册途径之一）。
+            // 纯指令、不产生声明；调用方 `if (d >= 0)` 会跳过本条。
+            if (lex.cur_t() != "Identifier") {
+                parse_fatal_at("T-PAR-E101", "expected modifier name after '#modifier'", cm_i);
+            }
+            var rid_i: i64 = lex.advance_i();
+            lex.modifier_register(lex.tk_v(rid_i));
+            if (lex.cur_t() == "Semicolon") { lex.advance_i(); }
+            return -1;
+        }
+        if (cm_id == "extern") {
+            parse_fatal_at("T-ANN-E454", "modifier '#extern' is obsolete; use the `extern` keyword instead", cm_i);
+        }
+        if (lex.modifier_known(cm_id) == false) {
+            parse_fatal_at("T-ANN-E453", base.sb_cat3("modifier '#", cm_id, "' is not registered"), cm_i);
+        }
+        capmod = cm_id;
+    }
+
     // 模块系统（M-Module）：顶层声明可用 `pub` 修饰，标记对外可见。
     // 旧 `export` 同位置修饰已删除（见 §3.13）；`pub` 与 `export` 曾等价置导出位，现统一仅 `pub`；
     // 真正的可见性判据是「文件 @module(pub) ∧ 声明 pub」，在 sema 侧合取。
@@ -2773,8 +2814,36 @@ pub fn parse_declaration() i64 {
     // `desugar_func_clauses` 按名脱糖为单一函数 + match 臂。跨文件合并见 Route 2。
     if (lex.cur_v() == "overload") {
         lex.advance_i();   // 吃掉 `overload`
+        if (lex.cur_t() == "KwStruct") {
+            // ── overload struct（开放可扩展组，ia=1）──（struct-modifiers 设计 §2.1/§2.2）
+            // 编译器合成尾部 `_` 扩展锚点；`extend overload struct` 追加字段/方法（同编译单元）。
+            lex.advance_i();   // 吃掉 `struct`
+            if (lex.cur_t() != "Identifier") {
+                parse_fatal("expected struct name after 'struct' in overload struct declaration");
+            }
+            var sni_o: i64 = lex.advance_i();
+            var sname_o: string = lex.tk_v(sni_o);
+            lex.g_agent_anchor = sni_o;
+            lex.g_struct_exported = is_export;
+            base.validate_decl_name(sname_o, sni_o);
+            var sd_o: i64 = parse_struct_decl(sname_o, anns, "auto");
+            if (sd_o >= 0) {
+                base.node_set_ia((sd_o as u64), 1);   // 1 = overload 组
+                base.node_at(sd_o, sni_o);
+                if (is_export) { base.node_set_bc((sd_o as u64), true); }   // S4 §0.14.7 SoA
+            }
+            return sd_o;
+        }
         if (lex.cur_t() != "KwFunc") {
-            parse_fatal_at("T-PAR-E102", "expected 'fn' after 'overload'", lex.pos);
+            // 与布局修饰互斥：`overload extern struct` / `overload packed struct` 不允许
+            // （D9：extern 不支持 overload；packed 不开放扩展）。
+            if (lex.cur_t() == "Identifier" && (lex.cur_v() == "extern" || lex.cur_v() == "packed")) {
+                parse_fatal_at("T-PAR-E102",
+                    base.sb_cat3("'overload' and layout modifier '", lex.cur_v(),
+                        "' are mutually exclusive (overload struct does not support packed/extern layout)"),
+                    lex.pos);
+            }
+            parse_fatal_at("T-PAR-E102", "expected 'fn' or 'struct' after 'overload'", lex.pos);
         }
         lex.advance_i();   // 吃掉 `fn`
         if (lex.cur_t() != "Identifier") {
@@ -2803,6 +2872,29 @@ pub fn parse_declaration() i64 {
             parse_fatal_at("T-PAR-E102", "expected 'overload' after 'extend'", lex.pos);
         }
         lex.advance_i();   // 吃掉 `overload`
+        if (lex.cur_t() == "KwStruct") {
+            // ── extend overload struct（跨模块追加字段+方法，ia=2）──（struct-modifiers 设计 §2.1/§2.2）
+            // 复用函数 overload 的 extend 边机制（lex.g_extend_name/g_extend_file + emit_deps）。
+            lex.advance_i();   // 吃掉 `struct`
+            if (lex.cur_t() != "Identifier") {
+                parse_fatal("expected struct name after 'struct' in extend overload struct declaration");
+            }
+            var sni_e: i64 = lex.advance_i();
+            var sname_e: string = lex.tk_v(sni_e);
+            lex.g_agent_anchor = sni_e;
+            lex.g_struct_exported = is_export;
+            base.validate_decl_name(sname_e, sni_e);
+            var sd_e: i64 = parse_struct_decl(sname_e, anns, "auto");
+            if (sd_e >= 0) {
+                base.node_set_ia((sd_e as u64), 2);   // 2 = extend 追加
+                base.node_at(sd_e, sni_e);
+                if (is_export) { base.node_set_bc((sd_e as u64), true); }   // S4 §0.14.7 SoA
+                // REQ-EXT-1：登记 extend 意图（组名 + 扩展者单元名），供 emit_deps 输出 extend 边。
+                append(lex.g_extend_name, base.node_sa((sd_e as u64)));
+                append(lex.g_extend_file, base.base_no_tc(base.node_file((sd_e as u64))));
+            }
+            return sd_e;
+        }
         if (lex.cur_t() != "KwFunc") {
             parse_fatal_at("T-PAR-E102", "expected 'fn' after 'extend overload'", lex.pos);
         }
@@ -2901,24 +2993,90 @@ pub fn parse_declaration() i64 {
         }
         return sd_p;
     }
+
+    // ── `extern` 结构体修饰关键词（C-API 严格 C 规范，关键字领头，镜像 packed）──
+    // C-API 严格 C 规范：声明序 = 内存序、标准 C 对齐/填充、C 兼容；专用于 capi / C FFI；
+    // 不支持 overload/extend（与 OpenMod 互斥，待 overload 落地后由 sema 校验）。
+    // `extern` 在词法上仍是普通标识符（非保留关键字，与 `packed` 同构），仅在声明头、紧跟
+    // `struct` 前被识别为布局修饰；其余语境（含 `#extern` 注解）仍是普通标识符。peek 守卫
+    // 确保只对 `extern struct X` 生效，避免误吞 `extern` 作为普通标识符的用法。
+    if (lex.cur_t() == "Identifier" && lex.cur_v() == "extern") {
+        var xkw_i: i64 = lex.pos;   // 指向 `extern` token（用于错误定位）
+        lex.advance_i();   // 吃掉 `extern`
+        if (lex.cur_t() == "KwStruct") {
+            lex.advance_i();   // 吃掉 `struct`
+            var layout_x: string = "extern";
+            if (lex.cur_t() != "Identifier") {
+                parse_fatal("expected struct name after 'struct' in extern struct declaration");
+            }
+            var sni_x: i64 = lex.advance_i();
+            var sname_x: string = lex.tk_v(sni_x);
+            lex.g_agent_anchor = sni_x;
+            lex.g_struct_exported = is_export;
+            base.validate_decl_name(sname_x, sni_x);
+            var sd_x: i64 = parse_struct_decl(sname_x, anns, layout_x);
+            if (sd_x >= 0) {
+                base.node_at(sd_x, sni_x);
+                if (is_export) { base.node_set_bc((sd_x as u64), true); }   // S4 §0.14.7 SoA
+            }
+            return sd_x;
+        }
+        // D9：`extern` 与 `overload` 互斥（extern 专用于 C 兼容、布局须稳定，不支持 overload/extend）。
+        if (lex.cur_v() == "overload") {
+            parse_fatal_at("T-PAR-E102",
+                "'extern' and 'overload' are mutually exclusive (extern does not support overload/extend)",
+                xkw_i);
+        }
+        parse_fatal_at("T-PAR-E102", "expected 'struct' after 'extern'", xkw_i);
+    }
+
+    // ── `concept` 约束类型声明（不可实例化，函数+字段约束，泛型边界）──
+    // 复用 StructDecl 节点（node_sb="concept" 标记）；成员即约束：字段约束存 node.lb、
+    // 方法约束（以 `;` 结尾的 extern 前向声明形态）存 node.la（concept 不发射，故此槽
+    // 复用为方法约束链，与注解槽互不冲突）。语义由 sema 注册为 kind="concept" 并禁止实例化；
+    // 泛型边界 `T:HasName` 由 Task #4b 处理。
+    if (lex.cur_t() == "Identifier" && lex.cur_v() == "concept") {
+        var cn_i: i64 = lex.advance_i();   // 吃掉 `concept`
+        if (lex.cur_t() != "Identifier") {
+            parse_fatal_at("T-PAR-E102", "expected concept name after 'concept'", cn_i);
+        }
+        var cni: i64 = lex.advance_i();
+        var cname: string = lex.tk_v(cni);
+        base.validate_decl_name(cname, cni);
+        var cd: i64 = parse_struct_decl(cname, anns, "concept");
+        if (cd >= 0) {
+            base.node_at(cd, cni);
+            if (is_export) { base.node_set_bc((cd as u64), true); }
+        }
+        return cd;
+    }
+
     if (lex.cur_t() == "KwStruct") {
         lex.advance_i();   // 吃掉 `struct`
         // layout 注解 #soa/#aos：name-first 文法在 parse_decl_body 检测；
         // 关键字领头文法里它出现在 struct 之后、名字之前，此处等价检测。
-        var layout: string = "default";
+        var layout: string = "auto";   // 默认布局内部标签（非关键字；不写修饰即默认）
         if (lex.cur_t() == "Hash") {
             lex.advance_i();
             var li: i64 = lex.advance_i();
-            // 布局注解值：`soa`/`aos` 是普通标识符；`auto`/`extern` 是保留关键字（KwAuto/KwExtern），
-            // 其 token 类型是关键字而非 Identifier，故此处置或条件放行，否则 #auto/#extern 会被跳过。
-            if (lex.tk_t(li) == "Identifier" || lex.tk_t(li) == "KwAuto" || lex.tk_t(li) == "KwExtern") {
+            // 布局注解值：`soa`/`aos` 是内建修饰词（容器布局轴，与成员布局正交，D8 保留）。
+            // `#<id>` 统一走修饰词注册表校验（设计 §2.2）：未知 id 报错 T-ANN-E453；
+            // 旧 `#extern` 已由 `extern` 关键字取代，给迁移提示 T-ANN-E454（不再静默忽略）。
+            if (lex.tk_t(li) == "Identifier") {
                 var lv: string = lex.tk_v(li);
+                if (lv == "extern") {
+                    parse_fatal_at("T-ANN-E454", "modifier '#extern' is obsolete; use the `extern` keyword instead", li);
+                }
+                if (lex.modifier_known(lv) == false) {
+                    parse_fatal_at("T-ANN-E453", base.sb_cat3("modifier '#", lv, "' is not registered"), li);
+                }
                 if (lv == "soa") { layout = "soa"; }
                 else if (lv == "aos") { layout = "aos"; }
-                else if (lv == "auto") { layout = "auto"; }      // §6.4：优化重排布局（sema 重排 node_lb）
-                else if (lv == "extern") { layout = "extern"; }  // §6.4：C-ABI 声明序（与 default 同语义，显式标注）
             }
         }
+        // 前置 `#<id>`（设计 T13 写法 `#id struct Name`）：容器布局轴影响 layout。
+        if (capmod == "soa") { layout = "soa"; }
+        else if (capmod == "aos") { layout = "aos"; }
         if (lex.cur_t() != "Identifier") {
             parse_fatal("expected struct name after 'struct' in struct declaration");
         }
@@ -5093,6 +5251,9 @@ pub fn parse_struct_decl(name: string, anns: i64, layout: string) i64 {
     var r_sfield: i64 = -1;
     var r_sfield_t: i64 = -1;
     var r_idx: i64 = 0;   // 位置字段元组（struct T { T1, T2 }）的自动字段名计数 `_0`/`_1`/...
+    var is_concept: bool = (layout == "concept");
+    var r_method: i64 = -1;   // concept 模式：方法约束链（最终存 node.la，concept 不发射）
+    var r_method_t: i64 = -1;
     lex.g_method_head = -1;
     lex.g_method_tail = -1;
     lex.g_const_head = -1;   // P3a：重置关联常量收集链（每次进入新 struct 清空）
@@ -5104,8 +5265,16 @@ pub fn parse_struct_decl(name: string, anns: i64, layout: string) i64 {
             var mname: string = expect_tok("Identifier");
             var mfd: i64 = parse_method_decl(name, mname, r_anns);
             if (mfd >= 0) {
-                lex.g_method_tail = base.list_push(lex.g_method_head, lex.g_method_tail, mfd);
-                if (lex.g_method_head < 0) { lex.g_method_head = lex.g_method_tail; }
+                if (is_concept) {
+                    // concept 方法约束用逻辑名（不按 concept 名 mangle），便于 concept_satisfied
+                    // 按实现结构体名拼回（person_name）。非真实方法，不刷入 decl_list。
+                    base.node_set_sa((mfd as u64), mname);
+                    r_method_t = base.list_push(r_method, r_method_t, mfd);
+                    if (r_method < 0) { r_method = r_method_t; }
+                } else {
+                    lex.g_method_tail = base.list_push(lex.g_method_head, lex.g_method_tail, mfd);
+                    if (lex.g_method_head < 0) { lex.g_method_head = lex.g_method_tail; }
+                }
             }
         } else if (lex.cur_t() == "KwConst") {
             // P3a：结构体关联常量 `const Name = ...`（重命名为 `<struct>_Name` 的全局常量，
@@ -5127,8 +5296,10 @@ pub fn parse_struct_decl(name: string, anns: i64, layout: string) i64 {
             base.validate_const_name(cname, cti);
             var cfull: string = base.sb_cat3(name, "_", cname);
             var cfd: i64 = base.mk_GlobalConstDecl(cfull, false, ctn, cinit, -1, cti);
-            lex.g_const_tail = base.list_push(lex.g_const_head, lex.g_const_tail, cfd);
-            if (lex.g_const_head < 0) { lex.g_const_head = lex.g_const_tail; }
+            if (!is_concept) {
+                lex.g_const_tail = base.list_push(lex.g_const_head, lex.g_const_tail, cfd);
+                if (lex.g_const_head < 0) { lex.g_const_head = lex.g_const_tail; }
+            }
         } else if (lex.cur_t() == "Identifier" && lex.peek_t(1) == "KwFunc") {
             // 方言统一（Stage 2）：`mname fn(...)` 结构体方法旧文法已废弃，统一为 `fn mname(...)`。
             // 转换器已把整树结构体方法迁到 `fn mname`，此处直接报迁移错误而非误当成字段解析。
@@ -5139,6 +5310,11 @@ pub fn parse_struct_decl(name: string, anns: i64, layout: string) i64 {
             var __it: i64 = parse_sfield();
             r_sfield_t = base.list_push(r_sfield, r_sfield_t, __it);
             if (r_sfield < 0) { r_sfield = r_sfield_t; }
+        } else if (lex.cur_t() == "Identifier" && lex.cur_v() == "_" && lex.peek_t(1) == "Semicolon") {
+            // 扩展锚点 `_`：`overload struct` 的尾部占位标记（struct-modifiers 设计 §2.1），
+            // 纯语法、不生成字段；extend overload 追加字段接在其后（合并期处理）。
+            lex.advance_i();   // 吃掉 `_`
+            if (lex.cur_t() == "Semicolon") { lex.advance_i(); }
         } else {
             // 位置字段元组语法：`struct T { T1, T2, ... }` —— 字段自动命名 `_0`/`_1`/...。
             // 任意「类型起始 token」（标识符类型、类型关键字 string/void/map/unit、
@@ -5159,7 +5335,14 @@ pub fn parse_struct_decl(name: string, anns: i64, layout: string) i64 {
         }
     }
     expect_tok("RBrace");
-    var __id: i64 = base.mk_StructDecl(name, layout, bp_type2(anns, r_anns), bp_has_type2(anns, r_anns), bp_is2(anns, r_anns), list_concat(anns, r_anns), r_sfield, -1);
+    // concept 方法约束链存全局表（lex.g_concept_method_*），避开 StructDecl.node.la 注解槽
+    // （否则 ann_validate 会把方法名当注解名误报 unknown annotation）。字段约束仍在 node.lb。
+    if (is_concept && r_method >= 0) {
+        append(lex.g_concept_method_names, name);
+        append(lex.g_concept_method_heads, r_method);
+    }
+    var r_la: i64 = list_concat(anns, r_anns);
+    var __id: i64 = base.mk_StructDecl(name, layout, bp_type2(anns, r_anns), bp_has_type2(anns, r_anns), bp_is2(anns, r_anns), r_la, r_sfield, -1);
     return __id;
 }
 

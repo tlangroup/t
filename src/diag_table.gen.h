@@ -16,6 +16,8 @@ static const DiagDef DIAG_DEFS[] = {
   { "T-ANN-E450", "error", "ANN", "T_ANNOTATION_UNKNOWN", "UNKNOWN", "unknown annotation" },
   { "T-ANN-E451", "error", "ANN", "T_ANNOTATION_INVALID_ARG", "INVALID_ARG", "invalid annotation argument" },
   { "T-ANN-E452", "error", "ANN", "T_ANNOTATION_WRONG_TARGET", "WRONG_TARGET", "annotation applied to wrong target" },
+  { "T-ANN-E453", "error", "ANN", "T_MODIFIER_UNREGISTERED", "UNREGISTERED", "modifier is not registered" },
+  { "T-ANN-E454", "error", "ANN", "T_MODIFIER_OBSOLETE", "OBSOLETE", "modifier is obsolete" },
   { "T-CDE-E910", "error", "CDE", "T_CGEN_TYPE_MISMATCH", "TYPE_MISMATCH_CGEN", "type_info supports struct only (codegen)" },
   { "T-CLO-E780", "error", "CLO", "T_CLOSURE_CAPTURE", "CAPTURE", "closure capture error" },
   { "T-CLO-E781", "error", "CLO", "T_CLOSURE_FN_ESCAPE", "CLOSURE_FN_ESCAPE", "comptime function escaped to runtime" },
@@ -178,13 +180,15 @@ static const DiagDef DIAG_DEFS[] = {
   { "T-VEC-W927", "warning", "VEC", "T_VECTOR_WIDER_THAN_NATIVE", "VECTOR_WIDER_THAN_NATIVE", "vector is wider than the native SIMD register and will be split" },
   { "T-VEC-W947", "warning", "VEC", "T_TILE_WIDER_THAN_NATIVE", "TILE_WIDER_THAN_NATIVE", "hardware tile is wider than the native SIMD register and will fall back to scalar loops" },
 };
-#define DIAG_COUNT 165
+#define DIAG_COUNT 167
 
 /* legacy (old semantic name) -> machine code alias table */
 static const struct { const char* legacy; const char* code; } DIAG_LEGACY[] = {
   { "T_ANNOTATION_UNKNOWN", "T-ANN-E450" },
   { "T_ANNOTATION_INVALID_ARG", "T-ANN-E451" },
   { "T_ANNOTATION_WRONG_TARGET", "T-ANN-E452" },
+  { "T_MODIFIER_UNREGISTERED", "T-ANN-E453" },
+  { "T_MODIFIER_OBSOLETE", "T-ANN-E454" },
   { "T_CGEN_TYPE_MISMATCH", "T-CDE-E910" },
   { "T_CLOSURE_CAPTURE", "T-CLO-E780" },
   { "T_CLOSURE_FN_ESCAPE", "T-CLO-E781" },
@@ -334,7 +338,7 @@ static const struct { const char* legacy; const char* code; } DIAG_LEGACY[] = {
   { "T_VECTOR_WIDER_THAN_NATIVE", "T-VEC-W927" },
   { "T_TILE_WIDER_THAN_NATIVE", "T-VEC-W947" },
 };
-#define DIAG_LEGACY_COUNT 151
+#define DIAG_LEGACY_COUNT 153
 
 const DiagDef* diag_find(const char* code);        /* exact machine-code lookup */
 const DiagDef* diag_find_any(const char* id);      /* machine code OR legacy name */

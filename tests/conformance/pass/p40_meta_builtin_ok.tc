@@ -8,10 +8,10 @@ MyInt i64;
 enum Color : u8 { Red; Green; }
 // P1 反射测试用：含对齐敏感字段的结构体（C-ABI 默认布局）
 struct Mixed { a: i8; b: i32; c: i64; }
-// P2 `.auto` 优化重排布局（§6.4）：mixed 对齐字段，优化后 16B（i@0/b@8/c@9），运行时回读两后端一致。
-struct #auto AutoMixed { b: u8; i: i64; c: u8; }
-// P2 `#extern` 显式 C-ABI 声明序（与 default 同语义）：24B，i@8。
-struct #extern ExtMixed { b: u8; i: i64; c: u8; }
+// 默认布局（无修饰，内部标签 "auto"，非关键字）：声明序 = 内存序，标准 C 布局，24B（b@0/i@8/c@16）。
+struct AutoMixed { b: u8; i: i64; c: u8; }
+// extern 显式 C-API 严格 C 规范：声明序 = 内存序，标准 C 布局，24B，i@8。
+extern struct ExtMixed { b: u8; i: i64; c: u8; }
 
 // ── P2b：类型构造元函数（comptime 合成新类型，type-as-value，对齐 Zig）──
 //    每个都返回「类型值节点」，可像真实类型一样喂给 @size_of / @offset_of /
@@ -81,17 +81,15 @@ fn p40_align_bit() bool {
 // ② `comptime T: type` 形参 + @type_equal 分支：docs/compiler/meta_design.md §6 的 get_width 模式。
 //    未取分支里的 @compile_error 被 mb_prune_if 剪掉，不误报。
 
-// ⑥ P2 `.auto` 优化重排布局 / `#extern` 显式 C-ABI（§6.4）。
-//    `.auto` 结构体在 mb_pass 期按（对齐↓、尺寸↓、声明序↑）重排 node_lb，两后端同源读取，
-//    故 C 后端（按名）与 LLVM 后端（按位置）布局必然一致；运行时字段访问回读亦一致。
-//    `#extern` 语义等同 default（声明序），仅作显式标注。
+// ⑥ 默认布局（无修饰，内部标签 "auto"）/ extern 显式 C-ABI。
+//    二者均声明序 = 内存序、标准 C 布局；运行时字段访问回读两后端一致（C 按名 / LLVM 按位置，同源 node_lb）。
 fn p40_layout() bool {
-    // #auto 优化重排：对齐大者优先
-    if (@size_of(AutoMixed) != 16) { return false; }
-    if (@offset_of(AutoMixed, "i") != 0) { return false; }
-    if (@offset_of(AutoMixed, "b") != 8) { return false; }
-    if (@offset_of(AutoMixed, "c") != 9) { return false; }
-    // #extern 保持声明序（C-ABI）
+    // 默认布局：声明序 = 内存序（无重排）
+    if (@size_of(AutoMixed) != 24) { return false; }
+    if (@offset_of(AutoMixed, "b") != 0) { return false; }
+    if (@offset_of(AutoMixed, "i") != 8) { return false; }
+    if (@offset_of(AutoMixed, "c") != 16) { return false; }
+    // extern 显式 C-ABI：声明序 = 内存序
     if (@size_of(ExtMixed) != 24) { return false; }
     if (@offset_of(ExtMixed, "i") != 8) { return false; }
     // 运行时字段访问：赋值后回读，验证两后端内存布局一致（C 按名 / LLVM 按位置，同源 node_lb）
