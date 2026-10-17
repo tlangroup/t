@@ -155,6 +155,15 @@ const KEYWORDS: Record<string, TokenType> = {
     "void": TokenType.KwVoid,
     "string": TokenType.KwString,
     "StringBuilder": TokenType.KwStringBuilder,
+    // ── §set-ops 引导桥接（gen0 only）────────────────────────────
+    // 真实编译器（src/tc.tc + lib/std/rc/cst.tc）已把 `and`/`or` 提升为 bool 关键字，
+    // 并把 `&&`/`||` 让位给集合代数。但本 TypeScript 参考实现（tc0，仅作自举 gen0）尚未
+    // 同步那套词法/语义改造；源码（src/*.tc）自身全部用 `and`/`or` 写 bool 逻辑，而
+    // `&&`/`||` 仅以字符串字面量出现。故此处把 `and`/`or` 直接映射到既有 `And`/`Or`
+    // （bool 逻辑）token，使 tc0 能解析新源码并产出与真实编译器一致的 C（bool → C 的
+    // &&/||）。tc0 不实现集合代数，但编译编译器源码不需要——真实编译器由 src 生成。
+    "and": TokenType.And,
+    "or": TokenType.Or,
 };
 
 export function lookupKeyword(text: string): TokenType | null {
