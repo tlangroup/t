@@ -93,6 +93,14 @@ flowchart TD
 - 智能体自动验证报告（自举不动点达成、gate L2 全绿、基线 diff 摘要）；
 - 偏离记录汇总。
 
+> ⚠ **开 PR 之前的最后一步（强制）：刷新并提交自举种子 `ci/seed/tc.exe`**
+>
+> 1. `main` 是本仓库 CI / nightly 唯一被测分支；nightly 的 guard 作业只对「自上次成功 nightly 以来 main 有没有新提交」做判断 —— **main 一前进，下一场 nightly 必跑**。
+> 2. `ci/seed/tc.exe` 是自举起点，必须与被测源码**同代**：src 改变自举契约（新语法 / 内建签名）却没带上新种子时，nightly 会在「Bootstrap g1 from seed」0.2s 就 FAIL 并 fail-fast（如 `src/tc.tc:20:43 T-PAR-E101`），该红灯与代码质量无关。
+> 3. 故：**PR 开出之前**必须 `npm run seed:refresh`（内含写入前后双校验），若种子有变化则与源码 **同一批提交**一起推上 PR 分支。
+> 4. 兜底：`.github/workflows/seed-freshness.yml` 在面向 main 的 PR 上校验「种子能否 `check src/tc.tc` 0 error」，不同代直接 FAIL 并给出修复命令。
+> 5. 修法只有「新种子同新代码一起进 main」，单在一侧刷种子救不了另一侧。
+
 **智能体不自合主干**，停在「等人工手动复核测试」。
 
 **闸门 ③**：用户按清单手动复核测试 → 通过 → 合入 `main`/`wb`（合入由人工测试通过后触发；按现行约定可由智能体在用户明确「通过」后合入 `wb`）。
@@ -104,6 +112,7 @@ flowchart TD
 - **分支模型**：`main`/`wb` 受保护（仅人工测试通过后合入）；开发在长命 `feat/<feature>` 分支，单智能体独占，无并行分支、无 merge queue、无 CODEOWNERS。
 - **提交纪律**：原子提交；一子任务一提交；**不 squash**（保留子任务粒度作 bisect 锚点）；message 用祈使句写 what、正文写 why。
 - **基线随源码同提交**：IR/TIR 快照基线重录与对应源码改动在**同一 commit**。
+- **⭐ 种子随改 src 的 PR 同提交**：改动了 `src/**`（自举契约可能变化）的 PR，在**开出之前**必须 `npm run seed:refresh` 并把 `ci/seed/tc.exe` 一并提交；否则 PR 合入 main 后下一场 nightly 必然红灯（`Bootstrap g1 from seed` 0.2s FAIL）。由 `seed-freshness.yml` 在 PR 阶段兜底。
 - **防漂移**：周期 `merge main` 进 `feat/<feature>`，合并后重跑自举。
 - **PR 角色**：人工手动测试移交单，非 code-review；内容见 §4 终点交付。
 - **智能体禁区**：不得直推/直合 `main`；`wb` 仅在用户明确「测试通过」后合入。
@@ -117,6 +126,7 @@ flowchart TD
 3. 编码中发生严重偏离仍自行推进。
 4. 跳过自举 / gate / 基线同提交任一即 commit。
 5. 未经人工测试通过自行合入主干。
+6. **开面向 main 的 PR 前未刷新并提交自举种子**（改了 `src/**` 却没带 `ci/seed/tc.exe`）—— 会让「PR 合入 → nightly 必跑」这条链路稳定变红。
 
 ---
 
