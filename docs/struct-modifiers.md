@@ -38,7 +38,7 @@ extern struct CStat { dev: i32; ino: u64; }        // C-API 严格 C 规范（ca
 
 ```t
 // 模块 A
-overload struct Entity { id: u64; pos: Vec3; _; }   // 开放组，编译器合成尾部 `_` 锚点
+overload struct Entity { id: u64; pos: Vec3; }      // 开放组：开放性由 `overload` 表达
 
 // 模块 B（同一编译单元）
 extend overload struct Entity {
@@ -48,7 +48,9 @@ extend overload struct Entity {
 ```
 
 要点：
-- `overload struct X` 标记为"可扩展组"；`extend overload struct X` 追加字段 + 方法。
+- `overload struct X` 标记为"可扩展组"；`extend overload struct X` 追加字段 + 方法，追加内容排在字段链尾部。
+- **开放性完全由 `overload` 表达**：不需要（也不能）再写尾部 `_;`。旧文档描述的"扩展锚点 `_`"
+  从未生效（不生成任何 AST 节点），已于 2026-10-18 拆除。
 - **须同编译单元**：单独编译 `extend` 片段（无对应 overload 组）报 `T-OVL-E980`。
 - `extern` 与 `overload` 互斥（双向 `extern overload` / `overload extern` 均报 `T-PAR-E102`）。
 
