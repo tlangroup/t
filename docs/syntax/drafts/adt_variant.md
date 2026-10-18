@@ -1,7 +1,7 @@
 # 语法规则草稿 · 代数数据类型（ADT）：以 variant 为本体  [DRAFT]
 
 > **状态**：草稿（DRAFT）—— 依据既有实装与法律框架（L-02/L-03/L-04/L-14）起草，**待用户「规则采纳」指令**方可并入 `docs/reference.md`，原草稿随即标记失效。
-> **依据**：`src/parse.tc`（`parse_variant_decl`/`parse_case` L3716–L3754）、`src/sema.tc`（`register_variant_helpers`、`ti_mk("Variant")`）、`src/codegen_c.tc`/`codegen_ll.tc` 的 VariantDecl 处理；`docs/syntax/drafts/match.md`（§6.1 明确把 variant 解构列为前向依赖 TODO）；`docs/syntax/drafts/decl_variant.md` / `decl_enum.md`。
+> **依据**：`src/parse.tc`（`parse_variant_decl`/`parse_case` L3716–L3754）、`src/sema.tc`（`register_variant_helpers`、`ti_mk("Variant")`）、`src/codegen_c.tc`/`src/tir_to_ll.tc` 的 VariantDecl 处理；`docs/syntax/drafts/match.md`（§6.1 明确把 variant 解构列为前向依赖 TODO）；`docs/syntax/drafts/decl_variant.md` / `decl_enum.md`。
 > **范围裁定**（2026-08-20 用户裁定）：① 以 `variant` 为 ADT 本体补全；② `enum` 与 `variant` 保留分工（enum=常量集 / variant=带载荷和类型）；③ 泛型 `comptime` 本期留接口、不实现。
 > **作用对象**：把 t 已有的「积类型 `struct` + 和类型 `variant` + 常量集 `enum` + 模式匹配 `match`」收口成一套自洽的代数数据类型体系。**唯一新增能力**是 `match` 对 `variant` 构造器的**解构 + 穷尽性**，以及配套补齐的多载荷 case、`@repr` 收窄 tag、递归 variant、`@derive` 目标扩展。
 
@@ -151,7 +151,7 @@ else { /* _ 兜底 */ }
 ```
 
 - **C 后端**：复用现有 `VariantDecl` 的 `_tag`/`_u` 布局（`codegen_c.tc` L2214 已处理 EnumDecl/UnionDecl 同类结构）；绑定从 `_u._uN[.fK]` 读取。
-- **LLVM 后端**：`codegen_ll.tc` 的 VariantDecl 路径已生成等价 `struct { i32 _tag; %union... }`；按 `extractvalue`/`gep` 取 `_tag` 与对应 union 成员。
+- **LLVM 后端**：`src/tir_to_ll.tc` 的 VariantDecl 路径已生成等价 `struct { i32 _tag; %union... }`；按 `extractvalue`/`gep` 取 `_tag` 与对应 union 成员。
 - **穷尽性**是纯检查期保证，发射侧无需兜底（但 `_` 兜底臂仍存在，编译为 `else`）。
 - **自举不动点**：variant 声明形态改动须保持 `tc → g2 → g3 → g4` 四代 `.ll` 逐字节相同（`tools/gate.mjs` L2）。
 
