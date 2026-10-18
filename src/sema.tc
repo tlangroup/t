@@ -11530,10 +11530,11 @@ pub fn emit_deps() void {
         var done: bool = false;
         while (j < dl and done == false) {
             var g2: i64 = lex__decl_list[j];
-            // REQ-EXT-1：FuncDecl（extend fn）与 StructDecl（overload struct 组，ia==1）
+            // REQ-EXT-1：FuncDecl（extend fn）、StructDecl 与 VariantDecl（overload 组，ia==1）
             // 都可作为被扩展者，按裸名或 "<模块>__<名>" 后缀匹配。
             if (base__node_kind((g2 as u64)) == "FuncDecl"
-                or (base__node_kind((g2 as u64)) == "StructDecl" and base__node_ia((g2 as u64)) == 1)) {
+                or ((base__node_kind((g2 as u64)) == "StructDecl" or base__node_kind((g2 as u64)) == "VariantDecl")
+                    and base__node_ia((g2 as u64)) == 1)) {
                 var sa2: string = base__node_sa((g2 as u64));
                 var hit: bool = false;
                 if (sa2 == nm) { hit = true; }
@@ -14773,36 +14774,43 @@ pub fn mb_struct_align(d: i64, depth: i64) i64 {
     return maxa;
 }
 
-// ── 开放维度：overload struct + extend struct 合并（struct-modifiers 设计 §2.1/§2.2）──
-// 在 hir_build 之前运行：把 `extend struct X`（ia==2）的字段链追加到同名
-// `overload struct X`（ia==1）字段链尾部，再把 ia==2 节点从 decl_list 移除（避免重复类型注册 /
+// ── 开放维度：overload struct/variant + extend struct/variant 合并 ──
+// 在 hir_build 之前运行：把 `extend <kind> X`（ia==2）的字段/构造器链追加到同名
+// `overload <kind> X`（ia==1）链尾部，再把 ia==2 节点从 decl_list 移除（避免重复类型注册 /
 // 重复发射）。跨文件但同编译单元（二者都在 decl_list）同样合并；单独编译（base 不在 decl_list）
 // 或 base 非 overload 组 ⇒ T-OVL-E980（复用函数 overload 的报错码）。
-// ⚠ 合并只搬字段；struct 内联方法在 parse 期已脱糖为顶层自由函数（flush_struct_methods），
+// variant 侧额外：合并后按最终顺序对构造器 tag（VC.ia）连续重编号 0..n-1（D2），
+// 并对合并后全集做同名构造器检查 T-OVL-E981（D1 边界）。
+// ⚠ 合并只搬字段/构造器；struct 内联方法在 parse 期已脱糖为顶层自由函数（flush_struct_methods），
 //   与 StructDecl 节点解耦，故无需在此处理。
 pub fn mb_struct_extend_merge() void {
-    // 收集 extend 追加（ia==2）的 StructDecl
+    // 收集 extend 追加（ia==2）的 StructDecl / VariantDecl
     var exts: []i64 = [];
     var n: i64 = slice_len(lex__decl_list) as i64;
     var i: i64 = 0;
     while (i < n) {
         var d: i64 = lex__decl_list[i];
-        if (base__node_kind((d as u64)) == "StructDecl" and base__node_ia((d as u64)) == 2) {
+        var kk: string = base__node_kind((d as u64));
+        if ((kk == "StructDecl" or kk == "VariantDecl") and base__node_ia((d as u64)) == 2) {
             append(exts, d);
         }
         i = i + 1;
     }
     if (slice_len(exts) == 0) { return; }
-    // 合并：把 ext 字段链接到 base 字段链尾部
+    // 合并：把 ext 链链接到 base 链尾部
     var ki: i64 = 0;
     while (ki < slice_len(exts) as i64) {
         var ext: i64 = exts[ki];
         var ename: string = base__node_sa((ext as u64));
+        var ekind: string = base__node_kind((ext as u64));
+        var kword: string = "variant";
+        if (ekind == "StructDecl") { kword = "struct"; }
         var base0: i64 = -1;
         var j: i64 = 0;
         while (j < n) {
             var d2: i64 = lex__decl_list[j];
-            if (base__node_kind((d2 as u64)) == "StructDecl" and base__node_ia((d2 as u64)) == 1) {
+            var kk2: string = base__node_kind((d2 as u64));
+            if (kk2 == ekind and base__node_ia((d2 as u64)) == 1) {
                 var bsa: string = base__node_sa((d2 as u64));
                 var hit: bool = false;
                 if (bsa == ename) { hit = true; }
@@ -14815,7 +14823,7 @@ pub fn mb_struct_extend_merge() void {
         }
         if (base0 < 0) {
             parse.fc_err("T-OVL-E980",
-                base.sb_cat4("extend '", ename, "' has no matching 'overload struct ", base.sb_cat2(ename, "' group in this file")),
+                base.sb_cat4("extend '", ename, "' has no matching 'overload ", base.sb_cat2(kword, "' group in this file")),
                 ext);
         } else {
             var base_head: i64 = base__node_lb((base0 as u64));
@@ -14827,6 +14835,10 @@ pub fn mb_struct_extend_merge() void {
                 } else {
                     base.node_set_lb((base0 as u64), ext_head);
                 }
+            }
+            // variant 侧：合并后 tag 重编号 + 同名构造器检查
+            if (ekind == "VariantDecl") {
+                mb_variant_extend_finalize(base0);
             }
         }
         ki = ki + 1;
@@ -14843,6 +14855,43 @@ pub fn mb_struct_extend_merge() void {
         m = m + 1;
     }
     lex.decl_list = kept;
+}
+
+// variant 开放维度收尾（open-variant 设计 D2 / D1 边界）：合并后按最终顺序对构造器
+// tag（VC.ia）连续重编号 0..n-1；并对合并后全集做同名构造器检查 T-OVL-E981。
+// 必须在 mb_struct_extend_merge 把 ext 链链接到 base 链尾部之后调用。
+pub fn mb_variant_extend_finalize(d: i64) void {
+    var ks: []i64 = base.kids_chain(base.node_lb((d as u64)));
+    // 第一遍：合并后连续重编号 tag（base 段在前、ext 段在后 → 0..n-1 紧凑）
+    var ksi: i64 = 0;
+    var tag: i64 = 0;
+    while (ksi < slice_len(ks) as i64) {
+        var kv: i64 = ks[ksi];
+        base.node_set_ia((kv as u64), tag);
+        tag = tag + 1;
+        ksi = ksi + 1;
+    }
+    // 第二遍：同名构造器检查（D1 边界）
+    var names: []string = [];
+    var ksi2: i64 = 0;
+    while (ksi2 < slice_len(ks) as i64) {
+        var kv2: i64 = ks[ksi2];
+        var cn: string = base.node_sa((kv2 as u64));
+        var dup: bool = false;
+        var di: i64 = 0;
+        while (di < slice_len(names) as i64) {
+            if (names[di] == cn) { dup = true; break; }
+            di = di + 1;
+        }
+        if (dup) {
+            parse.fc_err("T-OVL-E981",
+                base.sb_cat3("variant extend 重复构造器 `", cn, "`：同一 variant 合并后全集中不允许出现同名 case"),
+                kv2);
+        } else {
+            append(names, cn);
+        }
+        ksi2 = ksi2 + 1;
+    }
 }
 
 pub fn mb_struct_size(d: i64, depth: i64) i64 {

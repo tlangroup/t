@@ -2867,6 +2867,28 @@ pub fn parse_declaration() i64 {
             }
             return sd_o;
         }
+        if (lex.cur_t() == "KwVariant") {
+            // ── overload variant（开放可扩展组，ia=1）──（open-variant 设计 §3.0/§3.1）
+            // 开放性由 `overload` 关键字独占表达；extend 侧裸 extend（见 extend 分支）。
+            // ⚠ parse_variant_decl 内部会自行 lex.advance_i() 吃掉名字 token，故此处只读取、
+            // 不消费（与下方 KwVariant 桥一致），名字位置取 lex.pos。
+            lex.advance_i();   // 吃掉 `variant`
+            if (lex.cur_t() != "Identifier") {
+                parse_fatal("expected variant name after 'variant' in overload variant declaration");
+            }
+            var vname_o: string = lex.cur_v();
+            var vidx_o: i64 = lex.pos;
+            lex.g_agent_anchor = vidx_o;
+            lex.g_struct_exported = is_export;
+            base.validate_decl_name(vname_o, vidx_o);
+            var vd_o: i64 = parse_variant_decl(vname_o, anns);
+            if (vd_o >= 0) {
+                base.node_set_ia((vd_o as u64), 1);   // 1 = overload 组
+                base.node_at(vd_o, vidx_o);
+                if (is_export) { base.node_set_bc((vd_o as u64), true); }   // S4 §0.14.7 SoA
+            }
+            return vd_o;
+        }
         if (lex.cur_t() != "KwFunc") {
             // 与布局修饰互斥：`overload extern struct` / `overload packed struct` 不允许
             // （D9：extern 不支持 overload；packed 不开放扩展）。
@@ -2926,8 +2948,33 @@ pub fn parse_declaration() i64 {
             }
             return sd_e;
         }
+        if (lex.cur_t() == "KwVariant") {
+            // ── extend variant（向本文件内已存在的 overload variant 组追加构造器，ia=2）──
+            // （open-variant 设计 §3.0/§3.1；公理 extend ⊑ overload，extend 子句裸写）
+            // 复用 overload 的 extend 边机制（lex.g_extend_name/g_extend_file + emit_deps）。
+            // ⚠ 同 overload variant：parse_variant_decl 内部自行吃掉名字 token，此处只读取、不消费。
+            lex.advance_i();   // 吃掉 `variant`
+            if (lex.cur_t() != "Identifier") {
+                parse_fatal("expected variant name after 'variant' in extend variant declaration");
+            }
+            var vname_e: string = lex.cur_v();
+            var vidx_e: i64 = lex.pos;
+            lex.g_agent_anchor = vidx_e;
+            lex.g_struct_exported = is_export;
+            base.validate_decl_name(vname_e, vidx_e);
+            var vd_e: i64 = parse_variant_decl(vname_e, anns);
+            if (vd_e >= 0) {
+                base.node_set_ia((vd_e as u64), 2);   // 2 = extend 追加
+                base.node_at(vd_e, vidx_e);
+                if (is_export) { base.node_set_bc((vd_e as u64), true); }   // S4 §0.14.7 SoA
+                // REQ-EXT-1：登记 extend 意图（组名 + 扩展者单元名），供 emit_deps 输出 extend 边。
+                append(lex.g_extend_name, base.node_sa((vd_e as u64)));
+                append(lex.g_extend_file, base.base_no_tc(base.node_file((vd_e as u64))));
+            }
+            return vd_e;
+        }
         if (lex.cur_t() != "KwFunc") {
-            parse_fatal_at("T-PAR-E102", "expected 'fn' or 'struct' after 'extend'", lex.pos);
+            parse_fatal_at("T-PAR-E102", "expected 'fn', 'struct' or 'variant' after 'extend'", lex.pos);
         }
         lex.advance_i();   // 吃掉 `fn`
         if (lex.cur_t() != "Identifier") {
