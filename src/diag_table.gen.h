@@ -115,7 +115,7 @@ static const DiagDef DIAG_DEFS[] = {
   { "T-NAM-W402", "warning", "NAM", "T_NAME_CONST_UPPER", "CONST_UPPER", "constant name should be UPPER_SNAKE_CASE" },
   { "T-NAM-W403", "warning", "NAM", "T_NAME_ANNOTATION_LOWER", "ANNOTATION_LOWER", "annotation name should be lowercase snake_case" },
   { "T-NAM-W404", "warning", "NAM", "W_C_KEYWORD_IDENT", "C_KEYWORD_IDENT", "identifier collides with a C keyword" },
-  { "T-OVL-E980", "error", "OVL", "T_OVERLOAD_EXTEND_NO_GROUP", "EXTEND_NO_GROUP", "extend overload has no matching overload fn group" },
+  { "T-OVL-E980", "error", "OVL", "T_OVERLOAD_EXTEND_NO_GROUP", "EXTEND_NO_GROUP", "extend has no matching overload fn group" },
   { "T-PAR-E100", "error", "PAR", "T_PARSE_INVALID_EXPR", "INVALID_EXPR", "invalid expression" },
   { "T-PAR-E101", "error", "PAR", "T_PARSE_SYNTAX", "SYNTAX", "syntax error" },
   { "T-PAR-E102", "error", "PAR", "T_PARSE_REMOVED_SYNTAX", "REMOVED_SYNTAX", "this syntax has been removed" },

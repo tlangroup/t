@@ -2838,7 +2838,7 @@ pub fn parse_declaration() i64 {
     }
 
     // ── overload 上下文关键词（Route 1）──
-    // `overload fn name(...)` 声明一组同名函数子句；`extend overload fn name(...)`
+    // `overload fn name(...)` 声明一组同名函数子句；`extend fn name(...)`
     // 向本文件内已存在的 overload 组追加子句。二者解析为函数子句（FuncDecl），
     // 以节点 `ia` 槽标记（1=overload 声明 / 2=extend 追加），声明组复用既有
     // `desugar_func_clauses` 按名脱糖为单一函数 + match 臂。跨文件合并见 Route 2。
@@ -2846,7 +2846,7 @@ pub fn parse_declaration() i64 {
         lex.advance_i();   // 吃掉 `overload`
         if (lex.cur_t() == "KwStruct") {
             // ── overload struct（开放可扩展组，ia=1）──（struct-modifiers 设计 §2.1/§2.2）
-            // 开放性由 `overload` 关键字独占表达：`extend overload struct` 的字段/方法
+            // 开放性由 `overload` 关键字独占表达：`extend struct` 的字段/方法
             // 直接追加到本组的字段链尾部（合并期 list_last + list_link，sema.tc:14821）。
             // ⚠ 早期设计文档曾描述「编译器合成尾部 `_` 扩展锚点」，该写法从未生效
             //   （parse 期吞掉且不生成任何节点，2026-10-18 拆除）；遗留的 `_;` 已是语法错误。
@@ -2901,16 +2901,14 @@ pub fn parse_declaration() i64 {
     }
     if (lex.cur_v() == "extend") {
         lex.advance_i();   // 吃掉 `extend`
-        if (lex.cur_v() != "overload") {
-            parse_fatal_at("T-PAR-E102", "expected 'overload' after 'extend'", lex.pos);
-        }
-        lex.advance_i();   // 吃掉 `overload`
+        // 公理（docs/design/open-variant §3.0）：extend ⊑ overload，extend 子句裸写，
+        // `overload` 仅出现在声明处，不再要求 `extend` 后紧跟 `overload`。
         if (lex.cur_t() == "KwStruct") {
-            // ── extend overload struct（跨模块追加字段+方法，ia=2）──（struct-modifiers 设计 §2.1/§2.2）
+            // ── extend struct（跨模块追加字段+方法，ia=2）──（struct-modifiers 设计 §2.1/§2.2）
             // 复用函数 overload 的 extend 边机制（lex.g_extend_name/g_extend_file + emit_deps）。
             lex.advance_i();   // 吃掉 `struct`
             if (lex.cur_t() != "Identifier") {
-                parse_fatal("expected struct name after 'struct' in extend overload struct declaration");
+                parse_fatal("expected struct name after 'struct' in extend struct declaration");
             }
             var sni_e: i64 = lex.advance_i();
             var sname_e: string = lex.tk_v(sni_e);
@@ -2929,11 +2927,11 @@ pub fn parse_declaration() i64 {
             return sd_e;
         }
         if (lex.cur_t() != "KwFunc") {
-            parse_fatal_at("T-PAR-E102", "expected 'fn' after 'extend overload'", lex.pos);
+            parse_fatal_at("T-PAR-E102", "expected 'fn' or 'struct' after 'extend'", lex.pos);
         }
         lex.advance_i();   // 吃掉 `fn`
         if (lex.cur_t() != "Identifier") {
-            parse_fatal("expected function name after 'extend overload fn'");
+            parse_fatal("expected function name after 'extend fn'");
         }
         var fni: i64 = lex.advance_i();
         var fname: string = lex.tk_v(fni);
@@ -3574,7 +3572,7 @@ pub fn fc_merge() void {
     }
 
     // 逐子句 → match arm。两遍扫描：pass 0 具体臂、pass 1 通配（_）臂，
-    // 保证「兜底晚于所有具体子句」（§2.4 / §3.3），并使 extend overload 追加的
+    // 保证「兜底晚于所有具体子句」（§2.4 / §3.3），并使 extend 追加的
     // 具体臂能先于通配生效（同文件 extend 在源码上位于通配之后也正确）。
     var ah: i64 = -1;
     var at: i64 = -1;
@@ -3771,7 +3769,7 @@ pub fn fc_merge_type() void {
 }
 
 pub fn desugar_func_clauses() void {
-    // overload（Route 1）：`extend overload` 必须引用本文件内已存在的
+    // overload（Route 1）：`extend` 必须引用本文件内已存在的
     // `overload fn` 组（ia==1），否则报 T-OVL-E980。跨文件合并见 Route 2。
     var n: i64 = slice_len(lex.decl_list) as i64;
     var k: i64 = 0;
@@ -3795,7 +3793,7 @@ pub fn desugar_func_clauses() void {
             }
             if (found == false) {
                 fc_err("T-OVL-E980",
-                    base.sb_cat4("extend overload '", base.node_sa((ek as u64)),
+                    base.sb_cat4("extend '", base.node_sa((ek as u64)),
                         "' has no matching 'overload fn ", base.sb_cat2(base.node_sa((ek as u64)), "' group in this file")),
                     ek);
             }
@@ -3807,7 +3805,7 @@ pub fn desugar_func_clauses() void {
         var d: i64 = lex.decl_list[i];
         // 分组守卫：仅「裸子句式」函数（ba==false）参与子句组合并；普通函数
         // （ba==true，如 `fn main() i64 { ... }`）与脱糖产物一律跳过。类型组判定
-        // （fc_merge_type）额外要求 ia∈{1,2}（overload / extend overload），否则普通
+        // （fc_merge_type）额外要求 ia∈{1,2}（overload / extend），否则普通
         // `fn` 裸子句组（即使全裸带类型）会误入 R3 类别格分派（见 T-OVL-E981）。
         if (base.node_kind((d as u64)) == "FuncDecl" and base.node_ba((d as u64)) == false) {
             g_fc_n = 0;

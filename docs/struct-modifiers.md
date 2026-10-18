@@ -41,14 +41,14 @@ extern struct CStat { dev: i32; ino: u64; }        // C-API 严格 C 规范（ca
 overload struct Entity { id: u64; pos: Vec3; }      // 开放组：开放性由 `overload` 表达
 
 // 模块 B（同一编译单元）
-extend overload struct Entity {
+extend struct Entity {
     tag: u32;
     fn describe(self: Entity) string { return int_to_str(self.tag); }
 }
 ```
 
 要点：
-- `overload struct X` 标记为"可扩展组"；`extend overload struct X` 追加字段 + 方法，追加内容排在字段链尾部。
+- `overload struct X` 标记为"可扩展组"；`extend struct X` 追加字段 + 方法，追加内容排在字段链尾部。
 - **开放性完全由 `overload` 表达**：不需要（也不能）再写尾部 `_;`。旧文档描述的"扩展锚点 `_`"
   从未生效（不生成任何 AST 节点），已于 2026-10-18 拆除。
 - **须同编译单元**：单独编译 `extend` 片段（无对应 overload 组）报 `T-OVL-E980`。
@@ -107,7 +107,7 @@ fn greet(T:HasName, x: T) string { ... }   // 泛型边界：类型参数 T 前�
 | `T-PAR-E102` | 布局 / 开放修饰互斥（`packed extern` / `extern overload` / `overload extern`） |
 | `T-CON-E100` | `concept` 不可实例化（当作值类型位置使用） |
 | `T-CON-E101` | 类型不满足 `concept` 约束 |
-| `T-OVL-E980` | `extend overload struct` 无对应 overload 组（同编译单元要求） |
+| `T-OVL-E980` | `extend struct` 无对应 overload 组（同编译单元要求） |
 | `T-ANN-E453` | 修饰词未注册（未知 `#<id>`） |
 | `T-ANN-E454` | 修饰词已废弃（`#extern`，附迁移提示） |
 
