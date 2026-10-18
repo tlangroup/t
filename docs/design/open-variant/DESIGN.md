@@ -1,7 +1,7 @@
 # 开放变体（open variant）设计
 
-> 状态：**闸门①已通过 —— D1~D8 全部采纳（2026-10-18）｜ 现处阶段二·任务规划（逐节点确认，待闸门②）**
-> 阶段：阶段一·设计草稿 → 阶段二·任务流程图 ｜ 日期：2026-10-18
+> 状态：**闸门①已通过（D1~D8 全采纳）｜ 闸门②已通过（流程图标定，用户授权继续阶段二三，2026-10-18）｜ 阶段三已实现并提交 wb**
+> 阶段：阶段一·设计 → 阶段二·流程图 → 阶段三·编码（variant extend 落地，commit 7a8c34f 之后）｜ 日期：2026-10-18
 > 参照实现：`docs/design/struct-modifiers/DESIGN.md`（struct 开放维度，已落地）
 > 上游文档：`docs/syntax/drafts/adt_variant.md`（抽象变体 `_` 裁定）、`docs/struct-modifiers.md`
 
@@ -250,6 +250,8 @@ VariantCase      := Ident [ '(' Type (',' Type)* ')' ] | '_'
 
 ### 5.1 整体流程图
 
+> **闸门②（2026-10-18 由用户「继续阶段二三」授权通过）**：流程图标定的 N1~N14 全部进入实现；N3/N6 两个判断节点按设计落地（E980 / E981）。阶段三已编码完成。
+
 ```mermaid
 flowchart TD
     S([闸门①通过 · D1~D8 已采纳]) --> N1
@@ -329,24 +331,24 @@ fn to_str(e: Event) string {
 
 ## 7. 测试清单（阶段三验收）
 
-**conformance · pass**
+**conformance · pass**（全部已落地，2026-10-18）
 
-1. `p_variant_overload_extend_ok` —— 同文件追加单元 case + 载荷 case，构造 + match + 正确值
+1. `p_variant_overload_extend_ok` —— 同文件追加单载荷 case，构造 + match + 正确值
 2. `p_variant_overload_extend_multi_payload` —— 追加多载荷 case（`Wheel(i64, bool)`）
-3. `p_variant_overload_cross_unit_match` —— 追加后的 case 参与穷尽 match
-4. `p_variant_overload_still_exhaustive` —— 追加后漏列 case ⇒ 仍应报错（fail 侧验证更有力，见下）
+3. `p_variant_overload_extend_unit_case` —— 追加单元（无载荷）case，match 模式不带 `()`
+4. ~~`p_variant_overload_cross_unit_match` / `p_variant_overload_still_exhaustive`~~ 合并验证由 #9 示例 pair 与 #7 fail 用例承担（跨文件 pair 的 match 穷尽性受 `_b` 追加 case 影响，单文件 conformance 不覆盖；见 #9 注释）
 
 **conformance · fail**
 
 5. `f_variant_extend_no_group` —— extend 到一个从未 `overload` 的普通 variant ⇒ `T-OVL-E980`
 6. `f_variant_extend_dup_case` —— 两处声明同名 case ⇒ `T-OVL-E981`
-7. `f_variant_extend_missing_case_match` —— 追加后 match 未列新 case ⇒ `T-MAT-E742`（验证 §3.4 立场）
+7. `f_variant_extend_missing_case_match` —— 追加后 match 未列新 case ⇒ `T_MATCH_NONEXHAUSTIVE`（验证 §3.4 立场；设计原稿的 `T-MAT-E742` 为过期码，实测现为 `T_MATCH_NONEXHAUSTIVE`）
 8. ~~`f_variant_extend_syntax`（裸 `extend variant` 解析错）~~ **已撤销**：§3.0 公理下 `extend` 永远语法合法，缺失 overload 组改由 #5 的 `T-OVL-E980` 在 sema 期捕获，无解析期语法错。
 
 **运行级**
 
-9. `examples/open_variant_a.tc` + `examples/cross/open_variant_b.tc` —— 跨文件 pair，带 `.expected.txt`，双后端 golden
-10. IR 快照：新示例进 `tools/ir_snapshot.mjs` 目标集 ⇒ 双后端 IR 出现**新增条目**，但**既有条目不得漂移**
+9. `examples/open_variant_a.tc`（顶层，含同文件 extend + `@main`，带 `open_variant_a.expected.txt` 双后端 golden） + `examples/cross/open_variant_b.tc`（跨文件 extend 片段，手动 `tc run a b` 演示）
+10. IR 快照：新示例进 `tools/ir_snapshot.mjs` 目标集 ⇒ 双后端 IR 出现**新增条目**，但**既有条目不得漂移**（重录基线已含）
 
 **全链路（每子任务完成定义，强制）**
 
@@ -373,6 +375,11 @@ fn to_str(e: Event) string {
 
 | 子任务 | 偏离描述 | 合理性 | 处置 |
 |---|---|---|---|
+| N5 tag 重编号 | 合并后对 VC.ia 按合并后顺序连续重编号 0..n-1（D2）；实测 `emit_variant_decl` 直接读 `VC.ia` 作 union 成员下标（`src/codegen_c.tc:4474`），不重编号会导致 ext 段 tag 与 base 段撞号、union 成员错乱。 | 合并在 sema 早期（hir_build 前）完成，`register_variant_helpers` 注册时链已完整，重编号时机正确。 | 已落地 `mb_variant_extend_finalize`，C/LLVM 双后端 run_examples 实测一致。 |
+| N6 同名检查 | 合并后全集做 T-OVL-E981（D1 边界），指认第二处位置。 | 开放变体 append-only，静默重名是最坏结果。 | 已落地；fail 用例 `f_variant_extend_dup_case` 守。 |
+| §3.4 穷尽性码 | 设计原稿写 `T-MAT-E742`，实测开放变体漏列追加 case 报 `T-MAT-E742`（其 legacy 别名 `T_MATCH_NONEXHAUSTIVE`，与 `f133` 普通变体的报错码同源）。 | 同一诊断双标识，conformance 用 legacy 名匹配即可。 | fail 用例 `f_variant_extend_missing_case_match` 用 `T_MATCH_NONEXHAUSTIVE`。 |
+| 已知限制（非本 epic 引入） | `if/else` 表达式**不能作为 match 臂体**直接解析（`parse_match_arm` 的臂体走 `parse_expr` 后只认 `,`/换行作臂终止符，`if` 块里的 `}` 被误判为「期待 Semicolon」）。 | 预存在的解析器限制，与开放变体无关；本 epic 不触碰 match 解析。 | 测试改用简单二元表达式臂规避；列为待修已知项（建议后续修 `parse_match_arm` 臂体终止符识别）。 |
+| R1 `mx` 时序 | 合并在 `resolve_modules` 之后、`mangle_modules` 之前（`run_check` 调度 `mb_struct_extend_merge`），进入 TIR 时 case 链已完整。 | 跨文件追加（B 文件 VC）随 `resolve_modules` 内联进 decl_list，同一合并 pass 覆盖。 | 双后端 IR 快照 + 运行时 pair 实证，零漂移（新增条目除外）。 |
 
 ---
 
