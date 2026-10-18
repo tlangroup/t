@@ -1,7 +1,7 @@
 # 开放变体（open variant）设计
 
-> 状态：**待用户确认（闸门 ①）**
-> 阶段：阶段一·设计草稿 ｜ 日期：2026-10-18
+> 状态：**闸门①已通过 —— D1~D8 全部采纳（2026-10-18）｜ 现处阶段二·任务规划（逐节点确认，待闸门②）**
+> 阶段：阶段一·设计草稿 → 阶段二·任务流程图 ｜ 日期：2026-10-18
 > 参照实现：`docs/design/struct-modifiers/DESIGN.md`（struct 开放维度，已落地）
 > 上游文档：`docs/syntax/drafts/adt_variant.md`（抽象变体 `_` 裁定）、`docs/struct-modifiers.md`
 
@@ -24,13 +24,13 @@ variant Event { Key(i64); Click(i64, i64); }      // 原文件
 
 这与「可组合的程序结构」矛盾——尤其当一个通用库类型（事件、语法节点、AST 节点）希望被使用方按自己的域追加分支时。
 
-struct 侧已经解决了同样的问题（`overload struct` + `extend overload struct`），本设计把同一套开放维度搬到 variant 上。
+struct 侧已经解决了同样的问题（`overload struct` 声明开放组 + `extend struct` 追加，按 §3.0 公理裸 `extend`；历史上曾写作 `extend overload struct`，已于 2026-10-18 迁移为裸 `extend`），本设计把同一套开放维度搬到 variant 上，variant 侧直接采用裸 `extend`。
 
 ### 1.3 一句话方案
 
 ```
 库侧：  overload variant Event { Key(i64); Click(i64, i64); }   // 声明为「开放组」
-使用方：extend overload variant Event { Wheel(i64); }        // 追加构造器
+使用方：extend variant Event { Wheel(i64); }                  // 追加构造器（裸 extend；overload 只出现在声明）
 ```
 
 **追加之后，`Event` 的 case 全集 = 组声明 ∪ 所有 extend 追加**，且类型仍是同一个 `%Event` / `Event` —— 不是子类型、不是新类型。
@@ -127,6 +127,24 @@ variant 没有理由继承一个被证明为空操作的写法 —— 这是 §2
 
 ---
 
+## 3.0 公理：`extend` ⊑ `overload`（2026-10-18 裁定）
+
+> **公理**：`extend` 的语义必然是「向一个已存在的、`overload` 声明的可合并开放组追加」。`extend` 无法脱离 overload 独立成立——`extend` 一个非 overload 的东西在语义上不成立（那不是 extension，是别的词）。
+> 因此 **`extend` 子句中的 `overload` 标记是纯冗余**：解析器／sema 靠名字查「这是否为 overload 组」即可，词面不必再标一次。任何语言（不限于 t）都应裸写 `extend`。
+
+规范语法（fn / struct / variant **三者统一**）：
+
+```
+overload <kind> Name { … }     // 声明开放组（opt-in，overload 只在此出现一次）
+extend   <kind> Name { … }     // 追加，裸 extend，无需 overload
+```
+
+- **variant 侧**：本次直接采用裸 `extend variant` 规范（见 §3.1、§5）。
+- **fn / struct 侧**：历史上曾写作 `extend overload fn` / `extend overload struct`，属**违背本公理的冗余写法，已于 2026-10-18 迁移为裸 `extend`**（"no exception"）。
+  - 迁移列为本 epic 的**跟随清理**（§5 节点 N0）；它触及已发布语法（fn/struct 的 extend 子句），需用户显式授权后再执行，不悄悄塞进 variant 编码。
+
+---
+
 ## 3. 方案设计
 
 ### 3.1 语法（EBNF）
@@ -134,18 +152,18 @@ variant 没有理由继承一个被证明为空操作的写法 —— 这是 §2
 ```
 VariantDecl      := 'variant' Ident '{' CaseList '}'                      // 现状：普通常闭
 OpenVariantDecl  := 'overload' 'variant' Ident '{' CaseList '}'           // 新增：开放组（A 侧）
-ExtendVariant    := 'extend' 'overload' 'variant' Ident '{' CaseList '}'  // 新增：追加（B 侧）
+ExtendVariant    := 'extend' 'variant' Ident '{' CaseList '}'            // 新增：追加（B 侧，裸 extend，见 §3.0 公理）
 CaseList         := ( VariantCase ';' )+
 VariantCase      := Ident [ '(' Type (',' Type)* ')' ] | '_'
 // `_` 只能出现在末位（现状规则：T-PAR-E103）
 ```
 
-约束（对齐 struct 开放维度）：
+约束（对齐 struct 开放维度，并遵循 §3.0 公理）：
 
-1. **`extend` 后必须紧跟 `overload`** —— 写 `extend variant ...` 直接报解析错（对齐 struct 的 `T-PAR-E102` 口径）。
-2. **被扩展者必须已用 `overload` 声明** —— 否则找不到组，报 `T-OVL-E980`（与 struct 走同一条诊断，语义「无匹配的开放组」）。
-3. **必须同一编译单元** —— 与上条同源，跨编译单元即 E980。
-4. **extend 段不可为空**、不可出现在 `overload` 组声明之前（顺序无关：**见 D3**，推荐不强制顺序，因为合并 pass 在 sema 期做，线序无意义）。
+0. **`extend` 子句裸写（公理）** —— `overload` 仅出现在「声明开放组」处；`extend variant` 不再写 `overload`（历史 `extend overload struct/fn` 已于 2026-10-18 迁移为裸 `extend`，见 §3.0）。
+1. **被扩展者必须已用 `overload` 声明** —— 否则找不到组，报 `T-OVL-E980`（与 struct 走同一条诊断，语义「无匹配的开放组」）；注意「裸 `extend` 指向非 overload」同样在 sema 期以 E980 捕获，**不再有解析期语法错**。
+2. **必须同一编译单元** —— 与上条同源，跨编译单元即 E980。
+3. **extend 段不可为空**、不可出现在 `overload` 组声明之前（顺序无关：**见 D3**，推荐不强制顺序，因为合并 pass 在 sema 期做，线序无意义）。
 
 ### 3.2 语义：case 链拼接
 
@@ -201,7 +219,7 @@ VariantCase      := Ident [ '(' Type (',' Type)* ')' ] | '_'
 | 新增物 | 消费者 |
 |---|---|
 | `overload variant` 组标记（`ia=1`） | extend 合并 pass 的 base 查找 + `emit_deps` 的 extend 边输出 |
-| `extend overload variant`（`ia=2`） | 同上（作为 ext 项） |
+| `extend variant`（`ia=2`） | 同上（作为 ext 项） |
 | `T-OVL-E981` | sema 合并 pass 的重名检查（必然触发于重复 case） |
 | `emit_deps` extend 边扩到 `VariantDecl` | tote 增量构建（“被扩展单元 + 扩展闭包”拼同一编译单元） |
 
@@ -209,32 +227,69 @@ VariantCase      := Ident [ '(' Type (',' Type)* ')' ] | '_'
 
 ---
 
-## 4. 关键决策清单（★ 请逐条裁决）
+## 4. 关键决策清单（★ 已全部采纳，2026-10-18）
 
 | 编号 | 决策点 | 选项 | 建议 | 理由 |
 |---|---|---|---|---|
-| **D1** | 开放的含义 | A. 仅追加构造器（append-only）<br>B. 追加 + 可覆盖已有 case 载荷 | **A** | B 会让 `<V>_as_<C>` 等 helper 签名漂移、既有调用点 ABI 破裂，且无语义先例可循；A 与 struct 开放维度完全同构 |
-| **D2** | 追加后 tag 如何编号 | A. 合并后连续重编号（0..n-1）<br>B. 各段保留原号，允许空洞 | **A** | tag 是编译单元内部布局细节，不跨 ABI；重编号保证紧凑，union size 不因空洞膨胀 |
-| **D3** | 是否要求先出现开放组声明 | A. 不要求（sema 期合并，线序无关）<br>B. 要求 `overload` 组在前 | **A** | 合并是 sema pass，与源码顺序无关；强制顺序只会徒增约束 |
-| **D4** | 是否必须 `overload` opt-in | A. 必须（无 `overload` 不可 extend）<br>B. 任意 variant 均可被 extend | **A** | 保持「一处声明 = 全集起点」的可读性；也让遗漏 `extend` 意图成为显式错误而非静默追加 |
-| **D5** | 开放变体的 match 穷尽性 | A. 仍强制（须显式 `_` 才豁免）<br>B. 开放即自动豁免 | **A** | 合并后全集已定，强制检查免费且更安全；`_` 语义保持单一 |
-| **D6** | `T-PAR-E104`（多载荷方位 Gag，无 emit 点） | A. 本 epic 顺手接线<br>B. 显式标注待清理、不动<br>C. 现在就删 | **B**（待你定） | 与本特性无关，但属「登记即死」；删除需确认历史上是否留给外部文档引用 |
-| **D7** | `_` 锚点写法是否要对齐 struct | A. variant **不用**锚点（本设计立场）<br>B. 引入 `overload variant V { A; _; }` 锚点 | **A** | 见 §2 —— variant 的 `_` 已是抽象标记，复用必然二义；且 §2.1 证明 struct 锚点是零痕迹空操作，没有继承价值 |
-| **D8** ✅已决 | struct 那个**零痕迹锚点**如何处置（§2.1 发现） | A. 删除该语法分支<br>B. 保留 + 废弃警告、下 epic 删<br>C. 仅文档标注无效 | **A**（用户 2026-10-18 裁定） | 用户裁定「没有兼容策略、当前没有用户」⇒ 废弃警告的迁移窗口无意义，直接删。已执行 —— 改动清单见 §2.1「D8 的落地结果」 |
+| **D1** | 开放的含义 | A. 仅追加构造器（append-only）<br>B. 追加 + 可覆盖已有 case 载荷 | **A** ✅已采纳 | B 会让 `<V>_as_<C>` 等 helper 签名漂移、既有调用点 ABI 破裂，且无语义先例可循；A 与 struct 开放维度完全同构 |
+| **D2** | 追加后 tag 如何编号 | A. 合并后连续重编号（0..n-1）<br>B. 各段保留原号，允许空洞 | **A** ✅已采纳 | tag 是编译单元内部布局细节，不跨 ABI；重编号保证紧凑，union size 不因空洞膨胀 |
+| **D3** | 是否要求先出现开放组声明 | A. 不要求（sema 期合并，线序无关）<br>B. 要求 `overload` 组在前 | **A** ✅已采纳 | 合并是 sema pass，与源码顺序无关；强制顺序只会徒增约束 |
+| **D4** | 是否必须 `overload` opt-in | A. 必须（无 `overload` 不可 extend）<br>B. 任意 variant 均可被 extend | **A** ✅已采纳 | 保持「一处声明 = 全集起点」的可读性；也让遗漏 `extend` 意图成为显式错误而非静默追加；**extend 子句按 §3.0 公理裸写，无 `overload`** |
+| **D5** | 开放变体的 match 穷尽性 | A. 仍强制（须显式 `_` 才豁免）<br>B. 开放即自动豁免 | **A** ✅已采纳 | 合并后全集已定，强制检查免费且更安全；`_` 语义保持单一 |
+| **D6** | `T-PAR-E104`（多载荷方位 Gag，无 emit 点） | A. 本 epic 顺手接线<br>B. 显式标注待清理、不动<br>C. 现在就删 | **B** ✅已采纳（标注待清理、不动） | 与本特性无关，但属「登记即死」；删除需确认历史上是否留给外部文档引用 |
+| **D7** | `_` 锚点写法是否要对齐 struct | A. variant **不用**锚点（本设计立场）<br>B. 引入 `overload variant V { A; _; }` 锚点 | **A** ✅已采纳 | 见 §2 —— variant 的 `_` 已是抽象标记，复用必然二义；且 §2.1 证明 struct 锚点是零痕迹空操作，没有继承价值 |
+| **D8** ✅已决 | struct 那个**零痕迹锚点**如何处置（§2.1 发现） | A. 删除该语法分支<br>B. 保留 + 废弃警告、下 epic 删<br>C. 仅文档标注无效 | **A** ✅已决（2026-10-18 已执行） | 用户裁定「没有兼容策略、当前没有用户」⇒ 废弃警告的迁移窗口无意义，直接删。已执行 —— 改动清单见 §2.1「D8 的落地结果」 |
 
 ---
 
-## 5. 实施路径预览（阶段二会细化为逐节点流程图）
+## 5. 阶段二 · 任务流程图（逐节点确认，待闸门②）
 
-| # | 落点 | 现状位置 | 动作 |
-|---|---|---|---|
-| T1 | parse 桥 | `src/parse.tc:3142-3152`（variant 桥）、`2899-2927`（struct extend 桥） | 增加 `extend overload variant` / `overload variant` 分支，产出 `VariantDecl` + `node_set_ia`（1=组 / 2=ext） |
-| T2 | sema 合并 pass | `src/sema.tc:14783` `mb_struct_extend_merge` | 抽取通用 case/字段链拼核，`StructDecl` 判定扩展为 `StructDecl \| VariantDecl` |
-| T3 | 重号与报错 | 新代码 | 合并时按 D2 重编号；重复 case → `T-OVL-E981`；无组 → `T-OVL-E980`（复用） |
-| T4 | extend 依赖边 | `src/sema.tc:11533` | 条件从 `StructDecl && ia==1` 扩到含 `VariantDecl && ia==1` |
-| T5 | 布局 / 发射 | `src/tir.tc:1607`、`src/codegen_c.tc:4429` | **预期零改动**（只读已拼接 case 链），但须用 IR 快照与运行时 pair 验证 |
-| T6 | 测试 | `tests/conformance/**`、`examples/**` | 见 §7 |
-| T7 | 验证链 | — | 自举不动点 → gate L2 → IR 基线 → `seed:check`（改了 src，按纪律必跑） |
+> 闸门①已通过（D1~D8 全部采纳，2026-10-18）。本阶段把 T1~T7 细化为**逐节点流程图**，
+> 分支 / 关键判断节点已显式标注。请逐节点确认（重点：**N3 / N6** 两个判断节点；N2 语法校验已按 §3.0 公理撤销），
+> 任一处需调整告诉我；确认全过后，再进阶段三编码。
+
+### 5.1 整体流程图
+
+```mermaid
+flowchart TD
+    S([闸门①通过 · D1~D8 已采纳]) --> N1
+    N1["N1 解析分流<br/>识别 overload variant（组,ia=1）与 extend variant（ext,ia=2）<br/>src/parse.tc:3142-3152"] --> N3["N3 sema 合并 pass 定位 base 开放组<br/>mb_struct_extend_merge 扩到 VariantDecl<br/>src/sema.tc:14783 / 调度 16216"]
+    N3 -- "找不到 overload 组 / 跨编译单元（含裸 extend 指向非 overload）" --> E2[T-OVL-E980]
+    N3 -- 找到 --> N4["N4 拼接 VC 链到 base 链尾<br/>list_last + list_link<br/>src/sema.tc:14821"]
+    N4 --> N5["N5 tag 重编号（D2）<br/>合并后连续 0..n-1"]
+    N5 --> N6{同名 case?}
+    N6 -- 是 --> E3[T-OVL-E981 · 指认两处位置]
+    N6 -- 否 --> N7["N7 extend 节点移出 decl_list"]
+    N7 --> N8["N8 extend 依赖边扩到 VariantDecl && ia==1<br/>src/sema.tc:11533"]
+    N8 --> N9["N9 布局 / 发射（T5）<br/>预期零改动，只读拼接链 · R1:[]Event 步长"]
+    N9 --> N10["N10 测试 · conformance 1~8 + examples pair 9~10"]
+    N10 --> N11["N11 tc check src/tc.tc 0 error"]
+    N11 --> N12["N12 自举不动点 g2==g3==g4"]
+    N12 --> N13["N13 gate L2 全绿（双后端）"]
+    N13 --> N14["N14 改了 src ⇒ seed:check / seed:refresh 同提交"]
+    N14 --> F([提交 · 待手动测试→闸门③])
+    E2 --> X
+    E3 --> X
+```
+
+### 5.2 逐节点清单（动作 / 落点 / 关键判断 / 验收判据）
+
+| 节点 | 动作 | 落点（现状位置） | 关键判断 / 分支 | 验收判据 |
+|---|---|---|---|---|
+| **N0** ✅ | **跟随清理（2026-10-18 已授权并落地）**：fn/struct 的 `extend overload <kind>` 迁移为裸 `extend <kind>`（§3.0 公理，no exception） | `src/parse.tc` extend 桥；`examples/overload_*`、`struct_extend_*`、`tests/conformance/**` | 已授权执行；裸 extend 已落地，全仓 `extend overload` 出现处归零（仅设计文档保留历史描述） | 全仓 `extend overload` 出现处归零 |
+| **N1** | 解析分流：识别 `overload variant`（组，ia=1）与 `extend variant`（ext，ia=2），产出 `VariantDecl` | `src/parse.tc:3142-3152` variant 桥；参照 `2899-2927` struct extend 桥 | 与 struct 桥同构，新增 variant 分支；`extend` 裸写（无 `overload` 子句） | 单测：两种声明都能 parse 出正确的 ia |
+| **N3** | sema 合并 pass：定位 base 开放组 | `src/sema.tc:14783` `mb_struct_extend_merge`，调度 `16216` | 分支：**找不到 `overload` 组 / 跨编译单元 → `T-OVL-E980`**（约束 2/3） | 对应 `f_variant_extend_no_group` |
+| **N4** | 拼接 VC 链到 base 链尾 | `src/sema.tc:14821` `list_last + list_link` | 复用 struct 拼核；`StructDecl` 判定扩为 `StructDecl \| VariantDecl` | 合并后 case 全集 = 组 ∪ ext |
+| **N5** | tag 重编号（D2） | 合并后新代码 | **连续重编号 0..n-1**（非保号） | union size 紧凑、无空洞 |
+| **N6** | 重名检查（D1 边界） | 合并 pass 内 | 分支：**同 variant 同名 case → `T-OVL-E981`，指认两处** | 对应 `f_variant_extend_dup_case` |
+| **N7** | extend 节点移出 `decl_list` | sema | 避免重复类型注册 / 重名误报（照搬 struct） | 单组只注册一次 helper |
+| **N8** | extend 依赖边扩展 | `src/sema.tc:11533` | 条件 `StructDecl && ia==1` → 含 `VariantDecl && ia==1` | tote 增量构建闭包正确 |
+| **N9** | 布局 / 发射（T5） | `src/tir.tc:1607`、`src/codegen_c.tc:4429` | **预期零改动**；风险 R1：`[]Event` 切片步长 | IR 快照：既有条目零漂移 |
+| **N10** | 测试 | `tests/conformance/**`、`examples/**` | 见 §7 清单 1~10 | pass 1~8 + 双后端 golden 9~10 |
+| **N11** | 类型检查 | — | — | `tc check src/tc.tc` 0 error |
+| **N12** | 自举不动点 | — | — | `g2 == g3 == g4`（IR md5 一致） |
+| **N13** | 门禁 L2 | — | — | `gate L2` 全绿（含 IR 快照 / conformance / run_examples 双后端） |
+| **N14** | 种子同步 | `ci/seed/tc.exe` | 改了 src ⇒ 必跑 | `npm run seed:check`（必要时 `seed:refresh`，与代码同提交） |
 
 ---
 
@@ -248,8 +303,8 @@ VariantCase      := Ident [ '(' Type (',' Type)* ')' ] | '_'
 // 库侧：声明为开放组
 overload variant Event { Key(i64); Click(i64, i64); }
 
-// 使用方：追加构造器（同一文件或另一文件均可）
-extend overload variant Event { Wheel(i64); }
+// 使用方：追加构造器（同一文件或另一文件均可，裸 extend）
+extend variant Event { Wheel(i64); }
 
 fn to_str(e: Event) string {
     return match (e) {
@@ -286,7 +341,7 @@ fn to_str(e: Event) string {
 5. `f_variant_extend_no_group` —— extend 到一个从未 `overload` 的普通 variant ⇒ `T-OVL-E980`
 6. `f_variant_extend_dup_case` —— 两处声明同名 case ⇒ `T-OVL-E981`
 7. `f_variant_extend_missing_case_match` —— 追加后 match 未列新 case ⇒ `T-MAT-E742`（验证 §3.4 立场）
-8. `f_variant_extend_syntax` —— 裸 `extend variant`（缺 `overload`）⇒ 解析错
+8. ~~`f_variant_extend_syntax`（裸 `extend variant` 解析错）~~ **已撤销**：§3.0 公理下 `extend` 永远语法合法，缺失 overload 组改由 #5 的 `T-OVL-E980` 在 sema 期捕获，无解析期语法错。
 
 **运行级**
 
