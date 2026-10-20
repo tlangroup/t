@@ -523,6 +523,47 @@ static void big_negate(uint8_t* m, int n) {
     }
 }
 
+// ── 任意位宽整数（>64）多精度算术（小端字节缓冲，与 t_sb_append_fmt_big 同布局）──
+// C 后端的 tmir-c 把 AWI 值存为 little-endian 字节缓冲（unsigned char*），本组函数是
+// 在 C 侧补齐 LLVM 后端原生 i<N>/u<N> 算术的等价物。位宽上限由 T_BIG_MAXBYTES 覆盖到 65535 位。
+
+// 把 int64_t 标量 widened 进 nbytes 小端缓冲：低 8 字节按值写入，剩余字节补 0（无符号）
+// 或 0xFF（有符号且为负）。用于 AWI 二元运算中「标量立即数/窄量」提升为全宽缓冲。
+void t_big_from_i64(void* dst, int64_t val, int nbytes, int is_signed) {
+    uint8_t* d = (uint8_t*)dst;
+    uint64_t u = (uint64_t)val;
+    for (int i = 0; i < 8 && i < nbytes; i++) d[i] = (uint8_t)(u >> (8 * i));
+    uint8_t fill = (uint8_t)((is_signed && val < 0) ? 0xFF : 0x00);
+    for (int i = 8; i < nbytes; i++) d[i] = fill;
+}
+
+// 全精度加法 dst = a + b（小端、nbytes 字节、带进位）。等价的 LLVM `add i<N>`。
+void t_big_add(void* dst, const void* a, const void* b, int nbytes) {
+    const uint8_t* x = (const uint8_t*)a;
+    const uint8_t* y = (const uint8_t*)b;
+    uint8_t* d = (uint8_t*)dst;
+    int carry = 0;
+    for (int i = 0; i < nbytes; i++) {
+        int s = (int)x[i] + (int)y[i] + carry;
+        d[i] = (uint8_t)s;
+        carry = s >> 8;
+    }
+}
+
+// 全精度减法 dst = a - b（小端、nbytes 字节、带借位）。等价的 LLVM `sub i<N>`。
+// 实现为 a + (~b) + 1（二补码取负），复用加法进位链，避免独立的借位分支。
+void t_big_sub(void* dst, const void* a, const void* b, int nbytes) {
+    const uint8_t* x = (const uint8_t*)a;
+    const uint8_t* y = (const uint8_t*)b;
+    uint8_t* d = (uint8_t*)dst;
+    int carry = 1;   // 取负 = 反码 + 1，起始进位 1 即完成 +1
+    for (int i = 0; i < nbytes; i++) {
+        int s = (int)x[i] + (int)((uint8_t)~y[i]) + carry;
+        d[i] = (uint8_t)s;
+        carry = s >> 8;
+    }
+}
+
 // 与 fmt_int_core 同构，但 magnitude 是任意宽度的小端字节缓冲。
 static TStr fmt_big_core(FmtSpec f, int neg, const uint8_t* magin, int nbytes) {
     if (f.zero && f.align == 0) { f.align = '='; f.fill = '0'; }

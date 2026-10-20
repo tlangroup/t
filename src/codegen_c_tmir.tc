@@ -222,6 +222,7 @@ pub fn c_tstr_size(ts: string) i64 {
     if (c_starts(ts, "[")) { return c_array_nelems(ts) * c_tstr_size(c_array_elem(ts)); }
     if (c_is_arr(ts)) { return c_array_nelems(ts) * c_tstr_size(c_array_elem(ts)); }
     if (c_is_vec(ts)) { return c_vec_nelems(ts) * c_tstr_size(c_vec_elem(ts)); }
+    if (c_is_awi_st(ts)) { return c_awi_size(ts); }
     return 8;
 }
 pub fn c_find_type_body(name: string) string {
@@ -276,6 +277,7 @@ pub fn c_agg_size_of_tyname(tn: string) i64 {
     if (tn == "") { return 0; }
     var t2: string = tn;
     if (c_starts(t2, "ptr<")) { t2 = c_strip_ptr(t2); }
+    if (c_is_awi_st(t2)) { return c_awi_size(t2); }   // AWI(N>64) 是 little-endian 字节缓冲聚合，尺寸=字节宽
     if (c_starts(t2, "%")) { return c_struct_size(t2); }
     // ⚠ 数组槽（arr<E x N>，如 slice/array literal 缓冲）必须按元素数×元素宽定尺寸，
     // 否则退化为 0 → 回退 c_tstr_size 默认 8 → 缓冲过小、越界写 UB。tir_st_to_str 对数组吐 arr<E x N> 而非 ptr<[...]>。
@@ -338,6 +340,132 @@ pub fn c_is_tile_st(st: string) bool {
     if (c_starts(s, "ptr<")) { s = c_strip_ptr(s); }
     return c_starts(s, "arr<arr<");
 }
+// 向量（vec<ELEM x N>，可能带 ptr<> 前缀）：定长 SIMD 向量，与瓦片同属「字节缓冲聚合」，
+// 但 1D（对应 LLVM <N x ELEM>）。c_is_vec_st 剥离 ptr<> 后判 vec< 前缀。
+pub fn c_is_vec_st(st: string) bool {
+    var s: string = st;
+    if (c_starts(s, "ptr<")) { s = c_strip_ptr(s); }
+    return c_is_vec(s);
+}
+// 从向量类型串解析元素 C 类型（如 "vec<i32 x 4>" -> "int32_t"，"vec<f64 x 2>" -> "double"）。
+pub fn c_vec_elem_cty(vst: string) string {
+    var s: string = vst;
+    if (c_starts(s, "ptr<")) { s = c_strip_ptr(s); }
+    var e: string = c_vec_elem(s);
+    if (e == "") { e = "i32"; }
+    return c_tystr_c(e);
+}
+// 从操作数解析其向量类型串（剥 ptr<>）：依次查 ins.st → 槽类型表 → 全局符号表（@ 全局），
+// 覆盖「全局向量被 reduce/vlen 引用时槽表查不到」的情形（vector_demo 的 g_scale）。
+pub fn c_vec_type_from_operand(op: TirOperand) string {
+    var nm: string = c_strip_suf(op.name);
+    var vst: string = c_strip_ptr(tir.tir_st_to_str(op.st));
+    if (c_is_vec(vst) == false) { vst = c_strip_ptr(c_slot_ty_find(nm)); }
+    if (c_is_vec(vst) == false and str_len(op.name) as i64 > 0 and op.name[0] == 64) {
+        vst = c_strip_ptr(tir.tir_st_to_str(c_global_st(nm)));
+    }
+    return vst;
+}
+// ── 任意位宽整数（AWI）：i<N>/u<N>，N>64 ──────────────────────────
+// 字节缓冲模型下与 LLVM 原生 i<N> 逐字对齐：值存为 little-endian unsigned char* 缓冲，
+// 格式化经 t_sb_append_fmt_big、算术经 t_big_* 运行库原语。N≤64（含 u7/i7/u9 等窄任意位宽）
+// 保持标量 int64_t/uint64_t，走既有标量格式化/算术路径，无需缓冲。
+// ⚠ 判定用 base.awi_bits(st) > 64：标准 i64/u64 等 awi_bits 返回 ≤64，天然排除；
+//   仅「真·任意位宽」（如 i128/u128/i200…）落入本分支。
+pub fn c_is_awi_st(st: string) bool {
+    var s: string = st;
+    if (c_starts(s, "ptr<")) { s = c_strip_ptr(s); }
+    if (c_starts(s, "i") or c_starts(s, "u")) {
+        var ab: i64 = base.awi_bits(s);
+        if (ab > 64) { return true; }
+    }
+    return false;
+}
+// AWI 字节宽（含 ptr<> 包装）；非 AWI 回落 8（不应命中）。
+pub fn c_awi_size(st: string) i64 {
+    var s: string = st;
+    if (c_starts(s, "ptr<")) { s = c_strip_ptr(s); }
+    var ab: i64 = base.awi_bits(s);
+    if (ab <= 0) { return 8; }
+    return (ab + 7) / 8;
+}
+// AWI 是否为有符号（i<N> 有符号，u<N> 无符号）。
+pub fn c_awi_signed(st: string) bool {
+    var s: string = st;
+    if (c_starts(s, "ptr<")) { s = c_strip_ptr(s); }
+    if (str_len(s) as i64 > 0 and s[0] == 105) { return true; }   // 'i'
+    return false;
+}
+// AWI 字面量（十进制 / 十六 / 二 / 八进制，可带前导 '-'）→ little-endian 字节数组初始器串
+// （如 "{255,0,0,...}"，长度 = c_awi_size(st)）。有符号负值按全宽二补码。供 CONST 发射填充缓冲。
+pub fn c_awi_lit_bytes(lit: string, st: string) string {
+    var nbytes: i64 = c_awi_size(st);
+    var neg: bool = false;
+    var s: string = lit;
+    if (str_len(s) as i64 > 0 and s[0] == 45) { neg = true; s = str_slice(s, 1, str_len(s)); }   // '-'
+    var radix: i64 = 10;
+    if (str_len(s) as i64 >= 2 and s[0] == 48) {   // '0'
+        if (s[1] == 120 or s[1] == 88) { radix = 16; s = str_slice(s, 2, str_len(s)); }  // x / X
+        else if (s[1] == 98 or s[1] == 66) { radix = 2; s = str_slice(s, 2, str_len(s)); }  // b / B
+        else if (s[1] == 111 or s[1] == 79) { radix = 8; s = str_slice(s, 2, str_len(s)); }  // o / O
+    }
+    var bytes: []i64 = [];
+    var bi: i64 = 0;
+    while (bi < nbytes) { append(bytes, 0); bi = bi + 1; }
+    var n: i64 = str_len(s);
+    var i: i64 = 0;
+    while (i < n) {
+        var c: i64 = s[i];
+        var d: i64;
+        if (c >= 48 and c <= 57) { d = c - 48; }
+        else if (c >= 65 and c <= 70) { d = c - 55; }
+        else if (c >= 97 and c <= 102) { d = c - 87; }
+        else { d = 0; }
+        var carry: i64 = d;
+        var j: i64 = 0;
+        while (j < nbytes) {
+            var v: i64 = bytes[j] * radix + carry;
+            bytes[j] = v & 0xFF;
+            carry = v >> 8;
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    if (neg) {
+        var k: i64 = 0;
+        while (k < nbytes) { bytes[k] = bytes[k] ^ 0xFF; k = k + 1; }
+        var carry2: i64 = 1;
+        var jj: i64 = 0;
+        while (jj < nbytes and carry2 != 0) {
+            var v2: i64 = bytes[jj] + carry2;
+            bytes[jj] = v2 & 0xFF;
+            carry2 = v2 >> 8;
+            jj = jj + 1;
+        }
+    }
+    var out: string = "{";
+    var q: i64 = 0;
+    while (q < nbytes) {
+        if (q > 0) { out = base.sb_cat2(out, ","); }
+        out = base.sb_cat2(out, base.i2s(bytes[q]));
+        q = q + 1;
+    }
+    out = base.sb_cat2(out, "}");
+    return out;
+}
+// 把「任意位宽整数（AWI，N>64）槽」登记为字节缓冲聚合基：预扫描阶段据此在 t_main 头部
+// 为其 t_alloc 一块 nbytes 缓冲（unsigned char*），避免 CONST/ADD/SUB 等临时槽被声明成
+// (unsigned char*)0 后 memcpy 自 NULL → 段错误（awi_demo 的 t0/t3…/t25 等中间槽）。
+// 仅 N>64 落入；N≤64 保持标量，不在此登记。
+pub fn c_awi_ensure_base(sn: string, st: string) void {
+    var stc: string = c_strip_ptr(st);
+    if (c_is_awi_st(stc) and c_is_agg_base(sn) == false) {
+        append(g_c_agg_base_name, sn);
+        var asz: i64 = c_awi_size(stc);
+        if (asz <= 0) { asz = 8; }
+        append(g_c_agg_base_size, asz);
+    }
+}
 // 从瓦片类型串解析元素 C 类型（如 "arr<arr<i32 x 3> x 2>" -> "int32_t"）。
 // 布局固定为 arr<arr<ELEM x COLS> x ROWS>，ELEM 位于 "arr<arr<" 前缀（8 字符）之后、内层 " x " 之前。
 pub fn c_tile_elem_cty(tst: string) string {
@@ -382,6 +510,8 @@ pub fn c_atoi_trim(s: string) i64 {
     return v;
 }
 pub fn c_vec_elem(ts: string) string {
+    if (c_starts(ts, "ptr<")) { ts = c_strip_ptr(ts); }   // 剥 ptr<> 包装（全局/指针形态）
+    if (c_is_vec(ts) == false) { return "i32"; }   // 防御：非向量（含空串）回落默认元素类型
     var s: i64 = 4;
     var e: i64 = str_len(ts) as i64 - 1;
     var body: string = str_slice(ts, s, e);
@@ -390,6 +520,8 @@ pub fn c_vec_elem(ts: string) string {
     return str_slice(body, 0, xi);
 }
 pub fn c_vec_nelems(ts: string) i64 {
+    if (c_starts(ts, "ptr<")) { ts = c_strip_ptr(ts); }   // 剥 ptr<> 包装（全局/指针形态）
+    if (c_is_vec(ts) == false) { return 0; }   // 防御：非向量（含空串）回落 0 lane
     var s: i64 = 4;
     var e: i64 = str_len(ts) as i64 - 1;
     var body: string = str_slice(ts, s, e);
@@ -511,6 +643,14 @@ pub fn c_is_enum_ty(ty: string) bool {
 // 类型名 → C 类型（函数签名 / 局部声明共用，保证前后向声明一致）。
 pub fn c_tystr_c(ty: string) string {
     if (ty == "" or ty == "void") { return "void"; }
+    // 向量（vec<ELEM x N>）：字节缓冲模型下与瓦片/定长数组同构 —— 一律按 unsigned char* 缓冲指针，
+    // 绝不走 int64_t 标量（否则 `scale4(v,k)` 形参/返回值被生成为 int64_t、向量逐元素写入越界踩踏）。
+    // 与 LLVM 后端的 <N x ELEM> 聚合逐字对齐；tmir-c 字节缓冲即 N*sizeof(ELEM) 字节。
+    if (c_is_vec(ty)) { return "unsigned char*"; }
+    // 任意位宽整数（AWI，N>64）：字节缓冲模型下与向量同构 —— 一律按 little-endian unsigned char* 缓冲指针，
+    // 绝不走 int64_t 标量（否则 u128 字面量被 (int64_t)(…) 截断/溢出、值透传给 t_sb_append_fmt_big 类型错配）。
+    // 与 LLVM 后端的原生 i<N>/u<N> 逐字对齐；tmir-c 缓冲即 ceil(N/8) 小端字节。N≤64 保持标量，不落此分支。
+    if (c_is_awi_st(ty)) { return "unsigned char*"; }
     if (c_is_enum_ty(ty)) { return "int64_t"; }   // 枚举是标量（LLVM 后端按 i64 擦除；C 用 int64_t 对齐）
     if (ty == "%TStr") { return "TStr"; }
     if (ty == "%TSlice") { return "TSlice"; }
@@ -1921,6 +2061,23 @@ pub fn c_emit_func(sb: StringBuilder, f: TMIRFunc) void {
     // 预扫描：地址槽（gep/addr_of/gep_idx 的 dst）+ 聚合基槽（addr_of 的 args[0]）
     //   + slot 类型名表（GEP/ADDR_OF/BITCAST/STRUCT_NEW/CALL/CONST_STR/ADD 结果类型）。
     {
+        // ⚠ 向量形参（vec<ELEM x N>）：即使函数体内未取址（如仅作逐元素二元源），也须声明为
+        // unsigned char* 缓冲指针而非 int64_t（否则 scale4 的 v/k 被生成为 int64_t、向量读取越界）。
+        // 标为聚合形参后 c_param_c_ty 返 unsigned char*，且入口处按值语义拷入本帧私有缓冲。
+        var _npp: i64 = slice_len(f.params) as i64;
+        var _pp: i64 = 0;
+        while (_pp < _npp) {
+            var _pv: string = f.params[_pp];
+            var _col: i64 = c_find_col(_pv, ":");
+            if (_col >= 0) {
+                var _pn: string = c_strip_suf(str_slice(_pv, 0, _col));
+                var _ptn: string = c_strip_ws(str_slice(_pv, _col + 1, str_len(_pv) as i64));
+                if (c_is_vec(c_strip_ptr(_ptn)) and c_is_agg_param(f.name, _pn) == false) {
+                    c_agg_param_mark(f.name, _pn);
+                }
+            }
+            _pp = _pp + 1;
+        }
         var pbi: i64 = 0;
         while (pbi < slice_len(f.blocks) as i64) {
             var pni: i64 = slice_len(f.blocks[pbi].insts) as i64;
@@ -1941,13 +2098,27 @@ pub fn c_emit_func(sb: StringBuilder, f: TMIRFunc) void {
                         var cst: string = tir.tir_st_to_str(pins.st);
                         var cst_core: string = c_strip_ptr(cst);
                         var cdn: string = c_strip_suf(pins.dst.name);
-                        if (c_is_arr(cst_core) and c_is_agg_base(cdn) == false
+                        // 瓦片/数组/向量结果内建（@tsplat/@splat…）：字节缓冲模型下结果须拥有缓冲，
+                        // 否则按标量 int64_t 声明 → 字节写越界踩踏 arena 元数据 → 挂死。
+                        if ((c_is_arr(cst_core) or c_is_vec(cst_core)) and c_is_agg_base(cdn) == false
                             and c_is_addr_slot(cdn) == false and c_is_param(g_cf, cdn) == false) {
                             c_slot_ty_mark(cdn, cst);
                             append(g_c_agg_base_name, cdn);
                             var asz: i64 = c_agg_size_of_tyname(cst_core);
                             if (asz <= 0) { asz = 8; }
                             append(g_c_agg_base_size, asz);
+                        }
+                        // 向量内建结果类型补正（TIR 的 call 目的 st 对 @reduce_*/@vlen 常记为标量/空，
+                        // 但 C 声明须用真实返回类型，否则结果槽被退化成 int64 → 浮点归约被截断/类型错配）：
+                        //   @vlen(v)         → i64（lane 数）
+                        //   @reduce_*(v)      → 向量元素类型（i32/f64 …）
+                        //   @splat(s,N)       → 向量类型（vec<elem x N>，上面已登记缓冲，此处只补类型名）
+                        var _cbn: string = c_cbase(c_strip_suf(pins.args[0].name));
+                        if (_cbn == "vlen" and c_is_agg_base(cdn) == false and c_is_param(g_cf, cdn) == false) {
+                            c_slot_ty_mark(cdn, "i64");
+                        } else if ((_cbn == "reduce_add" or _cbn == "reduce_mul" or _cbn == "reduce_max" or _cbn == "reduce_min") and slice_len(pins.args) as i64 >= 2) {
+                            var _vst: string = c_vec_type_from_operand(pins.args[1]);
+                            if (c_is_vec(_vst)) { c_slot_ty_mark(cdn, c_vec_elem(_vst)); }
                         }
                     }
                 }
@@ -1975,6 +2146,21 @@ pub fn c_emit_func(sb: StringBuilder, f: TMIRFunc) void {
                         if (asz <= 0) { asz = 8; }
                         append(g_c_agg_base_size, asz);
                     }
+                    // ⚠ 向量槽（vec<ELEM x N>）：与瓦片/数组同属「字节缓冲聚合」，即使未被 addr_of 取址
+                    // （如直接作逐元素二元/归约源）也必须落在字节缓冲，否则按标量 int64_t 声明 →
+                    // 向量逐元素写入越界踩踏（vector_demo 的 var a/b/c/... 全部向量局部）。
+                    // 带 ptr<> 包装（vec 常以 ptr<vec<...>> 形态流转）时剥 ptr<> 再判。
+                    if (c_is_vec(stn_core) and c_is_agg_base(sn) == false) {
+                        append(g_c_agg_base_name, sn);
+                        var asz: i64 = c_agg_size_of_tyname(stn_core);
+                        if (asz <= 0) { asz = 8; }
+                        append(g_c_agg_base_size, asz);
+                    }
+                    // ⚠ 任意位宽整数（AWI，N>64）：与向量/数组同属「字节缓冲聚合」，即使未被 addr_of 取址
+                    // （如直接作 format 实参 / 逐元素二元源）也必须落在字节缓冲，否则按标量 int64_t 声明 →
+                    // 字面量 (int64_t)(0xFFFF…) 溢出、值透传给 t_sb_append_fmt_big 类型错配
+                    // （awi_demo 的 var a/b/c/d/e/h 全部 AWI 局部）。N≤64 保持标量，不落此分支。
+                    c_awi_ensure_base(sn, stn_core);
                     // ⚠ 用户结构体值槽（%Struct，非数组 / 非标量 / 非运行库 struct TStr/TSlice/…）：
                     // 源码 `var l: Self;` 这类聚合局部在字节缓冲模型下是 unsigned char* 槽，
                     // 若初始化为 (unsigned char*)0，后续 ret/store 会 memcpy 自 NULL → 段错误
@@ -2153,7 +2339,7 @@ pub fn c_emit_func(sb: StringBuilder, f: TMIRFunc) void {
                 // 真实瓦片类型可能落在 ins.st 或 args[0].st（实测 tile `a+b` 的 ins.st 常为 ptr/空串）。
                 if (pins.op == tir__TIR_OP_ADD or pins.op == tir__TIR_OP_SUB or pins.op == tir__TIR_OP_MUL) {
                     var bst: string = tir.tir_st_to_str(pins.st);
-                    if (c_is_tile_st(bst) == false) { bst = tir.tir_st_to_str(pins.args[0].st); }
+                    if (c_is_tile_st(bst) == false and c_is_vec_st(bst) == false) { bst = tir.tir_st_to_str(pins.args[0].st); }
                     if (c_is_tile_st(bst)) {
                         var bn: string = c_strip_suf(pins.dst.name);
                         var bcore: string = c_strip_ptr(bst);
@@ -2163,7 +2349,38 @@ pub fn c_emit_func(sb: StringBuilder, f: TMIRFunc) void {
                             if (asz <= 0) { asz = 8; }
                             append(g_c_agg_base_size, asz);
                         }
+                    } else if (c_is_vec_st(bst)) {
+                        // 向量逐元素二元（a + b / a - b / a * b）结果槽：字节缓冲模型下须拥有缓冲，
+                        // 否则按标量 int64_t 声明 → 向量写入越界踩踏（vector_demo 的 c = a + [...]/e = a * g_scale）。
+                        var bn: string = c_strip_suf(pins.dst.name);
+                        var bcore: string = c_strip_ptr(bst);
+                        if (c_is_agg_base(bn) == false and c_is_addr_slot(bn) == false and c_is_param(g_cf, bn) == false) {
+                            append(g_c_agg_base_name, bn);
+                            var asz: i64 = c_agg_size_of_tyname(bcore);
+                            if (asz <= 0) { asz = 8; }
+                            append(g_c_agg_base_size, asz);
+                        }
                     }
+                }
+                // ⚠ 任意位宽整数（AWI，N>64）二元加/减结果槽：与瓦片/向量同属字节缓冲聚合，
+                // 须拥有缓冲（否则按标量 int64_t 声明 → memcpy 自 NULL / 缓冲过小踩踏）。
+                // 仅 ADD/SUB 走 AWI 分支（MUL 等暂不覆盖，按需扩展）。
+                if (pins.op == tir__TIR_OP_ADD or pins.op == tir__TIR_OP_SUB) {
+                    var bn: string = c_strip_suf(pins.dst.name);
+                    var bst: string = tir.tir_st_to_str(pins.st);
+                    if (c_is_awi_st(bst) == false) { bst = tir.tir_st_to_str(pins.args[0].st); }
+                    c_awi_ensure_base(bn, bst);
+                }
+                // ⚠ 任意位宽整数（AWI，N>64）字面量目的槽：CONST 指令不产生 SLOT，故须在此单独登记
+                // 字节缓冲聚合基，否则 t0/t3… 等中间槽被声明成 (unsigned char*)0 → memcpy 自 NULL 段错误。
+                // 判定须含「槽使用端类型」c_slot_st(cn)：窄立即数（如 `a+1` 的 `1`）定义端是 i64、使用端是 i128，
+                // 仅看定义端会漏判 → 漏登记 → 缓冲缺失（awi_demo 的 t24）。
+                if (pins.op == tir__TIR_OP_CONST) {
+                    var cn: string = c_strip_suf(pins.dst.name);
+                    var cst: string = tir.tir_st_to_str(pins.st);
+                    if (c_is_awi_st(cst) == false) { cst = c_slot_ty_find(cn); }
+                    if (c_is_awi_st(cst) == false) { cst = tir.tir_st_to_str(c_slot_st(cn, g_cf)); }
+                    c_awi_ensure_base(cn, cst);
                 }
                 if (pins.op == tir__TIR_OP_SLICE_AT or pins.op == tir__TIR_OP_CONST_PTR_NULL) {
                     var dn8: string = c_strip_suf(pins.dst.name);
@@ -2833,6 +3050,27 @@ pub fn c_emit_inst(sb: StringBuilder, ins: TMIRInst) void {
         if (cv == "inf") { cv = "(1.0/0.0)"; }
         else if (cv == "-inf") { cv = "(-1.0/0.0)"; }
         else if (cv == "nan") { cv = "(0.0/0.0)"; }
+        // 任意位宽整数（AWI，N>64）字面量：值存为 little-endian 字节缓冲，经静态字节数组 memcpy 进 dstn 缓冲，
+        // 而非标量强转（后者溢出/截断，且 t_sb_append_fmt_big 要的是字节指针）。覆盖十进制/十六/二/八进制与负字面量。
+        // ⚠ 判定须含「槽的使用端类型」c_slot_st(dstn)：LLVM 后端把窄立即数（如 `a+1` 的 `1`，const i64）
+        //   在 ADD 处隐式 sext 到结果宽（i128），TIR 里该槽的「使用端 st」是 i128 而「定义端 st」仍是 i64。
+        //   仅看定义端会漏判 → 槽被退化成 unsigned char* 空指针、CONST 又按标量强转 → 段错误（awi_demo 的 t24）。
+        var _cstst: string = tir.tir_st_to_str(ins.st);
+        if (c_is_awi_st(_cstst) == false) { _cstst = c_slot_ty_find(dstn); }
+        if (c_is_awi_st(_cstst) == false) { _cstst = tir.tir_st_to_str(c_slot_st(dstn, g_cf)); }
+        if (c_is_awi_st(_cstst)) {
+            var _est: string = _cstst;
+            var _nb: i64 = c_awi_size(_est);
+            var _bytes: string = c_awi_lit_bytes(cv, _est);
+            var _litn: string = base.sb_cat2("_awilit", base.i2s(g_c_tmpc));
+            g_c_tmpc = g_c_tmpc + 1;
+            sb_append_str(sb, "  { static const unsigned char "); sb_append_str(sb, _litn);
+            sb_append_str(sb, "["); sb_append_i64(sb, _nb); sb_append_str(sb, "] = ");
+            sb_append_str(sb, _bytes); sb_append_str(sb, "; memcpy((void*)(");
+            sb_append_str(sb, dstn); sb_append_str(sb, "), (void*)("); sb_append_str(sb, _litn);
+            sb_append_str(sb, "), (size_t)("); sb_append_i64(sb, _nb); sb_append_str(sb, ")); }\n");
+            return;
+        }
         // ⚠ 用 c_slot_c_ty（而非 tmir.tmir_st_c(c_slot_st)）：后者对「命名类型（枚举）」走 %→unsigned char*
         // 的聚合分支，会把枚举常量 0 误转成 (unsigned char*)(0) → int64_t←指针 编译失败
         // （enum_match_dispatch）。c_slot_c_ty 已借 c_is_enum_ty 把枚举识别为 int64_t。
@@ -3031,6 +3269,50 @@ pub fn c_emit_inst(sb: StringBuilder, ins: TMIRInst) void {
                 if (p0ty == "treduce_sum") { sb_append_str(sb, "      _acc = _acc + _v;\n"); }
                 else if (p0ty == "treduce_mul") { sb_append_str(sb, "      _acc = _acc * _v;\n"); }
                 else if (p0ty == "treduce_min") { sb_append_str(sb, "      if (_v < _acc) _acc = _v;\n"); }
+                else { sb_append_str(sb, "      if (_v > _acc) _acc = _v;\n"); }
+                sb_append_str(sb, "    }\n");
+            } else { sb_append_str(sb, " = 0;\n"); }
+            sb_append_str(sb, "    "); sb_append_str(sb, dstn); sb_append_str(sb, " = _acc;\n  }\n");
+            return;
+        }
+        // ── @Vector 向量内建（与 tir_to_ll 向量分支逐位对齐）──────────────
+        // @vlen(v)：lane 数编译期已知 → 直接发字面量 i64（LLVM 后端 insertelement/shufflevector 无关，只取 N）。
+        if (p0ty == "vlen") {
+            var _vst: string = c_vec_type_from_operand(ins.args[1]);
+            var _N: i64 = c_vec_nelems(_vst);
+            sb_append_str(sb, "  "); sb_append_str(sb, dstn); sb_append_str(sb, " = "); sb_append_i64(sb, _N); sb_append_str(sb, ";\n");
+            return;
+        }
+        // @splat(s, N)：dst 是 vec<elem x N> 字节缓冲，逐 lane 广播 = s（对齐 LLVM insertelement+shufflevector）。
+        if (p0ty == "splat") {
+            var _tst: string = c_strip_ptr(tir.tir_st_to_str(ins.st));
+            if (c_is_vec(_tst) == false) { _tst = c_strip_ptr(c_slot_ty_find(dstn)); }   // 回退到结果槽类型
+            var _ecty: string = c_vec_elem_cty(_tst);
+            if (_ecty == "" or _ecty == "void") { _ecty = "int32_t"; }
+            var _N: i64 = c_vec_nelems(_tst);
+            sb_append_str(sb, "  { "); sb_append_str(sb, _ecty); sb_append_str(sb, "* _tp = (");
+            sb_append_str(sb, _ecty); sb_append_str(sb, "*)("); sb_append_str(sb, dstn); sb_append_str(sb, "); int64_t _ii;\n");
+            sb_append_str(sb, "    for (_ii = 0; _ii < "); sb_append_i64(sb, _N); sb_append_str(sb, "; _ii++) { _tp[_ii] = (");
+            sb_append_str(sb, _ecty); sb_append_str(sb, ")("); c_emit_val(sb, ins.args[1]); sb_append_str(sb, "); }\n  }\n");
+            return;
+        }
+        // @reduce_add/mul/max/min(v)：向量是字节缓冲，逐 lane 折叠（max/min 用 < / > 比较，
+        // 与 LLVM icmp+select 同语义；本例向量均为 i32 有符号 / f64 浮点，< > 即正确谓词）。
+        if (p0ty == "reduce_add" or p0ty == "reduce_mul" or p0ty == "reduce_max" or p0ty == "reduce_min") {
+            var _vst: string = c_vec_type_from_operand(ins.args[1]);
+            var _ecty: string = c_vec_elem_cty(_vst);
+            if (_ecty == "" or _ecty == "void") { _ecty = "int32_t"; }
+            var _N: i64 = c_vec_nelems(_vst);
+            sb_append_str(sb, "  { "); sb_append_str(sb, _ecty); sb_append_str(sb, "* _tp = (");
+            sb_append_str(sb, _ecty); sb_append_str(sb, "*)("); c_emit_val(sb, ins.args[1]); sb_append_str(sb, "); ");
+            sb_append_str(sb, _ecty); sb_append_str(sb, " _acc");
+            if (_N > 0) {
+                sb_append_str(sb, " = _tp[0]; int64_t _ii;\n");
+                sb_append_str(sb, "    for (_ii = 1; _ii < "); sb_append_i64(sb, _N); sb_append_str(sb, "; _ii++) {\n");
+                sb_append_str(sb, "      "); sb_append_str(sb, _ecty); sb_append_str(sb, " _v = _tp[_ii];\n");
+                if (p0ty == "reduce_add") { sb_append_str(sb, "      _acc = _acc + _v;\n"); }
+                else if (p0ty == "reduce_mul") { sb_append_str(sb, "      _acc = _acc * _v;\n"); }
+                else if (p0ty == "reduce_min") { sb_append_str(sb, "      if (_v < _acc) _acc = _v;\n"); }
                 else { sb_append_str(sb, "      if (_v > _acc) _acc = _v;\n"); }
                 sb_append_str(sb, "    }\n");
             } else { sb_append_str(sb, " = 0;\n"); }
@@ -3528,6 +3810,69 @@ pub fn c_emit_inst(sb: StringBuilder, ins: TMIRInst) void {
             sb_append_str(sb, _mn); sb_append_str(sb, " _rp[_ii]; }\n  }\n");
             return;
         }
+    }
+    // 向量逐元素二元（vec<elem x N>）：与 LLVM <N x ELEM> 逐 lane 对齐，字节缓冲模型下把向量当
+    // 扁平 elem_cty* 缓冲，逐元素 apply op（仅数值 ADD/SUB/MUL；位运算/比较/移位不在此列）。
+    // ⚠ 与瓦片同：inst.st 常为 ptr 或空串，真实向量类型落在 inst.args[0].st。
+    var _vst: string = "";
+    if (c_is_vec_st(tir.tir_st_to_str(ins.st))) { _vst = tir.tir_st_to_str(ins.st); }
+    if (_vst == "" and c_is_vec_st(tir.tir_st_to_str(ins.args[0].st))) { _vst = tir.tir_st_to_str(ins.args[0].st); }
+    if (_vst != "") {
+        if (op == tir__TIR_OP_ADD or op == tir__TIR_OP_SUB or op == tir__TIR_OP_MUL) {
+            var _ecty: string = c_vec_elem_cty(_vst);
+            var _total: i64 = c_vec_nelems(_vst);
+            var _mn: string = c_binop_mnem(op);
+            sb_append_str(sb, "  { "); sb_append_str(sb, _ecty); sb_append_str(sb, "* _lp = (");
+            sb_append_str(sb, _ecty); sb_append_str(sb, "*)("); c_emit_val(sb, ins.args[0]); sb_append_str(sb, "); ");
+            sb_append_str(sb, _ecty); sb_append_str(sb, "* _rp = ("); sb_append_str(sb, _ecty); sb_append_str(sb, "*)("); c_emit_val(sb, ins.args[1]); sb_append_str(sb, "); ");
+            sb_append_str(sb, _ecty); sb_append_str(sb, "* _dp = ("); sb_append_str(sb, _ecty); sb_append_str(sb, "*)("); sb_append_str(sb, c_strip_suf(ins.dst.name)); sb_append_str(sb, "); int64_t _ii;\n");
+            sb_append_str(sb, "    for (_ii = 0; _ii < "); sb_append_i64(sb, _total); sb_append_str(sb, "; _ii++) { _dp[_ii] = _lp[_ii] ");
+            sb_append_str(sb, _mn); sb_append_str(sb, " _rp[_ii]; }\n  }\n");
+            return;
+        }
+    }
+    // 任意位宽整数（AWI，N>64）二元加/减：dst/arg 均为 little-endian 字节缓冲，经运行库 t_big_add/t_big_sub 计算，
+    // 与 LLVM 原生 i<N>/u<N> 算术逐字对齐。第二操作数可能是同宽缓冲（AWI）或窄标量（≤64 位，如 `a + 1`），
+    // 后者经 t_big_from_i64 提升为全宽缓冲（按标量自身符号零/符号扩展）。仅 ADD/SUB 走本分支（MUL 等暂不覆盖，按需扩展）。
+    var _awist: string = tir.tir_st_to_str(ins.st);
+    if (c_is_awi_st(_awist) == false and c_is_awi_st(tir.tir_st_to_str(ins.args[0].st))) { _awist = tir.tir_st_to_str(ins.args[0].st); }
+    if (c_is_awi_st(_awist) and (op == tir__TIR_OP_ADD or op == tir__TIR_OP_SUB)) {
+        var _nb: i64 = c_awi_size(_awist);
+        var _dstn: string = c_strip_suf(ins.dst.name);
+        var _a0st: string = tir.tir_st_to_str(ins.args[0].st);
+        var _a1st: string = tir.tir_st_to_str(ins.args[1].st);
+        var _a0expr: string = c_strip_suf(ins.args[0].name);
+        var _a1expr: string = c_strip_suf(ins.args[1].name);
+        var _need_block: bool = false;
+        // 操作数 0：AWI 缓冲直接用槽名；窄标量（≤64 位）经 t_big_from_i64 提升进临时缓冲。
+        if (c_is_awi_st(_a0st) == false) {
+            var _t0: string = base.sb_cat2("_awib", base.i2s(g_c_tmpc)); g_c_tmpc = g_c_tmpc + 1;
+            var _s0: string = "0"; if (c_starts(_a0st, "i")) { _s0 = "1"; }
+            sb_append_str(sb, "  { unsigned char* "); sb_append_str(sb, _t0);
+            sb_append_str(sb, " = (unsigned char*)t_alloc((size_t)("); sb_append_i64(sb, _nb); sb_append_str(sb, ")); t_big_from_i64((void*)(");
+            sb_append_str(sb, _t0); sb_append_str(sb, "), (int64_t)("); sb_append_str(sb, _a0expr);
+            sb_append_str(sb, "), (int)("); sb_append_i64(sb, _nb); sb_append_str(sb, "), "); sb_append_str(sb, _s0);
+            sb_append_str(sb, "); ");
+            _a0expr = _t0; _need_block = true;
+        } else if (_need_block == false) { sb_append_str(sb, "  { "); _need_block = true; }
+        // 操作数 1：同上。
+        if (c_is_awi_st(_a1st) == false) {
+            var _t1: string = base.sb_cat2("_awib", base.i2s(g_c_tmpc)); g_c_tmpc = g_c_tmpc + 1;
+            var _s1: string = "0"; if (c_starts(_a1st, "i")) { _s1 = "1"; }
+            sb_append_str(sb, "unsigned char* "); sb_append_str(sb, _t1);
+            sb_append_str(sb, " = (unsigned char*)t_alloc((size_t)("); sb_append_i64(sb, _nb); sb_append_str(sb, ")); t_big_from_i64((void*)(");
+            sb_append_str(sb, _t1); sb_append_str(sb, "), (int64_t)("); sb_append_str(sb, _a1expr);
+            sb_append_str(sb, "), (int)("); sb_append_i64(sb, _nb); sb_append_str(sb, "), "); sb_append_str(sb, _s1);
+            sb_append_str(sb, "); ");
+            _a1expr = _t1;
+        }
+        var _fn: string = "add"; if (op == tir__TIR_OP_SUB) { _fn = "sub"; }
+        sb_append_str(sb, "t_big_"); sb_append_str(sb, _fn);
+        sb_append_str(sb, "((unsigned char*)("); sb_append_str(sb, _dstn);
+        sb_append_str(sb, "), (unsigned char*)("); sb_append_str(sb, _a0expr);
+        sb_append_str(sb, "), (void*)("); sb_append_str(sb, _a1expr);
+        sb_append_str(sb, "), (int)("); sb_append_i64(sb, _nb); sb_append_str(sb, ")); }\n");
+        return;
     }
     // 浮点 / 整数 二元
     var mnem: string = c_binop_mnem(op);
