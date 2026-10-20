@@ -189,6 +189,8 @@ pub fn c_align_up(off: i64, a: i64) i64 {
     return r;
 }
 pub fn c_tstr_align(ts: string) i64 {
+    var rta: i64 = c_runtime_agg_align_n(c_rt_name(ts));
+    if (rta >= 0) { return rta; }
     if (ts == "i8" or ts == "u8") { return 1; }
     if (ts == "i16" or ts == "u16") { return 2; }
     if (ts == "i32" or ts == "u32") { return 4; }
@@ -210,7 +212,31 @@ pub fn c_is_scalar_tstr(ts: string) bool {
     return false;
 }
 
+// 运行库聚合名归一化：TIR 用 "%TStr" / "%TSlice" / "%TClosure" / "%TBitStr"（带 %），
+// 而字节缓冲尺寸/对齐特判只认无 % 的 "TStr"/...。两处都需命中 → 统一剥 % 后比对。
+// ⚠ 漏剥 → c_tstr_size("%TStr") 落到 c_struct_size("%TStr") 返回 0 → []TStr 切片 elem_size=0、
+// 含 TStr 字段的用户 struct 字段尺寸 0 → slice_at/memcpy 读错位内存 → TStr.ptr 变垃圾整数（如 0x7）、
+// .len 变天文数字 → t_sb_append_str 申请 ~1TB → t_arena_alloc 误判 OOM（tc_self miscompile 根因）。
+pub fn c_rt_name(ts: string) string {
+    if (c_starts(ts, "%")) { return str_slice(ts, 1, str_len(ts) as i64); }
+    return ts;
+}
+pub fn c_runtime_agg_size_n(nm: string) i64 {
+    if (nm == "TStr") { return 16; }
+    if (nm == "TSlice") { return 32; }
+    if (nm == "TClosure") { return 16; }
+    if (nm == "TBitStr") { return 24; }
+    return -1;
+}
+pub fn c_runtime_agg_align_n(nm: string) i64 {
+    if (nm == "TStr" or nm == "TSlice" or nm == "TClosure" or nm == "TBitStr") { return 8; }
+    return -1;
+}
 pub fn c_tstr_size(ts: string) i64 {
+    // ⚠ 运行库聚合（"%TStr"/"TStr"…）必须优先命中，且剥 % 后比对：否则 c_struct_size("%TStr") 返回 0
+    // → []TStr 切片 elem_size=0、含 string 字段的 struct 布局错位（tc_self miscompile 根因）。
+    var rtsz: i64 = c_runtime_agg_size_n(c_rt_name(ts));
+    if (rtsz >= 0) { return rtsz; }
     if (ts == "i8" or ts == "u8") { return 1; }
     if (ts == "i16" or ts == "u16") { return 2; }
     if (ts == "i32" or ts == "u32") { return 4; }
@@ -218,14 +244,6 @@ pub fn c_tstr_size(ts: string) i64 {
     if (ts == "f32") { return 4; }
     if (ts == "f64") { return 8; }
     if (ts == "ptr" or ts == "ptr<void>" or c_starts(ts, "ptr<")) { return 8; }
-    // ⚠ 运行库结构体（TStr/TSlice/TClosure/TBitStr）：字节缓冲模型里它们是定宽聚合值，
-    // 尺寸须与 runtime/t_runtime.h 的真实布局一致（TStr=ptr+len=16、TSlice=ptr+len+cap+elem_size=32、
-    // TClosure=fn+env=16、TBitStr=ptr+bit_len+cap=24）。漏判会退化成 8 → 切片 append 只拷 8B、
-    // 丢失长度/后续字段（[]string 元素变空串）、含 string 字段的用户 struct 布局错位（fmt_json_a1a / adt_*）。
-    if (ts == "TStr") { return 16; }
-    if (ts == "TSlice") { return 32; }
-    if (ts == "TClosure") { return 16; }
-    if (ts == "TBitStr") { return 24; }
     if (c_starts(ts, "%")) { return c_struct_size(ts); }
     if (c_starts(ts, "[")) { return c_array_nelems(ts) * c_tstr_size(c_array_elem(ts)); }
     if (c_is_arr(ts)) { return c_array_nelems(ts) * c_tstr_size(c_array_elem(ts)); }
@@ -276,6 +294,8 @@ pub fn c_find_type_body(name: string) string {
 // 等每操作数高频调用，且内部递归（c_tstr_size→c_struct_size），对超大模块累计成 O(insts×types) 重复计算；
 // 缓存后整编译仅按「类型数」计算一次（size+1 / align+1 哨兵：0 表示未缓存，合法值恒 ≥1）。
 pub fn c_struct_align(name: string) i64 {
+    var rta: i64 = c_runtime_agg_align_n(c_rt_name(name));
+    if (rta >= 0) { return rta; }
     var ca: i64 = map_get(g_c_sal, name);
     if (ca > 0) { return ca - 1; }
     var body: string = c_find_type_body(name);
@@ -294,6 +314,10 @@ pub fn c_struct_align(name: string) i64 {
     return maxa;
 }
 pub fn c_struct_size(name: string) i64 {
+    // ⚠ 运行库聚合（"%TStr"…）优先命中固定尺寸，剥 % 后比对：否则落到 c_find_type_body 返回 "" → 0，
+    // 使含 string 字段的 struct 布局错位、[]TStr 切片 elem_size=0（tc_self miscompile 根因）。
+    var rtsz: i64 = c_runtime_agg_size_n(c_rt_name(name));
+    if (rtsz >= 0) { return rtsz; }
     // 数组（LLVM 风格 "[N x E]" 或 arr<E x N>）按元素数 × 元素宽计算，否则按值类型查体失败返回 0。
     if (c_starts(name, "[") or c_is_arr(name)) { return c_array_nelems(name) * c_tstr_size(c_array_elem(name)); }
     if (c_is_vec(name)) { return c_vec_nelems(name) * c_tstr_size(c_vec_elem(name)); }
@@ -669,6 +693,12 @@ pub fn c_gep_offset(ty: string, idx: i64) i64 {
 pub fn c_is_runtime_agg(tn: string) bool {
     return tn == "%TStr" or tn == "%TSlice" or tn == "%TClosure" or tn == "%TBitStr";
 }
+// 运行库「指针句柄」类型（TSb / TMap）：在运行库里恒以指针（TSb* / TMap*）访问，全局须按指针赋值，
+// 切勿走聚合字节缓冲分支（会向 <name>_buf 写 8B 指针 → memcpy 目标为 struct 值非法，或写入错误偏移）。
+// 与 c_is_runtime_agg（TStr/TSlice/TClosure/TBitStr 按值）互补；TSb/TMap 以 '*' 结尾拼写（%TSb* / ptr<%TSb>）。
+pub fn c_is_runtime_handle_ptr(tn: string) bool {
+    return c_starts(tn, "%TSb") or c_starts(tn, "ptr<%TSb") or c_starts(tn, "%TMap") or c_starts(tn, "ptr<%TMap");
+}
 // 剥 "ptr<...>" 外层，返回内层类型名（处理嵌套 ">"，如 "ptr<arr<i8 x 24>>"）。
 pub fn c_strip_ptr(ty: string) string {
     if (c_starts(ty, "ptr<") == false) { return ty; }
@@ -724,7 +754,8 @@ pub fn c_tystr_c(ty: string) string {
     if (ty == "ptr<%TClosure>") { return "TClosure*"; }
     if (ty == "ptr<%TBitStr>") { return "TBitStr*"; }
     if (ty == "ptr<%TMap>" or ty == "%TMap") { return "TMap*"; }   // 运行库堆指针：保留具体类型
-    if (ty == "ptr<%TSb>" or ty == "%TSb") { return "TSb*"; }
+    if (ty == "ptr<%TMap>" or ty == "%TMap" or ty == "%TMap*") { return "TMap*"; }
+    if (ty == "ptr<%TSb>" or ty == "%TSb" or ty == "%TSb*") { return "TSb*"; }
     if (c_starts(ty, "ptr<%")) { return "unsigned char*"; }   // 用户聚合指针 → 字节缓冲
     if (c_starts(ty, "%")) { return "unsigned char*"; }         // 用户聚合 by-value（罕见）
     if (c_starts(ty, "ptr<")) { return "unsigned char*"; }      // 标量指针 → 缓冲指针（支撑 GEP 算术）
@@ -1471,6 +1502,51 @@ pub fn c_call_arg_val(bname: string) string {
     return "";
 }
 
+// 实参按「const void* 取地址」发射（map_set / map_get / slice_set 的字节指针形参，以及 c_emit_conv_arg 的
+// struct→ptr 分支）。若实参是 rvalue（函数调用结果 / 复合字面量），C 不允许对 rvalue 取地址
+// （clang: cannot take the address of an rvalue of type 'TStr'）→ 先提升为本块临时变量再取址。
+// 判定：c_emit_val 产出的表达式若含 '('，即为调用/复合字面量（非变量/全局 lvalue）→ rvalue。
+// 若实参已是以 '&' 开头的地址（如 TClosure 全局 &g），则直接透传，避免双重取址。
+// 提升声明写入 g_c_pre（调用语句的前置缓冲），由调用点发射器在调用语句之前落盘。
+pub fn c_emit_voidp_addr(sb: StringBuilder, op: TirOperand) void {
+    var _ex: StringBuilder = sb_new();
+    c_emit_val(_ex, op);
+    var _exs: string = sb_to_str(_ex);
+    // 是否「取址表达式本身已带 &」（TIR 直接给出 '&<expr>'）：内层 <expr> 可能是函数调用 / 复合字面量。
+    var _has_addr: bool = (str_len(_exs) as i64 >= 1 and _exs[0] == 38);
+    var _inner: string = _exs;
+    if (_has_addr) { _inner = str_slice(_exs, 1, str_len(_exs)); }
+    // rvalue 取址：内层表达式以标识符开头且含 '('（函数调用 / 结构体构造）→ 非 lvalue，C 不允许对其取址
+    // （clang: cannot take the address of an rvalue of type 'TStr'）。
+    //   须剥掉前导 '&'，把内层调用结果提升到本块临时变量，再取该临时变量的地址。
+    //   注：若 _inner 以 '(' 开头则属「类型转换 / 复合字面量」（C 里已是 lvalue，如 &(int64_t){x}），不提升。
+    if (str_len(_inner) as i64 >= 1 and _inner[0] != 40 and c_find_col(_inner, "(") >= 0) {
+        var _tn: string = base.sb_cat2("_ctmp", base.i2s(g_c_tmpc));
+        g_c_tmpc = g_c_tmpc + 1;
+        // 临时类型 = 内层调用返回类型：按函数表反查 ret_st → C 类型（聚合按结构体 / 标量按 int64_t）。
+        var _rty: string = "";
+        var _lp: i64 = c_find_col(_inner, "(");
+        if (_lp >= 0) {
+            var _fn: string = str_slice(_inner, 0, _lp);
+            var _rst: string = c_func_ret_st(_fn);
+            if (_rst != "") { _rty = c_tystr_c(_rst); }
+        }
+        if (_rty == "") { _rty = "TStr"; }   // 反查失败兜底：map 键/值最常见为 TStr
+        sb_append_str(g_c_pre, "  "); sb_append_str(g_c_pre, _rty); sb_append_str(g_c_pre, " ");
+        sb_append_str(g_c_pre, _tn); sb_append_str(g_c_pre, " = "); sb_append_str(g_c_pre, _inner);
+        sb_append_str(g_c_pre, ";\n");
+        sb_append_str(sb, "&"); sb_append_str(sb, _tn);
+        return;
+    }
+    if (_has_addr) { sb_append_str(sb, _exs); return; }  // 已是 &地址（含合法复合字面量 &(T){x}）
+    // ⚠ 聚合/指针值槽在字节缓冲模型里已是 unsigned char*（指向元素/对象的字节缓冲），
+    //   再取 & 会变成「指针变量自身的地址」，t_slice_set / t_map_put 据此拷贝 8B 指针 + 相邻栈垃圾 →
+    //   元素损坏（slice_set 含 string 字段的 struct 元素、map 键值含聚合时崩溃；tc_self 自举 token 池损坏根因之一）。
+    //   故值槽 C 类型为指针时直接发槽名（它本身就是字节地址），不再取 &。
+    if (c_c_ty_is_ptr(c_operand_c_ty(op))) { sb_append_str(sb, _exs); return; }
+    sb_append_str(sb, "&"); sb_append_str(sb, _exs);
+}
+
 pub fn c_emit_conv_arg(sb: StringBuilder, op: TirOperand, want: string) void {
     if (want == "") { c_emit_val(sb, op); return; }
     var got: string = c_operand_c_ty(op);
@@ -1480,8 +1556,9 @@ pub fn c_emit_conv_arg(sb: StringBuilder, op: TirOperand, want: string) void {
         return;
     }
     if (c_c_ty_is_ptr(want) and c_c_ty_is_struct(got)) {
-        sb_append_str(sb, "("); sb_append_str(sb, want); sb_append_str(sb, ")(void*)(&");
-        c_emit_val(sb, op); sb_append_str(sb, ")");
+        // struct 值实参须取址传入指针形参；rvalue 取址经 c_emit_voidp_addr 自动提升。
+        sb_append_str(sb, "("); sb_append_str(sb, want); sb_append_str(sb, ")(void*)(");
+        c_emit_voidp_addr(sb, op); sb_append_str(sb, ")");
         return;
     }
     c_emit_val(sb, op);
@@ -1555,6 +1632,7 @@ pub var g_c_sliceat_slot: []string;
 pub var g_c_ti_done: []string;      // 已合成 __ti_<T> 的类型名（去重）
 pub var g_c_ti_typedefs: bool;      // TypeMeta/FieldInfo typedef 是否已发射
 pub var g_c_tmpc: i64;                  // load/store 临时变量计数器
+pub var g_c_pre: StringBuilder;          // 取址 rvalue 提升前置声明缓冲（函数调用结果等不可取址值须先提升为本块临时变量）
 // 类型名 → 声明种类（i64 哨兵：0=无/1=Struct/2=Union/3=Enum），O(1) 替代 c_ti_decl_kind 的
 // O(lex.decl_list) 全扫描。⚠ 仅用 i64 字典：map[string]string 在 tir 后端 segfault（已实测）。
 // c_ti_arm 被每个 type_info 指令调用（prescan + 函数体发射两处），全编译器反射密集 → 累计成
@@ -2017,6 +2095,23 @@ pub fn tmir_to_c(m: TMIRModule) string {
             // （append_reset_global_slice 编译失败）。
             sb_append_str(sb, "static "); sb_append_str(sb, c_tystr_c(gty)); sb_append_str(sb, " ");
             sb_append_str(sb, g.name); sb_append_str(sb, " = {0};\n");
+        } else if (c_is_runtime_handle_ptr(gty)) {
+            // TSb / TMap：运行库聚合，全局以指针句柄（TSb* / TMap*）访问（tir_to_ll 的 g_ll、各模块 g_c_pre 等）。
+            // 字节缓冲模型若按「字节缓冲」发射会只给 8B（c_struct_size 对运行库句柄类型退化成 8），而 TSb 实为 32B
+            // （uint8_t*+int64+int64+TArena*）、TMap 亦为堆结构；(TSb*)/(TMap*) 转型后解引用越界读垃圾 → memcpy SIGSEGV。
+            // 故须声明「真实结构值 + 指针」两件套，使转型指向合法结构。与运行库签名严格一致。
+            var pty: string = c_tystr_c(gty);                                   // "TSb*" / "TMap*"
+            var stname: string = str_slice(pty, 0, str_len(pty) as i64 - 1);    // 剥尾随 '*' → "TSb" / "TMap"
+            var buf_name: string = base.sb_cat2(g.name, "_buf");
+            while (true) {
+                var gidx: i64 = map_get(g_c_global_idx, buf_name);
+                var uidx: i64 = map_get(g_c_used_buf, buf_name);
+                if (gidx > 0 or uidx > 0) { buf_name = base.sb_cat2(buf_name, "_buf"); }
+                else { break; }
+            }
+            map_set(g_c_used_buf, buf_name, 1);
+            sb_append_str(sb, "static "); sb_append_str(sb, stname); sb_append_str(sb, " "); sb_append_str(sb, buf_name); sb_append_str(sb, " = {0};\n");
+            sb_append_str(sb, "static "); sb_append_str(sb, pty); sb_append_str(sb, " "); sb_append_str(sb, g.name); sb_append_str(sb, " = &"); sb_append_str(sb, buf_name); sb_append_str(sb, ";\n");
         } else if (g.td >= tir__ST_NAMED_BASE or c_is_arr(gty)) {
             // 用户聚合 / 定长数组全局 → 字节缓冲（聚合数据落在缓冲里）。
             // ⚠ 尺寸必须用 c_struct_size：对 arr<E x N> 与命名聚合都正确；c_tstr_size 对 arr<> 退化成 8 → 缓冲过小、越界写 UB
@@ -2191,7 +2286,7 @@ pub fn c_prescan_mapget_tstr(f: TMIRFunc) void {
 pub fn c_emit_func(sb: StringBuilder, f: TMIRFunc) void {
     g_cf = f;
     g_c_addr_slot_name = []; g_c_addr_name = []; g_c_addr_st = []; g_c_addr_base_name = []; g_c_addr_base_ty = [];
-    g_c_agg_base_name = []; g_c_agg_base_size = []; g_c_tmpc = 0;
+    g_c_agg_base_name = []; g_c_agg_base_size = []; g_c_tmpc = 0; g_c_pre = sb_new();
     g_c_ptrbuf_name = []; g_c_ptrbuf_size = []; g_c_sliceat_slot = [];
     g_c_slot_tyname = []; g_c_slot_tyty = []; g_c_mapval_slot = []; g_c_alias_name = []; g_c_alias_to = [];
     // ⚠ 专用别名预收集 Pass：先于 pre-scan 主循环，把所有 BITCAST/STORE 的「槽别名」(dst→src)
@@ -3056,7 +3151,10 @@ pub fn c_emit_inst(sb: StringBuilder, ins: TMIRInst) void {
         var dname: string = ins.dst.name;
         if (str_len(dname) as i64 > 0 and dname[0] == 64) {   // 全局
             var gname: string = c_strip_suf(dname);
-            if (c_global_is_agg(gname)) {
+            var gstty: string = tir.tir_st_to_str(c_global_st(gname));
+            // ⚠ 运行库「指针句柄」全局（%TSb* / %TMap*：SB / Map 恒以指针访问）不参与聚合字节缓冲分支，
+            //   否则向 <name>_buf 写 8B 指针 → memcpy 目标为 struct 值非法（或写入错误偏移）。按指针标量赋值。
+            if (c_global_is_agg(gname) and c_is_runtime_handle_ptr(gstty) == false) {
                 if (c_global_is_bytebuf(gname)) {
                     var gsz: i64 = c_struct_size(tir.tir_st_to_str(c_global_st(gname)));
                     if (gsz <= 0) { gsz = c_tstr_size(tir.tir_st_to_str(c_global_st(gname))); }
@@ -3080,9 +3178,10 @@ pub fn c_emit_inst(sb: StringBuilder, ins: TMIRInst) void {
                 }
                 return;
             }
-            var vst: i64 = c_global_st(gname);
+            // ⚠ 落到此分支的含「指针句柄全局」（%TSb* / %TMap*）：按 c_tystr_c 给的 TSb* / TMap* 指针类型赋值；
+            //   其余为标量/标量指针全局，c_tystr_c 对基元回落 tmir_st_c，与声明一致。
             sb_append_str(sb, "  "); sb_append_str(sb, gname); sb_append_str(sb, " = (");
-            sb_append_str(sb, tmir.tmir_st_c(vst)); sb_append_str(sb, ")(");
+            sb_append_str(sb, c_tystr_c(gstty)); sb_append_str(sb, ")(");
             c_emit_val(sb, ins.args[0]); sb_append_str(sb, ");\n");
             return;
         }
@@ -3630,11 +3729,15 @@ pub fn c_emit_inst(sb: StringBuilder, ins: TMIRInst) void {
                 sb_append_str(sb, "  memset((void*)(&"); sb_append_str(sb, dstn);
                 sb_append_str(sb, "), 0, (size_t)("); sb_append_str(sb, base.i2s(mgdst_sz)); sb_append_str(sb, "));\n");
             }
-            sb_append_str(sb, "  "); sb_append_str(sb, cfname); sb_append_str(sb, "((TMap*)(");
-            c_emit_val(sb, ins.args[1]); sb_append_str(sb, "), (const void*)(&");
-            c_emit_val(sb, ins.args[2]); sb_append_str(sb, ")");
-            if (dstn != "") { sb_append_str(sb, ", (void*)(&"); sb_append_str(sb, dstn); sb_append_str(sb, ")"); }
-            else { sb_append_str(sb, ", (void*)(0)"); }
+            // key 按运行库要求「取地址」传入；实参先缓冲到 abuf（rvalue 取址提升须先于调用语句落盘）。
+            var abuf: StringBuilder = sb_new();
+            sb_append_str(abuf, "(TMap*)("); c_emit_val(abuf, ins.args[1]); sb_append_str(abuf, "), (const void*)(");
+            c_emit_voidp_addr(abuf, ins.args[2]); sb_append_str(abuf, ")");
+            if (dstn != "") { sb_append_str(abuf, ", (void*)(&"); sb_append_str(abuf, dstn); sb_append_str(abuf, ")"); }
+            else { sb_append_str(abuf, ", (void*)(0)"); }
+            if (str_len(sb_to_str(g_c_pre)) as i64 > 0) { sb_append_str(sb, sb_to_str(g_c_pre)); g_c_pre = sb_new(); }
+            sb_append_str(sb, "  "); sb_append_str(sb, cfname); sb_append_str(sb, "(");
+            sb_append_str(sb, sb_to_str(abuf));
             sb_append_str(sb, ");\n");
             return;
         }
@@ -3683,11 +3786,16 @@ pub fn c_emit_inst(sb: StringBuilder, ins: TMIRInst) void {
         // map_set(m, key, val) → t_map_put(TMap* m, const void* key, const void* val)：
         //   key/val 均按运行库要求「取地址」传入（int 键→&i64，string 键→&TStr，值同）；
         //   普通实参发射对「标量→void*」不会自动取址，必须显式 & 才能匹配 const void*。
-        if (p0ty == "map_set") {
-            sb_append_str(sb, "  "); sb_append_str(sb, cfname); sb_append_str(sb, "((TMap*)(");
-            c_emit_val(sb, ins.args[1]); sb_append_str(sb, "), (const void*)(&");
-            c_emit_val(sb, ins.args[2]); sb_append_str(sb, "), (const void*)(&");
-            c_emit_val(sb, ins.args[3]); sb_append_str(sb, "));\n");
+        if (p0ty == "map_set" or p0ty == "map_put") {
+            // key/val 均按运行库要求「取地址」传入；实参先缓冲到 abuf（rvalue 取址提升须先于调用语句落盘）。
+            var abuf: StringBuilder = sb_new();
+            sb_append_str(abuf, "(TMap*)("); c_emit_val(abuf, ins.args[1]); sb_append_str(abuf, "), (const void*)(");
+            c_emit_voidp_addr(abuf, ins.args[2]); sb_append_str(abuf, "), (const void*)(");
+            c_emit_voidp_addr(abuf, ins.args[3]); sb_append_str(abuf, ")");
+            if (str_len(sb_to_str(g_c_pre)) as i64 > 0) { sb_append_str(sb, sb_to_str(g_c_pre)); g_c_pre = sb_new(); }
+            sb_append_str(sb, "  "); sb_append_str(sb, cfname); sb_append_str(sb, "(");
+            sb_append_str(sb, sb_to_str(abuf));
+            sb_append_str(sb, ");\n");
             return;
         }
         // slice_set(s, i, elem) → t_slice_set(TSlice s, int64_t i, const void* elem)：
@@ -3695,10 +3803,23 @@ pub fn c_emit_inst(sb: StringBuilder, ins: TMIRInst) void {
         //   t_slice_set 按 s.elem_size 拷贝）；通用调用路径把 elem 按值传入 → 与 const void* 类型不符编译失败
         //   （base 的 node flags 全簇 t_slice_set(...) 命中）。s 按值传入（对齐 TSlice 形参）。
         if (p0ty == "slice_set") {
+            // elem 实参：地址槽 / 聚合基直接传缓冲指针；值槽取 & 得值地址（rvalue 经 c_emit_voidp_addr 提升）。
+            // ⚠ 漏判地址槽 → (const void*)(&_k) 取的是「指针变量自身地址」而非缓冲，
+            //    t_slice_set 从指针变量处拷贝 elem_size 字节（8B 指针 + 相邻栈垃圾）→
+            //    len==ptr / 半截 token 等错乱（tc_self 自举 token 池损坏根因）。
+            var abuf: StringBuilder = sb_new();
+            sb_append_str(abuf, ""); c_emit_val(abuf, ins.args[1]); sb_append_str(abuf, ", (int64_t)(");
+            c_emit_val(abuf, ins.args[2]); sb_append_str(abuf, "), ");
+            var _eis_addr: bool = c_is_addr_slot(ins.args[3].name) or c_is_agg_base(ins.args[3].name);
+            if (_eis_addr) {
+                sb_append_str(abuf, "(const void*)("); c_emit_val(abuf, ins.args[3]); sb_append_str(abuf, ")");
+            } else {
+                sb_append_str(abuf, "(const void*)("); c_emit_voidp_addr(abuf, ins.args[3]); sb_append_str(abuf, ")");
+            }
+            if (str_len(sb_to_str(g_c_pre)) as i64 > 0) { sb_append_str(sb, sb_to_str(g_c_pre)); g_c_pre = sb_new(); }
             sb_append_str(sb, "  "); sb_append_str(sb, cfname); sb_append_str(sb, "(");
-            c_emit_val(sb, ins.args[1]); sb_append_str(sb, ", (int64_t)(");
-            c_emit_val(sb, ins.args[2]); sb_append_str(sb, "), (const void*)(&");
-            c_emit_val(sb, ins.args[3]); sb_append_str(sb, "));\n");
+            sb_append_str(sb, sb_to_str(abuf));
+            sb_append_str(sb, ");\n");
             return;
         }
         // map_key_str_at / map_key_int_at：运行库按值返回 TStr / int64（2 参 m, i），
@@ -3727,7 +3848,9 @@ pub fn c_emit_inst(sb: StringBuilder, ins: TMIRInst) void {
             // 非 sret（纯 void 内建 / void 用户函数）：照常传参，丢弃 dst=。
             var is_sret_call: bool = (c_is_user_func(c_cbase(callee)) and c_is_builtin(c_cbase(callee)) == false
                                       and c_is_address(c_strip_suf(ins.dst.name)));
-            sb_append_str(sb, "  "); sb_append_str(sb, cfname); sb_append_str(sb, "(");
+            // 实参先缓冲到 abuf：c_emit_call_arg 内的 rvalue 取址提升（c_emit_conv_arg）会把临时声明写
+            // 入 g_c_pre，必须在调用语句之前落盘 → 故先收齐实参、再 flush g_c_pre、最后写调用语句。
+            var abuf: StringBuilder = sb_new();
             var first: bool = true;
             var call_poff: i64 = poff;
             if (is_sret_call) { call_poff = 1; }
@@ -3737,17 +3860,20 @@ pub fn c_emit_inst(sb: StringBuilder, ins: TMIRInst) void {
                 if (na >= 2 and c_strip_suf(ins.args[1].name) == c_strip_suf(ins.dst.name)) {
                     first = true;
                 } else {
-                    c_emit_val(sb, ins.dst); first = false;
+                    c_emit_val(abuf, ins.dst); first = false;
                 }
             }
             var a: i64 = 1;
             while (a < na) {
-                if (first == false) { sb_append_str(sb, ", "); }
+                if (first == false) { sb_append_str(abuf, ", "); }
                 first = false;
                 // sret：dst 已占 C 实参位 1，故 ins.args[a] 的 callee 形参索引 = a-1（用 call_poff=1 命中）。
-                c_emit_call_arg(sb, ins.args[a], a, p0ty, call_poff);
+                c_emit_call_arg(abuf, ins.args[a], a, p0ty, call_poff);
                 a = a + 1;
             }
+            if (str_len(sb_to_str(g_c_pre)) as i64 > 0) { sb_append_str(sb, sb_to_str(g_c_pre)); g_c_pre = sb_new(); }
+            sb_append_str(sb, "  "); sb_append_str(sb, cfname); sb_append_str(sb, "(");
+            sb_append_str(sb, sb_to_str(abuf));
             sb_append_str(sb, ");\n");
             return;
         }
@@ -3773,14 +3899,18 @@ pub fn c_emit_inst(sb: StringBuilder, ins: TMIRInst) void {
         if (dstn != "") { rdty = c_slot_c_ty(dstn); }
         // 目的槽为指针时包一层显式转换（TMap*→unsigned char* 等）；struct/标量目的不加（struct 值不可强转指针）。
         var wrap: bool = c_c_ty_is_ptr(rdty);
+        // 实参先缓冲到 abuf（理由同 ret_void 分支：rvalue 取址提升须先于调用语句落盘）。
+        var abuf: StringBuilder = sb_new();
+        var a: i64 = 1;
+        while (a < na) { if (a > 1) { sb_append_str(abuf, ", "); } c_emit_call_arg(abuf, ins.args[a], a, p0ty, poff); a = a + 1; }
+        if (str_len(sb_to_str(g_c_pre)) as i64 > 0) { sb_append_str(sb, sb_to_str(g_c_pre)); g_c_pre = sb_new(); }
         sb_append_str(sb, "  ");
         if (dstn != "") {
             sb_append_str(sb, dstn); sb_append_str(sb, " = ");
             if (wrap) { sb_append_str(sb, "("); sb_append_str(sb, rdty); sb_append_str(sb, ")("); }
         }
         sb_append_str(sb, cfname); sb_append_str(sb, "(");
-        var a: i64 = 1;
-        while (a < na) { if (a > 1) { sb_append_str(sb, ", "); } c_emit_call_arg(sb, ins.args[a], a, p0ty, poff); a = a + 1; }
+        sb_append_str(sb, sb_to_str(abuf));
         sb_append_str(sb, ")");
         if (wrap) { sb_append_str(sb, ")"); }
         sb_append_str(sb, ";\n");
