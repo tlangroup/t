@@ -106,6 +106,11 @@ void t_sb_append_fmt_int_conv(TSb* b, TStr spec, int64_t v, TStr mode);
 void t_sb_append_fmt_uint_conv(TSb* b, TStr spec, uint64_t v, TStr mode);
 // 任意位宽整数（>64）格式化：p 指向值的小端字节，nbits 为位宽，is_signed 为符号
 void t_sb_append_fmt_big(TSb* b, TStr spec, const void* p, int64_t nbits, int is_signed);
+// 任意位宽整数（>64）多精度算术（小端字节缓冲，与 t_sb_append_fmt_big 同布局）。
+// C 后端 tmir-c 把 AWI 值存为 little-endian 字节缓冲，本组函数补齐 LLVM 原生 i<N>/u<N> 算术。
+void t_big_from_i64(void* dst, int64_t val, int nbytes, int is_signed);
+void t_big_add(void* dst, const void* a, const void* b, int nbytes);
+void t_big_sub(void* dst, const void* a, const void* b, int nbytes);
 
 // ── 时间格式化（strftime / Python datetime.strftime 的 % 风格子集，M56/M57）──
 // now() -> 当前时刻微秒 epoch；format_time(spec, t_us, use_local) 按 UTC / 本地时区展开。
