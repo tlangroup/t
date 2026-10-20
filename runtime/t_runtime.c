@@ -83,7 +83,10 @@ TArena* t_arena_new(void) {
 #ifdef _WIN32
     // 预留大虚拟空间（不占物理内存），tir 降低超大模块（如完整 tc.tc）时按需提交。
     // 单一连续虚拟区域保证 a->base + a->used 指针语义与旧 malloc 实现一致。
-    a->size = (size_t)16 * 1024 * 1024 * 1024; // 16 GB 虚拟预留（仅占地址空间，无物理成本）
+    // ⚠ S5（删除自举 arena 约束）：tmir-c 字节缓冲模型对完整编译器（~2000 函数）的代码生成
+    // 产生大量临时串且 bump 永不回收，累计越过 16GB；放大到 64GB 以满足自举闭环
+    // （仅预留虚拟地址，物理页按需提交，实测宿主机空闲物理 ~45GB 充足）。
+    a->size = (size_t)64 * 1024 * 1024 * 1024; // 64 GB 虚拟预留（仅占地址空间，无物理成本）
     a->base = (uint8_t*)VirtualAlloc(NULL, a->size, MEM_RESERVE, PAGE_READWRITE);
     if (!a->base) t_fatal("arena: virtual reserve failed");
     a->committed = 0;
