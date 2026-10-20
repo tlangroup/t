@@ -233,6 +233,32 @@ pub fn c_tstr_size(ts: string) i64 {
     if (c_is_awi_st(ts)) { return c_awi_size(ts); }
     return 8;
 }
+// ⚠ 类型名 → 体索引查表（O(1) 替代 c_find_type_body 的 O(types) 线性扫描）：
+// c_struct_size/c_struct_align/c_tstr_size 等每处理一个聚合槽/操作数都会调用 c_find_type_body，
+// 对含数千类型的超大模块（如编译器自身）累计成 O(insts×types) 的扫描+临时串分配，拖垮 bump arena。
+// ⚠ 字典值须用 i64（存索引+1），绝不用 map[string]string：LLVM 后端对「字符串值字典」的 map_get
+// 会产出损坏切片指针 → 原生段错误（已实测 mstest 复现）。故查到索引后直接取 g_c_mod.types[idx].body。
+pub var g_c_type_body: map[string]i64;
+pub var g_c_type_body_built: bool = false;
+// 类型尺寸/对齐/字段偏移结果按名缓存（i64，value+1 哨兵：0=未缓存，合法值恒≥1）。
+// ⚠ 仅用 i64 字典：LLVM 后端无法在 map 中安全存取 string/[]string 值（会产生损坏指针导致段错误），
+// 已实测 map[string]string / map[string][]string 在 tir 后端 segfault，故全部走 i64 索引/哨兵。
+// 缓存后 c_struct_size/c_struct_align/c_gep_offset/c_ti_field_offset 整编译仅按「类型数/类型×字段」算一次，
+// 消除每操作数高频递归重算（O(insts×types) 重复计算 + O(F²) 字段循环）对 bump arena 的放大（原 OOM 根因）。
+pub var g_c_ssz: map[string]i64;
+pub var g_c_sal: map[string]i64;
+pub var g_c_off_cache: map[string]i64;
+pub var g_c_used_buf: map[string]i64;   // 字节缓冲伴生名占用集合（避免 <name>_buf 与真实全局/其它缓冲撞名）
+pub fn c_build_type_index() void {
+    g_c_type_body = map_new(g_c_type_body);
+    var nt: i64 = slice_len(g_c_mod.types) as i64;
+    var i: i64 = 0;
+    while (i < nt) {
+        map_set(g_c_type_body, g_c_mod.types[i].name, i + 1);
+        i = i + 1;
+    }
+    g_c_type_body_built = true;
+}
 pub fn c_find_type_body(name: string) string {
     // ⚠ 反射内建聚合（%TypeMeta/%FieldInfo/%TypeInfo）由 sema 合成注入，不进 module.types，
     // 故此处硬编码其布局（字段顺序须与 sema.ensure_reflection_builtins 严格一致，勿单边改）。
@@ -241,42 +267,52 @@ pub fn c_find_type_body(name: string) string {
     if (name == "%TypeMeta") { return "f0: %TStr, f1: i64, f2: i64, f3: i64, f4: %TSlice, f5: %TSlice"; }
     if (name == "%FieldInfo") { return "f0: %TStr, f1: i64, f2: %TStr, f3: i64, f4: i8, f5: i64"; }
     if (name == "%TypeInfo") { return "f0: i64, f1: ptr<%TypeMeta>"; }
-    var i: i64 = 0;
-    while (i < slice_len(g_c_mod.types) as i64) {
-        if (g_c_mod.types[i].name == name) { return g_c_mod.types[i].body; }
-        i = i + 1;
-    }
+    if (g_c_type_body_built == false) { c_build_type_index(); }
+    var idx: i64 = map_get(g_c_type_body, name);
+    if (idx > 0) { return g_c_mod.types[idx - 1].body; }
     return "";
 }
+// 类型尺寸/对齐结果按名缓存：c_struct_size/c_struct_align 被 c_tstr_size/c_gep_offset/c_ti_field_offset
+// 等每操作数高频调用，且内部递归（c_tstr_size→c_struct_size），对超大模块累计成 O(insts×types) 重复计算；
+// 缓存后整编译仅按「类型数」计算一次（size+1 / align+1 哨兵：0 表示未缓存，合法值恒 ≥1）。
 pub fn c_struct_align(name: string) i64 {
+    var ca: i64 = map_get(g_c_sal, name);
+    if (ca > 0) { return ca - 1; }
     var body: string = c_find_type_body(name);
-    if (body == "") { return 8; }
     var maxa: i64 = 1;
-    var i: i64 = 0;
-    while (true) {
-        var ft: string = c_field_type_at(body, i);
-        if (ft == "") { break; }
-        var a: i64 = c_tstr_align(ft);
-        if (a > maxa) { maxa = a; }
-        i = i + 1;
+    if (body != "") {
+        var i: i64 = 0;
+        while (true) {
+            var ft: string = c_field_type_at(body, i);
+            if (ft == "") { break; }
+            var a: i64 = c_tstr_align(ft);
+            if (a > maxa) { maxa = a; }
+            i = i + 1;
+        }
     }
+    map_set(g_c_sal, name, maxa + 1);
     return maxa;
 }
 pub fn c_struct_size(name: string) i64 {
     // 数组（LLVM 风格 "[N x E]" 或 arr<E x N>）按元素数 × 元素宽计算，否则按值类型查体失败返回 0。
     if (c_starts(name, "[") or c_is_arr(name)) { return c_array_nelems(name) * c_tstr_size(c_array_elem(name)); }
     if (c_is_vec(name)) { return c_vec_nelems(name) * c_tstr_size(c_vec_elem(name)); }
+    var cs: i64 = map_get(g_c_ssz, name);
+    if (cs > 0) { return cs - 1; }
     var body: string = c_find_type_body(name);
-    if (body == "") { return 0; }
-    var off: i64 = 0; var i: i64 = 0;
-    while (true) {
-        var ft: string = c_field_type_at(body, i);
-        if (ft == "") { break; }
-        off = c_align_up(off, c_tstr_align(ft));
-        off = off + c_tstr_size(ft);
-        i = i + 1;
+    var off: i64 = 0;
+    if (body != "") {
+        var i: i64 = 0;
+        while (true) {
+            var ft: string = c_field_type_at(body, i);
+            if (ft == "") { break; }
+            off = c_align_up(off, c_tstr_align(ft));
+            off = off + c_tstr_size(ft);
+            i = i + 1;
+        }
+        off = c_align_up(off, c_struct_align(name));
     }
-    off = c_align_up(off, c_struct_align(name));
+    map_set(g_c_ssz, name, off + 1);
     return off;
 }
 // 槽类型名（"%Foo" / "ptr<%Foo>" / "[N x E]"）→ 聚合缓冲字节尺寸（非聚合返回 0）。
@@ -293,8 +329,14 @@ pub fn c_agg_size_of_tyname(tn: string) i64 {
     if (c_is_vec(t2)) { return c_vec_nelems(t2) * c_tstr_size(c_vec_elem(t2)); }
     return 0;
 }
+// ⚠ 字段拆分按 body 串：本函数仅做一次拆分（不再按 body 缓存切片值字典——LLVM 后端无法在 map 中
+// 正确存取 []string 切片值，会产生损坏切片指针导致原生段错误）。O(insts×F²) 的放大已由
+// c_struct_size/c_struct_align/c_gep_offset 的「按类型名缓存 i64 结果」消除（每类型仅算一次）。
+pub fn c_field_split(body: string) []string {
+    return c_split_comma(body);
+}
 pub fn c_field_type_at(body: string, idx: i64) string {
-    var flds: []string = c_split_comma(body);
+    var flds: []string = c_field_split(body);
     if (idx < 0 or idx >= slice_len(flds) as i64) { return ""; }
     var f: string = flds[idx];
     var ci: i64 = c_find_col(f, ":");
@@ -600,18 +642,26 @@ pub fn c_gep_offset(ty: string, idx: i64) i64 {
     if (c_starts(ty, "[") or c_is_arr(ty)) { return idx * c_tstr_size(c_array_elem(ty)); }
     if (c_is_vec(ty)) { return idx * c_tstr_size(c_vec_elem(ty)); }
     if (c_starts(ty, "%") == false) { return idx * c_tstr_size(ty); }
+    var key: string = base.sb_cat3(ty, "#", base.i2s(idx));
+    var cv: i64 = map_get(g_c_off_cache, key);
+    if (cv > 0) { return cv - 1; }
     var body: string = c_find_type_body(ty);
-    if (body == "") { return idx * 8; }
-    var off: i64 = 0; var i: i64 = 0;
-    while (i < idx) {
-        var ft: string = c_field_type_at(body, i);
-        if (ft == "") { break; }
-        off = c_align_up(off, c_tstr_align(ft));
-        off = off + c_tstr_size(ft);
-        i = i + 1;
-    }
-    var fidx_t: string = c_field_type_at(body, idx);
-    off = c_align_up(off, c_tstr_align(fidx_t));
+    var off: i64 = 0;
+    if (body != "") {
+        var i: i64 = 0;
+        while (i < idx) {
+            var ft: string = c_field_type_at(body, i);
+            if (ft == "") { break; }
+            off = c_align_up(off, c_tstr_align(ft));
+            off = off + c_tstr_size(ft);
+            i = i + 1;
+        }
+        if (idx < slice_len(c_field_split(body)) as i64) {
+            var fc: string = c_field_type_at(body, idx);
+            off = c_align_up(off, c_tstr_align(fc));
+        }
+    } else { off = idx * 8; }
+    map_set(g_c_off_cache, key, off + 1);
     return off;
 }
 
@@ -1036,27 +1086,22 @@ pub fn c_slot_c_ty(n: string) string {
 //   导致本函数恒返回 funcs[0].ret_st、c_is_user_func 恒为真 → 大量调用被误判成 void/sret
 //   （sb_to_str 结果被丢弃、闭包/聚合返回值全 0）。正确判据：函数名重整后与 callee 基名相等。
 pub fn c_func_ret_st(callee: string) string {
+    var fi: i64 = c_func_lookup_first(callee);
+    if (fi >= 0) { return g_c_mod.funcs[fi].ret_st; }
+    return "";
+}
+pub fn c_is_user_func(callee: string) bool {
+    // 常见路径：综合查表取首个匹配；若该匹配是内建/声明副本（无体），线性兜底找下一个有体同名。
+    var fi: i64 = c_func_lookup_first(callee);
+    if (fi >= 0 and slice_len(g_c_mod.funcs[fi].blocks) as i64 > 0) { return true; }
     var nf: i64 = slice_len(g_c_mod.funcs) as i64;
     var i: i64 = 0;
     var cb: string = c_func_base(callee);
     while (i < nf) {
         var fnm: string = g_c_mod.funcs[i].name;
         if (fnm == callee or fnm == cb or c_fn_name(fnm) == cb) {
-            return g_c_mod.funcs[i].ret_st;
+            if (slice_len(g_c_mod.funcs[i].blocks) as i64 > 0) { return true; }
         }
-        i = i + 1;
-    }
-    return "";
-}
-pub fn c_is_user_func(callee: string) bool {
-    var nf: i64 = slice_len(g_c_mod.funcs) as i64;
-    var i: i64 = 0;
-    var cb: string = c_func_base(callee);
-    while (i < nf) {
-        var f: TMIRFunc = g_c_mod.funcs[i];
-        if (slice_len(f.blocks) as i64 == 0) { i = i + 1; continue; }   // 声明（无体）= 内建，非用户函数
-        var fnm: string = f.name;
-        if (fnm == callee or fnm == cb or c_fn_name(fnm) == cb) { return true; }
         i = i + 1;
     }
     return false;
@@ -1079,6 +1124,7 @@ pub fn c_cbase(name: string) string {
 // ⚠ 判据用「首参名 == __env」而非类型：高阶函数的闭包形参类型同样是 ptr<void>，只有名字能区分。
 pub fn c_build_func_index() void {
     g_c_func_idx = map_new(g_c_func_idx);
+    g_c_func_lookup = map_new(g_c_func_lookup);
     var nf: i64 = slice_len(g_c_mod.funcs) as i64;
     var i: i64 = 0;
     while (i < nf) {
@@ -1088,15 +1134,58 @@ pub fn c_build_func_index() void {
         map_set(g_c_func_idx, fnm, i + 1);
         map_set(g_c_func_idx, c_strip_suf(fnm), i + 1);
         map_set(g_c_func_idx, c_fn_name(fnm), i + 1);
+        // 综合查表（覆盖 overload 基名 / c_cbase / 运行库前缀剥离）：每键只登记首次出现（最小索引），
+        // 以严格复刻「列表序首个匹配」语义。供 c_func_ret_st / c_is_user_func / c_callee_param_ty 使用。
+        // ⚠ map_get 必须落到「显式 i64 局部」再比较：LLVM 后端对 `map_get(..)==0` 内联比较会误把
+        // out-param 类型推导成键类型(TStr)而非值类型(i64)，导致 IR 类型冲突（与 c_func_find 写法对齐）。
+        var h: i64 = 0;
+        h = map_get(g_c_func_lookup, fnm);
+        if (h == 0) { map_set(g_c_func_lookup, fnm, i + 1); }
+        var ks: string = c_strip_suf(fnm);
+        h = map_get(g_c_func_lookup, ks);
+        if (h == 0) { map_set(g_c_func_lookup, ks, i + 1); }
+        var kf: string = c_fn_name(fnm);
+        h = map_get(g_c_func_lookup, kf);
+        if (h == 0) { map_set(g_c_func_lookup, kf, i + 1); }
+        var kb: string = c_func_base(fnm);
+        h = map_get(g_c_func_lookup, kb);
+        if (h == 0) { map_set(g_c_func_lookup, kb, i + 1); }
+        var kc: string = c_cbase(fnm);
+        h = map_get(g_c_func_lookup, kc);
+        if (h == 0) { map_set(g_c_func_lookup, kc, i + 1); }
         i = i + 1;
     }
     g_c_func_idx_built = true;
+    g_c_func_lookup_built = true;
 }
 pub fn c_func_find(name: string) i64 {
     if (g_c_func_idx_built == false) { c_build_func_index(); }
     var v: i64 = map_get(g_c_func_idx, name);
     if (v == 0) { return -1; }
     return v - 1;
+}
+// 综合函数查表（O(1)）：返回首个（列表序最小）签名/基名匹配的函数索引，覆盖
+// `fnm==q || fnm==c_func_base(q) || c_fn_name(fnm)==c_func_base(q)` 三种条件取最小索引，
+// 严格等价于原 c_func_ret_st / c_is_user_func / c_callee_param_ty 的 O(funcs) 线性扫描首命中。
+pub fn c_func_lookup_first(q: string) i64 {
+    if (g_c_func_lookup_built == false) { c_build_func_index(); }
+    var best: i64 = -1;
+    var a: i64 = map_get(g_c_func_lookup, q);
+    if (a > 0) { best = a - 1; }
+    var cb: string = c_func_base(q);
+    var b: i64 = map_get(g_c_func_lookup, cb);
+    if (b > 0 and (best < 0 or (b - 1) < best)) { best = b - 1; }
+    return best;
+}
+pub fn c_build_global_index() void {
+    g_c_global_idx = map_new(g_c_global_idx);
+    var ng: i64 = slice_len(g_c_mod.globals) as i64;
+    var i: i64 = 0;
+    while (i < ng) {
+        map_set(g_c_global_idx, g_c_mod.globals[i].name, i + 1);
+        i = i + 1;
+    }
+    g_c_global_idx_built = true;
 }
 pub fn c_func_base(name: string) string {
     var b: string = c_strip_suf(name);
@@ -1310,6 +1399,19 @@ fn c_emit_call_arg(sb: StringBuilder, op: TirOperand, aidx: i64, bname: string, 
 //   导致调用点把 TStr 实参当 unsigned char* 取址（emit/closure_struct 等崩溃）。
 pub fn c_callee_param_ty(bname: string, pos: i64) string {
     if (pos < 0) { return ""; }
+    // 常见路径：综合查表取首个 strip_suf==bname 且有体的函数（O(1)）；否则线性兜底。
+    var fi: i64 = c_func_lookup_first(bname);
+    if (fi >= 0) {
+        var ff: TMIRFunc = g_c_mod.funcs[fi];
+        if (c_strip_suf(ff.name) == bname and c_is_builtin(c_strip_suf(ff.name)) == false and slice_len(ff.blocks) as i64 > 0) {
+            if (pos >= slice_len(ff.params) as i64) { return ""; }
+            var pv: string = ff.params[pos];
+            var col: i64 = c_find_col(pv, ":");
+            if (col < 0) { return ""; }
+            var pname: string = c_strip_suf(str_slice(pv, 0, col));
+            return c_param_c_ty(ff, pname);
+        }
+    }
     var i: i64 = 0;
     while (i < slice_len(g_c_mod.funcs) as i64) {
         var ff: TMIRFunc = g_c_mod.funcs[i];
@@ -1453,6 +1555,43 @@ pub var g_c_sliceat_slot: []string;
 pub var g_c_ti_done: []string;      // 已合成 __ti_<T> 的类型名（去重）
 pub var g_c_ti_typedefs: bool;      // TypeMeta/FieldInfo typedef 是否已发射
 pub var g_c_tmpc: i64;                  // load/store 临时变量计数器
+// 类型名 → 声明种类（i64 哨兵：0=无/1=Struct/2=Union/3=Enum），O(1) 替代 c_ti_decl_kind 的
+// O(lex.decl_list) 全扫描。⚠ 仅用 i64 字典：map[string]string 在 tir 后端 segfault（已实测）。
+// c_ti_arm 被每个 type_info 指令调用（prescan + 函数体发射两处），全编译器反射密集 → 累计成
+// O(type_info_ops × decl_list) 的扫描+字符串分配，拖垮 bump arena；一次建表后退化 O(1)。
+// 同时存 类型名 → 声明节点 id（g_c_decl_node），供 c_ti_emit_global 直接取字段，避免对 decl_list 的二次全扫描。
+pub var g_c_decl_kind: map[string]i64;
+pub var g_c_decl_node: map[string]i64;
+pub var g_c_decl_kind_built: bool = false;
+pub fn c_build_decl_kind() void {
+    g_c_decl_kind = map_new(g_c_decl_kind);
+    g_c_decl_node = map_new(g_c_decl_node);
+    var n: i64 = slice_len(lex.decl_list) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        var d: i64 = lex.decl_list[i];
+        var k: string = base.node_kind((d as u64));
+        var kn: i64 = 0;
+        if (k == "StructDecl") { kn = 1; }
+        else if (k == "UnionDecl") { kn = 2; }
+        else if (k == "EnumDecl") { kn = 3; }
+        else if (k == "VariantDecl") { kn = 2; }
+        else { i = i + 1; continue; }
+        var tn: string = base.node_sa((d as u64));
+        var de: i64 = map_get(g_c_decl_kind, tn);
+        if (de == 0) { map_set(g_c_decl_kind, tn, kn); map_set(g_c_decl_node, tn, d); }
+        i = i + 1;
+    }
+    g_c_decl_kind_built = true;
+}
+pub fn c_ti_decl_kind(tname: string) string {
+    if (g_c_decl_kind_built == false) { c_build_decl_kind(); }
+    var kn: i64 = map_get(g_c_decl_kind, tname);
+    if (kn == 1) { return "Struct"; }
+    if (kn == 2) { return "Union"; }
+    if (kn == 3) { return "Enum"; }
+    return "";
+}
 // 每函数 slot → 类型名（"ptr<%Event>"/"%TStr"/"i64"/"arr<i8 x 24>"…），用于 emit 期检索。
 pub var g_c_slot_tyname: []string;      // slot 名
 pub var g_c_slot_tyty: []string;        // 类型名字符串
@@ -1469,6 +1608,12 @@ pub var g_c_clo_globals: []string;      // 需发射 static TClosure 常量全�
 // 故在 tmir_to_c 入口建一次名→索引表，c_func_find 改为查表（存储 i+1，0 表示未命中）。
 pub var g_c_func_idx: map[string]i64;
 pub var g_c_func_idx_built: bool = false;
+// 综合函数查表（raw/strip_suf/fn_name/func_base/c_cbase 五键合一，首次出现优先）：覆盖 overload 基名匹配。
+pub var g_c_func_lookup: map[string]i64;
+pub var g_c_func_lookup_built: bool = false;
+// 全局名 → 索引查表（O(1) 替代 c_global_st 的 O(globals) 线性扫描）。
+pub var g_c_global_idx: map[string]i64;
+pub var g_c_global_idx_built: bool = false;
 
 pub fn c_addr_mark(n: string, st: i64) void {
     var i: i64 = 0;
@@ -1561,11 +1706,9 @@ pub fn c_addr_base_find(n: string) string {
     return "";
 }
 pub fn c_global_st(n: string) i64 {
-    var i: i64 = 0;
-    while (i < slice_len(g_c_mod.globals) as i64) {
-        if (g_c_mod.globals[i].name == n) { return g_c_mod.globals[i].td; }
-        i = i + 1;
-    }
+    if (g_c_global_idx_built == false) { c_build_global_index(); }
+    var vi: i64 = map_get(g_c_global_idx, n);
+    if (vi > 0) { return g_c_mod.globals[vi - 1].td; }
     return tir__ST_I32;
 }
 pub fn c_global_is_agg(n: string) bool {
@@ -1724,23 +1867,6 @@ pub fn c_ti_kind_num(arm: string) i64 {
     if (arm == "Module") { return 11; }
     return 7;
 }
-// 具名类型的真实种类在声明节点上（TD 只有 cat），须回查 decl_list。
-pub fn c_ti_decl_kind(tname: string) string {
-    var n: i64 = slice_len(lex.decl_list) as i64;
-    var i: i64 = 0;
-    while (i < n) {
-        var d: i64 = lex.decl_list[i];
-        var k: string = base.node_kind((d as u64));
-        if (base.node_sa((d as u64)) == tname) {
-            if (k == "StructDecl") { return "Struct"; }
-            if (k == "UnionDecl") { return "Union"; }
-            if (k == "EnumDecl") { return "Enum"; }
-            if (k == "VariantDecl") { return "Union"; }
-        }
-        i = i + 1;
-    }
-    return "";
-}
 pub fn c_ti_arm(tname: string) string {
     if (tname == "") { return "Struct"; }
     if (sema.is_module_type_name(tname)) { return "Module"; }
@@ -1761,20 +1887,9 @@ pub fn c_ti_is_ref(td: i64) bool {
 }
 // 第 idx 个字段的字节偏移（与 c_struct_size 同一套对齐规则）。
 pub fn c_ti_field_offset(tname: string, idx: i64) i64 {
-    var body: string = c_find_type_body(base.sb_cat2("%", tname));
-    if (body == "") { return idx * 8; }
-    var off: i64 = 0;
-    var i: i64 = 0;
-    while (i < idx) {
-        var ft: string = c_field_type_at(body, i);
-        if (ft == "") { break; }
-        off = c_align_up(off, c_tstr_align(ft));
-        off = off + c_tstr_size(ft);
-        i = i + 1;
-    }
-    var fc: string = c_field_type_at(body, idx);
-    if (fc != "") { off = c_align_up(off, c_tstr_align(fc)); }
-    return off;
+    // 复用 c_gep_offset 的 "ty#idx" 偏移缓存（i64 查表），避免每字段 O(idx²) 重算；
+    // 对反射 __ti_<T> 合成聚合（成千上万 GEP）累计放大成 O(insts×F²)，缓存后每 (类型,字段) 仅算一次。
+    return c_gep_offset(base.sb_cat2("%", tname), idx);
 }
 pub fn c_ti_emit_typedefs(sb: StringBuilder) void {
     if (g_c_ti_typedefs) { return; }
@@ -1795,25 +1910,21 @@ pub fn c_ti_emit_global(sb: StringBuilder, tname: string) void {
     var fnames: []string;
     var ftds: []i64;
     var ftags: []i64;
-    var n: i64 = slice_len(lex.decl_list) as i64;
-    var i: i64 = 0;
-    while (i < n) {
-        var d: i64 = lex.decl_list[i];
-        var k: string = base.node_kind((d as u64));
-        if ((k == "StructDecl" or k == "UnionDecl") and base.node_sa((d as u64)) == tname) {
-            var ks: []i64 = base.kids_chain(base.node_lb((d as u64)));
-            var ki: i64 = 0;
-            while (ki < slice_len(ks) as i64) {
-                var kv: i64 = ks[ki];
-                if (base.node_ia((kv as u64)) < 0) {
-                    append(fnames, base.node_sa((kv as u64)));
-                    append(ftds, sema.resolve_type_desc(base.node_na((kv as u64))));
-                    append(ftags, base.node_ib((kv as u64)));
-                }
-                ki = ki + 1;
+    // O(1) 取声明节点（原实现逐条扫 lex.decl_list，全编译器反射类型多 → O(distinct_types × decl_list) 放大）；
+    // 无对应声明节点（如内建/合成类型）则字段为空（FieldInfo[] 为空），与旧逻辑一致。
+    var dn: i64 = map_get(g_c_decl_node, tname);
+    if (dn > 0) {
+        var ks: []i64 = base.kids_chain(base.node_lb((dn as u64)));
+        var ki: i64 = 0;
+        while (ki < slice_len(ks) as i64) {
+            var kv: i64 = ks[ki];
+            if (base.node_ia((kv as u64)) < 0) {
+                append(fnames, base.node_sa((kv as u64)));
+                append(ftds, sema.resolve_type_desc(base.node_na((kv as u64))));
+                append(ftags, base.node_ib((kv as u64)));
             }
+            ki = ki + 1;
         }
-        i = i + 1;
     }
     var nf: i64 = slice_len(fnames) as i64;
     if (nf > 0) {
@@ -1852,6 +1963,10 @@ pub fn c_ti_emit_global(sb: StringBuilder, tname: string) void {
 pub fn tmir_to_c(m: TMIRModule) string {
     g_c_mod = m;
     g_c_func_idx_built = false; c_build_func_index();   // O(1) 名→索引表：消除 c_func_find 的 O(insts×funcs) 分配放大
+    g_c_type_body_built = false; c_build_type_index();   // O(1) 名→体查表：消除 c_find_type_body 的 O(insts×types) 扫描放大
+    g_c_global_idx_built = false; c_build_global_index();   // O(1) 名→索引表：消除 c_global_st 的 O(insts×globals) 扫描放大
+    g_c_ssz = map_new(g_c_ssz); g_c_sal = map_new(g_c_sal); g_c_off_cache = map_new(g_c_off_cache); g_c_used_buf = map_new(g_c_used_buf);   // 重置类型尺寸/对齐/偏移缓存 + 缓冲名占用集
+    g_c_decl_kind_built = false; c_build_decl_kind();   // O(1) 名→种类表：消除 c_ti_decl_kind 的 O(decl_list) 全扫描放大
     c_collect_enum_names();   // 枚举名集合（供 c_tystr_c 把枚举识别为标量 i64，避免当聚合指针）
     g_c_agg_param_name = [];
     g_c_thunk_req = [];
@@ -1909,10 +2024,25 @@ pub fn tmir_to_c(m: TMIRModule) string {
             var sz: i64 = c_struct_size(gty);
             if (sz <= 0) { sz = c_tstr_size(gty); }
             if (sz <= 0) { sz = 8; }
-            sb_append_str(sb, "static unsigned char "); sb_append_str(sb, g.name); sb_append_str(sb, "_buf[");
+            // ⚠ 字节缓冲伴生名 "<name>_buf" 可能与真实全局（如 `g_xxx_buf: string`）的 mangled 名冲突 → 重定义错误。
+            //   须在已登记全局名（g_c_global_idx）与已占用缓冲名（g_c_used_buf）之外另取唯一名（递归上抬 _buf 后缀）。
+            var buf_name: string = base.sb_cat2(g.name, "_buf");
+            while (true) {
+                // ⚠ 不能直接写 map_get(...) > 0 内联比较：LLVM 后端会把 map_get 返回类型误推导为键类型 %TStr
+                //   （而非 i64），导致 IR 类型冲突。须先赋给显式 i64 局部再比较。
+                var gidx: i64 = map_get(g_c_global_idx, buf_name);
+                var uidx: i64 = map_get(g_c_used_buf, buf_name);
+                if (gidx > 0 or uidx > 0) {
+                    buf_name = base.sb_cat2(buf_name, "_buf");
+                } else {
+                    break;
+                }
+            }
+            map_set(g_c_used_buf, buf_name, 1);
+            sb_append_str(sb, "static unsigned char "); sb_append_str(sb, buf_name); sb_append_str(sb, "[");
             sb_append_str(sb, base.i2s(sz)); sb_append_str(sb, "] = {0};\n");
             sb_append_str(sb, "static unsigned char* "); sb_append_str(sb, g.name); sb_append_str(sb, " = ");
-            sb_append_str(sb, g.name); sb_append_str(sb, "_buf;\n");
+            sb_append_str(sb, buf_name); sb_append_str(sb, ";\n");
         } else {
             sb_append_str(sb, "static "); sb_append_str(sb, tmir.tmir_st_c(g.td)); sb_append_str(sb, " ");
             sb_append_str(sb, g.name); sb_append_str(sb, " = 0;\n");
@@ -1967,9 +2097,6 @@ pub fn tmir_to_c(m: TMIRModule) string {
         if (f.is_extern) { i = i + 1; continue; }
         if (c_is_builtin(c_strip_suf(f.name))) { i = i + 1; continue; }   // 内建：运行库提供，不发射体
         if (slice_len(f.blocks) as i64 == 0) { i = i + 1; continue; }
-        eprint(base.sb_cat3("DBG-EMIT-FN ", base.i2s(i), " "));
-        eprint(c_strip_suf(f.name));
-        eprint("\n");
         c_emit_func(sb, f);
         i = i + 1;
     }
