@@ -220,6 +220,7 @@ pub fn c_tstr_size(ts: string) i64 {
     if (ts == "ptr" or ts == "ptr<void>" or c_starts(ts, "ptr<")) { return 8; }
     if (c_starts(ts, "%")) { return c_struct_size(ts); }
     if (c_starts(ts, "[")) { return c_array_nelems(ts) * c_tstr_size(c_array_elem(ts)); }
+    if (c_is_arr(ts)) { return c_array_nelems(ts) * c_tstr_size(c_array_elem(ts)); }
     if (c_is_vec(ts)) { return c_vec_nelems(ts) * c_tstr_size(c_vec_elem(ts)); }
     return 8;
 }
@@ -330,6 +331,56 @@ pub fn c_is_arr(ts: string) bool { return c_starts(ts, "arr<"); }
 // 向量（vec<ELEM x N>）：定长数组的语义等价物，按「元素数 × 元素宽」的字节缓冲建模
 // （与 LLVM 后端的 <N x ELEM> 聚合逐字对齐；tmir-c 字节缓冲模型下即 unsigned char buf[N*sizeof(ELEM)]）。
 pub fn c_is_vec(ts: string) bool { return c_starts(ts, "vec<"); }
+// 瓦片（arr<arr<elem x cols> x rows>，可能带 ptr<> 前缀）：2D 定长数组，逐元素语义。
+// 与 LLVM 后端 tir_to_ll 的瓦片分支逐位对齐（瓦片 = 嵌套定长数组，行主序）。
+pub fn c_is_tile_st(st: string) bool {
+    var s: string = st;
+    if (c_starts(s, "ptr<")) { s = c_strip_ptr(s); }
+    return c_starts(s, "arr<arr<");
+}
+// 从瓦片类型串解析元素 C 类型（如 "arr<arr<i32 x 3> x 2>" -> "int32_t"）。
+// 布局固定为 arr<arr<ELEM x COLS> x ROWS>，ELEM 位于 "arr<arr<" 前缀（8 字符）之后、内层 " x " 之前。
+pub fn c_tile_elem_cty(tst: string) string {
+    var s: string = tst;
+    if (c_starts(s, "ptr<")) { s = c_strip_ptr(s); }
+    var last: i64 = -1; var i: i64 = 0; var L: i64 = str_len(s);
+    while (i + 3 <= L) { if (s[i] == 32 and s[i + 1] == 120 and s[i + 2] == 32) { last = i; } i = i + 1; }
+    if (last < 0) { return "int32_t"; }
+    var before: string = str_slice(s, 0, last);   // "arr<arr<ELEM x COLS>"
+    var last2: i64 = -1; var j: i64 = 0; var L2: i64 = str_len(before);
+    while (j + 3 <= L2) { if (before[j] == 32 and before[j + 1] == 120 and before[j + 2] == 32) { last2 = j; } j = j + 1; }
+    if (last2 < 0) { return "int32_t"; }
+    var elem: string = str_slice(before, 8, last2);  // 跳过 "arr<arr<" 前缀取元素类型名
+    return tmir.tmir_st_c(tir.tir_st_from_str(elem));
+}
+// 从瓦片类型串解析 行×列 总数（如 "arr<arr<i32 x 3> x 2>" -> 6）。
+pub fn c_tile_total(tst: string) i64 {
+    var s: string = tst;
+    if (c_starts(s, "ptr<")) { s = c_strip_ptr(s); }
+    var last: i64 = -1; var i: i64 = 0; var L: i64 = str_len(s);
+    while (i + 3 <= L) { if (s[i] == 32 and s[i + 1] == 120 and s[i + 2] == 32) { last = i; } i = i + 1; }
+    if (last < 0) { return 0; }
+    var rows: i64 = c_atoi_trim(str_slice(s, last + 3, L));
+    var before: string = str_slice(s, 0, last);
+    var last2: i64 = -1; var j: i64 = 0; var L2: i64 = str_len(before);
+    while (j + 3 <= L2) { if (before[j] == 32 and before[j + 1] == 120 and before[j + 2] == 32) { last2 = j; } j = j + 1; }
+    var cols: i64 = 0;
+    if (last2 >= 0) { cols = c_atoi_trim(str_slice(before, last2 + 3, L2)); }
+    if (rows < 1) { rows = 1; }
+    if (cols < 1) { cols = 1; }
+    return rows * cols;
+}
+// 解析整数：跳过前导空白与尾随 '>'（瓦片串可能带尾 '>'），遇非数字停止。
+pub fn c_atoi_trim(s: string) i64 {
+    var i: i64 = 0; var L: i64 = str_len(s);
+    while (i < L and (s[i] == 32 or s[i] == 9 or s[i] == 62)) { i = i + 1; }
+    var neg: bool = false;
+    if (i < L and s[i] == 45) { neg = true; i = i + 1; }
+    var v: i64 = 0;
+    while (i < L) { var c: i64 = s[i]; if (c < 48 or c > 57) { break; } v = v * 10 + (c - 48); i = i + 1; }
+    if (neg) { v = -v; }
+    return v;
+}
 pub fn c_vec_elem(ts: string) string {
     var s: i64 = 4;
     var e: i64 = str_len(ts) as i64 - 1;
@@ -355,12 +406,28 @@ pub fn c_find_x(s: string) i64 {
     }
     return -1;
 }
+// 数组类型 "arr<ELEM x N>"（可嵌套，ELEM 自身含 " x "）在 body 内 depth==0 处找 " x " 分隔符，
+// 返回其下标；对嵌套瓦片 arr<arr<i32 x 3> x 2> 须取最外层分隔（行数），而非内层（列数），
+// 否则 c_array_nelems 误取列数、c_array_elem 取到残缺子串 → 尺寸算 0 → 缓冲回退 8B（tile_demo）。
+pub fn c_arr_sep_idx(body: string) i64 {
+    var depth: i64 = 0;
+    var L: i64 = str_len(body) as i64;
+    var i: i64 = 0;
+    while (i + 3 <= L) {
+        var c: i64 = body[i];
+        if (c == 60) { depth = depth + 1; }        // '<'
+        else if (c == 62) { depth = depth - 1; }   // '>'
+        else if (c == 32 and depth == 0 and body[i + 1] == 120 and body[i + 2] == 32) {
+            return i;                              // 找到 depth==0 的 " x "
+        }
+        i = i + 1;
+    }
+    return -1;
+}
 pub fn c_array_elem(ts: string) string {
     if (c_is_arr(ts)) {
-        var s: i64 = 4;
-        var e: i64 = str_len(ts) as i64 - 1;
-        var body: string = str_slice(ts, s, e);
-        var xi: i64 = c_find_x(body);
+        var body: string = str_slice(ts, 4, str_len(ts) as i64 - 1);
+        var xi: i64 = c_arr_sep_idx(body);
         if (xi < 0) { return "i32"; }
         return str_slice(body, 0, xi);
     }
@@ -375,10 +442,8 @@ pub fn c_array_elem(ts: string) string {
 }
 pub fn c_array_nelems(ts: string) i64 {
     if (c_is_arr(ts)) {
-        var s: i64 = 4;
-        var e: i64 = str_len(ts) as i64 - 1;
-        var body: string = str_slice(ts, s, e);
-        var xi: i64 = c_find_col(body, " x ");
+        var body: string = str_slice(ts, 4, str_len(ts) as i64 - 1);
+        var xi: i64 = c_arr_sep_idx(body);
         if (xi < 0) { return 0; }
         return tir.tir_atoi(str_slice(body, xi + 3, str_len(body) as i64));
     }
@@ -1869,6 +1934,22 @@ pub fn c_emit_func(sb: StringBuilder, f: TMIRFunc) void {
                     if (c_cbase(c_strip_suf(pins.args[0].name)) == "deser_str" and str_len(pins.dst.name) as i64 > 0) {
                         c_slot_ty_mark(c_strip_suf(pins.dst.name), "%TStr");
                     }
+                    // 瓦片/数组结果的内建（如 @tsplat）：字节缓冲模型下结果须拥有缓冲，否则按标量 int64_t
+                    // 声明 → 字节写越界踩踏 arena 元数据 → 挂死（tile_demo 的 tsplat 临时槽 t0）。
+                    // 仅对「内建」生效（用户函数聚合返回走 sret，dst 是出参指针、不在此列）。
+                    if (c_is_builtin(c_strip_suf(pins.args[0].name))) {
+                        var cst: string = tir.tir_st_to_str(pins.st);
+                        var cst_core: string = c_strip_ptr(cst);
+                        var cdn: string = c_strip_suf(pins.dst.name);
+                        if (c_is_arr(cst_core) and c_is_agg_base(cdn) == false
+                            and c_is_addr_slot(cdn) == false and c_is_param(g_cf, cdn) == false) {
+                            c_slot_ty_mark(cdn, cst);
+                            append(g_c_agg_base_name, cdn);
+                            var asz: i64 = c_agg_size_of_tyname(cst_core);
+                            if (asz <= 0) { asz = 8; }
+                            append(g_c_agg_base_size, asz);
+                        }
+                    }
                 }
                 // SLOT 声明：记录 slot 的声明类型名（如 "ptr<%Event>"/"i64"/"%TStr"），
                 // 这是类型名的权威来源（TIR 文本携带，TMIR 仅留数值 st）。
@@ -1884,9 +1965,13 @@ pub fn c_emit_func(sb: StringBuilder, f: TMIRFunc) void {
                     // slice_from_raw(arr,...) 实参 int64_t↔void* 错配（array_range / array_to_slice 编译失败）。
                     // 仅此处登记覆盖「无 addr_of 的数组槽」；有 addr_of 者已在 ADDR_OF 路径登记（c_is_agg_base 防重）。
                     var stn: string = tir.tir_st_to_str(pins.st);
-                    if (c_is_arr(stn) and c_is_agg_base(sn) == false) {
+                    // ⚠ 瓦片（arr<arr<elem x cols> x rows>）与数组槽：即使带 ptr<> 包装（tmir 常以
+                    // ptr<arr<arr<...>>> 形态流转）也必须落在字节缓冲，否则按标量 int64_t 声明 →
+                    // 字节写越界/缓冲过小、运行期踩踏 arena 元数据 → 挂死（tile_demo 的 tsplat 临时槽 t0）。
+                    var stn_core: string = c_strip_ptr(stn);
+                    if (c_is_arr(stn_core) and c_is_agg_base(sn) == false) {
                         append(g_c_agg_base_name, sn);
-                        var asz: i64 = c_agg_size_of_tyname(stn);
+                        var asz: i64 = c_agg_size_of_tyname(stn_core);
                         if (asz <= 0) { asz = 8; }
                         append(g_c_agg_base_size, asz);
                     }
@@ -2059,6 +2144,24 @@ pub fn c_emit_func(sb: StringBuilder, f: TMIRFunc) void {
                                 if (ret6 == "") { ret6 = tir.tir_st_to_str(pins.st); }
                                 c_slot_ty_mark(dn6, ret6);
                             }
+                        }
+                    }
+                }
+                // 瓦片逐元素二元（a + b / a - b / a * b）的结果槽：字节缓冲模型下须拥有缓冲，
+                // 否则按标量 int64_t 声明 → `_dp=(T*)dst` 写 total 元素越界踩踏 arena/栈元数据 →
+                // 运行期死循环挂死（tile_demo 的 `c = a + b`：结果临时槽 t28 写 24B 但只声明 8B）。
+                // 真实瓦片类型可能落在 ins.st 或 args[0].st（实测 tile `a+b` 的 ins.st 常为 ptr/空串）。
+                if (pins.op == tir__TIR_OP_ADD or pins.op == tir__TIR_OP_SUB or pins.op == tir__TIR_OP_MUL) {
+                    var bst: string = tir.tir_st_to_str(pins.st);
+                    if (c_is_tile_st(bst) == false) { bst = tir.tir_st_to_str(pins.args[0].st); }
+                    if (c_is_tile_st(bst)) {
+                        var bn: string = c_strip_suf(pins.dst.name);
+                        var bcore: string = c_strip_ptr(bst);
+                        if (c_is_agg_base(bn) == false and c_is_addr_slot(bn) == false and c_is_param(g_cf, bn) == false) {
+                            append(g_c_agg_base_name, bn);
+                            var asz: i64 = c_agg_size_of_tyname(bcore);
+                            if (asz <= 0) { asz = 8; }
+                            append(g_c_agg_base_size, asz);
                         }
                     }
                 }
@@ -2634,7 +2737,7 @@ pub fn c_emit_inst(sb: StringBuilder, ins: TMIRInst) void {
                 // （agent_npc_mind 的 intent_dir / Position 字段被写崩、读到堆地址的根因）。
                 if (c_starts(_dstf, "%") and c_is_enum_ty(_dstf) == false and c_is_runtime_struct_st(_dstf) == false) { _dst_agg = true; }
                 if (c_starts(_dst_inner, "%") and c_is_enum_ty(_dst_inner) == false and c_is_runtime_struct_st(_dst_inner) == false and c_starts(_dst_inner, "ptr<") == false) { _dst_agg = true; }
-                if (c_starts(_dstf, "[") or c_is_arr(_dstf) or c_is_vec(_dstf)) { _dst_agg = true; }
+                if (c_starts(_dstf, "[") or c_is_arr(_dstf) or c_is_arr(_dst_inner) or c_is_vec(_dstf)) { _dst_agg = true; }
                 if (_dst_agg) {
                     // ⚠ 运行库结构体字段（TStr/TSlice/TClosure/TBitStr，含 GEP 结果 ptr<%TStr>）：其尺寸
                     //   不在 module.types（c_struct_size("%TStr")==0），不能用硬算尺寸 memcpy。统一经
@@ -2893,6 +2996,45 @@ pub fn c_emit_inst(sb: StringBuilder, ins: TMIRInst) void {
             sb_append_str(sb, ucty); sb_append_str(sb, "*)(");
             sb_append_str(sb, cfname); sb_append_str(sb, "((const void*)(");
             c_emit_val(sb, ins.args[1]); sb_append_str(sb, ")));\n");
+            return;
+        }
+        // ── @Tile 瓦片内建（与 tir_to_ll 瓦片分支逐位对齐）────────────────
+        // @tsplat(scalar, rows, cols)：dst 是 arr<arr<elem x cols> x rows> 字节缓冲，
+        //   行主序扁平写（线性偏移 = ri*cols+ci，与 LLVM 嵌套数组布局一致），每元素 = scalar。
+        if (p0ty == "tsplat") {
+            var _tst: string = c_strip_ptr(tir.tir_st_to_str(ins.st));
+            var _ecty: string = c_tile_elem_cty(_tst);
+            if (_ecty == "" or _ecty == "void") { _ecty = "int32_t"; }
+            var _total: i64 = c_tile_total(_tst);
+            sb_append_str(sb, "  { "); sb_append_str(sb, _ecty); sb_append_str(sb, "* _tp = (");
+            sb_append_str(sb, _ecty); sb_append_str(sb, "*)("); sb_append_str(sb, dstn); sb_append_str(sb, "); int64_t _ii;\n");
+            sb_append_str(sb, "    for (_ii = 0; _ii < "); sb_append_i64(sb, _total); sb_append_str(sb, "; _ii++) { _tp[_ii] = (");
+            sb_append_str(sb, _ecty); sb_append_str(sb, ")("); c_emit_val(sb, ins.args[1]); sb_append_str(sb, "); }\n  }\n");
+            return;
+        }
+        // @treduce_sum/mul/min/max(tile)：tile 是字节缓冲，行主序 flatten 后逐元素折叠。
+        if (p0ty == "treduce_sum" or p0ty == "treduce_mul" or p0ty == "treduce_min" or p0ty == "treduce_max") {
+            var _ecty: string = c_tystr_c(tir.tir_st_to_str(ins.st));
+            if (_ecty == "" or _ecty == "void") { _ecty = "int32_t"; }
+            // 聚合类型可能落在 args[1].st 或槽类型表（LLVM 轨备注：真实聚合类型常落在参数槽，inst.st 为空）。
+            var _argn: string = c_strip_suf(ins.args[1].name);
+            var _tst: string = c_strip_ptr(tir.tir_st_to_str(ins.args[1].st));
+            if (c_is_tile_st(_tst) == false) { _tst = c_strip_ptr(c_slot_ty_find(_argn)); }
+            var _total: i64 = c_tile_total(_tst);
+            sb_append_str(sb, "  { "); sb_append_str(sb, _ecty); sb_append_str(sb, "* _tp = (");
+            sb_append_str(sb, _ecty); sb_append_str(sb, "*)("); c_emit_val(sb, ins.args[1]); sb_append_str(sb, "); ");
+            sb_append_str(sb, _ecty); sb_append_str(sb, " _acc");
+            if (_total > 0) {
+                sb_append_str(sb, " = _tp[0]; int64_t _ii;\n");
+                sb_append_str(sb, "    for (_ii = 1; _ii < "); sb_append_i64(sb, _total); sb_append_str(sb, "; _ii++) {\n");
+                sb_append_str(sb, "      "); sb_append_str(sb, _ecty); sb_append_str(sb, " _v = _tp[_ii];\n");
+                if (p0ty == "treduce_sum") { sb_append_str(sb, "      _acc = _acc + _v;\n"); }
+                else if (p0ty == "treduce_mul") { sb_append_str(sb, "      _acc = _acc * _v;\n"); }
+                else if (p0ty == "treduce_min") { sb_append_str(sb, "      if (_v < _acc) _acc = _v;\n"); }
+                else { sb_append_str(sb, "      if (_v > _acc) _acc = _v;\n"); }
+                sb_append_str(sb, "    }\n");
+            } else { sb_append_str(sb, " = 0;\n"); }
+            sb_append_str(sb, "    "); sb_append_str(sb, dstn); sb_append_str(sb, " = _acc;\n  }\n");
             return;
         }
         // ── 时间格式化（M56/M57）：C 运行库签名比 TIR 调用多一个 use_local / tz 形参 ──
@@ -3365,6 +3507,27 @@ pub fn c_emit_inst(sb: StringBuilder, ins: TMIRInst) void {
         sb_append_str(sb, "  "); sb_append_str(sb, dstn); sb_append_str(sb, " = t_str_concat(");
         c_emit_val(sb, ins.args[0]); sb_append_str(sb, ", "); c_emit_val(sb, ins.args[1]); sb_append_str(sb, ");\n");
         return;
+    }
+    // 瓦片逐元素二元（arr<arr<elem x cols> x rows>）：与 LLVM 嵌套 GEP 循环逐位对齐，
+    // 字节缓冲模型下把瓦片当行主序扁平 elem_cty* 缓冲，逐元素 apply op。
+    // ⚠ 实测 tile `a + b` 的 inst.st 常为 ptr 或空串，真实聚合类型落在 inst.args[0].st。
+    var _tst: string = "";
+    if (c_is_tile_st(tir.tir_st_to_str(ins.st))) { _tst = tir.tir_st_to_str(ins.st); }
+    if (_tst == "" and c_is_tile_st(tir.tir_st_to_str(ins.args[0].st))) { _tst = tir.tir_st_to_str(ins.args[0].st); }
+    if (_tst != "") {
+        // 仅数值逐元素 op 走瓦片分支（ADD/SUB/MUL）；位运算/比较/移位不在此列。
+        if (op == tir__TIR_OP_ADD or op == tir__TIR_OP_SUB or op == tir__TIR_OP_MUL) {
+            var _ecty: string = c_tile_elem_cty(_tst);
+            var _total: i64 = c_tile_total(_tst);
+            var _mn: string = c_binop_mnem(op);
+            sb_append_str(sb, "  { "); sb_append_str(sb, _ecty); sb_append_str(sb, "* _lp = (");
+            sb_append_str(sb, _ecty); sb_append_str(sb, "*)("); c_emit_val(sb, ins.args[0]); sb_append_str(sb, "); ");
+            sb_append_str(sb, _ecty); sb_append_str(sb, "* _rp = ("); sb_append_str(sb, _ecty); sb_append_str(sb, "*)("); c_emit_val(sb, ins.args[1]); sb_append_str(sb, "); ");
+            sb_append_str(sb, _ecty); sb_append_str(sb, "* _dp = ("); sb_append_str(sb, _ecty); sb_append_str(sb, "*)("); sb_append_str(sb, c_strip_suf(ins.dst.name)); sb_append_str(sb, "); int64_t _ii;\n");
+            sb_append_str(sb, "    for (_ii = 0; _ii < "); sb_append_i64(sb, _total); sb_append_str(sb, "; _ii++) { _dp[_ii] = _lp[_ii] ");
+            sb_append_str(sb, _mn); sb_append_str(sb, " _rp[_ii]; }\n  }\n");
+            return;
+        }
     }
     // 浮点 / 整数 二元
     var mnem: string = c_binop_mnem(op);
