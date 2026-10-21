@@ -6652,6 +6652,49 @@ pub fn reg_module_type_name(tn: string) void {
 }
 
 
+// ── match 值匹配优化（审查结论落地：P0/P2/P3 子集）─────────────────────────────
+// 仅值类型（整数/浮点/字符串/atom/bool/char/enum 判别子）下常量集闭合、穷尽性可判定，
+// 才启用「常量臂全局唯一、重复即硬错」与不可达臂升级 error。
+pub fn m_scr_is_value(ti: i64) bool {
+    var k: string = tip_kind(ti);
+    if (k == "Enum") { return true; }
+    if (k == "Scalar") {
+        var n: string = tip_name(ti);
+        if (n == "bool" or n == "string" or n == "atom" or n == "char"
+            or n == "f32" or n == "f64" or n == "isize" or n == "usize") { return true; }
+        // 有界整数族 i8..i64 / u8..u64
+        if (str_len(n) >= 1) {
+            if (starts_with(n, "i") or starts_with(n, "u")) { return true; }
+        }
+    }
+    return false;
+}
+
+// 把值匹配臂的模式节点降解为「常量键」；非可判定常量返回 ""。
+// int 取数值（不同字面量写法归一到同一键）；bool/str/atom/float 取文本；enum 单元 case 取 case 名。
+pub fn m_arm_const_key(pn: i64, scr: i64) string {
+    if (pn < 0) { return ""; }
+    var kd: string = base.node_kind((pn as u64));
+    if (kd == "paren") { return m_arm_const_key(base.node_na((pn as u64)), scr); }
+    if (kd == "int") {
+        var v: i64 = js_parse_int(base.node_sa((pn as u64)), base.node_ia((pn as u64)));
+        return base.sb_cat2("i:", base.i2s(v));
+    }
+    if (kd == "bool") {
+        if (base.node_ba((pn as u64))) { return "b:1"; }
+        return "b:0";
+    }
+    if (kd == "str") { return base.sb_cat2("s:", base.node_sa((pn as u64))); }
+    if (kd == "atom") { return base.sb_cat2("a:", base.node_sa((pn as u64))); }
+    if (kd == "float") { return base.sb_cat2("f:", base.node_sa((pn as u64))); }
+    // enum 单元 case：member(Enum.Case) 或 unit conpat(.Case)
+    if (tip_kind(scr) == "Enum") {
+        if (kd == "member") { return base.sb_cat2("m:", base.node_sa((pn as u64))); }
+        if (kd == "conpat" and base.node_na((pn as u64)) < 0) { return base.sb_cat2("c:", base.node_sa((pn as u64))); }
+    }
+    return "";
+}
+
 pub fn infer_expr(e: i64) i64 {
     // S2b 循环断路器（LLVM 后端安全版，关键修复见 g_infer_on 声明处注释）。
     // 包装层：进入置位标记、调用 body、返回前显式清零。**严禁使用 defer**——
@@ -7330,6 +7373,14 @@ pub fn infer_expr_body(e: i64) i64 {
         var m_c: i64 = base.node_la((e as u64));
         var mq_ks6520: []i64 = base.kids_chain_idx(base.node_la((e as u64)));
         var mq_ki6520: i64 = 0;
+        // 值匹配「常量/区间唯一性」侧表（P2）：仅在 m_scr_is_value 时填入，普通 match 不触碰。
+        var m_seen_ckey: []string = [];   // 已出现常量臂的规范化键
+        var m_seen_cint: []i64 = [];     // 对应整型值；-2 = 非整型常量
+        var m_seen_cln: []i64 = [];      // 更早臂的行号（报错定位）
+        var m_seen_rlo: []i64 = [];      // 已出现区间臂下界：-2 开放(无下界) / -1 非整型 / 否则整型
+        var m_seen_rhi: []i64 = [];
+        var m_seen_rln: []i64 = [];
+        var m_seen_rinc: []bool = [];    // 已出现区间臂是否闭合（..=，否则半开 .. 上界排他）
         while (mq_ki6520 < slice_len(mq_ks6520) as i64) {
             m_c = mq_ks6520[mq_ki6520];
             var m_k: Child = base.kids[m_c];
@@ -7338,9 +7389,16 @@ pub fn infer_expr_body(e: i64) i64 {
             if (m_rep and m_dead) {
                 var m_dfl: i64 = parse.n_line(m_k.val);
                 var m_dfc: i64 = parse.n_col(m_k.val);
-                base.diag_new("T-MAT-W744", "warning",
-                    "this match arm is unreachable: a previous wildcard or binding arm already matches every value",
-                    parse.n_file(m_k.val), m_dfl, m_dfc, m_dfl, m_dfc + 1);
+                if (m_scr_is_value(m_scr)) {
+                    // 值类型常量集闭合、穷尽性可判定 → 不可达臂升级为硬错（审查结论 P3）。
+                    base.diag_new("T-MAT-E760", "error",
+                        "this match arm is unreachable: a previous arm already matches every value of this value type",
+                        parse.n_file(m_k.val), m_dfl, m_dfc, m_dfl, m_dfc + 1);
+                } else {
+                    base.diag_new("T-MAT-W744", "warning",
+                        "this match arm is unreachable: a previous wildcard or binding arm already matches every value",
+                        parse.n_file(m_k.val), m_dfl, m_dfc, m_dfl, m_dfc + 1);
+                }
             }
             // C2 模式消歧：裸标识符首字母大写 → CaseName，改写为等价的 member 模式
             // （`Case` ⇒ `Enum.Case`），让 checker 与 C/LLVM 双后端复用既有 member 路径。
@@ -7413,6 +7471,73 @@ pub fn infer_expr_body(e: i64) i64 {
                     }
                 }
             }
+            // ── P2：值匹配「常量臂全局唯一、重复即硬错」（审查结论，sema 期检测）──
+            // 守卫臂（when 守卫）不参与唯一性侧表：守卫不穷尽该常量，故与同常量无守卫臂
+            // 构成合法「守卫细化」，不可判为重复（审查结论：守卫臂不可判定，保守跳过）。
+            if (m_rep and m_scr_is_value(m_scr) and base.node_nb((m_k.val as u64)) < 0) {
+                var m_pn: i64 = base.node_na((m_k.val as u64));
+                var m_ck: string = m_arm_const_key(m_pn, m_scr);
+                if (str_len(m_ck) > 0) {
+                    var m_pn2: i64 = m_pn;
+                    while (m_pn2 >= 0 and base.node_kind((m_pn2 as u64)) == "paren") { m_pn2 = base.node_na((m_pn2 as u64)); }
+                    var m_cv: i64 = -2;
+                    if (m_pn2 >= 0 and base.node_kind((m_pn2 as u64)) == "int") {
+                        m_cv = js_parse_int(base.node_sa((m_pn2 as u64)), base.node_ia((m_pn2 as u64)));
+                    }
+                    var m_j: i64 = 0;
+                    var m_hit: bool = false;
+                    // 重复常量（规范化键相同）→ 硬错
+                    while (m_j < slice_len(m_seen_ckey) as i64) {
+                        if (m_seen_ckey[m_j] == m_ck) {
+                            var m_msg: string = base.sb_cat5("match arm covers a value already handled by an earlier arm at line ",
+                                base.i2s(m_seen_cln[m_j]), ": duplicate constant ", m_ck, "");
+                            base.diag_new("T-MAT-E760", "error", m_msg,
+                                parse.n_file(m_k.val), parse.n_line(m_k.val), parse.n_col(m_k.val), parse.n_line(m_k.val), parse.n_col(m_k.val) + 1);
+                            m_hit = true;
+                            break;
+                        }
+                        m_j = m_j + 1;
+                    }
+                    // 常量落在更早的区间臂内 → 硬错
+                    if (m_hit == false and m_cv != -2) {
+                        m_j = 0;
+                        while (m_j < slice_len(m_seen_rlo) as i64) {
+                            var rlo: i64 = m_seen_rlo[m_j];
+                            var rhi: i64 = m_seen_rhi[m_j];
+                            var lo_ok: bool = false;
+                            if (rlo != -2) { if (rlo == -1 or rlo <= m_cv) { lo_ok = true; } }
+                            var hi_ok: bool = false;
+                            if (rhi != -2) {
+                                if (rhi == -1) { hi_ok = true; }
+                                else {
+                                    var rhi_eff: i64 = rhi;
+                                    if (m_seen_rinc[m_j] == false) { rhi_eff = rhi - 1; }  // 半开区间上界排他
+                                    if (m_cv <= rhi_eff) { hi_ok = true; }
+                                }
+                            }
+                            if (lo_ok and hi_ok) {
+                                base.diag_new("T-MAT-E760", "error",
+                                    "match arm constant is already covered by an earlier range arm",
+                                    parse.n_file(m_k.val), parse.n_line(m_k.val), parse.n_col(m_k.val), parse.n_line(m_k.val), parse.n_col(m_k.val) + 1);
+                                m_hit = true;
+                                break;
+                            }
+                            m_j = m_j + 1;
+                        }
+                    }
+                    if (m_hit == false) {
+                        append(m_seen_ckey, m_ck);
+                        append(m_seen_cint, m_cv);
+                        append(m_seen_cln, parse.n_line(m_k.val));
+                        // float NaN 脚枪（Wnan）：float 主体 + float 字面量臂
+                        if ((tip_name(m_scr) == "f32" or tip_name(m_scr) == "f64") and base.node_kind((m_pn2 as u64)) == "float") {
+                            base.diag_new("T-MAT-W761", "warning",
+                                "matching a float literal is unsafe: NaN never equals any value, so it silently falls through to a wildcard or default arm",
+                                parse.n_file(m_k.val), parse.n_line(m_k.val), parse.n_col(m_k.val), parse.n_line(m_k.val), parse.n_col(m_k.val) + 1);
+                        }
+                    }
+                }
+            }
             var m_prev: i64 = cur_scope;
             cur_scope = scope_new_at(m_prev, m_k.val);
             if (str_len(base.node_sa((m_k.val as u64))) > 0) {
@@ -7458,6 +7583,88 @@ pub fn infer_expr_body(e: i64) i64 {
                         if (m_rep and tip_kind(m_rhi) != "Unknown" and tip_kind(m_scr) != "Unknown") {
                             if (ti_equal(m_rhi, m_scr) == false and can_cast(m_rhi, m_scr) == false) {
                                 err_type_mismatch(base.node_nb((base.node_na((m_k.val as u64)) as u64)), m_scr, m_rhi);
+                            }
+                        }
+                    }
+                    // ── P2：区间臂唯一性（值匹配）──
+                    // 守卫区间臂同样跳过（与常量臂同理由：守卫不穷尽，保守不判重叠/覆盖）。
+                    if (m_rep and m_scr_is_value(m_scr) and base.node_nb((m_k.val as u64)) < 0) {
+                        var m_rnode: i64 = base.node_na((m_k.val as u64));
+                        var cur_incl: bool = base.node_ba((m_rnode as u64));  // true = ..= 闭合，否则 .. 半开
+                        var m_lon: i64 = base.node_na((m_rnode as u64));
+                        var m_hin: i64 = base.node_nb((m_rnode as u64));
+                        var rlo: i64 = -2;
+                        var rhi: i64 = -2;
+                        if (m_lon >= 0 and base.node_kind((m_lon as u64)) == "int") { rlo = js_parse_int(base.node_sa((m_lon as u64)), base.node_ia((m_lon as u64))); }
+                        if (m_hin >= 0 and base.node_kind((m_hin as u64)) == "int") { rhi = js_parse_int(base.node_sa((m_hin as u64)), base.node_ia((m_hin as u64))); }
+                        var m_j: i64 = 0;
+                        var m_hit: bool = false;
+                        // 区间含更早的整型常量 → 硬错
+                        while (m_j < slice_len(m_seen_cint) as i64) {
+                            var cv: i64 = m_seen_cint[m_j];
+                            if (cv != -2) {
+                                var lo_ok: bool = false;
+                                if (rlo != -2) { if (rlo == -1 or rlo <= cv) { lo_ok = true; } }
+                            var hi_ok: bool = false;
+                            if (rhi != -2) {
+                                if (rhi == -1) { hi_ok = true; }
+                                else {
+                                    var rhi_eff: i64 = rhi;
+                                    if (cur_incl == false) { rhi_eff = rhi - 1; }  // 半开区间上界排他
+                                    if (cv <= rhi_eff) { hi_ok = true; }
+                                }
+                            }
+                                if (lo_ok and hi_ok) {
+                                    base.diag_new("T-MAT-E760", "error",
+                                        "match range arm already covers an earlier constant arm",
+                                        parse.n_file(m_k.val), parse.n_line(m_k.val), parse.n_col(m_k.val), parse.n_line(m_k.val), parse.n_col(m_k.val) + 1);
+                                    m_hit = true;
+                                    break;
+                                }
+                            }
+                            m_j = m_j + 1;
+                        }
+                        // 区间与更早区间重叠 → 硬错（当前 `..` 通配无意义，由 m_dead 处理后续臂）
+                        if (m_hit == false) {
+                            if (rlo == -1 and rhi == -1) { m_hit = true; }
+                            else {
+                                m_j = 0;
+                                while (m_j < slice_len(m_seen_rlo) as i64) {
+                                    var slo: i64 = m_seen_rlo[m_j];
+                                    var shi: i64 = m_seen_rhi[m_j];
+                                    var sinc: bool = m_seen_rinc[m_j];
+                                    // 仅整型区间可比；开闭性经有效上界处理（开放=无界、半开=hi-1）
+                                    if (slo != -2 and shi != -2 and rlo != -2 and rhi != -2) {
+                                        var a_lo: i64 = rlo;   if (rlo == -1) { a_lo = -1; }       // 开放下界：下界侧交叠由对方决定
+                                        var a_hi_eff: i64 = rhi; if (rhi == -1) { a_hi_eff = -2; } else if (cur_incl == false) { a_hi_eff = rhi - 1; }
+                                        var b_lo: i64 = slo;   if (slo == -1) { b_lo = -1; }
+                                        var b_hi_eff: i64 = shi; if (shi == -1) { b_hi_eff = -2; } else if (sinc == false) { b_hi_eff = shi - 1; }
+                                        var ov: bool = true;
+                                        if (a_lo != -1 and b_hi_eff != -2) { if (a_lo > b_hi_eff) { ov = false; } }
+                                        if (b_lo != -1 and a_hi_eff != -2) { if (b_lo > a_hi_eff) { ov = false; } }
+                                        if (ov) {
+                                            base.diag_new("T-MAT-E760", "error",
+                                                "match range arms overlap: an earlier range already covers part of this range",
+                                                parse.n_file(m_k.val), parse.n_line(m_k.val), parse.n_col(m_k.val), parse.n_line(m_k.val), parse.n_col(m_k.val) + 1);
+                                            m_hit = true;
+                                            break;
+                                        }
+                                    }
+                                    m_j = m_j + 1;
+                                }
+                            }
+                        }
+                        if (m_hit == false) {
+                            append(m_seen_rlo, rlo);
+                            append(m_seen_rhi, rhi);
+                            append(m_seen_rln, parse.n_line(m_k.val));
+                            append(m_seen_rinc, cur_incl);
+                            // float NaN 脚枪（Wnan）：float 主体 + float 区间臂
+                            if ((tip_name(m_scr) == "f32" or tip_name(m_scr) == "f64")
+                                and ((m_lon >= 0 and base.node_kind((m_lon as u64)) == "float") or (m_hin >= 0 and base.node_kind((m_hin as u64)) == "float"))) {
+                                base.diag_new("T-MAT-W761", "warning",
+                                    "matching a float range is unsafe: NaN never falls inside any range, so it silently falls through to a wildcard or default arm",
+                                    parse.n_file(m_k.val), parse.n_line(m_k.val), parse.n_col(m_k.val), parse.n_line(m_k.val), parse.n_col(m_k.val) + 1);
                             }
                         }
                     }

@@ -304,11 +304,11 @@ async function emitOne(rel) {
         mkdirSync(join(ROOT, outDir), { recursive: true });
         const err = await execWithRetry(["compile", rel, "--emit-c", "--output", outDir]);
         if (err) return { rel, entries: null, error: `emit-c failed (exit ${err.code})${err.tail ? " :: " + err.tail : ""}` };
-        for (const ext of [".c", ".h"]) {
-            const f = join(ROOT, outDir, base + ext);
-            if (!existsSync(f)) return { rel, entries: null, error: `no ${base}${ext} produced` };
-            out[`${rel}::${ext.slice(1)}`] = md5Normalized(f, ext.slice(1));
-        }
+        // S5 删除旧 codegen_c.tc、C 后端改走 tmir→C 便携管线后，emit-c 只产出单文件
+        // self-contained 的 <base>.c（不再生成配套 <base>.h）。故快照仅比对 .c，不再要求 .h。
+        const f = join(ROOT, outDir, base + ".c");
+        if (!existsSync(f)) return { rel, entries: null, error: `no ${base}.c produced` };
+        out[`${rel}::c`] = md5Normalized(f, "c");
     }
 
     if (backends.includes("dev")) {
