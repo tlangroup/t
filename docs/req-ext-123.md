@@ -11,7 +11,7 @@
 | 编号 | 内容 | 状态 |
 |---|---|---|
 | **REQ-EXT-2** | `tc build --lib` 接受多文件位置参数并拼为同一编译单元 | ✅ **早已实现**（本次实证确认，无需改码） |
-| **REQ-EXT-3** | 跨文件 `extend overload fn` 解析接通（Route 2） | ✅ **早已实现**（本次实证确认，无需改码） |
+| **REQ-EXT-3** | 跨文件 `extend fn` 解析接通（Route 2） | ✅ **早已实现**（本次实证确认，无需改码） |
 | **REQ-EXT-1** | `--emit-deps` 额外输出 `kind:"extend"` 边 | ✅ **本次实现**（`src/sema.tc` `emit_deps` + `src/parse.tc` + `src/lex.tc`） |
 
 也就是说：三项请求的**阻塞点只有 REQ-EXT-1**，本次已解除。
@@ -42,7 +42,7 @@ tc run examples/overload_cross_a.tc examples/cross/overload_cross_b.tc
 → default / big / negative      (exit 0)
 ```
 
-`negative` 来自 b 文件 `extend overload fn classify(...)`，成功并入 a 文件的 `classify` 组并
+`negative` 来自 b 文件 `extend fn classify(...)`，成功并入 a 文件的 `classify` 组并
 在运行期正确派发 ⇒ 跨文件 extend 语义**本就成立**。单独编译 b 才报 `T-OVL-E980`（符合预期）。
 
 ---
@@ -74,7 +74,7 @@ tc check --emit-deps --lib-dir out/_reqext/lib out/_reqext/lib/foo.tc
 → {"entry":"out/_reqext/lib/foo.tc","edges":[]}
 ```
 
-（fixture：`foo.tc` 声明 `overload fn op`；`bar.tc` `@import("foo")` + `extend overload fn op`。）
+（fixture：`foo.tc` 声明 `overload fn op`；`bar.tc` `@import("foo")` + `extend fn op`。）
 
 ### 2.3 为什么必须「desugar 期登记意图，emit_deps 期解析归属」
 
@@ -119,7 +119,7 @@ tc check --emit-deps --lib-dir out/_reqext/lib out/_reqext/lib/foo.tc
 
 ## 4. 遗留
 
-- **粒度**：当前只覆盖 `extend overload fn`（函数）。设计里提到的数据结构 extend
+- **粒度**：当前只覆盖 `extend fn`（函数）。设计里提到的数据结构 extend
   （如 `extend struct`）在 tc 中**尚无语法**，待语言支持后按同样机制扩展。
 - **诊断溯源**：多文件拼接时 `g_file` 统一指向首文件（`tc_load_src` 注释已记），
   extend 报错行号可能不准 —— 不影响产物与缓存正确性。

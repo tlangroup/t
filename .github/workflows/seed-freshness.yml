@@ -1,0 +1,83 @@
+# ─────────────────────────────────────────────────────────────
+# 自举种子新鲜度校验（PR → main）
+#
+# 为什么需要这道卡口（2026-10-18 立）：
+#   ci/seed/tc.exe 是 CI / nightly 的**自举起点**，随仓库提交（out/ 被 gitignore）。
+#   它必须能编译「被测分支的 src/tc.tc」，即**种子与被测源码必须同代**。
+#   而 nightly 的 guard 作业是「自上次成功 nightly 以来 main 有新提交才跑」——
+#   也就是说，main 一旦前进，下一场 nightly 一定执行。此时若种子未随改动更新，
+#   nightly 会在「Bootstrap g1 from seed」0.2s 就 FAIL 并 fail-fast：
+#     典型报错 src/tc.tc:20:43 T-PAR-E101（旧解析器不认新语法）
+#   这类红灯与被测代码质量无关，纯粹是**同代性缺失**。
+#
+# 因此把「PR 之前更新 tc.exe」从口头纪律升级为 CI 卡口：
+#   面向 main 的 PR（含 wb → main 的交付 PR）一旦改动 src/std 而没带上新种子，
+#   本作业立刻 FAIL，并给出修复命令 —— 在合入前把红灯拦下来，而不是等 nightly。
+#
+# 判据：`ci/seed/tc.exe check src/tc.tc` 必须 0 error（与 tools/refresh_seed.mjs
+#   的判据一致）。refresh_seed.mjs 已内建 mimalloc / OS 提交限制 OOM 的识别，
+#   判不了时 SKIP 放行，不会把好种子误杀。check 不做链接，故无需安装 LLVM。
+#
+# 注意：pull_request 事件 checkout 的是 refs/pull/<n>/merge，即「PR 合入 main 后
+#   的样子」—— 正是我们最终要自举的那份代码，语义上正确。
+# ─────────────────────────────────────────────────────────────
+
+name: Seed freshness (PR → main)
+
+on:
+  pull_request:
+    branches: [main]
+    # 只有可能改变「自举契约」的路径才需要重跑；纯 docs / tools 改动不影响种子。
+    paths:
+      - "src/**"
+      - "std/**"
+      - "lib/**"
+      - "ci/seed/tc.exe"
+      - ".github/workflows/seed-freshness.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  seed:
+    name: seed compiles current src
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # refresh_seed.mjs --check 用 out/dbg/tc.exe 之外的 **ci/seed/tc.exe** 本体体检，
+      # 但脚本内 mkdir 依赖 ROOT 相对路径；这里显式落位只为让日志里有种子大小/版本信息，
+      # 真正被校验的对象始终是 ci/seed/tc.exe。
+      - name: Check seed freshness
+        shell: bash
+        run: |
+          mkdir -p out/dbg
+          cp ci/seed/tc.exe out/dbg/tc.exe
+          ls -la out/dbg/tc.exe
+          echo "── 判据：ci/seed/tc.exe 必须能编译当前 src/tc.tc（0 error） ──"
+          node tools/refresh_seed.mjs --check
+
+      # 仅在失败时输出的可操作指引（成功时本步不执行）。
+      - name: How to fix (on failure)
+        if: failure()
+        shell: bash
+        run: |
+          echo "::error::ci/seed/tc.exe 已过期：它编不动本 PR 的 src/tc.tc。"
+          echo ""
+          echo "修复（本地，自举不动点之后）："
+          echo "  1) node tools/bootstrap.mjs            # 或直接 tc build src/tc.tc 得到 g4"
+          echo "  2) cp out/dbg/g4.exe out/dbg/tc.exe"
+          echo "  3) node tools/refresh_seed.mjs         # 写入前/写入后各校验一次"
+          echo "  4) git add ci/seed/tc.exe && git commit -m 'chore(ci): 刷新自举种子'"
+          echo "  5) git push                            # 推 PR 分支，本作业重跑即为绿"
+          echo ""
+          echo "纪律：面向 main 的 PR 在开 PR / 更新 PR 之前，必须已刷新并提交 ci/seed/tc.exe。"
+          exit 1

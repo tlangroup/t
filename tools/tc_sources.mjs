@@ -8,7 +8,6 @@ export const TC_MODULES = [
   'src/parse.tc',       // step 2 语法 + 前端 lowering
   'src/sema.tc',        // step 3 语义（类型检查 / CTFE / TypeDesc 池）
   'src/comptime_fold.tc',    // step 3.5 全量 comptime 折叠（依赖 sema，被 tc.tc 在 run_check 后调用）
-  'src/codegen_c.tc',   // step 4a C 后端
   'src/test.tc',        // `tc test` 测试收集与运行器（依赖 sema / tir / tir_to_ll）
   'lib/repl.tc',        // REPL 模式（外部库；依赖 base，不修改 tc）
   'src/tc.tc',          // driver / main（import test + repl 并派发）

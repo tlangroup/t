@@ -41,12 +41,12 @@
 - **期望**：编译通过；Entity 标记可扩展组；尾部 `_` 锚点存在；实例化无需填充 `_`。
 - **理解假设**：`_` 为用户写出或编译器合成的扩展锚；`overload` 仅标记，不改默认布局。
 
-## T6 extend overload struct · 同单元合并
-- **输入**：文件A `overload struct Entity {...}` + 文件B `extend overload struct Entity { tag: u32; fn describe(self) string {...} }`，同编译单元编译。
+## T6 extend struct · 同单元合并
+- **输入**：文件A `overload struct Entity {...}` + 文件B `extend struct Entity { tag: u32; fn describe(self) string {...} }`，同编译单元编译。
 - **期望**：编译通过；合并后 Entity = `id, pos, _, tag` + `describe(self)`；`e.tag` / `e.describe()` 可用。
-- **理解假设**：复用 `extend overload fn` 的跨文件同单元合并规则（见 `examples/cross/overload_cross_*.tc`）。
+- **理解假设**：复用 `extend fn` 的跨文件同单元合并规则（见 `examples/cross/overload_cross_*.tc`）。
 
-## T7 extend overload struct · 单独编译
+## T7 extend struct · 单独编译
 - **输入**：仅文件B（无对应 `overload struct` 组）。
 - **期望**：**编译报错 `T-OVL-E980`**（无 overload 组可扩展）。
 - **理解假设**：直接复用函数侧 `T-OVL-E980`（同 `tests/conformance/fail/f_overload_extend_no_group.tc`）。
@@ -112,7 +112,7 @@
    → 我假设：**同名同类型**。
 4. **`overload struct` 尾部 `_` 锚点**：用户写出 vs 编译器纯合成（用户不可见）？
    → 我假设：**用户可写出 `_;` 占位，编译器保证其存在**。
-5. **`extend overload struct` 是否要求同编译单元**（同 `extend overload fn`）？
+5. **`extend struct` 是否要求同编译单元**（同 `extend fn`）？
    → 我假设：**是**，否则 `T-OVL-E980`。
 6. **`#id` 语义是否完全委托插件**（编译器零解释）？
    → 我假设：**是**，编译器只登记"被修饰"，语义全交给用户扩展函数。

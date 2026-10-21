@@ -201,8 +201,9 @@ async function runSample(sample) {
     if (e1.code !== e2.code) {
         errE = `exit code differs: ref=${e1.code} cand=${e2.code}`;
     } else if (e1.code === 0) {
-        // 固定比对 <base>.h / <base>.c（emitter 输出文件名规则），避免删目录（沙箱限制）
-        for (const ext of [".h", ".c"]) {
+        // 固定比对 <base>.c（tmir-c 单文件 self-contained C，不再产出 .h；旧 codegen_c.tc 已删）。
+        // 双轨对拍只需比对实际存在的 emit 产物即可验证不动点，缺失 .h 不是回归。
+        for (const ext of [".c"]) {
             const fr = join(dirRef, base + ext);
             const fc = join(dirCand, base + ext);
             if (!existsSync(fr) || !existsSync(fc)) { errE = `missing output file: ${base}${ext}`; break; }

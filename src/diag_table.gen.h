@@ -74,7 +74,9 @@ static const DiagDef DIAG_DEFS[] = {
   { "T-MAT-E743", "error", "MAT", "T_MATCH_PATTERN_ARITY", "PATTERN_ARITY", "match constructor pattern arity mismatch" },
   { "T-MAT-E750", "error", "MAT", "T_MATCH_SLICE_PATTERN", "SLICE_PAT", "slice pattern error" },
   { "T-MAT-E751", "error", "MAT", "T_MATCH_BARE_VARIANT_PATTERN", "BARE_VARIANT_PATTERN", "bare variant pattern is deprecated; use leading-dot form" },
+  { "T-MAT-E760", "error", "MAT", "T_MATCH_DUP_VALUE_ARM", "DUP_VALUE_ARM", "match arm covers a value already handled by an earlier arm (duplicate constant or overlapping range)" },
   { "T-MAT-W744", "warning", "MAT", "T_MATCH_ARM_UNREACHABLE", "ARM_UNREACHABLE", "match arm is unreachable" },
+  { "T-MAT-W761", "warning", "MAT", "T_MATCH_FLOAT_NAN_FOOTGUN", "FLOAT_NAN_FOOTGUN", "matching a float literal/range is unsafe: NaN never equals any value or range, so it silently falls through to a wildcard/default arm" },
   { "T-MOD-E550", "error", "MOD", "T_IMPORT_NOT_FOUND", "IMPORT_NOT_FOUND", "import target not found" },
   { "T-MOD-E551", "error", "MOD", "T_IMPORT_CYCLE", "IMPORT_CYCLE", "cyclic import detected" },
   { "T-MOD-E552", "error", "MOD", "T_IMPORT_IO", "IMPORT_IO", "import I/O failure" },
@@ -115,12 +117,12 @@ static const DiagDef DIAG_DEFS[] = {
   { "T-NAM-W402", "warning", "NAM", "T_NAME_CONST_UPPER", "CONST_UPPER", "constant name should be UPPER_SNAKE_CASE" },
   { "T-NAM-W403", "warning", "NAM", "T_NAME_ANNOTATION_LOWER", "ANNOTATION_LOWER", "annotation name should be lowercase snake_case" },
   { "T-NAM-W404", "warning", "NAM", "W_C_KEYWORD_IDENT", "C_KEYWORD_IDENT", "identifier collides with a C keyword" },
-  { "T-OVL-E980", "error", "OVL", "T_OVERLOAD_EXTEND_NO_GROUP", "EXTEND_NO_GROUP", "extend overload has no matching overload fn group" },
+  { "T-OVL-E980", "error", "OVL", "T_OVERLOAD_EXTEND_NO_GROUP", "EXTEND_NO_GROUP", "extend has no matching overload fn group" },
+  { "T-OVL-E981", "error", "OVL", "T_OVERLOAD_VARIANT_DUP_CASE", "VARIANT_EXTEND_DUP_CASE", "variant extend duplicate constructor" },
   { "T-PAR-E100", "error", "PAR", "T_PARSE_INVALID_EXPR", "INVALID_EXPR", "invalid expression" },
   { "T-PAR-E101", "error", "PAR", "T_PARSE_SYNTAX", "SYNTAX", "syntax error" },
   { "T-PAR-E102", "error", "PAR", "T_PARSE_REMOVED_SYNTAX", "REMOVED_SYNTAX", "this syntax has been removed" },
   { "T-PAR-E103", "error", "PAR", "T_VARIANT_ABSTRACT_MARKER", "VARIANT_ABSTRACT_MARKER", "variant abstract marker `_` must be last" },
-  { "T-PAR-E104", "error", "PAR", "T_VARIANT_MULTI_PAYLOAD", "VARIANT_MULTI_PAYLOAD", "multi-payload variant case not implemented yet" },
   { "T-PIP-E860", "error", "PIP", "T_PIPE_RHS_NOT_FUNC", "RHS_NOT_FUNC", "pipe right operand is not a function value" },
   { "T-PIP-E861", "error", "PIP", "T_PIPE_RHS_ARITY", "RHS_ARITY", "pipe right function must take exactly one parameter" },
   { "T-PIP-E862", "error", "PIP", "T_PIPE_ARG_TYPE", "ARG_TYPE", "piped value type is not assignable to the parameter type" },
@@ -180,7 +182,7 @@ static const DiagDef DIAG_DEFS[] = {
   { "T-VEC-W927", "warning", "VEC", "T_VECTOR_WIDER_THAN_NATIVE", "VECTOR_WIDER_THAN_NATIVE", "vector is wider than the native SIMD register and will be split" },
   { "T-VEC-W947", "warning", "VEC", "T_TILE_WIDER_THAN_NATIVE", "TILE_WIDER_THAN_NATIVE", "hardware tile is wider than the native SIMD register and will fall back to scalar loops" },
 };
-#define DIAG_COUNT 167
+#define DIAG_COUNT 169
 
 /* legacy (old semantic name) -> machine code alias table */
 static const struct { const char* legacy; const char* code; } DIAG_LEGACY[] = {
@@ -236,7 +238,9 @@ static const struct { const char* legacy; const char* code; } DIAG_LEGACY[] = {
   { "T_MATCH_PATTERN_ARITY", "T-MAT-E743" },
   { "T_MATCH_SLICE_PATTERN", "T-MAT-E750" },
   { "T_MATCH_BARE_VARIANT_PATTERN", "T-MAT-E751" },
+  { "T_MATCH_DUP_VALUE_ARM", "T-MAT-E760" },
   { "T_MATCH_ARM_UNREACHABLE", "T-MAT-W744" },
+  { "T_MATCH_FLOAT_NAN_FOOTGUN", "T-MAT-W761" },
   { "T_IMPORT_NOT_FOUND", "T-MOD-E550" },
   { "T_IMPORT_CYCLE", "T-MOD-E551" },
   { "T_IMPORT_IO", "T-MOD-E552" },
@@ -276,11 +280,11 @@ static const struct { const char* legacy; const char* code; } DIAG_LEGACY[] = {
   { "T_NAME_ANNOTATION_LOWER", "T-NAM-W403" },
   { "W_C_KEYWORD_IDENT", "T-NAM-W404" },
   { "T_OVERLOAD_EXTEND_NO_GROUP", "T-OVL-E980" },
+  { "T_OVERLOAD_VARIANT_DUP_CASE", "T-OVL-E981" },
   { "T_PARSE_INVALID_EXPR", "T-PAR-E100" },
   { "T_PARSE_SYNTAX", "T-PAR-E101" },
   { "T_PARSE_REMOVED_SYNTAX", "T-PAR-E102" },
   { "T_VARIANT_ABSTRACT_MARKER", "T-PAR-E103" },
-  { "T_VARIANT_MULTI_PAYLOAD", "T-PAR-E104" },
   { "T_PIPE_RHS_NOT_FUNC", "T-PIP-E860" },
   { "T_PIPE_RHS_ARITY", "T-PIP-E861" },
   { "T_PIPE_ARG_TYPE", "T-PIP-E862" },
@@ -338,7 +342,7 @@ static const struct { const char* legacy; const char* code; } DIAG_LEGACY[] = {
   { "T_VECTOR_WIDER_THAN_NATIVE", "T-VEC-W927" },
   { "T_TILE_WIDER_THAN_NATIVE", "T-VEC-W947" },
 };
-#define DIAG_LEGACY_COUNT 153
+#define DIAG_LEGACY_COUNT 155
 
 const DiagDef* diag_find(const char* code);        /* exact machine-code lookup */
 const DiagDef* diag_find_any(const char* id);      /* machine code OR legacy name */
