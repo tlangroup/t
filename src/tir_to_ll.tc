@@ -18,7 +18,27 @@ const llname = @import("src.llname");  // ⚠ 飞地规避：命名/槽分配子
 // 此处自包含发射 @__ti_<T> 全局常量（与 codegen_ll 同布局），复用 sema/lex 的字段元数据。
 const sema = @import("src.sema" :: resolve_type_desc, td_readable);
 const lex = @import("src.lex" :: decl_list);
-const codegen_c = @import("src.codegen_c" :: is_ref_type, math_is_mbuiltin_c, c_dev_has_kernels);
+// ── S5-删除：原 codegen_c.is_ref_type / c_dev_has_kernels / math_is_mbuiltin_c 迁至此处（LLVM 后端依赖）──
+pub fn is_ref_type(td: i64) bool {
+    if (td < 0) { return false; }
+    var t: sema.TD = sema.tds[td];
+    if (t.cat == "scalar" or t.cat == "void" or t.cat == "unknown") { return false; }
+    return true;
+}
+
+pub fn c_dev_has_kernels() bool {
+    var n: i64 = slice_len(lex.decl_list) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        if (base.node_kind((lex.decl_list[i] as u64)) == "FuncDecl" and base.node_bf((lex.decl_list[i] as u64)) == true) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// math_is_mbuiltin_c 已迁至 src/tir.tc（tir_to_ll 经 `const tir = @import("src.tir")` 复用，避免重复定义）
 const codegen_dev = @import("src.codegen_dev" :: emit_device_module);
 
 pub var g_ll: StringBuilder;
@@ -2412,7 +2432,7 @@ pub fn ll_emit_builtin(cn: string, toks: []string) bool {
     // 落入 ll_runtime_callee 通用路径被加 t_ 前缀 → t_fabs，而 runtime 仅定义 t_math_fabs（无 t_fabs）
     // → 链接 undefined；且返回类型被误判 i64。此处显式拦截，发 t_math_<cn> 并据尾缀定 double/float/i32。
     // 整数辅助（abs/gcd/...）与 pow_i 不在此列（math_is_mbuiltin_c 已排除），走普通函数调用。
-    if (llname.ll_starts(cn, "math__") == false and codegen_c__math_is_mbuiltin_c(cn)) {
+    if (llname.ll_starts(cn, "math__") == false and tir.math_is_mbuiltin_c(cn)) {
         var ty: string = "double";
         // 谓词类（isnan/isinf/isfinite/isnormal/signbit）返回 i32，而非浮点。
         if (cn == "signbit" or cn == "isnan" or cn == "isinf" or cn == "isfinite" or cn == "isnormal") {
@@ -2464,7 +2484,7 @@ pub fn ll_emit_builtin(cn: string, toks: []string) bool {
         // math 模块里的整数辅助函数（abs/sign/gcd/min/max/clamp/div_floor/div_ceil/
         // mod_e/ilog2/pow2_i/is_pow2/next_multiple_of/lerp_i）与 pow_i 都是真实函数，
         // 必须走普通函数调用，否则会被误写成 t_math_abs(double) 等导致类型错乱 / 链接失败。
-        if (codegen_c__math_is_mbuiltin_c(base2) == false) {
+        if (tir.math_is_mbuiltin_c(base2) == false) {
             return false;
         }
         var ty: string = "double";
@@ -4909,7 +4929,7 @@ pub fn tir_to_ll_emit(module: TIRModule) string {
     // 与 C 后端 emit_unit 语义对齐：仅当模块含 kernel fn 时发射，供 tll_gpu_launch 经
     // extern 引用。blob 经 codegen_dev.emit_device_module() 序列化（同 C 后端 emit_unit），
     // tir.tir_esc 转义为合法 LLVM c"" 字面量。
-    if (codegen_c__c_dev_has_kernels()) {
+    if (c_dev_has_kernels()) {
         var blob: string = codegen_dev__emit_device_module();
         if (str_len(blob) > 0) {
             var esc: string = tir.tir_esc(blob);
@@ -5164,7 +5184,7 @@ pub fn ll_emit_ti_global(tname: string) string {
             var fns: string = ll_emit_ti_strlit(fnames[j]);
             var tns: string = ll_emit_ti_strlit(sema.td_readable(ftds[j]));
             var isp: i64 = 0;
-            if (codegen_c__is_ref_type(ftds[j])) { isp = 1; }
+            if (is_ref_type(ftds[j])) { isp = 1; }
             var fst: string = tir.tir_st_of_td(ftds[j]);
             sb_append_str(fsb, "%FieldInfo { ");
             sb_append_str(fsb, fns);

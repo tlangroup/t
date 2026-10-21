@@ -94,7 +94,9 @@ for (const file of files) {
 // ── 防假绿：最小匹配数断言 ───────────────────────────────────────
 // 若 sb_cat 改名/改写法而正则未同步，匹配数会归零 —— 零样本同样打印 OK。
 // 阈值 ≈ 记录时实际值的 70%（2026-08-02: 编译器全源有 673 处 sb_catN）。
-const MIN_CALLS = 470;
+// 2026-10-21 S5 删除 codegen_c.tc（旧 C 后端）后，全源 sb_catN 降至 ~455，
+// 故阈值相应下调；仍保留足够余量以捕获正则失配（断正则会瞬间归零）。
+const MIN_CALLS = 400;
 if (isFullCompiler(files) && nScanned < MIN_CALLS) {
   console.error(`catn_check: 正则失配嫌疑 —— 只扫到 ${nScanned} 处 sb_catN，预期 >= ${MIN_CALLS}`);
   console.error('  多半是拼接 helper 改名或写法变更；请更新 checks 正则与阈值常量。');

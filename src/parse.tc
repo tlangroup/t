@@ -411,6 +411,14 @@ pub fn parse_type_inner() i64 {
         return -1;
     }
 
+// 类型位 concept 多约束连词开关（`&&`）：仅形参类型解析期间为真，见 parse_type_concept。
+// ⚠ 2026-10-18 回归修复：此前 parse_type **无条件**吃 `&&`，于是 `expr as T && cond`
+//   这类「类型转换 + 值级逻辑与」被误读成 `as (T && cond)`（cond 被当成 concept 名解析，
+//   随后的 `[` / `(` 落进类型位 ⇒ T_PARSE_SYNTAX）。旧源码（含 10-13 的 main 顶端）大量
+//   使用该写法，直接导致自举种子编译旧版本源码失败（nightly Bootstrap g1 步）。
+//   限定在形参位后，值级 `&&` 一律回到 parse_and，两种语义不再互相污染。
+pub var g_type_and: bool = false;
+
 // `T?` 后缀可选类型糖（与 `?T` 前缀等价）：先解析基类型，尾部每个 `?` 再包一层 optional。
 // `?T` 前缀分支在 parse_type_inner 内已直接产出 optional 节点，不在此重复包装。
 pub fn parse_type() i64 {
@@ -421,14 +429,27 @@ pub fn parse_type() i64 {
     }
     // §set-ops 岔路 B：concept 多约束连词 `T: A && B`。`&&` 是 SET 交集 token
     // （区别于 bool 关键字 `and`）；约束位把多个 concept 名连成 binary("&&", ...)
-    // 节点，由 sema.generic_normalize_func 拆解成约束列表。此处只在「类型位」吃 `&&`，
-    // 值表达式位的 `&&` 仍走 parse_and（set 交集），两者不冲突。
-    while (lex.cur_t() == "And") {
+    // 节点，由 sema.generic_normalize_func 拆解成约束列表。
+    // ⚠ 只有 `g_type_and` 为真（形参类型位）时才吃 `&&`：其余类型位（`as T`、局部变量
+    //   标注、返回类型、字段类型…）后面的 `&&` 都是**值级**逻辑与，必须留给 parse_and，
+    //   否则 `x as i64 && y[i] > 0` 会被解析成类型 `i64 && y` 并在 `[` 处报语法错。
+    while (g_type_and and lex.cur_t() == "And") {
         var ti: i64 = lex.advance_i();
         var right: i64 = parse_type();
         t0 = base.mk_binary("&&", t0, right, ti);
     }
     return t0;
+}
+
+// 形参类型位解析：开 g_type_and 后调 parse_type（支持 `T: A && B` 多约束）。
+// 递归调 parse_type 时开关仍为真，故 `A && B && C` 的三约束连词同样成立（左结合）。
+// 返回前恢复外层值，避免泄漏到返回类型 / 函数体。
+pub fn parse_type_concept() i64 {
+    var sv_and: bool = g_type_and;
+    g_type_and = true;
+    var t: i64 = parse_type();
+    g_type_and = sv_and;
+    return t;
 }
 
 // ── 表达式解析（优先级爬升，逐层照抄 tc0）─────────────────────
@@ -1993,7 +2014,7 @@ pub fn parse_func_decl(name: string, anns: i64, is_comptime: bool, is_kernel: bo
             lex.advance_i();
             pname = expect_tok("Identifier");
             expect_tok("Colon");
-            ptn = parse_type();
+            ptn = parse_type_concept();     // 形参位：允许多约束连词 `T: A && B`
             pcomp = true;
         } else if (lex.cur_t() == "Identifier" and lex.cur_v() == "_") {
             lex.advance_i();
@@ -2001,13 +2022,13 @@ pub fn parse_func_decl(name: string, anns: i64, is_comptime: bool, is_kernel: bo
             pname = "_";                  // 保持与既有 `_: T` 形参写法一致
             if (lex.cur_t() == "Colon") {     // `_ : T` —— 通配但显式标注类型
                 lex.advance_i();
-                ptn = parse_type();
+                ptn = parse_type_concept();   // 形参位：允许多约束连词
             }
         } else {
             if (lex.cur_t() == "Identifier" and lex.peek_t(1) == "Colon") {
                 pname = expect_tok("Identifier");
                 expect_tok("Colon");
-                ptn = parse_type();
+                ptn = parse_type_concept();   // 形参位：允许多约束连词 `T: A && B`
             } else {
                 if (lex.cur_t() == "Identifier") {
                     // 结构字面量模式：`Ident { ... }` —— 含前导点形式 `Point{.x=0}` 与
@@ -2817,7 +2838,7 @@ pub fn parse_declaration() i64 {
     }
 
     // ── overload 上下文关键词（Route 1）──
-    // `overload fn name(...)` 声明一组同名函数子句；`extend overload fn name(...)`
+    // `overload fn name(...)` 声明一组同名函数子句；`extend fn name(...)`
     // 向本文件内已存在的 overload 组追加子句。二者解析为函数子句（FuncDecl），
     // 以节点 `ia` 槽标记（1=overload 声明 / 2=extend 追加），声明组复用既有
     // `desugar_func_clauses` 按名脱糖为单一函数 + match 臂。跨文件合并见 Route 2。
@@ -2825,7 +2846,10 @@ pub fn parse_declaration() i64 {
         lex.advance_i();   // 吃掉 `overload`
         if (lex.cur_t() == "KwStruct") {
             // ── overload struct（开放可扩展组，ia=1）──（struct-modifiers 设计 §2.1/§2.2）
-            // 编译器合成尾部 `_` 扩展锚点；`extend overload struct` 追加字段/方法（同编译单元）。
+            // 开放性由 `overload` 关键字独占表达：`extend struct` 的字段/方法
+            // 直接追加到本组的字段链尾部（合并期 list_last + list_link，sema.tc:14821）。
+            // ⚠ 早期设计文档曾描述「编译器合成尾部 `_` 扩展锚点」，该写法从未生效
+            //   （parse 期吞掉且不生成任何节点，2026-10-18 拆除）；遗留的 `_;` 已是语法错误。
             lex.advance_i();   // 吃掉 `struct`
             if (lex.cur_t() != "Identifier") {
                 parse_fatal("expected struct name after 'struct' in overload struct declaration");
@@ -2842,6 +2866,28 @@ pub fn parse_declaration() i64 {
                 if (is_export) { base.node_set_bc((sd_o as u64), true); }   // S4 §0.14.7 SoA
             }
             return sd_o;
+        }
+        if (lex.cur_t() == "KwVariant") {
+            // ── overload variant（开放可扩展组，ia=1）──（open-variant 设计 §3.0/§3.1）
+            // 开放性由 `overload` 关键字独占表达；extend 侧裸 extend（见 extend 分支）。
+            // ⚠ parse_variant_decl 内部会自行 lex.advance_i() 吃掉名字 token，故此处只读取、
+            // 不消费（与下方 KwVariant 桥一致），名字位置取 lex.pos。
+            lex.advance_i();   // 吃掉 `variant`
+            if (lex.cur_t() != "Identifier") {
+                parse_fatal("expected variant name after 'variant' in overload variant declaration");
+            }
+            var vname_o: string = lex.cur_v();
+            var vidx_o: i64 = lex.pos;
+            lex.g_agent_anchor = vidx_o;
+            lex.g_struct_exported = is_export;
+            base.validate_decl_name(vname_o, vidx_o);
+            var vd_o: i64 = parse_variant_decl(vname_o, anns);
+            if (vd_o >= 0) {
+                base.node_set_ia((vd_o as u64), 1);   // 1 = overload 组
+                base.node_at(vd_o, vidx_o);
+                if (is_export) { base.node_set_bc((vd_o as u64), true); }   // S4 §0.14.7 SoA
+            }
+            return vd_o;
         }
         if (lex.cur_t() != "KwFunc") {
             // 与布局修饰互斥：`overload extern struct` / `overload packed struct` 不允许
@@ -2877,16 +2923,14 @@ pub fn parse_declaration() i64 {
     }
     if (lex.cur_v() == "extend") {
         lex.advance_i();   // 吃掉 `extend`
-        if (lex.cur_v() != "overload") {
-            parse_fatal_at("T-PAR-E102", "expected 'overload' after 'extend'", lex.pos);
-        }
-        lex.advance_i();   // 吃掉 `overload`
+        // 公理（docs/design/open-variant §3.0）：extend ⊑ overload，extend 子句裸写，
+        // `overload` 仅出现在声明处，不再要求 `extend` 后紧跟 `overload`。
         if (lex.cur_t() == "KwStruct") {
-            // ── extend overload struct（跨模块追加字段+方法，ia=2）──（struct-modifiers 设计 §2.1/§2.2）
+            // ── extend struct（跨模块追加字段+方法，ia=2）──（struct-modifiers 设计 §2.1/§2.2）
             // 复用函数 overload 的 extend 边机制（lex.g_extend_name/g_extend_file + emit_deps）。
             lex.advance_i();   // 吃掉 `struct`
             if (lex.cur_t() != "Identifier") {
-                parse_fatal("expected struct name after 'struct' in extend overload struct declaration");
+                parse_fatal("expected struct name after 'struct' in extend struct declaration");
             }
             var sni_e: i64 = lex.advance_i();
             var sname_e: string = lex.tk_v(sni_e);
@@ -2904,12 +2948,37 @@ pub fn parse_declaration() i64 {
             }
             return sd_e;
         }
+        if (lex.cur_t() == "KwVariant") {
+            // ── extend variant（向本文件内已存在的 overload variant 组追加构造器，ia=2）──
+            // （open-variant 设计 §3.0/§3.1；公理 extend ⊑ overload，extend 子句裸写）
+            // 复用 overload 的 extend 边机制（lex.g_extend_name/g_extend_file + emit_deps）。
+            // ⚠ 同 overload variant：parse_variant_decl 内部自行吃掉名字 token，此处只读取、不消费。
+            lex.advance_i();   // 吃掉 `variant`
+            if (lex.cur_t() != "Identifier") {
+                parse_fatal("expected variant name after 'variant' in extend variant declaration");
+            }
+            var vname_e: string = lex.cur_v();
+            var vidx_e: i64 = lex.pos;
+            lex.g_agent_anchor = vidx_e;
+            lex.g_struct_exported = is_export;
+            base.validate_decl_name(vname_e, vidx_e);
+            var vd_e: i64 = parse_variant_decl(vname_e, anns);
+            if (vd_e >= 0) {
+                base.node_set_ia((vd_e as u64), 2);   // 2 = extend 追加
+                base.node_at(vd_e, vidx_e);
+                if (is_export) { base.node_set_bc((vd_e as u64), true); }   // S4 §0.14.7 SoA
+                // REQ-EXT-1：登记 extend 意图（组名 + 扩展者单元名），供 emit_deps 输出 extend 边。
+                append(lex.g_extend_name, base.node_sa((vd_e as u64)));
+                append(lex.g_extend_file, base.base_no_tc(base.node_file((vd_e as u64))));
+            }
+            return vd_e;
+        }
         if (lex.cur_t() != "KwFunc") {
-            parse_fatal_at("T-PAR-E102", "expected 'fn' after 'extend overload'", lex.pos);
+            parse_fatal_at("T-PAR-E102", "expected 'fn', 'struct' or 'variant' after 'extend'", lex.pos);
         }
         lex.advance_i();   // 吃掉 `fn`
         if (lex.cur_t() != "Identifier") {
-            parse_fatal("expected function name after 'extend overload fn'");
+            parse_fatal("expected function name after 'extend fn'");
         }
         var fni: i64 = lex.advance_i();
         var fname: string = lex.tk_v(fni);
@@ -3550,7 +3619,7 @@ pub fn fc_merge() void {
     }
 
     // 逐子句 → match arm。两遍扫描：pass 0 具体臂、pass 1 通配（_）臂，
-    // 保证「兜底晚于所有具体子句」（§2.4 / §3.3），并使 extend overload 追加的
+    // 保证「兜底晚于所有具体子句」（§2.4 / §3.3），并使 extend 追加的
     // 具体臂能先于通配生效（同文件 extend 在源码上位于通配之后也正确）。
     var ah: i64 = -1;
     var at: i64 = -1;
@@ -3747,7 +3816,7 @@ pub fn fc_merge_type() void {
 }
 
 pub fn desugar_func_clauses() void {
-    // overload（Route 1）：`extend overload` 必须引用本文件内已存在的
+    // overload（Route 1）：`extend` 必须引用本文件内已存在的
     // `overload fn` 组（ia==1），否则报 T-OVL-E980。跨文件合并见 Route 2。
     var n: i64 = slice_len(lex.decl_list) as i64;
     var k: i64 = 0;
@@ -3771,7 +3840,7 @@ pub fn desugar_func_clauses() void {
             }
             if (found == false) {
                 fc_err("T-OVL-E980",
-                    base.sb_cat4("extend overload '", base.node_sa((ek as u64)),
+                    base.sb_cat4("extend '", base.node_sa((ek as u64)),
                         "' has no matching 'overload fn ", base.sb_cat2(base.node_sa((ek as u64)), "' group in this file")),
                     ek);
             }
@@ -3783,7 +3852,7 @@ pub fn desugar_func_clauses() void {
         var d: i64 = lex.decl_list[i];
         // 分组守卫：仅「裸子句式」函数（ba==false）参与子句组合并；普通函数
         // （ba==true，如 `fn main() i64 { ... }`）与脱糖产物一律跳过。类型组判定
-        // （fc_merge_type）额外要求 ia∈{1,2}（overload / extend overload），否则普通
+        // （fc_merge_type）额外要求 ia∈{1,2}（overload / extend），否则普通
         // `fn` 裸子句组（即使全裸带类型）会误入 R3 类别格分派（见 T-OVL-E981）。
         if (base.node_kind((d as u64)) == "FuncDecl" and base.node_ba((d as u64)) == false) {
             g_fc_n = 0;
@@ -5320,11 +5389,6 @@ pub fn parse_struct_decl(name: string, anns: i64, layout: string) i64 {
             var __it: i64 = parse_sfield();
             r_sfield_t = base.list_push(r_sfield, r_sfield_t, __it);
             if (r_sfield < 0) { r_sfield = r_sfield_t; }
-        } else if (lex.cur_t() == "Identifier" and lex.cur_v() == "_" and lex.peek_t(1) == "Semicolon") {
-            // 扩展锚点 `_`：`overload struct` 的尾部占位标记（struct-modifiers 设计 §2.1），
-            // 纯语法、不生成字段；extend overload 追加字段接在其后（合并期处理）。
-            lex.advance_i();   // 吃掉 `_`
-            if (lex.cur_t() == "Semicolon") { lex.advance_i(); }
         } else {
             // 位置字段元组语法：`struct T { T1, T2, ... }` —— 字段自动命名 `_0`/`_1`/...。
             // 任意「类型起始 token」（标识符类型、类型关键字 string/void/map/unit、

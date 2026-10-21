@@ -83,7 +83,10 @@ TArena* t_arena_new(void) {
 #ifdef _WIN32
     // 预留大虚拟空间（不占物理内存），tir 降低超大模块（如完整 tc.tc）时按需提交。
     // 单一连续虚拟区域保证 a->base + a->used 指针语义与旧 malloc 实现一致。
-    a->size = (size_t)16 * 1024 * 1024 * 1024; // 16 GB 虚拟预留（仅占地址空间，无物理成本）
+    // ⚠ S5（删除自举 arena 约束）：tmir-c 字节缓冲模型对完整编译器（~2000 函数）的代码生成
+    // 产生大量临时串且 bump 永不回收，累计越过 16GB；放大到 64GB 以满足自举闭环
+    // （仅预留虚拟地址，物理页按需提交，实测宿主机空闲物理 ~45GB 充足）。
+    a->size = (size_t)64 * 1024 * 1024 * 1024; // 64 GB 虚拟预留（仅占地址空间，无物理成本）
     a->base = (uint8_t*)VirtualAlloc(NULL, a->size, MEM_RESERVE, PAGE_READWRITE);
     if (!a->base) t_fatal("arena: virtual reserve failed");
     a->committed = 0;
@@ -520,6 +523,47 @@ static void big_negate(uint8_t* m, int n) {
         m[i] = (uint8_t)v;
         carry = v >> 8;
         if (!carry) break;
+    }
+}
+
+// ── 任意位宽整数（>64）多精度算术（小端字节缓冲，与 t_sb_append_fmt_big 同布局）──
+// C 后端的 tmir-c 把 AWI 值存为 little-endian 字节缓冲（unsigned char*），本组函数是
+// 在 C 侧补齐 LLVM 后端原生 i<N>/u<N> 算术的等价物。位宽上限由 T_BIG_MAXBYTES 覆盖到 65535 位。
+
+// 把 int64_t 标量 widened 进 nbytes 小端缓冲：低 8 字节按值写入，剩余字节补 0（无符号）
+// 或 0xFF（有符号且为负）。用于 AWI 二元运算中「标量立即数/窄量」提升为全宽缓冲。
+void t_big_from_i64(void* dst, int64_t val, int nbytes, int is_signed) {
+    uint8_t* d = (uint8_t*)dst;
+    uint64_t u = (uint64_t)val;
+    for (int i = 0; i < 8 && i < nbytes; i++) d[i] = (uint8_t)(u >> (8 * i));
+    uint8_t fill = (uint8_t)((is_signed && val < 0) ? 0xFF : 0x00);
+    for (int i = 8; i < nbytes; i++) d[i] = fill;
+}
+
+// 全精度加法 dst = a + b（小端、nbytes 字节、带进位）。等价的 LLVM `add i<N>`。
+void t_big_add(void* dst, const void* a, const void* b, int nbytes) {
+    const uint8_t* x = (const uint8_t*)a;
+    const uint8_t* y = (const uint8_t*)b;
+    uint8_t* d = (uint8_t*)dst;
+    int carry = 0;
+    for (int i = 0; i < nbytes; i++) {
+        int s = (int)x[i] + (int)y[i] + carry;
+        d[i] = (uint8_t)s;
+        carry = s >> 8;
+    }
+}
+
+// 全精度减法 dst = a - b（小端、nbytes 字节、带借位）。等价的 LLVM `sub i<N>`。
+// 实现为 a + (~b) + 1（二补码取负），复用加法进位链，避免独立的借位分支。
+void t_big_sub(void* dst, const void* a, const void* b, int nbytes) {
+    const uint8_t* x = (const uint8_t*)a;
+    const uint8_t* y = (const uint8_t*)b;
+    uint8_t* d = (uint8_t*)dst;
+    int carry = 1;   // 取负 = 反码 + 1，起始进位 1 即完成 +1
+    for (int i = 0; i < nbytes; i++) {
+        int s = (int)x[i] + (int)((uint8_t)~y[i]) + carry;
+        d[i] = (uint8_t)s;
+        carry = s >> 8;
     }
 }
 

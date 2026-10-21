@@ -18,7 +18,7 @@
 
 **子句（clause）**：声明组中的单条声明。每条声明对应匹配集合中的一个匹配路径。本规范以「子句」为正式称法。
 
-注：本项为术语层面的称法变更，overload 关键词以及 `extend overload` 的用法与书写形式均不随之改变，一条 overload 声明即一个子句。
+注：本项为术语层面的称法变更，overload 关键词以及 `extend` 的用法与书写形式均不随之改变，一条 overload 声明即一个子句。
 
 **类型格（type lattice）**与子类型关系，以及由属性定义偏序的属性式类型（property-based types）：Automated Systems of Property-Based Types，专利文献 US20200250558A1；另见类型信息模型相关文献。
 
@@ -54,7 +54,7 @@
 
 **术语层级**：一条带 `overload` 前缀的函数声明即一个子句；多条并列的 overload 声明构成一个声明组；声明组脱糖后生成一个函数与一列匹配臂，每个子句对应一条匹配臂，匹配臂中的模式即该子句声明的匹配依据。故称法层级为：声明组 → 子句 → 匹配臂；「overload 声明」与「子句」指同一条声明的两个称法，不构成两层。后文一律按此称法使用，不再另作说明。
 
-> **与既有函数子句的关系（合规性注）**：overload 声明组建立在 `docs/syntax/drafts/match.md` 的「函数子句模式匹配」之上（验证见 `examples/clause_demo.tc`）。一条 overload 声明在语法上即一条函数子句（参数位泛化为 `ParamPattern`，允许结构模式与 `when` 守卫），多条同名同元数子句由既有 `desugar_func_clauses` 在 AST lowering 阶段归并为单一 `FuncDecl`，其体为 `return match (__p0) { … }`。overload 在既有机制之上新增两项能力：① 参数位允许以**类别（kind）**为模式做类型分派（见 2.2 节类型子句）；② 允许以 `extend overload` 跨文件追加子句（见第 3 章）。其余脱糖与穷尽性判定复用既有 `match` 规则，语义真源唯一，满足 L-04 唯一语义。
+> **与既有函数子句的关系（合规性注）**：overload 声明组建立在 `docs/syntax/drafts/match.md` 的「函数子句模式匹配」之上（验证见 `examples/clause_demo.tc`）。一条 overload 声明在语法上即一条函数子句（参数位泛化为 `ParamPattern`，允许结构模式与 `when` 守卫），多条同名同元数子句由既有 `desugar_func_clauses` 在 AST lowering 阶段归并为单一 `FuncDecl`，其体为 `return match (__p0) { … }`。overload 在既有机制之上新增两项能力：① 参数位允许以**类别（kind）**为模式做类型分派（见 2.2 节类型子句）；② 允许以 `extend` 跨文件追加子句（见第 3 章）。其余脱糖与穷尽性判定复用既有 `match` 规则，语义真源唯一，满足 L-04 唯一语义。
 
 ### 1.2 范围
 
@@ -161,7 +161,7 @@ overload fn foo(Point{.x=0, .y=1}) unit { println(f"y"); }
 overload fn foo(_: Point) unit { println(f"unknown"); }
 ```
 
-上列声明取自示例源文件 `a.tc`；`b.tc` 以 `extend overload` 形式向同一声明组追加一条子句（见 3.2 节）。该声明组脱糖后的结果见 4.2 节，逐条映射关系见 4.3 节。
+上列声明取自示例源文件 `a.tc`；`b.tc` 以 `extend` 形式向同一声明组追加一条子句（见 3.2 节）。该声明组脱糖后的结果见 4.2 节，逐条映射关系见 4.3 节。
 
 > ⚠ **实现状态（KI-002，open）**：上列以 `Point{.x=0, .y=0}` 等结构字面量模式为依据的 overload 子句，其匹配语义依赖 `match` 的结构字面量模式判别。该判别在当前 **LLVM 后端运行期错编**——条件被丢弃、首臂恒命中（双后端对拍：LLVM 轨 `tc run` 输出 `1`、期望 `0`，C 轨 `0`），仅 **C 后端正确**。故本规范的结构/元组字面量模式子句在 KI-002 修复前于 LLVM 后端并不安全；验证请走 C 后端（`tc compile --emit-c` + clang）或暂以字段访问 + `if` 比较替代字面量模式。详见 `docs/compiler/known-issues.md` KI-002、`docs/syntax/drafts/match.md` §6.3。
 
@@ -289,12 +289,12 @@ anykind
 
 ## 3. 跨文件扩展
 
-### 3.1 extend overload 的语义
+### 3.1 extend 的语义
 
-`extend overload` 用于向已存在的声明组追加子句。其声明形式为：
+`extend` 用于向已存在的声明组追加子句。其声明形式为：
 
 ```
-extend overload fn <函数名>(<模式>[:<类型>]) <返回类型> { <语句块> }
+extend fn <函数名>(<模式>[:<类型>]) <返回类型> { <语句块> }
 ```
 
 `extend` 前缀表明该声明不创建新的函数实体，而是向同名函数的既有声明组追加一个子句。
@@ -306,7 +306,7 @@ extend overload fn <函数名>(<模式>[:<类型>]) <返回类型> { <语句块>
 在 `b.tc` 中声明的
 
 ```
-extend overload fn foo(Point{.x=1, .y=1}) unit { println(f"xy"); }
+extend fn foo(Point{.x=1, .y=1}) unit { println(f"xy"); }
 ```
 
 必须被并入 `a.tc` 中 `foo` 的同一匹配集合。合并后，该子句与原有子句共享同一函数名与参数类型签名。
@@ -321,11 +321,11 @@ extend overload fn foo(Point{.x=1, .y=1}) unit { println(f"xy"); }
 
 扩展后的声明组仍是同一函数的多子句形式，不构成新的函数实体。合并后的集合脱糖后产生同一个函数与同一列匹配臂（见 4.2 节）；`b.tc` 追加的子句仅表现为该列匹配臂中的一行，函数名与形参列表均取自原声明组。
 
-注：`extend overload` 不得被理解为在另一文件中定义了一个新的 `foo` 函数；合并后的声明组中不存在第二个同名函数实体。
+注：`extend` 不得被理解为在另一文件中定义了一个新的 `foo` 函数；合并后的声明组中不存在第二个同名函数实体。
 
 ### 3.5 开放集合
 
-`extend overload` 的设计意图在于将"一组模式"构造为可开放扩展的集合，而非封闭定义。任何持有该函数可见性的文件均可以 `extend overload` 形式追加子句。
+`extend` 的设计意图在于将"一组模式"构造为可开放扩展的集合，而非封闭定义。任何持有该函数可见性的文件均可以 `extend` 形式追加子句。
 
 ---
 
@@ -431,7 +431,7 @@ fn area(__p: Point) i64 {
 - `Point{.x=0, .y=0}` 臂来源于 `a.tc` 的第一条声明；
 - `Point{.x=1, .y=0}` 臂来源于 `a.tc` 的第二条声明；
 - `Point{.x=0, .y=1}` 臂来源于 `a.tc` 的第三条声明；
-- `Point{.x=1, .y=1}` 臂来源于 `b.tc` 的 `extend overload` 声明；
+- `Point{.x=1, .y=1}` 臂来源于 `b.tc` 的 `extend` 声明；
 - `_` 臂来源于 `a.tc` 的 `_:Point` 兜底声明。
 
 `_` 兜底臂的来源是声明组中的数值兜底声明。该声明组未启用类别匹配，故该数值兜底即本函数的总兜底（见 2.4 节）。该臂必须位于所有结构模式臂之后。
@@ -468,9 +468,9 @@ overload 不得被理解为函数重载。该关键词所区分的语义是同�
 
 **兜底子句应当设置**：声明组应当包含兜底子句，以承接未被更具体子句覆盖的输入。兜底子句与该组承担的依据类别一致——值与结构组用数值兜底（以通配模式 `_` 声明），类别组用类别兜底（以根节点声明）（见 2.4 节）。未设置兜底子句时，未命中任何子句的输入必须触发匹配失败。
 
-**跨文件扩展的插入位置**：`extend overload` 追加的子句必须与原声明组承担同一类依据，不得改变该组的依据类别；追加的子句必须排在兜底子句之前生效；扩展者应当确认新增子句的匹配优先级符合预期，避免既有子句被遮蔽（见 3.2 节）。
+**跨文件扩展的插入位置**：`extend` 追加的子句必须与原声明组承担同一类依据，不得改变该组的依据类别；追加的子句必须排在兜底子句之前生效；扩展者应当确认新增子句的匹配优先级符合预期，避免既有子句被遮蔽（见 3.2 节）。
 
-**类型子句须落在根节点子树内**：类型子句所声明的类别必须位于根节点的子树之内，根节点自身视为位于其子树之内；不属于该子树的类别必须在编译期报错，不得纳入匹配集合，也不得静默排除（见 2.2 节）。`extend overload` 追加的类型子句同受此约束。
+**类型子句须落在根节点子树内**：类型子句所声明的类别必须位于根节点的子树之内，根节点自身视为位于其子树之内；不属于该子树的类别必须在编译期报错，不得纳入匹配集合，也不得静默排除（见 2.2 节）。`extend` 追加的类型子句同受此约束。
 
 ### 5.3 实现者须知
 
@@ -552,12 +552,12 @@ overload 特性的实现按以下路线分期落地。每期独立验收、不�
 
 **Route 1 — 单文件值/结构模式 overload** 🔧
 - 新增保留关键字 `overload` 与 `extend`（当前为保留关键字；待 L-15 语法规则法可降级为上下文关键词，以复用既有的 `when` 关键字处理惯例）。
-- `overload fn name(...)` 与 `extend overload fn name(...)` 解析为函数子句（`FuncDecl`，以 `ia` 槽标记 1 / 2），声明组**复用既有 `desugar_func_clauses`** 脱糖为单一函数 + `match` 臂（与 `examples/clause_demo.tc` 同构，语义真源唯一）。
-- 约束：`extend overload` 必须引用本文件内已存在的 `overload fn` 组，否则报 `T-OVL-E901`；跨文件合并见 Route 2。值/结构组按 §2.5 顺序敏感性与不可达子句沿用 `match` 既有 `T-MAT-W744` 警告。
+- `overload fn name(...)` 与 `extend fn name(...)` 解析为函数子句（`FuncDecl`，以 `ia` 槽标记 1 / 2），声明组**复用既有 `desugar_func_clauses`** 脱糖为单一函数 + `match` 臂（与 `examples/clause_demo.tc` 同构，语义真源唯一）。
+- 约束：`extend` 必须引用本文件内已存在的 `overload fn` 组，否则报 `T-OVL-E901`；跨文件合并见 Route 2。值/结构组按 §2.5 顺序敏感性与不可达子句沿用 `match` 既有 `T-MAT-W744` 警告。
 - 验证基准：值 / 标量 / 字符串 / `when` 守卫模式 overload **双后端一致**；struct / 元组字面量模式 overload **仅 C 后端**。
 - 交付：`examples/overload_demo.tc`（+`.expected.txt`）、`examples/overload_struct_pat.tc`（C 后端）、conformance pass / fail 用例。
 
-**Route 2 — 跨文件 `extend overload`** ⬜
+**Route 2 — 跨文件 `extend`** ⬜
 - 让 `@import` 把被引入文件中同名 overload 子句并入同一编译单元的脱糖组（需改 import 作用域与 `desugar_func_clauses` 跨来源文件分组；当前 CLI 单文件编译单元，见 `src/tc.tc` argv 门槛）。
 - `T-OVL-E901` 的「本文件内」约束放宽到「可见域内」；前置声明 / 根节点绑定在跨文件场景的归属待定。
 
@@ -565,12 +565,12 @@ overload 特性的实现按以下路线分期落地。每期独立验收、不�
 - **落地方式：静态类型分派（编译期按实参静态类型选最具体子句，不引入运行期类型标签）**。类别格在解析期 / 语义期以字符串名实现：`anykind ⊃ scalarkind ⊃ {integralkind, floatkind}`，`namedkind` 覆盖 struct / enum / flag / variant / typealias 等具名类型；`string` / `bytes` 归入 `scalarkind`（overload.md §2.8）。
 - 具体程度（`parse.ovl_specificity`）：`-1`=具体类型精确匹配（最具体）；`0`=类别直接子（`integralkind`/`floatkind`/`namedkind`）；`1`=`scalarkind`；`2`=`anykind`；`<0`=不覆盖。调用点（`sema.ovl_dispatch_call`）取 `spec` 最小且唯一者，存在并列则报 `T-OVL-E903` 歧义，全部不覆盖报 `T-OVL-E901`/对应错误。
 - 类型组脱糖（`parse.fc_merge_type`）：每个子句降级为内部真实函数 `__name__cK`（`ia==0`），类别子句（`anykind` 等）保留为 `ClauseDead` 模板，调用点经 `sema.ovl_instantiate` 克隆 + 类型替换单态化；另生成入口包装 `name` 调用首个具体子句。组信息登记于扁平表 `g_ovl_tg_{names,cat,func,n,tmpl}`，供 `ovl_find_group` / `ovl_group_*_at` 查询。
-- 分组守卫：`desugar_func_clauses` 仅对裸子句式函数（`FuncDecl.ba==false`）分组；**类型组判定额外要求 `ia∈{1,2}`（`overload` / `extend overload`）**，普通 `fn` 裸子句组即使全裸带类型仍走值 / 结构组 `fc_merge`，不误入类别格（避免 `T-OVL-E981`）。
+- 分组守卫：`desugar_func_clauses` 仅对裸子句式函数（`FuncDecl.ba==false`）分组；**类型组判定额外要求 `ia∈{1,2}`（`overload` / `extend`）**，普通 `fn` 裸子句组即使全裸带类型仍走值 / 结构组 `fc_merge`，不误入类别格（避免 `T-OVL-E981`）。
 - 验证基准：**双后端一致**（`examples/overload_type.tc` 经 LLVM + C 后端对拍，输出 `i64/f64/bool/integral/scalar`）；conformance `tests/conformance/pass/p_overload_type.tc` 通过；失败用例 `f_overload_type_nomatch.tc`（`T-OVL-E903` 歧义）、`f_overload_type_purecat.tc`（`T-OVL-E982` 纯类别组需具体入口）覆盖诊断边界。
 
-**Route 2 — 跨文件 `extend overload`** 🔧
-- 多文件编译单元（`src.tc.tc` `@import` + `tc_load_src` 按序拼接源码、统一 `parse_unit` 填入同一 `lex.decl_list`）已落地；跨文件同名 `overload fn` / `extend overload fn` 子句由 `desugar_func_clauses` 按名并入同一脱糖组（与同文件一致）。
-- `T-OVL-E980`（`extend overload` 须引用可见域内已存在的 `overload fn` 组）已落地；验证见 `examples/overload_cross_a.tc` + `examples/overload_cross_b.tc`（双文件协作，双后端）。
+**Route 2 — 跨文件 `extend`** 🔧
+- 多文件编译单元（`src.tc.tc` `@import` + `tc_load_src` 按序拼接源码、统一 `parse_unit` 填入同一 `lex.decl_list`）已落地；跨文件同名 `overload fn` / `extend fn` 子句由 `desugar_func_clauses` 按名并入同一脱糖组（与同文件一致）。
+- `T-OVL-E980`（`extend` 须引用可见域内已存在的 `overload fn` 组）已落地；验证见 `examples/overload_cross_a.tc` + `examples/overload_cross_b.tc`（双文件协作，双后端）。
 - 前置声明 / 根节点绑定在跨文件场景的归属细节待 `decl_import` 规则法（L-15）补全，当前不影响编译产物与门禁。
 
 **明确不做**：真正函数重载（多个函数实体）。规范 §5.1 明确 overload 声明组脱糖后仅产生单一函数实体，本路线不偏离。
@@ -613,7 +613,7 @@ Raku 的 `multi sub`、Clojure 的 `defmulti` 与 Julia 的多重分派已将该
 
 名称本身即提示"这不是重载"，与本文开篇提出的矛盾点、5.1 节的结论完全同向，消除误读最为彻底，对外辨识度也最高。但规范用词宜中性，"伪／软"把价值判断写入了标识符；且其语义与"重载"强绑定，机制一旦演进为真正的类型分派，该名称立即失效。
 
-**采纳结论**：经评估采纳 `clauses` 作术语。`overload` 作为上下文关键词保持不变，一条 overload 声明即一个子句，正文中「分支」的称法统一替换为「子句」；`extend overload` 的用法与拼写不变。本项变更仅涉及术语称法，不改变任何语法形式与语义规则，也不改变示例中的书写方式。第 6 章参考文献中的「分支」指决策树的分支，属另一含义，不在本次替换范围内。
+**采纳结论**：经评估采纳 `clauses` 作术语。`overload` 作为上下文关键词保持不变，一条 overload 声明即一个子句，正文中「分支」的称法统一替换为「子句」；`extend` 的用法与拼写不变。本项变更仅涉及术语称法，不改变任何语法形式与语义规则，也不改变示例中的书写方式。第 6 章参考文献中的「分支」指决策树的分支，属另一含义，不在本次替换范围内。
 
 ### A.2 适用性说明
 
