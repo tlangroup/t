@@ -1539,11 +1539,30 @@ pub fn c_emit_voidp_addr(sb: StringBuilder, op: TirOperand) void {
         return;
     }
     if (_has_addr) { sb_append_str(sb, _exs); return; }  // 已是 &地址（含合法复合字面量 &(T){x}）
-    // ⚠ 聚合/指针值槽在字节缓冲模型里已是 unsigned char*（指向元素/对象的字节缓冲），
-    //   再取 & 会变成「指针变量自身的地址」，t_slice_set / t_map_put 据此拷贝 8B 指针 + 相邻栈垃圾 →
-    //   元素损坏（slice_set 含 string 字段的 struct 元素、map 键值含聚合时崩溃；tc_self 自举 token 池损坏根因之一）。
-    //   故值槽 C 类型为指针时直接发槽名（它本身就是字节地址），不再取 &。
-    if (c_c_ty_is_ptr(c_operand_c_ty(op))) { sb_append_str(sb, _exs); return; }
+    // 字节缓冲模型下，操作数 C 类型分两类：
+    //  ① 裸字节缓冲指针 "unsigned char*"：它本身就是「值字节所在缓冲的地址」，t_slice_set /
+    //     t_map_put 要的就是这个地址 → 直传，不可再取 &（否则取的是「指针变量自身地址」，
+    //     会连相邻栈垃圾一起拷 → slice_set 含 string 字段的 struct 元素、tc_self 自举 token 池损坏根因）。
+    //     涵盖：聚合基 / 地址槽、map 字面量键值的 (unsigned char*)(&tmp) 缓冲临时量、slice 元素缓冲等。
+    //  ② 具名指针值（TMap* / TSb* / TClosure* / int64_t* / ptr<%UserAgg> 等）：槽里存的是值本身
+    //     （如 map 值槽存 TMap* 指针、ptr<i64> 槽存机器指针），t_slice_set / t_map_put 须按「值字节」拷贝
+    //     → 必须取 & 拿值槽地址（8B 指针本身的字节），否则 map_set(m, k, inner_map) 会把 inner_map 这个
+    //     TMap* 当作「值字节源地址」，拷进值槽的是 TMap 结构体头 8B（arena 指针）→ 后续解引用崩溃。
+    // ⚠ 旧实现对 ALL 指针类型（c_c_ty_is_ptr）一刀切直传，把 ② 类 map 值槽（TMap*）误判成 ① 类缓冲指针。
+    //   正确区分只看「是否为裸字节缓冲 unsigned char*」：它才是唯一应直传的指针类别。
+    // 仅「裸字节缓冲 unsigned char*」直传；★map 值槽（C 类型也是 unsigned char*，但槽里存的是 TMap*
+    // 这个值本身）须取 & 拿值槽地址，否则 map_set(m, k, inner_map) 会把 inner_map 这个 TMap* 当
+    // 「值字节源地址」，拷进值槽的是 TMap 结构体头 8B（arena 指针）→ 后续解引用崩溃。
+    // 判定：沿 def-use 链回溯操作数到 t_map_new 句柄（g_c_map_vsz_name 登记者）即视为 map 值；
+    // 字节缓冲临时量（字面量键值的 (unsigned char*)(&tmp)）回溯不到 map 句柄 → 仍直传。
+    var _is_map_val: bool = false;
+    var _onm: string = c_strip_suf(op.name);
+    if (str_len(_onm) as i64 > 0) {
+        var _h: string = c_map_resolve_handle(_onm);
+        var _i: i64 = 0;
+        while (_i < slice_len(g_c_map_vsz_name) as i64) { if (g_c_map_vsz_name[_i] == _h) { _is_map_val = true; break; } _i = _i + 1; }
+    }
+    if (c_operand_c_ty(op) == "unsigned char*" and _is_map_val == false) { sb_append_str(sb, _exs); return; }
     sb_append_str(sb, "&"); sb_append_str(sb, _exs);
 }
 
