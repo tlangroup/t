@@ -4828,25 +4828,35 @@ pub fn utf8_cp_at(src: string, i: i64, n: i64) i64 {
     return cp;
 }
 
+// ⚠ 性能关键（2026-10-23 修复）：不可写成 `xid_start_lo[mid]` 直接索引全局数组。
+// LLVM 后端把「加载模块级 `var` 全局数组值」降级为「每调用一次 tll_alloc(5528/6448)
+// 整张堆拷贝」（见 gate L2 内存诊断：tc check 时 mi_heap 峰值被推到 ~21GB，绝大多
+// 数来自逐字符的 is_xid_* 调用）。改为先对全局数组取「零拷贝切片视图」（array→slice
+// lowering 自动补 @slice_from_raw，仅填切片槽的 ptr/len，不搬数据），再经切片索引
+// （指针算术）二分查找。C 后端本就按指针直接 GEP 索引，此写法双后端一致、零分配。
 pub fn is_xid_start(cp: i64) bool {
+    var slo: []i64 = xid_start_lo;
+    var shi: []i64 = xid_start_hi;
     var lo_i: i64 = 0;
     var hi_i: i64 = g_xid_start_count - 1;
     while (lo_i <= hi_i) {
         var mid: i64 = (lo_i + hi_i) / 2;
-        if (cp < xid_start_lo[mid]) { hi_i = mid - 1; }
-        else if (cp > xid_start_hi[mid]) { lo_i = mid + 1; }
+        if (cp < slo[mid]) { hi_i = mid - 1; }
+        else if (cp > shi[mid]) { lo_i = mid + 1; }
         else { return true; }
     }
     return false;
 }
 
 pub fn is_xid_cont(cp: i64) bool {
+    var slo: []i64 = xid_cont_lo;
+    var shi: []i64 = xid_cont_hi;
     var lo_i: i64 = 0;
     var hi_i: i64 = g_xid_cont_count - 1;
     while (lo_i <= hi_i) {
         var mid: i64 = (lo_i + hi_i) / 2;
-        if (cp < xid_cont_lo[mid]) { hi_i = mid - 1; }
-        else if (cp > xid_cont_hi[mid]) { lo_i = mid + 1; }
+        if (cp < slo[mid]) { hi_i = mid - 1; }
+        else if (cp > shi[mid]) { lo_i = mid + 1; }
         else { return true; }
     }
     return false;

@@ -53,6 +53,9 @@ void    t_arena_reset_parse(void);   // 回收解析本块
 void    t_arena_reset_front(void);   // 回收前端本块
 void    t_arena_reset_back(void);    // 回收后端本块（逐函数调用 → 本块用完即扔）
 void    t_arena_reset_func(void);    // 回收逐函数本块（emit 每函数后调用 → 函数体用完即扔）
+void    t_dbg_report_mem(void);       // 内存诊断：打印持久 arena 已用/容量字节（阶段 1a 拆解）
+size_t  t_dbg_mi_commit(void);        // 返回当前 mi_heap 提交字节（细粒度探针用）
+size_t  t_arena_committed_total(void);// 返回所有分区 arena 的 committed 总和（VirtualAlloc 提交）
 void    t_runtime_done(void);                   // 释放全局 arena（main 返回前调用）
 
 // ── string：不可变 UTF-8 视图 ──────────────────────────────────

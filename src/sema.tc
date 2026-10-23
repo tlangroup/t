@@ -3119,7 +3119,8 @@ pub fn builtin_ret(name: string) i64 {
     // arena_reset_* 整体回收该本块 arena（用完即扔）。均为 void、无实参，避免任何 TStr 返回 ABI。
     if (name == "arena_use_default" or name == "arena_use_parse" or name == "arena_use_front"
         or name == "arena_use_back" or name == "arena_use_func" or name == "arena_reset_parse"
-        or name == "arena_reset_front" or name == "arena_reset_back" or name == "arena_reset_func") {
+        or name == "arena_reset_front" or name == "arena_reset_back" or name == "arena_reset_func"
+        or name == "dbg_report_mem") {
         return ti_mk("Void");
     }
     if (name == "flag_set" or name == "print") {
@@ -11334,7 +11335,9 @@ pub fn load_module_file(path: string, alias: string) void {
     var saved_file: string = base.g_file;      // 进入模块前的源文件（provenance 定位用），用于正确回溯
     var base: i64 = slice_len(base__toks) as i64;   // 模块 token 将从此下标开始（tokenize 是 append 语义）
     var msrc: string = file_read_all(path);
+    if (getenv("T_MEMSTATS") == "1") { eprint("LM read " + path + " sz=" + base.i2s(str_len(msrc))); dbg_report_mem(); }
     lex__tokenize(msrc);                           // 追加在入口/父模块 token 之后
+    if (getenv("T_MEMSTATS") == "1") { eprint("LM tok " + path); dbg_report_mem(); }
     lex__pos = base;                               // 从本模块起点解析，而非 0（否则会重解析入口文件）
     base__g_cur_mod = alias;                        // 进入模块：标记 provenance
     base.g_file = path;                        // 切到模块源文件，使节点分配时记录正确的 g_node_file
@@ -11363,6 +11366,7 @@ pub fn load_module_file(path: string, alias: string) void {
     base__g_cur_mod = saved_mod;                    // 离开模块：恢复调用方上下文（支持库内嵌套 import 正确回溯）
     base.g_file = saved_file;                  // 恢复调用方源文件
     lex__pos = saved_pos;                          // 恢复调用方（入口或父模块）的解析位置
+    if (getenv("T_MEMSTATS") == "1") { eprint("LM done " + path); dbg_report_mem(); }
 }
 
 // 登记一条 import 声明上挂着的 `::` 选择性导入项（含通配 `*`）。
@@ -16493,16 +16497,19 @@ pub fn run_check() void {
     // 再做命名空间重整（`hello.add` → `hello__add`，模块顶层符号加 `别名__` 前缀）。
     // 单文件程序（无 import）零影响：无模块符号 ⇒ 无任何改写。
     resolve_modules();
+    if (getenv("T_MEMSTATS") == "1") { eprint("SEMA after_resolve_modules"); dbg_report_mem(); }
     // 开放维度：overload struct + extend struct 合并（struct-modifiers 设计 §2.1/§2.2）。
     // 必须在 mangle_modules（内含 check_entry_redefs 重名检查）之前运行：把 extend 字段并入
     // overload 组、并移除 ext 节点，避免同文件两个同名 StructDecl 被误报 T-NAM-E405；同时保证
     // 跨文件同编译单元（resolve_modules 已把模块声明并入 decl_list）也能在此合并。
     mb_struct_extend_merge();
     mangle_modules();
+    if (getenv("T_MEMSTATS") == "1") { eprint("SEMA after_mangle_modules"); dbg_report_mem(); }
 
     // S6（§4.11.3）：模块级脱糖改由注册表驱动（func_clauses(1)+lambdas(2)+
     // array_len_infer(3)，顺序与原硬编码一致，行为等价）。
     desugar_run_range(-1, 3);
+    if (getenv("T_MEMSTATS") == "1") { eprint("SEMA after_desugar"); dbg_report_mem(); }
     g_vl_checked = [];
 
     // 注册分三趟，因为 register_decl 对 FuncDecl **急切解析形参/返回类型**：
@@ -16516,7 +16523,9 @@ pub fn run_check() void {
     // parse 期那一份 HIR 是缓存制品（键 = 源哈希）；sema 消费的必须是**脱糖后**
     // 的树 —— 模块内联会追加声明、子句合并会改写节点、名字重整会改 sa。
     // 重建代价 = 一次 AstGen，换来 sema 全程只认 HIR。
+    if (getenv("T_MEMSTATS") == "1") { eprint("SEMA before_hirbuild"); dbg_report_mem(); }
     hir.hir_build(hir.g_last_src);
+    if (getenv("T_MEMSTATS") == "1") { eprint("SEMA after_hirbuild1"); dbg_report_mem(); }
 
     // 注册三趟（趟次语义不变），工作集与分类全部取自 HIR decl 指令。
     var n: i64 = slice_len(hir.g_hir.decls) as i64;
@@ -16550,13 +16559,16 @@ pub fn run_check() void {
         ib = ib + 1;
     }
     desugar_run_range(3, 4);  // S6（§4.11.3）：imports(4)，在 register 之后、mb/meta_pass 之前，行为等价
+    if (getenv("T_MEMSTATS") == "1") { eprint("SEMA after_register"); dbg_report_mem(); }
     passes_init();
     run_passes();   // S7（§4.12）：mark_call_callees → mb_pass → meta_pass，按注册序分发，行为等价
+    if (getenv("T_MEMSTATS") == "1") { eprint("SEMA after_passes"); dbg_report_mem(); }
     // ⚠ 再重建一次 HIR：mb_pass / meta_pass 会**改结构**（编译期块执行完即清空语句表、
     // `meta <expr>` 就地折叠成字面量）。注册期那一份指令流已与当前 CST 脱节 ——
     // 照它走会把「已被删除的语句」重新检查一遍（实测：`comptime {}` 里的
     // `@str_from_bytes` 被判 T-MTA-E605，因为它本该随块一起消失）。
     hir.hir_build(hir.g_last_src);
+    if (getenv("T_MEMSTATS") == "1") { eprint("SEMA after_hirbuild2"); dbg_report_mem(); }
     // 检查循环：走 HIR decl 指令流。检查期会合成新声明（__fmt_N / __pipe_N /
     // __import_N），故每次走到队尾就同步一次 AstGen，让循环自然覆盖（不动点）。
     var j: i64 = 0;

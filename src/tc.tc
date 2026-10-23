@@ -275,6 +275,7 @@ fn main() i32 @main {
         var an: i64 = slice_len(argv) as i64;
         var found_file: string = "";
         var files: []string;
+        var want_memstats: bool = false;
         while (ai < an) {
             if (argv[ai] == "--emit-deps") { lex.g_emit_deps = true; ai = ai + 1; continue; }
             if (argv[ai] == "--debug-libs") { lex.g_debug_libs = true; ai = ai + 1; continue; }
@@ -287,6 +288,7 @@ fn main() i32 @main {
             }
             if (argv[ai] == "--json") { base.g_diag_fmt = "json"; ai = ai + 1; continue; }
             if (argv[ai] == "--trace-comptime") { sema.g_meta_trace = true; ai = ai + 1; continue; }
+            if (argv[ai] == "--memstats") { want_memstats = true; ai = ai + 1; continue; }
             // R2 多文件：首个非 flag 即入口文件，其后所有位置参数并入同一编译单元
             if (found_file == "") { found_file = argv[ai]; }
             append(files, argv[ai]);
@@ -300,16 +302,36 @@ fn main() i32 @main {
         if (sema.has_errors()) { base.emit_diags(); return 1; }
         arena_use_parse();            // 前端本块 arena：parse 期 AST/CST 落 g_parse
         parse.parse_unit();
+        if (want_memstats) { eprint("PHASE after_parse"); dbg_report_mem(); }
         arena_use_default();          // sema 持久表（类型/符号）须落 g_arena，切回默认
         // HIR（ZIR 槽位）AstGen：pre-sema 真实跑一次，存 g_hir 供增量缓存锚点消费。
         // Stage A 仅产出生存（不崩溃 + 可序列化），sema 仍吃 CST，未消费 g_hir。
         hir.hir_run(src);
+        if (want_memstats) { eprint("PHASE after_hir"); dbg_report_mem(); }
         sema.run_check();
+        if (want_memstats) { eprint("PHASE after_sema"); dbg_report_mem(); }
         sema.run_device_check();
         comptime_fold.comptime_fold_pass();
         sema.meta_trace_flush();
         sema.ann_pass();
+        if (want_memstats) { eprint("PHASE after_ann"); dbg_report_mem(); }
         arena_reset_parse();        // 前端完成：释放 parse 期 AST/CST（g_parse）；check 无 emit，安全
+        if (want_memstats) {
+            var _n: i64 = base.node_count();
+            // SoA 侧表壳（每节点固定宽，dedup 不可缩；可变 backing 另计）：
+            // 10×i64(80) + 7×string(112) + Span(24) + Trivia头(32) = 248 B/节点
+            var _shell: i64 = _n * 248;
+            var _ntd: i64 = slice_len(sema.tds);
+            var _nti: i64 = slice_len(sema.tis);
+            // TD=72B, TI=88B, + tdf_*/tif_* 平行数组约 24B/项（tds 计 96B、tis 计 112B 粗估）
+            var _tds_MB: i64 = _ntd * 96 / 1048576;
+            var _tis_MB: i64 = _nti * 112 / 1048576;
+            eprint("MEMSTATS node_count=" + base.i2s(_n)
+                + " tds_count=" + base.i2s(_ntd) + " tis_count=" + base.i2s(_nti)
+                + " tds_MB=" + base.i2s(_tds_MB) + " tis_MB=" + base.i2s(_tis_MB)
+                + " soa_shell_MB=" + base.i2s(_shell / 1048576));
+            dbg_report_mem();
+        }
         if (lex.g_emit_deps) {
             sema.emit_deps();
             if (sema.has_errors()) { return 1; }

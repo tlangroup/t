@@ -32,6 +32,173 @@
 #include <windows.h>
 #endif
 
+// ── mi_malloc 调用方直方图（内存诊断，仅 T_MIHIST=1 时启用）───────────
+// 目的：定位「谁在 mi_heap 上分配了 21GB」。编译器（tc.exe）的 t_alloc / new 经
+// -D malloc→mi_malloc 全部走 mi_heap；本直方图按调用方返回地址聚合总字节与次数，
+// 退出时用 DbgHelp(SymFromAddr) 把地址还原成函数名（CodeView/PDB）。
+#include <stdint.h>
+#ifdef _WIN32
+#include <windows.h>
+#include <dbghelp.h>
+#pragma comment(lib, "dbghelp.lib")
+#endif
+static void* (*g_real_mi_malloc)(size_t)  = mi_malloc;
+static void* (*g_real_mi_realloc)(void*, size_t) = mi_realloc;
+static void* (*g_real_mi_calloc)(size_t, size_t) = mi_calloc;
+
+#define MIH_NBITS 17
+#define MIH_N (1u << MIH_NBITS)
+typedef struct { uintptr_t caller; unsigned long long bytes; unsigned long long cnt; } MIH_Ent;
+static MIH_Ent g_mih[MIH_N];
+static int g_mih_inited = 0;
+static int g_mih_on = 0;
+static int g_in_talloc = 0;
+int g_in_tll = 0;
+
+// 栈捕获：对「疑似元凶」尺寸的 mi 分配（恰好 6448/5528，对应 lex__tokenize 热点），
+// 抓取调用栈以定位真正的分配函数。g_total_mi 阈值用于跳过启动期（t.__ginit）噪声，
+// 只抓进入 tokenize 之后的分配。
+#ifdef _WIN32
+#define CAP_MAX 8
+#define CAP_FRAMES 16
+static int g_cap_n = 0;
+static void* g_cap[CAP_MAX][CAP_FRAMES];
+static unsigned long long g_cap_sz[CAP_MAX];
+static unsigned short g_cap_cnt[CAP_MAX];
+static unsigned long long g_total_mi = 0;
+#endif
+
+void mih_record(uintptr_t ra, size_t sz) {
+    if (!g_mih_on) return;
+    uintptr_t k = ra;
+    size_t i = (size_t)((k ^ (k >> 13) ^ (k >> 29)) & (MIH_N - 1));
+    for (int n = 0; n < 16; n++) {
+        MIH_Ent* e = &g_mih[(i + (size_t)n) & (MIH_N - 1)];
+        if (e->caller == 0 || e->caller == k) { e->caller = k; e->bytes += sz; e->cnt++; return; }
+    }
+}
+static void mih_print(void);
+static void mih_maybe_init(void) {
+    if (g_mih_inited) return;
+    g_mih_inited = 1;
+    const char* e = getenv("T_MIHIST");
+    if (e && e[0] == '1') {
+        g_mih_on = 1;
+#ifdef _WIN32
+        SymSetOptions(SYMOPT_UNDNAME | SYMOPT_LOAD_LINES);
+        SymInitialize(GetCurrentProcess(), NULL, TRUE);
+#endif
+        atexit(mih_print);
+    }
+}
+static void* t_mi_wrap_malloc(size_t sz) {
+    void* ra = __builtin_return_address(0);
+    void* p = g_real_mi_malloc(sz);
+    mih_maybe_init();
+    if (!g_in_talloc) mih_record((uintptr_t)ra, sz);
+#ifdef _WIN32
+    g_total_mi++;
+    // 抓取目标尺寸的调用栈：恰好 6448/5528 字节，且越过启动期阈值（进入 tokenize 之后），
+    // 每个尺寸只抓前 CAP_MAX 次，避免拖慢。
+    if (g_mih_on && g_total_mi > 3000000 && (sz == 6448 || sz == 5528) && g_cap_n < CAP_MAX) {
+        USHORT n = CaptureStackBackTrace(2, CAP_FRAMES, g_cap[g_cap_n], NULL);
+        g_cap_sz[g_cap_n] = (unsigned long long)sz;
+        g_cap_cnt[g_cap_n] = n;
+        g_cap_n++;
+    }
+#endif
+    return p;
+}
+static void* t_mi_wrap_realloc(void* ptr, size_t sz) {
+    void* ra = __builtin_return_address(0);
+    void* p = g_real_mi_realloc(ptr, sz);
+    mih_maybe_init();
+    if (!g_in_talloc) mih_record((uintptr_t)ra, sz);
+    return p;
+}
+static void* t_mi_wrap_calloc(size_t n, size_t sz) {
+    void* ra = __builtin_return_address(0);
+    void* p = g_real_mi_calloc(n, sz);
+    mih_maybe_init();
+    if (!g_in_talloc) mih_record((uintptr_t)ra, n * sz);
+    return p;
+}
+static void mih_print(void) {
+    if (!g_mih_on) return;
+    MIH_Ent top[40];
+    for (int i = 0; i < 40; i++) { top[i].caller = 0; top[i].bytes = 0; top[i].cnt = 0; }
+    for (size_t i = 0; i < MIH_N; i++) {
+        if (g_mih[i].caller == 0) continue;
+        if (g_mih[i].bytes > top[39].bytes) {
+            top[39] = g_mih[i];
+            for (int j = 39; j > 0 && top[j].bytes > top[j-1].bytes; j--) {
+                MIH_Ent t = top[j]; top[j] = top[j-1]; top[j-1] = t;
+            }
+        }
+    }
+    fprintf(stderr, "MIHIST_BEGIN\n");
+#ifdef _WIN32
+    // 打印目标尺寸分配的调用栈，定位真正的分配函数。
+    for (int c = 0; c < g_cap_n; c++) {
+        fprintf(stderr, "CAP_STK sz=%llu frames=%u\n", g_cap_sz[c], g_cap_cnt[c]);
+        for (unsigned short f = 0; f < g_cap_cnt[c]; f++) {
+            void* ip = g_cap[c][f];
+            char nm[256]; nm[0] = 0;
+            SYMBOL_INFO* si = (SYMBOL_INFO*)calloc(1, sizeof(SYMBOL_INFO) + 200);
+            if (si) {
+                si->SizeOfStruct = sizeof(SYMBOL_INFO); si->MaxNameLen = 199;
+                DWORD64 disp = 0;
+                if (SymFromAddr(GetCurrentProcess(), (DWORD64)(uintptr_t)ip, &disp, si))
+                    snprintf(nm, sizeof(nm), "%s+0x%llx", si->Name, (unsigned long long)disp);
+                else snprintf(nm, sizeof(nm), "??");
+                free(si);
+            }
+            fprintf(stderr, "   [%u] %s\n", f, nm);
+        }
+    }
+#endif
+    for (int i = 0; i < 40; i++) {
+        if (top[i].caller == 0) break;
+        unsigned long long avg = top[i].cnt ? top[i].bytes / top[i].cnt : 0;
+        char name[512]; name[0] = 0;
+#ifdef _WIN32
+        SYMBOL_INFO* si = (SYMBOL_INFO*)calloc(1, sizeof(SYMBOL_INFO) + 256);
+        if (si) {
+            si->SizeOfStruct = sizeof(SYMBOL_INFO);
+            si->MaxNameLen = 255;
+            DWORD64 disp = 0;
+            if (SymFromAddr(GetCurrentProcess(), (DWORD64)top[i].caller, &disp, si)) {
+                IMAGEHLP_LINE64 ln; memset(&ln, 0, sizeof(ln));
+                ln.SizeOfStruct = sizeof(IMAGEHLP_LINE64);
+                DWORD ldisp = 0;
+                if (SymGetLineFromAddr64(GetCurrentProcess(), (DWORD64)top[i].caller, &ldisp, &ln))
+                    snprintf(name, sizeof(name), "%s+0x%llx %s:%lu", si->Name,
+                             (unsigned long long)disp, ln.FileName, ln.LineNumber);
+                else
+                    snprintf(name, sizeof(name), "%s+0x%llx", si->Name, (unsigned long long)disp);
+                // 额外输出原始 caller 与函数起点（live VA），便于离线用 llvm-symbolizer
+                // 把 RVA 映射到生成 C(tc.c) 的行号：RVA = caller - funcStart。
+                fprintf(stderr, "MIHIST_RAW caller=0x%llx func=0x%llx %s\n",
+                        (unsigned long long)(uintptr_t)top[i].caller,
+                        (unsigned long long)si->Address, si->Name);
+            } else snprintf(name, sizeof(name), "??");
+            free(si);
+        }
+#else
+        snprintf(name, sizeof(name), "??");
+#endif
+        fprintf(stderr, "MIHIST %s bytes=%llu cnt=%llu avg=%llu\n",
+                name, top[i].bytes, top[i].cnt, avg);
+    }
+    fprintf(stderr, "MIHIST_END\n");
+}
+#undef mi_malloc
+#undef mi_realloc
+#undef mi_calloc
+#define mi_malloc(sz)  t_mi_wrap_malloc(sz)
+#define mi_realloc(p,sz) t_mi_wrap_realloc(p,sz)
+#define mi_calloc(n,sz) t_mi_wrap_calloc(n,sz)
+
 // 多区域分配器（2026-10-22 内存优化）：
 //   g_arena  —— 持久 / 跨块 arena（用户数据 + 编译器持久持有者：节点 SoA 侧表、g_ll 缓冲、
 //               跨函数持久字符串表）。绝不随本块 reset 而回收。
@@ -172,9 +339,12 @@ void t_arena_reset_to(TArena* a, size_t mark) {
 }
 
 // ── 通用堆分配（闭包 env / TClosure record）── 走 mimalloc
-void* t_alloc(size_t size) {
+__attribute__((noinline)) void* t_alloc(size_t size) {
+    g_in_talloc = 1;
     void* p = mi_malloc(size);
+    g_in_talloc = 0;
     if (!p) t_fatal("t_alloc: malloc failed");
+    if (!g_in_tll) mih_record((uintptr_t)__builtin_return_address(0), size);
     return p;
 }
 
@@ -2185,6 +2355,44 @@ void t_exit(int32_t code) { exit(code); }
 void t_print(TStr s)  { if (s.len > 0) fwrite(s.ptr, 1, (size_t)s.len, stdout);  fflush(stdout); }
 void t_eprint(TStr s) { if (s.len > 0) fwrite(s.ptr, 1, (size_t)s.len, stderr);  fflush(stderr); }
 void t_println(TStr s){ if (s.len > 0) fwrite(s.ptr, 1, (size_t)s.len, stdout); fputc('\n', stdout); fflush(stdout); }
+
+// 内存诊断：打印持久 arena 当前已分配字节 + mi_malloc 提交内存（阶段 1a 拆解用，无副作用）。
+// 2026-10-24 扩展：额外打印所有分区 arena 的 committed（VirtualAlloc 提交）与进程 PrivateUsage，
+// 以区分「arena 增长」与「mi_heap 增长」。
+size_t t_arena_committed_total(void) {
+    size_t t = 0;
+    if (g_arena) t += g_arena->committed;
+    if (g_parse) t += g_parse->committed;
+    if (g_front) t += g_front->committed;
+    if (g_back)  t += g_back->committed;
+    if (g_func)  t += g_func->committed;
+    return t;
+}
+void t_dbg_report_mem(void) {
+    size_t elapsed = 0, user = 0, sys = 0, rss = 0, peak_rss = 0, commit = 0, peak_commit = 0, faults = 0;
+    mi_process_info(&elapsed, &user, &sys, &rss, &peak_rss, &commit, &peak_commit, &faults);
+    size_t ac_total = t_arena_committed_total();
+    if (g_arena) {
+        fprintf(stderr, "MEMREPORT arena_used=%llu arena_commit=%llu arena_commit_total=%llu "
+            "parse=%llu front=%llu back=%llu func=%llu mimalloc_commit=%llu peak=%llu\n",
+            (unsigned long long)g_arena->used, (unsigned long long)g_arena->committed,
+            (unsigned long long)ac_total,
+            (unsigned long long)(g_parse?g_parse->committed:0),
+            (unsigned long long)(g_front?g_front->committed:0),
+            (unsigned long long)(g_back?g_back->committed:0),
+            (unsigned long long)(g_func?g_func->committed:0),
+            (unsigned long long)commit, (unsigned long long)peak_commit);
+    } else {
+        fprintf(stderr, "MEMREPORT arena_null arena_commit_total=%llu mimalloc_commit=%llu peak=%llu\n",
+            (unsigned long long)ac_total, (unsigned long long)commit, (unsigned long long)peak_commit);
+    }
+}
+// 返回当前 mi_heap 提交字节（供 t 侧细粒度探针使用）。
+size_t t_dbg_mi_commit(void) {
+    size_t elapsed = 0, user = 0, sys = 0, rss = 0, peak_rss = 0, commit = 0, peak_commit = 0, faults = 0;
+    mi_process_info(&elapsed, &user, &sys, &rss, &peak_rss, &commit, &peak_commit, &faults);
+    return commit;
+}
 
 // ── 测试内建（@panic / @assert / @assert_eq）──
 void t_panic(TStr msg) {
