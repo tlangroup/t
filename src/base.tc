@@ -4314,6 +4314,27 @@ pub fn sb_cat5(a: string, b: string, c: string, d: string, e: string) string {
     return sb_to_str(sb);
 }
 
+// 逃逸提升（2026-10-22 内存优化）：把字符串 s 拷贝进「持久 / 跨块 arena」(g_arena)，
+// 使其越过本块 scratch 区间（t_arena_reset_back 等）回收后仍有效。用于写入模块级持久
+// 持有者（g_ll_names / g_func_names / g_str_table / g_clo_thunk_req 等）的字符串——
+// 这些串跨函数/跨阶段长期存活，若落 scratch 会被 reset 悬空 → 重复 declare / 坏函数名。
+// 复用 t_str_concat（已落 g_arena）：与空串拼接即得一份持久副本（s 非空串本身也在 g_arena）。
+// 逃逸提升（2026-10-22 内存优化，2026-10-22 修正）【关键约束已推翻】本编译器 string `==` 是
+// 【内容比较】（t_str_eq / tll_str_eq，memcmp），并非指针(身份)比较（见 tir_to_ll.tc:4207 对
+// %TStr 走 tll_str_eq 内容比较）。因此「提升」做拷贝安全——去重表（g_ll_declared / g_ll_valptr
+// 等用 `==` 判等）按内容匹配，拷贝产生的新指针不破坏去重。此前本函数被误实现为 `return s`
+// （空操作），导致代际分配器（re-lowering）启用时持久累加 slice 存进 g_func 指针，
+// arena_reset_func 后悬垂、emit-ll 自举必然段错误。
+// 修正：切到 g_arena（持久区）后生成副本——副本落 g_arena；且后续同语句的 append（slice 扩容）
+// 也因 g_cur=g_arena 而把 backing 落 g_arena，从而「元素 + backing」双保险持久，跨函数回收不悬垂。
+// 不在此恢复 g_cur：调用方（emit 各累加 slice 站点）在 re-lowering 下的后续分配本就该落 g_arena
+// （函数体已在切 g_func 之前降级完毕，emit 只读体、写 IR 文本/持久 slice，均无需 g_func）；
+// 下一函数降级会由窗口的 arena_use_func() 重新切回 g_func。
+pub fn str_persist(s: string) string {
+    arena_use_default();
+    return sb_cat2(s, "");
+}
+
 pub fn sb_cat6(a: string, b: string, c: string, d: string, e: string, f: string) string {
     var sb: StringBuilder = sb_new();
     sb_append_str(sb, a);
