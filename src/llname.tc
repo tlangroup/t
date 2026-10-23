@@ -21,16 +21,22 @@ pub var g_ll_globalsts: []string;
 pub var g_ll_global_keys: []string;
 pub var g_ll_global_sts: []string;
 
-pub fn ll_set_curfn(n: string) void { g_ll_curfn = n; }
+pub fn ll_set_curfn(n: string) void { g_ll_curfn = base.str_persist(n); }
 
 // 登记一个模块级全局（裸名）。同时写入发射表与查询键表（键做 ll_mangle，与 ll_get_st/ll_alloca_st 查询键一致）。
 pub fn ll_add_global(name: string, st: string) void {
-    append(g_ll_globals, name);
-    append(g_ll_globalsts, st);
+    // ⚠ 代际分配器（2026-10-22）回归修复：g_ll_globals / g_ll_globalsts / g_ll_global_keys /
+    // g_ll_global_sts 是模块级持久表——ll_reset_slots 每个函数都回填一次，模块末尾还要 emit。
+    // 其 backing 必须落 g_arena：若在 g_func（逐函数重降级 arena）增长 backing，
+    // arena_reset_func 回收后下一函数的 ll_reset_slots 即读到悬垂 backing → 段错误。
+    // 本函数在 emit 期（ll_register_global 遇引用未声明全局）同样可达，故无条件切 g_arena。
+    arena_use_default();
+    append(g_ll_globals, base.str_persist(name));
+    append(g_ll_globalsts, base.str_persist(st));
     // 键存 '@'+mangle：与 ll_llname 对裸全局名（及 @name）的输出一致，保证 ll_get_st/ll_alloca_st 查表命中。
     var key: string = "@" + ll_mangle(name);
-    append(g_ll_global_keys, key);
-    append(g_ll_global_sts, st);
+    append(g_ll_global_keys, base.str_persist(key));
+    append(g_ll_global_sts, base.str_persist(st));
 }
 
 pub fn ll_reset_slots() void {
@@ -39,8 +45,8 @@ pub fn ll_reset_slots() void {
     var gi: i64 = 0;
     var gn: i64 = slice_len(g_ll_global_keys) as i64;
     while (gi < gn) {
-        append(g_ll_names, g_ll_global_keys[gi]);
-        append(g_ll_sts, g_ll_global_sts[gi]);
+        append(g_ll_names, base.str_persist(g_ll_global_keys[gi]));
+        append(g_ll_sts, base.str_persist(g_ll_global_sts[gi]));
         gi = gi + 1;
     }
 }
@@ -259,8 +265,8 @@ pub fn ll_set_st(name: string, st: string) void {
         if (g_ll_names[i] == name) { g_ll_sts[i] = st; return; }
         i = i + 1;
     }
-    append(g_ll_names, name);
-    append(g_ll_sts, st);
+    append(g_ll_names, base.str_persist(name));
+    append(g_ll_sts, base.str_persist(st));
 }
 
 // 发射单个槽的 alloca（含定长数组堆分配与聚合零初始化），返回要写入 g_ll 的字符串。
@@ -274,9 +280,9 @@ pub fn ll_emit_alloca(tname: string, st: string) string {
     var i: i64 = 0;
     var found: i64 = -1;
     while (i < n) { if (g_ll_names[i] == tname) { found = i; break; } i = i + 1; }
-    if (found < 0) { append(g_ll_names, tname); append(g_ll_sts, st); }
+    if (found < 0) { append(g_ll_names, base.str_persist(tname)); append(g_ll_sts, base.str_persist(st)); }
     else { g_ll_sts[found] = st; }
-    append(g_ll_emitted, tname);
+    append(g_ll_emitted, base.str_persist(tname));
     var sb: StringBuilder = sb_new();
     // 定长数组槽：栈 alloca 在地址流入逃逸 TSlice（如 first3 返回切片）时会悬空 → use-after-free。
     // 改为堆分配（tll_alloc）；堆是栈的超集，对所有用例语义安全（数据指针生命周期延长到堆上）。
