@@ -42,6 +42,20 @@ typedef struct { void* fn; void* env; } TClosure;
 void    t_runtime_init(int argc, char** argv);  // 保存 argc/argv 供 t_args()
 void    t_runtime_set_arena(TArena* a);         // 注入全局 arena
 TArena* t_arena_current(void);                  // 取全局 arena（供 sb_new 等内置）
+// 多区域分配器切换（2026-10-22 内存优化）：在编译各阶段/本块开始时把「当前 arena」切到
+// 对应的本块区域，使临时串落在该区域，块末整体回收（用完即扔）。persistent 区域恒为 g_arena。
+void    t_arena_use_default(void);   // 当前 arena = g_arena（持久）
+void    t_arena_use_parse(void);     // 当前 arena = 解析阶段本块
+void    t_arena_use_front(void);     // 当前 arena = 前端(脱糖+sema+lower)本块
+void    t_arena_use_back(void);      // 当前 arena = 后端(codegen)本块
+void    t_arena_use_func(void);      // 当前 arena = 逐函数本块（TIR 函数体）
+void    t_arena_reset_parse(void);   // 回收解析本块
+void    t_arena_reset_front(void);   // 回收前端本块
+void    t_arena_reset_back(void);    // 回收后端本块（逐函数调用 → 本块用完即扔）
+void    t_arena_reset_func(void);    // 回收逐函数本块（emit 每函数后调用 → 函数体用完即扔）
+void    t_dbg_report_mem(void);       // 内存诊断：打印持久 arena 已用/容量字节（阶段 1a 拆解）
+size_t  t_dbg_mi_commit(void);        // 返回当前 mi_heap 提交字节（细粒度探针用）
+size_t  t_arena_committed_total(void);// 返回所有分区 arena 的 committed 总和（VirtualAlloc 提交）
 void    t_runtime_done(void);                   // 释放全局 arena（main 返回前调用）
 
 // ── string：不可变 UTF-8 视图 ──────────────────────────────────
@@ -53,7 +67,8 @@ typedef struct { const uint8_t* ptr; int64_t len; } TStr;
 
 TStr    t_str_from_c(const char* s);
 TStr    t_str_slice(TStr s, int64_t start, int64_t end);   // 越界 → panic + JSON 诊断
-TStr    t_str_concat(TStr a, TStr b);                       // 拼接（arena 分配，补 \0）
+TStr    t_str_concat(TStr a, TStr b);                       // 拼接（结果经 t_str_intern 去重，stable 池 canonical 串）
+TStr    t_str_intern(TStr s);                              // 字符串驻留：按内容去重进 stable 池，返回 canonical TStr（跨进程生命周期稳定）
 uint8_t t_str_byte_at(TStr s, int64_t i);                   // 越界 → panic + JSON 诊断
 bool    t_str_eq(TStr a, TStr b);
 int64_t t_str_len(TStr s);

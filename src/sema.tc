@@ -73,7 +73,10 @@ pub var tif_params: []i64;  // 参数 TI 扁平池
 
 pub fn ti_mk(kind: string) i64 {
     var t: TI;
-    t.kind = kind;
+    // ⚠ 代际分配器（2026-10-22）：TI 表 tis 同为跨函数持久池，须常驻 g_arena，
+    // 与 td_mk 同口径（见其注释）。重降级期切 g_arena 再 append + 逃逸提升字符串字段。
+    if (tir.g_relowering) { arena_use_default(); }
+    if (tir.g_relowering) { t.kind = base.str_persist(kind); } else { t.kind = kind; }
     t.name = "";
     t.und = "";
     t.bw = 0;
@@ -82,17 +85,23 @@ pub fn ti_mk(kind: string) i64 {
     t.val = -1;
     t.alen = 0;
     append(tis, t);
-    var i: i64 = (slice_len(tis) as i64) - 1;
     append(tif_ret, -1);
     append(tif_pstart, -1);
     append(tif_pcount, 0);
-    return i;
+    if (tir.g_relowering) {
+        if (tir.g_relowering_scratch_func) { arena_use_func(); } else { arena_use_default(); }
+    } else { arena_use_default(); }
+    return (slice_len(tis) as i64) - 1;
 }
 
 pub fn ti_named(kind: string, name: string) i64 {
     var i: i64 = ti_mk(kind);
     var t: TI = tis[i];
-    t.name = name;
+    // ⚠ 代际分配器（2026-10-22）：name 可能重降级期在 g_func 计算，须逃逸提升到 g_arena。
+    if (tir.g_relowering) {
+        t.name = base.str_persist(name);
+        if (tir.g_relowering_scratch_func) { arena_use_func(); }
+    } else { t.name = name; }
     slice_set(tis, i, t);
     return i;
 }
@@ -100,7 +109,11 @@ pub fn ti_named(kind: string, name: string) i64 {
 pub fn ti_with_und(kind: string, name: string, und: string) i64 {
     var i: i64 = ti_named(kind, name);
     var t: TI = tis[i];
-    t.und = und;
+    // ⚠ 代际分配器（2026-10-22）：und 可能重降级期在 g_func 计算，须逃逸提升到 g_arena。
+    if (tir.g_relowering) {
+        t.und = base.str_persist(und);
+        if (tir.g_relowering_scratch_func) { arena_use_func(); }
+    } else { t.und = und; }
     slice_set(tis, i, t);
     return i;
 }
@@ -1635,10 +1648,14 @@ pub fn resolve_ti(tn: i64) i64 {
         var fpstart: i64 = slice_len(tif_params) as i64;
         var fpc: i64 = slice_len(fbuf) as i64;
         var fj0: i64 = 0;
+        if (tir.g_relowering) { arena_use_default(); }
         while (fj0 < fpc) {
             append(tif_params, fbuf[fj0]);
             fj0 = fj0 + 1;
         }
+        if (tir.g_relowering) {
+            if (tir.g_relowering_scratch_func) { arena_use_func(); } else { arena_use_default(); }
+        } else { arena_use_default(); }
         return ti_func(fret, fpstart, fpc);
     }
     return ti_mk("Unknown");
@@ -2886,10 +2903,14 @@ pub fn register_decl(d: i64) void {
         var fpstart2: i64 = slice_len(tif_params) as i64;
         var fpc2: i64 = slice_len(fbuf2) as i64;
         var fj1: i64 = 0;
+        if (tir.g_relowering) { arena_use_default(); }
         while (fj1 < fpc2) {
             append(tif_params, fbuf2[fj1]);
             fj1 = fj1 + 1;
         }
+        if (tir.g_relowering) {
+            if (tir.g_relowering_scratch_func) { arena_use_func(); } else { arena_use_default(); }
+        } else { arena_use_default(); }
         tif_ret[fti] = fret2;
         tif_pstart[fti] = fpstart2;
         tif_pcount[fti] = fpc2;
@@ -3094,6 +3115,14 @@ pub fn list_prev_val(head: i64, last: i64) i64 {
 pub fn builtin_ret(name: string) i64 {
     // 注：assert_eq/assert_true/assert_false/assert_panic 内建已移除（LLVM 后端是
     // no-op、C 后端缺实现，属死桩）。真实断言见 std.testing。手动改 GEN 块。
+    // 多区域分配器切换 / 复位内建（2026-10-22）：arena_use_* 切当前 arena 到对应阶段本块，
+    // arena_reset_* 整体回收该本块 arena（用完即扔）。均为 void、无实参，避免任何 TStr 返回 ABI。
+    if (name == "arena_use_default" or name == "arena_use_parse" or name == "arena_use_front"
+        or name == "arena_use_back" or name == "arena_use_func" or name == "arena_reset_parse"
+        or name == "arena_reset_front" or name == "arena_reset_back" or name == "arena_reset_func"
+        or name == "dbg_report_mem") {
+        return ti_mk("Void");
+    }
     if (name == "flag_set" or name == "print") {
         return ti_mk("Void");
     }
@@ -8184,9 +8213,20 @@ pub fn infer_expr_body(e: i64) i64 {
         // 则改写 callee 为裸 ident 并（方法首参 self）前置 receiver 为第 0 实参，随后走下方
         // ident 分支正常解析（含实参校验 / 返回类型）。类型级 `Point.create()` 与值级 `p.origin()`
         // 同构处理。幂等：改写后 callee 是 ident，二次进入不再走本分支。
+        // P3b 结构体方法脱糖：仅当 receiver 是「值 / 类型名」（struct/union/named），
+        // 不是模块值。若 receiver 是模块值（如 base.sb_cat5 的 base），跳过本分支，
+        // 落到下方 6814 模块值成员访问（按 <key>__<field> 改写）——否则 receiver 被当普通值
+        // infer_expr → T-SEM-E201（模块值非可运算值；单进程下 import 语句经 modval_load 把
+        // 模块名登记为 Module 类型符号故不报错，但 lib 独立编译入口模块不会自我 import）。
         if (base.node_kind((base.node_na((e as u64)) as u64)) == "member" and base.node_na((base.node_na((e as u64)) as u64)) >= 0) {
             var afm: i64 = base.node_na((e as u64));
             var afrecv: i64 = base.node_na((afm as u64));
+            // 模块值接收者（base.sb_cat5 的 base）不是结构体：跳过 P3b 方法脱糖，
+            // 落到下方 6814 模块值成员访问（按 <key>__<field> 改写）。否则 receiver 被当普通值
+            // infer_expr → T-SEM-E201（模块值非可运算值；单进程下 import 语句经 modval_load 把
+            // 模块名登记为 Module 类型符号故不报错，但 lib 独立编译入口模块不会自我 import）。
+            var af_is_modval: bool = (base.node_kind((afrecv as u64)) == "ident" and str_len(g_modval_get(base.node_sa((afrecv as u64)))) as i64 > 0);
+            if (af_is_modval == false) {
             var afname: string = base.node_sa((afm as u64));
             var afti: i64 = infer_expr(afrecv);
             var afk: string = tip_kind(afti);
@@ -8245,6 +8285,7 @@ pub fn infer_expr_body(e: i64) i64 {
                             base.sb_cat4("类型 ", afstruct, " 没有关联函数/方法 ", afname), e);
                     }
                 }
+            }
             }
         }
         if (base.node_kind((base.node_na((e as u64)) as u64)) == "ident") {
@@ -11306,7 +11347,9 @@ pub fn load_module_file(path: string, alias: string) void {
     var saved_file: string = base.g_file;      // 进入模块前的源文件（provenance 定位用），用于正确回溯
     var base: i64 = slice_len(base__toks) as i64;   // 模块 token 将从此下标开始（tokenize 是 append 语义）
     var msrc: string = file_read_all(path);
+    if (getenv("T_MEMSTATS") == "1") { eprint("LM read " + path + " sz=" + base.i2s(str_len(msrc))); dbg_report_mem(); }
     lex__tokenize(msrc);                           // 追加在入口/父模块 token 之后
+    if (getenv("T_MEMSTATS") == "1") { eprint("LM tok " + path); dbg_report_mem(); }
     lex__pos = base;                               // 从本模块起点解析，而非 0（否则会重解析入口文件）
     base__g_cur_mod = alias;                        // 进入模块：标记 provenance
     base.g_file = path;                        // 切到模块源文件，使节点分配时记录正确的 g_node_file
@@ -11335,6 +11378,7 @@ pub fn load_module_file(path: string, alias: string) void {
     base__g_cur_mod = saved_mod;                    // 离开模块：恢复调用方上下文（支持库内嵌套 import 正确回溯）
     base.g_file = saved_file;                  // 恢复调用方源文件
     lex__pos = saved_pos;                          // 恢复调用方（入口或父模块）的解析位置
+    if (getenv("T_MEMSTATS") == "1") { eprint("LM done " + path); dbg_report_mem(); }
 }
 
 // 登记一条 import 声明上挂着的 `::` 选择性导入项（含通配 `*`）。
@@ -11409,6 +11453,11 @@ pub fn handle_one_import(imp: i64, at: i64) void {
     // 库导入（路径首段非 src）：走库搜索路径（入口/lib、工程根/lib、out/lib 预编译缓存），
     // 命中 .tc 源码则内联（名字重整后即为命名空间隔离）；若同时命中 .tlib 预编译产物则走外链模式。
     var chosen: string = "";
+    // 阶段 B/C（§5.3 多进程 bootstrap，2026-10-24）：rel = nm 的路径形式（"base" / "std/rc/cst"）；
+    // tint_dir = T_TINT_DIR 环境变量；loaded_tint 标记本依赖是否经接口文件（.tint）外链加载。
+    var rel: string = dots_to_slashes(nm);
+    var tint_dir: string = getenv("T_TINT_DIR");
+    var loaded_tint: bool = false;
     if (base.node_bd((imp as u64))) {   // S4 §0.14.7 SoA：原 `base__nodes[imp].bd`
         chosen = resolve_external_lib(nm);
         if (chosen == "") {
@@ -11418,17 +11467,27 @@ pub fn handle_one_import(imp: i64, at: i64) void {
         }
     } else {
         // `src.` 导入统一相对候选源码根解析；'.' 即路径分隔符：import(src.d.e) => <root>/src/d/e.tc
-        var rel: string = dots_to_slashes(nm);
-        var i: i64 = 0;
-        var nr: i64 = slice_len(g_src_roots) as i64;
-        while (i < nr) {
-            var cand: string = path_resolve(base__sb_cat4(g_src_roots[i], "/", rel, ".tc"));
-            if (path_exists(cand)) { chosen = cand; break; }
-            i = i + 1;
+        // 阶段 B 接口文件外链：若 T_TINT_DIR 已设且 <dir>/<rel>.tint 存在，则按「接口文件」加载
+        // （仅 pub 签名+类型定义，不含实现），使导入方进程不再建被依赖模块的语义图 → 自举峰值有界。
+        // 默认（未设 T_TINT_DIR）= 走原 .tc 源码，行为与旧版逐字节一致；故对既有单进程自举零影响。
+        if (str_len(tint_dir) > 0) {
+            var tcand: string = path_resolve(base__sb_cat4(tint_dir, "/", rel, ".tint"));
+            if (path_exists(tcand)) { chosen = tcand; loaded_tint = true; }
+        }
+        // T_TINT_DIR 已设且接口文件命中 → 优先用接口文件（不回退 .tc）；
+        // 否则回退到 .tc 源码供类型检查（兼容无接口文件的模块）。
+        if (chosen == "") {
+            var i: i64 = 0;
+            var nr: i64 = slice_len(g_src_roots) as i64;
+            while (i < nr) {
+                var cand: string = path_resolve(base__sb_cat4(g_src_roots[i], "/", rel, ".tc"));
+                if (path_exists(cand)) { chosen = cand; break; }
+                i = i + 1;
+            }
         }
         if (chosen == "") {
             parse__fc_err("T-MOD-E550",
-                base__sb_cat3("模块 'src.", nm, "' 无法解析：未在任何源码根下找到对应 .tc 文件"), imp);
+                base__sb_cat3("模块 'src.", nm, "' 无法解析：未在本工程 lib/ 或依赖库搜索路径下找到对应 .tc 文件"), imp);
             return;
         }
     }
@@ -11462,8 +11521,14 @@ pub fn handle_one_import(imp: i64, at: i64) void {
     // 链接模式探测：存在 .tlib 预编译产物且未用 as 别名（归档按规范名构建，as 别名会错配）→ 外链。
     // 库源码仍载入供类型检查，但导出符号改发 declare、私有跳过，归档在链接期并入（真·独立编译+链接）。
     var ar: string = "";
-    if (base.node_bd((imp as u64)) and user_alias == "" and in_mod_visited(chosen) == false) {   // S4 §0.14.7 SoA
-        ar = resolve_external_lib_archive(nm);
+    if (user_alias == "" and in_mod_visited(chosen) == false) {
+        if (base.node_bd((imp as u64))) {
+            ar = resolve_external_lib_archive(nm);
+        } else if (loaded_tint) {
+            // 内部模块经接口文件（.tint）外链加载：若同目录存在预编译 .tlib（编排层逐模块 build --lib 产出），
+            // 则走链接模式——本模块 codegen 该依赖发 declare，真实定义在 .tlib，链接期并入（§5.3 多进程 bootstrap）。
+            ar = resolve_internal_lib_archive(rel, tint_dir);
+        }
     }
     // 记录依赖图边（父 -> 子），供 --emit-deps 输出（父 = 当前活跃栈顶）。
     // 放在钻石去重 return 之前：重导入（如菱形共享根）也需记录边，否则依赖图缺失。
@@ -11483,7 +11548,9 @@ pub fn handle_one_import(imp: i64, at: i64) void {
     lex__g_mod_stack = slice_pop_str(lex__g_mod_stack);          // 离开：弹栈
     lex__g_mod_stack_alias = slice_pop_str(lex__g_mod_stack_alias);
     if (ar != "") {
-        append(lex__g_link_libs, alias);
+        // 存完整路径身份 idn（如 "src.base"）：与 in_link_libs(base.node_mod(d))（节点 provenance = idn）匹配，
+        // 使本模块 codegen 对该依赖的声明/全局发 declare、跳过内联。外部库 idn==alias（单段名）故等价。
+        append(lex__g_link_libs, idn);
         append(lex__g_ext_link, ar);
     }
 }
@@ -11527,6 +11594,21 @@ pub fn resolve_external_lib_archive(nm: string) string {
         if (path_exists(ar)) { return ar; }
         i = i + 1;
     }
+    return "";
+}
+
+// 内部模块预编译产物解析（§5.3 多进程 bootstrap）：返回 <tint_dir>/<rel>.tlib（重命名 LLVM 归档 .a）
+// 路径，未找到返回 ""。命中即走链接模式（内部模块 codegen 发 declare；真实定义在 .tlib，链接期并入）。
+// 与 resolve_external_lib_archive 平行：外部库搜 g_lib_dirs，内部模块搜 T_TINT_DIR 同级（编排层把 .tlib 落在
+// 接口文件同目录 out/mod/<rel>.tlib）。
+pub fn resolve_internal_lib_archive(rel: string, tint_dir: string) string {
+    if (str_len(tint_dir) == 0) { return ""; }
+    if (lex__g_debug_libs) {
+        var ar_d: string = path_resolve(base__sb_cat4(tint_dir, "/", rel, ".tlibd"));
+        if (path_exists(ar_d)) { return ar_d; }
+    }
+    var ar: string = path_resolve(base__sb_cat4(tint_dir, "/", rel, ".tlib"));
+    if (path_exists(ar)) { return ar; }
     return "";
 }
 
@@ -11880,7 +11962,13 @@ pub fn modval_load(mname: string, at: i64) void {
         // M2：g_sel_mod 记完整路径身份（src 导入 "src." + rest；库导入 rest 已完整）。
         var idn: string = rest;
         if (is_lib == false) { idn = "src." + rest; }
-        append(lex__g_sel_owner, base__g_cur_mod);
+        // ⚠ owner 必须用「写下这条 const/var 导入声明的那一层模块」的 provenance（at 节点的 node_mod），
+        // 而非 base__g_cur_mod：build --lib 在 run_check 前会把 g_cur_mod 重置为 ""（见 tc.tc line ~1016），
+        // 但本模块自身的顶层声明 node_mod 已是完整 idn（如 "src.lex"）。Pass 3 的 sel_lookup 以
+        // 裸引用节点的 node_mod（="src.lex"）反查 owner，若此处记 "" 会漏配 → 裸名（如 base.Tok 的兼容
+        // 通配导入）无法改写成 base__Tok，type mismatch 报 <unknown>。入口（非 lib）at.node_mod 为 ""，
+        // 与入口声明 node_mod 一致；故统一用 at.node_mod 即正确。
+        append(lex__g_sel_owner, base.node_mod(at));
         append(lex__g_sel_local, "");
         append(lex__g_sel_mod, idn);
         append(lex__g_sel_orig, "");
@@ -16465,16 +16553,19 @@ pub fn run_check() void {
     // 再做命名空间重整（`hello.add` → `hello__add`，模块顶层符号加 `别名__` 前缀）。
     // 单文件程序（无 import）零影响：无模块符号 ⇒ 无任何改写。
     resolve_modules();
+    if (getenv("T_MEMSTATS") == "1") { eprint("SEMA after_resolve_modules"); dbg_report_mem(); }
     // 开放维度：overload struct + extend struct 合并（struct-modifiers 设计 §2.1/§2.2）。
     // 必须在 mangle_modules（内含 check_entry_redefs 重名检查）之前运行：把 extend 字段并入
     // overload 组、并移除 ext 节点，避免同文件两个同名 StructDecl 被误报 T-NAM-E405；同时保证
     // 跨文件同编译单元（resolve_modules 已把模块声明并入 decl_list）也能在此合并。
     mb_struct_extend_merge();
     mangle_modules();
+    if (getenv("T_MEMSTATS") == "1") { eprint("SEMA after_mangle_modules"); dbg_report_mem(); }
 
     // S6（§4.11.3）：模块级脱糖改由注册表驱动（func_clauses(1)+lambdas(2)+
     // array_len_infer(3)，顺序与原硬编码一致，行为等价）。
     desugar_run_range(-1, 3);
+    if (getenv("T_MEMSTATS") == "1") { eprint("SEMA after_desugar"); dbg_report_mem(); }
     g_vl_checked = [];
 
     // 注册分三趟，因为 register_decl 对 FuncDecl **急切解析形参/返回类型**：
@@ -16488,7 +16579,9 @@ pub fn run_check() void {
     // parse 期那一份 HIR 是缓存制品（键 = 源哈希）；sema 消费的必须是**脱糖后**
     // 的树 —— 模块内联会追加声明、子句合并会改写节点、名字重整会改 sa。
     // 重建代价 = 一次 AstGen，换来 sema 全程只认 HIR。
+    if (getenv("T_MEMSTATS") == "1") { eprint("SEMA before_hirbuild"); dbg_report_mem(); }
     hir.hir_build(hir.g_last_src);
+    if (getenv("T_MEMSTATS") == "1") { eprint("SEMA after_hirbuild1"); dbg_report_mem(); }
 
     // 注册三趟（趟次语义不变），工作集与分类全部取自 HIR decl 指令。
     var n: i64 = slice_len(hir.g_hir.decls) as i64;
@@ -16522,13 +16615,16 @@ pub fn run_check() void {
         ib = ib + 1;
     }
     desugar_run_range(3, 4);  // S6（§4.11.3）：imports(4)，在 register 之后、mb/meta_pass 之前，行为等价
+    if (getenv("T_MEMSTATS") == "1") { eprint("SEMA after_register"); dbg_report_mem(); }
     passes_init();
     run_passes();   // S7（§4.12）：mark_call_callees → mb_pass → meta_pass，按注册序分发，行为等价
+    if (getenv("T_MEMSTATS") == "1") { eprint("SEMA after_passes"); dbg_report_mem(); }
     // ⚠ 再重建一次 HIR：mb_pass / meta_pass 会**改结构**（编译期块执行完即清空语句表、
     // `meta <expr>` 就地折叠成字面量）。注册期那一份指令流已与当前 CST 脱节 ——
     // 照它走会把「已被删除的语句」重新检查一遍（实测：`comptime {}` 里的
     // `@str_from_bytes` 被判 T-MTA-E605，因为它本该随块一起消失）。
     hir.hir_build(hir.g_last_src);
+    if (getenv("T_MEMSTATS") == "1") { eprint("SEMA after_hirbuild2"); dbg_report_mem(); }
     // 检查循环：走 HIR decl 指令流。检查期会合成新声明（__fmt_N / __pipe_N /
     // __import_N），故每次走到队尾就同步一次 AstGen，让循环自然覆盖（不动点）。
     var j: i64 = 0;
@@ -17444,10 +17540,14 @@ pub fn resolve_type_desc(tn: i64) i64 {
         var fpstart: i64 = slice_len(tdf_params) as i64;
         var fpc: i64 = slice_len(fbuf) as i64;
         var fj: i64 = 0;
+        if (tir.g_relowering) { arena_use_default(); }
         while (fj < fpc) {
             append(tdf_params, fbuf[fj]);
             fj = fj + 1;
         }
+        if (tir.g_relowering) {
+            if (tir.g_relowering_scratch_func) { arena_use_func(); } else { arena_use_default(); }
+        } else { arena_use_default(); }
         return td_func(fret, fpstart, fpc);
     }
     return td_mk("unknown");
@@ -17574,7 +17674,13 @@ pub fn td_func(ret: i64, pstart: i64, pcount: i64) i64 {
 
 pub fn td_mk(cat: string) i64 {
     var t: TD;
-    t.cat = cat;
+    // ⚠ 代际分配器（2026-10-22）：类型描述表 tds 是跨函数持久池，必须常驻 g_arena。
+    // 重降级期 g_cur==g_func，append 增长会把 backing 落 g_func → 被 arena_reset_func
+    // 回收（仅 used=0、无 decommit）→ 旧表项（含 lower_unit 期建的 tds[48]=i64）被覆盖
+    // → 后续 tir_size_bytes 读 tds[td].name 命中悬垂/覆盖内存 → emit-ll 段错误（Crash #3）。
+    // 故重降级期固定切 g_arena 再 append，并把字符串字段逃逸提升到 g_arena；写完按上下文还原。
+    if (tir.g_relowering) { arena_use_default(); }
+    if (tir.g_relowering) { t.cat = base.str_persist(cat); } else { t.cat = cat; }
     t.name = "";
     t.elem = -1;
     t.key = -1;
@@ -17582,18 +17688,25 @@ pub fn td_mk(cat: string) i64 {
     t.alen = -1;
     t.memspace = 0;
     append(tds, t);
-    var idx: i64 = (slice_len(tds) as i64) - 1;
     append(tdf_ret, -1);
     append(tdf_pstart, -1);
     append(tdf_pcount, 0);
-    return idx;
+    if (tir.g_relowering) {
+        if (tir.g_relowering_scratch_func) { arena_use_func(); } else { arena_use_default(); }
+    } else { arena_use_default(); }
+    return (slice_len(tds) as i64) - 1;
 }
 
 
 pub fn td_named_mk(cat: string, name: string) i64 {
     var i: i64 = td_mk(cat);
     var t: TD = tds[i];
-    t.name = name;
+    // ⚠ 代际分配器（2026-10-22）：name 可能是重降级期在 g_func 计算的字符串，
+    // 须逃逸提升到 g_arena 防止 arena_reset_func 回收后悬垂（见 td_mk 注释）。
+    if (tir.g_relowering) {
+        t.name = base.str_persist(name);
+        if (tir.g_relowering_scratch_func) { arena_use_func(); }
+    } else { t.name = name; }
     slice_set(tds, i, t);
     return i;
 }

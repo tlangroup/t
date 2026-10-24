@@ -10,7 +10,13 @@
 // ═══════════════════════════════════════════════════════════════
 
 #include "t_runtime.h"
+#include <stdint.h>
 #include <string.h>
+
+// 内存诊断探针（仅 T_MIHIST=1 启用；见 t_runtime.c 的 mi_malloc 调用方直方图）。
+// tll_alloc 是 LLVM 后端 new 的最外层包装；记录其调用方即可定位 21GB 的真凶。
+extern void mih_record(unsigned long long ra, unsigned long long sz);
+extern int  g_in_tll;
 
 // ── string ─────────────────────────────────────────────────────
 void    tll_print(TStr* s)                  { t_print(*s); }
@@ -91,7 +97,13 @@ int64_t tll_parse_time(TStr* spec, TStr* s, int64_t use_local) { return t_parse_
 
 // ── 通用堆分配（定长数组槽用；栈 alloca 在数组地址流入逃逸 TSlice 并返回时会悬空，
 //     故改走持久堆，堆是栈的超集，对全部用例安全。基于 t_alloc（持久 malloc，非 arena）──
-void*   tll_alloc(int64_t size)                             { return t_alloc((size_t)size); }
+__attribute__((noinline)) void* tll_alloc(int64_t size) {
+    g_in_tll = 1;
+    void* p = t_alloc((size_t)size);
+    g_in_tll = 0;
+    mih_record((unsigned long long)(uintptr_t)__builtin_return_address(0), (unsigned long long)size);
+    return p;
+}
 // 通用字节拷贝（变体全局常量：构造器在 t.__ginit 栈上物化 %V，需拷到堆以跨 ginit 栈帧持久化；
 // payload 自身已堆分配，故整体浅拷贝即安全）。
 void    tll_memcpy(void* dst, const void* src, int64_t n)   { if (n > 0) memcpy(dst, src, (size_t)n); }

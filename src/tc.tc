@@ -275,6 +275,7 @@ fn main() i32 @main {
         var an: i64 = slice_len(argv) as i64;
         var found_file: string = "";
         var files: []string;
+        var want_memstats: bool = false;
         while (ai < an) {
             if (argv[ai] == "--emit-deps") { lex.g_emit_deps = true; ai = ai + 1; continue; }
             if (argv[ai] == "--debug-libs") { lex.g_debug_libs = true; ai = ai + 1; continue; }
@@ -287,6 +288,7 @@ fn main() i32 @main {
             }
             if (argv[ai] == "--json") { base.g_diag_fmt = "json"; ai = ai + 1; continue; }
             if (argv[ai] == "--trace-comptime") { sema.g_meta_trace = true; ai = ai + 1; continue; }
+            if (argv[ai] == "--memstats") { want_memstats = true; ai = ai + 1; continue; }
             // R2 多文件：首个非 flag 即入口文件，其后所有位置参数并入同一编译单元
             if (found_file == "") { found_file = argv[ai]; }
             append(files, argv[ai]);
@@ -298,15 +300,41 @@ fn main() i32 @main {
         // 阶段闸门：词法错误会让 token 流失去结构（未终结串、坏数字…），
         // 继续 parse 只会撞上无关的 `parse error` 硬中断并盖掉真正的病因。
         if (sema.has_errors()) { base.emit_diags(); return 1; }
+        base.g_intern_active = false; // 阶段 1：parse 期不驻留（g_parse 临时串不得作 canonical）
+        base.str_intern_init();       // 阶段 1：在 g_arena 预分配字符串驻留表（运行期定址写，不污染 parse arena）
+        arena_use_parse();            // 前端本块 arena：parse 期 AST/CST 落 g_parse
         parse.parse_unit();
+        if (want_memstats) { eprint("PHASE after_parse"); dbg_report_mem(); }
+        arena_use_default();          // sema 持久表（类型/符号）须落 g_arena，切回默认
+        base.g_intern_active = true;  // 阶段 1：进入持久阶段，开启字符串驻留（canonical 落 g_arena，安全）
         // HIR（ZIR 槽位）AstGen：pre-sema 真实跑一次，存 g_hir 供增量缓存锚点消费。
         // Stage A 仅产出生存（不崩溃 + 可序列化），sema 仍吃 CST，未消费 g_hir。
         hir.hir_run(src);
+        if (want_memstats) { eprint("PHASE after_hir"); dbg_report_mem(); }
         sema.run_check();
+        if (want_memstats) { eprint("PHASE after_sema"); dbg_report_mem(); }
         sema.run_device_check();
         comptime_fold.comptime_fold_pass();
         sema.meta_trace_flush();
         sema.ann_pass();
+        if (want_memstats) { eprint("PHASE after_ann"); dbg_report_mem(); }
+        arena_reset_parse();        // 前端完成：释放 parse 期 AST/CST（g_parse）；check 无 emit，安全
+        if (want_memstats) {
+            var _n: i64 = base.node_count();
+            // SoA 侧表壳（每节点固定宽，dedup 不可缩；可变 backing 另计）：
+            // 10×i64(80) + 7×string(112) + Span(24) + Trivia头(32) = 248 B/节点
+            var _shell: i64 = _n * 248;
+            var _ntd: i64 = slice_len(sema.tds);
+            var _nti: i64 = slice_len(sema.tis);
+            // TD=72B, TI=88B, + tdf_*/tif_* 平行数组约 24B/项（tds 计 96B、tis 计 112B 粗估）
+            var _tds_MB: i64 = _ntd * 96 / 1048576;
+            var _tis_MB: i64 = _nti * 112 / 1048576;
+            eprint("MEMSTATS node_count=" + base.i2s(_n)
+                + " tds_count=" + base.i2s(_ntd) + " tis_count=" + base.i2s(_nti)
+                + " tds_MB=" + base.i2s(_tds_MB) + " tis_MB=" + base.i2s(_tis_MB)
+                + " soa_shell_MB=" + base.i2s(_shell / 1048576));
+            dbg_report_mem();
+        }
         if (lex.g_emit_deps) {
             sema.emit_deps();
             if (sema.has_errors()) { return 1; }
@@ -380,7 +408,8 @@ fn main() i32 @main {
         // compile --emit-c 改走 tmir→C 便携后端（与 emit-ll --backend tmir-c 同源），产出单 .c。
         var mod2: string = base.base_no_tc(file);
         var opt_level: i64 = 0;
-        tir__tir_set_recording_mir(true);
+            tir__tir_set_recording_mir(true);
+            tir.g_relowering = false;
         tir.lower_unit(mod2, file);
         tir__tir_set_recording_mir(false);
         tir__g_mir.globals = tir__g_mod.globals;
@@ -645,6 +674,7 @@ fn main() i32 @main {
         sema.ann_pass();
         if (sema.has_errors()) { base.emit_diags(); return 1; }
         var mod2: string = base.base_no_tc(src_file);
+        tir.g_relowering = false;
         tir.lower_unit(mod2, src_file);
         if (has_outp == false) { out_p = base.sb_cat4("out/", mode, "/", mod2); }
         var tirp: string = base.sb_cat2(out_p, ".tir");
@@ -721,6 +751,12 @@ fn main() i32 @main {
         sema.ann_pass();
         if (sema.has_errors()) { base.emit_diags(); return 1; }
         var mod2: string = base.base_no_tc(src_file);
+        // ⚠ 代际分配器（2026-10-22）：emit-ll 走 LLVM 后端，启用逐函数重降级压低峰值
+        // （函数体落 g_func 本块、emit 后立即 arena_reset_func 回收；tmir-c 后端禁用，因其消费 g_mod 真实体）。
+        // 持久全局累加 slice（g_ll_named_types / g_func_names / g_func_paramsts / g_ll_extern_funcs /
+        // g_ll_declared / g_clo_consts / g_clo_thunk_req / g_ll_valptr / g_ll_addrslot / g_ll_addrst /
+        // g_ll_func_rets / ps 及其字符串元素）已在 emit 侧统一「切 g_arena 追加」保护，跨函数回收后不悬垂。
+        tir.g_relowering = true;
         tir.lower_unit(mod2, src_file);
         if (has_outp == false) { out_p = base.sb_cat4("out/", mode, "/tirll_", mod2); }
         var llp: string = base.sb_cat2(out_p, ".tir.ll");
@@ -728,6 +764,7 @@ fn main() i32 @main {
         tir.tir_verify_module();
         var lltext: string = tir_to_ll.tir_to_ll_emit(tir.g_mod);
         file_write_all(llp, lltext);
+        tir.g_relowering = false;   // ⚠ 代际分配器：emit 完成后才关重降级（emit 期间须保持 true 以逐函数重降级）
         eprint(base.sb_cat3("Generated: ", base.to_bs(llp), "\n"));
         // --link-deps：把解析到的外部链接库（.tlib 归档）逐行打到 stdout，
         // 供 diffpipe 新轨手动 clang link 时一并并入（与 tc build 的 g_ext_link 一致）。
@@ -756,7 +793,9 @@ fn main() i32 @main {
         var ex_name: string = "";
         var is_example: bool = false;
         var is_lib: bool = false;        // build --lib：预编译外部库为 .tlib（归档 + 接口块）
-        var lib_alias: string = "";      // 库规范别名（= 源文件名 stem），用于名字重整前缀
+        var lib_alias: string = "";      // 库规范别名（= 源文件名 stem 或 --mod-id 覆写），用于名字重整前缀
+        var mod_id_override: string = "";// --mod-id：内部模块 build --lib 时显式指定完整路径身份（如 "src.base"），
+                                         // 使产出的 .tlib 符号与入口 import 重整一致（入口按 idn 重整，非 stem）。
         var ai2: i64 = 2;
         var an2: i64 = slice_len(argv) as i64;
         while (ai2 < an2) {
@@ -852,6 +891,11 @@ fn main() i32 @main {
                 ai2 = ai2 + 1;
                 continue;
             }
+            // --mod-id <idn>：内部模块 build --lib 时指定完整路径身份（如 "src.base"），
+            // 使 .tlib 符号重整与入口 import(idn) 一致；外部库（idn==stem）无需传。
+            if (argv[ai2] == "--mod-id") {
+                if (ai2 + 1 < an2) { mod_id_override = argv[ai2 + 1]; ai2 = ai2 + 2; continue; }
+            }
             if (argv[ai2] == "--debug") {
                 lex.g_lib_debug = true;
                 ai2 = ai2 + 1;
@@ -935,13 +979,40 @@ fn main() i32 @main {
         var src3: string = tc_load_src(files);
         if (sema.has_errors()) { base.emit_diags(); return 1; }
         if (is_lib) {
-            // 预编译库：以规范别名（源文件名 stem）作为名字重整命名空间，
-            // 使产出的 .tlib 归档符号（json__version）与下游 import(json) 的重整结果一致。
+            // 预编译库：lib_alias 作为名字重整命名空间 + 模块值自引用（M.xxx）键，
+            // 须与下游 import 的 alias 逐字节一致，否则链接缺符号。
+            //   · 外部库（无 --mod-id）：alias = 源文件名 stem（如 "json"），idn==alias。
+            //   · 内部模块（--mod-id src.base）：alias 取 idn 末段 "base"，
+            //     与入口 import(src.base) 的 alias=last_segment(idn)="base" 一致；
+            //     重整符号 = base__foo（mangled_name 内部对 alias 取末段，src.base→base），
+            //     入口侧同样以 alias "base" 重整 → 两侧 base__foo 匹配。
+            //   · g_lib_mod_idn 始终保留完整 idn（"src.base"），供 per-module ginit 符号
+            //     t_ginit_src_base 命名；入口 declare/call 亦用 idn，两侧一致。
             lib_alias = base.base_no_tc(src_file);
-            base.g_cur_mod = lib_alias;
+            if (mod_id_override != "") {
+                lib_alias = sema.last_segment(mod_id_override);   // "base"（模块值别名 / 子进程重整末段）
+                lex.g_lib_mod_idn = mod_id_override;          // "src.base"（完整 idn）
+            } else {
+                lex.g_lib_mod_idn = lib_alias;
+            }
+            // 解析期 provenance = 完整 idn（"src.base"）：① 符号 node_mod 落为 "src.base"，
+            //   与模块值键一致 → base.xxx 自引用经 g_modval_get("base")→"src.base" 命中本模块符号；
+            //   ② 重整取 last_segment(g_cur_mod) = "base" → 符号 base__foo，与入口 import(src.base)
+            //   的 alias="base" 重整逐字节一致。代码生成期（line ~1007）g_cur_mod 会被重置为 ""，
+            //   故在此捕获 provenance 即可。
+            base.g_cur_mod = lex.g_lib_mod_idn;
+            // 独立编译（build --lib）时本模块是「入口」而非被导入，handle_one_import 不会为其登记
+            // 模块值，导致 body 内的 base.xxx 自引用报「未定义标识符 base」。手动补登记：
+            //   alias("base") → idn("src.base")，与下游 import 的模块值键一致。
+            sema.g_modval_set(lib_alias, lex.g_lib_mod_idn);
             lex.g_lib_emit = true;       // 跳过进程级全局发射（t.__ginit / atom 表），避免链接冲突
         }
+        base.g_intern_active = false; // 阶段 1：parse 期不驻留（g_parse 临时串不得作 canonical）
+        base.str_intern_init();       // 阶段 1：在 g_arena 预分配字符串驻留表（运行期定址写，不污染 parse arena）
+        arena_use_parse();            // 前端本块 arena：parse 期 AST/CST 落 g_parse
         parse.parse_unit();
+        arena_use_default();          // sema 持久表（类型/符号）须落 g_arena，切回默认
+        base.g_intern_active = true;  // 阶段 1：进入持久阶段，开启字符串驻留（canonical 落 g_arena，安全）
         if (is_lib) { base.g_cur_mod = ""; }
         file_write_all("out/dbg/_phase.log", "run_check\n");
         sema.run_check();
@@ -961,6 +1032,8 @@ fn main() i32 @main {
         if (sema.has_warnings()) {
             sema.print_warn_summary();
         }
+        arena_reset_parse();        // 前端完成：释放 parse 期 AST/CST（g_parse）；lower/emit 只依赖 TIR+持久表
+        file_write_all("out/dbg/_phase.log", "front_reset_done\n");
 
         var mod2: string = base.base_no_tc(src_file);
         var lltext: string = "";
@@ -971,6 +1044,7 @@ fn main() i32 @main {
             // 路线 §11：sema → mir(pre-TIR 优化) → TIR → tmir → WAT
             // 开启录制：tir.lower_unit 在 TIR 发射期并行录制 pre-TIR 线性 MIR 到 g_mir
             tir__tir_set_recording_mir(true);
+            tir.g_relowering = false;
             tir.lower_unit(mod2, src_file);
             tir__tir_set_recording_mir(false);
             tir__g_mir.globals = tir__g_mod.globals;   // 非函数部分录制期不含，从 g_mod 取（优化不影响 globals）
@@ -985,6 +1059,7 @@ fn main() i32 @main {
         } else if (backend == "tmir-riscv") {
             // 路线 §11：sema → mir(pre-TIR 优化) → TIR → tmir → rv64 汇编
             tir__tir_set_recording_mir(true);
+            tir.g_relowering = false;
             tir.lower_unit(mod2, src_file);
             tir__tir_set_recording_mir(false);
             tir__g_mir.globals = tir__g_mod.globals;
@@ -999,18 +1074,27 @@ fn main() i32 @main {
         } else if (backend == "tir") {
             // S5 新轨（--backend tir 时进入）：sema → TIR → LLVM，结构化翻译（无文本 round-trip，§5.3/§5.6 合规）
             file_write_all("out/dbg/_phase.log", "lower_start\n");
+            // ⚠ 代际分配器（2026-10-22）：LLVM 后端启用逐函数重降级压低峰值
+            // （函数体落 g_func 本块、emit 后立即 arena_reset_func 回收；tmir-c 后端禁用，因其消费 g_mod 真实体）。
+            // 持久全局累加 slice 已在 emit 侧统一「切 g_arena 追加」保护（见 tir_to_ll.tc 各 append 站点），
+            // 跨函数回收后不悬垂。emit 完成后于下方重置回 false。
+            tir.g_relowering = true;
             tir.lower_unit(mod2, src_file);
             file_write_all("out/dbg/_phase.log", "lower_done\n");
             tir.tir_verify_module();
             file_write_all("out/dbg/_phase.log", "verify_done\n");
             lltext = tir_to_ll.tir_to_ll_emit(tir.g_mod);
             file_write_all("out/dbg/_phase.log", "emit_done\n");
+            tir.g_relowering = false;   // ⚠ 代际分配器：emit 完成后才关重降级（emit 期间须保持 true 以逐函数重降级）
             out_text = lltext;
 
             out_text = lltext;
         } else if (backend == "tmir-c") {
             // M2：tmir → C 便携后端（无需 LLVM）。sema → mir → TIR → tmir → .c。
+            // ⚠ 代际分配器：tmir-c 消费 g_mod/g_mir 真实体，禁用逐函数重降级（必须保留完整函数体）。
+            tir.g_relowering = false;
             tir__tir_set_recording_mir(true);
+            tir.g_relowering = false;
             tir.lower_unit(mod2, src_file);
             tir__tir_set_recording_mir(false);
             tir__g_mir.globals = tir__g_mod.globals;

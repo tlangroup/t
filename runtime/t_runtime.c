@@ -32,8 +32,191 @@
 #include <windows.h>
 #endif
 
-// 全局 arena：编译器单 arena 策略，由 t_runtime_set_arena 在 main 入口注入。
+// ── mi_malloc 调用方直方图（内存诊断，仅 T_MIHIST=1 时启用）───────────
+// 目的：定位「谁在 mi_heap 上分配了 21GB」。编译器（tc.exe）的 t_alloc / new 经
+// -D malloc→mi_malloc 全部走 mi_heap；本直方图按调用方返回地址聚合总字节与次数，
+// 退出时用 DbgHelp(SymFromAddr) 把地址还原成函数名（CodeView/PDB）。
+#include <stdint.h>
+#ifdef _WIN32
+#include <windows.h>
+#include <dbghelp.h>
+#pragma comment(lib, "dbghelp.lib")
+#endif
+static void* (*g_real_mi_malloc)(size_t)  = mi_malloc;
+static void* (*g_real_mi_realloc)(void*, size_t) = mi_realloc;
+static void* (*g_real_mi_calloc)(size_t, size_t) = mi_calloc;
+
+#define MIH_NBITS 17
+#define MIH_N (1u << MIH_NBITS)
+typedef struct { uintptr_t caller; unsigned long long bytes; unsigned long long cnt; } MIH_Ent;
+static MIH_Ent g_mih[MIH_N];
+static int g_mih_inited = 0;
+static int g_mih_on = 0;
+static int g_in_talloc = 0;
+int g_in_tll = 0;
+
+// 栈捕获：对「疑似元凶」尺寸的 mi 分配（恰好 6448/5528，对应 lex__tokenize 热点），
+// 抓取调用栈以定位真正的分配函数。g_total_mi 阈值用于跳过启动期（t.__ginit）噪声，
+// 只抓进入 tokenize 之后的分配。
+#ifdef _WIN32
+#define CAP_MAX 8
+#define CAP_FRAMES 16
+static int g_cap_n = 0;
+static void* g_cap[CAP_MAX][CAP_FRAMES];
+static unsigned long long g_cap_sz[CAP_MAX];
+static unsigned short g_cap_cnt[CAP_MAX];
+static unsigned long long g_total_mi = 0;
+#endif
+
+void mih_record(uintptr_t ra, size_t sz) {
+    if (!g_mih_on) return;
+    uintptr_t k = ra;
+    size_t i = (size_t)((k ^ (k >> 13) ^ (k >> 29)) & (MIH_N - 1));
+    for (int n = 0; n < 16; n++) {
+        MIH_Ent* e = &g_mih[(i + (size_t)n) & (MIH_N - 1)];
+        if (e->caller == 0 || e->caller == k) { e->caller = k; e->bytes += sz; e->cnt++; return; }
+    }
+}
+static void mih_print(void);
+static void mih_maybe_init(void) {
+    if (g_mih_inited) return;
+    g_mih_inited = 1;
+    const char* e = getenv("T_MIHIST");
+    if (e && e[0] == '1') {
+        g_mih_on = 1;
+#ifdef _WIN32
+        SymSetOptions(SYMOPT_UNDNAME | SYMOPT_LOAD_LINES);
+        SymInitialize(GetCurrentProcess(), NULL, TRUE);
+#endif
+        atexit(mih_print);
+    }
+}
+static void* t_mi_wrap_malloc(size_t sz) {
+    void* ra = __builtin_return_address(0);
+    void* p = g_real_mi_malloc(sz);
+    mih_maybe_init();
+    if (!g_in_talloc) mih_record((uintptr_t)ra, sz);
+#ifdef _WIN32
+    g_total_mi++;
+    // 抓取目标尺寸的调用栈：恰好 6448/5528 字节，且越过启动期阈值（进入 tokenize 之后），
+    // 每个尺寸只抓前 CAP_MAX 次，避免拖慢。
+    if (g_mih_on && g_total_mi > 3000000 && (sz == 6448 || sz == 5528) && g_cap_n < CAP_MAX) {
+        USHORT n = CaptureStackBackTrace(2, CAP_FRAMES, g_cap[g_cap_n], NULL);
+        g_cap_sz[g_cap_n] = (unsigned long long)sz;
+        g_cap_cnt[g_cap_n] = n;
+        g_cap_n++;
+    }
+#endif
+    return p;
+}
+static void* t_mi_wrap_realloc(void* ptr, size_t sz) {
+    void* ra = __builtin_return_address(0);
+    void* p = g_real_mi_realloc(ptr, sz);
+    mih_maybe_init();
+    if (!g_in_talloc) mih_record((uintptr_t)ra, sz);
+    return p;
+}
+static void* t_mi_wrap_calloc(size_t n, size_t sz) {
+    void* ra = __builtin_return_address(0);
+    void* p = g_real_mi_calloc(n, sz);
+    mih_maybe_init();
+    if (!g_in_talloc) mih_record((uintptr_t)ra, n * sz);
+    return p;
+}
+static void mih_print(void) {
+    if (!g_mih_on) return;
+    MIH_Ent top[40];
+    for (int i = 0; i < 40; i++) { top[i].caller = 0; top[i].bytes = 0; top[i].cnt = 0; }
+    for (size_t i = 0; i < MIH_N; i++) {
+        if (g_mih[i].caller == 0) continue;
+        if (g_mih[i].bytes > top[39].bytes) {
+            top[39] = g_mih[i];
+            for (int j = 39; j > 0 && top[j].bytes > top[j-1].bytes; j--) {
+                MIH_Ent t = top[j]; top[j] = top[j-1]; top[j-1] = t;
+            }
+        }
+    }
+    fprintf(stderr, "MIHIST_BEGIN\n");
+#ifdef _WIN32
+    // 打印目标尺寸分配的调用栈，定位真正的分配函数。
+    for (int c = 0; c < g_cap_n; c++) {
+        fprintf(stderr, "CAP_STK sz=%llu frames=%u\n", g_cap_sz[c], g_cap_cnt[c]);
+        for (unsigned short f = 0; f < g_cap_cnt[c]; f++) {
+            void* ip = g_cap[c][f];
+            char nm[256]; nm[0] = 0;
+            SYMBOL_INFO* si = (SYMBOL_INFO*)calloc(1, sizeof(SYMBOL_INFO) + 200);
+            if (si) {
+                si->SizeOfStruct = sizeof(SYMBOL_INFO); si->MaxNameLen = 199;
+                DWORD64 disp = 0;
+                if (SymFromAddr(GetCurrentProcess(), (DWORD64)(uintptr_t)ip, &disp, si))
+                    snprintf(nm, sizeof(nm), "%s+0x%llx", si->Name, (unsigned long long)disp);
+                else snprintf(nm, sizeof(nm), "??");
+                free(si);
+            }
+            fprintf(stderr, "   [%u] %s\n", f, nm);
+        }
+    }
+#endif
+    for (int i = 0; i < 40; i++) {
+        if (top[i].caller == 0) break;
+        unsigned long long avg = top[i].cnt ? top[i].bytes / top[i].cnt : 0;
+        char name[512]; name[0] = 0;
+#ifdef _WIN32
+        SYMBOL_INFO* si = (SYMBOL_INFO*)calloc(1, sizeof(SYMBOL_INFO) + 256);
+        if (si) {
+            si->SizeOfStruct = sizeof(SYMBOL_INFO);
+            si->MaxNameLen = 255;
+            DWORD64 disp = 0;
+            if (SymFromAddr(GetCurrentProcess(), (DWORD64)top[i].caller, &disp, si)) {
+                IMAGEHLP_LINE64 ln; memset(&ln, 0, sizeof(ln));
+                ln.SizeOfStruct = sizeof(IMAGEHLP_LINE64);
+                DWORD ldisp = 0;
+                if (SymGetLineFromAddr64(GetCurrentProcess(), (DWORD64)top[i].caller, &ldisp, &ln))
+                    snprintf(name, sizeof(name), "%s+0x%llx %s:%lu", si->Name,
+                             (unsigned long long)disp, ln.FileName, ln.LineNumber);
+                else
+                    snprintf(name, sizeof(name), "%s+0x%llx", si->Name, (unsigned long long)disp);
+                // 额外输出原始 caller 与函数起点（live VA），便于离线用 llvm-symbolizer
+                // 把 RVA 映射到生成 C(tc.c) 的行号：RVA = caller - funcStart。
+                fprintf(stderr, "MIHIST_RAW caller=0x%llx func=0x%llx %s\n",
+                        (unsigned long long)(uintptr_t)top[i].caller,
+                        (unsigned long long)si->Address, si->Name);
+            } else snprintf(name, sizeof(name), "??");
+            free(si);
+        }
+#else
+        snprintf(name, sizeof(name), "??");
+#endif
+        fprintf(stderr, "MIHIST %s bytes=%llu cnt=%llu avg=%llu\n",
+                name, top[i].bytes, top[i].cnt, avg);
+    }
+    fprintf(stderr, "MIHIST_END\n");
+}
+#undef mi_malloc
+#undef mi_realloc
+#undef mi_calloc
+#define mi_malloc(sz)  t_mi_wrap_malloc(sz)
+#define mi_realloc(p,sz) t_mi_wrap_realloc(p,sz)
+#define mi_calloc(n,sz) t_mi_wrap_calloc(n,sz)
+
+// 多区域分配器（2026-10-22 内存优化）：
+//   g_arena  —— 持久 / 跨块 arena（用户数据 + 编译器持久持有者：节点 SoA 侧表、g_ll 缓冲、
+//               跨函数持久字符串表）。绝不随本块 reset 而回收。
+//   g_cur    —— 当前 arena（t_arena_current() 返回值）。默认 = g_arena；编译器在各阶段/本块
+//               开始时切到对应区域，使临时串落在该区域，块末整体回收（用完即扔）。
+//   g_parse / g_front / g_back —— 解析 / 前端(脱糖+sema+lower) / 后端(codegen) 阶段的本块 arena。
+//               同阶段内的临时串落此处，阶段末或逐函数 reset 即回收，不再累积进 g_arena。
 static TArena* g_arena = NULL;
+static TArena* g_cur = NULL;
+static TArena* g_parse = NULL;
+static TArena* g_front = NULL;
+static TArena* g_back = NULL;
+// ⚠ 代际分配器（2026-10-22）：逐函数本块 arena。TIR 函数体（指令列表）落 g_func，
+// emit 每个函数后立即 t_arena_reset_func 整体回收，使自举峰值 ≈ 「语义图地板 + 单函数体」
+// 而非「语义图地板 + 全模块函数体」。这是压低 emit-ll src/tc.tc 峰值（原 ~21GB）的唯一杠杆。
+// g_func 仅承载 TIR 函数体；模块级持久 slice（g_mod.strings/types/globals）经 emit 侧
+// 显式切回 g_arena（arena_func_use_default），恒落持久区域。
+static TArena* g_func = NULL;
 
 // REPL 交互输入（M-REPL）：read_line 遇 EOF 后置位，供 stdin_eof() 查询。
 static int g_stdin_eof = 0;
@@ -132,10 +315,36 @@ void t_arena_free_all(TArena* a) {
     }
 }
 
+// ── 代际分配器原语（2026-10-22）：mark/reset 实现「单块 free」语义 ──
+// mark：返回当前 bump 偏移，作为回收点。
+size_t t_arena_mark(TArena* a) {
+    return a ? a->used : 0;
+}
+// reset_to：把 bump 偏移回退到 mark；Windows 上真正 MEM_DECOMMIT mark 以上的物理页，
+// 使这些页不再计入已提交（PrivateBytes），从而压低自举峰值。这是「代际回收」相对
+// t_arena_free_all（仅重置 used、不释放物理）更细的回收粒度。
+void t_arena_reset_to(TArena* a, size_t mark) {
+    if (a) {
+        if (mark > a->used) mark = a->used; // 安全：不允许前进到未分配区
+        a->used = mark;
+#ifdef _WIN32
+        if (mark < a->committed) {
+            size_t excess = a->committed - mark;
+            // 释放 mark 以上的物理页（保留预留虚拟地址）；下次分配从 mark 重新提交
+            VirtualFree(a->base + mark, excess, MEM_DECOMMIT);
+            a->committed = mark;
+        }
+#endif
+    }
+}
+
 // ── 通用堆分配（闭包 env / TClosure record）── 走 mimalloc
-void* t_alloc(size_t size) {
+__attribute__((noinline)) void* t_alloc(size_t size) {
+    g_in_talloc = 1;
     void* p = mi_malloc(size);
+    g_in_talloc = 0;
     if (!p) t_fatal("t_alloc: malloc failed");
+    if (!g_in_tll) mih_record((uintptr_t)__builtin_return_address(0), size);
     return p;
 }
 
@@ -158,14 +367,30 @@ TStr t_str_slice(TStr s, int64_t start, int64_t end) {
     TStr r; r.ptr = s.ptr + start; r.len = end - start; return r;
 }
 
-// 字符串拼接：在全局 arena 上分配 len_a+len_b+1 字节，拷贝两端，补 \0（UTF-8 视图）。
+// 字符串拼接：结果落在「持久 / 跨块 arena」(g_arena)，使其越过本块 scratch 区间（t_arena_cg_reset_to）
+// 仍有效。t 编译器把需跨函数/跨阶段持久保存的字符串（函数名、类型名、字符串表项、闭包 thunk 名等）
+// 经此内建产出；若落点随当前 arena 切换进入 scratch 会被 reset 悬空 → 重复 declare / 坏函数名。
+// 临时串（StringBuilder 缓冲、位串）才走 t_arena_current()（scratch），逐函数回收。
 TStr t_str_concat(TStr a, TStr b) {
+    // 去重：拼接结果经 t_str_intern 落 g_arena 的 canonical 副本（其契约即「产出持久串」，
+    // 故只把「原 g_arena 一份拷贝」换成「去重后一份」，不新增保留、不产生第二份 → 安全）。
+    // 重复类型名/标识符只留一份物理副本，缓解自举期重复串放大。
     int64_t n = a.len + b.len;
-    uint8_t* buf = (uint8_t*)t_arena_alloc(t_arena_current(), (size_t)(n + 1));
-    if (a.len > 0) { memcpy(buf, a.ptr, (size_t)a.len); }
-    if (b.len > 0) { memcpy(buf + a.len, b.ptr, (size_t)b.len); }
-    buf[n] = 0;
-    TStr r; r.ptr = buf; r.len = n; return r;
+    uint8_t* owned = NULL;
+    TStr s;
+    if (n <= 256) {
+        static uint8_t tmp[256];
+        s.ptr = tmp;
+    } else {
+        owned = (uint8_t*)mi_malloc((size_t)n);
+        s.ptr = owned;
+    }
+    s.len = n;
+    if (a.len > 0) memcpy((void*)s.ptr, a.ptr, (size_t)a.len);
+    if (b.len > 0) memcpy((void*)(s.ptr + a.len), b.ptr, (size_t)b.len);
+    TStr r = t_str_intern(s);
+    if (owned) mi_free(owned);
+    return r;
 }
 
 // ── 位串 bitstr（§15）─────────────────────────────────────────
@@ -275,6 +500,9 @@ TSb* t_sb_new(TArena* a) {
 
 static void sb_reserve(TSb* b, int64_t need) {
     if (b->cap >= need) return;
+    // 几何翻倍（ amortized O(1) 次扩容，遗存旧缓冲总浪费 ≤ 最终长度，内存有界）。
+    // 注：曾试「精确扩容到 need」消除 2× 过量分配，但会让「逐字符 append」的串每次
+    // 都重新分配 → O(N²) arena 浪费，自举 check 峰值 19.8G→50G（实测翻车）。故保留翻倍。
     int64_t ncap = b->cap < 16 ? 16 : b->cap * 2;
     while (ncap < need) ncap *= 2;
     uint8_t* nb = (uint8_t*)t_arena_alloc(b->arena, (size_t)ncap);
@@ -311,8 +539,10 @@ void t_sb_append_i64(TSb* b, int64_t v) {
 }
 
 TStr t_sb_to_str(TSb* b) {
-    // 复制到 arena：string 在 t 中不可变，调用方持有的结果不能被后续
-    // sb_clear + append 破坏（src lexer 复用 tmp builder 的关键前提）。
+    // 不驻留：SB 缓冲本身已在 b->arena（持久区 g_arena 或本块 scratch）。若此处再驻留，
+    // 持久区 SB 会「源缓冲 + 驻留副本」双份常驻 → 峰值 19.8G→50G 的实测翻车；
+    // 而 scratch 区 SB 驻留会把本该逐块回收的临时串永久钉死 → 更糟。
+    // 驻留只放在语义明确的 t_str_concat（其契约即「产出持久串」），见其实现。
     uint8_t* copy = (uint8_t*)t_arena_alloc(b->arena, (size_t)b->len + 1);
     if (b->len > 0) memcpy(copy, b->buf, (size_t)b->len);
     copy[b->len] = '\0';
@@ -1464,13 +1694,35 @@ void* t_array_concat(void* a, int64_t abytes, void* b, int64_t bbytes) {
     return out;
 }
 
-void t_runtime_set_arena(TArena* a) { g_arena = a; }
-TArena* t_arena_current(void) { return g_arena; }
+void t_runtime_set_arena(TArena* a) { g_arena = a; g_cur = a; }
+
+// 当前 arena：返回 g_cur，未设置时回退 g_arena（兼容用户程序单 arena 语义）。
+TArena* t_arena_current(void) { return g_cur ? g_cur : g_arena; }
+
+// ── 阶段 / 本块 arena 切换（编译器自用，经 t 内建 arena_use_* / arena_reset_* 调用）──
+// 这些函数本身极小，不分配，绝不触碰 g_arena。
+void t_arena_use_default(void) { g_cur = g_arena; }
+static TArena* t_arena_ensure(TArena** slot) {
+    if (*slot == NULL) { *slot = t_arena_new(); }
+    return *slot;
+}
+void t_arena_use_parse(void)  { g_cur = t_arena_ensure(&g_parse); }
+void t_arena_use_front(void)  { g_cur = t_arena_ensure(&g_front); }
+void t_arena_use_back(void)   { g_cur = t_arena_ensure(&g_back); }
+void t_arena_use_func(void)   { g_cur = t_arena_ensure(&g_func); }
+void t_arena_reset_parse(void) { if (g_parse) t_arena_free_all(g_parse); }
+void t_arena_reset_front(void) { if (g_front) t_arena_free_all(g_front); }
+void t_arena_reset_back(void)  { if (g_back)  t_arena_free_all(g_back); }
+void t_arena_reset_func(void)  { if (g_func)  t_arena_free_all(g_func); }
 
 static void slice_grow(TSlice* s) {
     if (g_arena == NULL) t_fatal("t_slice: arena not initialized");
     int64_t ncap = s->cap < 4 ? 4 : s->cap * 2;
-    void* np = t_arena_alloc(g_arena, (size_t)(ncap * s->elem_size));
+    // ⚠ 代际分配器（2026-10-22）：slice 增长跟随当前 arena（t_arena_current()），
+    // 不再硬编码 g_arena。这样「本块/逐函数」arena（g_back/g_func）承载的 slice（如 TIR
+    // 函数体指令列表）可随 arena reset 整体回收，压低自举峰值。模块级持久 slice
+    // （g_mod.strings/types/globals、g_ll）须在其增长时确保 current==g_arena（持久 arena）。
+    void* np = t_arena_alloc(t_arena_current(), (size_t)(ncap * s->elem_size));
     if (s->len > 0 && s->ptr) memcpy(np, s->ptr, (size_t)(s->len * s->elem_size));
     s->ptr = np;
     s->cap = ncap;
@@ -1756,11 +2008,16 @@ struct TSymPool {
     int32_t* htab;          // 去重哈希表：hash(str)&(cap-1) → id+1（0=空槽），线性探测
     int64_t  htab_cap;      // 2 的幂
     int64_t  htab_used;
-    int64_t* ent_off;       // id → 字符串在 bytes 中的偏移
+    int64_t* ent_off;       // id → 字符串在字节缓冲中的偏移
     int64_t* ent_len;       // id → 字符串长度
     int64_t  ent_count, ent_cap;
-    uint8_t* bytes;         // 所有字符串字节（bump，realloc 增长）
+    int      stable;        // 1=bump arena 后端（通用串驻留池：字节地址稳定、永不移动，可作跨阶段 canonical 串）
+                            // 0=mi_malloc/realloc（Sym 语言特性：支持 sym_release 真正回收，但 realloc 会移动 → 不能长期持 ptr）
+    int      own_arena;     // stable=1 时：1=池自管 bytes_arena（sym_release 可释放）；
+                            //                      0=bytes_arena 由调用方注入（如 g_arena），禁止 sym_pool_free 释放
+    uint8_t* bytes;         // stable=0：所有字符串字节（bump，realloc 增长）
     int64_t  bytes_len, bytes_cap;
+    TArena*  bytes_arena;   // stable=1：字节 bump 直接落 arena（提交即稳定、永不移动）
     int64_t  bits;          // 16 / 32（id 上限校验）
 };
 
@@ -1774,7 +2031,7 @@ static uint64_t sym_hash(const uint8_t* p, int64_t n) {
     return h;
 }
 
-static struct TSymPool* sym_pool_new(int64_t bits) {
+static struct TSymPool* sym_pool_new(int64_t bits, int stable, int own_arena) {
     // ⚠ 必须是 mi_*：sym_pool_free 用 mi_free 释放，混用 libc calloc 会堆损坏
     //   （实测 sym_demo 在 sym_release 后静默截断输出）。
     struct TSymPool* p = (struct TSymPool*)mi_calloc(1, sizeof(struct TSymPool));
@@ -1784,21 +2041,35 @@ static struct TSymPool* sym_pool_new(int64_t bits) {
     p->ent_cap = 8;
     p->ent_off = (int64_t*)mi_malloc(sizeof(int64_t) * (size_t)p->ent_cap);
     p->ent_len = (int64_t*)mi_malloc(sizeof(int64_t) * (size_t)p->ent_cap);
-    p->bytes_cap = 256;
-    p->bytes = (uint8_t*)mi_malloc((size_t)p->bytes_cap);
+    p->stable = stable;
+    p->own_arena = own_arena;
+    if (stable) {
+        // 通用串驻留后端：字节落 bump arena（提交即稳定、永不移动 → 可作 canonical 串）。
+        // own_arena=1：池自管独立 arena（sym_release 可释放）；
+        // own_arena=0：arena 由调用方注入（如 g_arena），禁止 sym_pool_free 释放（见 t_str_intern）。
+        p->bytes_arena = own_arena ? t_arena_new() : NULL;
+        p->bytes_len = 0;
+    } else {
+        p->bytes_cap = 256;
+        p->bytes = (uint8_t*)mi_malloc((size_t)p->bytes_cap);
+        p->bytes_len = 0;
+    }
     p->bits = bits;
-    if (!p->htab || !p->ent_off || !p->ent_len || !p->bytes) t_fatal("sym: pool buffers malloc failed");
+    if (!p->htab || !p->ent_off || !p->ent_len) t_fatal("sym: pool buffers malloc failed");
     return p;
 }
 
 static void sym_pool_free(struct TSymPool* p) {
     if (!p) return;
-    mi_free(p->htab); mi_free(p->ent_off); mi_free(p->ent_len); mi_free(p->bytes);
+    mi_free(p->htab); mi_free(p->ent_off); mi_free(p->ent_len);
+    if (p->stable) { if (p->own_arena && p->bytes_arena) { t_arena_free_all(p->bytes_arena); mi_free(p->bytes_arena); } }
+    else { mi_free(p->bytes); }
     mi_free(p);
 }
 
-// 按 tag 查池；create!=0 时不存在则新建并登记进注册表
-static struct TSymPool* sym_pool_for(TStr tag, int64_t bits, int create) {
+// 按 tag 查池；create!=0 时不存在则新建并登记进注册表。
+// stable / own_arena 仅用于新建池（字节后端选择与释放权）。
+static struct TSymPool* sym_pool_for(TStr tag, int64_t bits, int create, int stable, int own_arena) {
     for (int64_t i = 0; i < g_sym_reg.len; i++)
         if (t_str_eq(g_sym_reg.items[i].tag, tag)) return g_sym_reg.items[i].pool;
     if (!create) return NULL;
@@ -1813,13 +2084,22 @@ static struct TSymPool* sym_pool_for(TStr tag, int64_t bits, int create) {
     if (!tb) t_fatal("sym: tag malloc failed");
     if (tag.len > 0) memcpy(tb, tag.ptr, (size_t)tag.len);
     TStr tcopy; tcopy.ptr = tb; tcopy.len = tag.len;
-    struct TSymPool* p = sym_pool_new(bits);
+    struct TSymPool* p = sym_pool_new(bits, stable, own_arena);
     g_sym_reg.items[g_sym_reg.len].tag = tcopy;
     g_sym_reg.items[g_sym_reg.len].pool = p;
     g_sym_reg.len++;
     return p;
 }
 
+// 取第 id 个 entry 的字节指针：
+//   stable=1 池把字节落 bump arena（提交即稳定、永不移动），故直接存真实指针；
+//   stable=0 池字节在 mi_malloc/realloc 缓冲内（会移动），故存偏移，重算指针。
+static const uint8_t* sym_entry_ptr(struct TSymPool* p, int64_t id) {
+    if (p->stable) return (const uint8_t*)p->ent_off[id];
+    return p->bytes + p->ent_off[id];
+}
+
+// 哈希表扩容重散列（按 tag 池独立；entries 存偏移或指针，统一经 sym_entry_ptr 取字节）。
 static void sym_htab_rehash(struct TSymPool* p) {
     int64_t oldcap = p->htab_cap;
     int32_t* old = p->htab;
@@ -1830,7 +2110,7 @@ static void sym_htab_rehash(struct TSymPool* p) {
         int32_t slot = old[i];
         if (slot != 0) {
             int64_t id = slot - 1;
-            uint64_t h = sym_hash(p->bytes + p->ent_off[id], p->ent_len[id]);
+            uint64_t h = sym_hash(sym_entry_ptr(p, id), p->ent_len[id]);
             int64_t j = (int64_t)(h & (uint64_t)(p->htab_cap - 1));
             while (p->htab[j] != 0) j = (j + 1) & (p->htab_cap - 1);
             p->htab[j] = slot;
@@ -1839,28 +2119,37 @@ static void sym_htab_rehash(struct TSymPool* p) {
     mi_free(old);
 }
 
-uint64_t t_sym_intern(TStr tag, TStr str, int64_t bits) {
-    struct TSymPool* p = sym_pool_for(tag, bits, 1);
+// 向「已解析」的池驻留字符串，返回 id（内容去重）。
+//   stable=1：字节走 t_arena_alloc（存指针，地址永稳）；
+//   stable=0：字节走 mi_realloc（存偏移，realloc 移动后仍有效 → 支持 sym_release 回收）。
+static uint64_t sym_intern_into(struct TSymPool* p, TStr str) {
     uint64_t h = sym_hash(str.ptr, str.len);
     int64_t idx = (int64_t)(h & (uint64_t)(p->htab_cap - 1));
     while (p->htab[idx] != 0) {   // 去重命中检查
         int64_t id = p->htab[idx] - 1;
         if (p->ent_len[id] == str.len &&
-            (str.len == 0 || memcmp(p->bytes + p->ent_off[id], str.ptr, (size_t)str.len) == 0))
+            (str.len == 0 || memcmp(sym_entry_ptr(p, id), str.ptr, (size_t)str.len) == 0))
             return (uint64_t)id;
         idx = (idx + 1) & (p->htab_cap - 1);
     }
-    // 新字符串：写入 bytes（必要时 realloc；entries 存偏移，移动安全）
-    if (p->bytes_len + str.len > p->bytes_cap) {
-        int64_t nc = p->bytes_cap;
-        while (p->bytes_len + str.len > nc) nc *= 2;
-        uint8_t* nb = (uint8_t*)mi_realloc(p->bytes, (size_t)nc);
-        if (!nb) t_fatal("sym: bytes realloc failed");
-        p->bytes = nb; p->bytes_cap = nc;
+    // 新字符串：写入底层存储
+    int64_t off;
+    if (p->stable) {
+        uint8_t* dst = (uint8_t*)t_arena_alloc(p->bytes_arena, (size_t)str.len);
+        if (str.len > 0) memcpy(dst, str.ptr, (size_t)str.len);
+        off = (int64_t)dst;   // 直接存指针（arena 稳定）
+    } else {
+        if (p->bytes_len + str.len > p->bytes_cap) {
+            int64_t nc = p->bytes_cap;
+            while (p->bytes_len + str.len > nc) nc *= 2;
+            uint8_t* nb = (uint8_t*)mi_realloc(p->bytes, (size_t)nc);
+            if (!nb) t_fatal("sym: bytes realloc failed");
+            p->bytes = nb; p->bytes_cap = nc;
+        }
+        off = p->bytes_len;
+        if (str.len > 0) memcpy(p->bytes + off, str.ptr, (size_t)str.len);
+        p->bytes_len += str.len;
     }
-    int64_t off = p->bytes_len;
-    if (str.len > 0) memcpy(p->bytes + off, str.ptr, (size_t)str.len);
-    p->bytes_len += str.len;
     // 新 entry
     if (p->ent_count >= p->ent_cap) {
         int64_t nc = p->ent_cap * 2;
@@ -1870,8 +2159,8 @@ uint64_t t_sym_intern(TStr tag, TStr str, int64_t bits) {
         p->ent_off = no; p->ent_len = nl; p->ent_cap = nc;
     }
     int64_t id = p->ent_count;
-    if (bits == 16 && id >= 65535) t_fatal("sym: Sym16 pool overflow (>65535 strings)");
-    if (bits == 64 && id >= 9223372036854775807LL) t_fatal("sym: Sym64 pool overflow (>2^63 strings)");
+    if (p->bits == 16 && id >= 65535) t_fatal("sym: Sym16 pool overflow (>65535 strings)");
+    if (p->bits == 64 && id >= 9223372036854775807LL) t_fatal("sym: Sym64 pool overflow (>2^63 strings)");
     p->ent_off[id] = off;
     p->ent_len[id] = str.len;
     p->ent_count++;
@@ -1881,10 +2170,33 @@ uint64_t t_sym_intern(TStr tag, TStr str, int64_t bits) {
     return (uint64_t)id;
 }
 
+uint64_t t_sym_intern(TStr tag, TStr str, int64_t bits) {
+    // Sym 语言特性：非 stable 池（支持 sym_release 真正回收；realloc 会移动，故不可长期持 ptr）。
+    struct TSymPool* p = sym_pool_for(tag, bits, 1, 0, 1);
+    return sym_intern_into(p, str);
+}
+
 TStr t_sym_str(TStr tag, uint64_t id) {
-    struct TSymPool* p = sym_pool_for(tag, 32, 0);
+    struct TSymPool* p = sym_pool_for(tag, 32, 0, 0, 1);
     if (!p || (int64_t)id >= p->ent_count) { TStr e; e.ptr = (const uint8_t*)""; e.len = 0; return e; }
-    TStr r; r.ptr = p->bytes + p->ent_off[id]; r.len = p->ent_len[id]; return r;
+    TStr r; r.ptr = sym_entry_ptr(p, (int64_t)id); r.len = p->ent_len[id]; return r;
+}
+
+// 通用字符串驻留（方案 1・条目 1）：把 s 按内容去重进 "str" 标签的 stable 池，
+// 返回 canonical TStr。返回的 .ptr 落在 bump arena（提交即稳定、永不移动），
+// 进程生命周期内有效；相同内容反复出现只保留一份物理副本，直接削减编译器自举期
+// 重复字符串的内存放大（函数名 / 类型名 / IR label / "%fn.tN" 模板等高频重复串）。
+// 因 t 的 string == 为内容比较（见 base.str_persist 注释），canonical 化不改变任何语义。
+TStr t_str_intern(TStr s) {
+    if (s.len == 0) { TStr e; e.ptr = (const uint8_t*)""; e.len = 0; return e; }
+    // stable 后端但字节直接落 g_arena（own_arena=0）：g_arena 编译期全程稳定且本就是这些
+    // 持久串的旧落点，故驻留只去重、不新增任何保留语义（避免独立 64G 池把瞬时代码串
+    // 永久钉死 → 峰值 19.8G→50G/83G 的实测翻车）。g_arena 由 runtime 在 main 注入，
+    // 调用时必已就绪；own_arena=0 保证 sym_release 不会误释放 g_arena。
+    struct TSymPool* p = sym_pool_for(TSTR_LIT("str"), 32, 1, 1, 0);
+    p->bytes_arena = g_arena;
+    uint64_t id = sym_intern_into(p, s);
+    TStr r; r.ptr = sym_entry_ptr(p, (int64_t)id); r.len = p->ent_len[(int64_t)id]; return r;
 }
 
 // Atom：名字表由编译器发射到生成代码（t_atom_table[] / t_atom_count），此处还原名字。
@@ -2043,6 +2355,44 @@ void t_exit(int32_t code) { exit(code); }
 void t_print(TStr s)  { if (s.len > 0) fwrite(s.ptr, 1, (size_t)s.len, stdout);  fflush(stdout); }
 void t_eprint(TStr s) { if (s.len > 0) fwrite(s.ptr, 1, (size_t)s.len, stderr);  fflush(stderr); }
 void t_println(TStr s){ if (s.len > 0) fwrite(s.ptr, 1, (size_t)s.len, stdout); fputc('\n', stdout); fflush(stdout); }
+
+// 内存诊断：打印持久 arena 当前已分配字节 + mi_malloc 提交内存（阶段 1a 拆解用，无副作用）。
+// 2026-10-24 扩展：额外打印所有分区 arena 的 committed（VirtualAlloc 提交）与进程 PrivateUsage，
+// 以区分「arena 增长」与「mi_heap 增长」。
+size_t t_arena_committed_total(void) {
+    size_t t = 0;
+    if (g_arena) t += g_arena->committed;
+    if (g_parse) t += g_parse->committed;
+    if (g_front) t += g_front->committed;
+    if (g_back)  t += g_back->committed;
+    if (g_func)  t += g_func->committed;
+    return t;
+}
+void t_dbg_report_mem(void) {
+    size_t elapsed = 0, user = 0, sys = 0, rss = 0, peak_rss = 0, commit = 0, peak_commit = 0, faults = 0;
+    mi_process_info(&elapsed, &user, &sys, &rss, &peak_rss, &commit, &peak_commit, &faults);
+    size_t ac_total = t_arena_committed_total();
+    if (g_arena) {
+        fprintf(stderr, "MEMREPORT arena_used=%llu arena_commit=%llu arena_commit_total=%llu "
+            "parse=%llu front=%llu back=%llu func=%llu mimalloc_commit=%llu peak=%llu\n",
+            (unsigned long long)g_arena->used, (unsigned long long)g_arena->committed,
+            (unsigned long long)ac_total,
+            (unsigned long long)(g_parse?g_parse->committed:0),
+            (unsigned long long)(g_front?g_front->committed:0),
+            (unsigned long long)(g_back?g_back->committed:0),
+            (unsigned long long)(g_func?g_func->committed:0),
+            (unsigned long long)commit, (unsigned long long)peak_commit);
+    } else {
+        fprintf(stderr, "MEMREPORT arena_null arena_commit_total=%llu mimalloc_commit=%llu peak=%llu\n",
+            (unsigned long long)ac_total, (unsigned long long)commit, (unsigned long long)peak_commit);
+    }
+}
+// 返回当前 mi_heap 提交字节（供 t 侧细粒度探针使用）。
+size_t t_dbg_mi_commit(void) {
+    size_t elapsed = 0, user = 0, sys = 0, rss = 0, peak_rss = 0, commit = 0, peak_commit = 0, faults = 0;
+    mi_process_info(&elapsed, &user, &sys, &rss, &peak_rss, &commit, &peak_commit, &faults);
+    return commit;
+}
 
 // ── 测试内建（@panic / @assert / @assert_eq）──
 void t_panic(TStr msg) {

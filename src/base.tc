@@ -2658,7 +2658,7 @@ pub fn node_sc(n: u64) string {
 pub fn node_set_sc(n: u64, v: string) void {
     var id = nr_idx(n);
     if (id < 0 or id >= slice_len(g_node_sc)) { return; }
-    slice_set(g_node_sc, id, v);
+    slice_set(g_node_sc, id, str_intern(v));
 }
 // S4 第十二批（§0.14.7）：字符串载荷 sb（默认 ""；越界读也返 ""，与 node_new 旧初值 `n.sb = ""`
 // 逐点一致）。第二个 `[]string` 侧表，直接复用第六批 sc 的范式。
@@ -2689,7 +2689,7 @@ pub fn node_sb(n: u64) string {
 pub fn node_set_sb(n: u64, v: string) void {
     var id = nr_idx(n);
     if (id < 0 or id >= slice_len(g_node_sb)) { return; }
-    slice_set(g_node_sb, id, v);
+    slice_set(g_node_sb, id, str_intern(v));
 }
 
 // S4 第十九批（§0.14.7）SoA：Node.sa 主字符串载荷的访问面。
@@ -2717,7 +2717,7 @@ pub fn node_sa(n: u64) string {
 pub fn node_set_sa(n: u64, v: string) void {
     var id = nr_idx(n);
     if (id < 0 or id >= slice_len(g_node_sa)) { return; }
-    slice_set(g_node_sa, id, v);
+    slice_set(g_node_sa, id, str_intern(v));
 }
 
 pub struct Child {
@@ -4314,6 +4314,88 @@ pub fn sb_cat5(a: string, b: string, c: string, d: string, e: string) string {
     return sb_to_str(sb);
 }
 
+// 逃逸提升（2026-10-22 内存优化）：把字符串 s 拷贝进「持久 / 跨块 arena」(g_arena)，
+// 使其越过本块 scratch 区间（t_arena_reset_back 等）回收后仍有效。用于写入模块级持久
+// 持有者（g_ll_names / g_func_names / g_str_table / g_clo_thunk_req 等）的字符串——
+// 这些串跨函数/跨阶段长期存活，若落 scratch 会被 reset 悬空 → 重复 declare / 坏函数名。
+// 复用 t_str_concat（已落 g_arena）：与空串拼接即得一份持久副本（s 非空串本身也在 g_arena）。
+// 逃逸提升（2026-10-22 内存优化，2026-10-22 修正）【关键约束已推翻】本编译器 string `==` 是
+// 【内容比较】（t_str_eq / tll_str_eq，memcmp），并非指针(身份)比较（见 tir_to_ll.tc:4207 对
+// %TStr 走 tll_str_eq 内容比较）。因此「提升」做拷贝安全——去重表（g_ll_declared / g_ll_valptr
+// 等用 `==` 判等）按内容匹配，拷贝产生的新指针不破坏去重。此前本函数被误实现为 `return s`
+// （空操作），导致代际分配器（re-lowering）启用时持久累加 slice 存进 g_func 指针，
+// arena_reset_func 后悬垂、emit-ll 自举必然段错误。
+// 修正：切到 g_arena（持久区）后生成副本——副本落 g_arena；且后续同语句的 append（slice 扩容）
+// 也因 g_cur=g_arena 而把 backing 落 g_arena，从而「元素 + backing」双保险持久，跨函数回收不悬垂。
+// 不在此恢复 g_cur：调用方（emit 各累加 slice 站点）在 re-lowering 下的后续分配本就该落 g_arena
+// （函数体已在切 g_func 之前降级完毕，emit 只读体、写 IR 文本/持久 slice，均无需 g_func）；
+// 下一函数降级会由窗口的 arena_use_func() 重新切回 g_func。
+// ── 字符串驻留（阶段 1 / memory-control-spec §5.1：语义图去重）─────────────
+// 内容去重：相同字符串只保留「首次出现的指针」作 canonical，后续相等串共享之；不拷贝——
+// canonical 即既有合法持久串的指针（bump arena 永不回收，首次出现副本地址全程稳定）。
+// 映射表（g_intern_htab / g_intern_vals）在编译器启动期于 g_arena 预分配固定容量
+// （见 str_intern_init，由 tc.tc 编译入口调用），故运行期 str_intern 只做「定址写」
+// （slice_set）、绝不 append，从而不触碰当前 arena（parse 阶段安全、不污染 g_parse）。
+// 因 t 的 string == 为内容比较，同址化不改变任何语义，仅削减重复串的内存放大
+// （不同节点持有的「相等但异址」串合并为同址）。零后端 / 零运行期改动。
+var g_intern_cap: i64 = 0;        // 预分配容量（2 的幂）；0 = 未初始化（异常路径降级不驻留）
+var g_intern_count: i64 = 0;      // 已登记的不同串数
+var g_intern_htab: []i64 = [];    // 长度 = cap；0=空槽，存 (slot+1)
+var g_intern_vals: []string = []; // 长度 = cap；slot → canonical 串指针
+pub var g_intern_active: bool = false;  // 阶段闸门：仅「持久 arena 阶段」（g_cur==g_arena，即 sema/relowering/emit）开启驻留；
+                                    // parse 阶段 = false，避免把 g_parse 临时串指针存为 canonical（arena_reset_parse 后悬垂）
+
+pub fn str_intern_init() void {
+    if (g_intern_cap != 0) { return; }   // 幂等：跨文件（tc run <a> <b>）重复进入编译入口时不再 append，避免表被撑大 + 去重映射被重置
+    g_intern_cap = 1048576;       // 1<<20：支持至多 ~1M 不同串（远超自举编译器实际，无需 rehash）
+    g_intern_count = 0;
+    var i: i64 = 0;
+    while (i < g_intern_cap) { append(g_intern_htab, 0); append(g_intern_vals, ""); i = i + 1; }
+}
+
+pub fn str_hash(s: string) u64 {
+    var h: u64 = 1469598103934665603;   // FNV-1a 偏移基（u64）
+    // ⚠ 用 str_len(s) 而非 s.len：当前编译器对 string 的 `.len` 字段访问存在 latent codegen bug
+    // （emit 成 getelementptr %TStr i32 0, i32 0 误读 .ptr 内容当长度），但内置 str_len 走正确路径。
+    var n: i64 = str_len(s) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        h = h ^ (((s[i]) as u64) & 255);
+        h = h * 1099511628211;
+        i = i + 1;
+    }
+    return h;
+}
+
+pub fn str_intern(s: string) string {
+    if (g_intern_cap == 0) { return s; }   // 未初始化：降级，不驻留（异常路径）
+    if (!g_intern_active) { return s; } // 仅持久阶段驻留：parse 期 g_parse 临时串不得作 canonical（arena_reset_parse 后悬垂）；返回原串不改变语义
+    if (str_len(s) == 0) { return s; }
+    var mask: i64 = g_intern_cap - 1;
+    var h: u64 = str_hash(s);
+    var idx: i64 = (h & (mask as u64)) as i64;
+    while (g_intern_htab[idx] != 0) {
+        var slot: i64 = g_intern_htab[idx] - 1;
+        if (g_intern_vals[slot] == s) { return g_intern_vals[slot]; }
+        idx = (idx + 1) & mask;
+    }
+    // 新串：把首次出现的串持久化副本作 canonical（落 g_arena，定址写入预分配槽）。
+    // ⚠ 必须 str_persist：传入的 s 即便在「持久阶段」也可能是指向 g_parse 的串（parse 期写入的节点字段，
+    //   跨 arena_reset_parse 会悬垂）；只有 g_arena 副本能跨阶段存活。str_intern 仅在 g_intern_active
+    //   （g_cur 已为 g_arena）时执行，str_persist 的 arena_use_default 不扰动当前 arena。
+    if (g_intern_count >= g_intern_cap - 1) { return s; }  // 容量耗尽：降级不驻留，保证探针终止（总有空槽）
+    var p = str_persist(s);   // 持久化副本（g_arena），canonical 永远跨阶段安全
+    slice_set(g_intern_htab, idx, g_intern_count + 1);
+    slice_set(g_intern_vals, g_intern_count, p);
+    g_intern_count = g_intern_count + 1;
+    return p;
+}
+
+pub fn str_persist(s: string) string {
+    arena_use_default();
+    return sb_cat2(s, "");
+}
+
 pub fn sb_cat6(a: string, b: string, c: string, d: string, e: string, f: string) string {
     var sb: StringBuilder = sb_new();
     sb_append_str(sb, a);
@@ -4807,25 +4889,35 @@ pub fn utf8_cp_at(src: string, i: i64, n: i64) i64 {
     return cp;
 }
 
+// ⚠ 性能关键（2026-10-23 修复）：不可写成 `xid_start_lo[mid]` 直接索引全局数组。
+// LLVM 后端把「加载模块级 `var` 全局数组值」降级为「每调用一次 tll_alloc(5528/6448)
+// 整张堆拷贝」（见 gate L2 内存诊断：tc check 时 mi_heap 峰值被推到 ~21GB，绝大多
+// 数来自逐字符的 is_xid_* 调用）。改为先对全局数组取「零拷贝切片视图」（array→slice
+// lowering 自动补 @slice_from_raw，仅填切片槽的 ptr/len，不搬数据），再经切片索引
+// （指针算术）二分查找。C 后端本就按指针直接 GEP 索引，此写法双后端一致、零分配。
 pub fn is_xid_start(cp: i64) bool {
+    var slo: []i64 = xid_start_lo;
+    var shi: []i64 = xid_start_hi;
     var lo_i: i64 = 0;
     var hi_i: i64 = g_xid_start_count - 1;
     while (lo_i <= hi_i) {
         var mid: i64 = (lo_i + hi_i) / 2;
-        if (cp < xid_start_lo[mid]) { hi_i = mid - 1; }
-        else if (cp > xid_start_hi[mid]) { lo_i = mid + 1; }
+        if (cp < slo[mid]) { hi_i = mid - 1; }
+        else if (cp > shi[mid]) { lo_i = mid + 1; }
         else { return true; }
     }
     return false;
 }
 
 pub fn is_xid_cont(cp: i64) bool {
+    var slo: []i64 = xid_cont_lo;
+    var shi: []i64 = xid_cont_hi;
     var lo_i: i64 = 0;
     var hi_i: i64 = g_xid_cont_count - 1;
     while (lo_i <= hi_i) {
         var mid: i64 = (lo_i + hi_i) / 2;
-        if (cp < xid_cont_lo[mid]) { hi_i = mid - 1; }
-        else if (cp > xid_cont_hi[mid]) { lo_i = mid + 1; }
+        if (cp < slo[mid]) { hi_i = mid - 1; }
+        else if (cp > shi[mid]) { lo_i = mid + 1; }
         else { return true; }
     }
     return false;
