@@ -8213,9 +8213,20 @@ pub fn infer_expr_body(e: i64) i64 {
         // 则改写 callee 为裸 ident 并（方法首参 self）前置 receiver 为第 0 实参，随后走下方
         // ident 分支正常解析（含实参校验 / 返回类型）。类型级 `Point.create()` 与值级 `p.origin()`
         // 同构处理。幂等：改写后 callee 是 ident，二次进入不再走本分支。
+        // P3b 结构体方法脱糖：仅当 receiver 是「值 / 类型名」（struct/union/named），
+        // 不是模块值。若 receiver 是模块值（如 base.sb_cat5 的 base），跳过本分支，
+        // 落到下方 6814 模块值成员访问（按 <key>__<field> 改写）——否则 receiver 被当普通值
+        // infer_expr → T-SEM-E201（模块值非可运算值；单进程下 import 语句经 modval_load 把
+        // 模块名登记为 Module 类型符号故不报错，但 lib 独立编译入口模块不会自我 import）。
         if (base.node_kind((base.node_na((e as u64)) as u64)) == "member" and base.node_na((base.node_na((e as u64)) as u64)) >= 0) {
             var afm: i64 = base.node_na((e as u64));
             var afrecv: i64 = base.node_na((afm as u64));
+            // 模块值接收者（base.sb_cat5 的 base）不是结构体：跳过 P3b 方法脱糖，
+            // 落到下方 6814 模块值成员访问（按 <key>__<field> 改写）。否则 receiver 被当普通值
+            // infer_expr → T-SEM-E201（模块值非可运算值；单进程下 import 语句经 modval_load 把
+            // 模块名登记为 Module 类型符号故不报错，但 lib 独立编译入口模块不会自我 import）。
+            var af_is_modval: bool = (base.node_kind((afrecv as u64)) == "ident" and str_len(g_modval_get(base.node_sa((afrecv as u64)))) as i64 > 0);
+            if (af_is_modval == false) {
             var afname: string = base.node_sa((afm as u64));
             var afti: i64 = infer_expr(afrecv);
             var afk: string = tip_kind(afti);
@@ -8274,6 +8285,7 @@ pub fn infer_expr_body(e: i64) i64 {
                             base.sb_cat4("类型 ", afstruct, " 没有关联函数/方法 ", afname), e);
                     }
                 }
+            }
             }
         }
         if (base.node_kind((base.node_na((e as u64)) as u64)) == "ident") {
@@ -11441,6 +11453,11 @@ pub fn handle_one_import(imp: i64, at: i64) void {
     // 库导入（路径首段非 src）：走库搜索路径（入口/lib、工程根/lib、out/lib 预编译缓存），
     // 命中 .tc 源码则内联（名字重整后即为命名空间隔离）；若同时命中 .tlib 预编译产物则走外链模式。
     var chosen: string = "";
+    // 阶段 B/C（§5.3 多进程 bootstrap，2026-10-24）：rel = nm 的路径形式（"base" / "std/rc/cst"）；
+    // tint_dir = T_TINT_DIR 环境变量；loaded_tint 标记本依赖是否经接口文件（.tint）外链加载。
+    var rel: string = dots_to_slashes(nm);
+    var tint_dir: string = getenv("T_TINT_DIR");
+    var loaded_tint: bool = false;
     if (base.node_bd((imp as u64))) {   // S4 §0.14.7 SoA：原 `base__nodes[imp].bd`
         chosen = resolve_external_lib(nm);
         if (chosen == "") {
@@ -11450,17 +11467,27 @@ pub fn handle_one_import(imp: i64, at: i64) void {
         }
     } else {
         // `src.` 导入统一相对候选源码根解析；'.' 即路径分隔符：import(src.d.e) => <root>/src/d/e.tc
-        var rel: string = dots_to_slashes(nm);
-        var i: i64 = 0;
-        var nr: i64 = slice_len(g_src_roots) as i64;
-        while (i < nr) {
-            var cand: string = path_resolve(base__sb_cat4(g_src_roots[i], "/", rel, ".tc"));
-            if (path_exists(cand)) { chosen = cand; break; }
-            i = i + 1;
+        // 阶段 B 接口文件外链：若 T_TINT_DIR 已设且 <dir>/<rel>.tint 存在，则按「接口文件」加载
+        // （仅 pub 签名+类型定义，不含实现），使导入方进程不再建被依赖模块的语义图 → 自举峰值有界。
+        // 默认（未设 T_TINT_DIR）= 走原 .tc 源码，行为与旧版逐字节一致；故对既有单进程自举零影响。
+        if (str_len(tint_dir) > 0) {
+            var tcand: string = path_resolve(base__sb_cat4(tint_dir, "/", rel, ".tint"));
+            if (path_exists(tcand)) { chosen = tcand; loaded_tint = true; }
+        }
+        // T_TINT_DIR 已设且接口文件命中 → 优先用接口文件（不回退 .tc）；
+        // 否则回退到 .tc 源码供类型检查（兼容无接口文件的模块）。
+        if (chosen == "") {
+            var i: i64 = 0;
+            var nr: i64 = slice_len(g_src_roots) as i64;
+            while (i < nr) {
+                var cand: string = path_resolve(base__sb_cat4(g_src_roots[i], "/", rel, ".tc"));
+                if (path_exists(cand)) { chosen = cand; break; }
+                i = i + 1;
+            }
         }
         if (chosen == "") {
             parse__fc_err("T-MOD-E550",
-                base__sb_cat3("模块 'src.", nm, "' 无法解析：未在任何源码根下找到对应 .tc 文件"), imp);
+                base__sb_cat3("模块 'src.", nm, "' 无法解析：未在本工程 lib/ 或依赖库搜索路径下找到对应 .tc 文件"), imp);
             return;
         }
     }
@@ -11494,8 +11521,14 @@ pub fn handle_one_import(imp: i64, at: i64) void {
     // 链接模式探测：存在 .tlib 预编译产物且未用 as 别名（归档按规范名构建，as 别名会错配）→ 外链。
     // 库源码仍载入供类型检查，但导出符号改发 declare、私有跳过，归档在链接期并入（真·独立编译+链接）。
     var ar: string = "";
-    if (base.node_bd((imp as u64)) and user_alias == "" and in_mod_visited(chosen) == false) {   // S4 §0.14.7 SoA
-        ar = resolve_external_lib_archive(nm);
+    if (user_alias == "" and in_mod_visited(chosen) == false) {
+        if (base.node_bd((imp as u64))) {
+            ar = resolve_external_lib_archive(nm);
+        } else if (loaded_tint) {
+            // 内部模块经接口文件（.tint）外链加载：若同目录存在预编译 .tlib（编排层逐模块 build --lib 产出），
+            // 则走链接模式——本模块 codegen 该依赖发 declare，真实定义在 .tlib，链接期并入（§5.3 多进程 bootstrap）。
+            ar = resolve_internal_lib_archive(rel, tint_dir);
+        }
     }
     // 记录依赖图边（父 -> 子），供 --emit-deps 输出（父 = 当前活跃栈顶）。
     // 放在钻石去重 return 之前：重导入（如菱形共享根）也需记录边，否则依赖图缺失。
@@ -11515,7 +11548,9 @@ pub fn handle_one_import(imp: i64, at: i64) void {
     lex__g_mod_stack = slice_pop_str(lex__g_mod_stack);          // 离开：弹栈
     lex__g_mod_stack_alias = slice_pop_str(lex__g_mod_stack_alias);
     if (ar != "") {
-        append(lex__g_link_libs, alias);
+        // 存完整路径身份 idn（如 "src.base"）：与 in_link_libs(base.node_mod(d))（节点 provenance = idn）匹配，
+        // 使本模块 codegen 对该依赖的声明/全局发 declare、跳过内联。外部库 idn==alias（单段名）故等价。
+        append(lex__g_link_libs, idn);
         append(lex__g_ext_link, ar);
     }
 }
@@ -11559,6 +11594,21 @@ pub fn resolve_external_lib_archive(nm: string) string {
         if (path_exists(ar)) { return ar; }
         i = i + 1;
     }
+    return "";
+}
+
+// 内部模块预编译产物解析（§5.3 多进程 bootstrap）：返回 <tint_dir>/<rel>.tlib（重命名 LLVM 归档 .a）
+// 路径，未找到返回 ""。命中即走链接模式（内部模块 codegen 发 declare；真实定义在 .tlib，链接期并入）。
+// 与 resolve_external_lib_archive 平行：外部库搜 g_lib_dirs，内部模块搜 T_TINT_DIR 同级（编排层把 .tlib 落在
+// 接口文件同目录 out/mod/<rel>.tlib）。
+pub fn resolve_internal_lib_archive(rel: string, tint_dir: string) string {
+    if (str_len(tint_dir) == 0) { return ""; }
+    if (lex__g_debug_libs) {
+        var ar_d: string = path_resolve(base__sb_cat4(tint_dir, "/", rel, ".tlibd"));
+        if (path_exists(ar_d)) { return ar_d; }
+    }
+    var ar: string = path_resolve(base__sb_cat4(tint_dir, "/", rel, ".tlib"));
+    if (path_exists(ar)) { return ar; }
     return "";
 }
 
@@ -11912,7 +11962,13 @@ pub fn modval_load(mname: string, at: i64) void {
         // M2：g_sel_mod 记完整路径身份（src 导入 "src." + rest；库导入 rest 已完整）。
         var idn: string = rest;
         if (is_lib == false) { idn = "src." + rest; }
-        append(lex__g_sel_owner, base__g_cur_mod);
+        // ⚠ owner 必须用「写下这条 const/var 导入声明的那一层模块」的 provenance（at 节点的 node_mod），
+        // 而非 base__g_cur_mod：build --lib 在 run_check 前会把 g_cur_mod 重置为 ""（见 tc.tc line ~1016），
+        // 但本模块自身的顶层声明 node_mod 已是完整 idn（如 "src.lex"）。Pass 3 的 sel_lookup 以
+        // 裸引用节点的 node_mod（="src.lex"）反查 owner，若此处记 "" 会漏配 → 裸名（如 base.Tok 的兼容
+        // 通配导入）无法改写成 base__Tok，type mismatch 报 <unknown>。入口（非 lib）at.node_mod 为 ""，
+        // 与入口声明 node_mod 一致；故统一用 at.node_mod 即正确。
+        append(lex__g_sel_owner, base.node_mod(at));
         append(lex__g_sel_local, "");
         append(lex__g_sel_mod, idn);
         append(lex__g_sel_orig, "");
