@@ -300,10 +300,13 @@ fn main() i32 @main {
         // 阶段闸门：词法错误会让 token 流失去结构（未终结串、坏数字…），
         // 继续 parse 只会撞上无关的 `parse error` 硬中断并盖掉真正的病因。
         if (sema.has_errors()) { base.emit_diags(); return 1; }
+        base.g_intern_active = false; // 阶段 1：parse 期不驻留（g_parse 临时串不得作 canonical）
+        base.str_intern_init();       // 阶段 1：在 g_arena 预分配字符串驻留表（运行期定址写，不污染 parse arena）
         arena_use_parse();            // 前端本块 arena：parse 期 AST/CST 落 g_parse
         parse.parse_unit();
         if (want_memstats) { eprint("PHASE after_parse"); dbg_report_mem(); }
         arena_use_default();          // sema 持久表（类型/符号）须落 g_arena，切回默认
+        base.g_intern_active = true;  // 阶段 1：进入持久阶段，开启字符串驻留（canonical 落 g_arena，安全）
         // HIR（ZIR 槽位）AstGen：pre-sema 真实跑一次，存 g_hir 供增量缓存锚点消费。
         // Stage A 仅产出生存（不崩溃 + 可序列化），sema 仍吃 CST，未消费 g_hir。
         hir.hir_run(src);
@@ -790,7 +793,9 @@ fn main() i32 @main {
         var ex_name: string = "";
         var is_example: bool = false;
         var is_lib: bool = false;        // build --lib：预编译外部库为 .tlib（归档 + 接口块）
-        var lib_alias: string = "";      // 库规范别名（= 源文件名 stem），用于名字重整前缀
+        var lib_alias: string = "";      // 库规范别名（= 源文件名 stem 或 --mod-id 覆写），用于名字重整前缀
+        var mod_id_override: string = "";// --mod-id：内部模块 build --lib 时显式指定完整路径身份（如 "src.base"），
+                                         // 使产出的 .tlib 符号与入口 import 重整一致（入口按 idn 重整，非 stem）。
         var ai2: i64 = 2;
         var an2: i64 = slice_len(argv) as i64;
         while (ai2 < an2) {
@@ -886,6 +891,11 @@ fn main() i32 @main {
                 ai2 = ai2 + 1;
                 continue;
             }
+            // --mod-id <idn>：内部模块 build --lib 时指定完整路径身份（如 "src.base"），
+            // 使 .tlib 符号重整与入口 import(idn) 一致；外部库（idn==stem）无需传。
+            if (argv[ai2] == "--mod-id") {
+                if (ai2 + 1 < an2) { mod_id_override = argv[ai2 + 1]; ai2 = ai2 + 2; continue; }
+            }
             if (argv[ai2] == "--debug") {
                 lex.g_lib_debug = true;
                 ai2 = ai2 + 1;
@@ -969,15 +979,40 @@ fn main() i32 @main {
         var src3: string = tc_load_src(files);
         if (sema.has_errors()) { base.emit_diags(); return 1; }
         if (is_lib) {
-            // 预编译库：以规范别名（源文件名 stem）作为名字重整命名空间，
-            // 使产出的 .tlib 归档符号（json__version）与下游 import(json) 的重整结果一致。
+            // 预编译库：lib_alias 作为名字重整命名空间 + 模块值自引用（M.xxx）键，
+            // 须与下游 import 的 alias 逐字节一致，否则链接缺符号。
+            //   · 外部库（无 --mod-id）：alias = 源文件名 stem（如 "json"），idn==alias。
+            //   · 内部模块（--mod-id src.base）：alias 取 idn 末段 "base"，
+            //     与入口 import(src.base) 的 alias=last_segment(idn)="base" 一致；
+            //     重整符号 = base__foo（mangled_name 内部对 alias 取末段，src.base→base），
+            //     入口侧同样以 alias "base" 重整 → 两侧 base__foo 匹配。
+            //   · g_lib_mod_idn 始终保留完整 idn（"src.base"），供 per-module ginit 符号
+            //     t_ginit_src_base 命名；入口 declare/call 亦用 idn，两侧一致。
             lib_alias = base.base_no_tc(src_file);
-            base.g_cur_mod = lib_alias;
+            if (mod_id_override != "") {
+                lib_alias = sema.last_segment(mod_id_override);   // "base"（模块值别名 / 子进程重整末段）
+                lex.g_lib_mod_idn = mod_id_override;          // "src.base"（完整 idn）
+            } else {
+                lex.g_lib_mod_idn = lib_alias;
+            }
+            // 解析期 provenance = 完整 idn（"src.base"）：① 符号 node_mod 落为 "src.base"，
+            //   与模块值键一致 → base.xxx 自引用经 g_modval_get("base")→"src.base" 命中本模块符号；
+            //   ② 重整取 last_segment(g_cur_mod) = "base" → 符号 base__foo，与入口 import(src.base)
+            //   的 alias="base" 重整逐字节一致。代码生成期（line ~1007）g_cur_mod 会被重置为 ""，
+            //   故在此捕获 provenance 即可。
+            base.g_cur_mod = lex.g_lib_mod_idn;
+            // 独立编译（build --lib）时本模块是「入口」而非被导入，handle_one_import 不会为其登记
+            // 模块值，导致 body 内的 base.xxx 自引用报「未定义标识符 base」。手动补登记：
+            //   alias("base") → idn("src.base")，与下游 import 的模块值键一致。
+            sema.g_modval_set(lib_alias, lex.g_lib_mod_idn);
             lex.g_lib_emit = true;       // 跳过进程级全局发射（t.__ginit / atom 表），避免链接冲突
         }
+        base.g_intern_active = false; // 阶段 1：parse 期不驻留（g_parse 临时串不得作 canonical）
+        base.str_intern_init();       // 阶段 1：在 g_arena 预分配字符串驻留表（运行期定址写，不污染 parse arena）
         arena_use_parse();            // 前端本块 arena：parse 期 AST/CST 落 g_parse
         parse.parse_unit();
         arena_use_default();          // sema 持久表（类型/符号）须落 g_arena，切回默认
+        base.g_intern_active = true;  // 阶段 1：进入持久阶段，开启字符串驻留（canonical 落 g_arena，安全）
         if (is_lib) { base.g_cur_mod = ""; }
         file_write_all("out/dbg/_phase.log", "run_check\n");
         sema.run_check();

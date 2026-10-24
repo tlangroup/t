@@ -33,7 +33,13 @@ psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
 
 
 def peak(exe, args, label):
-    p = subprocess.Popen([exe] + args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    import os as _os
+    log = _os.environ.get("MEMPEAK_LOG")
+    if log:
+        _f = open(log, "w", encoding="utf-8", errors="replace")
+        p = subprocess.Popen([exe] + args, stdout=_f, stderr=_f)
+    else:
+        p = subprocess.Popen([exe] + args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     h = k32.OpenProcess(0x1000, False, p.pid)  # PROCESS_QUERY_LIMITED_INFORMATION
     pk = 0
     peak_ws = 0

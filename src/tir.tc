@@ -2118,11 +2118,13 @@ pub fn lower_unit(mod: string, source: string) void {
     // 模块级全局变量降级：元数据（g_global_names 等）必须在函数体发射前收集，
     // 否则 tir_emit_call 判定全局函数值变量（走 call_ind）时 g_global_names 尚为空 → 直调崩溃。
     // t.__ginit 初始化函数仍在末尾追加（函数体顺序无关，翻译器统一收集）。
-    // 预编译库模式（build --lib）跳过：进程级全局初始化由主程序（导入方）提供一份，
-    // 库内若再定义 t.__ginit 会与导入方重复定义冲突（对齐 legacy codegen_ll.emit_llunit
-    // 的 `if (lex.g_lib_emit == false) { emit_llginit(); }`）。
-    if (lex.g_lib_emit == false) {
-        tir_emit_ginit();
+    // 预编译库模式（build --lib）：每个模块发射独立 ginit（t_ginit_<mangled idn>），
+    // 由导入方 main 包裹器按 g_link_libs 逐库 declare + call，根治 §4.14.7 全局初始化断裂。
+    // 入口模式（非 lib）：沿用旧语义发射 t.__ginit（无全局时由 tir_to_ll main 包裹器补空兜底）。
+    if (lex.g_lib_emit) {
+        tir_emit_ginit(tir_ginit_sym(lex.g_lib_mod_idn), true);
+    } else {
+        tir_emit_ginit("t.__ginit", false);
     }
 }
 
@@ -2225,14 +2227,35 @@ pub fn tir_global_fnval_td(name: string) i64 {
     return -1;
 }
 
-// 发射 t.__ginit 函数：运行期初始化各全局（函数值闭包 / map 建表 / 标量常量）。
-// 仅当存在全局时生成；翻译器 main 包装器会调用之。
-pub fn tir_emit_ginit() void {
+// 由模块身份（idn，如 "src.base" / "json"）推导其独立 ginit 符号名。
+// '.' → '_'（C 标识符不允许 '.'，且 LLVM 亦无需 '.'），前缀 t_ginit_。
+// 必须与 tir_to_ll main 包裹器（入口侧）的同名推导逐字节一致，否则 declare/call 符号对不上 → 链接失败。
+pub fn tir_ginit_sym(idn: string) string {
+    var sb: StringBuilder = sb_new();
+    sb_append_str(sb, "t_ginit_");
+    var i: i64 = 0;
+    var n: i64 = str_len(idn);
+    while (i < n) {
+        var c: string = str_slice(idn, i, i + 1);
+        if (c == ".") { sb_append_str(sb, "_"); }
+        else { sb_append_str(sb, c); }
+        i = i + 1;
+    }
+    return sb_to_str(sb);
+}
+
+// 发射模块初始化函数：运行期初始化各全局（函数值闭包 / map 建表 / 标量常量）。
+// name：函数符号名。always_emit：库模式恒发射（即便空体），保证导入方 main 调用该符号时
+//   链接不缺定义；入口模式（false）沿用旧语义——无全局时跳过（由 tir_to_ll main 包裹器补空 t.__ginit 兜底）。
+// 这是 §4.14.7 根治：build --lib 此前跳过 t.__ginit，导致链接库全局初值恒零（如编译器自身
+// `pub var g_comptime_full: bool = true` 被读成 false）。现每个模块发射独立 ginit（t_ginit_<idn>），
+// 由导入方 main 包裹器按 g_link_libs 逐库 declare + call。
+pub fn tir_emit_ginit(name: string, always_emit: bool) void {
     g_cur_relower_decl = -1;   // ginit 真实体须持久，不重降级
-    if (slice_len(g_global_names) as i64 == 0) { return; }
+    if (always_emit == false and slice_len(g_global_names) as i64 == 0) { return; }
     var eb: []TIRInst = [];
     var gpp: []string = [];
-    g_cur_func = TIRFunc{ name: "t.__ginit", params: gpp, ret_st: "void", body: eb, is_extern: false, is_kernel: false, is_main: false };
+    g_cur_func = TIRFunc{ name: name, params: gpp, ret_st: "void", body: eb, is_extern: false, is_kernel: false, is_main: false };
     g_term = false;
     g_cur_line = 0;
     // ⚠ 录制路径（tmir 后端）必须重置 g_mir_cur，否则 ginit 指令会续写上一个函数的

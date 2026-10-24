@@ -264,14 +264,67 @@ Zig 的经验表明，编译器内存的杠杆不在"emit 期函数体"，而在
 | --- | --- | --- |
 | **阶段 0** | arena 基础设施 + SIGSEGV 修复 + 字符串驻留（中性） + `gate L2` 全绿 | ✅ 已完成（`4a29d03` + `b87e009`） |
 | **阶段 0.5** | LLVM 后端全局数组降级堆拷根因修复（XID 切片视图）+ MIHIST/`--memstats` 诊断 + `gate L2` 24/24 | ✅ 已完成（`5a4c55d`，峰值 21GB→2.5GB） |
-| **阶段 1** | 语义图 intern 池 `g_sema_pool`（类型/名去重，落 `g_arena`） | ⬜ 待启动 |
+| **阶段 1** | 语义图 intern 池 `g_sema_pool`（类型/名去重，落 `g_arena`） | ◐ 名去重(sa/sb/sc)已落地·实测中性；类型表去重 + 结构性分配削减待做（见下） |
 | **阶段 2** | 跨 decl 引用图探针 → 决定 per-decl 回收可行性 | ⬜ 待启动 |
 | **阶段 3** | 若探针可行：per-decl 代际窗口 | ⬜ 依赖阶段 2 |
 | **阶段 4** | 若仍不足：多进程 bootstrap（兜底） | ⬜ 兜底 |
 
-**下一步建议**：阶段 1（语义图 intern 池）直接攻击当前 ~2.5GB 地板里的 sema 大头（去重后预期可压到几百 MB 量级，Zig 模型）。注意目标量级已修正——不是消除 21GB 尖峰（已由阶段 0.5 解决），而是进一步压低 2.5GB 的合理地板。新的后端陷阱（§3.5 / Rule F）须在代码评审与 `T_MIHIST=1` 门禁中持续防范，避免同类降级堆拷回归。
+**下一步建议**：阶段 1 的「名去重」子项已落地（见 §8.1 实测结论），但**实证推翻了「字符串去重即可压到几百 MB」的旧假设**——`--memstats`/`T_MIHIST=1` 显示 3.22GiB 峰值里 mi_heap 占 2.85GiB，且 t 字符串内容**恒在 mi_heap**（运行期分配、进程结束前不回收、不可变），`str_intern` 对已分配串做内容去重**不释放副本**，故峰值中性。真正的「几百 MB」杠杆是：① 类型表去重（`td`/`tis` 按结构去重引用走 id，§5.1 另一半）；② 结构性分配削减（`base__node_new` 489MiB、`cst__kw_lookup` 393MiB 两大堆分配大头，见 §8.1）。这两者都是比名去重大得多的改动，须作为独立阶段评估，不再归入阶段 1 的「名去重」子项。
+
+### 8.1 阶段 1（名去重）实测结论（2026-10-24，已落地未达标）
+
+- **改动**：`src/base.tc` 新增字符串驻留器（`str_intern_init` / `str_hash` / `str_intern` + `g_intern_*` 池，落 `g_arena` 预分配）；`node_set_sa/sb/sc` 经 `str_intern(v)` 收敛；`src/tc.tc` 两编译入口（check ~303 / build ~981）在 `arena_use_parse` 前 `g_intern_active=false` + `str_intern_init`，`arena_use_default` 后 `g_intern_active=true`（阶段闸门：仅持久 arena 阶段驻留，parse 期 g_parse 临时串不落池）。
+- **⚠ 关键坑（已定位）**：t 的 `string.len` 字段访问在当前编译器 codegen 中存在 latent bug——`s.len` 被 emit 成 `getelementptr %TStr i32 0, i32 0`（误读 `.ptr` 内容当长度），全 `tc.ll` 仅 4 处且全在 `str_hash`/`str_intern`。编译器其余代码**从不**直接用 `s.len`（一律走内置 `str_len`），故此前未触发。驻留器已改用 `str_len(s)` 规避，零风险。
+- **回归验证（tc_new = 当前源码 bootstrap 一代）**：`tc check src/tc.tc` **exit=0**（崩溃已消）；`conformance` **373/373**；`ir_snapshot` **0 NEW / 0 GONE**（4 处 DIFF 来自新增编译器函数导致的 IR 漂移，合法）。
+- **峰值（实测失望）**：`tc check src/tc.tc` → `peak_private ≈ 2.66 GiB`（基线 tc.exe 2.61 GiB，**中性偏略增**）。原因：`str_intern` 对「已分配的重复串」返回 canonical 但不释放原串副本（mi_heap 直到进程结束才回收），且 `str_persist` 对每个唯一串额外拷贝一份 → 净效应不降反略增。
+- **根因（MEMREPORT + MIHIST 坐实）**：
+
+  | 阶段 | arena_commit | mi_heap(mimalloc) | peak |
+  | --- | --- | --- | --- |
+  | after_parse | 61 MiB | 677 MiB | 677 MiB |
+  | after_sema | 891 MiB | 2854 MiB | 3221 MiB |
+  | after_ann | 892 MiB | 2855 MiB | 3221 MiB |
+
+  - `MEMSTATS`：`node_count=291280`、`tis_count=111710`、`soa_shell=68MiB`、`tis=11MiB`——bump arena 语义图仅 ~892MiB（其中节点 SoA 壳 68MiB + 类型表 11MiB），**并非地板主因**。
+  - `T_MIHIST=1` 堆分配 Top2：`base__node_new` **489MiB**（291280×1680B，节点结构）、`cst__kw_lookup` **393MiB**（190700×688B）；其余 ~1.9GiB 散落于大量调用方。**字符串内容去重不是堆大头**。
+- **结论**：名去重（sa/sb/sc）作为 `g_sema_pool` 的基础设施已就位（池 + 收敛钩子），且**内容去重语义正确、零回归**，但**单靠它压不到几百 MB**。要达目标须另开：① `td`/`tis` 类型表结构去重（§5.1 另一半）；② `node_new`/`kw_lookup` 结构性分配削减（释放/避免中间结构，或走 §5.3 子进程兜底）。这两者均超出阶段 1 原「名去重」范畴，列为独立评估项。
 
 ---
+
+### 8.2 §5.3 多进程 bootstrap 设计（用户 2026-10-24 选定方向）
+
+**可行性实测（已做 spike）**：
+- 任意合法程序（`hello` / `adt_list` / `fstring_json` / `vector_demo`）`check` 峰值恒为 **0.71 GiB**，与程序大小无关 → 存在**固定基成本 ~0.71 GiB**（std 库 + 类型系统 + 运行期，每次编译必付）。
+- 整编译器 `tc check src/tc.tc` 峰值 **3.22 GiB** → 编译器自身语义图贡献约 **2.5 GiB**（291280 节点）。
+- **推论**：若把 `tc.tc` 拆成 K 个独立编译单元、各在独立 OS 进程编译，则每进程峰值 ≈ `0.71 + 2.5/K` GiB。K=4→~1.34GiB，K=8→~1.0GiB，K≥16→~0.71–0.86GiB。**整体自举峰值 = max(子进程峰值) ≈ 几百 MB 量级，有界**——§5.3 确能达标（地板即固定基 0.71GiB ≈ 七百 MB，已属「几百 MB」）。
+
+**当前阻断点**：`tc_load_src`（tc.tc:53）把命令行多文件**拼接成单源码、单模块、单进程**编译；`@import` 内部模块（如 `src.base`）走源码内联，无「预编译 .tlib + 外部引用」分离编译。故 §5.3 须让内部模块也能「预编译成 .tlib、被依赖方以外部符号引用」，再链接。
+
+**关键复用**：`.tlib` 库归档机制已存在（`tir_to_ll.build_tlib` / `lex.g_ext_link` / `tc build --link-deps`），当前服务**外部库**；扩展其对**内部模块**生效即 §5.3 的核心编译器改动。
+
+**⚠ 2026-10-24 修订（实测推翻"中等工作量"旧判）**：现有 `resolve_external_lib_archive` 外链模式**仍载入依赖源码供类型检查**（`sema.tc:11495` 「库源码仍载入供类型检查」），仅把 `.tlib` 留待链接期并入——故它**不降内存**：依赖图照样内联进子进程（sema 进程仍 2.3GiB）。要真正有界，外链必须改为**载「接口文件」**（仅 pub 签名 + 类型定义，不含实现），子进程不再建依赖语义图。
+- **推论**：按文件拆分 + 接口文件外链后，每子进程峰值 ≈ `固定基 0.71GiB + 本模块自身图 + 极小接口`，**整体自举峰值 = max(子进程峰值)**。但最大模块 `sema`/`tir` 自身图约 **0.87GiB+**（实测 sema/tir 独立 check 即使失败也已达 2.3GiB，其中自身图 0.87GiB+），故 max ≈ **1.5GiB**（非几百 MB）。
+- **几百 MB 的真正路径**：在文件级拆分 + 接口文件基础上，**再拆分 sema.tc / tir.tc 巨型模块**为子模块（编译器核心大重构，估数周）。
+- **结论**：用户 2026-10-24 选定「接受 ~1.5GiB 有界（中等工作量）」——实际等价于「文件级拆分 + 接口文件外链」（接口文件是必需项，非可选项）；要几百 MB 必须额外拆分巨型模块。阶段 B 即落地接口文件机制（生成 `.tint` + 外链改载 `.tint`），阶段 C 编排依赖序分进程编译 + 链接。
+
+**分阶段计划（建议）**：
+- **阶段 A（设计确认 + 依赖图）✅ 已完成（2026-10-24）**：导出编译器模块 `@import` 依赖图，**确认是无环 DAG（根 base）**——`base` 零内部依赖，其余模块均经 `lex`/`parse`/`hir`/`sema`/`tir`/`tmir`/`opmap`/`llname`/`mir` 等最终只指向 `base`，无任何回边。故 §5.3 **无需接口桩**，可干净地按拓扑序逐模块独立编译：`base` → `lex`/`opmap`/`llname` → `parse`/`hir` → `sema`/`tir` → `codegen_dev`/`codegen_riscv`/`codegen_wasm`/`codegen_c_tmir`/`tir_to_ll`/`comptime_fold`/`derive_gen`/`test` → `tc`。每模块在独立 OS 进程编译，引用依赖方预建 `.tlib`。
+- **阶段 B（接口文件 .tint 外链）✅ 已落地并验证（2026-10-24）**：`src/sema.tc` 的 `handle_one_import` 增加 `T_TINT_DIR` 门控——`@import("src.X")` 优先载 `<T_TINT_DIR>/X.tint`（仅 pub 签名+类型定义，不含实现），默认（未设）走原 `.tc` 源码、逐字节零影响。配套 `tools/gen_tint.py`（字符级扫描：剥离顶层 `fn` 函数体为 `;`、保留 struct/enum/variant/union/concept 体与 const/var/type/@import；内层 brace 匹配须跳过串/注释否则串内 `{}` 错配）。生成 `out/mod/*.tint`（除 `std.rc.cst`/`repl` 外全部 17 个 src 模块）。
+  - **实测（同二进制 `out/dbg/tc_new.exe`，`check src/tc.tc`）**：无 tint 基线峰值 **2.66 GiB** / exit 0 / 629 warnings；设 `T_TINT_DIR=out/mod` 后峰值 **0.99 GiB** / exit 0 / 629 warnings（诊断逐字节一致 → 接口文件语义等价）。**`check` 峰值从 2.66→0.99 GiB（−63%，已低于 1.5GiB 目标）**。
+  - **⚠ 关键边界**：阶段 B 仅降 **`check`（语义分析）** 峰值；`build`（codegen+链接）因需被依赖模块**完整实现**以发射代码，接口文件无法替代 → `build` 峰值**不受阶段 B 影响**（见下）。
+- **`build` 峰值实测（2026-10-24，同二进制无 tint）**：`tc build src/tc.tc --mode dbg` 峰值 **5.63 GiB**（= check 2.66 + codegen IR ~3GiB）。这才是真实自举（`tc build`）峰值，亦是须被 §5.3 有界化的对象。**阶段 B 对 `build` 无助**，必须由阶段 C（逐模块分进程编译 + 链接）解决：每模块进程仅建本模块图 + 极小接口 + 本模块 codegen，峰值有界 ≈ 0.99GiB 量级。
+- **阶段 C（逐模块分进程编译 + 链接 + per-module ginit 分裂）🔧 实现中（2026-10-24）**：
+  - **编译器侧改动（sema/tir/tir_to_ll/tc/lex）**：
+    1. **per-module ginit 分裂**：`tir_emit_ginit(name, always_emit)` 改为按模块 idn 发射独立 ginit `t_ginit_<mangled_idn>`（如 `t_ginit_src_base`），不再跳过库模式；`tir_to_ll` 入口 `main` 包装器在 `t.__ginit()` 之前，对 `g_link_libs` 每个成员 `declare` + `call` 其 `t_ginit_<idn>`（顺序按依赖拓扑，子先于父）。**必要性**：`lib` 模式此前跳过 `t.__ginit`，而编译器内部模块确有运行期初始化全局（如 `pub var g_comptime_full: bool = true;`，见 `tir.tc` ginit 注释），必须 per-module 自初始化，否则全局永久为零、静默错编（即旧 §4.14.7 阻断外部库 rc.cst 预编译的根因——本改动一举解除）。
+    2. **内部模块 .tlib 链接**：`handle_one_import` 对 `src.` 导入在 `loaded_tint` 时经新增 `resolve_internal_lib_archive(rel, tint_dir)`（查 `<T_TINT_DIR>/<rel>.tlib`）解析预编译产物，并注册 `g_link_libs` 存**完整 idn**（如 `src.base`，与 `in_link_libs(base.node_mod(d))` 的 node_mod 一致）使 codegen emit `declare`/跳过内联；`g_ext_link` 存 `.tlib` 路径交链接器。
+    3. **`--mod-id` 与模块身份**：`tc build --lib --mod-id src.base` 新增旗标；`lib_alias = last_segment(idn)="base"`（模块值别名 + 子进程重整末段，与入口 `import(src.base)` 的 alias 一致），`lex.g_lib_mod_idn = "src.base"`（完整 idn，供 ginit 符号名），解析期 `base.g_cur_mod = g_lib_mod_idn`（符号 node_mod 落 `src.base`，与模块值键一致，使 base.xxx 自引用可解析），并手动 `sema.g_modval_set(lib_alias, g_lib_mod_idn)`（独立编译时本模块是入口而非被导入，否则缺模块值）。
+  - **工具链**：`tools/gen_tint.py`（已修串/注释 brace 跳过 + decl 种类单次识别）、`tools/_mempeak2.py`（MEMPEAK_LOG）、**`tools/bootstrap_tc.mjs`**（外部库先预编译 mem/math/rc.cst/repl → out/lib/；再拓扑序逐内部模块 `build --lib --mod-id src.<m>` 出 out/mod/<m>.tlib；末步 build 入口 src/tc.tc 链接全部 .tlib；fixpoint 保证依赖先于依赖方）。
+  - **POC 验证（bool/int/string 全局跨模块初始化）✅**：构造 `src.poclib.tc`（`pub var g_flag/i64/string = ...`）+ 入口 `examples/poc_entry.tc`（`import("src.poclib")`）。`build --lib --mod-id src.poclib` 出 `out/mod/poclib.tlib`（含 `t_ginit_src_poclib`，正确 emit i8 1 / i64 42 / TStr 常量回填）；入口 `T_TINT_DIR=out/mod build` 载 `.tint` + 链接 `.tlib`，运行输出 `num=42 str=hello flag=1`，与单进程基线逐字节一致。**证毕 per-module ginit + 接口文件外链 + .tlib 链接端到端成立。**
+  - **⚠ 已知前置坑（已定位/规避）**：① 函数值全局（`var x: fn()R = @f`）的 ginit 在 `tir_emit_ginit` 有**既存 codegen bug**（`store ptr %llt5, ptr %llt5` 自写、GEP 结果 llt4/llt7 未用），与阶段 C 无关；编译器内部模块无此类全局（已 grep 确认无 `var = @fn` / `var : map[`），故不影响自举。② 独立编译入口缺模块值 → 已用 `g_modval_set` 补登记。③ 重建 `tc_phc.exe` 须输出到临时名再 `mv`（Windows 锁定运行中的自身二进制）。
+  - **待办**：跑通 `bootstrap_tc.mjs` 全量（17 内部模块 + 4 外部库 → tc_pc.exe），复测每子进程 `build` 峰值（目标 ~1.5GiB）、自举不动点 g2==g3==g4、等价性（诊断逐字节一致）、gate L2。
+- **阶段 D（门禁 + 收尾）**：`gate L2` 改走多进程路径；复测每子进程峰值（目标 ~1GiB 有界）；`ir_snapshot` 0 NEW/0 GONE；提交 wb。
+
+**风险**：模块依赖若存在环，需接口桩（先 emit 签名 .tlib 再补体）；链接器需正确处理跨模块 `@main`/全局符号；C 后端（`tmir-c`）须同步支持分模块 emit。阶段 A 先确认 DAG 无环再动手 B。
 
 ## 附录 A：Zig 0.17 vs t 内存模型对照
 

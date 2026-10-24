@@ -368,6 +368,7 @@ pub fn ll_flush_clo_thunks() void {
 // （tir.tc 暂不建模模块级全局变量声明，此处由翻译器兜底，使 legacy emit-ll 能编译的示例在 TIR 路径同样可编译。）
 pub fn ll_register_global(name: string, st: string) void {
     name = llname.ll_strip_suf(name);
+    if (name == "base__g_trivia_toks") { println("DBG_REG g_trivia_toks st=[" + st + "]"); }
     var n: i64 = slice_len(llname__g_ll_globals) as i64;
     var i: i64 = 0;
     while (i < n) {
@@ -375,6 +376,21 @@ pub fn ll_register_global(name: string, st: string) void {
         i = i + 1;
     }
     llname.ll_add_global(name, llname.st_to_ll(st));
+}
+
+// 判断全局是否「本模块自有」（出现在 g_mod.globals）。链接库（.tlib）提供的外部全局不在其中，
+// 须声明为 external 而非本地 zeroinitializer，否则与 .tlib 同名符号重复定义、或引用未声明报 undefined value。
+// （tir_emit_globals 已对链接库模块全局 skip，故 g_mod.globals 仅含本模块自有全局。）
+pub fn ll_global_is_own(nm: string) bool {
+    nm = llname.ll_strip_suf(nm);
+    if (nm == "base__g_trivia_toks") { println("DBG_ISOWN g_trivia_toks libemit=" + base.i2s(lex.g_lib_emit as i64)); }
+    var n: i64 = slice_len(tir.g_mod.globals) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        if (tir.g_mod.globals[i].name == nm) { return true; }
+        i = i + 1;
+    }
+    return false;
 }
 
 // 分支标签：@Lx -> curfn.Lx（LLVM 标签是函数局域，需加函数前缀避免跨函数重名）
@@ -474,6 +490,8 @@ pub fn ll_load(tname: string, st: string) string {
         var gst_is_ptr: bool = llname.ll_starts(gst, "ptr");
         if (str_len(gst) >= 1 and str_slice(gst, str_len(gst) - 1, str_len(gst)) == "*") { gst_is_ptr = true; }
         if (gst != "" and gst_is_ptr == false and llname.ll_starts(reqst, "ptr")) {
+            // ⚠ 跨模块全局按指针取地址时，须登记为 external（否则 LLVM 报 undefined value）。
+            ll_register_global(gnm, st);
             return "@" + llname.ll_mangle(gnm);
         }
         var r: string = ll_tmp();
@@ -3630,8 +3648,19 @@ pub fn ll_emit_inst(inst: TIRInst) void {
         var kn: i64 = slice_len(inst.args) as i64;
         while (ki < kn) {
             var a: string = inst.args[ki].name;
+            if (str_find(a, "g_trivia_toks") >= 0) { println("DBG_ARG a=[" + a + "] first=" + base.i2s(a[0] as i64) + " st=" + base.i2s(inst.args[ki].st as i64) + " isgl=" + base.i2s(llname.ll_is_global(a) as i64)); }
             if (str_len(a) >= 1 and a[0] == 64) {
-                var mref: string = llname.ll_mangle(str_slice(a, 1, str_len(a)));
+                // ⚠ 跨模块外部全局（来自链接库 .tlib）作实参：须登记为 external 声明，否则 LLVM 报 undefined value。
+                // 类型取 TIR 操作数携带的 ST（切片→%TSlice 等），与 .tlib 真实定义一致；缺失时回退 ll_get_st / ptr。
+                // 函数引用（@fn）非全局，跳过，避免与函数定义重名冲突。
+                var gnm: string = str_slice(a, 1, str_len(a));
+                var mref: string = llname.ll_mangle(gnm);
+                if (ll_is_func(mref) == false) {
+                    var argst: string = tir.tir_st_to_str(inst.args[ki].st);
+                    if (argst == "" or argst == "i64") { argst = llname.ll_get_st(a); }
+                    if (argst == "" or argst == "i64") { argst = "ptr"; }
+                    ll_register_global(gnm, argst);
+                }
                 if (ll_is_func(mref)) {
                     var clo: string = ll_emit_closure_const(mref, st);
                     if (first == false) { sb_append_str(argsb, ", "); }
@@ -3714,6 +3743,14 @@ pub fn ll_emit_inst(inst: TIRInst) void {
                         }
                     }
                     if (callee_wants_ptr) {
+                        // ⚠ 跨模块全局（来自链接库 .tlib）作实参按指针传递时，须登记为 external，
+                        // 否则 LLVM 报 use of undefined value。类型取 TIR 实参 ST（切片→%TSlice），与 .tlib 定义一致。
+                        var gnm: string = a;
+                        if (str_len(gnm) >= 1 and gnm[0] == 64) { gnm = str_slice(gnm, 1, str_len(gnm)); }
+                        var extst: string = tir.tir_st_to_str(inst.args[ki].st);
+                        if (extst == "" or extst == "i64") { extst = vst; }
+                        if (extst == "" or extst == "i64") { extst = "ptr"; }
+                        ll_register_global(gnm, extst);
                         v = llname.ll_llname(a);            // 传全局地址
                         pst = tir.tir_st_to_str(ptd);
                     } else {
@@ -5009,9 +5046,20 @@ pub fn tir_to_ll_emit(module: TIRModule) string {
     sb_append_str(g_ll, sb_to_str(g_ll_declbuf));
     var gi2: i64 = 0; var gn2: i64 = slice_len(llname__g_ll_globals) as i64;
     while (gi2 < gn2) {
-        sb_append_str(g_ll, "@"); sb_append_str(g_ll, llname.ll_mangle(llname__g_ll_globals[gi2]));
-        sb_append_str(g_ll, " = global "); sb_append_str(g_ll, llname.st_to_ll(llname__g_ll_globalsts[gi2]));
-        sb_append_str(g_ll, " zeroinitializer\n"); gi2 = gi2 + 1;
+        var gnm2: string = llname.ll_mangle(llname__g_ll_globals[gi2]);
+        var gst2: string = llname.st_to_ll(llname__g_ll_globalsts[gi2]);
+        // 链接模式 + 非本模块自有全局 = 来自链接库 .tlib 的外部符号：仅声明 external，定义由链接期归档提供。
+        // 单进程模式（g_lib_emit==false）g_mod.globals 含全部内联全局，一律本地 zeroinitializer。
+        if (lex.g_lib_emit and ll_global_is_own(llname__g_ll_globals[gi2]) == false) {
+            sb_append_str(g_ll, "@"); sb_append_str(g_ll, gnm2);
+            sb_append_str(g_ll, " = external global "); sb_append_str(g_ll, gst2);
+            sb_append_str(g_ll, "\n");
+        } else {
+            sb_append_str(g_ll, "@"); sb_append_str(g_ll, gnm2);
+            sb_append_str(g_ll, " = global "); sb_append_str(g_ll, gst2);
+            sb_append_str(g_ll, " zeroinitializer\n");
+        }
+        gi2 = gi2 + 1;
     }
     // ⚠ 代际分配器（2026-10-22）回归修复：从实时全局 g_mod.strings 重建 g_str_table。
     // 重降级（pass-1/pass-2）的 FuncDecl 体字面量已在此前 append 入 g_mod.strings，
@@ -5367,6 +5415,21 @@ pub fn ll_emit_ti_global(tname: string) string {
 
 // 主入口：消费 tir.tir_to_text() 文本，产出 .ll 文本（保留以兼容旧调用/对照）
 pub fn ll_emit_main_wrapper() void {
+    // lib 模式（build --lib）：无 @main，但 .ll 仍需运行期 shim 与 atom 表的 declare 才能通过
+    // LLVM 验证（调用 @tll_alloc 等但不声明 → clang -c 报 `use of undefined value '@tll_alloc'`）。
+    // 仅发 declare（定义由最终链接期的 t_runtime 提供），不发 main / t.__ginit 调用。
+    if (lex.g_lib_emit) {
+        sb_append_str(g_ll, "declare void @t_runtime_init(i32, ptr)\n");
+        sb_append_str(g_ll, "declare ptr @t_arena_new()\n");
+        sb_append_str(g_ll, "declare void @t_runtime_set_arena(ptr)\n");
+        sb_append_str(g_ll, "declare void @t_runtime_done()\n");
+        ll_maybe_declare("tll_alloc", "ptr", ["i64"]);
+        ll_maybe_declare("tll_memcpy", "void", ["ptr", "ptr", "i64"]);
+        sb_append_str(g_ll, "@.tirll_as0 = private unnamed_addr constant [1 x i8] zeroinitializer\n");
+        sb_append_str(g_ll, "@.tirll_ats0 = private unnamed_addr constant %TStr { ptr @.tirll_as0, i64 0 }\n");
+        ll_emit_atom_table();
+        return;
+    }
     if (g_has_main == false) { return; }
     sb_append_str(g_ll, "declare void @t_runtime_init(i32, ptr)\n");
     sb_append_str(g_ll, "declare ptr @t_arena_new()\n");
@@ -5394,11 +5457,36 @@ pub fn ll_emit_main_wrapper() void {
     if (have_ginit == false) {
         sb_append_str(g_ll, "define void @t.__ginit() {\n  ret void\n}\n");
     }
+    // 逐链接库（内部模块 .tint+.tlib 或外部库）的 per-module ginit 在模块级 declare
+    // （LLVM IR 要求 declare 在函数定义之外，置于 main 定义之前）；其 call 在 main 体内（见下）。
+    // 根治 §4.14.7：库模式跳过 t.__ginit，若不显式调用子模块 ginit，其全局初值恒零。
+    var gl_di: i64 = 0;
+    var gl_dn: i64 = slice_len(lex.g_link_libs) as i64;
+    while (gl_di < gl_dn) {
+        var gds: string = tir.tir_ginit_sym(lex.g_link_libs[gl_di]);
+        sb_append_str(g_ll, "declare void @");
+        sb_append_str(g_ll, gds);
+        sb_append_str(g_ll, "()\n");
+        gl_di = gl_di + 1;
+    }
     sb_append_str(g_ll, "define i32 @main(i32 %argc, ptr %argv) {\n");
     sb_append_str(g_ll, "entry:\n");
     sb_append_str(g_ll, "  call void @t_runtime_init(i32 %argc, ptr %argv)\n");
     sb_append_str(g_ll, "  %a = call ptr @t_arena_new()\n");
     sb_append_str(g_ll, "  call void @t_runtime_set_arena(ptr %a)\n");
+    // 逐链接库（内部模块 .tint+.tlib 或外部库）declare + call 其独立 ginit，
+    // 根治 §4.14.7：库模式跳过 t.__ginit，若不显式调用子模块 ginit，其全局初值恒零
+    // （如编译器自身 `pub var g_comptime_full: bool = true` 被读成 false → comptime 折叠失效）。
+    // g_link_libs 按依赖优先顺序登记（嵌套 import 先于父模块），故子 ginit 先于父运行。
+    var gl_i: i64 = 0;
+    var gl_n: i64 = slice_len(lex.g_link_libs) as i64;
+    while (gl_i < gl_n) {
+        var gs: string = tir.tir_ginit_sym(lex.g_link_libs[gl_i]);
+        sb_append_str(g_ll, "  call void @");
+        sb_append_str(g_ll, gs);
+        sb_append_str(g_ll, "()\n");
+        gl_i = gl_i + 1;
+    }
     sb_append_str(g_ll, "  call void @t.__ginit()\n");
     // wrapper 必须按入口函数真实返回类型调用 @t.<main>，否则与 define 的返回类型不匹配
     // （如 fn main() i64 → define i64 @t.main，但此前硬编码 call i32 触发 LLVM 未定义行为/崩溃）。
@@ -5432,6 +5520,9 @@ pub fn ll_emit_main_wrapper() void {
     }
     sb_append_str(g_ll, "}\n");
 }
+
+// 由模块身份推导独立 ginit 符号名：复用 tir.tc::tir_ginit_sym（本模块已 `const tir = @import("src.tir")`），
+// 入口侧 declare/call 与库侧 define 必须同名，否则链接缺符号。
 
 // ── 预编译外部库为 .tlib（Phase2 真·独立编译+链接）：把当前已 emit 的 <out>.ll
 // 经 clang -c 编为 .o，再用 llvm-ar 打成归档 <out>.tlib（重命名的 .a），并写出
