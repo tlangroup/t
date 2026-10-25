@@ -672,6 +672,8 @@ pub fn ti_equal(ai: i64, bi: i64) bool {
     if (a.kind == "Void" or a.kind == "String" or a.kind == "StringBuilder") {
         return true;
     }
+    // 一等子句（编译期一等值）：同种类即相等。独立种类而非 "Named"，见 ensure_clause_builtins 注释。
+    if (a.kind == "Clause") { return true; }
     if (a.kind == "BitStr") { return true; }
     if (a.kind == "Variant" or a.kind == "Unknown") {
         return true;
@@ -1076,6 +1078,8 @@ pub fn ti_str(i: i64) string {
     if (t.kind == "Sym") {
         return base.sb_cat5("Sym", base.i2s(t.bw), "(\"", t.name, "\")");
     }
+    // 一等子句（编译期一等值）
+    if (t.kind == "Clause") { return "clause"; }
     if (t.kind == "Pointer") {
         return base.sb_cat2("*", ti_str(t.elem));
     }
@@ -1491,6 +1495,55 @@ pub fn ensure_reflection_builtins() void {
     }
 }
 
+// ══════════════════════════════════════════════════════════════
+// 一等子句的合成内建（惰性注入，与 ensure_reflection_builtins 同规格）：
+//   · `ClauseKind` —— 子句类别枚举，当前成员仅 `pattern`；后续子功能追加成员即可，
+//     `@clause` 的语法与展开通通不变（设计 §5.1.1）。
+//   · `clause`     —— 编译期一等值的类型（设计 §4）。刻意注册为普通 named 类型，
+//     使 `[N]clause` 直接复用既有数组设施（字面量、下标、`++` 的 `[N+M]` 规则）。
+// ⚠ 两者都在用户已自行声明同名类型时让位（sym 查找优先），与 TypeInfo 的处理同款。
+// ══════════════════════════════════════════════════════════════
+pub var g_clause_builtins_done: bool = false;
+pub var g_ti_clause: i64 = -1;
+pub var g_ti_ClauseKind_ti: i64 = -1;
+
+// 类型（或类型的元素，递归）是否涉及 clause —— T-CLA-E724 的越界判据。
+// 覆盖 `clause` 本身与 `[N]clause` / `[N][M]clause` 等聚合形态。
+pub fn clause_ti_involves(ti: i64) bool {
+    if (ti < 0) { return false; }
+    var k: string = tip_kind(ti);
+    if (k == "Clause") { return true; }
+    if (k == "Array" or k == "Slice") {
+        if (tis[ti].elem >= 0) { return clause_ti_involves(tis[ti].elem); }
+    }
+    return false;
+}
+
+pub fn ensure_clause_builtins() void {
+    if (g_clause_builtins_done) { return; }
+    g_clause_builtins_done = true;
+    if (sym_lookup(global_scope, "ClauseKind") < 0) {
+        var ch: i64 = -1;
+        var ct: i64 = -1;
+        ct = base.list_push(ch, ct, base.mk_V("pattern", -1, -1, -1));
+        if (ch < 0) { ch = ct; }
+        var ck_decl: i64 = base.mk_EnumDecl("ClauseKind", "u8", -1, ch, -1);
+        g_ti_ClauseKind_ti = ti_named("Enum", "ClauseKind");
+        sym_define(global_scope, "ClauseKind", "type", g_ti_ClauseKind_ti, ck_decl);
+    }
+    if (sym_lookup(global_scope, "clause") < 0) {
+        // ⚠ 刻意用**独立的 TI 种类 "Clause"**，而不是 ti_named("Named", ...)：
+        // "Named" 是对用户具名类型的**未解析引用**，语义上等同 Unknown —— 实测
+        // `fn f() i64 { return a; }`（a 是 clause）会 0 error 静默放行，属静默错编。
+        // 独立种类让 ti_equal / ti_str 有明确分支，也让「漏到运行期」可硬拦（T-CLA-E724）。
+        g_ti_clause = ti_mk("Clause");
+        var cti: TI = tis[g_ti_clause];
+        cti.name = "clause";
+        slice_set(tis, g_ti_clause, cti);
+        sym_define(global_scope, "clause", "type", g_ti_clause, -1);
+    }
+}
+
 pub fn resolve_ti(tn: i64) i64 {
     if (tn < 0) {
         return ti_mk("Unknown");
@@ -1568,6 +1621,14 @@ pub fn resolve_ti(tn: i64) i64 {
     }
     if (base.node_kind((tn as u64)) == "named") {
         var rnm: string = base.node_sa((tn as u64));
+        // 一等子句的合成类型（设计 §4 / §5.1.1）：用户自行声明了同名类型则以用户的为准。
+        if (rnm == "clause" or rnm == "ClauseKind") {
+            var csi: i64 = sym_lookup(global_scope, rnm);
+            if (csi >= 0 and syms[csi].decl >= 0) { return syms[csi].ti; }
+            ensure_clause_builtins();
+            if (rnm == "clause") { return g_ti_clause; }
+            return g_ti_ClauseKind_ti;
+        }
         // 反射内建类型：若用户已自行声明（如编译 base.tc 自身）则走真实声明，
         // 否则惰性注入合成 VariantDecl/StructDecl，使 TypeInfo 在用户代码里可 match。
         if (rnm == "TypeInfo" or rnm == "TypeMeta" or rnm == "FieldInfo") {
@@ -6767,6 +6828,14 @@ pub fn infer_expr(e: i64) i64 {
 }
 
 pub fn infer_expr_body(e: i64) i64 {
+    // ── 一等子句 `@clause(...)`（设计 docs/compiler/first-class-clause.md §4 / §5.1）──
+    // 编译期一等值。其 pattern / guard / body 子树**一概不求值**（它们是 AST 位置，不是值
+    // 位置）：body 可以引用 pattern 绑定出来的名字，构造时尚无绑定 —— 一旦在此递归进入子树，
+    // 那些名字就会被误报「未定义标识符」。求值恒等由 meta_eval_rec 的同名分支保证。
+    if (base.node_kind((e as u64)) == "clause") {
+        ensure_clause_builtins();
+        return g_ti_clause;
+    }
     // ── 模块值 / 变体字面量 脱糖（在 hir_tag 派发前，避免新节点 kind 落入默认分支）──
     if (base.node_kind((e as u64)) == "variant_lit") {
         // M5 / P1 补丁：变体字面量构造 `V { .Case }` / `V { .Case(args) }` 的 case 名必须真实存在。
@@ -9317,6 +9386,18 @@ pub fn cs_var_decl(s: i64, init_i: i64) void {
         if (base.node_const(s) != 0) { check_const_ref(s); }
         return;
     }
+    // 一等子句是**编译期一等值**（设计 §4）：它没有运行期表示，故不得占用 var 槽位。
+    // 与上方 `var x: type` 相反 —— 那种是编译期绑定并令后端跳过槽位；clause 一律越界即错，
+    // 声明请用 `const`。这是 T-CLA-E724 的第一道闸门（局部）。
+    if (base.node_na((s as u64)) >= 0) {
+        var ct0: i64 = resolve_ti(base.node_na((s as u64)));
+        if (clause_ti_involves(ct0)) {
+            parse.fc_err("T-CLA-E724",
+                base.sb_cat3("clause 值不能声明为运行期变量 `", base.node_sa((s as u64)),
+                    "`；clause 只活在编译期，请改用 const"), s);
+            return;
+        }
+    }
     var vt: i64 = -1;
     // 管道许可上下文之一：初始化器（reference.md §3.15.6）
     if (base.node_nb((s as u64)) >= 0) { pipe_mark(base.node_nb((s as u64))); }
@@ -10436,6 +10517,16 @@ pub fn check_decl(d: i64) void {
 
 // 模块级全局变量（HIR 消费路径与 CST 路径共用）
 pub fn check_global_var_decl(d: i64) void {
+    // T-CLA-E724 的第二道闸门（全局）：clause 只活在编译期，不得占全局 var 存储。
+    if (base.node_na((d as u64)) >= 0) {
+        var gt0: i64 = resolve_ti(base.node_na((d as u64)));
+        if (clause_ti_involves(gt0)) {
+            parse.fc_err("T-CLA-E724",
+                base.sb_cat3("clause 值不能声明为全局运行期变量 `", base.node_sa((d as u64)),
+                    "`；clause 只活在编译期，请改用 const"), d);
+            return;
+        }
+    }
     if (base.node_nb((d as u64)) >= 0) {
         // 模块级全局的向量字面量构造：`var g: @Vector(4,i32) = [1,2,3,4];`
         // 与局部 var_decl 同一机制，注入期望类型后由 array_lit 分支升格。
@@ -12988,6 +13079,10 @@ pub fn meta_eval_rec(e: i64) i64 {
             "编译期求值步数超预算（疑似不终止的 meta 循环或递归）", e);
     }
     if (base.node_kind((e as u64)) == "int" or base.node_kind((e as u64)) == "string" or base.node_kind((e as u64)) == "bool") { return e; }
+    // 一等子句 `@clause(...)`：编译期求值**恒等** —— 返回节点自身，绝不递归进入
+    // pattern / guard / body 子树（那是 AST 位置，见 parse.parse_clause_lit 注释）。
+    // 这是「求值」与「展开」的分界：求值到此为止，展开是 §5.4 的事。
+    if (base.node_kind((e as u64)) == "clause") { return e; }
     // P5: 浮点字面量即编译期值——与 int/bool/string 同款，值以 `sa` 文本承载。
     //     变体 f64 载荷因此可直通构造/提取；浮点算术/比较留待 Phase B.2。
     if (base.node_kind((e as u64)) == "float") { return e; }
