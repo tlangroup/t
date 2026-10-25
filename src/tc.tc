@@ -351,6 +351,11 @@ fn main() i32 @main {
         var out_dir: string = "";
         var has_out: bool = false;
         var mode: string = "dbg";
+        // --link-deps：把解析到的外部链接库（.tlib 归档）逐行打到 stdout。
+        // 阶段 C 链接模式下，导入外部库（std.math 等）的模块会把调用发成 extern，
+        // 而 `compile --emit-c` 只产 .c、不负责链接；外部构建脚本（run_examples.mjs）
+        // 须拿到这些归档才能 clang 链接成功。
+        var c_link_deps: bool = false;
         var ai: i64 = 3;
         var an: i64 = slice_len(argv) as i64;
         var src_file: string = "";
@@ -377,6 +382,7 @@ fn main() i32 @main {
             }
             if (argv[ai] == "--json") { base.g_diag_fmt = "json"; ai = ai + 1; continue; }
             if (argv[ai] == "--trace-comptime") { sema.g_meta_trace = true; ai = ai + 1; continue; }
+            if (argv[ai] == "--link-deps") { c_link_deps = true; ai = ai + 1; continue; }
             // R2 多文件：非 flag 位置参数并入同一编译单元
             if (str_len(argv[ai]) as i64 >= 2 and str_slice(argv[ai], 0, 2) != "--") {
                 append(files, argv[ai]);
@@ -409,7 +415,7 @@ fn main() i32 @main {
         var mod2: string = base.base_no_tc(file);
         var opt_level: i64 = 0;
             tir__tir_set_recording_mir(true);
-            tir.g_relowering = false;
+            base.g_relowering = false;
         tir.lower_unit(mod2, file);
         tir__tir_set_recording_mir(false);
         tir__g_mir.globals = tir__g_mod.globals;
@@ -430,6 +436,15 @@ fn main() i32 @main {
         base.ensure_parent(cp);
         file_write_all(cp, out_text);
         print(base.sb_cat4("Generated: ", base.to_bs(cp), "\n", ""));
+        // --link-deps：逐行输出本单元依赖的外部 .tlib 归档（供外部构建脚本链接）
+        if (c_link_deps) {
+            var cld_i: i64 = 0;
+            var cld_n: i64 = slice_len(lex.g_ext_link) as i64;
+            while (cld_i < cld_n) {
+                print(lex.g_ext_link[cld_i]); print("\n");
+                cld_i = cld_i + 1;
+            }
+        }
         return 0;
     }
 
@@ -674,7 +689,7 @@ fn main() i32 @main {
         sema.ann_pass();
         if (sema.has_errors()) { base.emit_diags(); return 1; }
         var mod2: string = base.base_no_tc(src_file);
-        tir.g_relowering = false;
+        base.g_relowering = false;
         tir.lower_unit(mod2, src_file);
         if (has_outp == false) { out_p = base.sb_cat4("out/", mode, "/", mod2); }
         var tirp: string = base.sb_cat2(out_p, ".tir");
@@ -756,7 +771,7 @@ fn main() i32 @main {
         // 持久全局累加 slice（g_ll_named_types / g_func_names / g_func_paramsts / g_ll_extern_funcs /
         // g_ll_declared / g_clo_consts / g_clo_thunk_req / g_ll_valptr / g_ll_addrslot / g_ll_addrst /
         // g_ll_func_rets / ps 及其字符串元素）已在 emit 侧统一「切 g_arena 追加」保护，跨函数回收后不悬垂。
-        tir.g_relowering = true;
+        base.g_relowering = true;
         tir.lower_unit(mod2, src_file);
         if (has_outp == false) { out_p = base.sb_cat4("out/", mode, "/tirll_", mod2); }
         var llp: string = base.sb_cat2(out_p, ".tir.ll");
@@ -764,7 +779,7 @@ fn main() i32 @main {
         tir.tir_verify_module();
         var lltext: string = tir_to_ll.tir_to_ll_emit(tir.g_mod);
         file_write_all(llp, lltext);
-        tir.g_relowering = false;   // ⚠ 代际分配器：emit 完成后才关重降级（emit 期间须保持 true 以逐函数重降级）
+        base.g_relowering = false;   // ⚠ 代际分配器：emit 完成后才关重降级（emit 期间须保持 true 以逐函数重降级）
         eprint(base.sb_cat3("Generated: ", base.to_bs(llp), "\n"));
         // --link-deps：把解析到的外部链接库（.tlib 归档）逐行打到 stdout，
         // 供 diffpipe 新轨手动 clang link 时一并并入（与 tc build 的 g_ext_link 一致）。
@@ -1044,7 +1059,7 @@ fn main() i32 @main {
             // 路线 §11：sema → mir(pre-TIR 优化) → TIR → tmir → WAT
             // 开启录制：tir.lower_unit 在 TIR 发射期并行录制 pre-TIR 线性 MIR 到 g_mir
             tir__tir_set_recording_mir(true);
-            tir.g_relowering = false;
+            base.g_relowering = false;
             tir.lower_unit(mod2, src_file);
             tir__tir_set_recording_mir(false);
             tir__g_mir.globals = tir__g_mod.globals;   // 非函数部分录制期不含，从 g_mod 取（优化不影响 globals）
@@ -1059,7 +1074,7 @@ fn main() i32 @main {
         } else if (backend == "tmir-riscv") {
             // 路线 §11：sema → mir(pre-TIR 优化) → TIR → tmir → rv64 汇编
             tir__tir_set_recording_mir(true);
-            tir.g_relowering = false;
+            base.g_relowering = false;
             tir.lower_unit(mod2, src_file);
             tir__tir_set_recording_mir(false);
             tir__g_mir.globals = tir__g_mod.globals;
@@ -1078,23 +1093,23 @@ fn main() i32 @main {
             // （函数体落 g_func 本块、emit 后立即 arena_reset_func 回收；tmir-c 后端禁用，因其消费 g_mod 真实体）。
             // 持久全局累加 slice 已在 emit 侧统一「切 g_arena 追加」保护（见 tir_to_ll.tc 各 append 站点），
             // 跨函数回收后不悬垂。emit 完成后于下方重置回 false。
-            tir.g_relowering = true;
+            base.g_relowering = true;
             tir.lower_unit(mod2, src_file);
             file_write_all("out/dbg/_phase.log", "lower_done\n");
             tir.tir_verify_module();
             file_write_all("out/dbg/_phase.log", "verify_done\n");
             lltext = tir_to_ll.tir_to_ll_emit(tir.g_mod);
             file_write_all("out/dbg/_phase.log", "emit_done\n");
-            tir.g_relowering = false;   // ⚠ 代际分配器：emit 完成后才关重降级（emit 期间须保持 true 以逐函数重降级）
+            base.g_relowering = false;   // ⚠ 代际分配器：emit 完成后才关重降级（emit 期间须保持 true 以逐函数重降级）
             out_text = lltext;
 
             out_text = lltext;
         } else if (backend == "tmir-c") {
             // M2：tmir → C 便携后端（无需 LLVM）。sema → mir → TIR → tmir → .c。
             // ⚠ 代际分配器：tmir-c 消费 g_mod/g_mir 真实体，禁用逐函数重降级（必须保留完整函数体）。
-            tir.g_relowering = false;
+            base.g_relowering = false;
             tir__tir_set_recording_mir(true);
-            tir.g_relowering = false;
+            base.g_relowering = false;
             tir.lower_unit(mod2, src_file);
             tir__tir_set_recording_mir(false);
             tir__g_mir.globals = tir__g_mod.globals;

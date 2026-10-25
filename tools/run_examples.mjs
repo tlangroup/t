@@ -279,11 +279,17 @@ async function runCase(name) {
     // ② C 后端 —— 每用例独立子目录，避免并行踩踏导入模块的同名 .c/.h
     const cdir = join(CBACK, name);
     mkdirSync(cdir, { recursive: true });
-    const c = await sh(compiler, ["compile", src, "--emit-c", "--output", cdir], { timeout: COMPILE_TIMEOUT_MS });
+    // ⚠ 阶段 C 链接模式：`--link-deps` 让编译器把解析到的外部 .tlib 归档逐行打到 stdout。
+    //   导入 std.math 等外部库的用例在 C 侧调用是 extern，缺归档 ⇒ lld-link undefined symbol。
+    const c = await sh(compiler, ["compile", src, "--emit-c", "--link-deps", "--output", cdir], { timeout: COMPILE_TIMEOUT_MS });
     if (!c.ok) {
         problems.push(`c emit failed (exit ${c.code})`);
     } else {
         const cexe = join(cdir, `${name}.exe`);
+        const linkDeps = String(c.out || "")
+            .split("\n")
+            .map((s) => s.trim())
+            .filter((s) => s.length > 0 && /\.(tlib|tlibd)$/.test(s) && existsSync(s));
         // ⚠ 运行时不再以源码形式参与编译：t_runtime.c 现在依赖 vendored 第三方库
         // （mimalloc / fdlibm / imath / ryu），逐个编进来既不现实也让命令行失控。
         // 统一链接预编译的 out/<mode>/deps/t_runtime.lib（与 LLVM 后端同一份产物），
@@ -293,6 +299,7 @@ async function runCase(name) {
             join(cdir, `${name}.c`),
             "-I", RUNTIME, "-I", cdir, "-Wl,-subsystem:console",
             join(ROOT, "out", mode, "deps", "t_runtime.lib"),
+            ...linkDeps,
         ], { timeout: COMPILE_TIMEOUT_MS });
         if (!cc.ok) {
             problems.push(`c link failed (exit ${cc.code}): ${tailErr(cc.err)}`);
