@@ -327,7 +327,6 @@ fn classify(x: i64) string { return match (x) { <展开 G> }; }
 ```
 
 约束与诊断：
-- pattern 必须与形参 #0 的声明类型匹配，否则 `T-CLA-E725`。**（此处无需任何类型回填机制** —— 形参 `T` 就是 scrutinee，直接进入 §5.4 的重排与既有 match 检查。）
 - ret 必须与函数返回类型一致，否则 **复用** `T_MATCH_ARM_TYPE`；
 - 多形参（`x`, `k`）沿用既有脱糖策略：`#1` 起的模式折叠进该臂守卫。
 
@@ -392,7 +391,6 @@ const r = comptime apply(G, 7);              // 全编译期求值，折叠为�
 | `T-CLA-E720` | error | `@clause` 段位数错误（须含类别位、pattern 位、body 位；guard 须由 `when` 引出） |
 | `T-CLA-E721` | error | 未知子句类别（当前合法仅 `.pattern`；诊断须列出全部合法成员） |
 | `T-CLA-E724` | error | clause 值逃逸到运行期 |
-| `T-CLA-E725` | error | 子句组函数化时 pattern 与形参 #0 类型不符 |
 | `T-CLA-E726` | error | clause 实参不是编译期可折叠常量（编译期函数要求全部实参编译期已知） |
 | `T-CLA-W727` | warning | 子句被更早的无守卫子句完全遮蔽（排重丢弃）；多条无守卫通配亦由此收敛为一条 |
 

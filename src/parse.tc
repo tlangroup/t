@@ -2081,6 +2081,16 @@ pub fn parse_func_decl(name: string, anns: i64, is_comptime: bool, is_kernel: bo
     } else {
         if (lex.cur_t() == "LBrace") {
             body = parse_block();
+        } else if (lex.cur_t() == "Assign") {
+            // N13 函数化：`fn f(x: T) R = G;`（G 是 [N]clause 子句组）
+            // `= <expr>` 在函数体位此前是解析错误 ⇒ 空位利用，零新增语法。
+            // 体脱糖为 `return match (x) { G };`，由 desugar_clause_splices（parse_unit
+            // 末尾）把 G 摊平成臂 —— 与臂位展开走同一条路，不另设规则。
+            // G 展开后被完全擦除 ⇒ f 仍是**运行期**函数（与 §5.5 的判据一致）。
+            lex.advance_i();
+            var ge: i64 = parse_expr();
+            expect_tok("Semicolon");
+            body = clause_fn_body(name, ph, ge, rt);
         } else {
             parse_fatal("expected '{' or ';' after function signature");
         }
@@ -3270,6 +3280,7 @@ pub var g_spl_cl: []i64;      // 展开期收集的 clause 节点（顺序即源
 pub var g_spl_base: i64 = 0;  // 本次收集在 g_spl_cl 中的起始下标
 pub var g_spl_ord: []i64;     // 重排后的顺序（无守卫通配落末位）
 pub var g_spl_ord_base: i64 = 0;
+pub var g_spl_ord_n: i64 = 0;     // 本次展开在 g_spl_ord 中的**有效长度**（排重后可能更短）
 pub var g_spl_ok: bool = true;
 pub var g_spl_trace: i64 = 0;   // 追踪开关（排障时临时置 1）
 
@@ -3303,15 +3314,20 @@ pub fn clause_collect(x: i64) void {
     g_spl_ok = false;
 }
 
-// 无守卫通配 clause 判定（设计 §5.2.2）：pattern 是规范通配节点 **且** nb < 0。
-// 带守卫的通配不是不可反驳臂，不参与重排。
-pub fn clause_is_wildcard(c: i64) bool {
+// 「不可反驳」clause 判定（设计 §5.2.2 + N12 修正）：**无守卫** 且 pattern 是标识符。
+//
+// ⚠ 判据是「标识符」，**不是**「`_`」—— 这两者都不可反驳：
+//   · `_`        通配，匹配一切且不绑定
+//   · 裸绑定 `n` 匹配一切并顺带绑定名字（`@clause(.pattern, n, ...)`）
+// 早先只认 `_`，于是裸绑定子句被当成「可反驳」留在原位：它前面的排完了、它自己恒命中，
+// 后面所有子句全部变成死代码，而编译器一声不响 —— 典型的静默错编。
+// 带守卫的 clause 一律**不是**不可反驳（守卫可能为假），不参与重排。
+pub fn clause_is_irrefutable(c: i64) bool {
     if (c < 0) { return false; }
     if (base.node_nb((c as u64)) >= 0) { return false; }
     var pn: i64 = base.node_na((c as u64));
     if (pn < 0) { return false; }
-    if (base.node_kind((pn as u64)) != "ident") { return false; }
-    return base.node_sa((pn as u64)) == "_";
+    return base.node_kind((pn as u64)) == "ident";
 }
 
 // 若 match 的臂链含 clause_splice，就地展开；否则不动（幂等：展开后 splice 已消失）。
@@ -3352,25 +3368,47 @@ pub fn clause_expand_splice(m: i64) void {
         return;
     }
 
-    // ── N11 重排：无守卫通配 clause 移到末位（相对顺序保持）──
-    // 两趟扫描：先非通配，再通配。写入模块级 g_spl_ord（局部切片有逃逸坑，见其声明注释）。
+    // ── N11 重排 + N12 排重 ─────────────────────────────────────────
+    // 两趟扫描：先可反驳，再不可反驳 ⇒ 不可反驳 clause 落到末位充当 else（INV-2）。
+    // 写入模块级 g_spl_ord（局部切片有逃逸坑，见其声明注释）。
     g_spl_ord_base = slice_len(g_spl_ord) as i64;
     var oi: i64 = g_spl_base;
     while (oi < slice_len(g_spl_cl) as i64) {
-        if (clause_is_wildcard(g_spl_cl[oi]) == false) { append(g_spl_ord, g_spl_cl[oi]); }
+        if (clause_is_irrefutable(g_spl_cl[oi]) == false) { append(g_spl_ord, g_spl_cl[oi]); }
         oi = oi + 1;
     }
     oi = g_spl_base;
     while (oi < slice_len(g_spl_cl) as i64) {
-        if (clause_is_wildcard(g_spl_cl[oi])) { append(g_spl_ord, g_spl_cl[oi]); }
+        if (clause_is_irrefutable(g_spl_cl[oi])) { append(g_spl_ord, g_spl_cl[oi]); }
         oi = oi + 1;
+    }
+    // ── N12 排重：首个不可反驳 clause 之后的全部子句都被完全遮蔽 ──
+    //   （它恒命中，后面的永远走不到 —— 与 KI-002「恒命中首臂」同族，静默且难查）
+    //   ⇒ 保留它作为 else，其后一律丢弃并发 T-CLA-W727（合法但大概率是笔误）。
+    // ⚠ 用 g_spl_ord_n 记「有效长度」而非截断切片：模块级切片重新赋值有 arena 逃逸坑。
+    var ord_end: i64 = slice_len(g_spl_ord) as i64;
+    g_spl_ord_n = ord_end;
+    var first_irr: i64 = -1;
+    var fi: i64 = g_spl_ord_base;
+    while (fi < ord_end) {
+        if (clause_is_irrefutable(g_spl_ord[fi])) { first_irr = fi; break; }
+        fi = fi + 1;
+    }
+    if (first_irr >= 0 and first_irr + 1 < ord_end) {
+        var di2: i64 = first_irr + 1;
+        while (di2 < ord_end) {
+            parse.fc_warn("T-CLA-W727",
+                "子句被更早的无守卫不可反驳子句（通配 `_` 或裸绑定）完全遮蔽，已丢弃", g_spl_ord[di2]);
+            di2 = di2 + 1;
+        }
+        g_spl_ord_n = first_irr + 1;
     }
 
     // ── 生成既有 MatchArm 链 ──
     var ah: i64 = -1;
     var at: i64 = -1;
     var ai2: i64 = g_spl_ord_base;
-    while (ai2 < slice_len(g_spl_ord) as i64) {
+    while (ai2 < g_spl_ord_n) {
         var cl: i64 = g_spl_ord[ai2];
         var cpat: i64 = base.node_na((cl as u64));
         var csa: string = "";
@@ -3397,6 +3435,45 @@ pub fn clause_expand_splice(m: i64) void {
         ai2 = ai2 + 1;
     }
     base.node_set_la((m as u64), ah);
+}
+
+// ── N13 函数化：`fn f(x: T) R = G;` 的函数体脱糖 ─────────────────────────
+// 产出 block { return match (<形参#0>) { G }; }。
+//   · match 的臂链里直接放子句组表达式（**entry 索引**，同 parse_match_expr 的拼接位），
+//     由 desugar_clause_splices 统一摊平 —— 故函数化不需要自己实现展开。
+//   · 形参 #0 必须是**具名绑定**：它要当 scrutinee。裸 `_` / 字面量模式形参都不行。
+//   · 只支持单形参：多参时「非首位如何折叠进守卫」语义未定，宁可报错也不静默猜。
+pub fn clause_fn_body(fname: string, ph: i64, g: i64, rt: i64) i64 {
+    var ps: []i64 = base.kids_chain(ph);
+    if (slice_len(ps) != 1) {
+        parse.fc_err("T-CLA-E720",
+            base.sb_cat3("函数化 `fn ", fname, "` 当前只支持单形参（多参的折叠语义未定）"), g);
+        return -1;
+    }
+    var p0: i64 = ps[0];
+    var pname: string = base.node_sa((p0 as u64));
+    if (pname == "" or pname == "_" or base.node_nb((p0 as u64)) >= 0) {
+        parse.fc_err("T-CLA-E720",
+            base.sb_cat3("函数化 `fn ", fname, "` 的形参 #0 必须是具名绑定（它要当 match 的 scrutinee）"), g);
+        return -1;
+    }
+    var scr: i64 = base.mk_ident(pname, -1);
+    // 臂链：list_push 返回 kids 池 entry 索引（不是节点 id），与 parse_match_expr 同规格
+    var mh: i64 = -1;
+    var mt: i64 = -1;
+    mt = base.list_push(mh, mt, g);
+    if (mh < 0) { mh = mt; }
+    var m: i64 = base.mk_match(scr, mh, -1);
+    // ⚠ 函数体字段装的是**语句链 entry 索引**，不是 block 节点 ——
+    //   既有 parse_block() 返回的也是语句链头（head = list_push 的返回值），
+    //   desugar_func_clauses 合成体时同样直接把链头交给 mk_FuncDecl。
+    //   早先这里多包了一层 mk_block，于是该 block 的节点 id 被当作 entry 索引去索引
+    //   kids 池 ⇒ 越界崩溃（实测 `t_slice_at index 15 length 13`）。
+    var bh: i64 = -1;
+    var bt: i64 = -1;
+    bt = base.list_push(bh, bt, base.mk_return(m, -1));
+    if (bh < 0) { bh = bt; }
+    return bh;
 }
 
 // 在 parse 层的 decl_list 里按名查全局 const 的初始化器（不依赖 sema 符号表 ——
@@ -3639,6 +3716,14 @@ pub fn fc_err(code: string, msg: string, d: i64) void {
     var l: i64 = n_line(d);
     var c: i64 = n_col(d);
     base.diag_new(code, "error", msg, n_file(d), l, c, l, c + 4);
+}
+
+// 非致命形态告警：与 fc_err 同款定位，但级别为 warning（不中断编译）。
+// 供子句组排重这类「合法但大概率是笔误」的情形使用（T-CLA-W727）。
+pub fn fc_warn(code: string, msg: string, d: i64) void {
+    var l: i64 = n_line(d);
+    var c: i64 = n_col(d);
+    base.diag_new(code, "warning", msg, n_file(d), l, c, l, c + 4);
 }
 
 // 类型节点的结构指纹（脱糖期尚无 scope，故不走 resolve_ti）
