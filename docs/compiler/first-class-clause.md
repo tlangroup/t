@@ -448,7 +448,11 @@ const r = comptime apply(G, 7);              // 全编译期求值，折叠为�
 | N10 | ✅ | 臂位置的裸表达式（无 `=>`）承接 `[N]clause` ⇒ 在 **parse_unit 末尾、HIR 之前**展开为既有 `MatchArm` 链 |
 | N11 | ✅ | 无守卫通配 clause 重排到末位充当 `else`（INV-2）；运行期对拍通过 |
 | 约束 C1 | ✅ **已撤销** | 按用户要求「`const C = @clause(...)` 不必写 `: clause`，保持一致性」：改为对 clause **定向回填**符号类型（只回 clause，不动既有通用行为） |
-| N12 排重 / N13 函数化 | ⬜ 下一批 | — |
+| N12 排重 | ✅ | 首个不可反驳 clause 之后的全部子句被完全遮蔽 ⇒ 丢弃 + `T-CLA-W727`（只告警） |
+| N13 函数化 | ✅ | `fn f(x: T) R = G;`（`= <expr>` 在函数体位此前是解析错误 ⇒ 空位利用）；体脱糖为 `return match (x) { G };`，展开后 G 被完全擦除 ⇒ 仍是**运行期**函数 |
+| N14 自动置位 | ✅ | 含 clause 形参 ⇒ 自动升为编译期函数；挂靠既有 comptime 形参机制，单态化按实参生成实例 |
+| N15 实参常量 | ✅ | clause 形参的实参须能在编译期求值，否则 `T-CLA-E726` |
+| N16 三组探针 | ✅ | ① 同一 G 换 scrutinee 结果不同 ② 换 group 结果不同（不同实例）③ 当运行期函数值传入 ⇒ `T-CLO-E781` |
 
 > **验证结果（本批次，含 N10/N11）**
 > - `tc check src/tc.tc`：0 errors；**告警集合与改动前逐条一致**（633 = 633，差集为空）
@@ -470,6 +474,19 @@ const r = comptime apply(G, 7);              // 全编译期求值，折叠为�
 > **不是节点 id**。把拼接表达式的节点 id 直接当链元用会写坏链表（实测同一个 `t_slice_at` 崩溃）。
 >
 > **坑 P4（已修）**：`mk_arm` 末位是**记号索引**（内部走 `tk_line/tk_col`），不是节点 id。
+>
+> **坑 P9（已修，且是既有潜伏 bug）**：`instantiate_generic` 取实参用**「前 k 个」**，
+> 隐含假设 comptime 形参都排在最前。N14 的 clause 形参是第二位（`fn f(x: T, G: [N]clause)`）
+> ⇒ 把 `x`（=0，一个 int）当成子句组实参，症状极具误导性（报「不是子句组；实际得到 int」）。
+> 改为**按形参实际位置**取实参，并新增 `rewrite_generic_callsite_pos`（原函数保留签名委托，
+> 既有「comptime 形参在前」的形态逐字节不变）。
+>
+> **坑 P10（已修）**：单态**实例**继承了模板的 is_comptime ⇒ 后端跳过发射
+> ⇒ `lld-link: undefined symbol: t_fmt_with__g22_36`。模板才是编译期，**实例必须是运行期函数**。
+>
+> **坑 P11（已修，静默错结果）**：单态 key 不能用 `meta_val_key` —— 它回落去哈希 `node.sa`，
+> 而子句组节点 sa 为空 ⇒ 两个不同 group 算出同一 key ⇒ 共用同一实例。
+> 改用 `clause_group_key`（按实参源码 span 作 key）。
 >
 > **坑 P5（已修）**：clause 常量**不可从 decl_list 摘除**。摘掉后后续引用失去符号，
 > `return C;` 连「未定义标识符」都不报 ⇒ 新的静默洞。正解 = 保留声明 + 跳过发射。
