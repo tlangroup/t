@@ -1999,6 +1999,7 @@ pub fn desugar_lambdas() void {
 
 pub fn parse_func_decl(name: string, anns: i64, is_comptime: bool, is_kernel: bool) i64 {
     expect_tok("LParen");
+    var has_clause_param: bool = false;   // N14：是否含 clause 形参（⇒ 自动升为编译期函数）
     var ph: i64 = -1;
     var pt: i64 = -1;
     while (lex.cur_t() != "RParen" and lex.cur_t() != "Eof") {
@@ -2052,11 +2053,17 @@ pub fn parse_func_decl(name: string, anns: i64, is_comptime: bool, is_kernel: bo
         var panns: i64 = parse_annotations();
         if (pname != "" and pname != "_") { base.validate_c_keyword(pname, ppos); }
         var pid: i64 = base.mk_P(pname, ptn, panns, -1);
-        if (pwild or plit >= 0 or pguard >= 0 or pcomp) {
+        // N14：clause / [N]clause 形参 ⇒ 它是**编译期形参**（bb = true），
+        //   函数因此自动升为编译期函数（Q8 = 自动置位）。挂靠既有的 comptime 形参机制
+        //   （func_is_generic / instantiate_generic），从而「不同 group 实参 → 不同实例」。
+        //   ⚠ 门控是 clause 类型，既有代码没有任何 clause 形参 ⇒ 零影响。
+        var pclause: bool = type_node_is_clause(ptn);
+        if (pclause) { has_clause_param = true; }
+        if (pwild or plit >= 0 or pguard >= 0 or pcomp or pclause) {
             base.node_set_ba((pid as u64), pwild);   // S4 §0.14.7 SoA：侧表写（原 pn.ba = pwild；第十批）
             base.node_set_nb((pid as u64), plit);
             base.node_set_nc((pid as u64), pguard);   // S4 §0.14.7 SoA：侧表写（原 pn.nc = pguard；第九批）
-            if (pcomp) { base.node_set_bb((pid as u64), true); }   // S4 §0.14.7 SoA：侧表写（原 pn.bb）
+            if (pcomp or pclause) { base.node_set_bb((pid as u64), true); }   // S4 §0.14.7 SoA：侧表写（原 pn.bb）
         }
         pt = base.list_push(ph, pt, pid);
         if (ph < 0) {
@@ -2096,7 +2103,12 @@ pub fn parse_func_decl(name: string, anns: i64, is_comptime: bool, is_kernel: bo
         }
     }
 
-    var id: i64 = base.mk_FuncDecl(name, is_extern, is_comptime, rt, all, ph, body, -1);
+    // N14 自动置位：含 clause 形参 ⇒ 该函数是编译期函数（bb = true）。
+    //   后果（全部是既有行为，无需新代码）：① 函数体在 comptime 上下文检查；
+    //   ② 把它当运行期函数值传出去 ⇒ T-CLO-E781；③ 模板本身不发射，只有单态实例发射。
+    var fd_comptime: bool = is_comptime;
+    if (has_clause_param) { fd_comptime = true; }
+    var id: i64 = base.mk_FuncDecl(name, is_extern, fd_comptime, rt, all, ph, body, -1);
     if (is_kernel) {
         // S4 §0.14.7 SoA：bf 外置为侧表后无需「取值→改字段→slice_set 回写」，直接写侧表。
         base.node_set_bf((id as u64), true);   // Device 入口：host 双后端跳过，codegen_dev 处理
@@ -3282,6 +3294,8 @@ pub var g_spl_ord: []i64;     // 重排后的顺序（无守卫通配落末位�
 pub var g_spl_ord_base: i64 = 0;
 pub var g_spl_ord_n: i64 = 0;     // 本次展开在 g_spl_ord 中的**有效长度**（排重后可能更短）
 pub var g_spl_ok: bool = true;
+pub var g_spl_defer: bool = false;   // 本次收集遇到「clause 形参」名 ⇒ 推迟到实例化期再展开
+pub var g_clause_param_names: []string;   // 全体 clause 形参名（N14：模板体在 parse 期无法展开）
 pub var g_spl_trace: i64 = 0;   // 追踪开关（排障时临时置 1）
 
 // 递归收集：array_lit 元素 / `++`(Concat) 两侧 / 常量名（回查其初始化器）/ 单条 clause
@@ -3308,6 +3322,9 @@ pub fn clause_collect(x: i64) void {
     if (ck == "ident") {
         var cinit: i64 = clause_const_init(base.node_sa((x as u64)));
         if (cinit >= 0) { clause_collect(cinit); return; }
+        // N14：名字是一个 clause **形参** ⇒ 组值要到调用点才知道，parse 期无从展开。
+        //   标记「推迟」并保持 g_spl_ok，由实例化后的那趟 desugar 接手（见 instantiate_generic）。
+        if (clause_param_name_is(base.node_sa((x as u64)))) { g_spl_defer = true; return; }
         g_spl_ok = false;
         return;
     }
@@ -3348,6 +3365,7 @@ pub fn clause_expand_splice(m: i64) void {
 
     g_spl_base = slice_len(g_spl_cl) as i64;
     g_spl_ok = true;
+    g_spl_defer = false;
     ki = 0;
     while (ki < slice_len(ks) as i64) {
         var it: i64 = base.kids[ks[ki]].val;
@@ -3362,6 +3380,9 @@ pub fn clause_expand_splice(m: i64) void {
         ki = ki + 1;
     }
     var spl_n: i64 = (slice_len(g_spl_cl) as i64) - g_spl_base;
+    // N14 推迟：模板体里的 `match (x) { G }`（G 是 clause 形参）此刻无从展开，
+    //   原样保留，等 instantiate_generic 生成实例后再补跑展开。
+    if (g_spl_defer) { return; }
     if (g_spl_ok == false or spl_n <= 0) {
         parse.fc_err("T-CLA-E723",
             "match 臂位置的子句组必须是 `clause` 或 `[N]clause`（含 `++` 合并结果）", m);
@@ -3437,6 +3458,17 @@ pub fn clause_expand_splice(m: i64) void {
     base.node_set_la((m as u64), ah);
 }
 
+// 类型节点是否指向 clause / [N]clause（脱糖期尚无 scope，故按类型节点的**结构**判，
+// 不走 resolve_ti）。供 N14「含 clause 形参 ⇒ 自动升为编译期函数」使用。
+// 数组类型节点的字段规格：`mk_array(na = 元素类型节点, nb = 长度节点, ti)`。
+pub fn type_node_is_clause(t: i64) bool {
+    if (t < 0) { return false; }
+    var k: string = base.node_kind((t as u64));
+    if (k == "named" and base.node_sa((t as u64)) == "clause") { return true; }
+    if (k == "array") { return type_node_is_clause(base.node_na((t as u64))); }
+    return false;
+}
+
 // ── N13 函数化：`fn f(x: T) R = G;` 的函数体脱糖 ─────────────────────────
 // 产出 block { return match (<形参#0>) { G }; }。
 //   · match 的臂链里直接放子句组表达式（**entry 索引**，同 parse_match_expr 的拼接位），
@@ -3504,7 +3536,41 @@ pub fn expr_is_clause_group(x: i64) bool {
 // 全节点扫描：对每个 `match` 节点尝试展开其臂链里的子句组拼接位。
 // 用「扫全池」而非递归遍历 —— 拼接位可能出现在任意深度，而节点池是平铺的，
 // 逐个判 kind 即可覆盖，且新生成的是 arm 节点（不是 match），不会漏也不会重入。
+// 名字是否是某个函数的 clause 形参（N14）
+pub fn clause_param_name_is(nm: string) bool {
+    var i: i64 = 0;
+    while (i < slice_len(g_clause_param_names) as i64) {
+        if (g_clause_param_names[i] == nm) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+// 扫描 decl_list，收集所有 clause 形参名（模板体在 parse 期展开不了，要靠这张表识别）
+pub fn clause_collect_param_names() void {
+    g_clause_param_names = [];
+    var n: i64 = slice_len(lex.decl_list) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        var d: i64 = lex.decl_list[i];
+        if (base.node_kind((d as u64)) == "FuncDecl") {
+            var ks: []i64 = base.kids_chain(base.node_lb((d as u64)));
+            var ki: i64 = 0;
+            while (ki < slice_len(ks) as i64) {
+                var pv: i64 = ks[ki];
+                if (type_node_is_clause(base.node_na((pv as u64)))) {
+                    append(g_clause_param_names, base.node_sa((pv as u64)));
+                }
+                ki = ki + 1;
+            }
+        }
+        i = i + 1;
+    }
+}
+
 pub fn desugar_clause_splices() void {
+    // 第〇步：建 clause 形参名表（N14：模板体的展开要推迟到实例化期）
+    clause_collect_param_names();
     // 第一步：展开所有 match 臂链里的子句组拼接位
     var nn: i64 = base.node_count();
     var i: i64 = 0;
