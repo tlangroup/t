@@ -19,6 +19,13 @@ static const DiagDef DIAG_DEFS[] = {
   { "T-ANN-E453", "error", "ANN", "T_MODIFIER_UNREGISTERED", "UNREGISTERED", "modifier is not registered" },
   { "T-ANN-E454", "error", "ANN", "T_MODIFIER_OBSOLETE", "OBSOLETE", "modifier is obsolete" },
   { "T-CDE-E910", "error", "CDE", "T_CGEN_TYPE_MISMATCH", "TYPE_MISMATCH_CGEN", "type_info supports struct only (codegen)" },
+  { "T-CLA-E720", "error", "CLA", "T_CLAUSE_BAD_FORM", "BAD_FORM", "malformed @clause literal (missing kind / pattern / body, or guard not introduced by `when`)" },
+  { "T-CLA-E721", "error", "CLA", "T_CLAUSE_UNKNOWN_KIND", "UNKNOWN_KIND", "unknown clause kind member; only ClauseKind members are valid" },
+  { "T-CLA-E722", "error", "CLA", "T_CLAUSE_PATTERN_KIND_MIX", "PATTERN_KIND_MIX", "clause group mixes incompatible pattern kinds (literal / constructor / wildcard)" },
+  { "T-CLA-E723", "error", "CLA", "T_CLAUSE_MERGE_TYPE", "MERGE_TYPE", "`++` operands must both be clause arrays with the same element type" },
+  { "T-CLA-E724", "error", "CLA", "T_CLAUSE_ESCAPE", "ESCAPE", "clause value escapes to runtime; clause exists only in the compile-time phase" },
+  { "T-CLA-E726", "error", "CLA", "T_CLAUSE_ARG_NOT_CONST", "ARG_NOT_CONST", "clause argument must be a compile-time foldable constant" },
+  { "T-CLA-W727", "warning", "CLA", "T_CLAUSE_SHADOWED", "SHADOWED", "clause is fully shadowed by an earlier unguarded clause" },
   { "T-CLO-E780", "error", "CLO", "T_CLOSURE_CAPTURE", "CAPTURE", "closure capture error" },
   { "T-CLO-E781", "error", "CLO", "T_CLOSURE_FN_ESCAPE", "CLOSURE_FN_ESCAPE", "comptime function escaped to runtime" },
   { "T-DER-E500", "error", "DER", "T_DERIVE_UNSUPPORTED", "UNSUPPORTED", "unsupported @derive trait" },
@@ -182,7 +189,7 @@ static const DiagDef DIAG_DEFS[] = {
   { "T-VEC-W927", "warning", "VEC", "T_VECTOR_WIDER_THAN_NATIVE", "VECTOR_WIDER_THAN_NATIVE", "vector is wider than the native SIMD register and will be split" },
   { "T-VEC-W947", "warning", "VEC", "T_TILE_WIDER_THAN_NATIVE", "TILE_WIDER_THAN_NATIVE", "hardware tile is wider than the native SIMD register and will fall back to scalar loops" },
 };
-#define DIAG_COUNT 169
+#define DIAG_COUNT 176
 
 /* legacy (old semantic name) -> machine code alias table */
 static const struct { const char* legacy; const char* code; } DIAG_LEGACY[] = {
@@ -192,6 +199,13 @@ static const struct { const char* legacy; const char* code; } DIAG_LEGACY[] = {
   { "T_MODIFIER_UNREGISTERED", "T-ANN-E453" },
   { "T_MODIFIER_OBSOLETE", "T-ANN-E454" },
   { "T_CGEN_TYPE_MISMATCH", "T-CDE-E910" },
+  { "T_CLAUSE_BAD_FORM", "T-CLA-E720" },
+  { "T_CLAUSE_UNKNOWN_KIND", "T-CLA-E721" },
+  { "T_CLAUSE_PATTERN_KIND_MIX", "T-CLA-E722" },
+  { "T_CLAUSE_MERGE_TYPE", "T-CLA-E723" },
+  { "T_CLAUSE_ESCAPE", "T-CLA-E724" },
+  { "T_CLAUSE_ARG_NOT_CONST", "T-CLA-E726" },
+  { "T_CLAUSE_SHADOWED", "T-CLA-W727" },
   { "T_CLOSURE_CAPTURE", "T-CLO-E780" },
   { "T_CLOSURE_FN_ESCAPE", "T-CLO-E781" },
   { "T_DERIVE_UNSUPPORTED", "T-DER-E500" },
@@ -342,7 +356,7 @@ static const struct { const char* legacy; const char* code; } DIAG_LEGACY[] = {
   { "T_VECTOR_WIDER_THAN_NATIVE", "T-VEC-W927" },
   { "T_TILE_WIDER_THAN_NATIVE", "T-VEC-W947" },
 };
-#define DIAG_LEGACY_COUNT 155
+#define DIAG_LEGACY_COUNT 162
 
 const DiagDef* diag_find(const char* code);        /* exact machine-code lookup */
 const DiagDef* diag_find_any(const char* id);      /* machine code OR legacy name */
