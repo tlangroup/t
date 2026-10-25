@@ -99,6 +99,8 @@ pub var g_c_builtins: string =
     + " ser_atom ser_bool ser_f64 ser_int ser_str signbit slice_append slice_append_sized slice_at slice_concat slice_from_raw slice_len slice_new slice_ptr slice_set slice_sub some splat str_at str_byte_at str_concat str_eq str_from_c str_len str_slice sym_intern sym_intern64 "
     + " sym_release sym_release_all sym_str sys_run time_invalid tll_deser_str tll_map_put to_string treduce_max "
     + " treduce_min treduce_mul treduce_sum tsplat unwrap vlen args stdin_eof exit "
+    + " arena_use_default arena_use_parse arena_use_front arena_use_back arena_use_func "
+    + " arena_reset_parse arena_reset_front arena_reset_back arena_reset_func dbg_report_mem "
     // 数学内建（math_mbuiltin）：用户码以裸名调用，运行库导出 t_math_<name>。
     + " acos acosf asin asinf atan atanf cbrt cbrtf ceil ceilf cos cosf cosh coshf exp expf fabs fabsf floor floorf "
     + " fmod fmodf hypot hypotf log logf pow powf round roundf sin sinf sinh sinhf sqrt sqrtf tan tanf tanh tanhf "
@@ -112,7 +114,9 @@ pub var g_c_void_builtins: string =
     + " sb_append_fmt_char sb_append_fmt_float sb_append_fmt_int sb_append_fmt_int_conv "
     + " sb_append_fmt_str sb_append_fmt_str_conv sb_append_fmt_uint sb_append_fmt_uint_conv "
     + " sb_append_i64 sb_append_str sb_append_u64 sb_clear sb_free slice_append slice_append_sized "
-    + " slice_set sym_release sym_release_all ";
+    + " slice_set sym_release sym_release_all "
+    + " arena_use_default arena_use_parse arena_use_front arena_use_back arena_use_func "
+    + " arena_reset_parse arena_reset_front arena_reset_back arena_reset_func dbg_report_mem ";
 // 数学内建：用户裸名调用，运行库导出 t_math_<name>。
 pub var g_c_math_builtins: string =
     " acos acosf asin asinf atan atanf atan2 atan2f cbrt cbrtf ceil ceilf cos cosf cosh coshf exp expf exp2 exp2f expm1 expm1f "
@@ -1137,6 +1141,18 @@ pub fn c_is_user_func(callee: string) bool {
     }
     return false;
 }
+// 是否为「链接库外部函数」（is_extern，定义在 .tlib 归档里）。
+// 这类函数在 C 侧既无函数体、也**不带 t_ 前缀**（t_ 只标记运行库内建），
+// 故 c_callee 必须按重整裸名调用、前向声明循环必须为其发 extern 声明。
+pub fn c_is_extern_func(nm: string) bool {
+    var i: i64 = 0;
+    var n: i64 = slice_len(g_c_extern_names) as i64;
+    while (i < n) {
+        if (g_c_extern_names[i] == nm or g_c_extern_names[i] == c_fn_name(nm)) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
 // 调用名 → C 函数名基名：剥离 tll_/t_ 前缀与 '@' 全局前缀，得到运行库内建基名（"map_new"/"println"…）。
 // 用于内建集合判定与 void 判定（IR 中内建可能以 tll_* 形式出现）。
 pub fn c_cbase(name: string) string {
@@ -1598,6 +1614,9 @@ pub fn c_call_cname(callee: string) string {
     if (cb2 == "sys_run") { return "t_system"; }   // 运行库导出 t_system(TStr)；对齐 LLVM 后端的 tll_system 特例映射（C 轨无 tll_* shim）
     if (c_is_builtin(callee)) { return base.sb_cat2("t_", callee); }
     if (c_is_user_func(callee)) { return c_fn_name(base.sb_cat2("@", callee)); }
+    // ⚠ 链接模式（阶段 C）：外部库函数的归档导出符号就是重整裸名（math__log），
+    //   `t_` 前缀只属于运行库内建；加前缀会与 .tlib 符号对不上 ⇒ 链接期 undefined symbol。
+    if (c_is_extern_func(cb2)) { return c_fn_name(callee); }
     return base.sb_cat2("t_", callee);
 }
 // C 字符串字面量转义（双引号 / 反斜杠 / 控制字符）。
@@ -1624,6 +1643,8 @@ pub fn c_is_tstr_st(st: i64) bool {
 
 // ── 模块级 CFG / 聚合状态 ────────────────────────────────────
 pub var g_c_mod: TMIRModule;
+// 链接模式外部库函数名（is_extern）：来自 .tlib 归档，C 侧按重整裸名调用（无 t_ 前缀）。
+pub var g_c_extern_names: []string;
 pub var g_cf: TMIRFunc;
 pub var g_c_addr_slot_name: []string;   // 地址槽名（unsigned char* 指针声明）
 pub var g_c_addr_name: []string;        // 地址槽名（load/store 元素类型表）
@@ -2059,6 +2080,16 @@ pub fn c_ti_emit_global(sb: StringBuilder, tname: string) void {
 
 pub fn tmir_to_c(m: TMIRModule) string {
     g_c_mod = m;
+    // 链接模式（阶段 C）：登记外部库函数名，供 c_callee 判定「调用不带 t_ 前缀的归档符号」。
+    g_c_extern_names = [];
+    {
+        var efi: i64 = 0;
+        var efn: i64 = slice_len(m.funcs) as i64;
+        while (efi < efn) {
+            if (m.funcs[efi].is_extern) { append(g_c_extern_names, base.str_persist(c_fn_name(m.funcs[efi].name))); }
+            efi = efi + 1;
+        }
+    }
     g_c_func_idx_built = false; c_build_func_index();   // O(1) 名→索引表：消除 c_func_find 的 O(insts×funcs) 分配放大
     g_c_type_body_built = false; c_build_type_index();   // O(1) 名→体查表：消除 c_find_type_body 的 O(insts×types) 扫描放大
     g_c_global_idx_built = false; c_build_global_index();   // O(1) 名→索引表：消除 c_global_st 的 O(insts×globals) 扫描放大
@@ -2171,7 +2202,11 @@ pub fn tmir_to_c(m: TMIRModule) string {
         while (fdi < nfd) {
             var ff: TMIRFunc = m.funcs[fdi];
             if (c_is_builtin(c_strip_suf(ff.name))) { fdi = fdi + 1; continue; }   // 内建：运行库提供，不前向声明
-            if (slice_len(ff.blocks) as i64 == 0) { fdi = fdi + 1; continue; }
+            // ⚠ 链接模式（阶段 C）：外部库函数（is_extern，体在 .tlib 归档里）本模块无体，
+            //   但**必须前向声明**，否则 C 侧 "call to undeclared function"（实测 t_math__log 等 20 处）。
+            //   此前 `blocks==0 ⇒ continue` 把它们一并跳过 ⇒ 声明全丢。
+            var ff_ext: bool = ff.is_extern;
+            if (ff_ext == false and slice_len(ff.blocks) as i64 == 0) { fdi = fdi + 1; continue; }
             var fismain: bool = (ff.is_main or ff.name == "main" or ff.name == "@main");
             var ffname: string = c_fn_name(ff.name);
             if (fismain) { ffname = "t_main"; }
@@ -2182,7 +2217,9 @@ pub fn tmir_to_c(m: TMIRModule) string {
             else if (ff.ret_st != "") { fret = c_tystr_c(ff.ret_st); }
         }
         if (f_sret) { fret = "void"; }
-            if (fismain) { sb_append_str(sb, fret); } else { sb_append_str(sb, "static "); sb_append_str(sb, fret); }
+            // 外部库函数：定义由链接期 .tlib 归档提供 ⇒ 声明为 extern（不可 static，否则与归档符号冲突）。
+            if (ff_ext) { sb_append_str(sb, "extern "); sb_append_str(sb, fret); }
+            else if (fismain) { sb_append_str(sb, fret); } else { sb_append_str(sb, "static "); sb_append_str(sb, fret); }
             sb_append_str(sb, " "); sb_append_str(sb, ffname); sb_append_str(sb, "(");
             if (f_sret) { sb_append_str(sb, "unsigned char* __sret"); }
             var fp: i64 = 0;
@@ -3245,8 +3282,11 @@ pub fn c_emit_inst(sb: StringBuilder, ins: TMIRInst) void {
                 // 字段是「用户聚合」（嵌套 struct/数组/vector）或「指向用户聚合的指针」（GEP 入嵌套字段
                 // 得到 ptr<%Agg>，pointee 是用户聚合）→ 按聚合尺寸 memcpy，而非别名 8B 指针
                 // （agent_npc_mind 的 intent_dir / Position 字段被写崩、读到堆地址的根因）。
-                if (c_starts(_dstf, "%") and c_is_enum_ty(_dstf) == false and c_is_runtime_struct_st(_dstf) == false) { _dst_agg = true; }
-                if (c_starts(_dst_inner, "%") and c_is_enum_ty(_dst_inner) == false and c_is_runtime_struct_st(_dst_inner) == false and c_starts(_dst_inner, "ptr<") == false) { _dst_agg = true; }
+                // ⚠ 运行库结构体字段（TStr/TSlice/TClosure/TBitStr，GEP 入字段得 ptr<%TSlice> 等）也须
+                //   纳入 _dst_agg：g.xs=[] 源是空切片缓冲地址，若剔除会裸别名 8B 指针 → 不拷 TSlice.len
+                //   （hir_reset 的 node_to_hir=[] 残留 → 复用脱糖期缓存 HIR_OP_FN_DECL → T-SEM-E200）。
+                if (c_starts(_dstf, "%") and c_is_enum_ty(_dstf) == false) { _dst_agg = true; }
+                if (c_starts(_dst_inner, "%") and c_is_enum_ty(_dst_inner) == false and c_starts(_dst_inner, "ptr<") == false) { _dst_agg = true; }
                 if (c_starts(_dstf, "[") or c_is_arr(_dstf) or c_is_arr(_dst_inner) or c_is_vec(_dstf)) { _dst_agg = true; }
                 if (_dst_agg) {
                     // ⚠ 运行库结构体字段（TStr/TSlice/TClosure/TBitStr，含 GEP 结果 ptr<%TStr>）：其尺寸

@@ -288,7 +288,17 @@ pub fn tir_st_intern(s: string) i64 {
         if (g_st_pool[i] == s) { return ST_NAMED_BASE + i; }
         i = i + 1;
     }
-    append(g_st_pool, s);
+    // ⚠ 代际分配器（2026-10-22）：类型拼写池 g_st_pool 及其元素必须常驻 g_arena。
+    // 否则 backing 或元素串落 g_func，会被 arena_reset_func 回收 → tir_st_to_str 读到悬垂指针
+    // → emit-ll 阶段（pass-1 扫命名类型 / pass-2 重降级）访问 decommitted 页 → 段错误。
+    // (1) 把元素串逃逸提升到 g_arena（str_persist 拷贝 + 切 g_arena）；(2) append 前切 g_arena
+    // 使 backing 也落 g_arena；(3) 还原 arena 到调用方上下文（与包裹式持久 append 同口径，
+    // 见 base.g_relowering_scratch_func：lower_unit 期还原 g_arena，emit 重降级期还原 g_func）。
+    if (base.g_relowering) { arena_use_default(); }
+    append(g_st_pool, base.str_persist(s));
+    if (base.g_relowering) {
+        if (base.g_relowering_scratch_func) { arena_use_func(); } else { arena_use_default(); }
+    } else { arena_use_default(); }
     return ST_NAMED_BASE + (slice_len(g_st_pool) as i64) - 1;
 }
 
@@ -442,6 +452,28 @@ pub var g_cur_func: TIRFunc;
 pub var g_cur_line: u64;
 pub var g_term: bool = false;       // 当前基本块是否已终止（ret/br 之后不再发射指令）
 pub var g_recording_mir: bool = false;  // mir 录制开关（仅 tmir 后端路径开启；TIR 发射期并行录制 pre-TIR MIR）
+// ⚠ 代际分配器（2026-10-22）：emit 阶段逐函数重降级标志。置 true 时 lower_unit 对 FuncDecl
+// 只降级「签名 + 空体」进 g_arena（g_mod.funcs 恒持久），函数体本身推迟到 emit 阶段逐函数
+// 重降级进 g_func 本块 arena（用完即 arena_reset_func 回收）。这样 emit 峰值从「语义图地板 +
+// 全模块函数体」降为「语义图地板 + 单函数体」——这是压低 emit-ll src/tc.tc 峰值的唯一杠杆
+// （函数体是唯一可随 emit 推进逐块回收的大宗瞬态；模块级类型表/符号/字符串是真实持久地板）。
+// 仅 LLVM（tir_to_ll_emit）路径启用；tmir-c 后端消费 g_mod/g_mir 真实体，须保持 base.g_relowering=false。
+// ⚠ 代际分配器：与 g_mod.funcs 等长的「重降级 decl 索引」表（仅 base.g_relowering 时构建）。
+// 每位 = 对应 g_mod.funcs[fi] 的来源 FuncDecl 节点，或 -1（extern / ginit / 变体合成函数等
+// 真实体须跨阶段持久、不可重降级）。emit pass-2 据此区分「需重降级」与「直接用 module 真实体」。
+pub var g_relowering_decls: []i64 = [];
+// ⚠ 代际分配器：tir_append_cur_func 调用前由 driver 写入「当前函数的重降级 decl 索引」；
+// >=0 ⇒ FuncDecl（追加空体 + 记 decl）；-1 ⇒ 非 FuncDecl（追加真实体、不重降级）。
+pub var g_cur_relower_decl: i64 = -1;
+// ⚠ 代际分配器：emit 重降级调用 tir_lower_func 时置 true，抑制其向 g_mod.funcs 追加
+// （体已由 g_cur_func 持有、直接供 emit 消费，避免重复追加/悬垂）。
+pub var g_lower_suppress_append: bool = false;
+// ⚠ 代际分配器（2026-10-22）：包裹式「持久 append」的还原目标 arena 标志。
+// lower_unit 期 = false ⇒ 还原到 g_arena（默认持久区）——保证 g_mod.funcs / g_relowering_decls
+//   及变体·ginit 真实函数体落在 g_arena，跨 emit 的 arena_reset_func() 不被回收/覆盖；
+// emit 重降级期 = true ⇒ 还原到 g_func（scratch）——保证重降级 FuncDecl 体落在 g_func，
+//   emit 后立即 arena_reset_func() 收得回（峰值 ≈ 语义图地板 + 单函数体）。
+// 若不区分：lower_unit 的包裹还原会切到 g_func，使上述持久结构随 emit 首次 reset 被覆盖 → 段错误。
 pub var g_mir: TIRModule;                // 录制得到的 pre-TIR 线性 MIR（与 g_mod 平行，仅函数体由 tir_emit 录制）
 pub var g_mir_cur: TIRFunc;             // 当前函数的 MIR 录制缓冲
 
@@ -486,6 +518,12 @@ pub var g_match_scrut: i64 = -1;
 
 // ── 模块级全局变量（Stage 4 降级目标，解锁 func_type/lambda/map 全局等示例）──
 pub var g_globals_section: StringBuilder;   // 缓冲 `globals:` 段文本（@name ST 每行）
+// 阶段 C 多进程自举：被跳过的「链接库模块全局」登记表（同格式文本 `  @name ST`）。
+// 这些全局的定义由链接期 .tlib 归档提供，本模块只须声明 external；此前完全不登记，
+// 只有「经 ll_load/ll_store 惰性登记」的引用点位能拿到 external 声明，
+// 而内建直发路径（append / slice_set 等直接以内联文本取全局地址）不经过登记
+// ⇒ clang: use of undefined value '@base__g_trivia_toks'。故在此统一登记。
+pub var g_link_globals_section: StringBuilder;
 pub var g_global_names: []string;            // 顶层全局变量名（与下行并行）
 pub var g_global_fnval: []bool;              // 是否函数值（%TClosure）全局
 pub var g_global_map: []bool;                // 是否 map 全局（需 ginit 运行期建表）
@@ -533,6 +571,7 @@ pub fn tir_reset() void {
     var zvt: [][]i64 = [];
     g_vf_tds = zvt;
     g_globals_section = sb_new();
+    g_link_globals_section = sb_new();
     g_global_names = [];
     g_global_fnval = [];
     g_global_map = [];
@@ -1792,6 +1831,10 @@ pub fn tir_annotate_types(mod: string) void {
 pub fn lower_unit(mod: string, source: string) void {
     tir_reset();
     tir_verify_init();
+    // ⚠ 代际分配器：lower_unit 全程在 g_arena（持久区）作业——保证 g_mod.funcs / g_relowering_decls
+    // 及变体·ginit 真实函数体落在 g_arena，跨 emit 的 arena_reset_func() 不被回收/覆盖。
+    // 包裹式持久 append 的还原目标 = g_arena（见 base.g_relowering_scratch_func）。
+    base.g_relowering_scratch_func = false;
     if (g_recording_mir) { g_mir = TIRModule{ mod: mod, source: source, types: [], strings: [], funcs: [], globals: [] }; }
     g_mod.mod = mod;
     g_mod.source = source;
@@ -1907,12 +1950,17 @@ pub fn lower_unit(mod: string, source: string) void {
                 } else if (base.node_ba((d as u64))) {
                     tir_emit_extern(d);
                 } else {
-                    tir_lower_func(d);
+                    // ⚠ 代际分配器：base.g_relowering 模式下 FuncDecl 只降级签名（空体），函数体推迟到
+                    // emit 阶段逐函数重降级进 g_func 本块 arena（用完即扔）；非重降级模式走完整降级。
+                    g_cur_relower_decl = d;
+                    if (base.g_relowering) { tir_lower_func_sig(d); } else { tir_lower_func(d); }
                 }
             }
         }
         j = j + 1;
     }
+    // ⚠ 代际分配器：变体 ADT 合成函数（构造器/判别器/取载荷）是真实体、须跨阶段持久，不重降级。
+    g_cur_relower_decl = -1;
     // 变体 ADT：type-table + 构造器在 func 降级之后发射（paymax 需类型系统完全解析，见上方注释）。
     // 直接内联于 lower_unit：base 节点侧表 / base.kids 以全局方式访问，规避跨模块全局快照 bug。
     var vf_keys: []string = g_vf_keys;
@@ -1921,6 +1969,11 @@ pub fn lower_unit(mod: string, source: string) void {
     while (iv < n) {
         var dv: i64 = lex.decl_list[iv];
         if (base.node_kind((dv as u64)) == "VariantDecl") {
+            // 阶段 C 多进程自举：链接库模块的 VariantDecl 只须「类型信息」，不得重复合成 ADT 助手
+            // （_from_ / _is_ / _as_）—— 本模块合成体与 .tlib 内同名定义撞 →
+            // lld-link duplicate symbol（实测 base__TypeInfo_from_Int 等 12 个 × 每个模块一份；
+            // 各模块 defines=12 calls=0，纯冗余）。定义统一由 .tlib 归档提供，调用方走 declare。
+            if (base.node_mod(dv) != "" and lex.in_link_libs(base.node_mod(dv))) { iv = iv + 1; continue; }
             var vname: string = base.node_sa((dv as u64));
             // 复用 func 降级前「预注册 pass」算好的变体真实尺寸（g_var_names/g_var_sizes），
             // 保证 %V 类型体 { i64, [mx x i8] } 与切片 elem_size 逐字节一致（步长错 → 段错误）。
@@ -2000,8 +2053,7 @@ pub fn lower_unit(mod: string, source: string) void {
                     fi3 = fi3 + 1;
                 }
                 tir_emit(TIRInst{ op: TIR_OP_RET_VOID, st: ST_NONE, dst: tir_op(""), args: tir_a0(), is_comment: false, line: g_cur_line, cmt: "" });
-                if (g_recording_mir) { g_mir_cur.params = g_cur_func.params; append(g_mir.funcs, g_mir_cur); }
-    append(g_mod.funcs, g_cur_func);
+                tir_append_cur_func();
                 // ── 判别器 Name_is_Case(self: V) -> bool(i8) ──
                 // LLVM 后端消费 g_mod 但此前只发射 _from_ 构造器，缺 _is_/_as_ 函数体
                 // → 调用处仅 declare 不 define → 链接期 undefined symbol。C 后端走 legacy
@@ -2023,8 +2075,7 @@ pub fn lower_unit(mod: string, source: string) void {
                     tir_emit(TIRInst{ op: TIR_OP_EQ, st: tir_st_from_str("i1"), dst: tir_op("$eq"), args: tir_a2("$tv", "$cv"), is_comment: false, line: g_cur_line, cmt: "" });
                     tir_emit(TIRInst{ op: TIR_OP_ZEXT, st: tir_st_from_str("i8"), dst: tir_op("$rb"), args: tir_a1("$eq"), is_comment: false, line: g_cur_line, cmt: "" });
                     tir_emit(tir_emit_ret("i8", "$rb"));
-                    if (g_recording_mir) { g_mir_cur.params = g_cur_func.params; append(g_mir.funcs, g_mir_cur); }
-                    append(g_mod.funcs, g_cur_func);
+                    tir_append_cur_func();
                 }
                 // ── 取载荷：单载荷 Name_as_Case(self)->Payload；多载荷 Name_as_Case_fK(self)->FieldK ──
                 // ⚠ 单/多载荷判定以「实际载荷字段数 nf2」为准（与 _from_ 构造器、conpat_walk
@@ -2049,8 +2100,7 @@ pub fn lower_unit(mod: string, source: string) void {
                             tir_emit(TIRInst{ op: TIR_OP_BITCAST, st: tir_st_from_str(base.sb_cat3("ptr<", afst, ">")), dst: tir_op("$fpp"), args: tir_a1("$fp"), is_comment: false, line: g_cur_line, cmt: "" });
                             tir_emit(TIRInst{ op: TIR_OP_LOAD, st: tir_st_from_str(afst), dst: tir_op("$pv"), args: tir_a1("$fpp"), is_comment: false, line: g_cur_line, cmt: "" });
                             tir_emit(tir_emit_ret(afst, "$pv"));
-                            if (g_recording_mir) { g_mir_cur.params = g_cur_func.params; append(g_mir.funcs, g_mir_cur); }
-                            append(g_mod.funcs, g_cur_func);
+                            tir_append_cur_func();
                             aoff = aoff + tir_size_bytes(aftd);
                             afi = afi + 1;
                         }
@@ -2067,8 +2117,7 @@ pub fn lower_unit(mod: string, source: string) void {
                         tir_emit(TIRInst{ op: TIR_OP_BITCAST, st: tir_st_from_str(base.sb_cat3("ptr<", ast, ">")), dst: tir_op("$fpp"), args: tir_a1("$fp"), is_comment: false, line: g_cur_line, cmt: "" });
                         tir_emit(TIRInst{ op: TIR_OP_LOAD, st: tir_st_from_str(ast), dst: tir_op("$pv"), args: tir_a1("$fpp"), is_comment: false, line: g_cur_line, cmt: "" });
                         tir_emit(tir_emit_ret(ast, "$pv"));
-                        if (g_recording_mir) { g_mir_cur.params = g_cur_func.params; append(g_mir.funcs, g_mir_cur); }
-                        append(g_mod.funcs, g_cur_func);
+                        tir_append_cur_func();
                     }
                 }
                 cc2_ki = cc2_ki + 1;
@@ -2079,11 +2128,13 @@ pub fn lower_unit(mod: string, source: string) void {
     // 模块级全局变量降级：元数据（g_global_names 等）必须在函数体发射前收集，
     // 否则 tir_emit_call 判定全局函数值变量（走 call_ind）时 g_global_names 尚为空 → 直调崩溃。
     // t.__ginit 初始化函数仍在末尾追加（函数体顺序无关，翻译器统一收集）。
-    // 预编译库模式（build --lib）跳过：进程级全局初始化由主程序（导入方）提供一份，
-    // 库内若再定义 t.__ginit 会与导入方重复定义冲突（对齐 legacy codegen_ll.emit_llunit
-    // 的 `if (lex.g_lib_emit == false) { emit_llginit(); }`）。
-    if (lex.g_lib_emit == false) {
-        tir_emit_ginit();
+    // 预编译库模式（build --lib）：每个模块发射独立 ginit（t_ginit_<mangled idn>），
+    // 由导入方 main 包裹器按 g_link_libs 逐库 declare + call，根治 §4.14.7 全局初始化断裂。
+    // 入口模式（非 lib）：沿用旧语义发射 t.__ginit（无全局时由 tir_to_ll main 包裹器补空兜底）。
+    if (lex.g_lib_emit) {
+        tir_emit_ginit(tir_ginit_sym(lex.g_lib_mod_idn), true);
+    } else {
+        tir_emit_ginit("t.__ginit", false);
     }
 }
 
@@ -2099,7 +2150,29 @@ pub fn tir_emit_globals() void {
         // 否则与 .tlib 同名符号重复定义（duplicate symbol: math__PI / math__E / math__TAU …）。
         // 入口模块节点 g_node_mod == ""，src 内联导入节点的 g_node_mod 非空但不在 g_link_libs，
         // 二者均正常内联；仅「链接库」模块的全局跳过（其函数体由 tir_to_ll 走 external declare + 链接 .tlib）。
-        if (base.node_mod(d) != "" and lex.in_link_libs(base.node_mod(d))) { i = i + 1; continue; }
+        if (base.node_mod(d) != "" and lex.in_link_libs(base.node_mod(d))) {
+            // ⚠ 跳过 ≠ 不声明：链接库全局须登记进 g_link_globals_section，
+            // 由 tir_to_ll pass-1 统一注册为 external 声明（定义由 .tlib 提供）。
+            // 否则仅「经 ll_load/ll_store 惰性登记」的引用点有声明，内建直发路径
+            // （append 等直接内联 `@g` 文本）漏声明 → LLVM "use of undefined value"。
+            var lk: string = base.node_kind((d as u64));
+            if (lk == "var_decl" or lk == "GlobalVarDecl" or lk == "GlobalConstDecl") {
+                var lnm: string = base.node_sa((d as u64));
+                var lt: i64 = -1;
+                if (base.node_na((d as u64)) >= 0) { lt = sema.resolve_type_desc(base.node_na((d as u64))); }
+                var lst: string = "i64";
+                if (lt >= 0) {
+                    if (sema.tds[lt].cat == "func") { lst = "%TClosure"; }
+                    else { lst = tir_st_of_td(lt); }
+                }
+                sb_append_str(g_link_globals_section, "  @");
+                sb_append_str(g_link_globals_section, lnm);
+                sb_append_str(g_link_globals_section, " ");
+                sb_append_str(g_link_globals_section, lst);
+                sb_append_str(g_link_globals_section, "\n");
+            }
+            i = i + 1; continue;
+        }
         if (base.node_kind((d as u64)) != "var_decl" and base.node_kind((d as u64)) != "GlobalVarDecl" and base.node_kind((d as u64)) != "GlobalConstDecl") { i = i + 1; continue; }
         var nm: string = base.node_sa((d as u64));
         var t: i64 = -1;
@@ -2186,13 +2259,35 @@ pub fn tir_global_fnval_td(name: string) i64 {
     return -1;
 }
 
-// 发射 t.__ginit 函数：运行期初始化各全局（函数值闭包 / map 建表 / 标量常量）。
-// 仅当存在全局时生成；翻译器 main 包装器会调用之。
-pub fn tir_emit_ginit() void {
-    if (slice_len(g_global_names) as i64 == 0) { return; }
+// 由模块身份（idn，如 "src.base" / "json"）推导其独立 ginit 符号名。
+// '.' → '_'（C 标识符不允许 '.'，且 LLVM 亦无需 '.'），前缀 t_ginit_。
+// 必须与 tir_to_ll main 包裹器（入口侧）的同名推导逐字节一致，否则 declare/call 符号对不上 → 链接失败。
+pub fn tir_ginit_sym(idn: string) string {
+    var sb: StringBuilder = sb_new();
+    sb_append_str(sb, "t_ginit_");
+    var i: i64 = 0;
+    var n: i64 = str_len(idn);
+    while (i < n) {
+        var c: string = str_slice(idn, i, i + 1);
+        if (c == ".") { sb_append_str(sb, "_"); }
+        else { sb_append_str(sb, c); }
+        i = i + 1;
+    }
+    return sb_to_str(sb);
+}
+
+// 发射模块初始化函数：运行期初始化各全局（函数值闭包 / map 建表 / 标量常量）。
+// name：函数符号名。always_emit：库模式恒发射（即便空体），保证导入方 main 调用该符号时
+//   链接不缺定义；入口模式（false）沿用旧语义——无全局时跳过（由 tir_to_ll main 包裹器补空 t.__ginit 兜底）。
+// 这是 §4.14.7 根治：build --lib 此前跳过 t.__ginit，导致链接库全局初值恒零（如编译器自身
+// `pub var g_comptime_full: bool = true` 被读成 false）。现每个模块发射独立 ginit（t_ginit_<idn>），
+// 由导入方 main 包裹器按 g_link_libs 逐库 declare + call。
+pub fn tir_emit_ginit(name: string, always_emit: bool) void {
+    g_cur_relower_decl = -1;   // ginit 真实体须持久，不重降级
+    if (always_emit == false and slice_len(g_global_names) as i64 == 0) { return; }
     var eb: []TIRInst = [];
     var gpp: []string = [];
-    g_cur_func = TIRFunc{ name: "t.__ginit", params: gpp, ret_st: "void", body: eb, is_extern: false, is_kernel: false, is_main: false };
+    g_cur_func = TIRFunc{ name: name, params: gpp, ret_st: "void", body: eb, is_extern: false, is_kernel: false, is_main: false };
     g_term = false;
     g_cur_line = 0;
     // ⚠ 录制路径（tmir 后端）必须重置 g_mir_cur，否则 ginit 指令会续写上一个函数的
@@ -2231,7 +2326,9 @@ pub fn tir_emit_ginit() void {
                 if (gsymtd >= 0 and sema.tds[gsymtd].cat == "sym" and base.node_kind((nb as u64)) == "string") {
                     var valslotr: TirEmitRes = tir_emit_expr(nb); var valslot: string = valslotr.name;
                     var tagid: i64 = slice_len(g_mod.strings) as i64;
+                    if (base.g_relowering) { arena_use_default(); }
                     append(g_mod.strings, sema.tds[gsymtd].name);
+                    if (base.g_relowering) { if (base.g_relowering_scratch_func) { arena_use_func(); } else { arena_use_default(); } }
                     var tagslot: string = tir_tmp();
                     tir_emit(tir_emit_const_str(tagslot, base.i2s(tagid)));
                     var bitsslot: string = tir_tmp();
@@ -2308,14 +2405,19 @@ pub fn tir_emit_ginit() void {
         i = i + 1;
     }
     tir_emit(tir_emit_ret_void());
-    if (g_recording_mir) { g_mir_cur.params = g_cur_func.params; append(g_mir.funcs, g_mir_cur); }
-    append(g_mod.funcs, g_cur_func);
+    tir_append_cur_func();
 }
 
 pub fn tir_emit_extern(d: i64) void {
+    g_cur_relower_decl = -1;   // extern 真实体须持久，不重降级
     var ep: []string = [];
     var eb: []TIRInst = [];
     g_cur_func = TIRFunc{ name: base.node_sa((d as u64)), ret_st: tir_st_of_td(tir_func_ret_td(d)), params: ep, body: eb, is_extern: true, is_kernel: false, is_main: false };
+    // ⚠ 阶段 C 多进程/链接模式：extern 函数同样是一次「新函数开始」，必须重置 MIR 录制缓冲。
+    //   漏重置 ⇒ tir_append_cur_func 把上一个函数的 g_mir_cur（名不同、参数被刷新）当作本函数
+    //   追加进 g_mir.funcs ⇒ C 后端前向声明全部写成同一个名字（实测 std.math 的数十个函数
+    //   全被声明成 `int t_main(<各自签名>)`）⇒ clang: conflicting types for 't_main'。
+    if (g_recording_mir) { g_mir_cur = TIRFunc{ name: g_cur_func.name, ret_st: g_cur_func.ret_st, params: g_cur_func.params, body: [], is_extern: g_cur_func.is_extern, is_kernel: g_cur_func.is_kernel, is_main: g_cur_func.is_main }; }
     g_cur_ret_td = tir_func_ret_td(d);
     var c: i64 = base.node_lb((d as u64));
     // S4 §4.6 Phase 3：链先物化再遍历 —— 纯读取循环，与原手写链遍历逐点同序
@@ -2327,8 +2429,7 @@ pub fn tir_emit_extern(d: i64) void {
         append(g_cur_func.params, base.sb_cat4("$", base.node_sa((c_kv as u64)), ": ", pst));
         c_ki = c_ki + 1;
     }
-    if (g_recording_mir) { g_mir_cur.params = g_cur_func.params; append(g_mir.funcs, g_mir_cur); }
-    append(g_mod.funcs, g_cur_func);
+    tir_append_cur_func();
 }
 
 pub fn tir_func_ret_td(d: i64) i64 {
@@ -2356,7 +2457,32 @@ pub fn tir_ann_has(head: i64, name: string) bool {
     return false;
 }
 
+// ⚠ 代际分配器（2026-10-22）：base.g_relowering 安全追加当前降级函数到 g_mod.funcs。
+// 重降级（emit 逐函数）时函数体在 g_func 本块 arena（用完即扔），若原样追加会留下悬垂
+// 体指针（arena_reset_func 后）；故 FuncDecl（g_cur_relower_decl>=0）追加「空体元数据」副本，
+// 而真实体须持久者（ginit / 变体合成函数，g_cur_relower_decl==-1）仍追加 g_cur_func 全量。
+// 非重降级（lower_unit 模块级）走原样追加（体在 g_arena，跨阶段持久）。
+pub fn tir_append_cur_func() void {
+    if (g_recording_mir) { g_mir_cur.params = g_cur_func.params; append(g_mir.funcs, g_mir_cur); }
+    if (base.g_relowering) {
+        append(g_relowering_decls, g_cur_relower_decl);
+        if (g_cur_relower_decl >= 0) {
+            append(g_mod.funcs, TIRFunc{ name: g_cur_func.name, ret_st: g_cur_func.ret_st, params: g_cur_func.params, body: [], is_extern: g_cur_func.is_extern, is_kernel: g_cur_func.is_kernel, is_main: g_cur_func.is_main });
+        } else {
+            append(g_mod.funcs, g_cur_func);
+        }
+    } else {
+        append(g_mod.funcs, g_cur_func);
+    }
+}
+
 pub fn tir_lower_func(d: i64) void {
+    // ⚠ 代际分配器（2026-10-22）：本函数 arena-agnostic —— 函数体落「当前 arena」。
+    //   · emit 阶段逐函数重降级时，调用方先 arena_use_func()（切 g_func 本块）再调用本函数，
+    //     体落 g_func，降级完 arena_reset_func() 整体回收，压低峰值；
+    //   · lower_unit 模块级降级时当前 arena = g_arena，体落 g_arena（跨阶段持久）。
+    // 模块级持久 slice（g_mod.strings/types/globals）经下方 4 处 append 的 base.g_relowering 感知
+    // 切换恒落 g_arena，跨函数回收后不悬垂（见各站点注释）。
     var fp: []string = [];
     var fb: []TIRInst = [];
     g_cur_func = TIRFunc{ name: base.node_sa((d as u64)), ret_st: tir_st_of_td(tir_func_ret_td(d)), params: fp, body: fb, is_extern: false, is_kernel: false, is_main: tir_ann_has(base.node_la((d as u64)), "main") };
@@ -2440,8 +2566,36 @@ pub fn tir_lower_func(d: i64) void {
             tir_emit(tir_emit_ret(g_cur_func.ret_st, z));
         }
     }
-    if (g_recording_mir) { g_mir_cur.params = g_cur_func.params; append(g_mir.funcs, g_mir_cur); }
-    append(g_mod.funcs, g_cur_func);
+    // ⚠ 代际分配器：emit 逐函数重降级时（g_lower_suppress_append）不向 g_mod.funcs 追加，
+    // 体由 g_cur_func 持有直接供 emit 消费（避免重复追加）；其余路径正常追加。
+    if (g_lower_suppress_append == false) { tir_append_cur_func(); }
+}
+
+// ⚠ 代际分配器（2026-10-22）：签名级降级——只产出 FuncDecl 的「签名 + 空体」元数据进 g_arena，
+// 函数体推迟到 emit 阶段逐函数重降级（tir_lower_func + arena_use_func/arena_reset_func）。
+// 仅在 base.g_relowering 模式由 lower_unit 调用，代替完整 tir_lower_func（省去全函数体降级开销，
+// 且不把体落 g_arena）。参数收集与闭包 env 首参逻辑与 tir_lower_func 保持一致，确保签名等价。
+pub fn tir_lower_func_sig(d: i64) void {
+    var fp: []string = [];
+    g_cur_func = TIRFunc{ name: base.node_sa((d as u64)), ret_st: tir_st_of_td(tir_func_ret_td(d)), params: fp, body: [], is_extern: false, is_kernel: false, is_main: tir_ann_has(base.node_la((d as u64)), "main") };
+    // ⚠ 同 tir_emit_extern：新函数开始须同步 MIR 录制缓冲，避免把上一个函数的 g_mir_cur 追加进来。
+    if (g_recording_mir) { g_mir_cur = TIRFunc{ name: g_cur_func.name, ret_st: g_cur_func.ret_st, params: g_cur_func.params, body: [], is_extern: g_cur_func.is_extern, is_kernel: g_cur_func.is_kernel, is_main: g_cur_func.is_main }; }
+    g_cur_ret_td = tir_func_ret_td(d);
+    // 闭包合成函数（M48）：lambda 提升出的 FuncDecl 携带环境结构名时前置 env 首参（与 TClosure ABI 一致）。
+    if (base.node_sc((d as u64)) == "__lambda__" and str_len(base.node_sb((d as u64))) > 0) {
+        append(g_cur_func.params, base.sb_cat4("$__env", ": ", "ptr<void>", ""));
+    }
+    var c: i64 = base.node_lb((d as u64));
+    // S4 §4.6 Phase 3：链先物化再遍历 —— 纯读取循环，与原手写链遍历逐点同序
+    var c_ks: []i64 = base.kids_chain(c);
+    var c_ki: i64 = 0;
+    while (c_ki < slice_len(c_ks) as i64) {
+        var c_kv: i64 = c_ks[c_ki];
+        var pst: string = tir_st_of_td(sema.resolve_type_desc(base.node_na((c_kv as u64))));
+        append(g_cur_func.params, base.sb_cat4(base.sb_cat2("$", base.node_sa((c_kv as u64))), ": ", pst, ""));
+        c_ki = c_ki + 1;
+    }
+    tir_append_cur_func();
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -2482,7 +2636,11 @@ pub fn tir_emit_stmt(sid: i64) void {
         if (t >= 0 and sema.tds[t].cat == "sym" and base.node_nb((sid as u64)) >= 0 and base.node_kind((base.node_nb((sid as u64)) as u64)) == "string") {
             var valslotr: TirEmitRes = tir_emit_expr(base.node_nb((sid as u64))); var valslot: string = valslotr.name;
             var tagid: i64 = slice_len(g_mod.strings) as i64;
+            // ⚠ 代际分配器（2026-10-22）：g_mod.strings 缓冲恒落 g_arena（跨函数回收后不悬垂）；
+            // 降级进 g_func 本块时临时切回 g_arena 追加，追加后还原 g_func。
+            if (base.g_relowering) { arena_use_default(); }
             append(g_mod.strings, sema.tds[t].name);
+            if (base.g_relowering) { if (base.g_relowering_scratch_func) { arena_use_func(); } else { arena_use_default(); } }
             var tagslot: string = tir_tmp();
             tir_emit(TIRInst{ op: TIR_OP_CONST_STR, st: ST_NONE, dst: tir_op(tagslot), args: tir_a1(base.i2s(tagid)), is_comment: false, line: g_cur_line, cmt: "" });
             var bitsslot: string = tir_tmp();
@@ -3087,7 +3245,9 @@ pub fn tir_emit_assign(sid: i64, est: i64) TirEmitRes {
                 }
                 if (lhstd >= 0 and sema.tds[lhstd].cat == "sym" and base.node_kind((base.node_nb((sid as u64)) as u64)) == "string") {
                     var tagid: i64 = slice_len(g_mod.strings) as i64;
+                    if (base.g_relowering) { arena_use_default(); }
                     append(g_mod.strings, sema.tds[lhstd].name);
+                    if (base.g_relowering) { if (base.g_relowering_scratch_func) { arena_use_func(); } else { arena_use_default(); } }
                     var tagslot: string = tir_tmp();
                     tir_emit(TIRInst{ op: TIR_OP_CONST_STR, st: ST_NONE, dst: tir_op(tagslot), args: tir_a1(base.i2s(tagid)), is_comment: false, line: g_cur_line, cmt: "" });
                     var bitsslot: string = tir_tmp();
@@ -3310,7 +3470,9 @@ pub fn tir_emit_expr(e: i64) TirEmitRes {
     }
     if (kd == "string") {
         var id: i64 = slice_len(g_mod.strings) as i64;
+        if (base.g_relowering) { arena_use_default(); }
         append(g_mod.strings, base.node_sa((e as u64)));
+        if (base.g_relowering) { if (base.g_relowering_scratch_func) { arena_use_func(); } else { arena_use_default(); } }
         var d: string = tir_tmp();
         tir_emit(TIRInst{ op: TIR_OP_CONST_STR, st: ST_NONE, dst: tir_op(d), args: tir_a1(base.i2s(id)), is_comment: false, line: g_cur_line, cmt: "" });
         return TirEmitRes{ name: d, st: est };
@@ -3989,7 +4151,9 @@ pub fn tir_emit_call(e: i64) TirEmitRes {
             }
         }
         var sid: i64 = slice_len(g_mod.strings) as i64;
+        if (base.g_relowering) { arena_use_default(); }
         append(g_mod.strings, tag);
+        if (base.g_relowering) { if (base.g_relowering_scratch_func) { arena_use_func(); } else { arena_use_default(); } }
         var tagd: string = tir_tmp();
         tir_emit(TIRInst{ op: TIR_OP_CONST_STR, st: ST_NONE, dst: tir_op(tagd), args: tir_a1(base.i2s(sid)), is_comment: false, line: g_cur_line, cmt: "" });
         var idd: string = "";
@@ -6084,9 +6248,9 @@ pub fn tir_emit_match(sid: i64, as_stmt: bool, est: i64) TirEmitRes {
             while (cki < ckmax) {
                 if (g_vf_keys[cki] == ckey) { cflds = g_vf_nodes[cki]; break; }
                 cki = cki + 1;
-            }
-            var off3: i64 = 0;
-            var bi3: i64 = 0;
+        }
+        var off3: i64 = 0;
+        var bi3: i64 = 0;
             var bk3: i64 = base.node_la((base.node_na((armIds[i] as u64)) as u64));
             // S4 §4.6 Phase 3：链先物化再遍历 —— 纯读取循环，与原手写链遍历逐点同序
             var bk3_ks: []i64 = base.kids_chain(bk3);
