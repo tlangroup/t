@@ -1509,6 +1509,34 @@ pub var g_ti_ClauseKind_ti: i64 = -1;
 
 // 类型（或类型的元素，递归）是否涉及 clause —— T-CLA-E724 的越界判据。
 // 覆盖 `clause` 本身与 `[N]clause` / `[N][M]clause` 等聚合形态。
+// 求值结果是否是一个子句组（clause 单体 / array_lit 且元素皆 clause）。
+// 用于 N14 的 clause 值形参：实参求值后必须真是子句组，否则无从展开。
+pub fn meta_node_is_clause_group(n: i64) bool {
+    if (n < 0) { return false; }
+    var k: string = base.node_kind((n as u64));
+    if (k == "clause") { return true; }
+    if (k == "array_lit") {
+        var ks: []i64 = base.kids_chain(base.node_la((n as u64)));
+        if (slice_len(ks) == 0) { return false; }
+        var i: i64 = 0;
+        while (i < slice_len(ks) as i64) {
+            if (base.node_kind((ks[i] as u64)) != "clause") { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+    return false;
+}
+
+// N14 单态 key：按**实参的源码位置**区分实例。
+// ⚠ 不能用 meta_val_key（它回落去哈希 node.sa，而子句组节点的 sa 为空 ⇒
+//   两个不同的 group 会算出同一个 key ⇒ 共用同一实例 ⇒ **静默得到错结果**）。
+//   用 span（line/col）作 key：不同实参位置必不同；同一实参重复求值仍命中缓存（幂等）。
+pub fn clause_group_key(a: i64) string {
+    var sp: Span = base.node_span_id(a);
+    return base.sb_cat3("g", base.i2s(sp.line as i64), base.sb_cat2("_", base.i2s(sp.col as i64)));
+}
+
 pub fn clause_ti_involves(ti: i64) bool {
     if (ti < 0) { return false; }
     var k: string = tip_kind(ti);
@@ -2082,6 +2110,41 @@ pub fn meta_val_key(lit: i64) string {
 
 // 值实参：CTFE 求值 + 按形参声明类型校验。返回字面量节点 id，失败 -1（已报错）。
 pub fn meta_eval_value_arg(p: i64, a: i64) i64 {
+    // N14：clause / [N]clause 值形参 —— 子句组是编译期一等值，其「值」就是子句组 AST
+    //   本身，**不需要也不应**被折成字面量。求值后按形态校验即可（见下方 clause 分支）。
+    if (parse.type_node_is_clause(base.node_na((p as u64)))) {
+        var sv_top0: i64 = g_menv_top;
+        var sv_base0: i64 = g_menv_base;
+        var sv_q0: bool = g_meta_quiet;
+        g_menv_top = g_menv_nglobal;
+        g_menv_base = g_menv_nglobal;
+        g_meta_quiet = false;
+        g_meta_err = false;
+        if (g_meta_steps < 200000) { g_meta_steps = 200000; }
+        var gv: i64 = meta_eval(a);
+        g_menv_top = sv_top0;
+        g_menv_base = sv_base0;
+        g_meta_quiet = sv_q0;
+        var ge0: bool = g_meta_err;
+        g_meta_err = false;
+        if (gv < 0 or ge0) {
+            parse.fc_err("T-CLA-E726",
+                base.sb_cat3("clause 形参 `", base.node_sa((p as u64)),
+                    "` 的实参必须是编译期常量（子句组须在编译期展开）"), a);
+            return -1;
+        }
+        if (meta_node_is_clause_group(gv) == false) {
+            // 把**实际**算出来的节点种类写进诊断：否则用户（和我）都无从判断是
+            // 「实参写错了」还是「求值器折错了」—— 这正是本项目最忌讳的盲诊断。
+            parse.fc_err("T-CLA-E723",
+                base.sb_cat5("clause 形参 `", base.node_sa((p as u64)),
+                    "` 的实参求值结果不是子句组（clause / [N]clause）；实际得到 ",
+                    base.node_kind((gv as u64)),
+                    "，元素形态见源码"), a);
+            return -1;
+        }
+        return gv;
+    }
     // 先卡**声明类型**再求值：否则 `meta X: f64` 会先被求值器以 T_META_NOT_CONST
     // 拒掉，诊断指向实参而非那个根本不该存在的形参类型，误导排查方向。
     var tname: string = base.node_sa((base.node_na((p as u64)) as u64));
@@ -2149,23 +2212,38 @@ pub fn meta_eval_value_arg(p: i64, a: i64) i64 {
 // 改写调用点：callee → 实例名，移除前 k 个 comptime 实参，打上防重入标记。
 // 新建实例与命中缓存两条路径都必须走这里 —— 少一次 `bb = true` 就会让
 // infer_expr 反复重入 instantiate_generic。
+// 按 comptime 形参的**实际位置**摘除实参（见下方 pos 版注释）。
+// 保留原签名：位置即 0..k-1，与旧行为逐字节相同 ⇒ 既有调用点零影响。
 pub fn rewrite_generic_callsite(e: i64, iname: string, k: i64) void {
+    var pos0: []i64 = [];
+    var pi: i64 = 0;
+    while (pi < k) { append(pos0, pi); pi = pi + 1; }
+    rewrite_generic_callsite_pos(e, iname, pos0);
+}
+
+// ⚠ 原实现摘的是「**前 k 个**实参」，隐含假设 comptime 形参都排在最前。
+//   一旦 comptime 形参不在首位（N14 的 clause 形参就是第二位：`fn f(x: T, G: [N]clause)`），
+//   这条假设就崩了 —— 实测把 `x`（=0，一个 int）当成子句组实参，
+//   报「实参求值结果不是子句组；实际得到 int」，而真正的问题却藏在别处。
+//   ⇒ 改为按形参的实际位置摘除；对「comptime 形参在前」的既有形态完全等价。
+pub fn rewrite_generic_callsite_pos(e: i64, iname: string, cpos: []i64) void {
     base.node_set_sa((base.node_na((e as u64)) as u64), iname);
     var nh: i64 = -1;
     var nt: i64 = -1;
-    var ac2: i64 = base.node_la((e as u64));
-    var skip: i64 = 0;
     var mq_ks1920: []i64 = base.kids_chain_idx(base.node_la((e as u64)));
     var mq_ki1920: i64 = 0;
     while (mq_ki1920 < slice_len(mq_ks1920) as i64) {
-        ac2 = mq_ks1920[mq_ki1920];
-        if (skip < k) { skip = skip + 1; }
-        else {
-            nt = base.list_push(nh, nt, base.kids[ac2].val);
+        var at_pos: bool = false;
+        var qi: i64 = 0;
+        while (qi < slice_len(cpos) as i64) {
+            if (cpos[qi] == mq_ki1920) { at_pos = true; }
+            qi = qi + 1;
+        }
+        if (at_pos == false) {
+            nt = base.list_push(nh, nt, base.kids[mq_ks1920[mq_ki1920]].val);
             if (nh < 0) { nh = nt; }
         }
         mq_ki1920 = mq_ki1920 + 1;
-        ac2 = -1;
     }
     base.node_set_la((e as u64), nh);
     base.node_set_bb((e as u64), true);   // S4 §0.14.7 SoA：侧表写（原 en.bb = true）
@@ -2204,6 +2282,8 @@ pub fn instantiate_generic(tmpl: i64, e: i64) i64 {
     var cnames: []string;
     var cnodes: []i64;
     var cistype: []bool;
+    var has_clause: bool = false;   // N14：模板是否含 clause 形参（⇒ 实例体要补跑子句组展开）
+    var cpos: []i64;                // N14：comptime 形参在形参表中的实际位置
     var cp: i64 = base.node_lb((tmpl as u64));
     // S4 §4.6 Phase 3：链先物化再遍历 —— 纯读取循环
     var ks1962: []i64 = base.kids_chain(cp);
@@ -2212,6 +2292,8 @@ pub fn instantiate_generic(tmpl: i64, e: i64) i64 {
         var kv1962: i64 = ks1962[ki1962];
         var cpv: i64 = kv1962;
         if (base.node_bb((cpv as u64)) == true) {   // S4 §0.14.7 SoA：侧表读（原 cpn.bb）
+            if (parse.type_node_is_clause(base.node_na((cpv as u64)))) { has_clause = true; }
+            append(cpos, ki1962);   // N14：记下 comptime 形参的**实际位置**
             append(cnames, base.node_sa((cpv as u64)));
             append(cnodes, cpv);
             append(cistype, meta_param_is_type(cpv));
@@ -2219,16 +2301,23 @@ pub fn instantiate_generic(tmpl: i64, e: i64) i64 {
         ki1962 = ki1962 + 1;
     }
     var k: i64 = slice_len(cnames) as i64;
-    // 从调用点读取前 k 个实参
-    var cargs: []i64;
+    // 从调用点读取实参 —— ⚠ 按 comptime 形参的**实际位置**取，而非「前 k 个」
+    //   （N14：clause 形参常常不在首位。旧写法会把位置错开 ⇒ 拿错实参，见
+    //   rewrite_generic_callsite_pos 的注释）。
+    var allargs: []i64;
     var ac0: i64 = base.node_la((e as u64));
-    var i: i64 = 0;
-    while (ac0 >= 0 and i < k) {
-        append(cargs, base.kids[ac0].val);
-        i = i + 1;
+    while (ac0 >= 0) {
+        append(allargs, base.kids[ac0].val);
         ac0 = base.kids[ac0].next;
     }
-    if (i != k) { return -1; }
+    var cargs: []i64;
+    var i: i64 = 0;
+    while (i < k) {
+        var ap: i64 = cpos[i];
+        if (ap >= 0 and ap < (slice_len(allargs) as i64)) { append(cargs, allargs[ap]); }
+        i = i + 1;
+    }
+    if (slice_len(cargs) != k) { return -1; }
     // 构造单态化签名 + 具体量列表（类型参数 → 类型节点；值参数 → 字面量节点）
     var sig: string = "";
     var concretes: []i64;
@@ -2274,9 +2363,30 @@ pub fn instantiate_generic(tmpl: i64, e: i64) i64 {
                 }
             }
         } else {
+            // N15：clause 形参的实参必须是**编译期常量**（子句组要在编译期展开，
+            //   运行期值无从展开）。先自查再交给通用求值，避免两条诊断叠在一起。
+            if (clause_ti_involves(resolve_ti(base.node_na((cnodes[j] as u64))))) {
+                var sq0: bool = g_meta_quiet;
+                g_meta_quiet = true;
+                g_meta_err = false;
+                var cv_pre: i64 = meta_eval(cargs[j]);
+                g_meta_quiet = sq0;
+                var me0: bool = g_meta_err;
+                g_meta_err = false;
+                if (cv_pre < 0 or me0) {
+                    parse.fc_err("T-CLA-E726",
+                        base.sb_cat3("clause 形参 `", cnames[j],
+                            "` 的实参必须是编译期常量（子句组须在编译期展开）"), cargs[j]);
+                    return -1;
+                }
+            }
             cv2 = meta_eval_value_arg(cnodes[j], cargs[j]);
             if (cv2 < 0) { return -1; }
-            keyp = meta_val_key(cv2);
+            if (clause_ti_involves(resolve_ti(base.node_na((cnodes[j] as u64))))) {
+                keyp = clause_group_key(cargs[j]);   // ⚠ 见 clause_group_key 的注释
+            } else {
+                keyp = meta_val_key(cv2);
+            }
         }
         append(concretes, cv2);
         if (j > 0) { sig = base.sb_cat2(sig, "_"); }
@@ -2292,12 +2402,17 @@ pub fn instantiate_generic(tmpl: i64, e: i64) i64 {
         // comptime 实参也还在 → 回到 infer_expr 后 `base.node_bb(e) == false` 依旧成立，
         // 于是再次 instantiate → 再次命中 → 无限递归，编译器直接崩（exit 127）。
         // Phase A 的示例每个泛型每种实参只调一次，恰好绕过了这条路径。
-        rewrite_generic_callsite(e, iname, k);
+        rewrite_generic_callsite_pos(e, iname, cpos);
         return syms[si0].decl;
     }
     // 深克隆模板
     var inst: i64 = clone_node(tmpl);
     base.node_set_sa((inst as u64), iname);
+    // N14：模板因含 clause 形参而被自动置为编译期（bb = true，见 parse_func_decl），
+    //   但**实例必须清掉这个标记** —— 单态实例是普通运行期函数，否则后端按
+    //   「comptime fn 函数体仅存在于编译期」跳过发射 ⇒ 链接期 undefined symbol
+    //   （实测 `lld-link: undefined symbol: t_fmt_with__g22_36`）。
+    if (has_clause) { base.node_set_bb((inst as u64), false); }
     // 逐对替换 comptime 参数名 → 具体量（返回类型 + 函数体 + 各参数类型）。
     // ⚠ FuncDecl.lc 是**语句链表头**（kids 下标），不是节点 id —— 必须走 *_kids
     // 版本。Phase A 这里误传给了 subst_type_in_node：既漏替换体内类型位，又会去
@@ -2345,7 +2460,7 @@ pub fn instantiate_generic(tmpl: i64, e: i64) i64 {
         pp3 = -1;
     }
     base.node_set_lb((inst as u64), newp_head);
-    rewrite_generic_callsite(e, iname, k);
+    rewrite_generic_callsite_pos(e, iname, cpos);
     // 注册实例 + 追加 decl_list（check/emit 循环会重取长度，自动覆盖）
     append(lex.decl_list, inst);
     register_decl(inst);
@@ -2364,6 +2479,10 @@ pub fn instantiate_generic(tmpl: i64, e: i64) i64 {
     // 且 `if (@type_equal(T, u32))` 的死分支要在 check 看到之前剪掉。必须早于 meta_walk。
     mb_walk_list(base.node_lc((inst as u64)));
     meta_walk_list(base.node_lc((inst as u64)));
+    // N14：模板含 clause 形参时，实例体里的 `match (x) { G }` 此刻 G 才被换成具体子句组，
+    // 必须**在这里**补跑展开 —— 与上方 mb_walk/meta_walk 同一个道理（实例是 check 期才
+    // 生成的，parse_unit 末尾那趟脱糖当时还看不到它）。晚了 HIR 就会收到未展开的拼接位。
+    if (has_clause) { parse.desugar_clause_splices(); }
     g_meta_quiet = sq;
     g_meta_err = false;
     g_menv_top = st2;
