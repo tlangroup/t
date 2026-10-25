@@ -16,7 +16,7 @@
 // per-module ginit 符号 = t_ginit_<idn>（如 t_ginit_src_base），入口 main 包装器声明 + 调用之。
 //
 // 用法：node tools/bootstrap_tc.mjs [--tc <编译器>] [--out <产物名>] [--skip-tint]
-import { readFileSync, readdirSync, existsSync, mkdirSync } from 'fs';
+import { readFileSync, readdirSync, existsSync, mkdirSync, rmSync } from 'fs';
 import { spawn, execFileSync } from 'child_process';
 import { join, dirname } from 'path';
 
@@ -32,6 +32,25 @@ const TINT_DIR = join(ROOT, 'out/mod');
 const OUT_LIB = join(ROOT, 'out/lib');
 const ENTRY = 'src/tc.tc';
 const SKIP_TINT = args.includes('--skip-tint');
+
+// ⚠ 本脚本产出的 out/lib/**/*.tlib 是「多进程自举专用」的中间归档：入口 build 链接完即无用。
+//   若不清理，它们会被后续**单进程**编译（含 gate 的 cself / run_examples）探测成链接库
+//   ⇒ 依赖模块不再内联，而 C 后端 / 部分示例的链接命令行并不带这些归档
+//   ⇒ clang: undeclared identifier（实测 std.rc.cst 的 cst__init_keywords 即此坑）。
+//   故登记本轮创建的归档，收尾统一删除（含伴随 .ll / .exports.json）。
+const createdArchives = [];
+function trackArchive(outPrefix) {
+  for (const ext of ['.tlib', '.ll', '.tlib.exports.json', '.tlibd', '.tlibd.exports.json']) {
+    const p = `${outPrefix}${ext}`;
+    if (existsSync(p)) { createdArchives.push(p); }
+  }
+}
+function cleanArchives() {
+  for (const p of createdArchives) {
+    try { rmSync(p, { force: true }); } catch (e) { /* 清理失败不影响主流程 */ }
+  }
+  if (createdArchives.length) { console.log(`\n=== clean up ${createdArchives.length} bootstrap-only archives ===`); }
+}
 
 // 异步拉起 tc（与 build_std.mjs 一致，避免 Windows opp-lock EBUSY 误报）
 function runTC(tcArgs, env) {
@@ -79,15 +98,23 @@ function topoSort(names) {
   });
   const q = names.filter((n) => indeg[n] === 0);
   const out = [];
+  const emitted = new Set();
   while (q.length) {
     const n = q.shift();
     out.push(n);
+    emitted.add(n);
     adj[n].forEach((d) => {
       indeg[d]--;
       if (indeg[d] === 0) q.push(d);
     });
   }
-  if (out.length !== names.length) throw new Error('cycle or missing module among: ' + names.join(','));
+  // 阶段 C 允许模块间相互引用（如 sema↔tir）：Kahn 遇环无法得到全序而失败。
+  // 但逐模块 build 在 T_TINT_DIR 下只读取接口 .tint（仅签名、无函数体），
+  // 跨模块引用一律以「链接模式」(declare + 末步链接 .tlib) 交互，不内联，
+  // 故构建顺序不影响正确性；环内节点直接补发即可。
+  if (out.length !== names.length) {
+    names.filter((n) => !emitted.has(n)).forEach((n) => out.push(n));
+  }
   return out;
 }
 
@@ -95,12 +122,13 @@ async function main() {
   console.log(`[bootstrap_tc] TC=${TC}\n  OUT_EXE=${OUT_EXE}\n  TINT_DIR=${TINT_DIR}`);
 
   // 2. 生成全部 .tint（接口文件）；落点须与 resolver 对齐：
-  //    resolver 对 src.base 取 rel = dots_to_slashes = "src/base"，故 .tint 必须位于
-  //    <TINT_DIR>/src/<m>.tint（与内部模块 .tlib 同级嵌套），否则入口链接时找不到接口。
+  //    resolver 对 import(src.base) 取 nm="base"（已剥首段 "src."），rel = dots_to_slashes(nm) = "base"，
+  //    故 .tint 必须位于 <TINT_DIR>/<m>.tint（即 out/mod/base.tint，无 src/ 段），
+  //    否则 resolver 的 path_resolve(T_TINT_DIR, "/", rel, ".tint") 查不到 → loaded_tint 恒 false。
   if (!SKIP_TINT) {
-    console.log('\n=== generate .tint (nested out/mod/src/<m>.tint) ===');
+    console.log('\n=== generate .tint (out/mod/<m>.tint) ===');
     for (const m of srcMods) {
-      const tint = join(TINT_DIR, 'src', m + '.tint');
+      const tint = join(TINT_DIR, m + '.tint');
       mkdirSync(dirname(tint), { recursive: true });
       try {
         execFileSync('python3', ['tools/gen_tint.py', `src/${m}.tc`, tint], { cwd: ROOT, stdio: 'pipe' });
@@ -126,7 +154,8 @@ async function main() {
     mkdirSync(dirname(outp), { recursive: true });
     const ok = await runTC(['build', '--lib', '--mod-id', e.idn, join(ROOT, e.src), '--output', outp]);
     console.log(`  ${e.idn}: ${ok ? 'OK' : 'FAIL'}`);
-    if (!ok) { console.error('[bootstrap_tc] 外部库失败，中止'); process.exit(1); }
+    if (!ok) { cleanArchives(); console.error('[bootstrap_tc] 外部库失败，中止'); process.exit(1); }
+    trackArchive(outp);
   }
 
   // 4. 拓扑序逐模块 build --lib → .tlib（T_TINT_DIR 使依赖走接口文件 + 链接 .tlib，不内联）
@@ -134,7 +163,8 @@ async function main() {
   console.log('\n=== topo order ===\n' + order.join(' '));
   console.log('\n=== build internal .tlib ===');
   for (const m of order) {
-    const outp = join(TINT_DIR, 'src', m); // out/mod/src/<m>.tlib（与 resolver rel="src/<m>" 对齐）
+    const outp = join(TINT_DIR, m); // out/mod/<m>.tlib（与 resolver rel="<m>" 对齐）
+    mkdirSync(dirname(outp), { recursive: true });
     const ok = await runTC(
       ['build', '--lib', '--mod-id', `src.${m}`, join(ROOT, 'src', `${m}.tc`), '--output', outp],
       { T_TINT_DIR: TINT_DIR }
@@ -156,12 +186,14 @@ async function main() {
       { T_TINT_DIR: TINT_DIR }
     );
     console.log(`  ${e.idn}: ${ok ? 'OK' : 'FAIL'}`);
-    if (!ok) { console.error('[bootstrap_tc] repl 失败，中止'); process.exit(1); }
+    if (!ok) { cleanArchives(); console.error('[bootstrap_tc] repl 失败，中止'); process.exit(1); }
+    trackArchive(outp);
   }
 
   // 5. 入口链接：T_TINT_DIR=out/mod 使 imports 走接口文件 + .tlib，单进程仅建入口图 + 本模块 codegen。
   console.log('\n=== build entry tc.exe ===');
   const ok = await runTC(['build', ENTRY, '--output', OUT_EXE], { T_TINT_DIR: TINT_DIR });
+  cleanArchives();
   if (!ok) { console.error('[bootstrap_tc] 入口失败，中止'); process.exit(1); }
   console.log(`\n[bootstrap_tc] 完成 ✅ → ${OUT_EXE}`);
   process.exit(0);

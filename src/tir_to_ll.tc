@@ -162,7 +162,7 @@ pub fn ll_mark_valptr(name: string) void {
     var n: i64 = slice_len(g_ll_valptr) as i64;
     var i: i64 = 0;
     while (i < n) { if (g_ll_valptr[i] == name) { return; } i = i + 1; }
-    if (tir.g_relowering) { arena_use_default(); }
+    if (base.g_relowering) { arena_use_default(); }
     append(g_ll_valptr, base.str_persist(name));
     arena_use_default();   // ⚠ 代际分配器（2026-10-22）：emit 期 ambient 恒回持久区 g_arena；g_func 窗口只包住 tir_lower_func 本体
 }
@@ -183,7 +183,7 @@ pub fn ll_mark_addrslot(name: string, st: string) void {
         if (g_ll_addrslot[i] == name) { g_ll_addrst[i] = st; return; }
         i = i + 1;
     }
-    if (tir.g_relowering) { arena_use_default(); }
+    if (base.g_relowering) { arena_use_default(); }
     append(g_ll_addrslot, base.str_persist(name));
     append(g_ll_addrst, base.str_persist(st));
     arena_use_default();   // ⚠ 代际分配器（2026-10-22）：emit 期 ambient 恒回持久区 g_arena；g_func 窗口只包住 tir_lower_func 本体
@@ -251,7 +251,7 @@ pub fn ll_emit_closure_const(fnname: string, retst: string) string {
         if (g_clo_consts[i] == fnname) { return gname; }
         i = i + 1;
     }
-    if (tir.g_relowering) { arena_use_default(); }
+    if (base.g_relowering) { arena_use_default(); }
     append(g_clo_consts, base.str_persist(fnname));
     arena_use_default();   // ⚠ 代际分配器（2026-10-22）：emit 期 ambient 恒回持久区 g_arena；g_func 窗口只包住 tir_lower_func 本体
     var params: []string = ll_lookup_params(fnname);
@@ -265,7 +265,7 @@ pub fn ll_emit_closure_const(fnname: string, retst: string) string {
     }
     // 普通函数 → 延迟到模块末尾生成 thunk（ret 在全部函数 emit 后才已知；
     // store/ret 引用时该函数可能尚未 emit，立即生成会得到空返回类型）。
-    if (tir.g_relowering) { arena_use_default(); }
+    if (base.g_relowering) { arena_use_default(); }
     append(g_clo_thunk_req, base.str_persist(fnname));
     arena_use_default();   // ⚠ 代际分配器（2026-10-22）：emit 期 ambient 恒回持久区 g_arena；g_func 窗口只包住 tir_lower_func 本体
     return gname;
@@ -368,7 +368,6 @@ pub fn ll_flush_clo_thunks() void {
 // （tir.tc 暂不建模模块级全局变量声明，此处由翻译器兜底，使 legacy emit-ll 能编译的示例在 TIR 路径同样可编译。）
 pub fn ll_register_global(name: string, st: string) void {
     name = llname.ll_strip_suf(name);
-    if (name == "base__g_trivia_toks") { println("DBG_REG g_trivia_toks st=[" + st + "]"); }
     var n: i64 = slice_len(llname__g_ll_globals) as i64;
     var i: i64 = 0;
     while (i < n) {
@@ -383,7 +382,6 @@ pub fn ll_register_global(name: string, st: string) void {
 // （tir_emit_globals 已对链接库模块全局 skip，故 g_mod.globals 仅含本模块自有全局。）
 pub fn ll_global_is_own(nm: string) bool {
     nm = llname.ll_strip_suf(nm);
-    if (nm == "base__g_trivia_toks") { println("DBG_ISOWN g_trivia_toks libemit=" + base.i2s(lex.g_lib_emit as i64)); }
     var n: i64 = slice_len(tir.g_mod.globals) as i64;
     var i: i64 = 0;
     while (i < n) {
@@ -430,7 +428,14 @@ pub fn ll_ensure_slot(name: string, st: string) void {
 //     否则把值当 ptr 传入 → tll_slice_at 解引用读垃圾 len/cap → 越界 panic。
 // inner 为聚合类型名（%TSlice / %TStr 等）。
 pub fn ll_slice_base_addr(base: string, inner: string) string {
-    if (str_len(base) >= 1 and base[0] == 64) { return llname.ll_llname_ptr(base); }   // 全局变量 → 地址
+    if (str_len(base) >= 1 and base[0] == 64) {
+        // ⚠ 跨模块全局（来自链接库 .tlib）作切片/字符串基底：须登记为 external 声明，
+        // 否则 LLVM 报 use of undefined value（如 test 模块引用 base 模块的 base__kids 切片）。
+        // 与 ll_load 一致：无条件登记；emit 期由 ll_global_is_own 判定本模块自有 vs 链接库外部，
+        // 自有全局落本地 zeroinitializer、外部全局落 external 声明，不会重复定义。
+        ll_register_global(str_slice(base, 1, str_len(base)), inner);
+        return llname.ll_llname_ptr(base);   // 全局变量 → 地址
+    }
     if (llname.ll_is_emitted(base)) { return llname.ll_llname_ptr(base); }                  // 已 emit 的 alloca → 地址
     // base 是「值」(member 读取 / call 返回值) → 物化地址：alloca inner + store 值
     var baslot: string = ll_tmp();
@@ -863,7 +868,7 @@ pub fn ll_register_named_type(st: string) void {
                 i = i + 1;
             }
             if (seen == false) {
-                if (tir.g_relowering) { arena_use_default(); }
+                if (base.g_relowering) { arena_use_default(); }
                 append(g_ll_named_types, base.str_persist(st));
                 arena_use_default();   // ⚠ 代际分配器（2026-10-22）：emit 期 ambient 恒回持久区 g_arena；g_func 窗口只包住 tir_lower_func 本体
             }
@@ -1144,7 +1149,7 @@ pub fn ll_maybe_declare(fname: string, retst: string, argsts: []string) void {
         if (g_ll_declared[j] == fname) { return; }  // 已声明
         j = j + 1;
     }
-    if (tir.g_relowering) { arena_use_default(); }
+    if (base.g_relowering) { arena_use_default(); }
     append(g_ll_declared, base.str_persist(fname));
     arena_use_default();   // ⚠ 代际分配器（2026-10-22）：emit 期 ambient 恒回持久区 g_arena；g_func 窗口只包住 tir_lower_func 本体
     var sb: StringBuilder = sb_new();
@@ -1408,7 +1413,7 @@ pub fn ll_emit_func(name: string, params: []string, ret: string) void {
     llname.ll_reset_slots();   // ⚠ 飞地规避：槽状态在 llname.tc，经本函数重置（清 g_ll_names/g_ll_sts/g_ll_emitted/g_ll_curfn）
     llname.ll_set_curfn(name); // 重置后再置当前函数前缀
     g_ll_tmpc = 0;
-    if (tir.g_relowering) { arena_use_default(); }
+    if (base.g_relowering) { arena_use_default(); }
     append(g_ll_func_rets, base.str_persist(ret));
     arena_use_default();   // ⚠ 代际分配器（2026-10-22）：emit 期 ambient 恒回持久区 g_arena；g_func 窗口只包住 tir_lower_func 本体
     // 聚合返回 ABI（Win64）：>8B 结构一律经显式 sret 隐藏指针返回（ptr sret(...) 首参），
@@ -3447,7 +3452,7 @@ pub fn ll_emit_inst(inst: TIRInst) void {
                 // ⚠ 代际分配器（2026-10-22）回归修复：g_ll_clofnslot 是跨函数持久全局，backing 须落 g_arena；
                 // 否则 append 在 g_func 增长 backing，arena_reset_func 回收后 ll_emit_inst 后续读取（is_clofn 判定）
                 // 读到悬垂 backing → 野指针比较 → 段错误（与 g_ll_variant_types 同坑）。
-                if (tir.g_relowering) { arena_use_default(); }
+                if (base.g_relowering) { arena_use_default(); }
                 append(g_ll_clofnslot, base.str_persist(g));
                 arena_use_default();   // ⚠ 代际分配器（2026-10-22）：emit 期 ambient 恒回持久区 g_arena；g_func 窗口只包住 tir_lower_func 本体
             }
@@ -3648,7 +3653,7 @@ pub fn ll_emit_inst(inst: TIRInst) void {
         var kn: i64 = slice_len(inst.args) as i64;
         while (ki < kn) {
             var a: string = inst.args[ki].name;
-            if (str_find(a, "g_trivia_toks") >= 0) { println("DBG_ARG a=[" + a + "] first=" + base.i2s(a[0] as i64) + " st=" + base.i2s(inst.args[ki].st as i64) + " isgl=" + base.i2s(llname.ll_is_global(a) as i64)); }
+            // (debug print removed: str_find is not a t builtin nor a runtime symbol; keeping it broke self-hosting link with undefined t_str_find)
             if (str_len(a) >= 1 and a[0] == 64) {
                 // ⚠ 跨模块外部全局（来自链接库 .tlib）作实参：须登记为 external 声明，否则 LLVM 报 undefined value。
                 // 类型取 TIR 操作数携带的 ST（切片→%TSlice 等），与 .tlib 真实定义一致；缺失时回退 ll_get_st / ptr。
@@ -4819,7 +4824,7 @@ pub fn tir_to_ll_emit(module: TIRModule) string {
     // 落进 g_func，arena_reset_func() 回收后下一函数即读到悬垂 backing → 段错误（打地鼠）。
     // 关闭后降级全程落 g_arena（持久），语义与未开启代际分配器时一致，正确性优先。
     // 后续若要重新开启，必须先把上述全部持久 append 用 arena_use_default/str_persist 包裹。
-    tir.g_relowering_scratch_func = false;
+    base.g_relowering_scratch_func = false;
     g_ti_defs = sb_new();
     g_ti_ctors = sb_new();
     g_ti_typedefs = sb_new();
@@ -4854,7 +4859,11 @@ pub fn tir_to_ll_emit(module: TIRModule) string {
     // （全部重降级结束、ll_emit_string_globals 之前）从「实时全局 g_mod.strings」重建，否则 emit 出的
     // @.tirll_tstr<i> 全局定义缺失 → clang: use of undefined value（见 2026-10-22 回归修复）。
     // 模块级全局（沿用 g_globals_section 文本缓冲，格式与 translate 解析 globals: 段一致）
-    var glines: []string = ll_split_lines(sb_to_str(tir.g_globals_section));
+    // ⚠ 阶段 C 多进程自举：本模块自有全局 + 链接库外部全局一并登记。
+    //   链接库全局（tir.g_link_globals_section）不在 g_mod.globals 中，ll_global_is_own 判 false
+    //   ⇒ 末尾统一发射 `external global`，定义由链接期 .tlib 归档提供。
+    var gall: string = base.sb_cat3(sb_to_str(tir.g_globals_section), "\n", sb_to_str(tir.g_link_globals_section));
+    var glines: []string = ll_split_lines(gall);
     var gi: i64 = 0;
     var gn: i64 = slice_len(glines) as i64;
     while (gi < gn) {
@@ -4898,7 +4907,7 @@ pub fn tir_to_ll_emit(module: TIRModule) string {
                     // 其 backing 必须落 g_arena；否则 append 在 g_func（emit 重降级 arena）增长 backing，
                     // arena_reset_func 回收后 ll_is_variant（pass-2 发射期逐函数读取）读到悬垂 backing →
                     // 野指针比较 → 访问 decommitted/越界页 → 段错误（与 g_st_pool/tir.tc:291 同坑）。
-                    if (tir.g_relowering) { arena_use_default(); }
+                    if (base.g_relowering) { arena_use_default(); }
                     append(g_ll_variant_types, base.str_persist(vn));
                     arena_use_default();   // ⚠ 代际分配器（2026-10-22）：emit 期 ambient 恒回持久区 g_arena；g_func 窗口只包住 tir_lower_func 本体
                 }
@@ -4910,7 +4919,7 @@ pub fn tir_to_ll_emit(module: TIRModule) string {
             // ⚠ 代际分配器（2026-10-22）回归修复：g_main_fn/g_main_ret 是跨阶段持久全局，
             // 须存 g_arena 副本；直接存 g_pf_name/g_pf_ret（g_func 重降级 arena 指针）会在
             // arena_reset_func 后被覆盖/悬垂，导致后续 name==g_main_fn 比较读到野内容。
-            if (tir.g_relowering) { arena_use_default(); }
+            if (base.g_relowering) { arena_use_default(); }
             g_has_main = true; g_main_fn = base.str_persist(g_pf_name); g_main_ret = base.str_persist(g_pf_ret);
             arena_use_default();   // ⚠ 代际分配器（2026-10-22）：emit 期 ambient 恒回持久区 g_arena；g_func 窗口只包住 tir_lower_func 本体
         }
@@ -4929,9 +4938,9 @@ pub fn tir_to_ll_emit(module: TIRModule) string {
         // 回收；emit pass-2 再重降级一次正式发射（双次重降级，顺序/结果与原单次降级一致）。
         // 非 FuncDecl（extern/ginit/变体合成）体在 g_arena 真实存在，直接扫 f.body。
         var ntp_src: []TIRInst = f.body;
-        if (tir.g_relowering and fi < slice_len(tir.g_relowering_decls) and tir.g_relowering_decls[fi] >= 0) {
+        if (base.g_relowering and fi < slice_len(tir.g_relowering_decls) and tir.g_relowering_decls[fi] >= 0) {
             var ntp_rl: i64 = tir.g_relowering_decls[fi];
-            if (tir.g_relowering_scratch_func) { arena_use_func(); }
+            if (base.g_relowering_scratch_func) { arena_use_func(); }
             tir.g_lower_suppress_append = true;
             tir.tir_lower_func(ntp_rl);
             tir.g_lower_suppress_append = false;
@@ -4953,11 +4962,11 @@ pub fn tir_to_ll_emit(module: TIRModule) string {
             }
             ntp_i = ntp_i + 1;
         }
-        if (tir.g_relowering and fi < slice_len(tir.g_relowering_decls) and tir.g_relowering_decls[fi] >= 0) {
-            if (tir.g_relowering_scratch_func) { arena_reset_func(); }
+        if (base.g_relowering and fi < slice_len(tir.g_relowering_decls) and tir.g_relowering_decls[fi] >= 0) {
+            if (base.g_relowering_scratch_func) { arena_reset_func(); }
         }
         var ps: []string = []; var pi3: i64 = 0; var plen3: i64 = slice_len(g_pf_params) as i64;
-        if (tir.g_relowering) { arena_use_default(); }
+        if (base.g_relowering) { arena_use_default(); }
         while (pi3 < plen3) { append(ps, base.str_persist(g_pf_params[pi3 + 1])); pi3 = pi3 + 2; }
         append(g_func_names, base.str_persist(g_pf_name)); append(g_func_paramsts, ps);
         if (f.is_extern) { append(g_ll_extern_funcs, base.str_persist(g_pf_name)); }   // 导入库函数：本模块不 emit 函数体，须 declare + 链接 .tlib
@@ -4981,8 +4990,8 @@ pub fn tir_to_ll_emit(module: TIRModule) string {
         // 落 g_func 降级 → 发射本函数 → arena_reset_func 回收，自举峰值 ≈ 「语义图地板 + 单函数体」
         // 而非「语义图地板 + 全模块函数体」。非 FuncDecl（ginit/变体合成）体恒在 g_arena 真实存在。
         var relowered: bool = false;
-        if (tir.g_relowering and fi2 < slice_len(tir.g_relowering_decls) and tir.g_relowering_decls[fi2] >= 0) {
-            if (tir.g_relowering_scratch_func) { arena_use_func(); }
+        if (base.g_relowering and fi2 < slice_len(tir.g_relowering_decls) and tir.g_relowering_decls[fi2] >= 0) {
+            if (base.g_relowering_scratch_func) { arena_use_func(); }
             tir.g_lower_suppress_append = true;
             tir.tir_lower_func(tir.g_relowering_decls[fi2]);
             tir.g_lower_suppress_append = false;
@@ -5030,7 +5039,7 @@ pub fn tir_to_ll_emit(module: TIRModule) string {
             bi = bi + 1;
         }
         sb_append_str(g_ll, "}\n\n");
-        if (relowered and tir.g_relowering_scratch_func) { arena_reset_func(); }
+        if (relowered and base.g_relowering_scratch_func) { arena_reset_func(); }
         fi2 = fi2 + 1;
     }
     // ⚠ 代际分配器（2026-10-22）回归修复：pass-2 结束 = 逐函数重降级窗口关闭，剩余装配
@@ -5048,9 +5057,10 @@ pub fn tir_to_ll_emit(module: TIRModule) string {
     while (gi2 < gn2) {
         var gnm2: string = llname.ll_mangle(llname__g_ll_globals[gi2]);
         var gst2: string = llname.st_to_ll(llname__g_ll_globalsts[gi2]);
-        // 链接模式 + 非本模块自有全局 = 来自链接库 .tlib 的外部符号：仅声明 external，定义由链接期归档提供。
-        // 单进程模式（g_lib_emit==false）g_mod.globals 含全部内联全局，一律本地 zeroinitializer。
-        if (lex.g_lib_emit and ll_global_is_own(llname__g_ll_globals[gi2]) == false) {
+        // 非本模块自有全局 = 来自链接库 .tlib 的外部符号：仅声明 external，定义由链接期归档提供。
+        // （入口链接模式 g_lib_emit==false 但同样链接 .tlib：cst 等外部库全局须 external，否则与 .tlib
+        // 同名符号撞 → duplicate symbol。纯单进程模式无链接库，g_mod.globals 含全部自有全局，恒不走此分支。）
+        if (ll_global_is_own(llname__g_ll_globals[gi2]) == false) {
             sb_append_str(g_ll, "@"); sb_append_str(g_ll, gnm2);
             sb_append_str(g_ll, " = external global "); sb_append_str(g_ll, gst2);
             sb_append_str(g_ll, "\n");
@@ -5116,6 +5126,10 @@ pub fn tir_to_ll_emit(module: TIRModule) string {
 // 与旧轨 emit_ll_atom_table 完全一致：运行期 t_atom_str/t_deser_atom 经 extern 引用此表。
 // 旧轨此前硬编码 1 元素占位表，导致 :ok/:error/:ready 等真实原子未入表 → atom_str 返回空。
 pub fn ll_emit_atom_table() void {
+    // 进程级全局（t.__ginit / t_atom_table / t_atom_count）：仅入口程序发射一次，
+    // 链接库（build --lib，g_lib_emit=true）必须跳过，否则每个 .tlib 都内嵌一份定义，
+    // 入口链接期与 .tlib 同名符号撞 → duplicate symbol: t_atom_table / t_atom_count。
+    if (lex.g_lib_emit) { return; }
     var cnt: i64 = sema.g_atom_cnt;
     var elems: StringBuilder = sb_new();
     sb_append_str(elems, "%TStr { ptr @.tirll_as0, i64 0 }");   // index 0 占位空串
@@ -5297,7 +5311,7 @@ pub fn ll_emit_ti_ctor_def() void {
         }
         sb_append_str(g_ti_ctors, sb_to_str(sb));
         // 登记为模块内已定义函数，阻止 ll_maybe_declare 再发 declare（declare+define 同函数名 = redefinition 错误）。
-        if (tir.g_relowering) { arena_use_default(); }
+        if (base.g_relowering) { arena_use_default(); }
         append(g_func_names, base.str_persist(base.sb_cat2("TypeInfo_from_", arm)));
         arena_use_default();   // ⚠ 代际分配器（2026-10-22）：emit 期 ambient 恒回持久区 g_arena；g_func 窗口只包住 tir_lower_func 本体
         i = i + 1;
@@ -5316,7 +5330,7 @@ pub fn ll_emit_ti_global(tname: string) string {
     // 这正是 emit-ll 全自举 fi2≈1800/1804/1812 随机崩溃的真根因：崩与不崩取决于该时刻
     // current 是否已被某次 str_persist（base.tc:4333，切 g_arena 后不还原）意外留在 g_arena，
     // 故增删任何分配都会平移崩溃点（heisenbug），而非某个固定坏指针。
-    if (tir.g_relowering) { arena_use_default(); }
+    if (base.g_relowering) { arena_use_default(); }
     append(g_ti_done, base.str_persist(tname));
     arena_use_default();   // ⚠ 代际分配器（2026-10-22）：emit 期 ambient 恒回持久区 g_arena；g_func 窗口只包住 tir_lower_func 本体
     var arm: string = ll_ti_arm(tname);

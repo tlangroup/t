@@ -75,7 +75,11 @@ function buildOne(mod, debug) {
     const outp = join(OUT_DIR, ...parts);
     // 嵌套模块（如 rc/cst）的父目录可能尚不存在，编译器不会自动创建，先补齐。
     mkdirSync(dirname(outp), { recursive: true });
-    const cargs = ["build", "--lib", src, "--output", outp];
+    // ⚠ 必须显式 --mod-id std.<mod>：库模式下的 per-module ginit 符号由 idn 决定
+    //   （tir_ginit_sym("std.math") = t_ginit_std_math）。缺省时 idn 为空 ⇒ 该符号不存在，
+    //   而阶段 C 的导入方 main 包装器会 declare + call t_ginit_std_math ⇒
+    //   lld-link: undefined symbol: t_ginit_std_math（math_extra_demo / math_stdlib_demo 即此坑）。
+    const cargs = ["build", "--lib", "--mod-id", `std.${mod}`, src, "--output", outp];
     if (debug) cargs.push("--debug");
     const p = spawn(TC, cargs, { cwd: ROOT, windowsHide: true });
     let out = "";
