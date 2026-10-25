@@ -445,25 +445,36 @@ const r = comptime apply(G, 7);              // 全编译期求值，折叠为�
 | N5 | ✅ | `ClauseKind` 合成枚举（成员 `pattern`）+ 类型 `clause` 惰性注入；`resolve_ti` 的 named 分支前置分流，用户自声明同名类型时让位 |
 | N6 | ✅ | `infer_expr_body` 与 `meta_eval_rec` 各增一个 `clause` 分支；后者**恒等返回**，不递归子树 |
 | N7 | ✅（有约束） | `[N]clause` 字面量与 `++` 走既有 Array 分支（`ti_equal` + `[N+M]`），但**须显式标注**（见下方约束 C1） |
-| N8 | ✅（第一层） | 局部 / 全局 `var` 声明 clause ⇒ `T-CLA-E724`（`clause_ti_involves` 递归覆盖 `[N]clause`）。类型错位由既有 `T-SEM-E202` 拦 |
-| N9 |  推迟到 Phase 2 | `is_wildcard` 目前无处可观测（clause 还不能展开，也没有内省内建）。Phase 2 一旦能展开，重排结果本身就是它的判据，届时补 |
+| N8 | ✅ | 局部 / 全局 `var` 声明 clause ⇒ `T-CLA-E724`（`clause_ti_involves` 递归覆盖 `[N]clause`）；clause **常量**则保留声明、只跳过发射（`g_skip_clause_const`）。类型错位由既有 `T-SEM-E202` 拦 |
+| N9 | ✅（由 N11 自证） | `is_wildcard` 无需内省：重排结果本身就是它的判据 —— `examples/clause_expand.tc` 把通配写在组首位，期望输出 `10 11 -1 99 -2`（不重排则全是 `-1`） |
+| N10 | ✅ | 臂位置的裸表达式（无 `=>`）承接 `[N]clause` ⇒ 在 **parse_unit 末尾、HIR 之前**展开为既有 `MatchArm` 链 |
+| N11 | ✅ | 无守卫通配 clause 重排到末位充当 `else`（INV-2）；运行期对拍通过 |
+| 约束 C1 | ✅ **已撤销** | 按用户要求「`const C = @clause(...)` 不必写 `: clause`，保持一致性」：改为对 clause **定向回填**符号类型（只回 clause，不动既有通用行为） |
+| N12 排重 / N13 函数化 | ⬜ 下一批 | — |
 
-> **验证结果（本批次）**
-> - `tc check src/tc.tc`：0 errors；**告警集合与改动前逐条一致**（633 = 633，差集为空）⇒ 未引入新告警
-> - `conformance`：**377 passed / 0 failed**（373 原有 + 4 新增）
-> - 自举不动点：`g1.ll ≡ g2.ll ≡ g3.ll`（md5 `16d863a8…` 三代逐字节一致）
+> **验证结果（本批次，含 N10/N11）**
+> - `tc check src/tc.tc`：0 errors；**告警集合与改动前逐条一致**（633 = 633，差集为空）
+> - `conformance`：**378 passed / 0 failed**（373 原有 + 5 新增）
+> - 自举不动点：`g1.ll ≡ g2.ll ≡ g3.ll`（md5 `6f38ba44…` 三代逐字节一致）
+> - 运行期对拍：`examples/clause_expand.tc` 实际输出 == 期望输出（`10 11 -1 99 -2`）
 > - ⬜ 待跑：`gate L2` 全量、IR 快照重录（判据 0 新增 / 0 缺失后 `--update`）
-
-> **约束 C1（实测发现，非本特性引入）**：**未标注的全局 `const` 不回填符号类型** ——
-> `check_global_const_decl` 不像 `check_global_var_decl` 那样做 `mk_type_node_from_ti` 回填。
-> 后果是 `const A = [1,2]; const B: i64 = A;` 也是静默放行（既有行为，可用普通类型复现）。
-> ⇒ 本特性**不**去改这条核心链路（波及面过大），改为要求 clause 声明写显式标注：
-> `const C: clause = @clause(...)`。这与 L-02（显式）方向一致，故接受。
 
 > **坑 P1（已修）**：`clause` 一度注册为 `ti_named("Named", "clause")`。`"Named"` 是**未解析引用**，
 > 语义等同 Unknown ⇒ `fn f() i64 { return C; }` **0 error 静默放行**。改用独立种类 `ti_mk("Clause")`
-> 并补 `ti_str` / `ti_equal` 两个分支后，该错编被既有 `T-SEM-E202` 拦下，错误文案为
-> `expected i64 but got clause`。这正是「不要给新类型走未解析路径」的实证理由。
+> 并补 `ti_str` / `ti_equal` 两个分支后，该错编被既有 `T-SEM-E202` 拦下（`expected i64 but got clause`）。
+
+> **坑 P2（已修，本批最关键）**：展开**不能**挂在 sema（`infer_expr`）。
+> HIR AstGen（`hir_build`）在 run_check **之前**就把 match 的臂链降级成 `HIR_OP_MATCH_ARM`，
+> 届时臂链里还是未展开的拼接位 ⇒ AstGen 按「链元即臂」处理而崩（`t_slice_at`）。
+> ⇒ 展开是纯语法变换，必须挂在 `parse_unit` 末尾、HIR 之前。这也顺带保证了 CST 与 HIR 两条通路一致。
+>
+> **坑 P3（已修）**：臂链的 head/tail 是 **`kids` 池的 entry 索引**（`list_push` 的返回值），
+> **不是节点 id**。把拼接表达式的节点 id 直接当链元用会写坏链表（实测同一个 `t_slice_at` 崩溃）。
+>
+> **坑 P4（已修）**：`mk_arm` 末位是**记号索引**（内部走 `tk_line/tk_col`），不是节点 id。
+>
+> **坑 P5（已修）**：clause 常量**不可从 decl_list 摘除**。摘掉后后续引用失去符号，
+> `return C;` 连「未定义标识符」都不报 ⇒ 新的静默洞。正解 = 保留声明 + 跳过发射。
 
 ### Phase 1 — 值层（构造 + 合并 + 通配形态）
 
