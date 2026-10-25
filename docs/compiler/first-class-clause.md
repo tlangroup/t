@@ -454,12 +454,21 @@ const r = comptime apply(G, 7);              // 全编译期求值，折叠为�
 | N15 实参常量 | ✅ | clause 形参的实参须能在编译期求值，否则 `T-CLA-E726` |
 | N16 三组探针 | ✅ | ① 同一 G 换 scrutinee 结果不同 ② 换 group 结果不同（不同实例）③ 当运行期函数值传入 ⇒ `T-CLO-E781` |
 
+> **Phase 3（N14/N15/N16）验收**：`examples/clause_param.tc` 运行期输出 `10 -1 -5 99` == 期望；
+> conformance **383/383**；`hir_test` PASS；`tc check src/tc.tc` 0 errors / 633 warnings；
+> 自举 `g1 ≡ g2 ≡ g3`（md5 `efb04905…`）；gate L2 23/1（唯一失败=快照预期偏差）+ 快照重录后 24/24 等价全绿。
+> ⚠ 约束：**内联 `GA ++ [C]` 当 clause 实参会被判 `T-CLA-E726`**（meta 折不出组值）；先存成具名 const 即可。
+
 > **验证结果（本批次，含 N10/N11）**
 > - `tc check src/tc.tc`：0 errors；**告警集合与改动前逐条一致**（633 = 633，差集为空）
 > - `conformance`：**378 passed / 0 failed**（373 原有 + 5 新增）
 > - 自举不动点：`g1.ll ≡ g2.ll ≡ g3.ll`（md5 `6f38ba44…` 三代逐字节一致）
 > - 运行期对拍：`examples/clause_expand.tc` 实际输出 == 期望输出（`10 11 -1 99 -2`）
-> - ⬜ 待跑：`gate L2` 全量、IR 快照重录（判据 0 新增 / 0 缺失后 `--update`）
+> - ✅ `gate L2` 全量已跑：**23 passed / 1 failed**，唯一失败 = 「产物快照比对」（改 src 的预期偏差）；
+>   ✅ IR 快照：判据 `2 差异 / 2 新增 / 0 缺失`（0 缺失 ✓，2 新增 = 新示例 clause_* 的 c/ll）⇒
+>   `--update` 重录 134 targets / 271 entries，复查 **271 份产物逐字节相同** ⇒ 快照步等价 PASS = **24/24**。
+>   最终全批次口径：`tc check src/tc.tc` 0 errors / 633 warnings；conformance **383/383**；
+>   自举不动点 `g1 ≡ g2 ≡ g3`（Phase 3 md5 `efb04905…`）。
 
 > **坑 P1（已修）**：`clause` 一度注册为 `ti_named("Named", "clause")`。`"Named"` 是**未解析引用**，
 > 语义等同 Unknown ⇒ `fn f() i64 { return C; }` **0 error 静默放行**。改用独立种类 `ti_mk("Clause")`
