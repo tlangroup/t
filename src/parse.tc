@@ -3249,6 +3249,210 @@ pub fn parse_declaration() i64 {
     return d;
 }
 
+// ══════════════════════════════════════════════════════════════
+// N10/N11：子句组展开（设计 §5.4）
+//
+// 输入：臂链中混有 `clause_splice` 节点（na = 一个求值后应为 [N]clause 的表达式）
+// 输出：就地把这些节点替换为既有 MatchArm 链，其中
+//       · 无守卫通配 clause 经**重排**落到末位 ⇒ else 收尾臂（INV-2 终端保证）
+//       · 其余 clause 保持源码顺序在前
+//
+// clause → arm 的映射（复用既有 arm 语义，故不引入任何新分派）：
+//   · pattern 是 `_`            → mk_arm("",  isw=true,  pat=-1, guard, body)
+//   · pattern 是小写标识符      → mk_arm(名,  isw=false, pat=-1, guard, body)  【绑定】
+//   · pattern 是其它表达式      → mk_arm("",  isw=false, pat=该节点, guard, body)【等值模式】
+// ══════════════════════════════════════════════════════════════
+// ⚠ 全部用**模块级**切片 + 基址偏移，不用局部 `[]i64`、也不做 `g_xx = []` 重赋值：
+//   t 对「函数内建数组字面量的切片」不做逃逸提升，跨帧读回 p[i] 会得到悬空内存
+//   （本项目已有实证：ovl_specificity 的类别表）。局部 `ord`/`wild` 曾因此读到
+//   被回收的槽位（症状：`t_slice_at index N length M` 且 M 随机）。
+pub var g_spl_cl: []i64;      // 展开期收集的 clause 节点（顺序即源码顺序）
+pub var g_spl_base: i64 = 0;  // 本次收集在 g_spl_cl 中的起始下标
+pub var g_spl_ord: []i64;     // 重排后的顺序（无守卫通配落末位）
+pub var g_spl_ord_base: i64 = 0;
+pub var g_spl_ok: bool = true;
+pub var g_spl_trace: i64 = 0;   // 追踪开关（排障时临时置 1）
+
+// 递归收集：array_lit 元素 / `++`(Concat) 两侧 / 常量名（回查其初始化器）/ 单条 clause
+pub fn clause_collect(x: i64) void {
+    if (x < 0) { g_spl_ok = false; return; }
+    var ck: string = base.node_kind((x as u64));
+    if (ck == "clause") { append(g_spl_cl, x); return; }
+    if (ck == "paren" or ck == "comptime") { clause_collect(base.node_na((x as u64))); return; }
+    if (ck == "array_lit") {
+        // ⚠ 元素链头在 `la`，且是 kids 池 entry 索引（不是节点 id）—— 与臂链同规格。
+        var ak: []i64 = base.kids_chain_idx(base.node_la((x as u64)));
+        var ai: i64 = 0;
+        while (ai < slice_len(ak) as i64) {
+            clause_collect(base.kids[ak[ai]].val);
+            ai = ai + 1;
+        }
+        return;
+    }
+    if (ck == "binary" and base.node_sa((x as u64)) == "Concat") {
+        clause_collect(base.node_na((x as u64)));
+        clause_collect(base.node_nb((x as u64)));
+        return;
+    }
+    if (ck == "ident") {
+        var cinit: i64 = clause_const_init(base.node_sa((x as u64)));
+        if (cinit >= 0) { clause_collect(cinit); return; }
+        g_spl_ok = false;
+        return;
+    }
+    g_spl_ok = false;
+}
+
+// 无守卫通配 clause 判定（设计 §5.2.2）：pattern 是规范通配节点 **且** nb < 0。
+// 带守卫的通配不是不可反驳臂，不参与重排。
+pub fn clause_is_wildcard(c: i64) bool {
+    if (c < 0) { return false; }
+    if (base.node_nb((c as u64)) >= 0) { return false; }
+    var pn: i64 = base.node_na((c as u64));
+    if (pn < 0) { return false; }
+    if (base.node_kind((pn as u64)) != "ident") { return false; }
+    return base.node_sa((pn as u64)) == "_";
+}
+
+// 若 match 的臂链含 clause_splice，就地展开；否则不动（幂等：展开后 splice 已消失）。
+pub fn clause_expand_splice(m: i64) void {
+    var chain: i64 = base.node_la((m as u64));
+    if (chain < 0) { return; }
+    // 先看有没有拼接位；没有则零开销返回（既有 match 完全不受影响）
+    var ks: []i64 = base.kids_chain_idx(chain);
+    var ki: i64 = 0;
+    var has: bool = false;
+    while (ki < slice_len(ks) as i64) {
+        // 拼接位 = 链元不是 `arm`（parse.try_parse_clause_splice 直接把表达式节点放进链，
+        // 不额外包一层节点种类，见其注释）
+        if (base.node_kind((base.kids[ks[ki]].val as u64)) != "arm") { has = true; }
+        ki = ki + 1;
+    }
+    if (has == false) { return; }
+
+    g_spl_base = slice_len(g_spl_cl) as i64;
+    g_spl_ok = true;
+    ki = 0;
+    while (ki < slice_len(ks) as i64) {
+        var it: i64 = base.kids[ks[ki]].val;
+        if (base.node_kind((it as u64)) != "arm") {
+            clause_collect(it);
+        } else {
+            // 拼接位与普通臂混写：暂不支持（混写会让「重排后谁在前」失去确定语义）
+            parse.fc_err("T-CLA-E720",
+                "match 臂位置的子句组展开暂不支持与普通臂混写；请整组展开或全部写成普通臂", it);
+            return;
+        }
+        ki = ki + 1;
+    }
+    var spl_n: i64 = (slice_len(g_spl_cl) as i64) - g_spl_base;
+    if (g_spl_ok == false or spl_n <= 0) {
+        parse.fc_err("T-CLA-E723",
+            "match 臂位置的子句组必须是 `clause` 或 `[N]clause`（含 `++` 合并结果）", m);
+        return;
+    }
+
+    // ── N11 重排：无守卫通配 clause 移到末位（相对顺序保持）──
+    // 两趟扫描：先非通配，再通配。写入模块级 g_spl_ord（局部切片有逃逸坑，见其声明注释）。
+    g_spl_ord_base = slice_len(g_spl_ord) as i64;
+    var oi: i64 = g_spl_base;
+    while (oi < slice_len(g_spl_cl) as i64) {
+        if (clause_is_wildcard(g_spl_cl[oi]) == false) { append(g_spl_ord, g_spl_cl[oi]); }
+        oi = oi + 1;
+    }
+    oi = g_spl_base;
+    while (oi < slice_len(g_spl_cl) as i64) {
+        if (clause_is_wildcard(g_spl_cl[oi])) { append(g_spl_ord, g_spl_cl[oi]); }
+        oi = oi + 1;
+    }
+
+    // ── 生成既有 MatchArm 链 ──
+    var ah: i64 = -1;
+    var at: i64 = -1;
+    var ai2: i64 = g_spl_ord_base;
+    while (ai2 < slice_len(g_spl_ord) as i64) {
+        var cl: i64 = g_spl_ord[ai2];
+        var cpat: i64 = base.node_na((cl as u64));
+        var csa: string = "";
+        var cisw: bool = false;
+        var cpat2: i64 = cpat;
+        if (cpat >= 0 and base.node_kind((cpat as u64)) == "ident") {
+            if (base.node_sa((cpat as u64)) == "_") {
+                csa = "";
+                cisw = true;
+                cpat2 = -1;
+            } else {
+                csa = base.node_sa((cpat as u64));    // 绑定名
+                cisw = false;
+                cpat2 = -1;
+            }
+        }
+        // ⚠ mk_arm 末位是**记号索引**（内部走 tk_line/tk_col），不是节点 id ——
+        //   早先这里误传了 clause 节点 id，实测崩在 `t_slice_at index 24 length 4`。
+        //   故传 -1 不锚定，再沿用既有 `node_set_span_id` 惯用法把 clause 的位置复制过来，
+        //   使展开出的臂仍能报出原始行列。
+        var arm: i64 = base.mk_arm(csa, cisw, cpat2, base.node_nb((cl as u64)), base.node_nc((cl as u64)), -1);
+        at = base.list_push(ah, at, arm);
+        if (ah < 0) { ah = at; }
+        ai2 = ai2 + 1;
+    }
+    base.node_set_la((m as u64), ah);
+}
+
+// 在 parse 层的 decl_list 里按名查全局 const 的初始化器（不依赖 sema 符号表 ——
+// 本脱糖趟跑在 HIR 之前，那时 sema 尚未建符号）。
+pub fn clause_const_init(name: string) i64 {
+    var n: i64 = slice_len(lex.decl_list) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        var d: i64 = lex.decl_list[i];
+        if (base.node_kind((d as u64)) == "GlobalConstDecl" and base.node_sa((d as u64)) == name) {
+            return base.node_nb((d as u64));
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// 表达式是否是「子句组」（clause / [N]clause / `++` 合并结果）—— 借 clause_collect 判定。
+// 用于把 clause 常量从 decl_list 摘掉（见 desugar_clause_splices 的第二步）。
+pub fn expr_is_clause_group(x: i64) bool {
+    var b: i64 = slice_len(g_spl_cl) as i64;
+    g_spl_ok = true;
+    clause_collect(x);
+    var n: i64 = (slice_len(g_spl_cl) as i64) - b;
+    return g_spl_ok and n > 0;
+}
+
+// 全节点扫描：对每个 `match` 节点尝试展开其臂链里的子句组拼接位。
+// 用「扫全池」而非递归遍历 —— 拼接位可能出现在任意深度，而节点池是平铺的，
+// 逐个判 kind 即可覆盖，且新生成的是 arm 节点（不是 match），不会漏也不会重入。
+pub fn desugar_clause_splices() void {
+    // 第一步：展开所有 match 臂链里的子句组拼接位
+    var nn: i64 = base.node_count();
+    var i: i64 = 0;
+    while (i < nn) {
+        if (base.node_kind((i as u64)) == "match") { clause_expand_splice(i); }
+        i = i + 1;
+    }
+    // 第二步：把 clause 常量登记进 base 的「编译期专用」标记表。
+    //   声明**仍留在 decl_list**（摘掉会让后续引用失去符号 ⇒ 静默洞），只是 hir/tir
+    //   在各自阶段跳过它：clause 没有运行期布局，AstGen 降级会产 HIR_OP_RAW（门禁要求 0），
+    //   LLVM 发射会产 `getelementptr [N x %clause]` ⇒ clang "must be sized"。
+    //   放在 parse 期是必须的 —— hir_build 早于 sema，晚一步就来不及。
+    var dn: i64 = slice_len(lex.decl_list) as i64;
+    var di: i64 = 0;
+    while (di < dn) {
+        var d: i64 = lex.decl_list[di];
+        if (base.node_kind((d as u64)) == "GlobalConstDecl"
+            and expr_is_clause_group(base.node_nb((d as u64)))) {
+            base.clause_const_mark(d);
+        }
+        di = di + 1;
+    }
+}
+
+
 pub fn parse_unit() void {
     while (lex.cur_t() != "Eof") {
         if (lex.cur_t() == "Semicolon") {
@@ -3267,6 +3471,12 @@ pub fn parse_unit() void {
     // 注意：子句合并（desugar_func_clauses）与 lambda 提升（desugar_lambdas）
     // 现在改在 run_check 里、模块内联（resolve_modules）完成之后统一跑一遍，
     // 以便覆盖「入口 + 所有被 import 的模块」合并后的整张 decl_list。
+    //
+    // ⚠ 子句组展开**不能**照它们那样放到 run_check：HIR AstGen（hir_build）在
+    //   run_check **之前**就把 match 的臂链降级成 HIR_OP_MATCH_ARM，届时臂链里还
+    //   是未展开的拼接位 ⇒ AstGen 按「链元即臂」处理而崩（实测 `t_slice_at`）。
+    //   展开是纯语法变换（不依赖 sema 的类型），故放在这里、HIR 之前，最稳。
+    desugar_clause_splices();
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -4665,6 +4875,31 @@ pub fn parse_match_subpat() i64 {
 
 // match 臂解析（支持 S1 或模式 `|` 与 S3 as-模式 `x @ pat`）。
 // 或模式脱糖为多个并列臂（共用守卫与体），返回这一组臂的链表头。
+// 试探「臂位置是否是一个子句组拼接位」。命中直接返回**表达式节点本身**；
+// 未命中返回 -1 且**保证词法位置已还原**，调用方应照常走 parse_match_arm。
+//
+// ⚠ 刻意**不引入新节点种类**（初版造了个 `clause_splice` 包一层，实测 dump-ast / emit-hir
+//   直接崩在 `t_slice_at` —— 新种类未进 CST 种类表，下游遍历按种类索引即越界）。
+//   改为把表达式节点原样放进臂链：sema 侧用「链元 kind != "arm"」识别拼接位，
+//   既省掉一层包装，也省掉注册种类的连带改动。表达式自带锚点，诊断位置不受影响。
+pub fn try_parse_clause_splice() i64 {
+    var t: string = lex.cur_t();
+    var can_expr: bool = false;
+    if (t == "Identifier") { can_expr = true; }
+    if (t == "LBracket") { can_expr = true; }     // 数组字面量 / 切片模式，二者都可用 parse_expr 解析
+    if (t == "LParen") { can_expr = true; }
+    if (can_expr == false) { return -1; }
+    var sp_save: i64 = lex.pos;
+    var sp_e: i64 = parse_expr();
+    var sp_next: string = lex.cur_t();
+    if (sp_next == "RBrace" or sp_next == "Comma") {
+        if (sp_next == "Comma") { lex.advance_i(); }
+        return sp_e;
+    }
+    lex.pos = sp_save;                             // 不是拼接位：整体回退
+    return -1;
+}
+
 pub fn parse_match_arm() i64 {
     var am_ti: i64 = lex.pos;
     var am_sa: []string;
@@ -4747,14 +4982,33 @@ pub fn parse_match_expr() i64 {
     var mx_head: i64 = -1;
     var mx_tail: i64 = -1;
     while (lex.cur_t() != "RBrace" and lex.cur_t() != "Eof") {
-        var mx_a: i64 = parse_match_arm();
-        if (mx_a >= 0) {
-            if (mx_head < 0) {
-                mx_head = mx_a;
-            } else {
-                base.list_link(mx_tail, mx_a);
+        // ── 子句组拼接位（N10）──────────────────────────────────────────
+        // 臂位置出现一个**不含 `=>` 的裸表达式**在今天是解析错误，属空位利用：
+        // 令其承载 `[N]clause` 值，由 desugar_clause_splices 展开为臂（设计 §5.4）。
+        // 判据：**先按表达式解析，若紧随其后是 `}` 或 `,`，则它是拼接位** ——
+        //    · 普通臂 `0 => 1` / `n when n > 0 => ...` 解析完表达式后必见 `=>` 或 `when`
+        //      ⇒ 回退、按原路径解析为臂；
+        //    · 拼接位 `match (x) { G }` 解析完 `G` 后见 `}` ⇒ 命中。
+        // ⚠ 只对「表达式位必定能成功解析」的起首记号做试探：`_` / `1..5` / `<<...>>`
+        //   这类是**模式专用**写法，parse_expr 会撞上 parse_fatal（直接 exit）而无法回退。
+        var mx_sp: i64 = try_parse_clause_splice();
+        if (mx_sp >= 0) {
+            // ⚠ 臂链的 head/tail 一律是 **kids 池的 entry 索引**（base.list_push 的返回值），
+            //   不是节点 id。try_parse_clause_splice 返回的是表达式节点 id，必须经 list_push
+            //   压成链元 —— 直接拿节点 id 当链元用会写坏链表（实测 `t_slice_at` 越界）。
+            var mx_e: i64 = base.list_push(mx_head, mx_tail, mx_sp);
+            if (mx_head < 0) { mx_head = mx_e; }
+            mx_tail = mx_e;
+        } else {
+            var mx_a: i64 = parse_match_arm();
+            if (mx_a >= 0) {
+                if (mx_head < 0) {
+                    mx_head = mx_a;
+                } else {
+                    base.list_link(mx_tail, mx_a);
+                }
+                mx_tail = base.list_last(mx_a);
             }
-            mx_tail = base.list_last(mx_a);
         }
     }
     expect_tok("RBrace");
