@@ -5619,6 +5619,79 @@ pub fn n_line(ni: i64) i64 {
 }
 
 
+// ══════════════════════════════════════════════════════════════
+// 一等子句字面量 `@clause(.pattern, <pat>, [when <guard>,] <body>)`
+// ── 设计：docs/compiler/first-class-clause.md §1.1 / §5.1 ──
+//
+// 参数位是 **AST 位置**，不是值位置：一概不求值。理由有二 ——
+//   ① body 可引用 pattern 绑定出来的名字（构造时尚无任何绑定）；
+//   ② 通配 `_` 在表达式位根本非法（只有模式位才接受它）。
+// 故本函数只做语法归约，产出 kind="clause"：
+//   sa = 子句类别枚举 ClauseKind 的成员名（当前仅 "pattern"）
+//   na = pattern 子树    nb = guard 子树（-1 = 无守卫）    nc = body 子树
+//
+// 形态判别靠第 3 段是否为 `when`，**不靠数逗号**：guard 与 body 同为 Expr，
+// 元数判别会把「两段都像表达式」的歧义一路带进 sema（见设计 §1.1）。
+// ══════════════════════════════════════════════════════════════
+
+// ClauseKind 合成枚举的合法成员。Phase 1 只有 `pattern`；后续子功能往此表
+// 追加成员即可，`@clause` 的语法与展开通通不变（设计 §5.1.1）。
+pub fn clause_kind_member(k: string) bool {
+    if (k == "pattern") { return true; }
+    return false;
+}
+
+pub fn clause_kind_list() string {
+    return ".pattern";
+}
+
+// 调用点已确认内建名 == "clause"，当前 token 是 '('。
+pub fn parse_clause_lit(ti_at: i64) i64 {
+    expect_tok("LParen");
+    var ti_k: i64 = lex.pos;
+    expect_tok("Dot");
+    var km: string = expect_tok("Identifier");
+    if (clause_kind_member(km) == false) {
+        parse_fatal_at("T-CLA-E721",
+            base.sb_cat5("未知子句类别 `.", km, "`；当前合法值仅 ", clause_kind_list(), "（ClauseKind 合成枚举成员）"),
+            ti_k);
+    }
+    expect_tok("Comma");
+    // ── pattern 位：`_` 通配站位（不绑定，L-02）或普通表达式 ──
+    var pn: i64 = -1;
+    if (lex.cur_t() == "_") {
+        lex.advance_i();
+        pn = base.mk_ident("_", -1);
+    } else {
+        pn = parse_expr();
+    }
+    // 缺 body 位须在期待逗号**之前**判，否则会先撞上通用的 T-PAR-E101 而报不到 E720。
+    if (lex.cur_t() == "RParen") {
+        parse_fatal_at("T-CLA-E720",
+            "@clause 字面量缺 body 位；合法形态 `@clause(.pattern, <pat>, [when <guard>,] <body>)`",
+            ti_at);
+    }
+    expect_tok("Comma");
+    // ── 可选守卫段：`when <expr>`，其后须再跟一个逗号与 body ──
+    var gn: i64 = -1;
+    if (lex.cur_t() == "KwWhen") {
+        lex.advance_i();
+        gn = parse_expr();
+        expect_tok("Comma");
+    }
+    // ── body 位 ──
+    var bn: i64 = parse_expr();
+    if (lex.cur_t() == "Comma") { lex.advance_i(); }     // 允许尾随逗号
+    expect_tok("RParen");
+    var cid: i64 = base.node_new("clause");
+    base.node_set_sa((cid as u64), km);
+    base.node_set_na((cid as u64), pn);
+    base.node_set_nb((cid as u64), gn);
+    base.node_set_nc((cid as u64), bn);
+    base.node_at(cid, ti_at);
+    return cid;
+}
+
 pub fn parse_meta_builtin() i64 {
     var ti_at: i64 = lex.advance_i();               // '@'
     // P2b：允许 @struct / @enum / @fn 这些关键字作为内建名（否则关键字 token 被 Identifier 期望拒绝）。
@@ -5633,6 +5706,9 @@ pub fn parse_meta_builtin() i64 {
         parse_fatal(base.sb_cat2("语法错误：@ 后须接内建名，实际读到 ", lex.cur_v()));
         return -1;
     }
+    // 一等子句字面量 `@clause(...)`：参数位一律不求值（AST 位置），故在消耗 '(' 之前
+    // 就分流到独立解析路径，不进通用的「按 ma 逐个 parse_expr」循环。
+    if (nm == "clause") { return parse_clause_lit(ti_at); }
     expect_tok("LParen");
     var head: i64 = -1;
     var tail: i64 = -1;
