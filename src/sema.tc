@@ -8294,12 +8294,10 @@ pub fn infer_expr_body(e: i64) i64 {
             // 非法 IR（`and %Perm`），此处一并收口为结构化报错。
             if (op == "&&" or op == "||" or tip_is_packed(lt) or tip_is_packed(rt)) {
                 var sbset: StringBuilder = sb_new();
-                var setname: string = "交集 Intersect";
-                var cptname: string = "`Intersect`";
+                var setname: string = "交集";
                 var setcode: string = "T-SET-E101";
                 if (op == "||") {
-                    setname = "并集 Union";
-                    cptname = "`Union`";
+                    setname = "并集";
                     setcode = "T-SET-E102";
                 }
                 sb_append_str(sbset, "集合运算符 `");
@@ -8310,25 +8308,45 @@ pub fn infer_expr_body(e: i64) i64 {
                 sb_append_str(sbset, ti_str(lt));
                 sb_append_str(sbset, " 与 ");
                 sb_append_str(sbset, ti_str(rt));
-                sb_append_str(sbset, "；内建实现目前只覆盖 bitstr，其它类型请实现对应 concept ");
-                sb_append_str(sbset, cptname);
-                sb_append_str(sbset, " 后再使用（布尔逻辑请用 `and` / `or`）");
+                // ⚠ 文案不指向 `Intersect` / `Union` concept：那套扩展机制目前**只有设计、没有实装**
+                //   （src/lib 里查无此 concept），指向它等于承诺一个用户根本无法实现的扩展点 ——
+                //   与 §12.2 的 `^^` 同款缺陷。同理不再写"只覆盖 bitstr"（位域亦已支持）。
+                sb_append_str(sbset, "；内建实现目前只覆盖 bitstr 与位域（packed struct）");
+                sb_append_str(sbset, "（布尔逻辑请用 `and` / `or`）");
                 parse.fc_err(setcode, sb_to_str(sbset), e);
                 return ti_mk("Unknown");
             }
         }
-        // `^` 对 bitstr：对称差尚未实装（`^^` 属后续批次），不能沿用「返回左操作数类型」的
-        // 兜底 —— 那会让后端产出非法 IR `xor %TBitStr`（同 `&`/`|` 的静默错编缺口）。
-        if (op == "^" and tip_kind(lt) == "BitStr" and tip_kind(rt) == "BitStr") {
-            parse.fc_err("T-SET-E103",
-                "位串暂不支持 `^`：对称差运算符 `^^` 属后续批次，当前可用 `&&`（交）/ `||`（并）", e);
-            return ti_mk("Unknown");
-        }
-        // 位域的 `^` 同理：对称差 `^^` 属后续批次，此前静默产出非法 IR `xor %Perm`，此处收口。
-        if (op == "^" and tip_is_packed(lt) and tip_is_packed(rt)) {
-            parse.fc_err("T-SET-E105",
-                "位域暂不支持 `^`：对称差运算符 `^^` 属后续批次，当前可用 `&&`（交）/ `||`（并）", e);
-            return ti_mk("Unknown");
+        // `^` 对集合类型（bitstr / 位域）：差集与对称差的运算符**留待后续批次设计**，当前一律
+        // 不支持 —— 不能沿用「返回左操作数类型」的兜底，那会让后端产出非法 IR
+        // （实测 `Perm ^ i64` → 0 error，却在 LLVM 校验期炸 `xor %Perm %a, %b`）。
+        // ⚠ 判定用「任一侧」而非「两侧」：`&` / `|` 的单侧缺口已收口，`^` 曾漏掉单侧
+        //   （`Perm ^ i64` / `i64 ^ bitstr` 均 0 error + 后端非法 IR），此处按同一口径补上。
+        // ⚠ 文案**不指名**尚未设计的符号（如 `^^`）—— 那等于对未定项做承诺，
+        //   用户撞到报错会被指向一个根本不存在、也没定义过拼写的运算符。
+        if (op == "^") {
+            if (tip_kind(lt) == "BitStr" or tip_kind(rt) == "BitStr") {
+                parse.fc_err("T-SET-E103",
+                    "位串不支持 `^`：集合代数当前只提供 `&&`（交）与 `||`（并）；差集 / 对称差的运算符留待后续批次设计", e);
+                return ti_mk("Unknown");
+            }
+            if (tip_is_packed(lt) and tip_is_packed(rt) and ti_equal(lt, rt) == false) {
+                // 两侧位域但类型不同：与 `&&` / `||` 同口径报 E104 —— 位域是名义类型、
+                // 位宽由布局定死，跨位域类型没有良定义的位对应关系（比"`^` 不支持"更根本）。
+                var sbx: StringBuilder = sb_new();
+                sb_append_str(sbx, "集合运算符 `^` 两侧位域类型不同：");
+                sb_append_str(sbx, ti_str(lt));
+                sb_append_str(sbx, " 与 ");
+                sb_append_str(sbx, ti_str(rt));
+                sb_append_str(sbx, "；位域是名义类型且位宽由布局定死，不支持跨位域类型的集合运算");
+                parse.fc_err("T-SET-E104", sb_to_str(sbx), e);
+                return ti_mk("Unknown");
+            }
+            if (tip_is_packed(lt) or tip_is_packed(rt)) {
+                parse.fc_err("T-SET-E105",
+                    "位域不支持 `^`：集合代数当前只提供 `&&`（交）与 `||`（并）；差集 / 对称差的运算符留待后续批次设计", e);
+                return ti_mk("Unknown");
+            }
         }
         if (op == "==" or op == "!=" or op == "<" or op == ">" or op == "<=" or op == ">=") {
             return ti_scalar("bool");
