@@ -1,0 +1,92 @@
+diff --git a/src/sema.tc b/src/sema.tc
+index 557b149..4442aaf 100644
+--- a/src/sema.tc
++++ b/src/sema.tc
+@@ -3,7 +3,7 @@
+ //
+ // 内容：类型检查器（TypeInfo 池）、comptime/meta 泛型单态化、CTFE 求值器、
+ //       编译期内建，以及供两个后端消费的 TypeDesc（TD）池。
+-// 依赖：base, lex, parse, hir。
++// 依赖：base, lex, parse, hir, tir（tir 经 @import 读取其接口文件，sema↔tir 互引由容忍环检测处理）。
+ //
+ // Stage B（HIR 消费）：sema 的**遍历与分派**一律以 HIR 指令为输入 ——
+ // 顶层声明工作集取自 hir.g_hir.decls，函数体/语句走 HIR BLOCK 指令流，
+@@ -16,6 +16,7 @@ const base = @import("src.base");
+ const lex = @import("src.lex");
+ const parse = @import("src.parse");
+ const hir = @import("src.hir");
++const tir = @import("src.tir");
+ 
+ // ── TypeDesc 池（复刻 TypeDesc interface）──────────────────────
+ // 类型描述库由语义分析阶段产出（构建 TD 索引），供两个代码生成后端消费，
+@@ -11405,6 +11406,11 @@ pub fn sel_register(imp: i64, alias: string) void {
+     }
+ }
+ 
++// 阶段 C 多进程自举：当前正以 --lib --mod-id 独立编译的入口模块完整 idn（如 "src.sema"）。
++// 接口文件（.tint）加载若遇到对「自身」的导入（如 sema 的 .tint 被 tir 加载时反向引回 sema），
++// 视为 no-op（仅登记模块值、不重加载、不报环错、不重复定义）。空串 = 非多进程子模块编译。
++pub var g_self_mod_idn: string = "";
++
+ // 解析单个 import 声明：定位模块文件 → 去重/环检测 → 内联加载
+ pub fn handle_one_import(imp: i64, at: i64) void {
+     var nm: string = base.node_sb((imp as u64));
+@@ -11491,6 +11497,18 @@ pub fn handle_one_import(imp: i64, at: i64) void {
+             return;
+         }
+     }
++    // 阶段 C 多进程自举：接口文件（.tint）加载遇到「自身」导入 → no-op（打破 sema↔tir 环，避免重复定义）。
++    // 当以 --lib --mod-id src.M 独立编译 M 时，依赖方 N 的 .tint 会反向 import src.M；
++    // 此时 src.M 正是当前入口（已被全量编译），重加载其接口会与入口全量定义撞名，故仅登记模块值即返回。
++    // 阶段 C 多进程自举：接口文件（.tint）加载遇到「自身」导入 → no-op（打破 sema↔tir 环，避免重复定义）。
++    // 当以 --lib --mod-id src.M 独立编译 M 时，依赖方 N 的 .tint 会反向 import src.M；
++    // 此时 src.M 正是当前入口（已被全量编译），重加载其接口会与入口全量定义撞名，故仅登记模块值即返回。
++    if (loaded_tint and idn == g_self_mod_idn) {
++        if (str_len(g_modval_get(alias)) as i64 == 0) { g_modval_set(alias, idn); }
++        var seg: string = last_segment(idn);
++        if (seg != alias and str_len(g_modval_get(seg)) as i64 == 0) { g_modval_set(seg, idn); }
++        return;
++    }
+     // 选择性导入（`:: a, b as c` / `:: *`）登记。必须在钻石去重 return 之前：
+     // 同一模块被多处导入时，每个导入点的 `::` 绑定都要生效。
+     // M2：g_sel_mod 记完整路径身份（供 Pass 3 mangled_name / def_lookup / reexport 一致）。
+@@ -11500,22 +11518,12 @@ pub fn handle_one_import(imp: i64, at: i64) void {
+     // 在 resolve 处已 g_modval_set；此处补齐声明式路径，二者幂等（g_modval_get 取首个）。
+     // M2：g_modval 键须为完整路径身份 idn（源码写末段别名 X，infer 经 g_modval_get 得 idn）。
+     if (str_len(g_modval_get(alias)) as i64 == 0) { g_modval_set(alias, idn); }
+-    // 环检测：chosen 已在活跃加载栈 → 循环依赖（import 不能成环）。
++    // 环检测：chosen 已在活跃加载栈 → 循环依赖。t 语言支持模块间相互引用
++    // （单进程扁平命名空间与多进程接口文件均依赖延迟解析），成环不再致命：
++    // 直接跳过本次加载（首次加载已登记其符号，引用在后续 sema 阶段统一解析），
++    // 下方 in_mod_visited 去重防止重复定义与无限递归。
+     var ci: i64 = mod_stack_index(chosen);
+     if (ci >= 0) {
+-        var csb: StringBuilder = sb_new();
+-        var k: i64 = 0;
+-        var m: i64 = slice_len(lex__g_mod_stack) as i64;
+-        while (k < m) {
+-            if (k > 0) { sb_append_str(csb, " -> "); }
+-            sb_append_str(csb, lex__g_mod_stack_alias[k]);
+-            k = k + 1;
+-        }
+-        sb_append_str(csb, " -> ");
+-        sb_append_str(csb, alias);
+-        parse__fc_err("T-MOD-E551",
+-            base__sb_cat3("检测到循环依赖：", sb_to_str(csb),
+-                "（import 不能成环，请抽公共模块或改用运行时依赖注入）"), imp);
+         return;
+     }
+     // 链接模式探测：存在 .tlib 预编译产物且未用 as 别名（归档按规范名构建，as 别名会错配）→ 外链。
+diff --git a/src/tc.tc b/src/tc.tc
+index b651bc1..0c00c02 100644
+--- a/src/tc.tc
++++ b/src/tc.tc
+@@ -1005,6 +1005,8 @@ fn main() i32 @main {
+             // 模块值，导致 body 内的 base.xxx 自引用报「未定义标识符 base」。手动补登记：
+             //   alias("base") → idn("src.base")，与下游 import 的模块值键一致。
+             sema.g_modval_set(lib_alias, lex.g_lib_mod_idn);
++            // 阶段 C 多进程自举：记录当前独立编译的入口模块 idn，供 handle_one_import 打破自身接口引用环。
++            if (mod_id_override != "") { sema.g_self_mod_idn = lex.g_lib_mod_idn; }
+             lex.g_lib_emit = true;       // 跳过进程级全局发射（t.__ginit / atom 表），避免链接冲突
+         }
+         base.g_intern_active = false; // 阶段 1：parse 期不驻留（g_parse 临时串不得作 canonical）
