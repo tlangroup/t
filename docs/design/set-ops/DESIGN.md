@@ -26,8 +26,8 @@
 | bool 逻辑 | `||` | ~~逻辑或~~ **Step 2 起不再作布尔**，让位给集合并集 | — | ⛔ 已移除（Step 2） |
 | bool 逻辑 | `or` | 逻辑或 | bool | ✅ 已实装 |
 | 约束连词 | `&&` | 约束合取（T: A && B，编译器内部逻辑 AND） | concept（多约束） | ✅ 已实装（T6） |
-| 集合代数 | `&&` | 交集（∩） | bitstr（flag 待后续） | ✅ 已实装（Step 2） |
-| 集合代数 | `||` | 并集（∪） | bitstr（flag 待后续） | ✅ 已实装（Step 2） |
+| 集合代数 | `&&` | 交集（∩） | bitstr / 位域（packed struct） | ✅ 已实装（Step 2） |
+| 集合代数 | `||` | 并集（∪） | bitstr / 位域（packed struct） | ✅ 已实装（Step 2） |
 
 - `bitstr` 特殊：既是位序列（可 `++` 拼接）又是位集合（Step 2 可 `&&`/`||` 交并）。
 - `flag`（位标志枚举）在 Step 2 进集合代数族（`&&`/`||`），第一批不吃 `++`。
@@ -82,7 +82,7 @@
   （双后端比对输出 `RANGE_IN_OK`）。
 - ✅ **Step 2 第二步已完成（2026-10-26，详见 §10）**：值表达式位 `And`/`Or` token 改派发集合运算
   （`op="&&"`/`"||"` → bitstr 交并）+ T7 `T-SET-E*` 诊断 + 改写 `p_setops_bool_spellings.tc`。
-  ⚠ flag（位域）交并**未随本批实装**（理由见 §10.1）。
+  ✅ 位域（packed struct）交并已随 §11 实装（2026-10-26）。
 
 ## 8. 风险 / 成本
 
@@ -162,7 +162,7 @@
 |---|---|---|
 | 不同位宽的 bitstr 交并 | 结果位数 = **max(a.bit_len, b.bit_len)**，较短一侧按**零扩展**对齐 | 位串表示"位位置集合"时，缺失的高位本就是"不含该成员"，零扩展即集合语义的自然写法；也与整数隐式零扩展一致 |
 | `&` / `\|` 对 bitstr | 与 `&&` / `\|\|` **同一条通路**（位串上两者语义本就相同） | 顺带补齐"类型检查放行、后端产出非法 IR"的静默错编缺口，比单纯报错更有用 |
-| flag（位标志） | **本批不实装**，报 `T-SET-E101/E102`；留作后续批次 | ① `flag` 声明关键字已被积类型统一废弃（改用 `packed struct`），本设计的"flag"前提已变；② 后端表示不一致（LLVM `%Perm = type { i16 }` 值 vs C 端 `unsigned char*` 按指针传），无"取底层整数"的现成通路 |
+| flag（位标志） | 本批不实装，报 `T-SET-E101/E102`；**已在 §11（2026-10-26）实装为位域 `packed struct`** | ① `flag` 声明关键字已被积类型统一废弃（改用 `packed struct`），本设计的"flag"前提已变；② 后端表示不一致（LLVM `%Perm = type { i16 }` 值 vs C 端 `unsigned char*` 按指针传），无"取底层整数"的现成通路 ⇒ 当时判为需单开一批 |
 
 ### 10.2 改动清单
 
@@ -205,3 +205,93 @@
   `src/tc.tc::{c,ll}` 2 处 DIFF（编译器自身源码变更）+ 新增 golden 的 2 条 NEW，**0 缺失**；
   且**没有任何既存 example 的 IR 变化** ⇒ 新语义未影响既有行为。
 - 四代产物已安装为 `out/dbg/tc.exe`（md5 `b0f4daef…`）。
+
+## 11. Step 2 第 3 小步：位域（packed struct）集合交 / 并（2026-10-26）
+
+§10.1 曾把位域判为"需单开一批"，理由是两后端表示不一致、且无"取底层整数"的现成通路。
+本批结论：**那条通路其实早就有了**（packed 成员读写与字面量构造各用一半），拼起来即可，
+且不需要任何 runtime shim —— 见 §11.2。
+
+### 11.1 语义裁定
+
+| 议题 | 裁定 | 理由 |
+|---|---|---|
+| 交 / 并的语义 | **宿主整型 AND / OR** | 位域整体就是"位位置集合"，各字段占互不重叠的位段 ⇒ 等价于**逐字段的位与 / 位或**（实测 `Perm{...} && Perm{...}` = 逐字段取小者，`\|\|` = 取大者） |
+| 两侧类型 | 必须是**同一个**位域类型；不同 → `T-SET-E104` | 位域是名义类型、位宽由布局定死，没有 bitstr 那种"取 max + 零扩展"的依据；跨位域类型时"谁的第 3 位对应谁的哪一位"无良定义 |
+| 结果类型 | = 该位域类型（不做位宽提升） | 同上：布局定死，`max(a,b)` 无从谈起 |
+| padding 位（`total .. host_bits-1`） | **不额外掩码**，原样参与运算 | 与 P8 的 `flag_set` / `flag_get` 一致（宿主字本就当通用位容器用）；且零成本 |
+| `&` / `\|` | 与 `&&` / `\|\|` **同一条通路** | 同 bitstr 的处理：补齐"类型检查放行、后端产出非法 IR `and %Perm`"的静默错编缺口 |
+| `^` | 不支持 → `T-SET-E105` | 对称差 `^^` 属后续批次；此前静默产出 `xor %Perm` |
+
+### 11.2 关键实现选择：在 **TIR 层**降，不在后端拦
+
+与 §10（bitstr 走 runtime shim）不同，本批**没有**写两套后端拦截，而是在 `src/tir.tc`
+的 `tir_emit_binary` 里把 `&&` / `||` / `&` / `|` 展开成三段式：
+
+```
+ADDR_OF (ptr<%Perm>) → GEP[0,0] → LOAD hostst   // 抽宿主整型（两侧各一份）
+AND / OR  hostst                                 // 位运算
+STRUCT_NEW %Perm ← hostst                        // 裹回聚合
+```
+
+理由：这三段正是 packed 成员读写（P5）与 packed 字面量构造（P5）**已在双后端验证过**的通路
+（含那条 `ptr<%Name>` 的 ADDR_OF 槽型修正 —— 宿主整型 < 8 字节时按值分配会被 8 字节指针写穿栈）。
+一次实现两端同构：实测两个后端**首次运行即逐字相同**，没有出现 §10.3 那类"只有单后端才看得见"的坑。
+
+> 推论（可复用的经验）：凡是 packed 相关的新语义，先找 TIR 层已有的等价指令序列拼装，
+> 而不是新增 shim —— shim 要同时照顾 C 端按值返回与 LLVM 端 sret 两套约定，
+> 那儿才是 `out` 参位置写反、静默写进左操作数这类 bug 的温床（§10.3 坑 2）。
+
+### 11.3 踩到的坑：判别式选错 = 功能静默不生效
+
+首版用 `tip_is_flag()` 判别位域：**编译通过、0 error，但功能完全不生效**
+（`Perm && Perm` 照旧报 `T-SET-E101`）。
+
+- `tip_is_flag` 判的是 `TI.kind == "Struct" && TI.und != ""`；
+- 但 `und` 现在**只有 Enum 声明会写**（`ti_with_und` 的唯一调用点在 enum decl）。
+  `flag` 关键字 P7 移除后，packed struct 走 `ti_named`，`und` 恒空 ⇒ 该判据**恒假**。
+- 改用新增的 `tip_is_packed()`：`mb_type_decl(tip_name(ti))` 取声明节点，判 `node_sb(d) == "packed"`。
+  ⚠ 不用 `pk_find_struct`（布局池）：它在 `check_struct_decl` 时才填充，sema 期遇到
+  "函数在前、packed 声明在后"的次序会漏判；`lex__decl_list` 是词法期全量收集，无次序问题。
+
+**教训**：判别式"看起来对 + `tc check` 全绿"不等于生效。凡"某个分支应该被走进"的改动，
+必须用**能观察到结果差异**的最小用例验证（本例即 `var c: Perm = a && b;` 还报不报错），
+而不是只看编译器自身检查通过 —— 这类 bug 不会报错，只会让新功能悄悄变成死代码。
+
+### 11.4 改动清单
+
+| 位置 | 改动 |
+|---|---|
+| `src/sema.tc` | 新增 `tip_is_packed()`；集合分派：同位域类型 → 该类型；跨位域 → `T-SET-E104`；单侧位域 → `E101` / `E102`（顺带收口 `&` / `\|` 的静默缺口）；位域 `^` → `E105` |
+| `src/tir.tc` | `tir_emit_binary` 拦截 + `tir_packed_bin_ty` / `tir_packed_setop` / `tir_packed_host_st` / `tir_packed_host` 四个辅助 |
+| `tests/conformance/pass/p_setops_packed_{intersect,union}.tc` | 新增 2 |
+| `tests/conformance/fail/f_setops_packed_{mixed,xor,half}.tc` | 新增 3（`E104` / `E105` / `E101`） |
+| `examples/setops_packed.{tc,expected.txt}` | 新增运行期 golden：u8 / u16 / u64 三种宿主宽度 + 嵌套 + `&` / `\|` + 自检 |
+
+### 11.5 验证
+- `tc check src/tc.tc`：0 error / **635** warnings（+2 为本批新增 `tip_is_packed` / `tir_packed_*` 的命名告警）。
+- 双后端对拍：`examples/setops_packed.tc` LLVM 与 tmir-c **逐字相同**：
+
+  ```
+  perm && r=1 w=0 lv=3 own=42      交：逐字段位与（r 1&1、w 1&0、lv 7&3、own 42&42）
+  perm || r=1 w=1 lv=7 own=42      并：逐字段位或
+  perm  & r=1 w=0 lv=3 own=42      `&` 与 `&&` 同义
+  perm  | r=1 w=1 lv=7 own=42      `|` 与 `||` 同义
+  perm nest r=1 w=1 lv=7 own=42    嵌套 (a && b) || (a || b)
+  tiny && a=1 b=0 c=0              宿主 u8：0b101 & 0b011
+  tiny || a=1 b=1 c=1              宿主 u8：0b101 | 0b011
+  wide && lo=33818120 hi=40        宿主 u64：0x12345678 & 0x0F0F0F0F = 0x02040608；0xAB & 0x3C = 0x28
+  wide || lo=524246911 hi=191      宿主 u64：0x12345678 | 0x0F0F0F0F = 0x1F3F5F7F；0xAB | 0x3C = 0xBF
+  setops_packed OK
+  ```
+
+  三种宿主宽度（u8 / u16 / u64）全覆盖 —— 宿主 < 8 字节正是 P5「ADDR_OF 槽按值分配会写穿栈」的敏感路径。
+- conformance **391 / 391**（386 + 本批 5）。
+- 种子体检通过（`08046b37…` 仍可编译 src，0 error / 635 warnings）⇒ 无需刷新。
+- IR 快照基线重录（**138 targets / 279 entries**，用 gate 的 g1 录）：2 处 DIFF（`src/tc.tc::{c,ll}`）
+  + 2 条 NEW（`examples/setops_packed.tc::{c,ll}`），**0 缺失**，且**无任何既存 example 的 IR 变化**。
+- **gate L2：24 passed / 0 failed（2422.6s）**；自举不动点 `g2==g3`、`g2==g3==g4`、C 后端自举、
+  run_examples 双后端（103/103）、conformance、difftest 代际对拍、MIR differential 全绿。
+- 四代产物已安装为 `out/dbg/tc.exe`（md5 `96c03c71…`）。
+- ⚠ 批量并发下 `concat_demo` 偶发 720s 超时属**已知环境 flake**（单跑 EXIT=0 且输出逐字一致），
+  本批 103 例在门禁内全绿。

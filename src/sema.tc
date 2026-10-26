@@ -606,6 +606,21 @@ pub fn tip_is_flag(i: i64) bool {
     return t.kind == "Struct" and t.und != "";
 }
 
+// 位域（packed struct）判别。
+// ⚠ 不能复用 `tip_is_flag`：它判的是 `und` 非空，而 `und` 目前只有 **Enum** 声明会写
+//   （`flag` 关键字在 P7 已移除，packed struct 走 `ti_named`，`und` 恒空）⇒ 该判据恒假。
+// ⚠ 也不用 `pk_find_struct`（布局池）：它在 `check_struct_decl` 时才填充，sema 期遇到
+//   「函数在前、packed 声明在后」的次序会漏判。`lex__decl_list` 是词法期全量收集，无次序问题。
+pub fn tip_is_packed(i: i64) bool {
+    if (i < 0) { return false; }
+    // 廉价前置过滤：只有 Struct 才可能是位域（标量/枚举/概念名不必去扫 decl_list）。
+    if (tip_kind(i) != "Struct") { return false; }
+    var sd: i64 = mb_type_decl(tip_name(i));
+    if (sd < 0) { return false; }
+    if (base.node_kind((sd as u64)) != "StructDecl") { return false; }
+    return base.node_sb((sd as u64)) == "packed";
+}
+
 // 条件位置（if / while / for 的条件，match 的 `when` 守卫）只接受 bool。
 // Unknown 一律放行：该表达式多半已有诊断，再报一次只会级联噪声。
 //
@@ -8249,15 +8264,35 @@ pub fn infer_expr_body(e: i64) i64 {
                     "；其余类型暂不支持 ++"), e);
             return ti_mk("Unknown");
         }
-        // §set-ops Step 2：值级 `&&` / `||` = 集合交 / 并。内建实现目前覆盖 bitstr；
-        // `&` / `|` 对 bitstr 与集合运算同义（同一条位运算通路），顺带补齐此前
+        // §set-ops Step 2：值级 `&&` / `||` = 集合交 / 并。内建实现覆盖 bitstr 与位域（packed struct）；
+        // `&` / `|` 对这两类与集合运算同义（同一条位运算通路），顺带补齐此前
         // 「类型检查放行、后端产出非法 IR」的静默错编缺口（实测 `and %TBitStr` / `and %Perm`）。
         // 其余类型一律结构化报错并指向扩展点 concept（Intersect / Union，见 §4）。
         if (op == "&&" or op == "||" or op == "&" or op == "|") {
             if (tip_kind(lt) == "BitStr" and tip_kind(rt) == "BitStr") {
                 return ti_mk("BitStr");
             }
-            if (op == "&&" or op == "||") {
+            // 位域（packed struct）交 / 并 = 宿主整型 AND / OR。两侧须是**同一个**位域类型：
+            // 位域是名义类型、位宽由布局定死，没有 bitstr 那种「取 max + 零扩展」的依据，
+            // 跨位域类型的交 / 并没有良定义的位对应关系（谁的第 3 位对应谁的哪一位？）。
+            if (tip_is_packed(lt) and tip_is_packed(rt)) {
+                if (ti_equal(lt, rt)) {
+                    return lt;
+                }
+                var sbf: StringBuilder = sb_new();
+                sb_append_str(sbf, "集合运算符 `");
+                sb_append_str(sbf, op);
+                sb_append_str(sbf, "` 两侧位域类型不同：");
+                sb_append_str(sbf, ti_str(lt));
+                sb_append_str(sbf, " 与 ");
+                sb_append_str(sbf, ti_str(rt));
+                sb_append_str(sbf, "；位域是名义类型且位宽由布局定死，不支持跨位域类型的交 / 并");
+                parse.fc_err("T-SET-E104", sb_to_str(sbf), e);
+                return ti_mk("Unknown");
+            }
+            // 仅一侧是位域：`&&` / `||` 本就报错；`&` / `|` 此前静默放行并在后端产出
+            // 非法 IR（`and %Perm`），此处一并收口为结构化报错。
+            if (op == "&&" or op == "||" or tip_is_packed(lt) or tip_is_packed(rt)) {
                 var sbset: StringBuilder = sb_new();
                 var setname: string = "交集 Intersect";
                 var cptname: string = "`Intersect`";
@@ -8287,6 +8322,12 @@ pub fn infer_expr_body(e: i64) i64 {
         if (op == "^" and tip_kind(lt) == "BitStr" and tip_kind(rt) == "BitStr") {
             parse.fc_err("T-SET-E103",
                 "位串暂不支持 `^`：对称差运算符 `^^` 属后续批次，当前可用 `&&`（交）/ `||`（并）", e);
+            return ti_mk("Unknown");
+        }
+        // 位域的 `^` 同理：对称差 `^^` 属后续批次，此前静默产出非法 IR `xor %Perm`，此处收口。
+        if (op == "^" and tip_is_packed(lt) and tip_is_packed(rt)) {
+            parse.fc_err("T-SET-E105",
+                "位域暂不支持 `^`：对称差运算符 `^^` 属后续批次，当前可用 `&&`（交）/ `||`（并）", e);
             return ti_mk("Unknown");
         }
         if (op == "==" or op == "!=" or op == "<" or op == ">" or op == "<=" or op == ">=") {

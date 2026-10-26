@@ -3992,6 +3992,18 @@ pub fn tir_emit_binary(e: i64) TirEmitRes {
         slice_set(sema.tds, ccat_td3, ccat_t3);
         ost = tir_st_of_td(ccat_td3);
     }
+    // §set-ops Step 2b：位域（packed struct）集合交 / 并 —— 聚合值不能走 `and` / `or` 指令
+    // （实测产出非法 IR `and %Perm`），改走「抽宿主整型 → 位运算 → 裹回聚合」三段式。
+    // ⚠ 刻意放在 **TIR 层**而不是两个后端各拦一次：ADDR_OF → GEP[0] → LOAD hostst 这条序列
+    // 就是 packed 成员读写（P5）已在双后端验证过的通路，STRUCT_NEW 同理（packed 字面量，P5），
+    // 故一次实现两端同构，不必再写两套 shim（也就没有「out 参排末位」那类坑）。
+    if (op == "&&" or op == "||" or op == "&" or op == "|") {
+        var pkty: string = tir_packed_bin_ty(ost);
+        if (str_len(pkty) > 0) {
+            var pkres: string = tir_packed_setop(op, pkty, ls, rs);
+            return TirEmitRes{ name: pkres, st: tir_st_from_str(pkty) };
+        }
+    }
     var opc: string = opmap.tir_binop(base.node_sa((e as u64)), ost);
     var d: string = tir_tmp();
     var __bin_args: []TirOperand = [];
@@ -4003,6 +4015,59 @@ pub fn tir_emit_binary(e: i64) TirEmitRes {
         return TirEmitRes{ name: d, st: ST_I1 };
     }
     return TirEmitRes{ name: d, st: tir_st_from_str(ost) };
+}
+
+// 位域（packed struct）二元运算的类型判定：命中返回规范形式 `%Name`，非位域返回 ""。
+// ⚠ 只看 `ost`（操作数实际发射类型）：它在本函数上方已对 `ost == "i64"` 做过左操作数兜底。
+//   刻意**不再**对整体表达式调 `tir_expr_st` —— 那会经 tir_expr_td 触发 node_set_type 的
+//   缓存回收副作用，对**每一个**普通 `&` / `|` 都产生一次额外写入，风险远大于收益。
+pub fn tir_packed_bin_ty(ost: string) string {
+    if (sema.pk_find_struct(tir_strip_pct(ost)) >= 0) { return base.sb_cat2("%", tir_strip_pct(ost)); }
+    return "";
+}
+
+// 位域集合交 / 并：两侧宿主整型 AND / OR，再裹回聚合（packed 单 host 字段）。
+// 结果与 packed 字面量构造同构（TIR_OP_STRUCT_NEW + 单个 hostst 实参）。
+pub fn tir_packed_setop(op: string, psty: string, ls: string, rs: string) string {
+    var hostst: string = tir_packed_host_st(psty);
+    var hstc: i64 = tir_st_from_str(hostst);
+    var ha: string = tir_packed_host(ls, psty);
+    var hb: string = tir_packed_host(rs, psty);
+    var hr: string = tir_tmp();
+    var sop: i64 = TIR_OP_AND;
+    if (op == "||" or op == "|") { sop = TIR_OP_OR; }
+    var __ps_args: []TirOperand = [];
+    append(__ps_args, tir_op(ha));
+    append(__ps_args, tir_op(hb));
+    tir_emit(TIRInst{ op: sop, st: hstc, dst: tir_op(hr), args: __ps_args, is_comment: false, line: g_cur_line, cmt: "" });
+    var d: string = tir_tmp();
+    var __pn_args: []TirOperand = [];
+    append(__pn_args, tir_op_st(hr, hstc));
+    tir_emit(TIRInst{ op: TIR_OP_STRUCT_NEW, st: tir_st_from_str(psty), dst: tir_op(d), args: __pn_args, is_comment: false, line: g_cur_line, cmt: "" });
+    return d;
+}
+
+// 位域的宿主整型名（u8/u16/u32/u64 → i8/i16/i32/i64）；查不到退回 i64。
+pub fn tir_packed_host_st(psty: string) string {
+    var pk: i64 = sema.pk_find_struct(tir_strip_pct(psty));
+    if (pk >= 0 and pk < slice_len(sema.pk_struct_under) as i64) {
+        return sema.pk_host_st(sema.pk_struct_under[pk]);
+    }
+    return "i64";
+}
+
+// 取位域值槽里的宿主整型（packed 单 host 字段，field_index 恒 0 → GEP[0]）。
+// 与 tir_member_addr 的 packed 路径逐字同构，含那条 `ptr<%Name>` 的 ADDR_OF 槽型修正 ——
+// 宿主整型可能 < 8 字节（%Perm = type { i8 }），按值类型分配会被 8 字节指针写穿栈 → 段错误（P5）。
+pub fn tir_packed_host(v: string, psty: string) string {
+    var hostst: string = tir_packed_host_st(psty);
+    var addr: string = tir_tmp();
+    tir_emit(TIRInst{ op: TIR_OP_ADDR_OF, st: tir_st_from_str(base.sb_cat3("ptr<", psty, ">")), dst: tir_op(addr), args: tir_a1(v), is_comment: false, line: g_cur_line, cmt: "" });
+    var faddr: string = tir_tmp();
+    tir_emit(TIRInst{ op: TIR_OP_GEP, st: tir_st_from_str(hostst), dst: tir_op(faddr), args: tir_a3(addr, "0", "0"), is_comment: false, line: g_cur_line, cmt: "" });
+    var hv: string = tir_tmp();
+    tir_emit(TIRInst{ op: TIR_OP_LOAD, st: tir_st_from_str(hostst), dst: tir_op(hv), args: tir_a1(tir_os(faddr, tir_st_from_str(base.sb_cat3("ptr<", hostst, ">")))), is_comment: false, line: g_cur_line, cmt: "" });
+    return hv;
 }
 
 // 短路逻辑 && / ||（memory-first，无 phi；镜像 codegen_ll.tc:1898-1922 的 br i1+phi 短路控制流，
