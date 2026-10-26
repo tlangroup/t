@@ -5728,8 +5728,23 @@ pub fn rng_pure(e: i64) bool {
 }
 
 // 闭区间 `..=hi` 的**排他**上界：hi + 1。半开区间原样返回。
+// ⚠ 闭合区间把 `hi` 抬成 `hi + 1`。此处**不能**无条件合成 `+` 节点：
+//   `comptime_fold_pass` 跑在 `run_check()` **之后**（tc.tc 三处调度均是），它会遍历到
+//   sema 期合成的节点并折叠；而 `rng_lit(1)` 是合成的字面量、未经 infer ⇒ 折叠期右操作数
+//   被当成 0，`8 + 1` 折成 8 —— 表现为 `s[6..=8]` 少一个字符、`1..=4` 物化少一个元素
+//   （而端点含变量时因含运行期引用被折叠跳过，反而正确：故「字面量错、变量对」）。
+//   常量端点直接算出字面量，不再造二元节点，天然免疫该折叠。
 pub fn rng_excl_hi(hi: i64, incl: bool) i64 {
     if (incl == false) { return hi; }
+    // ⚠ 字面量的权威值在 **sa**（sema 自身推断 int 类型时就是 `lit_u64(node_sa)`，
+    //   从不读 ia）；sb 存位宽后缀（`8i64`），决定类型，必须一并带到新节点上。
+    if (base.node_kind((hi as u64)) == "int") {
+        var nv: i64 = (lit_u64(base.node_sa((hi as u64))) as i64) + 1;
+        var nid: i64 = (base.mk_int(base.i2s(nv), nv, -1) as i64);
+        base.node_set_sb((nid as u64), base.node_sb((hi as u64)));   // 位宽后缀：保类型不退化
+        base.node_set_span_id(nid, base.node_span_id(hi));
+        return nid;
+    }
     return base.mk_binary("+", hi, rng_lit(1), -1);
 }
 

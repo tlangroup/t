@@ -142,7 +142,7 @@ NL.push(``);
 NL.push(`// 平行 NodeRef 数组 g_node_nref（默认 0 = 未登记），node_new 双写保证正确。`);
 NL.push(`pub var g_node_nref: []u64;`);
 NL.push(`pub fn cst_nref_of(id: i64) u64 {`);
-NL.push(`    if (id < 0 || id >= slice_len(g_node_nref)) { return 0; }`);
+NL.push(`    if (id < 0 or id >= slice_len(g_node_nref)) { return 0; }`);
 NL.push(`    return g_node_nref[id];`);
 NL.push(`}`);
 NL.push(``);
