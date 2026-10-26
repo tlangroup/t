@@ -227,6 +227,10 @@ void tll_bitstr_concat(TBitStr* out, TBitStr* a, TBitStr* b) {
     r.bit_len = total;
     *out = r;
 }
+// 位串集合交 / 并（§set-ops Step 2）：out 排**末位**（与 tll_str_concat / tll_slice_concat 同构）。
+// ⚠ 顺序错了会静默把结果写进左操作数 —— 实测过：写成 (out,a,b) 时 `a && b` 把 a 清零、结果槽空。
+void tll_bitstr_and(TBitStr* a, TBitStr* b, TBitStr* out) { *out = t_bitstr_and(*a, *b); }
+void tll_bitstr_or(TBitStr* a, TBitStr* b, TBitStr* out) { *out = t_bitstr_or(*a, *b); }
 uint64_t tll_bitstr_extract(TBitStr* s, int64_t bit_off, int64_t bits, int little) {
     return t_bitstr_extract(*s, bit_off, bits, little);
 }

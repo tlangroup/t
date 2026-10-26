@@ -11,7 +11,7 @@
 ## 1. 锁定的决策（用户 2026-10-17 拍板，含 Step 1 / Step 2 两阶段）
 
 - **Step 1（当前批次）—— 布尔双拼写**：逻辑与同时支持 `&&` 与 `and`；逻辑或同时支持 `||` 与 `or`。`&&`/`||` 在第一步**保留为布尔**，与 `and`/`or` 完全同义。
-- **Step 2（后续批次）—— 释放 `&&`/`||`**：**删除布尔运算符的 `&&` 与 `||`**，届时 `&&`/`||` 才让位给集合运算（交集 / 并集），布尔仅保留 `and`/`or`。
+- **Step 2（2026-10-26 已落地，见 §10）—— 释放 `&&`/`||`**：值表达式位的 `&&`/`||` **不再是布尔**，改派集合交 / 并；布尔只保留 `and`/`or`。
 - **类型约束连词 `&&`（两阶段均保留）**：`T: A && B` 在类型位表示多 concept 约束合取，**由编译器内部指定逻辑 AND**，与值表达式位隔离。
 - **`++` 有序合并**：值级，已实装（`sema.tc` 的 `++` 分派），作用于 string / bitstr / 数组 / map。
 - **值级 `&&`/`||` 集合运算**（交集 / 并集）：**推迟到 Step 2**，不在 Step 1 实装（Step 1 中 `&&`/`||` 仅是布尔别名）。
@@ -21,13 +21,13 @@
 | 族 | 符 | 语义 | 适用类型 | 现状 |
 |---|---|---|---|---|
 | 有序合并 | `++` | 有序合并 / 拼接 | string / bitstr / 数组 / map | ✅ 已实装 |
-| bool 逻辑 | `&&` | 逻辑与（Step 1 与 `and` 同义） | bool | ✅ 已实装（Step 1） |
-| bool 逻辑 | `and` | 逻辑与 | bool | ✅ 已实装（Step 1） |
-| bool 逻辑 | `||` | 逻辑或（Step 1 与 `or` 同义） | bool | ✅ 已实装（Step 1） |
-| bool 逻辑 | `or` | 逻辑或 | bool | ✅ 已实装（Step 1） |
+| bool 逻辑 | `&&` | ~~逻辑与~~ **Step 2 起不再作布尔**，让位给集合交集 | — | ⛔ 已移除（Step 2） |
+| bool 逻辑 | `and` | 逻辑与 | bool | ✅ 已实装 |
+| bool 逻辑 | `||` | ~~逻辑或~~ **Step 2 起不再作布尔**，让位给集合并集 | — | ⛔ 已移除（Step 2） |
+| bool 逻辑 | `or` | 逻辑或 | bool | ✅ 已实装 |
 | 约束连词 | `&&` | 约束合取（T: A && B，编译器内部逻辑 AND） | concept（多约束） | ✅ 已实装（T6） |
-| 集合代数 | `&&` | 交集（∩） | bitstr / flag | ⬜ Step 2 |
-| 集合代数 | `||` | 并集（∪） | bitstr / flag | ⬜ Step 2 |
+| 集合代数 | `&&` | 交集（∩） | bitstr（flag 待后续） | ✅ 已实装（Step 2） |
+| 集合代数 | `||` | 并集（∪） | bitstr（flag 待后续） | ✅ 已实装（Step 2） |
 
 - `bitstr` 特殊：既是位序列（可 `++` 拼接）又是位集合（Step 2 可 `&&`/`||` 交并）。
 - `flag`（位标志枚举）在 Step 2 进集合代数族（`&&`/`||`），第一批不吃 `++`。
@@ -80,8 +80,9 @@
   该路径此前**无任何守卫**：conformance 的 pass 用例只跑 `tc check` 不运行程序，
   examples 里也没有 `in` + 区间字面量的用例 ⇒ 新增 golden 用例 `examples/range_in_bool.tc`
   （双后端比对输出 `RANGE_IN_OK`）。
-- **Step 2 第二步（待做）**：值表达式位 `And`/`Or` token 改派发集合运算（`op="&&"`/`"||"` →
-  bitstr/flag 交并）+ T7 `T-SET-E*` 诊断 + 改写 `p_setops_bool_spellings.tc`。
+- ✅ **Step 2 第二步已完成（2026-10-26，详见 §10）**：值表达式位 `And`/`Or` token 改派发集合运算
+  （`op="&&"`/`"||"` → bitstr 交并）+ T7 `T-SET-E*` 诊断 + 改写 `p_setops_bool_spellings.tc`。
+  ⚠ flag（位域）交并**未随本批实装**（理由见 §10.1）。
 
 ## 8. 风险 / 成本
 
@@ -152,3 +153,55 @@
 - ⚠ 附带修的一处基础设施：`src/base.tc` 的 `GEN:node-structs` 生成区（28–1635 行）内也有 `||`，
   手改会让 gate「CST kind 清单一致性」步 FAIL ⇒ 已同步改 `tools/cstgen.mjs:145` 模板并 `--emit` 重生成。
   ⭐ Step 2 第 2 小步（`&&`/`||` 全量退场）须连生成器模板一起扫。
+
+## 10. Step 2 第 2 小步：释放 `&&`/`||` 为集合运算符（2026-10-26）
+
+### 10.1 语义裁定（本批锁定的三个决定）
+
+| 议题 | 裁定 | 理由 |
+|---|---|---|
+| 不同位宽的 bitstr 交并 | 结果位数 = **max(a.bit_len, b.bit_len)**，较短一侧按**零扩展**对齐 | 位串表示"位位置集合"时，缺失的高位本就是"不含该成员"，零扩展即集合语义的自然写法；也与整数隐式零扩展一致 |
+| `&` / `\|` 对 bitstr | 与 `&&` / `\|\|` **同一条通路**（位串上两者语义本就相同） | 顺带补齐"类型检查放行、后端产出非法 IR"的静默错编缺口，比单纯报错更有用 |
+| flag（位标志） | **本批不实装**，报 `T-SET-E101/E102`；留作后续批次 | ① `flag` 声明关键字已被积类型统一废弃（改用 `packed struct`），本设计的"flag"前提已变；② 后端表示不一致（LLVM `%Perm = type { i16 }` 值 vs C 端 `unsigned char*` 按指针传），无"取底层整数"的现成通路 |
+
+### 10.2 改动清单
+
+| 位置 | 改动 |
+|---|---|
+| `runtime/t_runtime.{h,c}` | 新增 `t_bitstr_and` / `t_bitstr_or`（共用 `t_bitstr_setop`，零扩展到 max） |
+| `runtime/t_shim_ll.c` | 新增 `tll_bitstr_and` / `tll_bitstr_or`（**out 排末位**，与 `tll_str_concat` 同构） |
+| `src/parse.tc` | `parse_and` / `parse_or`：`And`/`Or` 产出 `"&&"`/`"\|\|"`（集合），`KwAnd`/`KwOr` 产出 `"and"`/`"or"`（布尔）。⚠ op 必须在 `advance_i()` **之前**判定 |
+| `src/opmap.tc` | `tir_binop` 补 `"&&"`→`and`、`"\|\|"`→`or`；`tir_op_from_str` 同步补映射 |
+| `src/sema.tc` | 值位集合分派：bitstr×bitstr → `BitStr`；其余类型 → `T-SET-E101`（交）/`T-SET-E102`（并），提示实现 `Intersect`/`Union` concept；bitstr 的 `^` → `T-SET-E103` |
+| `src/tir_to_ll.tc` | 位运算发射前拦截 `%TBitStr` → `call void @tll_bitstr_and/or(a, b, out)` |
+| `src/codegen_c_tmir.tc` | 同上拦截（须排在 `dst = (` 前缀发射**之前**）→ `t_bitstr_and(a, b)`（C 端 `t_*` 按值返回） |
+| `tests/conformance/fail/f_setops_bool_{intersect,union}.tc` | 新增：bool 上用 `&&`/`\|\|` 报结构化错误 |
+| `tests/conformance/pass/p_setops_bitstr_setops.tc` | 新增：bitstr 集合运算类型检查 |
+| `tests/conformance/pass/p_setops_bool_spellings.tc` | 改写：去掉 `&&`/`\|\|` 布尔断言，只留 `and`/`or` |
+| `examples/setops_bitstr.{tc,expected.txt}` | 新增运行期 golden（交 / 并 / 零扩展三条路径，双后端对拍） |
+| `docs/**/*.tc`（2 处） | 示例代码布尔拼写迁移 |
+
+### 10.3 本批踩到的三个坑（值得记住）
+
+1. **opmap 缺映射 = 静默降级**（与 §9 Bug A 同款）：`tir_binop` 缺 `"&&"` 会落 `unsupported_binop`。
+   凡新增值级运算符，**必须同时补 `tir_binop` 与 `tir_op_from_str` 两张表**。
+2. **shim 参数顺序**：LLVM 轨 `tll_*` 一律 **out 排末位**（同 `tll_str_concat`）。本批首版误写成 `(out,a,b)`，
+   实测后果是 `a && b` **把结果写进左操作数 `a`**（`a` 被清零、结果槽空转），且不报错 —— 典型的静默错编，
+   只能靠双后端对拍发现（C 端正确、LLVM 端 `a=0`）。
+3. **槽类型必须用规范形式 `%TBitStr`**：登记成无 `%` 的形式会让后续「结果槽 → 变量槽」的拷贝解析出空类型
+   （`load , ptr` 非法 IR）。
+
+### 10.4 验证
+- `tc check src/tc.tc`：0 error / 633 warnings（与基线一致）。
+- 双后端对拍：`examples/setops_bitstr.tc` → `AND=128 OR=255 ZEXT=160`，LLVM 与 tmir-c **逐字相同**
+  （179 & 204 = 128、179 \| 204 = 255、179 & 224 = 160）。
+- conformance **386 / 386**（原 383 + 本批新增 3：bool 交 / 并报错各 1、bitstr 集合运算 1）；
+  类型位 `T: A && B` 的多概念用例（`p_setops_multiconcept_ok` / `f_setops_multiconcept_fail`）保持原判据不受影响。
+- examples 双后端 **102 / 102**。
+- 种子体检通过（`08046b37…` 仍可编译当前 src，0 error / 633 warnings）⇒ 无需刷新。
+- **gate L2：24 passed / 0 failed（3458.8s）**，其中自举不动点 `g2 == g3`、`g2 == g3 == g4`、
+  C 后端自举、run_examples 双后端、difftest 代际对拍均 PASS。
+- IR 快照基线重录（137 targets / 277 entries，用 gate 的 g1 录）：漂移为
+  `src/tc.tc::{c,ll}` 2 处 DIFF（编译器自身源码变更）+ 新增 golden 的 2 条 NEW，**0 缺失**；
+  且**没有任何既存 example 的 IR 变化** ⇒ 新语义未影响既有行为。
+- 四代产物已安装为 `out/dbg/tc.exe`（md5 `b0f4daef…`）。
