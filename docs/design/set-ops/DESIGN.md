@@ -1,6 +1,7 @@
 # 集合类操作符设计（Set-Ops）
 
 > 状态：**Step 1（第一批）已落地并验证**（2026-10-17 用户拍板：布尔双拼写；值级集合运算推迟 Step 2）。
+> **过渡编译器已于 2026-10-26 退役** —— 种子与主线编译器均已支持 `and`/`or`，自举链条两端同构，桥接不再需要（详见 §8）。
 > 关联：`src/opmap.tc`（`Concat`=op63）、`src/lex.tc`、`src/parse.tc`（`parse_and/or`）、`src/sema.tc`（类型分派 / comptime 折叠 / 泛型约束解析）、`lib/std/rc/cst.tc`（关键字表）。
 
 ## 1. 锁定的决策（用户 2026-10-17 拍板，含 Step 1 / Step 2 两阶段）
@@ -64,5 +65,8 @@
 ## 8. 风险 / 成本
 
 - Step 1 双拼写：`and`/`or` 关键字在 `src` 内**零标识符冲突**（仅出现在注释与内部 TIR 文本 `and`/`or`=位运算 op 38/39）；`&&`/`||` 仍布尔，与 `and`/`or` 完全同义。
-- 自举恢复：过渡编译器 T'（worktree `transitional` 分支 = HEAD + T1 + T2）由 seed（`out/dbg/tc.exe`）构建，再编译主仓 set-ops 源码产出 N；N 自我编译不动点（g1≡g2≡g3≡g4）已验证。
+- 自举恢复（**已退役，2026-10-26**）：过渡编译器 T'（旧 worktree `transitional` 分支 = HEAD + T1 + T2）由 seed（`out/dbg/tc.exe`）构建，再编译主仓 set-ops 源码产出 N；N 自我编译不动点（g1≡g2≡g3≡g4）已验证。
+  - **退役依据**：`ci/seed/tc.exe` 于 2026-10-18 构建，**晚于 set-ops 落地（2026-10-17，提交 `17cea77`）**，实测可编译当前 `src/tc.tc`（0 error / 633 warnings）⇒ 自举链条的**起点（种子）与终点（主线编译器）都已支持 `and`/`or`**，桥接失去存在意义。
+  - **处置**：worktree `t_transitional` 与分支 `transitional` 已删除；桥接改动留档 `.workbuddy/transitional_setops_bridge_wip_2026-10-26.patch`，原 tip 钉在 `backup/transitional-setops-2026-10-26`。
+  - **对 Step 2 的影响**：Step 2 删除布尔 `&&`/`||`（§1）后，源码布尔全量改用 `and`/`or` —— 仍落在种子能力范围内，**无需重建桥接**。
 - Step 2 切换需注意：值表达式位 `&&`/`||` 改派发集合运算时，须确保与类型位约束 `&&` 隔离（`T: A && B` 不触发集合分派）。
