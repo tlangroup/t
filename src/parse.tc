@@ -202,8 +202,9 @@ pub fn parse_type_inner() i64 {
     var t: string = lex.cur_t();
     // 括号类型 `( Type )`：只用来改写类型运算符的结合边界，**不包层、不引入新 kind**，
     // 直接返回内部类型节点 ⇒ 对 sema / codegen 完全透明（<(A && B)?> 与 <C> 得到同一个 kind 的形态）。
-    // 存在理由：`g_type_and` 在 `as T`（:673）与 `fid > T`（:5523）两处为假，那里写不出合取类型；
-    // 括号是唯一的正经退路（`x as (A && B)`、`fid > (A && B)`）；`(A && B)?`、`*(A && B)` 同理。
+    // 存在理由：两处**表达式内部**类型位（`as T` 的 parse_post_cast、`fid > T` 的 M52 读路径）
+    //   必须关闭合取连词（否则 `x as T && cond` 会被误读）⇒ 那里写不出合取类型，
+    //   括号是唯一的正经退路（`x as (A && B)`、`fid > (A && B)`）；`(A && B)?`、`*(A && B)` 同理。
     // ⚠ `()` 空括号不合法 —— unit / void 请用既有的关键字，不要指望 `()` 占位。
     // ⚠ 这里调用的是 **parse_type**（非 inner）：括号内部允许完整的后缀 `?` 与合取连词，
     //   这与 `[N]T` / `*T` / `?T` 内部的处理保持一致。
@@ -425,16 +426,18 @@ pub fn parse_type_inner() i64 {
     }
 
 // 类型位 concept 多约束连词开关（`&&`）：仅形参类型解析期间为真，见 parse_type_concept。
-// ⚠ 2026-10-18 回归修复：此前 parse_type **无条件**吃 `&&`，于是 `expr as T && cond`
+// ⚠ 2026-10-18 回归：此前 parse_type **无条件**吃 `&&`，于是 `expr as T && cond`
 //   这类「类型转换 + 值级逻辑与」被误读成 `as (T && cond)`（cond 被当成 concept 名解析，
 //   随后的 `[` / `(` 落进类型位 ⇒ T_PARSE_SYNTAX）。旧源码（含 10-13 的 main 顶端）大量
 //   使用该写法，直接导致自举种子编译旧版本源码失败（nightly Bootstrap g1 步）。
-//   限定在形参位后，值级 `&&` 一律回到 parse_and，两种语义不再互相污染。
-pub var g_type_and: bool = false;
-
-// `T?` 后缀可选类型糖（与 `?T` 前缀等价）：先解析基类型，尾部每个 `?` 再包一层 optional。
-// `?T` 前缀分支在 parse_type_inner 内已直接产出 optional 节点，不在此重复包装。
-pub fn parse_type() i64 {
+//
+// ⭐ 2026-10-27（set-ops §13.8 R1 + R2）：昔日用一个可变全局 bool `g_type_and` 区分，
+//   但它是**状态** —— 调用方忘了设/忘了还原就污染后续解析（正是上条回归的形态）。
+//   现改为**显式形参** `allow_and`，并**反转默认值**：默认放行合取，只有两个确凿的
+//   表达式内部类型位显式传 false（见 parse_post_cast 与 `fid > T`）。这样做的好处是
+//   **新增类型位自动获得类型代数能力**，不必回头补开关 —— 少一处「忘了加标志」的静默失败；
+//   而危险方向（把值级 `&&` 误吃进类型）只剩两个受控点。
+pub fn parse_type_ex(allow_and: bool) i64 {
     var t0: i64 = parse_type_inner();
     while (lex.cur_t() == "Question") {
         lex.advance_i();
@@ -443,26 +446,27 @@ pub fn parse_type() i64 {
     // §set-ops 岔路 B：concept 多约束连词 `T: A && B`。`&&` 是 SET 交集 token
     // （区别于 bool 关键字 `and`）；约束位把多个 concept 名连成 binary("&&", ...)
     // 节点，由 sema.generic_normalize_func 拆解成约束列表。
-    // ⚠ 只有 `g_type_and` 为真（形参类型位）时才吃 `&&`：其余类型位（`as T`、局部变量
-    //   标注、返回类型、字段类型…）后面的 `&&` 都是**值级**逻辑与，必须留给 parse_and，
-    //   否则 `x as i64 && y[i] > 0` 会被解析成类型 `i64 && y` 并在 `[` 处报语法错。
-    while (g_type_and and lex.cur_t() == "And") {
+    // allow_and 为假时这里直接停 ⇒ `&&` 交回表达式层的 parse_and（即 `x as T && cond`
+    // 仍读作「转换后再逻辑与」），两种语义互不污染。
+    while (allow_and and lex.cur_t() == "And") {
         var ti: i64 = lex.advance_i();
-        var right: i64 = parse_type();
+        // 递归必须透传 allow_and：合取右侧与左侧同属一个判断，且 false 位不会在右侧复活。
+        var right: i64 = parse_type_ex(allow_and);
         t0 = base.mk_binary("&&", t0, right, ti);
     }
     return t0;
 }
 
-// 形参类型位解析：开 g_type_and 后调 parse_type（支持 `T: A && B` 多约束）。
-// 递归调 parse_type 时开关仍为真，故 `A && B && C` 的三约束连词同样成立（左结合）。
-// 返回前恢复外层值，避免泄漏到返回类型 / 函数体。
+// 默认放行版本：**所有无歧义的类型位**（该类型的后面不可能接表达式）都用它。
+// 典型：形参、返回类型、struct/variant 字段、数组/指针/optional /map 元素位、局部变量标注等。
+pub fn parse_type() i64 {
+    return parse_type_ex(true);
+}
+
+// 形参类型位解析（支持 `T: A && B` 多约束）：语义与 parse_type 相同（同为放行），
+// 保留独立函数名是为了在调用点标注「这里是约束位」的意图，便于将来若需区分两者时有落点。
 pub fn parse_type_concept() i64 {
-    var sv_and: bool = g_type_and;
-    g_type_and = true;
-    var t: i64 = parse_type();
-    g_type_and = sv_and;
-    return t;
+    return parse_type_ex(true);
 }
 
 // ── 表达式解析（优先级爬升，逐层照抄 tc0）─────────────────────
@@ -683,7 +687,10 @@ pub fn parse_post_call(e: i64, ti: i64) i64 {
 }
 
 pub fn parse_post_cast(e: i64, ti: i64) i64 {
-    var tt: i64 = parse_type();
+    // ⚠ 此处类型之后紧接**表达式**（`x as T && cond` 合法且常见）⇒ 不允许吃合取连词。
+    // 这是 set-ops §13.8 R2 唯二之一需要显式传 false 的位置（另一处是 `fid > T`）。
+    // 若确需在 `as` 后写合取类型，请加括号：`x as (A && B)` —— 见 parse_type_inner 的 LParen 分支。
+    var tt: i64 = parse_type_ex(false);
     var id: i64 = base.mk_cast(e, tt, ti);
     return id;
 }
@@ -5533,7 +5540,9 @@ pub fn parse_cmp() i64 {
         // 由 deser_type_of 在 check 期把 ident 节点重解释为类型。
         var right: i64 = -1;
         if (op == ">" and tok_type_only(lex.cur_t())) {
-            right = parse_type();
+            // ⚠ 与 `as T` 同形的第二个表达式内部类型位：`x > A && B` 若开放合取会被读成
+            // 「反序列化到类型 A && B」，而用户几乎总是想写 `(x > A) && B`。故此处同样传 false。
+            right = parse_type_ex(false);
         } else {
             right = parse_shift();
         }
