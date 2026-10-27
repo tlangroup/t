@@ -79,6 +79,8 @@ static const DiagDef DIAG_DEFS[] = {
   { "T-MAT-E741", "error", "MAT", "T_MATCH_ARM_TYPE", "ARM_TYPE", "match arm type mismatch" },
   { "T-MAT-E742", "error", "MAT", "T_MATCH_NONEXHAUSTIVE", "NONEXHAUSTIVE", "match is not exhaustive" },
   { "T-MAT-E743", "error", "MAT", "T_MATCH_PATTERN_ARITY", "PATTERN_ARITY", "match constructor pattern arity mismatch" },
+  { "T-MAT-E745", "error", "MAT", "", "PRED_NOT_RELOP", "predicate pattern supports only relational operators (`<` `>` `<=` `>=` `==` `!=`)" },
+  { "T-MAT-E746", "error", "MAT", "", "PRED_SCRUTINEE_NOT_VAR", "the scrutinee of a predicate pattern must be a variable" },
   { "T-MAT-E750", "error", "MAT", "T_MATCH_SLICE_PATTERN", "SLICE_PAT", "slice pattern error" },
   { "T-MAT-E751", "error", "MAT", "T_MATCH_BARE_VARIANT_PATTERN", "BARE_VARIANT_PATTERN", "bare variant pattern is deprecated; use leading-dot form" },
   { "T-MAT-E760", "error", "MAT", "T_MATCH_DUP_VALUE_ARM", "DUP_VALUE_ARM", "match arm covers a value already handled by an earlier arm (duplicate constant or overlapping range)" },
@@ -189,7 +191,7 @@ static const DiagDef DIAG_DEFS[] = {
   { "T-VEC-W927", "warning", "VEC", "T_VECTOR_WIDER_THAN_NATIVE", "VECTOR_WIDER_THAN_NATIVE", "vector is wider than the native SIMD register and will be split" },
   { "T-VEC-W947", "warning", "VEC", "T_TILE_WIDER_THAN_NATIVE", "TILE_WIDER_THAN_NATIVE", "hardware tile is wider than the native SIMD register and will fall back to scalar loops" },
 };
-#define DIAG_COUNT 176
+#define DIAG_COUNT 178
 
 /* legacy (old semantic name) -> machine code alias table */
 static const struct { const char* legacy; const char* code; } DIAG_LEGACY[] = {

@@ -489,6 +489,55 @@ fn main_fn() fault(FrameErr)!i32 @main {
 - ⚠ **B5 不砍（A-28）**：保留 A-4 的非 `pub` 推导 ⇒ 跨函数可达集分析（R-3）必须做。B5 排在最后，但**不是可选项**。
 - ⚠ B4 之后 IR 形态会变（新增闭包槽位与间接调用）⇒ **IR 快照基线必须用 g1 重录**。
 
+### 11.1 B2 批次 · 编码实录（2026-10-27 完成）
+
+**状态：✅ 已编码并通过门禁**（gate L2 **23 passed / 1 failed**，唯一 FAIL 项根因见下「IR 快照」条；
+静态 check 0 error / 自举 g1 exit=0 / conformance 400 passed 0 failed / examples golden 双后端逐字节一致）。
+批次台账与后续批次的验证链见 `docs/design/fault/DESIGN.md`。
+
+实际落点与附录 A 预估的**唯一偏差**：`parse_struct_lit` 里的形态判定不是 3 处而是 **4 处**，
+且真正先截走谓词的是第 ② 处（`is_tuple`），不是原先标记的变体判定：
+
+| # | 判定点 | 位置 | 改动 |
+|---|---|---|---|
+| ① | `named_form` | `parse.tc` ~866 | 加第三式 `Dot+Ident+非终结符` ⇒ 否则落位置式 |
+| ② | **`is_tuple`** | `parse.tc` ~845 | **加谓词排除式**（漏掉此处的实测后果：谓词被当匿名元组字面量截走） |
+| ③ | 变体构造 `V{ .Case }` | `parse.tc` ~939 | 加 `pat_is_pat_end(peek(2))` 条件 |
+| ④ | 具名字段循环 | `parse.tc` ~951 | 加谓词分支：消费 Dot→ident→运算符→`parse_expr()` |
+
+**三条踩坑（均为「不报错、只是走错路」型，值得作为范式记住）：**
+
+1. **漏改 `is_tuple`（根因）**：`is_tuple` 在变体判定**之前**执行，且条件只排除 `Assign`。
+   `.{ .age < 0 }` 的 peek(2)=`Lt` 不在排除集 ⇒ `is_tuple=true` ⇒ 谓词被当匿名元组字面量截走，
+   症状是「`struct User 没有字段 _0`」这种莫名其妙的类型错，而非「不支持」。
+   ⇒ 与 KI-002 / bitstr `&` / 位域 `&` 同款：不报错，只是走错一条路。
+
+2. **默认分支承载真实语义（我引入的 bug）**：`pat_relop_text()` 原本**没有** `Lt` 分支——
+   `<` 是靠 `return "<"` 这个默认分支兜住的。我为表达「不认识的运算符」把默认值改成 `"?"`
+   ⇒ 静默丢掉 `<` 的映射，症状是 E745 文案打出「这里是 `?`」。
+   ⇒ **改函数默认返回值前，先确认默认值是否被当作某个真实 case 在用。**
+
+3. **arm 名 ≠ 类型 kind（我引入的 bug）**：我写了 `ti_mk("Bool")` / `tip_kind(plt) != "Bool"`，
+   但 `Bool` 只是 `ti_arm_of()` 返回的 **arm 名**；bool 是 **scalar**，
+   其 `tip_kind` 是 `"Scalar"`、`tip_name` 是 `"bool"`（小写）。
+   ⇒ `ti_mk("Bool")` 得到空类型名 ⇒ 报错文案显示 `expected  but got bool`（expected 为空）。
+   ⇒ **kind（Scalar/Enum/Variant…）与类型名（bool/User…）是两套标识，别混用。`
+
+**门禁证据（本次实测）：**
+- `tc check src` → `errors = 0`
+- 自举 g1（`bootstrap_tc.mjs --tc ci/seed/tc.exe`）→ `exit=0`；
+  ⚠ 工具会给 `--out` **再追加一次 `.exe` 后缀** ⇒ 传 `_b2g1.exe` 实际产出 `_b2g1.exe.exe`。
+- conformance 全量 → `400 passed, 0 failed, 400 total`（含新增 3 例）
+- `run_examples_tmir.mjs --only predpat_demo` → PASS；LLVM 与 tmir-c **逐字节一致**
+  ⇒ 坐实 **N7 = 后端零改动**
+- IR 快照：改前（`out/dbg/tc.exe`，pre-B2）与改后编译器对同一示例产出**逐字节相同的 IR** ⇒ B2 对既有示例零漂移。
+  ⚠ 门禁「产物快照比对」报 **6 处 DIFF**，`ir_snapshot` 明确归因 `compilerMd5` 溯源漂移，且 **0 新增 / 0 缺失**；
+  6 处 = `math_extra_demo` / `math_stdlib_demo` / `std_demo` 三个 `@import("std.*")` 示例 × 双后端
+  —— 这是**基线录制编译器用错**的签名（项目笔记已记：基线**必须用 gate 的 `out/dbg/g1.exe` 录**，
+  我误用了自建的 `_b2g1.exe.exe`；两者同为 post-B2，故与 B2 无关）。
+  佐证：这 3 个示例在 gate 的 `run_examples dbg (双后端)` 与 `C 后端自举` 两步均 PASS ⇒ 运行期无差异。
+  处置：`node tools/ir_snapshot.mjs --update --compiler out/dbg/g1.exe --jobs 1` 重录后回验 0 差异。
+
 ---
 
 ## 12. 早期评审结论存根（已被推翻的部分，保留以防复发）

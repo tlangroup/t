@@ -804,6 +804,59 @@ pub fn synth_tuple_type_name(elems: []i64) string {
     return sb_to_str(sb);
 }
 
+// ── 谓词模式的关系运算符判定（fault B2 / 节点 N1–N3）────────────────────────
+// 用于识别 `.{ .age < 0 }` 这类「具名字段 + 关系运算」的谓词模式。
+// ⚠ 与 `Assign`（`.x = v` 具名字段初始化）**互斥**：关系符出现即证明它是谓词而非字段赋值。
+// ⚠ 关系符集合必须与 `parse_cmp` / `parse_eq` 的取值逐字一致（`<` `>` `<=` `>=` `==` `!=`），
+//    否则 sema / codegen_c / tir 三处的 op 字符串分派会对不上（静默错编）。
+// ⚠ 判定方向是**排除法**（枚举「字段之后合法出现的终结符」），不是枚举运算符：
+//    枚举运算符会漏掉未列出的 op（如 `&` `|` `^`），让它们悄悄落回位置式路径 ⇒
+//    拿到「莫名其妙的类型错」而不是「不支持的运算符」。穷举终结符才是完备判据。
+pub fn pat_is_pat_end(t: string) bool {
+    if (t == "Assign") { return true; }     // `.x = v`
+    if (t == "Comma") { return true; }      // 字段分隔
+    if (t == "RBrace") { return true; }     // `V{ .Case }` 变体无参
+    if (t == "LParen") { return true; }     // `V{ .Case(a) }` 变体带参
+    if (t == "Eof") { return true; }
+    return false;
+}
+
+// 二元节点 op 文本 → 是否关系运算符。sema 侧校验谓词模式时用，与 `pat_is_pat_end`
+// 互补：前者说「是不是合法谓词 op」，后者说「是不是模式收尾」。两处**必须同步修改**。
+pub fn pat_is_relop_text(op: string) bool {
+    if (op == "<") { return true; }
+    if (op == ">") { return true; }
+    if (op == "<=") { return true; }
+    if (op == ">=") { return true; }
+    if (op == "==") { return true; }
+    if (op == "!=") { return true; }
+    return false;
+}
+
+// 运算符 token → 二元节点 op 文本（关系运算与 parse_cmp / parse_eq 的映射表同源）。
+// ⚠ 默认返回 `"?"`（而非某个具体 op）：走到这里说明它**不是**终结符，即用户确实
+//    写了运算符，只是本位置不支持（如 `.{ .a + 1 }`）。交给 sema 报 T-MAT-E745
+//    给出明确文案，不要静默降级成位置式模式。
+pub fn pat_relop_text(t: string) string {
+    // ⚠ `Lt` **必须显式列出**：原实现靠默认返回 `"<"` 来兜 Lt，
+    //   一旦把默认值改成 `"?"`（用于表达「不认识的运算符」）就会静默丢掉 `<` 的映射。
+    if (t == "Lt") { return "<"; }
+    if (t == "Gt") { return ">"; }
+    if (t == "LtEq") { return "<="; }
+    if (t == "GtEq") { return ">="; }
+    if (t == "Eq") { return "=="; }
+    if (t == "NotEq") { return "!="; }
+    if (t == "Plus") { return "+"; }
+    if (t == "Minus") { return "-"; }
+    if (t == "Star") { return "*"; }
+    if (t == "Slash") { return "/"; }
+    if (t == "Percent") { return "%"; }
+    if (t == "BitAnd") { return "&"; }
+    if (t == "BitOr") { return "|"; }
+    if (t == "BitXor") { return "^"; }
+    return "?";
+}
+
 pub fn parse_struct_lit(type_name: string, ti: i64) i64 {
     lex.advance_i();
     var head: i64 = -1;
@@ -815,7 +868,11 @@ pub fn parse_struct_lit(type_name: string, ti: i64) i64 {
     if (g_in_match_pat) {
         var c0: string = lex.cur_t();
         var named_form: bool = (c0 == "Identifier" and lex.peek_t(1) == "Colon") or
-                               (c0 == "Dot" and lex.peek_t(1) == "Identifier" and lex.peek_t(2) == "Assign");
+                               (c0 == "Dot" and lex.peek_t(1) == "Identifier" and lex.peek_t(2) == "Assign") or
+                               // B2 新增：谓词式 `.{ .f <op> v }` —— 首字段后紧跟运算符
+                               //          （非终结符即运算符，见 pat_is_pat_end）
+                               (c0 == "Dot" and lex.peek_t(1) == "Identifier" and
+                                pat_is_pat_end(lex.peek_t(2)) == false);
         if (named_form == false) { positional = true; }
     }
     if (positional) {
@@ -845,6 +902,12 @@ pub fn parse_struct_lit(type_name: string, ti: i64) i64 {
         if (ft0 == "Identifier" and lex.peek_t(1) == "Colon") {
             is_tuple = false;
         } else if (ft0 == "Dot" and lex.peek_t(1) == "Identifier" and lex.peek_t(2) == "Assign") {
+            is_tuple = false;
+        } else if (ft0 == "Dot" and lex.peek_t(1) == "Identifier" and
+                   pat_is_pat_end(lex.peek_t(2)) == false) {
+            // ⚠ 谓词式 `.{ .f <op> v }`（B2）：**不是**匿名元组字面量。
+            //   这一分支在「变体构造」判定之前执行，若不排除运算符，
+            //   谓词会先被 is_tuple 截走 ⇒ 后面三处改了也不生效（实测坑）。
             is_tuple = false;
         } else {
             is_tuple = true;
@@ -878,13 +941,41 @@ pub fn parse_struct_lit(type_name: string, ti: i64) i64 {
     // 变体构造字面量 `V { .Case }` / `V { .Case(args) }`：首个字段位出现 `.Case` 且其后
     // 不是 `=`（与具名字段 `.x = v` 区分），即视为变体 case 构造（变体恒单构造子，仅一个）。
     // 脱糖交由 sema（variant_lit → <V>_from_<C>(args) 调用，复用既有 V_from_C 发射路径）。
-    if (lex.cur_t() == "Dot" and lex.peek_t(1) == "Identifier" and lex.peek_t(2) != "Assign") {
+    // ⚠ B2 修正：原判定 `peek(2) != "Assign"` 会把 `.{ .a < 1 }` / `.{ .a == 1 }` 一并吞成
+    //   变体构造（`V{ .Case }`）⇒ 谓词模式在 parse 期就被截走，落到 sema 时形态已错。
+    //   ⇒ 必须**同时**确认后继是终结符（N1），否则 N2/N3 加了也不生效。
+    if (lex.cur_t() == "Dot" and lex.peek_t(1) == "Identifier" and
+        lex.peek_t(2) != "Assign" and pat_is_pat_end(lex.peek_t(2))) {
         return parse_variant_lit(type_name, ti);
     }
-    // 具名字段：接受旧式 `x: v` 与新式 `.x = v`（两者并存以保自举不动点）。
+    // 具名字段：接受旧式 `x: v`、新式 `.x = v`、以及 B2 新增的谓词式 `.x <op> v`。
+    // ⚠ 变量声明一律提在 while 之外：C 后端对循环体内 `var` 同名的重复声明会报 redefinition。
+    var fname: string;
+    var val: i64;
+    var relop: string;
     while (lex.cur_t() != "RBrace" and lex.cur_t() != "Eof") {
-        var fname: string;
-        if (lex.cur_t() == "Dot" and lex.peek_t(1) == "Identifier" and lex.peek_t(2) == "Assign") {
+        fname = "";
+        val = -1;
+        relop = "";
+        if (lex.cur_t() == "Dot" and lex.peek_t(1) == "Identifier" and
+            pat_is_pat_end(lex.peek_t(2)) == false) {
+            // 谓词式：合成 `binary(op, 占位左端, v)`。
+            // 占位左端是 `ident(sa="")`，由 sema 在 struct_lit_pat_check 里重写为 `member(scr, fname)`
+            // —— parse 期没有 scrutinee 信息，必须先留位再回填。
+            lex.advance_i();                        // 消费 Dot
+            fname = expect_tok("Identifier");
+            relop = pat_relop_text(lex.cur_t());
+            var rti: i64 = lex.advance_i();         // 消费关系运算符
+            var sav: bool = g_in_match_pat;
+            g_in_match_pat = false;                 // 右端是普通值表达式，不是模式
+            var rhs: i64 = parse_expr();
+            g_in_match_pat = sav;
+            // 左端合成 `member(ident("__scr"), fname)`：`__scr` 是**占位**，
+            // 由 sema 的 struct_lit_pat_check 回填为真实 scrutinee 表达式节点
+            // （parse 期无从得知 scrutinee 是什么）。
+            // ⚠ 不能直接留 ident("") 再靠 infer 兜：ident 会被当普通标识符解析 ⇒ 误报未定义。
+            val = base.mk_binary(relop, base.mk_member(fname, base.mk_ident("__scr", -1), rti), rhs, rti);
+        } else if (lex.cur_t() == "Dot" and lex.peek_t(1) == "Identifier" and lex.peek_t(2) == "Assign") {
             lex.advance_i();                       // 消费 Dot
             fname = expect_tok("Identifier");
             expect_tok("Assign");
@@ -892,7 +983,9 @@ pub fn parse_struct_lit(type_name: string, ti: i64) i64 {
             fname = expect_tok("Identifier");
             expect_tok("Colon");
         }
-        var val: i64 = parse_expr();
+        if (val < 0) {
+            val = parse_expr();
+        }
         var fid: i64 = base.mk_FV(fname, val, -1);
         tail = base.list_push(head, tail, fid);
         if (head < 0) {
