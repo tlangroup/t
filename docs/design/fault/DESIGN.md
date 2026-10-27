@@ -100,6 +100,27 @@ fault 的设计讨论已在 2026-10-27 收口，编码已开工 ⇒ 两侧都需
 - ⚠ **B4 的前置**：G-1（tmir-c 编译不了「返回结构体的闭包」）/ G-2（数组元素上的闭包调用发未定义符号 `t__`）
   是**既有**缺口，已用 pre-B1 编译器复现 ⇒ B4 的 repair 闭包必然撞上，**先修再谈 B4**
 
+### 3.4 ✅ B4 前置 G-1 已修（2026-10-28）
+
+根因是**两套 ABI 混用**：用户聚合返回函数走 `void <fn>(unsigned char* __sret, <params…>)`，
+而统一 TClosure ABI 要求 `code(env, 实参…) → 聚合缓冲指针`。`c_emit_thunks` 原来只按形参原样转发。
+修法：`src/codegen_c_tmir.tc` 两处 —— ① thunk 体改为「分配缓冲 → sret 首参转发 → return 指针」；
+② `c_clo_code` 的判据从「带 env 首参 ⇒ 用裸函数名」改为「**聚合返回 ⇒ 一律走 thunk**」
+（带 env 的聚合返回函数签名是 `void <fn>(__sret, __env, args…)`，当 code 用会让 env 落进 `__sret`）。
+
+**门禁证据（24 步按 `gate.mjs` 步骤定义逐条手工复现，见 `fault.md` §D.3）**
+- 自举不动点 **g1 == g2 == g3 == g4**（`0fe9c283…`，强于门禁只需 g2 == g3）
+- ⭐ **C 后端自举**：`g4.exe --emit-c src/tc.tc` → clang → 该 C 产物 `emit-ll src/tc.tc`
+  与 LLVM 产物 **md5 逐字节相同** ⇒ 修复后的 C 后端能编译编译器自身且行为一致
+- conformance 415/415（g1 与 C 自举产物各一遍）、run_examples dbg 109/109、双轨对拍 109/109、
+  difftest 代际对拍 27/27、MIR opt=1/2 FAILS:0、lint 0 findings
+- 产物快照唯一 FAIL（合法漂移）→ 重录 **144 targets / 291 entries**，回验 **291/291 逐字节相同**
+- ⚠ **偏差**：本批**不是**一次 `gate.mjs L2` 跑出来的 —— 后台执行通道故障（exit 125），
+  改为逐条手工复现；判据一致，但无 gate 汇总行作单一证据源。
+
+**⚠ 仍阻塞 B4 的只剩 G-2**（数组元素上的闭包间接调用，前端名字解析为空）；
+G-3（嵌套字段赋值）已用整结构体赋值绕开。
+
 ---
 
 ## 4. 偏离记录

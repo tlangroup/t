@@ -893,3 +893,87 @@ fault E over T   ⇒  sema/parse 合成具名 struct `__fault_<E>`：
 | **G-3** | ⚠ **既有后端缺口**：**嵌套字段赋值** `v.val.age = 42` 双后端都不生效（读到 0）；整结构体赋值 `v.val = User{...}` 正常 | golden 改用整结构体赋值 |
 | **D-10** | ⭐ **HIR 侧不是零改动**（推翻 C.2 P8 的「HIR 零改动」预估）：`hir_lower_decl` 的 `else` 兜底给未知 kind 发 `HIR_OP_RAW`，而门禁 **「RAW 合计 0」是硬判据**（`hir_test` 扫全部 143 个 examples/src）⇒ `examples/faultgroup_decl.tc` 1 处 RAW 直接让 gate L2 第 15 步 FAIL | 复用 `HIR_OP_TYPE_ALIAS_DECL`（与「模块值别名复用 `IMPORT_DECL`」同款手法）：`sa`=组名、`ty`=`over T` 文本；**并在 `check_decl_hir` 显式回落 `check_fault_decl`** —— 否则会掉进「其余 type_alias：声明期无动作」的兜底，组的语义校验被整趟静默跳过 |
 | **D-11** | ⭐ **「兜底分派」是新增 decl kind 的系统性雷区**：D-8（`ann_pass` 的 `decl_target` 兜底）与 D-10（`check_decl_hir` 的 op 兜底）是**同一类** —— 新增 kind 若只靠「兜底路径也能走通」，一定会在某个要求更严的门禁上炸 | 新增 decl kind 的清单：① `ann_pass` ② `hir_lower_decl` ③ `check_decl_hir` ④ `register_decl` —— 四处都要**显式**处理，不能依赖兜底 |
+
+### C.6 快照差异的判读（B1 实测）
+
+| DIFF / NEW | 成因 | 是否合法 |
+|---|---|---|
+| `src/tc.tc::c` / `::ll` | 编译器自身源码变了，发射产物必然变 | ✅ 合法 |
+| `examples/import_module_type.tc::c` / `::ll` | 该例用 `@type_info` **反射 `src.base`**；给 `base.tc` 新增 `pub fn` 会改变模块公开面 ⇒ IR 字节变 | ✅ 合法（**stdout 未变**，run_examples 双后端 PASS）|
+| `examples/faultgroup_demo.tc::c` / `::ll` | 本批新增示例 | ✅ 合法（NEW）|
+| 4 个 `@import("std.*")` 示例 × 双后端成片 DIFF | ⚠ **比对用了非 gate 的 g1**（如 `bootstrap_tc` 产出的 `_xxx.exe.exe`） | ❌ 伪差异 —— 先用 gate 的 `out/dbg/g1.exe` 重录 |
+
+⇒ ⭐ **IR 变 ≠ 语义变**：先看 `run_examples_tmir` 的 stdout 对拍，再看 IR 快照。
+⇒ ⭐ 判据模板：**「0 GONE + 每条 DIFF/NEW 都能指名道姓解释」= 合法漂移**。
+
+---
+
+## 附录 D · B4 前置：后端缺口 G-1 修复（2026-10-28）
+
+### D.0 为什么必须先修
+
+B4 的 repair 闭包签名是 `fn() T`，而 `T` 就是组的 `over T`（用户结构体的常态）。
+⇒ 只要 `T` 是聚合，**tmir-c 轨整份编译失败**，双后端 golden 立刻红。
+
+### D.1 复现与根因
+
+最小复现（`examples/closure_struct_ret.tc` ①）：
+
+```t
+struct Pt { x: i64; y: i64; }
+var f = fn () Pt { return Pt{ .x = 11, .y = 22 }; };
+var p: Pt = f();
+```
+
+tmir-c 发射出：
+
+```c
+static void __lam_0(unsigned char* __sret);          // ← 用户聚合返回：sret 约定
+static unsigned char* __lam_0__clo_thunk(void* __env) {
+  return __lam_0();                                   // ← ❌ 少了 __sret 实参
+}
+```
+
+根因是**两套 ABI 混用**：
+
+| 约定 | 签名 |
+|---|---|
+| 用户函数（聚合返回） | `void <fn>(unsigned char* __sret, <params…>)`（与 LLVM 轨逐字对齐）|
+| 统一 TClosure ABI | `code(env, 实参…)`，聚合返回时**返回聚合缓冲指针** `unsigned char*` |
+
+`c_emit_thunks` 只按「形参原样转发」生成体，没做 sret 适配。
+
+### D.2 修复
+
+`src/codegen_c_tmir.tc` 两处：
+
+1. **`c_emit_thunks`**：返回类型是 sret 聚合时，thunk 体改为
+   `分配缓冲 → <fn>(__sret, <args…>) → return __sret`。
+2. **`c_clo_code`**：⭐ **判据从「带 env 首参 ⇒ 用裸函数名」改为「聚合返回 ⇒ 一律走 thunk」**。
+   - 旧判据在**标量**返回下成立（env 是真实首参，`code(env, args…)` 就是它自己）；
+   - 但带 env 的**聚合返回**函数签名是 `void <fn>(unsigned char* __sret, void* __env, args…)`，
+     当 code 用会让 env 落进 `__sret`、用户实参整体错位（**G-1b**，同源的第二处）。
+   - 附带细节：带 env 时 thunk **不再另加** `void* __env`（否则与自带 `__env` 形参重名，C 编译不过）。
+
+### D.3 验证（2026-10-28 全量，24 步逐项实跑）
+
+- `examples/closure_struct_ret.tc`（① 不捕获 ② 捕获外层变量）双后端 **逐字节一致**
+- **自举不动点**：g1.ll == g2.ll == g3.ll == g4.ll（`0fe9c283…`）
+  —— 强于门禁判据（只需 g2 == g3）
+- ⭐ **C 后端自举（cself）**：`g4.exe --emit-c src/tc.tc` → clang → 该 C 产物再
+  `emit-ll src/tc.tc`，与 LLVM 产物 **md5 逐字节相同** ⇒ 修复后的 C 后端能编译编译器自身且行为一致
+- conformance 415/415（g1 与 C 自举产物各一遍）；run_examples dbg 109/109；
+  run_examples_tmir 134/134；difftest 代际对拍 27/27；双轨对拍 109/109；
+  MIR opt=1/2 FAILS:0；lint 冒烟 0 findings；ir_verify 0 warn；LLVMVerifyModule OK
+- **产物快照**：唯一 FAIL（合法漂移）→ 用 g1 重录 **144 targets / 291 entries**（B1 基线为 143/289：
+  +1 target = 新增 `closure_struct_ret`，+2 entries = 其 `::ll` / `::c`），回验 **291/291 逐字节相同**
+- ⚠ **执行方式偏差**：本批门禁**不是**一次 `gate.mjs L2` 跑出来的 —— 后台执行通道故障（exit 125），
+  改为按 gate.mjs 的步骤定义**逐条手工复现**并各自记录证据（日志见 `out/_*.log`）。
+  判据与 gate 完全一致，但**没有 gate 自身的汇总行**作为单一证据来源。
+
+### D.4 ⚠ 仍未修：G-2（数组元素上的闭包间接调用）
+
+`fs[0]()` 在**双后端**都发射未定义符号 `t__`（链接失败）；先取到局部再调用则静默崩溃。
+- 根因在**前端**（callee 是 index 表达式 ⇒ 名字解析为空），不在后端。
+- **不阻塞 B4**：A-32 已用 N 个独立字段 `r0..r(N-1)` 绕开数组通路；`resume(.name)` 的槽位索引是编译期常量。
+- 若日后想改回 `[N]%TClosure`，须先修这条。
