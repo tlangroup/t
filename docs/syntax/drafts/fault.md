@@ -135,12 +135,13 @@ trap validate(u) {
 | - | -------------------------------------------------- | --------------- |
 | 1 | 谓词自带语义，不用记名字                                       | ❌（名字是任意标识符）     |
 | 2 | raise 处与 handle 处共享同一谓词词汇，不一致即编译错                  | ❌               |
-| 3 | **组 → 生成 `if` 链 / 校验函数**（组是**规格**，variant 是**数据**） | ❌ 关键差异          |
+| 3 | **组 → 生成校验函数 / 文档反例表**（组是**规格**，variant 是**数据**）<br>⚠ **生成 `if` 链已证伪**（A-23） | ❌ 关键差异          |
 | 4 | 谓词**语法恒等**检查（语义重叠不检查，见 A-17）                       | ⚠ **降级后归零**      |
 | 5 | **多策略选择权归调用者，且内部结构不进 API**                         | ❌ 关键差异（路径 ③ 带来） |
 
 - ⭐ **必要性的全部重量现压在 3、5 两项上**（A-17 使 4 归零）。若只做 1、2，它就是 `variant` 的语法糖，直接违反 **L-04 第 6 条** —— 此时"还不如更多 tag 的 variant"的判断**成立**。
-- 反过来说：只要 3、5 落地，"用更少的错误编码得到更复杂的处理流程"就不矛盾了 —— 复杂度不在你写的代码里，在编译器从组里**生成**出来的代码里，在上层**选择**的策略组合里。
+- 反过来说：只要 3、5 落地，"用更少的错误编码得到更复杂的处理流程"就不矛盾了 —— 复杂度不在你写的代码里，在编译器从组里**生成**出来的代码里（校验函数）、在上层**选择**的策略组合里。
+- ⚠ **差异项 3 的收益须按 A-23 打折**：组能生成的是「**不带 repair 的**纯谓词校验函数」（`fn frame_check(f : Frame) FrameErr?`，顶层可复用）与文档反例表，**生成不了** raise 的 `if` 链 —— 后者必须手写，因为每个 raise 都带着只属于该函数的 repair 闭包。⇒ A-22 的短键简写正是为这个"省不掉的手写部分"减小负担。
 - ⚠ **A-17 的代价与为什么可接受**：组内两条谓词语义重叠（如 `.len > 16384` 与 `.len > 0, .csum = 0`）⇒ 规格描述有歧义，但**运行时行为完全确定** —— F-2 恒等分派的分派键是 **raise 处写死的 tag**，不是对输入重跑谓词。**组是规格，不是分派表**；分派发生在 raise 处的手写 `if` 链里。⇒ 重叠只伤可读性，不伤正确性，故降级成立。
 
 ### 3.1 硬适用判据（决定是否值得做）
@@ -159,15 +160,16 @@ trap validate(u) {
 // —— 具名故障集：编译期声明，也是公开 API 契约 ——
 // + （见 §8 A-6：clause 不进 IR，故不得用运行时容器类型）
 FaultSetDecl: "fault" UpperIdent "over" Type "{" (FaultMember ";" )+ "}"
-FaultMember:  PredPat "->" UpperIdent ( "repairs" "{" RepairName ("," RepairName)* "}" )?
-//                                       ^ repair 名在此登记；登记后才是公开契约
+// + 组声明是唯一真源：谓词、全名、repair 契约三样都只在这里写一次（§8 A-22）
+FaultMember:  PredPat "->" FaultName ( "repairs" "{" RepairName ("," RepairName)* "}" )?
+//                                     ^ repair 名在此登记；登记后才是公开契约
+FaultName:    UpperIdent "." UpperIdent    // 组名.成员名；**末段** = raise 处的短键
 
 // —— raise：必须写在函数体内（repair 要捕获该函数的作用域）——
 // + scrutinee 已移除（§8 A-18）：谓词的类型锚在组的 `over T` 上，raise 处不传值
-RaiseExpr: "Err" "(" FaultGroup ")"
-FaultGroup:  FaultClause ("++" RepairClause)*
-FaultClause:  "@clause" "(" ".fault"  "," PredPat "," Expr ")"
-// + 新增变体
+// + 谓词与全名也已移除（§8 A-22）：raise 处只写成员短名，它们是**引用**而非定义
+RaiseExpr: "Err" "(" FaultRef ("++" RepairClause)* ")"
+FaultRef:     "." UpperIdent                       // .AgeNegative —— 组内成员的短键
 RepairClause: "@clause" "(" ".repair" "," RepairName "," FuncLit ")"
 // + 修法名：成员式记号，与 .{ .f = v } 同形
 RepairName:  "." ident
@@ -201,6 +203,15 @@ FuncLit: "fn" "(" ParamList? ")" Type Block   // ⚠ t 现行无 -> 箭头（ref
   ⚠ 位置式 `.{a, b}` 与本稿 `.{ .f = v }` 的消歧已由「字段是否带前导点」解决（`reference.md` §2991）。
 - **`resume` 无保留字冲突**：全仓 `src/*.tc` 与 examples 0 命中（t 亦无协程 / `yield`）。
 - **repair 必须写在函数体内**：硬约束，不是风格。R-1 要求闭包捕获抛出点作用域，而具名组声明在顶层，那里没有 `u`。
+- ⭐ **三个位置的键形式不对称，是有意的（§8 A-22）**：
+
+  | 位置 | 键 | 为什么是这个 |
+  |---|---|---|
+  | 组声明 | `.{ .age < 0 } -> UserErr.AgeNegative` | **定义**：谓词与全名在此登记一次 |
+  | raise | `.AgeNegative` | **引用**。raise 处已被 `if u.age < 0` 包着，谓词再写一遍就是重复（A-22 首要理由） |
+  | trap 臂 | `.{ .age < 0 }` | **引用**。trap 处没有 `if`，谓词在此提供即时信息，不必跳转查组 |
+
+  ⇒ 三者都**唯一定位**到同一 clause（谓词靠 A-2 唯一性，短名靠组内末段唯一），但各取该位置**最省**的形式。这不是同一位置的两种写法，故不构成 L-04 第 6 条的多写。
 
 ---
 
@@ -235,7 +246,8 @@ match (__fv.tag) {
 - **`recover(e)` 是糖，不是新语义**：脱糖为 `resume(合成闭包 fn() T { return e; })`。  
   ⇒ 路径 ① 因此是路径 ③ 的退化特例，两者共用一套机制，**不构成 L-04 第 6 条的"多写共存"**。
 - **穷尽性（L-03）**：`trap` 的覆盖判定 = 组内每个 clause 是否至少被一条臂引用；与 `enum` 全 case 覆盖同一套分析。
-- **生成收益（提案原文未使用，本稿要求补上）**：既然 clause 是编译期数据，`validate` 体内的 `if` 链**应由组生成**，谓词在组内只出现一次，满足单一真源。
+- **生成收益（A-23 修正版）**：clause 是编译期数据 ⇒ 组应生成 ① **纯谓词校验函数** `fn frame_check(f : Frame) FrameErr?`（无 repair，顶层可复用）与 ② 文档/测试用的反例表。  
+  ⚠ **生成不了 raise 的 `if` 链** —— 每个 raise 都挂着只属于该函数的 repair 闭包（A-12 禁跨函数复用）⇒ 那部分必须手写，谓词在源码里也就无法只出现一次。**A-22 的短键简写正是给这部分减负。**
 
 ---
 
@@ -252,15 +264,13 @@ fault UserErr over User {
 
 fn validate(u : User) fault(UserErr)!User {
     if u.age < 0 {
-        return Err(
-              @clause(.fault, .{ .age < 0 }, UserErr.AgeNegative)
+        return Err(.AgeNegative                    // 短键 = 组内成员的末段（A-22）
            ++ @clause(.repair, .use_default, fn() User { return User{ .age : DEFAULT_AGE, .name : u.name }; })
            ++ @clause(.repair, .clamp,       fn() User { return User{ .age : 0,          .name : u.name }; })
         );
     }
     if u.name == "" {
-        return Err(
-              @clause(.fault, .{ .name = "" }, UserErr.NameEmpty)
+        return Err(.NameEmpty
            ++ @clause(.repair, .anon, fn() User { return User{ .name : ANON, .age : u.age }; })
         );
     }
@@ -287,16 +297,14 @@ fault FrameErr over Frame {
 // ⚠ magic 校验失败时 Frame 尚未构造 —— raise 处没有值可传，这正是 A-18 移除 scrutinee 的动机
 fn decode(buf : bytes) fault(FrameErr)!Frame {
     if !is_ours(buf) {
-        return Err(
-              @clause(.fault, .{ .magic != 0xCAFEBABE }, FrameErr.NotOurs)
+        return Err(.NotOurs                        // 短键（A-22）；谓词只在组里写一次
            ++ @clause(.repair, .skip,   fn() Frame { return FRAME_NOP; })
            ++ @clause(.repair, .as_raw, fn() Frame { return raw_frame(buf); })
         );
     }
     var f : Frame = parse(buf);
     if f.len > 16384 {
-        return Err(
-              @clause(.fault, .{ .len > 16384 }, FrameErr.TooLarge)
+        return Err(.TooLarge
            ++ @clause(.repair, .truncate, fn() Frame { return trunc_frame(buf, 16384); })
         );
     }
@@ -326,9 +334,10 @@ fn main_fn() fault(FrameErr)!i32 @main {
 
 ⇒ **策略的选择权与定义权分离**，且分离不需要任何数据外流。同一份 `decode` 在另一调用点可选 `.as_raw` / `.abort`，库代码一字不改。
 
-> ✅ **本例原有两处自相矛盾，已由 A-18 / A-19 解决**：① `Err(f0, ...)` 的 scrutinee 已移除（raise 处不传值，类型锚在 `over T`）；
+> ✅ **本例原有两处自相矛盾，已由 A-18 / A-19 解决；raise 写法另由 A-22 简写**：① `Err(f0, ...)` 的 scrutinee 已移除（raise 处不传值，类型锚在 `over T`）；
 > ② `route` 签名已改为 `fault(FrameErr)!Frame`，与 `_ => resume(.abort)` 的传播语义一致。
 > ⭐ 注意 `.abort` **只有一个语义：向上传播**。它到达语言最外层（`main` 之外）时由运行时接手 ⇒ 打印 + 非零退出码，不是"换了一个意思"。这与 Rust `main` + `?` 的先例同形。
+> ⭐ **A-22 的减负效果**：每个 raise 从 `@clause(.fault, .{ .magic != 0xCAFEBABE }, FrameErr.NotOurs)` 缩到 `.NotOurs` —— 谓词与全名都只在组里写一次，且**不与外层的 `if !is_ours(buf)` 重复**。
 
 ---
 
@@ -336,7 +345,7 @@ fn main_fn() fault(FrameErr)!i32 @main {
 
 | 编号 | 依赖项 | 现状 | 增量 | 量级 |
 |---|---|---|---|---|
-| D1 | `@clause` 与一等 clause 组 | ✅ 已落地：`@clause(.pattern,...)`、组 `[C0,C1]`、`match(x){G}` 展开 + N11 重排（`examples/clause_expand.tc`） | 新增 `.fault` / `.repair` 变体 + 谓词存储 + 组展开点 | 小 |
+| D1 | `@clause` 与一等 clause 组 | ✅ 已落地：`@clause(.pattern,...)`、组 `[C0,C1]`、`match(x){G}` 展开 + N11 重排（`examples/clause_expand.tc`） | 新增 `.repair` 变体 + **短键 `.Name` 解析**（A-22，取代 `.fault` 变体）+ 组展开点 | 小 |
 | D2 | `.{ .f = v }` 具名字段模式 | ⚠ `match.md` 已采纳 EBNF，但**全仓 examples/tests 无覆盖** | 先补 conformance/双后端用例证其可用，再扩展 | 小 |
 | D3 | 谓词中的关系表达式 + 嵌套路径 `.flags.bit0` | ❌ 未落地。`PatternExpr` 现仅 `Literal` | 扩展 `PatternExpr` + 位访问 | 中 |
 | D4 | `++` | ✅ 已存在（opmap `Concat`/63，`tll_slice_concat`） | 0 | 0 |
@@ -396,6 +405,8 @@ fn main_fn() fault(FrameErr)!i32 @main {
 | **A-19** | **`.abort` 与顶层传播** | `.abort` **只有一个语义 = 向上传播**；传播到 `main` 之外时由运行时接手 ⇒ 打印 + 非零退出码 | 与 Rust `main` + `?` 同形。含 `.abort` 臂的函数签名必须写 `fault(E)!T`（A-8）。⚠ 修正 §6.2 原文 `fn route(c:Conn) void` 的自相矛盾 |
 | **A-20** | **`trap` 是否专用于错误处理** | **是**，`trap` 为错误专用关键词，**不复用 `match`** | 见下方 §8.1 的论证：trap 是**更严格的 match**，不是一个新语法 |
 | **A-21** | **trap 的通配臂** | 允许 `_`，但**通配臂上只允许 `resume(.abort)`** | 否则 `_ => resume(.skip)` 会吞掉未处理的故障，与 A-15 冲突。⇒ 你要么逐 clause 处理，要么显式说「其余一律上传」，没有第三条路 |
+| **A-22** | **raise 处的写法（Q13）** | **简写：只写成员短名** `Err(.AgeNegative ++ ...)`；谓词与全名**都不在 raise 处写** | 三条理由：① **不与 `if` 重复** —— raise 的 `if u.age < 0` 无法由组生成（闭包体函数私有，A-12），写谓词就是同一条件写两遍；② **零规范化**：键 = 字符串恒等，raise 路径不需要谓词规范化；③ 与 `resume(.skip)` **同形**，词汇只有成员式短键一种。组内仍是唯一真源 |
+| **A-23** | **「组 → 生成 `if` 链」** | ❌ **做不到，已更正**为「组 → 生成**纯谓词校验函数** + 文档反例表」 | 含 repair 的 raise 链**无法**由组生成：repair 闭包体引用抛出点的局部变量（`u`），而组声明在顶层、A-12 又禁止跨函数复用 ⇒ raise 处的 `if` 必须手写。⇒ 差异项 3 的收益范围相应收窄（见 §3） |
 
 ### 8.1 为什么 `trap` 值得独占一个关键词（A-20 的论证）
 
@@ -424,6 +435,7 @@ fn main_fn() fault(FrameErr)!i32 @main {
 | 处理点读取出错的**数据本身**（打印/统计/记录） | F-3 无载荷 | 用 variant + 载荷（§3.1 判据） |
 | 未处理的故障自动崩溃 / 打印调用栈 | 无异常栈机制 | 由 `.abort` 传到 `main` 之外后由运行时接手（打印 + 非零退出码，A-19） |
 | **组内语义重叠的静态检查** | A-17 已降级 | 组是**规格**不是分派表 ⇒ 重叠不伤正确性，只伤可读性；由文档与评审负责 |
+| **由组生成 raise 的 `if` 链** | repair 闭包体引用抛出点局部变量，A-12 禁跨函数复用 | 只能生成**不带 repair 的**校验函数与反例表（A-23）；raise 处仍需手写，负担由 A-22 的短键简写承担 |
 
 ### 9.2 法律验证（待做）
 
@@ -452,8 +464,8 @@ fn main_fn() fault(FrameErr)!i32 @main {
 |---|---|---|---|
 | **B1** | `FaultSetDecl` 解析 + 具名组登记 + `fault(E)!T` 类型 kind | D5 | 是（新 TI kind） |
 | **B2** | `PatternExpr` 放宽到关系表达式 + 嵌套 `FieldPath`；谓词规范化与恒等比较（D7） | D3 / D7 | **否**（编译期活） |
-| **B3** | `@clause(.fault)` / `@clause(.repair)` 变体 + repair 名 → 槽位索引（R-2） | D1 / D4 | **否** |
-| **B4** | `trap` / `resume` / `recover` 脱糖为 `match` + 常量索引间接调用；组 → 生成 `if` 链 | R-1（已实装，零新机制） | 否（复用 `CALL_IND`） |
+| **B3** | 短键 `.Name` 引用解析（A-22）+ `@clause(.repair)` 变体 + repair 名 → 槽位索引（R-2） | D1 / D4 | **否** |
+| **B4** | `trap` / `resume` / `recover` 脱糖为 `match` + 常量索引间接调用；组 → 生成**校验函数**（A-23：不是 `if` 链） | R-1（已实装，零新机制） | 否（复用 `CALL_IND`） |
 | **B5** | 跨函数可达故障集 / 可达 repair 分析，经 `.tlib` TIR 摘要 | R-3 | 否 |
 | **B6** | 门禁收口：conformance 用例 + examples golden 双后端 + 自举 + IR 快照重录 | 全部 | — |
 
@@ -475,6 +487,7 @@ fn main_fn() fault(FrameErr)!i32 @main {
 | 「签名可不写 `!T`」 | ❌ **已改为必须写**（§8 A-8）。因 ③ 的传播是默认隐式的 |
 | 「组内重叠即报错」（A-1 后半） | ❌ **已降级为只查语法恒等**（§8 A-17）。判定语义重叠与 A-3 互斥；且 F-2 下组是规格不是分派表 ⇒ 重叠不伤正确性。代价：§3 差异项 4 归零 |
 | 「`Err(<scrutinee>, <group>)` 显式写出」（A-5） | ❌ **已撤销，改 `Err(<group>)`**（§8 A-18）。raise 时 scrutinee 往往尚不存在，且与 A-6 的 `over T` 重复承载类型信息 |
+| 「组 → 生成 raise 的 `if` 链」（差异项 3 前半） | ❌ **做不到**（§8 A-23）。repair 闭包体是函数私有的（A-12）⇒ 只能生成无 repair 的校验函数。⇒ **A-22 的短键简写是为这个省不掉的手写部分减负** |
 
 ---
 
@@ -550,7 +563,7 @@ fn main_fn() fault(FrameErr)!i32 @main {
 |---|---|---|---|
 | **Q1** | **诊断码归属**：新开 `FLT` 类，还是复用既有 | ① 复用：`MAT`（谓词/模式，[740,779] 已用 9）/`CLA`（clause 变体，[720,739] 已用 7）/`CLO`（repair 闭包，[780,809] 已用 2）⇒ **零区间改动**；② 新开 `FLT` ⇒ **必须先从别的 CAT 切一块** | ⚠ **000–999 已被 `gen_diag.mjs` 的 `RANGES` 全部切满，无空段**。新 CAT 只能仿 CLA/TIM 先例（二者共享 700–739 百年段、子区间 700–719 / 720–739 切分）做**区间再切分**，须同步改 `gen_diag.mjs` 与 `docs/diagnostics.md` §1.3。候选空段：`AGT`[880,909] 仅 1 条实码、`DEV`[950,979] 仅 4 条、`OVL`[980,999] 仅 2 条 |
 | **Q2** | 每条新诊断的**三个名字** | `code` / `name`（冻结短语义名）/ `legacy`（旧语义名，可 null） | `gen_diag.mjs` 有 `legacySeen` 唯一性校验（"duplicate legacy name" ⇒ 别名碰撞），`name` 也要起好。这是一笔容易被漏掉的固定成本 |
-| **Q3** | **谓词常量是否先折叠**再比较 | ① 折叠（`.a < 1+1` ≡ `.a < 2`）；② 不折叠 | ⚠ 不折叠的后果：同一谓词两种写法被判成**两个** clause ⇒ 语义上重叠却绕开 A-1 检查、且恒等分派失效（raise 写 `< 2`、trap 写 `< 1+1` ⇒ 对不上）。⚠ 注意 sema 之后还有一趟 `comptime_fold_pass()`，它会不会顺带把谓词折掉、还是必须显式处理，是 B2 的一个**隐性落点** |
+| **Q3** | **谓词常量是否先折叠**再比较 | ① 折叠（`.a < 1+1` ≡ `.a < 2`）；② 不折叠 | ⚠ A-22 后的适用范围已收窄：**raise 路径不再需要**（键是短名），只剩组内唯一性检查与 trap 臂的谓词匹配仍需。不折叠的后果：同一谓词两种写法被判成**两个** clause ⇒ 绕开 A-2、且 trap 写 `< 1+1` 与组写 `< 2` 对不上。⚠ 注意 sema 之后还有一趟 `comptime_fold_pass()`，它会不会顺带把谓词折掉、还是必须显式处理，是 B2 的一个**隐性落点** |
 
 #### A.5.2 ⭐ 文档内部冲突（A-1 与 A-3 互斥）
 
@@ -585,4 +598,6 @@ fn main_fn() fault(FrameErr)!i32 @main {
 |---|---|
 | Q11 | L-04 唯一语义验证（§9.2 标 ⚠ 待核）：`resume` / `recover` / `.abort` 三式 |
 | ~~Q12~~ | ✅ **已裁定 = A-20/A-21**：`trap` 保留为错误专用关键词（论证见 §8.1），通配臂只允许 `.abort` |
-| **Q13** | **raise 处要不要还写错误名**（Q7 的同源问题）：现在 `Err(@clause(.fault, .{ .age<0 }, UserErr.AgeNegative) ++ ...)` 里谓词与名字都写了，而组里已有 `谓词 → 名字` 的映射。① 去掉，raise 只写谓词（A-2 唯一性保证定位）；② 保留 |
+| ~~Q13~~ | ✅ **已裁定 = A-22**：raise 处写**成员短名** `.AgeNegative`（不是纯谓词、也不是全名）。⇒ 组内仍需登记谓词与全名，raise 处省掉两者 |
+| **Q14** | **trap 臂是否也接受短名** `.AgeNegative => resume(.x)` | ① **否**（保持谓词，与组声明同形）—— A-22 后三处键形式不对称是有意的，见 §4 末；② 是（两处统一为短名，raise 与 trap 完全对称，但 trap 处失去谓词的即时信息）。⚠ 若选 ②，需与 Q10 联动复核 |
+| **Q15** | **repair 登记能否也简写** | 现状 `++ @clause(.repair, .use_default, fn() User { ... })`。候选：① 保留包装；② 简写 `++ .use_default => fn() User { ... }`（`=>` 与 trap 臂同形，省 20 字符）。⚠ 风险：`++` 与 `=>` 的优先级/结合性需确认 parse 无歧义 |
