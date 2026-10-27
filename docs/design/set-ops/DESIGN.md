@@ -42,7 +42,10 @@
 ## 4. 可扩展性（对应需求 #3 / #4）—— Step 2 落地
 
 - Step 2 集合操作符对"未处理类型"必须**结构化报错并指向扩展点**。
-- Step 2 第一批落地：内置类型（bitstr / flag）由编译器提供内建实现；其它类型 → 抛 `T-SET-E*` 错误，提示实现对应 concept（`Intersect` / `Union`）。
+- Step 2 第一批落地：内置类型（bitstr / flag）由编译器提供内建实现；其它类型 → 抛 `T-SET-E*` 错误。
+  ⚠ 早期文案提示「实现 `Intersect` / `Union` concept」，但该扩展机制**只有设计、没有实装**
+  （`src` / `lib` 查无此 concept，见 §12.2）⇒ 现行报错文案**不**指向它，避免把用户送到
+  一个无法实现的扩展点上。
 - 完整"第三方扩展" = 把 `&&`/`||` 脱糖为 concept 方法调用 + 内建 impl。Step 2 先保证"未处理即报错 + 扩展提示"。
 
 ## 5. 编译期内建（comptime）—— Step 2 落地
@@ -173,7 +176,7 @@
 | `runtime/t_shim_ll.c` | 新增 `tll_bitstr_and` / `tll_bitstr_or`（**out 排末位**，与 `tll_str_concat` 同构） |
 | `src/parse.tc` | `parse_and` / `parse_or`：`And`/`Or` 产出 `"&&"`/`"\|\|"`（集合），`KwAnd`/`KwOr` 产出 `"and"`/`"or"`（布尔）。⚠ op 必须在 `advance_i()` **之前**判定 |
 | `src/opmap.tc` | `tir_binop` 补 `"&&"`→`and`、`"\|\|"`→`or`；`tir_op_from_str` 同步补映射 |
-| `src/sema.tc` | 值位集合分派：bitstr×bitstr → `BitStr`；其余类型 → `T-SET-E101`（交）/`T-SET-E102`（并），提示实现 `Intersect`/`Union` concept；bitstr 的 `^` → `T-SET-E103` |
+| `src/sema.tc` | 值位集合分派：bitstr×bitstr → `BitStr`；位域×同位域 → 宿主整型 AND/OR；其余类型（**含 bool**）→ `T-SET-E101`（交）/`T-SET-E102`（并），文案只说「内建实现覆盖 bitstr 与位域，布尔请用 `and`/`or`」，**不指向** `Intersect`/`Union`（未实装）；bitstr 的 `^` → `T-SET-E103`、位域 → `T-SET-E105` |
 | `src/tir_to_ll.tc` | 位运算发射前拦截 `%TBitStr` → `call void @tll_bitstr_and/or(a, b, out)` |
 | `src/codegen_c_tmir.tc` | 同上拦截（须排在 `dst = (` 前缀发射**之前**）→ `t_bitstr_and(a, b)`（C 端 `t_*` 按值返回） |
 | `tests/conformance/fail/f_setops_bool_{intersect,union}.tc` | 新增：bool 上用 `&&`/`\|\|` 报结构化错误 |
@@ -716,3 +719,37 @@ bitstr / 位域的 `&` / `|` 不会误折（meta_eval 对这两类操作数本�
 `f_setops_packed_mixed`（改 `&`），新增 `f_setops_removed_ampamp` / `f_setops_removed_pipepipe`
 锁定「已移除」的报错形态；examples `setops_bitstr` / `setops_packed` / `as_cast_no_conj` 同步迁移
 （前两者顺带把 bitstr 的 `&` / `|` **运行期**覆盖补上 —— 此前只有 `&&` / `||` 有 golden）。
+
+### 13.10 剩余项清单（2026-10-27 盘点）
+
+R1 / R2 / R3 / R5 / R6 与 §13.6 全部步骤均已落地。剩下的分三类。
+
+**A. 待裁定（需要用户拍板才能动）**
+
+| 编号 | 议题 | 现状 | 为什么现在不能做 |
+|---|---|---|---|
+| A1 | **n-ary / spread**（§13.5） | 只有二元 `a & b`；spread 未设计 | 静态列表表达不了动态 arity，值钱的是 spread；形态需另起一轮裁定（建议走方括号 `[a,b]`，别给花括号加第六职） |
+| A2 | **差集 / 对称差运算符** | 集合类型上的 `^` 一律 `T-SET-E103`（bitstr）/ `T-SET-E105`（位域），明说「留待后续批次设计」 | 用户目前**没有任何**表达差集的手段。按 §12.5 纪律文案不指名符号（不提 `^^`），但这意味着该能力缺口是显式的 |
+| A3 | **类型位的 join / 补** | 类型域只有 meet；`A \| B`（约束析取）与 `not A` 均无 | 析取需要 union type + 动态派发，补不可判定 ⇒ §13.2 已裁定**不做**。后果：约束语言无法表达「满足任一」，将来泛型若需要须重开 |
+
+**B. 待落点（设计已定，无消费方则无法验证）**
+
+- **R4 延后拆解**：`#entity` 在 `src/parse.tc` / `src/sema.tc` 中 grep 零命中 ⇒ 现在动 sema 只能改了却验证不了。
+  触发条件见 §13.8 R4（`#entity struct X = ...` parser 通路落地，或先裁定 AST 落点 + 占位降解器）。
+
+**C. 已核查并排除（不是未做，是查过没有问题）**
+
+- **bool 的编译期路径**：`const c: bool = true & false;` 仍报 `T-SET-E101` ⇒ sema 的收口覆盖 `const`
+  初始化式，comptime 折叠没有独立绕过通路（对照 §12 那条「sema 后还有一趟 `comptime_fold_pass`」的教训，
+  这是本批特意去查的漏口）。
+- **对称面**：`bitstr and bitstr` 报 `T-SEM-E202`（`expected ... got bool`）⇒ 删 `&&` 后用户无法用
+  关键字 `and` 静默拿回位运算语义，`and` / `or` 严格只吃 bool。
+- **`^` 的单侧判定**：已按「任一侧」收口（E103 / E105），不再是第三次出现的那种单侧漏网。
+- **种子**：`npm run seed:check` 通过（md5 `08046b37…`）⇒ 本批未引入新语法，无需 `seed:refresh`。
+
+**D. 已清掉的文档债务（本批顺带）**
+
+`docs/reference.md` 的 `@rule` 示例、优先级塔描述、向量诊断举例中的 `&&` / `||` 已改 `and` / `or`
+（记号表那一行**保留** `&&` / `||` —— 词法层确实仍产出这两个记号，只是不在表达式文法里）；
+DESIGN §4 / 实施地图里「提示实现 `Intersect`/`Union` concept」已标注为**只有设计、未实装**，
+并说明现行文案为何不指向它。
