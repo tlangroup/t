@@ -857,6 +857,31 @@ pub fn pat_relop_text(t: string) string {
     return "?";
 }
 
+// ── 故障子句的谓词位形态校验（fault B3 / 附录 B M3）────────────────────────
+// `@clause(.fault, <谓词>, <全名>)` 的谓词必须是 `.{...}`（struct_lit），且每个字段值是
+//   · 等值约束（普通字面量 / 常量表达式），或
+//   · 关系二元式（`binary` 且 op ∈ 关系集，判据复用 B2 的 pat_is_relop_text）
+// 二者之外（`.{ .a + 1 }`、位置式 `.{a, b}`、空 `.{}`）一律不合法 ⇒ 报 T-CLA-E730。
+// ⚠ 收口纪律（§11）：不收口就会静默错编 —— 与 bitstr `&` / 位域 `&` / `^` 同款。
+pub fn clause_pred_ok(pn: i64) bool {
+    if (pn < 0) { return false; }
+    if (base.node_kind((pn as u64)) != "struct_lit") { return false; }
+    var fks: []i64 = base.kids_chain_idx(base.node_la((pn as u64)));
+    if (slice_len(fks) == 0) { return false; }
+    var fi: i64 = 0;
+    while (fi < slice_len(fks) as i64) {
+        var fv: i64 = base.kids[fks[fi]].val;
+        // 位置式字段（sa == ""）不是谓词约束
+        if (base.node_sa((fv as u64)) == "") { return false; }
+        var vv: i64 = base.node_na((fv as u64));
+        if (vv >= 0 and base.node_kind((vv as u64)) == "binary") {
+            if (pat_is_relop_text(base.node_sa((vv as u64))) == false) { return false; }
+        }
+        fi = fi + 1;
+    }
+    return true;
+}
+
 pub fn parse_struct_lit(type_name: string, ti: i64) i64 {
     lex.advance_i();
     var head: i64 = -1;
@@ -3401,6 +3426,7 @@ pub fn parse_declaration() i64 {
 //   t 对「函数内建数组字面量的切片」不做逃逸提升，跨帧读回 p[i] 会得到悬空内存
 //   （本项目已有实证：ovl_specificity 的类别表）。局部 `ord`/`wild` 曾因此读到
 //   被回收的槽位（症状：`t_slice_at index N length M` 且 M 随机）。
+pub var g_spl_fault: bool = false;   // 本次收集含「非 pattern 子句」（.fault / .repair）—— 故障子句不能当臂展开（fault B3 / 附录 B M5）
 pub var g_spl_cl: []i64;      // 展开期收集的 clause 节点（顺序即源码顺序）
 pub var g_spl_base: i64 = 0;  // 本次收集在 g_spl_cl 中的起始下标
 pub var g_spl_ord: []i64;     // 重排后的顺序（无守卫通配落末位）
@@ -3415,7 +3441,14 @@ pub var g_spl_trace: i64 = 0;   // 追踪开关（排障时临时置 1）
 pub fn clause_collect(x: i64) void {
     if (x < 0) { g_spl_ok = false; return; }
     var ck: string = base.node_kind((x as u64));
-    if (ck == "clause") { append(g_spl_cl, x); return; }
+    if (ck == "clause") {
+        // ⚠ 故障/修复子句**照旧收集**（否则 expr_is_clause_group 会判假 ⇒ 编译期标记
+        //   不生效 ⇒ clause 值漏进 IR），但置位 g_spl_fault，由 clause_expand_splice
+        //   在「要把它们当臂展开」时报错（附录 B M5 / M6）。
+        if (base.node_sa((x as u64)) != "pattern") { g_spl_fault = true; }
+        append(g_spl_cl, x);
+        return;
+    }
     if (ck == "paren" or ck == "comptime") { clause_collect(base.node_na((x as u64))); return; }
     if (ck == "array_lit") {
         // ⚠ 元素链头在 `la`，且是 kids 池 entry 索引（不是节点 id）—— 与臂链同规格。
@@ -3479,6 +3512,7 @@ pub fn clause_expand_splice(m: i64) void {
     g_spl_base = slice_len(g_spl_cl) as i64;
     g_spl_ok = true;
     g_spl_defer = false;
+    g_spl_fault = false;
     ki = 0;
     while (ki < slice_len(ks) as i64) {
         var it: i64 = base.kids[ks[ki]].val;
@@ -3496,6 +3530,13 @@ pub fn clause_expand_splice(m: i64) void {
     // N14 推迟：模板体里的 `match (x) { G }`（G 是 clause 形参）此刻无从展开，
     //   原样保留，等 instantiate_generic 生成实例后再补跑展开。
     if (g_spl_defer) { return; }
+    // 故障 / 修复子句（`@clause(.fault, ...)` / `@clause(.repair, ...)`）是**编译期登记**，
+    // 不是 match 臂 —— 它们没有 pattern/guard/body 的臂语义，展开成臂必是错编（附录 B M6）。
+    if (g_spl_fault) {
+        parse.fc_err("T-CLA-E731",
+            "故障子句 `@clause(.fault, ...)` / 修复子句 `@clause(.repair, ...)` 不能展开为 match 臂", m);
+        return;
+    }
     if (g_spl_ok == false or spl_n <= 0) {
         parse.fc_err("T-CLA-E723",
             "match 臂位置的子句组必须是 `clause` 或 `[N]clause`（含 `++` 合并结果）", m);
@@ -6167,11 +6208,24 @@ pub fn n_line(ni: i64) i64 {
 // 追加成员即可，`@clause` 的语法与展开通通不变（设计 §5.1.1）。
 pub fn clause_kind_member(k: string) bool {
     if (k == "pattern") { return true; }
+    // fault B3（附录 B M1）：故障子句与修复子句。`@clause` 的语法与展开通通不变，
+    // 只是多两个类别成员 —— 但二者**不是** match 臂，见 clause_expand_splice 的 E731 把关。
+    if (k == "fault") { return true; }
+    if (k == "repair") { return true; }
     return false;
 }
 
+// ⚠ 报错文案纪律：这里列的每个名字都必须是 `clause_kind_member` 里**真实存在**的成员
+//   （T-CLA-E721 的文案直接读本表的返回值）。
 pub fn clause_kind_list() string {
-    return ".pattern";
+    return ".pattern / .fault / .repair";
+}
+
+// 类别是否属于「故障族」（编译期登记，不参与 match 臂展开）。
+pub fn clause_kind_is_fault(k: string) bool {
+    if (k == "fault") { return true; }
+    if (k == "repair") { return true; }
+    return false;
 }
 
 // 调用点已确认内建名 == "clause"，当前 token 是 '('。
@@ -6186,9 +6240,34 @@ pub fn parse_clause_lit(ti_at: i64) i64 {
             ti_k);
     }
     expect_tok("Comma");
-    // ── pattern 位：`_` 通配站位（不绑定，L-02）或普通表达式 ──
+    // ── 第二段：按类别分派（fault B3 / 附录 B M2~M4）─────────────────────
+    //   .pattern : `_` 通配站位（不绑定，L-02）或普通表达式（既有）
+    //   .fault   : 谓词 `.{ .f <op> v }` —— 必须置 g_in_match_pat 才会走谓词分支
+    //   .repair  : 修法名 `.name` —— 前导点成员，与 `.Red` 同形
     var pn: i64 = -1;
-    if (lex.cur_t() == "_") {
+    if (km == "fault") {
+        var sav_pat: bool = g_in_match_pat;
+        g_in_match_pat = true;                  // 谓词位：让 parse_struct_lit 走谓词分支
+        pn = parse_expr();
+        g_in_match_pat = sav_pat;
+        if (clause_pred_ok(pn) == false) {
+            parse_fatal_at("T-CLA-E730",
+                "@clause(.fault, ...) 的谓词必须是 `.{ .字段 = 值 }` 或 `.{ .字段 <op> 值 }`（op 仅 `<` `>` `<=` `>=` `==` `!=`）",
+                pn);
+        }
+    } else if (km == "repair") {
+        if (lex.cur_t() == "Dot" and lex.peek_t(1) == "Identifier") {
+            lex.advance_i();                            // 消费 Dot
+            var ti_rn: i64 = lex.advance_i();           // 修法名
+            pn = base.mk_member(lex.tk_v(ti_rn), -1, -1);
+            base.node_set_lb((pn as u64), 1);           // 标记 leading-dot member
+            base.node_at(pn, ti_rn);
+        } else {
+            parse_fatal_at("T-CLA-E729",
+                "@clause(.repair, ...) 的第二段必须是 `.修法名` 形式（如 `.use_default`）", lex.pos);
+            pn = -1;
+        }
+    } else if (lex.cur_t() == "_") {
         lex.advance_i();
         pn = base.mk_ident("_", -1);
     } else {
@@ -6202,8 +6281,14 @@ pub fn parse_clause_lit(ti_at: i64) i64 {
     }
     expect_tok("Comma");
     // ── 可选守卫段：`when <expr>`，其后须再跟一个逗号与 body ──
+    // ⚠ 故障族子句**不接受守卫**：它们是编译期登记（`谓词 → 全名` / `修法名 → 闭包`），
+    //   没有「匹配失败则继续找下一条」的语义，守卫对它毫无意义（附录 B M2）。
     var gn: i64 = -1;
     if (lex.cur_t() == "KwWhen") {
+        if (clause_kind_is_fault(km)) {
+            parse_fatal_at("T-CLA-E728",
+                base.sb_cat3("`@clause(.", km, ", ...)` 不接受 `when` 守卫：它是编译期登记，不是 match 臂"), lex.pos);
+        }
         lex.advance_i();
         gn = parse_expr();
         expect_tok("Comma");

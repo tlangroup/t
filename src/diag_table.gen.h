@@ -25,6 +25,10 @@ static const DiagDef DIAG_DEFS[] = {
   { "T-CLA-E723", "error", "CLA", "T_CLAUSE_MERGE_TYPE", "MERGE_TYPE", "`++` operands must both be clause arrays with the same element type" },
   { "T-CLA-E724", "error", "CLA", "T_CLAUSE_ESCAPE", "ESCAPE", "clause value escapes to runtime; clause exists only in the compile-time phase" },
   { "T-CLA-E726", "error", "CLA", "T_CLAUSE_ARG_NOT_CONST", "ARG_NOT_CONST", "clause argument must be a compile-time foldable constant" },
+  { "T-CLA-E728", "error", "CLA", "", "FAULT_CLAUSE_GUARD", "`@clause(.fault, ...)` / `@clause(.repair, ...)` take no `when` guard (they are compile-time registrations, not match arms)" },
+  { "T-CLA-E729", "error", "CLA", "", "REPAIR_NAME_FORM", "the second operand of `@clause(.repair, ...)` must be a repair name of the form `.name`" },
+  { "T-CLA-E730", "error", "CLA", "", "FAULT_PRED_FORM", "the predicate of `@clause(.fault, ...)` must be `.{...}` with only equality / relational field constraints" },
+  { "T-CLA-E731", "error", "CLA", "", "FAULT_CLAUSE_IN_ARM", "fault / repair clauses cannot be spliced into a match arm chain" },
   { "T-CLA-W727", "warning", "CLA", "T_CLAUSE_SHADOWED", "SHADOWED", "clause is fully shadowed by an earlier unguarded clause" },
   { "T-CLO-E780", "error", "CLO", "T_CLOSURE_CAPTURE", "CAPTURE", "closure capture error" },
   { "T-CLO-E781", "error", "CLO", "T_CLOSURE_FN_ESCAPE", "CLOSURE_FN_ESCAPE", "comptime function escaped to runtime" },
@@ -191,7 +195,7 @@ static const DiagDef DIAG_DEFS[] = {
   { "T-VEC-W927", "warning", "VEC", "T_VECTOR_WIDER_THAN_NATIVE", "VECTOR_WIDER_THAN_NATIVE", "vector is wider than the native SIMD register and will be split" },
   { "T-VEC-W947", "warning", "VEC", "T_TILE_WIDER_THAN_NATIVE", "TILE_WIDER_THAN_NATIVE", "hardware tile is wider than the native SIMD register and will fall back to scalar loops" },
 };
-#define DIAG_COUNT 178
+#define DIAG_COUNT 182
 
 /* legacy (old semantic name) -> machine code alias table */
 static const struct { const char* legacy; const char* code; } DIAG_LEGACY[] = {
