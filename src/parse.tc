@@ -247,6 +247,39 @@ pub fn parse_type_inner() i64 {
         expect_tok("RParen");
         return base.mk_tile(tel, trows, tcols, tfl, tti);
     }
+    // 错误联合类型 `fault ( E ) ! T`（fault B1 / 附录 C P7）。
+    //   E = 已声明的具名故障组；T = 成功类型，必须与组的 `over T` **同构**。
+    //   理由（A-26 / A-27）：槽位数 N 是**组**的属性 ⇒ 运行期载体 `__fault_<E>` 每组只有一个，
+    //   在组声明期即已合成完毕，故此处只需按名引用，不必也不该重新计算布局。
+    // ⚠ 类型位的 `fault` 恒带 `(`（组声明形态是 `fault <名> over`，不带括号）⇒ 无歧义。
+    // ⚠ `fault` 是**上下文关键词**（mod 阶）：lexer 仍发 Identifier。理由：
+    //   `@clause(.fault, ...)` 里的 `.fault` 是**成员名**，若把 `fault` 强制成关键字，
+    //   `expect_tok("Identifier")` 会在那里直接撞语法错（实测打断了 B3 的 4 个用例）。
+    if (t == "Identifier" and lex.cur_v() == "fault" and lex.peek_t(1) == "LParen") {
+        var fti: i64 = lex.advance_i();            // `fault`
+        lex.advance_i();                            // '('
+        if (lex.cur_t() != "Identifier") {
+            parse_fatal("expected fault group name in `fault(<Group>)!T`");
+        }
+        var gi: i64 = lex.advance_i();
+        var gname: string = lex.tk_v(gi);
+        expect_tok("RParen");
+        if (lex.cur_t() != "Not") {
+            parse_fatal_at("T-PAR-E101", "expected '!' after `fault(<Group>)` in `fault(<Group>)!T`", lex.pos);
+        }
+        lex.advance_i();                            // '!'
+        var stn: i64 = parse_type();
+        var gix: i64 = fault_group_index(gname);
+        if (gix < 0) {
+            parse_fatal_at("T-CLA-E732",
+                base.sb_cat3("未知故障组 `", gname, "`：`fault(E)!T` 的 E 必须是已声明的具名故障组，且组声明须先于使用"), gi);
+        }
+        if (type_node_mangle(stn) != g_fg_over[gix]) {
+            parse_fatal_at("T-CLA-E733",
+                base.sb_cat5("`fault(", gname, ")!", type_node_mangle(stn), "` 的成功类型必须与组声明的 `over` 类型逐字一致"), gi);
+        }
+        return base.mk_named(fault_struct_name(gname), fti);
+    }
     if (t == "KwFunc") {
         lex.advance_i();
         expect_tok("LParen");
@@ -2894,6 +2927,159 @@ pub fn parse_expect_stmt() i64 {
     return base.mk_if(cond, th, -1, ti);
 }
 
+// ══════════════════════════════════════════════════════════════
+// 具名故障组声明 `fault E over T { 谓词 -> E.成员名 repairs { .a, .b }; ... }`
+// ── 设计：docs/syntax/drafts/fault.md §4 / 附录 C（fault B1）──
+//
+// F-1：组**只活在编译期**。本函数做三件事：
+//   ① 语法归约 → `FaultDecl`（sa=组名 / na=`over T` 类型节点 / la=成员链）
+//   ② **立刻**合成运行期载体 `__fault_<E>`（A-32：tag / val / r0..r(N-1)），并
+//      **先于** FaultDecl 追加进 decl_list —— 此刻 N 与 over T 都已确定，故
+//      `fault(E)!T` 类型位只需按名引用，不必回头查 N（附录 C P6）。
+//   ③ 登记 (组名, `over T` 规范名)，供类型位校验（附录 C P7）。
+//
+// ⚠ 成员复用既有 `F` 节点（sa=成员名 / na=谓词 / la=repair 名链）：
+//   组成员本质就是「组的字段」，且 F 自带 i64 槽可留给 sema 回填槽位基址
+//   ⇒ **不新增第二个 kind**（少一处 GEN 区改动 = 少一处漂移风险）。
+// ══════════════════════════════════════════════════════════════
+
+pub var g_fg_names: []string;    // 已解析的组名（按文本序；供 `fault(E)!T` 校验）
+pub var g_fg_over: []string;     // 对应 `over T` 的规范名（type_node_mangle）
+
+pub fn fault_struct_name(g: string) string {
+    return base.sb_cat2("__fault_", g);
+}
+
+pub fn fault_group_index(g: string) i64 {
+    var i: i64 = 0;
+    while (i < slice_len(g_fg_names) as i64) {
+        if (g_fg_names[i] == g) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+pub fn parse_fault_decl() i64 {
+    var ti_f: i64 = lex.pos;
+    lex.advance_i();                        // 吃掉 `fault`
+    if (lex.cur_t() != "Identifier") {
+        parse_fatal("expected fault group name after 'fault'");
+    }
+    var ni: i64 = lex.advance_i();
+    var gname: string = lex.tk_v(ni);
+    // `over` 是**上下文关键词**（mod 阶）：lexer 仍发 Identifier ⇒ 必须按**词文本**判定。
+    // ⚠ 它绝不可改成强制关键字：`over` 在 src/parse.tc:1140 是局部变量名（附录 C P1）。
+    if (lex.cur_v() != "over") {
+        parse_fatal_at("T-CLA-E738",
+            "故障组声明必须写成 `fault <Name> over <Type> { ... }`（此处应为 `over`）", lex.pos);
+    }
+    lex.advance_i();
+    var otn: i64 = parse_type();
+    if (lex.cur_t() != "LBrace") {
+        parse_fatal_at("T-PAR-E101", "expected '{' after `fault <Name> over <Type>`", lex.pos);
+    }
+    lex.advance_i();                        // 吃掉 '{'
+
+    var mh: i64 = -1;
+    var mt: i64 = -1;
+    while (lex.cur_t() != "RBrace" and lex.cur_t() != "Eof") {
+        // ── 谓词位 ── 必须临时置 g_in_match_pat，否则 parse_struct_lit 走不到谓词分支
+        //    （与 B3 的 M10 同族：**不报错**，只是静默走错路）
+        var sav_pat: bool = g_in_match_pat;
+        g_in_match_pat = true;
+        var pn: i64 = parse_expr();
+        g_in_match_pat = sav_pat;
+        if (clause_pred_ok(pn) == false) {
+            parse_fatal_at("T-MAT-E747",
+                "故障组成员的谓词必须是 `.{ .字段 = 值 }` 或 `.{ .字段 <op> 值 }`（op 仅 `<` `>` `<=` `>=` `==` `!=`）", pn);
+        }
+        if (lex.cur_t() != "Arrow") {
+            parse_fatal_at("T-PAR-E101", "expected '->' between fault predicate and fault name", lex.pos);
+        }
+        lex.advance_i();                    // 吃掉 '->'
+        if (lex.cur_t() != "Identifier") {
+            parse_fatal("expected fault name after '->' in fault group member");
+        }
+        var qi: i64 = lex.advance_i();
+        var qpre: string = lex.tk_v(qi);
+        if (lex.cur_t() != "Dot" or lex.peek_t(1) != "Identifier") {
+            parse_fatal_at("T-CLA-E735", "故障成员全名必须写成 `<组名>.<成员名>`（如 `UserErr.AgeNegative`）", qi);
+        }
+        lex.advance_i();                    // Dot
+        var mi: i64 = lex.advance_i();
+        var mname: string = lex.tk_v(mi);
+        if (qpre != gname) {
+            parse_fatal_at("T-CLA-E735",
+                base.sb_cat5("故障成员全名 `", qpre, ".", mname, "` 的前缀必须等于本组名"), qi);
+        }
+        // ── 可选 `repairs { .a, .b }` ──
+        var rh: i64 = -1;
+        var rt: i64 = -1;
+        if (lex.cur_v() == "repairs") {
+            lex.advance_i();
+            if (lex.cur_t() != "LBrace") {
+                parse_fatal_at("T-PAR-E101", "expected '{' after `repairs`", lex.pos);
+            }
+            lex.advance_i();
+            while (lex.cur_t() != "RBrace" and lex.cur_t() != "Eof") {
+                if (lex.cur_t() != "Dot" or lex.peek_t(1) != "Identifier") {
+                    parse_fatal_at("T-CLA-E734", "repair 名必须写成 `.修法名`（如 `.use_default`）", lex.pos);
+                }
+                lex.advance_i();            // Dot
+                var ri: i64 = lex.advance_i();
+                var rn: i64 = base.mk_ident(lex.tk_v(ri), ri);
+                rt = base.list_push(rh, rt, rn);
+                if (rh < 0) { rh = rt; }
+                if (lex.cur_t() == "Comma") { lex.advance_i(); } else { break; }
+            }
+            expect_tok("RBrace");
+        }
+        if (lex.cur_t() == "Semicolon") { lex.advance_i(); }
+        var mn: i64 = base.mk_F(mname, -1, pn, rh, mi);
+        mt = base.list_push(mh, mt, mn);
+        if (mh < 0) { mh = mt; }
+    }
+    expect_tok("RBrace");
+
+    // ── 合成运行期载体（A-32）──
+    // 布局：`tag : i64`（0=Ok，成员 i 为 i+1）/ `val : T`（T 为 void 时省略）/ `r0..r(N-1) : fn() T`
+    // ⚠ 用 N 个**独立字段**而非 `[N]%TClosure`：实测「数组元素上的闭包间接调用」在双后端
+    //   是坏的（发射未定义符号 `t__` / 静默崩溃），而结构体单闭包字段正常（附录 C C.0 F-2）。
+    var nrep: i64 = 0;
+    var ks: []i64 = base.kids_chain(mh);
+    var ki: i64 = 0;
+    while (ki < slice_len(ks) as i64) {
+        var rs: []i64 = base.kids_chain(base.node_la((ks[ki] as u64)));
+        nrep = nrep + slice_len(rs) as i64;
+        ki = ki + 1;
+    }
+    var fh: i64 = -1;
+    var ft: i64 = -1;
+    var f_tag: i64 = base.mk_F("tag", -1, base.mk_scalar("i64", -1), -1, -1);
+    ft = base.list_push(fh, ft, f_tag); if (fh < 0) { fh = ft; }
+    if (type_node_mangle(otn) != "void") {
+        var f_val: i64 = base.mk_F("val", -1, otn, -1, -1);
+        ft = base.list_push(fh, ft, f_val);
+    }
+    var ft_ret: i64 = base.mk_func_type(otn, -1, -1);
+    var si: i64 = 0;
+    while (si < nrep) {
+        var f_ri: i64 = base.mk_F(base.sb_cat2("r", base.i2s(si)), -1, ft_ret, -1, -1);
+        ft = base.list_push(fh, ft, f_ri);
+        si = si + 1;
+    }
+    var sd: i64 = base.mk_StructDecl(fault_struct_name(gname), "auto", "", false, false, -1, fh, -1);
+    base.node_at(sd, ti_f);   // 合成节点挂到 `fault` 记号上（便于诊断定位）
+    append(lex.decl_list, sd);
+
+    // ⚠ **不要**在这里 append FaultDecl：`parse_unit` 会把 parse_declaration 的返回值
+    //   追加进 decl_list（实测重复追加会让 dump-ast 出现两份同 id 的 FaultDecl）。
+    var fd: i64 = base.mk_FaultDecl(gname, otn, mh, ti_f);
+    append(g_fg_names, gname);
+    append(g_fg_over, type_node_mangle(otn));
+    return fd;
+}
+
 pub fn parse_declaration() i64 {
     // 可见性/编译期前缀须在 `@` 文件级指令之前消费，使 `pub @import(...)`（模块重导出）
     // 与 `pub @module(...)` 可正确解析；`@` 指令自身仍不接任何前缀语义。
@@ -2975,6 +3161,12 @@ pub fn parse_declaration() i64 {
     // 旧 `export` 同位置修饰已删除（见 §3.13）；`pub` 与 `export` 曾等价置导出位，现统一仅 `pub`；
     // 真正的可见性判据是「文件 @module(pub) ∧ 声明 pub」，在 sema 侧合取。
 
+    // ── 具名故障组声明 `fault E over T { ... }`（fault B1 / 附录 C P4）──
+    // 组的可见性（`pub fault`）暂不处理：组是编译期契约，跨模块可见性属 B5。
+    // ⚠ 同类型位：`fault` 是上下文关键词，按**词文本 + 前瞻**（后随组名 Identifier）判定。
+    if (lex.cur_v() == "fault" and lex.peek_t(1) == "Identifier") {
+        return parse_fault_decl();
+    }
     if (lex.cur_t() == "KwVar") {
         var d: i64 = parse_global_var(false, is_comptime);
         if (is_export) { base.node_set_bc((d as u64), true); }   // S4 §0.14.7 SoA
