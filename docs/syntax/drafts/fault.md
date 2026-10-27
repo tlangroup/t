@@ -337,6 +337,14 @@ fn route(c : Conn) void {
 | R-opt3 | env 构造只发生在**错误路径**上；成功路径零成本 |
 | D3-opt | `.flags.bit0` 别给 `u16` 新造位访问内建：把 `flags` 声明成 `packed struct`（`bit0: u1`）→ 走既有成员访问，零成本 |
 
+### 7.2 ⚠ D2 的实地核查结论（2026-10-27，推翻三条预估）
+
+| 原预估 | 实地证据 | 结论 |
+|---|---|---|
+| 「KI-002 未修，struct 字面量模式在 LLVM 轨恒命中首臂」 | `match.md` §6.3 正文（L345）记 2026-09-26 已修；`src/tir.tc:5827` 的 `struct_lit` 条件分支真实存在；`examples/tuple_match_demo` / `tuple_destructure_demo` 双端 PASS。**§6.3 标题仍写 `open`，是过期文档债务** | **KI-002 已修**，不构成 B2 前置阻塞；但 `tests/known-issues/` **不被 conformance/difftest 自动扫描**，该目录无回归价值 |
+| 「`.{ .f = v }` 零覆盖 ⇒ parse 要从零做」 | `src/parse.tc:887` 具名字段循环**已支持 `.f = v`**（与旧式 `f: v` 并存） | parse 通路**已存在**，但零用例 ⇒ 未验证 |
+| 「C / LLVM 两条链各改一遍」 | `match_chain_from` 在 `src/*.tc` 中**只出现在注释里，无定义**；`codegen_c.tc` 内无任何 `struct_lit` 处理 | **TIR 是 match 的单一语义真源**，C 与 LLVM 都消费 TIR ⇒ 改 TIR 一处即双后端一致 |
+
 ---
 
 ## 8. 已裁定的设计决策（2026-10-27）
@@ -420,3 +428,64 @@ fn route(c : Conn) void {
 | 「传播 ⇒ 必须补载荷」（原 F-5 后半段） | ❌ **已被 R-1/R-2 撤销**（见 §1.2）。传播需上移的是**作用域**，不是数据 |
 | 「先做路径 ①，③ 另立」 | ❌ **已改为直接做 ③**（§8 A-7）。① 是 ③ 的退化特例 |
 | 「签名可不写 `!T`」 | ❌ **已改为必须写**（§8 A-8）。因 ③ 的传播是默认隐式的 |
+
+---
+
+## 附录 A · B2 批次改动点清单（逐节点，供阶段②确认）
+
+> 目标：让 `match` 的字面量模式支持**谓词字段** `.{ .f <op> v }`（进而支撑 `.{ .age < 0 }` 这类故障谓词）。
+> 前置：§7.2 的三条核查结论。诊断码轴：`T-MAT-E744` / `E745` 空闲（已占用：E740 类型、E741 字段、E742 穷尽、E743、E750/751 slice）。
+
+### A.1 当前数据流（实测）
+
+```text
+.{ .age < 0 }
+  → parse_match_alt_atom (parse.tc:5021)   Dot+LBrace → parse_struct_lit("", -1)
+  → parse_struct_lit (parse.tc:815)        named_form 判定
+       现在只有 `f: v` / `.f = v` 两式
+       ⇒ `.f < v` 判定失败 → positional = true
+  → 位置式分支 (parse.tc:821)              `.age < 0` 整个被当成「第 0 字段的匹配值」
+       ⇒ 语义错位（想要谓词，得到位置等值比较）
+  → struct_lit_pat_check (sema.tc:4108)    非 ident ⇒ 当字面量 → infer_expr 得 bool
+       ⇒ 与字段类型 i64 不匹配 → err_type_mismatch（错误诊断，不是正确行为）
+  → tir_match_pattern_cond (tir.tc:5827)   GEP+LOAD+EQ
+```
+
+### A.2 逐节点改动
+
+| # | 文件 · 位置 | 现状 | 改动 | 量级 |
+|---|---|---|---|---|
+| **N1** | `parse.tc:881` 变体构造判定 | `Dot+Ident+peek(2) != "Assign"` → `parse_variant_lit` | ⚠ **必须先加关系符排除**，否则 `.{ .a < 1 }` 会落进 `V{ .Case }` 变体构造分支 | 极小 |
+| **N2** | `parse.tc:817-818` `named_form` | 仅 `Ident+Colon` / `Dot+Ident+Assign` | 加第三式 `Dot+Ident+{Lt,Gt,LtEq,GtEq,EqEq,NotEq}` | 极小 |
+| **N3** | `parse.tc:884-906` 具名字段循环 | 仅 `.f = v` / `f: v` | 加 `.f <op> v`：消费 Dot → ident → 运算符 token → `parse_expr()` 取右端；结果存为 FV(fname, `binary(op, __fscr占位, rhs)`) | 小 |
+| **N4** | `sema.tc:4108-4116` `struct_lit_pat_check` | ident → 绑定；其余 → 字面量类型比对 | 加 `binary` 分支：① 校验 op ∈ 关系集（否则新码 `T-MAT-E745`）；② 校验 rhs 与字段类型可比（`ti_equal`/`can_cast`）；③ **把占位左端重写为 `member(scrutinee, fname)`** | 中 |
+| **N5** | sema · scrutinee 求值 | — | ⚠ 脱糖后若 scrutinee 是复杂表达式（`match(validate(u))` ⇒ `__scr.age`）会**重复求值 N 次**。须先绑到编译期临时 | 中（需设计） |
+| **N6** | `tir.tc:5827+` `struct_lit` 条件分支 | 逐字段 GEP+LOAD+`TIR_OP_EQ` | 字段值为 `binary` 时直接 `tir_emit_expr(该节点)` 取 i1 作条件；AND 链逻辑不变 | 小 |
+| **N7** | 后端（C / LLVM） | — | **0**（TIR 是单一真源，见 §7.2） | **0** |
+| **N8** | `tir.tc` 新 op | — | **0**。`TIR_OP_SLT=44` / `SGE=46` / `NE=53` 等均已存在且有字符串映射 | **0** |
+
+- **消歧总表**（三者在首 token 上可判，但依赖 N1 先于 N2/N3 生效）：
+
+| 形态 | 判定 | 语义 |
+|---|---|---|
+| `.{a, b}` | 首元素非 `Dot` | 位置式（既有） |
+| `V{ .Case }` | `Dot+Ident+` 后既非 `=` 也非关系符 | 变体构造（既有） |
+| `.{ .a = 1 }` | `Dot+Ident+Assign` | 具名字段等值（既有，零用例） |
+| `.{ .a < 1 }` | `Dot+Ident+` 关系符 | **谓词（B2 新增）** |
+
+### A.3 门禁
+
+| 项 | 内容 |
+|---|---|
+| 静态 | conformance pass：`.{ .a < 1 }` 命中/不命中、`.{ .a + 1 }` 报 `T-MAT-E745`、字段不存在报 `T-MAT-E741`、与位置式/变体构造的消歧 |
+| **运行期（不可省）** | ⚠ 分派落臂是**运行期语义**，而 conformance 从不运行程序 ⇒ 必补 `examples/predpat_demo.tc` + `.expected.txt` **双后端对拍**。用例须含「应当**不**命中的分叉」（KI-002 当年正是只测全匹配场景才漏掉的） |
+| 自举 | `tc check src/tc.tc` → 自举 g1/g2 → gate L2 |
+| IR 快照 | N6 改变 IR 形态 ⇒ 基线**用 g1 重录** |
+
+### A.4 顺带要清的文档债务
+
+| 文件 | 债务 |
+|---|---|
+| `docs/syntax/drafts/match.md` §6.3 | 标题仍写「KI-002 open」，正文 L345 已记 2026-09-26 修复 ⇒ 标题改「已修，保留作回归参考」 |
+| `docs/syntax/drafts/match.md` L41 | `PatternExpr: Literal` 与 parse 实现（`parse_expr()` 能吞任意表达式）**不一致** ⇒ B2 后改为 `PatternExpr: Literal \| RelExpr` |
+| `tests/known-issues/` | 目录说明自承「不被 conformance/difftest 自动扫描」⇒ KI-002 用例无回归价值；B2 的用例必须放 `examples/`（走 `run_examples`）或 `tests/conformance/` |
