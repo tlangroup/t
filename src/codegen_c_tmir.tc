@@ -1266,7 +1266,15 @@ pub fn c_thunk_name(fname: string) string { return base.sb_cat2(c_fn_name(fname)
 // 函数引用 → TClosure.field0（code 指针）的 C 表达式；普通函数登记 thunk 需求并返回 thunk 名。
 pub fn c_clo_code(name: string) string {
     var b: string = c_func_base(name);
-    if (c_func_has_env(b)) { return c_fn_name(b); }
+    // ⭐ 聚合返回者一律走 thunk（**含**带 env 首参的闭包函数）—— 判据优先于 has_env，
+    //    详见 c_emit_thunks 头注释：TClosure ABI 的 code(env, args…) 与用户聚合返回函数的
+    //    `void <fn>(unsigned char* __sret, void* __env, args…)` 差一个 sret 首参，必须适配。
+    var cfi: i64 = c_func_find(b);
+    var cret: string = "";
+    if (cfi >= 0) { cret = g_c_mod.funcs[cfi].ret_st; }
+    if (c_is_sret_type(cret) == false) {
+        if (c_func_has_env(b)) { return c_fn_name(b); }
+    }
     var i: i64 = 0;
     while (i < slice_len(g_c_thunk_req) as i64) { if (g_c_thunk_req[i] == b) { return c_thunk_name(b); } i = i + 1; }
     append(g_c_thunk_req, b);
@@ -1324,7 +1332,18 @@ pub fn c_prescan_thunks(m: TMIRModule) void {
         fi = fi + 1;
     }
 }
-// 发射普通函数的 env 适配 thunk：static R <fn>__clo_thunk(void* __env, <params…>) { [return] <fn>(<args…>); }
+// 发射「函数引用 → TClosure.code」的适配 thunk。
+//
+// 统一 TClosure ABI：**code(env, 实参…) → 返回值**（聚合返回时返回**聚合缓冲指针** `unsigned char*`）。
+// 但被包装的**用户函数**是 sret 约定：`void <fn>(unsigned char* __sret, <params…>)`（与 LLVM 轨逐字对齐）。
+// ⇒ 两条路径都必须经 thunk 做「缓冲分配 + sret 首参转发」：
+//   · 标量返回：`static R <fn>__clo_thunk(void* __env, <params…>) { return <fn>(<args…>); }`
+//   · 聚合返回：`static unsigned char* <fn>__clo_thunk(<params…>) { buf = t_alloc(N); <fn>(buf, <args…>); return buf; }`
+//
+// ⭐ 此前「带 env 首参 → code 直接用裸函数名」在**聚合返回**下不成立：
+//    带 env 的聚合返回函数签名是 `void <fn>(unsigned char* __sret, void* __env, args…)`，
+//    当 code 用时 env 会落进 __sret、用户实参整体错位（G-1b）。
+//    ⇒ 判据改为「返回类型是 sret 聚合」优先，一律走 thunk。
 pub fn c_emit_thunks(sb: StringBuilder) void {
     var n: i64 = slice_len(g_c_thunk_req) as i64;
     var i: i64 = 0;
@@ -1335,22 +1354,57 @@ pub fn c_emit_thunks(sb: StringBuilder) void {
         if (fi < 0) { continue; }
         var f: TMIRFunc = g_c_mod.funcs[fi];
         if (f.is_main or f.name == "main" or f.name == "@main") { continue; }
+        var has_env: bool = c_func_has_env(fname);
+        var is_sret: bool = c_is_sret_type(f.ret_st);
         var ret: string = "void";
         if (f.ret_st != "" and f.ret_st != "void") { ret = c_tystr_c(f.ret_st); }
         var np: i64 = slice_len(f.params) as i64;
         sb_append_str(sb, "static "); sb_append_str(sb, ret); sb_append_str(sb, " ");
-        sb_append_str(sb, c_thunk_name(fname)); sb_append_str(sb, "(void* __env");
+        sb_append_str(sb, c_thunk_name(fname)); sb_append_str(sb, "(");
+        // ⭐ 带 env 首参者：函数**自己**的首参就是 __env（即 TClosure.env），
+        //    thunk 不再另加一个 __env，否则形参重名（C 编译不过）。
+        var firstp: bool = true;
+        if (has_env == false) {
+            sb_append_str(sb, "void* __env");
+            firstp = false;
+        }
         var p: i64 = 0;
         while (p < np) {
             var pv: string = f.params[p];
             var col: i64 = c_find_col(pv, ":");
             if (col < 0) { p = p + 1; continue; }
             var pn: string = c_strip_suf(str_slice(pv, 0, col));
-            sb_append_str(sb, ", "); sb_append_str(sb, c_param_c_ty(f, pn)); sb_append_str(sb, " ");
-            sb_append_str(sb, pn);
+            if (firstp == false) { sb_append_str(sb, ", "); }
+            sb_append_str(sb, c_param_c_ty(f, pn)); sb_append_str(sb, " "); sb_append_str(sb, pn);
+            firstp = false;
             p = p + 1;
         }
-        sb_append_str(sb, ") {\n  ");
+        sb_append_str(sb, ") {\n");
+        // 聚合返回（sret）：分配缓冲 → 以 __sret 首参转发 → 把指针交还调用点
+        //   （调用点随后 memcpy 进目的槽，与直接调用的 sret 处理逐字一致）。
+        if (is_sret) {
+            var rsz: i64 = c_struct_size(f.ret_st);
+            if (rsz <= 0) { rsz = 8; }
+            sb_append_str(sb, "  unsigned char* __sret = (unsigned char*)t_alloc((size_t)(");
+            sb_append_str(sb, base.i2s(rsz)); sb_append_str(sb, "));\n");
+            sb_append_str(sb, "  memset((void*)__sret, 0, (size_t)(");
+            sb_append_str(sb, base.i2s(rsz)); sb_append_str(sb, "));\n");
+            sb_append_str(sb, "  "); sb_append_str(sb, c_fn_name(fname));
+            sb_append_str(sb, "(__sret");
+            var r: i64 = 0;
+            while (r < np) {
+                var pv3: string = f.params[r];
+                var col3: i64 = c_find_col(pv3, ":");
+                if (col3 >= 0) {
+                    sb_append_str(sb, ", ");
+                    sb_append_str(sb, c_strip_suf(str_slice(pv3, 0, col3)));
+                }
+                r = r + 1;
+            }
+            sb_append_str(sb, ");\n  return __sret;\n}\n");
+            continue;
+        }
+        sb_append_str(sb, "  ");
         if (ret == "void") { sb_append_str(sb, c_fn_name(fname)); }
         else { sb_append_str(sb, "return "); sb_append_str(sb, c_fn_name(fname)); }
         sb_append_str(sb, "(");
