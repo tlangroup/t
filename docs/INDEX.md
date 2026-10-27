@@ -9,6 +9,7 @@
 | 目录 | 用途 | 放置内容 |
 |---|---|---|
 | `docs/compiler/` | **编译器架构与设计** | 编译管线、IR（含 TIR）、代码生成（C/LLVM/…）、设备·GPU、CTFE·编译期求值、元编程设计 |
+| `docs/design/` | **特性落地工作区（三阶段闸门流程件）** | 每个已过闸门①的特性一个子目录：`DESIGN.md`（决策清单 + 状态行）、`EXAMPLES*.tc`、`TESTS.md`（测试矩阵）。流程规范见 `AGENT_WORKFLOW.md` §2。现有：`open-variant/`、`set-ops/`、`struct-modifiers/`、`fault/` |
 | `docs/laws/` | 语言法则 | 语言宪法与各项法则（`L-02`~`L-15`、`general.md`） |
 | `docs/presentation/` | 演示与汇报 | 架构图、汇报页（HTML/JSON、dataflow 等） |
 | `docs/syntax/` | 语法规范 | 语法 EBNF、草案（`drafts/`） |
@@ -20,6 +21,9 @@
 
 1. **编译器内部设计文档一律进 `docs/compiler/`**，不要再放 `docs/` 顶层。已迁移：`tir-design.md`、`compiler-pipeline-design.md`、`device-design.md`、`comptime-design.md`、`meta_design.md`、`meta_target.tc`。
 2. **语言法则进 `docs/laws/`**；**语法规范/草案进 `docs/syntax/`**；**演示/汇报产物进 `docs/presentation/`**。
+   - ⭐ **`docs/design/<feature>/` 与 `docs/syntax/drafts/` 的分工**：前者是**流程件**（「这个功能怎么落地」——随闸门推进改状态行、带可执行示例与测试矩阵、记批次台账与验证证据），后者是**规范件/草案**（「这个语法长什么样」——文法 EBNF 与语义裁定）。
+     判据：还在讨论语言该是什么样 → `drafts/`；已开始讨论怎么分批落地、跑没跑过门禁 → `design/`。
+     同一特性允许两侧各有其物（`fault` 即如此），但**内容不得重叠**：语法裁定只在 `drafts/`，批次与证据只在 `design/`，两边互引而不互抄。
 3. **`docs/` 顶层只保留尚待归类的语言/工具类文档**（参考、标准库、规范、诊断、REPL 等），后续可再拆 `docs/lang/`、`docs/tooling/` 等。
 4. **文档间互引用仓库根相对路径**（如 `docs/compiler/tir-design.md`），不要用 `./xxx.md` 同级相对路径——这样文档移动后引用仍成立。
 5. **改动文档路径后，必须同步更新所有引用点**：`grep -rn '旧路径' .`（排除 `out/`）后统一改写，覆盖 `src/`、`tools/`、`runtime/`、`examples/`、`tests/`、`docs/`。
