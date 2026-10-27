@@ -1,0 +1,42 @@
+// 具名故障组 + 错误联合类型的运行期表示（fault 批次 B1）
+//
+// 本例钉住的是 **A-32 的布局**：`fault E over T` 由编译器合成具名 struct
+//     tag : i64            // 0 = Ok；成员 i 的 tag = i+1
+//     val : T              // 成功值
+//     r0..r(N-1) : fn() T  // 组内全部 repair 槽位，按成员声明序展平
+// 本组 N = 3（AgeNegative 占槽 0/1，NameEmpty 占槽 2）⇒ 字段为 r0 / r1 / r2；
+// 下面**读 r2** 就是在证明「第二个成员的槽位基址 = 2」（槽位少一个则编译不过）。
+//
+// ⚠ 这是**运行期** golden：conformance 只做 `tc check`、从不运行程序，
+//   故「结构真的按设计布局」只能靠本例 + 双后端对拍来证明。
+//
+// ⚠ 本例刻意**不调用** repair 闭包：实测两处既有后端缺口（与 B1 无关，B4 必须处理）——
+//   ① tmir-c 无法编译「返回结构体的闭包」（`__lam_N` 的 sret 声明与调用不一致）；
+//   ② 「数组元素上的闭包间接调用」在 LLVM 轨发射未定义符号 `t__`。
+//   另：嵌套字段赋值 `v.val.age = 42` 在双后端都不生效（整结构体赋值正常），故本例用后者。
+
+struct User {
+    age: i64;
+    name: string;
+}
+
+fault UserErr over User {
+    .{ .age < 0 }   -> UserErr.AgeNegative repairs { .use_default, .clamp };
+    .{ .name = "" } -> UserErr.NameEmpty    repairs { .anon };
+}
+
+fn main_fn() i32 @main {
+    // 零值即 Ok：`tag == 0`
+    var v : fault(UserErr)!User;
+    println(i2s(v.tag));
+
+    // val 是可写的成功值字段（整结构体赋值；嵌套字段赋值是既有缺口，见文件头）
+    v.val = User{ .age = 42i64, .name = "x" };
+    println(i2s(v.val.age));
+
+    // r0 属 AgeNegative、r2 属 NameEmpty（槽位按成员声明序展平）
+    var f0 : fn() User = v.r0;
+    var f2 : fn() User = v.r2;
+    println(i2s(v.tag));
+    return 0;
+}

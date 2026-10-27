@@ -24,11 +24,18 @@ static const DiagDef DIAG_DEFS[] = {
   { "T-CLA-E722", "error", "CLA", "T_CLAUSE_PATTERN_KIND_MIX", "PATTERN_KIND_MIX", "clause group mixes incompatible pattern kinds (literal / constructor / wildcard)" },
   { "T-CLA-E723", "error", "CLA", "T_CLAUSE_MERGE_TYPE", "MERGE_TYPE", "`++` operands must both be clause arrays with the same element type" },
   { "T-CLA-E724", "error", "CLA", "T_CLAUSE_ESCAPE", "ESCAPE", "clause value escapes to runtime; clause exists only in the compile-time phase" },
+  { "T-CLA-E725", "error", "CLA", "", "FAULT_MEMBER_REDECL", "duplicate fault member name within one group" },
   { "T-CLA-E726", "error", "CLA", "T_CLAUSE_ARG_NOT_CONST", "ARG_NOT_CONST", "clause argument must be a compile-time foldable constant" },
   { "T-CLA-E728", "error", "CLA", "", "FAULT_CLAUSE_GUARD", "`@clause(.fault, ...)` / `@clause(.repair, ...)` take no `when` guard (they are compile-time registrations, not match arms)" },
   { "T-CLA-E729", "error", "CLA", "", "REPAIR_NAME_FORM", "the second operand of `@clause(.repair, ...)` must be a repair name of the form `.name`" },
   { "T-CLA-E730", "error", "CLA", "", "FAULT_PRED_FORM", "the predicate of `@clause(.fault, ...)` must be `.{...}` with only equality / relational field constraints" },
   { "T-CLA-E731", "error", "CLA", "", "FAULT_CLAUSE_IN_ARM", "fault / repair clauses cannot be spliced into a match arm chain" },
+  { "T-CLA-E732", "error", "CLA", "", "FAULT_UNKNOWN_GROUP", "`fault(E)!T` refers to an undeclared fault group; the group declaration must precede its use" },
+  { "T-CLA-E733", "error", "CLA", "", "FAULT_TYPE_MISMATCH", "the success type of `fault(E)!T` must be identical to the group's `over` type" },
+  { "T-CLA-E734", "error", "CLA", "", "FAULT_REPAIR_NAME_FORM", "a repair name must be written as `.name`" },
+  { "T-CLA-E735", "error", "CLA", "", "FAULT_MEMBER_NAME_PREFIX", "a fault member's full name must be `<GroupName>.<MemberName>`" },
+  { "T-CLA-E738", "error", "CLA", "", "FAULT_DECL_MISSING_OVER", "a fault group declaration must be written as `fault <Name> over <Type> { ... }`" },
+  { "T-CLA-E739", "error", "CLA", "", "FAULT_GROUP_REDECL", "fault group is already declared" },
   { "T-CLA-W727", "warning", "CLA", "T_CLAUSE_SHADOWED", "SHADOWED", "clause is fully shadowed by an earlier unguarded clause" },
   { "T-CLO-E780", "error", "CLO", "T_CLOSURE_CAPTURE", "CAPTURE", "closure capture error" },
   { "T-CLO-E781", "error", "CLO", "T_CLOSURE_FN_ESCAPE", "CLOSURE_FN_ESCAPE", "comptime function escaped to runtime" },
@@ -85,8 +92,12 @@ static const DiagDef DIAG_DEFS[] = {
   { "T-MAT-E743", "error", "MAT", "T_MATCH_PATTERN_ARITY", "PATTERN_ARITY", "match constructor pattern arity mismatch" },
   { "T-MAT-E745", "error", "MAT", "", "PRED_NOT_RELOP", "predicate pattern supports only relational operators (`<` `>` `<=` `>=` `==` `!=`)" },
   { "T-MAT-E746", "error", "MAT", "", "PRED_SCRUTINEE_NOT_VAR", "the scrutinee of a predicate pattern must be a variable" },
+  { "T-MAT-E747", "error", "MAT", "", "FAULT_PRED_FORM", "a fault member's predicate must be `.{ .field = value }` or `.{ .field <op> value }` with `<` `>` `<=` `>=` `==` `!=`" },
+  { "T-MAT-E748", "error", "MAT", "", "FAULT_PRED_UNKNOWN_FIELD", "the predicate refers to a field that does not exist in the group's `over` type" },
+  { "T-MAT-E749", "error", "MAT", "", "FAULT_PRED_DUP", "duplicate predicate in fault group (predicates must be unique within a group)" },
   { "T-MAT-E750", "error", "MAT", "T_MATCH_SLICE_PATTERN", "SLICE_PAT", "slice pattern error" },
   { "T-MAT-E751", "error", "MAT", "T_MATCH_BARE_VARIANT_PATTERN", "BARE_VARIANT_PATTERN", "bare variant pattern is deprecated; use leading-dot form" },
+  { "T-MAT-E752", "error", "MAT", "", "FAULT_REPAIR_DUP", "duplicate repair name within one fault member" },
   { "T-MAT-E760", "error", "MAT", "T_MATCH_DUP_VALUE_ARM", "DUP_VALUE_ARM", "match arm covers a value already handled by an earlier arm (duplicate constant or overlapping range)" },
   { "T-MAT-W744", "warning", "MAT", "T_MATCH_ARM_UNREACHABLE", "ARM_UNREACHABLE", "match arm is unreachable" },
   { "T-MAT-W761", "warning", "MAT", "T_MATCH_FLOAT_NAN_FOOTGUN", "FLOAT_NAN_FOOTGUN", "matching a float literal/range is unsafe: NaN never equals any value or range, so it silently falls through to a wildcard/default arm" },
@@ -195,7 +206,7 @@ static const DiagDef DIAG_DEFS[] = {
   { "T-VEC-W927", "warning", "VEC", "T_VECTOR_WIDER_THAN_NATIVE", "VECTOR_WIDER_THAN_NATIVE", "vector is wider than the native SIMD register and will be split" },
   { "T-VEC-W947", "warning", "VEC", "T_TILE_WIDER_THAN_NATIVE", "TILE_WIDER_THAN_NATIVE", "hardware tile is wider than the native SIMD register and will fall back to scalar loops" },
 };
-#define DIAG_COUNT 182
+#define DIAG_COUNT 193
 
 /* legacy (old semantic name) -> machine code alias table */
 static const struct { const char* legacy; const char* code; } DIAG_LEGACY[] = {

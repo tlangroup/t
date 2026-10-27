@@ -809,3 +809,87 @@ parse 侧 `clause_collect` 的 Concat 分支一直存在却从走不到。
 | **M9** | **sema 的 `++` 分支原先只放行 bitstr/String/Slice/Array/Map**，`clause ++ clause` 报 `T-BIT-E515` ⇒ **D4「`++` 已存在 ⇒ 增量 0」是未验证的文档债务**（parse 侧 `clause_collect` 的 Concat 分支一直存在，但从走不到） | 在 `sema.tc` 的 `op == "Concat"` 分支最前加 `Clause ++ Clause ⇒ Clause`（与 `[C0,C1]` 数组式同义）。这是本次唯一一处**超出附录 B 预估**的改动 |
 | **M10** | `parse_clause_lit` 的谓词位必须**临时置 `g_in_match_pat = true`**：`parse_struct_lit` 的谓词分支只在模式位生效，表达式位的 `.{ .age < 0 }` 不会走谓词分支 | 已在 `.fault` 分支内包裹保存/恢复 |
 | **M11** | E731 用例会**附带**一条 `T-MAT-E740`（`F_AGE` 大写被当 case 名）—— 是拼进臂链后的二次误读 | 无害：conformance 的判据是「期望码出现」，不要求唯一 |
+
+---
+
+## 附录 C · B1 批次改动点清单（逐节点）
+
+> 目标：落地**具名故障组声明** `fault E over T { ... }` 与**错误联合类型** `fault(E)!T`
+> 的运行期表示。前置：B2（谓词模式）、B3（`@clause(.fault/.repair)` 变体）均已完成。
+> ⚠ 诊断码以 `tools/diag_defs.json` 为准（唯一真源）。
+
+### C.0 ⚠ 开工前实测出的两处「文档没写、但会决定布局」的事实（2026-10-27）
+
+| # | 实测 | 后果 |
+|---|---|---|
+| **F-1** | §5 运行层写作 `{ tag: i64, repairs: [N]%TClosure }`，**没有承载成功值的字段**；但 `Ok(u)` 必须把 `u` 带出去，而借道「合成一个 Ok 闭包塞进 repairs[0]」会违反 §7.1 **R-opt3（成功路径零成本）** | ⇒ **必须**有独立的 `val: T` 字段 |
+| **F-2** | 实测「**数组元素**上的闭包间接调用」在当前双后端是坏的：`v.rs[2]()` 发射未定义符号 `t__`（链接失败）；把元素先取到局部再调用则**静默无输出**（崩溃）。而**结构体单闭包字段** `v.r()` 完全正常 | ⇒ `repairs` 用 `[N]%TClosure` 会把 B4 的 `resume` 脱糖直接架在未验证的后端通路上 |
+
+### C.1 新裁定 A-32（运行期布局 · 对 A-27 的**细化**而非推翻）
+
+```text
+fault E over T   ⇒  sema/parse 合成具名 struct `__fault_<E>`：
+    tag : i64            // 0 = Ok；成员 i 的 tag = i + 1
+    val : T              // 成功值（T == over T）；T 为 void 时省略该字段
+    r0 .. r(N-1) : fn() T   // 组内全部 repair 槽位，按成员声明序展平
+```
+
+- **保留 A-27 的实质**：仍是「sema 为每组合成具名 struct」⇒ **不新增 TI kind、不碰后端**。
+- **相对 §5 原文的两处偏离**：① 加 `val: T`（F-1，R-opt3 要求成功路径零分配）；
+  ② `[N]%TClosure` 改为 **N 个独立字段**（F-2，绕开数组元素闭包调用这条未验证通路）。
+- **槽位编号（R-2，B3 已把此项移入 B1）**：按成员声明顺序展平，成员 m 的第 k 个 repair
+  ⇒ 字段 `r<base(m)+k>`；`base(m)` = m 之前所有成员的 repair 数之和（A-26：N 属组）。
+- ⚠ `tag` 从 **1** 开始编号给成员，0 保留给 Ok —— 使「未初始化 = Ok」这一零值语义成立
+  （B1 的 golden 正是靠 `var v : fault(E)!T;` 读 `v.tag == 0` 来钉住布局的）。
+
+### C.2 逐节点改动
+
+| # | 文件 · 位置 | 改动 | 量级 |
+|---|---|---|---|
+| **P1** | `lib/std/rc/cst.tc` 关键字表 | ⚠ **实测改过**：`fault` 起初做成 forced（`KwFault`），结果打断了 B3 的 4 个用例 —— `@clause(.fault, ...)` 的 `.fault` 是**成员名**，`expect_tok("Identifier")` 撞语法错。⇒ `fault` / `over` / `repairs` **一律 mod 阶**（上下文关键词，lexer 仍发 Identifier，parser 按词文本+前瞻判定）。另：`over` 在 `src/parse.tc:1140` 是局部变量名，强制化会直接破坏自举源码 | 极小 |
+| **P2** | `tools/cst_kinds.json` + `tools/cst_nodes.json` | 新增 kind `FaultDecl`（sa=组名 / na=over 类型节点 / la=成员链）⇒ `node tools/cstgen.mjs --emit` 重生成两处 GEN 区 | 小 |
+| **P3** | `src/base.tc` | 手写 `mk_FaultDecl`（GEN 区外，与其它 mk_* 同列），含 `cst_register_RecFaultDecl` 双写 | 极小 |
+| **P4** | `src/parse.tc` `parse_declaration` | 新增 `KwFault` 分支 → `parse_fault_decl` | 极小 |
+| **P5** | `src/parse.tc` 新增 `parse_fault_decl` | `fault <名> over <类型> { 成员; … }`；成员 = 谓词 `->` `组名.成员名` [`repairs { .a, .b }`] `;`。谓词位须**临时置 `g_in_match_pat`**（与 B3 的 M10 同族）。成员复用既有 `F` 节点（sa=成员名 / na=谓词 / la=repair 名链），**不新增第二个 kind** | 中 |
+| **P6** | `src/parse.tc` 合成 struct | 组声明解析完毕后立即合成 `__fault_<E>`（此时 N 与 over T 都已知）追加进 `decl_list`，先于 `FaultDecl` 本身 | 小 |
+| **P7** | `src/parse.tc` `parse_type_inner` | `fault ( E ) ! T` → 校验 E 已声明（E732）、T 与 `over T` 同构（E733），返回 `mk_named("__fault_" + E)` | 小 |
+| **P8** | `src/sema.tc` `check_decl` | 新增 `FaultDecl` 分支 → `check_fault_decl`。⚠ **实测改过**：原估「HIR 侧零改动」（靠 `hir_lower_decl` 的 RAW 兜底 + `check_decl_hir` 回落）**被门禁证伪** ⇒ 见 **D-10** 与 P12 | 极小 |
+| **P9** | `src/sema.tc` 新增 `check_fault_decl` | 组名唯一（E739）/ 成员名唯一（E725）/ 谓词形态（E734）/ 谓词字段须在 `over T` 中（E735）/ 组内谓词重复（E736）/ 成员内 repair 名重复（E737）；登记成员与槽位表 | 中 |
+| **P10** | `tools/diag_defs.json` | 实测新增 **11** 条（182 → 193）：CLA 段 `E725 / E732 / E733 / E734 / E735 / E738 / E739`；MAT 段 `E747 / E748 / E749 / E752`（谓词类诊断归 MAT，不占 CLA 的 `[720,739]`） | 小 |
+| **P12** | `src/hir.tc` `hir_lower_decl` + `src/sema.tc` `check_decl_hir` | ⚠ **编码后新增**（D-10）：`FaultDecl` 显式降级为 `HIR_OP_TYPE_ALIAS_DECL`（sa=组名 / ty=`over T`），并在 `check_decl_hir` 显式回落 `check_fault_decl` | 极小 |
+| **P11** | 后端 | **0**（合成的是普通 StructDecl，走既有通路） | 0 |
+
+### C.3 门禁
+
+| 项 | 内容 |
+|---|---|
+| 静态 | conformance pass：组声明 + `fault(E)!T` 签名 + 变量声明 + 读 `.tag`/`.val`；fail 8 例：未知组 / T 与 over 不一致 / 谓词重复 / repair 名重复 / 组名重复 / 成员名重复 / 谓词形态 / 谓词字段不在 T |
+| 运行期 | ⚠ B1 有真实运行期产物（合成 struct 进入 IR）⇒ **必须**有 golden：`examples/faultgroup_demo` 声明组 + `var v : fault(E)!T;` 读 `v.tag`(0) 与 `v.val.age`(0)，**双后端逐字节一致** |
+| 自举 | `tc check src` → 自举 g1 → conformance → golden → gate L2 → 用 gate 的 g1 重录 IR 基线 |
+| 已知不覆盖 | 槽位索引的正确性在 B1 **无消费者**（B4 的 `resume` 才读），故 B1 只保证「计算逻辑 + 登记表」存在，正确性由 B4 的 golden 钉住（已记入 `docs/design/fault/TESTS.md`） |
+
+### C.4 ⚠ 本批**不做**（留给 B4/B5，避免返工）
+
+| 项 | 归谁 | 理由 |
+|---|---|---|
+| `Err(...)` / `Ok(...)` / `trap` / `resume` / `recover` | B4 | 脱糖批；且 `Ok` 需要「写 val」这条通路，本批无人构造该结构 |
+| 谓词常量折叠后再比较（A-25） | B4 | 组内判重只需**结构键**；跨位置（raise ↔ 组声明）比较才需要折叠 |
+| 组 → 生成纯谓词校验函数（A-23） | B4 | 同上，属生成物 |
+| 跨模块组可见性（`.tlib` 摘要） | B5 | 与跨函数可达集分析同一基础设施 |
+| 组名 / 成员名必须大写开头（EBNF 写 UpperIdent） | 延后 | 未定诊断码，先不设限（已记入 §A.6 延后项） |
+| **数组元素上的闭包间接调用** | B4 前置 | 实测坏（C.0 F-2）；本批用 N 个独立字段绕开，但若 B4 想改回 `[N]%TClosure`，须先修该通路 |
+
+### C.5 编码后的实测偏差与既有缺口（2026-10-27）
+
+| # | 偏差 / 缺口 | 处置 |
+|---|---|---|
+| **D-5** | `fault` 强制成关键字 ⇒ B3 的 `@clause(.fault, ...)` 解析失败（conformance 4 例红） | 三个新词统一降为 **mod 阶上下文关键词**（见 P1 修订行） |
+| **D-6** | **TD / TI 混淆**：`resolve_type_desc` 返回的是 `tds`（类型**描述**）下标，不是 `tis`（类型）下标。喂给 `tip_name` 会读到无关表项 —— 实测把第二组的 `over Frame` 报成「over 类型 `User`」 | 改用 `resolve_ti`。⚠ 这两张表同在 sema 且都叫「类型」，凡 `tip_*` 前必须确认拿到的是 TI |
+| **D-7** | `g_fgrp_mem_cnt[g]` 若在循环**结束后**才回写，整轮循环里它恒为 0 ⇒ 成员名判重静默失效（用例 `f_fault_dup_member` 只报出无关诊断） | 计数改为**循环内增量回写** |
+| **D-8** | `ann_pass` 遍历每条 decl 的 `la` 当注解链校验，而 `decl_target` 对未知 kind 兜底返回 `"global"` ⇒ **每个组成员名都被当成未知注解**报 `T-ANN-E450` | 在 `ann_pass` 显式跳过 `FaultDecl`。⚠ 这是「新增 decl kind」的通用地雷：任何按 `decl_target` 兜底分派的 pass 都要复查 |
+| **D-9** | `parse_fault_decl` 里 `append(lex.decl_list, fd)` 是**重复**的：`parse_unit` 会追加 `parse_declaration` 的返回值（dump-ast 出现两份同 id 的 FaultDecl） | 只 append 合成的 StructDecl，FaultDecl 靠返回值进表 |
+| **G-1** | ⚠ **既有后端缺口**（与 B1 无关，用 pre-B1 编译器复现过）：**tmir-c 无法编译「返回结构体的闭包」** —— `__lam_N` 声明为 `static void __lam_N(unsigned char* __sret)`，调用点却写 `return __lam_N();` | B4 的 repair 闭包必然撞它 ⇒ 双后端 golden 会立刻抓到，先修再谈 B4 |
+| **G-2** | ⚠ **既有后端缺口**：「**数组元素**上的闭包间接调用」在 LLVM 轨发射未定义符号 `t__`（链接失败）；先取到局部再调用则静默崩溃。结构体单闭包字段 `v.r()` 正常 | A-32 因此用 N 个独立字段而非 `[N]%TClosure`；若 B4 想改回数组，须先修这条 |
+| **G-3** | ⚠ **既有后端缺口**：**嵌套字段赋值** `v.val.age = 42` 双后端都不生效（读到 0）；整结构体赋值 `v.val = User{...}` 正常 | golden 改用整结构体赋值 |
+| **D-10** | ⭐ **HIR 侧不是零改动**（推翻 C.2 P8 的「HIR 零改动」预估）：`hir_lower_decl` 的 `else` 兜底给未知 kind 发 `HIR_OP_RAW`，而门禁 **「RAW 合计 0」是硬判据**（`hir_test` 扫全部 143 个 examples/src）⇒ `examples/faultgroup_decl.tc` 1 处 RAW 直接让 gate L2 第 15 步 FAIL | 复用 `HIR_OP_TYPE_ALIAS_DECL`（与「模块值别名复用 `IMPORT_DECL`」同款手法）：`sa`=组名、`ty`=`over T` 文本；**并在 `check_decl_hir` 显式回落 `check_fault_decl`** —— 否则会掉进「其余 type_alias：声明期无动作」的兜底，组的语义校验被整趟静默跳过 |
+| **D-11** | ⭐ **「兜底分派」是新增 decl kind 的系统性雷区**：D-8（`ann_pass` 的 `decl_target` 兜底）与 D-10（`check_decl_hir` 的 op 兜底）是**同一类** —— 新增 kind 若只靠「兜底路径也能走通」，一定会在某个要求更严的门禁上炸 | 新增 decl kind 的清单：① `ann_pass` ② `hir_lower_decl` ③ `check_decl_hir` ④ `register_decl` —— 四处都要**显式**处理，不能依赖兜底 |

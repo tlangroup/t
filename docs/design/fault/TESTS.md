@@ -26,7 +26,16 @@
 | `fail/f_fault_clause_pred_form.tc` | `error T-CLA-E730`（谓词位不是等值/关系约束，如 `.{ .age + 1 }`） | B3 | ✅ |
 | `fail/f_repair_clause_name_form.tc` | `error T-CLA-E729`（修法名不是 `.名` 形态） | B3 | ✅ |
 | `fail/f_fault_clause_in_match_arm.tc` | `error T-CLA-E731`（故障子句被拼进 match 臂链） | B3 | ✅ |
-| `fail/f_fault_no_group.tc` | 未注册故障组（CAT 待定，B1 定） | B1 | ⬜ |
+| `pass/p_fault_group_decl.tc` | 组声明 + `fault(E)!T` 可引用 + 合成结构可声明并读写字段（**不含**返回 `fault(E)!T` 的函数——那要等 B4 的 `Ok/Err`） | B1 | ✅ |
+| `fail/f_fault_unknown_group.tc` | `error T-CLA-E732`（`fault(NoSuch)!T` 组未声明） | B1 | ✅ |
+| `fail/f_fault_type_mismatch.tc` | `error T-CLA-E733`（成功类型与 `over T` 不一致） | B1 | ✅ |
+| `fail/f_fault_dup_group.tc` | `error T-CLA-E739`（组名重复） | B1 | ✅ |
+| `fail/f_fault_dup_member.tc` | `error T-CLA-E725`（成员名重复） | B1 | ✅ |
+| `fail/f_fault_missing_over.tc` | `error T-CLA-E738`（缺 `over`） | B1 | ✅ |
+| `fail/f_fault_pred_form.tc` | `error T-MAT-E747`（谓词形态非法） | B1 | ✅ |
+| `fail/f_fault_pred_unknown_field.tc` | `error T-MAT-E748`（谓词字段不在 `over T`） | B1 | ✅ |
+| `fail/f_fault_dup_pred.tc` | `error T-MAT-E749`（组内谓词重复，A-2） | B1 | ✅ |
+| `fail/f_fault_dup_repair.tc` | `error T-MAT-E752`（成员内 repair 名重复，A-11） | B1 | ✅ |
 | `fail/f_clause_bad_anchor.tc` | `@clause` 锚点非法（CAT 待定，B3 定） | B3 | ⬜ |
 | `fail/f_trap_wildcard_nonabort.tc` | 通配臂只允许 `resume(.abort)`（A-21） | B4 | ⬜ |
 | `fail/f_repair_cross_fn.tc` | repair 闭包禁跨函数复用（A-12） | B4/B5 | ⬜ |
@@ -34,6 +43,8 @@
 - 诊断码唯一真源：`tools/diag_defs.json` → 生成 `src/diag_table.gen.h`。
   ⚠ 000–999 已被 `gen_diag.mjs` 的 `RANGES` 切满 ⇒ 新 CAT 只能做**区间再切分**（仿 CLA/TIM 先例）。
 - 现有三条走 **MAT** 段（E743 之后递增 E745/E746），未新增 CAT。
+- B3 增 CLA 段 E728–E731；**B1 增 10 条**：CLA E725/E732/E733/E734/E735/E738/E739（组与类型层）
+  + MAT E747/E748/E749/E752（谓词层，与 E745/E746 同族）。
 
 ---
 
@@ -43,7 +54,9 @@
 |---|---|---|---|
 | `examples/predpat_demo.tc` + `.expected.txt` | 谓词模式：命中 / **不命中** / 边界相等 / 混合字段（`<`、`>=`、`==` 混排） | B2 | ✅ 双后端逐字节一致 |
 | `examples/faultclause_demo.tc` + `.expected.txt` | 故障/修复子句的**零副作用**：声明它们的程序照常运行，且 `.pattern` 的臂展开不受影响 | B3 | ✅ 双后端逐字节一致 |
-| 待补 | `fault(E)!T` 返回 + trap 分派 | B1/B4 | ⬜ |
+| `examples/faultgroup_demo.tc` + `.expected.txt` | **A-32 布局**：`tag`(0=Ok) / `val`(可写成功值) / `r0..r(N-1)`（读 `r2` 即证明第二成员槽位基址 = 2，槽位少一个则编译不过）。⚠ 刻意**不调用**闭包：三处既有后端缺口见 `fault.md` §C.5 G-1..G-3 | B1 | ✅ 双后端逐字节一致 |
+| 待补 | `fault(E)!T` 返回 + trap 分派 + **repair 槽位映射**（`resume(.名)` → 第几号槽） | B4 | ⬜ |
+| 待补 | 谓词规范化后跨位置恒等（raise ↔ 组声明，A-25 折叠） | B4 | ⬜ |
 | 待补 | repair 闭包上传 + `.abort` | B4 | ⬜ |
 
 `predpat_demo` 的期望输出（12 行）：`-1 1 0 9 0 0 7 5 0 3 2 1`

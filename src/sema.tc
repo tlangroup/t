@@ -10778,6 +10778,238 @@ pub fn check_enum_decl(d: i64) void {
     }
 }
 
+// ══════════════════════════════════════════════════════════════
+// 具名故障组（fault B1 / 附录 C P9）
+// ── 设计：docs/syntax/drafts/fault.md §4 / §5 / 附录 C ──
+//
+// F-1：组**只活在编译期**。这里只做「登记 + 校验」，不产生任何运行期动作：
+//   · 组表 g_fgrp_*（名称 / over 的 TI / 槽位总数 / 成员区间）
+//   · 成员表 g_fmem_*（所属组 / 成员名 / tag / 槽位基址 / repair 数 / 谓词节点）
+//   · 修法表 g_frep_*（所属成员 / 修法名 / **绝对**槽位）
+// 运行期载体 `__fault_<E>` 已由 parse 合成（A-32），本模块不碰。
+//
+// ⚠ A-26：槽位数 N 是**组**的属性 ⇒ 组内增减 repair 会改变 `fault(E)!T` 的布局
+//   （编译期可发现的破坏性变更）。槽位按成员声明顺序展平编号（R-2，B3 移入本批）。
+// ⚠ A-3 的「合取无序」用**逐字段配对**实现（t 当前无字符串序比较，故不用排序法）。
+// ══════════════════════════════════════════════════════════════
+
+pub var g_fgrp_name: []string;      // 组名
+pub var g_fgrp_over: []i64;         // `over T` 的 TI
+pub var g_fgrp_slot_n: []i64;       // N：组内 repair 槽位总数
+pub var g_fgrp_mem_begin: []i64;    // 成员区间起点（g_fmem_* 下标）
+pub var g_fgrp_mem_cnt: []i64;      // 成员个数
+
+pub var g_fmem_group: []i64;        // 所属组
+pub var g_fmem_name: []string;      // 成员名
+pub var g_fmem_tag: []i64;          // 运行期 tag（0 保留给 Ok，成员从 1 起）
+pub var g_fmem_slot: []i64;         // 槽位基址
+pub var g_fmem_nrep: []i64;         // 该成员的 repair 数
+pub var g_fmem_pred: []i64;         // 谓词节点（struct_lit）
+
+pub var g_frep_member: []i64;       // 所属成员（g_fmem_* 下标）
+pub var g_frep_name: []string;      // 修法名
+pub var g_frep_slot: []i64;         // **绝对**槽位（= 字段名 r<slot>）
+
+pub fn fault_group_find(name: string) i64 {
+    var i: i64 = 0;
+    while (i < slice_len(g_fgrp_name) as i64) {
+        if (g_fgrp_name[i] == name) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+pub fn fault_member_find(g: i64, mname: string) i64 {
+    if (g < 0 or g >= slice_len(g_fgrp_mem_begin) as i64) { return -1; }
+    var b: i64 = g_fgrp_mem_begin[g];
+    var n: i64 = g_fgrp_mem_cnt[g];
+    var i: i64 = 0;
+    while (i < n) {
+        if (g_fmem_name[b + i] == mname) { return b + i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// 取 `(组, 成员, 修法名)` 对应的绝对槽位；不存在返回 -1（B4 的 `resume` 消费）。
+pub fn fault_repair_slot(m: i64, rname: string) i64 {
+    if (m < 0 or m >= slice_len(g_fmem_slot) as i64) { return -1; }
+    var b: i64 = g_fmem_slot[m];
+    var n: i64 = g_fmem_nrep[m];
+    var i: i64 = 0;
+    while (i < n) {
+        if (g_frep_name[b + i] == rname) { return b + i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// 谓词右值的文本化（仅用于**结构键**：组内判重，不做常量折叠 —— 折叠留到 B4 的跨位置比较）。
+pub fn fault_pred_val_text(v: i64) string {
+    if (v < 0) { return "?"; }
+    var k: string = base.node_kind((v as u64));
+    if (k == "int" or k == "float" or k == "string" or k == "bool") {
+        var t: string = base.node_sa((v as u64));
+        var sfx: string = base.node_sb((v as u64));
+        if (sfx != "" and sfx != "?") { t = base.sb_cat2(t, sfx); }
+        return t;
+    }
+    if (k == "ident" or k == "atom" or k == "sym") { return base.node_sa((v as u64)); }
+    if (k == "unary") {
+        return base.sb_cat2(base.node_sa((v as u64)), fault_pred_val_text(base.node_na((v as u64))));
+    }
+    if (k == "binary") {
+        return base.sb_cat3(fault_pred_val_text(base.node_na((v as u64))),
+            base.node_sa((v as u64)),
+            fault_pred_val_text(base.node_nb((v as u64))));
+    }
+    return base.sb_cat3("<", k, ">");
+}
+
+// 单个谓词约束的文本化：`字段名 <op> 右值`（等值约束的 op 记作 `=`）。
+pub fn fault_pred_field_text(fv: i64) string {
+    var fname: string = base.node_sa((fv as u64));
+    var vv: i64 = base.node_na((fv as u64));
+    var op: string = "=";
+    var rhs: i64 = vv;
+    if (vv >= 0 and base.node_kind((vv as u64)) == "binary") {
+        op = base.node_sa((vv as u64));
+        rhs = base.node_nb((vv as u64));
+    }
+    return base.sb_cat3(base.sb_cat2(fname, " "), base.sb_cat2(op, " "), fault_pred_val_text(rhs));
+}
+
+// 两个谓词是否**同一合取**（A-3：合取项无序 ⇒ 逐字段配对，不用排序）。
+pub fn fault_pred_same(a: i64, b: i64) bool {
+    if (a < 0 or b < 0) { return false; }
+    var ka: []i64 = base.kids_chain_idx(base.node_la((a as u64)));
+    var kb: []i64 = base.kids_chain_idx(base.node_la((b as u64)));
+    if (slice_len(ka) != slice_len(kb)) { return false; }
+    var i: i64 = 0;
+    while (i < slice_len(ka) as i64) {
+        var ta: string = fault_pred_field_text(base.kids[ka[i]].val);
+        var found: bool = false;
+        var j: i64 = 0;
+        while (j < slice_len(kb) as i64) {
+            if (fault_pred_field_text(base.kids[kb[j]].val) == ta) { found = true; break; }
+            j = j + 1;
+        }
+        if (found == false) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+pub fn check_fault_decl(d: i64) void {
+    var gname: string = base.node_sa((d as u64));
+    if (fault_group_find(gname) >= 0) {
+        parse.fc_err("T-CLA-E739", base.sb_cat3("故障组 `", gname, "` 已声明"), d);
+        return;
+    }
+    // ⚠ 必须是 **TI** 而非 TD：`resolve_type_desc` 返回的是 `tds`（类型**描述**）下标，
+    //   喂给 tip_* 会读到完全无关的表项（实测报出「over 类型 `User`」这种张冠李戴的名字）。
+    var over_ti: i64 = resolve_ti(base.node_na((d as u64)));
+    var over_sname: string = tip_name(over_ti);
+    var over_is_struct: bool = tip_kind(over_ti) == "Struct";
+
+    var g: i64 = slice_len(g_fgrp_name) as i64;
+    append(g_fgrp_name, gname);
+    append(g_fgrp_over, over_ti);
+    append(g_fgrp_slot_n, 0);
+    append(g_fgrp_mem_begin, slice_len(g_fmem_name) as i64);
+    append(g_fgrp_mem_cnt, 0);
+
+    var ms: []i64 = base.kids_chain(base.node_la((d as u64)));
+    var mi: i64 = 0;
+    var nslot: i64 = 0;
+    var nmem: i64 = 0;
+    var mname: string = "";
+    var pn: i64 = -1;
+    var fks: []i64;
+    var fi: i64 = 0;
+    var fv: i64 = -1;
+    var fname: string = "";
+    var pi: i64 = 0;
+    var rs: []i64;
+    var ri: i64 = 0;
+    var rname: string = "";
+    var rj: i64 = 0;
+    var midx: i64 = -1;
+    var slot_base: i64 = 0;
+    while (mi < slice_len(ms) as i64) {
+        var mn: i64 = ms[mi];
+        mname = base.node_sa((mn as u64));
+        pn = base.node_na((mn as u64));
+        // ① 成员名唯一（同一组内）
+        if (fault_member_find(g, mname) >= 0) {
+            parse.fc_err("T-CLA-E725",
+                base.sb_cat5("故障组 `", gname, "` 内成员 `", mname, "` 重复声明"), mn);
+        }
+        // ② 谓词的每个字段必须存在于 `over T`
+        if (over_is_struct) {
+            fks = base.kids_chain_idx(base.node_la((pn as u64)));
+            fi = 0;
+            while (fi < slice_len(fks) as i64) {
+                fv = base.kids[fks[fi]].val;
+                fname = base.node_sa((fv as u64));
+                if (struct_field_ti(over_sname, fname) < 0) {
+                    parse.fc_err("T-MAT-E748",
+                        base.sb_cat5("谓词字段 `", fname, "` 不存在于组的 over 类型 `", over_sname, "`"), fv);
+                }
+                fi = fi + 1;
+            }
+        }
+        // ③ 谓词在组内唯一（A-2；A-3 的无序合取由 fault_pred_same 保证）
+        pi = 0;
+        while (pi < mi) {
+            if (fault_pred_same(pn, g_fmem_pred[g_fgrp_mem_begin[g] + pi])) {
+                parse.fc_err("T-MAT-E749",
+                    base.sb_cat3("故障组 `", gname, "` 内谓词重复（谓词是恒等分派的键，必须唯一）"), pn);
+            }
+            pi = pi + 1;
+        }
+        // ④ repair 名登记 + 成员内唯一（A-11；不同成员允许同名）
+        rs = base.kids_chain(base.node_la((mn as u64)));
+        slot_base = nslot;
+        midx = slice_len(g_fmem_name) as i64;
+        ri = 0;
+        while (ri < slice_len(rs) as i64) {
+            rname = base.node_sa((rs[ri] as u64));
+            rj = 0;
+            while (rj < ri) {
+                if (base.node_sa((rs[rj] as u64)) == rname) {
+                    parse.fc_err("T-MAT-E752",
+                        base.sb_cat5("故障成员 `", mname, "` 内 repair 名 `", rname, "` 重复"), rs[ri]);
+                }
+                rj = rj + 1;
+            }
+            append(g_frep_member, midx);
+            append(g_frep_name, rname);
+            append(g_frep_slot, slot_base + ri);
+            ri = ri + 1;
+        }
+        append(g_fmem_group, g);
+        append(g_fmem_name, mname);
+        append(g_fmem_tag, mi + 1);
+        append(g_fmem_slot, slot_base);
+        append(g_fmem_nrep, slice_len(rs) as i64);
+        append(g_fmem_pred, pn);
+        nslot = nslot + slice_len(rs) as i64;
+        nmem = nmem + 1;
+        // ⚠ 计数必须**在这里**增量回写：fault_member_find 读的是 g_fgrp_mem_cnt[g]，
+        //   若等到循环结束才写，则整轮循环里它恒为 0 ⇒ 成员名判重永远查不到（静默失效）。
+        g_fgrp_mem_cnt[g] = nmem;
+        mi = mi + 1;
+    }
+    g_fgrp_slot_n[g] = nslot;
+    // 槽位基址回填到成员节点的 ia 槽（F 节点自带 i64 槽，B4 可直接读）
+    mi = 0;
+    while (mi < slice_len(ms) as i64) {
+        base.node_set_ia((ms[mi] as u64), g_fmem_slot[g_fgrp_mem_begin[g] + mi]);
+        mi = mi + 1;
+    }
+}
+
 pub fn check_decl(d: i64) void {
     if (base.node_kind((d as u64)) == "FuncDecl") {
         // Device 入口 `kernel fn`：设备体不在 host 阶段做类型检查（设备安全子集属 M4 未来工作，
@@ -10795,6 +11027,13 @@ pub fn check_decl(d: i64) void {
         check_enum_decl(d);
         return;
     }
+    // 具名故障组（fault B1 / 附录 C P8）：HIR 侧零改动 —— `hir_lower_decl` 的 else 兜底
+    // 会为未知 decl kind 发 HIR_OP_RAW，而 check_decl_hir 对 RAW 回落到本函数。
+    if (base.node_kind((d as u64)) == "FaultDecl") {
+        check_fault_decl(d);
+        return;
+    }
+
     if (base.node_kind((d as u64)) == "GlobalVarDecl") {
         check_global_var_decl(d);
         return;
@@ -10955,6 +11194,12 @@ pub fn check_decl_hir(di: i64) void {
         var k: string = base.node_kind((d as u64));
         if (k == "GlobalVarDecl") { check_global_var_decl(d); return; }
         if (k == "GlobalConstDecl") { check_global_const_decl(d); return; }
+        return;
+    }
+    if (op == hir.HIR_OP_TYPE_ALIAS_DECL) {
+        // 具名故障组（fault B1 / 附录 C P8）在 HIR 侧复用 TYPE_ALIAS_DECL 以避开 RAW 逃生舱
+        // ⇒ 这里必须**显式**回落到 check_fault_decl，否则组的语义校验会被整趟跳过（不报错）。
+        if (base.node_kind((d as u64)) == "FaultDecl") { check_fault_decl(d); return; }
         return;
     }
     // 其余（import / module / type_alias / union / variant / const_decl）：
@@ -17519,6 +17764,9 @@ pub fn ann_pass() void {
     var i: i64 = 0;
     while (i < n) {
         var d: i64 = lex__decl_list[i];
+        // fault B1：`FaultDecl` 的 `la` 是**成员链**而不是注解链，而 decl_target 对它
+        // 兜底返回 "global" ⇒ 若不加这道闸，每个成员名都会被当成未知注解报 T-ANN-E450。
+        if (base.node_kind((d as u64)) == "FaultDecl") { i = i + 1; continue; }
         var target: string = decl_target(base.node_kind((d as u64)));
         var c: i64 = base.node_la((d as u64));
         var mq_ks13952: []i64 = base.kids_chain_idx(base.node_la((d as u64)));

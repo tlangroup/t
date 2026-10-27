@@ -1,6 +1,6 @@
 # fault / trap / repair 落地台账（阶段三）
 
-> 状态：**闸门①已通过**（A-1…A-31 全部裁定，Q1…Q15 无剩余，2026-10-27）｜**闸门②已通过**（B1–B6 批次拆分 + 附录 A 逐节点确认）｜**阶段三·编码进行中**：B2 ✅、B3 ✅ 已过门禁（2026-10-27），B1 未开工
+> 状态：**闸门①已通过**（A-1…A-32 全部裁定，Q1…Q15 无剩余，2026-10-27）｜**闸门②已通过**（B1–B6 批次拆分 + 附录 A/B/C 逐节点确认）｜**阶段三·编码进行中**：B2 ✅、B3 ✅、B1 ✅ 已过门禁（2026-10-27），B4 未开工
 > 阶段：阶段一·设计 → 阶段二·流程图 → 阶段三·编码｜日期：2026-10-27
 > **语法/语义权威**：`docs/syntax/drafts/fault.md`（唯一真源，§8 裁定表 A-1…A-31、§11 批次拆分、附录 A 逐节点清单）
 > **本文件的职责**：只记**批次台账 / 验证证据 / 偏离记录**，**不复制裁定** —— 两处内容一旦重复，必然出现「一处改一处没改」的文档骗人事件（本项目已累计 4 次）。
@@ -25,7 +25,7 @@ fault 的设计讨论已在 2026-10-27 收口，编码已开工 ⇒ 两侧都需
 |---|---|---|---|
 | **B2** | `PatternExpr` 放宽到关系表达式（谓词模式）+ A-16 硬约束 + 值级 match 语义（N4/N6） | ✅ **完成** | gate L2 **23 passed / 1 failed**；唯一 FAIL 为「产物快照」且根因是基线录制编译器用错（见 §3），非代码回归 |
 | **B3** | `@clause(.fault)` / `@clause(.repair)` 变体 + 形态校验 + 「不进运行期」保证（槽位索引按 A-26 归 B1） | ✅ **完成** | gate L2 **23 passed / 1 failed**；唯一 FAIL 为产物快照的**合法漂移**（2 DIFF = `src/tc.tc` 自举产物、2 NEW = 新示例、0 GONE），已重录 |
-| **B1** | `FaultSetDecl` 解析 + 具名组登记 + `fault(E)!T` 运行时表示（A-27 后不新增 TI kind） | ⬜ 未开工 | — |
+| **B1** | `FaultSetDecl` 解析 + 具名组登记 + `fault(E)!T` 运行时表示（A-27/A-32：合成具名 struct，不新增 TI kind） | ✅ **完成** | 见 §3.3 |
 | **B4** | `trap` / `resume` / `recover` 脱糖为 `match` + 常量索引间接调用；组 → 生成校验函数（A-23） | ⬜ 未开工 | — |
 | **B5** | 跨函数可达故障集 / 可达 repair 分析，经 `.tlib` TIR 摘要（A-28：不砍） | ⬜ 未开工 | — |
 | **B6** | 门禁收口：conformance 用例 + examples golden 双后端 + 自举 + IR 快照重录 | ⬜ 未开工 | — |
@@ -75,6 +75,31 @@ fault 的设计讨论已在 2026-10-27 收口，编码已开工 ⇒ 两侧都需
 - 四个新诊断码 E728 / E729 / E730 / E731 均已实测触发且文案正确
 - 落点与三条实测偏差（M9 `++` 文档债务 / M10 谓词位须置 `g_in_match_pat` / M11 附带诊断）见 `fault.md` §11.2 与附录 B
 
+### 3.3 B1 门禁证据（2026-10-27）
+
+- `tc check src/tc.tc --json` → `errors = 0`（warnings 638，与改前持平）
+- 自举一代（`bootstrap_tc.mjs --tc out/dbg/tc.exe` → `_b1h1.exe.exe`）→ `exit=0`
+- conformance → **415 passed / 0 failed / 415 total**（新增 10 例：1 pass + 9 fail）
+- golden：`examples/faultgroup_demo`（`0\n42\n0\n`）LLVM 与 tmir-c **逐字节一致** ⇒ 坐实 **N7 = 后端零改动**（合成的是普通 StructDecl）
+- gate L2 **第一轮** → 22 passed / **2 failed**（3136s）：
+  - FAIL ① = **HIR AstGen 验证**：`examples/faultgroup_demo.tc` 1 处 `HIR_OP_RAW` 逃生舱，门禁要求 **RAW 合计 0** ⇒ **真 bug**（不是漂移），见 **D-10**
+  - FAIL ② = 产物快照 6 处（合法漂移，见下）
+- gate L2 **第二轮**（修完 D-10）→ 23 passed / 1 failed（3256s）：唯一 FAIL = 产物快照的**合法漂移**
+  - `4 DIFF` = `src/tc.tc::c` / `::ll`（编译器自身源码变大，必然）
+    + `examples/import_module_type.tc::c` / `::ll`
+    （该例用 `@type_info` 反射 `src.base`，而 B1 给 `base.tc` 新增 `pub fn mk_FaultDecl`
+     ⇒ 模块公开面 +1；实测新 IR 出现 196 处该符号名，**stdout 未变**，run_examples 双后端 PASS）
+  - `2 NEW` = 新示例 `faultgroup_demo`
+  - **0 GONE** ⇒ 既有 141 个示例 IR 零漂移
+  - ⚠ 对照：`_b1h1.exe.exe`（非 gate 的 g1）跑同一比对会多出 4 个 `@import("std.*")` 示例 × 双后端
+    的 8 处 DIFF —— 这是**「基线录错编译器」的指纹**，不是回归（与 B2 那次同源）
+- 已用 gate 的 `out/dbg/g1.exe` 重录（143 targets / 289 entries）并回验 **289/289 逐字节相同**
+- 11 个新诊断码（CLA `E725 / E732 / E733 / E734 / E735 / E738 / E739`
+  + MAT `E747 / E748 / E749 / E752`）均已实测触发且文案正确
+- 逐节点改动点与偏差 D-5…D-11、既有后端缺口 G-1…G-3 见 `fault.md` 附录 C（§C.2 / §C.5）
+- ⚠ **B4 的前置**：G-1（tmir-c 编译不了「返回结构体的闭包」）/ G-2（数组元素上的闭包调用发未定义符号 `t__`）
+  是**既有**缺口，已用 pre-B1 编译器复现 ⇒ B4 的 repair 闭包必然撞上，**先修再谈 B4**
+
 ---
 
 ## 4. 偏离记录
@@ -85,6 +110,14 @@ fault 的设计讨论已在 2026-10-27 收口，编码已开工 ⇒ 两侧都需
 | D-2 | B2 | 谓词模式的 scrutinee 约束（A-16）落成**两个**诊断码：E745（非关系运算符）/ E746（scrutinee 非变量） | 已入 `tools/diag_defs.json`（唯一真源），MAT 段 000–999 已切满，走既有区间 |
 | D-3 | B3 | **槽位索引（R-2）从 B3 移到 B1** | A-26 已裁定 N（槽位数）是**组**的属性；组（B1）落地前做索引属返工（附录 B §B.5） |
 | D-4 | B3 | 多出一处 `sema.tc` 改动：`++` 的 Concat 分支原不放行 clause（`T-BIT-E515`） | 文档债务第 5 次：`fault.md` §7 D4 记「`++` 已存在 ⇒ 增量 0」**未验证**；已在 Concat 分支最前加 `Clause ++ Clause` |
+| D-5 | B1 | **`fault` 不能做强制关键字**：做成 `KwFault` 后 `@clause(.fault, ...)` 的 `.fault`（成员名）撞 `expect_tok("Identifier")`，B3 的 4 个用例全红 | `fault` / `over` / `repairs` 一律降为 **mod 阶上下文关键词**，按词文本 + 前瞻判定（`fault.md` §C.5 D-5） |
+| D-6 | B1 | **A-32（新裁定）**：§5 原写的运行层 `{ tag, repairs:[N]%TClosure }` **没有承载成功值的字段**，`Ok(u)` 无处安放；且「数组元素上的闭包调用」实测是坏的 | 布局改为 `{ tag: i64, val: T, r0..r(N-1): fn() T }`（`fault.md` §C.1）；`val` 由 R-opt3（成功路径零成本）倒逼，N 个独立字段由实测缺口倒逼 |
+| D-7 | B1 | 三处**既有后端缺口**（与 B1 无关，已用 pre-B1 编译器复现）：tmir-c 编译不了「返回结构体的闭包」；数组元素上的闭包调用发未定义符号 `t__`；嵌套字段赋值双后端都不生效 | 本批绕开（golden 用整结构体赋值、不调闭包）；**B4 的 repair 闭包必然撞前两条 ⇒ 先修再谈 B4**（`fault.md` §C.5 G-1..G-3） |
+| **D-10** | B1 | ⭐ **HIR 侧不是零改动**（推翻「附录 C P8」的预估）：`hir_lower_decl` 的 `else` 兜底给未知 kind 发 `HIR_OP_RAW`，而门禁 **「RAW 合计 0」是硬判据** ⇒ `examples/faultgroup_demo.tc` 1 处 RAW 让 gate L2 第 15 步 FAIL | 复用 `HIR_OP_TYPE_ALIAS_DECL` + 在 `check_decl_hir` 显式回落 `check_fault_decl`（`fault.md` §C.5 D-10 / D-11） |
+
+> ⚠ **编号口径（防文档骗人）**：本表 D-1…D-5 与 `fault.md` 同源；**D-6 / D-7 是本表自建编号**
+> （分别对应 `fault.md` §C.1 的 A-32 与 §C.5 的 G-1..G-3）。自 D-10 起**一律沿用 `fault.md` §C.5 的编号**，
+> 本表只做索引 —— 两处各编一套号必然出现「同一件事两个号」。
 
 ---
 
