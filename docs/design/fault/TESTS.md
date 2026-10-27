@@ -21,6 +21,11 @@
 | `pass/p_predpat_hit_miss.tc` | `// EXPECT: pass` | B2 | ✅ |
 | `fail/f_predpat_nonrelop.tc` | `error T-MAT-E745`（`.{ .age + 1 }` 用了非关系运算符） | B2 | ✅ |
 | `fail/f_predpat_scrutinee_expr.tc` | `error T-MAT-E746`（`match(validate(u))` —— scrutinee 不是变量，A-16） | B2 | ✅ |
+| `pass/p_fault_clause_forms.tc` | `@clause(.fault, ...)` / `@clause(.repair, ...)` 可声明（含 `++` 合并） | B3 | ✅ |
+| `fail/f_fault_clause_guard.tc` | `error T-CLA-E728`（故障/修复子句不接受 `when` 守卫） | B3 | ✅ |
+| `fail/f_fault_clause_pred_form.tc` | `error T-CLA-E730`（谓词位不是等值/关系约束，如 `.{ .age + 1 }`） | B3 | ✅ |
+| `fail/f_repair_clause_name_form.tc` | `error T-CLA-E729`（修法名不是 `.名` 形态） | B3 | ✅ |
+| `fail/f_fault_clause_in_match_arm.tc` | `error T-CLA-E731`（故障子句被拼进 match 臂链） | B3 | ✅ |
 | `fail/f_fault_no_group.tc` | 未注册故障组（CAT 待定，B1 定） | B1 | ⬜ |
 | `fail/f_clause_bad_anchor.tc` | `@clause` 锚点非法（CAT 待定，B3 定） | B3 | ⬜ |
 | `fail/f_trap_wildcard_nonabort.tc` | 通配臂只允许 `resume(.abort)`（A-21） | B4 | ⬜ |
@@ -37,6 +42,7 @@
 | 用例 | 覆盖 | 批次 | 状态 |
 |---|---|---|---|
 | `examples/predpat_demo.tc` + `.expected.txt` | 谓词模式：命中 / **不命中** / 边界相等 / 混合字段（`<`、`>=`、`==` 混排） | B2 | ✅ 双后端逐字节一致 |
+| `examples/faultclause_demo.tc` + `.expected.txt` | 故障/修复子句的**零副作用**：声明它们的程序照常运行，且 `.pattern` 的臂展开不受影响 | B3 | ✅ 双后端逐字节一致 |
 | 待补 | `fault(E)!T` 返回 + trap 分派 | B1/B4 | ⬜ |
 | 待补 | repair 闭包上传 + `.abort` | B4 | ⬜ |
 

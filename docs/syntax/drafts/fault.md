@@ -540,6 +540,46 @@ fn main_fn() fault(FrameErr)!i32 @main {
 
 ---
 
+### 11.2 B3 批次 · 编码实录（2026-10-27 完成）
+
+**状态：✅ 已编码并通过门禁**（gate L2 **23 passed / 1 failed**；唯一 FAIL 项 = 产物快照，
+且经核为**合法漂移**：`2 处 DIFF = src/tc.tc::ll / ::c`（编译器自身源码变了，必然）、
+`2 处 NEW = examples/faultclause_demo::ll / ::c`（新增示例）、**0 GONE** ⇒ 既有 141 个示例 IR 零漂移）。
+逐节点清单见**附录 B**；批次台账与后续批次见 `docs/design/fault/DESIGN.md`。
+
+**落点（与附录 B 预估一致，除 M9）**
+
+| # | 位置 | 改动 |
+|---|---|---|
+| M1 | `parse.tc` `clause_kind_member` / `clause_kind_list` | 加 `.fault` / `.repair`；E721 文案随之列出三者 |
+| M2 | `parse.tc` `parse_clause_lit` | 按类别三路分派；故障族拒绝 `when` 守卫（E728） |
+| M3 | `parse.tc` 新增 `clause_pred_ok` | 谓词必须是 `.{...}` 且字段为等值/关系约束（否则 E730） |
+| M4 | `parse.tc` `.repair` 第二段 | 只接受 `Dot+Identifier`（leading-dot member），否则 E729 |
+| M5 | `parse.tc` `clause_collect` | 故障子句**照旧收集**（否则编译期标记不生效 ⇒ 漏进 IR），另置 `g_spl_fault` 标志 |
+| M6 | `parse.tc` `clause_expand_splice` | `g_spl_fault` ⇒ 报 E731，不展开为臂 |
+| **M9** | `sema.tc` `op == "Concat"` | **超出预估**：加 `Clause ++ Clause ⇒ Clause`（见下） |
+
+**一条文档债务（第 5 次同类）**：§7 D4 记「`++` 已存在 ⇒ 增量 0」，实测 sema 的 Concat 分支
+**只放行 bitstr / String / Slice / Array / Map**，`clause ++ clause` 报 `T-BIT-E515`；
+parse 侧 `clause_collect` 的 Concat 分支一直存在却从走不到。
+⇒ 判据是「跑一遍」，不是「记号已存在」。修法：Concat 分支最前加 `Clause` 放行（与 `[C0,C1]` 同义）。
+
+**另一处非显然点（M10）**：`.fault` 的谓词位必须**临时置 `g_in_match_pat = true`** ——
+`parse_struct_lit` 的谓词分支只在模式位生效；表达式位的 `.{ .age < 0 }` 不会走谓词分支
+（症状不会是「不支持」，而是落在别的形态上，与 B2 的 `is_tuple` 漏改同族）。
+
+**门禁证据（本次实测）**
+- `tc check src/tc.tc --json` → `errors = 0`
+- 自举（`bootstrap_tc.mjs --tc ci/seed/tc.exe`）→ `exit=0`
+- `tools/refresh_seed.mjs --check` → 种子仍可编译 src（0 error）
+- conformance 全量 → **405 passed / 0 failed**（含新增 5 例）
+- `run_examples_tmir.mjs --only faultclause_demo` → PASS，LLVM 与 tmir-c **逐字节一致**
+  ⇒ 故障/修复子句**零运行期副作用**，且不影响 `.pattern` 的臂展开
+- gate L2：自举不动点 / 四代不动点 / 双轨对拍 / C 后端自举 / MIR differential / rls 全 PASS
+- IR 快照：0 GONE ⇒ 既有示例零漂移；已用 gate 的 `g1` 重录
+
+---
+
 ## 12. 早期评审结论存根（已被推翻的部分，保留以防复发）
 
 | 原结论 | 现状 |
@@ -693,3 +733,79 @@ fn main_fn() fault(FrameErr)!i32 @main {
 |---|---|---|
 | P-1 | **错误码整体扫描的必要性评估**：当前 176 条诊断码是否有冗余 / 需整合 / 分类归属错配（§A.4 已记 `CDE` 区间文档与代码不一致一处） | B6 收口后，或下次新增诊断码时顺带做 |
 | P-2 | **v2 候选：raise 处短名简写** `Err(.AgeNegative ++ ...)`（A-22 撤销时降级） | 仅当 raise 手写负担**被实测证实**为问题时启用；启用前须重开 L-04 判定 |
+
+---
+
+## 附录 B · B3 批次改动点清单（逐节点）
+
+> 目标：让 `@clause` 支持两个故障变体 ——
+> `@clause(.fault, <谓词>, <全名>)` 与 `@clause(.repair, <修法名>, <闭包>)`，
+> 并保证它们**只活在编译期**（F-1：不进 IR、不参与 match 臂展开）。
+> 前置：B2（谓词模式已落地，`.{ .age < 0 }` 可解析且可校验）。
+> ⚠ 诊断码以 `tools/diag_defs.json` 为准（唯一真源）。CLA 段 = `[720,739]`，
+> 已用 E720/E721/E722/E723/E724/E726/W727 ⇒ B3 取 **E728 / E729 / E730 / E731**。
+
+### B.1 当前数据流（实测，2026-10-27）
+
+```text
+@clause(.pattern, p, body)
+  → parse_meta_builtin (parse.tc:6240)    nm == "clause" ⇒ parse_clause_lit
+  → clause_kind_member (parse.tc:6168)    仅 "pattern" 合法，其余报 T-CLA-E721
+  → node_new("clause")                    sa=类别 / na=pattern / nb=guard / nc=body
+  → infer_expr_body (sema.tc:7031)        kind=="clause" ⇒ 直接返回 g_ti_clause，
+                                          子树**一概不求值**（AST 位置，不是值位置）
+  → meta_eval_rec (sema.tc:13389)         clause 求值**恒等**（返回自身）
+  → desugar_clause_splices (parse.tc:3684) clause 常量打编译期标记 ⇒ 不进 IR
+```
+
+⇒ **新增变体天然继承「不进运行期」**：clause 子树无人求值，只需保证
+① 语法归约接受新形态；② 形态校验落在**构造时**（parse）；③ 不被 match 臂展开误吞。
+
+### B.2 逐节点改动
+
+| # | 文件 · 位置 | 现状 | 改动 | 量级 |
+|---|---|---|---|---|
+| **M1** | `parse.tc:6168` `clause_kind_member` | 仅 `pattern` | 加 `fault` / `repair`；`clause_kind_list()` 同步（⚠ 报错文案纪律：E721 文案要列**当前真实存在**的成员） | 极小 |
+| **M2** | `parse.tc:6178` `parse_clause_lit` | 单一形态（pattern / [when guard] / body） | 按 `km` 三路分派：`.pattern` 原样；`.fault` = 谓词 + 全名（**拒绝 `when`** ⇒ E728）；`.repair` = `.名` + 闭包（**拒绝 `when`** ⇒ E728） | 小 |
+| **M3** | `parse.tc` 新增 `clause_pred_field_ok` | — | 校验 `.fault` 的谓词位：必须是 `.{...}`（struct_lit）且每个字段值是**等值字面量**或**关系二元式**（复用 B2 的 `pat_is_relop_text` 判据），否则 E730 | 小 |
+| **M4** | `parse.tc` repair 名归约 | — | `.repair` 第二段必须是 `Dot+Identifier`（产 leading-dot member，与 `.Red` 同形），否则 E729 | 极小 |
+| **M5** | `parse.tc:3415` `clause_collect` | 见 `clause` 即收 | 仍**全部收集**（保证 `expr_is_clause_group` 为真 ⇒ 编译期标记生效、不漏进 IR），但**置 `g_spl_fault` 标志**标记「含非 pattern 子句」 | 极小 |
+| **M6** | `parse.tc:3464` `clause_expand_splice` | 收集的 clause 一律当臂展开 | 若 `g_spl_fault` ⇒ 报 E731（故障/修复子句不能作 match 臂） | 极小 |
+| **M7** | `sema.tc:1571` `ClauseKind` 合成枚举 | 仅成员 `pattern` | **本批不动**（字面量类别位由 parse 把守，枚举成员无人引用）。⚠ 留给 B1：若日后 `ClauseKind.fault` 要可引用，须同步此处 | 0 |
+| **M8** | 后端（C / LLVM / TIR） | — | **0**（clause 不进 IR；B2 已证 TIR 是 match 单一真源） | 0 |
+
+### B.3 形态总表（消歧靠首段类别成员，无二义）
+
+| 形态 | 判定 | 语义 |
+|---|---|---|
+| `@clause(.pattern, p, [when g,] b)` | 类别 = `.pattern` | 既有：match 臂子句（参与展开/重排） |
+| `@clause(.fault, .{...}, 全名)` | 类别 = `.fault` | **故障子句**（编译期登记，不进臂展开） |
+| `@clause(.repair, .名, fn(){...})` | 类别 = `.repair` | **修复子句**（编译期登记，不进臂展开） |
+
+### B.4 门禁
+
+| 项 | 内容 |
+|---|---|
+| 静态 | conformance pass：两个变体可被声明（`++` 合并亦可）；fail：未知类别（E721）、`.fault` 带 `when`（E728）、`.repair` 名非 `.ident`（E729）、谓词字段非等值/关系（E730）、故障子句进 match 臂（E731） |
+| 运行期 | 本批**无运行期语义**（clause 不进 IR）⇒ golden 的判据是「零副作用」：声明故障子句的程序照常运行、双后端输出逐字节一致 |
+| 自举 | `tc check src` → 自举 g1 → gate L2 |
+| IR 快照 | 预期 **0 漂移**（现有 examples 无一使用新变体）；若出现漂移须逐项说明 |
+
+### B.5 ⚠ 本批**不做**的事（留给后续批次，避免返工）
+
+| 项 | 归谁 | 理由 |
+|---|---|---|
+| repair 名 → **槽位索引** | **B1** | A-26 已裁定 N（槽位数）是**组**的属性：组内增减 repair 会改变 `fault(E)!T` 布局。在组（B1）落地前做索引属返工 |
+| 组的声明与登记 `fault E over T { ... }` | B1 | 同上 |
+| `Err(...)` / `trap` / `resume` / `recover` | B4 | 脱糖批 |
+| 谓词规范化 + 恒等比较（D7 全量） | B1/B4 | 恒等比较的**另一端**（组声明）尚不存在，无从比较 |
+
+> ⇒ **B3 的净交付**：语法与形态校验层 + 「不进运行期」的保证。它是 B1/B4 的无歧义前置，且不含会被后续批次推翻的部分。
+
+### B.6 编码后的实测偏差（2026-10-27）
+
+| # | 偏差 | 处置 |
+|---|---|---|
+| **M9** | **sema 的 `++` 分支原先只放行 bitstr/String/Slice/Array/Map**，`clause ++ clause` 报 `T-BIT-E515` ⇒ **D4「`++` 已存在 ⇒ 增量 0」是未验证的文档债务**（parse 侧 `clause_collect` 的 Concat 分支一直存在，但从走不到） | 在 `sema.tc` 的 `op == "Concat"` 分支最前加 `Clause ++ Clause ⇒ Clause`（与 `[C0,C1]` 数组式同义）。这是本次唯一一处**超出附录 B 预估**的改动 |
+| **M10** | `parse_clause_lit` 的谓词位必须**临时置 `g_in_match_pat = true`**：`parse_struct_lit` 的谓词分支只在模式位生效，表达式位的 `.{ .age < 0 }` 不会走谓词分支 | 已在 `.fault` 分支内包裹保存/恢复 |
+| **M11** | E731 用例会**附带**一条 `T-MAT-E740`（`F_AGE` 大写被当 case 名）—— 是拼进臂链后的二次误读 | 无害：conformance 的判据是「期望码出现」，不要求唯一 |
