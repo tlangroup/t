@@ -201,6 +201,7 @@ OpOrPunct:
   | "(" | ")" | "{" | "}" | "[" | "]" | "@" | "#"
 ```
 
+- ⚠ `&&` / `||` 记号仍由**词法层**产出，但已从表达式文法移除（2026-10-27，set-ops §13.9）：集合交 / 并用 `&` / `|`，布尔逻辑用 `and` / `or`。刻意保留记号是为了报「已移除，请改用 …」，而不是让 `&&` 被切成两个 `&`、令 `a && b` 静默变成 `a & (&b)`。
 - 顶层声明为**并置式**：声明名后直接跟声明种类关键字（`Name fn ...`、`Name struct ...`），无绑定算子。⚠ `::` 绑定算子已于 2026-08-01 移除；旧写法 `Name :: func ...` 由 parser 报带迁移指引的硬错误。
 - **管道记号最大匹配**（2026-08-10）：扫描到 `|` 时按长度降序尝试 3 字符 `|->` / `|>?` → 2 字符 `||` / `|>` → 1 字符 `|`。三个新记号对既有合法源码**零破坏**（`a | -> b`、`a | > ? b`、`a | > b` 在旧文法下均非法），语义见 §3.15。
 - `#` 用于内存布局指令 `#aos` / `#soa`（⚠ spec-only 实变换未接入）。
@@ -449,13 +450,13 @@ sfield : Ident ":" ( Integer | type ) anns ";"
 
 // ── 表达式二进制优先级塔（fold=bin：左结合二元运算折叠）──
 // 形状：base ( (op | op | ...) base )*  →  while (op) { left = mk_bin(op, left, parse_base(), ti); }
-// 运算符字面量即 mk_bin 的 op 串（"&&"→"&&"、"<<"→"<<"），token kind 由 gen_ebnf 的 OPKIND 映射。
+// 运算符字面量即 mk_bin 的 op 串（"and"→"and"、"<<"→"<<"），token kind 由 gen_ebnf 的 OPKIND 映射。
 
 // @rule or params=() ret=i64 node=_ eatFirst=false fold=bin
-or : and ( "||" and )*
+or : and ( "or" and )*
 
 // @rule and params=() ret=i64 node=_ eatFirst=false fold=bin
-and : bitor ( "&&" bitor )*
+and : bitor ( "and" bitor )*
 
 // @rule bitor params=() ret=i64 node=_ eatFirst=false fold=bin
 bitor : bitxor ( "|" bitxor )*
@@ -1160,8 +1161,8 @@ AssignExpr: PipeExpr ("=" AssignExpr)?
 // L0 管道级：最低优先级，包在 OrExpr 外层（详见 §3.15）
 PipeExpr:  OrExpr (PipeOp OrExpr)*
 PipeOp:    "|->" | "|>?" | "|>"
-OrExpr:    AndExpr ("||" AndExpr)*
-AndExpr:   BitOrExpr ("&&" BitOrExpr)*
+OrExpr:    AndExpr ("or" AndExpr)*
+AndExpr:   BitOrExpr ("and" BitOrExpr)*
 BitOrExpr: BitXorExpr ("|" BitXorExpr)*
 BitXorExpr: BitAndExpr ("^" BitAndExpr)*
 BitAndExpr: EqExpr ("&" EqExpr)*
@@ -1448,7 +1449,7 @@ main fn() i64 @main {
     auto b = id(f64, 1.5);       // → id__f64，b : f64
     auto c = id(string, "hi");   // → id__string，c : string
     auto m = max(i64, 7, 99);    // → max__i64，m : i64
-    if (a == 42 && m == 99 && c == "hi") { return 0; }
+    if (a == 42 and m == 99 and c == "hi") { return 0; }
     return 1;
 }
 ```
@@ -1513,7 +1514,7 @@ tagged  fn(comptime N: i64, x: i64) i64    { return x + comptime N * 100; }  // 
 
 - **类型**：`i64` 整数族、`bool`、`string`。**浮点暂不支持**（报 `T_META_NOT_CONST`）——
   第 7 条要求求值可复现，浮点结合序须先定死。字符串仅支持 `==` / `!=`，不做拼接 / 切片。
-- **表达式**：算术、位运算（`& | ^ << >>`）、比较、`&&` / `||`（惰性短路）、
+- **表达式**：算术、位运算（`& | ^ << >>`）、比较、`and` / `or`（布尔逻辑，惰性短路）、
   括号、显式 `as` 转型（按标量位宽做二进制补码窄化）、`comptime fn` 调用。
 - **语句**（`comptime {}` 与 `comptime fn` 体内）：`var` / 赋值 / `if` / `while` / `block` /
   `return` / `break` / `continue`。
@@ -1590,8 +1591,8 @@ main fn() i64 @main {
     var d: i64 = comptime fact(10);     // → store i64 3628800（编译期递归展开）
     auto n = id(i64, 42);               // → id__i64
     auto s = id(string, "hi");          // → id__string
-    if (a == 6 && b == 15 && c == 30 && d == 3628800 && n == 42
-        && s == "hi" && KLIMIT == 100) { return 0; }
+    if (a == 6 and b == 15 and c == 30 and d == 3628800 and n == 42
+        and s == "hi" and KLIMIT == 100) { return 0; }
     return 1;
 }
 ```
@@ -2575,7 +2576,7 @@ auto total = sum_i32(__pipe_0(es, is_alive, hp_of));
 | 禁用位置 | 理由 |
 |---|---|
 | `if` / `while` / `for` 条件 | 条件位无提升点 |
-| `&&` / `\|\|` 右操作数 | 提升会破坏短路求值 |
+| `and` / `or` 右操作数 | 提升会破坏短路求值 |
 | `match` 臂体、`when` 守卫 | 臂是条件执行，提升会改变求值时机 |
 | 函数调用实参 | 提升会改变实参间的副作用顺序 |
 | 数组下标、结构体字面量字段值 | 同上 |
@@ -2648,8 +2649,8 @@ RangeExpr:
 | for 迭代 | `for (i in a..b)` | 计数循环（见下） |
 | 切片索引 | `s[a..b]` | `str_slice` / `slice_sub` 调用 |
 | 字节视图索引 | `b[a..b]` | `bytes_slice` 调用 |
-| match 臂 | `1..5 => ...` | 比较链 `x >= 1 && x < 5` |
-| 成员测试 | `x in a..b` | 比较合取 `x >= a && x < b` |
+| match 臂 | `1..5 => ...` | 比较链 `x >= 1 and x < 5` |
+| 成员测试 | `x in a..b` | 比较合取 `x >= a and x < b` |
 | 其余值位置 | `var xs: []i64 = 2..6;` | 物化成 `[]i64`（`__range_fill` 助手） |
 
 **for 迭代**降解为零分配计数循环，上界先落临时量：

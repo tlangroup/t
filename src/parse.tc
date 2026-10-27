@@ -443,16 +443,16 @@ pub fn parse_type_ex(allow_and: bool) i64 {
         lex.advance_i();
         t0 = base.mk_optional(t0, -1);
     }
-    // §set-ops 岔路 B：concept 多约束连词 `T: A && B`。`&&` 是 SET 交集 token
-    // （区别于 bool 关键字 `and`）；约束位把多个 concept 名连成 binary("&&", ...)
-    // 节点，由 sema.generic_normalize_func 拆解成约束列表。
-    // allow_and 为假时这里直接停 ⇒ `&&` 交回表达式层的 parse_and（即 `x as T && cond`
-    // 仍读作「转换后再逻辑与」），两种语义互不污染。
-    while (allow_and and lex.cur_t() == "And") {
+    // §set-ops 岔路 B：concept 多约束连词 `T: A & B`（§13.3 格族：类型位 meet 与值位
+    // 集合交同为 `&`，不再另立 `&&`）。约束位把多个 concept 名连成 binary("&", ...)
+    // 节点，由 sema.generic_normalize_func / collect_concept_constraints 拆解成约束列表。
+    // allow_and 为假时这里直接停 ⇒ `&` 交回表达式层的 parse_bitand（即 `x as T & y`
+    // 读作「转换后再按位与」），两种语义互不污染。
+    while (allow_and and lex.cur_t() == "BitAnd") {
         var ti: i64 = lex.advance_i();
         // 递归必须透传 allow_and：合取右侧与左侧同属一个判断，且 false 位不会在右侧复活。
         var right: i64 = parse_type_ex(allow_and);
-        t0 = base.mk_binary("&&", t0, right, ti);
+        t0 = base.mk_binary("&", t0, right, ti);
     }
     return t0;
 }
@@ -463,7 +463,7 @@ pub fn parse_type() i64 {
     return parse_type_ex(true);
 }
 
-// 形参类型位解析（支持 `T: A && B` 多约束）：语义与 parse_type 相同（同为放行），
+// 形参类型位解析（支持 `T: A & B` 多约束）：语义与 parse_type 相同（同为放行），
 // 保留独立函数名是为了在调用点标注「这里是约束位」的意图，便于将来若需区分两者时有落点。
 pub fn parse_type_concept() i64 {
     return parse_type_ex(true);
@@ -2035,7 +2035,7 @@ pub fn parse_func_decl(name: string, anns: i64, is_comptime: bool, is_kernel: bo
             lex.advance_i();
             pname = expect_tok("Identifier");
             expect_tok("Colon");
-            ptn = parse_type_concept();     // 形参位：允许多约束连词 `T: A && B`
+            ptn = parse_type_concept();     // 形参位：允许多约束连词 `T: A & B`
             pcomp = true;
         } else if (lex.cur_t() == "Identifier" and lex.cur_v() == "_") {
             lex.advance_i();
@@ -2049,7 +2049,7 @@ pub fn parse_func_decl(name: string, anns: i64, is_comptime: bool, is_kernel: bo
             if (lex.cur_t() == "Identifier" and lex.peek_t(1) == "Colon") {
                 pname = expect_tok("Identifier");
                 expect_tok("Colon");
-                ptn = parse_type_concept();   // 形参位：允许多约束连词 `T: A && B`
+                ptn = parse_type_concept();   // 形参位：允许多约束连词 `T: A & B`
             } else {
                 if (lex.cur_t() == "Identifier") {
                     // 结构字面量模式：`Ident { ... }` —— 含前导点形式 `Point{.x=0}` 与
@@ -5602,12 +5602,14 @@ pub fn parse_bitor() i64 {
 
 pub fn parse_and() i64 {
     var left: i64 = parse_bitor();
-    // §set-ops step2：`&&`(And) 已改派**集合交集**，`and`(KwAnd) 才是布尔逻辑与 —— 二者不再同义。
-    // 集合语义由 sema 按类型分派（bitstr 交并；其余类型报 T-SET-E101/E102）。
-    // ⚠ op 必须在 advance_i() 之前判定：吞掉 token 后 cur_t() 已指向下一个。
-    while (lex.cur_t() == "And" or lex.cur_t() == "KwAnd") {
-        var op: string = "&&";
-        if (lex.cur_t() == "KwAnd") { op = "and"; }
+    // §set-ops §13.3：`&&` 已从语言中**移除** —— 格族统一为 `&`（集合交 / 位与），
+    // 布尔逻辑只剩关键字 `and`。这里显式报错而不是让它落进上层当普通语法错
+    // （那样只会得到「期待 X，实际读到 &&」，看不出该换成什么）。
+    if (lex.cur_t() == "And") {
+        parse_fatal("`&&` 已从语言中移除：集合交 / 位与请写 `&`，布尔逻辑请写 `and`");
+    }
+    while (lex.cur_t() == "KwAnd") {
+        var op: string = "and";
         var ti: i64 = lex.advance_i();
         var right: i64 = parse_bitor();
         left = mk_bin(op, left, right, ti);
@@ -5617,11 +5619,14 @@ pub fn parse_and() i64 {
 
 pub fn parse_or() i64 {
     var left: i64 = parse_and();
-    // §set-ops step2：`||`(Or) 已改派**集合并集**，`or`(KwOr) 才是布尔逻辑或 —— 二者不再同义。
-    // ⚠ op 必须在 advance_i() 之前判定（同上）。
-    while (lex.cur_t() == "Or" or lex.cur_t() == "KwOr") {
-        var op: string = "||";
-        if (lex.cur_t() == "KwOr") { op = "or"; }
+    // §set-ops §13.3：`||` 已从语言中**移除** —— 格族统一为 `|`（集合并 / 位或），
+    // 布尔逻辑只剩关键字 `or`。同 `&&`：显式报错以便指出该换成什么。
+    // ⚠ `|`(BitOr) 仍是闭包起始与 match 臂分隔符，它只在**中缀位**才是二元或，不受此影响。
+    if (lex.cur_t() == "Or") {
+        parse_fatal("`||` 已从语言中移除：集合并 / 位或请写 `|`，布尔逻辑请写 `or`");
+    }
+    while (lex.cur_t() == "KwOr") {
+        var op: string = "or";
         var ti: i64 = lex.advance_i();
         var right: i64 = parse_and();
         left = mk_bin(op, left, right, ti);

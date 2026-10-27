@@ -2544,9 +2544,9 @@ pub fn generic_param_constraint(pid: i64) []string {
     return [];
 }
 
-// 从约束类型节点收集 concept 名列表（§set-ops 岔路 B：多约束连词 `&&`）。
+// 从约束类型节点收集 concept 名列表（§set-ops 岔路 B：多约束连词 `&`，§13.3 格族）。
 //   named(concept)      → [name]
-//   binary("&&", L, R)  → collect(L) ++ collect(R)
+//   binary("&", L, R)   → collect(L) ++ collect(R)
 //   optional(X)         → collect(X)（容错：约束非 optional，但允许裸 `?` 包裹）
 //   其它（非 concept 名 / 非连词）→ 跳过；仅当 use_scope=true（符号表已就绪，
 //   脱糖后兜底遍）时对「named 但非 concept」报错，捕捉跨模块拼写错误。
@@ -2554,7 +2554,7 @@ pub fn collect_concept_constraints(tn: i64, use_scope: bool) []string {
     var out: []string;
     if (tn < 0) { return out; }
     var k: string = base.node_kind((tn as u64));
-    if (k == "binary" and base.node_sa((tn as u64)) == "&&") {
+    if (k == "binary" and base.node_sa((tn as u64)) == "&") {
         var ls: []string = collect_concept_constraints(base.node_na((tn as u64)), use_scope);
         var rs: []string = collect_concept_constraints(base.node_nb((tn as u64)), use_scope);
         var i: i64 = 0;
@@ -2572,7 +2572,7 @@ pub fn collect_concept_constraints(tn: i64, use_scope: bool) []string {
             append(out, rn);
         } else if (use_scope) {
             parse.fc_err("T-CON-E103",
-                base.sb_cat3("约束位置的类型 `", rn, "` 不是已注册的 concept：多约束连词 `&&` 只能连接 concept 名"), tn);
+                base.sb_cat3("约束位置的类型 `", rn, "` 不是已注册的 concept：多约束连词 `&` 只能连接 concept 名"), tn);
         }
         return out;
     }
@@ -2670,7 +2670,7 @@ pub fn generic_normalize_func(d: i64, use_scope: bool) void {
                 ti2 = ti2 + 1;
             }
         } else {
-            // 约束类型节点：named(concept) 单约束，或 binary("&&", ...) 多约束连词（§set-ops 岔路 B）。
+            // 约束类型节点：named(concept) 单约束，或 binary("&", ...) 多约束连词（§set-ops 岔路 B）。
             // 约束名存侧表 g_gpc_*（不能用 nb/nc：pp_is_pattern 查 nb/nc 会把类型参数误判为模式参数 →
             // 触发子句组合并 / T-MAT-E742）；na 置 type 占位，避免 resolve_ti 把 concept 当值类型实例化 → T-CON-E100。
             var na_node: i64 = base.node_na((pv as u64));
@@ -2684,7 +2684,7 @@ pub fn generic_normalize_func(d: i64, use_scope: bool) void {
                     append(g_gpc_names, [rn]);
                     is_tp = true;
                 }
-            } else if (nak == "binary" and base.node_sa((na_node as u64)) == "&&") {
+            } else if (nak == "binary" and base.node_sa((na_node as u64)) == "&") {
                 // 多约束（§set-ops 岔路 B）：`T: A && B`。拆解所有 concept 叶子，纳为约束列表。
                 var cnames: []string = collect_concept_constraints(na_node, use_scope);
                 if (slice_len(cnames) as i64 > 0) {
@@ -8264,11 +8264,15 @@ pub fn infer_expr_body(e: i64) i64 {
                     "；其余类型暂不支持 ++"), e);
             return ti_mk("Unknown");
         }
-        // §set-ops Step 2：值级 `&&` / `||` = 集合交 / 并。内建实现覆盖 bitstr 与位域（packed struct）；
-        // `&` / `|` 对这两类与集合运算同义（同一条位运算通路），顺带补齐此前
-        // 「类型检查放行、后端产出非法 IR」的静默错编缺口（实测 `and %TBitStr` / `and %Perm`）。
-        // 其余类型一律结构化报错并指向扩展点 concept（Intersect / Union，见 §4）。
-        if (op == "&&" or op == "||" or op == "&" or op == "|") {
+        // §set-ops §13.3：格族只剩 `&`（交）与 `|`（并）—— 值级 `&&` / `||` 已从语言中移除。
+        // 内建实现覆盖 bitstr 与位域（packed struct）；`&` / `|` 对这两类即集合运算
+        // （同一条位运算通路），顺带补齐此前「类型检查放行、后端产出非法 IR」的静默错编缺口
+        // （实测 `and %TBitStr` / `and %Perm`）。
+        // ⚠ bool **不在**格族内：布尔逻辑只有关键字 `and` / `or`，故 bool 上的 `&` / `|` 一并收口
+        //   报错。否则删掉 `&&` 之后 `t & f` 会静默按位与（i1 上恰好等于逻辑与），
+        //   等于把 step2「bool 不参与集合代数、布尔请用 and/or」的裁定悄悄推翻 ——
+        //   这正是本项目反复吃亏的「检查通过但语义已变」。
+        if (op == "&" or op == "|") {
             if (tip_kind(lt) == "BitStr" and tip_kind(rt) == "BitStr") {
                 return ti_mk("BitStr");
             }
@@ -8290,13 +8294,13 @@ pub fn infer_expr_body(e: i64) i64 {
                 parse.fc_err("T-SET-E104", sb_to_str(sbf), e);
                 return ti_mk("Unknown");
             }
-            // 仅一侧是位域：`&&` / `||` 本就报错；`&` / `|` 此前静默放行并在后端产出
-            // 非法 IR（`and %Perm`），此处一并收口为结构化报错。
-            if (op == "&&" or op == "||" or tip_is_packed(lt) or tip_is_packed(rt)) {
+            // 仅一侧是位域：`&` / `|` 此前静默放行并在后端产出非法 IR（`and %Perm`），
+            // 此处与 bool 一并收口为结构化报错。
+            if (pipe_is_bool(lt) or pipe_is_bool(rt) or tip_is_packed(lt) or tip_is_packed(rt)) {
                 var sbset: StringBuilder = sb_new();
                 var setname: string = "交集";
                 var setcode: string = "T-SET-E101";
-                if (op == "||") {
+                if (op == "|") {
                     setname = "并集";
                     setcode = "T-SET-E102";
                 }
@@ -8327,7 +8331,7 @@ pub fn infer_expr_body(e: i64) i64 {
         if (op == "^") {
             if (tip_kind(lt) == "BitStr" or tip_kind(rt) == "BitStr") {
                 parse.fc_err("T-SET-E103",
-                    "位串不支持 `^`：集合代数当前只提供 `&&`（交）与 `||`（并）；差集 / 对称差的运算符留待后续批次设计", e);
+                    "位串不支持 `^`：集合代数当前只提供 `&`（交）与 `|`（并）；差集 / 对称差的运算符留待后续批次设计", e);
                 return ti_mk("Unknown");
             }
             if (tip_is_packed(lt) and tip_is_packed(rt) and ti_equal(lt, rt) == false) {
@@ -8344,19 +8348,18 @@ pub fn infer_expr_body(e: i64) i64 {
             }
             if (tip_is_packed(lt) or tip_is_packed(rt)) {
                 parse.fc_err("T-SET-E105",
-                    "位域不支持 `^`：集合代数当前只提供 `&&`（交）与 `||`（并）；差集 / 对称差的运算符留待后续批次设计", e);
+                    "位域不支持 `^`：集合代数当前只提供 `&`（交）与 `|`（并）；差集 / 对称差的运算符留待后续批次设计", e);
                 return ti_mk("Unknown");
             }
         }
         if (op == "==" or op == "!=" or op == "<" or op == ">" or op == "<=" or op == ">=") {
             return ti_scalar("bool");
         }
-        // bool 逻辑（§set-ops step1）：`and` / `or` 与 `&&` / `||` 同为布尔逻辑与/或
+        // 布尔逻辑（§set-ops §13.3）：`and` / `or` 是**唯一**的布尔拼写（`&&` / `||` 已移除）。
         if (op == "and" or op == "or") {
             return ti_scalar("bool");
         }
-        // §set-ops step1：值级 `&&`/`||` 在第一步仍作布尔（与 `and`/`or` 同义，见上方分支），
-        // 集合交集/并集语义推迟到第二步；此处不再为值级 "&&"/"||" 派发集合错误（T-SET-E101/E102）。
+        // 走到这里的 `&` / `|` 是整型位运算（bitstr / 位域 / bool 已在上方分支处理或报错）。
         if (tip_kind(lt) == "Scalar" and tip_kind(rt) == "Scalar") {
             if (ti_equal(lt, rt)) {
                 return lt;
@@ -13790,9 +13793,10 @@ pub fn meta_eval_binary(e: i64) i64 {
         }
         return mv_bool(base.node_ba((r0 as u64)));
     }
-    // 集合代数 `&&` / `||`（§set-ops）：bitstr/flag 交集/并集，第一批为运行期语义，
-    // comptime 不折叠（返回 -1，交运行期求值；与 `++` 同策略）。
-    if (op == "&&" or op == "||") { return -1; }
+    // ⚠ 此处**刻意不为** `&` / `|` 加「comptime 不折叠」：那样会连带关掉整型常量的
+    //   编译期折叠（`const F = A | B`），令既有 IR 多出一条运行期指令。
+    //   bitstr / 位域的 `&` / `|` 不会误折 —— meta_eval 对这两类操作数本就返回 -1。
+    //   （原 `&&` / `||` 的这条分支随该二记号一并移除，见 §set-ops §13.3。）
     var lv: i64 = meta_eval(base.node_na((e as u64)));
     if (lv < 0) { return -1; }
     var rv: i64 = meta_eval(base.node_nb((e as u64)));
