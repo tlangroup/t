@@ -185,6 +185,25 @@ pub fn c_is_runtime_struct_st(st: string) bool {
     if (t2 == "TStr" or t2 == "TSlice" or t2 == "TClosure" or t2 == "TBitStr") { return true; }
     return false;
 }
+// 入口（@main）的返回值是否**丢弃**（⇒ 退出码恒 0）。与 LLVM 侧 tir_to_ll 的 main wrapper
+// 判据对齐：只有整数类返回类型才收敛成退出码，其余一律不可。
+// 判据用「C 侧返回类型」而非槽类型：运行库结构体（TStr 等）在字节缓冲模型里**可能**是值槽
+// （`return (s)` 里的 s 就是 TStr 值，不是指针）⇒ 只看槽是否为指针会漏判（main_ret_string）。
+pub fn c_main_ret_discard(st: string) bool {
+    if (str_len(st) as i64 == 0) { return false; }
+    if (st == "void") { return false; }
+    if (c_is_sret_type(st)) { return true; }
+    if (c_is_runtime_struct_st(st)) { return true; }
+    if (c_c_ty_is_ptr(c_tystr_c(st))) { return true; }
+    return false;
+}
+// 是否入口函数（@main）。判据与 c_emit_func 的 `ismain` 逐字一致：注解标记，或名为 main / @main。
+pub fn c_is_main_fn(f: TMIRFunc) bool {
+    if (f.is_main) { return true; }
+    if (f.name == "main") { return true; }
+    if (f.name == "@main") { return true; }
+    return false;
+}
 pub fn c_align_up(off: i64, a: i64) i64 {
     if (a <= 1) { return off; }
     var m: i64 = a - 1;
@@ -790,6 +809,9 @@ pub var g_c_gep_wrap: string = "";
 // RET 时把返回值缓冲 memcpy 进 __sret 再 ret void。
 pub var g_c_sret: bool = false;
 pub var g_c_sret_size: i64 = 0;
+// 入口函数（@main）的返回类型是否 void：入口包装器 `int __rc = t_main()` 对 `void t_main()`
+// 无法取值 ⇒ 须改成 `t_main(); int __rc = 0;`。由 c_emit_func 在发射入口时回填。
+pub var g_c_main_void: bool = false;
 pub fn c_emit_gep_dstpre(sb: StringBuilder, dstn: string) void {
     g_c_gep_wrap = "";
     var gdty: string = c_slot_c_ty(dstn);
@@ -2266,9 +2288,11 @@ pub fn tmir_to_c(m: TMIRModule) string {
             if (fismain) { ffname = "t_main"; }
         var f_sret: bool = (fismain == false and c_is_sret_type(ff.ret_st));
         var fret: string = "int";
-        if (fismain == false) {
-            if (ff.ret_st == "void") { fret = "void"; }
-            else if (ff.ret_st != "") { fret = c_tystr_c(ff.ret_st); }
+        // ⚠ 入口（@main）也必须能是 `void t_main()`：此前入口一律按 int 前向声明，
+        //   与定义处（已修正为 void）冲突 ⇒ clang "conflicting types for 't_main'"。
+        if (ff.ret_st == "void") { fret = "void"; }
+        else if (fismain == false) {
+            if (ff.ret_st != "") { fret = c_tystr_c(ff.ret_st); }
         }
         if (f_sret) { fret = "void"; }
             // 外部库函数：定义由链接期 .tlib 归档提供 ⇒ 声明为 extern（不可 static，否则与归档符号冲突）。
@@ -2295,6 +2319,7 @@ pub fn tmir_to_c(m: TMIRModule) string {
         c_emit_clo_globals(sb);
     }
     // 函数
+    g_c_main_void = false;
     var nf: i64 = slice_len(m.funcs) as i64;
     var i: i64 = 0;
     while (i < nf) {
@@ -2322,7 +2347,8 @@ pub fn tmir_to_c(m: TMIRModule) string {
             sb_append_str(sb, "    t_runtime_init(argc, argv);\n");
             sb_append_str(sb, "    TArena* __a = t_arena_new();\n");
             sb_append_str(sb, "    t_runtime_set_arena(__a);\n");
-            sb_append_str(sb, "    int __rc = t_main();\n");
+            if (g_c_main_void) { sb_append_str(sb, "    t_main();\n    int __rc = 0;\n"); }
+            else { sb_append_str(sb, "    int __rc = t_main();\n"); }
             sb_append_str(sb, "    t_runtime_done();\n");
             sb_append_str(sb, "    return __rc;\n");
             sb_append_str(sb, "}\n");
@@ -2793,9 +2819,14 @@ pub fn c_emit_func(sb: StringBuilder, f: TMIRFunc) void {
     if (ismain) { fname = "t_main"; }
     var retctype: string = "int";
     g_c_sret = false; g_c_sret_size = 0;
-    if (ismain == false) {
-        if (f.ret_st == "void") { retctype = "void"; }
-        else if (f.ret_st != "") { retctype = c_tystr_c(f.ret_st); }
+    // ⚠ 入口（@main）的 C 签名恒为 `int`（包装器取它作退出码），与 LLVM 的 `ret i32 %r` 对齐；
+    //   但如果入口声明为 void，则必须是 `void t_main()` —— 否则函数体发 `return;`，
+    //   clang 报 "non-void function 't_main' should return a value"。
+    if (f.ret_st == "void") {
+        retctype = "void";
+        if (ismain) { g_c_main_void = true; }
+    } else if (ismain == false) {
+        if (f.ret_st != "") { retctype = c_tystr_c(f.ret_st); }
     }
     // sret：用户聚合返回 → void 返回 + 显式 __sret 出参指针（首形参），与 LLVM 后端逐字对齐。
     if (ismain == false and c_is_sret_type(f.ret_st)) {
@@ -2992,6 +3023,15 @@ pub fn c_is_param(f: TMIRFunc, n: string) bool {
 pub fn c_emit_term(sb: StringBuilder, term: TMIRInst) void {
     if (term.op == tir__TIR_OP_RET_VOID) { sb_append_str(sb, "  return;\n"); return; }
     if (term.op == tir__TIR_OP_RET) {
+        // 入口（@main）的 C 签名恒为 `int`（包装器拿它当退出码），但入口可以声明任意返回类型。
+        // 与 LLVM 后端 tir_to_ll 的 main wrapper 逐字对齐：整数/浮点按值收敛为退出码，
+        // **其余一律丢弃 ⇒ 退出码 0**（LLVM 侧即 `ret i32 0`）。
+        // 未收敛前：`fn main() P @main` 发 `return (t3)`（`unsigned char*`）→ clang
+        // "incompatible pointer to integer conversion"；`string` / `fn` 返回同样挂。
+        if (c_is_main_fn(g_cf)) {
+            if (c_is_func_ref(term.dst.name)) { sb_append_str(sb, "  return 0;\n"); return; }
+            if (c_main_ret_discard(g_cf.ret_st)) { sb_append_str(sb, "  return 0;\n"); return; }
+        }
         // 返回函数值（fn 类型）→ 返回 &static TClosure 常量（对齐 LLVM 的 @.tirll_clo_<fn>）。
         if (c_is_func_ref(term.dst.name)) {
             sb_append_str(sb, "  return (unsigned char*)(&"); sb_append_str(sb, c_clo_global(term.dst.name));
