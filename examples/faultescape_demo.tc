@@ -1,0 +1,129 @@
+// 故障签名的**跨函数推导**（fault 批次 B5a / 附录 H / A-36 / A-37）
+//
+// 本例钉住三件事：
+//   A-36：非 `pub` 函数可以**不写** `fault(E)!T` —— 编译器按调用图推导（A-4 的「非 pub 可推导」）。
+//         推导出的签名对调用者可见 ⇒ 中间层不必为每个函数手写具名组。
+//   A-38：v1 的传播是**直通** —— 载体当普通值传递/返回，`trap` 只在最终消费点出现。
+//   A-37：v1 只支持单组（跨组上传要重映射 tag ⇒ 破坏 R-2）；多组一律报 T-MAT-E773。
+//
+// ④ 另含「一文件两个故障组」的**回归**：B1 曾把 `g_fmem_slot`（组内槽位号）当成
+//   `g_frep_*` 的表下标 ⇒ 第二组的所有修法报 E757「不属于该成员」（改动前的 g1 同样复现）。
+//
+// ⚠ 这是**运行期** golden：conformance 只做 `tc check`、从不运行程序 ⇒
+//   「推导出的签名在双后端真的能跑通」只能靠本例证明。
+// ⚠ 一律「先把闭包调用结果存进局部变量再读字段」，不写 `f().name` —— 既有缺口 G-5。
+
+struct User {
+    age: i64;
+    name: string;
+}
+
+fault UserErr over User {
+    .{ .age < 0 }   -> UserErr.AgeNegative repairs { .use_default, .clamp };
+    .{ .name = "" } -> UserErr.NameEmpty    repairs { .anon };
+}
+
+// 第二组：**刻意**与 UserErr 同名修法（.clamp），正是它暴露了 B1 的槽位/下标混用
+fault RangeErr over User {
+    .{ .age > 200 } -> RangeErr.TooOld repairs { .clamp };
+}
+
+// 显式声明的两个抛出点（推导的输入源）
+fn validate(u : User) fault(UserErr)!User {
+    if (u.age < 0) {
+        return Err(
+            @clause(.fault, .{ .age < 0 }, UserErr.AgeNegative)
+         ++ @clause(.repair, .use_default, fn () User { return User{ .age = 18i64, .name = u.name }; })
+         ++ @clause(.repair, .clamp,       fn () User { return User{ .age = 0i64,  .name = u.name }; })
+        );
+    }
+    if (u.name == "") {
+        return Err(
+            @clause(.fault, .{ .name = "" }, UserErr.NameEmpty)
+         ++ @clause(.repair, .anon, fn () User { return User{ .age = u.age, .name = "anon" }; })
+        );
+    }
+    return Ok(u);
+}
+
+fn raise_range(u : User) fault(RangeErr)!User {
+    if (u.age > 200) {
+        return Err(
+            @clause(.fault, .{ .age > 200 }, RangeErr.TooOld)
+         ++ @clause(.repair, .clamp, fn () User { return User{ .age = 200i64, .name = u.name }; })
+        );
+    }
+    return Ok(u);
+}
+
+// ── ① 位置① 直通：`return <会抛的调用>` ⇒ 推导为 `fault(UserErr)!User` ──
+// 签名写法仍是 `User`，编译器按可达集补成载体（A-36）。
+fn pass_thru(u : User) User {
+    return validate(u);
+}
+
+// ── ② 非 return 位置的传播（A-38 的直通语义）──
+// `f` 的类型就是载体，`return f` 原样交出 ⇒ 传播天然成立，不需要早期返回脱糖。
+fn pass_var(u : User) User {
+    var f = validate(u);
+    return f;
+}
+
+// ── ③ 有 `.abort` 上传 ⇒ 也会被推导（此前必报 T-MAT-E768）──
+fn only_age(u : User) User {
+    return trap validate(u) {
+        .{ .age < 0 } => resume(.clamp);
+        _             => resume(.abort);
+    };
+}
+
+// ── ④ 三层链路：每层都省写了 `fault(E)!T`，载体一路穿到 main ──
+fn mid(u : User) User {
+    return only_age(u);
+}
+fn top(u : User) User {
+    return mid(u);
+}
+
+fn main_fn() i32 @main {
+    // ① -5/bob ⇒ AgeNegative ⇒ clamp ⇒ 0/bob
+    var a : User = trap pass_thru(User{ .age = -5i64, .name = "bob" }) {
+        .{ .age < 0 }   => resume(.clamp);
+        .{ .name = "" } => resume(.anon);
+    };
+    println(i2s(a.age));
+    println(a.name);
+
+    // ② 3/"" ⇒ NameEmpty ⇒ anon ⇒ 3/anon
+    var b : User = trap pass_var(User{ .age = 3i64, .name = "" }) {
+        .{ .age < 0 }   => resume(.clamp);
+        .{ .name = "" } => resume(.anon);
+    };
+    println(i2s(b.age));
+    println(b.name);
+
+    // ③④ 3/"" ⇒ only_age 只修 age<0 ⇒ NameEmpty 原样上传两层 ⇒ 3/anon
+    var c : User = trap top(User{ .age = 3i64, .name = "" }) {
+        .{ .age < 0 }   => resume(.clamp);
+        .{ .name = "" } => resume(.anon);
+    };
+    println(i2s(c.age));
+    println(c.name);
+
+    // ④ 内层已修好 ⇒ 外层的臂一条都不落 ⇒ 走末尾取 val ⇒ 0/bob
+    var d : User = trap top(User{ .age = -5i64, .name = "bob" }) {
+        .{ .age < 0 }   => resume(.clamp);
+        .{ .name = "" } => resume(.anon);
+    };
+    println(i2s(d.age));
+    println(d.name);
+
+    // 两组共存（B1 缺口的回归）：250/old ⇒ TooOld ⇒ clamp ⇒ 200/old
+    var e : User = trap raise_range(User{ .age = 250i64, .name = "old" }) {
+        .{ .age > 200 } => resume(.clamp);
+    };
+    println(i2s(e.age));
+    println(e.name);
+
+    return 0;
+}

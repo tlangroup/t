@@ -1,0 +1,44 @@
+// EXPECT: pass
+// B5a / A-36：非 `pub` 函数可省略 `fault(E)!T` ——
+// `return <会抛的调用>` 把载体**原样**交出 ⇒ 编译器推导出签名 `fault(UserErr)!User`。
+
+struct User {
+    age: i64;
+    name: string;
+}
+
+fault UserErr over User {
+    .{ .age < 0 }   -> UserErr.AgeNegative repairs { .use_default, .clamp };
+    .{ .name = "" } -> UserErr.NameEmpty    repairs { .anon };
+}
+
+fn validate(u : User) fault(UserErr)!User {
+    if (u.age < 0) {
+        return Err(
+            @clause(.fault, .{ .age < 0 }, UserErr.AgeNegative)
+         ++ @clause(.repair, .use_default, fn () User { return User{ .age = 18i64, .name = u.name }; })
+         ++ @clause(.repair, .clamp,       fn () User { return User{ .age = 0i64,  .name = u.name }; })
+        );
+    }
+    if (u.name == "") {
+        return Err(
+            @clause(.fault, .{ .name = "" }, UserErr.NameEmpty)
+         ++ @clause(.repair, .anon, fn () User { return User{ .age = u.age, .name = "anon" }; })
+        );
+    }
+    return Ok(u);
+}
+
+fn pass_thru(u : User) User {
+    return validate(u);
+}
+
+// 推导出的签名对调用者可见 ⇒ 这里可以直接 `trap`
+fn main_fn() i32 @main {
+    var x : User = trap pass_thru(User{ .age = -5i64, .name = "bob" }) {
+        .{ .age < 0 }   => resume(.clamp);
+        .{ .name = "" } => resume(.anon);
+    };
+    println(i2s(x.age));
+    return 0;
+}

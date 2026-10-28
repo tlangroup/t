@@ -482,7 +482,9 @@ fn main_fn() fault(FrameErr)!i32 @main {
 | **B2** | `PatternExpr` 放宽到关系表达式 + 嵌套 `FieldPath`；谓词规范化与恒等比较（D7）。⚠ **A-29：含值级 match 语义** ⇒ N4 / N6 不可省，且 A-16 成为真约束 | D3 / D7 | **否**（编译期活） |
 | **B3** | `@clause(.fault)` / `@clause(.repair)` 变体 + repair 名 → 槽位索引（R-2） | D1 / D4 | **否** |
 | **B4** | `trap` / `resume` / `recover` 脱糖为 `match` + 常量索引间接调用；组 → 生成**校验函数**（A-23：不是 `if` 链） | R-1（已实装，零新机制） | 否（复用 `CALL_IND`） |
-| **B5** | 跨函数可达故障集 / 可达 repair 分析，经 `.tlib` TIR 摘要 | R-3 | 否 |
+| **B5a** | **跨函数签名推导**：可达集不动点 + 返回类型回填 + `pub` 边界（A-36 / A-37） | R-3 | 否 | ✅ 已完成（附录 H） |
+| **B5b** | 早期返回脱糖（`var x = <call>;` ⇒ `if (tag != 0) return;`） | R-3 | 否 | ⬜ A-38 的直通已够用，此步是语法糖 |
+| **B5c** | @main 之外由运行时接手（A-19 的落地：打印 + 非零退出码） | A-19 | 否 | ⬜ |
 | **B6** | 门禁收口：conformance 用例 + examples golden 双后端 + 自举 + IR 快照重录 | 全部 | — |
 
 - **建议顺序**：B2 → B3 → B1 → B4 → B5。理由：B2/B3/B4 全在编译期、不碰后端，可先把语义跑通并产出 golden；B1 是唯一的大件（A-27 后降为「中」），放在通路验证之后改动更稳。
@@ -1208,3 +1210,105 @@ if (__tfv_N.tag == 2) { x = <recover 表达式>; }
 - B4b 的**跨函数**部分（B5）：跨函数可达集分析（R-3）—— 未开工。
 - 组 → 生成纯谓词校验函数（A-23）：未开工（v2 候选）。
 - `trap` 的**表达式**位置：A-34 只开两个位置，其余留白（v2）。
+
+---
+
+## 附录 H · B5 设计（跨函数可达集 R-3，2026-10-28 定稿）
+
+### H.1 现状基线（B4b 收尾时实测 —— 四个探针）
+
+`fn p(u : User) User`（非 `pub`、未写 `fault(...)`）体内出现会抛故障的调用，当前一律报错：
+
+| 探针 | 写法 | 当前诊断 |
+|---|---|---|
+| P1 | `return validate(u);`（return 位直通） | T-SEM-E202 `expected User but got __fault_UserErr` |
+| P2 | `var f = validate(u); return f;`（非 return 位） | T-SEM-E202 同上 |
+| P3 | `return trap validate(u) { … => resume(.abort); };` | T-MAT-E768 带 `.abort` 的 `trap` 要求签名是 `fault(UserErr)!User` |
+| P4 | 在 `main` 里 `trap p4(...)`（p4 会抛但未声明） | T-SEM-E202 + T-MAT-E765 `trap` 只能捕 `fault(<组>)!<T>` |
+
+⇒ 现状是**声明集一刀切**：不写 `fault(E)!T` 就不可用。B5 要做的是让**非 `pub`** 函数免写。
+
+### H.2 新裁定
+
+| # | 议题 | 裁定 | 理由 |
+|---|---|---|---|
+| **A-36** | 推导的适用边界 | **非 `pub` 函数可省略 `fault(E)!T`（由编译器推导）；`pub fn` 必须显式写**。@main 例外：不推导也不要求声明 | A-4 原文即「`pub` 必须写具名组；非 `pub` 可内联推导」。t 的 `pub` 是**函数级**关键字（`pub fn` → `FuncDecl.bc=1`），无需新造记号。@main 例外来自 A-19：到 main 之外由运行时接手 |
+| **A-37** | 多组逃逸 | **推导只支持单组**；escape 集含 ≥2 个不同组 ⇒ 报诊断，要求用户合并成一个组 | 跨组上传必须重映射 tag/槽位，会**破坏 R-2**：B4b 的跨函数链路之所以零 shim，正是因为内外层共用同一组、tag 空间一致。保住这个性质比支持多组更重要 |
+| **A-38** | v1 传播语义 | **B5a 只做「直通」**（载体当值传递），不做早期返回脱糖；B5b 再补 `var x = <call>;` 的早期返回 | 直通已能让 P1~P4 全通过（见 H.3），且与 A-33 的 `trap` 脱糖零冲突；早期返回是**增强**不是前提 |
+| **A-39** | 跨模块 | **`.tlib` 只承载「推导后」的签名** ⇒ 导入方无需再做跨函数分析 | 推导在**单文件内闭环**（预编译时已完成并固化进签名）。导入边界一律按 A-36 的 `pub` 规则 ⇒ 摘要基础设施零新增 |
+| **A-40** | 诊断码归属 | 复用既有类（**不开 `FLT`**，A-24） | 与 B1~B4 一致 |
+
+### H.3 直通语义为什么够用（P2 的关键）
+
+`var f = validate(u);` 里 `f` 的类型就是载体；`return f` 把载体原样交出 ⇒ **传播天然成立**，
+不需要插入 `if (tag != 0) return;`（那只是**语法糖**，语义等价）。
+代价：把 `f` 当 `User` 用（`f.age`）会报类型错 ⇒ 用户必须 `trap`。
+⇒ E.4 记的「非 return 位置的隐式传播」在 v1 交给 **B5b**（脱糖为早期返回 + 绑定 `val`）。
+
+### H.4 逐节点清单（B5a）
+
+| # | 位置 | 改动 |
+|---|---|---|
+| **N1** | `sema.tc` `passes_init` | 注册 `fault_escape_pass`（stage 1 / ANALYSIS / requires `meta_pass`）⇒ 在 `run_passes` 内自动跑，**早于** 17900 行的 `hir_build` 与检查循环 |
+| **N2** | 新增 `fault_escape_walk` / `fault_escape_walk_list` | 遍历形态照抄 `mb_walk`（`na/nb/nc/nd` + `la/lb/lc` 三条 kids 链 + form③ 物化） |
+| **N3** | per-func 记录（平行切片，守 SoA 铁律） | `g_fe_decl`（FuncDecl 节点）/ `g_fe_pub`（bc）/ `g_fe_declared`（已写 `fault(...)`）/ `g_fe_raise`（体内 raise 的组下标集）/ `g_fe_cal`（体内调用到的函数符号下标集）/ `g_fe_esc`（推导出的组集）/ `g_fe_ret_ti` |
+| **N4** | 收集 raise 组 | 体内 `Err(@clause(.fault, …, <E>.<M>))` ⇒ 取组；与 B4a 的 `fault_err_member_of` 同路径 |
+| **N5** | 收集 callee + 「是否被 trap 包着」 | `call` 节点 ⇒ 符号表查得 fti；callee 的 `tif_ret` 是载体（或**本轮刚变成**载体）⇒ 传播。**被 `trap` 包住的调用不传播**（H.5 判据） |
+| **N6** | 不动点 | `esc(f) = raise(f) ∪ ⋃ esc(g)`（g 为 N5 的传播 callee）。集合只增不减 ⇒ 必然收敛；递归/互递归靠「集合单调增长」自然终止 |
+| **N7** | 应用 | 非 `pub` + 未声明 + `esc` 非空 ⇒ 回填 `tif_ret[fti]` = 组载体 TI，并回填 `FuncDecl.na` 的返回类型节点。**照抄 5055 行「`|v: T| expr` 闭包返回类型推断」的回填手法**（tif_ret + n.na 两处，且已有递归保护先例） |
+| **N8** | 诊断 ① | `pub fn` 逃逸非空但未显式声明（A-36） |
+| **N9** | 诊断 ② | escape 含 ≥2 个不同组（A-37） |
+| **N10** | 测试 | conformance pass 4 例（P1~P4）+ fail 2 例（N8/N9）；`examples/faultescape_demo` 双后端 golden（含跨函数推导链） |
+
+### H.5 「调用被 trap 包着」的判据
+
+预扫期看到的还是原始树：`trap <call>(...) { … }`。
+判据：**`call` 节点的父是 `trap` 节点**（`trap` 的 `na` = 被捕表达式）。
+⚠ 不能靠「函数体内存在 trap」判定 —— 那会把 `return trap a() {…} ; return b();` 里的 `b()` 也当成被处理过。
+⇒ 必须**逐调用点**判定，且只看直接父子关系（A-34 已限定 `trap` 只开 return / 初始化两个位置，
+被捕表达式恒是 `trap.na`，判据因此是结构性的、不靠名字）。
+
+### H.6 ⭐⭐ 实际踩中的两处（都是「按字面猜节点形态」—— 与记忆里 4 次同族）
+
+| 现象 | 我猜的形态 | **真实形态** | 后果 |
+|---|---|---|---|
+| 所有穷尽 `trap` 的 scrutinee 被当成「未消费」⇒ 不该推导的函数被误推导（`p_fault_trap` 回归：4 条 E202） | kind == `"trap"` | **kind == `"match"` + `sc == "__trap__"`**（见 `trap_node_is`） | `g_fe_cons` 从未置位 ⇒ 逃逸集恒包含被捕者的组 |
+| 直接 raise 的函数推导不出组 | `Err(...)` 的调用名在 call 节点的 `sa` | 调用名在 **`na` 指向的 ident 的 `sa`**（与 `fault_raise_try` 判别 `Ok`/`Err` 同款） | `g_fe_inerr` 从未 > 0 ⇒ `.fault` 子句全部落空 |
+
+⇒ 通法：**先抄既有判别式的节点访问路径，再按它写**（`trap_node_is` / `fault_raise_try` 就是现成的答案），
+不要凭语法长相猜 kind 与槽位。
+
+### H.7 实测（B5a，2026-10-28）
+
+- `tc check src/tc.tc` **errors=0 / warnings=639**（+1 = 新变量 `reqF`，与既有 `reqA..reqE` 同款命名告警）
+- conformance **440 passed / 0 failed**（+4 pass / +2 fail：三个推导形态 + 两组回归 / E772 + E773）
+- `run_examples_tmir` **112 passed / 0 failed**；新 golden `examples/faultescape_demo` 双后端逐字节一致：
+  `0/bob 3/anon 3/anon 0/bob 200/old`（直通 / 直通传播 / 三层链路 / 内层已修好取 val / 两组共存）
+- ⭐⭐ **顺带修掉 B1 的既有缺口**：`fault_repair_slot` 把「组内槽位号」当 `g_frep_*` 表下标
+  ⇒ 一文件两个组时第二组的所有修法报 E757（**改动前的 g1 同样复现**，非 B5a 引入）。
+  修法：新增 `g_fmem_rep_begin` 专供查表，返回值仍用组内槽位号（`r<slot>` 字段名）。
+- 探针 P1~P4 的**现状**：P4（推导后 `trap` 可捕）首轮即通过；P1/P2/P3 首轮的 E202 全部落在
+  **main 没有消费载体**上 ⇒ 让 main `trap` 后三例全绿（P3 还需 main 用穷尽臂，位置② 禁 `.abort`）。
+- **gate L2（58min，keep-going）：23 passed / 1 failed** —— 唯一 FAIL 项 = 产物快照，且经核为
+  **合法漂移**：`2 DIFF = src/tc.tc::ll / ::c`（编译器自身源码变了，必然）+ `2 NEW = faultescape_demo`、
+  **0 GONE** ⇒ 既有 145 个目标 IR **零漂移**（没有任何既有函数被意外推导）。
+  关键步全 PASS：自举一代、**自举不动点 g2==g3**、**四代不动点 g2==g3==g4**、conformance 440、
+  run_examples dbg 双后端、双轨对拍、C 后端自举、MIR differential、rls 快速通道。
+- 基线用 gate 的 g1 重录 **147 targets / 297 entries**，回验 **297 份逐字节相同**。
+- 种子体检通过（B4b 那颗种子就能编译 B5a 的 src）⇒ 未刷新。
+
+### H.8 ⚠ 本批**不做**（留给 B5b / B5c / v2）
+
+| 项 | 归谁 | 理由 |
+|---|---|---|
+| `var x = <call>;` 的**早期返回脱糖**（`if (tag != 0) return;` + 绑定 `val`） | B5b | A-38 的直通已让全部形态可用，早期返回只是**语法糖**（语义等价）；且与 A-33 的 `trap` 脱糖共用机制 |
+| @main 之外由**运行时接手**（A-19：打印 + 非零退出码） | B5c | 当前 @main 里写 `.abort` 仍报 E768（位置② 禁用）；A-36 已保证 @main **不被推导**，不会破坏入口 |
+| 跨组合并 / tag 重映射 | v2 | A-37 明确定为 v1 不做 |
+| `.tlib` 摘要基础设施 | 不需要 | A-39：推导在单文件内闭环，`.tlib` 承载的是**推导后**的签名 |
+
+### H.9 ⭐⭐ 踩点预警（写码前必读）
+
+- ⭐ **回填必须在 `hir_build` 之前**：`run_check` 里 17900 行的 `hir_build` 在 `run_passes` 之后 ⇒
+  改 CST 的 `FuncDecl.na` 即可被后续 HIR 自动反映；**但 TI 侧要同时改 `tif_ret`**，二者缺一必不一致。
+- ⭐ **预扫时符号表只有注册态**：`tif_ret` 已有值（register 急切解析），但推导结果尚未写入 ⇒ 这正是 N6 不动点存在的理由。
+- ⭐ 探针 P1/P3/P4 通过 **`trap` 侧的 E765 会自然消失**（p4 的返回类型变成载体），**不要**在 `trap` 里加豁免分支。

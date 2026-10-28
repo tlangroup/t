@@ -1,0 +1,44 @@
+// EXPECT: pass
+// B5a / A-38：非 return 位置的传播在 v1 走**直通**语义 ——
+// `var f = <会抛的调用>;` 里 f 的类型就是载体，`return f` 原样交出 ⇒ 传播天然成立。
+
+struct User {
+    age: i64;
+    name: string;
+}
+
+fault UserErr over User {
+    .{ .age < 0 }   -> UserErr.AgeNegative repairs { .use_default, .clamp };
+    .{ .name = "" } -> UserErr.NameEmpty    repairs { .anon };
+}
+
+fn validate(u : User) fault(UserErr)!User {
+    if (u.age < 0) {
+        return Err(
+            @clause(.fault, .{ .age < 0 }, UserErr.AgeNegative)
+         ++ @clause(.repair, .use_default, fn () User { return User{ .age = 18i64, .name = u.name }; })
+         ++ @clause(.repair, .clamp,       fn () User { return User{ .age = 0i64,  .name = u.name }; })
+        );
+    }
+    if (u.name == "") {
+        return Err(
+            @clause(.fault, .{ .name = "" }, UserErr.NameEmpty)
+         ++ @clause(.repair, .anon, fn () User { return User{ .age = u.age, .name = "anon" }; })
+        );
+    }
+    return Ok(u);
+}
+
+fn pass_var(u : User) User {
+    var f = validate(u);
+    return f;
+}
+
+fn main_fn() i32 @main {
+    var x : User = trap pass_var(User{ .age = 3i64, .name = "" }) {
+        .{ .age < 0 }   => resume(.clamp);
+        .{ .name = "" } => resume(.anon);
+    };
+    println(i2s(x.age));
+    return 0;
+}

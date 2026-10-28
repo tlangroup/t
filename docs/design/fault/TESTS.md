@@ -78,7 +78,16 @@
 | `examples/faulttrap_demo.tc` + `.expected.txt` | **消费侧运行期行为**（25 行）：位置②（clamp / `recover`）；位置① 全修三条路径（clamp / anon / 直通）；位置① `recover`；位置① `.abort` ⇒ 消费臂得 tag 0、未落臂成员原样上传得 tag 2 且槽位仍是组内绝对槽位 2；**跨函数链路**（内层 `.abort` 上传 ⇒ 外层 `trap` 消费，可三层叠加，recover 与 resume 混用）。⚠ 一律「先落局部变量再读字段」（既有缺口 G-5） | B4b | ✅ 双后端逐字节一致 |
 | 待补 | 谓词规范化后跨位置恒等（raise ↔ 组声明 ↔ trap 臂，A-25 折叠）—— 已由 E756/E766 在编译期覆盖 | B4b | ✅（编译期）|
 | `examples/faulttrap_demo.tc` ⑦⑧⑨⑩ | **跨函数链路的运行期部分**：内层 `.abort` 上传 ⇒ 外层 `trap` 消费（可三层叠加、`recover` 与 `resume` 混用）；内层已修好时外层不落臂直接取 `val` | B4b | ✅ 双后端逐字节一致 |
-| 待补 | 跨函数**编译期**可达集 R-3（未上传的 repair 可被静态判定 + 诊断） | B5 | ⬜ |
+| `pass/p_fault_escape_return.tc` | **A-36 推导①**：非 `pub` + 未声明，`return <会抛的调用>` 直通 ⇒ 推导出的签名对调用者可见（调用点可直接 `trap`） | B5a | ✅ |
+| `pass/p_fault_escape_var.tc` | **A-38 推导②**：非 return 位置 `var f = <会抛的调用>` 走直通传播 | B5a | ✅ |
+| `pass/p_fault_escape_abort.tc` | **A-36 推导③**：带 `.abort` 的 `trap` 也能推导 ⇒ 不写 `fault(E)!T` 时不再报 T-MAT-E768 | B5a | ✅ |
+| `pass/p_fault_group_two.tc` | ⭐⭐ **B1 既有缺口的回归**：一文件两个组（且刻意同名修法 `.clamp`）⇒ 第二组的修法全部可查 | B5a | ✅ |
+| `fail/f_fault_escape_pub_needs_decl.tc` | A-36 边界：`pub fn` 逃逸必须显式声明（T-MAT-E772）。⚠ 刻意**不调用**它 ⇒ 只有 1 条诊断，无派生噪声 | B5a | ✅ |
+| `fail/f_fault_escape_multi_group.tc` | A-37：同时暴露两个组 ⇒ T-MAT-E773（v1 不支持跨组 tag 重映射）。同理刻意不调用 | B5a | ✅ |
+| `examples/faultescape_demo.tc` + `.expected.txt` | **推导的运行期行为**（双后端逐字节）：直通 / 直通传播 / 三层链路 / 内层已修好取 `val` / **两组共存**。`0/bob 3/anon 3/anon 0/bob 200/old` | B5a | ✅ 双后端逐字节一致 |
+| 待补 | **早期返回脱糖**（`var x = <call>;` ⇒ `if (tag != 0) return;` + 绑定 `val`） | B5b | ⬜ A-38 的直通已够用 |
+| 待补 | @main 之外由运行时接手（A-19 落地：打印 + 非零退出码） | B5c | ⬜ |
+| 待补 | 跨函数**编译期**可达集（未上传的 repair 可被静态判定 + 诊断） | B6 | ⬜ |
 
 `predpat_demo` 的期望输出（12 行）：`-1 1 0 9 0 0 7 5 0 3 2 1`
 ——其中 **0 是刻意设计的「不该命中」分支**，命中即说明谓词或分派写反。
