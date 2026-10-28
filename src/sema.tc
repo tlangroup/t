@@ -10817,11 +10817,15 @@ pub var g_fgrp_over: []i64;         // `over T` 的 TI
 pub var g_fgrp_slot_n: []i64;       // N：组内 repair 槽位总数
 pub var g_fgrp_mem_begin: []i64;    // 成员区间起点（g_fmem_* 下标）
 pub var g_fgrp_mem_cnt: []i64;      // 成员个数
+// B5a：登记该组的**声明节点**。用于让 `check_fault_decl` 幂等 —— 逃遥 pass 先登记一遍、
+// 检查循环再来一次是**设计内**的两趟；只有「另一处声明撞了同一个组名」才是真重复（E739）。
+pub var g_fgrp_decl: []i64;
 
 pub var g_fmem_group: []i64;        // 所属组
 pub var g_fmem_name: []string;      // 成员名
 pub var g_fmem_tag: []i64;          // 运行期 tag（0 保留给 Ok，成员从 1 起）
-pub var g_fmem_slot: []i64;         // 槽位基址
+pub var g_fmem_slot: []i64;         // 组内槽位基址（字段名 r<slot>，每组从 0 起）
+pub var g_fmem_rep_begin: []i64;    // 该成员的 repair 在 g_frep_* 表中的起始下标（查表用，跨组唯一）
 pub var g_fmem_nrep: []i64;         // 该成员的 repair 数
 pub var g_fmem_pred: []i64;         // 谓词节点（struct_lit）
 
@@ -10850,14 +10854,22 @@ pub fn fault_member_find(g: i64, mname: string) i64 {
     return -1;
 }
 
-// 取 `(组, 成员, 修法名)` 对应的绝对槽位；不存在返回 -1（B4 的 `resume` 消费）。
+// 取 `(组, 成员, 修法名)` 对应的槽位；不存在返回 -1（B4 的 `resume` 消费）。
+// ⭐⭐ **两套编号必须分开**（B5a 探针实测出的 B1 既有缺口，改动前的 g1 同样复现）：
+//   · `g_fmem_slot[m]` 是**组内槽位号**（A-32 载体的字段名 `r<slot>`，每组从 0 起）；
+//   · `g_frep_*` 的下标是**全局 append 序**（跨组共享一张表）。
+//   二者只在「全文件只有一个组、且该组恰是最先登记的」时相等 —— 一旦同文件出现第二个组，
+//   第二组的成员会拿组内槽位号 0 去查 repair 表，查到的是**第一组的修法名** ⇒
+//   E757「修法 X 不属于故障成员 Y」（第二组的所有修法全部查不到）。
+//   ⇒ 查表用 g_fmem_rep_begin（frep 表下标），返回用 g_fmem_slot（组内槽位号）。
 pub fn fault_repair_slot(m: i64, rname: string) i64 {
-    if (m < 0 or m >= slice_len(g_fmem_slot) as i64) { return -1; }
-    var b: i64 = g_fmem_slot[m];
+    if (m < 0 or m >= slice_len(g_fmem_rep_begin) as i64) { return -1; }
+    var rb: i64 = g_fmem_rep_begin[m];      // 查表：frep 表下标
+    var sb: i64 = g_fmem_slot[m];           // 返回：组内槽位号（字段名 r<slot>）
     var n: i64 = g_fmem_nrep[m];
     var i: i64 = 0;
     while (i < n) {
-        if (g_frep_name[b + i] == rname) { return b + i; }
+        if (g_frep_name[rb + i] == rname) { return sb + i; }
         i = i + 1;
     }
     return -1;
@@ -11522,7 +11534,11 @@ pub fn trap_pos_err(e: i64) void {
 
 pub fn check_fault_decl(d: i64) void {
     var gname: string = base.node_sa((d as u64));
-    if (fault_group_find(gname) >= 0) {
+    var exg: i64 = fault_group_find(gname);
+    if (exg >= 0) {
+        // B5a：同一节点被登记两趟（逃遥 pass + 检查循环）是设计内的 ⇒ 静默返回，
+        // 否则第二趟会把刚登记好的自己报成「组已声明」。真重复声明（另处节点）照旧报 E739。
+        if (g_fgrp_decl[exg] == d) { return; }
         parse.fc_err("T-CLA-E739", base.sb_cat3("故障组 `", gname, "` 已声明"), d);
         return;
     }
@@ -11538,6 +11554,7 @@ pub fn check_fault_decl(d: i64) void {
     append(g_fgrp_slot_n, 0);
     append(g_fgrp_mem_begin, slice_len(g_fmem_name) as i64);
     append(g_fgrp_mem_cnt, 0);
+    append(g_fgrp_decl, d);
 
     var ms: []i64 = base.kids_chain(base.node_la((d as u64)));
     var mi: i64 = 0;
@@ -11553,6 +11570,7 @@ pub fn check_fault_decl(d: i64) void {
     var rs: []i64;
     var ri: i64 = 0;
     var rname: string = "";
+    var rbeg: i64 = 0;
     var rj: i64 = 0;
     var midx: i64 = -1;
     var slot_base: i64 = 0;
@@ -11591,6 +11609,7 @@ pub fn check_fault_decl(d: i64) void {
         // ④ repair 名登记 + 成员内唯一（A-11；不同成员允许同名）
         rs = base.kids_chain(base.node_la((mn as u64)));
         slot_base = nslot;
+        rbeg = slice_len(g_frep_name) as i64;
         midx = slice_len(g_fmem_name) as i64;
         ri = 0;
         while (ri < slice_len(rs) as i64) {
@@ -11609,6 +11628,7 @@ pub fn check_fault_decl(d: i64) void {
             ri = ri + 1;
         }
         append(g_fmem_group, g);
+        append(g_fmem_rep_begin, rbeg);
         append(g_fmem_name, mname);
         append(g_fmem_tag, mi + 1);
         append(g_fmem_slot, slot_base);
@@ -17743,6 +17763,259 @@ pub fn passes_has(name: string) bool { return passes_find(name).name != ""; }
 //   run_check 内自动调度（auto_run=true）： mark_call_callees → mb_pass → meta_pass
 //   run_check 外由 src/tc.tc 显式调度（auto_run=false）：comptime_fold_pass → ann_pass
 // 顺序与 run_check / src/tc.tc 原硬编码逐点相同 ⇒ 行为等价（run_passes 只跑 auto_run 子集）。
+// ── B5a · 跨函数可达故障集（R-3 / A-36 / A-37）────────────────────────
+// 非 `pub` 函数可以省略 `fault(E)!T`：本 pass 按调用图把「逃逸故障集」算到不动点，
+// 再把该函数的返回类型回填成组载体 `__fault_<E>`（A-32）。
+//
+// ⚠ 时机（附录 H.6）：必须在 `run_passes` 内、且在 `hir_build` 与检查循环**之前**
+//   ⇒ 推导结果对 check 全程可见 ⇒ `trap` 侧的 E765 / E768 **自动放行**（它们的判据
+//   就是「当前函数返回类型是否为载体」）⇒ **trap 与 raise 的逻辑一行都不用改**。
+// ⚠ A-37：v1 只支持单组。跨组上传必须重映射 tag/槽位，会破坏 R-2 的零 shim 性质
+//   （B4b 的跨函数链路正依赖内外层 tag 空间一致）⇒ 多组一律报 E773，不做重映射。
+// ⚠ A-36 的例外：@main 不推导（A-19：到 main 之外由运行时接手；改成载体会破坏入口）。
+
+pub var g_fe_node: []i64;     // FuncDecl 节点
+pub var g_fe_fti: []i64;      // 函数 TI（tif_ret 下标）
+pub var g_fe_pub: []bool;     // `pub fn`（字面写了 pub ⇒ 必须显式声明，A-4）
+pub var g_fe_main: []bool;    // @main 入口（不推导）
+pub var g_fe_decl: []bool;    // 返回类型已是载体（显式声明过）⇒ 不参与推导
+pub var g_fe_grp: []i64;      // 推导出的组（-1 = 无）
+pub var g_fe_multi: []bool;   // 逃逸了 ≥2 个不同组（A-37）
+pub var g_fe_g1: []i64;       // E773 文案用：撞上的前两个组
+pub var g_fe_g2: []i64;
+pub var g_fe_wg: i64;         // 本轮走出的第一个组
+pub var g_fe_wg2: i64;        // 本轮走出的第二个（仅用于 E773 文案）
+pub var g_fe_wmulti: bool;
+pub var g_fe_inerr: i64;      // 嵌套在 `Err(...)` 内的深度（只认 Err 里的 .fault 子句）
+pub var g_fe_cons: bool;      // 当前节点是被「无 .abort 的 trap」消费的 scrutinee
+
+// 收集一个新组：只保「单组 or 多组」的二元状态，不存列表（A-37 的直接后果）。
+fn fault_esc_seen(g: i64) void {
+    if (g < 0) { return; }
+    if (g_fe_wg < 0) { g_fe_wg = g; return; }
+    if (g_fe_wg == g) { return; }
+    if (g_fe_wg2 < 0) { g_fe_wg2 = g; }
+    g_fe_wmulti = true;
+}
+
+// 取调用点目标的「当前返回类型所对应的组」（-1 = 不是载体）。
+// ⚠ 读的是**当前** tif_ret ⇒ 上一轮刚推导出来的结果本轮就能看到，这是不动点的动力来源。
+fn fault_esc_callee_group(c: i64) i64 {
+    var ce: i64 = base.node_na((c as u64));
+    if (ce < 0) { return -1; }
+    if (base.node_kind((ce as u64)) != "ident") { return -1; }
+    var si: i64 = sym_lookup(global_scope, base.node_sa((ce as u64)));
+    if (si < 0) { return -1; }
+    var ti: i64 = syms[si].ti;
+    if (ti < 0) { return -1; }
+    if (tip_kind(ti) != "Func") { return -1; }
+    if (ti >= slice_len(tif_ret) as i64) { return -1; }
+    return fault_struct_group_of(tif_ret[ti]);
+}
+
+// `trap` 臂里 `.abort` 的条数（A-19：有它 ⇒ 载体继续上传 ⇒ 不计入「已消费」）。
+fn fault_esc_trap_abort(tp: i64) i64 {
+    var nab: i64 = 0;
+    var ks: []i64 = base.kids_chain_idx(base.node_la((tp as u64)));
+    var i: i64 = 0;
+    while (i < slice_len(ks) as i64) {
+        var a: i64 = base.kids[ks[i]].val;
+        if (a >= 0) {
+            var body: i64 = base.node_nc((a as u64));
+            if (body >= 0 and base.node_kind((body as u64)) == "call") {
+                var cal: i64 = base.node_na((body as u64));
+                if (cal >= 0 and base.node_kind((cal as u64)) == "ident") {
+                    if (base.node_sa((cal as u64)) == "resume") {
+                        var aks: []i64 = base.kids_chain_idx(base.node_la((body as u64)));
+                        if (slice_len(aks) as i64 >= 1) {
+                            var a1: i64 = base.kids[aks[0]].val;
+                            if (a1 >= 0 and base.node_kind((a1 as u64)) == "member") {
+                                if (base.node_sa((a1 as u64)) == "abort") { nab = nab + 1; }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return nab;
+}
+
+fn fault_esc_walk_list(head: i64) void {
+    if (head < 0) { return; }
+    var ks: []i64 = base.kids_chain_idx(head);
+    var i: i64 = 0;
+    while (i < slice_len(ks) as i64) {
+        fault_esc_walk(base.kids[ks[i]].val);
+        i = i + 1;
+    }
+}
+
+fn fault_esc_walk(e: i64) void {
+    if (e < 0) { return; }
+    var k: string = base.node_kind((e as u64));
+    // H.5：只认「trap 的直接 scrutinee」被消费；臂体是 repair 闭包，由**抛出点**注册，
+    // 不属本函数的逃逸集（否则 `trap g(x)` 会把 g 的组算漏/算重，取决于遍历顺序）。
+    // ⭐ 陷阱（实测踩中）：trap 节点的 kind **不是** "trap" —— 它复用 `match` 节点、
+    //   靠 `sc == "__trap__"` 标记（见 trap_node_is）。按字面猜 "trap" 会**恒不匹配**，
+    //   结果是所有 trap 的 scrutinee 都被当成「未被消费」⇒ 穷尽 trap 的函数也被误推导。
+    if (trap_node_is(e)) {
+        if (fault_esc_trap_abort(e) == 0) { g_fe_cons = true; }
+        fault_esc_walk(base.node_na((e as u64)));
+        g_fe_cons = false;
+        return;
+    }
+    // lambda 体属于另一个函数（闭包自己的逃逸集），不并进外层
+    if (k == "lambda") { return; }
+    // `.fault` 子句 ⇒ 直接取组；`.repair` 的闭包体不参与（同 lambda 的理由）
+    if (k == "clause") {
+        if (base.node_sa((e as u64)) == "fault" and g_fe_inerr > 0) {
+            var full: i64 = base.node_nc((e as u64));
+            if (full >= 0 and base.node_kind((full as u64)) == "member") {
+                fault_esc_seen(fault_group_find(base.node_sa((base.node_na((full as u64)) as u64))));
+            }
+        }
+        return;
+    }
+    if (k == "call") {
+        // ⚠ 调用名在 **na 指向的 ident 的 sa**，不在 call 节点自己的 sa
+        //   （与 fault_raise_try 判别 Ok/Err 的方式一致）。
+        var cname: string = "";
+        var cal0: i64 = base.node_na((e as u64));
+        if (cal0 >= 0 and base.node_kind((cal0 as u64)) == "ident") {
+            cname = base.node_sa((cal0 as u64));
+        }
+        if (cname == "Err") {
+            // 只走实参链（`c1 ++ c2` 也是 la 里的 Concat 二元）
+            g_fe_inerr = g_fe_inerr + 1;
+            fault_esc_walk_list(base.node_la((e as u64)));
+            g_fe_inerr = g_fe_inerr - 1;
+            return;
+        }
+        if (g_fe_cons == true) { g_fe_cons = false; } else { fault_esc_seen(fault_esc_callee_group(e)); }
+    }
+    fault_esc_walk(base.node_na((e as u64)));
+    fault_esc_walk(base.node_nb((e as u64)));
+    fault_esc_walk(base.node_nc((e as u64)));
+    fault_esc_walk(base.node_nd((e as u64)));
+    fault_esc_walk_list(base.node_la((e as u64)));
+    fault_esc_walk_list(base.node_lb((e as u64)));
+    fault_esc_walk_list(base.node_lc((e as u64)));
+}
+
+pub fn fault_escape_pass() void {
+    // ① 组必须先于逃逸分析登记：`check_fault_decl`（填 g_fgrp_*）原本只在**检查循环**里
+    //    被调用（11652 行）⇒ 若不做这一步，本 pass 看到的 g_fgrp_name 恒空，全部推导落空。
+    //    幂等由 `check_fault_decl` 开头的「同节点已登记 ⇒ 直接返回」保证（重复声明 E739 仍报）。
+    var nd: i64 = slice_len(lex__decl_list) as i64;
+    var di: i64 = 0;
+    while (di < nd) {
+        var dd: i64 = lex__decl_list[di];
+        if (base.node_kind((dd as u64)) == "FaultDecl") { check_fault_decl(dd); }
+        di = di + 1;
+    }
+
+    // ② 建表（只收 FuncDecl）
+    g_fe_node = [];
+    g_fe_fti = [];
+    g_fe_pub = [];
+    g_fe_main = [];
+    g_fe_decl = [];
+    g_fe_grp = [];
+    g_fe_multi = [];
+    g_fe_g1 = [];
+    g_fe_g2 = [];
+    var i: i64 = 0;
+    while (i < nd) {
+        var d: i64 = lex__decl_list[i];
+        if (base.node_kind((d as u64)) == "FuncDecl") {
+            var fti: i64 = -1;
+            var si: i64 = sym_lookup(global_scope, base.node_sa((d as u64)));
+            if (si >= 0) { fti = syms[si].ti; }
+            var isfn: bool = false;
+            if (fti >= 0) {
+                if (tip_kind(fti) == "Func") {
+                    if (fti < slice_len(tif_ret) as i64) { isfn = true; }
+                }
+            }
+            append(g_fe_node, d);
+            append(g_fe_fti, fti);
+            append(g_fe_pub, base.node_bc((d as u64)));
+            append(g_fe_main, parse.ann_find(base.node_la((d as u64)), "main") >= 0);
+            if (isfn) {
+                append(g_fe_decl, fault_struct_group_of(tif_ret[fti]) >= 0);
+            } else {
+                append(g_fe_decl, true);
+            }
+            append(g_fe_grp, -1);
+            append(g_fe_multi, false);
+            append(g_fe_g1, -1);
+            append(g_fe_g2, -1);
+        }
+        i = i + 1;
+    }
+
+    // ③ 不动点：esc(f) = raise(f) ∪ ⋃ esc(callee)。返回类型就地回填 ⇒ 下一轮立即可见。
+    //    集合只增不减 ⇒ 必然收敛；递归/互递归靠「单调增长」自然终止（轮数上限只是保险）。
+    var m: i64 = slice_len(g_fe_node) as i64;
+    var round: i64 = 0;
+    var changed: bool = true;
+    while (changed == true and round < 64) {
+        changed = false;
+        round = round + 1;
+        var j: i64 = 0;
+        while (j < m) {
+            if (g_fe_decl[j] == false and g_fe_main[j] == false) {
+                g_fe_wg = -1;
+                g_fe_wg2 = -1;
+                g_fe_wmulti = false;
+                g_fe_inerr = 0;
+                g_fe_cons = false;
+                fault_esc_walk(g_fe_node[j]);
+                if (g_fe_wmulti == true) {
+                    if (g_fe_multi[j] == false) { g_fe_multi[j] = true; changed = true; }
+                    if (g_fe_g1[j] < 0) { g_fe_g1[j] = g_fe_wg; }
+                    if (g_fe_g2[j] < 0) { g_fe_g2[j] = g_fe_wg2; }
+                } else {
+                    if (g_fe_wg != g_fe_grp[j]) { g_fe_grp[j] = g_fe_wg; changed = true; }
+                }
+                // 推导结果**就地**落地，让本轮后面的函数（以及下一轮）立刻看到
+                if (g_fe_multi[j] == false and g_fe_grp[j] >= 0 and g_fe_pub[j] == false) {
+                    if (g_fe_decl[j] == false) {
+                        var cti: i64 = ti_named("Struct", base.sb_cat2("__fault_", g_fgrp_name[g_fe_grp[j]]));
+                        if (g_fe_fti[j] >= 0 and g_fe_fti[j] < slice_len(tif_ret) as i64) {
+                            tif_ret[g_fe_fti[j]] = cti;
+                        }
+                        base.node_set_na((g_fe_node[j] as u64), mk_type_node_from_ti(cti));
+                    }
+                }
+            }
+            j = j + 1;
+        }
+    }
+
+    // ④ 诊断（推导本身已在 ③ 落地；这里只报「推导不了」的两种）
+    var k2: i64 = 0;
+    while (k2 < m) {
+        if (g_fe_decl[k2] == false and g_fe_main[k2] == false) {
+            var fname: string = base.node_sa((g_fe_node[k2] as u64));
+            if (g_fe_multi[k2] == true) {
+                var mmsg: string = base.sb_cat6("函数 `", fname, "` 同时暴露 `",
+                    g_fgrp_name[g_fe_g1[k2]], "` 与 `", g_fgrp_name[g_fe_g2[k2]]);
+                parse.fc_err("T-MAT-E773", mmsg + "` 的故障（v1 只支持单组）—— 请把它们合并成一个组",
+                    g_fe_node[k2]);
+            } else if (g_fe_grp[k2] >= 0 and g_fe_pub[k2] == true) {
+                parse.fc_err("T-MAT-E772",
+                    base.sb_cat5("`pub` 函数 `", fname, "` 会抛出 `",
+                        g_fgrp_name[g_fe_grp[k2]], "` ⇒ 必须显式写出它的故障组（A-4）"),
+                    g_fe_node[k2]);
+            }
+        }
+        k2 = k2 + 1;
+    }
+}
+
 pub fn passes_init() void {
     g_passes = [];
     var req0: []string = [];
@@ -17754,6 +18027,9 @@ pub fn passes_init() void {
     var reqC: []string = []; append(reqC, "meta_pass");
     var p4: Pass; p4.name = "comptime_fold_pass"; p4.stage = 1; p4.kind = PASS_TRANSFORM; p4.requires = reqC; p4.auto_run = false; register_pass(p4);
     var reqD: []string = []; append(reqD, "comptime_fold_pass");
+    var reqF: []string = []; append(reqF, "meta_pass");
+    // B5a：跨函数可达故障集。必须晚于 mb_pass/meta_pass（体已被改写），早于 hir_build。
+    var p5: Pass; p5.name = "fault_escape_pass"; p5.stage = 1; p5.kind = PASS_ANALYSIS; p5.requires = reqF; p5.auto_run = true; register_pass(p5);
     var reqE: []string = []; append(reqE, "comptime_fold_pass");
     var p6: Pass; p6.name = "ann_pass";           p6.stage = 1; p6.kind = PASS_TRANSFORM; p6.requires = reqE; p6.auto_run = false; register_pass(p6);
 }
@@ -17770,6 +18046,7 @@ pub fn run_passes() void {
         if (p.name == "mark_call_callees") { mark_call_callees(); }
         else if (p.name == "mb_pass") { mb_pass(); }
         else if (p.name == "meta_pass") { meta_pass(); }
+        else if (p.name == "fault_escape_pass") { fault_escape_pass(); }
         i = i + 1;
     }
 }

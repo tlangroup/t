@@ -116,6 +116,8 @@ static const DiagDef DIAG_DEFS[] = {
   { "T-MAT-E769", "error", "MAT", "", "TRAP_NONEXHAUSTIVE", "`trap` without `.abort` must cover every member of the fault group" },
   { "T-MAT-E770", "error", "MAT", "", "TRAP_REPAIR_SLOT", "repair name is not declared for the fault member of this trap arm" },
   { "T-MAT-E771", "error", "MAT", "", "TRAP_WILD_ONLY_ABORT", "the wildcard trap arm `_` accepts only `resume(.abort)`" },
+  { "T-MAT-E772", "error", "MAT", "", "FAULT_ESCAPE_PUB_NEEDS_DECL", "pub function can raise `<E>`; it must declare `fault(E)!T` explicitly" },
+  { "T-MAT-E773", "error", "MAT", "", "FAULT_ESCAPE_MULTI_GROUP", "function escapes faults of more than one group; v1 derivation supports a single group" },
   { "T-MAT-W744", "warning", "MAT", "T_MATCH_ARM_UNREACHABLE", "ARM_UNREACHABLE", "match arm is unreachable" },
   { "T-MAT-W761", "warning", "MAT", "T_MATCH_FLOAT_NAN_FOOTGUN", "FLOAT_NAN_FOOTGUN", "matching a float literal/range is unsafe: NaN never equals any value or range, so it silently falls through to a wildcard/default arm" },
   { "T-MOD-E550", "error", "MOD", "T_IMPORT_NOT_FOUND", "IMPORT_NOT_FOUND", "import target not found" },
@@ -223,7 +225,7 @@ static const DiagDef DIAG_DEFS[] = {
   { "T-VEC-W927", "warning", "VEC", "T_VECTOR_WIDER_THAN_NATIVE", "VECTOR_WIDER_THAN_NATIVE", "vector is wider than the native SIMD register and will be split" },
   { "T-VEC-W947", "warning", "VEC", "T_TILE_WIDER_THAN_NATIVE", "TILE_WIDER_THAN_NATIVE", "hardware tile is wider than the native SIMD register and will fall back to scalar loops" },
 };
-#define DIAG_COUNT 210
+#define DIAG_COUNT 212
 
 /* legacy (old semantic name) -> machine code alias table */
 static const struct { const char* legacy; const char* code; } DIAG_LEGACY[] = {
