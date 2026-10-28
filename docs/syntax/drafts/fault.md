@@ -482,7 +482,9 @@ fn main_fn() fault(FrameErr)!i32 @main {
 | **B2** | `PatternExpr` 放宽到关系表达式 + 嵌套 `FieldPath`；谓词规范化与恒等比较（D7）。⚠ **A-29：含值级 match 语义** ⇒ N4 / N6 不可省，且 A-16 成为真约束 | D3 / D7 | **否**（编译期活） |
 | **B3** | `@clause(.fault)` / `@clause(.repair)` 变体 + repair 名 → 槽位索引（R-2） | D1 / D4 | **否** |
 | **B4** | `trap` / `resume` / `recover` 脱糖为 `match` + 常量索引间接调用；组 → 生成**校验函数**（A-23：不是 `if` 链） | R-1（已实装，零新机制） | 否（复用 `CALL_IND`） |
-| **B5** | 跨函数可达故障集 / 可达 repair 分析，经 `.tlib` TIR 摘要 | R-3 | 否 |
+| **B5a** | **跨函数签名推导**：可达集不动点 + 返回类型回填 + `pub` 边界（A-36 / A-37） | R-3 | 否 | ✅ 已完成（附录 H） |
+| **B5b** | 早期返回脱糖（`var x = <call>;` ⇒ `if (tag != 0) return;`） | R-3 | 否 | ⬜ A-38 的直通已够用，此步是语法糖 |
+| **B5c** | @main 之外由运行时接手（A-19 的落地：打印 + 非零退出码） | A-19 | 否 | ⬜ |
 | **B6** | 门禁收口：conformance 用例 + examples golden 双后端 + 自举 + IR 快照重录 | 全部 | — |
 
 - **建议顺序**：B2 → B3 → B1 → B4 → B5。理由：B2/B3/B4 全在编译期、不碰后端，可先把语义跑通并产出 golden；B1 是唯一的大件（A-27 后降为「中」），放在通路验证之后改动更稳。
@@ -1266,7 +1268,38 @@ if (__tfv_N.tag == 2) { x = <recover 表达式>; }
 ⇒ 必须**逐调用点**判定，且只看直接父子关系（A-34 已限定 `trap` 只开 return / 初始化两个位置，
 被捕表达式恒是 `trap.na`，判据因此是结构性的、不靠名字）。
 
-### H.6 ⚠ 踩点预警（写码前必读）
+### H.6 ⭐⭐ 实际踩中的两处（都是「按字面猜节点形态」—— 与记忆里 4 次同族）
+
+| 现象 | 我猜的形态 | **真实形态** | 后果 |
+|---|---|---|---|
+| 所有穷尽 `trap` 的 scrutinee 被当成「未消费」⇒ 不该推导的函数被误推导（`p_fault_trap` 回归：4 条 E202） | kind == `"trap"` | **kind == `"match"` + `sc == "__trap__"`**（见 `trap_node_is`） | `g_fe_cons` 从未置位 ⇒ 逃逸集恒包含被捕者的组 |
+| 直接 raise 的函数推导不出组 | `Err(...)` 的调用名在 call 节点的 `sa` | 调用名在 **`na` 指向的 ident 的 `sa`**（与 `fault_raise_try` 判别 `Ok`/`Err` 同款） | `g_fe_inerr` 从未 > 0 ⇒ `.fault` 子句全部落空 |
+
+⇒ 通法：**先抄既有判别式的节点访问路径，再按它写**（`trap_node_is` / `fault_raise_try` 就是现成的答案），
+不要凭语法长相猜 kind 与槽位。
+
+### H.7 实测（B5a，2026-10-28）
+
+- `tc check src/tc.tc` **errors=0 / warnings=639**（+1 = 新变量 `reqF`，与既有 `reqA..reqE` 同款命名告警）
+- conformance **440 passed / 0 failed**（+4 pass / +2 fail：三个推导形态 + 两组回归 / E772 + E773）
+- `run_examples_tmir` **112 passed / 0 failed**；新 golden `examples/faultescape_demo` 双后端逐字节一致：
+  `0/bob 3/anon 3/anon 0/bob 200/old`（直通 / 直通传播 / 三层链路 / 内层已修好取 val / 两组共存）
+- ⭐⭐ **顺带修掉 B1 的既有缺口**：`fault_repair_slot` 把「组内槽位号」当 `g_frep_*` 表下标
+  ⇒ 一文件两个组时第二组的所有修法报 E757（**改动前的 g1 同样复现**，非 B5a 引入）。
+  修法：新增 `g_fmem_rep_begin` 专供查表，返回值仍用组内槽位号（`r<slot>` 字段名）。
+- 探针 P1~P4 的**现状**：P4（推导后 `trap` 可捕）首轮即通过；P1/P2/P3 首轮的 E202 全部落在
+  **main 没有消费载体**上 ⇒ 让 main `trap` 后三例全绿（P3 还需 main 用穷尽臂，位置② 禁 `.abort`）。
+
+### H.8 ⚠ 本批**不做**（留给 B5b / B5c / v2）
+
+| 项 | 归谁 | 理由 |
+|---|---|---|
+| `var x = <call>;` 的**早期返回脱糖**（`if (tag != 0) return;` + 绑定 `val`） | B5b | A-38 的直通已让全部形态可用，早期返回只是**语法糖**（语义等价）；且与 A-33 的 `trap` 脱糖共用机制 |
+| @main 之外由**运行时接手**（A-19：打印 + 非零退出码） | B5c | 当前 @main 里写 `.abort` 仍报 E768（位置② 禁用）；A-36 已保证 @main **不被推导**，不会破坏入口 |
+| 跨组合并 / tag 重映射 | v2 | A-37 明确定为 v1 不做 |
+| `.tlib` 摘要基础设施 | 不需要 | A-39：推导在单文件内闭环，`.tlib` 承载的是**推导后**的签名 |
+
+### H.9 ⭐⭐ 踩点预警（写码前必读）
 
 - ⭐ **回填必须在 `hir_build` 之前**：`run_check` 里 17900 行的 `hir_build` 在 `run_passes` 之后 ⇒
   改 CST 的 `FuncDecl.na` 即可被后续 HIR 自动反映；**但 TI 侧要同时改 `tif_ret`**，二者缺一必不一致。
