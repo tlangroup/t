@@ -5512,6 +5512,119 @@ pub fn parse_match_expr() i64 {
     return base.mk_match(mx_scrut, mx_head, mx_ti);
 }
 
+// ══════════════════════════════════════════════════════════════
+// fault B4b：`trap <e> { <臂> }` —— 故障消费（附录 E / A-33 / A-34）
+// ──────────────────────────────────────────────────────────────
+// 形态上与 `match (<e>) { <臂> }` 完全同构 ⇒ **复用 match / arm 节点**，不新增节点 kind
+//   ⇒ HIR 侧零改动（保住门禁「RAW 逃生舱合计 0」）。
+// 判别靠 match 节点的 **sc 侧表** == TRAP_MARK（sc 在 match 节点上无其他用途）。
+//
+// ⚠ A-20 说的是 trap 在**语义**上是错误专用关键词（不复用 match），不是词法关键字：
+//   `trap` / `resume` / `recover` 三者在 src/ lib/ examples/ tests/ 全仓 **0 命中**，
+//   故一律按「词文本 + 所在位置」识别，不动 lex 关键字表与 cstgen 节点清单。
+//
+// 臂文法（EBNF §4）：
+//   TrapArm:      ( PredPat | "_" ) "=>" ( ResumeExpr | RecoverExpr ) ","?
+//   ResumeExpr:   "resume"  "(" "." ident ")"      // `.abort` 亦走此形（A-21）
+//   RecoverExpr:  "recover" "(" Expr ")"
+// ══════════════════════════════════════════════════════════════
+
+pub fn trap_mark() string { return "__trap__"; }
+
+// 臂右端 `resume(.修法名)` / `recover(<expr>)`。
+// 二者都降为**普通 call 节点**（callee 是 ident("resume"/"recover")）：
+//   · 它们是**仅在 trap 臂内**合法的伪函数，sema 的 trap 脱糖会先把臂体摘出来再消解，
+//     绝不会走到 infer 的「调用函数 resume」路径 ⇒ 无需任何新节点。
+//   · 若用户真写了 `fn resume(...)`，那是他的函数，与本语法无关（A-35 的同款不冲突设计）。
+pub fn parse_trap_arm_body(ti_at: i64) i64 {
+    var kw: string = lex.cur_v();
+    lex.advance_i();                    // 消费 `resume` / `recover`
+    expect_tok("LParen");
+    var an: i64 = -1;
+    if (kw == "resume") {
+        if (lex.cur_t() == "Dot" and lex.peek_t(1) == "Identifier") {
+            lex.advance_i();                        // 消费 Dot
+            var ti_rn: i64 = lex.advance_i();       // 修法名
+            an = base.mk_member(lex.tk_v(ti_rn), -1, -1);
+            base.node_set_lb((an as u64), 1);       // 标记 leading-dot member（与 @clause(.repair, ...) 同形）
+            base.node_at(an, ti_rn);
+        } else {
+            parse_fatal_at("T-MAT-E762",
+                "`resume(...)` 的实参必须是 `.修法名` 形式（如 `resume(.use_default)`；上传写作 `resume(.abort)`）",
+                lex.pos);
+        }
+    } else {
+        an = parse_expr();
+    }
+    if (lex.cur_t() == "Comma") { lex.advance_i(); }   // 允许尾随逗号
+    expect_tok("RParen");
+    var ah: i64 = -1;
+    var at: i64 = -1;
+    at = base.list_push(ah, at, an);
+    if (ah < 0) { ah = at; }
+    return base.mk_call(base.mk_ident(kw, -1), ah, ti_at);
+}
+
+// 单条 trap 臂 ⇒ arm 节点（sa="" / ba=是否通配 / na=谓词(-1=通配) / nb=-1 / nc=臂体）
+pub fn parse_trap_arm() i64 {
+    var ta_ti: i64 = lex.pos;
+    var ta_pat: i64 = -1;
+    var ta_wild: bool = false;
+    // ⚠ 通配判定必须是 `Identifier + 词文本 "_"`，**不能**写 `lex.cur_t() == "_"`：
+    //   lexer **不产生** "_" 这个 token 类型（`_` 走标识符起始，is_ident_start 含 95）
+    //   ⇒ `cur_t() == "_"` 是恒假的死判据（与 `tip_is_flag()` 同款）。既有 parse.tc 里
+    //   939 / 5022 / 5328 / 5412 / 5433 等处仍留着这个形态，属历史遗留，勿照抄。
+    if (lex.cur_t() == "Identifier" and lex.cur_v() == "_") {
+        lex.advance_i();                        // 通配臂（A-21：右端只允许 resume(.abort)）
+        ta_pat = -1;
+        ta_wild = true;
+    } else {
+        var ta_sav: bool = g_in_match_pat;
+        g_in_match_pat = true;                  // 谓词位：让 parse_struct_lit 走谓词分支
+        ta_pat = parse_expr();
+        g_in_match_pat = ta_sav;
+        if (clause_pred_ok(ta_pat) == false) {
+            // ⚠ parse_fatal_at 收 **token 索引**，不是节点 id（实测传节点会被当 token 定位到
+            //   完全无关的源码位置，误导排查）。
+            parse_fatal_at("T-MAT-E759",
+                "trap 臂的谓词必须是 `.{ .字段 <op> 值, ... }` 形式（op 仅 `<` `>` `<=` `>=` `==` `!=`）",
+                ta_ti);
+        }
+    }
+    expect_tok("FatArrow");
+    var ta_body: i64 = -1;
+    if (lex.cur_t() == "Identifier" and (lex.cur_v() == "resume" or lex.cur_v() == "recover")
+        and lex.peek_t(1) == "LParen") {
+        ta_body = parse_trap_arm_body(ta_ti);
+    } else {
+        parse_fatal_at("T-MAT-E763",
+            "trap 臂的右端必须是 `resume(.修法名)` 或 `recover(<表达式>)`", lex.pos);
+    }
+    // 臂分隔符：逗号（match 惯例）与分号（与组声明 `.{...} -> ... repairs {...};` 同形）都收。
+    if (lex.cur_t() == "Comma" or lex.cur_t() == "Semicolon") { lex.advance_i(); }
+    return base.mk_arm("", ta_wild, ta_pat, -1, ta_body, ta_ti);
+}
+
+pub fn parse_trap_expr() i64 {
+    var tp_ti: i64 = lex.advance_i();           // 消费 `trap`
+    var tp_scrut: i64 = parse_expr();           // 被 trap 的表达式（在 `{` 处自然停手）
+    expect_tok("LBrace");
+    var tp_head: i64 = -1;
+    var tp_tail: i64 = -1;
+    while (lex.cur_t() != "RBrace" and lex.cur_t() != "Eof") {
+        var tp_a: i64 = parse_trap_arm();
+        // ⚠ 臂链的 head/tail 是 **kids 池 entry 索引**（list_push 的返回值），不是节点 id
+        //   （实测：直接拿节点 id 当链元会写坏链表 → t_slice_at 越界）。
+        var tp_e: i64 = base.list_push(tp_head, tp_tail, tp_a);
+        if (tp_head < 0) { tp_head = tp_e; }
+        tp_tail = tp_e;
+    }
+    expect_tok("RBrace");
+    var tp_m: i64 = base.mk_match(tp_scrut, tp_head, tp_ti);
+    base.node_set_sc((tp_m as u64), trap_mark());
+    return tp_m;
+}
+
 pub fn parse_primary() i64 {
     var t: string = lex.cur_t();
     // M-meta Phase D：编译期内建 `@name(...)`。`@` 在**表达式起始位**此前空闲
@@ -5528,6 +5641,12 @@ pub fn parse_primary() i64 {
         var ti_meta: i64 = lex.advance_i();
         var inner: i64 = parse_expr();
         return base.mk_comptime(inner, ti_meta);
+    }
+    // fault B4b：故障消费 `trap <e> { <臂> }`（附录 E / A-33）。
+    // ⚠ `trap` **不进 lex 关键字表**：全仓 0 命中，按「Identifier + 词文本 == "trap"」在
+    //   主表达式位识别即可。做成词法关键字会连累 HIR/cstgen 关键字清单，与收益不成比例。
+    if (t == "Identifier" and lex.cur_v() == "trap") {
+        return parse_trap_expr();
     }
     // Erlang 式原子字面量：`:name` → atom 节点（表达式位置的 `:` 此前未使用）
     if (t == "Colon") {

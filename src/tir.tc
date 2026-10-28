@@ -2715,7 +2715,13 @@ pub fn tir_emit_stmt(sid: i64) void {
     if (kd == "while") { tir_emit_while(sid); return; }
     if (kd == "for_each") { tir_emit_for_each(sid); return; }
     if (kd == "block") {
-        tir_blk_push();
+        // fault B4b 位置②：`var x : T = trap …;` 的脱糖产物块。它只是**一条语句的展开**，
+        //   不是新作用域 —— 其中声明的 x 必须对块外继续可见（A-34）。
+        //   ⚠ 若不特殊处理，本块的 push/pop 会把 x 登记在子深度，块外 `tir_find_local_idx`
+        //   的 `g_local_depths[i] <= g_blk_depth` 过滤就查不到它 ⇒ 被当成未定义全局，
+        //   链接期报 `undefined symbol: x`（实测）。bf 标记时跳过深度增减，产物变量留在父深度。
+        var tflat: bool = base.node_bf((sid as u64));
+        if (tflat == false) { tir_blk_push(); }
         var c: i64 = base.node_la((sid as u64));
         // S4 §4.6 Phase 3：链先物化再遍历 —— 纯读取循环，与原手写链遍历逐点同序
         var c_ks: []i64 = base.kids_chain(c);
@@ -2725,7 +2731,7 @@ pub fn tir_emit_stmt(sid: i64) void {
             tir_emit_stmt(c_kv);
             c_ki = c_ki + 1;
         }
-        tir_blk_pop();
+        if (tflat == false) { tir_blk_pop(); }
         return;
     }
     if (kd == "comptime_block") {
@@ -3338,6 +3344,20 @@ pub fn tir_emit_assign(sid: i64, est: i64) TirEmitRes {
                 }
             }
             var faddr: string = tir_member_addr(base.node_na((sid as u64)));
+            // ⭐ G-4（与 tir_emit_struct_lit 同因同解，见那里完整注释）：
+            //   `b.r0 = seven;` 的右值是**裸函数符号**，而 fn 类型字段的下游按 **TClosure\*** 消费
+            //   ⇒ 落槽前必须先包成 %TClosure 值。捕获型 lambda 的右值已是堆指针（非 '@' 开头），
+            //   判据天然只命中裸函数符号。
+            //   ⚠ 右值指令已在上方发射（本分支只是补一段闭包构造），故此处不重发右值。
+            if (str_len(rhs) >= 1 and rhs[0] == 64) {
+                // ⚠ 必须用 tir_member_expr_td（沿 member 链自解析），**不能**用 tir_expr_td /
+                //   tir_lhs_td：后者对 member 节点落到 meta_type_of_expr 兜底，拿不到字段真实 TD
+                //   （实测 `b.r0 = seven` 判不出 func ⇒ 不包闭包 ⇒ C 后端段错误）。
+                var mftd: i64 = tir_member_expr_td(pmnode);
+                if (mftd >= 0 and mftd < slice_len(sema.tds) as i64 and sema.tds[mftd].cat == "func") {
+                    rhs = tir_make_closure_value(rhs, "");
+                }
+            }
             if (faddr != "") {
                 tir_emit(TIRInst{ op: TIR_OP_STORE, st: ST_NONE, dst: tir_op(faddr), args: tir_a1(rhs), is_comment: false, line: g_cur_line, cmt: "" });
                 return TirEmitRes{ name: rhs, st: est };
@@ -5050,6 +5070,24 @@ pub fn tir_emit_struct_lit(e: i64) TirEmitRes {
             }
         } else {
             var fsr: TirEmitRes = tir_emit_expr(base.node_na((fc_kv as u64))); fs = fsr.name; fst = fsr.st;
+        }
+        // ⭐ G-4 修复：fn 类型字段的「裸函数符号」必须先包成 %TClosure 值再落槽。
+        //   形态：`Box{ .r0 = seven }` / `Box{ .r0 = fn(){...} }` —— 字段值是 `@fn`。
+        //   而该字段的下游消费方是「取字段值当 **TClosure\***，再 GEP 解包 field0/field1」
+        //   （结构体字段存的是 ptr，不是内联 TClosure）⇒ 存裸 code 必炸：
+        //     · LLVM 轨：`store i64 @fn` ⇒ clang「global variable reference must have
+        //       pointer type」→ 链接失败（改动前的编译器对普通 `P3{ .a = 5 }` 同款的标量字段才炸）；
+        //     · tmir-c 轨：字段里存裸 code ⇒ `b.r0()` 把函数机器码当 TClosure 结构读 → 段错误。
+        //   ⚠ 捕获型 lambda 已是闭包值（tir_emit_closure_make 产出的是堆指针，**不以 '@' 开头**）
+        //     ⇒ 判据「值以 '@' 开头」天然只命中裸函数符号，两类永不重叠。
+        //   ⚠ 与 %TClosure.field0 语义互斥：那里必须存**裸 code**（各后端按
+        //     g_ll_clofnslot / c_clo_code 判别），此处是 fn 类型字段，存闭包值。
+        if (str_len(base.node_sa((e as u64))) > 0 and str_len(fs) >= 1 and fs[0] == 64) {
+            var ftdc: i64 = tir_field_td(base.node_sa((e as u64)), base.node_sa((fc_kv as u64)));
+            if (ftdc >= 0 and ftdc < slice_len(sema.tds) as i64 and sema.tds[ftdc].cat == "func") {
+                fs = tir_make_closure_value(fs, "");
+                fst = tir_st_from_str("ptr<void>");
+            }
         }
         append(fnames, base.node_sa((fc_kv as u64)));
         append(fvals, fs);

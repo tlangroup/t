@@ -137,11 +137,19 @@ G-3（嵌套字段赋值）已用整结构体赋值绕开。
 | **D-12** | B4a | ⭐ **差点误判** `++` 不存在：它的 op 名是 **"Concat"**（B3 已为它加过 Concat 分支，见 D-4）。按字面量 `"++"` grep 得 0 命中 ⇒ 首版据此改用逗号实参 | 实现改为**同时**支持 `Err(c1 ++ c2 ++ c3)` 与 `Err(c1, c2, c3)`（递归展平 Concat 链）；golden 用设计稿的规范形态 `++`（`fault.md` §F.2） |
 | **D-13** | B4a | ⭐ `Ok` 必须**显式**写 `.tag = 0i64`，不能省略靠零初始化 | 为绕开 G-6（C 后端对缺失的**标量**字段会分配 0 字节缓冲并把指针当值用）；缺失聚合/指针字段无害（`fault.md` §F.2） |
 | **D-14** | B4a | ⭐ `base.kids_chain_idx(la)` 返回 **kids 链下标**，不是节点 id，须再取 `kids[i].val` | 首版三处直接把下标当节点 ⇒ `Err(...)` 的实参全被判成非 clause（`T-MAT-E754` 误报） |
-| **G-4** | B4a | ⚠ 既有缺口：**非捕获** lambda 当闭包值 ⇒ `store i64 @__lam_0, ptr %x`（全局引用非指针）链接失败；捕获了变量的 lambda 正常 | B4a 绕开（golden 的 repair 闭包都捕获了 `u`）；**B4b 的 `recover(e)` 合成闭包可能不捕获 ⇒ 必然撞它** |
+| **G-4** | B4a→B4b ✅ | ⚠ 既有缺口。⚠ **旧归因错误**：非捕获 lambda 与具名函数单独用都正常，真因是 **fn 类型的槽（struct 字段 / 变量）被写成裸函数符号**（`Box{ .r0 = seven }` / `b.r0 = seven` / `var f: fn()i64 = seven`）⇒ LLVM `store i64 @fn, ptr %x` 链接失败、C 轨把函数机器码当 TClosure 读 | 修在 **TIR 层**（`tir_emit_struct_lit` 具名字段 + `tir_emit_assign` member 分支）：判据「值以 `@` 开头 = 裸函数符号」⇒ `tir_make_closure_value` 包成 `%TClosure`。⚠ 后端层判别不可靠（fn 槽的 TIR 型是 `ptr<void>`，与 %TClosure 基址无从区分）⇒ 两轮后端层尝试均回退 |
 | **G-5** | B4a | ⚠ 既有缺口：从闭包调用结果**直接**读 string 字段（`g().name`）出空串且程序随后停住；i64 字段与非闭包的 `mk().n` 都正常 | golden 一律先落局部变量再读字段 |
 | **G-6** | B4a | ⚠ 既有缺口：**C 后端**对结构体字面量缺失的**标量**字段分配 0 字节缓冲 + 把指针当值 ⇒ `incompatible pointer to integer conversion` | B4a 靠补全 `tag` 绕开（不动后端）；普通 `P3{ .a = 5 }` 在改动前的编译器上同样炸 |
 | **D-10** | B1 | ⭐ **HIR 侧不是零改动**（推翻「附录 C P8」的预估）：`hir_lower_decl` 的 `else` 兜底给未知 kind 发 `HIR_OP_RAW`，而门禁 **「RAW 合计 0」是硬判据** ⇒ `examples/faultgroup_demo.tc` 1 处 RAW 让 gate L2 第 15 步 FAIL | 复用 `HIR_OP_TYPE_ALIAS_DECL` + 在 `check_decl_hir` 显式回落 `check_fault_decl`（`fault.md` §C.5 D-10 / D-11） |
 
+
+| **D-15** | B4b | ⭐ **A-33 的脱糖示意漏了 `Ok` 那层**：示意写 `return __fv1.r0()`，那只在「函数签名就是 `T`」时成立；有 `.abort` 臂时签名**必**是 `fault(E)!T`，不包会直接在 return 处报 T-SEM-E202 | 消费臂一律补 `Ok(<修复值>)` ⇒ 由 B4a 的 `fault_raise_ok` 就地改成 `__fault_<E>` struct_lit（`fault.md` §G.2） |
+| **D-16** | B4b | ⭐⭐ **`lex.cur_t() == "_"` 是恒假的死判据**：lexer 不产 `"_"` token 类型（`_` 走 is_ident_start）⇒ 通配臂 `_` 从未被识别，谓词位拿到 `ident("_")` 而报 E759。既有 `parse.tc` 的 939/5022/5328/5412/5433 等处仍是错形态 | 改为 `lex.cur_t() == "Identifier" and lex.cur_v() == "_"` |
+| **D-17** | B4b | ⭐ 位置② 的产物块**不能**是新作用域：TIR 的 `tir_find_local_idx` 用 `g_local_depths[i] <= g_blk_depth` 过滤 ⇒ 块内声明的 `x` 出块即查不到 ⇒ 被当未定义全局 ⇒ 链接期 `undefined symbol: x` | 产物块打 `bf=1`，`tir_emit_stmt` 的 block 分支据此跳过 `tir_blk_push/pop` |
+| **D-18** | B4b | 脱糖失败会挨**两条**诊断：具体码 + 一条误导的 E764（退回普通路径后由 infer 的 match 分支补发） | 发诊断时给 trap 节点打 `bc=1`，infer 的 match 分支见到 bc 即不补发 |
+| **D-19** | B4b | `parse_fatal_at(code, msg, ti)` 收 **token 索引**（且 `exit(1)`），传节点 id 会把诊断定位到完全无关的源码位置 | 一律传 token 索引 |
+| **D-20** | B4b | ⭐ **脱糖产物嵌套 ⇒ 后续 pass 不递归进入**：`fault_raise_try` 挂在语句分派位，只看顶层语句；if 分支内的 `return Ok(...)` 轮不到它 ⇒ `Ok` 原样走到后端（LLVM 类型不符 / C 报 `t_Ok` 未声明） | `Ok(...)` 在**脱糖当场**就地改写，不留给后续 pass |
+| **D-21** | B4b | `recover(e)` 直接脱糖成 `return e;` / `x = e`，**不合成闭包** | A-23 的「recover = resume(合成闭包)」只是语义等价说明；产物没必要造 thunk 再调用它，顺带彻底避开 G-4 |
 > ⚠ **编号口径（防文档骗人）**：本表 D-1…D-5 与 `fault.md` 同源；**D-6 / D-7 是本表自建编号**
 > （分别对应 `fault.md` §C.1 的 A-32 与 §C.5 的 G-1..G-3）。自 D-10 起**一律沿用 `fault.md` §C.5 的编号**，
 > 本表只做索引 —— 两处各编一套号必然出现「同一件事两个号」。
@@ -152,5 +160,9 @@ G-3（嵌套字段赋值）已用整结构体赋值绕开。
 
 - 语法权威：`docs/syntax/drafts/fault.md`
 - 测试矩阵：`docs/design/fault/TESTS.md`
-- 运行期 golden：`examples/predpat_demo.tc` + `.expected.txt`（B2）
-- 诊断用例：`tests/conformance/pass/p_predpat_hit_miss.tc`、`fail/f_predpat_nonrelop.tc`、`fail/f_predpat_scrutinee_expr.tc`（B2）
+- 运行期 golden：`examples/predpat_demo.tc` + `.expected.txt`（B2）、
+  `examples/faultraise_demo.tc`（B4a）、`examples/faulttrap_demo.tc`（B4b）
+- 诊断用例：`tests/conformance/pass/p_predpat_hit_miss.tc`、`fail/f_predpat_nonrelop.tc`、
+  `fail/f_predpat_scrutinee_expr.tc`（B2）；
+  `pass/p_fault_raise.tc` + `fail/f_fault_*.tc`（B4a）；
+  `pass/p_fault_trap.tc` + `fail/f_fault_trap_*.tc`（B4b，11 条覆盖 E759/E762…E771）

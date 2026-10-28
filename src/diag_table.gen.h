@@ -104,7 +104,18 @@ static const DiagDef DIAG_DEFS[] = {
   { "T-MAT-E756", "error", "MAT", "", "FAULT_ERR_MEMBER", "the raised fault member does not match the group declaration" },
   { "T-MAT-E757", "error", "MAT", "", "FAULT_ERR_REPAIR_SLOT", "repair name is not declared for the raised fault member" },
   { "T-MAT-E758", "error", "MAT", "", "FAULT_ERR_CLAUSE_KIND", "`Err(...)` accepts only `@clause(.fault, ...)` and `@clause(.repair, ...)`" },
+  { "T-MAT-E759", "error", "MAT", "", "TRAP_PRED_FORM", "trap arm pattern must be a predicate `.{ .field <op> value, ... }`" },
   { "T-MAT-E760", "error", "MAT", "T_MATCH_DUP_VALUE_ARM", "DUP_VALUE_ARM", "match arm covers a value already handled by an earlier arm (duplicate constant or overlapping range)" },
+  { "T-MAT-E762", "error", "MAT", "", "TRAP_RESUME_FORM", "`resume(...)` argument must be `.repair-name`（use `.abort` to propagate）" },
+  { "T-MAT-E763", "error", "MAT", "", "TRAP_ARM_BODY", "trap arm body must be `resume(.name)` or `recover(<expr>)`" },
+  { "T-MAT-E764", "error", "MAT", "", "TRAP_POSITION", "`trap` is only allowed in `return trap ...;` and `var x: T = trap ...;`" },
+  { "T-MAT-E765", "error", "MAT", "", "TRAP_NOT_FAULT", "`trap` scrutinee must have type `fault(E)!T`" },
+  { "T-MAT-E766", "error", "MAT", "", "TRAP_PRED_MEMBER", "trap arm predicate does not match any member of the fault group" },
+  { "T-MAT-E767", "error", "MAT", "", "TRAP_DUP_MEMBER", "trap arm covers a fault member already handled by an earlier arm" },
+  { "T-MAT-E768", "error", "MAT", "", "TRAP_ABORT_POSITION", "`resume(.abort)` requires `return trap ...;` in a `fault(E)!T` function" },
+  { "T-MAT-E769", "error", "MAT", "", "TRAP_NONEXHAUSTIVE", "`trap` without `.abort` must cover every member of the fault group" },
+  { "T-MAT-E770", "error", "MAT", "", "TRAP_REPAIR_SLOT", "repair name is not declared for the fault member of this trap arm" },
+  { "T-MAT-E771", "error", "MAT", "", "TRAP_WILD_ONLY_ABORT", "the wildcard trap arm `_` accepts only `resume(.abort)`" },
   { "T-MAT-W744", "warning", "MAT", "T_MATCH_ARM_UNREACHABLE", "ARM_UNREACHABLE", "match arm is unreachable" },
   { "T-MAT-W761", "warning", "MAT", "T_MATCH_FLOAT_NAN_FOOTGUN", "FLOAT_NAN_FOOTGUN", "matching a float literal/range is unsafe: NaN never equals any value or range, so it silently falls through to a wildcard/default arm" },
   { "T-MOD-E550", "error", "MOD", "T_IMPORT_NOT_FOUND", "IMPORT_NOT_FOUND", "import target not found" },
@@ -212,7 +223,7 @@ static const DiagDef DIAG_DEFS[] = {
   { "T-VEC-W927", "warning", "VEC", "T_VECTOR_WIDER_THAN_NATIVE", "VECTOR_WIDER_THAN_NATIVE", "vector is wider than the native SIMD register and will be split" },
   { "T-VEC-W947", "warning", "VEC", "T_TILE_WIDER_THAN_NATIVE", "TILE_WIDER_THAN_NATIVE", "hardware tile is wider than the native SIMD register and will fall back to scalar loops" },
 };
-#define DIAG_COUNT 199
+#define DIAG_COUNT 210
 
 /* legacy (old semantic name) -> machine code alias table */
 static const struct { const char* legacy; const char* code; } DIAG_LEGACY[] = {

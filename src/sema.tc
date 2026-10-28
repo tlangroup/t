@@ -7656,6 +7656,15 @@ pub fn infer_expr_body(e: i64) i64 {
     }
     // match 表达式（L-15）：分支结果类型统一 + when 守卫布尔显式 + 穷尽性
     if (k == "match") {
+        // fault B4b：`trap` 复用 match 节点（sc == "__trap__"）。A-34 只开 return / 初始化
+        //   两个位置，二者都在 cs_return / cs_var_decl 里先手脱糖；能走到这里说明它出现在
+        //   表达式位（实参、二元运算、裸语句…）一律拒绝。
+        //   ⚠ bc == 1 = 本 trap 已发过**具体**诊断（E762/E763/E765~E771 任一），此时
+        //     脱糖失败后退回的这条路径不得再补一条 E764，否则用户看到两条、其中一条误导。
+        if (base.node_sc((e as u64)) == "__trap__") {
+            if (base.node_bc((e as u64)) == false) { trap_pos_err(e); }
+            return ti_mk("Unknown");
+        }
         var m_scr: i64 = ie_sub(ei, 0, base.node_na((e as u64)));
         var m_res: i64 = -1;
         var m_irref: bool = false;
@@ -9655,6 +9664,8 @@ pub fn cs_block_node(s: i64) void {
 
 // 局部变量声明（var/const/let 统一路径）
 pub fn cs_var_decl(s: i64, init_i: i64) void {
+    // fault B4b：trap 侧脱糖（位置② `var x : T = trap <e> { … };`）。同 cs_return，须先于 infer。
+    if (trap_desugar_vardecl(s)) { trap_check_block(s); return; }
     // S3/Q1：持有 type 值的局部变量（var x: type = ...）→ 编译期绑定，代码期擦除（无运行期槽位）。
     // 初始化器须是编译期已知的类型值（裸类型名 / @type_val(...) 等）；变量本身登记进 g_cvar 表，
     // 供 comptime 上下文引用时由 meta_eval 解析为 type 值节点；双后端在 emit 时跳过其槽位分配。
@@ -9826,6 +9837,10 @@ pub fn cs_forin(s: i64, iter_i: i64, body_i: i64) void {
 
 // return 语句
 pub fn cs_return(s: i64, val_i: i64) void {
+    // fault B4b：trap 侧脱糖（位置① `return trap <e> { … };`）。
+    // ⚠ 必须在 infer **之前**改写：臂体的 `resume(...)` / `recover(...)` 是合成 call 节点，
+    //   一旦先走 infer 就会被当成对未声明函数 `resume` / `recover` 的调用（A-35）而报 T-SEM-E201。
+    if (trap_desugar_return(s)) { trap_check_block(s); return; }
     if (base.node_na((s as u64)) >= 0) {
         // fault B4a：raise 侧脱糖（`Ok(v)` / `Err(@clause(...), …)`）。
         // ⚠ 必须在 infer **之前**改写 —— 否则 `Ok` / `Err` 会先被当成对未声明函数的
@@ -11117,6 +11132,392 @@ pub fn fault_raise_try(e: i64, cur_ret: i64) void {
     if (fault_ctor_name_free(cname) == false) { return; }
     if (cname == "Ok") { fault_raise_ok(e, g); return; }
     fault_raise_err(e, g);
+}
+
+// ══════════════════════════════════════════════════════════════
+// fault B4b：`trap` / `resume` / `recover` 脱糖（附录 E / A-33 / A-34 / A-21）
+// ──────────────────────────────────────────────────────────────
+// **A-33**：`trap` 脱糖为「`var __tfv = <e>;` + **按 tag 的 if 链**」，
+//   **不是**单个 `match` 表达式。理由（F-4）：`.abort` 臂要 `return __tfv`
+//   （类型 `fault(E)!T`），其余臂要 `return __tfv.rK()`（类型 `T`），
+//   同一 `match` 的臂必须同型 ⇒ 装不下；if 链每支是独立 `return`，类型各归各位。
+//   ⚠ 代价：它要**插入语句**，B4a 的「就地改 kind」手法办不到 ⇒
+//     落点必须是语句分派位（`check_stmt_hir` / `check_stmt_cst`），见下方。
+// **A-34**（位置约束）
+//   | 位置 | `.abort` | 穷尽性 |
+//   |---|---|---|
+//   | `return trap <e> { … };` | ✅ ⇒ `return __tfv` | 有 `.abort` 时不要求 |
+//   | `var x : T = trap <e> { … };` | ❌ 报编译错 | **必须穷尽**组内全部成员 |
+// 全部产物是**既有节点**（var_decl / if / return / assignment / member / call / binary）
+//   ⇒ 判据仍是 L-04：不加新发射路径、不加新节点 kind。
+// ══════════════════════════════════════════════════════════════
+
+// `trap` 在 parse 期降为 `match` 节点 + sc 标记（与 parse.trap_mark 逐字一致）。
+pub fn trap_node_is(e: i64) bool {
+    if (e < 0) { return false; }
+    if (base.node_kind((e as u64)) != "match") { return false; }
+    return base.node_sc((e as u64)) == "__trap__";
+}
+
+pub var g_trap_mem: []i64;      // 臂落到的成员下标（-1 = 通配 abort 臂）
+pub var g_trap_slot: []i64;     // 修法槽位（recover / abort 为 -1）
+pub var g_trap_rec: []i64;      // `recover(<expr>)` 的表达式节点（-1 = 非 recover 臂）
+pub var g_trap_abort: []i64;    // 1 = 该臂上传（.abort）
+pub var g_trap_wild: []i64;     // 1 = 通配臂 `_`
+pub var g_trap_bad: i64;        // 1 = 本 trap 已发过诊断（不必继续走完）
+pub var g_trap_ti: i64;         // 被捕表达式的 TI（`__fault_<E>` 载体）
+
+fn trap_arm_add(m: i64, slot: i64, rec: i64, ab: i64, wd: i64) void {
+    append(g_trap_mem, m);
+    append(g_trap_slot, slot);
+    append(g_trap_rec, rec);
+    append(g_trap_abort, ab);
+    append(g_trap_wild, wd);
+}
+
+// 谓词 ⇒ 成员下标（A-2 / A-25 / A-22：须与组内声明规范化后恒等）
+fn trap_pred_member(p: i64, g: i64) i64 {
+    if (p < 0) { return -1; }
+    var b: i64 = g_fgrp_mem_begin[g];
+    var n: i64 = g_fgrp_mem_cnt[g];
+    var i: i64 = 0;
+    while (i < n) {
+        if (fault_pred_same(p, g_fmem_pred[b + i])) { return b + i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// 成员 m 是否已被更早的臂覆盖（后者永不生效）
+fn trap_has_mem(m: i64) bool {
+    var i: i64 = 0;
+    while (i < slice_len(g_trap_mem) as i64) {
+        if (g_trap_mem[i] == m) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn trap_arm_bad(code: string, msg: string, a: i64) void {
+    parse.fc_err(code, msg, a);
+    g_trap_bad = 1;
+}
+
+// 单条臂 ⇒ 追加到 g_trap_*；失败置 g_trap_bad（已发诊断）。
+fn trap_arm_scan(a: i64, g: i64) void {
+    var body: i64 = base.node_nc((a as u64));
+    var wild: i64 = 0;
+    if (base.node_ba((a as u64))) { wild = 1; }
+    var callee: i64 = -1;
+    if (body >= 0 and base.node_kind((body as u64)) == "call") { callee = base.node_na((body as u64)); }
+    if (callee < 0 or base.node_kind((callee as u64)) != "ident") {
+        trap_arm_bad("T-MAT-E763", "trap 臂的右端必须是 `resume(.修法名)` 或 `recover(<表达式>)`", a);
+        return;
+    }
+    var kw: string = base.node_sa((callee as u64));
+    // 实参链首（resume / recover 都只有一个实参；解析期已保证形态）
+    var a1: i64 = -1;
+    var ks: []i64 = base.kids_chain_idx(base.node_la((body as u64)));
+    if (slice_len(ks) as i64 >= 1) { a1 = base.kids[ks[0]].val; }
+    if (kw == "resume") {
+        if (a1 < 0 or base.node_kind((a1 as u64)) != "member") {
+            trap_arm_bad("T-MAT-E762",
+                "`resume(...)` 的实参必须是 `.修法名` 形式（如 `resume(.use_default)`；上传写作 `resume(.abort)`）", a);
+            return;
+        }
+        var rn: string = base.node_sa((a1 as u64));
+        if (rn == "abort") {
+            // A-19：`.abort` 只有一个语义 —— 原样上传给调用者
+            if (wild == 1) { trap_arm_add(-1, -1, -1, 1, 1); return; }
+            var ma: i64 = trap_pred_member(base.node_na((a as u64)), g);
+            if (ma < 0) {
+                trap_arm_bad("T-MAT-E766",
+                    "trap 臂的谓词与故障组声明不一致（A-22：v1 无简写，须与组内声明逐字对应）", a);
+                return;
+            }
+            if (trap_has_mem(ma)) {
+                trap_arm_bad("T-MAT-E767", "两条 trap 臂落到了同一个故障成员（后者永不生效）", a);
+                return;
+            }
+            trap_arm_add(ma, -1, -1, 1, 0);
+            return;
+        }
+        if (wild == 1) {
+            // A-21：通配臂只允许 `.abort`，不能用 `_` 吞掉未处理的故障
+            trap_arm_bad("T-MAT-E771",
+                "通配臂 `_` 的右端只允许 `resume(.abort)`（A-21：不可用通配吞掉未处理的故障）", a);
+            return;
+        }
+        var m: i64 = trap_pred_member(base.node_na((a as u64)), g);
+        if (m < 0) {
+            trap_arm_bad("T-MAT-E766",
+                "trap 臂的谓词与故障组声明不一致（A-22：v1 无简写，须与组内声明逐字对应）", a);
+            return;
+        }
+        if (trap_has_mem(m)) {
+            trap_arm_bad("T-MAT-E767", "两条 trap 臂落到了同一个故障成员（后者永不生效）", a);
+            return;
+        }
+        // A-26：修法名 → **编译期绝对槽位**（属成员，不是全局递增）
+        var slot: i64 = fault_repair_slot(m, rn);
+        if (slot < 0) {
+            trap_arm_bad("T-MAT-E770",
+                base.sb_cat5("修法 `.", rn, "` 不属于该臂落到的故障成员 `", g_fmem_name[m], "`"), a);
+            return;
+        }
+        trap_arm_add(m, slot, -1, 0, 0);
+        return;
+    }
+    if (kw == "recover") {
+        if (wild == 1) {
+            trap_arm_bad("T-MAT-E771",
+                "通配臂 `_` 的右端只允许 `resume(.abort)`（A-21：不可用通配吞掉未处理的故障）", a);
+            return;
+        }
+        var m2: i64 = trap_pred_member(base.node_na((a as u64)), g);
+        if (m2 < 0) {
+            trap_arm_bad("T-MAT-E766",
+                "trap 臂的谓词与故障组声明不一致（A-22：v1 无简写，须与组内声明逐字对应）", a);
+            return;
+        }
+        if (trap_has_mem(m2)) {
+            trap_arm_bad("T-MAT-E767", "两条 trap 臂落到了同一个故障成员（后者永不生效）", a);
+            return;
+        }
+        // ⭐ `recover(e)` **直接**脱糖成 `return e;`，不真的合成闭包。
+        //   A-23 的「recover(e) = resume(合成闭包 fn() T { return e; })」只是**语义等价**说明：
+        //   该臂的返回值与 `__tfv` 无关，直接返回即可。顺带避开 G-4（合成闭包若不捕获
+        //   任何变量，会撞上「非捕获 lambda 当闭包值」的既有后端缺口）。
+        trap_arm_add(m2, -1, a1, 0, 0);
+        return;
+    }
+    trap_arm_bad("T-MAT-E763", "trap 臂的右端必须是 `resume(.修法名)` 或 `recover(<表达式>)`", a);
+}
+
+// 发诊断 + 给 trap 节点打「已报过」标记（bc）。
+// ⚠ 没有这个标记，脱糖失败后会退回普通路径，由 infer_expr 的 match 分支再报一次
+//   T-MAT-E764（位置错）—— 用户看到的是「一条真诊断 + 一条误导的位置诊断」。
+fn trap_err(tp: i64, code: string, msg: string, at: i64) void {
+    parse.fc_err(code, msg, at);
+    base.node_set_bc((tp as u64), true);
+}
+
+// 解析全部臂 ⇒ 组下标；-1 = 已发诊断（或类型不是故障载体）。
+// ⚠ 这里对 scrutinee 做了一次 `infer_expr`，随后脱糖产物里的 `var __tfv = <scrut>` 会再
+//   推断一次 —— 与 desugar_value_loop（先推断 else/break 值再重走产物）同款既定做法。
+fn trap_collect(tp: i64) i64 {
+    var scrut: i64 = base.node_na((tp as u64));
+    g_trap_mem = [];
+    g_trap_slot = [];
+    g_trap_rec = [];
+    g_trap_abort = [];
+    g_trap_wild = [];
+    g_trap_bad = 0;
+    g_trap_ti = infer_expr(scrut);
+    var g: i64 = fault_struct_group_of(g_trap_ti);
+    if (g < 0) {
+        trap_err(tp, "T-MAT-E765",
+            base.sb_cat3("`trap` 只能捕 `fault(<组>)!<T>` 的表达式，实际类型是 `", ti_str(g_trap_ti), "`"),
+            scrut);
+        return -1;
+    }
+    var arms: []i64 = base.kids_chain(base.node_la((tp as u64)));
+    var i: i64 = 0;
+    while (i < slice_len(arms) as i64) {
+        trap_arm_scan(arms[i], g);
+        i = i + 1;
+    }
+    if (g_trap_bad != 0) {
+        // 臂级诊断（E762/E763/E766/E767/E770/E771）已在 trap_arm_scan 里发过，此处只补标记，
+        //   免得退回普通路径后再挨一条误导的 E764。
+        base.node_set_bc((tp as u64), true);
+        return -1;
+    }
+    return g;
+}
+
+// `__tfv.tag == <k>`（k 为成员的**运行期 tag**）
+fn trap_tag_eq(fv: string, k: i64) i64 {
+    var lit: i64 = base.mk_int(base.i2s(k), 10, -1);
+    base.node_set_sb((lit as u64), "i64");
+    return base.mk_binary("==",
+        base.mk_member("tag", base.mk_ident(fv, -1), -1), lit, -1);
+}
+
+// `__tfv.r<slot>()`
+fn trap_slot_call(fv: string, slot: i64) i64 {
+    var memb: i64 = base.mk_member(base.sb_cat2("r", base.i2s(slot)), base.mk_ident(fv, -1), -1);
+    return base.mk_call(memb, -1, -1);
+}
+
+// 穷尽性（无 `.abort` 时）：组内每个成员都至少被一条臂引用（A-15）。
+fn trap_exhaustive(g: i64, tp: i64) bool {
+    var b: i64 = g_fgrp_mem_begin[g];
+    var n: i64 = g_fgrp_mem_cnt[g];
+    var j: i64 = 0;
+    while (j < n) {
+        if (trap_has_mem(b + j) == false) {
+            trap_err(tp, "T-MAT-E769",
+                base.sb_cat3("`trap` 未覆盖故障成员 `", g_fmem_name[b + j],
+                    "`；没有 `resume(.abort)` 臂时必须覆盖组内全部成员（A-15）"), tp);
+            return false;
+        }
+        j = j + 1;
+    }
+    return true;
+}
+
+// ── 位置①：`return trap <e> { … };` ⇒ 就地改写成 block ──
+// 返回 false = 不是 trap（或已报错）⇒ 调用方退回普通路径。
+pub fn trap_desugar_return(s: i64) bool {
+    var tp: i64 = base.node_na((s as u64));
+    if (trap_node_is(tp) == false) { return false; }
+    var g: i64 = trap_collect(tp);
+    if (g < 0) { return false; }
+    var narm: i64 = slice_len(g_trap_mem) as i64;
+    var nab: i64 = 0;
+    var i: i64 = 0;
+    while (i < narm) { if (g_trap_abort[i] != 0) { nab = nab + 1; } i = i + 1; }
+    // A-19 + A-34：有上传臂 ⇒ 所在函数签名必须承载 `fault(E)!T`（否则无处可传）
+    if (nab > 0 and fault_struct_group_of(cur_ret) != g) {
+        trap_err(tp, "T-MAT-E768",
+            base.sb_cat5("带 `resume(.abort)` 的 `trap` 要求所在函数的返回值类型是 `fault(",
+                g_fgrp_name[g], ")!", ti_str(g_fgrp_over[g]), "`"), tp);
+        return false;
+    }
+    if (nab == 0 and trap_exhaustive(g, tp) == false) { return false; }
+    // 组装：var __tfv + 逐成员 if 链 + 尾 return
+    var fv: string = base.sb_cat2("__tfv_", base.i2s(tp));
+    var h: i64 = -1;
+    var t: i64 = -1;
+    var vd: i64 = base.mk_var_decl(fv, false, mk_type_node_from_ti(g_trap_ti),
+        base.node_na((tp as u64)), -1);
+    t = base.list_push(h, t, vd);
+    if (h < 0) { h = t; }
+    i = 0;
+    while (i < narm) {
+        if (g_trap_abort[i] == 0) {
+            var rv: i64 = -1;
+            if (g_trap_rec[i] >= 0) { rv = g_trap_rec[i]; } else { rv = trap_slot_call(fv, g_trap_slot[i]); }
+            if (nab > 0) {
+                // 有上传臂 ⇒ 所在函数签名是 `fault(E)!T`，修好的值 T 必须先装进 tag=0 的
+                //   载体（`Ok(v)`）才能与上传臂的 `return __tfv` 同型（A-19 + A-33）。
+                //   ⚠ A-33 的示意里省了这层包装（写 `return __fv.r0()`）—— 那只在
+                //     「函数签名就是 T」时成立；有 `.abort` 时签名必是 `fault(E)!T`，不包会
+                //     直接在 return 处报 T-SEM-E202。包出来的 `Ok(...)` 是既有 call 节点，
+                //     由 B4a 的 fault_raise_try 就地改写成 `__fault_<E>` struct_lit（A-35）。
+                var oc: i64 = base.mk_ident("Ok", -1);
+                var oah: i64 = -1;
+                var oat: i64 = -1;
+                oat = base.list_push(oah, oat, rv);
+                if (oah < 0) { oah = oat; }
+                rv = base.mk_call(oc, oah, tp);
+                // ⚠ 必须**此刻**就改写成 struct_lit，不能留给后续 pass：
+                //   产物里这条 return 嵌在 if 分支内，而 trap_check_block 只遍历 s 的
+                //   **直接**子语句（不递归进 if），sema 的 if 分支也不调 fault_raise_try
+                //   ⇒ 留到后面 `Ok` 会原样走到后端（LLVM: 类型不符 / C: `t_Ok` 未声明）。
+                fault_raise_ok(rv, g);
+            }
+            var ret: i64 = base.mk_return(rv, -1);
+            var th: i64 = -1;
+            var tt: i64 = -1;
+            tt = base.list_push(th, tt, ret);
+            if (th < 0) { th = tt; }
+            // lb = -2：无 else 分支（见 stmt_can_fall_through 的 if 分支约定）
+            var ifn: i64 = base.mk_if(trap_tag_eq(fv, g_fmem_tag[g_trap_mem[i]]), th, -2, -1);
+            t = base.list_push(h, t, ifn);
+        }
+        i = i + 1;
+    }
+    if (nab > 0) {
+        // 未落到任何臂的 tag 一律原样上传（A-19 的唯一语义）
+        t = base.list_push(h, t, base.mk_return(base.mk_ident(fv, -1), -1));
+    } else {
+        // 已穷尽 ⇒ 剩下的只有 tag 0（Ok）⇒ 取成功值
+        t = base.list_push(h, t,
+            base.mk_return(base.mk_member("val", base.mk_ident(fv, -1), -1), -1));
+    }
+    base.node_set_kind((s as u64), "block");
+    base.node_set_na((s as u64), -1);
+    base.node_set_la((s as u64), h);
+    hir.hir_invalidate((s as u64));
+    return true;
+}
+
+// ── 位置②：`var x : T = trap <e> { … };` ⇒ 就地改写成 block ──
+pub fn trap_desugar_vardecl(s: i64) bool {
+    var tp: i64 = base.node_nb((s as u64));
+    if (trap_node_is(tp) == false) { return false; }
+    var g: i64 = trap_collect(tp);
+    if (g < 0) { return false; }
+    var narm: i64 = slice_len(g_trap_mem) as i64;
+    var i: i64 = 0;
+    while (i < narm) {
+        if (g_trap_abort[i] != 0) {
+            trap_err(tp, "T-MAT-E768",
+                "`var x : T = trap ...;` 禁止 `resume(.abort)`：`.abort` 的语义是向上传播，只有 `return trap ...;` 能用（A-34）",
+                tp);
+            return false;
+        }
+        i = i + 1;
+    }
+    if (trap_exhaustive(g, tp) == false) { return false; }
+    var fv: string = base.sb_cat2("__tfv_", base.i2s(tp));
+    var xname: string = base.node_sa((s as u64));
+    var xis: i64 = base.node_const(s);
+    // 缺标注时用组的 `over T` 补上（A-34 位置②的 T 必是 over 类型）
+    var xtn: i64 = base.node_na((s as u64));
+    if (xtn < 0) { xtn = mk_type_node_from_ti(g_fgrp_over[g]); }
+    var h: i64 = -1;
+    var t: i64 = -1;
+    var vd: i64 = base.mk_var_decl(fv, false, mk_type_node_from_ti(g_trap_ti),
+        base.node_na((tp as u64)), -1);
+    t = base.list_push(h, t, vd);
+    if (h < 0) { h = t; }
+    var xd: i64 = base.mk_var_decl(xname, xis != 0, xtn,
+        base.mk_member("val", base.mk_ident(fv, -1), -1), -1);
+    t = base.list_push(h, t, xd);
+    i = 0;
+    while (i < narm) {
+        var rv: i64 = -1;
+        if (g_trap_rec[i] >= 0) { rv = g_trap_rec[i]; } else { rv = trap_slot_call(fv, g_trap_slot[i]); }
+        var asg: i64 = base.mk_assignment("=", base.mk_ident(xname, -1), rv, -1);
+        var th: i64 = -1;
+        var tt: i64 = -1;
+        tt = base.list_push(th, tt, asg);
+        if (th < 0) { th = tt; }
+        var ifn: i64 = base.mk_if(trap_tag_eq(fv, g_fmem_tag[g_trap_mem[i]]), th, -2, -1);
+        t = base.list_push(h, t, ifn);
+        i = i + 1;
+    }
+    base.node_set_kind((s as u64), "block");
+    base.node_set_na((s as u64), -1);
+    base.node_set_nb((s as u64), -1);
+    base.node_set_la((s as u64), h);
+    // 产物块**不是新作用域**：bf = 1 ⇒ TIR 发射时不增减块深度，让 x / __tfv 登记在父深度，
+    //   块外的后续语句才解析得到 x（A-34 位置②要求 x 对外可见）。
+    base.node_set_bf((s as u64), true);
+    hir.hir_invalidate((s as u64));
+    return true;
+}
+
+// 脱糖产物必须在**当前作用域**逐条检查，不能直接 cs_block_node —— 后者会新开一层作用域，
+//   使 `var x : T = trap ...;` 声明出的 x 在块外不可见（A-34 位置②要求 x 对外可见）。
+fn trap_check_block(s: i64) void {
+    var ks: []i64 = base.kids_chain_idx(base.node_la((s as u64)));
+    var i: i64 = 0;
+    while (i < slice_len(ks) as i64) {
+        var k: Child = base.kids[ks[i]];
+        check_stmt(k.val);
+        i = i + 1;
+    }
+}
+
+// 其余位置（表达式位 / 裸语句位等）一律拒绝：A-34 只开 return 与初始化两个位置。
+pub fn trap_pos_err(e: i64) void {
+    parse.fc_err("T-MAT-E764",
+        "`trap` 只允许出现在 `return trap <e> { … };` 与 `var x : T = trap <e> { … };` 两个位置（A-34）",
+        e);
 }
 
 pub fn check_fault_decl(d: i64) void {
