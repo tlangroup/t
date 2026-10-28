@@ -1,0 +1,39 @@
+// EXPECT: pass
+// B5c（A-19 落地）：`@main` 不承载故障（A-36 豁免），其 `return trap <e> { … resume(.abort) }`
+// 不再报 T-MAT-E768；未覆盖的故障在运行期由运行时接手（打印 + 非零退出码）。
+// ⚠ conformance 只做 `tc check` 静态检查，不运行程序；运行期 eprint+exit 行为由手动双后端运行钉死。
+
+struct User {
+    age: i64;
+    name: string;
+}
+
+fault UserErr over User {
+    .{ .age < 0 }   -> UserErr.AgeNegative repairs { .use_default, .clamp };
+    .{ .name = "" } -> UserErr.NameEmpty    repairs { .anon };
+}
+
+fn validate(u : User) fault(UserErr)!User {
+    if (u.age < 0) {
+        return Err(
+            @clause(.fault, .{ .age < 0 }, UserErr.AgeNegative)
+         ++ @clause(.repair, .use_default, fn () User { return u; })
+         ++ @clause(.repair, .clamp,       fn () User { return u; })
+        );
+    }
+    if (u.name == "") {
+        return Err(
+            @clause(.fault, .{ .name = "" }, UserErr.NameEmpty)
+         ++ @clause(.repair, .anon, fn () User { return User{ .age = u.age, .name = "anon" }; })
+        );
+    }
+    return Ok(u);
+}
+
+// @main 未声明故障签名，且 `trap` 带 `.abort` ⇒ B5c 前此处必报 T-MAT-E768，B5c 后应放行。
+fn main_fn() User @main {
+    return trap validate(User{ .age = 3i64, .name = "ok" }) {
+        .{ .age < 0 } => resume(.clamp);
+        _             => resume(.abort);
+    };
+}

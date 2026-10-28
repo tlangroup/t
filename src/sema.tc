@@ -11390,8 +11390,13 @@ pub fn trap_desugar_return(s: i64) bool {
     var nab: i64 = 0;
     var i: i64 = 0;
     while (i < narm) { if (g_trap_abort[i] != 0) { nab = nab + 1; } i = i + 1; }
-    // A-19 + A-34：有上传臂 ⇒ 所在函数签名必须承载 `fault(E)!T`（否则无处可传）
-    if (nab > 0 and fault_struct_group_of(cur_ret) != g) {
+    // A-19 + A-34：有上传臂 ⇒ 所在函数签名必须承载 `fault(E)!T`（否则无处可传）。
+    // B5c：@main 例外 —— @main 不承载故障（A-36），其 `.abort` 直接交运行时接手（打印 + 非零退出码）。
+    var is_main: bool = false;
+    if (g_cur_func_decl >= 0 and parse.ann_find(base.node_la((g_cur_func_decl as u64)), "main") >= 0) {
+        is_main = true;
+    }
+    if (nab > 0 and is_main == false and fault_struct_group_of(cur_ret) != g) {
         trap_err(tp, "T-MAT-E768",
             base.sb_cat5("带 `resume(.abort)` 的 `trap` 要求所在函数的返回值类型是 `fault(",
                 g_fgrp_name[g], ")!", ti_str(g_fgrp_over[g]), "`"), tp);
@@ -11411,13 +11416,13 @@ pub fn trap_desugar_return(s: i64) bool {
         if (g_trap_abort[i] == 0) {
             var rv: i64 = -1;
             if (g_trap_rec[i] >= 0) { rv = g_trap_rec[i]; } else { rv = trap_slot_call(fv, g_trap_slot[i]); }
-            if (nab > 0) {
-                // 有上传臂 ⇒ 所在函数签名是 `fault(E)!T`，修好的值 T 必须先装进 tag=0 的
-                //   载体（`Ok(v)`）才能与上传臂的 `return __tfv` 同型（A-19 + A-33）。
-                //   ⚠ A-33 的示意里省了这层包装（写 `return __fv.r0()`）—— 那只在
-                //     「函数签名就是 T」时成立；有 `.abort` 时签名必是 `fault(E)!T`，不包会
-                //     直接在 return 处报 T-SEM-E202。包出来的 `Ok(...)` 是既有 call 节点，
-                //     由 B4a 的 fault_raise_try 就地改写成 `__fault_<E>` struct_lit（A-35）。
+            if (nab > 0 and fault_struct_group_of(cur_ret) == g) {
+                // 有上传臂且所在函数返回类型承载该故障组（正常函数 / 显式声明 `fault(E)!T` 的 @main）
+                //   ⇒ 修好的值 T 必须先装进 tag=0 的载体（`Ok(v)`）才能与上传臂的 `return __tfv`
+                //   同型（A-19 + A-33）。包出来的 `Ok(...)` 由 B4a 的 fault_raise_try 就地改写成
+                //   `__fault_<E>` struct_lit（A-35）。
+                //   ⚠ 若返回类型**不**承载该组（典型是未声明故障签名的 @main，A-36 豁免），则
+                //     此处**不**包载体，直接 `return rv`（T），末端 `.abort` 由运行时接手（B5c）。
                 var oc: i64 = base.mk_ident("Ok", -1);
                 var oah: i64 = -1;
                 var oat: i64 = -1;
@@ -11442,8 +11447,42 @@ pub fn trap_desugar_return(s: i64) bool {
         i = i + 1;
     }
     if (nab > 0) {
-        // 未落到任何臂的 tag 一律原样上传（A-19 的唯一语义）
-        t = base.list_push(h, t, base.mk_return(base.mk_ident(fv, -1), -1));
+        if (fault_struct_group_of(cur_ret) == g) {
+            // 返回类型承载该故障组 ⇒ 未落到任何臂的 tag 一律原样上传（A-19 的唯一语义）。
+            // 典型：正常函数 / 显式声明 `fault(E)!T` 的 @main。
+            t = base.list_push(h, t, base.mk_return(base.mk_ident(fv, -1), -1));
+        } else {
+            // B5c：未承载故障的 @main（A-36 豁免）`.abort` ⇒ 运行时接手（A-19）。
+            //   成员臂已各自 `return <修复值 T>`；此处处理落点：
+            //   · tag==0（Ok）⇒ 走末尾的 `return val`；
+            //   · tag!=0 且未覆盖（未处理错误）⇒ 打印故障信息 + 非零退出码。
+            //   ⚠ 不能 `return __tfv`（main 返回 T 而非 carrier）。
+            //   写成 `if (tag != 0) { eprint; exit(1); } return val;`：运行期错误分支被 exit(1)
+            //   终止，OK 分支落到末尾 return；末尾这条 return 满足「函数必须显式 return」结构检查。
+            var zero: i64 = base.mk_int("0", 10, -1);
+            base.node_set_sb((zero as u64), "i64");
+            var tag_neq_0: i64 = base.mk_binary("!=",
+                base.mk_member("tag", base.mk_ident(fv, -1), -1), zero, -1);
+            var errh: i64 = -1;
+            var errt: i64 = -1;
+            var msg: string = base.sb_cat3("fault ", g_fgrp_name[g],
+                ": unhandled fault propagated past @main, aborting\n");
+            var eah: i64 = -1;
+            var eat: i64 = -1;
+            eat = base.list_push(eah, eat, base.mk_string(msg, -1));
+            if (eah < 0) { eah = eat; }
+            errt = base.list_push(errh, errt, base.mk_expr(base.mk_call(base.mk_ident("eprint", -1), eah, -1), -1));
+            if (errh < 0) { errh = errt; }
+            var xah: i64 = -1;
+            var xat: i64 = -1;
+            xat = base.list_push(xah, xat, rng_lit(1));
+            if (xah < 0) { xah = xat; }
+            errt = base.list_push(errh, errt, base.mk_expr(base.mk_call(base.mk_ident("exit", -1), xah, -1), -1));
+            var errif: i64 = base.mk_if(tag_neq_0, errh, -2, -1);
+            t = base.list_push(h, t, errif);
+            // 末尾显式 return val：OK 情况走这里；错误情况已被 exit(1) 终止，本条不可达但满足结构检查。
+            t = base.list_push(h, t, base.mk_return(base.mk_member("val", base.mk_ident(fv, -1), -1), -1));
+        }
     } else {
         // 已穷尽 ⇒ 剩下的只有 tag 0（Ok）⇒ 取成功值
         t = base.list_push(h, t,
