@@ -537,6 +537,10 @@ fn main_fn() fault(FrameErr)!i32 @main {
   我误用了自建的 `_b2g1.exe.exe`；两者同为 post-B2，故与 B2 无关）。
   佐证：这 3 个示例在 gate 的 `run_examples dbg (双后端)` 与 `C 后端自举` 两步均 PASS ⇒ 运行期无差异。
   处置：`node tools/ir_snapshot.mjs --update --compiler out/dbg/g1.exe --jobs 1` 重录后回验 0 差异。
+  ⭐ **2026-10-28 复查**（B4b 时定位）：这 6 处还有**第二个可能根因** —— `out/lib/std/*.tlib` 缺失时
+  3 个 std 示例退回源码内联导入，与链接模式 IR 不同（签名同样是「3 个 std 示例 × 双后端」）。
+  两者都会命中同一批目标且处置相同（重录）；**判据是「0 NEW / 0 GONE」，切勿据此回退代码**。
+  已给 `ir_snapshot` 加 std .tlib 前置守卫（§G.4），签名重现时可直接定性。
 
 ---
 
@@ -1127,7 +1131,11 @@ if (__tfv_N.tag == 1) { return Ok(__tfv_N.r0()); }   // ← A-33 示意里漏掉
 return __tfv_N;                                       // .abort：原样上传
 ```
 
-位置② `var x : T = trap <e> {…};`：
+跨函数链路（A-19 的核心承诺，实测已通）：`.abort` 把载体原样交给调用者，
+调用者的 `trap` 拿到的是**同一个** `__fault_<E>` ⇒ 整条链**不需要 unwind / continuation**
+（代价低的根因：M48 闭包**按值捕获** ⇒ 闭包自包含、执行位置无关）。可无限层叠加。
+
+位置② `var x : T = trap <e> {…}`：
 
 ```text
 var __tfv_N : fault(E)!T = <e>;          // ┐ 三条都在**父作用域**，产物块不新开作用域
@@ -1176,11 +1184,18 @@ if (__tfv_N.tag == 2) { x = <recover 表达式>; }
 - `tc check src/tc.tc` **errors=0 / warnings=638**（与改动前持平，无新增警告）
 - conformance **434 passed / 0 failed**（+1 pass / +11 fail 用例全绿）
 - `run_examples_tmir` **111 passed / 0 failed**（+1 新 golden `faulttrap_demo`，双后端逐字节一致）
-- `examples/faulttrap_demo` 双后端输出逐字节 =
-  `0 / bob / 77 / fixed / 0 / bob / 3 / anon / 7 / amy / 99 / bob / 0 / 0 / 2 / 3 / anon`
+- `examples/faulttrap_demo` 双后端输出逐字节（25 行）=
+  `0/bob`（位置② clamp）・`77/fixed`（位置② recover）・`0/bob` `3/anon` `7/amy`（位置① 全修三条路径）
+  ・`99/bob`（位置① recover）・`0/0`（位置① `.abort` ⇒ 消费臂得 tag 0）・`2/3/anon`（上传）
+  ・`0/bob` `3/anon`（跨函数）・`3/anon`（三层 recover）・`0/bob`（内层已修好 ⇒ 外层不落臂⇒取 val）
 - 自举**四代不动点 g2 == g3 == g4**（gate L2 第 19 步，权威判据——不是 exe md5，是 IR）
 - 双轨对拍（旧轨 LLVM vs 新轨 TIR）PASS；C 后端自举 + conformance PASS；rls 快速通道 PASS
-- 产物快照用 gate 的 g1 重录 **146 targets / 295 entries**（8 处 DIFF + 2 NEW + **0 GONE**，全部预期内）
+- 产物快照用 gate 的 g1 重录 **146 targets / 295 entries**。首验报 8 处 DIFF，其中 **6 处是假差异**
+  （本地 `out/lib/std/{mem,math}.tlib` 缺失 ⇒ 3 个 `@import("std.*")` 示例退回**源码内联**导入，
+  与链接模式的 IR 逐字节不同；重建 .tlib 后三者 md5 **逐字节回到基线值**，与本次改动无关）。
+  真差异只有 `faulttrap_demo` 2 处（本批新增 4 个跨函数用例），**0 NEW / 0 GONE**
+  ⇒ 既有 144 个目标 IR 零漂移。已给 `tools/ir_snapshot.mjs` 加**前置守卫**：缺 std .tlib 则自动
+  `build_std` 重建、仍缺则硬失败，不在「内联模式」下录制/比对基线（见 §11.2 B2 的同签名旧账）
 - 种子已刷新（`ci/seed/tc.exe`，md5 `dbe2cebb…`）：新种子能编译 `trap` 语法且自举一代通过
 
 ### G.5 ⚠ B4 尚未完成的部分
