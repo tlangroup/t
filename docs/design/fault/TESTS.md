@@ -43,7 +43,18 @@
 | `fail/f_fault_err_pred_mismatch.tc` | `error T-MAT-E756`（谓词与组声明不恒等，A-2 / A-25） | B4a | ✅ |
 | `fail/f_fault_err_repair_slot.tc` | `error T-MAT-E757`（修法名不属于该成员） | B4a | ✅ |
 | `fail/f_clause_bad_anchor.tc` | `@clause` 锚点非法（CAT 待定，B3 定） | B3 | ⬜ |
-| `fail/f_trap_wildcard_nonabort.tc` | 通配臂只允许 `resume(.abort)`（A-21） | B4 | ⬜ |
+| `pass/p_fault_trap.tc` | `trap` 四种合法形态（位置①无/有 `.abort`、位置②、位置②+`recover`）都能过 sema 并完成脱糖（只 check，不运行） | B4b | ✅ |
+| `fail/f_fault_trap_pred_form.tc` | `error T-MAT-E759`（谓词形态非法，parse 期） | B4b | ✅ |
+| `fail/f_fault_trap_resume_form.tc` | `error T-MAT-E762`（`resume` 实参不是 `.修法名`） | B4b | ✅ |
+| `fail/f_fault_trap_arm_body.tc` | `error T-MAT-E763`（臂右端不是 `resume(...)`/`recover(...)`） | B4b | ✅ |
+| `fail/f_fault_trap_position.tc` | `error T-MAT-E764`（`trap` 出现在表达式位） | B4b | ✅ |
+| `fail/f_fault_trap_not_fault.tc` | `error T-MAT-E765`（被捕表达式不是 `fault(E)!T`） | B4b | ✅ |
+| `fail/f_fault_trap_pred_member.tc` | `error T-MAT-E766`（谓词与组内声明不恒等，A-22/A-25） | B4b | ✅ |
+| `fail/f_fault_trap_dup_member.tc` | `error T-MAT-E767`（两条臂落到同一成员） | B4b | ✅ |
+| `fail/f_fault_trap_abort_position.tc` | `error T-MAT-E768`（位置② 用了 `.abort`） | B4b | ✅ |
+| `fail/f_fault_trap_nonexhaustive.tc` | `error T-MAT-E769`（位置② 未穷尽，A-15） | B4b | ✅ |
+| `fail/f_fault_trap_repair_slot.tc` | `error T-MAT-E770`（修法名不属于本臂成员，A-26） | B4b | ✅ |
+| `fail/f_fault_trap_wild_only_abort.tc` | `error T-MAT-E771`（通配臂只允许 `resume(.abort)`，A-21） | B4b | ✅ |
 | `fail/f_repair_cross_fn.tc` | repair 闭包禁跨函数复用（A-12） | B4/B5 | ⬜ |
 
 - 诊断码唯一真源：`tools/diag_defs.json` → 生成 `src/diag_table.gen.h`。
@@ -51,6 +62,7 @@
 - 现有三条走 **MAT** 段（E743 之后递增 E745/E746），未新增 CAT。
 - B3 增 CLA 段 E728–E731；**B1 增 10 条**：CLA E725/E732/E733/E734/E735/E738/E739（组与类型层）
   + MAT E747/E748/E749/E752（谓词层，与 E745/E746 同族）。
+- **B4a 增 6 条** MAT E753–E758；**B4b 增 11 条** MAT E759–E771（A-24：不开新 CAT）。诊断总数 193 → 199 → **210**。
 
 ---
 
@@ -63,9 +75,9 @@
 | `examples/faultgroup_demo.tc` + `.expected.txt` | **A-32 布局**：`tag`(0=Ok) / `val`(可写成功值) / `r0..r(N-1)`（读 `r2` 即证明第二成员槽位基址 = 2，槽位少一个则编译不过）。⚠ 刻意**不调用**闭包：三处既有后端缺口见 `fault.md` §C.5 G-1..G-3 | B1 | ✅ 双后端逐字节一致 |
 | `pass/p_fault_raise.tc` | raise 两种实参形态（`++` 串联 / 逗号分隔）都能过 sema 并完成脱糖（只 check，不运行） | B4a | ✅ |
 | `examples/faultraise_demo.tc` + `.expected.txt` | **raise 侧运行期行为**：`Ok(u)` ⇒ tag 0 + `val` 落值；`Err(...)` ⇒ tag 1/2 + 槽 0/1/2 挂上 repair 闭包且**调用**它们得到预期值。⚠ 一律「先落局部变量再读字段」（既有缺口 G-5） | B4a | ✅ 双后端逐字节一致 |
-| 待补 | `fault(E)!T` 返回 + trap 分派 + **repair 槽位映射**（`resume(.名)` → 第几号槽） | B4b | ⬜ |
-| 待补 | 谓词规范化后跨位置恒等（raise ↔ 组声明，A-25 折叠） | B4 | ⬜ |
-| 待补 | repair 闭包上传 + `.abort` | B4 | ⬜ |
+| `examples/faulttrap_demo.tc` + `.expected.txt` | **消费侧运行期行为**：位置②（clamp / `recover`）；位置① 全修（clamp / anon / 直通）；位置① `recover`；位置① `.abort` ⇒ 消费臂得 tag 0、未落臂成员原样上传得 tag 2 且槽位仍是组内绝对槽位 2。⚠ 一律「先落局部变量再读字段」（既有缺口 G-5） | B4b | ✅ 双后端逐字节一致 |
+| 待补 | 谓词规范化后跨位置恒等（raise ↔ 组声明 ↔ trap 臂，A-25 折叠）—— 已由 E756/E766 在编译期覆盖 | B4b | ✅（编译期）|
+| 待补 | repair 闭包上传 + `.abort` 的**跨函数**链路（B5 可达集） | B5 | ⬜ |
 
 `predpat_demo` 的期望输出（12 行）：`-1 1 0 9 0 0 7 5 0 3 2 1`
 ——其中 **0 是刻意设计的「不该命中」分支**，命中即说明谓词或分派写反。
@@ -91,5 +103,5 @@
 
 1. `tc run examples/predpat_demo.tc` 输出与 `.expected.txt` 一致
 2. 故意把谓词写反（`<` ↔ `>`），确认**不命中**分支的行为符合直觉
-3. （B3/B4 后）`trap` 里选不同 repair，确认执行位置无关（路径③ 的核心承诺）
+3. （B4b 后）`trap` 里选不同 repair（`.use_default` / `.clamp` / `.anon`），确认执行位置无关（路径③ 的核心承诺）；把 `.abort` 换成 `recover(...)`，确认上传与就地修复的行为差异
 4. （B4 后）不写 repair 也不 recover 的 fault，确认运行时接手并给出非零退出

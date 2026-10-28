@@ -1,0 +1,75 @@
+// EXPECT: pass
+// `trap` 的四种合法形态（fault 批次 B4b / A-33 / A-34）：
+//   ① `return trap <e> {…};` 无 `.abort` ⇒ 必须穷尽 ⇒ 签名是 `T`
+//   ② `return trap <e> {…};` 有 `.abort` ⇒ 不要求穷尽 ⇒ 签名是 `fault(E)!T`
+//   ③ `var x : T = trap <e> {…};` 禁止 `.abort`、必须穷尽
+//   ④ `recover(<expr>)` 就地给值（脱糖就是 `return <expr>;`，不合成闭包）
+//
+// ⚠ conformance 只做 `tc check`、不运行程序 ⇒ 本例证明的是「四种形态都能过 sema 并完成
+//   脱糖，且位置/穷尽性/槽位约束都被接受」；**运行期**行为（tag 值、槽位索引、上传语义）
+//   由 examples/faulttrap_demo 的 golden 双后端对拍钉住。
+
+struct User {
+    age: i64;
+    name: string;
+}
+
+fault UserErr over User {
+    .{ .age < 0 }   -> UserErr.AgeNegative repairs { .use_default, .clamp };
+    .{ .name = "" } -> UserErr.NameEmpty    repairs { .anon };
+}
+
+fn validate(u : User) fault(UserErr)!User {
+    if (u.age < 0) {
+        return Err(
+            @clause(.fault, .{ .age < 0 }, UserErr.AgeNegative)
+         ++ @clause(.repair, .use_default, fn () User { return u; })
+         ++ @clause(.repair, .clamp, fn () User { return u; })
+        );
+    }
+    if (u.name == "") {
+        return Err(
+            @clause(.fault, .{ .name = "" }, UserErr.NameEmpty)
+         ++ @clause(.repair, .anon, fn () User { return u; })
+        );
+    }
+    return Ok(u);
+}
+
+// ① 位置① 无 `.abort`：穷尽 ⇒ 签名就是 `User`
+fn trap_all(u : User) User {
+    return trap validate(u) {
+        .{ .age < 0 }   => resume(.clamp);
+        .{ .name = "" } => resume(.anon);
+    };
+}
+
+// ② 位置① 有 `.abort`：不穷尽也行 ⇒ 签名必须是 `fault(UserErr)!User`
+fn trap_pass(u : User) fault(UserErr)!User {
+    return trap validate(u) {
+        .{ .age < 0 } => resume(.use_default);
+        _             => resume(.abort);
+    };
+}
+
+// ③ + ④ 位置②：禁止 `.abort`、必须穷尽；`recover` 就地给值
+fn trap_var(u : User) User {
+    var v : User = trap validate(u) {
+        .{ .age < 0 }   => recover(User{ .age = 99i64, .name = u.name });
+        .{ .name = "" } => resume(.anon);
+    };
+    return v;
+}
+
+fn main_fn() i32 @main {
+    var a : User = trap_all(User{ .age = -1i64, .name = "x" });
+    var b : fault(UserErr)!User = trap_pass(User{ .age = 2i64, .name = "" });
+    var c : User = trap_var(User{ .age = -3i64, .name = "z" });
+    var d : User = c;
+    var e : User = b.val;
+    println(i2s(a.age));
+    println(i2s(b.tag));
+    println(i2s(d.age));
+    println(i2s(e.age));
+    return 0;
+}

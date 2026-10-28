@@ -1105,3 +1105,87 @@ return __fv1;                                 // .abort：原样上传
   而 B4a 用的「就地改 kind」手法**不适用于插入语句** ⇒ 须另找 desugar pass 钩子。
 - 组 → 生成纯谓词校验函数（A-23）：未开工。
 - ⚠ B4b 的 `recover(e)` 脱糖出的合成闭包**可能不捕获任何变量** ⇒ **必然撞 G-4** ⇒ 先修 G-4。
+
+---
+
+## 附录 G · B4b 实测结果（消费侧，`trap` / `resume` / `recover` / `.abort`，2026-10-28）
+
+### G.1 落地的东西
+
+`trap` 脱糖（A-33）的**实际**产物 —— 位置① `return trap <e> {…};`：
+
+```text
+// 无 .abort（签名 = T，必须穷尽）
+var __tfv_N : fault(E)!T = <e>;
+if (__tfv_N.tag == 1) { return __tfv_N.r0(); }
+if (__tfv_N.tag == 2) { return __tfv_N.r2(); }
+return __tfv_N.val;
+
+// 有 .abort（签名 = fault(E)!T，不要求穷尽）
+var __tfv_N : fault(E)!T = <e>;
+if (__tfv_N.tag == 1) { return Ok(__tfv_N.r0()); }   // ← A-33 示意里漏掉的那一层
+return __tfv_N;                                       // .abort：原样上传
+```
+
+位置② `var x : T = trap <e> {…};`：
+
+```text
+var __tfv_N : fault(E)!T = <e>;          // ┐ 三条都在**父作用域**，产物块不新开作用域
+var x : T = __tfv_N.val;                 // │
+if (__tfv_N.tag == 1) { x = __tfv_N.r0(); }   // ┘
+if (__tfv_N.tag == 2) { x = <recover 表达式>; }
+```
+
+- 入口挂在 **语句分派位**（不是表达式位）：`cs_return` 与 `cs_var_decl` 的**最前**（infer 之前），
+  因为臂体 `resume(...)` / `recover(...)` 是合成的 `call` 节点，先走 infer 就会被当成对未声明
+  函数 `resume` / `recover` 的调用而报 T-SEM-E201。
+- 产物在**当前作用域**逐条 `check_stmt`（不新建作用域 ⇒ 位置② 的 `x` 对块外可见，A-34）。
+- 全部产物是既有节点（`var_decl` / `if` / `return` / `assignment` / `member` / `call` / `binary`）
+  ⇒ L-04 成立：不加新 kind、不加新发射路径、HIR 侧零改动。
+- 新诊断码 **11 条**（`T-MAT-E759` … `T-MAT-E771`），诊断码总数 199 → **210**。
+
+### G.2 ⚠ 与 A-33 设计稿的偏差
+
+| # | 内容 | 处置 |
+|---|---|---|
+| **D-15** | ⭐ **A-33 的脱糖示意漏了 `Ok` 那层**：示意写 `return __fv1.r0()`，那只在「函数签名就是 `T`」时成立。有 `.abort` 臂时签名**必**是 `fault(E)!T`，不包会直接在 return 处报 T-SEM-E202（`expected __fault_UserErr but got User`） | 消费臂一律补 `Ok(<修复值>)`，交给 B4a 的 `fault_raise_ok` 就地改成 `__fault_<E>` struct_lit |
+| **D-16** | ⭐⭐ **`lex.cur_t() == "_"` 是恒假的死判据**：lexer 不产 `"_"` 这个 token 类型（`_` 走 is_ident_start）⇒ 通配臂 `_` 从未被识别，谓词解析拿到 `ident("_")` 而报 E759。既有 `parse.tc` 的 939/5022/5328/5412/5433 等处仍是这个错形态 | 改为 `lex.cur_t() == "Identifier" and lex.cur_v() == "_"` |
+| **D-17** | ⭐ 位置② 的产物块**不能**是新作用域：TIR 的 `tir_find_local_idx` 用 `g_local_depths[i] <= g_blk_depth` 过滤 ⇒ 块内声明的 `x` 出了块就查不到 ⇒ 当成未定义全局 ⇒ 链接期 `undefined symbol: x` | 产物块打 `bf=1`，`tir_emit_stmt` 的 block 分支据此跳过 `tir_blk_push/pop` |
+| **D-18** | 脱糖失败会挨**两条**诊断：具体码 + 一条误导的 E764（退回普通路径后由 infer 的 match 分支补发） | 发诊断时给 trap 节点打 `bc=1`，infer 的 match 分支见到 bc 就不再补发 |
+| **D-19** | `parse_fatal_at(code, msg, ti)` 收 **token 索引**（且 `exit(1)`），传节点 id 会把诊断定位到完全无关的源码位置 —— 排查时极误导 | 一律传 token 索引 |
+| **D-20** | ⭐ **脱糖产物嵌套 ⇒ 后续 pass 不递归进入**：`fault_raise_try` 挂在语句分派位，只看到顶层语句；if 分支内的 `return Ok(...)` 轮不到它 ⇒ `Ok` 原样走到后端（LLVM 类型不符 / C 报 `t_Ok` 未声明） | `Ok(...)` 在**脱糖当场**就地改写，不留给后续 pass |
+| **D-21** | `recover(e)` 直接脱糖成 `return e;` / `x = e`，**不真的合成闭包** —— A-23 的「recover = resume(合成闭包)」只是**语义等价**说明，产物没必要造一个 thunk 再调用它。顺带彻底避开 G-4 | 采纳 |
+
+### G.3 G-4 已修（B4b 的前置）
+
+- ⚠ **旧归因是错的**：F.2 记的「非捕获 lambda 当闭包值」被证伪 —— 非捕获 lambda（`var f = fn(){…}`）与
+  具名函数单独使用**都正常**。真因是 **fn 类型的槽（struct 字段 / 变量）被写成裸函数符号**。
+- 修在 **TIR 层**（不写后端 shim）：
+  - `tir_emit_struct_lit` 的具名字段：`Box{ .r1 = seven }`
+  - `tir_emit_assign` 的 member 分支：`b.r0 = seven`
+  - 判据「值以 `@` 开头 = 裸函数符号」⇒ `tir_make_closure_value`（堆分配 16B `%TClosure`，
+    GEP[0,0] 存 code、GEP[0,1] 存 env，返回 `ptr<void>`）。
+- ⭐ 两条**互斥**的 fn 槽语义（这是本批最易混的一点）：
+  - ① `%TClosure.field0`（闭包构造）必须存**裸 code** —— `CALL_IND` 直接 `call field0`；
+  - ② fn 类型的**变量 / 结构体字段**必须存**闭包值** `ptr %TClosure` —— 下游是「取 8 字节当 `TClosure*` 再解包」。
+- ⚠ 后端层修不动：fn 槽的 TIR 型是 `ptr<void>`，与 `%TClosure` 基址无从区分（两轮后端层尝试均失败并回退）。
+- ⚠ member 分支取字段 TD 必须用 `tir_member_expr_td`（沿 member 链自解析），用 `tir_expr_td` / `tir_lhs_td` 会落兜底拿不到。
+
+### G.4 门禁证据
+
+- `tc check src/tc.tc` **errors=0 / warnings=638**（与改动前持平，无新增警告）
+- conformance **434 passed / 0 failed**（+1 pass / +11 fail 用例全绿）
+- `run_examples_tmir` **111 passed / 0 failed**（+1 新 golden `faulttrap_demo`，双后端逐字节一致）
+- `examples/faulttrap_demo` 双后端输出逐字节 =
+  `0 / bob / 77 / fixed / 0 / bob / 3 / anon / 7 / amy / 99 / bob / 0 / 0 / 2 / 3 / anon`
+
+### G.5 ⚠ B4 尚未完成的部分
+
+- ⚠ **`trap` / `resume` / `recover` 未进 lex 关键字表**（A-20 的 v1 取舍：做成词法关键字会连累
+  HIR/cstgen 关键字清单，与收益不成比例）。代价：名为 `trap` 的函数/变量在**表达式位**会被本语法
+  抢走（`return trap(x);` 会因 `expect_tok("LBrace")` 失败而报 T-PAR-E101）。当前 src/lib/examples/tests
+  全仓 0 命中。v2 若需支持用户自定义 `trap` 标识符，在 `parse_primary` 的识别处补
+  `and lex.peek_t(1) != "LParen"` 前瞻即可（`resume` / `recover` 只在臂内识别，天然不冲突）。
+- B4b 的**跨函数**部分（B5）：跨函数可达集分析（R-3）—— 未开工。
+- 组 → 生成纯谓词校验函数（A-23）：未开工（v2 候选）。
+- `trap` 的**表达式**位置：A-34 只开两个位置，其余留白（v2）。

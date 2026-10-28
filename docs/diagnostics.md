@@ -63,7 +63,7 @@
 | FID | fid/atom 序列化 | 650–699 | `T_FID_RESERVED_NAME`→E650 … `T_FID_SEEK_ARG`→E661 |
 | TIM | 时间内建 | 700–719 | `T_TIME_BAD_SPEC`→E700、`PARSE_UNSUPPORTED`→E701、`SPEC_TYPE`→E702、`ARG_TYPE`→E703 |
 | CLA | 一等子句（`first-class clause`） | 720–739 | `T_CLAUSE_BAD_FORM`→E720、`UNKNOWN_KIND`→E721、`PATTERN_KIND_MIX`→E722、`MERGE_TYPE`→E723、`ESCAPE`→E724、`ARG_NOT_CONST`→E726、`W_CLAUSE_SHADOWED`→W727 |
-| MAT | match | 740–779 | `T_MATCH_UNKNOWN_CASE`→E740、`ARM_TYPE`→E741、`NONEXHAUSTIVE`→E742 |
+| MAT | match | 740–779 | `T_MATCH_UNKNOWN_CASE`→E740、`ARM_TYPE`→E741、`NONEXHAUSTIVE`→E742、谓词模式 E745/E746（B2）、fault 组/谓词 E747–E752（B1）、raise E753–E758（B4a）、`trap` E759–E771（B4b） |
 | CLO | 闭包/捕获 | 780–809 | `T_CLOSURE_CAPTURE`→CLO-E780 |
 | FUN | 函数子句/重载 | 810–849 | `T_FUNC_CLAUSE_BIND_CONFLICT`→E810、`ARITY`→E811、`NO_TYPE`→E812、`RET_TYPE`→E813、`BODY`→E814 |
 | FLG | flag 位域 | 850–859 | `T_FLAG_OFFSET_CONFLICT`→E850、`OVERFLOW`→E851 |
@@ -369,6 +369,24 @@ help: add `export` to `Bar` in src/foo/lib.tc, or rename the import
 | T-MAT-E740 | E | T_MATCH_UNKNOWN_CASE | 未知 match case |
 | T-MAT-E741 | E | T_MATCH_ARM_TYPE | 分支类型不一致 |
 | T-MAT-E742 | E | T_MATCH_NONEXHAUSTIVE | match 未穷尽 |
+
+### MAT 759–771（fault 批次 B4b：`trap` / `resume` / `recover` / `.abort`）
+| 新码 | 等级 | 名字 | 含义 |
+|---|---|---|---|
+| T-MAT-E759 | E | TRAP_PRED_FORM | trap 臂的谓词形态非法（parse 期发，早于 sema） |
+| T-MAT-E762 | E | TRAP_RESUME_FORM | `resume(...)` 的实参不是 `.修法名` |
+| T-MAT-E763 | E | TRAP_ARM_BODY | trap 臂的右端不是 `resume(...)` / `recover(...)` |
+| T-MAT-E764 | E | TRAP_POSITION | `trap` 出现在 A-34 允许的两个位置之外（表达式位 / 裸语句位） |
+| T-MAT-E765 | E | TRAP_NOT_FAULT | 被捕表达式的静态类型不是 `fault(<组>)!<T>` |
+| T-MAT-E766 | E | TRAP_PRED_MEMBER | trap 臂的谓词与组内声明不恒等（A-22 / A-25） |
+| T-MAT-E767 | E | TRAP_DUP_MEMBER | 两条 trap 臂落到同一故障成员（后者永不生效） |
+| T-MAT-E768 | E | TRAP_ABORT_POSITION | `.abort` 用在了位置②，或位置① 的函数签名不是 `fault(E)!T` |
+| T-MAT-E769 | E | TRAP_NONEXHAUSTIVE | 无 `.abort` 的 `trap` 未覆盖组内全部成员（A-15） |
+| T-MAT-E770 | E | TRAP_REPAIR_SLOT | 修法名不属于本臂落到的成员（A-26 组内绝对槽位） |
+| T-MAT-E771 | E | TRAP_WILD_ONLY_ABORT | 通配臂 `_` 的右端不是 `resume(.abort)`（A-21） |
+
+> ⚠ **E759 与 E762 之间跳号是刻意的，不是遗漏**：E760 已被 B2 的 `T-MAT-E760 DUP_VALUE_ARM` 占用，
+>   E761 是 B4b 分号前的空号（冻结后新码只增不重排，故留空而非回收）。
 
 ### CLO 780
 | 新码 | 等级 | 旧语义名 | 含义 |
