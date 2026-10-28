@@ -1171,13 +1171,17 @@ if (__tfv_N.tag == 2) { x = <recover 表达式>; }
 - ⚠ 后端层修不动：fn 槽的 TIR 型是 `ptr<void>`，与 `%TClosure` 基址无从区分（两轮后端层尝试均失败并回退）。
 - ⚠ member 分支取字段 TD 必须用 `tir_member_expr_td`（沿 member 链自解析），用 `tir_expr_td` / `tir_lhs_td` 会落兜底拿不到。
 
-### G.4 门禁证据
+### G.4 门禁证据（gate L2 **24 passed / 0 failed**，4204s）
 
 - `tc check src/tc.tc` **errors=0 / warnings=638**（与改动前持平，无新增警告）
 - conformance **434 passed / 0 failed**（+1 pass / +11 fail 用例全绿）
 - `run_examples_tmir` **111 passed / 0 failed**（+1 新 golden `faulttrap_demo`，双后端逐字节一致）
 - `examples/faulttrap_demo` 双后端输出逐字节 =
   `0 / bob / 77 / fixed / 0 / bob / 3 / anon / 7 / amy / 99 / bob / 0 / 0 / 2 / 3 / anon`
+- 自举**四代不动点 g2 == g3 == g4**（gate L2 第 19 步，权威判据——不是 exe md5，是 IR）
+- 双轨对拍（旧轨 LLVM vs 新轨 TIR）PASS；C 后端自举 + conformance PASS；rls 快速通道 PASS
+- 产物快照用 gate 的 g1 重录 **146 targets / 295 entries**（8 处 DIFF + 2 NEW + **0 GONE**，全部预期内）
+- 种子已刷新（`ci/seed/tc.exe`，md5 `dbe2cebb…`）：新种子能编译 `trap` 语法且自举一代通过
 
 ### G.5 ⚠ B4 尚未完成的部分
 
