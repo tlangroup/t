@@ -85,7 +85,8 @@
 | `fail/f_fault_escape_pub_needs_decl.tc` | A-36 边界：`pub fn` 逃逸必须显式声明（T-MAT-E772）。⚠ 刻意**不调用**它 ⇒ 只有 1 条诊断，无派生噪声 | B5a | ✅ |
 | `fail/f_fault_escape_multi_group.tc` | A-37：同时暴露两个组 ⇒ T-MAT-E773（v1 不支持跨组 tag 重映射）。同理刻意不调用 | B5a | ✅ |
 | `examples/faultescape_demo.tc` + `.expected.txt` | **推导的运行期行为**（双后端逐字节）：直通 / 直通传播 / 三层链路 / 内层已修好取 `val` / **两组共存**。`0/bob 3/anon 3/anon 0/bob 200/old` | B5a | ✅ 双后端逐字节一致 |
-| 待补 | **早期返回脱糖**（`var x = <call>;` ⇒ `if (tag != 0) return;` + 绑定 `val`） | B5b | ⬜ A-38 的直通已够用 |
+| `pass/p_fault_escape_desugar.tc` | **早期返回脱糖**（`var x = <call>;` ⇒ `if (tag != 0) return;` + 绑定 `val`） | B5b | ✅ 守卫：变量被当载体用（`return x`/`trap x`/`x.tag`）则**不**脱糖，保留直通 |
+| `examples/faultescape_b5b.tc` | 同上，运行期 golden（成功路径 `4/bob`，双后端逐字节一致） | B5b | ✅ |
 | 待补 | @main 之外由运行时接手（A-19 落地：打印 + 非零退出码） | B5c | ⬜ |
 | 待补 | 跨函数**编译期**可达集（未上传的 repair 可被静态判定 + 诊断） | B6 | ⬜ |
 

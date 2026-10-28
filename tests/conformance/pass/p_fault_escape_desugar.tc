@@ -1,0 +1,46 @@
+// EXPECT: pass
+// B5b / A-38：早期返回脱糖 —— `var x = <会抛的调用>;` 自动 early-return（传播载体）+ 绑定 val，
+// 使 x 在后续代码里直接作为 T 使用（不必再手写 trap）。
+//
+// ⭐ 本例钉住脱糖的**触发条件**与其**守卫**：
+//   · x 只被当 T 用（读字段 / 参与构造）⇒ 触发脱糖；
+//   · 若 x 被当**载体**用（`return x` / `trap x` / `x.tag`）则**不**脱糖，保留直通语义
+//     （见 pass/p_fault_escape_var.tc 的 `var f = validate(u); return f;`）。
+
+struct User {
+    age: i64;
+    name: string;
+}
+
+fault UserErr over User {
+    .{ .age < 0 }   -> UserErr.AgeNegative repairs { .clamp };
+    .{ .name = "" } -> UserErr.NameEmpty    repairs { .anon };
+}
+
+// 省略 `fault(E)!T`：由调用图推导（A-36）
+fn validate(u : User) User {
+    if (u.name == "") {
+        return Err(
+            @clause(.fault, .{ .name = "" }, UserErr.NameEmpty)
+         ++ @clause(.repair, .anon, fn () User { return User{ .age = u.age, .name = "anon" }; })
+        );
+    }
+    return Ok(u);
+}
+
+// x 被当 T 使用（读字段、构造新值）⇒ 触发 B5b 脱糖
+fn use_it(u : User) User {
+    var x = validate(u);   // B5b：x 直接是 User（已解包），无需 trap
+    return Ok(User{ .age = x.age + 1i64, .name = x.name });
+}
+
+fn main_fn() i32 @main {
+    // 无 `.abort` 臂 ⇒ trap 必须覆盖组内**全部**成员（A-15）
+    var a : User = trap use_it(User{ .age = 3i64, .name = "bob" }) {
+        .{ .age < 0 }   => resume(.clamp);
+        .{ .name = "" } => resume(.anon);
+    };
+    println(i2s(a.age));
+    println(a.name);
+    return 0;
+}

@@ -1,0 +1,41 @@
+// 故障批次 B5b / A-38：**早期返回脱糖**的运行期 golden（成功路径，exit 0）。
+//
+// `var x = validate(u);` 经 B5b 脱糖后 x 直接是 User（已解包），可被当作 T 使用；
+// 错误路径由 early-return 自动把载体传播出去（本例走成功路径，不触发传播）。
+// ⚠ 与 examples/faultescape_demo 的分工：demo 钉住「直通」语义，本例钉住「脱糖」语义。
+
+struct User {
+    age: i64;
+    name: string;
+}
+
+fault UserErr over User {
+    .{ .age < 0 }   -> UserErr.AgeNegative repairs { .clamp };
+    .{ .name = "" } -> UserErr.NameEmpty    repairs { .anon };
+}
+
+fn validate(u : User) User {
+    if (u.name == "") {
+        return Err(
+            @clause(.fault, .{ .name = "" }, UserErr.NameEmpty)
+         ++ @clause(.repair, .anon, fn () User { return User{ .age = u.age, .name = "anon" }; })
+        );
+    }
+    return Ok(u);
+}
+
+fn use_it(u : User) User {
+    var x = validate(u);
+    return Ok(User{ .age = x.age + 1i64, .name = x.name });
+}
+
+fn main_fn() i32 @main {
+    // 无 `.abort` 臂 ⇒ trap 必须覆盖组内**全部**成员（A-15）
+    var a : User = trap use_it(User{ .age = 3i64, .name = "bob" }) {
+        .{ .age < 0 }   => resume(.clamp);
+        .{ .name = "" } => resume(.anon);
+    };
+    println(i2s(a.age));
+    println(a.name);
+    return 0;
+}

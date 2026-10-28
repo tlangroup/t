@@ -18055,6 +18055,207 @@ pub fn fault_escape_pass() void {
     }
 }
 
+// ══════════════════════════════════════════════════════════════
+// fault B5b：早期返回脱糖（A-38 / fault.md H.8）
+// ──────────────────────────────────────────────────────────────
+// `var x = <会抛的调用>;` ⇒
+//     var __esc_N = <call>;
+//     if (__esc_N.tag != 0) return __esc_N;   // 传播载体（A-19）
+//     var x = __esc_N.val;                    // x 直接是 T（绑定 val）
+// 产物块打 bf=1（非新作用域）⇒ x 对块外可见（A-34 位置②同款）。
+//
+// 这是**语义保持的语法糖**：直通（`var f = <call>;` 里 f 就是载体）本就可用，
+// 本步只是替用户写出 `if (tag != 0) return;` + 取 `val`。
+//
+// ⭐⭐ 四道守卫（缺一必破坏既有的直通语义）：
+//   ① 变量被当作**载体**使用（`return x` / `trap x` / 读 `x.tag`）⇒ **不**脱糖，
+//      保留直通 —— p_fault_escape_var 的 `var f = validate(u); return f;` 正是此形态，
+//      一旦脱糖 f 变成 T，`return f` 就与「函数返回载体」不同型 ⇒ 该用例反红。
+//   ② LHS 显式标注了 `fault(E)!T` ⇒ 用户就是要载体，不脱糖。
+//   ③ 所在函数必须承载**同一组**（否则 `return __esc_N` 与它的返回类型不同型）。
+//   ④ @main 不承载故障（A-36 豁免）⇒ 其体内一律不脱糖。
+// ══════════════════════════════════════════════════════════════
+
+// 判别：e 是否是「名为 name 的 ident」
+fn b5b_ident_is(e: i64, name: string) bool {
+    if (e < 0) { return false; }
+    if (base.node_kind((e as u64)) != "ident") { return false; }
+    return base.node_sa((e as u64)) == name;
+}
+
+// 判别：变量 name 是否被当作**载体**使用（return 值 / trap scrutinee / 读 .tag）
+fn b5b_used_as_carrier_list(head: i64, name: string) bool {
+    if (head < 0) { return false; }
+    var ks: []i64 = base.kids_chain_idx(head);
+    var i: i64 = 0;
+    while (i < slice_len(ks) as i64) {
+        if (b5b_used_as_carrier(base.kids[ks[i]].val, name) == true) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn b5b_used_as_carrier(e: i64, name: string) bool {
+    if (e < 0) { return false; }
+    var k: string = base.node_kind((e as u64));
+    if (k == "return") {
+        if (b5b_ident_is(base.node_na((e as u64)), name) == true) { return true; }
+    }
+    // ⚠ trap 节点的 kind 是 "match" + sc=="__trap__"（trap_node_is），不是 "trap"
+    if (trap_node_is(e) == true) {
+        if (b5b_ident_is(base.node_na((e as u64)), name) == true) { return true; }
+    }
+    if (k == "member") {
+        if (base.node_sa((e as u64)) == "tag") {
+            if (b5b_ident_is(base.node_na((e as u64)), name) == true) { return true; }
+        }
+    }
+    // lambda / clause 的体属于别的函数，不并进来扫（同 fault_esc_walk 的理由）
+    if (k == "lambda" or k == "clause") { return false; }
+    if (b5b_used_as_carrier(base.node_na((e as u64)), name) == true) { return true; }
+    if (b5b_used_as_carrier(base.node_nb((e as u64)), name) == true) { return true; }
+    if (b5b_used_as_carrier(base.node_nc((e as u64)), name) == true) { return true; }
+    if (b5b_used_as_carrier(base.node_nd((e as u64)), name) == true) { return true; }
+    if (b5b_used_as_carrier_list(base.node_la((e as u64)), name) == true) { return true; }
+    if (b5b_used_as_carrier_list(base.node_lb((e as u64)), name) == true) { return true; }
+    if (b5b_used_as_carrier_list(base.node_lc((e as u64)), name) == true) { return true; }
+    return false;
+}
+
+// 取**函数**声明 d 的返回值类型所承载的故障组（不承载 ⇒ -1）
+fn b5b_func_ret_group(d: i64) i64 {
+    if (d < 0) { return -1; }
+    var si: i64 = sym_lookup(global_scope, base.node_sa((d as u64)));
+    if (si < 0) { return -1; }
+    var fti: i64 = syms[si].ti;
+    if (fti < 0) { return -1; }
+    if (tip_kind(fti) != "Func") { return -1; }
+    if (fti >= slice_len(tif_ret) as i64) { return -1; }
+    return fault_struct_group_of(tif_ret[fti]);
+}
+
+// 判别：调用 e 的被调函数返回类型是否为故障载体；是则返回该载体 TI，否则 -1
+fn b5b_call_carrier_ti(e: i64) i64 {
+    if (e < 0) { return -1; }
+    if (base.node_kind((e as u64)) != "call") { return -1; }
+    // ⭐ 调用名在 na 指向的 ident 的 sa，不在 call 节点自己的 sa
+    var cal: i64 = base.node_na((e as u64));
+    if (cal < 0) { return -1; }
+    if (base.node_kind((cal as u64)) != "ident") { return -1; }
+    var si: i64 = sym_lookup(global_scope, base.node_sa((cal as u64)));
+    if (si < 0) { return -1; }
+    var fti: i64 = syms[si].ti;
+    if (fti < 0) { return -1; }
+    if (tip_kind(fti) != "Func") { return -1; }
+    if (fti >= slice_len(tif_ret) as i64) { return -1; }
+    var rt: i64 = tif_ret[fti];
+    if (fault_struct_group_of(rt) >= 0) { return rt; }
+    return -1;
+}
+
+// 就地改写：`var x = <call>;` ⇒ 早期返回 + 绑定 val 的 bf=1 块
+fn b5b_desugar_one(s: i64, cti: i64, g: i64) void {
+    var xname: string = base.node_sa((s as u64));
+    var xis: i64 = base.node_const(s);
+    // val 的类型：用户显式标注（且非载体）优先，否则用组的 over T
+    var xtn: i64 = base.node_na((s as u64));
+    if (xtn < 0) { xtn = mk_type_node_from_ti(g_fgrp_over[g]); }
+    var call0: i64 = base.node_nb((s as u64));
+    var escv: string = base.sb_cat2("__esc_", base.i2s(s));
+    var h: i64 = -1;
+    var t: i64 = -1;
+    // ① var __esc_N : <载体> = <call>;
+    var vd: i64 = base.mk_var_decl(escv, false, mk_type_node_from_ti(cti), call0, -1);
+    t = base.list_push(h, t, vd);
+    if (h < 0) { h = t; }
+    // ② if (__esc_N.tag != 0) { return __esc_N; }   （lb = -2：无 else 分支）
+    var zero: i64 = base.mk_int("0", 10, -1);
+    base.node_set_sb((zero as u64), "i64");
+    var tag_neq_0: i64 = base.mk_binary("!=",
+        base.mk_member("tag", base.mk_ident(escv, -1), -1), zero, -1);
+    var ret: i64 = base.mk_return(base.mk_ident(escv, -1), -1);
+    var th: i64 = -1;
+    var tt: i64 = -1;
+    tt = base.list_push(th, tt, ret);
+    if (th < 0) { th = tt; }
+    var ifn: i64 = base.mk_if(tag_neq_0, th, -2, -1);
+    t = base.list_push(h, t, ifn);
+    // ③ var x = __esc_N.val;
+    var xd: i64 = base.mk_var_decl(xname, xis != 0, xtn,
+        base.mk_member("val", base.mk_ident(escv, -1), -1), -1);
+    t = base.list_push(h, t, xd);
+    // 落定：s 由 var_decl 变成 block
+    base.node_set_kind((s as u64), "block");
+    base.node_set_na((s as u64), -1);
+    base.node_set_nb((s as u64), -1);
+    base.node_set_la((s as u64), h);
+    // bf = 1 ⇒ 产物块**不是**新作用域，x 对块外可见（A-34 位置②同款）
+    base.node_set_bf((s as u64), true);
+    hir.hir_invalidate((s as u64));
+}
+
+fn b5b_desugar_walk_list(d: i64, head: i64) void {
+    if (head < 0) { return; }
+    var ks: []i64 = base.kids_chain_idx(head);
+    var i: i64 = 0;
+    while (i < slice_len(ks) as i64) {
+        b5b_desugar_walk(d, base.kids[ks[i]].val);
+        i = i + 1;
+    }
+}
+
+fn b5b_desugar_walk(d: i64, e: i64) void {
+    if (e < 0) { return; }
+    var k: string = base.node_kind((e as u64));
+    if (k == "var_decl") {
+        var cti: i64 = b5b_call_carrier_ti(base.node_nb((e as u64)));
+        if (cti >= 0) {
+            var g: i64 = fault_struct_group_of(cti);
+            var ok: bool = true;
+            // ② LHS 显式标注了载体 ⇒ 用户就是要载体，不脱糖
+            if (base.node_na((e as u64)) >= 0) {
+                var lti: i64 = resolve_ti(base.node_na((e as u64)));
+                if (fault_struct_group_of(lti) >= 0) { ok = false; }
+            }
+            // ③ 所在函数必须承载同一组，否则 return __esc_N 不同型
+            if (ok == true and b5b_func_ret_group(d) != g) { ok = false; }
+            // ① 被当载体使用 ⇒ 保留直通
+            if (ok == true) {
+                if (b5b_used_as_carrier(d, base.node_sa((e as u64))) == true) { ok = false; }
+            }
+            if (ok == true) {
+                b5b_desugar_one(e, cti, g);
+                // ⭐ 产物块是合成物：不再递归进去，否则其中的
+                //   `var __esc_N = <call>`（初始化器仍是会抛的调用）会被二次脱糖 ⇒ 无限递归。
+                return;
+            }
+        }
+    }
+    b5b_desugar_walk(d, base.node_na((e as u64)));
+    b5b_desugar_walk(d, base.node_nb((e as u64)));
+    b5b_desugar_walk(d, base.node_nc((e as u64)));
+    b5b_desugar_walk(d, base.node_nd((e as u64)));
+    b5b_desugar_walk_list(d, base.node_la((e as u64)));
+    b5b_desugar_walk_list(d, base.node_lb((e as u64)));
+    b5b_desugar_walk_list(d, base.node_lc((e as u64)));
+}
+
+// 入口：对每个（非 @main 的）函数体做一次早期返回脱糖
+pub fn b5b_escape_desugar() void {
+    var nd: i64 = slice_len(lex__decl_list) as i64;
+    var i: i64 = 0;
+    while (i < nd) {
+        var d: i64 = lex__decl_list[i];
+        if (base.node_kind((d as u64)) == "FuncDecl") {
+            // ④ @main 不承载故障（A-36 豁免）⇒ 其体内一律不脱糖
+            if (parse.ann_find(base.node_la((d as u64)), "main") < 0) {
+                b5b_desugar_walk(d, d);
+            }
+        }
+        i = i + 1;
+    }
+}
+
 pub fn passes_init() void {
     g_passes = [];
     var req0: []string = [];
@@ -18069,6 +18270,10 @@ pub fn passes_init() void {
     var reqF: []string = []; append(reqF, "meta_pass");
     // B5a：跨函数可达故障集。必须晚于 mb_pass/meta_pass（体已被改写），早于 hir_build。
     var p5: Pass; p5.name = "fault_escape_pass"; p5.stage = 1; p5.kind = PASS_ANALYSIS; p5.requires = reqF; p5.auto_run = true; register_pass(p5);
+    var reqF2: []string = []; append(reqF2, "fault_escape_pass");
+    // B5b：早期返回脱糖。必须**晚于** fault_escape_pass（要靠它回填的 tif_ret 才能判别
+    //   「调用返回载体」与「所在函数承载同组」），且早于 hir_build ⇒ 产物由后续 hir_build2 反映。
+    var p5b: Pass; p5b.name = "b5b_escape_desugar"; p5b.stage = 1; p5.kind = PASS_TRANSFORM; p5b.requires = reqF2; p5b.auto_run = true; register_pass(p5b);
     var reqE: []string = []; append(reqE, "comptime_fold_pass");
     var p6: Pass; p6.name = "ann_pass";           p6.stage = 1; p6.kind = PASS_TRANSFORM; p6.requires = reqE; p6.auto_run = false; register_pass(p6);
 }
@@ -18086,6 +18291,7 @@ pub fn run_passes() void {
         else if (p.name == "mb_pass") { mb_pass(); }
         else if (p.name == "meta_pass") { meta_pass(); }
         else if (p.name == "fault_escape_pass") { fault_escape_pass(); }
+        else if (p.name == "b5b_escape_desugar") { b5b_escape_desugar(); }
         i = i + 1;
     }
 }
