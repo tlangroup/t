@@ -205,6 +205,8 @@ const SMOKE_SKIP = new Map([
     // 退出码 1 是**预期结果**，跑进 --all 冒烟会被当成失败 ⇒ 仅供手动双后端验证，
     // 不在冒烟集合内（其语义由 conformance p_fault_main_abort 静态覆盖 + 手动实跑）。
     ["fault_main_abort", "故意 exit(1)（B5c：未处理故障逃出 @main 由运行时接手），不是冒烟用例"],
+    // B6：本例刻意消费一个「未上传」的 repair 槽位 ⇒ 空槽护栏 eprint + exit(1)。
+    ["faultrepair_missing", "故意 exit(1)（B6：未上传的 repair 被 resume 消费，空槽护栏接手），不是冒烟用例"],
 ]);
 
 // 无 @main 的示例是「被别的示例 import 的库模块」：build/run 需要入口，

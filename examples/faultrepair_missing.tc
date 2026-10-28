@@ -1,0 +1,55 @@
+// 未上传的 repair 被 `resume(.m)` 消费 ⇒ 运行期护栏接手（fault 批次 B6）
+//
+// 组内声明了修法，不代表**每条** raise 都会把它挂上：A-26 让槽位数 N 属于组，
+// 但某条 `Err(...)` 完全可以只抛不挂（本例的 NameEmpty 就是）。此时槽位是空指针，
+// 此前 `resume(.anon)` 会**直接调用空闭包 ⇒ EXIT=139 段错误**（静默崩溃）。
+//
+// 现在 trap 的 `resume(.m)` 臂在调用前插了空槽检查：
+//     if (<fv>.r<slot> == null) { eprint(...); exit(1); }
+// ⇒ 崩溃变成一条明确的诊断 + 非零退出码（与 B5c「未处理故障由运行时接手」同手法）。
+//
+// ⚠ 本例**故意** exit(1) ⇒ 不进 run_examples golden（无 .expected.txt），已加入 SMOKE_SKIP。
+//   手动验证：`tc run examples/faultrepair_missing.tc` ⇒ 先打印正常路径的 `0`，随后 stderr 含
+//   `fault UserErr: member `NameEmpty` was raised without repair slot r2; aborting`，退出码 1。
+
+struct User {
+    age: i64;
+    name: string;
+}
+
+fault UserErr over User {
+    .{ .age < 0 }   -> UserErr.AgeNegative repairs { .use_default, .clamp };
+    .{ .name = "" } -> UserErr.NameEmpty    repairs { .anon };
+}
+
+// 内层：AgeNegative 挂了 .clamp；**NameEmpty 只抛、不挂** .anon
+fn inner(u : User) fault(UserErr)!User {
+    if (u.age < 0) {
+        return Err(
+            @clause(.fault, .{ .age < 0 }, UserErr.AgeNegative)
+         ++ @clause(.repair, .clamp, fn () User { return User{ .age = 0i64, .name = u.name }; })
+        );
+    }
+    if (u.name == "") {
+        return Err(@clause(.fault, .{ .name = "" }, UserErr.NameEmpty));
+    }
+    return Ok(u);
+}
+
+// 外层：穷尽地消费两个成员 —— 其中 `resume(.anon)` 命中未上传的槽位 r2
+fn outer(u : User) User {
+    return trap inner(u) {
+        .{ .age < 0 }   => resume(.clamp);
+        .{ .name = "" } => resume(.anon);
+    };
+}
+
+fn main_fn() i32 @main {
+    // 先跑一条**上传了**修法的路径，证明护栏没有破坏正常语义
+    var a : User = outer(User{ .age = -5i64, .name = "bob" });
+    println(i2s(a.age));
+    // 再跑未上传的那条 ⇒ 护栏接手：eprint + exit(1)（下面这行不会被执行到）
+    var b : User = outer(User{ .age = 3i64, .name = "" });
+    println(i2s(b.age));
+    return 0;
+}

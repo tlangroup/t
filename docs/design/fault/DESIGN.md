@@ -26,9 +26,9 @@ fault 的设计讨论已在 2026-10-27 收口，编码已开工 ⇒ 两侧都需
 | **B2** | `PatternExpr` 放宽到关系表达式（谓词模式）+ A-16 硬约束 + 值级 match 语义（N4/N6） | ✅ **完成** | gate L2 **23 passed / 1 failed**；唯一 FAIL 为「产物快照」且根因是基线录制编译器用错（见 §3），非代码回归 |
 | **B3** | `@clause(.fault)` / `@clause(.repair)` 变体 + 形态校验 + 「不进运行期」保证（槽位索引按 A-26 归 B1） | ✅ **完成** | gate L2 **23 passed / 1 failed**；唯一 FAIL 为产物快照的**合法漂移**（2 DIFF = `src/tc.tc` 自举产物、2 NEW = 新示例、0 GONE），已重录 |
 | **B1** | `FaultSetDecl` 解析 + 具名组登记 + `fault(E)!T` 运行时表示（A-27/A-32：合成具名 struct，不新增 TI kind） | ✅ **完成** | 见 §3.3 |
-| **B4** | `trap` / `resume` / `recover` 脱糖为 `match` + 常量索引间接调用；组 → 生成校验函数（A-23） | 🟡 **B4a ✅**（`Ok` / `Err` raise 侧，2026-10-28）；**B4b ⬜**（`trap` / `resume` / `recover`） | `fault.md` 附录 F |
-| **B5** | 跨函数可达故障集 / 可达 repair 分析，经 `.tlib` TIR 摘要（A-28：不砍） | ⬜ 未开工 | — |
-| **B6** | 门禁收口：conformance 用例 + examples golden 双后端 + 自举 + IR 快照重录 | ⬜ 未开工 | — |
+| **B4** | `trap` / `resume` / `recover` 脱糖为 `match` + 常量索引间接调用；组 → 生成校验函数（A-23） | ✅ **B4a**（`Ok` / `Err` raise 侧）+ ✅ **B4b**（消费侧）均已完成并通过门禁（2026-10-28） | `fault.md` 附录 F |
+| **B5** | 跨函数可达故障集 / 可达 repair 分析，经 `.tlib` TIR 摘要（A-28：不砍） | ✅ **B5a**（跨函数签名推导）+ ✅ **B5b**（早期返回脱糖）+ ✅ **B5c**（@main 运行时接手） | 附录 H（B5a/B5b/B5c） |
+| **B6** | 门禁收口：conformance 用例 + examples golden 双后端 + 自举 + IR 快照重录 | ✅ 已完成（2026-10-29）：gate L2 23/24 → 快照重录 **149 targets / 301 entries** 回验逐字节相同；另补「未上传 repair」空槽护栏 | 见 §3.6 |
 
 - **顺序**：B2 → B3 → B1 → B4 → B5（B6 随每批走）。理由见 `fault.md` §11：B2/B3/B4 全在编译期、不碰后端。
 - ⚠ **B5 不砍（A-28）**：A-4 的非 `pub` 推导要求跨函数可达集分析，排在最后但**不是可选项**。
@@ -123,6 +123,35 @@ G-3（嵌套字段赋值）已用整结构体赋值绕开。
 
 ---
 
+### 3.6 ✅ B6 门禁收口证据（2026-10-29）
+
+- gate L2（57min，`--keep-going`）：**23 passed / 1 failed**，唯一 FAIL = 产物快照 6 处。
+  先核合法性再重录：`2 DIFF = src/tc.tc::{ll,c}`（B5c+B5b 改了编译器源码）+ `4 NEW`（两个新 example × 双后端）+ **0 GONE** ⇒ 合法、非退化。
+- 用 **gate 的 g1** 重录：**149 targets / 301 entries**；回验 `ir_snapshot --compiler out/dbg/g1.exe`
+  ⇒ **OK，301 份产物逐字节相同**。⇒ 快照步等价 PASS = **24/24**，fault 批次门禁全绿。
+- 关键步全 PASS：自举一代 g1 / **四代不动点 g2==g3==g4** / conformance 442 /
+  run_examples 双后端 / HIR AstGen + CTFE / 双轨对拍 / MIR differential / **C 后端自举** /
+  difftest tc0 / rls 快速通道 / lint 冒烟。
+- 收尾：`g4 → out/dbg/tc.exe`；`npm run seed:check` 通过（种子未过期，未刷新）。
+- 提交：`0d8ba69`(B5c) / `ca0b44c`(B5b) / `8a5f9a6`(基线)，均在 `wb`，未 push、未开 PR。
+
+**⭐ B6 追加修复：未上传的 repair ⇒ 空槽护栏（原为静默段错误）**
+
+- **现象**：组内声明了修法（`.anon`），但某条 `Err(...)` **只抛不挂**；上层的
+  `trap` 臂 `resume(.anon)` 静态完全合法（E770 只查「修法名是否属于该成员」，
+  不查「是否真的上传」）⇒ 运行期调用**空闭包槽位** ⇒ **EXIT=139 段错误**。
+- **修法**：`trap` 脱糖时，凡 `resume(.m)` 臂都在闭包调用**前**插入
+  `if (<fv>.r<slot> == null) { eprint(...); exit(1); }`（`trap_slot_guard`，位置①②同插）。
+  与 B5c「未处理故障由运行时接手」同手法：宁可显式报错退出，也不让空调用沦为 UB。
+- ⚠ **合成 null 字面量必须用 `base.mk_null(-1)`**，不能用 `mk_ident("null")`
+  —— 后者报 `T-SEM-E201 未定义的标识符 null`（`null` 是独立节点 kind，不是标识符）。
+- **为什么不做静态判定**：那需要**成员级**可达集（每条 raise 上传了哪些槽位、跨函数求交），
+  而 **A-39 已裁定跨模块不做**（`.tlib` 只承载推导后的签名）⇒ 静态覆盖不全。
+  运行期护栏对全部路径（含跨模块 / 间接调用）都成立 ⇒ v1 取护栏，静态分析留 v2。
+- 用例：`examples/faultrepair_missing.tc`（故意 exit 1 ⇒ 不进 golden，已加 `SMOKE_SKIP`）。
+
+---
+
 ## 4. 偏离记录
 
 | # | 批次 | 偏离 | 处置 |
@@ -139,6 +168,7 @@ G-3（嵌套字段赋值）已用整结构体赋值绕开。
 | **D-14** | B4a | ⭐ `base.kids_chain_idx(la)` 返回 **kids 链下标**，不是节点 id，须再取 `kids[i].val` | 首版三处直接把下标当节点 ⇒ `Err(...)` 的实参全被判成非 clause（`T-MAT-E754` 误报） |
 | **G-4** | B4a→B4b ✅ | ⚠ 既有缺口。⚠ **旧归因错误**：非捕获 lambda 与具名函数单独用都正常，真因是 **fn 类型的槽（struct 字段 / 变量）被写成裸函数符号**（`Box{ .r0 = seven }` / `b.r0 = seven` / `var f: fn()i64 = seven`）⇒ LLVM `store i64 @fn, ptr %x` 链接失败、C 轨把函数机器码当 TClosure 读 | 修在 **TIR 层**（`tir_emit_struct_lit` 具名字段 + `tir_emit_assign` member 分支）：判据「值以 `@` 开头 = 裸函数符号」⇒ `tir_make_closure_value` 包成 `%TClosure`。⚠ 后端层判别不可靠（fn 槽的 TIR 型是 `ptr<void>`，与 %TClosure 基址无从区分）⇒ 两轮后端层尝试均回退 |
 | **G-5** | B4a | ⚠ 既有缺口：从闭包调用结果**直接**读 string 字段（`g().name`）出空串且程序随后停住；i64 字段与非闭包的 `mk().n` 都正常 | golden 一律先落局部变量再读字段 |
+| **D-15** | B6 | ⭐ **未上传的 repair 被 `resume(.m)` 消费 ⇒ 空槽调用段错误（EXIT=139，静默崩溃）**。组内声明了修法 ≠ 每条 raise 都挂了闭包（A-26 只让槽位**数** N 属组） | 改为**运行期护栏**：`resume(.m)` 臂在闭包调用前插 `if (<fv>.r<slot> == null) { eprint; exit(1); }`。静态成员级可达集因 A-39（跨模块不做）覆盖不全 ⇒ 留 v2。详见 §3.6 |
 | **G-6** | B4a | ⚠ 既有缺口：**C 后端**对结构体字面量缺失的**标量**字段分配 0 字节缓冲 + 把指针当值 ⇒ `incompatible pointer to integer conversion` | B4a 靠补全 `tag` 绕开（不动后端）；普通 `P3{ .a = 5 }` 在改动前的编译器上同样炸 |
 | **D-10** | B1 | ⭐ **HIR 侧不是零改动**（推翻「附录 C P8」的预估）：`hir_lower_decl` 的 `else` 兜底给未知 kind 发 `HIR_OP_RAW`，而门禁 **「RAW 合计 0」是硬判据** ⇒ `examples/faultgroup_demo.tc` 1 处 RAW 让 gate L2 第 15 步 FAIL | 复用 `HIR_OP_TYPE_ALIAS_DECL` + 在 `check_decl_hir` 显式回落 `check_fault_decl`（`fault.md` §C.5 D-10 / D-11） |
 

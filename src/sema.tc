@@ -11129,6 +11129,30 @@ pub fn fault_raise_err(e: i64, g: i64) void {
             if (head < 0) { head = tail; }
         }
     }
+    // ③b B6：**未上传的槽位必须显式写成 `.r<k> = null`** —— 不能靠「字段缺失」。
+    //   既有缺口 G-6 / 偏离 D-13：C 后端对结构体字面量里**缺失的标量字段**不做零初始化
+    //   （会分配 0 字节缓冲并把指针当值）⇒ 省略的槽位是**垃圾**而非空指针，
+    //   运行期 `resume(.m)` 的空槽护栏（`trap_slot_guard`）判不出来 ⇒ 仍然段错误。
+    //   A-26 让槽位数 N 属组 ⇒ 逐个槽位补 null，载体即全字段确定。
+    var k: i64 = 0;
+    while (k < g_fgrp_slot_n[g]) {
+        var used: bool = false;
+        var jj: i64 = 0;
+        while (jj < slice_len(cs) as i64) {
+            var a3: i64 = cs[jj];
+            jj = jj + 1;
+            if (base.node_sa((a3 as u64)) == "repair") {
+                var rn3: string = base.node_sa((base.node_na((a3 as u64)) as u64));
+                if (fault_repair_slot(m, rn3) == k) { used = true; }
+            }
+        }
+        if (used == false) {
+            var fz: i64 = base.mk_FV(base.sb_cat2("r", base.i2s(k)), base.mk_null(-1), -1);
+            tail = base.list_push(head, tail, fz);
+            if (head < 0) { head = tail; }
+        }
+        k = k + 1;
+    }
     fault_node_to_struct_lit(e, base.sb_cat2("__fault_", g_fgrp_name[g]), head);
 }
 
@@ -11362,6 +11386,43 @@ fn trap_slot_call(fv: string, slot: i64) i64 {
     return base.mk_call(memb, -1, -1);
 }
 
+// B6 护栏：`resume(.m)` 的修法槽位**可能未被上传** —— 组内声明了该修法，但抛出点的那条
+//   `Err(...)` 没有挂对应闭包 ⇒ 槽位是空指针，直接调用即**段错误**（静默崩溃，实测 EXIT=139）。
+//   此处在调用前插入
+//       if (<fv>.r<slot> == null) { eprint(<msg>); exit(1); }
+//   与 B5c 的「未处理故障由运行时接手」同手法：宁可显式报错退出，也不让空闭包调用沦为 UB。
+//
+//   ⚠ 为什么不做静态判定：那需要**成员级**可达集（每个 raise 点上传了哪些槽位，跨函数求交），
+//     而 A-39 已裁定跨模块不做（`.tlib` 只承载推导后的签名）⇒ 静态覆盖不全。
+//     运行期护栏是唯一对全部路径（含跨模块 / 间接调用）都成立的手段，静态分析留 v2。
+fn trap_slot_guard(fv: string, slot: i64, g: i64, mem: i64) i64 {
+    var memb: i64 = base.mk_member(base.sb_cat2("r", base.i2s(slot)), base.mk_ident(fv, -1), -1);
+    var cmp: i64 = base.mk_binary("==", memb, base.mk_null(-1), -1);
+    var msg: string = "fault ";
+    msg = base.sb_cat2(msg, g_fgrp_name[g]);
+    msg = base.sb_cat2(msg, ": member `");
+    msg = base.sb_cat2(msg, g_fmem_name[mem]);
+    msg = base.sb_cat2(msg, "` was raised without repair slot r");
+    msg = base.sb_cat2(msg, base.i2s(slot));
+    msg = base.sb_cat2(msg, "; aborting\n");
+    var eh: i64 = -1;
+    var et: i64 = -1;
+    // eprint(<msg>)
+    var ah: i64 = -1;
+    var at: i64 = -1;
+    at = base.list_push(ah, at, base.mk_string(msg, -1));
+    if (ah < 0) { ah = at; }
+    et = base.list_push(eh, et, base.mk_expr(base.mk_call(base.mk_ident("eprint", -1), ah, -1), -1));
+    if (eh < 0) { eh = et; }
+    // exit(1)
+    var xh: i64 = -1;
+    var xt: i64 = -1;
+    xt = base.list_push(xh, xt, rng_lit(1));
+    if (xh < 0) { xh = xt; }
+    et = base.list_push(eh, et, base.mk_expr(base.mk_call(base.mk_ident("exit", -1), xh, -1), -1));
+    return base.mk_if(cmp, eh, -2, -1);
+}
+
 // 穷尽性（无 `.abort` 时）：组内每个成员都至少被一条臂引用（A-15）。
 fn trap_exhaustive(g: i64, tp: i64) bool {
     var b: i64 = g_fgrp_mem_begin[g];
@@ -11438,6 +11499,12 @@ pub fn trap_desugar_return(s: i64) bool {
             var ret: i64 = base.mk_return(rv, -1);
             var th: i64 = -1;
             var tt: i64 = -1;
+            // B6：只有 `resume(.m)` 臂会调用槽位闭包 ⇒ 只对它插空槽护栏
+            //   （`recover(<expr>)` 臂用的是用户自己的表达式，不涉及槽位）。
+            if (g_trap_rec[i] < 0) {
+                tt = base.list_push(th, tt, trap_slot_guard(fv, g_trap_slot[i], g, g_trap_mem[i]));
+                if (th < 0) { th = tt; }
+            }
             tt = base.list_push(th, tt, ret);
             if (th < 0) { th = tt; }
             // lb = -2：无 else 分支（见 stmt_can_fall_through 的 if 分支约定）
@@ -11535,6 +11602,11 @@ pub fn trap_desugar_vardecl(s: i64) bool {
         var asg: i64 = base.mk_assignment("=", base.mk_ident(xname, -1), rv, -1);
         var th: i64 = -1;
         var tt: i64 = -1;
+        // B6：同位置① —— 只对 `resume(.m)` 臂插空槽护栏。
+        if (g_trap_rec[i] < 0) {
+            tt = base.list_push(th, tt, trap_slot_guard(fv, g_trap_slot[i], g, g_trap_mem[i]));
+            if (th < 0) { th = tt; }
+        }
         tt = base.list_push(th, tt, asg);
         if (th < 0) { th = tt; }
         var ifn: i64 = base.mk_if(trap_tag_eq(fv, g_fmem_tag[g_trap_mem[i]]), th, -2, -1);

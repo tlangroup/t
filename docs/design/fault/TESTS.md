@@ -87,8 +87,9 @@
 | `examples/faultescape_demo.tc` + `.expected.txt` | **推导的运行期行为**（双后端逐字节）：直通 / 直通传播 / 三层链路 / 内层已修好取 `val` / **两组共存**。`0/bob 3/anon 3/anon 0/bob 200/old` | B5a | ✅ 双后端逐字节一致 |
 | `pass/p_fault_escape_desugar.tc` | **早期返回脱糖**（`var x = <call>;` ⇒ `if (tag != 0) return;` + 绑定 `val`） | B5b | ✅ 守卫：变量被当载体用（`return x`/`trap x`/`x.tag`）则**不**脱糖，保留直通 |
 | `examples/faultescape_b5b.tc` | 同上，运行期 golden（成功路径 `4/bob`，双后端逐字节一致） | B5b | ✅ |
-| 待补 | @main 之外由运行时接手（A-19 落地：打印 + 非零退出码） | B5c | ⬜ |
-| 待补 | 跨函数**编译期**可达集（未上传的 repair 可被静态判定 + 诊断） | B6 | ⬜ |
+| `examples/fault_main_abort.tc` | @main 之外由运行时接手（A-19 落地：eprint + `exit(1)`，故意非零退出 ⇒ 不进 golden、已加 SMOKE_SKIP） | B5c | ✅ |
+| `examples/faultrepair_missing.tc` | **未上传的 repair 被 `resume(.m)` 消费** ⇒ 空槽护栏接手（eprint + `exit(1)`）。修复前为 **EXIT=139 段错误**（静默崩溃） | B6 | ✅ 双后端已验 |
+| 待补 | 跨函数**编译期**可达集（未上传的 repair 可被静态判定 + 诊断） | v2 | ⬜ **改判 v2**：静态需「成员级」可达集（每条 raise 上传了哪些槽位，跨函数求交）；而 A-39 已裁定跨模块不做（`.tlib` 只承载推导后的签名）⇒ 静态覆盖不全。v1 改用**运行期护栏**（上一行）对全部路径成立 |
 
 `predpat_demo` 的期望输出（12 行）：`-1 1 0 9 0 0 7 5 0 3 2 1`
 ——其中 **0 是刻意设计的「不该命中」分支**，命中即说明谓词或分派写反。
