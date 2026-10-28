@@ -1,0 +1,66 @@
+// 故障组的 raise 侧：`Ok(v)` / `Err(@clause(...), …)`（fault 批次 B4a）
+//
+// 本例钉住 **A-35 + D-12**：`Ok` / `Err` **不是关键字**（`Ok`/`Err` 已被 variant 变体名
+// 占用），而是靠「预期类型是 `fault(E)!T` + 名字未声明为函数」双条件识别，随后把
+// `call` 节点**就地改写**成 `__fault_<E>` 的 struct_lit（A-32 布局）。
+//
+// 本例用设计稿 §6 的规范形态 `Err(c1 ++ c2 ++ c3)`。
+//   实现**同时**也接受逗号分隔实参 `Err(c1, c2, c3)`（两种形态各有一致性测试覆盖）。
+//
+// ⚠ 这是**运行期** golden：conformance 只做 `tc check`、从不运行程序 ⇒
+//   「tag 与槽位真的按组声明算对了」只能靠本例 + 双后端对拍证明。
+
+struct User {
+    age: i64;
+    name: string;
+}
+
+fault UserErr over User {
+    .{ .age < 0 }   -> UserErr.AgeNegative repairs { .use_default, .clamp };
+    .{ .name = "" } -> UserErr.NameEmpty    repairs { .anon };
+}
+
+fn validate(u : User) fault(UserErr)!User {
+    if (u.age < 0) {
+        return Err(
+            @clause(.fault, .{ .age < 0 }, UserErr.AgeNegative)
+         ++ @clause(.repair, .use_default, fn () User { return User{ .age = 18i64, .name = u.name }; })
+         ++ @clause(.repair, .clamp,       fn () User { return User{ .age = 0i64,  .name = u.name }; })
+        );
+    }
+    if (u.name == "") {
+        return Err(
+            @clause(.fault, .{ .name = "" }, UserErr.NameEmpty)
+         ++ @clause(.repair, .anon, fn () User { return User{ .age = u.age, .name = "anon" }; })
+        );
+    }
+    return Ok(u);
+}
+
+fn main_fn() i32 @main {
+    // ① 成功路径：`Ok(u)` ⇒ tag 保持零初始化 = 0，val = u
+    var ok : fault(UserErr)!User = validate(User{ .age = 7i64, .name = "amy" });
+    println(i2s(ok.tag));
+    println(ok.val.name);
+
+    // ② 失败路径一：`Err(...)` ⇒ tag = 1（AgeNegative），槽 0 / 1 挂上 repair 闭包
+    var bad : fault(UserErr)!User = validate(User{ .age = -5i64, .name = "bob" });
+    println(i2s(bad.tag));
+    var u0 : User = bad.r0();
+    println(i2s(u0.age));            // .use_default ⇒ 18
+    var u1 : User = bad.r1();
+    println(i2s(u1.age));            // .clamp ⇒ 0
+
+    // ③ 失败路径二：第二个成员 ⇒ tag = 2，槽位基址 = 2
+    var non : fault(UserErr)!User = validate(User{ .age = 3i64, .name = "" });
+    println(i2s(non.tag));
+    var u2 : User = non.r2();
+    println(i2s(u2.age));            // 3（闭包按值捕获了 u）
+    println(u2.name);                // .anon ⇒ "anon"
+    return 0;
+}
+//
+// ⚠ 上面一律「先把闭包调用结果存进局部变量再读字段」，**不要**写成 `bad.r0().age`。
+//   实测既有缺口 **G-5**：从闭包调用结果**直接**读 **string** 字段（`g().name`）会打出空串
+//   且程序随后停住；i64 字段可以，普通函数（非闭包）的 `mk().n` 也正常。
+//   与 fault 无关 —— 用一段不含任何 fault 代码的最小例即可复现（见 fault.md §E.5）。

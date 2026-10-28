@@ -977,3 +977,131 @@ static unsigned char* __lam_0__clo_thunk(void* __env) {
 - 根因在**前端**（callee 是 index 表达式 ⇒ 名字解析为空），不在后端。
 - **不阻塞 B4**：A-32 已用 N 个独立字段 `r0..r(N-1)` 绕开数组通路；`resume(.name)` 的槽位索引是编译期常量。
 - 若日后想改回 `[N]%TClosure`，须先修这条。
+
+---
+
+## 附录 E · B4 批次改动点清单（逐节点）
+
+### E.0 ⚠ 开工前实测出的三处「设计稿没写、但决定形态」的事实（2026-10-28）
+
+| # | 实测 | 后果 |
+|---|---|---|
+| **F-3** | ⭐ **`Ok` / `Err` 已被 variant 变体名占用**：`examples/adt_status.tc` 有 `variant Status { Ok(i64); Err(i64); _ }`，`tests/conformance/pass/p50/p55` 亦用 `Ok` / `Err` 作变体名 | ⇒ **`Ok`/`Err` 绝不能做成关键字**（forced 或 mod 阶都不行）：既破坏既有程序，又抢走用户命名空间。改走 **A-35** 的「预期类型 + 名字未声明」双条件判定 |
+| **F-4** | `.abort` 臂的值是 `fault(E)!T`，成功臂的值是 `T`，**二者不同型**；而 `match` 要求各臂同型 | ⇒ **`trap` 脱糖不成单个 `match` 表达式**（推翻 §5 的脱糖示意）。改走 **A-33** 的「var + if 链 / 每支 return」形态 |
+| **F-5** | `stmt_returns()` 已能识别「`match` 全臂 `return`」与「`if` 两支都 return」⇒ 脱糖后的形态**无需**新增任何流分析 | 零新增流分析（A-33 直接复用） |
+
+### E.1 两条新裁定（A-33 / A-34 / A-35）
+
+**A-33（trap 的脱糖形态）** —— `trap` 脱糖为「`var __fv = <e>;` + **按 tag 的 if 链**，每支以 `return` 结尾」，
+**不是**单个 `match` 表达式。
+
+- 理由（F-4）：`.abort` 臂要 `return __fv`（类型 `fault(E)!T`），成功臂要 `return __fv.rK()`（类型 `T`），
+  同一 `match` 的臂必须同型 ⇒ 装不下。if 链每支是独立 `return` 语句，类型各归各位。
+- 判据仍是 L-04：if / var / 字段读 / 间接调用**全是既有节点**，不加新发射路径。
+
+```text
+return trap serve(c) {
+    .{ .magic != 0xCAFEBABE } => resume(.skip),
+    .{ .len > 16384 }         => resume(.truncate),
+    _                         => resume(.abort),
+};
+```
+⇒
+```text
+var __fv1 : fault(FrameErr)!Frame = serve(c);
+if (__fv1.tag == 1) { return __fv1.r0(); }   // NotOurs.skip → 槽 0
+if (__fv1.tag == 2) { return __fv1.r2(); }   // TooLarge.truncate → 槽 2
+return __fv1;                                 // .abort：原样上传
+```
+
+**A-34（trap 的位置约束）**
+
+| 位置 | 通配臂 `.abort` | 穷尽性 |
+|---|---|---|
+| `return trap <e> { … };`（return 位置） | ✅ 允许 ⇒ `return __fv` | 有 `.abort` 时不要求穷尽 |
+| `var x : T = trap <e> { … };`（初始化位置） | ❌ **禁止**，报编译错 | **必须穷尽**组内全部成员 |
+
+- 理由：`.abort` 的语义是「把故障原样返回给调用者」（A-19），非 return 位置没有返回值可承载它。
+- 与 **A-21**（通配臂只允许 `.abort`）合起来 ⇒ 非 return 位置**压根没有通配臂可用**，
+  A-15（不能吞掉未处理故障）因此是**结构性**的，不靠 lint。
+
+**A-35（Ok / Err 的识别方式）** —— 不做关键字，走**双条件**判定：
+
+1. 所在位置的**预期类型**是 `fault(E)!T`（return 该类型 / 赋值给该类型的变量）；
+2. `Ok` / `Err` 在当前作用域**不是已声明的函数**。
+
+- 满足两条 ⇒ 当构造器；否则当普通 `call`（用户函数照旧可用）。
+- 代价：`fn Ok(...)` 定义在**返回 `fault(E)!T`** 的函数里被 `return Ok(x)` 调用时会被抢。
+  ⇒ v1 接受；诊断在「预期是 fault union 但构造失败」时才发，普通场景零影响。
+
+### E.2 逐节点改动
+
+| # | 落点 | 改动 | 量级 |
+|---|---|---|---|
+| **Q1** | `src/parse.tc` 主表达式位 | 按**词文本 + 前瞻**识别 `trap`（后跟非 `(`）/ `resume`（后跟 `(`）/ `recover`（后跟 `(`），产出专用节点；⚠ `Ok` / `Err` **不动**（A-35，parse 期照旧是普通 `call`） | 中 |
+| **Q2** | `src/parse.tc` | `trap` 的臂解析复用既有 `arm` 节点（与 `match` 同形），臂右侧为 `resume(...)` / `recover(...)` | 小 |
+| **Q3** | `src/sema.tc` return 检查 | 遇 `trap` ⇒ 按 A-34 判定位置；按 A-33 合成 `var __fv` + if 链；臂的谓词经 `fault_pred_same` 与组内声明比对（A-2/A-25）⇒ 得 tag；`resume(.name)` 经 `fault_repair_slot` ⇒ 得槽位 | **大** |
+| **Q4** | `src/sema.tc` | `Ok(e)` / `Err(...)`：按 A-35 双条件拦截 ⇒ 合成 `__fault_<E>` 的 `struct_lit`（`tag` 字面量 / `val` / `rK` 闭包），再走既有 `infer_expr` | 中 |
+| **Q5** | `src/sema.tc` | 谓词常量折叠（A-25）：`Err` 与 `trap` 臂的谓词须与组内声明**规范化后恒等** | 小（B1 已有 `fault_pred_same`）|
+| **Q6** | `tools/diag_defs.json` | 新诊断码（复用 CLA/MAT/CLO 段，**不开 FLT**，A-24） | 小 |
+| **Q7** | `examples/` + golden | 至少 1 个**运行期**双后端 golden（conformance 只 check，§10） | 小 |
+
+### E.3 门禁
+
+同 §C.3：`tc check src/tc.tc` → 自举 g1/g2 → gate L2 → conformance → examples 双后端 → IR 快照重录。
+
+### E.4 ⚠ 本批**不做**（留给 B5 / v2）
+
+| 项 | 归谁 | 理由 |
+|---|---|---|
+| 组 → 生成纯谓词校验函数（A-23） | v2 | A-23 已把它降级为「可选收益」；与本批的构造/消费通路正交 |
+| `trap` 的**表达式**位置（`var x = trap …` 之外的任意表达式位） | v2 | A-34 只开 return / 初始化两个位置，其余留白 |
+| 非 return 位置的隐式传播（`var f = decode(buf);`） | B5 | 属跨函数可达集分析（R-3） |
+| G-2（数组元素上的闭包间接调用） | 延后 | A-32 已绕开；`resume` 的槽位是编译期常量，不碰数组通路 |
+
+---
+
+## 附录 F · B4a 实测结果（raise 侧，`Ok` / `Err`，2026-10-28）
+
+### F.1 落地的东西
+
+| 形态 | 脱糖产物 |
+|---|---|
+| `return Ok(v)` | `__fault_<E> { .tag = 0i64, .val = v }` |
+| `return Err(@clause(.fault, .{p}, E.M), @clause(.repair, .n, fn() T {…}), …)` | `__fault_<E> { .tag = <K>i64, .r<slot> = <闭包> }` |
+
+- 入口 `fault_raise_try` 挂在 `sema::cs_return` 的 **infer 之前**（`infer` 之后再改写就轮不到了：
+  `Ok`/`Err` 会先被当成对未声明函数的调用而报 T-SEM-E2xx）。
+- 就地改写手法照抄 `infer_expr_body` 的 `variant_lit → call` 脱糖：
+  建新节点 → `node_set_kind/na/la/sa/ia` → `hir_invalidate`。**不新增节点 kind**
+  ⇒ HIR 侧零改动（实测 RAW 逃生舱合计 **0** / 145 文件）。
+- 新诊断码 **6 条**（`T-MAT-E753…E758`），诊断码总数 193 → **199**。
+
+### F.2 ⚠ 实测偏差与新缺口
+
+| # | 内容 | 处置 |
+|---|---|---|
+| **D-12** | ⭐ **差点误判**：`++` **是存在**的 —— 它的 op 名是 **"Concat"**（B3 已为它加过 Concat 分支，见 DESIGN.md D-4）。按字面量 `"++"` 去 grep 会 0 命中，首版据此断言「t 没有 `++`」而改用逗号实参 | 实现改为**同时**支持两种形态（递归展平 Concat 链）：`Err(c1 ++ c2 ++ c3)` 与 `Err(c1, c2, c3)`。golden 用设计稿的规范形态 `++`，两种形态各有一致性测试覆盖 |
+| **D-13** | ⭐ `Ok` 必须**显式**写 `.tag = 0i64`，不能省略靠零初始化 | 见下方 G-6；缺失**聚合/指针**字段无害，补 tag 即可 |
+| **G-4** | ⚠ 既有缺口：**非捕获** lambda 当闭包值用 ⇒ `store i64 @__lam_0, ptr %x`（全局引用非指针）链接失败。捕获了变量的 lambda 正常（按值捕获 ⇒ `__env_N` 堆分配） | 本批绕开（golden 的 repair 闭包都捕获了 `u`）；**B4b 的 `recover(e)` 会撞它**（合成闭包可能不捕获） |
+| **G-5** | ⚠ 既有缺口：从**闭包调用结果直接读 string 字段**（`g().name`）打出空串且程序随后停住；i64 字段可以，普通非闭包函数 `mk().n` 也正常。与 fault 无关（不含任何 fault 代码即可复现） | golden 一律「先落局部变量再读字段」 |
+| **G-6** | ⚠ 既有缺口：**C 后端**对结构体字面量缺失的**标量**字段分配 **0 字节缓冲**并把**指针**当值用 ⇒ `incompatible pointer to integer conversion`。改动前的编译器对普通 `P3{ .a = 5 }` 同样炸 | 本批靠**补全 tag 字段**绕开（不动后端）；缺失聚合/指针字段是正常的 |
+| **D-14** | ⭐ `base.kids_chain_idx(la)` 返回的是 **kids 链下标**，不是节点 id —— 必须再取 `kids[i].val` | 首版三处直接用下标当节点 ⇒ `Err(...)` 的实参全判成非 clause（`T-MAT-E754` 误报） |
+
+### F.3 门禁证据
+
+- `tc check src/tc.tc` **errors=0 / warnings=638**（与改动前持平，无新增警告）
+- conformance **421 passed / 0 failed**（+6 条新 fail 用例全绿）
+- `run_examples_tmir --all` **135 passed / 0 failed**（+1 新 golden，双后端逐字节一致）
+- `hir_test` RAW 逃生舱 **0**（145 文件）
+- 自举不动点：**g1.ll == g2.ll** = `07f09e78…`（g1/g2 的 **exe** md5 不同，但那只是二进制里嵌了输出路径，判据看 IR）
+- 产物快照：用 gate 方式构建的 `out/dbg/g1.exe` 重录 **145 targets / 293 entries**（ll:145 / c:145 / dev:3）
+- `examples/faultraise_demo` 双后端输出逐字节 = `0 / amy / 1 / 18 / 0 / 2 / 3 / anon`
+
+### F.4 ⚠ B4 尚未完成的部分（B4b）
+
+- `trap` / `resume` / `recover` / `.abort` —— **未开工**。
+  它需要**语句插入**（`var __fv = e;` + 按 tag 的 `if` 链 + 每支 `return`），
+  而 B4a 用的「就地改 kind」手法**不适用于插入语句** ⇒ 须另找 desugar pass 钩子。
+- 组 → 生成纯谓词校验函数（A-23）：未开工。
+- ⚠ B4b 的 `recover(e)` 脱糖出的合成闭包**可能不捕获任何变量** ⇒ **必然撞 G-4** ⇒ 先修 G-4。

@@ -98,6 +98,12 @@ static const DiagDef DIAG_DEFS[] = {
   { "T-MAT-E750", "error", "MAT", "T_MATCH_SLICE_PATTERN", "SLICE_PAT", "slice pattern error" },
   { "T-MAT-E751", "error", "MAT", "T_MATCH_BARE_VARIANT_PATTERN", "BARE_VARIANT_PATTERN", "bare variant pattern is deprecated; use leading-dot form" },
   { "T-MAT-E752", "error", "MAT", "", "FAULT_REPAIR_DUP", "duplicate repair name within one fault member" },
+  { "T-MAT-E753", "error", "MAT", "", "FAULT_OK_ARITY", "`Ok` takes exactly one argument (the success value)" },
+  { "T-MAT-E754", "error", "MAT", "", "FAULT_ERR_NON_CLAUSE", "every argument of `Err(...)` must be an `@clause(...)` literal" },
+  { "T-MAT-E755", "error", "MAT", "", "FAULT_ERR_FAULT_CLAUSE", "`Err(...)` needs exactly one `@clause(.fault, ...)` naming the raised member" },
+  { "T-MAT-E756", "error", "MAT", "", "FAULT_ERR_MEMBER", "the raised fault member does not match the group declaration" },
+  { "T-MAT-E757", "error", "MAT", "", "FAULT_ERR_REPAIR_SLOT", "repair name is not declared for the raised fault member" },
+  { "T-MAT-E758", "error", "MAT", "", "FAULT_ERR_CLAUSE_KIND", "`Err(...)` accepts only `@clause(.fault, ...)` and `@clause(.repair, ...)`" },
   { "T-MAT-E760", "error", "MAT", "T_MATCH_DUP_VALUE_ARM", "DUP_VALUE_ARM", "match arm covers a value already handled by an earlier arm (duplicate constant or overlapping range)" },
   { "T-MAT-W744", "warning", "MAT", "T_MATCH_ARM_UNREACHABLE", "ARM_UNREACHABLE", "match arm is unreachable" },
   { "T-MAT-W761", "warning", "MAT", "T_MATCH_FLOAT_NAN_FOOTGUN", "FLOAT_NAN_FOOTGUN", "matching a float literal/range is unsafe: NaN never equals any value or range, so it silently falls through to a wildcard/default arm" },
@@ -206,7 +212,7 @@ static const DiagDef DIAG_DEFS[] = {
   { "T-VEC-W927", "warning", "VEC", "T_VECTOR_WIDER_THAN_NATIVE", "VECTOR_WIDER_THAN_NATIVE", "vector is wider than the native SIMD register and will be split" },
   { "T-VEC-W947", "warning", "VEC", "T_TILE_WIDER_THAN_NATIVE", "TILE_WIDER_THAN_NATIVE", "hardware tile is wider than the native SIMD register and will fall back to scalar loops" },
 };
-#define DIAG_COUNT 193
+#define DIAG_COUNT 199
 
 /* legacy (old semantic name) -> machine code alias table */
 static const struct { const char* legacy; const char* code; } DIAG_LEGACY[] = {
