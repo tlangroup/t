@@ -75,9 +75,10 @@
 | `examples/faultgroup_demo.tc` + `.expected.txt` | **A-32 布局**：`tag`(0=Ok) / `val`(可写成功值) / `r0..r(N-1)`（读 `r2` 即证明第二成员槽位基址 = 2，槽位少一个则编译不过）。⚠ 刻意**不调用**闭包：三处既有后端缺口见 `fault.md` §C.5 G-1..G-3 | B1 | ✅ 双后端逐字节一致 |
 | `pass/p_fault_raise.tc` | raise 两种实参形态（`++` 串联 / 逗号分隔）都能过 sema 并完成脱糖（只 check，不运行） | B4a | ✅ |
 | `examples/faultraise_demo.tc` + `.expected.txt` | **raise 侧运行期行为**：`Ok(u)` ⇒ tag 0 + `val` 落值；`Err(...)` ⇒ tag 1/2 + 槽 0/1/2 挂上 repair 闭包且**调用**它们得到预期值。⚠ 一律「先落局部变量再读字段」（既有缺口 G-5） | B4a | ✅ 双后端逐字节一致 |
-| `examples/faulttrap_demo.tc` + `.expected.txt` | **消费侧运行期行为**：位置②（clamp / `recover`）；位置① 全修（clamp / anon / 直通）；位置① `recover`；位置① `.abort` ⇒ 消费臂得 tag 0、未落臂成员原样上传得 tag 2 且槽位仍是组内绝对槽位 2。⚠ 一律「先落局部变量再读字段」（既有缺口 G-5） | B4b | ✅ 双后端逐字节一致 |
+| `examples/faulttrap_demo.tc` + `.expected.txt` | **消费侧运行期行为**（25 行）：位置②（clamp / `recover`）；位置① 全修三条路径（clamp / anon / 直通）；位置① `recover`；位置① `.abort` ⇒ 消费臂得 tag 0、未落臂成员原样上传得 tag 2 且槽位仍是组内绝对槽位 2；**跨函数链路**（内层 `.abort` 上传 ⇒ 外层 `trap` 消费，可三层叠加，recover 与 resume 混用）。⚠ 一律「先落局部变量再读字段」（既有缺口 G-5） | B4b | ✅ 双后端逐字节一致 |
 | 待补 | 谓词规范化后跨位置恒等（raise ↔ 组声明 ↔ trap 臂，A-25 折叠）—— 已由 E756/E766 在编译期覆盖 | B4b | ✅（编译期）|
-| 待补 | repair 闭包上传 + `.abort` 的**跨函数**链路（B5 可达集） | B5 | ⬜ |
+| `examples/faulttrap_demo.tc` ⑦⑧⑨⑩ | **跨函数链路的运行期部分**：内层 `.abort` 上传 ⇒ 外层 `trap` 消费（可三层叠加、`recover` 与 `resume` 混用）；内层已修好时外层不落臂直接取 `val` | B4b | ✅ 双后端逐字节一致 |
+| 待补 | 跨函数**编译期**可达集 R-3（未上传的 repair 可被静态判定 + 诊断） | B5 | ⬜ |
 
 `predpat_demo` 的期望输出（12 行）：`-1 1 0 9 0 0 7 5 0 3 2 1`
 ——其中 **0 是刻意设计的「不该命中」分支**，命中即说明谓词或分派写反。

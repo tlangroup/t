@@ -71,6 +71,32 @@ fn pass_clamp(u : User) fault(UserErr)!User {
     };
 }
 
+// ── 跨函数链路：`.abort` 上传 ⇒ 调用者的 `trap` 再消费（A-19 的核心承诺）──────
+// 内层只修 age<0，其余**原样上传**；外层拿到的是同一个 `__fault_<E>` 载体，
+// 于是整条链**不需要 unwind / continuation**（代价低的根因：M48 闭包按值捕获 ⇒ 自包含）。
+
+fn inner(u : User) fault(UserErr)!User {
+    return trap validate(u) {
+        .{ .age < 0 } => resume(.clamp);
+        _             => resume(.abort);
+    };
+}
+
+fn outer(u : User) User {
+    return trap inner(u) {
+        .{ .age < 0 }   => resume(.use_default);
+        .{ .name = "" } => resume(.anon);
+    };
+}
+
+// 三层 + `recover`：验证链式可叠加，且 recover 与 resume 可混用
+fn outer2(u : User) User {
+    return trap inner(u) {
+        .{ .age < 0 }   => recover(User{ .age = 42i64, .name = "rec" });
+        .{ .name = "" } => resume(.anon);
+    };
+}
+
 fn main_fn() i32 @main {
     // ① 位置②：`var x : T = trap <e> {…};`（禁止 `.abort`、必须穷尽）
     var v1 : User = trap validate(User{ .age = -5i64, .name = "bob" }) {
@@ -118,5 +144,25 @@ fn main_fn() i32 @main {
     var d2 : User = d1.r2();
     println(i2s(d2.age));            // 3
     println(d2.name);                // anon
+
+    // ⑦ 跨函数：内层修好 ⇒ 外层收到 tag 0 ⇒ 直接取 val
+    var e1 : User = outer(User{ .age = -5i64, .name = "bob" });
+    println(i2s(e1.age));            // 0（inner 的 .clamp）
+    println(e1.name);                // bob
+
+    // ⑧ 跨函数：内层上传 NameEmpty ⇒ 外层修
+    var f1 : User = outer(User{ .age = 3i64, .name = "" });
+    println(i2s(f1.age));            // 3
+    println(f1.name);                // anon
+
+    // ⑨ 三层 + recover
+    var g1 : User = outer2(User{ .age = 3i64, .name = "" });
+    println(i2s(g1.age));            // 3
+    println(g1.name);                // anon
+
+    // ⑩ 内层已修好 ⇒ 外层的臂一条都不落 ⇒ 走末尾的 `return __tfv.val`
+    var h1 : User = outer2(User{ .age = -5i64, .name = "bob" });
+    println(i2s(h1.age));            // 0
+    println(h1.name);                // bob
     return 0;
 }
