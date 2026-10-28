@@ -1289,6 +1289,13 @@ if (__tfv_N.tag == 2) { x = <recover 表达式>; }
   修法：新增 `g_fmem_rep_begin` 专供查表，返回值仍用组内槽位号（`r<slot>` 字段名）。
 - 探针 P1~P4 的**现状**：P4（推导后 `trap` 可捕）首轮即通过；P1/P2/P3 首轮的 E202 全部落在
   **main 没有消费载体**上 ⇒ 让 main `trap` 后三例全绿（P3 还需 main 用穷尽臂，位置② 禁 `.abort`）。
+- **gate L2（58min，keep-going）：23 passed / 1 failed** —— 唯一 FAIL 项 = 产物快照，且经核为
+  **合法漂移**：`2 DIFF = src/tc.tc::ll / ::c`（编译器自身源码变了，必然）+ `2 NEW = faultescape_demo`、
+  **0 GONE** ⇒ 既有 145 个目标 IR **零漂移**（没有任何既有函数被意外推导）。
+  关键步全 PASS：自举一代、**自举不动点 g2==g3**、**四代不动点 g2==g3==g4**、conformance 440、
+  run_examples dbg 双后端、双轨对拍、C 后端自举、MIR differential、rls 快速通道。
+- 基线用 gate 的 g1 重录 **147 targets / 297 entries**，回验 **297 份逐字节相同**。
+- 种子体检通过（B4b 那颗种子就能编译 B5a 的 src）⇒ 未刷新。
 
 ### H.8 ⚠ 本批**不做**（留给 B5b / B5c / v2）
 
