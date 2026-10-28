@@ -36,6 +36,12 @@
 | `fail/f_fault_pred_unknown_field.tc` | `error T-MAT-E748`（谓词字段不在 `over T`） | B1 | ✅ |
 | `fail/f_fault_dup_pred.tc` | `error T-MAT-E749`（组内谓词重复，A-2） | B1 | ✅ |
 | `fail/f_fault_dup_repair.tc` | `error T-MAT-E752`（成员内 repair 名重复，A-11） | B1 | ✅ |
+| `fail/f_fault_ok_arity.tc` | `error T-MAT-E753`（`Ok` 实参数目 ≠ 1） | B4a | ✅ |
+| `fail/f_fault_err_non_clause.tc` | `error T-MAT-E754`（`Err(...)` 实参不是 `@clause(...)`） | B4a | ✅ |
+| `fail/f_fault_err_no_fault_clause.tc` | `error T-MAT-E755`（缺 `@clause(.fault, ...)`） | B4a | ✅ |
+| `fail/f_fault_err_unknown_member.tc` | `error T-MAT-E756`（全名不在组内） | B4a | ✅ |
+| `fail/f_fault_err_pred_mismatch.tc` | `error T-MAT-E756`（谓词与组声明不恒等，A-2 / A-25） | B4a | ✅ |
+| `fail/f_fault_err_repair_slot.tc` | `error T-MAT-E757`（修法名不属于该成员） | B4a | ✅ |
 | `fail/f_clause_bad_anchor.tc` | `@clause` 锚点非法（CAT 待定，B3 定） | B3 | ⬜ |
 | `fail/f_trap_wildcard_nonabort.tc` | 通配臂只允许 `resume(.abort)`（A-21） | B4 | ⬜ |
 | `fail/f_repair_cross_fn.tc` | repair 闭包禁跨函数复用（A-12） | B4/B5 | ⬜ |
@@ -55,7 +61,9 @@
 | `examples/predpat_demo.tc` + `.expected.txt` | 谓词模式：命中 / **不命中** / 边界相等 / 混合字段（`<`、`>=`、`==` 混排） | B2 | ✅ 双后端逐字节一致 |
 | `examples/faultclause_demo.tc` + `.expected.txt` | 故障/修复子句的**零副作用**：声明它们的程序照常运行，且 `.pattern` 的臂展开不受影响 | B3 | ✅ 双后端逐字节一致 |
 | `examples/faultgroup_demo.tc` + `.expected.txt` | **A-32 布局**：`tag`(0=Ok) / `val`(可写成功值) / `r0..r(N-1)`（读 `r2` 即证明第二成员槽位基址 = 2，槽位少一个则编译不过）。⚠ 刻意**不调用**闭包：三处既有后端缺口见 `fault.md` §C.5 G-1..G-3 | B1 | ✅ 双后端逐字节一致 |
-| 待补 | `fault(E)!T` 返回 + trap 分派 + **repair 槽位映射**（`resume(.名)` → 第几号槽） | B4 | ⬜ |
+| `pass/p_fault_raise.tc` | raise 两种实参形态（`++` 串联 / 逗号分隔）都能过 sema 并完成脱糖（只 check，不运行） | B4a | ✅ |
+| `examples/faultraise_demo.tc` + `.expected.txt` | **raise 侧运行期行为**：`Ok(u)` ⇒ tag 0 + `val` 落值；`Err(...)` ⇒ tag 1/2 + 槽 0/1/2 挂上 repair 闭包且**调用**它们得到预期值。⚠ 一律「先落局部变量再读字段」（既有缺口 G-5） | B4a | ✅ 双后端逐字节一致 |
+| 待补 | `fault(E)!T` 返回 + trap 分派 + **repair 槽位映射**（`resume(.名)` → 第几号槽） | B4b | ⬜ |
 | 待补 | 谓词规范化后跨位置恒等（raise ↔ 组声明，A-25 折叠） | B4 | ⬜ |
 | 待补 | repair 闭包上传 + `.abort` | B4 | ⬜ |
 

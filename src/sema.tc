@@ -9827,6 +9827,10 @@ pub fn cs_forin(s: i64, iter_i: i64, body_i: i64) void {
 // return 语句
 pub fn cs_return(s: i64, val_i: i64) void {
     if (base.node_na((s as u64)) >= 0) {
+        // fault B4a：raise 侧脱糖（`Ok(v)` / `Err(@clause(...), …)`）。
+        // ⚠ 必须在 infer **之前**改写 —— 否则 `Ok` / `Err` 会先被当成对未声明函数的
+        //   调用（`infer_expr` 走 callee 解析）而报 T-SEM-E2xx，永远轮不到本改写。
+        fault_raise_try(base.node_na((s as u64)), cur_ret);
         // 管道许可上下文之三：return 值
         pipe_mark(base.node_na((s as u64)));
         var saved_ve3: i64 = g_vec_expect;
@@ -10898,6 +10902,221 @@ pub fn fault_pred_same(a: i64, b: i64) bool {
         i = i + 1;
     }
     return true;
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// fault B4a：raise 侧 —— `Ok(v)` / `Err(@clause(...), …)`
+// ──────────────────────────────────────────────────────────────────────────
+// A-35：Ok/Err **不是关键字**（F-3：`Ok`/`Err` 已被 variant 变体名大量占用
+//   —— `examples/adt_status.tc` 有 `variant Status { Ok(i64); Err(i64); _ }`）。
+//   双条件判定：① 所在位置的预期类型是 `fault(E)!T`（此处 = 函数声明返回类型）；
+//              ② `Ok`/`Err` 在当前作用域**不是已声明的函数**。
+// 命中 ⇒ 把 `call` 节点**就地改写**为 `__fault_<E>` 的 struct_lit。手法照抄
+//   infer_expr_body 的 variant_lit→call 脱糖：建新节点 → node_set_kind/na/la/sa/ia
+//   → hir_invalidate。**不新增节点 kind** ⇒ HIR 侧零改动（门禁「RAW 合计 0」）。
+// ⚠ D-12（实测偏离）：设计稿 §6 的 `Err(c1 ++ c2 ++ c3)` **写不出来** —— t 根本没有
+//   `++` 运算符（全仓 `src/*.tc` 对 `"++"` 0 命中）。改用**逗号分隔实参**
+//   `Err(c1, c2, …)`：`@clause` 本就是合法表达式，call 实参链现成可用
+//   ⇒ 零新增语法、零新增运算符、零新增节点。
+
+// 判定 TI 是否为故障联合体 `__fault_<E>`；是则返回组下标，否则 -1。
+pub fn fault_struct_group_of(ti: i64) i64 {
+    if (ti < 0) { return -1; }
+    if (tip_kind(ti) != "Struct") { return -1; }
+    var nm: string = tip_name(ti);
+    if (str_len(nm) as i64 <= 8) { return -1; }
+    if (str_slice(nm, 0, 8) != "__fault_") { return -1; }
+    return fault_group_find(str_slice(nm, 8, str_len(nm) as i64));
+}
+
+// A-35 条件②：名字未被声明为**函数**（variant 变体名 / 变量 均不算冲突）
+pub fn fault_ctor_name_free(nm: string) bool {
+    var si: i64 = sym_lookup(cur_scope, nm);
+    if (si < 0) { si = sym_lookup(global_scope, nm); }
+    if (si < 0) { return true; }
+    var d: i64 = syms[si].decl;
+    if (d < 0) { return true; }
+    if (base.node_kind((d as u64)) == "FuncDecl") { return false; }
+    return true;
+}
+
+// 把 `e` 就地改写成 struct_lit（同步清单照抄 variant_lit→call 脱糖）
+pub fn fault_node_to_struct_lit(e: i64, sname: string, head: i64) void {
+    var lit: i64 = base.mk_struct_lit(sname, head, -1);
+    base.node_set_kind((e as u64), base.node_kind((lit as u64)));
+    base.node_set_na((e as u64), base.node_na((lit as u64)));
+    base.node_set_la((e as u64), base.node_la((lit as u64)));
+    base.node_set_sa((e as u64), base.node_sa((lit as u64)));
+    base.node_set_ia((e as u64), base.node_ia((lit as u64)));
+    hir.hir_invalidate((e as u64));
+}
+
+// `Ok(v)` ⇒ `__fault_<E> { .val = v }`（tag 字段省略 ⇒ 零初始化 = 0 = Ok，R-opt3）
+pub fn fault_raise_ok(e: i64, g: i64) void {
+    var ks: []i64 = base.kids_chain_idx(base.node_la((e as u64)));
+    if (slice_len(ks) as i64 != 1) {
+        parse.fc_err("T-MAT-E753",
+            base.sb_cat3("`Ok` 需要恰好 1 个实参（成功值），实际 ", base.i2s(slice_len(ks) as i64), " 个"), e);
+        return;
+    }
+    // ⚠ 显式写 `.tag = 0i64`，**不能**省略靠零初始化：C 后端对「结构体字面量缺失的
+    //   **标量**字段」会分配 0 字节缓冲并把**指针**当值用 ⇒ clang 报
+    //   `incompatible pointer to integer conversion`（既有缺口 G-6，与本批无关 ——
+    //   改动前的编译器对普通 `P3{ .a = 5 }` 同样炸）。缺失**聚合/指针**字段则正常，
+    //   ⇒ 补上 tag 后，缺失的 r0..r(N-1)（闭包指针）无害，双后端都能过。
+    var taglit: i64 = base.mk_int("0", 10, -1);
+    base.node_set_sb((taglit as u64), "i64");
+    var head: i64 = -1;
+    var tail: i64 = -1;
+    var ftag: i64 = base.mk_FV("tag", taglit, -1);
+    tail = base.list_push(head, tail, ftag);
+    if (head < 0) { head = tail; }
+    var fv: i64 = base.mk_FV("val", base.kids[ks[0]].val, -1);
+    tail = base.list_push(head, tail, fv);
+    fault_node_to_struct_lit(e, base.sb_cat2("__fault_", g_fgrp_name[g]), head);
+}
+
+// 解析 `@clause(.fault, <谓词>, <组>.<成员>)` 的 body ⇒ 成员下标；失败发诊断并返 -1。
+pub fn fault_err_member_of(fc: i64, g: i64) i64 {
+    var full: i64 = base.node_nc((fc as u64));
+    if (full < 0 or base.node_kind((full as u64)) != "member") {
+        parse.fc_err("T-MAT-E756",
+            "`@clause(.fault, ...)` 的 body 必须是 `<组名>.<成员名>` 形式（如 `UserErr.AgeNegative`）", fc);
+        return -1;
+    }
+    var oname: string = base.node_sa((base.node_na((full as u64)) as u64));
+    var mname: string = base.node_sa((full as u64));
+    if (oname != g_fgrp_name[g]) {
+        parse.fc_err("T-MAT-E756",
+            base.sb_cat5("故障全名 `", oname, ".", mname, "` 的组名与当前函数的故障组不符"), fc);
+        return -1;
+    }
+    var m: i64 = fault_member_find(g, mname);
+    if (m < 0) {
+        parse.fc_err("T-MAT-E756",
+            base.sb_cat5("故障组 `", g_fgrp_name[g], "` 没有成员 `", mname, "`"), fc);
+        return -1;
+    }
+    // A-2 / A-25：谓词须与组内声明**规范化后恒等**（A-22：v1 无简写，逐字对应）
+    if (fault_pred_same(base.node_na((fc as u64)), g_fmem_pred[m]) == false) {
+        parse.fc_err("T-MAT-E756",
+            base.sb_cat3("抛出 `", mname, "` 的谓词与故障组声明不一致（A-22：v1 无简写，须逐字对应）"), fc);
+        return -1;
+    }
+    return m;
+}
+
+// `Err(@clause(.fault, …), @clause(.repair, …), …)` ⇒
+//   `__fault_<E> { .tag = <K>i64, .r<slot> = <闭包> }`
+// `Err(...)` 的 clause 收集器。**同时**接受两种形态：
+//   · 设计稿 §6 的 `c1 ++ c2 ++ c3`（binary 节点，op 名 **"Concat"**）
+//   · 逗号分隔实参 `c1, c2, c3`
+// ⚠ D-12 修正：`++` **是存在**的（B3 已为它加过 Concat 分支，见 DESIGN.md D-4）。
+//   按字面量 `"++"` 去 grep 会 0 命中（op 存的是 "Concat"），别据此断言它不存在。
+pub var g_fclause_scratch: []i64;
+pub var g_fclause_bad: i64;
+
+pub fn fault_clause_collect(x: i64) void {
+    if (x < 0) { return; }
+    var k: string = base.node_kind((x as u64));
+    if (k == "clause") { append(g_fclause_scratch, x); return; }
+    if (k == "binary" and base.node_sa((x as u64)) == "Concat") {
+        fault_clause_collect(base.node_na((x as u64)));
+        fault_clause_collect(base.node_nb((x as u64)));
+        return;
+    }
+    if (g_fclause_bad < 0) { g_fclause_bad = x; }
+}
+
+pub fn fault_raise_err(e: i64, g: i64) void {
+    var ks: []i64 = base.kids_chain_idx(base.node_la((e as u64)));
+    g_fclause_scratch = [];
+    g_fclause_bad = -1;
+    var j: i64 = 0;
+    while (j < slice_len(ks) as i64) {
+        fault_clause_collect(base.kids[ks[j]].val);
+        j = j + 1;
+    }
+    if (g_fclause_bad >= 0) {
+        parse.fc_err("T-MAT-E754",
+            "`Err(...)` 的每个实参都必须是 `@clause(...)` 字面量（可再用 `++` 串联）", g_fclause_bad);
+        return;
+    }
+    var cs: []i64 = g_fclause_scratch;
+    if (slice_len(cs) as i64 == 0) {
+        parse.fc_err("T-MAT-E755",
+            "`Err(...)` 至少要有一条 `@clause(.fault, ...)` 指名抛出的故障成员", e);
+        return;
+    }
+    // ① 类别校验 + 定位 `.fault` 子句
+    var fc: i64 = -1;
+    var i: i64 = 0;
+    while (i < slice_len(cs) as i64) {
+        var a: i64 = cs[i];
+        i = i + 1;
+        var km: string = base.node_sa((a as u64));
+        if (km != "fault" and km != "repair") {
+            parse.fc_err("T-MAT-E758",
+                base.sb_cat3("`Err(...)` 只接受 `@clause(.fault, ...)` 与 `@clause(.repair, ...)`，实际 `.",
+                    km, "`"), a);
+            return;
+        }
+        if (km == "fault") {
+            if (fc >= 0) {
+                parse.fc_err("T-MAT-E755", "`Err(...)` 只能有一条 `@clause(.fault, ...)`", a);
+                return;
+            }
+            fc = a;
+        }
+    }
+    if (fc < 0) {
+        parse.fc_err("T-MAT-E755",
+            "`Err(...)` 缺 `@clause(.fault, ...)`：必须指名抛出哪个故障成员", e);
+        return;
+    }
+    // ② 解析成员（顺带校验谓词恒等）
+    var m: i64 = fault_err_member_of(fc, g);
+    if (m < 0) { return; }
+    // ③ 构造字段链：.tag = <K>，每条 `.repair` 一个 `.r<槽位>`
+    var taglit: i64 = base.mk_int(base.i2s(g_fmem_tag[m]), 10, -1);
+    base.node_set_sb((taglit as u64), "i64");
+    var head: i64 = -1;
+    var tail: i64 = -1;
+    var ftag: i64 = base.mk_FV("tag", taglit, -1);
+    tail = base.list_push(head, tail, ftag);
+    if (head < 0) { head = tail; }
+    i = 0;
+    while (i < slice_len(cs) as i64) {
+        var a2: i64 = cs[i];
+        i = i + 1;
+        if (base.node_sa((a2 as u64)) == "repair") {
+            var rn: string = base.node_sa((base.node_na((a2 as u64)) as u64));
+            var slot: i64 = fault_repair_slot(m, rn);
+            if (slot < 0) {
+                parse.fc_err("T-MAT-E757",
+                    base.sb_cat5("修法 `.", rn, "` 不属于故障成员 `", g_fmem_name[m], "`"), a2);
+                return;
+            }
+            var fr: i64 = base.mk_FV(base.sb_cat2("r", base.i2s(slot)), base.node_nc((a2 as u64)), -1);
+            tail = base.list_push(head, tail, fr);
+            if (head < 0) { head = tail; }
+        }
+    }
+    fault_node_to_struct_lit(e, base.sb_cat2("__fault_", g_fgrp_name[g]), head);
+}
+
+// 入口：若 `e` 是故障构造器且 `cur_ret` 是 `fault(E)!T`，就地改写它。
+pub fn fault_raise_try(e: i64, cur_ret: i64) void {
+    var g: i64 = fault_struct_group_of(cur_ret);
+    if (g < 0) { return; }
+    if (base.node_kind((e as u64)) != "call") { return; }
+    var callee: i64 = base.node_na((e as u64));
+    if (callee < 0 or base.node_kind((callee as u64)) != "ident") { return; }
+    var cname: string = base.node_sa((callee as u64));
+    if (cname != "Ok" and cname != "Err") { return; }
+    if (fault_ctor_name_free(cname) == false) { return; }
+    if (cname == "Ok") { fault_raise_ok(e, g); return; }
+    fault_raise_err(e, g);
 }
 
 pub fn check_fault_decl(d: i64) void {
