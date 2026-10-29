@@ -860,6 +860,13 @@ pub fn c_emit_esz(sb: StringBuilder, szop: TirOperand, ecty: string) void {
 // 「指向用户聚合的指针」类型（ptr<%Struct> / ptr<%Perm>…，不含运行库结构体与枚举）。
 // 用于 ADDR_OF：用户聚合值槽在字节缓冲模型里本身就是缓冲指针，取址 = 指针值本身；
 // 而 ptr<i64> / ptr<void> 之类持有机器指针值的槽，取址必须是 &slot（槽变量的地址）。
+// G-5：目的类型是**用户聚合值类型** `%Name`（而非 `ptr<%Name>`）——ADDR_OF 的 st 写法。
+// 复用 c_is_user_agg_ptr_ty 的排除表（运行库结构体 / 枚举 / 非聚合一律 false）。
+pub fn c_is_user_agg_val_ty(ty: string) bool {
+    if (str_len(ty) == 0) { return false; }
+    if (ty[0] != 37) { return false; }   // 37 = '%'
+    return c_is_user_agg_ptr_ty(base.sb_cat3("ptr<", ty, ">"));
+}
 pub fn c_is_user_agg_ptr_ty(ty: string) bool {
     if (c_starts(ty, "ptr<%") == false) { return false; }
     var L: i64 = str_len(ty) as i64;
@@ -1723,6 +1730,10 @@ pub var g_c_mod: TMIRModule;
 pub var g_c_extern_names: []string;
 pub var g_cf: TMIRFunc;
 pub var g_c_addr_slot_name: []string;   // 地址槽名（unsigned char* 指针声明）
+// G-5：被 CALL_IND **聚合返回**赋过值的槽。这类槽声明上是聚合基（`unsigned char* t8 = t8_buf`），
+// 但被调方返回的是**另一块**缓冲，赋值后 t8 已改指 ⇒ ADDR_OF 不能取 `t8_buf`（那是空的旧缓冲），
+// 必须取槽里的当前指针值 t8（与 LLVM 侧 sret 缓冲语义对齐）。
+pub var g_c_aggcall_slot: []string;
 pub var g_c_addr_name: []string;        // 地址槽名（load/store 元素类型表）
 pub var g_c_addr_st: []i64;             // 地址槽元素 ST（load/store 宽度）
 pub var g_c_addr_base_name: []string;   // 地址槽名
@@ -1815,6 +1826,11 @@ pub fn c_addr_mark(n: string, st: i64) void {
     append(g_c_addr_name, n); append(g_c_addr_st, st);
 }
 
+pub fn c_is_aggcall_slot(n: string) bool {
+    var i: i64 = 0;
+    while (i < slice_len(g_c_aggcall_slot) as i64) { if (g_c_aggcall_slot[i] == n) { return true; } i = i + 1; }
+    return false;
+}
 pub fn c_is_addr_slot(n: string) bool {
     var i: i64 = 0;
     while (i < slice_len(g_c_addr_slot_name) as i64) { if (g_c_addr_slot_name[i] == n) { return true; } i = i + 1; }
@@ -2422,6 +2438,7 @@ pub fn c_prescan_mapget_tstr(f: TMIRFunc) void {
 pub fn c_emit_func(sb: StringBuilder, f: TMIRFunc) void {
     g_cf = f;
     g_c_addr_slot_name = []; g_c_addr_name = []; g_c_addr_st = []; g_c_addr_base_name = []; g_c_addr_base_ty = [];
+    g_c_aggcall_slot = [];
     g_c_agg_base_name = []; g_c_agg_base_size = []; g_c_tmpc = 0; g_c_pre = sb_new();
     g_c_ptrbuf_name = []; g_c_ptrbuf_size = []; g_c_sliceat_slot = [];
     g_c_slot_tyname = []; g_c_slot_tyty = []; g_c_mapval_slot = []; g_c_alias_name = []; g_c_alias_to = [];
@@ -3156,6 +3173,11 @@ pub fn c_emit_inst(sb: StringBuilder, ins: TMIRInst) void {
             if (c_tystr_c(tir.tir_st_to_str(c_global_st(basen))) == "TClosure") { basebuf = base.sb_cat2("(unsigned char*)(&", basen); basebuf = base.sb_cat2(basebuf, ")"); }
             else { basebuf = basen; }
         }
+        // ⭐ G-5：源槽被 CALL_IND 的**聚合返回**赋过值 ⇒ 它虽是聚合基（有 <slot>_buf），
+        //   但已被改指到被调方返回的缓冲；ADDR_OF 必须取**槽里的当前指针值**，
+        //   取 <slot>_buf 会读到空的旧缓冲（实测 `f(3).s` ⇒ string 空、i64 字段 0）。
+        //   必须**先于** c_is_agg_base 判定，否则被后者抢走。
+        else if (c_is_aggcall_slot(basen)) { basebuf = basen; }
         else if (c_is_agg_base(basen)) { basebuf = base.sb_cat2(basen, "_buf"); }
         // 纯地址槽（slice_at / GEP / bitcast / struct_new… 结果，持有指针值但无自有缓冲）：
         // 取址 = 该指针本身。若按聚合基取 <slot>_buf 会指到不存在的（或全 0 的）缓冲。
@@ -4081,6 +4103,14 @@ pub fn c_emit_inst(sb: StringBuilder, ins: TMIRInst) void {
         var rst: string = tir.tir_st_to_str(ins.st);
         var rty: string = "void";
         if (ins.st != tir__ST_NONE and rst != "" and rst != "void") { rty = c_tystr_c(rst); }
+        // ⭐ G-5：聚合返回的间接调用会把 dst **改指**到被调方返回的缓冲 ⇒ 登记该槽，
+        //   后续 ADDR_OF 必须取槽里的指针值（详见 g_c_aggcall_slot 注释）。
+        if (dstn != "" and c_is_user_agg_val_ty(rst)) {
+            var already: bool = false;
+            var z: i64 = 0;
+            while (z < slice_len(g_c_aggcall_slot) as i64) { if (g_c_aggcall_slot[z] == dstn) { already = true; } z = z + 1; }
+            if (already == false) { append(g_c_aggcall_slot, dstn); }
+        }
         sb_append_str(sb, "  { TClosure* _ccl"); sb_append_str(sb, rn); sb_append_str(sb, " = (TClosure*)(");
         c_emit_val(sb, ins.args[0]); sb_append_str(sb, ");\n    ");
         if (rty != "void" and dstn != "") { sb_append_str(sb, dstn); sb_append_str(sb, " = "); }

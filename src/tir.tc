@@ -5435,6 +5435,10 @@ pub fn tir_member_addr(e: i64) string {
         }
     }
     var base_slot: string = "";
+    // G-5：tir_emit_expr 返回的权威结果类型（兜底用）。
+    // ⚠ TirEmitRes.st 是**类型码 i64**（tir_st_from_str 的产物），不是字符串 ——
+    //   直接按 string 用 str_len/[0] 会恒不命中（第一版就栽在这里，修复看似生效实则没进）。
+    var base_res_st: i64 = ST_NONE;
     if (base.node_kind((bn as u64)) == "index") {
         // 切片/数组下标作 member 基底：必须取「元素地址」（tir_emit_index_addr）。
         // 不能走 tir_emit_expr —— 它内部是 index_read，会 load 出元素「值」，
@@ -5446,8 +5450,20 @@ pub fn tir_member_addr(e: i64) string {
     } else {
         var base_slotr: TirEmitRes = tir_emit_expr(bn);
         base_slot = base_slotr.name;
+        base_res_st = base_slotr.st;
     }
     var base_st: string = tir_member_base_st(bn);   // 嵌套 member 权威基底类型（字符串路径，绕开 TD 越界回退 i64）
+    // ⭐ G-5：member 基底是**间接调用**（被调者为函数值变量，如 `f(3).s`）时，
+    //   tir_member_base_st 末尾走 tir_expr_st → meta_type_of_expr 解析不出间接调用的返回类型
+    //   ⇒ 退化成 "i64" ⇒ sname="i64" ⇒ tir_field_index 恒 0、GEP/LOAD 全按 i64
+    //   ⇒ **恰好读到字段 0（i64）所以「i64 字段正常」，而 string 字段读出空串**
+    //   （台账 G-5 原描述正是此现象）；C 后端还会因 `b = (TStr)(t12);` 强转直接 clang 报错。
+    //   tir_emit_expr 的 .st 已由 tir_emit_call 按 FuncType TD 的 tdf_ret 修正过，是权威结果
+    //   类型 ⇒ 仅当 base_st 拿不到结构名（非 '%' 开头）时用它兜底，零基线扰动。
+    if (str_len(base_st) > 0 and base_st[0] != '%') {
+        var brs: string = tir_st_to_str(base_res_st);
+        if (str_len(brs) > 0 and brs[0] == '%') { base_st = brs; }
+    }
     // ⚠ 合成 deref 节点没有 ti（sema 已跑完，新建节点无类型缓存）→ tir_member_base_st 对它取不到
     // 结构名而退化成 "i64"，导致 sname="i64" → fidx 恒 0、GEP 基类型错。此处按已知被指结构名
     // 直接覆盖，绕开对合成节点做类型推断。
