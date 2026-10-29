@@ -1,0 +1,67 @@
+// Option 对齐 Zig 0.17：`.?` 断言取出 与 `orelse` 兜底
+//
+// 二者都在 parser 层脱糖为**已有节点组合**，双后端零改动：
+//   x.?          ⇒ unwrap(x)
+//                  （none 时运行期 panic，语义 ≡ Zig 的 `x orelse unreachable`）
+//   a orelse b   ⇒ { var __ol_N = a;
+//                    match (is_some(__ol_N)) { true => unwrap(__ol_N), false => b } }
+//
+// 脱糖形状决定了两条语义保证，本例把每一条都变成可观察的输出：
+//   ① 左操作数**只求值一次**（放入临时变量）
+//   ② 右操作数**短路**（左非 none 时完全不求值）
+
+struct Point { x: i64; y: i64; }
+
+var g_lhs_calls: i64 = 0;
+var g_rhs_calls: i64 = 0;
+
+fn maybe_pos(i: i64) ?i64 {
+    g_lhs_calls = g_lhs_calls + 1;
+    if (i > 0) { return some(i * 10); }
+    return ?;
+}
+
+fn fallback() i64 {
+    g_rhs_calls = g_rhs_calls + 1;
+    return -1;
+}
+
+@main
+fn main() i64 {
+    // ── `.?`：断言非 none 并取值 ──
+    // ⚠ 用中间变量而非 `some(42)`：整数字面量实参存在既有推断债（会被推成 ?u8），见设计稿已知问题
+    var fortytwo: i64 = 42;
+    var a: ?i64 = some(fortytwo);
+    println(f"a.? = {a.?}");
+
+    // ── `.?` 取出的值可以继续缀接成员访问 ──
+    var pt: Point;
+    pt.x = 3;
+    pt.y = 4;
+    var op: ?Point = some(pt);
+    println(f"op.?.x + op.?.y = {op.?.x + op.?.y}");
+
+    // ── orelse：左非 none ⇒ 取其值，右侧不求值 ──
+    var v1: i64 = maybe_pos(5) orelse fallback();
+    println(f"v1={v1} rhs_calls={g_rhs_calls}");
+
+    // ── orelse：左为 none ⇒ 走兜底，右侧求值一次 ──
+    var v2: i64 = maybe_pos(-5) orelse fallback();
+    println(f"v2={v2} rhs_calls={g_rhs_calls}");
+
+    // ── 左操作数只求值一次：上面两处各调用 maybe_pos 一次 ──
+    println(f"lhs_calls={g_lhs_calls}");
+
+    // ── 链式（右结合）：逐层兜底 ──
+    var v3: i64 = maybe_pos(-1) orelse maybe_pos(-2) orelse 777;
+    println(f"v3={v3}");
+
+    // ── Z10：右侧与比较运算相邻时必须显式括号（裸写是编译错误）──
+    // 这里是 Zig 里那类真正两读都可的形式：`?bool orelse bool`。
+    // 因为 ob 有值，右侧 `(v1 == v2)` 根本不会被求值 ⇒ v4 仍是 true（顺带再验一次短路）。
+    var seen: bool = true;
+    var ob: ?bool = some(seen);
+    var v4: bool = ob orelse (v1 == v2);
+    if (v4) { println("v4=true"); } else { println("v4=false"); }
+    return 0;
+}

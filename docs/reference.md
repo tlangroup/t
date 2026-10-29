@@ -1272,7 +1272,7 @@ ArrayType: "[" Expr "]" Type          // 定长数组 [N]T
 SliceType: "[" "]" Type               // 动态切片 []T
 MapType: "map" "[" Type "]" Type      // 哈希映射 map[K]V  ✅ tote
 PointerType: "*" Type                 // 指针 *T
-OptionalType: Type "?"                // 可选 T?
+OptionalType: "?" Type                // 可选 ?T（Zig 式前缀；后缀 T? 已于 2026-10-29 移除，见 §3.5.0）
 FlagArrayType: "flag" "[" Integer "]" // 位域数组 flag[N]
 NamedType: Ident                      // 结构体/枚举/flag/variant/别名名
 SymType: "Sym" ("32"|"16") "(" StringLiteral ")"
@@ -1298,10 +1298,10 @@ TupleType: "." "{" Type ("," Type)* "}"         // ✅ tc 匿名元组类型；�
 - 类型名解析：先查内建，再查当前单元已声明命名类型。
 - **数组字面量 `[e1, e2, …]`**：元素类型取首元素推断，整型元素统一提升为 `i64`（`[1,2,3]` 是 `[3]i64` 而非 `[3]u8`）；空字面量 `[]` 元素类型未知，可赋给任意 `[]T` / `[N]T`。定长数组与切片之间只要元素可转型即可互赋（目标为定长数组时长度须一致）。赋给 `[]T` 时脱糖为运行期 `slice_new` + 逐元素 `append`；赋给 `[N]T` 时 C 后端用花括号初始化器、LLVM 后端零初始化后按 `getelementptr` 逐元素 `store`。
 
-#### 3.5.0 可选类型 `T?` ✅ tc（2026-08-30）
+#### 3.5.0 可选类型 `?T` ✅ tc（2026-08-30；2026-10-29 语法收敛为前缀）
 
 - **表示模型（可空指针）**：`?T` 的值就是「指向元素的指针」，`none` 即空指针——C 后端落 `T*`、LLVM 后端落 `ptr`；`sizeof(?T) == sizeof(void*)`，无带标签结构体的额外字段与分支开销。
-- **类型语法**：后缀 `T?`（规范形，等价的前缀 `?T` 亦接受）。元素类型可以是标量，也可以是聚合（struct 等；聚合在 LLVM 后端本就按 `ptr` 表示，`unwrap` 直接返回校验过的指针、不再 `load`）。
+- **类型语法**：**前缀 `?T`，对齐 Zig 0.17**（裁定 O-1，见 `docs/design/option/DESIGN.md`）。**后缀 `T?` 已于 2026-10-29 从语法中删除**：`parse_type_ex` 不再吃类型之后的 `Question`，故 `i64?` 会在 `?` 处由调用方直接报错位，而不是静默落成 Optional。裸 `?` 在**表达式位**仍是 opt_none 字面量（含义不变，见下）。元素类型可以是标量，也可以是聚合（struct 等；聚合在 LLVM 后端本就按 `ptr` 表示，`unwrap` 直接返回校验过的指针、不再 `load`）。
 - **`?` none 字面量**：表达式位的裸 `?`。与 `null` 同手法——静态类型是顶层 `Unknown`，由赋值 / 返回的目标 `?T` 反推元素类型，故 `var x: ?i64 = ?;` 与 `return ?;` 均成立。（不可用 `Optional(Unknown)`：统一器只处理顶层 `Unknown`，嵌套的不会被反推。）
 - **内建（类型规则见 §3.8）**
 
@@ -1314,6 +1314,22 @@ TupleType: "." "{" Type ("," Type)* "}"         // ✅ tc 匿名元组类型；�
 - **`some(x)` 的生命周期（v1 限制）**：值分配在全局 arena 上且**不回收**（与闭包的 v1 限制一致，有意为之）。故在长循环里反复 `some()` 会累积内存；自动释放需引入所有权或 GC，属后续里程碑。
 - **无隐式提升（L-02 显式原则）**：`T` 与 `?T` **不**自动转换——构造必须显式 `some(x)`，取值必须显式 `unwrap(x)`（或先 `is_some` 探测）。与 `f > T` 读路径的 Option B 裁定（§3.11）取舍一致：宁可啰嗦，也不让「空值」在类型层面隐形。
 - **诊断**：`unwrap` / `is_some` / `is_none` 的实参必须是 `?T`，否则报 **`T-SEM-E790`**。该校验在检查期拦下传标量的情形，避免 LLVM 后端把标量当 `ptr` 传给运行时。conformance `f_optional_unwrap_nonopt`；正例 `p_optional_basic`；示例 `examples/optional_demo.tc`。
+
+##### 3.5.0.1 `.?` 断言取出与 `orelse` 兜底 ✅ tc（2026-10-29，裁定 O-3 / O-4）
+
+两条都是 **parser 层脱糖**，不引入新节点类型、不改动 HIR/TIR/双后端：
+
+| 写法 | 脱糖为 | 语义 |
+|---|---|---|
+| `x.?` | `unwrap(x)` | 断言非 `none` 并取值；`none` 时 panic。等价于 Zig 的 `x orelse unreachable` |
+| `a orelse b` | `{ var __ol_N = a; match (is_some(__ol_N)) { true => unwrap(__ol_N), false => b } }` | 左非 `none` 取其值，否则求值 `b` |
+
+由此得到两条保证：**左操作数只求值一次**（落入临时变量），**右操作数短路**（左非 `none` 时完全不求值）。
+
+- **优先级**：`orelse` 是塔中**最松的二元级**（`assign → orelse → pipe → … → range → or → … → primary`），与 Zig 的优先级表一致。
+- **Z10 括号要求**：`orelse` 的操作数若**顶层**是裸写的比较表达式（`a orelse b == c`、`a == b orelse c`）是**编译错误 `T-PAR-E001`**——不是按某种优先级静默解析。加括号后合法：`a orelse (b == c)`、`(a == b) orelse c`。
+- 结果类型：两臂的 LUB（左侧为元素类型 `T`，右侧为兜底值类型）。
+- conformance：`p_opt_dot_question` / `p_orelse_basic`；反例 `f_orelse_ambiguous_precedence` / `f_orelse_ambiguous_lhs`；示例 `examples/option_zig.tc`。
 
 **新增运行期原语**
 

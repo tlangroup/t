@@ -3683,6 +3683,19 @@ pub fn c_emit_inst(sb: StringBuilder, ins: TMIRInst) void {
             sb_append_str(sb, ucty); sb_append_str(sb, "*)(");
             sb_append_str(sb, cfname); sb_append_str(sb, "((const void*)(");
             c_emit_val(sb, ins.args[1]); sb_append_str(sb, ")));\n");
+            // ⭐ O-3：聚合元素的 unwrap 会把 dst **改指**到 `t_opt_unwrap` 返回的 arena 指针，
+            //   而 dst 自带的 `<dst>_buf` 是声明段就已 memset 成 0 的旧缓冲 ⇒ 后续 ADDR_OF 必须取
+            //   **槽里的当前指针值**，否则 `op.?.x` 读到空缓冲得 0（LLVM 后端 3+4=7、C 后端 0，
+            //   静默错编）。这与 G-5（CALL_IND 聚合返回 buf 改指）完全同型 ⇒ 复用同一张登记表。
+            //   标量元素两个判定都不成立，故既有标量通路一字不变。
+            var _utn: string = c_slot_ty_find(dstn);
+            if (_utn == "") { _utn = tir.tir_st_to_str(ins.st); }
+            if (c_is_user_agg_val_ty(_utn) or c_is_user_agg_ptr_ty(_utn)) {
+                var already_u: bool = false;
+                var zu: i64 = 0;
+                while (zu < slice_len(g_c_aggcall_slot) as i64) { if (g_c_aggcall_slot[zu] == dstn) { already_u = true; } zu = zu + 1; }
+                if (already_u == false) { append(g_c_aggcall_slot, dstn); }
+            }
             return;
         }
         // ── @Tile 瓦片内建（与 tir_to_ll 瓦片分支逐位对齐）────────────────

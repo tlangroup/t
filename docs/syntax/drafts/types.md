@@ -20,7 +20,7 @@ ArrayType: "[" Expr "]" Type          // 定长数组 [N]T
 SliceType: "[" "]" Type               // 切片 []T
 MapType: "map" "[" Type "]" Type      // map[K]V
 PointerType: "*" Type                 // 指针 *T
-OptionalType: Type "?"                // 可选 T?
+OptionalType: "?" Type                // 可选 ?T（Zig 式前缀；后缀 T? 已于 2026-10-29 移除）
 FlagArrayType: "flag" "[" Integer "]" // 位域数组 flag[N]
 NamedType: Ident                      // 结构体/枚举/flag/variant/别名名
 FuncType: "fn" "(" TypeList? ")" "->" Type   // 函数类型（✅ tote：函数指针 + 匿名函数字面量 M46 + 按值捕获闭包 M48）
@@ -48,7 +48,7 @@ buf: [256]u8;
 items: []i32;
 dict: map[string]i64;
 p: *Vec3;
-maybe: i32?;
+maybe: ?i32;
 flags: flag[bool];
 fnt: fn(i64) -> void;   // ✅ tote 函数类型
 ```

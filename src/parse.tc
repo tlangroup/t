@@ -201,12 +201,12 @@ pub fn is_scalar_name(name: string) bool {
 pub fn parse_type_inner() i64 {
     var t: string = lex.cur_t();
     // 括号类型 `( Type )`：只用来改写类型运算符的结合边界，**不包层、不引入新 kind**，
-    // 直接返回内部类型节点 ⇒ 对 sema / codegen 完全透明（<(A && B)?> 与 <C> 得到同一个 kind 的形态）。
+    // 直接返回内部类型节点 ⇒ 对 sema / codegen 完全透明（<?(A && B)> 与 <C> 得到同一个 kind 的形态）。
     // 存在理由：两处**表达式内部**类型位（`as T` 的 parse_post_cast、`fid > T` 的 M52 读路径）
     //   必须关闭合取连词（否则 `x as T && cond` 会被误读）⇒ 那里写不出合取类型，
-    //   括号是唯一的正经退路（`x as (A && B)`、`fid > (A && B)`）；`(A && B)?`、`*(A && B)` 同理。
+    //   括号是唯一的正经退路（`x as (A && B)`、`fid > (A && B)`）；`?(A && B)`、`*(A && B)` 同理。
     // ⚠ `()` 空括号不合法 —— unit / void 请用既有的关键字，不要指望 `()` 占位。
-    // ⚠ 这里调用的是 **parse_type**（非 inner）：括号内部允许完整的后缀 `?` 与合取连词，
+    // ⚠ 这里调用的是 **parse_type**（非 inner）：括号内部允许完整的合取连词与前缀 `?T`，
     //   这与 `[N]T` / `*T` / `?T` 内部的处理保持一致。
     if (t == "LParen") {
         lex.advance_i();
@@ -472,10 +472,11 @@ pub fn parse_type_inner() i64 {
 //   而危险方向（把值级 `&&` 误吃进类型）只剩两个受控点。
 pub fn parse_type_ex(allow_and: bool) i64 {
     var t0: i64 = parse_type_inner();
-    while (lex.cur_t() == "Question") {
-        lex.advance_i();
-        t0 = base.mk_optional(t0, -1);
-    }
+    // ⚠ 2026-10-29：**后缀 `T?` 已从语法中删除** —— Zig 0.17 只有前缀 `?T`（裁定 O-1，
+    //   docs/design/option/DESIGN.md §2）。此处不再吃类型之后的 `Question`：
+    //   遇到 `i64?` 会停在 `?` 上，由调用方的 expect_tok 直接报错位，
+    //   而不是静默落成 Optional。裸 `?` 现在只剩「表达式位 opt_none 字面量」一处含义。
+    //   （历史上这里的 while 循环还会重复累加 `T??` / `T???`，一并移除。）
     // §set-ops 岔路 B：concept 多约束连词 `T: A & B`（§13.3 格族：类型位 meet 与值位
     // 集合交同为 `&`，不再另立 `&&`）。约束位把多个 concept 名连成 binary("&", ...)
     // 节点，由 sema.generic_normalize_func / collect_concept_constraints 拆解成约束列表。
@@ -648,8 +649,90 @@ pub fn parse_bitstr_lit(pat: bool) i64 {
     return base.mk_bitstr(h, -1);
 }
 
-pub fn parse_assign_expr() i64 {
+// ── O-4：`orelse`（对齐 Zig 0.17）──────────────────────────────
+// `a orelse b`：左操作数为 `?T`，非 none 时取出其值，否则求值右操作数。
+// 两条硬性语义要求使它**不能**压成 `orelse(a, b)` 这样的普通内建调用：
+//   ① 左操作数必须**只求值一次**（故须落入临时变量）；
+//   ② 右操作数必须**短路**（none 时不得求值）。
+// 因此走与值 if（`parse_value_if`，parse.tc:5195）同款姿势 —— 在 parser 层脱糖为
+// **已有节点组合**，双后端一行都不用改（设计 §2.9 姿势 A「脱糖在前、分后端在后」）：
+//
+//     { var __ol_N = a;
+//       match (is_some(__ol_N)) { true => unwrap(__ol_N), false => b } }
+//
+// 外层是 `block_expr`（base.tc:3450）；末语句必须是 `expr` 包装，因为 `infer_block_expr`
+// （sema.tc:6518）只把**末条 `expr` 语句**的 `na` 认作块值。临时名用自增计数器保证嵌套唯一，
+// 同 `desugar_value_loop` 按节点 id 命名的做法。
+//
+// **优先级**：塔变为 `assign → orelse → pipe → in → concat → range → or → … → primary`。
+// orelse 是最松的二元级 —— 与 Zig 的优先级表一致（orelse / catch 最低）。
+// 放在这里还有个工程好处：下行各层**一个调用点都不用改**，`a..b` / `a |> f` 等既有行为
+// 一字不变，满足 L-03「塔只向下扩展、不重排」。
+var g_orelse_uid: i64;
+
+// Z10：与比较运算混用时 Zig 要求显式括号 —— `x orelse y == z` 在 Zig 是**编译错误**，
+// 不是解析妥协。判据是操作数的**顶层**节点：写了括号时顶层是 `paren`（parse.tc:1280
+// 保留括号节点），裸写时顶层是 `binary` 且其 `sa` 为比较算符 ⇒ 二者可区分。
+fn orelse_operand_is_bare_cmp(n: i64) bool {
+    if (n < 0) { return false; }
+    if (base.node_kind((n as u64)) != "binary") { return false; }
+    var op: string = base.node_sa((n as u64));
+    if (op == "==" or op == "!=" or op == "<" or op == ">" or op == "<=" or op == ">=") { return true; }
+    return false;
+}
+
+// 单实参内建调用（some/unwrap/is_some/is_none 均按名字识别，见 sema.tc:8761）
+fn mk_call1(name: string, arg: i64, ti: i64) i64 {
+    var ah: i64 = base.list_push(-1, -1, arg);
+    return base.mk_call(base.mk_ident(name, -1), ah, ti);
+}
+
+pub fn desugar_orelse(a: i64, b: i64, ti: i64) i64 {
+    g_orelse_uid = g_orelse_uid + 1;
+    var tname: string = base.sb_cat2("__ol_", base.i2s(g_orelse_uid));
+    // var __ol_N = a;   —— na = -1：不写类型标注，由初始化式推断
+    var vd: i64 = base.mk_var_decl(tname, false, -1, a, ti);
+    var cond: i64 = mk_call1("is_some", base.mk_ident(tname, ti), ti);
+    var tval: i64 = mk_call1("unwrap", base.mk_ident(tname, ti), ti);
+    var t_arm: i64 = base.mk_arm("", false, base.mk_bool(true, ti), -1, tval, ti);
+    var f_arm: i64 = base.mk_arm("", false, base.mk_bool(false, ti), -1, b, ti);
+    // ⚠ mk_match 的 la 是 kids（Child）链表**下标**，不是节点 id —— 必须走 list_push。
+    var head: i64 = -1;
+    var tail: i64 = -1;
+    tail = base.list_push(head, tail, t_arm);
+    if (head < 0) { head = tail; }
+    tail = base.list_push(head, tail, f_arm);
+    if (head < 0) { head = tail; }
+    var m: i64 = base.mk_match(cond, head, ti);
+    var mstmt: i64 = base.mk_expr(m, ti);
+    var s_head: i64 = -1;
+    var s_tail: i64 = -1;
+    s_tail = base.list_push(s_head, s_tail, vd);
+    if (s_head < 0) { s_head = s_tail; }
+    s_tail = base.list_push(s_head, s_tail, mstmt);
+    if (s_head < 0) { s_head = s_tail; }
+    return base.mk_block_expr(s_head, ti);
+}
+
+pub fn parse_orelse() i64 {
     var left: i64 = parse_pipe();
+    if (lex.cur_t() == "KwOrelse") {
+        // 不明示括号就拒绝，并直接指出该怎么写（同 parse_value_if:5201 的报错风格，不带诊断码）
+        if (orelse_operand_is_bare_cmp(left)) {
+            parse_fatal("ambiguous precedence: parenthesize the comparison operand of `orelse` (write `(a == b) orelse c`, not `a == b orelse c`)");
+        }
+        var ti: i64 = lex.advance_i();
+        var right: i64 = parse_orelse();     // 右结合，同 `a = b = c`
+        if (orelse_operand_is_bare_cmp(right)) {
+            parse_fatal("ambiguous precedence: parenthesize the comparison operand of `orelse` (write `a orelse (b == c)`, not `a orelse b == c`)");
+        }
+        return desugar_orelse(left, right, ti);
+    }
+    return left;
+}
+
+pub fn parse_assign_expr() i64 {
+    var left: i64 = parse_orelse();
     if (lex.cur_t() == "Assign") {
         var ti: i64 = lex.advance_i();
         var right: i64 = parse_assign_expr();
@@ -5908,6 +5991,22 @@ pub fn lbracket_is_next_arm_pattern() bool {
     return false;
 }
 
+// ── O-3：`.?` 断言取出（对齐 Zig 0.17）─────────────────────────
+// `x.?` ≡ `x orelse unreachable`：dst 为 none 时 panic，否则取出元素值。
+// 实现刻意做成**脱糖为既有内建调用 `unwrap(x)`**，而不是新增节点类型 —— 三个前提已核实：
+//   ① sema 对 some/unwrap/is_some/is_none **按名字**识别（`fname` 取调用目标 ident 的
+//      `sa`，见 sema.tc:8662 / 8761），合成 call 节点因此走完全相同的通路；
+//   ② `unwrap` 的运行期 panic 已经具备（runtime/t_runtime.c:246 `t_opt_unwrap` 遇
+//      NULL 打 JSON 错误并 exit(1)，LLVM shim 在 t_shim_ll.c:58 直接复用它）；
+//   ③ 既有 parser 层合成 call 的先例见 parse.tc:2916（模板脱糖合成 `format` 调用）。
+// ⇒ HIR/TIR/C 后端/LLVM 后端**一行都不用改**，这正是设计 §2.9 姿势 A「脱糖在前、分后端在后」。
+// ⚠ 别把它做成 `?.` 可选链：Zig 明确不做（Z12），理由见 docs/design/option/DESIGN.md。
+fn mk_opt_unwrap_postfix(e: i64, ti: i64) i64 {
+    lex.advance_i();                                    // 吃掉 `?`（Dot 已由调用方消费）
+    var ah: i64 = base.list_push(-1, -1, e);            // 实参链表：仅 e 一个元素
+    return base.mk_call(base.mk_ident("unwrap", -1), ah, ti);
+}
+
 pub fn parse_postfix() i64 {
     var e: i64 = parse_primary();
     while (lex.cur_t() == "Dot" or lex.cur_t() == "LBracket" or lex.cur_t() == "LParen") {
@@ -5920,7 +6019,11 @@ pub fn parse_postfix() i64 {
             break;
         }
         var ti: i64 = lex.advance_i();
-        if (t == "Dot") { e = parse_post_member(e, ti); }
+        if (t == "Dot") {
+            // O-3：`.?` 断言取出（语义 ≡ Zig 的 `x orelse unreachable`）。
+            if (lex.cur_t() == "Question") { e = mk_opt_unwrap_postfix(e, ti); }
+            else { e = parse_post_member(e, ti); }
+        }
         if (t == "LBracket") { e = parse_post_index(e, ti); }
         if (t == "LParen") { e = parse_post_call(e, ti); }
     }
