@@ -4788,6 +4788,21 @@ pub fn tir_emit_call(e: i64) TirEmitRes {
         tir_emit(tir_emit_call_ind(call_ind_retst, d, field_res.name, cargs));
         return TirEmitRes{ name: d, st: tir_st_from_str(call_ind_retst) };
     }
+    // ⭐ G-2：`fs[0](args)` —— 被调者是 **index** 节点且元素类型为 func。
+    //   此前无此分支 ⇒ 落到下方「被调函数名」路径，而 index 节点取不到函数名（cname 为空）
+    //   ⇒ TIR 发 `call i64 $t @ $arg`（空名）⇒ LLVM 发 `call i64 @t__`（未定义符号，链接失败）。
+    //   与上面 member 分支同构：用 tir_emit_index_read 把下标表达式求值成元素槽
+    //   （ptr<void> = 指向 %TClosure），再 call_ind（后端 GEP 解包 code/env）。
+    //   ⚠ 返回类型必须取自元素 TD 的 tdf_ret：retst 默认是 i64，聚合返回（%TStr 等）会签名错配。
+    if (base.node_kind((callee_id as u64)) == "index") {
+        var idx_td: i64 = tir_expr_td(callee_id);
+        if (idx_td >= 0 and idx_td < slice_len(sema.tds) as i64 and sema.tds[idx_td].cat == "func") {
+            var idx_res: TirEmitRes = tir_emit_index_read(callee_id);
+            var ci_retst: string = tir_st_of_td(sema.tdf_ret[idx_td]);
+            tir_emit(tir_emit_call_ind(ci_retst, d, idx_res.name, cargs));
+            return TirEmitRes{ name: d, st: tir_st_from_str(ci_retst) };
+        }
+    }
     // 间接调用：被调者是本地槽（闭包值，ptr<void> 指向 %TClosure）→ call_ind；
     // 否则是被调函数名 → 直接 call。镜像 codegen_ll.tc ll_call（局部/全局函数类型变量 → 间接）。
     var callee_ref: string = base.sb_cat2("@", cname);
@@ -5223,9 +5238,11 @@ pub fn tir_emit_array_lit(e: i64, force_td: i64) TirEmitRes {
     if (td < 0) { td = tir_expr_td(e); }
     var cat: string = "";
     var elem_st: string = "i64";
+    var elem_td: i64 = -1;   // G-2：元素 TD（判 fn 元素是否需要包 %TClosure）
     if (td >= 0) {
         var t: TD = sema.tds[td];
         cat = t.cat;
+        elem_td = t.elem;
         elem_st = tir_st_of_td(t.elem);
     } else if (N > 0) {
         elem_st = tir_expr_st(elems[0]);
@@ -5255,6 +5272,18 @@ pub fn tir_emit_array_lit(e: i64, force_td: i64) TirEmitRes {
         var i: i64 = 0;
         while (i < N) {
             var esr: TirEmitRes = tir_emit_expr(elems[i]); var es: string = esr.name;
+            // ⭐ G-2：fn 元素的「裸函数符号」必须先包成 %TClosure 值，与 G-4 的 fn 结构体字段
+            //   同款（见 tir_emit_struct_lit）。数组元素槽是 ptr<void>（**指向** %TClosure），
+            //   下游 call_ind 会 GEP 解包 field0=code / field1=env；存裸 code 的后果：
+            //     · LLVM：`store i64 @fn` ⇒ clang「global variable reference must have pointer type」；
+            //     · tmir-c：把函数机器码当 %TClosure 读 ⇒ 段错误。
+            //   ⚠ 捕获型 lambda 已是堆闭包指针（`tir_emit_closure_make` 产物，**不以 '@' 开头**）
+            //     ⇒ 判据天然只命中裸函数符号，两类永不重叠。
+            if (elem_td >= 0 and elem_td < slice_len(sema.tds) as i64) {
+                if (sema.tds[elem_td].cat == "func" and str_len(es) >= 1 and es[0] == 64) {
+                    es = tir_make_closure_value(es, "");
+                }
+            }
             append(__al_args, tir_op(es));
             i = i + 1;
         }
