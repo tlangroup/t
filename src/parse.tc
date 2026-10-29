@@ -5605,6 +5605,45 @@ pub fn parse_trap_arm() i64 {
     return base.mk_arm("", ta_wild, ta_pat, -1, ta_body, ta_ti);
 }
 
+// 选项 A：paren-aware 前瞻，决定主表达式位的 `trap` 是关键词还是用户标识符。
+// 调用约定：cur token 恰为 `trap`（Identifier）。
+//   关键词读法 = `trap <expr> { <臂> }`，必须能在 scrutinee 之后见到 `{`；
+//   标识符读法 = 调用 `trap(...)` 或裸引用 `trap`。
+// 判定：
+//   · 紧跟 `(` ⇒ 跨过**平衡**括号组；组后首个顶层（depth==0）token 是 `{` ⇒ 关键词，否则调用。
+//     （正确处理 `trap (e) { }` 括号 scrutinee 与 `trap(5)` 调用；嵌套 `(a+(b*c))` 亦平衡。）
+//   · 紧跟终结符（`;` `,` `)` `]` `}` EOF）⇒ `var x = trap;` / `foo(trap)` ⇒ 标识符。
+//   · 其余（标识符 / 字面量 / 可起表达式者）⇒ 关键词读法。
+// ⚠ 不处理「运算符前缀 scrutinee」（`trap *p { }` vs `var x = trap * 2`）这种病态二义——
+//   二者任一方向都只会清晰报错而非静默错编，且 fault 实代码 scrutinee 恒为调用 / 名字 / 括号。
+pub fn trap_is_keyword_form() bool {
+    var nxt: string = lex.peek_t(1);
+    if (nxt == "LParen") {            // ⚠ token 类型是命名串（"LParen"），不是字面 "("（同文件 expect_tok("LParen")）
+        var depth: i64 = 0;
+        var i: i64 = 1;
+        while (true) {
+            var tk: string = lex.peek_t(i);
+            if (tk == "Eof") { return false; }
+            if (tk == "LParen") { depth = depth + 1; }
+            else if (tk == "RParen") {
+                depth = depth - 1;
+                if (depth < 0) { return false; }
+            }
+            else if (depth == 0) {
+                // 括号组已闭合，下一个顶层 token 决定读法
+                return tk == "LBrace";
+            }
+            i = i + 1;
+            if (i > 8192) { return false; }   // 防爆：异常深嵌套视为非关键词
+        }
+    }
+    // 紧跟终结符 ⇒ `var x = trap;` / `foo(trap)` / 表达式末尾 ⇒ 标识符（裸引用 / 运算元）
+    if (nxt == "Semicolon" or nxt == "Comma" or nxt == "RParen" or nxt == "RBracket" or nxt == "RBrace" or nxt == "Eof") {
+        return false;
+    }
+    return true;                    // 其余（标识符 / 字面量 / 可起表达式者）⇒ 关键词读法
+}
+
 pub fn parse_trap_expr() i64 {
     var tp_ti: i64 = lex.advance_i();           // 消费 `trap`
     var tp_scrut: i64 = parse_expr();           // 被 trap 的表达式（在 `{` 处自然停手）
@@ -5643,9 +5682,10 @@ pub fn parse_primary() i64 {
         return base.mk_comptime(inner, ti_meta);
     }
     // fault B4b：故障消费 `trap <e> { <臂> }`（附录 E / A-33）。
-    // ⚠ `trap` **不进 lex 关键字表**：全仓 0 命中，按「Identifier + 词文本 == "trap"」在
-    //   主表达式位识别即可。做成词法关键字会连累 HIR/cstgen 关键字清单，与收益不成比例。
-    if (t == "Identifier" and lex.cur_v() == "trap") {
+    // ⚠ `trap` **不进 lex 关键字表**（A-20）：按「Identifier + 词文本 == "trap" + 前瞻判定」识别。
+    //   主表达式位与用户标识符碰撞（`fn trap(...)` / `var x = trap`），故用 paren-aware 前瞻区分：
+    //   关键词读法要求 scrutinee 之后必须跟 `{`，否则是调用 / 裸引用。
+    if (t == "Identifier" and lex.cur_v() == "trap" and trap_is_keyword_form()) {
         return parse_trap_expr();
     }
     // Erlang 式原子字面量：`:name` → atom 节点（表达式位置的 `:` 此前未使用）
