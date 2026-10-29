@@ -1315,6 +1315,22 @@ TupleType: "." "{" Type ("," Type)* "}"         // ✅ tc 匿名元组类型；�
 - **无隐式提升（L-02 显式原则）**：`T` 与 `?T` **不**自动转换——构造必须显式 `some(x)`，取值必须显式 `unwrap(x)`（或先 `is_some` 探测）。与 `f > T` 读路径的 Option B 裁定（§3.11）取舍一致：宁可啰嗦，也不让「空值」在类型层面隐形。
 - **诊断**：`unwrap` / `is_some` / `is_none` 的实参必须是 `?T`，否则报 **`T-SEM-E790`**。该校验在检查期拦下传标量的情形，避免 LLVM 后端把标量当 `ptr` 传给运行时。conformance `f_optional_unwrap_nonopt`；正例 `p_optional_basic`；示例 `examples/optional_demo.tc`。
 
+##### 3.5.0.1 `.?` 断言取出与 `orelse` 兜底 ✅ tc（2026-10-29，裁定 O-3 / O-4）
+
+两条都是 **parser 层脱糖**，不引入新节点类型、不改动 HIR/TIR/双后端：
+
+| 写法 | 脱糖为 | 语义 |
+|---|---|---|
+| `x.?` | `unwrap(x)` | 断言非 `none` 并取值；`none` 时 panic。等价于 Zig 的 `x orelse unreachable` |
+| `a orelse b` | `{ var __ol_N = a; match (is_some(__ol_N)) { true => unwrap(__ol_N), false => b } }` | 左非 `none` 取其值，否则求值 `b` |
+
+由此得到两条保证：**左操作数只求值一次**（落入临时变量），**右操作数短路**（左非 `none` 时完全不求值）。
+
+- **优先级**：`orelse` 是塔中**最松的二元级**（`assign → orelse → pipe → … → range → or → … → primary`），与 Zig 的优先级表一致。
+- **Z10 括号要求**：`orelse` 的操作数若**顶层**是裸写的比较表达式（`a orelse b == c`、`a == b orelse c`）是**编译错误 `T-PAR-E001`**——不是按某种优先级静默解析。加括号后合法：`a orelse (b == c)`、`(a == b) orelse c`。
+- 结果类型：两臂的 LUB（左侧为元素类型 `T`，右侧为兜底值类型）。
+- conformance：`p_opt_dot_question` / `p_orelse_basic`；反例 `f_orelse_ambiguous_precedence` / `f_orelse_ambiguous_lhs`；示例 `examples/option_zig.tc`。
+
 **新增运行期原语**
 
 | 原语 | C 端 | LLVM 端 |

@@ -90,6 +90,61 @@ bar-lambda（`parse.tc:1746`）与 inline-for（`parse.tc:5120`）。
 **这是 B 期开工前要先定死的一件事**，否则会重演历史的同型故障——
 值级 `&&` 曾被类型位误吃进去（从而静默改变解析结果），根因同样是「新增一处语法没先把前瞻裁定写清楚」。
 
+### O-3/O-4 落点调研（2026-10-29，实查结论）
+
+两条都能做到**零新节点类型、零后端改动**——全部走「脱糖在前、分后端在后」，
+与值 if（`parse_value_if`）、值循环（`desugar_value_loop`）同姿势。
+
+- **`?T` 的内建按名字识别**：`sema.tc:8761` 的条件是 `fname == "some"/"unwrap"/"is_some"/"is_none"`，
+  其中 `fname` 取调用目标 ident 的 `sa`。⇒ 只要 parser 合成出一个 `call(ident("unwrap"), [x])` 节点，
+  sema/TIR/C/LLVM 全链路按现有路径走，**一行后端代码都不用动**。
+- **`unwrap` 在 none 时确实 panic**：`runtime/t_runtime.c:246` `t_opt_unwrap` 遇 NULL 打 JSON 错误并 `exit(1)`，
+  `runtime/t_shim_ll.c:58` 的 LLVM shim 直接复用它。⇒ `.?` ≡ `orelse unreachable` 的运行期语义已经现成。
+
+**`.?`（O-3）**：`parse_postfix` 的 Dot 分支（`parse.tc:5912`）里，Dot 已消费后若 `cur_t()=="Question"`，
+吃 `?` 并合成 `unwrap` 调用。前缀参考 `parse.tc:2916`（既有 parser 层合成 call 的先例）。
+`.?` 可继续缀 genius（`x.?.field`）天然成立，因为后缀循环接着跑。
+
+**`orelse`（O-4）**：必须**单次求值左操作数 + 短路**，故不能压成 `orelse(a,b)` 内建调用。脱糖为：
+
+```
+a orelse b   ⇒   { var __ol_N = a;
+                   match (is_some(__ol_N)) { true => unwrap(__ol_N), false => b } }
+```
+
+外层用 `base.mk_block_expr`（`base.tc:3450`），末语句须是 `base.mk_expr` 包着的 match ——
+`infer_block_expr`（`sema.tc:6518`）只认 `expr` 语句的 `na` 作块值。
+match 节点的拼法照抄 `parse_value_if`（`parse.tc:5203-5212`，二臂 `true`/`false`，手工 push kids 链表）。
+临时名用自增计数器保证嵌套唯一，对齐 `desugar_value_loop` 按节点 id 命名的做法。
+
+**顺带挖出并修掉一个 C 后端的静默错编（2026-10-29）**
+
+`.?` 让聚合值的直接使用第一次变得顺手，于是踩响了 C 后端既有的一个雷：
+
+```t
+var p: Point = op.?;  p.x + p.y   // 两步写法：双后端都得 7
+op.?.x + op.?.y                   // 直接缀接：LLVM 得 7，**tmir-c 得 0**
+```
+
+根因：C 后端给每个聚合槽都配了自有缓冲（`<slot>_buf`，声明段 `t_alloc` + `memset 0`，
+且 `<slot> = <slot>_buf`）。而 `t_opt_unwrap` 那条发射是 `dst = *(unsigned char**)(...)`，
+把 `dst` **改指**到了 arena 指针 —— `<dst>_buf` 于是变成一份全 0 的陈旧缓冲，
+后续成员访问按聚合基取 `<dst>_buf` ⇒ 读到 0。
+
+这与已登记缺陷 **G-5**（`CALL_IND` 聚合返回同样会改指）完全同型，故修法直接复用它的登记表
+`g_c_aggcall_slot`：在 `unwrap` 发射末尾，若元素是用户聚合则登记 `dst`，
+使 `ADDR_OF` 取「槽里的当前指针值」而非陈旧缓冲。标量元素两个判定都不成立 ⇒ 既有标量通路一字未动。
+（改的是共享 codegen，已用 examples 全量双后端 + conformance 全量回归守住回归面。）
+把新级插在 **`range` 与 `or` 之间**（`parse_range` 的左操作数改调 `parse_orelse`，
+而 `..` 两端仍直呼 `parse_or`）。这样：
+
+- `==` 等比较仍绑得比它紧 ⇒ 符合 Z10；
+- `a orelse b |> f` 读成 `(a orelse b) |> f`（管道是松的那层）；
+- range 端点不被 `orelse` 吃掉，既有 `lo..hi` 行为一字不变，符合 L-03「塔只向下扩展、不重排」。
+
+**新增关键字**：`lib/std/rc/cst.tc:36-38,55` 是冻结手维护的三张并行数组 + `g_kw_count`（46），
+加 `orelse` 要四处同步。全仓 `.tc` 源码 `grep orelse` **零匹配**，无标识符冲突。
+
 ### O-6 ABI：`opt.boxed` → `opt.tagged`
 
 按 `tir-design.md §15.2` 裁定 2，by-value 形态本来就在规格里（`opt.tagged<ST>` = `{i8, ST}`），
