@@ -1,0 +1,35 @@
+// 数组元素上的闭包调用（G-2）：`fs[i](args)` —— 数组/切片里存 fn 值再按下标调用。
+// 修复前：TIR 把被调者解析成**空名**（`call i64 $t @ $arg`）⇒ LLVM 发 `call i64 @t__`
+// （未定义符号，链接失败）；且数组字面量的 fn 元素没包成 %TClosure，直接 `store i64 @fn`
+// ⇒ clang「global variable reference must have pointer type」。双后端都挂。
+//
+// 修复要点（两处缺一不可，均在 TIR 层 ⇒ 一次修好双后端）：
+//  ① 数组字面量的 fn 元素：裸函数符号 `@fn` 必须先包成 %TClosure 值
+//     （与 G-4 的 fn 结构体字段同款）⇒ 元素槽存的是**指向 %TClosure 的 ptr<void>**。
+//  ② `fs[0](args)` 的被调者是 index 节点 ⇒ 走 call_ind（GEP 解包 code/env），
+//     不能落进「按函数名直调」路径（index 节点取不到函数名）。
+fn add1(x: i64) i64 { return x + 1i64; }
+fn add2(x: i64) i64 { return x + 2i64; }
+fn mk(b: i64) fn(i64) i64 {
+    return fn (y: i64) i64 { return y + b; };
+}
+struct Box { f: fn(i64) i64; }
+fn main_fn() i32 @main {
+    // ① 裸函数符号数组
+    var fs: [2]fn(i64) i64 = [add1, add2];
+    var a: i64 = fs[0](5i64);
+    var b: i64 = fs[1](5i64);
+    println(i2s(a));
+    println(i2s(b));
+    // ② 捕获型闭包数组（元素已是堆闭包指针，不需要再包）
+    var gs: [2]fn(i64) i64 = [mk(10i64), mk(20i64)];
+    var c: i64 = gs[0](5i64);
+    var d: i64 = gs[1](5i64);
+    println(i2s(c));
+    println(i2s(d));
+    // ③ 结构体字段上的闭包调用（G-4 既有路径，回归）
+    var bx: Box = Box{ .f = add1 };
+    var e: i64 = bx.f(5i64);
+    println(i2s(e));
+    return 0;
+}

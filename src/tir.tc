@@ -1936,7 +1936,7 @@ pub fn lower_unit(mod: string, source: string) void {
     while (j < n) {
         var d: i64 = lex.decl_list[j];
         if (base.node_kind((d as u64)) == "FuncDecl") {
-            // S8：`comptime fn` 函数体仅存在于编译期（见 T-CLO-E781「其函数体仅存在于编译期」），
+            // S8：`comptime fn` 函数体仅存在于编译期（见 T-CLO-E001「其函数体仅存在于编译期」），
             // 运行期永不调用，故不降级为运行期 TIR 函数——两个后端（LLVM / tmir-c）都不会发射其
             // 定义。否则 `@type_info` 等仅编译期 op（TIR_OP_TYPEINFO, op 62）会落进运行期代码，
             // tmir-c 后端无该 op 支撑 → `unsupported op 62` + 临时量未声明致 C 编译失败。
@@ -2715,7 +2715,13 @@ pub fn tir_emit_stmt(sid: i64) void {
     if (kd == "while") { tir_emit_while(sid); return; }
     if (kd == "for_each") { tir_emit_for_each(sid); return; }
     if (kd == "block") {
-        tir_blk_push();
+        // fault B4b 位置②：`var x : T = trap …;` 的脱糖产物块。它只是**一条语句的展开**，
+        //   不是新作用域 —— 其中声明的 x 必须对块外继续可见（A-34）。
+        //   ⚠ 若不特殊处理，本块的 push/pop 会把 x 登记在子深度，块外 `tir_find_local_idx`
+        //   的 `g_local_depths[i] <= g_blk_depth` 过滤就查不到它 ⇒ 被当成未定义全局，
+        //   链接期报 `undefined symbol: x`（实测）。bf 标记时跳过深度增减，产物变量留在父深度。
+        var tflat: bool = base.node_bf((sid as u64));
+        if (tflat == false) { tir_blk_push(); }
         var c: i64 = base.node_la((sid as u64));
         // S4 §4.6 Phase 3：链先物化再遍历 —— 纯读取循环，与原手写链遍历逐点同序
         var c_ks: []i64 = base.kids_chain(c);
@@ -2725,7 +2731,7 @@ pub fn tir_emit_stmt(sid: i64) void {
             tir_emit_stmt(c_kv);
             c_ki = c_ki + 1;
         }
-        tir_blk_pop();
+        if (tflat == false) { tir_blk_pop(); }
         return;
     }
     if (kd == "comptime_block") {
@@ -3338,6 +3344,20 @@ pub fn tir_emit_assign(sid: i64, est: i64) TirEmitRes {
                 }
             }
             var faddr: string = tir_member_addr(base.node_na((sid as u64)));
+            // ⭐ G-4（与 tir_emit_struct_lit 同因同解，见那里完整注释）：
+            //   `b.r0 = seven;` 的右值是**裸函数符号**，而 fn 类型字段的下游按 **TClosure\*** 消费
+            //   ⇒ 落槽前必须先包成 %TClosure 值。捕获型 lambda 的右值已是堆指针（非 '@' 开头），
+            //   判据天然只命中裸函数符号。
+            //   ⚠ 右值指令已在上方发射（本分支只是补一段闭包构造），故此处不重发右值。
+            if (str_len(rhs) >= 1 and rhs[0] == 64) {
+                // ⚠ 必须用 tir_member_expr_td（沿 member 链自解析），**不能**用 tir_expr_td /
+                //   tir_lhs_td：后者对 member 节点落到 meta_type_of_expr 兜底，拿不到字段真实 TD
+                //   （实测 `b.r0 = seven` 判不出 func ⇒ 不包闭包 ⇒ C 后端段错误）。
+                var mftd: i64 = tir_member_expr_td(pmnode);
+                if (mftd >= 0 and mftd < slice_len(sema.tds) as i64 and sema.tds[mftd].cat == "func") {
+                    rhs = tir_make_closure_value(rhs, "");
+                }
+            }
             if (faddr != "") {
                 tir_emit(TIRInst{ op: TIR_OP_STORE, st: ST_NONE, dst: tir_op(faddr), args: tir_a1(rhs), is_comment: false, line: g_cur_line, cmt: "" });
                 return TirEmitRes{ name: rhs, st: est };
@@ -3992,6 +4012,18 @@ pub fn tir_emit_binary(e: i64) TirEmitRes {
         slice_set(sema.tds, ccat_td3, ccat_t3);
         ost = tir_st_of_td(ccat_td3);
     }
+    // §set-ops Step 2b：位域（packed struct）集合交 / 并 —— 聚合值不能走 `and` / `or` 指令
+    // （实测产出非法 IR `and %Perm`），改走「抽宿主整型 → 位运算 → 裹回聚合」三段式。
+    // ⚠ 刻意放在 **TIR 层**而不是两个后端各拦一次：ADDR_OF → GEP[0] → LOAD hostst 这条序列
+    // 就是 packed 成员读写（P5）已在双后端验证过的通路，STRUCT_NEW 同理（packed 字面量，P5），
+    // 故一次实现两端同构，不必再写两套 shim（也就没有「out 参排末位」那类坑）。
+    if (op == "&" or op == "|") {
+        var pkty: string = tir_packed_bin_ty(ost);
+        if (str_len(pkty) > 0) {
+            var pkres: string = tir_packed_setop(op, pkty, ls, rs);
+            return TirEmitRes{ name: pkres, st: tir_st_from_str(pkty) };
+        }
+    }
     var opc: string = opmap.tir_binop(base.node_sa((e as u64)), ost);
     var d: string = tir_tmp();
     var __bin_args: []TirOperand = [];
@@ -4003,6 +4035,59 @@ pub fn tir_emit_binary(e: i64) TirEmitRes {
         return TirEmitRes{ name: d, st: ST_I1 };
     }
     return TirEmitRes{ name: d, st: tir_st_from_str(ost) };
+}
+
+// 位域（packed struct）二元运算的类型判定：命中返回规范形式 `%Name`，非位域返回 ""。
+// ⚠ 只看 `ost`（操作数实际发射类型）：它在本函数上方已对 `ost == "i64"` 做过左操作数兜底。
+//   刻意**不再**对整体表达式调 `tir_expr_st` —— 那会经 tir_expr_td 触发 node_set_type 的
+//   缓存回收副作用，对**每一个**普通 `&` / `|` 都产生一次额外写入，风险远大于收益。
+pub fn tir_packed_bin_ty(ost: string) string {
+    if (sema.pk_find_struct(tir_strip_pct(ost)) >= 0) { return base.sb_cat2("%", tir_strip_pct(ost)); }
+    return "";
+}
+
+// 位域集合交 / 并：两侧宿主整型 AND / OR，再裹回聚合（packed 单 host 字段）。
+// 结果与 packed 字面量构造同构（TIR_OP_STRUCT_NEW + 单个 hostst 实参）。
+pub fn tir_packed_setop(op: string, psty: string, ls: string, rs: string) string {
+    var hostst: string = tir_packed_host_st(psty);
+    var hstc: i64 = tir_st_from_str(hostst);
+    var ha: string = tir_packed_host(ls, psty);
+    var hb: string = tir_packed_host(rs, psty);
+    var hr: string = tir_tmp();
+    var sop: i64 = TIR_OP_AND;
+    if (op == "|") { sop = TIR_OP_OR; }
+    var __ps_args: []TirOperand = [];
+    append(__ps_args, tir_op(ha));
+    append(__ps_args, tir_op(hb));
+    tir_emit(TIRInst{ op: sop, st: hstc, dst: tir_op(hr), args: __ps_args, is_comment: false, line: g_cur_line, cmt: "" });
+    var d: string = tir_tmp();
+    var __pn_args: []TirOperand = [];
+    append(__pn_args, tir_op_st(hr, hstc));
+    tir_emit(TIRInst{ op: TIR_OP_STRUCT_NEW, st: tir_st_from_str(psty), dst: tir_op(d), args: __pn_args, is_comment: false, line: g_cur_line, cmt: "" });
+    return d;
+}
+
+// 位域的宿主整型名（u8/u16/u32/u64 → i8/i16/i32/i64）；查不到退回 i64。
+pub fn tir_packed_host_st(psty: string) string {
+    var pk: i64 = sema.pk_find_struct(tir_strip_pct(psty));
+    if (pk >= 0 and pk < slice_len(sema.pk_struct_under) as i64) {
+        return sema.pk_host_st(sema.pk_struct_under[pk]);
+    }
+    return "i64";
+}
+
+// 取位域值槽里的宿主整型（packed 单 host 字段，field_index 恒 0 → GEP[0]）。
+// 与 tir_member_addr 的 packed 路径逐字同构，含那条 `ptr<%Name>` 的 ADDR_OF 槽型修正 ——
+// 宿主整型可能 < 8 字节（%Perm = type { i8 }），按值类型分配会被 8 字节指针写穿栈 → 段错误（P5）。
+pub fn tir_packed_host(v: string, psty: string) string {
+    var hostst: string = tir_packed_host_st(psty);
+    var addr: string = tir_tmp();
+    tir_emit(TIRInst{ op: TIR_OP_ADDR_OF, st: tir_st_from_str(base.sb_cat3("ptr<", psty, ">")), dst: tir_op(addr), args: tir_a1(v), is_comment: false, line: g_cur_line, cmt: "" });
+    var faddr: string = tir_tmp();
+    tir_emit(TIRInst{ op: TIR_OP_GEP, st: tir_st_from_str(hostst), dst: tir_op(faddr), args: tir_a3(addr, "0", "0"), is_comment: false, line: g_cur_line, cmt: "" });
+    var hv: string = tir_tmp();
+    tir_emit(TIRInst{ op: TIR_OP_LOAD, st: tir_st_from_str(hostst), dst: tir_op(hv), args: tir_a1(tir_os(faddr, tir_st_from_str(base.sb_cat3("ptr<", hostst, ">")))), is_comment: false, line: g_cur_line, cmt: "" });
+    return hv;
 }
 
 // 短路逻辑 && / ||（memory-first，无 phi；镜像 codegen_ll.tc:1898-1922 的 br i1+phi 短路控制流，
@@ -4703,6 +4788,21 @@ pub fn tir_emit_call(e: i64) TirEmitRes {
         tir_emit(tir_emit_call_ind(call_ind_retst, d, field_res.name, cargs));
         return TirEmitRes{ name: d, st: tir_st_from_str(call_ind_retst) };
     }
+    // ⭐ G-2：`fs[0](args)` —— 被调者是 **index** 节点且元素类型为 func。
+    //   此前无此分支 ⇒ 落到下方「被调函数名」路径，而 index 节点取不到函数名（cname 为空）
+    //   ⇒ TIR 发 `call i64 $t @ $arg`（空名）⇒ LLVM 发 `call i64 @t__`（未定义符号，链接失败）。
+    //   与上面 member 分支同构：用 tir_emit_index_read 把下标表达式求值成元素槽
+    //   （ptr<void> = 指向 %TClosure），再 call_ind（后端 GEP 解包 code/env）。
+    //   ⚠ 返回类型必须取自元素 TD 的 tdf_ret：retst 默认是 i64，聚合返回（%TStr 等）会签名错配。
+    if (base.node_kind((callee_id as u64)) == "index") {
+        var idx_td: i64 = tir_expr_td(callee_id);
+        if (idx_td >= 0 and idx_td < slice_len(sema.tds) as i64 and sema.tds[idx_td].cat == "func") {
+            var idx_res: TirEmitRes = tir_emit_index_read(callee_id);
+            var ci_retst: string = tir_st_of_td(sema.tdf_ret[idx_td]);
+            tir_emit(tir_emit_call_ind(ci_retst, d, idx_res.name, cargs));
+            return TirEmitRes{ name: d, st: tir_st_from_str(ci_retst) };
+        }
+    }
     // 间接调用：被调者是本地槽（闭包值，ptr<void> 指向 %TClosure）→ call_ind；
     // 否则是被调函数名 → 直接 call。镜像 codegen_ll.tc ll_call（局部/全局函数类型变量 → 间接）。
     var callee_ref: string = base.sb_cat2("@", cname);
@@ -4986,6 +5086,24 @@ pub fn tir_emit_struct_lit(e: i64) TirEmitRes {
         } else {
             var fsr: TirEmitRes = tir_emit_expr(base.node_na((fc_kv as u64))); fs = fsr.name; fst = fsr.st;
         }
+        // ⭐ G-4 修复：fn 类型字段的「裸函数符号」必须先包成 %TClosure 值再落槽。
+        //   形态：`Box{ .r0 = seven }` / `Box{ .r0 = fn(){...} }` —— 字段值是 `@fn`。
+        //   而该字段的下游消费方是「取字段值当 **TClosure\***，再 GEP 解包 field0/field1」
+        //   （结构体字段存的是 ptr，不是内联 TClosure）⇒ 存裸 code 必炸：
+        //     · LLVM 轨：`store i64 @fn` ⇒ clang「global variable reference must have
+        //       pointer type」→ 链接失败（改动前的编译器对普通 `P3{ .a = 5 }` 同款的标量字段才炸）；
+        //     · tmir-c 轨：字段里存裸 code ⇒ `b.r0()` 把函数机器码当 TClosure 结构读 → 段错误。
+        //   ⚠ 捕获型 lambda 已是闭包值（tir_emit_closure_make 产出的是堆指针，**不以 '@' 开头**）
+        //     ⇒ 判据「值以 '@' 开头」天然只命中裸函数符号，两类永不重叠。
+        //   ⚠ 与 %TClosure.field0 语义互斥：那里必须存**裸 code**（各后端按
+        //     g_ll_clofnslot / c_clo_code 判别），此处是 fn 类型字段，存闭包值。
+        if (str_len(base.node_sa((e as u64))) > 0 and str_len(fs) >= 1 and fs[0] == 64) {
+            var ftdc: i64 = tir_field_td(base.node_sa((e as u64)), base.node_sa((fc_kv as u64)));
+            if (ftdc >= 0 and ftdc < slice_len(sema.tds) as i64 and sema.tds[ftdc].cat == "func") {
+                fs = tir_make_closure_value(fs, "");
+                fst = tir_st_from_str("ptr<void>");
+            }
+        }
         append(fnames, base.node_sa((fc_kv as u64)));
         append(fvals, fs);
         append(fvalsts, fst);
@@ -5120,9 +5238,11 @@ pub fn tir_emit_array_lit(e: i64, force_td: i64) TirEmitRes {
     if (td < 0) { td = tir_expr_td(e); }
     var cat: string = "";
     var elem_st: string = "i64";
+    var elem_td: i64 = -1;   // G-2：元素 TD（判 fn 元素是否需要包 %TClosure）
     if (td >= 0) {
         var t: TD = sema.tds[td];
         cat = t.cat;
+        elem_td = t.elem;
         elem_st = tir_st_of_td(t.elem);
     } else if (N > 0) {
         elem_st = tir_expr_st(elems[0]);
@@ -5152,6 +5272,18 @@ pub fn tir_emit_array_lit(e: i64, force_td: i64) TirEmitRes {
         var i: i64 = 0;
         while (i < N) {
             var esr: TirEmitRes = tir_emit_expr(elems[i]); var es: string = esr.name;
+            // ⭐ G-2：fn 元素的「裸函数符号」必须先包成 %TClosure 值，与 G-4 的 fn 结构体字段
+            //   同款（见 tir_emit_struct_lit）。数组元素槽是 ptr<void>（**指向** %TClosure），
+            //   下游 call_ind 会 GEP 解包 field0=code / field1=env；存裸 code 的后果：
+            //     · LLVM：`store i64 @fn` ⇒ clang「global variable reference must have pointer type」；
+            //     · tmir-c：把函数机器码当 %TClosure 读 ⇒ 段错误。
+            //   ⚠ 捕获型 lambda 已是堆闭包指针（`tir_emit_closure_make` 产物，**不以 '@' 开头**）
+            //     ⇒ 判据天然只命中裸函数符号，两类永不重叠。
+            if (elem_td >= 0 and elem_td < slice_len(sema.tds) as i64) {
+                if (sema.tds[elem_td].cat == "func" and str_len(es) >= 1 and es[0] == 64) {
+                    es = tir_make_closure_value(es, "");
+                }
+            }
             append(__al_args, tir_op(es));
             i = i + 1;
         }
@@ -5303,19 +5435,35 @@ pub fn tir_member_addr(e: i64) string {
         }
     }
     var base_slot: string = "";
+    // G-5：tir_emit_expr 返回的权威结果类型（兜底用）。
+    // ⚠ TirEmitRes.st 是**类型码 i64**（tir_st_from_str 的产物），不是字符串 ——
+    //   直接按 string 用 str_len/[0] 会恒不命中（第一版就栽在这里，修复看似生效实则没进）。
+    var base_res_st: i64 = ST_NONE;
     if (base.node_kind((bn as u64)) == "index") {
         // 切片/数组下标作 member 基底：必须取「元素地址」（tir_emit_index_addr）。
         // 不能走 tir_emit_expr —— 它内部是 index_read，会 load 出元素「值」，
         // 随后 ADDR_OF 把值物化成临时副本再取址，于是 `s[i].f = v` 只改了副本、
         // 且没有 slice_set 写回 → 写入静默丢失。编译器自身因此永远设不上
         // `nodes[d].bc = true`（pub 标记），跨模块可见性恒假 → src/tc.tc 报
-        // 17956 条 T-MOD-E558。判据：examples/_slicefield.tc。
+        // 17956 条 T-MOD-E008。判据：examples/_slicefield.tc。
         base_slot = tir_emit_index_addr(bn);
     } else {
         var base_slotr: TirEmitRes = tir_emit_expr(bn);
         base_slot = base_slotr.name;
+        base_res_st = base_slotr.st;
     }
     var base_st: string = tir_member_base_st(bn);   // 嵌套 member 权威基底类型（字符串路径，绕开 TD 越界回退 i64）
+    // ⭐ G-5：member 基底是**间接调用**（被调者为函数值变量，如 `f(3).s`）时，
+    //   tir_member_base_st 末尾走 tir_expr_st → meta_type_of_expr 解析不出间接调用的返回类型
+    //   ⇒ 退化成 "i64" ⇒ sname="i64" ⇒ tir_field_index 恒 0、GEP/LOAD 全按 i64
+    //   ⇒ **恰好读到字段 0（i64）所以「i64 字段正常」，而 string 字段读出空串**
+    //   （台账 G-5 原描述正是此现象）；C 后端还会因 `b = (TStr)(t12);` 强转直接 clang 报错。
+    //   tir_emit_expr 的 .st 已由 tir_emit_call 按 FuncType TD 的 tdf_ret 修正过，是权威结果
+    //   类型 ⇒ 仅当 base_st 拿不到结构名（非 '%' 开头）时用它兜底，零基线扰动。
+    if (str_len(base_st) > 0 and base_st[0] != '%') {
+        var brs: string = tir_st_to_str(base_res_st);
+        if (str_len(brs) > 0 and brs[0] == '%') { base_st = brs; }
+    }
     // ⚠ 合成 deref 节点没有 ti（sema 已跑完，新建节点无类型缓存）→ tir_member_base_st 对它取不到
     // 结构名而退化成 "i64"，导致 sname="i64" → fidx 恒 0、GEP 基类型错。此处按已知被指结构名
     // 直接覆盖，绕开对合成节点做类型推断。
@@ -5786,6 +5934,24 @@ pub fn tir_match_pattern_cond(armId: i64, scr: string, scr_base: string, scr_st:
             // 绑定字段（ident，含 _ 通配）：不参与比较条件，仅在命中臂的 body 内提取。
             // 跳过以免把绑定标识符当字面量整体发射比较（静默错编）。
             if (fval_node >= 0 and base.node_kind((fval_node as u64)) == "ident") {
+                fvp_ki = fvp_ki + 1;
+                continue;
+            }
+            // ── 谓词模式（fault B2 / 节点 N6）──────────────────────────────
+            // 字段值是 `binary(op, member(scr, f), v)`：整段求值即得 i1 条件。
+            // ⚠ 与下方字面量路径的区别：字面量走 `GEP+LOAD+EQ`（比较字段值 vs 常量），
+            //   谓词走 `tir_emit_expr`（比较字段值 vs **表达式**，op 不限于 ==）。
+            //   ⇒ 若此处不改，谓词会被当成字面量发射 `EQ(load(GEP), binary(...))` ⇒ 静默错编。
+            if (fval_node >= 0 and base.node_kind((fval_node as u64)) == "binary" and
+                parse.pat_is_relop_text(base.node_sa((fval_node as u64)))) {
+                var pc: string = tir_emit_expr(fval_node).name;
+                if (cond == "") {
+                    cond = pc;
+                } else {
+                    var pcc: string = tir_tmp();
+                    tir_emit(TIRInst{ op: TIR_OP_AND, st: tir_st_from_str("i1"), dst: tir_op(pcc), args: tir_a2(cond, pc), is_comment: false, line: g_cur_line, cmt: "" });
+                    cond = pcc;
+                }
                 fvp_ki = fvp_ki + 1;
                 continue;
             }

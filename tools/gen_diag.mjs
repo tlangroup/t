@@ -18,17 +18,15 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DEFS = path.join(__dirname, '..', 'tools', 'diag_defs.json');
 const OUT = path.join(__dirname, '..', 'src', 'diag_table.gen.h');
 
+// 重排后（选项 c：分类连续、每类从 000 起）每个 CAT 的 NNN 都落在 0..999 内。
+// 不再按段隔离——code 含 CAT 前缀，天然全局唯一；这里仅做 0..999 上界校验。
 const RANGES = {
-  LEX: [0, 79], ICE: [80, 99], PAR: [100, 199], SEM: [200, 299],
-  FST: [300, 399], NAM: [400, 449], ANN: [450, 499], DER: [500, 549],
-  MOD: [550, 599], MTA: [600, 649], FID: [650, 699], TIM: [700, 739],
-  MAT: [740, 779], CLO: [780, 809], FUN: [810, 849], FLG: [850, 859],
-  PIP: [860, 869], RNG: [870, 879], AGT: [880, 909], CDE: [910, 919],
-  VEC: [920, 949], DEV: [950, 979], OVL: [980, 999],
-  // ⚠ TIM 原占 700–739；现与 CLA 共享 700–739 百年段，子区间切为 700–719 / 720–739
-  //   （与既有 LEX/ICE 共段 000–099 的先例同款，见 docs/diagnostics.md §1.3）。
-  //   TIM 实码最大 703，收缩后仍全部落在 700–719 内，无需改动既有码。
-  CLA: [720, 739],
+  LEX: [0, 999], ICE: [0, 999], PAR: [0, 999], SEM: [0, 999],
+  FST: [0, 999], NAM: [0, 999], ANN: [0, 999], DER: [0, 999],
+  MOD: [0, 999], MTA: [0, 999], FID: [0, 999], TIM: [0, 999],
+  MAT: [0, 999], CLO: [0, 999], FUN: [0, 999], FLG: [0, 999], CLA: [0, 999],
+  PIP: [0, 999], RNG: [0, 999], AGT: [0, 999], CDE: [0, 999],
+  VEC: [0, 999], DEV: [0, 999], OVL: [0, 999],
 };
 
 const CODE_RE = /^T-([A-Z]{3})-([EWI])(\d{3})$/;
@@ -62,9 +60,9 @@ for (const d of defs) {
     if (legacySeen.has(d.legacy)) errors.push(`${d.code}: duplicate legacy name "${d.legacy}" (alias collision)`);
     legacySeen.add(d.legacy);
   }
-  catSeen[cat] = catSeen[cat] || new Set();
-  if (catSeen[cat].has(nnn)) errors.push(`${d.code}: NNN ${nnn} reused within CAT ${cat}`);
-  catSeen[cat].add(nnn);
+  catSeen[cat + sev] = catSeen[cat + sev] || new Set();
+  if (catSeen[cat + sev].has(nnn)) errors.push(`${d.code}: NNN ${nnn} reused within CAT ${cat} (${sev})`);
+  catSeen[cat + sev].add(nnn);
   if (!d.name) errors.push(`${d.code}: missing name`);
   if (!d.message) errors.push(`${d.code}: missing message`);
 }

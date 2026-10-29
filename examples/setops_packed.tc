@@ -1,0 +1,89 @@
+// §set-ops §13.3：位域（packed struct）的集合交（`&`）/ 并（`|`） —— 运行期 golden。
+// 与 examples/setops_bitstr.tc 同构：同一份程序在 LLVM 与 tmir-c 两后端跑，stdout 必须逐字相同。
+//
+// 语义要点：位域的字段是**互不重叠**的位段，故「宿主整型 AND / OR」等价于
+// **逐字段的位与 / 位或**（交 = 逐字段取交，并 = 逐字段取并），与直觉一致。
+
+packed struct Perm {   // 1+1+4+8 = 14 位 → 宿主 u16
+    readable: u1;
+    writable: u1;
+    level:    u4;
+    owner_id: u8;
+}
+
+packed struct Tiny {   // 3 位 → 宿主 u8
+    a: u1;
+    b: u1;
+    c: u1;
+}
+
+packed struct Wide {   // 32+8 = 40 位 → 宿主 u64
+    lo: u32;
+    hi: u8;
+}
+
+fn show_perm(tag: string, p: Perm) void {
+    var sb: StringBuilder = sb_new();
+    sb_append_str(sb, tag); sb_append_str(sb, " r="); sb_append_u64(sb, p.readable as u64);
+    sb_append_str(sb, " w="); sb_append_u64(sb, p.writable as u64);
+    sb_append_str(sb, " lv="); sb_append_u64(sb, p.level as u64);
+    sb_append_str(sb, " own="); sb_append_u64(sb, p.owner_id as u64);
+    sb_append_str(sb, "\n");
+    print(sb_to_str(sb));
+}
+
+fn show_tiny(tag: string, t: Tiny) void {
+    var sb: StringBuilder = sb_new();
+    sb_append_str(sb, tag); sb_append_str(sb, " a="); sb_append_u64(sb, t.a as u64);
+    sb_append_str(sb, " b="); sb_append_u64(sb, t.b as u64);
+    sb_append_str(sb, " c="); sb_append_u64(sb, t.c as u64);
+    sb_append_str(sb, "\n");
+    print(sb_to_str(sb));
+}
+
+fn show_wide(tag: string, w: Wide) void {
+    var sb: StringBuilder = sb_new();
+    sb_append_str(sb, tag); sb_append_str(sb, " lo="); sb_append_u64(sb, w.lo as u64);
+    sb_append_str(sb, " hi="); sb_append_u64(sb, w.hi as u64);
+    sb_append_str(sb, "\n");
+    print(sb_to_str(sb));
+}
+
+@main fn main() i32 {
+    var a: Perm = Perm{ readable: 1, writable: 1, level: 7, owner_id: 42 };
+    var b: Perm = Perm{ readable: 1, writable: 0, level: 3, owner_id: 42 };
+
+    var ci: Perm = a & b;    // 逐字段位与：r=1 w=0 lv=3 own=42
+    var cu: Perm = a | b;    // 逐字段位或：r=1 w=1 lv=7 own=42
+    var cn: Perm = (a & b) | (a | b);   // 嵌套：先交后并
+    show_perm("perm  &", ci);
+    show_perm("perm  |", cu);
+    show_perm("perm nest", cn);
+
+    var x: Tiny = Tiny{ a: 1, b: 0, c: 1 };
+    var y: Tiny = Tiny{ a: 1, b: 1, c: 0 };
+    var ti2: Tiny = x & y;    // 0b101 & 0b011 = 0b001
+    var tu2: Tiny = x | y;    // 0b101 | 0b011 = 0b111
+    show_tiny("tiny  &", ti2);
+    show_tiny("tiny  |", tu2);
+
+    var p: Wide = Wide{ lo: 0x12345678, hi: 0xAB };
+    var q: Wide = Wide{ lo: 0x0F0F0F0F, hi: 0x3C };
+    var wi: Wide = p & q;    // lo=0x02040608 hi=0x28
+    var wu: Wide = p | q;    // lo=0x1F3F5F7F hi=0xBF
+    show_wide("wide  &", wi);
+    show_wide("wide  |", wu);
+
+    // 自检：交 = 逐字段取小者（此处恰等于 b），并 = 逐字段取大者（此处恰等于 a）
+    if ((ci.readable == b.readable and ci.writable == b.writable and ci.level == b.level and ci.owner_id == b.owner_id)
+        and (cu.readable == a.readable and cu.writable == a.writable and cu.level == a.level and cu.owner_id == a.owner_id)
+        and (ti2.a == 1 and ti2.b == 0 and ti2.c == 0)
+        and (tu2.a == 1 and tu2.b == 1 and tu2.c == 1)
+        and (wi.lo == 0x02040608 and wi.hi == 0x28)
+        and (wu.lo == 0x1F3F5F7F and wu.hi == 0xBF)) {
+        println("setops_packed OK");
+        return 0;
+    }
+    println("setops_packed WRONG");
+    return 1;
+}

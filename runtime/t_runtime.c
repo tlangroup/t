@@ -420,6 +420,24 @@ TBitStr t_bitstr_concat(TBitStr a, TBitStr b) {
     return r;
 }
 
+// 集合交 / 并（§set-ops Step 2：`&&` = 交集，`||` = 并集）。
+// 结果位数 = max(a.bit_len, b.bit_len)：较短一侧按**零扩展**对齐 —— 位串表示"位位置集合"时，
+// 缺失的高位本就是"不含该成员"，零扩展即集合语义的自然写法（与整数隐式零扩展一致）。
+static TBitStr t_bitstr_setop(TBitStr a, TBitStr b, int is_or) {
+    int64_t total = a.bit_len > b.bit_len ? a.bit_len : b.bit_len;
+    TBitStr r = t_bitstr_new(total);
+    for (int64_t i = 0; i < total; i++) {
+        int ba = (i < a.bit_len) ? ((a.ptr[i / 8] >> (7 - (i % 8))) & 1) : 0;
+        int bb = (i < b.bit_len) ? ((b.ptr[i / 8] >> (7 - (i % 8))) & 1) : 0;
+        int bit = is_or ? (ba | bb) : (ba & bb);
+        if (bit) { r.ptr[i / 8] |= (uint8_t)(1 << (7 - (i % 8))); }
+    }
+    r.bit_len = total;
+    return r;
+}
+TBitStr t_bitstr_and(TBitStr a, TBitStr b) { return t_bitstr_setop(a, b, 0); }
+TBitStr t_bitstr_or(TBitStr a, TBitStr b) { return t_bitstr_setop(a, b, 1); }
+
 void t_bitstr_append_val(TBitStr* dst, uint64_t val, int64_t bits, int little) {
     int64_t cur = dst->bit_len;
     for (int64_t i = 0; i < bits; i++) {

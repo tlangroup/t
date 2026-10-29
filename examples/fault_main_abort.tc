@@ -1,0 +1,45 @@
+// 运行期钉死 B5c（A-19）行为：未声明故障签名的 @main 用 `return trap ... { resume(.abort) }`，
+// 当故障未被任何臂覆盖时，由运行时接手 —— 打印故障信息并以非零退出码退出。
+// ⚠ 非零退出码 ⇒ 不进 run_examples golden（会被判失败）；本例仅供手动双后端运行验证。
+//   期望：stderr 含 "fault UserErr: unhandled fault propagated past @main, aborting"，退出码 = 1。
+//
+// 验证命令（双后端）：
+//   node tools/tc_cli.mjs run examples/fault_main_abort.tc            # 默认后端
+//   node tools/tc_cli.mjs run -b c examples/fault_main_abort.tc       # C 后端
+//   echo $LASTEXITCODE   # 应为 1
+
+struct User {
+    age: i64;
+    name: string;
+}
+
+fault UserErr over User {
+    .{ .age < 0 }   -> UserErr.AgeNegative repairs { .use_default, .clamp };
+    .{ .name = "" } -> UserErr.NameEmpty    repairs { .anon };
+}
+
+fn validate(u : User) fault(UserErr)!User {
+    if (u.age < 0) {
+        return Err(
+            @clause(.fault, .{ .age < 0 }, UserErr.AgeNegative)
+         ++ @clause(.repair, .use_default, fn () User { return u; })
+         ++ @clause(.repair, .clamp,       fn () User { return u; })
+        );
+    }
+    if (u.name == "") {
+        return Err(
+            @clause(.fault, .{ .name = "" }, UserErr.NameEmpty)
+         ++ @clause(.repair, .anon, fn () User { return User{ .age = u.age, .name = "anon" }; })
+        );
+    }
+    return Ok(u);
+}
+
+// 故意让 `validate` 返回 NameEmpty（name 为空），而 trap 只覆盖 .age<0、其余 `.abort`
+// ⇒ NameEmpty 未被覆盖 ⇒ 运行期 eprint + exit(1)。
+fn main_fn() User @main {
+    return trap validate(User{ .age = 5i64, .name = "" }) {
+        .{ .age < 0 } => resume(.clamp);
+        _             => resume(.abort);
+    };
+}

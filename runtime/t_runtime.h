@@ -178,6 +178,8 @@ void    t_bitstr_append_bitstr(TBitStr* dst, TBitStr src);  // 追加整个 src�
 int64_t t_bitstr_bitlen(TBitStr s);                          // 返回 s.bit_len
 uint64_t t_bitstr_extract(TBitStr s, int64_t bit_off, int64_t bits, int little); // 提取 [bit_off,bit_off+bits) 为 u64（与 t_bitstr_append_val 打包互逆）
 TBitStr t_bitstr_sub(TBitStr s, int64_t bit_off);            // 返回 [bit_off, bit_len) 的字节对齐副本视图（match /bitstr 段）
+TBitStr t_bitstr_and(TBitStr a, TBitStr b);                  // 集合交集 `&&`（§set-ops Step 2）：零扩展到 max(bit_len)
+TBitStr t_bitstr_or(TBitStr a, TBitStr b);                   // 集合并集 `||`（§set-ops Step 2）：零扩展到 max(bit_len)
 
 // ── map[K]V：开放寻址，K 限定 string / 整数 ───────────────────
 // key_kind: 0 = TStr, 1 = int64

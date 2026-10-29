@@ -185,6 +185,25 @@ pub fn c_is_runtime_struct_st(st: string) bool {
     if (t2 == "TStr" or t2 == "TSlice" or t2 == "TClosure" or t2 == "TBitStr") { return true; }
     return false;
 }
+// 入口（@main）的返回值是否**丢弃**（⇒ 退出码恒 0）。与 LLVM 侧 tir_to_ll 的 main wrapper
+// 判据对齐：只有整数类返回类型才收敛成退出码，其余一律不可。
+// 判据用「C 侧返回类型」而非槽类型：运行库结构体（TStr 等）在字节缓冲模型里**可能**是值槽
+// （`return (s)` 里的 s 就是 TStr 值，不是指针）⇒ 只看槽是否为指针会漏判（main_ret_string）。
+pub fn c_main_ret_discard(st: string) bool {
+    if (str_len(st) as i64 == 0) { return false; }
+    if (st == "void") { return false; }
+    if (c_is_sret_type(st)) { return true; }
+    if (c_is_runtime_struct_st(st)) { return true; }
+    if (c_c_ty_is_ptr(c_tystr_c(st))) { return true; }
+    return false;
+}
+// 是否入口函数（@main）。判据与 c_emit_func 的 `ismain` 逐字一致：注解标记，或名为 main / @main。
+pub fn c_is_main_fn(f: TMIRFunc) bool {
+    if (f.is_main) { return true; }
+    if (f.name == "main") { return true; }
+    if (f.name == "@main") { return true; }
+    return false;
+}
 pub fn c_align_up(off: i64, a: i64) i64 {
     if (a <= 1) { return off; }
     var m: i64 = a - 1;
@@ -790,6 +809,9 @@ pub var g_c_gep_wrap: string = "";
 // RET 时把返回值缓冲 memcpy 进 __sret 再 ret void。
 pub var g_c_sret: bool = false;
 pub var g_c_sret_size: i64 = 0;
+// 入口函数（@main）的返回类型是否 void：入口包装器 `int __rc = t_main()` 对 `void t_main()`
+// 无法取值 ⇒ 须改成 `t_main(); int __rc = 0;`。由 c_emit_func 在发射入口时回填。
+pub var g_c_main_void: bool = false;
 pub fn c_emit_gep_dstpre(sb: StringBuilder, dstn: string) void {
     g_c_gep_wrap = "";
     var gdty: string = c_slot_c_ty(dstn);
@@ -838,6 +860,13 @@ pub fn c_emit_esz(sb: StringBuilder, szop: TirOperand, ecty: string) void {
 // 「指向用户聚合的指针」类型（ptr<%Struct> / ptr<%Perm>…，不含运行库结构体与枚举）。
 // 用于 ADDR_OF：用户聚合值槽在字节缓冲模型里本身就是缓冲指针，取址 = 指针值本身；
 // 而 ptr<i64> / ptr<void> 之类持有机器指针值的槽，取址必须是 &slot（槽变量的地址）。
+// G-5：目的类型是**用户聚合值类型** `%Name`（而非 `ptr<%Name>`）——ADDR_OF 的 st 写法。
+// 复用 c_is_user_agg_ptr_ty 的排除表（运行库结构体 / 枚举 / 非聚合一律 false）。
+pub fn c_is_user_agg_val_ty(ty: string) bool {
+    if (str_len(ty) == 0) { return false; }
+    if (ty[0] != 37) { return false; }   // 37 = '%'
+    return c_is_user_agg_ptr_ty(base.sb_cat3("ptr<", ty, ">"));
+}
 pub fn c_is_user_agg_ptr_ty(ty: string) bool {
     if (c_starts(ty, "ptr<%") == false) { return false; }
     var L: i64 = str_len(ty) as i64;
@@ -1266,7 +1295,15 @@ pub fn c_thunk_name(fname: string) string { return base.sb_cat2(c_fn_name(fname)
 // 函数引用 → TClosure.field0（code 指针）的 C 表达式；普通函数登记 thunk 需求并返回 thunk 名。
 pub fn c_clo_code(name: string) string {
     var b: string = c_func_base(name);
-    if (c_func_has_env(b)) { return c_fn_name(b); }
+    // ⭐ 聚合返回者一律走 thunk（**含**带 env 首参的闭包函数）—— 判据优先于 has_env，
+    //    详见 c_emit_thunks 头注释：TClosure ABI 的 code(env, args…) 与用户聚合返回函数的
+    //    `void <fn>(unsigned char* __sret, void* __env, args…)` 差一个 sret 首参，必须适配。
+    var cfi: i64 = c_func_find(b);
+    var cret: string = "";
+    if (cfi >= 0) { cret = g_c_mod.funcs[cfi].ret_st; }
+    if (c_is_sret_type(cret) == false) {
+        if (c_func_has_env(b)) { return c_fn_name(b); }
+    }
     var i: i64 = 0;
     while (i < slice_len(g_c_thunk_req) as i64) { if (g_c_thunk_req[i] == b) { return c_thunk_name(b); } i = i + 1; }
     append(g_c_thunk_req, b);
@@ -1324,7 +1361,18 @@ pub fn c_prescan_thunks(m: TMIRModule) void {
         fi = fi + 1;
     }
 }
-// 发射普通函数的 env 适配 thunk：static R <fn>__clo_thunk(void* __env, <params…>) { [return] <fn>(<args…>); }
+// 发射「函数引用 → TClosure.code」的适配 thunk。
+//
+// 统一 TClosure ABI：**code(env, 实参…) → 返回值**（聚合返回时返回**聚合缓冲指针** `unsigned char*`）。
+// 但被包装的**用户函数**是 sret 约定：`void <fn>(unsigned char* __sret, <params…>)`（与 LLVM 轨逐字对齐）。
+// ⇒ 两条路径都必须经 thunk 做「缓冲分配 + sret 首参转发」：
+//   · 标量返回：`static R <fn>__clo_thunk(void* __env, <params…>) { return <fn>(<args…>); }`
+//   · 聚合返回：`static unsigned char* <fn>__clo_thunk(<params…>) { buf = t_alloc(N); <fn>(buf, <args…>); return buf; }`
+//
+// ⭐ 此前「带 env 首参 → code 直接用裸函数名」在**聚合返回**下不成立：
+//    带 env 的聚合返回函数签名是 `void <fn>(unsigned char* __sret, void* __env, args…)`，
+//    当 code 用时 env 会落进 __sret、用户实参整体错位（G-1b）。
+//    ⇒ 判据改为「返回类型是 sret 聚合」优先，一律走 thunk。
 pub fn c_emit_thunks(sb: StringBuilder) void {
     var n: i64 = slice_len(g_c_thunk_req) as i64;
     var i: i64 = 0;
@@ -1335,22 +1383,57 @@ pub fn c_emit_thunks(sb: StringBuilder) void {
         if (fi < 0) { continue; }
         var f: TMIRFunc = g_c_mod.funcs[fi];
         if (f.is_main or f.name == "main" or f.name == "@main") { continue; }
+        var has_env: bool = c_func_has_env(fname);
+        var is_sret: bool = c_is_sret_type(f.ret_st);
         var ret: string = "void";
         if (f.ret_st != "" and f.ret_st != "void") { ret = c_tystr_c(f.ret_st); }
         var np: i64 = slice_len(f.params) as i64;
         sb_append_str(sb, "static "); sb_append_str(sb, ret); sb_append_str(sb, " ");
-        sb_append_str(sb, c_thunk_name(fname)); sb_append_str(sb, "(void* __env");
+        sb_append_str(sb, c_thunk_name(fname)); sb_append_str(sb, "(");
+        // ⭐ 带 env 首参者：函数**自己**的首参就是 __env（即 TClosure.env），
+        //    thunk 不再另加一个 __env，否则形参重名（C 编译不过）。
+        var firstp: bool = true;
+        if (has_env == false) {
+            sb_append_str(sb, "void* __env");
+            firstp = false;
+        }
         var p: i64 = 0;
         while (p < np) {
             var pv: string = f.params[p];
             var col: i64 = c_find_col(pv, ":");
             if (col < 0) { p = p + 1; continue; }
             var pn: string = c_strip_suf(str_slice(pv, 0, col));
-            sb_append_str(sb, ", "); sb_append_str(sb, c_param_c_ty(f, pn)); sb_append_str(sb, " ");
-            sb_append_str(sb, pn);
+            if (firstp == false) { sb_append_str(sb, ", "); }
+            sb_append_str(sb, c_param_c_ty(f, pn)); sb_append_str(sb, " "); sb_append_str(sb, pn);
+            firstp = false;
             p = p + 1;
         }
-        sb_append_str(sb, ") {\n  ");
+        sb_append_str(sb, ") {\n");
+        // 聚合返回（sret）：分配缓冲 → 以 __sret 首参转发 → 把指针交还调用点
+        //   （调用点随后 memcpy 进目的槽，与直接调用的 sret 处理逐字一致）。
+        if (is_sret) {
+            var rsz: i64 = c_struct_size(f.ret_st);
+            if (rsz <= 0) { rsz = 8; }
+            sb_append_str(sb, "  unsigned char* __sret = (unsigned char*)t_alloc((size_t)(");
+            sb_append_str(sb, base.i2s(rsz)); sb_append_str(sb, "));\n");
+            sb_append_str(sb, "  memset((void*)__sret, 0, (size_t)(");
+            sb_append_str(sb, base.i2s(rsz)); sb_append_str(sb, "));\n");
+            sb_append_str(sb, "  "); sb_append_str(sb, c_fn_name(fname));
+            sb_append_str(sb, "(__sret");
+            var r: i64 = 0;
+            while (r < np) {
+                var pv3: string = f.params[r];
+                var col3: i64 = c_find_col(pv3, ":");
+                if (col3 >= 0) {
+                    sb_append_str(sb, ", ");
+                    sb_append_str(sb, c_strip_suf(str_slice(pv3, 0, col3)));
+                }
+                r = r + 1;
+            }
+            sb_append_str(sb, ");\n  return __sret;\n}\n");
+            continue;
+        }
+        sb_append_str(sb, "  ");
         if (ret == "void") { sb_append_str(sb, c_fn_name(fname)); }
         else { sb_append_str(sb, "return "); sb_append_str(sb, c_fn_name(fname)); }
         sb_append_str(sb, "(");
@@ -1647,6 +1730,10 @@ pub var g_c_mod: TMIRModule;
 pub var g_c_extern_names: []string;
 pub var g_cf: TMIRFunc;
 pub var g_c_addr_slot_name: []string;   // 地址槽名（unsigned char* 指针声明）
+// G-5：被 CALL_IND **聚合返回**赋过值的槽。这类槽声明上是聚合基（`unsigned char* t8 = t8_buf`），
+// 但被调方返回的是**另一块**缓冲，赋值后 t8 已改指 ⇒ ADDR_OF 不能取 `t8_buf`（那是空的旧缓冲），
+// 必须取槽里的当前指针值 t8（与 LLVM 侧 sret 缓冲语义对齐）。
+pub var g_c_aggcall_slot: []string;
 pub var g_c_addr_name: []string;        // 地址槽名（load/store 元素类型表）
 pub var g_c_addr_st: []i64;             // 地址槽元素 ST（load/store 宽度）
 pub var g_c_addr_base_name: []string;   // 地址槽名
@@ -1739,6 +1826,11 @@ pub fn c_addr_mark(n: string, st: i64) void {
     append(g_c_addr_name, n); append(g_c_addr_st, st);
 }
 
+pub fn c_is_aggcall_slot(n: string) bool {
+    var i: i64 = 0;
+    while (i < slice_len(g_c_aggcall_slot) as i64) { if (g_c_aggcall_slot[i] == n) { return true; } i = i + 1; }
+    return false;
+}
 pub fn c_is_addr_slot(n: string) bool {
     var i: i64 = 0;
     while (i < slice_len(g_c_addr_slot_name) as i64) { if (g_c_addr_slot_name[i] == n) { return true; } i = i + 1; }
@@ -2212,9 +2304,11 @@ pub fn tmir_to_c(m: TMIRModule) string {
             if (fismain) { ffname = "t_main"; }
         var f_sret: bool = (fismain == false and c_is_sret_type(ff.ret_st));
         var fret: string = "int";
-        if (fismain == false) {
-            if (ff.ret_st == "void") { fret = "void"; }
-            else if (ff.ret_st != "") { fret = c_tystr_c(ff.ret_st); }
+        // ⚠ 入口（@main）也必须能是 `void t_main()`：此前入口一律按 int 前向声明，
+        //   与定义处（已修正为 void）冲突 ⇒ clang "conflicting types for 't_main'"。
+        if (ff.ret_st == "void") { fret = "void"; }
+        else if (fismain == false) {
+            if (ff.ret_st != "") { fret = c_tystr_c(ff.ret_st); }
         }
         if (f_sret) { fret = "void"; }
             // 外部库函数：定义由链接期 .tlib 归档提供 ⇒ 声明为 extern（不可 static，否则与归档符号冲突）。
@@ -2241,6 +2335,7 @@ pub fn tmir_to_c(m: TMIRModule) string {
         c_emit_clo_globals(sb);
     }
     // 函数
+    g_c_main_void = false;
     var nf: i64 = slice_len(m.funcs) as i64;
     var i: i64 = 0;
     while (i < nf) {
@@ -2268,7 +2363,8 @@ pub fn tmir_to_c(m: TMIRModule) string {
             sb_append_str(sb, "    t_runtime_init(argc, argv);\n");
             sb_append_str(sb, "    TArena* __a = t_arena_new();\n");
             sb_append_str(sb, "    t_runtime_set_arena(__a);\n");
-            sb_append_str(sb, "    int __rc = t_main();\n");
+            if (g_c_main_void) { sb_append_str(sb, "    t_main();\n    int __rc = 0;\n"); }
+            else { sb_append_str(sb, "    int __rc = t_main();\n"); }
             sb_append_str(sb, "    t_runtime_done();\n");
             sb_append_str(sb, "    return __rc;\n");
             sb_append_str(sb, "}\n");
@@ -2342,6 +2438,7 @@ pub fn c_prescan_mapget_tstr(f: TMIRFunc) void {
 pub fn c_emit_func(sb: StringBuilder, f: TMIRFunc) void {
     g_cf = f;
     g_c_addr_slot_name = []; g_c_addr_name = []; g_c_addr_st = []; g_c_addr_base_name = []; g_c_addr_base_ty = [];
+    g_c_aggcall_slot = [];
     g_c_agg_base_name = []; g_c_agg_base_size = []; g_c_tmpc = 0; g_c_pre = sb_new();
     g_c_ptrbuf_name = []; g_c_ptrbuf_size = []; g_c_sliceat_slot = [];
     g_c_slot_tyname = []; g_c_slot_tyty = []; g_c_mapval_slot = []; g_c_alias_name = []; g_c_alias_to = [];
@@ -2739,9 +2836,14 @@ pub fn c_emit_func(sb: StringBuilder, f: TMIRFunc) void {
     if (ismain) { fname = "t_main"; }
     var retctype: string = "int";
     g_c_sret = false; g_c_sret_size = 0;
-    if (ismain == false) {
-        if (f.ret_st == "void") { retctype = "void"; }
-        else if (f.ret_st != "") { retctype = c_tystr_c(f.ret_st); }
+    // ⚠ 入口（@main）的 C 签名恒为 `int`（包装器取它作退出码），与 LLVM 的 `ret i32 %r` 对齐；
+    //   但如果入口声明为 void，则必须是 `void t_main()` —— 否则函数体发 `return;`，
+    //   clang 报 "non-void function 't_main' should return a value"。
+    if (f.ret_st == "void") {
+        retctype = "void";
+        if (ismain) { g_c_main_void = true; }
+    } else if (ismain == false) {
+        if (f.ret_st != "") { retctype = c_tystr_c(f.ret_st); }
     }
     // sret：用户聚合返回 → void 返回 + 显式 __sret 出参指针（首形参），与 LLVM 后端逐字对齐。
     if (ismain == false and c_is_sret_type(f.ret_st)) {
@@ -2938,6 +3040,15 @@ pub fn c_is_param(f: TMIRFunc, n: string) bool {
 pub fn c_emit_term(sb: StringBuilder, term: TMIRInst) void {
     if (term.op == tir__TIR_OP_RET_VOID) { sb_append_str(sb, "  return;\n"); return; }
     if (term.op == tir__TIR_OP_RET) {
+        // 入口（@main）的 C 签名恒为 `int`（包装器拿它当退出码），但入口可以声明任意返回类型。
+        // 与 LLVM 后端 tir_to_ll 的 main wrapper 逐字对齐：整数/浮点按值收敛为退出码，
+        // **其余一律丢弃 ⇒ 退出码 0**（LLVM 侧即 `ret i32 0`）。
+        // 未收敛前：`fn main() P @main` 发 `return (t3)`（`unsigned char*`）→ clang
+        // "incompatible pointer to integer conversion"；`string` / `fn` 返回同样挂。
+        if (c_is_main_fn(g_cf)) {
+            if (c_is_func_ref(term.dst.name)) { sb_append_str(sb, "  return 0;\n"); return; }
+            if (c_main_ret_discard(g_cf.ret_st)) { sb_append_str(sb, "  return 0;\n"); return; }
+        }
         // 返回函数值（fn 类型）→ 返回 &static TClosure 常量（对齐 LLVM 的 @.tirll_clo_<fn>）。
         if (c_is_func_ref(term.dst.name)) {
             sb_append_str(sb, "  return (unsigned char*)(&"); sb_append_str(sb, c_clo_global(term.dst.name));
@@ -3062,6 +3173,11 @@ pub fn c_emit_inst(sb: StringBuilder, ins: TMIRInst) void {
             if (c_tystr_c(tir.tir_st_to_str(c_global_st(basen))) == "TClosure") { basebuf = base.sb_cat2("(unsigned char*)(&", basen); basebuf = base.sb_cat2(basebuf, ")"); }
             else { basebuf = basen; }
         }
+        // ⭐ G-5：源槽被 CALL_IND 的**聚合返回**赋过值 ⇒ 它虽是聚合基（有 <slot>_buf），
+        //   但已被改指到被调方返回的缓冲；ADDR_OF 必须取**槽里的当前指针值**，
+        //   取 <slot>_buf 会读到空的旧缓冲（实测 `f(3).s` ⇒ string 空、i64 字段 0）。
+        //   必须**先于** c_is_agg_base 判定，否则被后者抢走。
+        else if (c_is_aggcall_slot(basen)) { basebuf = basen; }
         else if (c_is_agg_base(basen)) { basebuf = base.sb_cat2(basen, "_buf"); }
         // 纯地址槽（slice_at / GEP / bitcast / struct_new… 结果，持有指针值但无自有缓冲）：
         // 取址 = 该指针本身。若按聚合基取 <slot>_buf 会指到不存在的（或全 0 的）缓冲。
@@ -3284,7 +3400,7 @@ pub fn c_emit_inst(sb: StringBuilder, ins: TMIRInst) void {
                 // （agent_npc_mind 的 intent_dir / Position 字段被写崩、读到堆地址的根因）。
                 // ⚠ 运行库结构体字段（TStr/TSlice/TClosure/TBitStr，GEP 入字段得 ptr<%TSlice> 等）也须
                 //   纳入 _dst_agg：g.xs=[] 源是空切片缓冲地址，若剔除会裸别名 8B 指针 → 不拷 TSlice.len
-                //   （hir_reset 的 node_to_hir=[] 残留 → 复用脱糖期缓存 HIR_OP_FN_DECL → T-SEM-E200）。
+                //   （hir_reset 的 node_to_hir=[] 残留 → 复用脱糖期缓存 HIR_OP_FN_DECL → T-SEM-E000）。
                 if (c_starts(_dstf, "%") and c_is_enum_ty(_dstf) == false) { _dst_agg = true; }
                 if (c_starts(_dst_inner, "%") and c_is_enum_ty(_dst_inner) == false and c_starts(_dst_inner, "ptr<") == false) { _dst_agg = true; }
                 if (c_starts(_dstf, "[") or c_is_arr(_dstf) or c_is_arr(_dst_inner) or c_is_vec(_dstf)) { _dst_agg = true; }
@@ -3987,6 +4103,14 @@ pub fn c_emit_inst(sb: StringBuilder, ins: TMIRInst) void {
         var rst: string = tir.tir_st_to_str(ins.st);
         var rty: string = "void";
         if (ins.st != tir__ST_NONE and rst != "" and rst != "void") { rty = c_tystr_c(rst); }
+        // ⭐ G-5：聚合返回的间接调用会把 dst **改指**到被调方返回的缓冲 ⇒ 登记该槽，
+        //   后续 ADDR_OF 必须取槽里的指针值（详见 g_c_aggcall_slot 注释）。
+        if (dstn != "" and c_is_user_agg_val_ty(rst)) {
+            var already: bool = false;
+            var z: i64 = 0;
+            while (z < slice_len(g_c_aggcall_slot) as i64) { if (g_c_aggcall_slot[z] == dstn) { already = true; } z = z + 1; }
+            if (already == false) { append(g_c_aggcall_slot, dstn); }
+        }
         sb_append_str(sb, "  { TClosure* _ccl"); sb_append_str(sb, rn); sb_append_str(sb, " = (TClosure*)(");
         c_emit_val(sb, ins.args[0]); sb_append_str(sb, ");\n    ");
         if (rty != "void" and dstn != "") { sb_append_str(sb, dstn); sb_append_str(sb, " = "); }
@@ -4263,6 +4387,20 @@ pub fn c_emit_inst(sb: StringBuilder, ins: TMIRInst) void {
     if ((op == tir__TIR_OP_EQ or op == tir__TIR_OP_NE)
         and (c_c_ty_is_struct(c_operand_c_ty(ins.args[0])) or c_c_ty_is_struct(c_operand_c_ty(ins.args[1])))) {
         c_emit_str_eq(sb, dstn, op == tir__TIR_OP_NE, ins.args[0], ins.args[1]);
+        return;
+    }
+    // §set-ops Step 2：bitstr 集合交 / 并 —— 聚合值不能走 `&` / `|`（实测 clang 报
+    // "invalid operands to binary expression"），改为调用运行库 t_bitstr_and / t_bitstr_or。
+    // ⚠ C 运行库 t_* 一律**按值返回**，与 LLVM 轨 tll_* 的 sret 末位出参不同（同 `++` 的处理）。
+    // ⚠ 必须排在下方 `dst = (` 前缀发射之前，否则会多出一对括号。
+    if ((op == tir__TIR_OP_AND or op == tir__TIR_OP_OR)
+        and tir.tir_st_to_str(ins.st) == "%TBitStr") {
+        var sfn: string = "t_bitstr_and";
+        if (op == tir__TIR_OP_OR) { sfn = "t_bitstr_or"; }
+        sb_append_str(sb, "  "); sb_append_str(sb, dstn); sb_append_str(sb, " = ");
+        sb_append_str(sb, sfn); sb_append_str(sb, "(");
+        c_emit_sval_arg(sb, ins.args[0], "TBitStr"); sb_append_str(sb, ", ");
+        c_emit_sval_arg(sb, ins.args[1], "TBitStr"); sb_append_str(sb, ");\n");
         return;
     }
     sb_append_str(sb, "  "); sb_append_str(sb, dstn); sb_append_str(sb, " = ");

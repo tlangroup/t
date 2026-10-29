@@ -23,6 +23,11 @@
 // 反之，一旦出现 DIFF，必须人工确认该差异是否为改动的预期效果；
 // 确认无误后用 --update 重录基线。
 //
+// ⚠ 快照对**导入模式**敏感：std 库以 `.tlib` 链接导入、还是因 .tlib 缺失而回退到
+//   源码内联导入，两者 IR 逐字节不同。故本脚本在入口强制 `out/lib/std/{mem,math}.tlib`
+//   就绪（缺失则自动 build_std，仍缺则硬失败），否则 3 个 std 示例 × 双后端会稳定
+//   报 6 处与源码改动无关的假 DIFF（2026-10-28 事故）。
+//
 // 用法:
 //   node tools/ir_snapshot.mjs                 # 与基线比对（默认）
 //   node tools/ir_snapshot.mjs --update        # 重录基线
@@ -76,6 +81,33 @@ for (let i = 0; i < argv.length; i++) {
 if (!existsSync(compiler)) {
     console.error(`ir_snapshot: compiler not found: ${compiler}`);
     process.exit(2);
+}
+
+// ── 前置守卫：std 库必须以「链接模式」(.tlib) 就绪，否则拒绝录制/比对 ──────────
+// 事故（2026-10-28）：out/lib/std/{mem,math}.tlib 缺失时，编译器对 `@import("std.*")`
+//   自动**回退到源码内联**导入。两种导入模式的 IR 逐字节不同 ⇒ 3 个 std 示例 × 双后端
+//   稳定报 **6 处假 DIFF**，与源码改动无关，极易被误判成「某批次改了 IR 发射」。
+//   实测：重建 .tlib 后三个示例的 md5 逐字节回到基线值 —— 故差异源头是环境，不是代码。
+// 守卫逻辑：缺则先就地重建（门禁已单独跑过 build_std，正常是 no-op）；仍缺则硬失败，
+//   绝不静默在「内联模式」下产出/比对基线（那会污染基线，且下次更难发现）。
+const STD_MODULES = ["mem", "math"]; // 与 tools/build_std.mjs 的 MODULES 保持一致
+function stdLibMissing() {
+    return STD_MODULES.filter((m) => !existsSync(join(ROOT, "out", "lib", "std", `${m}.tlib`)));
+}
+{
+    const missing = stdLibMissing();
+    if (missing.length > 0) {
+        console.log(`ir_snapshot: std .tlib 缺失 [${missing.join(", ")}] ⇒ 自动重建（否则 std 示例按源码内联发射，与基线不可比）`);
+        try {
+            execFileSync(process.execPath, [join(ROOT, "tools", "build_std.mjs"), "--tc", compiler],
+                { cwd: ROOT, stdio: "ignore", windowsHide: true });
+        } catch { /* 落到下面的硬失败统一报 */ }
+        const still = stdLibMissing();
+        if (still.length > 0) {
+            console.error(`ir_snapshot: std .tlib 仍缺失 [${still.join(", ")}] ⇒ 拒绝在「源码内联」模式下录制/比对基线`);
+            process.exit(2);
+        }
+    }
 }
 
 // ── 工作目录：每轮独占，绝不复用 ─────────────────────────────────

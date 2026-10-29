@@ -1,0 +1,45 @@
+// 既有后端缺口 G-5 + 闭包 thunk 的聚合返回 ABI：
+//   ① `var f: fn(i64) P = mkp;  f(1i64)` —— 闭包调用**返回结构体**。
+//      此前 LLVM 的 thunk `@fn.__clo_thunk(ptr sret(%P), ptr %__env, <args>)` 在转发时
+//      把 `%__env` 也当实参塞给了**没有 env 首参**的原函数 ⇒ 实参整体错位，
+//      v 收到 env(null=0) 而非 1 ⇒ `f(1i64).n` 打出 0。
+//   ② `f(3i64).s` —— **直接**读闭包调用结果的 string 字段。
+//      此前 member 基底是间接调用时 tir_member_base_st 退化成 "i64"
+//      ⇒ 字段下标恒 0、GEP/LOAD 全按 i64 ⇒ 恰好读到字段 0（i64）所以
+//      「i64 字段正常、string 字段空」；C 后端还会因 `b = (TStr)(t12);` 直接 clang 报错。
+//   ③ 捕获型 lambda 返回结构体（走同一条 call_ind 路径，作回归）。
+
+struct P { n: i64; s: string; }
+
+fn mkp(v: i64) P { return P{ .n = v, .s = "hi" }; }
+
+fn make_adder(b: i64) fn(i64) P {
+    return fn (v: i64) P { return P{ .n = v + b, .s = "lam" }; };
+}
+
+fn main_fn() i32 @main {
+    // ① 裸 fn 引用 → 闭包，聚合返回
+    var f: fn(i64) P = mkp;
+    var a: P = f(1i64);
+    println(i2s(a.n));
+    println(a.s);
+
+    // ② 直接读闭包调用结果的 string 字段
+    var d: string = f(3i64).s;
+    println(d);
+    var dn: i64 = f(4i64).n;
+    println(i2s(dn));
+
+    // ③ 捕获型 lambda（env 非空）
+    var g: fn(i64) P = make_adder(100i64);
+    var c: P = g(5i64);
+    println(i2s(c.n));
+    println(c.s);
+    var e: string = g(7i64).s;
+    println(e);
+
+    // ④ 直调回归（一直可用，防回退）
+    var z: i64 = mkp(9i64).n;
+    println(i2s(z));
+    return 0;
+}

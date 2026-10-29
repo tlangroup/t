@@ -201,6 +201,7 @@ OpOrPunct:
   | "(" | ")" | "{" | "}" | "[" | "]" | "@" | "#"
 ```
 
+- ⚠ `&&` / `||` 记号仍由**词法层**产出，但已从表达式文法移除（2026-10-27，set-ops §13.9）：集合交 / 并用 `&` / `|`，布尔逻辑用 `and` / `or`。刻意保留记号是为了报「已移除，请改用 …」，而不是让 `&&` 被切成两个 `&`、令 `a && b` 静默变成 `a & (&b)`。
 - 顶层声明为**并置式**：声明名后直接跟声明种类关键字（`Name fn ...`、`Name struct ...`），无绑定算子。⚠ `::` 绑定算子已于 2026-08-01 移除；旧写法 `Name :: func ...` 由 parser 报带迁移指引的硬错误。
 - **管道记号最大匹配**（2026-08-10）：扫描到 `|` 时按长度降序尝试 3 字符 `|->` / `|>?` → 2 字符 `||` / `|>` → 1 字符 `|`。三个新记号对既有合法源码**零破坏**（`a | -> b`、`a | > ? b`、`a | > b` 在旧文法下均非法），语义见 §3.15。
 - `#` 用于内存布局指令 `#aos` / `#soa`（⚠ spec-only 实变换未接入）。
@@ -328,7 +329,7 @@ DeclBodyDispatch:
 - `{ field = expr }` 节点构造块：`field` 为 AST 节点字段；`expr` 中 `@sym` 引用 body 中符号的解析结果，`name`/`anns` 等参数名与 `list_concat(...)` 等辅助调用原样保留。构造块默认发射为 §2.9 生成的 `mk_<NodeKind>(...)` 一行调用，未在块中列出的槽自动填 `node_new` 初值。
 - `// @rule <name> ... mk=inline`：额外元数据，**关闭** `mk_<kind>(...)` 发射、退回「`node_new` + 逐槽赋值 + `slice_set`」内联形态。仅当某个 `expr` 内部会**分配新 AST 节点**时才需要：函数实参先于 `node_new` 求值，子节点索引会挪到父节点之前，导致 AST 结构漂移。目前仅 `sfield` 命中（`sfield_na` 会 `mk_scalar("void")`）。
 - ⚠ 走 `mk_` 路径时，构造块内各 `expr` 的**求值顺序会被重排为 Node 字段序**（`sa sb sc has_* ia ib ba bb na..nd la..lc`），而非书写顺序。因此块内含**有副作用**的表达式时须自查重排后语义不变。当前唯一的副作用调用是 `list_concat`（就地改写 `kids` 链），它在 `flag_decl`/`struct_decl` 重排后仍排在所有读注解链的 `bp_*`/`str_or` 之后，故安全。
-- `// @rule <name> ... fold=bin`：额外元数据，标记该规则是**左结合二元运算塔**（`base (op base)*` 形状）。生成器发射 `while (op 集合) { left = mk_bin(op, left, parse_base(), ti); }`；运算符字面量即 `mk_bin` 的 op 串（如 `"<<"`→`"<<"`、`"&&"`→`"&&"`），其 token kind 由 `tools/gen_ebnf.mjs` 的 `OPKIND` 表映射（覆盖结构标点表）。
+- `// @rule <name> ... fold=bin`：额外元数据，标记该规则是**左结合二元运算塔**（`base (op base)*` 形状）。生成器发射 `while (op 集合) { left = mk_bin(op, left, parse_base(), ti); }`；运算符字面量即 `mk_bin` 的 op 串（如 `"<<"`→`"<<"`、`"and"`→`"and"`），其 token kind 由 `tools/gen_ebnf.mjs` 的 `OPKIND` 表映射（覆盖结构标点表）。
 - `// @rule <name> ... fold=pre`：额外元数据，标记该规则是**前缀一元折叠**（`(op)* base` 形状，右结合递归）。生成器发射 `if (cur_t() in ops) { op; operand = parse_<self>(); return mk_un(op, operand, ti); } return parse_<base>();`；运算符字面量即 `mk_un` 的 op 串（如 `"!"`→`"!"`、`"-"`→`"-"`、`"~"`→`"~"`），其 token kind 由 `OPKIND` 映射（`!`→Not、`-`→Minus、`~`→BitNot）。递归目标为规则自身（允许 `!!x` 堆叠），无 op 时落到 `base`。
 - `// @rule <name> ... fold=post`：额外元数据，标记该规则是**左结合后缀折叠**（`base ( lead nt | lead nt | ... )* ( lead nt )?` 形状）。每个后缀分支 = `引导 token 字面量 + 胶水非终结符`；生成器发射 `var e = parse_base(); while (引导 token 集合) { var ti = advance_i(); e = parse_<胶水>(e, ti); }`，尾部 `( lead nt )?` 可选分支发射单次 `if`。胶水 helper（如 `post_member`/`post_index`/`post_call`/`post_cast`）为手写函数，签名 `(e: i64, ti: i64) i64`，负责消费引导 token 之后的剩余形态并返回折叠后的节点。`fold` 当前支持 `bin`/`pre`/`post`/`prim`/`disp` 五类通用模式，以及语句体专用的 `whilex`/`returnx`（纯序列 + node_at）/ `ifx`（if/else-if 链）/ `forx`（peek 前瞻分流两段式）/ `swx`（case/default 循环聚合）五种专用模式。
 - `// @rule <name> ... fold=prim`：额外元数据，标记该规则是**终端驱动 dispatch**（`term nt | term nt | ...` 形状）。每个分支 = `分发终端 + 胶水非终结符`；终端可为命名终端（`Integer`/`Float`/`String`/`Ident`）或字面量（关键字/标点）。生成器发射 `if (cur_t() == "K") { var ti = advance_i(); return parse_<胶水>(ti); }` 链，末尾发射错误兜底（`eprint` + `exit(1)`）。胶水 helper 为手写函数，签名 `(ti: i64) i64`，负责分发 token 之后的剩余形态并构造节点。
@@ -449,13 +450,13 @@ sfield : Ident ":" ( Integer | type ) anns ";"
 
 // ── 表达式二进制优先级塔（fold=bin：左结合二元运算折叠）──
 // 形状：base ( (op | op | ...) base )*  →  while (op) { left = mk_bin(op, left, parse_base(), ti); }
-// 运算符字面量即 mk_bin 的 op 串（"&&"→"&&"、"<<"→"<<"），token kind 由 gen_ebnf 的 OPKIND 映射。
+// 运算符字面量即 mk_bin 的 op 串（"and"→"and"、"<<"→"<<"），token kind 由 gen_ebnf 的 OPKIND 映射。
 
 // @rule or params=() ret=i64 node=_ eatFirst=false fold=bin
-or : and ( "||" and )*
+or : and ( "or" and )*
 
 // @rule and params=() ret=i64 node=_ eatFirst=false fold=bin
-and : bitor ( "&&" bitor )*
+and : bitor ( "and" bitor )*
 
 // @rule bitor params=() ret=i64 node=_ eatFirst=false fold=bin
 bitor : bitxor ( "|" bitxor )*
@@ -1160,8 +1161,8 @@ AssignExpr: PipeExpr ("=" AssignExpr)?
 // L0 管道级：最低优先级，包在 OrExpr 外层（详见 §3.15）
 PipeExpr:  OrExpr (PipeOp OrExpr)*
 PipeOp:    "|->" | "|>?" | "|>"
-OrExpr:    AndExpr ("||" AndExpr)*
-AndExpr:   BitOrExpr ("&&" BitOrExpr)*
+OrExpr:    AndExpr ("or" AndExpr)*
+AndExpr:   BitOrExpr ("and" BitOrExpr)*
 BitOrExpr: BitXorExpr ("|" BitXorExpr)*
 BitXorExpr: BitAndExpr ("^" BitAndExpr)*
 BitAndExpr: EqExpr ("&" EqExpr)*
@@ -1237,7 +1238,7 @@ MapLit:    "[" (Expr ":" Expr ("," Expr ":" Expr)*)? "]"   // 当首元素后跟
 FuncLit:   "fn" "(" ParamList? ")" ("->")? Type Block         // 匿名函数；静态类型即同签名 FuncType
 ```
 
-- **优先级塔固定（L-03 可预判）**：管道级 L0（`|->`/`|>?`/`|>`）最低、`||` 次低、`*`/`/`/`%` 最高，11 级全部左结合；赋值 `=` 右结合；无右结合二元运算符。塔层级与 `parse_pipe → parse_or → … → parse_mul → parse_unary → parse_postfix → parse_primary` 一一对应，不可调换。管道级为 2026-08-10 在既有 10 级塔**外侧**新增的一层，塔内顺序一字未动。
+- **优先级塔固定（L-03 可预判）**：管道级 L0（`|->`/`|>?`/`|>`）最低、`or`（`KwOr`）次低、`*`/`/`/`%` 最高，11 级全部左结合；赋值 `=` 右结合；无右结合二元运算符。塔层级与 `parse_pipe → parse_or → … → parse_mul → parse_unary → parse_postfix → parse_primary` 一一对应，不可调换。管道级为 2026-08-10 在既有 10 级塔**外侧**新增的一层，塔内顺序一字未动。
 - **全行为显式（L-02）**：`as` 为唯一显式类型转换（仅一次、不可 `e as T1 as T2`）；无隐式类型转换 / 隐式布尔 / 隐式内存分配；复合字面量（数组 `[...]` / map `[k:v]` / 结构体 `T{...}`）显式构造。
 - **静态类型安全（L-03）**：每个 `Expr` 的静态类型由 checker 推算；元素 / 字段 / 下标 / `type_info` 静态校验；`MapLit` 与 `ArrayLit` 共用 `[ ]`，由首元素后是否跟 `:`` 向前看消歧（无二义）。
 - **唯一写法（L-04 ✅）**：调用 `f(x)`、转换 `e as T`、下标 `e[i]`、成员 `e.f`、结构体 `T{...}`、数组 `[...]`、map `[k:v]`、匿名函数 `fn(...) T {...}` 均仅一种标准写法，无 `->` 记号。函数返回类型一律并置（`fn(...) T`），编译器已于 2026-08-20 移除对 `fn(...) -> T` 箭头的解析，规范彻底收敛为唯一写法（见 §3.1 声明形式）。
@@ -1448,7 +1449,7 @@ main fn() i64 @main {
     auto b = id(f64, 1.5);       // → id__f64，b : f64
     auto c = id(string, "hi");   // → id__string，c : string
     auto m = max(i64, 7, 99);    // → max__i64，m : i64
-    if (a == 42 && m == 99 && c == "hi") { return 0; }
+    if (a == 42 and m == 99 and c == "hi") { return 0; }
     return 1;
 }
 ```
@@ -1513,7 +1514,7 @@ tagged  fn(comptime N: i64, x: i64) i64    { return x + comptime N * 100; }  // 
 
 - **类型**：`i64` 整数族、`bool`、`string`。**浮点暂不支持**（报 `T_META_NOT_CONST`）——
   第 7 条要求求值可复现，浮点结合序须先定死。字符串仅支持 `==` / `!=`，不做拼接 / 切片。
-- **表达式**：算术、位运算（`& | ^ << >>`）、比较、`&&` / `||`（惰性短路）、
+- **表达式**：算术、位运算（`& | ^ << >>`）、比较、`and` / `or`（布尔逻辑，惰性短路）、
   括号、显式 `as` 转型（按标量位宽做二进制补码窄化）、`comptime fn` 调用。
 - **语句**（`comptime {}` 与 `comptime fn` 体内）：`var` / 赋值 / `if` / `while` / `block` /
   `return` / `break` / `continue`。
@@ -1590,8 +1591,8 @@ main fn() i64 @main {
     var d: i64 = comptime fact(10);     // → store i64 3628800（编译期递归展开）
     auto n = id(i64, 42);               // → id__i64
     auto s = id(string, "hi");          // → id__string
-    if (a == 6 && b == 15 && c == 30 && d == 3628800 && n == 42
-        && s == "hi" && KLIMIT == 100) { return 0; }
+    if (a == 6 and b == 15 and c == 30 and d == 3628800 and n == 42
+        and s == "hi" and KLIMIT == 100) { return 0; }
     return 1;
 }
 ```
@@ -2575,7 +2576,7 @@ auto total = sum_i32(__pipe_0(es, is_alive, hp_of));
 | 禁用位置 | 理由 |
 |---|---|
 | `if` / `while` / `for` 条件 | 条件位无提升点 |
-| `&&` / `\|\|` 右操作数 | 提升会破坏短路求值 |
+| `and` / `or` 右操作数 | 提升会破坏短路求值 |
 | `match` 臂体、`when` 守卫 | 臂是条件执行，提升会改变求值时机 |
 | 函数调用实参 | 提升会改变实参间的副作用顺序 |
 | 数组下标、结构体字面量字段值 | 同上 |
@@ -2648,8 +2649,8 @@ RangeExpr:
 | for 迭代 | `for (i in a..b)` | 计数循环（见下） |
 | 切片索引 | `s[a..b]` | `str_slice` / `slice_sub` 调用 |
 | 字节视图索引 | `b[a..b]` | `bytes_slice` 调用 |
-| match 臂 | `1..5 => ...` | 比较链 `x >= 1 && x < 5` |
-| 成员测试 | `x in a..b` | 比较合取 `x >= a && x < b` |
+| match 臂 | `1..5 => ...` | 比较链 `x >= 1 and x < 5` |
+| 成员测试 | `x in a..b` | 比较合取 `x >= a and x < b` |
 | 其余值位置 | `var xs: []i64 = 2..6;` | 物化成 `[]i64`（`__range_fill` 助手） |
 
 **for 迭代**降解为零分配计数循环，上界先落临时量：
@@ -2833,7 +2834,7 @@ VectorType : "@Vector" "(" ComptimeLen "," Type ")"
 - `T-VEC-E922`：lane 数 < 1。
 - `T-VEC-E923`：总字节数（lane 数 × lane 宽度）不是 2 的幂（`@Vector(3, i32)` → 建议 `@Vector(4, i32)`）。
 - `T-VEC-E924`：逐元素运算两侧 lane 数或 lane 类型不一致（向量间无隐式提升；标量须先 `@splat` 广播）；**以及** `[a,b,c,d]` 字面量构造向量时元素个数 ≠ lane 数、或某元素无法隐式转成 lane 类型。
-- `T-VEC-E925`：运算符不支持向量操作数（`==`/`<`/`&&` 等；判等需先 `@reduce_*` 或逐 lane 比较，后端不发射比较掩码）。
+- `T-VEC-E925`：运算符不支持向量操作数（`==`/`<`/`and` 等；判等需先 `@reduce_*` 或逐 lane 比较，后端不发射比较掩码）。
 - `T-VEC-E926`：向量内建实参非法（如 `@reduce_add(标量)`、缺实参）。
 - `T-VEC-W927`：向量宽于本机寄存器（第 2 层警告，见上）。
 

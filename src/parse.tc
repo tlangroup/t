@@ -28,7 +28,7 @@ pub fn parse_fatal_at(code: string, msg: string, ti: i64) void {
 
 // 定位到「当前 token」的致命语法错误（绝大多数站点用这个）。
 pub fn parse_fatal(msg: string) void {
-    parse_fatal_at("T-PAR-E101", msg, lex.pos);
+    parse_fatal_at("T-PAR-E001", msg, lex.pos);
 }
 
 pub fn expect_tok(t: string) string {
@@ -36,7 +36,7 @@ pub fn expect_tok(t: string) string {
         var idx: i64 = lex.advance_i();
         return lex.tk_v(idx);
     }
-    parse_fatal(base.sb_cat4("语法错误：期待 ", t, "，实际读到 ", lex.cur_v()));
+    parse_fatal(base.sb_cat4("expected ", t, ", but found ", lex.cur_v()));
     return "";
 }
 
@@ -147,7 +147,7 @@ pub fn parse_annotations() i64 {
             nti = lex.pos - 1;
         }
         if (base.is_lower_snake(name) == false) {
-            base.warn_name("T-NAM-W403", base.sb_cat3("annotation name '", name, "' should be lowercase snake_case"), nti, str_len(name) as i64);
+            base.warn_name("T-NAM-W003", base.sb_cat3("annotation name '", name, "' should be lowercase snake_case"), nti, str_len(name) as i64);
         }
         var args_head: i64 = -1;
         if (lex.cur_t() == "LParen") {
@@ -200,6 +200,20 @@ pub fn is_scalar_name(name: string) bool {
 
 pub fn parse_type_inner() i64 {
     var t: string = lex.cur_t();
+    // 括号类型 `( Type )`：只用来改写类型运算符的结合边界，**不包层、不引入新 kind**，
+    // 直接返回内部类型节点 ⇒ 对 sema / codegen 完全透明（<(A && B)?> 与 <C> 得到同一个 kind 的形态）。
+    // 存在理由：两处**表达式内部**类型位（`as T` 的 parse_post_cast、`fid > T` 的 M52 读路径）
+    //   必须关闭合取连词（否则 `x as T && cond` 会被误读）⇒ 那里写不出合取类型，
+    //   括号是唯一的正经退路（`x as (A && B)`、`fid > (A && B)`）；`(A && B)?`、`*(A && B)` 同理。
+    // ⚠ `()` 空括号不合法 —— unit / void 请用既有的关键字，不要指望 `()` 占位。
+    // ⚠ 这里调用的是 **parse_type**（非 inner）：括号内部允许完整的后缀 `?` 与合取连词，
+    //   这与 `[N]T` / `*T` / `?T` 内部的处理保持一致。
+    if (t == "LParen") {
+        lex.advance_i();
+        var pt_paren_inner: i64 = parse_type();
+        expect_tok("RParen");
+        return pt_paren_inner;
+    }
     // 硬件 SIMD 向量类型 `@Vector(comptime len, BaseT)`（类型位）。
     // 类型位的 `@` 此前完全空闲（注解只在声明前，编译期内建 `@name(...)` 只在表达式位），
     // 故 `@Vector(` 无歧义。`comptime` 前缀可选，仅作文档性强调——长度必须是编译期常量。
@@ -232,6 +246,39 @@ pub fn parse_type_inner() i64 {
         var tfl: i64 = parse_expr();
         expect_tok("RParen");
         return base.mk_tile(tel, trows, tcols, tfl, tti);
+    }
+    // 错误联合类型 `fault ( E ) ! T`（fault B1 / 附录 C P7）。
+    //   E = 已声明的具名故障组；T = 成功类型，必须与组的 `over T` **同构**。
+    //   理由（A-26 / A-27）：槽位数 N 是**组**的属性 ⇒ 运行期载体 `__fault_<E>` 每组只有一个，
+    //   在组声明期即已合成完毕，故此处只需按名引用，不必也不该重新计算布局。
+    // ⚠ 类型位的 `fault` 恒带 `(`（组声明形态是 `fault <名> over`，不带括号）⇒ 无歧义。
+    // ⚠ `fault` 是**上下文关键词**（mod 阶）：lexer 仍发 Identifier。理由：
+    //   `@clause(.fault, ...)` 里的 `.fault` 是**成员名**，若把 `fault` 强制成关键字，
+    //   `expect_tok("Identifier")` 会在那里直接撞语法错（实测打断了 B3 的 4 个用例）。
+    if (t == "Identifier" and lex.cur_v() == "fault" and lex.peek_t(1) == "LParen") {
+        var fti: i64 = lex.advance_i();            // `fault`
+        lex.advance_i();                            // '('
+        if (lex.cur_t() != "Identifier") {
+            parse_fatal("expected fault group name in `fault(<Group>)!T`");
+        }
+        var gi: i64 = lex.advance_i();
+        var gname: string = lex.tk_v(gi);
+        expect_tok("RParen");
+        if (lex.cur_t() != "Not") {
+            parse_fatal_at("T-PAR-E001", "expected '!' after `fault(<Group>)` in `fault(<Group>)!T`", lex.pos);
+        }
+        lex.advance_i();                            // '!'
+        var stn: i64 = parse_type();
+        var gix: i64 = fault_group_index(gname);
+        if (gix < 0) {
+            parse_fatal_at("T-CLA-E011",
+                base.sb_cat3("未知故障组 `", gname, "`：`fault(E)!T` 的 E 必须是已声明的具名故障组，且组声明须先于使用"), gi);
+        }
+        if (type_node_mangle(stn) != g_fg_over[gix]) {
+            parse_fatal_at("T-CLA-E012",
+                base.sb_cat5("`fault(", gname, ")!", type_node_mangle(stn), "` 的成功类型必须与组声明的 `over` 类型逐字一致"), gi);
+        }
+        return base.mk_named(fault_struct_name(gname), fti);
     }
     if (t == "KwFunc") {
         lex.advance_i();
@@ -412,44 +459,47 @@ pub fn parse_type_inner() i64 {
     }
 
 // 类型位 concept 多约束连词开关（`&&`）：仅形参类型解析期间为真，见 parse_type_concept。
-// ⚠ 2026-10-18 回归修复：此前 parse_type **无条件**吃 `&&`，于是 `expr as T && cond`
+// ⚠ 2026-10-18 回归：此前 parse_type **无条件**吃 `&&`，于是 `expr as T && cond`
 //   这类「类型转换 + 值级逻辑与」被误读成 `as (T && cond)`（cond 被当成 concept 名解析，
-//   随后的 `[` / `(` 落进类型位 ⇒ T_PARSE_SYNTAX）。旧源码（含 10-13 的 main 顶端）大量
+//   随后的 `[` / `(` 落进类型位 ⇒ T-PAR-E001）。旧源码（含 10-13 的 main 顶端）大量
 //   使用该写法，直接导致自举种子编译旧版本源码失败（nightly Bootstrap g1 步）。
-//   限定在形参位后，值级 `&&` 一律回到 parse_and，两种语义不再互相污染。
-pub var g_type_and: bool = false;
-
-// `T?` 后缀可选类型糖（与 `?T` 前缀等价）：先解析基类型，尾部每个 `?` 再包一层 optional。
-// `?T` 前缀分支在 parse_type_inner 内已直接产出 optional 节点，不在此重复包装。
-pub fn parse_type() i64 {
+//
+// ⭐ 2026-10-27（set-ops §13.8 R1 + R2）：昔日用一个可变全局 bool `g_type_and` 区分，
+//   但它是**状态** —— 调用方忘了设/忘了还原就污染后续解析（正是上条回归的形态）。
+//   现改为**显式形参** `allow_and`，并**反转默认值**：默认放行合取，只有两个确凿的
+//   表达式内部类型位显式传 false（见 parse_post_cast 与 `fid > T`）。这样做的好处是
+//   **新增类型位自动获得类型代数能力**，不必回头补开关 —— 少一处「忘了加标志」的静默失败；
+//   而危险方向（把值级 `&&` 误吃进类型）只剩两个受控点。
+pub fn parse_type_ex(allow_and: bool) i64 {
     var t0: i64 = parse_type_inner();
     while (lex.cur_t() == "Question") {
         lex.advance_i();
         t0 = base.mk_optional(t0, -1);
     }
-    // §set-ops 岔路 B：concept 多约束连词 `T: A && B`。`&&` 是 SET 交集 token
-    // （区别于 bool 关键字 `and`）；约束位把多个 concept 名连成 binary("&&", ...)
-    // 节点，由 sema.generic_normalize_func 拆解成约束列表。
-    // ⚠ 只有 `g_type_and` 为真（形参类型位）时才吃 `&&`：其余类型位（`as T`、局部变量
-    //   标注、返回类型、字段类型…）后面的 `&&` 都是**值级**逻辑与，必须留给 parse_and，
-    //   否则 `x as i64 && y[i] > 0` 会被解析成类型 `i64 && y` 并在 `[` 处报语法错。
-    while (g_type_and and lex.cur_t() == "And") {
+    // §set-ops 岔路 B：concept 多约束连词 `T: A & B`（§13.3 格族：类型位 meet 与值位
+    // 集合交同为 `&`，不再另立 `&&`）。约束位把多个 concept 名连成 binary("&", ...)
+    // 节点，由 sema.generic_normalize_func / collect_concept_constraints 拆解成约束列表。
+    // allow_and 为假时这里直接停 ⇒ `&` 交回表达式层的 parse_bitand（即 `x as T & y`
+    // 读作「转换后再按位与」），两种语义互不污染。
+    while (allow_and and lex.cur_t() == "BitAnd") {
         var ti: i64 = lex.advance_i();
-        var right: i64 = parse_type();
-        t0 = base.mk_binary("&&", t0, right, ti);
+        // 递归必须透传 allow_and：合取右侧与左侧同属一个判断，且 false 位不会在右侧复活。
+        var right: i64 = parse_type_ex(allow_and);
+        t0 = base.mk_binary("&", t0, right, ti);
     }
     return t0;
 }
 
-// 形参类型位解析：开 g_type_and 后调 parse_type（支持 `T: A && B` 多约束）。
-// 递归调 parse_type 时开关仍为真，故 `A && B && C` 的三约束连词同样成立（左结合）。
-// 返回前恢复外层值，避免泄漏到返回类型 / 函数体。
+// 默认放行版本：**所有无歧义的类型位**（该类型的后面不可能接表达式）都用它。
+// 典型：形参、返回类型、struct/variant 字段、数组/指针/optional /map 元素位、局部变量标注等。
+pub fn parse_type() i64 {
+    return parse_type_ex(true);
+}
+
+// 形参类型位解析（支持 `T: A & B` 多约束）：语义与 parse_type 相同（同为放行），
+// 保留独立函数名是为了在调用点标注「这里是约束位」的意图，便于将来若需区分两者时有落点。
 pub fn parse_type_concept() i64 {
-    var sv_and: bool = g_type_and;
-    g_type_and = true;
-    var t: i64 = parse_type();
-    g_type_and = sv_and;
-    return t;
+    return parse_type_ex(true);
 }
 
 // ── 表达式解析（优先级爬升，逐层照抄 tc0）─────────────────────
@@ -512,7 +562,7 @@ pub fn parse_range() i64 {
         var phi: i64 = -1;
         if (range_end_omitted() == false) { phi = parse_or(); }
         if (pincl and phi < 0) {
-            parse_fatal_at("T-RNG-E874", "`..=` 是闭合区间，必须给出右端点（想要开放右端请用 `..`）", pti);
+            parse_fatal_at("T-RNG-E003", "`..=` is a closed range and requires a right endpoint (use `..` for an open right end)", pti);
         }
         return base.mk_range(-1, phi, pincl, pti);
     }
@@ -523,7 +573,7 @@ pub fn parse_range() i64 {
         var hi: i64 = -1;
         if (range_end_omitted() == false) { hi = parse_or(); }
         if (incl and hi < 0) {
-            parse_fatal_at("T-RNG-E874", "`..=` 是闭合区间，必须给出右端点（想要开放右端请用 `..`）", ti);
+            parse_fatal_at("T-RNG-E003", "`..=` is a closed range and requires a right endpoint (use `..` for an open right end)", ti);
         }
         return base.mk_range(left, hi, incl, ti);
     }
@@ -575,13 +625,13 @@ pub fn parse_bitstr_lit(pat: bool) i64 {
             if (lex.cur_t() == "Slash") {
                 lex.advance_i();
                 if (lex.cur_t() != "Identifier") {
-                    parse_fatal_at("T-BIT-E513", "位串段 `/` 后须为 bitstr/big/little 说明符", lex.pos);
+                    parse_fatal_at("T-BIT-E513", "the segment after `/` in a bit string must be a bitstr/big/little specifier", lex.pos);
                 }
                 var spi: i64 = lex.advance_i();
                 var sp: string = lex.tk_v(spi);
                 if (sp == "bitstr") { rest = true; }
                 else if (sp == "big" or sp == "little") { endian = sp; }
-                else { parse_fatal_at("T-BIT-E513", base.sb_cat3("未知位串说明符 `", sp, "`"), spi); }
+                else { parse_fatal_at("T-BIT-E513", base.sb_cat3("unknown bit string specifier `", sp, "`"), spi); }
             }
             var seg: i64 = base.mk_bitstr_seg(val, width, endian, rest, -1);
             t = base.list_push(h, t, seg);
@@ -591,7 +641,7 @@ pub fn parse_bitstr_lit(pat: bool) i64 {
         }
     }
     if (lex.cur_t() != "ShiftRight") {
-        parse_fatal_at("T-BIT-E514", "位串字面量须以 `>>` 闭合", ti0);
+        parse_fatal_at("T-BIT-E514", "a bit string literal must be closed with `>>`", ti0);
     }
     lex.advance_i();
     if (pat) { return base.mk_bitstr_pat(h, -1); }
@@ -670,7 +720,10 @@ pub fn parse_post_call(e: i64, ti: i64) i64 {
 }
 
 pub fn parse_post_cast(e: i64, ti: i64) i64 {
-    var tt: i64 = parse_type();
+    // ⚠ 此处类型之后紧接**表达式**（`x as T && cond` 合法且常见）⇒ 不允许吃合取连词。
+    // 这是 set-ops §13.8 R2 唯二之一需要显式传 false 的位置（另一处是 `fid > T`）。
+    // 若确需在 `as` 后写合取类型，请加括号：`x as (A && B)` —— 见 parse_type_inner 的 LParen 分支。
+    var tt: i64 = parse_type_ex(false);
     var id: i64 = base.mk_cast(e, tt, ti);
     return id;
 }
@@ -784,6 +837,84 @@ pub fn synth_tuple_type_name(elems: []i64) string {
     return sb_to_str(sb);
 }
 
+// ── 谓词模式的关系运算符判定（fault B2 / 节点 N1–N3）────────────────────────
+// 用于识别 `.{ .age < 0 }` 这类「具名字段 + 关系运算」的谓词模式。
+// ⚠ 与 `Assign`（`.x = v` 具名字段初始化）**互斥**：关系符出现即证明它是谓词而非字段赋值。
+// ⚠ 关系符集合必须与 `parse_cmp` / `parse_eq` 的取值逐字一致（`<` `>` `<=` `>=` `==` `!=`），
+//    否则 sema / codegen_c / tir 三处的 op 字符串分派会对不上（静默错编）。
+// ⚠ 判定方向是**排除法**（枚举「字段之后合法出现的终结符」），不是枚举运算符：
+//    枚举运算符会漏掉未列出的 op（如 `&` `|` `^`），让它们悄悄落回位置式路径 ⇒
+//    拿到「莫名其妙的类型错」而不是「不支持的运算符」。穷举终结符才是完备判据。
+pub fn pat_is_pat_end(t: string) bool {
+    if (t == "Assign") { return true; }     // `.x = v`
+    if (t == "Comma") { return true; }      // 字段分隔
+    if (t == "RBrace") { return true; }     // `V{ .Case }` 变体无参
+    if (t == "LParen") { return true; }     // `V{ .Case(a) }` 变体带参
+    if (t == "Eof") { return true; }
+    return false;
+}
+
+// 二元节点 op 文本 → 是否关系运算符。sema 侧校验谓词模式时用，与 `pat_is_pat_end`
+// 互补：前者说「是不是合法谓词 op」，后者说「是不是模式收尾」。两处**必须同步修改**。
+pub fn pat_is_relop_text(op: string) bool {
+    if (op == "<") { return true; }
+    if (op == ">") { return true; }
+    if (op == "<=") { return true; }
+    if (op == ">=") { return true; }
+    if (op == "==") { return true; }
+    if (op == "!=") { return true; }
+    return false;
+}
+
+// 运算符 token → 二元节点 op 文本（关系运算与 parse_cmp / parse_eq 的映射表同源）。
+// ⚠ 默认返回 `"?"`（而非某个具体 op）：走到这里说明它**不是**终结符，即用户确实
+//    写了运算符，只是本位置不支持（如 `.{ .a + 1 }`）。交给 sema 报 T-MAT-E004
+//    给出明确文案，不要静默降级成位置式模式。
+pub fn pat_relop_text(t: string) string {
+    // ⚠ `Lt` **必须显式列出**：原实现靠默认返回 `"<"` 来兜 Lt，
+    //   一旦把默认值改成 `"?"`（用于表达「不认识的运算符」）就会静默丢掉 `<` 的映射。
+    if (t == "Lt") { return "<"; }
+    if (t == "Gt") { return ">"; }
+    if (t == "LtEq") { return "<="; }
+    if (t == "GtEq") { return ">="; }
+    if (t == "Eq") { return "=="; }
+    if (t == "NotEq") { return "!="; }
+    if (t == "Plus") { return "+"; }
+    if (t == "Minus") { return "-"; }
+    if (t == "Star") { return "*"; }
+    if (t == "Slash") { return "/"; }
+    if (t == "Percent") { return "%"; }
+    if (t == "BitAnd") { return "&"; }
+    if (t == "BitOr") { return "|"; }
+    if (t == "BitXor") { return "^"; }
+    return "?";
+}
+
+// ── 故障子句的谓词位形态校验（fault B3 / 附录 B M3）────────────────────────
+// `@clause(.fault, <谓词>, <全名>)` 的谓词必须是 `.{...}`（struct_lit），且每个字段值是
+//   · 等值约束（普通字面量 / 常量表达式），或
+//   · 关系二元式（`binary` 且 op ∈ 关系集，判据复用 B2 的 pat_is_relop_text）
+// 二者之外（`.{ .a + 1 }`、位置式 `.{a, b}`、空 `.{}`）一律不合法 ⇒ 报 T-CLA-E009。
+// ⚠ 收口纪律（§11）：不收口就会静默错编 —— 与 bitstr `&` / 位域 `&` / `^` 同款。
+pub fn clause_pred_ok(pn: i64) bool {
+    if (pn < 0) { return false; }
+    if (base.node_kind((pn as u64)) != "struct_lit") { return false; }
+    var fks: []i64 = base.kids_chain_idx(base.node_la((pn as u64)));
+    if (slice_len(fks) == 0) { return false; }
+    var fi: i64 = 0;
+    while (fi < slice_len(fks) as i64) {
+        var fv: i64 = base.kids[fks[fi]].val;
+        // 位置式字段（sa == ""）不是谓词约束
+        if (base.node_sa((fv as u64)) == "") { return false; }
+        var vv: i64 = base.node_na((fv as u64));
+        if (vv >= 0 and base.node_kind((vv as u64)) == "binary") {
+            if (pat_is_relop_text(base.node_sa((vv as u64))) == false) { return false; }
+        }
+        fi = fi + 1;
+    }
+    return true;
+}
+
 pub fn parse_struct_lit(type_name: string, ti: i64) i64 {
     lex.advance_i();
     var head: i64 = -1;
@@ -795,7 +926,11 @@ pub fn parse_struct_lit(type_name: string, ti: i64) i64 {
     if (g_in_match_pat) {
         var c0: string = lex.cur_t();
         var named_form: bool = (c0 == "Identifier" and lex.peek_t(1) == "Colon") or
-                               (c0 == "Dot" and lex.peek_t(1) == "Identifier" and lex.peek_t(2) == "Assign");
+                               (c0 == "Dot" and lex.peek_t(1) == "Identifier" and lex.peek_t(2) == "Assign") or
+                               // B2 新增：谓词式 `.{ .f <op> v }` —— 首字段后紧跟运算符
+                               //          （非终结符即运算符，见 pat_is_pat_end）
+                               (c0 == "Dot" and lex.peek_t(1) == "Identifier" and
+                                pat_is_pat_end(lex.peek_t(2)) == false);
         if (named_form == false) { positional = true; }
     }
     if (positional) {
@@ -825,6 +960,12 @@ pub fn parse_struct_lit(type_name: string, ti: i64) i64 {
         if (ft0 == "Identifier" and lex.peek_t(1) == "Colon") {
             is_tuple = false;
         } else if (ft0 == "Dot" and lex.peek_t(1) == "Identifier" and lex.peek_t(2) == "Assign") {
+            is_tuple = false;
+        } else if (ft0 == "Dot" and lex.peek_t(1) == "Identifier" and
+                   pat_is_pat_end(lex.peek_t(2)) == false) {
+            // ⚠ 谓词式 `.{ .f <op> v }`（B2）：**不是**匿名元组字面量。
+            //   这一分支在「变体构造」判定之前执行，若不排除运算符，
+            //   谓词会先被 is_tuple 截走 ⇒ 后面三处改了也不生效（实测坑）。
             is_tuple = false;
         } else {
             is_tuple = true;
@@ -858,13 +999,41 @@ pub fn parse_struct_lit(type_name: string, ti: i64) i64 {
     // 变体构造字面量 `V { .Case }` / `V { .Case(args) }`：首个字段位出现 `.Case` 且其后
     // 不是 `=`（与具名字段 `.x = v` 区分），即视为变体 case 构造（变体恒单构造子，仅一个）。
     // 脱糖交由 sema（variant_lit → <V>_from_<C>(args) 调用，复用既有 V_from_C 发射路径）。
-    if (lex.cur_t() == "Dot" and lex.peek_t(1) == "Identifier" and lex.peek_t(2) != "Assign") {
+    // ⚠ B2 修正：原判定 `peek(2) != "Assign"` 会把 `.{ .a < 1 }` / `.{ .a == 1 }` 一并吞成
+    //   变体构造（`V{ .Case }`）⇒ 谓词模式在 parse 期就被截走，落到 sema 时形态已错。
+    //   ⇒ 必须**同时**确认后继是终结符（N1），否则 N2/N3 加了也不生效。
+    if (lex.cur_t() == "Dot" and lex.peek_t(1) == "Identifier" and
+        lex.peek_t(2) != "Assign" and pat_is_pat_end(lex.peek_t(2))) {
         return parse_variant_lit(type_name, ti);
     }
-    // 具名字段：接受旧式 `x: v` 与新式 `.x = v`（两者并存以保自举不动点）。
+    // 具名字段：接受旧式 `x: v`、新式 `.x = v`、以及 B2 新增的谓词式 `.x <op> v`。
+    // ⚠ 变量声明一律提在 while 之外：C 后端对循环体内 `var` 同名的重复声明会报 redefinition。
+    var fname: string;
+    var val: i64;
+    var relop: string;
     while (lex.cur_t() != "RBrace" and lex.cur_t() != "Eof") {
-        var fname: string;
-        if (lex.cur_t() == "Dot" and lex.peek_t(1) == "Identifier" and lex.peek_t(2) == "Assign") {
+        fname = "";
+        val = -1;
+        relop = "";
+        if (lex.cur_t() == "Dot" and lex.peek_t(1) == "Identifier" and
+            pat_is_pat_end(lex.peek_t(2)) == false) {
+            // 谓词式：合成 `binary(op, 占位左端, v)`。
+            // 占位左端是 `ident(sa="")`，由 sema 在 struct_lit_pat_check 里重写为 `member(scr, fname)`
+            // —— parse 期没有 scrutinee 信息，必须先留位再回填。
+            lex.advance_i();                        // 消费 Dot
+            fname = expect_tok("Identifier");
+            relop = pat_relop_text(lex.cur_t());
+            var rti: i64 = lex.advance_i();         // 消费关系运算符
+            var sav: bool = g_in_match_pat;
+            g_in_match_pat = false;                 // 右端是普通值表达式，不是模式
+            var rhs: i64 = parse_expr();
+            g_in_match_pat = sav;
+            // 左端合成 `member(ident("__scr"), fname)`：`__scr` 是**占位**，
+            // 由 sema 的 struct_lit_pat_check 回填为真实 scrutinee 表达式节点
+            // （parse 期无从得知 scrutinee 是什么）。
+            // ⚠ 不能直接留 ident("") 再靠 infer 兜：ident 会被当普通标识符解析 ⇒ 误报未定义。
+            val = base.mk_binary(relop, base.mk_member(fname, base.mk_ident("__scr", -1), rti), rhs, rti);
+        } else if (lex.cur_t() == "Dot" and lex.peek_t(1) == "Identifier" and lex.peek_t(2) == "Assign") {
             lex.advance_i();                       // 消费 Dot
             fname = expect_tok("Identifier");
             expect_tok("Assign");
@@ -872,7 +1041,9 @@ pub fn parse_struct_lit(type_name: string, ti: i64) i64 {
             fname = expect_tok("Identifier");
             expect_tok("Colon");
         }
-        var val: i64 = parse_expr();
+        if (val < 0) {
+            val = parse_expr();
+        }
         var fid: i64 = base.mk_FV(fname, val, -1);
         tail = base.list_push(head, tail, fid);
         if (head < 0) {
@@ -1153,10 +1324,10 @@ pub fn parse_local_var(is_const: bool, is_export: bool) i64 {
         base.validate_var_name(name, nti);
     }
     var id: i64 = base.mk_var_decl(name, is_const, tn, init, ti);
-    // 模块系统（M-Module）：pub 只能修饰顶层声明；局部/嵌套变量加 pub → T-MOD-E556
+    // 模块系统（M-Module）：pub 只能修饰顶层声明；局部/嵌套变量加 pub → T-MOD-E006
     if (is_export) {
         base.node_set_bc((id as u64), true);   // S4 §0.14.7 SoA：取代 `nodes[id].bc = true`
-        fc_err("T-MOD-E556", "pub 只能修饰顶层声明，不能修饰局部/嵌套变量", id);
+        fc_err("T-MOD-E006", "pub 只能修饰顶层声明，不能修饰局部/嵌套变量", id);
     }
     return id;
 }
@@ -1168,10 +1339,10 @@ pub fn parse_auto_stmt() i64 {
     var ti: i64 = lex.advance_i();
     var name: string = expect_tok("Identifier");
     if (lex.cur_t() == "Colon") {
-        parse_fatal("'auto' 推断变量不可标注类型，直接写 `auto 名字 = 初值;` 或改用 `let 名字 = 初值;`");
+        parse_fatal("an 'auto' inferred variable cannot be annotated with a type; write `auto name = init;` or use `let name = init;`");
     }
     if (lex.cur_t() != "Assign") {
-        parse_fatal("'auto' 变量必须有初始化器 `auto 名字 = 初值;`");
+        parse_fatal("an 'auto' variable must have an initializer: `auto name = init;`");
     }
     lex.advance_i();
     var init: i64 = parse_expr();
@@ -1285,7 +1456,7 @@ fn block_is_single(head: i64) bool {
 //    那是已记录的 -O2 自编译 UB（笔记第 14 条）。
 //
 // 硬约束：块必须以**表达式语句**结尾（T 语句一律带 `;`）。无尾随表达式的块取值
-// 属 P5（void → unit），当前按 fail-fast 报 T-PAR-E101，绝不静默降级。
+// 属 P5（void → unit），当前按 fail-fast 报 T-PAR-E001，绝不静默降级。
 pub fn parse_block_expr() i64 {
     var tl: i64 = lex.pos;           // 记块起点行号；`{`/`}` 由 parse_block 自己吞
     var body: i64 = parse_block();
@@ -1307,7 +1478,7 @@ pub fn parse_block_expr() i64 {
         last = block_trailing_expr(body);
     }
     if (last < 0) {
-        parse_fatal("值位置的块必须以表达式语句结尾（如 `{ 1; }`）");
+        parse_fatal("a block in value position must end with an expression statement (e.g. `{ 1; }`)");
     }
     if (block_is_single(body)) {
         return base.node_na((last as u64));  // ① 快路径：脱糖为表达式本身
@@ -1585,7 +1756,7 @@ pub fn parse_bar_lambda() i64 {
             lex.advance_i();                // 吃掉 ':'
             ptn = parse_type();
         } else {
-            // 省略类型 `|v|` → 参数类型占位为 Infer；检查期若无上下文回填则触发 T-SEM-E214
+            // 省略类型 `|v|` → 参数类型占位为 Infer；检查期若无上下文回填则触发 T-SEM-E013
             ptn = base.mk_infer_ret();
         }
         var pid: i64 = base.mk_P(pname, ptn, -1, -1);
@@ -1617,7 +1788,7 @@ pub fn parse_bar_lambda() i64 {
 // 提升 lambda 之前先算「自由变量 ∩ 外层函数可见变量」= 捕获集：
 //   * 绑定名栈 cap_bnd 按词法作用域压/弹（回退长度即出栈）
 //   * 自由名 cap_free 去重收集，保持首次出现顺序（决定 env 字段顺序）
-// 绑定集宁可**多收**不可少收：多收 → 少捕获 → 后续 T_UNDEFINED_IDENT 响亮报错；
+// 绑定集宁可**多收**不可少收：多收 → 少捕获 → 后续 T-SEM-E001 响亮报错；
 // 少收 → 多捕获 → 环境字段遮蔽同名局部，属静默错编。
 pub var cap_bnd: []string;
 pub var cap_bnd_n: i64;
@@ -1869,7 +2040,7 @@ pub fn lift_one_lambda(lid: i64) void {
         var ei: i64 = envm_find(nm);
         if (ei >= 0) {
             if (envm_t[ei] < 0) {
-                fc_err("T-CLO-E780",
+                fc_err("T-CLO-E000",
                     base.sb_cat3("无法捕获外层绑定 `", nm,
                         "`：它没有显式类型标注（如 for-each 迭代变量），环境结构无法为其定型。请先赋给带类型标注的局部变量再捕获"), lid);
             } else {
@@ -2015,7 +2186,7 @@ pub fn parse_func_decl(name: string, anns: i64, is_comptime: bool, is_kernel: bo
             lex.advance_i();
             pname = expect_tok("Identifier");
             expect_tok("Colon");
-            ptn = parse_type_concept();     // 形参位：允许多约束连词 `T: A && B`
+            ptn = parse_type_concept();     // 形参位：允许多约束连词 `T: A & B`
             pcomp = true;
         } else if (lex.cur_t() == "Identifier" and lex.cur_v() == "_") {
             lex.advance_i();
@@ -2029,7 +2200,7 @@ pub fn parse_func_decl(name: string, anns: i64, is_comptime: bool, is_kernel: bo
             if (lex.cur_t() == "Identifier" and lex.peek_t(1) == "Colon") {
                 pname = expect_tok("Identifier");
                 expect_tok("Colon");
-                ptn = parse_type_concept();   // 形参位：允许多约束连词 `T: A && B`
+                ptn = parse_type_concept();   // 形参位：允许多约束连词 `T: A & B`
             } else {
                 if (lex.cur_t() == "Identifier") {
                     // 结构字面量模式：`Ident { ... }` —— 含前导点形式 `Point{.x=0}` 与
@@ -2105,7 +2276,7 @@ pub fn parse_func_decl(name: string, anns: i64, is_comptime: bool, is_kernel: bo
 
     // N14 自动置位：含 clause 形参 ⇒ 该函数是编译期函数（bb = true）。
     //   后果（全部是既有行为，无需新代码）：① 函数体在 comptime 上下文检查；
-    //   ② 把它当运行期函数值传出去 ⇒ T-CLO-E781；③ 模板本身不发射，只有单态实例发射。
+    //   ② 把它当运行期函数值传出去 ⇒ T-CLO-E001；③ 模板本身不发射，只有单态实例发射。
     var fd_comptime: bool = is_comptime;
     if (has_clause_param) { fd_comptime = true; }
     var id: i64 = base.mk_FuncDecl(name, is_extern, fd_comptime, rt, all, ph, body, -1);
@@ -2132,7 +2303,7 @@ pub fn parse_func_decl(name: string, anns: i64, is_comptime: bool, is_kernel: bo
 // ═════════════════════════════════════════════════════════════
 // ── agent 脱糖辅助 ───────────────────────────────────────────────
 // PascalCase → snake_case：agent 生成的普通函数名须遵循「普通函数 = 小蛇形」命名规范
-// （原 <Name>_step / <Name>_spawn 以大写开头，被 validate_decl_name 误判为类型并告警 T_NAME_TYPE_CAMEL）。
+// （原 <Name>_step / <Name>_spawn 以大写开头，被 validate_decl_name 误判为类型并告警 T-NAM-W000）。
 pub fn pascal_to_snake(s: string) string {
     var sb: StringBuilder = sb_new();
     var i: u64 = 0;
@@ -2379,11 +2550,11 @@ pub fn parse_module_decl() i64 {
             if (lex.cur_t() == "Identifier") {
                 an = expect_tok("Identifier");
             } else {
-                parse_fatal_at("T-PAR-E101", "expected module attribute name", ati);
+                parse_fatal_at("T-PAR-E001", "expected module attribute name", ati);
             }
         }
         if (an != "pub" and an != "internal") {
-            parse_fatal_at("T-PAR-E101",
+            parse_fatal_at("T-PAR-E001",
                 base.sb_cat3("unknown module attribute '", an, "' (expected `pub` or `internal`)"), ati);
         }
         if (str_len(attrs) == 0) {
@@ -2447,13 +2618,13 @@ pub fn parse_decl_body(name: string, anns: i64, is_comptime: bool) i64 {
         if (lex.tk_t(li) == "Identifier") {
             var lv: string = lex.tk_v(li);
             // `#<id>` 修饰词注册表校验（struct-modifiers 设计 §2.2 CapMod）：
-            // 未知 id 强制报错（T-ANN-E453，非静默忽略）；旧 `#extern` 已由 `extern`
-            // 关键字取代，给迁移提示（T-ANN-E454）。
+            // 未知 id 强制报错（T-ANN-E003，非静默忽略）；旧 `#extern` 已由 `extern`
+            // 关键字取代，给迁移提示（T-ANN-E004）。
             if (lv == "extern") {
-                parse_fatal_at("T-ANN-E454", "modifier '#extern' is obsolete; use the `extern` keyword instead", li);
+                parse_fatal_at("T-ANN-E004", "modifier '#extern' is obsolete; use the `extern` keyword instead", li);
             }
             if (lex.modifier_known(lv) == false) {
-                parse_fatal_at("T-ANN-E453", base.sb_cat3("modifier '#", lv, "' is not registered"), li);
+                parse_fatal_at("T-ANN-E003", base.sb_cat3("modifier '#", lv, "' is not registered"), li);
             }
             if (lv == "soa") {
                 layout = "soa";
@@ -2473,28 +2644,28 @@ pub fn parse_decl_body(name: string, anns: i64, is_comptime: bool) i64 {
     // 新文法，此处不再兼容旧式（与 Stage 2 的 `fn name` 收紧一致）。关键字领头桥在
     // parse_declaration 中处理（消费关键字 → 读名字 → 调用对应 parse_*_decl）。
     if (t == "KwStruct") {
-        parse_fatal_at("T-PAR-E102", base.sb_cat5("type declarations must use the `struct ", name, "` form; `", name, " struct` is no longer supported"), lex.pos);
+        parse_fatal_at("T-PAR-E002", base.sb_cat5("type declarations must use the `struct ", name, "` form; `", name, " struct` is no longer supported"), lex.pos);
     }
     if (t == "KwEnum") {
-        parse_fatal_at("T-PAR-E102", base.sb_cat5("type declarations must use the `enum ", name, "` form; `", name, " enum` is no longer supported"), lex.pos);
+        parse_fatal_at("T-PAR-E002", base.sb_cat5("type declarations must use the `enum ", name, "` form; `", name, " enum` is no longer supported"), lex.pos);
     }
     if (t == "KwUnion") {
-        parse_fatal_at("T-PAR-E102", base.sb_cat5("type declarations must use the `union ", name, "` form; `", name, " union` is no longer supported"), lex.pos);
+        parse_fatal_at("T-PAR-E002", base.sb_cat5("type declarations must use the `union ", name, "` form; `", name, " union` is no longer supported"), lex.pos);
     }
     if (t == "KwVariant") {
-        parse_fatal_at("T-PAR-E102", base.sb_cat5("type declarations must use the `variant ", name, "` form; `", name, " variant` is no longer supported"), lex.pos);
+        parse_fatal_at("T-PAR-E002", base.sb_cat5("type declarations must use the `variant ", name, "` form; `", name, " variant` is no longer supported"), lex.pos);
     }
     if (t == "KwAgent") {
-        parse_fatal_at("T-PAR-E102", base.sb_cat5("type declarations must use the `agent ", name, "` form; `", name, " agent` is no longer supported"), lex.pos);
+        parse_fatal_at("T-PAR-E002", base.sb_cat5("type declarations must use the `agent ", name, "` form; `", name, " agent` is no longer supported"), lex.pos);
     }
     if (t == "KwFunc") {
         // `step fn(...)` 是 agent 子句关键字形式（非普通函数声明），保留旧路径以兼容
-        // tests/conformance/fail/f22_clause_body.tc（其 EXPECT: error T_FUNC_CLAUSE_BODY）。
+        // tests/conformance/fail/f22_clause_body.tc（其 EXPECT: error T-FUN-E004）。
         if (name == "step") {
             lex.advance_i();
             return parse_func_decl(name, anns, is_comptime, false);
         }
-        parse_fatal_at("T-PAR-E102", base.sb_cat3("function declarations must use the `fn name(...)` form; `", name, " fn(...)` is no longer supported"), lex.pos);
+        parse_fatal_at("T-PAR-E002", base.sb_cat3("function declarations must use the `fn name(...)` form; `", name, " fn(...)` is no longer supported"), lex.pos);
     }
     return parse_type_alias(name, anns);
 // <<< GEN:parser_dispatch <<<
@@ -2756,6 +2927,159 @@ pub fn parse_expect_stmt() i64 {
     return base.mk_if(cond, th, -1, ti);
 }
 
+// ══════════════════════════════════════════════════════════════
+// 具名故障组声明 `fault E over T { 谓词 -> E.成员名 repairs { .a, .b }; ... }`
+// ── 设计：docs/syntax/drafts/fault.md §4 / 附录 C（fault B1）──
+//
+// F-1：组**只活在编译期**。本函数做三件事：
+//   ① 语法归约 → `FaultDecl`（sa=组名 / na=`over T` 类型节点 / la=成员链）
+//   ② **立刻**合成运行期载体 `__fault_<E>`（A-32：tag / val / r0..r(N-1)），并
+//      **先于** FaultDecl 追加进 decl_list —— 此刻 N 与 over T 都已确定，故
+//      `fault(E)!T` 类型位只需按名引用，不必回头查 N（附录 C P6）。
+//   ③ 登记 (组名, `over T` 规范名)，供类型位校验（附录 C P7）。
+//
+// ⚠ 成员复用既有 `F` 节点（sa=成员名 / na=谓词 / la=repair 名链）：
+//   组成员本质就是「组的字段」，且 F 自带 i64 槽可留给 sema 回填槽位基址
+//   ⇒ **不新增第二个 kind**（少一处 GEN 区改动 = 少一处漂移风险）。
+// ══════════════════════════════════════════════════════════════
+
+pub var g_fg_names: []string;    // 已解析的组名（按文本序；供 `fault(E)!T` 校验）
+pub var g_fg_over: []string;     // 对应 `over T` 的规范名（type_node_mangle）
+
+pub fn fault_struct_name(g: string) string {
+    return base.sb_cat2("__fault_", g);
+}
+
+pub fn fault_group_index(g: string) i64 {
+    var i: i64 = 0;
+    while (i < slice_len(g_fg_names) as i64) {
+        if (g_fg_names[i] == g) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+pub fn parse_fault_decl() i64 {
+    var ti_f: i64 = lex.pos;
+    lex.advance_i();                        // 吃掉 `fault`
+    if (lex.cur_t() != "Identifier") {
+        parse_fatal("expected fault group name after 'fault'");
+    }
+    var ni: i64 = lex.advance_i();
+    var gname: string = lex.tk_v(ni);
+    // `over` 是**上下文关键词**（mod 阶）：lexer 仍发 Identifier ⇒ 必须按**词文本**判定。
+    // ⚠ 它绝不可改成强制关键字：`over` 在 src/parse.tc:1140 是局部变量名（附录 C P1）。
+    if (lex.cur_v() != "over") {
+        parse_fatal_at("T-CLA-E015",
+            "a fault group declaration must be written as `fault <Name> over <Type> { ... }` (expected `over` here)", lex.pos);
+    }
+    lex.advance_i();
+    var otn: i64 = parse_type();
+    if (lex.cur_t() != "LBrace") {
+        parse_fatal_at("T-PAR-E001", "expected '{' after `fault <Name> over <Type>`", lex.pos);
+    }
+    lex.advance_i();                        // 吃掉 '{'
+
+    var mh: i64 = -1;
+    var mt: i64 = -1;
+    while (lex.cur_t() != "RBrace" and lex.cur_t() != "Eof") {
+        // ── 谓词位 ── 必须临时置 g_in_match_pat，否则 parse_struct_lit 走不到谓词分支
+        //    （与 B3 的 M10 同族：**不报错**，只是静默走错路）
+        var sav_pat: bool = g_in_match_pat;
+        g_in_match_pat = true;
+        var pn: i64 = parse_expr();
+        g_in_match_pat = sav_pat;
+        if (clause_pred_ok(pn) == false) {
+            parse_fatal_at("T-MAT-E006",
+                "a fault group member's predicate must be `.{ .field = value }` or `.{ .field <op> value }` (op is one of `<` `>` `<=` `>=` `==` `!=`)", pn);
+        }
+        if (lex.cur_t() != "Arrow") {
+            parse_fatal_at("T-PAR-E001", "expected '->' between fault predicate and fault name", lex.pos);
+        }
+        lex.advance_i();                    // 吃掉 '->'
+        if (lex.cur_t() != "Identifier") {
+            parse_fatal("expected fault name after '->' in fault group member");
+        }
+        var qi: i64 = lex.advance_i();
+        var qpre: string = lex.tk_v(qi);
+        if (lex.cur_t() != "Dot" or lex.peek_t(1) != "Identifier") {
+            parse_fatal_at("T-CLA-E014", "a fault member's full name must be written as `<group>.<member>` (e.g. `UserErr.AgeNegative`)", qi);
+        }
+        lex.advance_i();                    // Dot
+        var mi: i64 = lex.advance_i();
+        var mname: string = lex.tk_v(mi);
+        if (qpre != gname) {
+            parse_fatal_at("T-CLA-E014",
+                base.sb_cat5("the prefix of the fault member full name `", qpre, ".", mname, "` 的前缀必须等于本组名"), qi);
+        }
+        // ── 可选 `repairs { .a, .b }` ──
+        var rh: i64 = -1;
+        var rt: i64 = -1;
+        if (lex.cur_v() == "repairs") {
+            lex.advance_i();
+            if (lex.cur_t() != "LBrace") {
+                parse_fatal_at("T-PAR-E001", "expected '{' after `repairs`", lex.pos);
+            }
+            lex.advance_i();
+            while (lex.cur_t() != "RBrace" and lex.cur_t() != "Eof") {
+                if (lex.cur_t() != "Dot" or lex.peek_t(1) != "Identifier") {
+                    parse_fatal_at("T-CLA-E013", "a repair name must be written as `.repair_name` (e.g. `.use_default`)", lex.pos);
+                }
+                lex.advance_i();            // Dot
+                var ri: i64 = lex.advance_i();
+                var rn: i64 = base.mk_ident(lex.tk_v(ri), ri);
+                rt = base.list_push(rh, rt, rn);
+                if (rh < 0) { rh = rt; }
+                if (lex.cur_t() == "Comma") { lex.advance_i(); } else { break; }
+            }
+            expect_tok("RBrace");
+        }
+        if (lex.cur_t() == "Semicolon") { lex.advance_i(); }
+        var mn: i64 = base.mk_F(mname, -1, pn, rh, mi);
+        mt = base.list_push(mh, mt, mn);
+        if (mh < 0) { mh = mt; }
+    }
+    expect_tok("RBrace");
+
+    // ── 合成运行期载体（A-32）──
+    // 布局：`tag : i64`（0=Ok，成员 i 为 i+1）/ `val : T`（T 为 void 时省略）/ `r0..r(N-1) : fn() T`
+    // ⚠ 用 N 个**独立字段**而非 `[N]%TClosure`：实测「数组元素上的闭包间接调用」在双后端
+    //   是坏的（发射未定义符号 `t__` / 静默崩溃），而结构体单闭包字段正常（附录 C C.0 F-2）。
+    var nrep: i64 = 0;
+    var ks: []i64 = base.kids_chain(mh);
+    var ki: i64 = 0;
+    while (ki < slice_len(ks) as i64) {
+        var rs: []i64 = base.kids_chain(base.node_la((ks[ki] as u64)));
+        nrep = nrep + slice_len(rs) as i64;
+        ki = ki + 1;
+    }
+    var fh: i64 = -1;
+    var ft: i64 = -1;
+    var f_tag: i64 = base.mk_F("tag", -1, base.mk_scalar("i64", -1), -1, -1);
+    ft = base.list_push(fh, ft, f_tag); if (fh < 0) { fh = ft; }
+    if (type_node_mangle(otn) != "void") {
+        var f_val: i64 = base.mk_F("val", -1, otn, -1, -1);
+        ft = base.list_push(fh, ft, f_val);
+    }
+    var ft_ret: i64 = base.mk_func_type(otn, -1, -1);
+    var si: i64 = 0;
+    while (si < nrep) {
+        var f_ri: i64 = base.mk_F(base.sb_cat2("r", base.i2s(si)), -1, ft_ret, -1, -1);
+        ft = base.list_push(fh, ft, f_ri);
+        si = si + 1;
+    }
+    var sd: i64 = base.mk_StructDecl(fault_struct_name(gname), "auto", "", false, false, -1, fh, -1);
+    base.node_at(sd, ti_f);   // 合成节点挂到 `fault` 记号上（便于诊断定位）
+    append(lex.decl_list, sd);
+
+    // ⚠ **不要**在这里 append FaultDecl：`parse_unit` 会把 parse_declaration 的返回值
+    //   追加进 decl_list（实测重复追加会让 dump-ast 出现两份同 id 的 FaultDecl）。
+    var fd: i64 = base.mk_FaultDecl(gname, otn, mh, ti_f);
+    append(g_fg_names, gname);
+    append(g_fg_over, type_node_mangle(otn));
+    return fd;
+}
+
 pub fn parse_declaration() i64 {
     // 可见性/编译期前缀须在 `@` 文件级指令之前消费，使 `pub @import(...)`（模块重导出）
     // 与 `pub @module(...)` 可正确解析；`@` 指令自身仍不接任何前缀语义。
@@ -2809,7 +3133,7 @@ pub fn parse_declaration() i64 {
         var cm_h: i64 = lex.pos;
         lex.advance_i();   // 吃掉 `#`
         if (lex.cur_t() != "Identifier") {
-            parse_fatal_at("T-PAR-E101", "expected modifier name after '#'", cm_h);
+            parse_fatal_at("T-PAR-E001", "expected modifier name after '#'", cm_h);
         }
         var cm_i: i64 = lex.advance_i();
         var cm_id: string = lex.tk_v(cm_i);
@@ -2817,7 +3141,7 @@ pub fn parse_declaration() i64 {
             // `#modifier <id>`：注册自定义修饰词（设计 §2.2 注册途径之一）。
             // 纯指令、不产生声明；调用方 `if (d >= 0)` 会跳过本条。
             if (lex.cur_t() != "Identifier") {
-                parse_fatal_at("T-PAR-E101", "expected modifier name after '#modifier'", cm_i);
+                parse_fatal_at("T-PAR-E001", "expected modifier name after '#modifier'", cm_i);
             }
             var rid_i: i64 = lex.advance_i();
             lex.modifier_register(lex.tk_v(rid_i));
@@ -2825,10 +3149,10 @@ pub fn parse_declaration() i64 {
             return -1;
         }
         if (cm_id == "extern") {
-            parse_fatal_at("T-ANN-E454", "modifier '#extern' is obsolete; use the `extern` keyword instead", cm_i);
+            parse_fatal_at("T-ANN-E004", "modifier '#extern' is obsolete; use the `extern` keyword instead", cm_i);
         }
         if (lex.modifier_known(cm_id) == false) {
-            parse_fatal_at("T-ANN-E453", base.sb_cat3("modifier '#", cm_id, "' is not registered"), cm_i);
+            parse_fatal_at("T-ANN-E003", base.sb_cat3("modifier '#", cm_id, "' is not registered"), cm_i);
         }
         capmod = cm_id;
     }
@@ -2837,6 +3161,12 @@ pub fn parse_declaration() i64 {
     // 旧 `export` 同位置修饰已删除（见 §3.13）；`pub` 与 `export` 曾等价置导出位，现统一仅 `pub`；
     // 真正的可见性判据是「文件 @module(pub) ∧ 声明 pub」，在 sema 侧合取。
 
+    // ── 具名故障组声明 `fault E over T { ... }`（fault B1 / 附录 C P4）──
+    // 组的可见性（`pub fault`）暂不处理：组是编译期契约，跨模块可见性属 B5。
+    // ⚠ 同类型位：`fault` 是上下文关键词，按**词文本 + 前瞻**（后随组名 Identifier）判定。
+    if (lex.cur_v() == "fault" and lex.peek_t(1) == "Identifier") {
+        return parse_fault_decl();
+    }
     if (lex.cur_t() == "KwVar") {
         var d: i64 = parse_global_var(false, is_comptime);
         if (is_export) { base.node_set_bc((d as u64), true); }   // S4 §0.14.7 SoA
@@ -2856,7 +3186,7 @@ pub fn parse_declaration() i64 {
     }
     if (lex.cur_t() == "KwImport") {
         // 旧 `import(X)` 括号形式已删除；统一改用 `@import("X")`（见 docs/reference.md §3.13）
-        parse_fatal_at("T-PAR-E102", "`import(X)` was removed; write `@import(\"X\")` instead", lex.pos);
+        parse_fatal_at("T-PAR-E002", "`import(X)` was removed; write `@import(\"X\")` instead", lex.pos);
     }
 
     // ── overload 上下文关键词（Route 1）──
@@ -2915,12 +3245,12 @@ pub fn parse_declaration() i64 {
             // 与布局修饰互斥：`overload extern struct` / `overload packed struct` 不允许
             // （D9：extern 不支持 overload；packed 不开放扩展）。
             if (lex.cur_t() == "Identifier" and (lex.cur_v() == "extern" or lex.cur_v() == "packed")) {
-                parse_fatal_at("T-PAR-E102",
+                parse_fatal_at("T-PAR-E002",
                     base.sb_cat3("'overload' and layout modifier '", lex.cur_v(),
                         "' are mutually exclusive (overload struct does not support packed/extern layout)"),
                     lex.pos);
             }
-            parse_fatal_at("T-PAR-E102", "expected 'fn' or 'struct' after 'overload'", lex.pos);
+            parse_fatal_at("T-PAR-E002", "expected 'fn' or 'struct' after 'overload'", lex.pos);
         }
         lex.advance_i();   // 吃掉 `fn`
         if (lex.cur_t() != "Identifier") {
@@ -2996,7 +3326,7 @@ pub fn parse_declaration() i64 {
             return vd_e;
         }
         if (lex.cur_t() != "KwFunc") {
-            parse_fatal_at("T-PAR-E102", "expected 'fn', 'struct' or 'variant' after 'extend'", lex.pos);
+            parse_fatal_at("T-PAR-E002", "expected 'fn', 'struct' or 'variant' after 'extend'", lex.pos);
         }
         lex.advance_i();   // 吃掉 `fn`
         if (lex.cur_t() != "Identifier") {
@@ -3074,7 +3404,7 @@ pub fn parse_declaration() i64 {
         var pkw_i: i64 = lex.pos;   // 指向 `packed` token（用于错误定位）
         lex.advance_i();   // 吃掉 `packed`
         if (lex.cur_t() != "KwStruct") {
-            parse_fatal_at("T-PAR-E102", "expected 'struct' after 'packed'", pkw_i);
+            parse_fatal_at("T-PAR-E002", "expected 'struct' after 'packed'", pkw_i);
         }
         lex.advance_i();   // 吃掉 `struct`
         var layout_p: string = "packed";
@@ -3123,11 +3453,11 @@ pub fn parse_declaration() i64 {
         }
         // D9：`extern` 与 `overload` 互斥（extern 专用于 C 兼容、布局须稳定，不支持 overload/extend）。
         if (lex.cur_v() == "overload") {
-            parse_fatal_at("T-PAR-E102",
+            parse_fatal_at("T-PAR-E002",
                 "'extern' and 'overload' are mutually exclusive (extern does not support overload/extend)",
                 xkw_i);
         }
-        parse_fatal_at("T-PAR-E102", "expected 'struct' after 'extern'", xkw_i);
+        parse_fatal_at("T-PAR-E002", "expected 'struct' after 'extern'", xkw_i);
     }
 
     // ── `concept` 约束类型声明（不可实例化，函数+字段约束，泛型边界）──
@@ -3138,7 +3468,7 @@ pub fn parse_declaration() i64 {
     if (lex.cur_t() == "Identifier" and lex.cur_v() == "concept") {
         var cn_i: i64 = lex.advance_i();   // 吃掉 `concept`
         if (lex.cur_t() != "Identifier") {
-            parse_fatal_at("T-PAR-E102", "expected concept name after 'concept'", cn_i);
+            parse_fatal_at("T-PAR-E002", "expected concept name after 'concept'", cn_i);
         }
         var cni: i64 = lex.advance_i();
         var cname: string = lex.tk_v(cni);
@@ -3160,15 +3490,15 @@ pub fn parse_declaration() i64 {
             lex.advance_i();
             var li: i64 = lex.advance_i();
             // 布局注解值：`soa`/`aos` 是内建修饰词（容器布局轴，与成员布局正交，D8 保留）。
-            // `#<id>` 统一走修饰词注册表校验（设计 §2.2）：未知 id 报错 T-ANN-E453；
-            // 旧 `#extern` 已由 `extern` 关键字取代，给迁移提示 T-ANN-E454（不再静默忽略）。
+            // `#<id>` 统一走修饰词注册表校验（设计 §2.2）：未知 id 报错 T-ANN-E003；
+            // 旧 `#extern` 已由 `extern` 关键字取代，给迁移提示 T-ANN-E004（不再静默忽略）。
             if (lex.tk_t(li) == "Identifier") {
                 var lv: string = lex.tk_v(li);
                 if (lv == "extern") {
-                    parse_fatal_at("T-ANN-E454", "modifier '#extern' is obsolete; use the `extern` keyword instead", li);
+                    parse_fatal_at("T-ANN-E004", "modifier '#extern' is obsolete; use the `extern` keyword instead", li);
                 }
                 if (lex.modifier_known(lv) == false) {
-                    parse_fatal_at("T-ANN-E453", base.sb_cat3("modifier '#", lv, "' is not registered"), li);
+                    parse_fatal_at("T-ANN-E003", base.sb_cat3("modifier '#", lv, "' is not registered"), li);
                 }
                 if (lv == "soa") { layout = "soa"; }
                 else if (lv == "aos") { layout = "aos"; }
@@ -3256,11 +3586,11 @@ pub fn parse_declaration() i64 {
     // 声明形态为 `Name fn(...)` / `Name struct {...}`，绑定符 `::` 已移除。
     // 遇到旧写法给出带名字的迁移指引，而非笼统的语法错误。
     if (lex.cur_t() == "DoubleColon") {
-        parse_fatal_at("T-PAR-E102", base.sb_cat5("the '::' binder was removed; write `", name, " fn(...)` / `", name, " struct {...}` instead"), lex.pos);
+        parse_fatal_at("T-PAR-E002", base.sb_cat5("the '::' binder was removed; write `", name, " fn(...)` / `", name, " struct {...}` instead"), lex.pos);
     }
     // `func` 已更名为 `fn`：否则会落进 type-alias 分支报出无关的 "expected Semicolon"。
     if (lex.cur_t() == "Identifier" and lex.cur_v() == "func") {
-        parse_fatal_at("T-PAR-E102", base.sb_cat3("keyword 'func' was renamed to 'fn'; write `", name, " fn(...)` instead"), lex.pos);
+        parse_fatal_at("T-PAR-E002", base.sb_cat3("keyword 'func' was renamed to 'fn'; write `", name, " fn(...)` instead"), lex.pos);
     }
 
     var d: i64 = parse_decl_body(name, anns, is_comptime);
@@ -3288,6 +3618,7 @@ pub fn parse_declaration() i64 {
 //   t 对「函数内建数组字面量的切片」不做逃逸提升，跨帧读回 p[i] 会得到悬空内存
 //   （本项目已有实证：ovl_specificity 的类别表）。局部 `ord`/`wild` 曾因此读到
 //   被回收的槽位（症状：`t_slice_at index N length M` 且 M 随机）。
+pub var g_spl_fault: bool = false;   // 本次收集含「非 pattern 子句」（.fault / .repair）—— 故障子句不能当臂展开（fault B3 / 附录 B M5）
 pub var g_spl_cl: []i64;      // 展开期收集的 clause 节点（顺序即源码顺序）
 pub var g_spl_base: i64 = 0;  // 本次收集在 g_spl_cl 中的起始下标
 pub var g_spl_ord: []i64;     // 重排后的顺序（无守卫通配落末位）
@@ -3302,7 +3633,14 @@ pub var g_spl_trace: i64 = 0;   // 追踪开关（排障时临时置 1）
 pub fn clause_collect(x: i64) void {
     if (x < 0) { g_spl_ok = false; return; }
     var ck: string = base.node_kind((x as u64));
-    if (ck == "clause") { append(g_spl_cl, x); return; }
+    if (ck == "clause") {
+        // ⚠ 故障/修复子句**照旧收集**（否则 expr_is_clause_group 会判假 ⇒ 编译期标记
+        //   不生效 ⇒ clause 值漏进 IR），但置位 g_spl_fault，由 clause_expand_splice
+        //   在「要把它们当臂展开」时报错（附录 B M5 / M6）。
+        if (base.node_sa((x as u64)) != "pattern") { g_spl_fault = true; }
+        append(g_spl_cl, x);
+        return;
+    }
     if (ck == "paren" or ck == "comptime") { clause_collect(base.node_na((x as u64))); return; }
     if (ck == "array_lit") {
         // ⚠ 元素链头在 `la`，且是 kids 池 entry 索引（不是节点 id）—— 与臂链同规格。
@@ -3366,6 +3704,7 @@ pub fn clause_expand_splice(m: i64) void {
     g_spl_base = slice_len(g_spl_cl) as i64;
     g_spl_ok = true;
     g_spl_defer = false;
+    g_spl_fault = false;
     ki = 0;
     while (ki < slice_len(ks) as i64) {
         var it: i64 = base.kids[ks[ki]].val;
@@ -3373,7 +3712,7 @@ pub fn clause_expand_splice(m: i64) void {
             clause_collect(it);
         } else {
             // 拼接位与普通臂混写：暂不支持（混写会让「重排后谁在前」失去确定语义）
-            parse.fc_err("T-CLA-E720",
+            parse.fc_err("T-CLA-E000",
                 "match 臂位置的子句组展开暂不支持与普通臂混写；请整组展开或全部写成普通臂", it);
             return;
         }
@@ -3383,8 +3722,15 @@ pub fn clause_expand_splice(m: i64) void {
     // N14 推迟：模板体里的 `match (x) { G }`（G 是 clause 形参）此刻无从展开，
     //   原样保留，等 instantiate_generic 生成实例后再补跑展开。
     if (g_spl_defer) { return; }
+    // 故障 / 修复子句（`@clause(.fault, ...)` / `@clause(.repair, ...)`）是**编译期登记**，
+    // 不是 match 臂 —— 它们没有 pattern/guard/body 的臂语义，展开成臂必是错编（附录 B M6）。
+    if (g_spl_fault) {
+        parse.fc_err("T-CLA-E010",
+            "故障子句 `@clause(.fault, ...)` / 修复子句 `@clause(.repair, ...)` 不能展开为 match 臂", m);
+        return;
+    }
     if (g_spl_ok == false or spl_n <= 0) {
-        parse.fc_err("T-CLA-E723",
+        parse.fc_err("T-CLA-E003",
             "match 臂位置的子句组必须是 `clause` 或 `[N]clause`（含 `++` 合并结果）", m);
         return;
     }
@@ -3405,7 +3751,7 @@ pub fn clause_expand_splice(m: i64) void {
     }
     // ── N12 排重：首个不可反驳 clause 之后的全部子句都被完全遮蔽 ──
     //   （它恒命中，后面的永远走不到 —— 与 KI-002「恒命中首臂」同族，静默且难查）
-    //   ⇒ 保留它作为 else，其后一律丢弃并发 T-CLA-W727（合法但大概率是笔误）。
+    //   ⇒ 保留它作为 else，其后一律丢弃并发 T-CLA-W000（合法但大概率是笔误）。
     // ⚠ 用 g_spl_ord_n 记「有效长度」而非截断切片：模块级切片重新赋值有 arena 逃逸坑。
     var ord_end: i64 = slice_len(g_spl_ord) as i64;
     g_spl_ord_n = ord_end;
@@ -3418,7 +3764,7 @@ pub fn clause_expand_splice(m: i64) void {
     if (first_irr >= 0 and first_irr + 1 < ord_end) {
         var di2: i64 = first_irr + 1;
         while (di2 < ord_end) {
-            parse.fc_warn("T-CLA-W727",
+            parse.fc_warn("T-CLA-W000",
                 "子句被更早的无守卫不可反驳子句（通配 `_` 或裸绑定）完全遮蔽，已丢弃", g_spl_ord[di2]);
             di2 = di2 + 1;
         }
@@ -3478,14 +3824,14 @@ pub fn type_node_is_clause(t: i64) bool {
 pub fn clause_fn_body(fname: string, ph: i64, g: i64, rt: i64) i64 {
     var ps: []i64 = base.kids_chain(ph);
     if (slice_len(ps) != 1) {
-        parse.fc_err("T-CLA-E720",
+        parse.fc_err("T-CLA-E000",
             base.sb_cat3("函数化 `fn ", fname, "` 当前只支持单形参（多参的折叠语义未定）"), g);
         return -1;
     }
     var p0: i64 = ps[0];
     var pname: string = base.node_sa((p0 as u64));
     if (pname == "" or pname == "_" or base.node_nb((p0 as u64)) >= 0) {
-        parse.fc_err("T-CLA-E720",
+        parse.fc_err("T-CLA-E000",
             base.sb_cat3("函数化 `fn ", fname, "` 的形参 #0 必须是具名绑定（它要当 match 的 scrutinee）"), g);
         return -1;
     }
@@ -3785,7 +4131,7 @@ pub fn fc_err(code: string, msg: string, d: i64) void {
 }
 
 // 非致命形态告警：与 fc_err 同款定位，但级别为 warning（不中断编译）。
-// 供子句组排重这类「合法但大概率是笔误」的情形使用（T-CLA-W727）。
+// 供子句组排重这类「合法但大概率是笔误」的情形使用（T-CLA-W000）。
 pub fn fc_warn(code: string, msg: string, d: i64) void {
     var l: i64 = n_line(d);
     var c: i64 = n_col(d);
@@ -3832,7 +4178,7 @@ pub fn fc_body_expr(d: i64) i64 {
 }
 
 // 由第 idx 个参数位推定类型节点：优先取任一子句的显式 `name: type` 标注，
-// 否则由该位首个字面量模式推定；均无则返回 -1（报 T_FUNC_CLAUSE_NO_TYPE）。
+// 否则由该位首个字面量模式推定；均无则返回 -1（报 T-FUN-E002）。
 pub fn fc_param_type(idx: i64) i64 {
     var i: i64 = 0;
     while (i < g_fc_n) {
@@ -3871,7 +4217,7 @@ pub fn fc_param_name(idx: i64, gd: i64) string {
                     nm = base.node_sa((p as u64));
                 } else {
                     if (nm != base.node_sa((p as u64))) {
-                        fc_err("T-FUN-E810",
+                        fc_err("T-FUN-E000",
                             base.sb_cat4("function clause group '", base.node_sa((gd as u64)),
                                 "': parameter #", base.sb_cat3(base.i2s(idx), " binds different names ('",
                                 base.sb_cat4(nm, "' vs '", base.node_sa((p as u64)), "'); only parameter #0 may vary"))),
@@ -3929,7 +4275,7 @@ pub fn fc_merge() void {
     var i: i64 = 1;
     while (i < g_fc_n) {
         if (list_count(base.node_lb((g_fc_d[i] as u64))) != arity) {
-            fc_err("T-FUN-E811",
+            fc_err("T-FUN-E001",
                 base.sb_cat3("function clause group '", base.node_sa((gd as u64)), "': all clauses must have the same arity"),
                 g_fc_d[i]);
             return;
@@ -3937,7 +4283,7 @@ pub fn fc_merge() void {
         i = i + 1;
     }
     if (arity < 1) {
-        fc_err("T-FUN-E811",
+        fc_err("T-FUN-E001",
             base.sb_cat3("function clause group '", base.node_sa((gd as u64)), "': pattern clauses require at least one parameter"),
             gd);
         return;
@@ -3950,7 +4296,7 @@ pub fn fc_merge() void {
     while (idx < arity) {
         var ptn: i64 = fc_param_type(idx);
         if (ptn < 0) {
-            fc_err("T-FUN-E812",
+            fc_err("T-FUN-E002",
                 base.sb_cat4("function clause group '", base.node_sa((gd as u64)), "': cannot infer type of parameter #",
                     base.sb_cat2(base.i2s(idx), "; annotate it as 'name: Type' in one clause")),
                 gd);
@@ -3971,7 +4317,7 @@ pub fn fc_merge() void {
     var k: i64 = 1;
     while (k < g_fc_n) {
         if (fc_type_key(base.node_na((g_fc_d[k] as u64))) != fc_type_key(base.node_na((gd as u64)))) {
-            fc_err("T-FUN-E813",
+            fc_err("T-FUN-E003",
                 base.sb_cat3("function clause group '", base.node_sa((gd as u64)), "': all clauses must declare the same return type"),
                 g_fc_d[k]);
             return;
@@ -3999,7 +4345,7 @@ pub fn fc_merge() void {
             if ((pass == 0 and is_catch_all) or (pass == 1 and is_catch_all == false)) { c = c + 1; continue; }
             var be: i64 = fc_body_expr(cd);
             if (be < 0) {
-                fc_err("T-FUN-E814",
+                fc_err("T-FUN-E004",
                     base.sb_cat3("function clause group '", base.node_sa((gd as u64)),
                         "': clause body must be a single expression (it becomes a match arm)"),
                     cd);
@@ -4022,7 +4368,7 @@ pub fn fc_merge() void {
         pass = pass + 1;
     }
 
-    // 合成 match 承接首子句锚点：T_MATCH_NONEXHAUSTIVE 才能报出文件与行列
+    // 合成 match 承接首子句锚点：T-MAT-E002 才能报出文件与行列
     var scr: i64 = base.mk_ident("__p0", -1);
     base.node_set_span_id(scr, base.node_span_id(gd));
     base.node_set_span_id(scr, base.node_span_id(gd));
@@ -4058,12 +4404,12 @@ pub fn fc_merge_type() void {
         var cd: i64 = g_fc_d[k];
         var p0: i64 = fc_list_nth(base.node_lb((cd as u64)), 0);
         if (p0 < 0) {
-            fc_err("T-OVL-E981", base.sb_cat3("type-group '", base_name, "': 首参数缺失"), cd);
+            fc_err("T-OVL-E001", base.sb_cat3("type-group '", base_name, "': 首参数缺失"), cd);
             return;
         }
         var cname: string = fc_param_catname(p0);
         if (str_len(cname) == 0) {
-            fc_err("T-OVL-E981",
+            fc_err("T-OVL-E001",
                 base.sb_cat3("type-group '", base_name,
                     "': 每个子句首参数须带显式类型标注（如 `v: i64`），以便静态分派"), cd);
             return;
@@ -4102,7 +4448,7 @@ pub fn fc_merge_type() void {
     var ka: i64 = 1;
     while (ka < m) {
         if (list_count(base.node_lb((g_fc_d[ka] as u64))) != arity) {
-            fc_err("T-FUN-E811",
+            fc_err("T-FUN-E001",
                 base.sb_cat3("type-group '", base_name, "': all clauses must have the same arity"), g_fc_d[ka]);
             return;
         }
@@ -4112,7 +4458,7 @@ pub fn fc_merge_type() void {
     var kr: i64 = 1;
     while (kr < m) {
         if (fc_type_key(base.node_na((g_fc_d[kr] as u64))) != fc_type_key(base.node_na((g_fc_d[0] as u64)))) {
-            fc_err("T-FUN-E813",
+            fc_err("T-FUN-E003",
                 base.sb_cat3("type-group '", base_name, "': all clauses must declare the same return type"), g_fc_d[kr]);
             return;
         }
@@ -4178,7 +4524,7 @@ pub fn fc_merge_type() void {
 
 pub fn desugar_func_clauses() void {
     // overload（Route 1）：`extend` 必须引用本文件内已存在的
-    // `overload fn` 组（ia==1），否则报 T-OVL-E980。跨文件合并见 Route 2。
+    // `overload fn` 组（ia==1），否则报 T-OVL-E000。跨文件合并见 Route 2。
     var n: i64 = slice_len(lex.decl_list) as i64;
     var k: i64 = 0;
     while (k < n) {
@@ -4189,7 +4535,7 @@ pub fn desugar_func_clauses() void {
             // 随即丢失，事后扫 decl_list 找不到（实测踩坑）。
             // 「被扩展者归属」刻意不在此解析：模块加载发生在 desugar_imports（order 4），
             // 晚于本 pass（order 1），此刻对方模块的组尚未进 decl_list（故跨模块 extend 仍报
-            // T-OVL-E980）。归属留到 emit_deps（模块已加载完、且其组 decl 的 ia 仍为 1）再解析。
+            // T-OVL-E000）。归属留到 emit_deps（模块已加载完、且其组 decl 的 ia 仍为 1）再解析。
             append(lex.g_extend_name, base.node_sa((ek as u64)));
             append(lex.g_extend_file, base.base_no_tc(base.node_file((ek as u64))));
             var found: bool = false;
@@ -4200,7 +4546,7 @@ pub fn desugar_func_clauses() void {
                 m = m + 1;
             }
             if (found == false) {
-                fc_err("T-OVL-E980",
+                fc_err("T-OVL-E000",
                     base.sb_cat4("extend '", base.node_sa((ek as u64)),
                         "' has no matching 'overload fn ", base.sb_cat2(base.node_sa((ek as u64)), "' group in this file")),
                     ek);
@@ -4214,7 +4560,7 @@ pub fn desugar_func_clauses() void {
         // 分组守卫：仅「裸子句式」函数（ba==false）参与子句组合并；普通函数
         // （ba==true，如 `fn main() i64 { ... }`）与脱糖产物一律跳过。类型组判定
         // （fc_merge_type）额外要求 ia∈{1,2}（overload / extend），否则普通
-        // `fn` 裸子句组（即使全裸带类型）会误入 R3 类别格分派（见 T-OVL-E981）。
+        // `fn` 裸子句组（即使全裸带类型）会误入 R3 类别格分派（见 T-OVL-E001）。
         if (base.node_kind((d as u64)) == "FuncDecl" and base.node_ba((d as u64)) == false) {
             g_fc_n = 0;
             g_fc_d[0] = d;
@@ -4514,7 +4860,7 @@ pub fn parse_fstring(ti: i64) i64 {
             // `!` 前必须是一个「已完结的表达式」，否则那是前缀取反（如 `{!ok}`）
             if (cm1 == 33 and fstr_prev_ends_expr(body, exprEnd - 2)) {
                 if (fstr_is_conv(cm2) == false) {
-                    parse_fatal("f-string 转换字段只能是 `!s`/`!r`/`!a`/`!j`/`!c`/`!p`");
+                    parse_fatal("an f-string conversion field can only be `!s`/`!r`/`!a`/`!j`/`!c`/`!p`");
                 }
                 convc = cm2;
                 exprEnd = exprEnd - 2;
@@ -4628,7 +4974,7 @@ pub fn parse_conpat() i64 {
     // 限定形式 `Shape.Circle(r)`（cp_qual 非空）仍合法。前导点 `.Case` 由
     // leading_dot_to_conpat 接管，从不进入本分支，故此处只拦裸写。
     if (cp_qual == "" and tok_starts_upper(cp_name)) {
-        parse_fatal_at("T-MAT-E751",
+        parse_fatal_at("T-MAT-E011",
             "bare variant pattern `" + cp_name + "` is deprecated; use leading-dot form `." + cp_name + "`",
             cp_ti);
     }
@@ -4660,13 +5006,13 @@ pub fn parse_slice_pat() i64 {
     while (lex.cur_t() != "RBracket" and lex.cur_t() != "Eof") {
         if (sp_first == false) {
             if (lex.cur_t() == "Comma") { lex.advance_i(); }
-            else { parse_fatal_at("T-MAT-E750", "slice pattern: expected ',' or ']' between elements", lex.pos); }
+            else { parse_fatal_at("T-MAT-E010", "slice pattern: expected ',' or ']' between elements", lex.pos); }
         }
         sp_first = false;
         if (lex.cur_t() == "DotDot") {
             lex.advance_i();
             if (sp_rest >= 0) {
-                parse_fatal_at("T-MAT-E750", "slice pattern: at most one '..' is allowed", lex.pos);
+                parse_fatal_at("T-MAT-E010", "slice pattern: at most one '..' is allowed", lex.pos);
             }
             var rp: i64 = base.mk_rest(sp_ti);
             sp_tail = base.list_push(sp_head, sp_tail, rp);
@@ -4682,7 +5028,7 @@ pub fn parse_slice_pat() i64 {
         } else {
             var ep: i64 = parse_match_subpat();
             if (ep < 0) {
-                parse_fatal_at("T-MAT-E750", "slice pattern: '_' wildcard must not carry a binding", lex.pos);
+                parse_fatal_at("T-MAT-E010", "slice pattern: '_' wildcard must not carry a binding", lex.pos);
             }
             sp_tail = base.list_push(sp_head, sp_tail, ep);
             if (sp_head < 0) { sp_head = sp_tail; }
@@ -4815,7 +5161,7 @@ pub fn parse_if_stmt() i64 {
 // P1（everything-is-value）：值位置的 `if` 脱糖为 `match (c) { true => THEN, false => ELSE }`。
 // 动机：match 已是表达式且自带结果槽（__mres），而 if/Block 仍是 Statement；借道 match
 // 可让值 if 落地而**后端零改动** —— 正是设计 §2.9 姿势 A「desugar 在前、分后端在后」。
-// 前置：bool 穷尽性修复（true+false 两臂齐备即穷尽），否则会误报 T-MAT-E742。
+// 前置：bool 穷尽性修复（true+false 两臂齐备即穷尽），否则会误报 T-MAT-E002。
 // 限制：分支体须为**单一表达式**（Block 尚不是表达式，多语句分支待 P1 Stage 1 的 Block 取值）。
 // 块语句链表的**末条**语句；当且仅当它是 `expr` 语句时返回其节点 id，否则 -1。
 
@@ -4851,7 +5197,7 @@ pub fn parse_value_if() i64 {
         }
     }
     if (else_e < 0) {
-        parse_fatal("值位置的 `if` 必须有 `else` 分支（无值路径供值属 P3/P5，当前不支持）");
+        parse_fatal("an `if` in value position must have an `else` branch (valueless paths P3/P5 are not yet supported)");
     }
     var t_arm: i64 = base.mk_arm("", false, base.mk_bool(true, ti), -1, then_e, ti);
     var f_arm: i64 = base.mk_arm("", false, base.mk_bool(false, ti), -1, else_e, ti);
@@ -4949,7 +5295,7 @@ pub fn parse_statement() i64 {
     }
     if (tv == "pub") {
         // 局部作用域：pub 只能修饰顶层声明，不能修饰局部 var/let/const（M-Module）。
-        // 旧 `export` 关键字已删除，可见性统一用 `pub`；局部 pub 误用报 T-MOD-E556。
+        // 旧 `export` 关键字已删除，可见性统一用 `pub`；局部 pub 误用报 T-MOD-E006。
         lex.advance_i();   // 吃掉 pub
         var lt2: string = lex.cur_t();
         if (lt2 == "KwVar") {
@@ -4964,7 +5310,7 @@ pub fn parse_statement() i64 {
             return parse_local_let(true);
         }
         // pub 后不是 var/let/const：非法局部 pub，报错（吃掉该 token 避免级联）
-        parse_fatal_at("T-MOD-E556", "pub 只能修饰顶层声明，不能修饰局部/嵌套声明", lex.pos);
+        parse_fatal_at("T-MOD-E006", "`pub` can only modify a top-level declaration, not a local/nested declaration", lex.pos);
         return -1;
     }
     return parse_expr_or_assign_stmt();
@@ -5166,6 +5512,158 @@ pub fn parse_match_expr() i64 {
     return base.mk_match(mx_scrut, mx_head, mx_ti);
 }
 
+// ══════════════════════════════════════════════════════════════
+// fault B4b：`trap <e> { <臂> }` —— 故障消费（附录 E / A-33 / A-34）
+// ──────────────────────────────────────────────────────────────
+// 形态上与 `match (<e>) { <臂> }` 完全同构 ⇒ **复用 match / arm 节点**，不新增节点 kind
+//   ⇒ HIR 侧零改动（保住门禁「RAW 逃生舱合计 0」）。
+// 判别靠 match 节点的 **sc 侧表** == TRAP_MARK（sc 在 match 节点上无其他用途）。
+//
+// ⚠ A-20 说的是 trap 在**语义**上是错误专用关键词（不复用 match），不是词法关键字：
+//   `trap` / `resume` / `recover` 三者在 src/ lib/ examples/ tests/ 全仓 **0 命中**，
+//   故一律按「词文本 + 所在位置」识别，不动 lex 关键字表与 cstgen 节点清单。
+//
+// 臂文法（EBNF §4）：
+//   TrapArm:      ( PredPat | "_" ) "=>" ( ResumeExpr | RecoverExpr ) ","?
+//   ResumeExpr:   "resume"  "(" "." ident ")"      // `.abort` 亦走此形（A-21）
+//   RecoverExpr:  "recover" "(" Expr ")"
+// ══════════════════════════════════════════════════════════════
+
+pub fn trap_mark() string { return "__trap__"; }
+
+// 臂右端 `resume(.修法名)` / `recover(<expr>)`。
+// 二者都降为**普通 call 节点**（callee 是 ident("resume"/"recover")）：
+//   · 它们是**仅在 trap 臂内**合法的伪函数，sema 的 trap 脱糖会先把臂体摘出来再消解，
+//     绝不会走到 infer 的「调用函数 resume」路径 ⇒ 无需任何新节点。
+//   · 若用户真写了 `fn resume(...)`，那是他的函数，与本语法无关（A-35 的同款不冲突设计）。
+pub fn parse_trap_arm_body(ti_at: i64) i64 {
+    var kw: string = lex.cur_v();
+    lex.advance_i();                    // 消费 `resume` / `recover`
+    expect_tok("LParen");
+    var an: i64 = -1;
+    if (kw == "resume") {
+        if (lex.cur_t() == "Dot" and lex.peek_t(1) == "Identifier") {
+            lex.advance_i();                        // 消费 Dot
+            var ti_rn: i64 = lex.advance_i();       // 修法名
+            an = base.mk_member(lex.tk_v(ti_rn), -1, -1);
+            base.node_set_lb((an as u64), 1);       // 标记 leading-dot member（与 @clause(.repair, ...) 同形）
+            base.node_at(an, ti_rn);
+        } else {
+            parse_fatal_at("T-MAT-E020",
+                "`resume(...)` argument must be a `.repair_name` form (e.g. `resume(.use_default)`; upload is written as `resume(.abort)`)",
+                lex.pos);
+        }
+    } else {
+        an = parse_expr();
+    }
+    if (lex.cur_t() == "Comma") { lex.advance_i(); }   // 允许尾随逗号
+    expect_tok("RParen");
+    var ah: i64 = -1;
+    var at: i64 = -1;
+    at = base.list_push(ah, at, an);
+    if (ah < 0) { ah = at; }
+    return base.mk_call(base.mk_ident(kw, -1), ah, ti_at);
+}
+
+// 单条 trap 臂 ⇒ arm 节点（sa="" / ba=是否通配 / na=谓词(-1=通配) / nb=-1 / nc=臂体）
+pub fn parse_trap_arm() i64 {
+    var ta_ti: i64 = lex.pos;
+    var ta_pat: i64 = -1;
+    var ta_wild: bool = false;
+    // ⚠ 通配判定必须是 `Identifier + 词文本 "_"`，**不能**写 `lex.cur_t() == "_"`：
+    //   lexer **不产生** "_" 这个 token 类型（`_` 走标识符起始，is_ident_start 含 95）
+    //   ⇒ `cur_t() == "_"` 是恒假的死判据（与 `tip_is_flag()` 同款）。既有 parse.tc 里
+    //   939 / 5022 / 5328 / 5412 / 5433 等处仍留着这个形态，属历史遗留，勿照抄。
+    if (lex.cur_t() == "Identifier" and lex.cur_v() == "_") {
+        lex.advance_i();                        // 通配臂（A-21：右端只允许 resume(.abort)）
+        ta_pat = -1;
+        ta_wild = true;
+    } else {
+        var ta_sav: bool = g_in_match_pat;
+        g_in_match_pat = true;                  // 谓词位：让 parse_struct_lit 走谓词分支
+        ta_pat = parse_expr();
+        g_in_match_pat = ta_sav;
+        if (clause_pred_ok(ta_pat) == false) {
+            // ⚠ parse_fatal_at 收 **token 索引**，不是节点 id（实测传节点会被当 token 定位到
+            //   完全无关的源码位置，误导排查）。
+            parse_fatal_at("T-MAT-E019",
+                "a trap arm's predicate must be of the form `.{ .field <op> value, ... }` (op is one of `<` `>` `<=` `>=` `==` `!=`)",
+                ta_ti);
+        }
+    }
+    expect_tok("FatArrow");
+    var ta_body: i64 = -1;
+    if (lex.cur_t() == "Identifier" and (lex.cur_v() == "resume" or lex.cur_v() == "recover")
+        and lex.peek_t(1) == "LParen") {
+        ta_body = parse_trap_arm_body(ta_ti);
+    } else {
+        parse_fatal_at("T-MAT-E021",
+            "a trap arm's right side must be `resume(.repair_name)` or `recover(<expr>)`", lex.pos);
+    }
+    // 臂分隔符：逗号（match 惯例）与分号（与组声明 `.{...} -> ... repairs {...};` 同形）都收。
+    if (lex.cur_t() == "Comma" or lex.cur_t() == "Semicolon") { lex.advance_i(); }
+    return base.mk_arm("", ta_wild, ta_pat, -1, ta_body, ta_ti);
+}
+
+// 选项 A：paren-aware 前瞻，决定主表达式位的 `trap` 是关键词还是用户标识符。
+// 调用约定：cur token 恰为 `trap`（Identifier）。
+//   关键词读法 = `trap <expr> { <臂> }`，必须能在 scrutinee 之后见到 `{`；
+//   标识符读法 = 调用 `trap(...)` 或裸引用 `trap`。
+// 判定：
+//   · 紧跟 `(` ⇒ 跨过**平衡**括号组；组后首个顶层（depth==0）token 是 `{` ⇒ 关键词，否则调用。
+//     （正确处理 `trap (e) { }` 括号 scrutinee 与 `trap(5)` 调用；嵌套 `(a+(b*c))` 亦平衡。）
+//   · 紧跟终结符（`;` `,` `)` `]` `}` EOF）⇒ `var x = trap;` / `foo(trap)` ⇒ 标识符。
+//   · 其余（标识符 / 字面量 / 可起表达式者）⇒ 关键词读法。
+// ⚠ 不处理「运算符前缀 scrutinee」（`trap *p { }` vs `var x = trap * 2`）这种病态二义——
+//   二者任一方向都只会清晰报错而非静默错编，且 fault 实代码 scrutinee 恒为调用 / 名字 / 括号。
+pub fn trap_is_keyword_form() bool {
+    var nxt: string = lex.peek_t(1);
+    if (nxt == "LParen") {            // ⚠ token 类型是命名串（"LParen"），不是字面 "("（同文件 expect_tok("LParen")）
+        var depth: i64 = 0;
+        var i: i64 = 1;
+        while (true) {
+            var tk: string = lex.peek_t(i);
+            if (tk == "Eof") { return false; }
+            if (tk == "LParen") { depth = depth + 1; }
+            else if (tk == "RParen") {
+                depth = depth - 1;
+                if (depth < 0) { return false; }
+            }
+            else if (depth == 0) {
+                // 括号组已闭合，下一个顶层 token 决定读法
+                return tk == "LBrace";
+            }
+            i = i + 1;
+            if (i > 8192) { return false; }   // 防爆：异常深嵌套视为非关键词
+        }
+    }
+    // 紧跟终结符 ⇒ `var x = trap;` / `foo(trap)` / 表达式末尾 ⇒ 标识符（裸引用 / 运算元）
+    if (nxt == "Semicolon" or nxt == "Comma" or nxt == "RParen" or nxt == "RBracket" or nxt == "RBrace" or nxt == "Eof") {
+        return false;
+    }
+    return true;                    // 其余（标识符 / 字面量 / 可起表达式者）⇒ 关键词读法
+}
+
+pub fn parse_trap_expr() i64 {
+    var tp_ti: i64 = lex.advance_i();           // 消费 `trap`
+    var tp_scrut: i64 = parse_expr();           // 被 trap 的表达式（在 `{` 处自然停手）
+    expect_tok("LBrace");
+    var tp_head: i64 = -1;
+    var tp_tail: i64 = -1;
+    while (lex.cur_t() != "RBrace" and lex.cur_t() != "Eof") {
+        var tp_a: i64 = parse_trap_arm();
+        // ⚠ 臂链的 head/tail 是 **kids 池 entry 索引**（list_push 的返回值），不是节点 id
+        //   （实测：直接拿节点 id 当链元会写坏链表 → t_slice_at 越界）。
+        var tp_e: i64 = base.list_push(tp_head, tp_tail, tp_a);
+        if (tp_head < 0) { tp_head = tp_e; }
+        tp_tail = tp_e;
+    }
+    expect_tok("RBrace");
+    var tp_m: i64 = base.mk_match(tp_scrut, tp_head, tp_ti);
+    base.node_set_sc((tp_m as u64), trap_mark());
+    return tp_m;
+}
+
 pub fn parse_primary() i64 {
     var t: string = lex.cur_t();
     // M-meta Phase D：编译期内建 `@name(...)`。`@` 在**表达式起始位**此前空闲
@@ -5182,6 +5680,13 @@ pub fn parse_primary() i64 {
         var ti_meta: i64 = lex.advance_i();
         var inner: i64 = parse_expr();
         return base.mk_comptime(inner, ti_meta);
+    }
+    // fault B4b：故障消费 `trap <e> { <臂> }`（附录 E / A-33）。
+    // ⚠ `trap` **不进 lex 关键字表**（A-20）：按「Identifier + 词文本 == "trap" + 前瞻判定」识别。
+    //   主表达式位与用户标识符碰撞（`fn trap(...)` / `var x = trap`），故用 paren-aware 前瞻区分：
+    //   关键词读法要求 scrutinee 之后必须跟 `{`，否则是调用 / 裸引用。
+    if (t == "Identifier" and lex.cur_v() == "trap" and trap_is_keyword_form()) {
+        return parse_trap_expr();
     }
     // Erlang 式原子字面量：`:name` → atom 节点（表达式位置的 `:` 此前未使用）
     if (t == "Colon") {
@@ -5279,7 +5784,7 @@ pub fn parse_primary() i64 {
     if (t == "Identifier") {
         // 内建文件描述符常量（M51）：stdin/stdout/stderr 在**表达式位置**直接降为
         // fidconst 节点（值 0/1/2），与 atom 同为编译期常量、零运行时查找。
-        // 声明位置的同名标识符由 sym_define 的保留名检查拦截（T_FID_RESERVED_NAME）。
+        // 声明位置的同名标识符由 sym_define 的保留名检查拦截（T-FID-E000）。
         var fcv: i64 = lex.fid_const_of(lex.cur_v());
         if (fcv >= 0) {
             var ti_Fid: i64 = lex.advance_i();
@@ -5520,7 +6025,9 @@ pub fn parse_cmp() i64 {
         // 由 deser_type_of 在 check 期把 ident 节点重解释为类型。
         var right: i64 = -1;
         if (op == ">" and tok_type_only(lex.cur_t())) {
-            right = parse_type();
+            // ⚠ 与 `as T` 同形的第二个表达式内部类型位：`x > A && B` 若开放合取会被读成
+            // 「反序列化到类型 A && B」，而用户几乎总是想写 `(x > A) && B`。故此处同样传 false。
+            right = parse_type_ex(false);
         } else {
             right = parse_shift();
         }
@@ -5580,9 +6087,13 @@ pub fn parse_bitor() i64 {
 
 pub fn parse_and() i64 {
     var left: i64 = parse_bitor();
-    // §set-ops step1：布尔运算符同时支持 `&&`(And) 与 `and`(KwAnd)，二者同义，均产出 "and"。
-    // 值级 `&&` 不再作为集合交集（集合运算留待第二步），避免与 bool 重叠。
-    while (lex.cur_t() == "And" or lex.cur_t() == "KwAnd") {
+    // §set-ops §13.3：`&&` 已从语言中**移除** —— 格族统一为 `&`（集合交 / 位与），
+    // 布尔逻辑只剩关键字 `and`。这里显式报错而不是让它落进上层当普通语法错
+    // （那样只会得到「期待 X，实际读到 &&」，看不出该换成什么）。
+    if (lex.cur_t() == "And") {
+        parse_fatal("`&&` has been removed from the language: write `&` for set intersection / bitwise-and, and `and` for boolean logic");
+    }
+    while (lex.cur_t() == "KwAnd") {
         var op: string = "and";
         var ti: i64 = lex.advance_i();
         var right: i64 = parse_bitor();
@@ -5593,8 +6104,13 @@ pub fn parse_and() i64 {
 
 pub fn parse_or() i64 {
     var left: i64 = parse_and();
-    // §set-ops step1：布尔运算符同时支持 `||`(Or) 与 `or`(KwOr)，二者同义，均产出 "or"。
-    while (lex.cur_t() == "Or" or lex.cur_t() == "KwOr") {
+    // §set-ops §13.3：`||` 已从语言中**移除** —— 格族统一为 `|`（集合并 / 位或），
+    // 布尔逻辑只剩关键字 `or`。同 `&&`：显式报错以便指出该换成什么。
+    // ⚠ `|`(BitOr) 仍是闭包起始与 match 臂分隔符，它只在**中缀位**才是二元或，不受此影响。
+    if (lex.cur_t() == "Or") {
+        parse_fatal("`||` has been removed from the language: write `|` for set union / bitwise-or, and `or` for boolean logic");
+    }
+    while (lex.cur_t() == "KwOr") {
         var op: string = "or";
         var ti: i64 = lex.advance_i();
         var right: i64 = parse_and();
@@ -5788,7 +6304,7 @@ pub fn parse_struct_decl(name: string, anns: i64, layout: string) i64 {
             // 方言统一（Stage 2）：`mname fn(...)` 结构体方法旧文法已废弃，统一为 `fn mname(...)`。
             // 转换器已把整树结构体方法迁到 `fn mname`，此处直接报迁移错误而非误当成字段解析。
             var mname: string = expect_tok("Identifier");
-            parse_fatal_at("T-PAR-E102", base.sb_cat6("method `", mname, " fn(...)` removed; use `fn ", mname, "(...)` (struct ", base.sb_cat2(name, ")")), lex.pos);
+            parse_fatal_at("T-PAR-E002", base.sb_cat6("method `", mname, " fn(...)` removed; use `fn ", mname, "(...)` (struct ", base.sb_cat2(name, ")")), lex.pos);
         } else if (lex.cur_t() == "Identifier" and lex.peek_t(1) == "Colon") {
             // 具名字段：`name: Type;`（沿用既有 parse_sfield）
             var __it: i64 = parse_sfield();
@@ -5925,8 +6441,8 @@ pub fn parse_variant_decl(name: string, anns: i64) i64 {
             else if (lex.cur_t() == "Semicolon") { lex.advance_i(); }
             // 只允许出现在末位：其后必须收尾。
             if (lex.cur_t() != "RBrace") {
-                parse_fatal_at("T-PAR-E103",
-                    "variant 的抽象标记 `_` 只能位于末位（其后不得再有 case）", lex.pos);
+                parse_fatal_at("T-PAR-E003",
+                    "a variant's abstract marker `_` may only appear in the last position (no case may follow it)", lex.pos);
             }
         } else {
         var __it: i64 = parse_case(ci);
@@ -6043,11 +6559,24 @@ pub fn n_line(ni: i64) i64 {
 // 追加成员即可，`@clause` 的语法与展开通通不变（设计 §5.1.1）。
 pub fn clause_kind_member(k: string) bool {
     if (k == "pattern") { return true; }
+    // fault B3（附录 B M1）：故障子句与修复子句。`@clause` 的语法与展开通通不变，
+    // 只是多两个类别成员 —— 但二者**不是** match 臂，见 clause_expand_splice 的 E731 把关。
+    if (k == "fault") { return true; }
+    if (k == "repair") { return true; }
     return false;
 }
 
+// ⚠ 报错文案纪律：这里列的每个名字都必须是 `clause_kind_member` 里**真实存在**的成员
+//   （T-CLA-E001 的文案直接读本表的返回值）。
 pub fn clause_kind_list() string {
-    return ".pattern";
+    return ".pattern / .fault / .repair";
+}
+
+// 类别是否属于「故障族」（编译期登记，不参与 match 臂展开）。
+pub fn clause_kind_is_fault(k: string) bool {
+    if (k == "fault") { return true; }
+    if (k == "repair") { return true; }
+    return false;
 }
 
 // 调用点已确认内建名 == "clause"，当前 token 是 '('。
@@ -6057,29 +6586,60 @@ pub fn parse_clause_lit(ti_at: i64) i64 {
     expect_tok("Dot");
     var km: string = expect_tok("Identifier");
     if (clause_kind_member(km) == false) {
-        parse_fatal_at("T-CLA-E721",
-            base.sb_cat5("未知子句类别 `.", km, "`；当前合法值仅 ", clause_kind_list(), "（ClauseKind 合成枚举成员）"),
+        parse_fatal_at("T-CLA-E001",
+            base.sb_cat5("unknown clause kind `.", km, "`；当前合法值仅 ", clause_kind_list(), "（ClauseKind 合成枚举成员）"),
             ti_k);
     }
     expect_tok("Comma");
-    // ── pattern 位：`_` 通配站位（不绑定，L-02）或普通表达式 ──
+    // ── 第二段：按类别分派（fault B3 / 附录 B M2~M4）─────────────────────
+    //   .pattern : `_` 通配站位（不绑定，L-02）或普通表达式（既有）
+    //   .fault   : 谓词 `.{ .f <op> v }` —— 必须置 g_in_match_pat 才会走谓词分支
+    //   .repair  : 修法名 `.name` —— 前导点成员，与 `.Red` 同形
     var pn: i64 = -1;
-    if (lex.cur_t() == "_") {
+    if (km == "fault") {
+        var sav_pat: bool = g_in_match_pat;
+        g_in_match_pat = true;                  // 谓词位：让 parse_struct_lit 走谓词分支
+        pn = parse_expr();
+        g_in_match_pat = sav_pat;
+        if (clause_pred_ok(pn) == false) {
+            parse_fatal_at("T-CLA-E009",
+                "the predicate in `@clause(.fault, ...)` must be `.{ .field = value }` or `.{ .field <op> value }` (op is one of `<` `>` `<=` `>=` `==` `!=`)",
+                pn);
+        }
+    } else if (km == "repair") {
+        if (lex.cur_t() == "Dot" and lex.peek_t(1) == "Identifier") {
+            lex.advance_i();                            // 消费 Dot
+            var ti_rn: i64 = lex.advance_i();           // 修法名
+            pn = base.mk_member(lex.tk_v(ti_rn), -1, -1);
+            base.node_set_lb((pn as u64), 1);           // 标记 leading-dot member
+            base.node_at(pn, ti_rn);
+        } else {
+            parse_fatal_at("T-CLA-E008",
+                "the second argument of `@clause(.repair, ...)` must be a `.repair_name` form (e.g. `.use_default`)", lex.pos);
+            pn = -1;
+        }
+    } else if (lex.cur_t() == "_") {
         lex.advance_i();
         pn = base.mk_ident("_", -1);
     } else {
         pn = parse_expr();
     }
-    // 缺 body 位须在期待逗号**之前**判，否则会先撞上通用的 T-PAR-E101 而报不到 E720。
+    // 缺 body 位须在期待逗号**之前**判，否则会先撞上通用的 T-PAR-E001 而报不到 E720。
     if (lex.cur_t() == "RParen") {
-        parse_fatal_at("T-CLA-E720",
-            "@clause 字面量缺 body 位；合法形态 `@clause(.pattern, <pat>, [when <guard>,] <body>)`",
+        parse_fatal_at("T-CLA-E000",
+            "`@clause` literal is missing the body argument; valid form is `@clause(.pattern, <pat>, [when <guard>,] <body>)`",
             ti_at);
     }
     expect_tok("Comma");
     // ── 可选守卫段：`when <expr>`，其后须再跟一个逗号与 body ──
+    // ⚠ 故障族子句**不接受守卫**：它们是编译期登记（`谓词 → 全名` / `修法名 → 闭包`），
+    //   没有「匹配失败则继续找下一条」的语义，守卫对它毫无意义（附录 B M2）。
     var gn: i64 = -1;
     if (lex.cur_t() == "KwWhen") {
+        if (clause_kind_is_fault(km)) {
+            parse_fatal_at("T-CLA-E007",
+                base.sb_cat3("`@clause(.", km, ", ...)` does not accept a `when` guard: it is a compile-time registration, not a match arm"), lex.pos);
+        }
         lex.advance_i();
         gn = parse_expr();
         expect_tok("Comma");
@@ -6108,7 +6668,7 @@ pub fn parse_meta_builtin() i64 {
             or lex.cur_t() == "KwAs") {
         nm = lex.tk_v(lex.advance_i());
     } else {
-        parse_fatal(base.sb_cat2("语法错误：@ 后须接内建名，实际读到 ", lex.cur_v()));
+        parse_fatal(base.sb_cat2("syntax error: `@` must be followed by a builtin name, but found ", lex.cur_v()));
         return -1;
     }
     // 一等子句字面量 `@clause(...)`：参数位一律不求值（AST 位置），故在消耗 '(' 之前

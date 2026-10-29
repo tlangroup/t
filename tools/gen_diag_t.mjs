@@ -5,7 +5,7 @@
 // 与 src/diag_table.gen.h 同源（都由 gen_diag.mjs / 本脚本从同一 JSON 生成）。
 //
 // 生成的代码提供：
-//   - 平行数组 g_dcode / g_dsev / g_dcat / g_dname / g_dlegacy / g_dnote（机器码主表）
+//   - 平行数组 g_dcode / g_dsev / g_dcat / g_dname / g_dlegacy / g_dnote / g_dmsg（机器码主表）
 //   - legacy 别名表 g_leg_name / g_leg_idx（旧语义名 -> 机器码下标）
 //   - g_dcount / g_legcount 长度常量（编译期已知，供消费者免 slice_len 遍历）
 //   - diag_ensure()   保留为空函数（静态定长数组已编译期初始化，维持调用点兼容）
@@ -36,7 +36,7 @@ const defs = [...raw.defs].sort((a, b) => a.code.localeCompare(b.code));
 const esc = (s) => JSON.stringify(s == null ? '' : String(s));
 
 // 预计算各列（定长，编译期已知）
-const codeArr = [], sevArr = [], catArr = [], nameArr = [], legArr = [], noteArr = [];
+const codeArr = [], sevArr = [], catArr = [], nameArr = [], legArr = [], noteArr = [], helpArr = [], msgArr = [];
 const legNameArr = [], legIdxArr = [];
 defs.forEach((d, i) => {
   codeArr.push(esc(d.code));
@@ -45,6 +45,8 @@ defs.forEach((d, i) => {
   nameArr.push(esc(d.name));
   legArr.push(esc(d.legacy == null ? '' : d.legacy));
   noteArr.push(esc(d.note == null ? '' : d.note));
+  helpArr.push(esc(d.help == null ? '' : d.help));
+  msgArr.push(esc(d.message == null ? '' : d.message));
   if (d.legacy != null) { legNameArr.push(esc(d.legacy)); legIdxArr.push(String(i)); }
 });
 const N = codeArr.length;
@@ -66,6 +68,8 @@ lines.push('var g_dcat: [' + N + ']string = [' + catArr.join(', ') + '];');
 lines.push('var g_dname: [' + N + ']string = [' + nameArr.join(', ') + '];');
 lines.push('var g_dlegacy: [' + N + ']string = [' + legArr.join(', ') + '];');
 lines.push('var g_dnote: [' + N + ']string = [' + noteArr.join(', ') + '];');
+lines.push('var g_dhelp: [' + N + ']string = [' + helpArr.join(', ') + '];');
+lines.push('var g_dmsg: [' + N + ']string = [' + msgArr.join(', ') + '];');
 lines.push('var g_leg_name: [' + M + ']string = [' + legNameArr.join(', ') + '];');
 lines.push('var g_leg_idx: [' + M + ']i64 = [' + legIdxArr.join(', ') + '];');
 lines.push('');

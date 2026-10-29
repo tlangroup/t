@@ -1,0 +1,46 @@
+// EXPECT: pass
+// B5a：带 `resume(.abort)` 的 `trap` 要求所在函数能承载载体 ——
+// 推导使其成立 ⇒ 不必手写 `fault(UserErr)!User`（此前必报 T-MAT-E026）。
+
+struct User {
+    age: i64;
+    name: string;
+}
+
+fault UserErr over User {
+    .{ .age < 0 }   -> UserErr.AgeNegative repairs { .use_default, .clamp };
+    .{ .name = "" } -> UserErr.NameEmpty    repairs { .anon };
+}
+
+fn validate(u : User) fault(UserErr)!User {
+    if (u.age < 0) {
+        return Err(
+            @clause(.fault, .{ .age < 0 }, UserErr.AgeNegative)
+         ++ @clause(.repair, .use_default, fn () User { return User{ .age = 18i64, .name = u.name }; })
+         ++ @clause(.repair, .clamp,       fn () User { return User{ .age = 0i64,  .name = u.name }; })
+        );
+    }
+    if (u.name == "") {
+        return Err(
+            @clause(.fault, .{ .name = "" }, UserErr.NameEmpty)
+         ++ @clause(.repair, .anon, fn () User { return User{ .age = u.age, .name = "anon" }; })
+        );
+    }
+    return Ok(u);
+}
+
+fn only_age(u : User) User {
+    return trap validate(u) {
+        .{ .age < 0 } => resume(.clamp);
+        _            => resume(.abort);
+    };
+}
+
+fn main_fn() i32 @main {
+    var x : User = trap only_age(User{ .age = 3i64, .name = "" }) {
+        .{ .age < 0 }   => resume(.clamp);
+        .{ .name = "" } => resume(.anon);
+    };
+    println(i2s(x.age));
+    return 0;
+}

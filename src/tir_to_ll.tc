@@ -333,7 +333,11 @@ pub fn ll_flush_clo_thunks() void {
             sb_append_str(g_clo_constbuf, sym);
             sb_append_str(g_clo_constbuf, "(ptr sret(");
             sb_append_str(g_clo_constbuf, llname.st_to_ll(retst));
-            sb_append_str(g_clo_constbuf, ") %__sret, ptr %__env");
+            // ⚠ 原函数**没有 env 首参**（有 env 的已在 ll_emit_closure_const 里
+            //   提前返回、根本不生成 thunk）⇒ 转发时必须**丢掉** %__env，否则
+            //   它会被当成第一个实参塞进去（聚合返回 ⇒ 实参整体错位，实测
+            //   `var f: fn(i64) P = mkp; f(1i64)` 的 v 收到 env(null=0) 而非 1）。
+            sb_append_str(g_clo_constbuf, ") %__sret");
             if (str_len(argstr) > 0) { sb_append_str(g_clo_constbuf, ", "); sb_append_str(g_clo_constbuf, argstr); }
             sb_append_str(g_clo_constbuf, ")\n");
             sb_append_str(g_clo_constbuf, "  ret void\n}\n");
@@ -3372,7 +3376,7 @@ pub fn ll_emit_inst(inst: TIRInst) void {
         // 会先把元素值 load 出来、物化成临时副本再取址 —— 于是 `s[i].f = v` 只改了副本，
         // 且没有 slice_set 写回 → 写入静默丢失。这是 LLVM 后端编译编译器自身失败的
         // 根因：`nodes[d].bc = true` 从不生效 → 跨模块 pub 判定恒假 → src/tc.tc 报
-        // 17956 条 T-MOD-E558。判据见 examples/_slicefield.tc（写入失效返回 1）。
+        // 17956 条 T-MOD-E008。判据见 examples/_slicefield.tc（写入失效返回 1）。
         var xst0: string = llname.ll_get_st(x);
         // ⚠ 只在「取聚合字段」时直传指针（st 为 `%` 结构体/TStr/TSlice）。
         // 无条件放行会误伤 map：map 句柄槽登记类型也是 ptr，对其取址期望的是
@@ -3775,7 +3779,7 @@ pub fn ll_emit_inst(inst: TIRInst) void {
             // 行为错乱（实测：类型定义区整段消失、alloca arr<%TStr x 0>）。
             // 此处按位宽双向适配：宽→窄 trunc，窄→宽 zext/sext。
             // ⚠ 刻意不用辅助函数：全由 `if (形参==字面量) { return 字面量; }` 构成的函数体
-            //   会被解析器当作 match 子句组（T-FUN-E814），故就地展开。
+            //   会被解析器当作 match 子句组（T-FUN-E004），故就地展开。
             var fit_i: i64 = ki - 1;
             if (fit_i < slice_len(callee_params) as i64) {
                 var fit_decl: string = callee_params[fit_i];
@@ -4604,6 +4608,28 @@ pub fn ll_emit_inst(inst: TIRInst) void {
             sb_append_str(g_ll, resT); sb_append_str(g_ll, ", ptr "); sb_append_str(g_ll, og); sb_append_str(g_ll, "\n");
             iiT = iiT + 1;
         }
+        return;
+    }
+    // §set-ops Step 2：bitstr 集合交 / 并 —— 聚合值不能走 `and` / `or` 指令（此前实测
+    // 产出非法 IR `and %TBitStr`），改为调用运行库（sret 末位 out 参，与 tll_bitstr_concat 同构）。
+    if (st == "%TBitStr" or st == "TBitStr") {
+        var setfn: string = "tll_bitstr_and";
+        if (o == tir__TIR_OP_OR) { setfn = "tll_bitstr_or"; }
+        // ⚠ 一律用规范形式 "%TBitStr" 登记槽类型：后续「结果槽 → 变量槽」的拷贝按
+        // ll_get_st 取型，若登记成无 % 的形式会解析出空类型（实测 `load , ptr` 非法 IR）。
+        var bst: string = "%TBitStr";
+        ll_ensure_slot(d, bst);
+        llname.ll_set_st(d, bst);
+        ll_maybe_declare(setfn, "void", ["ptr", "ptr", "ptr"]);
+        sb_append_str(g_ll, "  call void @");
+        sb_append_str(g_ll, setfn);
+        sb_append_str(g_ll, "(ptr ");
+        sb_append_str(g_ll, llname.ll_llname(a));
+        sb_append_str(g_ll, ", ptr ");
+        sb_append_str(g_ll, llname.ll_llname(b));
+        sb_append_str(g_ll, ", ptr ");
+        sb_append_str(g_ll, llname.ll_llname(d));
+        sb_append_str(g_ll, ")\n");
         return;
     }
     var da: string = ll_load_coerce(a, tir.tir_st_to_str(inst.args[0].st), st);

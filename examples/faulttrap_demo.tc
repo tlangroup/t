@@ -1,0 +1,168 @@
+// 故障消费侧：`trap` / `resume` / `recover` / `.abort`（fault 批次 B4b / 附录 E）
+//
+// 本例钉住 **A-33 + A-34 + A-21 + A-19 + A-22**：
+//   A-33：`trap` 脱糖为「`var __tfv = <e>;` + 按 tag 的 if 链（每支 return）」，
+//         **不是**单个 match —— .abort 臂的值是 `fault(E)!T`、其余臂是 `T`，match 要求同型（F-4）。
+//   A-34：`trap` 只开 `return trap <e> {…};` 与 `var x : T = trap <e> {…};` 两个位置。
+//         位置① 允许 `.abort`（有它时不要求穷尽），位置② 禁止 `.abort` 且**必须**穷尽。
+//   A-21：通配臂 `_` 的右端只允许 `resume(.abort)`（A-15 因此是结构性的，不靠 lint）。
+//   A-19：`.abort` 的唯一语义 = 把载体原样上传给调用者。
+//   A-22：谓词 v1 无简写，须与组内声明逐字对应（组声明 / raise / trap 臂三处恒等）。
+//   A-35：脱糖产物里的 `Ok(<修复值>)` 复用 B4a 的 raise 侧，由 sema 就地改写成 `__fault_<E>` 载体。
+//
+// ⚠ 这是**运行期** golden：conformance 只做 `tc check`、从不运行程序 ⇒
+//   「tag 与槽位真的按组声明算对了」只能靠本例 + 双后端对拍证明。
+//
+// ⚠ 一律「先把闭包调用结果存进局部变量再读字段」，不写 `f().name` —— 既有缺口 G-5：
+//   从闭包调用结果**直接**读 string 字段会打出空串且程序随后停住（与 fault 无关）。
+
+struct User {
+    age: i64;
+    name: string;
+}
+
+fault UserErr over User {
+    .{ .age < 0 }   -> UserErr.AgeNegative repairs { .use_default, .clamp };
+    .{ .name = "" } -> UserErr.NameEmpty    repairs { .anon };
+}
+
+fn validate(u : User) fault(UserErr)!User {
+    if (u.age < 0) {
+        return Err(
+            @clause(.fault, .{ .age < 0 }, UserErr.AgeNegative)
+         ++ @clause(.repair, .use_default, fn () User { return User{ .age = 18i64, .name = u.name }; })
+         ++ @clause(.repair, .clamp,       fn () User { return User{ .age = 0i64,  .name = u.name }; })
+        );
+    }
+    if (u.name == "") {
+        return Err(
+            @clause(.fault, .{ .name = "" }, UserErr.NameEmpty)
+         ++ @clause(.repair, .anon, fn () User { return User{ .age = u.age, .name = "anon" }; })
+        );
+    }
+    return Ok(u);
+}
+
+// ── 位置①：`return trap <e> {…};` ──────────────────────────────
+// 无 `.abort` ⇒ 必须穷尽组内全部成员 ⇒ 结果已无故障可传，函数签名就是 `T`。
+
+// 全部成员借组内的 repair 修好
+fn repair_all(u : User) User {
+    return trap validate(u) {
+        .{ .age < 0 }   => resume(.clamp);
+        .{ .name = "" } => resume(.anon);
+    };
+}
+
+// `recover(<expr>)` 不借组内 repair，就地给值（脱糖就是 `return <expr>;`，不合成闭包）
+fn repair_rec(u : User) User {
+    return trap validate(u) {
+        .{ .age < 0 }   => recover(User{ .age = 99i64, .name = u.name });
+        .{ .name = "" } => resume(.anon);
+    };
+}
+
+// 有 `.abort` ⇒ 未落臂的成员原样上传 ⇒ 函数签名必须是 `fault(UserErr)!User`；
+// 已落臂的成员修好后要装进 tag=0 的载体（`Ok(v)`）才能与上传臂同型。
+fn pass_clamp(u : User) fault(UserErr)!User {
+    return trap validate(u) {
+        .{ .age < 0 } => resume(.clamp);
+        _             => resume(.abort);
+    };
+}
+
+// ── 跨函数链路：`.abort` 上传 ⇒ 调用者的 `trap` 再消费（A-19 的核心承诺）──────
+// 内层只修 age<0，其余**原样上传**；外层拿到的是同一个 `__fault_<E>` 载体，
+// 于是整条链**不需要 unwind / continuation**（代价低的根因：M48 闭包按值捕获 ⇒ 自包含）。
+
+fn inner(u : User) fault(UserErr)!User {
+    return trap validate(u) {
+        .{ .age < 0 } => resume(.clamp);
+        _             => resume(.abort);
+    };
+}
+
+fn outer(u : User) User {
+    return trap inner(u) {
+        .{ .age < 0 }   => resume(.use_default);
+        .{ .name = "" } => resume(.anon);
+    };
+}
+
+// 三层 + `recover`：验证链式可叠加，且 recover 与 resume 可混用
+fn outer2(u : User) User {
+    return trap inner(u) {
+        .{ .age < 0 }   => recover(User{ .age = 42i64, .name = "rec" });
+        .{ .name = "" } => resume(.anon);
+    };
+}
+
+fn main_fn() i32 @main {
+    // ① 位置②：`var x : T = trap <e> {…};`（禁止 `.abort`、必须穷尽）
+    var v1 : User = trap validate(User{ .age = -5i64, .name = "bob" }) {
+        .{ .age < 0 }   => resume(.clamp);
+        .{ .name = "" } => resume(.anon);
+    };
+    println(i2s(v1.age));            // 0（.clamp）
+    println(v1.name);                // bob
+
+    // ② 位置② + `recover`
+    var v2 : User = trap validate(User{ .age = -5i64, .name = "bob" }) {
+        .{ .age < 0 }   => recover(User{ .age = 77i64, .name = "fixed" });
+        .{ .name = "" } => resume(.anon);
+    };
+    println(i2s(v2.age));            // 77
+    println(v2.name);                // fixed
+
+    // ③ 位置① 全修路径（clamp / anon / 直通）
+    var a1 : User = repair_all(User{ .age = -5i64, .name = "bob" });
+    println(i2s(a1.age));
+    println(a1.name);
+
+    var a2 : User = repair_all(User{ .age = 3i64, .name = "" });
+    println(i2s(a2.age));
+    println(a2.name);
+
+    var a3 : User = repair_all(User{ .age = 7i64, .name = "amy" });
+    println(i2s(a3.age));
+    println(a3.name);
+
+    // ④ 位置① 的 recover 路径
+    var b1 : User = repair_rec(User{ .age = -5i64, .name = "bob" });
+    println(i2s(b1.age));
+    println(b1.name);
+
+    // ⑤ 位置① 的 `.abort` 路径：clamp 落到成员 0 ⇒ 修好后 tag = 0
+    var c1 : fault(UserErr)!User = pass_clamp(User{ .age = -5i64, .name = "bob" });
+    println(i2s(c1.tag));
+    var c2 : User = c1.val;
+    println(i2s(c2.age));            // 0（.clamp 已把 age 修成 0）
+
+    // ⑥ 未落臂的成员（NameEmpty）原样上传 ⇒ tag = 2，槽位仍是组内绝对槽位 2
+    var d1 : fault(UserErr)!User = pass_clamp(User{ .age = 3i64, .name = "" });
+    println(i2s(d1.tag));
+    var d2 : User = d1.r2();
+    println(i2s(d2.age));            // 3
+    println(d2.name);                // anon
+
+    // ⑦ 跨函数：内层修好 ⇒ 外层收到 tag 0 ⇒ 直接取 val
+    var e1 : User = outer(User{ .age = -5i64, .name = "bob" });
+    println(i2s(e1.age));            // 0（inner 的 .clamp）
+    println(e1.name);                // bob
+
+    // ⑧ 跨函数：内层上传 NameEmpty ⇒ 外层修
+    var f1 : User = outer(User{ .age = 3i64, .name = "" });
+    println(i2s(f1.age));            // 3
+    println(f1.name);                // anon
+
+    // ⑨ 三层 + recover
+    var g1 : User = outer2(User{ .age = 3i64, .name = "" });
+    println(i2s(g1.age));            // 3
+    println(g1.name);                // anon
+
+    // ⑩ 内层已修好 ⇒ 外层的臂一条都不落 ⇒ 走末尾的 `return __tfv.val`
+    var h1 : User = outer2(User{ .age = -5i64, .name = "bob" });
+    println(i2s(h1.age));            // 0
+    println(h1.name);                // bob
+    return 0;
+}
