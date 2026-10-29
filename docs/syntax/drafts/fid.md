@@ -249,10 +249,10 @@ main fn() -> i64 {
 FidRead: FidValue ">" TypeExpr
 ```
 
-- `TypeExpr` 取受限子集：标量 | 命名类型 | 数组 `[N]T` | 切片 `[]T` | map | 指针 `*` | optional `T?`。**不含函数类型**。
+- `TypeExpr` 取受限子集：标量 | 命名类型 | 数组 `[N]T` | 切片 `[]T` | map | 指针 `*` | optional `?T`。**不含函数类型**。（原文写 `T?`；后缀已于 2026-10-29 移除，改用 Zig 式前缀。）
 - **消歧按左操作数类型，不看右操作数**（与 D1 一致——`<` 也是靠左操作数定语义）：`fid` 无序，故 `fid > x` 永远不可能是「大于比较」，它只能表示反序列化。于是 `f > i64` 与 `f > 3` 都先被判为「读」，区别只在右操作数是否合法：`i64` 是类型 ⇒ 正常读出；`3` 是值而非类型 ⇒ 报 `T_FID_DESERIALIZE_NEEDS_TYPE`（不再退化为大于比较）。
 - 因此**不存在类型名/值名歧义**：右操作数被强制要求为类型，写出非类型的 ident 直接报错，无需 `T_FID_READ_AMBIGUOUS` 一类兜底。复杂泛型等任意合法类型表达式直接写作 `f > T` 即可（L-04 唯一写法，**不另设 `fread` 内建**）。
-- **结果类型 = `TypeExpr`**，但为可表达 EOF，**返回 `T?`（optional）**：读到值 ⇒ 非 null；EOF / 解析失败 ⇒ `null`（L-09 零 UB，不 panic）。故 `f > i64` 的类型是 `i64?`。
+- **结果类型 = `TypeExpr`**，但为可表达 EOF，**返回 `?T`（optional）**：读到值 ⇒ 非 null；EOF / 解析失败 ⇒ `null`（L-09 零 UB，不 panic）。故 `f > i64` 的类型是 `?i64`。
 - ⚠️ **采纳 §7.1 时须同步修订 D1**：D1 当前把「`fid` 且 `>`」报 `T_FID_NOT_ORDERED` 预留；采纳后该项改为「`fid > type` = 反序列化」，`<=`/`>=` 仍报 `T_FID_NOT_ORDERED`。
 
 **各格式读语义（与 D5 写语义镜像）：**
@@ -271,9 +271,9 @@ main fn() -> i64 {
     var f: fid = fopen("data.txt", :read);
     if (fid_is_open(f)) {
         defer { fclose(f); }
-        var n: i64? = f > i64;        // 读一个 i64，EOF 时 n == null
+        var n: ?i64 = f > i64;        // 读一个 i64，EOF 时 n == null
         if (n != null) { print(i2s(n)); }
-        var s: string? = f > string;  // 读下一个空白分隔 token
+        var s: ?string = f > string;  // 读下一个空白分隔 token
     }
     return 0;
 }

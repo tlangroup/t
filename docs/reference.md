@@ -1272,7 +1272,7 @@ ArrayType: "[" Expr "]" Type          // 定长数组 [N]T
 SliceType: "[" "]" Type               // 动态切片 []T
 MapType: "map" "[" Type "]" Type      // 哈希映射 map[K]V  ✅ tote
 PointerType: "*" Type                 // 指针 *T
-OptionalType: Type "?"                // 可选 T?
+OptionalType: "?" Type                // 可选 ?T（Zig 式前缀；后缀 T? 已于 2026-10-29 移除，见 §3.5.0）
 FlagArrayType: "flag" "[" Integer "]" // 位域数组 flag[N]
 NamedType: Ident                      // 结构体/枚举/flag/variant/别名名
 SymType: "Sym" ("32"|"16") "(" StringLiteral ")"
@@ -1298,10 +1298,10 @@ TupleType: "." "{" Type ("," Type)* "}"         // ✅ tc 匿名元组类型；�
 - 类型名解析：先查内建，再查当前单元已声明命名类型。
 - **数组字面量 `[e1, e2, …]`**：元素类型取首元素推断，整型元素统一提升为 `i64`（`[1,2,3]` 是 `[3]i64` 而非 `[3]u8`）；空字面量 `[]` 元素类型未知，可赋给任意 `[]T` / `[N]T`。定长数组与切片之间只要元素可转型即可互赋（目标为定长数组时长度须一致）。赋给 `[]T` 时脱糖为运行期 `slice_new` + 逐元素 `append`；赋给 `[N]T` 时 C 后端用花括号初始化器、LLVM 后端零初始化后按 `getelementptr` 逐元素 `store`。
 
-#### 3.5.0 可选类型 `T?` ✅ tc（2026-08-30）
+#### 3.5.0 可选类型 `?T` ✅ tc（2026-08-30；2026-10-29 语法收敛为前缀）
 
 - **表示模型（可空指针）**：`?T` 的值就是「指向元素的指针」，`none` 即空指针——C 后端落 `T*`、LLVM 后端落 `ptr`；`sizeof(?T) == sizeof(void*)`，无带标签结构体的额外字段与分支开销。
-- **类型语法**：后缀 `T?`（规范形，等价的前缀 `?T` 亦接受）。元素类型可以是标量，也可以是聚合（struct 等；聚合在 LLVM 后端本就按 `ptr` 表示，`unwrap` 直接返回校验过的指针、不再 `load`）。
+- **类型语法**：**前缀 `?T`，对齐 Zig 0.17**（裁定 O-1，见 `docs/design/option/DESIGN.md`）。**后缀 `T?` 已于 2026-10-29 从语法中删除**：`parse_type_ex` 不再吃类型之后的 `Question`，故 `i64?` 会在 `?` 处由调用方直接报错位，而不是静默落成 Optional。裸 `?` 在**表达式位**仍是 opt_none 字面量（含义不变，见下）。元素类型可以是标量，也可以是聚合（struct 等；聚合在 LLVM 后端本就按 `ptr` 表示，`unwrap` 直接返回校验过的指针、不再 `load`）。
 - **`?` none 字面量**：表达式位的裸 `?`。与 `null` 同手法——静态类型是顶层 `Unknown`，由赋值 / 返回的目标 `?T` 反推元素类型，故 `var x: ?i64 = ?;` 与 `return ?;` 均成立。（不可用 `Optional(Unknown)`：统一器只处理顶层 `Unknown`，嵌套的不会被反推。）
 - **内建（类型规则见 §3.8）**
 
