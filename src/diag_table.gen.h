@@ -204,6 +204,7 @@ static const DiagDef DIAG_DEFS[] = {
   { "T-SEM-E019", "error", "SEM", "", "VALUE_LOOP_PLAIN_BREAK", "plain `break` (without value) is not allowed in a value loop; use `break <expr>`" },
   { "T-SEM-E020", "error", "SEM", "", "NON_VALUE_LOOP_IN_EXPR", "a loop used as an expression must be a value loop (with `else` clause or `break <value>` in body)" },
   { "T-SEM-W000", "warning", "SEM", "", "OVERFLOW_LITERAL", "integer literal overflow" },
+  { "T-STR-W000", "warning", "STR", "", "STRING_OP_DEPRECATED", "string == / != is a content comparison and is deprecated" },
   { "T-TIM-E000", "error", "TIM", "", "BAD_SPEC", "invalid time format specifier" },
   { "T-TIM-E001", "error", "TIM", "", "PARSE_UNSUPPORTED", "time parsing unsupported" },
   { "T-TIM-E002", "error", "TIM", "", "SPEC_TYPE", "time specifier type mismatch" },
@@ -225,7 +226,7 @@ static const DiagDef DIAG_DEFS[] = {
   { "T-VEC-W000", "warning", "VEC", "", "VECTOR_WIDER_THAN_NATIVE", "vector is wider than the native SIMD register and will be split" },
   { "T-VEC-W001", "warning", "VEC", "", "TILE_WIDER_THAN_NATIVE", "hardware tile is wider than the native SIMD register and will fall back to scalar loops" },
 };
-#define DIAG_COUNT 212
+#define DIAG_COUNT 213
 
 /* legacy (old semantic name) -> machine code alias table */
 static const struct { const char* legacy; const char* code; } DIAG_LEGACY[] = {
