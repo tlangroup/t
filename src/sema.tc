@@ -1317,6 +1317,9 @@ pub fn check_call_args(e: i64, fti: i64, fname: string) void {
             g_lead_expect = saved_le4;
             var pt: i64 = tif_params[pstart + got];
             intlit_overflow_warn(k.val, pt);
+            if (null_lit_bad(k.val, pt)) {
+                err_null_into(k.val, pt);
+            }
             if (tip_kind(at) != "Unknown" and ti_equal(pt, at) == false and can_cast(at, pt) == false) {
                 err_type_mismatch(k.val, pt, at);
             }
@@ -1349,7 +1352,156 @@ pub fn check_indirect_call(e: i64, fti: i64) void {
     check_call_args(e, fti, "");
 }
 
+// ── O-7：`T → ?T` 隐式提升（对齐 Zig Z3）──────────────────────────────────
+//
+// Zig 没有 `some()`，靠「T 可隐式装进 ?T」把构造函数整个消灭。t 的宪法条款 L-02 原本
+// 禁止该方向的自动转换；本次按用户裁定放开（理由与代价见 docs/design/option/DESIGN.md O-7：
+// 放开的前提是 O-6 已把 ABI 换成按值布局，提升是「写一个 tag」的零分配动作）。
+//
+// ⚠ 这里**只做放行 + 打标记，不改写 AST**：base 没有节点克隆原语（节点是 24 张平行侧表），
+//   原地改写成 call 需要重建子树，风险高于收益。真正的包装交给 TIR 层
+//   （tir_emit_expr 读本标记后补一个 STRUCT_NEW 写入 __tag=1 + payload）。
+// 副作用因此被限制在「类型检查放行」这一件事上，AST 与 HIR 一字不动。
+
+pub var g_optlift_nodes: []i64;   // 已判定为「隐式提升」的表达式节点
+
+pub fn opt_lift_has(e: i64) bool {
+    var i: i64 = 0;
+    var n: i64 = slice_len(g_optlift_nodes) as i64;
+    while (i < n) {
+        if (g_optlift_nodes[i] == e) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+pub fn opt_lift_mark(e: i64) void {
+    if (opt_lift_has(e)) { return; }
+    append(g_optlift_nodes, e);
+}
+
+// 尝试把 `act` 提升进 `exp`（exp 必须是 Optional）。成功返回 true（调用方应放行，不报错）。
+pub fn opt_try_lift(e: i64, exp: i64, act: i64) bool {
+    if (exp < 0) { return false; }
+    if (exp >= slice_len(tis) as i64) { return false; }
+    if (tip_kind(exp) != "Optional") { return false; }
+    if (opt_lift_has(e)) { return true; }          // 已判定过：直接放行（防重推断递归）
+    if (act >= 0 and act < slice_len(tis) as i64 and tip_kind(act) == "Optional") { return false; }
+    var el: i64 = tis[exp].elem;
+    if (el < 0) { return false; }
+    // 整数字面量按量级自推断（5 → u8），与 `?i64` 的元素类型对不上 ⇒ 先按期望的元素类型
+    // 重推断（写 sb 位宽后缀 + 清类型缓存），否则 `var a: ?i64 = 5;` 仍会被拒。
+    if (base.node_kind((e as u64)) == "int" and base.node_sb((e as u64)) == "") {
+        if (el < slice_len(tis) as i64 and tis[el].kind == "Scalar") {
+            base.node_set_sb((e as u64), tip_name(el));
+            base.node_set_type(e, -1);
+            act = infer_expr(e);
+        }
+    }
+    if (act < 0 or act >= slice_len(tis) as i64) { return false; }
+    if (ti_equal(el, act) == false) { return false; }
+    opt_lift_mark(e);
+    return true;
+}
+
+// ── O-2（代码侧）：`null` 不能流进非 Optional / 非 Pointer 的定型目标 ──────────
+//
+// 背景：`null` 的静态类型一直是**顶层 Unknown**，靠「由目标反推」放行，副作用是
+// `var x: i64 = null;` 也通过（DESIGN.md §3 O-2 登记的已知副作用）。
+// ⚠ 这里刻意**不改**成专属 `null_t` 类型：Unknown 的放行语义散落在 lub（match 臂
+//   合流）、未定型推断、Array→Slice 构造等一大片既有逻辑里，换类型会同时引爆
+//   `var m: *TypeMeta = match (ti) { .Struct(mt) => mt, _ => null };` 这类既有合法写法。
+// ⇒ 采用**加法守卫**：只在「右值是空值字面量 + 目标是定型且不接受 null」时补一条诊断。
+pub fn ti_null_ok(t: i64) bool {
+    if (t < 0) { return true; }
+    if (t >= slice_len(tis) as i64) { return true; }
+    var k: string = tip_kind(t);
+    if (k == "Unknown") { return true; }
+    if (k == "Optional") { return true; }
+    if (k == "Pointer") { return true; }
+    return false;
+}
+
+pub fn null_lit_bad(node: i64, exp: i64) bool {
+    if (node < 0) { return false; }
+    var k: string = base.node_kind((node as u64));
+    if (k != "null" and k != "opt_none") { return false; }
+    if (exp < 0) { return false; }
+    if (exp >= slice_len(tis) as i64) { return false; }
+    if (tip_kind(exp) == "Unknown") { return false; }
+    return ti_null_ok(exp) == false;
+}
+
+pub fn err_null_into(node: i64, exp: i64) void {
+    var es: string = ti_str(exp);
+    var l: i64 = parse.n_line(node);
+    var c: i64 = parse.n_col(node);
+    var di: i64 = base.diag_new("T-SEM-E002", "error",
+        base.sb_cat2("`null` is not assignable to a value of type ", es),
+        parse.n_file(node), l, c, l, c + 4);
+    base.slb_begin();
+    base.slb_add(base.sb_cat2("expected: ", es));
+    base.slb_add("found:    null");
+    base.slb_add("hint: `null` is assignable only to an optional `?T` or a pointer `*T`");
+    base.diag_set_nt(di, base.slb_head);
+}
+
+// O-2 推断债（二）：`var a: ?i64 = some(7);` ⇒ 「expected ?i64 but got ?u8」。
+// 根因：`some` 是**无 Func 签名**的内建 ⇒ 走不到形参类型注入那条路，实参 `7` 按量级
+// 自推断成 u8。修法放在**报错点**（此处 `exp` 一定已知且可靠）：把 `some(...)` 实参子树里的
+// 无位宽后缀整数字面量按期望元素类型补 sb + 清类型缓存，再重推断一次，相等即放行。
+// ⚠ 只对 `some(...)` 生效：其他内建 / 普通调用各有自己的签名注入通路，不受这个债影响。
+fn opt_retag_intlits(n: i64, w: string) void {
+    if (n < 0) { return; }
+    var k: string = base.node_kind((n as u64));
+    if (k == "int") {
+        if (base.node_sb((n as u64)) == "") {
+            base.node_set_sb((n as u64), w);
+            base.node_set_type(n, -1);
+        }
+        return;
+    }
+    if (k == "float" or k == "bool" or k == "string" or k == "ident" or k == "null" or k == "opt_none") { return; }
+    var na: i64 = base.node_na((n as u64));
+    if (na >= 0 and na != n) { opt_retag_intlits(na, w); }
+    var nb: i64 = base.node_nb((n as u64));
+    if (nb >= 0 and nb != n) { opt_retag_intlits(nb, w); }
+    // call / 构造：`la` 是 kids（Child）链表下标，须走 kids_chain_idx 物化后再遍历。
+    var la: i64 = base.node_la((n as u64));
+    if (la >= 0) {
+        var ks: []i64 = base.kids_chain_idx(la);
+        var i: i64 = 0;
+        while (i < slice_len(ks) as i64) {
+            var kv: Child = base.kids[ks[i]];
+            if (kv.val != n) { opt_retag_intlits(kv.val, w); }
+            i = i + 1;
+        }
+    }
+}
+
+pub fn opt_try_retag_some(e: i64, exp: i64) bool {
+    if (e < 0) { return false; }
+    if (exp < 0 or exp >= slice_len(tis) as i64) { return false; }
+    if (tip_kind(exp) != "Optional") { return false; }
+    var el: i64 = tis[exp].elem;
+    if (el < 0 or el >= slice_len(tis) as i64) { return false; }
+    if (tis[el].kind != "Scalar") { return false; }
+    if (base.node_kind((e as u64)) != "call") { return false; }
+    var callee: i64 = base.node_na((e as u64));
+    if (callee < 0) { return false; }
+    if (base.node_kind((callee as u64)) != "ident" or base.node_sa((callee as u64)) != "some") { return false; }
+    var oan: i64 = call_arg_node(e, 0);
+    if (oan < 0) { return false; }
+    opt_retag_intlits(oan, tip_name(el));
+    var nt: i64 = infer_expr(e);
+    return ti_equal(exp, nt);
+}
+
 pub fn err_type_mismatch(eni: i64, exp: i64, act: i64) void {
+    // O-2：`some(<整数字面量>)` 按量级推宽的元素类型对不上 ⇒ 先按期望元素类型重推断。
+    if (opt_try_retag_some(eni, exp)) { return; }
+    // O-7：期望 ?T 而实得 T ⇒ 隐式提升，不报错（包装由 TIR 层补）。
+    if (opt_try_lift(eni, exp, act)) { return; }
     var es: string = ti_str(exp);
     var fs2: string = ti_str(act);
     var l: i64 = parse.n_line(eni);
@@ -8760,6 +8912,19 @@ pub fn infer_expr_body(e: i64) i64 {
             // 可选类型内建：some(x)→Optional(实参类型)；unwrap(x)→Optional 元素类型；is_some/is_none(x)→bool。
             if ((fname == "some" or fname == "unwrap" or fname == "is_some" or fname == "is_none") and base.node_la((e as u64)) >= 0) {
                 var oan: i64 = call_arg_node(e, 0);
+                // O-2 推断债：`some` 是**内建、没有 Func 签名**，走不到形参类型注入那条路，
+                // 于是 `some(5)` 的实参按量级自推断成 u8 ⇒ `var a: ?i64 = some(5);` 报
+                // 「expected ?i64 but got ?u8」。修法：推断实参**之前**按期望类型的元素类型
+                // 给无位宽后缀的整数字面量补 sb（与 O-7 opt_try_lift 的重推断同手法）。
+                // 期望类型的来源：var 声明 / 赋值 / return / call 形参注入都会设 g_lead_expect。
+                if (fname == "some" and base.node_kind((oan as u64)) == "int" and base.node_sb((oan as u64)) == "") {
+                    if (g_lead_expect >= 0 and g_lead_expect < slice_len(tis) as i64 and tip_kind(g_lead_expect) == "Optional") {
+                        var sxi: TI = tis[g_lead_expect];
+                        if (sxi.elem >= 0 and sxi.elem < slice_len(tis) as i64 and tis[sxi.elem].kind == "Scalar") {
+                            base.node_set_sb((oan as u64), tip_name(sxi.elem));
+                        }
+                    }
+                }
                 var oat: i64 = ie_sub_in(ei, oan);
                 if (fname == "some") {
                     // 实参是**元素值**（非可选），结果为 Optional(该实参类型)。
@@ -9733,6 +9898,9 @@ pub fn cs_var_decl(s: i64, init_i: i64) void {
         g_tile_expect = saved_te2;
         g_lead_expect = saved_le2;
         intlit_overflow_warn(base.node_nb((s as u64)), vt);
+        if (null_lit_bad(base.node_nb((s as u64)), vt)) {
+            err_null_into(base.node_nb((s as u64)), vt);
+        }
         if (tip_kind(it) != "Unknown" and ti_equal(it, vt) == false) {
             var vk: string = tip_kind(vt);
             // P3：位域 TI kind 已归 `Struct`，按 `tip_is_flag`（und 非空）判别。
@@ -9866,6 +10034,9 @@ pub fn cs_return(s: i64, val_i: i64) void {
                 base.node_na((s as u64)));
         }
         intlit_overflow_warn(base.node_na((s as u64)), cur_ret);
+        if (null_lit_bad(base.node_na((s as u64)), cur_ret)) {
+            err_null_into(base.node_na((s as u64)), cur_ret);
+        }
         if (tip_kind(rt) != "Unknown" and ti_equal(rt, cur_ret) == false) {
             if (can_cast(rt, cur_ret) == false) {
                 err_type_mismatch(base.node_na((s as u64)), cur_ret, rt);
@@ -9916,6 +10087,9 @@ pub fn cs_assignment(s: i64, ai: i64) void {
     g_tile_expect = saved_te1;
     g_lead_expect = saved_le1;
     intlit_overflow_warn(base.node_nb((s as u64)), tt);
+    if (null_lit_bad(base.node_nb((s as u64)), tt)) {
+        err_null_into(base.node_nb((s as u64)), tt);
+    }
     if (tip_kind(tt) != "Unknown" and tip_kind(vt2) != "Unknown" and ti_equal(tt, vt2) == false) {
         var str_to_sym2: bool = tip_kind(tt) == "Sym" and tip_kind(vt2) == "String";
         if (str_to_sym2 == false and can_cast(vt2, tt) == false) {
@@ -10247,6 +10421,9 @@ pub fn check_stmt_cst(s: i64) void {
                     base.node_na((s as u64)));
             }
             intlit_overflow_warn(base.node_na((s as u64)), cur_ret);
+            if (null_lit_bad(base.node_na((s as u64)), cur_ret)) {
+                err_null_into(base.node_na((s as u64)), cur_ret);
+            }
             if (tip_kind(rt) != "Unknown" and ti_equal(rt, cur_ret) == false) {
                 if (can_cast(rt, cur_ret) == false) {
                     err_type_mismatch(base.node_na((s as u64)), cur_ret, rt);
@@ -11851,6 +12028,9 @@ pub fn check_global_var_decl(d: i64) void {
                 }
             }
         }
+        if (null_lit_bad(base.node_nb((d as u64)), vt)) {
+            err_null_into(base.node_nb((d as u64)), vt);
+        }
         if (tip_kind(it) != "Unknown" and tip_kind(vt) != "Unknown" and ti_equal(it, vt) == false) {
             // Sym 全局变量允许由字符串赋值（自动 intern → id）
             var gss: bool = tip_kind(vt) == "Sym" and tip_kind(it) == "String";
@@ -11892,6 +12072,9 @@ pub fn check_global_const_decl(d: i64) void {
         g_tile_expect = saved_te7;
         if (base.node_na((d as u64)) >= 0) {
             var ct: i64 = resolve_ti(base.node_na((d as u64)));
+            if (null_lit_bad(base.node_nb((d as u64)), ct)) {
+                err_null_into(base.node_nb((d as u64)), ct);
+            }
             if (tip_kind(it2) != "Unknown" and ti_equal(it2, ct) == false) {
                 if (can_cast(it2, ct) == false) {
                     err_type_mismatch(base.node_nb((d as u64)), ct, it2);
