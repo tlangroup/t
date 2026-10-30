@@ -7366,6 +7366,44 @@ pub fn infer_expr_body(e: i64) i64 {
     // `@compile_error` 本就只许活在编译期上下文；`@type_*` 折不掉意味着类型实参
     // 在编译期不可解析。两者都不该、也无法降级为运行期代码（第 8 条）。
     if (k == "mbuiltin") {
+        if (base.node_sa((e as u64)) == "embed_file") {
+            // @embed_file("rel/path")：编译期读文件，把调用节点原地改写成 string 字面量。
+            // 二进制安全：TStr 常量用 sizeof(s)-1 取长度（非 strlen），NUL 字节无损。
+            // 路径基准：相对「包含本调用的源文件」所在目录；绝对路径（'/' 开头或 'X:' 盘符）直接使用。
+            var ef_a: i64 = base.node_la((e as u64));
+            if (ef_a < 0) { parse.fc_err("T-MTA-E006", "@embed_file 需要 1 个字符串字面量实参（相对调用源文件的路径）", e); return ti_mk("Unknown"); }
+            var ef_pn: i64 = base.kids[ef_a].val;
+            if (base.node_kind((ef_pn as u64)) != "string") { parse.fc_err("T-MTA-E006", "@embed_file 的实参必须是编译期字符串字面量", e); return ti_mk("Unknown"); }
+            var ef_rel: string = base.node_sa((ef_pn as u64));
+            var ef_abs: bool = false;
+            if ((str_len(ef_rel) as i64) > 0 and ef_rel[0] == 47) { ef_abs = true; }       // 以 '/' 开头：绝对 unix 路径
+            if ((str_len(ef_rel) as i64) >= 2 and ef_rel[1] == 58) { ef_abs = true; }       // 'X:' 盘符：绝对 windows 路径
+            var ef_full: string = ef_rel;
+            if (ef_abs == false) {
+                var ef_src: string = base.node_file((e as u64));
+                var ef_cut: i64 = -1;
+                var ef_i: i64 = (str_len(ef_src) as i64) - 1;
+                while (ef_i >= 0) {
+                    if (ef_src[ef_i] == 47 or ef_src[ef_i] == 92) { ef_cut = ef_i; break; }
+                    ef_i = ef_i - 1;
+                }
+                if (ef_cut >= 0) { ef_full = str_slice(ef_src, 0, ef_cut) + "/" + ef_rel; }
+            }
+            if (file_exists(ef_full) == false) { parse.fc_err("T-MTA-E006", base.sb_cat3("@embed_file: 找不到文件 ", ef_full, ""), e); return ti_mk("Unknown"); }
+            var ef_bytes: string = file_read_all(ef_full);
+            // 与真实字符串字面量同构：仅 kind + sa（字节），其余槽位清零。
+            base.node_set_kind((e as u64), "string");
+            base.node_set_sa((e as u64), ef_bytes);
+            base.node_set_na((e as u64), -1);
+            base.node_set_nb((e as u64), -1);
+            base.node_set_nc((e as u64), -1);
+            base.node_set_nd((e as u64), -1);
+            base.node_set_la((e as u64), -1);
+            base.node_set_ib((e as u64), -1);
+            base.node_set_lc((e as u64), -1);
+            hir.hir_invalidate((e as u64));
+            return ti_mk("String");
+        }
         if (base.node_sa((e as u64)) == "compile_error") {
             // 语义同 Zig 的 @compileError：**只要被分析到就触发**。CTFE 执行到会触发，
             // 走到 check（说明这段代码真的会被编译）同样触发。死分支已由 mb_prune_if
