@@ -1300,19 +1300,33 @@ TupleType: "." "{" Type ("," Type)* "}"         // ✅ tc 匿名元组类型；�
 
 #### 3.5.0 可选类型 `?T` ✅ tc（2026-08-30；2026-10-29 语法收敛为前缀）
 
-- **表示模型（可空指针）**：`?T` 的值就是「指向元素的指针」，`none` 即空指针——C 后端落 `T*`、LLVM 后端落 `ptr`；`sizeof(?T) == sizeof(void*)`，无带标签结构体的额外字段与分支开销。
+- **表示模型（带标签按值布局 `opt.tagged`）** ✅ tc（2026-10-30，裁定 O-6）：`?T` 编译为
+  `%Opt_<E>` = `struct { i64 __tag, E __val }`——**按值、零堆分配**；`none` ⇔ `__tag == 0`，
+  `some` ⇔ `__tag != 0`。tag 用 `i64`（而非 i8）使 payload 偏移恒为 8，与 t 的 8 字节对齐一致，
+  双后端都不必各算对齐。类型名由元素类型**派生**（同元素 ⇒ 同名），故 std 的 `.tlib` 与主程序
+  分别编译也不会错位。
+  - ⚠ 早期实现是 `opt.boxed`（`?T` = `T*` 可空指针、`some()` 在 arena 上拷贝且永不回收）；
+    已于 2026-10-30 随 O-6 整体替换，`sizeof(?T)` 不再是 `sizeof(void*)`。
 - **类型语法**：**前缀 `?T`，对齐 Zig 0.17**（裁定 O-1，见 `docs/design/option/DESIGN.md`）。**后缀 `T?` 已于 2026-10-29 从语法中删除**：`parse_type_ex` 不再吃类型之后的 `Question`，故 `i64?` 会在 `?` 处由调用方直接报错位，而不是静默落成 Optional。裸 `?` 在**表达式位**仍是 opt_none 字面量（含义不变，见下）。元素类型可以是标量，也可以是聚合（struct 等；聚合在 LLVM 后端本就按 `ptr` 表示，`unwrap` 直接返回校验过的指针、不再 `load`）。
 - **`?` none 字面量**：表达式位的裸 `?`。与 `null` 同手法——静态类型是顶层 `Unknown`，由赋值 / 返回的目标 `?T` 反推元素类型，故 `var x: ?i64 = ?;` 与 `return ?;` 均成立。（不可用 `Optional(Unknown)`：统一器只处理顶层 `Unknown`，嵌套的不会被反推。）
 - **内建（类型规则见 §3.8）**
 
   | 形式 | 结果类型 | 语义 |
   |---|---|---|
-  | `some(x)` | `?T`（`T` = `x` 的类型） | 在 arena 上拷贝 `x` 并返回其指针。`x` 可为任意表达式（非左值亦合法）。 |
+  | `some(x)` | `?T`（`T` = `x` 的类型） | 按值构造 `__tag=1` + payload。`x` 可为任意表达式（非左值亦合法）。**无堆分配**（O-6 之后）。 |
   | `unwrap(x)` | `T` | 取元素值。`x` 为 `none` 时运行期 panic（stderr 打印 `{"error":"unwrap_none",…}` 后 `exit(1)`）。 |
-  | `is_some(x)` / `is_none(x)` | `bool` | 空值探测，即指针与 null 的比较，零开销。 |
+  | `is_some(x)` / `is_none(x)` | `bool` | 空值探测，即读 `__tag` 与 0 的比较，零开销。 |
 
-- **`some(x)` 的生命周期（v1 限制）**：值分配在全局 arena 上且**不回收**（与闭包的 v1 限制一致，有意为之）。故在长循环里反复 `some()` 会累积内存；自动释放需引入所有权或 GC，属后续里程碑。
-- **无隐式提升（L-02 显式原则）**：`T` 与 `?T` **不**自动转换——构造必须显式 `some(x)`，取值必须显式 `unwrap(x)`（或先 `is_some` 探测）。与 `f > T` 读路径的 Option B 裁定（§3.11）取舍一致：宁可啰嗦，也不让「空值」在类型层面隐形。
+- **`some(<整数字面量>)` 的位宽**：`some` 是**无 Func 签名**的内建 ⇒ 走不到形参类型注入；
+  字面量按量级自推断（`7` → `u8`）曾使 `var a: ?i64 = some(7);` 报 E002。现按**目标元素类型**
+  给无后缀字面量补位宽后缀后重推断（`opt_try_retag_some`），故该写法成立（示例 `examples/option_some_lit.tc`）。
+- **`null` 的流向限制** ✅ tc（2026-10-30，裁定 O-2 代码侧）：`null` / 裸 `?` 的静态类型是顶层
+  `Unknown`（靠目标反推元素类型），但**只允许流进 `?T` 或 `*T`**；`var x: i64 = null;`
+  报 **`T-SEM-E002`**（conformance `f_opt_null_into_scalar`）。
+- **隐式提升（L-02 修订 2026-10-30）**：`?T → T` **永不隐式**（取值必须显式 `unwrap` / `.?` /
+  `orelse`，conformance `f_opt_no_implicit_unwrap`）；反向 **`T → ?T` 允许隐式**
+  （`var a: ?i64 = 5;` / `f(3)` / `return 7;` 均成立，包装由 TIR 补一个 `__tag=1`）。
+  修订理由：O-6 之后提升是「写一个 tag」的零分配动作，与 L-02 要防的「空值/开销隐形」不再冲突。
 - **诊断**：`unwrap` / `is_some` / `is_none` 的实参必须是 `?T`，否则报 **`T-SEM-E790`**。该校验在检查期拦下传标量的情形，避免 LLVM 后端把标量当 `ptr` 传给运行时。conformance `f_optional_unwrap_nonopt`；正例 `p_optional_basic`；示例 `examples/optional_demo.tc`。
 
 ##### 3.5.0.1 `.?` 断言取出与 `orelse` 兜底 ✅ tc（2026-10-29，裁定 O-3 / O-4）
@@ -1330,6 +1344,23 @@ TupleType: "." "{" Type ("," Type)* "}"         // ✅ tc 匿名元组类型；�
 - **Z10 括号要求**：`orelse` 的操作数若**顶层**是裸写的比较表达式（`a orelse b == c`、`a == b orelse c`）是**编译错误 `T-PAR-E001`**——不是按某种优先级静默解析。加括号后合法：`a orelse (b == c)`、`(a == b) orelse c`。
 - 结果类型：两臂的 LUB（左侧为元素类型 `T`，右侧为兜底值类型）。
 - conformance：`p_opt_dot_question` / `p_orelse_basic`；反例 `f_orelse_ambiguous_precedence` / `f_orelse_ambiguous_lhs`；示例 `examples/option_zig.tc`。
+
+##### 3.5.0.2 载荷捕获 `if (x) |v|` / `while (x) |v|` ✅ tc（2026-10-30，裁定 O-5）
+
+对齐 Zig 0.17：`if` / `while` 的 `)` 之后可写 `|v|`，把非 `none` 的**元素值**绑定到 `v`。
+
+| 写法 | 脱糖为 | 说明 |
+|---|---|---|
+| `if (x) \|v\| { B } [else E]` | `{ var __optc_N = x; if (is_some(__optc_N)) { var v = unwrap(__optc_N); B } [else E] }` | 条件只求值一次；`v` 只在捕获块内可见 |
+| `while (x) \|v\| { B }` | `while (true) { var __optc_N = x; if (is_none(__optc_N)) { break; } var v = unwrap(__optc_N); B }` | 条件**每轮重新求值**（临时量落在循环体内），收到 `null` 才停 |
+| `if (x) \|v\| { E1; } else { E2; }`（值位） | `{ var __optc_N = x; match (is_some(__optc_N)) { true => { var v = unwrap(__optc_N); E1; }, false => E2 } }` | 值位分支体须以**表达式语句**结尾，即 `{ e; }` |
+
+- **无歧义**：bar-lambda `\|v\| expr` 只在表达式**起始位**识别；inline-for 由 `inline` 前缀区分。
+  ⇒ `if` / `while` 的 `)` 之后紧跟 `|` 是唯一形态，无需前瞻。
+- **不做 `\|*v\|`**（Zig 的可变指针捕获）：`unwrap` 返回副本，取址指向临时量 ⇒ 报 `T-PAR-E001`。
+- 捕获块内照常可用 `break` / `continue`（`while` 形态下 `continue` 会重新求值条件）。
+- conformance：`f_opt_capture_ptr` / `f_opt_capture_nonopt`（后者由内建的 `T-SEM-E790` 挡下）；
+  示例 `examples/option_capture.tc`。
 
 **新增运行期原语**
 
@@ -3077,6 +3108,9 @@ Block           : "{" Statement* "}"
 Statement       : VarDecl | ConstDecl | Assign | If | While | Return | ExprStmt | Block
                 | ExpectStmt
 ExpectStmt      : "expect" "(" Expression ("," String)? ")" ";"
+If              : "if" "(" Expression ")" OptCapture? Block ("else" (If | Block))?
+While           : "while" "(" Expression ")" OptCapture? Block ("else" Block)?
+OptCapture      : "|" Ident "|"              // 载荷捕获，见 §3.5.0.2；不做 `|*v|`
 Expression      : Literal | Ident | Call | FieldAccess | Unary | Binary | Pipeline | "(" Expression ")"
 Pipeline        : Expression (("|->" | "|>?" | "|>") Expression)*   // L0 最低级，左结合
 StructLit        : (Ident | ".")? "{" FieldInit ("," FieldInit)* "}"

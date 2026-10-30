@@ -2056,22 +2056,38 @@ pub fn ll_emit_builtin(cn: string, toks: []string) bool {
         return true;
     }
     if (cn == "unwrap") {
-        // ?T ↔ ptr 模型：unwrap(p) 调 tll_opt_unwrap 取「指向元素值的指针」，再 load 出元素值。
-        // 标量 load 出 i64/u8…；聚合(%Point 等) load 出 %Struct 值——与旧轨 codegen_ll 对齐。
+        // O-6 opt.tagged：?T = %Opt_E = { i64 __tag, E __val }。
+        // 读 __tag；none 时用 select 把 payload 指针选成 null，交给既有的 tll_opt_unwrap(null)
+        // 去 panic（打 JSON 后 exit(1)）—— 复用现成原语，无需新运行时函数，也无需新增基本块。
         var argst: string = llname.ll_get_st(toks[4]);
-        var elem: string = "i64";
-        if (llname.ll_starts(argst, "ptr<")) { elem = ll_ptr_inner(argst); }
-        else if (argst == "ptr") { elem = "i8"; }
-        else { elem = argst; }
-        // ⚠ ll_load 会立即把 load 语句 append 到 g_ll，必须先在 call 行之外取好值寄存器名，
-        // 再拼 call 行，否则 load 语句会被插进 call 行中间导致 IR 非法。
-        var argval: string = ll_load(toks[4], argst);
+        var elem: string = tir.tir_opt_elem_st(argst);
+        if (elem == "") { elem = "i64"; }
+        var op: string = ll_map_argptr(toks[4], argst);
+        var opll: string = llname.st_to_ll(argst);
+        var tgp: string = ll_tmp();
+        sb_append_str(g_ll, "  "); sb_append_str(g_ll, tgp);
+        sb_append_str(g_ll, " = getelementptr "); sb_append_str(g_ll, opll);
+        sb_append_str(g_ll, ", ptr "); sb_append_str(g_ll, op); sb_append_str(g_ll, ", i32 0, i32 0\n");
+        var tgv: string = ll_tmp();
+        sb_append_str(g_ll, "  "); sb_append_str(g_ll, tgv);
+        sb_append_str(g_ll, " = load i64, ptr "); sb_append_str(g_ll, tgp); sb_append_str(g_ll, "\n");
+        var cmpr: string = ll_tmp();
+        sb_append_str(g_ll, "  "); sb_append_str(g_ll, cmpr);
+        sb_append_str(g_ll, " = icmp eq i64 "); sb_append_str(g_ll, tgv); sb_append_str(g_ll, ", 0\n");
+        var vgp: string = ll_tmp();
+        sb_append_str(g_ll, "  "); sb_append_str(g_ll, vgp);
+        sb_append_str(g_ll, " = getelementptr "); sb_append_str(g_ll, opll);
+        sb_append_str(g_ll, ", ptr "); sb_append_str(g_ll, op); sb_append_str(g_ll, ", i32 0, i32 1\n");
+        var sel: string = ll_tmp();
+        sb_append_str(g_ll, "  "); sb_append_str(g_ll, sel);
+        sb_append_str(g_ll, " = select i1 "); sb_append_str(g_ll, cmpr);
+        sb_append_str(g_ll, ", ptr null, ptr "); sb_append_str(g_ll, vgp); sb_append_str(g_ll, "\n");
         ll_maybe_declare("tll_opt_unwrap", "ptr", ["ptr"]);
         var r: string = ll_tmp();
         sb_append_str(g_ll, "  ");
         sb_append_str(g_ll, r);
         sb_append_str(g_ll, " = call ptr @tll_opt_unwrap(ptr ");
-        sb_append_str(g_ll, argval);
+        sb_append_str(g_ll, sel);
         sb_append_str(g_ll, ")\n");
         var v: string = ll_tmp();
         sb_append_str(g_ll, "  ");
@@ -2204,37 +2220,48 @@ pub fn ll_emit_builtin(cn: string, toks: []string) bool {
     // 元素 LLVM 类型从实参槽类型取：标量 argst 即元素；聚合 argst 形如 %Point 即元素；指针 argst 即元素。
     // 旧实现仅取 x 的栈地址→ptrtoint（无拷贝），返回即悬空指针，unwrap 读出垃圾（optional_demo 现 42→1.3e11）。
     if (cn == "some") {
+        // O-6 opt.tagged：把 tag/payload 直接 store 进 dst 的 %Opt_E 槽，**零 arena 分配**
+        // （旧实现调 tll_opt_some 堆拷贝，每次构造都分配且永不回收）。
         var argst: string = llname.ll_get_st(toks[4]);
         var elem: string = argst;
-        var oslot: string = ll_map_argptr(toks[4], argst);
-        // sizeof(elem) = getelementptr <elem>, ptr null, i32 1 → ptrtoint to i64
-        var szg: string = ll_tmp();
-        sb_append_str(g_ll, "  "); sb_append_str(g_ll, szg);
-        sb_append_str(g_ll, " = getelementptr "); sb_append_str(g_ll, llname.st_to_ll(elem));
-        sb_append_str(g_ll, ", ptr null, i32 1\n");
-        var sz: string = ll_tmp();
-        sb_append_str(g_ll, "  "); sb_append_str(g_ll, sz);
-        sb_append_str(g_ll, " = ptrtoint ptr "); sb_append_str(g_ll, szg);
-        sb_append_str(g_ll, " to i64\n");
-        ll_maybe_declare("tll_opt_some", "ptr", ["ptr", "i64"]);
-        var r: string = ll_tmp();
-        sb_append_str(g_ll, "  "); sb_append_str(g_ll, r);
-        sb_append_str(g_ll, " = call ptr @tll_opt_some(ptr ");
-        sb_append_str(g_ll, oslot);
-        sb_append_str(g_ll, ", i64 "); sb_append_str(g_ll, sz);
-        sb_append_str(g_ll, ")\n");
-        var dstst: string = base.sb_cat3("ptr<", elem, ">");
-        ll_ensure_slot(d, dstst); llname.ll_set_st(d, dstst); ll_store(d, dstst, r);
+        var dstst: string = tir.tir_opt_tagged_name(elem);
+        ll_ensure_slot(d, dstst); llname.ll_set_st(d, dstst);
+        var dp: string = llname.ll_llname_ptr(d);
+        var dstll: string = llname.st_to_ll(dstst);
+        // __tag = 1
+        var tgp: string = ll_tmp();
+        sb_append_str(g_ll, "  "); sb_append_str(g_ll, tgp);
+        sb_append_str(g_ll, " = getelementptr "); sb_append_str(g_ll, dstll);
+        sb_append_str(g_ll, ", ptr "); sb_append_str(g_ll, dp); sb_append_str(g_ll, ", i32 0, i32 0\n");
+        sb_append_str(g_ll, "  store i64 1, ptr "); sb_append_str(g_ll, tgp); sb_append_str(g_ll, "\n");
+        // __val = x（聚合元素同样走 load/store 整块，LLVM 侧合法）
+        var vgp: string = ll_tmp();
+        sb_append_str(g_ll, "  "); sb_append_str(g_ll, vgp);
+        sb_append_str(g_ll, " = getelementptr "); sb_append_str(g_ll, dstll);
+        sb_append_str(g_ll, ", ptr "); sb_append_str(g_ll, dp); sb_append_str(g_ll, ", i32 0, i32 1\n");
+        var xv: string = ll_load(toks[4], elem);
+        sb_append_str(g_ll, "  store "); sb_append_str(g_ll, llname.st_to_ll(elem));
+        sb_append_str(g_ll, " "); sb_append_str(g_ll, xv);
+        sb_append_str(g_ll, ", ptr "); sb_append_str(g_ll, vgp); sb_append_str(g_ll, "\n");
         return true;
     }
     if (cn == "is_some" or cn == "is_none") {
-        var pv: string = ll_load(toks[4], "ptr");
+        // O-6：判空读 __tag（偏移 0），不再是「指针是否为 null」。
+        var argst: string = llname.ll_get_st(toks[4]);
+        var op: string = ll_map_argptr(toks[4], argst);
+        var tgp: string = ll_tmp();
+        sb_append_str(g_ll, "  "); sb_append_str(g_ll, tgp);
+        sb_append_str(g_ll, " = getelementptr "); sb_append_str(g_ll, llname.st_to_ll(argst));
+        sb_append_str(g_ll, ", ptr "); sb_append_str(g_ll, op); sb_append_str(g_ll, ", i32 0, i32 0\n");
+        var tgv: string = ll_tmp();
+        sb_append_str(g_ll, "  "); sb_append_str(g_ll, tgv);
+        sb_append_str(g_ll, " = load i64, ptr "); sb_append_str(g_ll, tgp); sb_append_str(g_ll, "\n");
         var pred: string = "ne";
         if (cn == "is_none") { pred = "eq"; }
         var cmp: string = ll_tmp();
         sb_append_str(g_ll, "  "); sb_append_str(g_ll, cmp);
         sb_append_str(g_ll, " = icmp "); sb_append_str(g_ll, pred);
-        sb_append_str(g_ll, " ptr "); sb_append_str(g_ll, pv); sb_append_str(g_ll, ", null\n");
+        sb_append_str(g_ll, " i64 "); sb_append_str(g_ll, tgv); sb_append_str(g_ll, ", 0\n");
         var z: string = ll_tmp();
         sb_append_str(g_ll, "  "); sb_append_str(g_ll, z);
         sb_append_str(g_ll, " = zext i1 "); sb_append_str(g_ll, cmp); sb_append_str(g_ll, " to i64\n");
@@ -4840,6 +4867,13 @@ pub fn ll_emit_string_globals() void {
 // 每条指令直接消费 inst.tokens（结构化 token 列表，发射期由 tir_line 解析，无整行文本字段）。
 // 产出 .ll 与 tir_to_ll_translate(tir.tir_to_text()) 逐字节一致（对拍基线不变）。
 pub fn tir_to_ll_emit(module: TIRModule) string {
+    // O-6：?T 的 %Opt_<E> 类型必须在「第 1 遍：TT 类型声明」之前全部登记完毕。
+    // 否则函数体降级（在第 1 遍之后）时才惰性注册的类型不会出现在 types: 段
+    // ⇒ LLVM "use of undefined type" / "Cannot allocate unsized type"。
+    tir.tir_pregister_opt_types();
+    // ⚠ 不能靠 `append(module.types, ...)` 补条目：`module` 是 TIRModule 的**值拷贝**，
+    //   对 struct 参数的 slice 字段 append 不会写回（t 的值语义），实测补了也不生效。
+    //   改为在第 1 遍发射完之后**直接补发行**（下方 types 循环之后）。
     ll_reset();
     // ⚠ 代际分配器（2026-10-22）：emit 重降级期，包裹式持久 append 的还原目标 = g_func（scratch），
     // 保证重降级 FuncDecl 体落在 g_func、emit 后立即 arena_reset_func() 收得回（峰值杠杆）。
@@ -4878,6 +4912,10 @@ pub fn tir_to_ll_emit(module: TIRModule) string {
         ll_emit_type_line(base.sb_cat3(t.name, " = struct { ", base.sb_cat2(t.body, " }")));
         ti = ti + 1;
     }
+    // O-6：opt.tagged 类型**不在此处补发**。
+    // ⚠ 此刻函数体尚未降级（`lower_unit` 不降级 FuncDecl 体，体在 emit 期才重降级），
+    //   故 tir.g_opt_types 还是空的，补发必然无效。真正的补发点在下方「命名类型声明」循环
+    //   （第 1 遍函数降级之后、第 2 遍发射函数体之前）——那时 g_opt_types 才真正填满。
     // type_info 反射所需的 %TypeMeta / %FieldInfo 现在由 base.tc 声明为真实 t struct，
     // 由通用 struct 类型发射路径输出（见 module.types），此处不再手定义。
     // 字符串表：FuncDecl 体在 emit 期才重降级，其字面量经 append(g_mod.strings) 入表（lower_unit 不降级
@@ -5000,8 +5038,29 @@ pub fn tir_to_ll_emit(module: TIRModule) string {
         fi = fi + 1;
     }
     // 命名类型声明（%Perm 等位标志/枚举，i64 底类型）置于函数之前
+    // ⚠ O-6：?T 的 %Opt_E 若没进 module.types（函数体是在第 1 遍之后才降级的 ⇒ 其类型注册赶不上
+    //   类型段），就会落到这里被兜底成 `= type i64`（单字段、无花括号），随后
+    //   `getelementptr %Opt_E, ptr ..., i32 0, i32 1` 报 invalid getelementptr indices。
+    //   此刻函数体已降级完毕，tir.g_opt_types 才是完整的 ⇒ 在这里按真布局补发。
     var ni: i64 = 0; var nn: i64 = slice_len(g_ll_named_types) as i64;
-    while (ni < nn) { sb_append_str(g_ll, g_ll_named_types[ni]); sb_append_str(g_ll, " = type i64\n"); ni = ni + 1; }
+    while (ni < nn) {
+        var ntname: string = g_ll_named_types[ni];
+        var nt_done: bool = false;
+        if (str_len(ntname) > 5 and str_slice(ntname, 0, 5) == "%Opt_") {
+            var ots: []TIRType = tir.g_opt_types;
+            var oq: i64 = 0;
+            var oqn: i64 = slice_len(ots) as i64;
+            while (oq < oqn) {
+                if (ots[oq].name == ntname) {
+                    ll_emit_type_line(base.sb_cat3(ntname, " = struct { ", base.sb_cat2(ots[oq].body, " }")));
+                    nt_done = true;
+                }
+                oq = oq + 1;
+            }
+        }
+        if (nt_done == false) { sb_append_str(g_ll, ntname); sb_append_str(g_ll, " = type i64\n"); }
+        ni = ni + 1;
+    }
     // 第 2 遍：发射函数体
     // ⚠ 内存优化（2026-10-22）回溯：后端本块 arena（g_back）实验证明对 emit-ll 自举路径**净增**峰值
     // —— emit 是编译最后阶段，收尾才 t_arena_reset_back 来不及压低峰值；g_back 在 g_arena 语义图

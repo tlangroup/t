@@ -2172,6 +2172,25 @@ pub fn c_ti_emit_global(sb: StringBuilder, tname: string) void {
 
 pub fn tmir_to_c(m: TMIRModule) string {
     g_c_mod = m;
+    // O-6：?T 的 %Opt_<E> 类型须在「类型索引/尺寸表」构建**之前**全部登记完毕。
+    // tir_st_of_td 里的惰性注册只覆盖到降级时真正走过的路径，而函数体是在
+    // 类型表构建之后才降级的 ⇒ 漏登记的类型拿不到 body ⇒ c_struct_size=0 ⇒ 缓冲尺寸 0。
+    tir.tir_pregister_opt_types();
+    // ⚠ 同上：C 后端读的是 g_c_mod（TMIRModule 的另一份值拷贝），必须显式合并，
+    //   否则 c_find_type_body 返回空 ⇒ c_struct_size 算成 0 ⇒ 缓冲尺寸 0。
+    {
+        var ots: []TIRType = tir.g_opt_types;
+        var oi: i64 = 0;
+        var on: i64 = slice_len(ots) as i64;
+        while (oi < on) {
+            var ofd: bool = false;
+            var oj: i64 = 0;
+            var ojn: i64 = slice_len(g_c_mod.types) as i64;
+            while (oj < ojn) { if (g_c_mod.types[oj].name == ots[oi].name) { ofd = true; } oj = oj + 1; }
+            if (ofd == false) { append(g_c_mod.types, ots[oi]); }
+            oi = oi + 1;
+        }
+    }
     // 链接模式（阶段 C）：登记外部库函数名，供 c_callee 判定「调用不带 t_ 前缀的归档符号」。
     g_c_extern_names = [];
     {
@@ -2721,12 +2740,21 @@ pub fn c_emit_func(sb: StringBuilder, f: TMIRFunc) void {
                             var vsz6c: i64 = c_map_handle_valsz(hn6c);
                             c_slot_ty_mark(dn6, c_map_val_st(vsz6c));
                             append(g_c_mapval_slot, dn6);
-                        } else if (cb6 == "some") {
-                            // 可选类型 ?T 在 C 后端按「可空指针」(unsigned char*) 表示（对齐 LLVM 后端 some→arena 拷贝返回指针）。
-                            // some(x) 的 dst 须声明为地址槽(unsigned char*)，否则其名义槽类型（值类型 i64…）与
-                            // 发射的 (unsigned char*)(t_opt_some(...)) 赋值冲突 → incompatible pointer→int 转换。
-                            // 标地址槽后 c_slot_c_ty 直接返 unsigned char*，且 c_add_scalar 跳过它避免重复声明。
-                            if (c_is_addr_slot(dn6) == false) { append(g_c_addr_slot_name, dn6); }
+                        } else if (cb6 == "some" or cb6 == "unwrap") {
+                            // O-6：这两个内建的结果都是 **memcpy 写进 dst 槽**，故聚合结果槽必须拥有缓冲。
+                            //   some   → dst 类型 %Opt_E（恒为聚合）：要写 tag + payload
+                            //   unwrap → dst 类型是元素 E：聚合元素须整块拷出（旧实现是「改指到 arena 指针」，
+                            //            本就不需要缓冲；改成拷贝后没有缓冲就会写到空指针 ⇒ 段错误）
+                            // 旧实现标地址槽是为了让 dst 名义类型 = unsigned char*，与返回的 arena 指针对齐；
+                            // 现在 dst 持的是缓冲首址，c_is_agg_base 同样使它按 unsigned char* 声明。
+                            // 标量元素两个判定都不成立 ⇒ 既有标量通路一字不变。
+                            var ost: string = tir.tir_st_to_str(pins.st);
+                            if (c_is_user_agg_val_ty(ost)) {
+                                var osz: i64 = c_struct_size(ost);
+                                if (osz <= 0) { osz = 16; }
+                                c_slot_ty_mark(dn6, ost);
+                                if (c_is_agg_base(dn6) == false) { append(g_c_agg_base_name, dn6); append(g_c_agg_base_size, osz); }
+                            }
                         } else if (c_is_math_builtin(c_strip_suf(pins.args[0].name))) {
                             // 数学内建（@sqrt/@sin/... → 运行库 t_math_sqrt 等）：运行库按 double/float 返回，
                             // 但 TIR call 目的 st 常被错记为标量 i64/i32，导致结果槽被声明成 int64 → double 被截断
@@ -3662,39 +3690,62 @@ pub fn c_emit_inst(sb: StringBuilder, ins: TMIRInst) void {
         // some(x) → t_opt_some(&x, sizeof(x))（arena 拷贝 x 并返回指针）；dst 即可选指针（unsigned char*）。
         // is_some(op)/is_none(op) → (op != 0)/(op == 0) ? 1 : 0（op 为 void* 可选指针）。
         if (p0ty == "some") {
-            var xn: string = c_strip_suf(ins.args[1].name);
-            var xcty: string = c_slot_c_ty(xn);
-            if (xcty == "") { xcty = "int64_t"; }
-            sb_append_str(sb, "  "); sb_append_str(sb, dstn); sb_append_str(sb, " = (unsigned char*)(t_opt_some((const void*)(&");
-            c_emit_val(sb, ins.args[1]); sb_append_str(sb, "), (int64_t)(sizeof("); sb_append_str(sb, xcty); sb_append_str(sb, "))));\n");
+            // O-6 opt.tagged：?T = { i64 __tag, E __val }，some 直接把 tag/payload 写进 dst 的缓冲。
+            // 零 arena 分配（旧实现每次构造都 t_opt_some 堆拷贝且永不回收，正是 O-7 隐式提升的阻碍）。
+            var osty: string = tir.tir_st_to_str(ins.st);
+            var obody: string = c_find_type_body(osty);
+            var elst: string = c_field_type_at(obody, 1);
+            if (elst == "") { elst = "i64"; }
+            // __tag = 1
+            sb_append_str(sb, "  { int64_t _otag = 1; memcpy((void*)("); sb_append_str(sb, dstn);
+            sb_append_str(sb, " + 0), &_otag, 8); }\n");
+            // __val = x（聚合元素：实参槽本身即指向缓冲的指针，按尺寸整块拷贝）
+            if (c_is_user_agg_val_ty(elst)) {
+                var esz: i64 = c_struct_size(elst);
+                if (esz <= 0) { esz = 8; }
+                sb_append_str(sb, "  memcpy((void*)("); sb_append_str(sb, dstn); sb_append_str(sb, " + 8), (void*)(");
+                c_emit_val(sb, ins.args[1]); sb_append_str(sb, "), (size_t)("); sb_append_str(sb, base.i2s(esz));
+                sb_append_str(sb, "));\n");
+            } else {
+                var elcty: string = c_tystr_c(elst);
+                if (elcty == "") { elcty = "int64_t"; }
+                sb_append_str(sb, "  { "); sb_append_str(sb, elcty); sb_append_str(sb, " _ov = ");
+                c_emit_val(sb, ins.args[1]); sb_append_str(sb, "; memcpy((void*)("); sb_append_str(sb, dstn);
+                sb_append_str(sb, " + 8), &_ov, sizeof(_ov)); }\n");
+            }
             return;
         }
         if (p0ty == "is_some" or p0ty == "is_none") {
+            // O-6：判空读 __tag（偏移 0）。旧实现比较指针是否为 NULL；
+            // 保留 NULL 判定是为兼容「未被期望类型覆盖」路径下仍按指针表示的 none。
             var pred: string = "!="; if (p0ty == "is_none") { pred = "=="; }
-            sb_append_str(sb, "  "); sb_append_str(sb, dstn); sb_append_str(sb, " = ((");
-            c_emit_val(sb, ins.args[1]); sb_append_str(sb, ") "); sb_append_str(sb, pred); sb_append_str(sb, " 0 ? 1 : 0);\n");
+            sb_append_str(sb, "  "); sb_append_str(sb, dstn); sb_append_str(sb, " = (((");
+            c_emit_val(sb, ins.args[1]); sb_append_str(sb, ") != 0 && (*(int64_t*)(");
+            c_emit_val(sb, ins.args[1]); sb_append_str(sb, ")) "); sb_append_str(sb, pred);
+            sb_append_str(sb, " 0) ? 1 : 0);\n");
             return;
         }
-        // unwrap(op) → t_opt_unwrap(op) 返回「指向元素值的指针」，须按 dst 类型解引用取值（对齐 LLVM load）。
+        // unwrap(op)：O-6 下读 __tag 判定；none 时把 payload 指针选成 NULL 交给既有的
+        // t_opt_unwrap(NULL)（打 JSON 后 exit(1)）—— 复用现成 panic，零运行时改动。
+        // 用三元选指针而非分支，C 与 LLVM 两侧形状一致（LLVM 侧是 select）。
         if (p0ty == "unwrap") {
-            var ucty: string = c_slot_c_ty(dstn);
-            if (ucty == "") { ucty = "int64_t"; }
-            sb_append_str(sb, "  "); sb_append_str(sb, dstn); sb_append_str(sb, " = *(");
-            sb_append_str(sb, ucty); sb_append_str(sb, "*)(");
-            sb_append_str(sb, cfname); sb_append_str(sb, "((const void*)(");
-            c_emit_val(sb, ins.args[1]); sb_append_str(sb, ")));\n");
-            // ⭐ O-3：聚合元素的 unwrap 会把 dst **改指**到 `t_opt_unwrap` 返回的 arena 指针，
-            //   而 dst 自带的 `<dst>_buf` 是声明段就已 memset 成 0 的旧缓冲 ⇒ 后续 ADDR_OF 必须取
-            //   **槽里的当前指针值**，否则 `op.?.x` 读到空缓冲得 0（LLVM 后端 3+4=7、C 后端 0，
-            //   静默错编）。这与 G-5（CALL_IND 聚合返回 buf 改指）完全同型 ⇒ 复用同一张登记表。
-            //   标量元素两个判定都不成立，故既有标量通路一字不变。
             var _utn: string = c_slot_ty_find(dstn);
             if (_utn == "") { _utn = tir.tir_st_to_str(ins.st); }
-            if (c_is_user_agg_val_ty(_utn) or c_is_user_agg_ptr_ty(_utn)) {
-                var already_u: bool = false;
-                var zu: i64 = 0;
-                while (zu < slice_len(g_c_aggcall_slot) as i64) { if (g_c_aggcall_slot[zu] == dstn) { already_u = true; } zu = zu + 1; }
-                if (already_u == false) { append(g_c_aggcall_slot, dstn); }
+            sb_append_str(sb, "  { unsigned char* _op = (unsigned char*)(");
+            c_emit_val(sb, ins.args[1]);
+            sb_append_str(sb, ");\n");
+            sb_append_str(sb, "    unsigned char* _pv = ((_op != 0 && (*(int64_t*)(_op)) != 0) ? (_op + 8) : (unsigned char*)0);\n");
+            sb_append_str(sb, "    unsigned char* _ur = (unsigned char*)(t_opt_unwrap((const void*)(_pv)));\n");
+            if (c_is_user_agg_val_ty(_utn)) {
+                var usz: i64 = c_struct_size(_utn);
+                if (usz <= 0) { usz = 8; }
+                sb_append_str(sb, "    memcpy((void*)("); sb_append_str(sb, dstn);
+                sb_append_str(sb, "), (void*)(_ur), (size_t)("); sb_append_str(sb, base.i2s(usz)); sb_append_str(sb, ")); }\n");
+            } else {
+                var ucty: string = c_tystr_c(_utn);
+                if (ucty == "") { ucty = "int64_t"; }
+                sb_append_str(sb, "    memcpy((void*)(&"); sb_append_str(sb, dstn);
+                sb_append_str(sb, "), (void*)(_ur), sizeof("); sb_append_str(sb, ucty); sb_append_str(sb, ")); }\n");
             }
             return;
         }
