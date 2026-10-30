@@ -512,6 +512,31 @@ pub var g_cur_ret_td: i64 = -1;       // 当前函数返回类型 TD（return �
 // 直接 -1）导致返回 string/struct 的 match 的 __mres 槽宽度不足（as-模式 v @ range => str 等）」。
 // 仅作用于顶层表达式一次：读取后立即清零，避免污染子表达式的真实类型。
 pub var g_expect_st: i64 = ST_NONE;
+
+// O-7：隐式提升的递归抑制（见 tir_emit_expr 的提升分支）。
+pub var g_optlift_busy: []i64;
+
+pub fn tir_optlift_busy_has(e: i64) bool {
+    var i: i64 = 0;
+    var n: i64 = slice_len(g_optlift_busy) as i64;
+    while (i < n) {
+        if (g_optlift_busy[i] == e) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+pub fn tir_optlift_busy_del(e: i64) void {
+    var i: i64 = 0;
+    var n: i64 = slice_len(g_optlift_busy) as i64;
+    while (i < n) {
+        if (g_optlift_busy[i] == e) {
+            slice_set(g_optlift_busy, i, -1);
+            return;
+        }
+        i = i + 1;
+    }
+}
 // 当前 match 的 scrutinee 表达式节点（S6 切片模式取元素 scr[i] 时用，
 // 避免把临时量名字反查回节点）。tir_emit_match 进入时设置，退出时不清零（单帧内有效）。
 pub var g_match_scrut: i64 = -1;
@@ -1168,7 +1193,8 @@ pub fn tir_st_of_td(td: i64) string {
     }
     if (t.cat == "map") { return "ptr<void>"; }
     if (t.cat == "bitstr") { return "%TBitStr"; }   // 位串（§15）：与 TStr/TSlice 同构，LLVM 侧为聚合 {ptr,i64,i64}
-    if (t.cat == "optional") { return base.sb_cat3("ptr<", tir_st_of_td(t.elem), ">"); }  // Stage 1 opt.boxed
+    // O-6：opt.tagged —— 按值 `{ i64 __tag, E __val }`，零分配（取代 opt.boxed 的 ptr<E> 装箱）。
+    if (t.cat == "optional") { return tir_ensure_opt_tagged(tir_st_of_td(t.elem)); }
     if (t.cat == "sym") {
         if (t.alen == 16) { return "u16"; }
         if (t.alen == 64) { return "u64"; }
@@ -1725,6 +1751,129 @@ pub fn tir_add_struct_tt(name: string, field_head: i64) void {
 pub fn tir_add_union_tt(name: string) void {
     // union 擦除为 { i8 tag, <max-member ST> }；Stage 1 仅登记 %Name 占位
     append(g_mod.types, TIRType{ name: base.sb_cat2("%", name), body: "f0: i8" });
+}
+
+// ── O-6 opt.tagged：?T 的按值布局 ─────────────────────────────────────────
+//
+// 旧 ABI（opt.boxed）把 ?T 抹成 `ptr<E>`：`some(x)` = arena 分配 + memcpy，none = 空指针。
+// 代价是**每次构造都堆分配且永不回收**，于是 `T → ?T` 隐式提升（O-7）会把「开销」也一起隐形，
+// 这比 L-02 原本要防的「空值隐形」更糟。
+//
+// 新 ABI（opt.tagged）：?T = `%Opt_<E>` = `struct { i64 __tag, E __val }`，按值、零分配。
+//   none ⇒ __tag == 0；some ⇒ __tag != 0 且 __val 有效。
+//   tag 用 **i64 而非 i8** 是刻意的：payload 偏移恒为 8，与 t 的 8 字节对齐布局一致，
+//   C 后端（手工偏移 memcpy）与 LLVM（`{ i64, E }` 的默认对齐）无需各自算对齐即可逐字节对齐。
+//
+// 类型名由元素 ST **派生**（同元素 ⇒ 同名），而非按首次出现顺序编号：
+//   std 的 .tlib 与主程序分别编译时，编号会错位导致同名异义；派生名天然保证跨模块类型等价。
+
+pub fn tir_opt_tagged_name(elem_st: string) string {
+    var s: string = "";
+    var i: i64 = 0;
+    var n: i64 = str_len(elem_st) as i64;
+    while (i < n) {
+        var ch: string = str_slice(elem_st, i, i + 1);
+        // 元素 ST 可能含 `ptr<>` / `arr<E x N>` / `%Name` —— 全部压成合法标识符字符。
+        if (ch == "%" or ch == "<" or ch == ">" or ch == " " or ch == "," or ch == ":" or ch == ".") { ch = "_"; }
+        s = base.sb_cat2(s, ch);
+        i = i + 1;
+    }
+    return base.sb_cat2("%Opt_", s);
+}
+
+// 幂等注册：已注册则直接返回名字，否则补进 module.types（后端类型声明段）与 g_ssz（tir_sizeof）。
+// ⚠ 同时登记进 **g_opt_types**：后端拿到的 module 是值拷贝，其 types 未必包含此处追加的条目
+//   （实测：降级当场注册的通常在拷贝里；后期才用到的不在）⇒ 后端必须改读本表再自行补发，
+//   否则该类型被兜底成 `= type i64`（单字段）⇒ GEP `i32 0, i32 1` 非法。
+pub var g_opt_types: []TIRType;
+
+pub fn tir_ensure_opt_tagged(elem_st: string) string {
+    var nm: string = tir_opt_tagged_name(elem_st);
+    var k: i64 = 0;
+    var kn: i64 = slice_len(g_opt_types) as i64;
+    while (k < kn) {
+        if (g_opt_types[k].name == nm) { return nm; }
+        k = k + 1;
+    }
+    var obody: string = base.sb_cat3("__tag: i64, __val: ", elem_st, "");
+    append(g_opt_types, TIRType{ name: nm, body: obody });
+    var i: i64 = 0;
+    var n: i64 = slice_len(g_mod.types) as i64;
+    while (i < n) {
+        if (g_mod.types[i].name == nm) { return nm; }
+        i = i + 1;
+    }
+    append(g_mod.types, TIRType{ name: nm, body: obody });
+    append(g_ssz_name, nm);
+    var fs: []string = [];
+    append(fs, "i64");
+    append(fs, elem_st);
+    append(g_ssz_fields, fs);
+    return nm;
+}
+
+// 预注册：后端在发射「类型声明段」之前必须调一次。
+// ⚠ 不能只靠 tir_st_of_td 的惰性注册 —— 函数体是在类型声明段**之后**才降级的，
+//   那时补进 g_mod.types 的条目不会出现在声明里 ⇒ LLVM "use of undefined type"。
+//   这里改为遍历 sema 的类型表直接扫出全部 optional（含嵌套 ??T，由 tir_st_of_td 递归带出）。
+// 由 opt.tagged 类型名反解元素 ST。
+// ⚠ 名字是 sanitize 过的（`<`/`>`/`%` 全压成 `_`）⇒ **不可逆**，必须查登记表而不是字符串切割，
+//    否则 `?ptr<i64>` 会被解成 `ptr_i64_` 这种不存在的类型 → LLVM "use of undefined type"。
+pub fn tir_opt_elem_st(optname: string) string {
+    var i: i64 = 0;
+    var n: i64 = slice_len(g_ssz_name) as i64;
+    while (i < n) {
+        if (g_ssz_name[i] == optname) {
+            var fs: []string = g_ssz_fields[i];
+            if (slice_len(fs) as i64 >= 2) { return fs[1]; }
+        }
+        i = i + 1;
+    }
+    return "i64";
+}
+
+// 把「期望类型」注入给即将发射的 RHS —— **仅当**目标是 ?T 且 RHS 是 none 字面量时才注入，
+// 因此对其余所有赋值/初始化路径零影响（不触碰既有基线）。注入后由 tir_emit_expr 的 null 分支消费。
+pub fn tir_maybe_expect_opt_none(rhs: i64, dst_st: string) void {
+    if (rhs < 0) { return; }
+    if (str_len(dst_st) <= 5) { return; }
+    if (str_slice(dst_st, 0, 5) != "%Opt_") { return; }
+    var k: string = base.node_kind((rhs as u64));
+    if (k != "null" and k != "opt_none") { return; }
+    g_expect_st = tir_st_from_str(dst_st);
+}
+
+pub fn tir_pregister_opt_types() void {
+    var i: i64 = 0;
+    var n: i64 = slice_len(sema.tds) as i64;
+    while (i < n) {
+        if (sema.tds[i].cat == "optional") { var _unused: string = tir_st_of_td(i); }
+        i = i + 1;
+    }
+}
+
+// 收集全部 opt.tagged 类型条目，供后端合并进**它自己那份** module（TIRModule 按值传参 ⇒
+// 后端拿到的是拷贝，写 tir.g_mod 不会自动同步过去；必须显式交给后端 append）。
+// 幂等：同元素类型只产出一条。后端侧再按 name 去重即可安全重复调用。
+pub fn tir_collect_opt_types() []TIRType {
+    var out: []TIRType = [];
+    var i: i64 = 0;
+    var n: i64 = slice_len(sema.tds) as i64;
+    while (i < n) {
+        if (sema.tds[i].cat == "optional") {
+            var el: i64 = sema.tds[i].elem;
+            var est: string = "i64";
+            if (el >= 0 and el < slice_len(sema.tds) as i64) { est = tir_st_of_td(el); }
+            var nm: string = tir_opt_tagged_name(est);
+            var fd: bool = false;
+            var j: i64 = 0;
+            var m: i64 = slice_len(out) as i64;
+            while (j < m) { if (out[j].name == nm) { fd = true; } j = j + 1; }
+            if (fd == false) { append(out, TIRType{ name: nm, body: base.sb_cat3("__tag: i64, __val: ", est, "") }); }
+        }
+        i = i + 1;
+    }
+    return out;
 }
 
 // ── 变体 ADT 辅助（T1：构造器发射 + conpat 绑定提取）──────────────────
@@ -2685,6 +2834,8 @@ pub fn tir_emit_stmt(sid: i64) void {
                     tir_emit(TIRInst{ op: TIR_OP_CONST, st: tir_st_from_str(st), dst: tir_op(daw), args: tir_a1(base.node_sa((base.node_nb((sid as u64)) as u64))), is_comment: false, line: g_cur_line, cmt: "" });
                     tir_emit(TIRInst{ op: TIR_OP_STORE, st: ST_NONE, dst: tir_op(slot), args: tir_a1(daw), is_comment: false, line: g_cur_line, cmt: "" });
                 } else {
+                    // O-6：`var o: ?i64 = null` 须让初始化器知道目标是 %Opt_X，否则发射成空指针。
+                    tir_maybe_expect_opt_none(base.node_nb((sid as u64)), st);
                     var initr: TirEmitRes = tir_emit_expr(base.node_nb((sid as u64))); var init: string = initr.name;
                     if (st == "%TSlice") { init = tir_maybe_array_to_slice(init, base.node_nb((sid as u64))); }
                     tir_emit(TIRInst{ op: TIR_OP_STORE, st: ST_NONE, dst: tir_op(slot), args: tir_a1(init), is_comment: false, line: g_cur_line, cmt: "" });
@@ -3234,6 +3385,8 @@ pub fn tir_emit_assign(sid: i64, est: i64) TirEmitRes {
             }
             var __er4: TirEmitRes = tir_emit_map_lit(base.node_nb((sid as u64)), lhstd); rhs = __er4.name;
         } else {
+            // O-6：`o = null`（o 为 ?T）须让 RHS 知道目标是 %Opt_X，否则发射成空指针。
+            tir_maybe_expect_opt_none(base.node_nb((sid as u64)), tir_st_to_str(est));
             var __er5: TirEmitRes = tir_emit_expr(base.node_nb((sid as u64))); rhs = __er5.name;
         }
         if (base.node_kind((base.node_na((sid as u64)) as u64)) == "ident") {
@@ -3455,6 +3608,29 @@ pub fn tir_emit_expr(e: i64) TirEmitRes {
     if (g_expect_st != ST_NONE) { est = g_expect_st; g_expect_st = ST_NONE; }
     if (est == ST_NONE) { est = tir_st_from_str(tir_expr_st(e)); }
 
+    // O-7：`T → ?T` 隐式提升。sema 已在类型检查处放行并打标记（sema.opt_lift_has），
+    // 这里补上真正的包装：先按原语义发射出元素值，再 STRUCT_NEW 成 %Opt_E（__tag=1 + payload）。
+    // 用 STRUCT_NEW 而非新指令，双后端（C 的 `{0}` 缓冲 + 逐字段 GEP、LLVM 的 zeroinitializer +
+    // 逐字段 store）都已支持，零后端改动。
+    // ⚠ 递归会再次命中同一个标记 ⇒ 用 busy 集合作一次性抑制（发射元素值时不再提升）。
+    if (sema.opt_lift_has(e) and tir_optlift_busy_has(e) == false) {
+        append(g_optlift_busy, e);
+        var ev: TirEmitRes = tir_emit_expr(e);
+        tir_optlift_busy_del(e);
+        var opt_name: string = tir_st_to_str(est);
+        if (str_len(opt_name) <= 5 or str_slice(opt_name, 0, 5) != "%Opt_") {
+            opt_name = tir_ensure_opt_tagged(tir_st_to_str(ev.st));
+        }
+        var tagc: string = tir_tmp();
+        tir_emit(TIRInst{ op: TIR_OP_CONST, st: ST_I64, dst: tir_op(tagc), args: tir_a1("1"), is_comment: false, line: g_cur_line, cmt: "" });
+        var dn2: string = tir_tmp();
+        var __oa: []string = [];
+        append(__oa, tagc);
+        append(__oa, ev.name);
+        tir_emit(TIRInst{ op: TIR_OP_STRUCT_NEW, st: tir_st_from_str(opt_name), dst: tir_op(dn2), args: __oa, is_comment: false, line: g_cur_line, cmt: "" });
+        return TirEmitRes{ name: dn2, st: tir_st_from_str(opt_name) };
+    }
+
     if (kd == "assign" or kd == "assignment") { return tir_emit_assign(e, est); }
     if (kd == "match") { return tir_emit_match(e, false, est); }
     // P1 Stage 1b：多语句值块 `{ s1; ...; sn; e; }` —— 值即**尾随表达式**的槽。
@@ -3548,6 +3724,17 @@ pub fn tir_emit_expr(e: i64) TirEmitRes {
         return TirEmitRes{ name: d, st: ST_I8 };
     }
     if (kd == "null" or kd == "opt_none") {
+        // O-6：?T 已改为按值布局 %Opt_X，none 即「全零」（tag == 0）。
+        // 若上下文期望 ?T，必须发射**零初始化的聚合值**（零参 STRUCT_NEW：C 端 `= {0}`、
+        // LLVM 端 zeroinitializer），而不能发射空指针常量：
+        //   ① C 后端会把聚合槽的缓冲指针改指成 0，后续 some 写入即段错误；
+        //   ② LLVM 侧 `store ptr null` 与 %Opt_X 槽类型冲突。
+        var nst: string = tir_st_to_str(est);
+        if (str_len(nst) > 5 and str_slice(nst, 0, 5) == "%Opt_") {
+            var dn: string = tir_tmp();
+            tir_emit(TIRInst{ op: TIR_OP_STRUCT_NEW, st: est, dst: tir_op(dn), args: tir_a0(), is_comment: false, line: g_cur_line, cmt: "" });
+            return TirEmitRes{ name: dn, st: est };
+        }
         var d: string = tir_tmp();
         tir_emit(TIRInst{ op: TIR_OP_CONST_PTR_NULL, st: tir_st_from_str("ptr<void>"), dst: tir_op(d), args: tir_a0(), is_comment: false, line: g_cur_line, cmt: "" });
         return TirEmitRes{ name: d, st: ST_PTR_VOID };
@@ -4408,7 +4595,7 @@ pub fn tir_emit_call(e: i64) TirEmitRes {
             var ed: i64 = tir_expr_td(argnode);
             var est: string = "i64";
             if (ed >= 0 and ed < slice_len(sema.tds) as i64) { est = tir_st_of_td(ed); }
-            dstst = base.sb_cat3("ptr<", est, ">");
+            dstst = tir_ensure_opt_tagged(est);   // O-6：?T = %Opt_<E>（按值），不再是 ptr<E>
         } else {
             var otd: i64 = tir_expr_td(argnode);
             if (otd >= 0 and otd < slice_len(sema.tds) as i64 and sema.tds[otd].cat == "optional") {
