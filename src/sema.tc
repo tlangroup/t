@@ -7404,6 +7404,34 @@ pub fn infer_expr_body(e: i64) i64 {
             hir.hir_invalidate((e as u64));
             return ti_mk("String");
         }
+        if (base.node_sa((e as u64)) == "bitCast" or base.node_sa((e as u64)) == "bitcast") {
+            // @bitCast(T, value)：把 value 的位模式原样重解释为 T（真位重解释，非算术转换）。
+            // 运行期可用：codegen 发射 TIR_OP_BITCAST（C/LLVM 双后端已实现其 lowering）。
+            // 要求 sizeof(T) == sizeof(typeof(value))；NaN/Inf/-0.0 位模式原样保留。
+            var bc_la: i64 = base.node_la((e as u64));
+            if (bc_la < 0) { parse.fc_err("T-SEM-E007", "@bitCast 需要 2 个实参 (类型, 值)", e); return ti_mk("Unknown"); }
+            var bc_ks: []i64 = base.kids_chain_idx(bc_la);
+            if (slice_len(bc_ks) as i64 != 2) { parse.fc_err("T-SEM-E007", "@bitCast 需要 (类型, 值) 两个实参", e); return ti_mk("Unknown"); }
+            // 第一个实参是「类型」本身（如 f32 / u32 / MyStruct），不是值；用 deser_type_of 把
+            // 类型表达式节点归一成类型描述符，再取其 name（与 @type_size 等同源解析路径）。
+            var bc_td: i64 = deser_type_of(base__kids[bc_ks[0]].val);
+            var bc_tinfo: TD = tds[bc_td];
+            var bc_tname: string = bc_tinfo.name;
+            if (bc_tname == "") { parse.fc_err("T-SEM-E008", "@bitCast 的第一个实参必须是类型（如 f32 / u32）", e); return ti_mk("Unknown"); }
+            var bc_vti: i64 = infer_expr(base__kids[bc_ks[1]].val);
+            if (bc_vti < 0 or tis[bc_vti].kind == "Unknown") { return ti_mk("Unknown"); }
+            var bc_vname: string = tip_name(bc_vti);
+            var bc_wt: i64 = sema_bitcast_width(bc_tname);
+            var bc_wv: i64 = sema_bitcast_width(bc_vname);
+            if (bc_wt < 0 or bc_wv < 0 or bc_wt != bc_wv) {
+                parse.fc_err("T-SEM-E008",
+                    base.sb_cat3("@bitCast 要求源与目标同尺寸：", bc_vname, base.sb_cat2(" -> ", bc_tname)), e);
+                return ti_mk("Unknown");
+            }
+            // 目标类型名暂存到节点 sb 槽（mbuiltin 节点的 sb 空闲），供 codegen 读取。
+            base.node_set_sb((e as u64), bc_tname);
+            return ti_named("Scalar", bc_tname);
+        }
         if (base.node_sa((e as u64)) == "compile_error") {
             // 语义同 Zig 的 @compileError：**只要被分析到就触发**。CTFE 执行到会触发，
             // 走到 check（说明这段代码真的会被编译）同样触发。死分支已由 mb_prune_if
@@ -10756,6 +10784,10 @@ pub fn check_struct_decl(d: i64) void {
     if (base.node_sb((d as u64)) == "packed") {
         check_packed_layout(d);
     }
+    // pb 修饰关键词：`@pb` / `#pb` 标记的结构体是 protobuf message；其字段 `@N` 是线格式
+    // 契约字段号（protobuf 语义），必须显式给出、不可自动分配。统一经 la 上的 `pb` 注解识别
+    // （`@pb` 注解与 `#pb` 合成的 `pb` 注解走同一条路径）。
+    var is_pb: bool = parse.ann_find(base.node_la((d as u64)), "pb") >= 0;
     var c: i64 = base.node_lb((d as u64));
     var total: i64 = 0;
     var tag_count: i64 = 0;
@@ -10777,6 +10809,13 @@ pub fn check_struct_decl(d: i64) void {
     if (tag_count > 0 and tag_count < total) {
         base.diag_new("T-SEM-E010", "error",
             base.sb_cat3("struct '", base.node_sa((d as u64)), "' 的字段 tagID 必须「全显式 @N」或「全自动」：不能部分字段写 @N、部分不写"),
+            parse.n_file(d), parse.n_line(d), parse.n_col(d), parse.n_line(d), parse.n_col(d) + 4);
+        return;
+    }
+    // ── pb message：字段号是线格式契约，必须每个字段都显式 @N（禁止自动分配 1,2,3…）──
+    if (is_pb and tag_count < total) {
+        base.diag_new("T-SEM-E010", "error",
+            base.sb_cat3("pb struct '", base.node_sa((d as u64)), "' 的每个字段都必须显式标注 @N tag id（protobuf 字段号是线格式契约，不可自动分配）"),
             parse.n_file(d), parse.n_line(d), parse.n_col(d), parse.n_line(d), parse.n_col(d) + 4);
         return;
     }
@@ -17583,6 +17622,16 @@ pub fn mb_pass() void {
 // P4 值→类型查询：在 CTFE 期把表达式 e 的静态类型折成类型节点（类型即值）。
 // 覆盖 p45 用到的形态：变量 / 浮点 / 字符串 / 结构体 / 结构体字段 / 切片 / 定长数组 /
 // 数组元素 / 函数返回值 / 字面量 / cast 表达式。返回类型节点，-1 表示无法确定。
+// 标量位宽（仅 @bitCast 用）：与 tir.tc:tir_width 同源但本模块内联，避免跨模块链接。
+// ⚠ 仅覆盖标量/浮点；聚合类型不走这里（R-013 的 @bitCast 仅服务标量真位重解释）。
+pub fn sema_bitcast_width(st: string) i64 {
+    if (st == "i8" or st == "u8" or st == "bool") { return 8; }
+    if (st == "i16" or st == "u16") { return 16; }
+    if (st == "i32" or st == "u32" or st == "f32") { return 32; }
+    if (st == "i64" or st == "u64" or st == "f64") { return 64; }
+    return -1;       // 未知/聚合：交给下游宽度校验报错路径
+}
+
 pub fn meta_type_of_expr(e: i64) i64 {
     if (e < 0) { return -1; }
     if (base.node_kind((e as u64)) == "paren" or base.node_kind((e as u64)) == "comptime") { return meta_type_of_expr(base.node_na((e as u64))); }
@@ -19051,6 +19100,9 @@ pub fn ann_check_item(v: string, is_derive: bool, l: i64, c: i64) void {
 // validate（复刻 registry.ts:168）；ai = A 节点索引
 pub fn ann_validate(ai: i64, target: string) void {
     var name: string = base.node_sa((ai as u64));
+    // pb 修饰关键词：`@pb` 标记结构体为 protobuf message（与 `#pb` 同义）。非注册注解，
+    // 跳过未知注解校验（不要求进 g_ad_name 表，避免并行数组维护成本）。
+    if (name == "pb") { return; }
     var l: i64 = base.node_span_id(ai).line as i64;
     var c: i64 = base.node_span_id(ai).col as i64;
     var name_len: i64 = str_len(name) as i64;

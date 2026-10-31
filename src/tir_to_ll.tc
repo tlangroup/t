@@ -3130,6 +3130,38 @@ pub fn ll_emit_inst(inst: TIRInst) void {
         var castDst: string = dll;
         var srcIsInt: bool = ll_llty_is_int(srcLlTy);
         var dstIsInt: bool = ll_llty_is_int(dll);
+        if (srcIsInt and (dstIsInt or ll_is_float(dll))) {
+            // @bitCast 跨标量（整数源）：TIR 整数值恒以 i64 承载，若目标标量位宽更窄
+            // （如 f32 / u32 / i8），直接 `bitcast i64 to float` 非法（位宽不等）。sema 已保证
+            // 源/目标逻辑位宽相等，故先把整数源截/扩到目标整数位宽，再做真位重解释。
+            var dstW: i64 = base.ll_bits(dll);
+            var srcW: i64 = base.ll_bits(srcLlTy);
+            if (dstW > 0 and srcW > 0 and dstW != srcW) {
+                var idst: string = "i64";
+                if (dstW == 8) { idst = "i8"; } else if (dstW == 16) { idst = "i16"; } else if (dstW == 32) { idst = "i32"; } else { idst = "i64"; }
+                var adj: string = ll_tmp();
+                sb_append_str(g_ll, "  "); sb_append_str(g_ll, adj);
+                if (srcW > dstW) {
+                    sb_append_str(g_ll, " = trunc "); sb_append_str(g_ll, srcLlTy);
+                    sb_append_str(g_ll, " "); sb_append_str(g_ll, srcv);
+                    sb_append_str(g_ll, " to "); sb_append_str(g_ll, idst);
+                } else {
+                    sb_append_str(g_ll, " = zext "); sb_append_str(g_ll, srcLlTy);
+                    sb_append_str(g_ll, " "); sb_append_str(g_ll, srcv);
+                    sb_append_str(g_ll, " to "); sb_append_str(g_ll, idst);
+                }
+                sb_append_str(g_ll, "\n");
+                srcv = adj; srcLlTy = idst;
+            }
+            if (dstIsInt) {
+                // 整数→整数：调整后即结果，无需再发 bitcast（避免 `bitcast iN to iN` 同型非法）
+                ll_ensure_slot(dst, dstst_eff);
+                llname.ll_set_st(dst, dstst_eff);
+                ll_store(dst, dstst_eff, srcv);
+                return;
+            }
+            // 整数→浮点：调整为 i<dstW> 后，落回下方 bitcast 通路
+        }
         if (srcLlTy == "ptr" and dstIsInt) {
             castop = "ptrtoint";
         } else if (srcIsInt and llname.ll_starts(dll, "ptr")) {
