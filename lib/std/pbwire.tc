@@ -1,0 +1,512 @@
+// lib/std/pbwire.tc —— pb3 wire 层标量原语（R-015，thyme M2/M4 地基）
+//
+// 分层：本模块是 L2「pb3 语义」的 schema-less 部分——纯字节↔值转换，不依赖任何 schema。
+// 依赖 schema 的部分（TDA/FieldDef 遍历、map entry 合成）由 thyme 自持，不在此。
+//
+// 设计（与 thyme 002 文档对齐）：
+//   * 畸形输入一律返回显式错误码（PbWireErr），绝不用 -1 / 哨兵值。
+//   * 错误模型用「结果结构体 + 显式错误码」而非 fault 联合：t 的 fault(E)!T 联合是
+//     `over` 单一载荷类型 + repair 闭包，面向数据校验语义，与「字节解析器返回异构成功值 + 错误码」
+//     不匹配；规范明确允许「t 侧可微调」。每个 read 函数返回 {.err, .value, .consumed}。
+//   * 读写均按**小端**（pb3 wire format 规定）；定宽整数的字节抽取/拼装在模块内联展开（byteorder 的
+//     to_le 当前 C 后端尚不支持数组返回值，故此处自持 LE 编解码），sint 复用 std.zigzag，
+//     float/double 经 R-013 @bitCast 把位模式转成 f32/f64（双后端真位重解释）。
+//
+// 用法：
+//   import(std.pbwire);
+//   var r = pbwire.read_varint(buf, 0);
+//   if (r.err == pbwire.ERR_OK) { ... r.value ... r.consumed ... }
+
+@module(pub)
+
+@import("std.zigzag");
+
+// ── 错误码（u64 常量，非 enum：t 编译器当前对 @module 内枚举的 LLVM/C 发射有局限）──
+// 畸形输入一律返回显式错误码，绝不用 -1 / 哨兵值。
+pub const ERR_OK: u64 = 0;
+pub const ERR_TRUNCATED: u64 = 1;          // 流在 field/value 中途结束
+pub const ERR_NON_MINIMAL_VARINT: u64 = 2;  // 非最短 varint 编码（多余高位零字节 / 超 10 字节）
+pub const ERR_FIELD_NUMBER_OVERFLOW: u64 = 3;// field number 超 2^29-1
+pub const ERR_DEPTH_EXCEEDED: u64 = 4;      // 子消息嵌套超上限
+pub const ERR_BOUNDS_EXCEEDED: u64 = 5;     // 长度前缀越界
+pub const ERR_BAD_WIRE_TYPE: u64 = 6;        // wire_type 不在 {0,1,2,5}（含已废弃的 3/4 groups）
+
+// ── wire type 常量 ──
+pub const WT_VARINT: u64 = 0;
+pub const WT_I64: u64 = 1;
+pub const WT_LEN: u64 = 2;
+pub const WT_SGROUP: u64 = 3;
+pub const WT_EGROUP: u64 = 4;
+pub const WT_I32: u64 = 5;
+
+// ════════════════════════════════════════════════════════════════
+// varint：1~10 字节变长无符号整数（小端，每组 7 位 + 续位）
+// ════════════════════════════════════════════════════════════════
+
+struct VarintRes {
+    err: u64;
+    value: u64;
+    consumed: i64;
+}
+
+// 读一个 varint；错误时 err != Ok，consumed 为已消耗的字节数（含截断点）。
+pub fn read_varint(buf: []u8, off: i64) VarintRes {
+    var r: VarintRes;
+    r.err = ERR_OK; r.value = 0; r.consumed = 0;
+    var result: u64 = 0;
+    var shift: i64 = 0;
+    var i: i64 = off;
+    var n: i64 = slice_len(buf);
+    while (shift < 64) {
+        if (i >= n) { r.err = ERR_TRUNCATED; r.consumed = i - off; return r; }
+        var bv: u64 = buf[i] as u64;
+        if (shift == 63) {
+            // 第 10 字节：仅最低 1 位（bit 63）有效，其余高位必须为零
+            if ((bv & 0x7F) > 1) { r.err = ERR_NON_MINIMAL_VARINT; r.consumed = i - off + 1; return r; }
+        }
+        result = result | ((bv & 0x7Fu64) << (shift as u64));
+        i = i + 1;
+        if ((bv & 0x80) == 0) {
+            // 末字节：非最短判定（shift>0 且本字节全零 ⇒ 多余高位零字节）
+            if (shift > 0 and shift < 63 and (bv & 0x7F) == 0) { r.err = ERR_NON_MINIMAL_VARINT; r.consumed = i - off; return r; }
+            r.value = result;
+            r.consumed = i - off;
+            return r;
+        }
+        shift = shift + 7;
+    }
+    // 10 字节后仍带续位 ⇒ 溢出（11 字节）
+    r.err = ERR_NON_MINIMAL_VARINT;
+    r.consumed = i - off;
+    return r;
+}
+
+// varint 编码所需字节数（v=0 ⇒ 1）。
+pub fn varint_size(v: u64) i64 {
+    var n: i64 = 1;
+    var x: u64 = v;
+    while (x >= 0x80u64) { x = x / 128u64; n = n + 1; }
+    return n;
+}
+
+// 写 varint 到 buf[off..]；返回写入字节数。调用方须保证 buf 足够大（varint_size(v)）。
+pub fn write_varint(buf: []u8, off: i64, v: u64) i64 {
+    var i: i64 = off;
+    var x: u64 = v;
+    while (x >= 0x80u64) {
+        buf[i] = ((x & 0x7Fu64) as u8) | 0x80u8;
+        x = x / 128u64;
+        i = i + 1;
+    }
+    buf[i] = x as u8;
+    i = i + 1;
+    return i - off;
+}
+
+// ════════════════════════════════════════════════════════════════
+// tag / key：field_number(29 位) << 3 | wire_type(3 位)
+// ════════════════════════════════════════════════════════════════
+
+struct KeyRes {
+    err: u64;
+    field: u64;
+    wire_type: u64;
+    consumed: i64;
+}
+
+pub fn read_key(buf: []u8, off: i64) KeyRes {
+    var vr: VarintRes = read_varint(buf, off);
+    var r: KeyRes;
+    r.err = ERR_OK; r.field = 0; r.wire_type = 0; r.consumed = 0;
+    if (vr.err != ERR_OK) { r.err = vr.err; r.consumed = vr.consumed; return r; }
+    var key: u64 = vr.value;
+    var wt: u64 = key & 7;
+    var fnum: u64 = key / 8u64;
+    // wire_type 仅 {0,1,2,5} 合法；3/4（已废弃 groups）按规范识别但不实现 ⇒ BadWireType
+    if (wt != 0 and wt != 1 and wt != 2 and wt != 5) { r.err = ERR_BAD_WIRE_TYPE; r.consumed = vr.consumed; return r; }
+    // field number 上限 2^29-1（proto 规定）；超界 ⇒ FieldNumberOverflow
+    if (fnum > 0x1FFFFFFF) { r.err = ERR_FIELD_NUMBER_OVERFLOW; r.consumed = vr.consumed; return r; }
+    r.field = fnum; r.wire_type = wt; r.consumed = vr.consumed;
+    return r;
+}
+
+// 写 key 到 buf[off..]；返回写入字节数。
+pub fn write_key(buf: []u8, off: i64, field: u64, wire_type: u64) i64 {
+    return write_varint(buf, off, (field << 3) | (wire_type & 7));
+}
+
+// ════════════════════════════════════════════════════════════════
+// 定宽标量（小端，字节抽取/拼装在模块内联展开；有符号仅 reinterpret 位模式）
+// ════════════════════════════════════════════════════════════════
+
+struct ScalarRes32 {
+    err: u64;
+    value: u32;
+    consumed: i64;
+}
+struct ScalarRes64 {
+    err: u64;
+    value: u64;
+    consumed: i64;
+}
+
+pub fn read_fixed32(buf: []u8, off: i64) u32 {
+    return (buf[off] as u32)
+         | ((buf[off + 1] as u32) << 8)
+         | ((buf[off + 2] as u32) << 16)
+         | ((buf[off + 3] as u32) << 24);
+}
+pub fn write_fixed32(buf: []u8, off: i64, v: u32) i64 {
+    buf[off] = v as u8;
+    buf[off + 1] = (v >> 8) as u8;
+    buf[off + 2] = (v >> 16) as u8;
+    buf[off + 3] = (v >> 24) as u8;
+    return 4;
+}
+pub fn read_sfixed32(buf: []u8, off: i64) i32 {
+    var v: u32 = (buf[off] as u32)
+              | ((buf[off + 1] as u32) << 8)
+              | ((buf[off + 2] as u32) << 16)
+              | ((buf[off + 3] as u32) << 24);
+    return v as i32;
+}
+pub fn write_sfixed32(buf: []u8, off: i64, v: i32) i64 {
+    buf[off] = v as u8;
+    buf[off + 1] = (v >> 8) as u8;
+    buf[off + 2] = (v >> 16) as u8;
+    buf[off + 3] = (v >> 24) as u8;
+    return 4;
+}
+
+pub fn read_fixed64(buf: []u8, off: i64) u64 {
+    return (buf[off] as u64)
+         | ((buf[off + 1] as u64) << 8)
+         | ((buf[off + 2] as u64) << 16)
+         | ((buf[off + 3] as u64) << 24)
+         | ((buf[off + 4] as u64) << 32)
+         | ((buf[off + 5] as u64) << 40)
+         | ((buf[off + 6] as u64) << 48)
+         | ((buf[off + 7] as u64) << 56);
+}
+pub fn write_fixed64(buf: []u8, off: i64, v: u64) i64 {
+    buf[off] = v as u8;
+    buf[off + 1] = (v >> 8) as u8;
+    buf[off + 2] = (v >> 16) as u8;
+    buf[off + 3] = (v >> 24) as u8;
+    buf[off + 4] = (v >> 32) as u8;
+    buf[off + 5] = (v >> 40) as u8;
+    buf[off + 6] = (v >> 48) as u8;
+    buf[off + 7] = (v >> 56) as u8;
+    return 8;
+}
+pub fn read_sfixed64(buf: []u8, off: i64) i64 {
+    var v: u64 = (buf[off] as u64)
+              | ((buf[off + 1] as u64) << 8)
+              | ((buf[off + 2] as u64) << 16)
+              | ((buf[off + 3] as u64) << 24)
+              | ((buf[off + 4] as u64) << 32)
+              | ((buf[off + 5] as u64) << 40)
+              | ((buf[off + 6] as u64) << 48)
+              | ((buf[off + 7] as u64) << 56);
+    return v as i64;
+}
+pub fn write_sfixed64(buf: []u8, off: i64, v: i64) i64 {
+    buf[off] = v as u8;
+    buf[off + 1] = (v >> 8) as u8;
+    buf[off + 2] = (v >> 16) as u8;
+    buf[off + 3] = (v >> 24) as u8;
+    buf[off + 4] = (v >> 32) as u8;
+    buf[off + 5] = (v >> 40) as u8;
+    buf[off + 6] = (v >> 48) as u8;
+    buf[off + 7] = (v >> 56) as u8;
+    return 8;
+}
+
+// ════════════════════════════════════════════════════════════════
+// sint（zigzag）：先 zigzag 编解码为 varint，再走 varint 路径
+// ════════════════════════════════════════════════════════════════
+
+struct Sint32Res {
+    err: u64;
+    value: i32;
+    consumed: i64;
+}
+struct Sint64Res {
+    err: u64;
+    value: i64;
+    consumed: i64;
+}
+
+pub fn read_sint32(buf: []u8, off: i64) Sint32Res {
+    var vr: VarintRes = read_varint(buf, off);
+    var r: Sint32Res;
+    r.err = ERR_OK; r.value = 0; r.consumed = 0;
+    if (vr.err != ERR_OK) { r.err = vr.err; r.consumed = vr.consumed; return r; }
+    r.value = zigzag.decode_u32(vr.value as u32);
+    r.consumed = vr.consumed;
+    return r;
+}
+pub fn write_sint32(buf: []u8, off: i64, v: i32) i64 {
+    return write_varint(buf, off, zigzag.encode_i32(v) as u64);
+}
+
+pub fn read_sint64(buf: []u8, off: i64) Sint64Res {
+    var vr: VarintRes = read_varint(buf, off);
+    var r: Sint64Res;
+    r.err = ERR_OK; r.value = 0; r.consumed = 0;
+    if (vr.err != ERR_OK) { r.err = vr.err; r.consumed = vr.consumed; return r; }
+    r.value = zigzag.decode_u64(vr.value);
+    r.consumed = vr.consumed;
+    return r;
+}
+pub fn write_sint64(buf: []u8, off: i64, v: i64) i64 {
+    return write_varint(buf, off, zigzag.encode_i64(v));
+}
+
+// ════════════════════════════════════════════════════════════════
+// bool（varint 0/1）
+// ════════════════════════════════════════════════════════════════
+
+struct BoolRes {
+    err: u64;
+    value: bool;
+    consumed: i64;
+}
+
+pub fn read_bool(buf: []u8, off: i64) BoolRes {
+    var vr: VarintRes = read_varint(buf, off);
+    var r: BoolRes;
+    r.err = ERR_OK; r.value = false; r.consumed = 0;
+    if (vr.err != ERR_OK) { r.err = vr.err; r.consumed = vr.consumed; return r; }
+    r.value = (vr.value != 0);
+    r.consumed = vr.consumed;
+    return r;
+}
+pub fn write_bool(buf: []u8, off: i64, v: bool) i64 {
+    if (v) { return write_varint(buf, off, 1); }
+    return write_varint(buf, off, 0);
+}
+
+// ════════════════════════════════════════════════════════════════
+// float / double：底层按 4/8 字节定宽读成位模式，再经 @bitCast 转 f32/f64
+// （R-013 已落地：双后端真位重解释，NaN/Inf/-0.0 位模式原样保留）
+// ════════════════════════════════════════════════════════════════
+
+struct FloatRes {
+    err: u64;
+    value: f32;
+    consumed: i64;
+}
+struct DoubleRes {
+    err: u64;
+    value: f64;
+    consumed: i64;
+}
+
+pub fn read_float(buf: []u8, off: i64) f32 {
+    var bits: u32 = (buf[off] as u32)
+                 | ((buf[off + 1] as u32) << 8)
+                 | ((buf[off + 2] as u32) << 16)
+                 | ((buf[off + 3] as u32) << 24);
+    return @bitCast(f32, bits);
+}
+pub fn write_float(buf: []u8, off: i64, v: f32) i64 {
+    var bits: u32 = @bitCast(u32, v);
+    buf[off] = bits as u8;
+    buf[off + 1] = (bits >> 8) as u8;
+    buf[off + 2] = (bits >> 16) as u8;
+    buf[off + 3] = (bits >> 24) as u8;
+    return 4;
+}
+pub fn read_double(buf: []u8, off: i64) f64 {
+    var bits: u64 = (buf[off] as u64)
+                 | ((buf[off + 1] as u64) << 8)
+                 | ((buf[off + 2] as u64) << 16)
+                 | ((buf[off + 3] as u64) << 24)
+                 | ((buf[off + 4] as u64) << 32)
+                 | ((buf[off + 5] as u64) << 40)
+                 | ((buf[off + 6] as u64) << 48)
+                 | ((buf[off + 7] as u64) << 56);
+    return @bitCast(f64, bits);
+}
+pub fn write_double(buf: []u8, off: i64, v: f64) i64 {
+    var bits: u64 = @bitCast(u64, v);
+    buf[off] = bits as u8;
+    buf[off + 1] = (bits >> 8) as u8;
+    buf[off + 2] = (bits >> 16) as u8;
+    buf[off + 3] = (bits >> 24) as u8;
+    buf[off + 4] = (bits >> 32) as u8;
+    buf[off + 5] = (bits >> 40) as u8;
+    buf[off + 6] = (bits >> 48) as u8;
+    buf[off + 7] = (bits >> 56) as u8;
+    return 8;
+}
+
+// ════════════════════════════════════════════════════════════════
+// R-016 · 长度分隔（wire type 2）：string / bytes / 嵌套消息 / repeated
+// 设计（与 thyme 002 文档对齐）：
+//   * 长度前缀用 varint（非定宽）；read/write 均显式校验越界 ⇒ BoundsExceeded。
+//   * read_submessage / read_bytes 返回「限定在长度范围内的只读零拷贝子视图」
+//     （t 切片语法 buf[start..start+len]），绝不「先解再校验」式越界串读。
+//   * packed 与 non-packed 两种 repeated 编码都由 thyme 在 schema 层接受；
+//     pbwire 只提供长度分隔原语，写出统一走 write_bytes（packed）。
+//   * 嵌套深度上限（防栈溢出/恶意输入）由 thyme 驱动递归时把关，pbwire 不自持。
+// ════════════════════════════════════════════════════════════════
+
+struct BytesRes {
+    err: u64;
+    data: []u8;
+    consumed: i64;
+}
+struct SubMsgRes {
+    err: u64;
+    view: []u8;
+    consumed: i64;
+}
+
+// 长度前缀：varint 编码的长度（非定宽）。语义等同 read/write_varint，单列以明示 wire 层角色。
+pub fn read_len_prefix(buf: []u8, off: i64) VarintRes { return read_varint(buf, off); }
+pub fn write_len_prefix(buf: []u8, off: i64, len: u64) i64 { return write_varint(buf, off, len); }
+
+// 读长度分隔块：先读 varint 长度前缀，再读该长度的 payload，返回只读子视图。
+// 越界（off + 前缀长 + len > buf 长）⇒ BoundsExceeded，绝不越界读取半截数据。
+pub fn read_bytes(buf: []u8, off: i64) BytesRes {
+    var vr: VarintRes = read_varint(buf, off);
+    var r: BytesRes;
+    r.err = ERR_OK; r.data = buf[0..0]; r.consumed = 0;
+    if (vr.err != ERR_OK) { r.err = vr.err; r.consumed = vr.consumed; return r; }
+    var len: i64 = vr.value as i64;
+    var n: i64 = slice_len(buf);
+    if (off + vr.consumed + len > n) { r.err = ERR_BOUNDS_EXCEEDED; r.consumed = vr.consumed; return r; }
+    var start: i64 = off + vr.consumed;
+    r.data = buf[start..start + len];
+    r.consumed = vr.consumed + len;
+    return r;
+}
+
+// 写长度分隔块：varint 长度前缀 + payload 逐字节拷贝，返回写入总字节数。
+pub fn write_bytes(buf: []u8, off: i64, data: []u8) i64 {
+    var len: i64 = slice_len(data);
+    var wp: i64 = write_len_prefix(buf, off, len as u64);
+    var i: i64 = 0;
+    while (i < len) { buf[off + wp + i] = data[i]; i = i + 1; }
+    return wp + len;
+}
+
+// string 与 bytes 在 wire 层同构（长度前缀 + UTF-8 字节）；编码层归 thyme 解释。
+pub fn read_string(buf: []u8, off: i64) BytesRes { return read_bytes(buf, off); }
+pub fn write_string(buf: []u8, off: i64, s: []u8) i64 { return write_bytes(buf, off, s); }
+
+// 读子消息：返回限定在长度前缀范围内的只读子视图（零拷贝切片），供 thyme 在范围内再遍历。
+// 必须显式校验 off + 前缀长 + len ≤ buf 长，越界立即 BoundsExceeded；
+// 返回的子视图严格限制在声明长度内，杜绝「先解再校验」导致的错位静默。
+pub fn read_submessage(buf: []u8, off: i64) SubMsgRes {
+    var b: BytesRes = read_bytes(buf, off);
+    var r: SubMsgRes;
+    r.err = b.err; r.view = b.data; r.consumed = b.consumed;
+    return r;
+}
+
+// ════════════════════════════════════════════════════════════════
+// R-017 · unknown field 的保留与透传（thyme 版本容错地基）
+// 设计裁定（2026-10-31）：unknown 字段 捕获但不解析、原封不动保存。
+//   * pbwire 是 schema-less 的 wire 层，无法也不判断「某 field 是否 unknown」——
+//     该判定由 thyme 的 TDA/FieldDef 在遍历时做出。
+//   * pbwire 只负责：遇到要跳过的 field，按 wire_type 完整跳过其字节；或（可选）
+//     把该 field 从 tag 起的全部原始字节（含 tag 与长度前缀）捕获留存。
+//   * 绝不进入 LEN 字段内部、绝不递归下钻（嵌套 unknown 由 thyme 按 schema 驱动递归）。
+//   * keep_unknown 开关由 thyme 在调用处决定（调 skip_field 还是 capture_raw），非 pbwire 内部状态。
+// ════════════════════════════════════════════════════════════════
+
+struct SkipRes {
+    err: u64;
+    next_off: i64;
+}
+
+// 跳过 tag（off 处 varint）+ 按 wire_type 跳过 payload，返回 field 结束后的下一个偏移。
+// LEN 直接按长度前缀跳过整段，不进入内部；越界 ⇒ BoundsExceeded。
+// SGROUP/EGROUP(3/4) 已废弃 groups，仅识别不实现 ⇒ BadWireType。
+pub fn skip_field(buf: []u8, off: i64, wire_type: u64) SkipRes {
+    var kr: VarintRes = read_varint(buf, off);
+    var r: SkipRes;
+    r.err = ERR_OK; r.next_off = off;
+    if (kr.err != ERR_OK) { r.err = kr.err; r.next_off = off + kr.consumed; return r; }
+    var payload_off: i64 = off + kr.consumed;
+    var n: i64 = slice_len(buf);
+    if (wire_type == WT_VARINT) {
+        var vr: VarintRes = read_varint(buf, payload_off);
+        if (vr.err != ERR_OK) { r.err = vr.err; r.next_off = payload_off + vr.consumed; return r; }
+        r.next_off = payload_off + vr.consumed; return r;
+    }
+    if (wire_type == WT_I64) {
+        if (payload_off + 8 > n) { r.err = ERR_BOUNDS_EXCEEDED; return r; }
+        r.next_off = payload_off + 8; return r;
+    }
+    if (wire_type == WT_LEN) {
+        var vr: VarintRes = read_varint(buf, payload_off);
+        if (vr.err != ERR_OK) { r.err = vr.err; r.next_off = payload_off + vr.consumed; return r; }
+        var len: i64 = vr.value as i64;
+        if (payload_off + vr.consumed + len > n) { r.err = ERR_BOUNDS_EXCEEDED; r.next_off = payload_off + vr.consumed; return r; }
+        r.next_off = payload_off + vr.consumed + len; return r;
+    }
+    if (wire_type == WT_I32) {
+        if (payload_off + 4 > n) { r.err = ERR_BOUNDS_EXCEEDED; return r; }
+        r.next_off = payload_off + 4; return r;
+    }
+    r.err = ERR_BAD_WIRE_TYPE;
+    return r;
+}
+
+// 捕获该 field 从 tag 起的全部原始字节（含 tag 与长度前缀），原封不动。
+// 用于 keep_unknown=true 的透传：thyme 侧持有 []u8 列表，回写时原样追加到消息尾部
+// （字节级保真，无需重新组装）。绝不解析 payload 内部结构。越界 ⇒ BoundsExceeded。
+//
+// 注意：此处不能调 skip_field() 转发 buf——LLVM 后端在「跨模块函数把 []u8 再转交给
+// 另一个跨模块函数」时（嵌套跨模块切片传递）会把切片长度弄错（实测 length 退化成 1，
+// 触发 t_slice_sub 越界）。故内联 skip_field 的 skip 长度计算，只做单层跨模块 read_varint
+// 调用（与 read_bytes 同源，双后端均安全）。skip_field 仍保留供调用方单独使用。
+// 控制流写法刻意避开 else-if 链 + 末尾 fall-through（LLVM 后端对该形态下 buf 切片长度
+// 的 lowering 有 bug，会把 len 弄成 1）。改为：每个 wire_type 分支各自 early-return（与
+// read_bytes 同构、双后端安全），只有非法 wire_type 才走到末尾。
+pub fn capture_raw(buf: []u8, off: i64, wire_type: u64) BytesRes {
+    var r: BytesRes;
+    r.err = ERR_OK; r.data = buf[off..off]; r.consumed = 0;
+    var kr: VarintRes = read_varint(buf, off);
+    if (kr.err != ERR_OK) { r.err = kr.err; return r; }
+    var payload_off: i64 = off + kr.consumed;
+    var n: i64 = slice_len(buf);
+    if (wire_type == WT_LEN) {
+        var vr: VarintRes = read_varint(buf, payload_off);
+        if (vr.err != ERR_OK) { r.err = vr.err; return r; }
+        var len: i64 = vr.value as i64;
+        if (payload_off + vr.consumed + len > n) { r.err = ERR_BOUNDS_EXCEEDED; return r; }
+        var next_off: i64 = payload_off + vr.consumed + len;
+        r.data = buf[off..next_off];
+        r.consumed = next_off - off;
+        return r;
+    }
+    if (wire_type == WT_VARINT) {
+        var vr: VarintRes = read_varint(buf, payload_off);
+        if (vr.err != ERR_OK) { r.err = vr.err; return r; }
+        var next_off: i64 = payload_off + vr.consumed;
+        r.data = buf[off..next_off];
+        r.consumed = next_off - off;
+        return r;
+    }
+    if (wire_type == WT_I64) {
+        if (payload_off + 8 > n) { r.err = ERR_BOUNDS_EXCEEDED; return r; }
+        var next_off: i64 = payload_off + 8;
+        r.data = buf[off..next_off];
+        r.consumed = next_off - off;
+        return r;
+    }
+    if (wire_type == WT_I32) {
+        if (payload_off + 4 > n) { r.err = ERR_BOUNDS_EXCEEDED; return r; }
+        var next_off: i64 = payload_off + 4;
+        r.data = buf[off..next_off];
+        r.consumed = next_off - off;
+        return r;
+    }
+    r.err = ERR_BAD_WIRE_TYPE;
+    return r;
+}
