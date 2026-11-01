@@ -15590,11 +15590,18 @@ pub fn build_typemeta_value(tnode: i64, arm: string) i64 {
     ft = base__list_push(fh, ft, f_size);
     var f_kind: i64 = base__mk_FV("kind", mv_int(ti_arm_code(arm)), -1);
     ft = base__list_push(fh, ft, f_kind);
-    // field_types：Struct 类型由各字段类型合成 type 值数组
+    // field_types / fields：Struct 类型由各字段合成（type 值数组 + FieldInfo 数组）。
+    // 与运行期 type_info 暴露的 FieldInfo 成员（fi_name/fi_offset/fi_tag 等）保持一致：
+    // 同一份元信息，编译期与运行期两套入口不应出现「运行期有、编译期没有」的割裂。
     var fth: i64 = -1;
     var ftt: i64 = -1;
+    var ffh: i64 = -1;   // FieldInfo 值链表头（fields 数组元素）
+    var fft: i64 = -1;
     var nfields: i64 = 0;
     if (arm == "Struct") {
+        var si_f: i64 = sym_lookup(global_scope, tname);
+        var sdecl: i64 = -1;
+        if (si_f >= 0) { sdecl = syms[si_f].decl; }
         var fld: i64 = find_struct_fields(tname);
         if (fld >= 0) {
             var ks: []i64 = base.kids_chain(fld);
@@ -15602,10 +15609,31 @@ pub fn build_typemeta_value(tnode: i64, arm: string) i64 {
             while (ki < slice_len(ks) as i64) {
                 var fv_node: i64 = ks[ki];
                 var ftype: i64 = base.node_na((fv_node as u64));
+                // field_types 元素：真实 comptime type 值
                 var ftname: string = meta_type_to_str(ftype);
-                var tyval: i64 = type_node_from_ident(ftname);   // 真实 comptime type 值
+                var tyval: i64 = type_node_from_ident(ftname);
                 ftt = base__list_push(fth, ftt, tyval);
                 if (fth < 0) { fth = ftt; }
+                // fields 元素：FieldInfo 值（name/offset/type_name/type_size/is_ptr/tag）
+                var ffname: string = base.node_sa((fv_node as u64));
+                var ftag: i64 = base.node_ib((fv_node as u64));   // pb @N tagID（>=1 显式 / 自动分配 / -1）
+                var foff: i64 = -1;
+                if (sdecl >= 0) { foff = mb_struct_field_offset(sdecl, ffname); }
+                if (foff < 0) { foff = 0; }
+                var ftn: string = ti_type_name(ftype);
+                var ftsz: i64 = mb_size_of(ftype, 0);
+                if (ftsz < 0) { ftsz = 0; }
+                var fisptr: bool = (base.node_kind((ftype as u64)) == "pointer");
+                var fifh: i64 = -1; var fift: i64 = -1;
+                fift = base__list_push(fifh, fift, base__mk_FV("name", base.mk_string(ffname, -1), -1)); if (fifh < 0) { fifh = fift; }
+                fift = base__list_push(fifh, fift, base__mk_FV("offset", mv_int(foff), -1)); if (fifh < 0) { fifh = fift; }
+                fift = base__list_push(fifh, fift, base__mk_FV("type_name", base.mk_string(ftn, -1), -1)); if (fifh < 0) { fifh = fift; }
+                fift = base__list_push(fifh, fift, base__mk_FV("type_size", mv_int(ftsz), -1)); if (fifh < 0) { fifh = fift; }
+                fift = base__list_push(fifh, fift, base__mk_FV("is_ptr", mv_bool(fisptr), -1)); if (fifh < 0) { fifh = fift; }
+                fift = base__list_push(fifh, fift, base__mk_FV("tag", mv_int(ftag), -1)); if (fifh < 0) { fifh = fift; }
+                var fival: i64 = base__mk_struct_lit("FieldInfo", fifh, -1);
+                fft = base__list_push(ffh, fft, fival);
+                if (ffh < 0) { ffh = fft; }
                 nfields = nfields + 1;
                 ki = ki + 1;
             }
@@ -15614,7 +15642,7 @@ pub fn build_typemeta_value(tnode: i64, arm: string) i64 {
     var arr: i64 = base.mk_array_lit(fth, -1);
     var f_fc: i64 = base__mk_FV("field_count", mv_int(nfields), -1);
     ft = base__list_push(fh, ft, f_fc);
-    var f_fields: i64 = base__mk_FV("fields", base.mk_array_lit(-1, -1), -1);   // 占位空数组
+    var f_fields: i64 = base__mk_FV("fields", base.mk_array_lit(ffh, -1), -1);
     ft = base__list_push(fh, ft, f_fields);
     var f_ft: i64 = base__mk_FV("field_types", arr, -1);
     ft = base__list_push(fh, ft, f_ft);
@@ -16542,7 +16570,18 @@ pub fn meta_pass() void {
                 var gv: i64 = meta_eval(base.node_nb((d as u64)));
                 g_meta_quiet = false;
                 g_meta_err = false;
-                if (gv >= 0) { menv_push(base.node_sa((d as u64)), gv); }
+                if (gv >= 0) {
+                    menv_push(base.node_sa((d as u64)), gv);
+                    // R-018：CTFE 折叠结果落地到运行期常量。const/let 初始化器一旦可编译期
+                    // 折叠，将其 AST 替换为折叠后的字面量，使后续 check 与双后端 codegen 直接见到
+                    // 常量值，而非未折叠的 comptime fn 调用（后者无运行期体，会静默落 0 / 垃圾值，
+                    // 违反验收标准第 3 条「无法折叠必须报错」）。先落地标量字面量（int/bool/string/
+                    // float）——覆盖「编译期算出的数，运行期是常量」主路径；聚合值后续按需扩展。
+                    var gvk: string = base.node_kind((gv as u64));
+                    if (gvk == "int" or gvk == "bool" or gvk == "string" or gvk == "float") {
+                        base.node_set_nb((d as u64), gv);
+                    }
+                }
             }
         }
         i = i + 1;
