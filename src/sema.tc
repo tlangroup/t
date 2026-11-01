@@ -1590,6 +1590,9 @@ pub var g_refl_builtins_done: bool = false;
 pub var g_ti_TypeInfo_ti: i64 = -1;
 pub var g_ti_TypeMeta_ti: i64 = -1;
 pub var g_ti_FieldInfo_ti: i64 = -1;
+pub var g_ti_EnumMember_ti: i64 = -1;
+pub var g_ti_Attribute_ti: i64 = -1;   // R-020：@type_attributes 返回项
+pub var g_ti_AttrArg_ti: i64 = -1;     // R-020：注解实参项
 
 pub fn ensure_reflection_builtins() void {
     if (g_refl_builtins_done) { return; }
@@ -1632,6 +1635,48 @@ pub fn ensure_reflection_builtins() void {
         var fi_decl: i64 = base.mk_StructDecl("FieldInfo", "", "", false, false, -1, fif, -1);
         g_ti_FieldInfo_ti = ti_named("Struct", "FieldInfo");
         sym_define(global_scope, "FieldInfo", "type", g_ti_FieldInfo_ti, fi_decl);
+    }
+
+    // EnumMember（R-026）：name:string, value:i64 —— @enum_members(T) 编译期返回的
+    // 枚举成员表项。与 TypeMeta/FieldInfo 同规格：合成 StructDecl + 惰性注入 global_scope，
+    // 不进 decl_list（避免字段类型解析轮误报 UNKNOWN_TYPE）。
+    var emf: i64 = -1; var emt: i64 = -1;
+    emt = base.list_push(emf, emt, base.mk_member("name", base.mk_scalar("string", -1), -1)); if (emf < 0) { emf = emt; }
+    emt = base.list_push(emf, emt, base.mk_member("value", base.mk_scalar("i64", -1), -1)); if (emf < 0) { emf = emt; }
+    if (sym_lookup(global_scope, "EnumMember") < 0) {
+        var em_decl: i64 = base.mk_StructDecl("EnumMember", "", "", false, false, -1, emf, -1);
+        g_ti_EnumMember_ti = ti_named("Struct", "EnumMember");
+        sym_define(global_scope, "EnumMember", "type", g_ti_EnumMember_ti, em_decl);
+        // 进 decl_list：使后端按普通结构发射 %EnumMember = type { ptr, i64 }，
+        // 从而 @enum_members(T) 的结果可在运行期物化（R-026 运行期半）。
+        // EnumMember 字段均为标量（string/i64），不会触发 TypeMeta/FieldInfo 那种
+        // 合成字段类型不可解析的 UNKNOWN_TYPE 问题。
+        append(lex.decl_list, em_decl);
+    }
+
+    // AttrArg（R-020）：kind:i64, value:string —— @type_attributes / @field_attributes 返回的
+    // 注解实参项。kind 编码：0=string, 1=number, 2=bool, 3=ident, 4=list（逗号连接名）。
+    // 与 EnumMember 同规格：合成 StructDecl + 惰性注入 global_scope + 进 decl_list（支撑运行期物化）。
+    var aaf: i64 = -1; var aat: i64 = -1;
+    aat = base.list_push(aaf, aat, base.mk_member("kind", base.mk_scalar("i64", -1), -1)); if (aaf < 0) { aaf = aat; }
+    aat = base.list_push(aaf, aat, base.mk_member("value", base.mk_scalar("string", -1), -1)); if (aaf < 0) { aaf = aat; }
+    if (sym_lookup(global_scope, "AttrArg") < 0) {
+        var aa_decl: i64 = base.mk_StructDecl("AttrArg", "", "", false, false, -1, aaf, -1);
+        g_ti_AttrArg_ti = ti_named("Struct", "AttrArg");
+        sym_define(global_scope, "AttrArg", "type", g_ti_AttrArg_ti, aa_decl);
+        append(lex.decl_list, aa_decl);
+    }
+
+    // Attribute（R-020）：name:string, args:[]AttrArg —— 用户级注解的反射表项。
+    // 与 EnumMember 同规格进 decl_list，使 @type_attributes(T) 结果可在运行期物化。
+    var atf: i64 = -1; var att: i64 = -1;
+    att = base.list_push(atf, att, base.mk_member("name", base.mk_scalar("string", -1), -1)); if (atf < 0) { atf = att; }
+    att = base.list_push(atf, att, base.mk_member("args", base.mk_slice(base.mk_named("AttrArg", -1), -1), -1)); if (atf < 0) { atf = att; }
+    if (sym_lookup(global_scope, "Attribute") < 0) {
+        var at_decl: i64 = base.mk_StructDecl("Attribute", "", "", false, false, -1, atf, -1);
+        g_ti_Attribute_ti = ti_named("Struct", "Attribute");
+        sym_define(global_scope, "Attribute", "type", g_ti_Attribute_ti, at_decl);
+        append(lex.decl_list, at_decl);
     }
 
     // TypeInfo variant arms：Int=0 … Union=10，Module=11（顺序对齐 base.tc:5606），单载荷 *TypeMeta（Bool 无载荷）
@@ -1826,12 +1871,15 @@ pub fn resolve_ti(tn: i64) i64 {
         }
         // 反射内建类型：若用户已自行声明（如编译 base.tc 自身）则走真实声明，
         // 否则惰性注入合成 VariantDecl/StructDecl，使 TypeInfo 在用户代码里可 match。
-        if (rnm == "TypeInfo" or rnm == "TypeMeta" or rnm == "FieldInfo") {
+        if (rnm == "TypeInfo" or rnm == "TypeMeta" or rnm == "FieldInfo" or rnm == "EnumMember" or rnm == "Attribute" or rnm == "AttrArg") {
             var rsi: i64 = sym_lookup(global_scope, rnm);
             if (rsi >= 0 and syms[rsi].decl >= 0) { return syms[rsi].ti; }
             ensure_reflection_builtins();
             if (rnm == "TypeInfo") { return g_ti_TypeInfo_ti; }
             if (rnm == "TypeMeta") { return g_ti_TypeMeta_ti; }
+            if (rnm == "EnumMember") { return g_ti_EnumMember_ti; }
+            if (rnm == "Attribute") { return g_ti_Attribute_ti; }
+            if (rnm == "AttrArg") { return g_ti_AttrArg_ti; }
             return g_ti_FieldInfo_ti;
         }
         // 位串基元类型 `bitstr`（§15）：值级 (ptr u8, bit_len, cap)，与 []u8 同构。
@@ -7678,6 +7726,12 @@ pub fn infer_expr_body(e: i64) i64 {
             // P2b 类型构造元函数：返回 comptime 类型值（类型即值），静态类型记 Any，
             // 真正类型节点在 CTFE（meta_eval_mbuiltin）期产出并流入单态化。
             return ti_mk("Any");
+        } else if (base.node_sa((e as u64)) == "enum_members") {
+            // R-026：@enum_members(T) 编译期返回 []EnumMember（成员名/值表）。
+            // 结果类型固定为 []EnumMember，与具体枚举无关，故在类型推断期即可定死，
+            // 无需延迟到 CTFE（与 @int/@struct 等「类型即值」元函数不同）。
+            ensure_reflection_builtins();
+            return ti_elem_of("Slice", g_ti_EnumMember_ti);
         } else {
             parse.fc_err("T-MTA-E007",
                 base.sb_cat3("未知的编译期内建 `@", base.node_sa((e as u64)), "`"), e);
@@ -14667,9 +14721,74 @@ pub fn meta_eval_member(e: i64) i64 {
 // 且预算已耗尽时补充 500000，避免共享预算在语义分析期（早于 meta_pass 的 500000 重置）
 // 直接归零、导致合法 const 求值误报 T-MTA-E011。递归链不补预算，故不终止的 comptime
 // 循环（tests/conformance/fail/f66_meta_budget.tc）仍会被 500000 步预算截断。
+
+// ── R-020 注解反射辅助：把解析期注解节点（A 链）折叠为 []Attribute / []AttrArg 编译期值 ──
+// AttrArg.kind 编码：0=string, 1=number, 2=bool, 3=ident, 4=list（多个 ident 用逗号连接）。
+pub fn meta_attr_args_to_array(args_head: i64) i64 {
+    var ah: i64 = -1; var at: i64 = -1;
+    if (args_head >= 0) {
+        var ks: []i64 = base.kids_chain(args_head);
+        var ki: i64 = 0;
+        while (ki < slice_len(ks) as i64) {
+            var arg: i64 = ks[ki];
+            var kind: i64 = 0;
+            var val: string = "";
+            var ak: string = base.node_kind((arg as u64));
+            if (ak == "string") { kind = 0; val = base.node_sa((arg as u64)); }
+            else if (ak == "number") { kind = 1; val = base.node_sa((arg as u64)); }
+            else if (ak == "bool") { kind = 2; if (base.node_sa((arg as u64)) == "true") { val = "true"; } else { val = "false"; } }
+            else if (ak == "ident") { kind = 3; val = base.node_sa((arg as u64)); }
+            else if (ak == "list") {
+                kind = 4;
+                var lks: []i64 = base.kids_chain(base.node_la((arg as u64)));
+                var li: i64 = 0;
+                while (li < slice_len(lks) as i64) {
+                    var ln: i64 = lks[li];
+                    if (li > 0) { val = base__sb_cat2(val, ","); }
+                    val = base__sb_cat2(val, base.node_sa((ln as u64)));
+                    li = li + 1;
+                }
+            } else { kind = 0; val = ""; }
+            var fkh: i64 = -1; var fkt: i64 = -1;
+            fkt = base__list_push(fkh, fkt, base__mk_FV("kind", mv_int(kind), -1)); if (fkh < 0) { fkh = fkt; }
+            fkt = base__list_push(fkh, fkt, base__mk_FV("value", base.mk_string(val, -1), -1)); if (fkh < 0) { fkh = fkt; }
+            var argval: i64 = base__mk_struct_lit("AttrArg", fkh, -1);
+            at = base__list_push(ah, at, argval);
+            if (ah < 0) { ah = at; }
+            ki = ki + 1;
+        }
+    }
+    var arr: i64 = base.mk_array_lit(ah, -1);
+    base.node_set_type(arr, ti_elem_of("Slice", g_ti_AttrArg_ti));
+    return arr;
+}
+
+// 把一个注解链（A 节点链表）折叠为 []Attribute 编译期值。
+pub fn meta_attr_to_array(anns_head: i64) i64 {
+    var ah: i64 = -1; var at: i64 = -1;
+    if (anns_head >= 0) {
+        var ks: []i64 = base.kids_chain(anns_head);
+        var ki: i64 = 0;
+        while (ki < slice_len(ks) as i64) {
+            var ann: i64 = ks[ki];
+            var aname: string = base.node_sa((ann as u64));
+            var args: i64 = meta_attr_args_to_array(base.node_la((ann as u64)));
+            var fkh: i64 = -1; var fkt: i64 = -1;
+            fkt = base__list_push(fkh, fkt, base__mk_FV("name", base.mk_string(aname, -1), -1)); if (fkh < 0) { fkh = fkt; }
+            fkt = base__list_push(fkh, fkt, base__mk_FV("args", args, -1)); if (fkh < 0) { fkh = fkt; }
+            var aval: i64 = base__mk_struct_lit("Attribute", fkh, -1);
+            at = base__list_push(ah, at, aval);
+            if (ah < 0) { ah = at; }
+            ki = ki + 1;
+        }
+    }
+    var arr: i64 = base.mk_array_lit(ah, -1);
+    base.node_set_type(arr, ti_elem_of("Slice", g_ti_Attribute_ti));
+    return arr;
+}
+
 pub fn meta_eval(e: i64) i64 {
-    g_me_depth = g_me_depth + 1;
-    if (g_me_depth == 1 and g_meta_steps <= 0) { g_meta_steps = 500000; g_me_count = 0; }
+    g_me_depth = g_me_depth + 1;    if (g_me_depth == 1 and g_meta_steps <= 0) { g_meta_steps = 500000; g_me_count = 0; }
     var r: i64 = meta_eval_rec(e);
     g_me_depth = g_me_depth - 1;
     return r;
@@ -14811,6 +14930,111 @@ pub fn meta_eval_rec(e: i64) i64 {
         var r: i64 = base.mk_ct_variant("TypeInfo", arm, payload);
         base.node_set_type(r, g_ti_TypeInfo_ti);
         return r;
+    }
+    if (base.node_kind((e as u64)) == "enummembers") {
+        // @enum_members(T) 编译期返回 []EnumMember（成员名/值表，供 R-022 反射读取）。
+        // 与 @type_info 同走 CTFE 折叠：meta_eval 在此构造 comptime array_lit 值，
+        // 由 comptime_fold_pass 原地改写为 array_lit 节点，TIR 再经
+        // tir_maybe_array_to_slice 物化为运行时 %TSlice（与 var x: []T = [..] 同路径）。
+        var tnode: i64 = base.node_na((e as u64));
+        if (tnode < 0) {
+            var tname0: string = base.node_sa((e as u64));
+            tnode = type_node_from_ident(tname0);
+        }
+        var tname: string = ti_type_name(tnode);
+        ensure_reflection_builtins();
+        var si: i64 = sym_lookup(global_scope, tname);
+        if (si < 0) {
+            return meta_fail("T-MTA-E016", base__sb_cat2("`@enum_members` 找不到类型 `", tname), e);
+        }
+        var decl: i64 = syms[si].decl;
+        if (base.node_kind((decl as u64)) != "EnumDecl") {
+            return meta_fail("T-MTA-E016",
+                base__sb_cat3("`@enum_members` 要求枚举类型，但 `", tname, "` 不是枚举"), e);
+        }
+        var mh: i64 = base.node_lb((decl as u64));
+        var emh: i64 = -1;
+        var emt: i64 = -1;
+        if (mh >= 0) {
+            var ks: []i64 = base.kids_chain(mh);
+            var ki: i64 = 0;
+            while (ki < slice_len(ks) as i64) {
+                var mn: i64 = ks[ki];
+                var mname: string = base.node_sa((mn as u64));
+                // 取折出的整型值（与 Enum.Member 解析同源：g_enum_cn/g_enum_cvi）
+                var mval: i64 = -1;
+                var key: string = base__sb_cat2(tname, base__sb_cat2(".", mname));
+                var gi: i64 = 0;
+                var gn: i64 = slice_len(g_enum_cn) as i64;
+                while (gi < gn) {
+                    if (g_enum_cn[gi] == key) { mval = g_enum_cvi[gi]; break; }
+                    gi = gi + 1;
+                }
+                var fifh: i64 = -1;
+                var fift: i64 = -1;
+                fift = base__list_push(fifh, fift, base__mk_FV("name", base.mk_string(mname, -1), -1));
+                if (fifh < 0) { fifh = fift; }
+                fift = base__list_push(fifh, fift, base__mk_FV("value", mv_int(mval), -1));
+                if (fifh < 0) { fifh = fift; }
+                var emval: i64 = base__mk_struct_lit("EnumMember", fifh, -1);
+                emt = base__list_push(emh, emt, emval);
+                if (emh < 0) { emh = emt; }
+                ki = ki + 1;
+            }
+        }
+        var arr: i64 = base.mk_array_lit(emh, -1);
+        base.node_set_type(arr, ti_elem_of("Slice", g_ti_EnumMember_ti));
+        return arr;
+    }
+    if (base.node_kind((e as u64)) == "typeattributes") {
+        // @type_attributes(T) 编译期返回 []Attribute（类型声明上的用户级注解表，供 R-020/R-022 反射读取）。
+        var tnode: i64 = base.node_na((e as u64));
+        if (tnode < 0) {
+            var tname0: string = base.node_sa((e as u64));
+            tnode = type_node_from_ident(tname0);
+        }
+        var tname: string = ti_type_name(tnode);
+        ensure_reflection_builtins();
+        var si: i64 = sym_lookup(global_scope, tname);
+        if (si < 0) {
+            return meta_fail("T-MTA-E016", base__sb_cat2("`@type_attributes` 找不到类型 `", tname), e);
+        }
+        var decl: i64 = syms[si].decl;
+        var anns: i64 = -1;
+        if (decl >= 0) { anns = base.node_la((decl as u64)); }
+        return meta_attr_to_array(anns);
+    }
+    if (base.node_kind((e as u64)) == "fieldattributes") {
+        // @field_attributes(T, "field") 编译期返回 []Attribute（指定字段上的注解表，供 R-021 @deprecated 反射读取）。
+        var tnode: i64 = base.node_na((e as u64));
+        if (tnode < 0) {
+            var tname0: string = base.node_sa((e as u64));
+            tnode = type_node_from_ident(tname0);
+        }
+        var tname: string = ti_type_name(tnode);
+        var fan: string = base.node_sb((e as u64));
+        ensure_reflection_builtins();
+        var si: i64 = sym_lookup(global_scope, tname);
+        if (si < 0) {
+            return meta_fail("T-MTA-E016", base__sb_cat2("`@field_attributes` 找不到类型 `", tname), e);
+        }
+        var decl: i64 = syms[si].decl;
+        if (base.node_kind((decl as u64)) != "StructDecl") {
+            return meta_fail("T-MTA-E016",
+                base__sb_cat3("`@field_attributes` 要求结构体类型，但 `", tname, "` 不是结构体"), e);
+        }
+        var flds: i64 = base.node_lb((decl as u64));
+        var anns: i64 = -1;
+        if (flds >= 0) {
+            var ks: []i64 = base.kids_chain(flds);
+            var ki: i64 = 0;
+            while (ki < slice_len(ks) as i64) {
+                var f: i64 = ks[ki];
+                if (base.node_sa((f as u64)) == fan) { anns = base.node_la((f as u64)); break; }
+                ki = ki + 1;
+            }
+        }
+        return meta_attr_to_array(anns);
     }
     return meta_fail("T-MTA-E016",
         base__sb_cat3("表达式 `", base.node_kind((e as u64)), "` 不可编译期求值"), e);
@@ -18957,7 +19181,7 @@ pub struct AnnDef {
 pub var g_ad_count: i64 = 39;
 pub var g_ad_name: [39]string = ["test", "test_skip", "test_only", "expect_fail", "test_group", "skip", "only", "should_fail", "tag", "derive", "cfg", "cfg_attr", "allow", "warn", "deny", "deprecated", "repr", "no_padding", "align", "bitpack", "offset", "binary_offset", "binary_skip", "soa", "aos", "inline", "no_inline", "must_use", "const_fn", "unsafe", "main", "export_symbol", "link_name", "c_export", "panic_handler", "doc", "doc_file", "export", "auto_convert"];
 pub var g_ad_spec: [39]string = ["none", "none", "none", "none", "string", "mixed", "none", "none", "ident_list", "ident_list", "ident", "mixed", "ident_list", "ident_list", "ident_list", "string", "ident", "none", "number", "ident", "number", "number", "none", "none", "none", "none", "none", "none", "none", "none", "none", "string", "string", "none", "none", "string", "string", "mixed", "none"];
-pub var g_ad_targets: [39]string = ["func", "func", "func", "func", "func", "func", "func", "func", "func", "struct, enum, flag, flag_set, union", "global, func, struct, enum, var, const", "global, func, struct, enum", "global, func, struct, var, const", "global, func, struct, var, const", "global, func, struct, var, const", "global, func, struct, enum, var, const", "struct, enum, union", "struct, flag", "struct, union", "struct", "flag_slot", "field", "field", "struct", "struct", "func", "func", "func", "func", "func", "func", "func", "func", "func", "func", "global, func, struct, enum, var, const, field", "func, struct, enum", "field, func, var, const", "struct, enum"];
+pub var g_ad_targets: [39]string = ["func", "func", "func", "func", "func", "func", "func", "func", "func", "struct, enum, flag, flag_set, union", "global, func, struct, enum, var, const", "global, func, struct, enum", "global, func, struct, var, const", "global, func, struct, var, const", "global, func, struct, var, const", "global, func, struct, enum, var, const, field", "struct, enum, union", "struct, flag", "struct, union", "struct", "flag_slot", "field", "field", "struct", "struct", "func", "func", "func", "func", "func", "func", "func", "func", "func", "func", "global, func, struct, enum, var, const, field", "func, struct, enum", "field, func, var, const", "struct, enum"];
 pub var g_ad_depr: [39]bool = [true, true, true, true, true, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, true];
 pub var g_ad_repl: [39]string = ["a `test \"name\" { ... }` declaration", "@skip", "@only", "@should_fail", "a `suite \"name\" { ... }` block", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "@derive(FromString)"];
 
