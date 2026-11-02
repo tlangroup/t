@@ -9467,17 +9467,51 @@ pub fn infer_expr_body(e: i64) i64 {
         //  LLVM 发 `load i64, ptr null`、C 发非法的 `PF.encrypted` —— 静默错编，
         //  与 Enum 同批治理。）
         if (obk == "Variant") {
-            // M5 / P1：Variant 成员访问（如 `Shape.Circle`）此前无任何成员名校验。
-            // ⚠ 与 Enum/Flag 两分支不同：此处**不加 bd（callee）豁免**。
-            //    variant 的构造器本就以「成员访问充当 callee」的形式书写（`Shape.Circle(1.0)`），
-            //    加豁免会让最常见的构造形态连同拼错的 case 名一起逃过校验（设计文档 case 15）。
-            //    struct 的 bd 豁免是为 `p.clone()` 这类**方法调用**（成员名不是字段）而设的，
-            //    variant 没有方法，不存在该合法情形；安全性由全仓零误报扫描兜底。
-            // 返回值维持 Unknown 不变 —— 构造器具名形的发射走 call 分支，此处改返回值会牵动后端。
-            if (member_exists_in_type(obt, base.node_sa((e as u64))) == false) {
+            // R-037 修复：变体点式成员访问 `V.Case`（如 `Shape.Circle` / `Shape.Empty`）此前仅做
+            // 成员名校验、随后返回 Unknown 而**不改写节点**——后端把 `V.Case` 当成「类型值 V 的字段读」
+            // 发射，运行期静默 abort（exit 3 无诊断），正是 thyme 标注的 R-037 静默错编。
+            // ⚠ 与 Enum/Flag 两分支不同：此处**不加 bd（callee）豁免**（理由同原注释：variant 构造器
+            //   本就以成员访问充当 callee 书写，豁免会让最常见形态连同拼错 case 名一起逃过校验）。
+            // 修复：合法 case 改写成对应构造器（与 leading-dot `.Case` 取值同构，见上方 9358）：
+            //   · 带载荷 case → `V.Case` 改写为构造器**函数引用** `<V>_from_Case`（交由外层 (args) 调用）；
+            //   · 无载荷 case → `V.Case` 改写为**零参调用** `<V>_from_Case()`，直接得到变体值。
+            // 二者均 return infer_expr(e) 重入，类型由构造器符号决定，不再返回 Unknown → 消除静默错编。
+            var r037_mn: string = base.node_sa((e as u64));
+            if (member_exists_in_type(obt, r037_mn) == false) {
                 parse.fc_err("T-SEM-E015",
                     base.sb_cat4("变体 `", tip_name(obt), "` 没有 case `",
-                        base.sb_cat2(base.node_sa((e as u64)), "`：请检查拼写")), e);
+                        base.sb_cat2(r037_mn, "`：请检查拼写")), e);
+                return ti_mk("Unknown");
+            }
+            var r037_vname: string = variant_name_of_case(r037_mn);
+            if (str_len(r037_vname) as i64 > 0) {
+                var r037_decl: i64 = variant_decl_of(obt);
+                var r037_vc: i64 = -1;
+                if (r037_decl >= 0) { r037_vc = variant_find_case(r037_decl, r037_mn); }
+                var r037_has_payload: bool = false;
+                if (r037_vc >= 0) {
+                    r037_has_payload = (base.node_lb((r037_vc as u64)) >= 0) or (base.node_na((r037_vc as u64)) >= 0);
+                }
+                var r037_ctor: string = base.sb_cat3(r037_vname, "_from_", r037_mn);
+                if (r037_has_payload) {
+                    // 带载荷：改写为构造器函数引用（ident），外层 (args) 调用之。
+                    var r037_cid: i64 = base.mk_ident(r037_ctor, -1);
+                    base.node_set_kind((e as u64), "ident");
+                    base.node_set_sa((e as u64), base.node_sa((r037_cid as u64)));
+                    base.node_set_na((e as u64), -1);
+                    base.node_set_lb((e as u64), 0);
+                    hir.hir_invalidate((e as u64));
+                    return infer_expr(e);
+                }
+                // 无载荷：改写为零参构造器调用，直接得到变体值（与 leading-dot `.Case` 取值同构）。
+                var r037_cid2: i64 = base.mk_ident(r037_ctor, -1);
+                var r037_call: i64 = base.mk_call(r037_cid2, -1, -1);
+                base.node_set_kind((e as u64), base.node_kind((r037_call as u64)));
+                base.node_set_na((e as u64), base.node_na((r037_call as u64)));
+                base.node_set_la((e as u64), base.node_la((r037_call as u64)));
+                base.node_set_sa((e as u64), base.node_sa((r037_call as u64)));
+                hir.hir_invalidate((e as u64));
+                return infer_expr(e);
             }
             return ti_mk("Unknown");
         }
@@ -13226,6 +13260,37 @@ pub fn sel_register(imp: i64, alias: string) void {
     }
 }
 
+// R-023（extend 口子）：解析 T_IMPORT_EXTS 环境变量，返回用户配置的「额外导入扩展名」列表
+// （如 thyme 设 `T_IMPORT_EXTS=.tproto`）。t 本身不内嵌任何 schema 扩展名知识——thyme 通过此
+// 环境变量自行决定可导入哪些扩展名。逗号/空白分隔，每项自动补前导 '.'。
+pub fn import_extra_exts() []string {
+    var raw: string = getenv("T_IMPORT_EXTS");
+    var out: []string = [];
+    if (str_len(raw) == 0) { return out; }
+    var i: i64 = 0;
+    var n: i64 = str_len(raw);
+    var start: i64 = 0;
+    while (i <= n) {
+        var is_sep: bool = false;
+        if (i == n) { is_sep = true; }
+        else if (raw[i] == 44) { is_sep = true; }   // 44 = ','
+        if (is_sep) {
+            var a: i64 = start;
+            var b: i64 = i;
+            while (a < b and raw[a] == 32) { a = a + 1; }   // 去前导空格
+            while (b > a and raw[b - 1] == 32) { b = b - 1; } // 去尾随空格
+            if (b > a) {
+                var tok: string = str_slice(raw, a, b);
+                if (tok[0] != 46) { tok = base.sb_cat2(".", tok); }   // 46 = '.'，确保以 '.' 开头
+                append(out, tok);
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
 // 解析单个 import 声明：定位模块文件 → 去重/环检测 → 内联加载
 pub fn handle_one_import(imp: i64, at: i64) void {
     var nm: string = base.node_sb((imp as u64));
@@ -13298,19 +13363,31 @@ pub fn handle_one_import(imp: i64, at: i64) void {
         // T_TINT_DIR 已设且接口文件命中 → 优先用接口文件（不回退 .tc）；
         // 否则回退到 .tc 源码供类型检查（兼容无接口文件的模块）。
         if (chosen == "") {
-            // R-023：导入解析支持 .tproto 后缀（thyme schema 文件）。
-            // 先剥掉已带的已知源码扩展名，再按 .tc / .tproto 顺序尝试。
+            // R-023（extend 口子）：导入解析除默认 .tc 外，额外尝试 T_IMPORT_EXTS 列出的扩展名。
+            // t 本身不内嵌任何特定 schema 扩展名——thyme 设 T_IMPORT_EXTS=.tproto 即可自行导入 *.tproto。
             var rx: string = rel;
             var rl: i64 = str_len(rx);
-            if (rl >= 7 and str_slice(rx, rl - 7, rl) == ".tproto") { rx = str_slice(rx, 0, rl - 7); }
-            else if (rl >= 3 and str_slice(rx, rl - 3, rl) == ".tc") { rx = str_slice(rx, 0, rl - 3); }
+            // 剥掉已带的已知扩展名（.tc 及用户配置的扩展名），避免 ``foo.tproto.tc`` 之类拼接。
+            if (rl >= 3 and str_slice(rx, rl - 3, rl) == ".tc") { rx = str_slice(rx, 0, rl - 3); }
+            var exts: []string = import_extra_exts();
+            var ei: i64 = 0;
+            while (ei < slice_len(exts) as i64) {
+                var el: i64 = str_len(exts[ei]);
+                if (rl >= el and str_slice(rx, rl - el, rl) == exts[ei]) { rx = str_slice(rx, 0, rl - el); break; }
+                ei = ei + 1;
+            }
             var i: i64 = 0;
             var nr: i64 = slice_len(g_src_roots) as i64;
             while (i < nr) {
                 var cand: string = path_resolve(base__sb_cat4(g_src_roots[i], "/", rx, ".tc"));
                 if (path_exists(cand)) { chosen = cand; break; }
-                var cand2: string = path_resolve(base__sb_cat4(g_src_roots[i], "/", rx, ".tproto"));
-                if (path_exists(cand2)) { chosen = cand2; break; }
+                var ej: i64 = 0;
+                while (ej < slice_len(exts) as i64) {
+                    var cand2: string = path_resolve(base__sb_cat4(g_src_roots[i], "/", rx, exts[ej]));
+                    if (path_exists(cand2)) { chosen = cand2; break; }
+                    ej = ej + 1;
+                }
+                if (chosen != "") { break; }
                 i = i + 1;
             }
         }
@@ -13390,11 +13467,17 @@ pub fn handle_one_import(imp: i64, at: i64) void {
 // （.tlib 预编译外链在 Phase2 接入；T_LIB_PATH 环境变量亦在 Phase2 纳入。）
 pub fn resolve_external_lib(nm: string) string {
     var rel: string = dots_to_slashes(nm);
-    // R-023：导入解析支持 .tproto 后缀——先剥掉已知源码扩展名再尝试。
+    // R-023（extend 口子）：除默认 .tc 外，支持 T_IMPORT_EXTS 配置的额外扩展名（t 不内嵌 .tproto 知识）。
     var rx: string = rel;
     var rl: i64 = str_len(rx);
-    if (rl >= 7 and str_slice(rx, rl - 7, rl) == ".tproto") { rx = str_slice(rx, 0, rl - 7); }
-    else if (rl >= 3 and str_slice(rx, rl - 3, rl) == ".tc") { rx = str_slice(rx, 0, rl - 3); }
+    if (rl >= 3 and str_slice(rx, rl - 3, rl) == ".tc") { rx = str_slice(rx, 0, rl - 3); }
+    var exts: []string = import_extra_exts();
+    var ei: i64 = 0;
+    while (ei < slice_len(exts) as i64) {
+        var el: i64 = str_len(exts[ei]);
+        if (rl >= el and str_slice(rx, rl - el, rl) == exts[ei]) { rx = str_slice(rx, 0, rl - el); break; }
+        ei = ei + 1;
+    }
     var dirs: []string = lex__g_lib_dirs;          // compute_lib_dirs 已填充
     var i: i64 = 0;
     var nd: i64 = slice_len(dirs) as i64;
@@ -13402,16 +13485,30 @@ pub fn resolve_external_lib(nm: string) string {
         var base: string = dirs[i];
         var c_tc: string = path_resolve(base__sb_cat4(base, "/", rx, ".tc"));
         if (path_exists(c_tc)) { return c_tc; }
-        var c_tp: string = path_resolve(base__sb_cat4(base, "/", rx, ".tproto"));
-        if (path_exists(c_tp)) { return c_tp; }
+        var ej: i64 = 0;
+        while (ej < slice_len(exts) as i64) {
+            var c_tx: string = path_resolve(base__sb_cat4(base, "/", rx, exts[ej]));
+            if (path_exists(c_tx)) { return c_tx; }
+            ej = ej + 1;
+        }
         var c_idx: string = path_resolve(base__sb_cat4(base, "/", rx, "/index.tc"));
         if (path_exists(c_idx)) { return c_idx; }
-        var c_idxtp: string = path_resolve(base__sb_cat4(base, "/", rx, "/index.tproto"));
-        if (path_exists(c_idxtp)) { return c_idxtp; }
+        var ej2: i64 = 0;
+        while (ej2 < slice_len(exts) as i64) {
+            var suf2: string = base.sb_cat2("/index", exts[ej2]);
+            var c_idxtp: string = path_resolve(base__sb_cat4(base, "/", rx, suf2));
+            if (path_exists(c_idxtp)) { return c_idxtp; }
+            ej2 = ej2 + 1;
+        }
         var c_lib: string = path_resolve(base__sb_cat4(base, "/", rx, "/lib.tc"));
         if (path_exists(c_lib)) { return c_lib; }
-        var c_libtp: string = path_resolve(base__sb_cat4(base, "/", rx, "/lib.tproto"));
-        if (path_exists(c_libtp)) { return c_libtp; }
+        var ej3: i64 = 0;
+        while (ej3 < slice_len(exts) as i64) {
+            var suf3: string = base.sb_cat2("/lib", exts[ej3]);
+            var c_libtp: string = path_resolve(base__sb_cat4(base, "/", rx, suf3));
+            if (path_exists(c_libtp)) { return c_libtp; }
+            ej3 = ej3 + 1;
+        }
         i = i + 1;
     }
     return "";
