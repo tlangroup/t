@@ -1119,6 +1119,27 @@ pub fn t_td_is_enum(td: i64) bool {
     }
     return false;
 }
+// R-028：枚举底层整型 st（如 "u8"/"i32"），供 tir_st_of_td / cast / 常量发射统一取用。
+// 数据权威源 = lex.decl_list 的 EnumDecl.sb（与 t_td_is_enum 同口径）。
+pub fn tir_enum_underlying_st(td: i64) string {
+    if (td < 0 or td >= slice_len(sema.tds) as i64) { return ""; }
+    var t: TD = sema.tds[td];
+    if (t.name == "") { return ""; }
+    return tir_enum_underlying_st_by_name(t.name);
+}
+pub fn tir_enum_underlying_st_by_name(tname: string) string {
+    if (tname == "") { return ""; }
+    var n: i64 = slice_len(lex.decl_list) as i64;
+    var i: i64 = 0;
+    while (i < n) {
+        var d: i64 = lex.decl_list[i];
+        if (base.node_kind((d as u64)) == "EnumDecl" and base.node_sa((d as u64)) == tname) {
+            return base.node_sb((d as u64));   // 底层整型名，如 "u8"/"i32"
+        }
+        i = i + 1;
+    }
+    return "";
+}
 // 按变体名查找 VariantDecl 节点索引（emit 期 lex.decl_list 可靠，无需 sym 表）。
 pub fn t_variant_decl_of_name(vname: string) i64 {
     if (vname == "") { return -1; }
@@ -1208,6 +1229,12 @@ pub fn tir_st_of_td(td: i64) string {
     }
     if (t.cat == "named") {
         if (t.name == "") { return "ptr<void>"; }
+        // R-028：枚举遵循声明的底层整型宽度，在 TIR 中直接以底层标量 st 表示
+        // （不再发 %Name 命名类型，一并消除 R-027 的 forward-ref / undefined type）。
+        if (t_td_is_enum(td)) {
+            var ust: string = tir_enum_underlying_st(td);
+            if (ust != "") { return ust; }
+        }
         return base.sb_cat2("%", t.name);    // 具名聚合 → %Name（偏离 3）
     }
     return "i64";
@@ -1397,7 +1424,13 @@ pub fn tir_expr_st(e: i64) string {
     if (kd == "ident") {
         // ⚠ 缓存的 node.td 须越界检查；越界则丢弃并回落影子表 g_local_sts（持有本模块真实发射类型）。
         var ntd: i64 = base.node_type(e);
-        if (ntd > 0 and ntd < slice_len(sema.tds) as i64) { return tir_st_of_td(ntd); }
+        if (ntd > 0 and ntd < slice_len(sema.tds) as i64) {
+            // ⚠ R-028：枚举局部变量物理存于 KI-006 加宽的 i64 槽，读取须返回 i64 与槽一致；
+            // 否则 `c as 窄整型` 会对 i64 槽寄存器错发 zext/trunc（非法）。枚举的窄底层宽仅用于
+            // 布局（tir_st_of_td）/ type_info，值读取按 i64 宽处理（与 R-028 前 %Color→i64 同效）。
+            if (t_td_is_enum(ntd)) { return "i64"; }
+            return tir_st_of_td(ntd);
+        }
         // ⚠ 严格等价说明：原 `n.td = -1` 写在 `var n: Node = base.nodes[e]` 的**值拷贝**上，从未写回
         // nodes[]（且此后不再读 n.td），故无实际效果；迁侧表时不得升级为 node_set_type，否则改变行为。
         // 越界缓存的真正回收点在上方 tir_expr_td 顶部（base.node_set_type(e, -1)），语义已对齐。
@@ -5147,18 +5180,28 @@ var cft: i64 = tir_expr_td(base.node_na((sid as u64)));
     // canonical codegen_ll 用 ll_etd(内层) 取发射类型，此处对齐。
     var inner_stc: i64 = innerr.st;
     var inner_st: string = tir_st_to_str(inner_stc);
+    // ⚠ R-028 修正：整数源须保持「实际发射类型」(innerr.st，KI-006 槽加宽后为 i64 寄存器)，
+    //   否则枚举/窄量局部 `c as 窄整型` 会拿声明窄宽（u8/i32）对 i64 槽寄存器错发 zext/trunc
+    //   （如 `c as i32` 成非法 `zext i64 to i32`）。仅当声明类型为浮点时才回落（修复 `as i64`
+    //   整数语境下 meta_type_of_expr 把浮点操作数误推断成 i64 的历史问题）；整数源一律沿用实际宽度。
     if (inner_st == "" or inner_st == "i64") {
         var is2: string = tir_expr_st(base.node_na((sid as u64)));
-        if (is2 != "" and is2 != "i64") { inner_st = is2; }
+        if (is2 != "" and is2 != "i64" and (is2 == "f32" or is2 == "f64" or is2 == "float")) { inner_st = is2; }
     }
-    // 枚举在 TIR 中被擦除为整数，但其 expr_st 仍是 %Name（未声明的 LLVM 类型）。
-    // 把枚举操作数按 i64 看待，使 as 转换走正确的整数宽度逻辑（no-op/trunc/zext/sext），
-    // 而不是 emit 引用未声明 %Color 的 `bitcast`。
-    // ⚠ TD-vs-TI：tir_expr_td 返回 TD 索引，tir_emit_cast 此处需用 TD 字段判定枚举，
-    // 绝不可把 TD 索引喂给 sema.tip_kind（读 tis[]，会越界 panic）。
+    // ⚠ 枚举在 TIR 中被擦除为底层标量整数。绝大多数情形下 innerr.st 已是正确整数宽
+    // （局部槽经 KI-006 加宽为 i64、常量/返回值为底层窄宽如 u32），直接沿用即可；
+    // 仅当 innerr.st 仍是命名类型（%Name，未声明 LLVM 类型）时才回落底层标量 st，
+    // 避免引用未声明 %Color 的 bitcast / 错发 zext i64→i32（非法）。
+    // ⚠ TD-vs-TI：tir_expr_td 返回 TD 索引，此处需用 TD 字段判定枚举，绝不可把 TD 索引
+    //   喂给 sema.tip_kind（读 tis[]，会越界 panic）。
     // ⚠ 枚举 TD 的 cat 是 "named"，用 cat=="enum" 判定永远不生效；必须走 t_td_is_enum 回查 EnumDecl。
     var cast_src_td: i64 = tir_expr_td(base.node_na((sid as u64)));
-    if (t_td_is_enum(cast_src_td)) { inner_st = "i64"; }
+    if (t_td_is_enum(cast_src_td)) {
+        if (inner_st == "" or (str_len(inner_st) >= 1 and inner_st[0] == 37)) {
+            var ust: string = tir_enum_underlying_st(cast_src_td);
+            if (ust != "") { inner_st = ust; }
+        }
+    }
     var target_st: string = tir_st_of_td(sema.resolve_type_desc(base.node_nb((sid as u64))));
     if (inner_st == target_st) { return TirEmitRes{ name: inner, st: est }; }
     var d: string = tir_tmp();
@@ -5708,8 +5751,11 @@ pub fn tir_member_read(e: i64) TirEmitRes {
         var cvnode: i64 = sema.enum_const_lookup(base.node_sa((base.node_na((e as u64)) as u64)), base.node_sa((e as u64)));
         if (cvnode >= 0) {
             var cval: i64 = sema.js_parse_int(base.node_sa((cvnode as u64)), base.node_ia((cvnode as u64)));
+            // R-028：枚举常量按底层整型宽度发射（不再恒为 i64），与收窄后的枚举值槽一致。
+            var est_st: string = tir_enum_underlying_st(tir_expr_td(e));
+            if (est_st == "") { est_st = "i64"; }
             var d: string = tir_tmp();
-            tir_emit(TIRInst{ op: TIR_OP_CONST, st: tir_st_from_str("i64"), dst: tir_op(d), args: tir_a1(base.i2s(cval)), is_comment: false, line: g_cur_line, cmt: "" });
+            tir_emit(TIRInst{ op: TIR_OP_CONST, st: tir_st_from_str(est_st), dst: tir_op(d), args: tir_a1(base.i2s(cval)), is_comment: false, line: g_cur_line, cmt: "" });
             return TirEmitRes{ name: d, st: tir_st_from_str(tir_expr_st(e)) };
         }
     }
