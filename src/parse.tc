@@ -198,6 +198,16 @@ pub fn is_scalar_name(name: string) bool {
 }
 // <<< GEN:scalar_pred <<<
 
+// R-024：内联（匿名）嵌套 struct / enum 类型（如 `#pb struct Outer { inner: struct { x: i64 @ 1; } @ 1; }`）。
+// 合成唯一名并按「元组类型」同范式 append 到 decl_list，返回 named 节点引用。
+// 注意：嵌套类型声明会被 sema 当作普通具名类型注册（与 .{...} 元组类型同机制），
+// 故 StructDecl / EnumDecl 必须真正进入 decl_list 才能被 resolve_ti 找到。
+var g_nested_type_seq: i64 = 0;
+pub fn next_nested_type_name() string {
+    g_nested_type_seq = g_nested_type_seq + 1;
+    return base.sb_cat2("__nested_", base.i2s(g_nested_type_seq));
+}
+
 pub fn parse_type_inner() i64 {
     var t: string = lex.cur_t();
     // 括号类型 `( Type )`：只用来改写类型运算符的结合边界，**不包层、不引入新 kind**，
@@ -369,6 +379,28 @@ pub fn parse_type_inner() i64 {
         lex.advance_i();
         // meta T: type 的「类型之类型」占位；单态化时整体移除，与 any 同语义。
         return base.node_new("type");
+    }
+    // R-024：内联 struct 类型 `struct { ... }`（匿名嵌套结构体，字段可自带 tagID / 嵌套更深）。
+    if (t == "KwStruct") {
+        lex.advance_i();   // 吃掉 `struct`
+        var nts: string = next_nested_type_name();
+        var sd: i64 = parse_struct_decl(nts, -1, "");
+        if (sd >= 0) {
+            base.node_at(sd, lex.pos - 1);
+            append(lex.decl_list, sd);
+        }
+        return base.mk_named(nts, -1);
+    }
+    // R-024：内联 enum 类型 `enum { ... }`（匿名嵌套枚举）。
+    if (t == "KwEnum") {
+        lex.advance_i();   // 吃掉 `enum`
+        var nte: string = next_nested_type_name();
+        var ed: i64 = parse_enum_decl(nte, -1);
+        if (ed >= 0) {
+            base.node_at(ed, lex.pos - 1);
+            append(lex.decl_list, ed);
+        }
+        return base.mk_named(nte, -1);
     }
     if (t == "Identifier") {
         var idx: i64 = lex.advance_i();
@@ -3262,6 +3294,12 @@ pub fn parse_declaration() i64 {
                 parse_fatal_at("T-ANN-E003", base.sb_cat3("modifier '#", cm_id, "' is not registered"), cm_i);
             }
             capmod = cm_id;
+            // R-034：注册的自定义修饰词（含内建 soa/aos）同时合成注解节点并入 anns，
+            // 使 @type_attributes / @field_attributes 反射能纳入（custom_type_n 不再恒 0）。
+            // ann_validate 对 modifier_known 名跳过未知注解校验（见 sema.tc）。
+            var mpan: i64 = base.mk_A(cm_id, -1, cm_i);
+            var mpan_entry: i64 = base.list_push(-1, -1, mpan);
+            anns = list_concat(anns, mpan_entry);
         }
     }
 
@@ -6710,6 +6748,16 @@ pub fn parse_case(ci: i64) i64 {
     expect_tok("RParen");
     }
     var r_anns: i64 = parse_annotations();
+    // R-025：variant case 的 tagID `@ Integer`（pb oneof 每个成员占一个 field number，
+    //   与 struct 字段同构；parse_annotations 已跳过 @<int>，此处单独吃）。
+    //   存于 VC.ib（通用节点 walker 只遍历 na/nb/nc/nd/la/lb/lc，不遍历 ia/ib，故 ib 安全；
+    //   而 nb 会被 mb_walk 当成节点指针遍历 ⇒ 不能放 nb）。multi-payload 计数不再占用 ib，
+    //   改由 match 检查期从 lb 列表长度推导（见 sema match 检查）。
+    var r_tag: i64 = -1;
+    if (lex.cur_t() == "At") {
+        lex.advance_i();
+        r_tag = parse_int_str(expect_tok("Integer"));
+    }
     if (lex.cur_t() == "Comma" or lex.cur_t() == "Semicolon") {
     if (lex.cur_t() == "Comma") {
     expect_tok("Comma");
@@ -6720,9 +6768,12 @@ pub fn parse_case(ci: i64) i64 {
     }
     }
     var __id: i64 = base.mk_VC(r_Ident, ci, r_type, r_anns, -1);
+    if (r_tag >= 0) {
+        base.node_set_ib((__id as u64), r_tag);   // R-025：case tagID（≥0 显式；-1 = 无）
+    }
     if (r_cnt >= 2) {
         base.node_set_lb((__id as u64), r_types);
-        base.node_set_ib((__id as u64), r_cnt);   // S4 §0.14.7 SoA：取代 `r_vn.ib`（下方 slice_set 回写生效）
+        // R-025：multi-payload 计数不再写 ib（ib 已让位给 tagID）；match 检查期从 lb 长度推导。
     }
     return __id;
 }

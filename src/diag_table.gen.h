@@ -176,6 +176,8 @@ static const DiagDef DIAG_DEFS[] = {
   { "T-PIP-E007", "error", "PIP", "", "VOID_MAP", "element-wise pipe stage function must not return void" },
   { "T-PIP-W000", "warning", "PIP", "", "DISPATCH_AMBIG", "|> whole-apply and element-map both match; whole-apply chosen" },
   { "T-PIP-W001", "warning", "PIP", "", "RESULT_UNUSED", "pipe result is discarded in expression-statement position" },
+  { "T-PRB-E001", "error", "PRB", "", "PB_ENUM_FIRST_NONZERO", "first member of a #pb enum must have value 0 (proto3 constraint)" },
+  { "T-PRB-E002", "error", "PRB", "", "PB_ENUM_DUPLICATE_VALUE", "duplicate enum member value requires @allow_alias (proto3 constraint)" },
   { "T-RNG-E000", "error", "RNG", "", "ITER_NO_START", "range iteration requires a start bound" },
   { "T-RNG-E001", "error", "RNG", "", "INDEX_UNSUPPORTED", "type does not support range indexing" },
   { "T-RNG-E002", "error", "RNG", "", "OPEN_AS_VALUE", "open-ended range cannot be used as a value" },
@@ -226,7 +228,7 @@ static const DiagDef DIAG_DEFS[] = {
   { "T-VEC-W000", "warning", "VEC", "", "VECTOR_WIDER_THAN_NATIVE", "vector is wider than the native SIMD register and will be split" },
   { "T-VEC-W001", "warning", "VEC", "", "TILE_WIDER_THAN_NATIVE", "hardware tile is wider than the native SIMD register and will fall back to scalar loops" },
 };
-#define DIAG_COUNT 213
+#define DIAG_COUNT 215
 
 /* legacy (old semantic name) -> machine code alias table */
 static const struct { const char* legacy; const char* code; } DIAG_LEGACY[] = {

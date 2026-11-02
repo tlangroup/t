@@ -4157,10 +4157,11 @@ pub fn conpat_check(pat: i64, scr: i64, rep: bool) void {
         }
         return;
     }
-    // 载荷个数：单元 0、单载荷 1、多载荷 = vcn.ib（>=2，载荷类型链在 vcn.lb）
+    // 载荷个数：单元 0、单载荷 1、多载荷 = lb 列表长度（载荷类型链在 vcn.lb）。
+    // ⚠ R-025：不再读 vcn.ib（ib 已让位给 case tagID），改为从 lb 链长度推导。
     var want: i64 = 0;
     if (base.node_lb((vc as u64)) >= 0) {
-        want = base.node_ib((vc as u64));   // S4 §0.14.7 SoA：侧表读（原 vcn.ib）
+        want = slice_len(base.kids_chain(base.node_lb((vc as u64))));   // S4 §0.14.7 SoA：侧表读（原 vcn.ib）
     } else if (base.node_na((vc as u64)) >= 0) {
         want = 1;
     }
@@ -11104,6 +11105,10 @@ pub fn check_packed_layout(d: i64) void {
     append(pk_struct_total, total);
 }
 
+// R-030：#pb enum proto3 校验的去重护栏（check_enum_decl 在 sema / HIR 两趟都会被调用）。
+pub var g_pb_enum_done: []i64 = [];
+pub var g_pb_seen_vals: []i64 = [];
+
 pub fn check_enum_decl(d: i64) void {
     if (is_int_name(base.node_sb((d as u64))) == false) {
         var di: i64 = base.diag_new("T-SEM-E002", "error",
@@ -11137,6 +11142,73 @@ pub fn check_enum_decl(d: i64) void {
         }
         mq_ki8868 = mq_ki8868 + 1;
         c = -1;
+    }
+    // ── R-030：#pb enum proto3 校验 ──
+    // `#pb` 标记的 enum 是 wire 契约的一部分，须满足 proto3 三条约束：
+    //   1) 首个成员值必须为 0；2) 重复值须显式 @allow_alias；3) 底层类型须为整型
+    //      （底层整型约束已由上方 is_int_name 检查覆盖：非整型报 T-SEM-E002）。
+    // 无 #pb 的 enum 是纯语言层，跳过本段（与 #pb struct 对称）。
+    // ⚠ 幂等护栏：check_enum_decl 在 sema 与 HIR 两趟都会被调用，防止同一 decl 重复报 PB 诊断。
+    var is_pb_enum: bool = parse.ann_find(base.node_la((d as u64)), "pb") >= 0;
+    if (is_pb_enum) {
+        var pb_seen: bool = false;
+        var pj: i64 = 0;
+        while (pj < slice_len(g_pb_enum_done) as i64) {
+            if (g_pb_enum_done[pj] == d) { pb_seen = true; }
+            pj = pj + 1;
+        }
+        if (pb_seen == false) {
+            append(g_pb_enum_done, d);
+            var allow_alias: bool = parse.ann_find(base.node_la((d as u64)), "allow_alias") >= 0;
+            // 计算各成员值（与 @enum_members 同源：显式值已折 int 字面量，未折尝试 meta_eval，否则自动编号）
+            var pb_mks: []i64 = base.kids_chain_idx(base.node_lb((d as u64)));
+            var pb_mki: i64 = 0;
+            var pb_auto: i64 = 0;
+            var pb_first: bool = true;
+            g_pb_seen_vals = [];
+            while (pb_mki < slice_len(pb_mks) as i64) {
+                var pmn: i64 = base.kids[pb_mks[pb_mki]].val;
+                var pmval: i64 = -1;
+                var pmvn: i64 = base.node_na((pmn as u64));
+                if (pmvn >= 0) {
+                    if (base.node_kind((pmvn as u64)) == "int") {
+                        pmval = js_parse_int(base.node_sa((pmvn as u64)), base.node_ia((pmvn as u64)));
+                    } else {
+                        var pvv: i64 = meta_eval(pmvn);
+                        g_meta_err = false;
+                        if (pvv >= 0 and base.node_kind((pvv as u64)) == "int") {
+                            pmval = js_parse_int(base.node_sa((pvv as u64)), base.node_ia((pvv as u64)));
+                        }
+                    }
+                } else {
+                    pmval = pb_auto;
+                }
+                if (pmval >= 0) {
+                    if (pb_first) {
+                        pb_first = false;
+                        if (pmval != 0) {
+                            base.diag_new("T-PRB-E001", "error",
+                                base.sb_cat5("pb enum '", base.node_sa((d as u64)), "' 的首个成员 '", base.node_sa((pmn as u64)), "' 的值必须为 0（proto3 约束）"),
+                                parse.n_file(pmn), parse.n_line(pmn), parse.n_col(pmn), parse.n_line(pmn), parse.n_col(pmn) + (str_len(base.node_sa((pmn as u64))) as i64));
+                        }
+                    }
+                    var psi: i64 = 0;
+                    var pdup: bool = false;
+                    while (psi < slice_len(g_pb_seen_vals) as i64) {
+                        if (g_pb_seen_vals[psi] == pmval) { pdup = true; }
+                        psi = psi + 1;
+                    }
+                    if (pdup and allow_alias == false) {
+                        base.diag_new("T-PRB-E002", "error",
+                            base.sb_cat7("pb enum '", base.node_sa((d as u64)), "' 成员 '", base.node_sa((pmn as u64)), "' 的值 ", base.i2s(pmval), " 与另一成员重复，须在该 enum 上显式标注 @allow_alias（proto3 约束）"),
+                            parse.n_file(pmn), parse.n_line(pmn), parse.n_col(pmn), parse.n_line(pmn), parse.n_col(pmn) + (str_len(base.node_sa((pmn as u64))) as i64));
+                    }
+                    if (pdup == false) { append(g_pb_seen_vals, pmval); }
+                    pb_auto = pmval + 1;
+                }
+                pb_mki = pb_mki + 1;
+            }
+        }
     }
 }
 
@@ -13226,11 +13298,19 @@ pub fn handle_one_import(imp: i64, at: i64) void {
         // T_TINT_DIR 已设且接口文件命中 → 优先用接口文件（不回退 .tc）；
         // 否则回退到 .tc 源码供类型检查（兼容无接口文件的模块）。
         if (chosen == "") {
+            // R-023：导入解析支持 .tproto 后缀（thyme schema 文件）。
+            // 先剥掉已带的已知源码扩展名，再按 .tc / .tproto 顺序尝试。
+            var rx: string = rel;
+            var rl: i64 = str_len(rx);
+            if (rl >= 7 and str_slice(rx, rl - 7, rl) == ".tproto") { rx = str_slice(rx, 0, rl - 7); }
+            else if (rl >= 3 and str_slice(rx, rl - 3, rl) == ".tc") { rx = str_slice(rx, 0, rl - 3); }
             var i: i64 = 0;
             var nr: i64 = slice_len(g_src_roots) as i64;
             while (i < nr) {
-                var cand: string = path_resolve(base__sb_cat4(g_src_roots[i], "/", rel, ".tc"));
+                var cand: string = path_resolve(base__sb_cat4(g_src_roots[i], "/", rx, ".tc"));
                 if (path_exists(cand)) { chosen = cand; break; }
+                var cand2: string = path_resolve(base__sb_cat4(g_src_roots[i], "/", rx, ".tproto"));
+                if (path_exists(cand2)) { chosen = cand2; break; }
                 i = i + 1;
             }
         }
@@ -13310,17 +13390,28 @@ pub fn handle_one_import(imp: i64, at: i64) void {
 // （.tlib 预编译外链在 Phase2 接入；T_LIB_PATH 环境变量亦在 Phase2 纳入。）
 pub fn resolve_external_lib(nm: string) string {
     var rel: string = dots_to_slashes(nm);
+    // R-023：导入解析支持 .tproto 后缀——先剥掉已知源码扩展名再尝试。
+    var rx: string = rel;
+    var rl: i64 = str_len(rx);
+    if (rl >= 7 and str_slice(rx, rl - 7, rl) == ".tproto") { rx = str_slice(rx, 0, rl - 7); }
+    else if (rl >= 3 and str_slice(rx, rl - 3, rl) == ".tc") { rx = str_slice(rx, 0, rl - 3); }
     var dirs: []string = lex__g_lib_dirs;          // compute_lib_dirs 已填充
     var i: i64 = 0;
     var nd: i64 = slice_len(dirs) as i64;
     while (i < nd) {
         var base: string = dirs[i];
-        var c_tc: string = path_resolve(base__sb_cat4(base, "/", rel, ".tc"));
+        var c_tc: string = path_resolve(base__sb_cat4(base, "/", rx, ".tc"));
         if (path_exists(c_tc)) { return c_tc; }
-        var c_idx: string = path_resolve(base__sb_cat4(base, "/", rel, "/index.tc"));
+        var c_tp: string = path_resolve(base__sb_cat4(base, "/", rx, ".tproto"));
+        if (path_exists(c_tp)) { return c_tp; }
+        var c_idx: string = path_resolve(base__sb_cat4(base, "/", rx, "/index.tc"));
         if (path_exists(c_idx)) { return c_idx; }
-        var c_lib: string = path_resolve(base__sb_cat4(base, "/", rel, "/lib.tc"));
+        var c_idxtp: string = path_resolve(base__sb_cat4(base, "/", rx, "/index.tproto"));
+        if (path_exists(c_idxtp)) { return c_idxtp; }
+        var c_lib: string = path_resolve(base__sb_cat4(base, "/", rx, "/lib.tc"));
         if (path_exists(c_lib)) { return c_lib; }
+        var c_libtp: string = path_resolve(base__sb_cat4(base, "/", rx, "/lib.tproto"));
+        if (path_exists(c_libtp)) { return c_libtp; }
         i = i + 1;
     }
     return "";
@@ -19445,6 +19536,12 @@ pub fn ann_validate(ai: i64, target: string) void {
     // pb 修饰关键词：`@pb` 标记结构体为 protobuf message（与 `#pb` 同义）。非注册注解，
     // 跳过未知注解校验（不要求进 g_ad_name 表，避免并行数组维护成本）。
     if (name == "pb") { return; }
+    // R-030：proto3 别名标记 `@allow_alias` 仅对 enum 合法（声明级），跳过未知注解校验。
+    // 改为无条件跳过：该标记只被 #pb enum 的 proto3 重复值检查消费，放宽为无条件不影响约束。
+    if (name == "allow_alias") { return; }
+    // R-034：注册的自定义修饰词（#modifier 注册 / 内建 soa/aos/pb）不是 @ 注解注册表成员，
+    // 但其合成注解节点已并入 anns 供反射读取；跳过未知注解校验，避免误报 T-ANN-E000。
+    if (lex.modifier_known(name)) { return; }
     var l: i64 = base.node_span_id(ai).line as i64;
     var c: i64 = base.node_span_id(ai).col as i64;
     var name_len: i64 = str_len(name) as i64;
