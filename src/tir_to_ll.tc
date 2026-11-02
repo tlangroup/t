@@ -422,6 +422,11 @@ pub fn ll_ensure_slot(name: string, st: string) void {
     // 本就容纳指针，不受影响。
     var ast: string = st;
     if (ast == "i1" or ast == "bool" or ast == "i8" or ast == "u8" or ast == "i16" or ast == "u16" or ast == "i32" or ast == "u32") { ast = "i64"; }
+    // ⚠ 指针槽固定 8 字节（不论所指类型大小）：ptr / ptr<X> 承载的是 8 字节地址值，若按所指类型
+    // 大小分配（如 ptr<i32> → alloca i32 = 4B、ptr<%OneField> → alloca %OneField = 4B），写指针会写穿
+    // 相邻栈槽 → 段错误（R-031：单字段小宽度 struct 的字段地址临时量即此情形；两字段 / 8 字节字段
+    // 因槽恰 ≥8 字节而巧合不崩）。与 421 行设计意图一致："指针槽按 ptr<elem>(8B) 分配"。
+    if (llname.ll_starts(ast, "ptr")) { ast = "ptr"; }
     sb_append_str(g_ll, llname.ll_emit_alloca(name, ast));
 }
 
@@ -5146,6 +5151,15 @@ pub fn tir_to_ll_emit(module: TIRModule) string {
                 // （循环变量/值）→ 运行时索引数组元素赋值不落盘（读回恒 0）。故此处
                 // 强制按指针宽度分配；其余值槽保持原类型（f32 仍为 float，不被误加宽）。
                 if (pins.op == tir__TIR_OP_GEP_IDX) { pst = base.sb_cat3("ptr<", pst, ">"); }
+                // ⚠ R-031 同源缺陷（KI-006 家族）：ADDR_OF 结果槽承载「被取址者的地址」(ptr<X>, 8B)，
+                // 但前端 ADDR_OF 的 inst.st 存的是「被取址者的类型」(如 %OneField)，并非指针类型；
+                // 若按该值类型分配槽（≤4B 的 struct/标量），后续 `store ptr`(8B) 写穿窄槽、踩坏相邻
+                // 栈槽 → 段错误（R-031：单字段小宽度 struct 的 `s.n = 1` 即此情形；两字段 / 8B 字段
+                // 因槽恰 ≥8B 而巧合不崩）。与 ADDR_OF 指令发射处（ll_emit_inst 3434 行兜底）
+                // 一致：仅在非指针类型时包成 ptr<…>，避免 `ptr<ptr<…>>` 双重包裹。
+                if (pins.op == tir__TIR_OP_ADDR_OF and (llname.ll_starts(pst, "ptr<") or pst == "ptr") == false) {
+                    pst = base.sb_cat3("ptr<", pst, ">");
+                }
                 if (str_len(pst) > 0 and pst != "void") {
                     ll_ensure_slot(pins.dst.name, pst);
                 }

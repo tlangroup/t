@@ -14958,18 +14958,30 @@ pub fn meta_eval_rec(e: i64) i64 {
         if (mh >= 0) {
             var ks: []i64 = base.kids_chain(mh);
             var ki: i64 = 0;
+            var auto_val: i64 = 0;   // 自动编号游标（与 fold_enum_values 同口径）
             while (ki < slice_len(ks) as i64) {
                 var mn: i64 = ks[ki];
                 var mname: string = base.node_sa((mn as u64));
-                // 取折出的整型值（与 Enum.Member 解析同源：g_enum_cn/g_enum_cvi）
+                // R-032：直接从成员节点取已折好的整型值，不再查 g_enum_cn/g_enum_cvi
+                // 全局表（该表在 CTFE 阶段未必填充，导致恒 -1 的静默错数据，违反 001 §5 红线）。
+                // 与 fold_enum_values 同源：成员值表达式在 na 上，显式值已折为 int 字面量，
+                // 未折的尝试再 meta_eval 一次；自动编号成员（na < 0）按游标续推。
                 var mval: i64 = -1;
-                var key: string = base__sb_cat2(tname, base__sb_cat2(".", mname));
-                var gi: i64 = 0;
-                var gn: i64 = slice_len(g_enum_cn) as i64;
-                while (gi < gn) {
-                    if (g_enum_cn[gi] == key) { mval = g_enum_cvi[gi]; break; }
-                    gi = gi + 1;
+                var mvn: i64 = base.node_na((mn as u64));
+                if (mvn >= 0) {
+                    if (base.node_kind((mvn as u64)) == "int") {
+                        mval = js_parse_int(base.node_sa((mvn as u64)), base.node_ia((mvn as u64)));
+                    } else {
+                        var vv: i64 = meta_eval(mvn);
+                        g_meta_err = false;   // 复位：避免不可折节点污染后续成员
+                        if (vv >= 0 and base.node_kind((vv as u64)) == "int") {
+                            mval = js_parse_int(base.node_sa((vv as u64)), base.node_ia((vv as u64)));
+                        }
+                    }
+                } else {
+                    mval = auto_val;   // 自动编号成员
                 }
+                if (mval >= 0) { auto_val = mval + 1; }
                 var fifh: i64 = -1;
                 var fift: i64 = -1;
                 fift = base__list_push(fifh, fift, base__mk_FV("name", base.mk_string(mname, -1), -1));
@@ -15373,6 +15385,35 @@ pub fn meta_eval_binary(e: i64) i64 {
     if (lv < 0) { return -1; }
     var rv: i64 = meta_eval(base.node_nb((e as u64)));
     if (rv < 0) { return -1; }
+    // R-036：编译期 `++`（Concat）—— 字符串拼接与数组（切片）拼接，与运行期 ++ 同源。
+    // 此前 CTFE 无此分支，导致 `comptime const A = "x" ++ "y"` / `slice_len` 静默失败、
+    // 退回零值（A=[] / 字符串空），正是 thyme 报告的「CTFE 下 ++ 静默为空」。
+    if (op == "Concat") {
+        if (base.node_kind((lv as u64)) == "string" and base.node_kind((rv as u64)) == "string") {
+            var sbs: StringBuilder = sb_new();
+            sb_append_str(sbs, base.node_sa((lv as u64)));
+            sb_append_str(sbs, base.node_sa((rv as u64)));
+            return base__mk_string(sb_to_str(sbs), -1);
+        }
+        if (base.node_kind((lv as u64)) == "array_lit" and base.node_kind((rv as u64)) == "array_lit") {
+            var h: i64 = -1;
+            var t: i64 = -1;
+            var c: i64 = base.node_la((lv as u64));
+            while (c >= 0) {
+                t = base__list_push(h, t, base__kids[c].val);
+                if (h < 0) { h = t; }
+                c = base__kids[c].next;
+            }
+            c = base.node_la((rv as u64));
+            while (c >= 0) {
+                t = base__list_push(h, t, base__kids[c].val);
+                if (h < 0) { h = t; }
+                c = base__kids[c].next;
+            }
+            return base__mk_array_lit(h, -1);
+        }
+        return meta_fail("T-MTA-E016", "编译期 `++` 的操作数须同为字符串或同为数组", e);
+    }
     if (base.node_kind((lv as u64)) == "string" or base.node_kind((rv as u64)) == "string") {
         if (base.node_kind((lv as u64)) != "string" or base.node_kind((rv as u64)) != "string") {
             return meta_fail("T-MTA-E016", "编译期字符串只能与字符串比较", e);
@@ -15882,7 +15923,7 @@ pub fn meta_eval_builtin(e: i64, name: string) i64 {
     // 故此处不再登记；编译期上下文里出现它们会落到下面的 impure / -2 分支而报错，
     // 编译期输出请改用 `@compile_log(...)`。
     if (name == "int_to_str" or name == "i2s") { isb = true; }
-    if (name == "str_len" or name == "str_at") { isb = true; }
+    if (name == "str_len" or name == "str_at" or name == "slice_len") { isb = true; }
     if (name == "sym_intern") { isb = true; }
     if (isb == false) {
         if (meta_builtin_impure(name)) {
@@ -15930,6 +15971,22 @@ pub fn meta_eval_builtin(e: i64, name: string) i64 {
             return meta_fail("T-MTA-E016", "编译期 `str_len` 的实参须是字符串", e);
         }
         return mv_int(str_len(base.node_sa((argv[0] as u64))) as i64);
+    }
+    // R-032/R-036 同族：编译期 slice_len —— 支持 array_lit（CTFE 数组值）与 string，
+    // 使 `comptime const N = slice_len(@enum_members(E))` 与 `slice_len("xy")` 能折出正确长度，
+    // 不再因 CTFE 期无 slice_len 内建而求值失败、退回 int 零值（表现为 ct_count=0 的静默错）。
+    if (name == "slice_len") {
+        if (an != 1) {
+            return meta_fail("T-MTA-E010", "编译期 `slice_len` 需要 1 个实参", e);
+        }
+        var bv: i64 = argv[0];
+        if (base.node_kind((bv as u64)) == "string") {
+            return mv_int(str_len(base.node_sa((bv as u64))) as i64);
+        }
+        if (base.node_kind((bv as u64)) == "array_lit") {
+            return mv_int(slice_len(base.kids_chain_idx(base.node_la((bv as u64)))) as i64);
+        }
+        return meta_fail("T-MTA-E016", "编译期 `slice_len` 的实参须是数组或字符串", e);
     }
     if (an != 2) {
         return meta_fail("T-MTA-E010", "编译期 `str_at` 需要 2 个实参", e);

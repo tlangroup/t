@@ -426,6 +426,7 @@ pub struct EnumDecl2 {
 pub struct Schema {
     structs: []StructDecl2;
     enums: []EnumDecl2;
+    errors: []string;     // 解析期诊断（不支持的声明等），不再静默丢弃（R-035 ③）
 }
 
 // 注解解析结果（携带新光标）
@@ -505,8 +506,20 @@ pub fn parse_struct(toks: []Token, i: i64) SParse {
         f.tag = -1;
         f.name = toks[i].src;
         i = i + 1;
+        // ② 每个字段显式重置注解与类型名：t 的循环内 var 不复零，否则上一字段的注解会串台、
+        //    残留类型名会污染本字段（R-035 ②）。
+        var f_empty_anns: []Annotation;
+        f.annotations = f_empty_anns;
+        f.type_name = "";
         if (i < n and str_eq(toks[i].kind, "Colon")) { i = i + 1; }
-        if (i < n and str_eq(toks[i].kind, "Identifier")) { f.type_name = toks[i].src; i = i + 1; }
+        // ① 类型位置复用通用 parse_type（正确处理 KwString / KwAny / KwVoid / KwUnit /
+        //    KwAuto、可选/切片/指针/映射/数组及点号前缀与泛型实参），不再因「关键字类型」导致
+        //    光标不推进、后续 @N 字段号整体错位（R-035 ①）。
+        if (i < n) {
+            var f_tr: PR = parse_type(toks, i);
+            f.type_name = type_node_str(f_tr.n);
+            i = f_tr.pos;
+        }
         // @N 字段号 或 @注解
         while (i < n and str_eq(toks[i].kind, "At")) {
             if (i + 1 < n and str_eq(toks[i + 1].kind, "Integer")) {
@@ -630,6 +643,19 @@ pub fn parse_schema(src: string) Schema {
             pending_pb = false;
             append(s.enums, ed);
             i = r.pos;
+            continue;
+        }
+        // ③ 不支持的顶层声明（variant/union/const/fn/let/trait/agent）：明确诊断并记入
+        //    s.errors，跳过其声明体，**不再静默丢弃**（R-035 ③，001 §5 红线）。
+        if (is_top_decl(k)) {
+            var dname: string = "";
+            if (i + 1 < n) { dname = toks[i + 1].src; }
+            var msg: string = "parse_schema: 不支持的顶层声明 '" ++ k ++ "'";
+            if (str_len(dname) > 0) { msg = msg ++ " (" ++ dname ++ ")"; }
+            msg = msg ++ " —— 该声明被忽略，未进入 Schema（请改用 struct/enum，或移除该声明）";
+            append(s.errors, msg);
+            println(msg);
+            i = skip_top_decl(toks, i);
             continue;
         }
         i = i + 1;
@@ -766,6 +792,67 @@ fn parse_type(toks: []Token, i: i64) PR {
     var n = mk_node("Type", i);
     append(n.children, mk_node(tok_kind(toks, i), i));
     return PR{ n: n, pos: i + 1 };
+}
+
+// R-035 ①：把 parse_type 产出的类型节点渲染为规范类型名串（与 FieldDecl.type_name 语义一致）。
+// 覆盖 TypeName（含点号前缀与泛型实参）、可选(?T)、指针(*T)、切片([]T)、数组([N]T)、映射(map[K]V)。
+fn type_node_str(n: Node) string {
+    var tag: string = n.tag;
+    var k: i64 = slice_len(n.children) as i64;
+    if (str_eq(tag, "TypeName")) { return n.text; }
+    if (str_eq(tag, "OptionalType")) {
+        if (k > 0) { return "?" ++ type_node_str(n.children[0]); }
+        return "?";
+    }
+    if (str_eq(tag, "PointerType")) {
+        if (k > 0) { return "*" ++ type_node_str(n.children[0]); }
+        return "*";
+    }
+    if (str_eq(tag, "SliceType")) {
+        if (k > 0) { return "[]" ++ type_node_str(n.children[0]); }
+        return "[]";
+    }
+    if (str_eq(tag, "ArrayType")) {
+        var elem: Node;
+        if (k > 0) { elem = n.children[k - 1]; }
+        return "[" ++ "]" ++ type_node_str(elem);
+    }
+    if (str_eq(tag, "MapType")) {
+        var key: Node;
+        var val: Node;
+        if (k >= 2) { key = n.children[k - 2]; val = n.children[k - 1]; }
+        else if (k == 1) { val = n.children[0]; }
+        return "map[" ++ type_node_str(key) ++ "]" ++ type_node_str(val);
+    }
+    if (k > 0) { return type_node_str(n.children[0]); }
+    return tag;
+}
+
+// R-035 ③：识别 Schema 模型不支持的顶层声明关键字（variant/union/const/fn/let/trait/agent）。
+// struct/enum 已被 parse_schema 处理；#pb/#modifier 经 Hash 分支处理。
+fn is_top_decl(k: string) bool {
+    return str_eq(k, "KwVariant") or str_eq(k, "KwUnion") or str_eq(k, "KwConst")
+        or str_eq(k, "KwFn") or str_eq(k, "KwLet") or str_eq(k, "KwTrait")
+        or str_eq(k, "KwAgent");
+}
+
+// 跳过整个顶层声明体（至下一个顶层声明起点或 Eof），避免不支持的声明被静默丢弃后还污染后续解析。
+fn skip_top_decl(toks: []Token, i: i64) i64 {
+    var n: i64 = slice_len(toks) as i64;
+    var depth: i64 = 0;
+    while (i < n) {
+        var kk: string = toks[i].kind;
+        if (str_eq(kk, "LBrace")) { depth = depth + 1; }
+        else if (str_eq(kk, "RBrace")) {
+            if (depth > 0) { depth = depth - 1; }
+            else { return i; }
+        }
+        if (depth == 0 and (str_eq(kk, "KwStruct") or str_eq(kk, "KwEnum") or str_eq(kk, "Hash"))) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return i;
 }
 
 // 把 pending 的 pub 标记与注解前置到声明节点（避免两级字段赋值，统一走本地拷贝）
