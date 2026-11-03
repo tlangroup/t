@@ -208,6 +208,29 @@ pub fn next_nested_type_name() string {
     return base.sb_cat2("__nested_", base.i2s(g_nested_type_seq));
 }
 
+// R-038：命名嵌套类型声明（struct/enum 体内嵌具名 struct/enum，如 `#pb struct Outer { struct Inner {...} }`）。
+// 与 protobuf 的 DescriptorProto.nested_type 同构：嵌套类型是「完全限定名 = 父__子」（Outer__Inner）的真实类型，
+// 注册进 decl_list 即为真实类型；父→子归属另由 register_nested_decl 登记，供 mangle_modules 把
+// `Outer.Inner` 重整为 `Outer__Inner`，亦供任何下游 TDA/tdagen 还原 NestedType 归属（不以扁平化 `OuterInner` 丢失归属）。
+pub var g_nested_full: []string = [];          // 子全名，如 Outer__Inner
+pub var g_nested_parent_full: []string = [];   // 父全名，如 Outer
+pub var g_nested_child_local: []string = [];   // 子本地名，如 Inner
+pub fn register_nested_decl(full: string, parent: string, child: string) void {
+    append(g_nested_full, full);
+    append(g_nested_parent_full, parent);
+    append(g_nested_child_local, child);
+}
+// 给定父全名 + 子本地名，返回子全名（命中才返回非空）；mangle_modules 用它判定 `Outer.Inner` 是否合法嵌套类型。
+pub fn nested_full_of(parent: string, child: string) string {
+    var cand: string = base.sb_cat3(parent, "__", child);
+    var k: i64 = 0;
+    while (k < slice_len(g_nested_full) as i64) {
+        if (g_nested_full[k] == cand) { return cand; }
+        k = k + 1;
+    }
+    return "";
+}
+
 pub fn parse_type_inner() i64 {
     var t: string = lex.cur_t();
     // 括号类型 `( Type )`：只用来改写类型运算符的结合边界，**不包层、不引入新 kind**，
@@ -6652,6 +6675,25 @@ pub fn parse_struct_decl(name: string, anns: i64, layout: string) i64 {
             var __it: i64 = parse_sfield();
             r_sfield_t = base.list_push(r_sfield, r_sfield_t, __it);
             if (r_sfield < 0) { r_sfield = r_sfield_t; }
+        } else if ((lex.cur_t() == "KwStruct" or lex.cur_t() == "KwEnum") and lex.peek_t(1) == "Identifier") {
+            // R-038：struct 体内嵌套具名 struct / enum 声明（如 `#pb struct Outer { struct Inner {...} }`）。
+            // 全名 = 父__子（Outer__Inner），与 protobuf NestedType 完全限定名同构；注册进 decl_list 即为真实类型，
+            // 父→子归属另由 register_nested_decl 登记（供 mangle_modules 把 `Outer.Inner` 重整为 `Outer__Inner`）。
+            // 仅拦截「关键字 + Ident」的具名形态；匿名内联 `struct {...}`（位置字段类型）仍走下方 else → parse_type 内联分支。
+            var r_is_enum: bool = (lex.cur_t() == "KwEnum");
+            lex.advance_i();                        // 吃掉 `struct` / `enum`
+            var r_child: string = expect_tok("Identifier");
+            var r_full: string = base.sb_cat3(name, "__", r_child);
+            var r_nd: i64 = -1;
+            if (r_is_enum) {
+                r_nd = parse_enum_decl(r_full, -1);
+            } else {
+                r_nd = parse_struct_decl(r_full, -1, "");
+            }
+            if (r_nd >= 0) {
+                append(lex.decl_list, r_nd);
+                register_nested_decl(r_full, name, r_child);
+            }
         } else {
             // 位置字段元组语法：`struct T { T1, T2, ... }` —— 字段自动命名 `_0`/`_1`/...。
             // 任意「类型起始 token」（标识符类型、类型关键字 string/void/map/unit、
