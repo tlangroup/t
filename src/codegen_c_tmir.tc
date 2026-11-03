@@ -173,8 +173,11 @@ pub fn c_is_sret_type(st: string) bool {
     var t2: string = st;
     if (c_starts(t2, "%")) { t2 = str_slice(t2, 1, str_len(t2) as i64); }
     if (t2 == "TStr" or t2 == "TSlice" or t2 == "TClosure" or t2 == "TBitStr") { return false; }
-    // 用户聚合（命名 struct / variant，'%' 前缀）与数组（'[' 前缀）→ sret（void + 出参指针）。
-    if (c_starts(st, "%") or st[0] == 91) { return true; }
+    // 用户聚合（命名 struct / variant，'%' 前缀）、LLVM 定长数组（'[' 前缀）与 TIR 定长数组（'arr<' 前缀）
+    // → sret（void + 出参指针）。定长数组按字节缓冲返回：C 侧必须经由 __sret 出参把缓冲拷出，
+    // 否则若按函数返回类型直接发 unsigned char*，会返回被调栈上局部数组的悬垂指针（读成 0 / 越界）。
+    // 此前只识别 '[' 前缀，漏掉 TIR 的 arr<E x N> 形式 → u32_to_le 之类返回 [4]u8 的函数在 C 后端静默错算。
+    if (c_starts(st, "%") or st[0] == 91 or c_is_arr(st)) { return true; }
     return false;
 }
 // 运行库结构体（TStr/TSlice/TClosure/TBitStr）：按值返回（RAX:RDX），非 sret。
@@ -767,6 +770,10 @@ pub fn c_tystr_c(ty: string) string {
     // 绝不走 int64_t 标量（否则 u128 字面量被 (int64_t)(…) 截断/溢出、值透传给 t_sb_append_fmt_big 类型错配）。
     // 与 LLVM 后端的原生 i<N>/u<N> 逐字对齐；tmir-c 缓冲即 ceil(N/8) 小端字节。N≤64 保持标量，不落此分支。
     if (c_is_awi_st(ty)) { return "unsigned char*"; }
+    // 定长数组（arr<ELEM x N>）：字节缓冲模型下即 unsigned char* 缓冲指针（与切片/向量同构），
+    // 绝不走 int64_t 标量（否则「函数按值返回定长数组」被生成为 int64_t，return 指针↔int64 类型不符，
+    // tmir-c 编译失败；rthyme-0044）。与 LLVM 后端的聚合逐字对齐；tmir-c 缓冲即 N*sizeof(ELEM) 字节。
+    if (c_is_arr(ty)) { return "unsigned char*"; }
     if (c_is_enum_ty(ty)) { return "int64_t"; }   // 枚举是标量（LLVM 后端按 i64 擦除；C 用 int64_t 对齐）
     if (ty == "%TStr") { return "TStr"; }
     if (ty == "%TSlice") { return "TSlice"; }

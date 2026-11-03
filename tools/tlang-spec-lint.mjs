@@ -101,7 +101,9 @@ function main() {
     const id = extractId(f);
     idsOnDisk.add(id);
     const doc = fs.readFileSync(path.join(args.specs, f), 'utf8');
-    const refs = (doc.match(/(examples\/tlang\/|tests\/tlang\/)\S+/g) || []).map((s) => s.trim());
+    // 只取「路径安全字符」，遇到中文标点 / 反引号 / 括号即止，
+    // 避免变更日志等叙述句里「path.tc，……」被贪婪吃成伪路径（rthyme-0043 曾误报）。
+    const refs = (doc.match(/(examples\/tlang\/|tests\/tlang\/)[A-Za-z0-9_.\/-]+/g) || []).map((s) => s.trim());
     let realRef = 0;
     for (const ref of refs) {
       if (fs.existsSync(path.join(root, ref))) realRef++;
