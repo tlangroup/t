@@ -161,6 +161,19 @@
 - 自动跑该需求的验证产物，抓输出，把 `commit + 输出哈希` 写回落地文档的 `## 验收结果` 证据块。
 - 把"自证已实现"标准化、可复跑，替代手动 grep 输出。
 
+### 3.5 `--self` / `--assert-tc-fresh` —— 与自举规范（bootstrap.md §4.4）衔接
+
+「哪个是最新版本的 tc.exe」在 t 自身作为 spec 持有方时必须有确定答案。`tools/tlang-verify.mjs` 与 `tools/tlang-spec-lint.mjs` 提供两个开关，把 `bootstrap.md §4.4` 的权威入口规则落到工具层：
+
+- **`--self`**：仅当 `--specs` 位于 **t 核心仓库**（目录下存在 `tools/gate.mjs`）时可用。它做两件事：
+  1. 默认 `--compiler` = `<t 仓库根>/out/dbg/tc.exe`——即 `bootstrap.md §4.4.1` 定义的**唯一权威稳定入口**，不再手选 `g1/g2/g3`；
+  2. 默认启用 `--assert-tc-fresh`。
+- **`--assert-tc-fresh`**：比对 `out/dbg/tc.exe` 与 `out/dbg/g4.exe` 的 md5，**不等即非零退出**——前置拦截"陈旧编译器"导致的误报（等价于 `ir_snapshot --assert-head`，但针对编译器自身入口）。修复见 `bootstrap.md §4.4.4`（`gate L2` 的 `boot4` 步会在不动点成立时自动 `cp g4.exe tc.exe`；或手动 `cp out/dbg/g4.exe out/dbg/tc.exe`）。
+
+> **适用边界**：`--self` / `--assert-tc-fresh` 只服务于 **t 核心仓库自身**（需要 `g4` 不动点）。第三方扩展者**不**用 `--self`，而是显式传 `--compiler <自身 tc.exe>`；其"最新版本"由第三方自己的构建/自举产物定义，与本仓库 `tc.exe` 无关。
+>
+> **当前状态提示**：t 仓库 `docs/tlang/` 当前是「规则书 + 工具」载体，尚未把自身语言特性按 `rXXXX` 骨架组织，故 `tlang-spec-lint --self` 会报"缺少 `_registry.json`"——这是预期，待 t 自身采用 `rXXXX` 骨架（把 R-000..010 等迁入）后消除，不视为规范破坏。
+
 ---
 
 ## 4. 补充规范（你的第 4 项：我继续添加）

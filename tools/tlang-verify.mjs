@@ -4,7 +4,12 @@
 // 用法：
 //   tlang-verify.mjs --specs <docs/tlang 目录> [--compiler <tc.exe>] [--lib-dir <dir>]
 //                   [--compiler-commit <sha>] [--assert-spec-version] [<rXXXX>...]
+//   tlang-verify.mjs --self --specs <t 仓库 docs/tlang> [--lib-dir <dir>] [<rXXXX>...]   # t 核心自用
 //   tlang-verify.mjs attest <rXXXX> --specs <dir> --compiler <tc> [--compiler-commit <sha>]
+//
+//   --self            仅 t 核心仓库：默认 --compiler out/dbg/tc.exe（权威入口，bootstrap §4.4），
+//                     并默认启用 --assert-tc-fresh（tc.exe 必须等于最新不动点 g4）。
+//   --assert-tc-fresh 校验 tc.exe == g4（md5），不等即非零退出（前置拦截「陈旧编译器」误报）。
 //
 // 行为：
 //   1) 以 --specs 目录的父级为工程根，定位 examples/tlang、tests/tlang。
@@ -27,7 +32,8 @@ import { execFileSync } from 'child_process';
 function parseArgs(argv) {
   const a = {
     specs: null, compiler: null, libDir: null, compilerCommit: null,
-    assertSpecVersion: false, attest: null, ids: [], help: false,
+    assertSpecVersion: false, assertTcFresh: false, noTcFresh: false, self: false,
+    attest: null, ids: [], help: false,
   };
   for (let i = 0; i < argv.length; i++) {
     const t = argv[i];
@@ -36,6 +42,9 @@ function parseArgs(argv) {
     else if (t === '--lib-dir') a.libDir = argv[++i];
     else if (t === '--compiler-commit') a.compilerCommit = argv[++i];
     else if (t === '--assert-spec-version') a.assertSpecVersion = true;
+    else if (t === '--assert-tc-fresh') a.assertTcFresh = true;
+    else if (t === '--no-tc-fresh') a.noTcFresh = true;
+    else if (t === '--self') a.self = true;
     else if (t === 'attest') a.attest = argv[++i];
     else if (t === '-h' || t === '--help') a.help = true;
     else if (/^r[A-Za-z0-9]+(-[A-Za-z0-9]+)?$/.test(t)) a.ids.push(t);
@@ -131,7 +140,28 @@ function discover(specsDir) {
       if (fs.existsSync(fail)) add(id, 'test', { kind: 'fail', tc: fail });
     }
   }
-  return { ids, exDir, teDir };
+  return { ids, exDir, teDir, root };
+}
+
+// 计算工程根（specsDir = <root>/docs/tlang → root = docs 的父级），转本机路径。
+function computeRoot(specsDir) {
+  return path.dirname(path.dirname(toNative(specsDir)));
+}
+
+// 新鲜度校验：tc.exe 必须等于最新不动点 g4（bootstrap §4.4）。仅适用于 t 核心仓库。
+function assertTcFresh(root) {
+  const tcP = toNative(path.join(root, 'out', 'dbg', 'tc.exe'));
+  const g4P = toNative(path.join(root, 'out', 'dbg', 'g4.exe'));
+  if (!fs.existsSync(tcP)) { console.error('[assert-tc-fresh] 缺少 tc.exe'); return false; }
+  if (!fs.existsSync(g4P)) { console.error('[assert-tc-fresh] 缺少 g4.exe（先跑 gate L2 生成不动点）'); return false; }
+  const th = crypto.createHash('md5').update(fs.readFileSync(tcP)).digest('hex');
+  const gh = crypto.createHash('md5').update(fs.readFileSync(g4P)).digest('hex');
+  if (th !== gh) {
+    console.error(`[assert-tc-fresh] tc.exe(${th.slice(0, 8)}) ≠ g4(${gh.slice(0, 8)})：tc.exe 陈旧（bootstrap §4.4.4）。请重跑 gate L2，或 cp out/dbg/g4.exe out/dbg/tc.exe`);
+    return false;
+  }
+  console.log(`[assert-tc-fresh] OK tc.exe == g4 (${th.slice(0, 8)})`);
+  return true;
 }
 
 function verifyOne(id, entry, compiler, libDir) {
@@ -193,7 +223,11 @@ function assertSpecVersion(specsDir, compilerCommit) {
 }
 
 function attest(args) {
-  if (!args.compiler) { console.error('attest 需要 --compiler'); process.exit(2); }
+  if (!args.compiler) { console.error('attest 需要 --compiler（或 --self）'); process.exit(2); }
+  if (args.assertTcFresh) {
+    const root = computeRoot(args.specs);
+    if (!assertTcFresh(root)) process.exit(1);
+  }
   const { ids } = discover(args.specs);
   const id = args.attest;
   if (!ids.has(id)) { console.error(`attest: 未找到需求 ${id}`); process.exit(2); }
@@ -231,13 +265,32 @@ function main() {
   const args = parseArgs(process.argv.slice(2));
   if (args.help || !args.specs) {
     console.log('用法: tlang-verify.mjs --specs <docs/tlang> [--compiler <tc>] [--lib-dir <dir>] [--compiler-commit <sha>] [--assert-spec-version] [<rXXXX>...]');
-    console.log('      tlang-verify.mjs attest <rXXXX> --specs <dir> --compiler <tc> [--compiler-commit <sha>]');
+    console.log('      tlang-verify.mjs --self --specs <t仓库 docs/tlang> [--lib-dir <dir>] [<rXXXX>...]   # t 核心自用，默认 tc.exe + 新鲜度校验');
+    console.log('      tlang-verify.mjs attest <rXXXX> --specs <dir> (--compiler <tc> | --self) [--compiler-commit <sha>]');
     process.exit(args.specs ? 0 : 2);
   }
   if (!fs.existsSync(args.specs)) { console.error(`--specs 不存在: ${args.specs}`); process.exit(2); }
+
+  // --self：t 核心自用，默认指向权威入口 tc.exe 并校验新鲜度（bootstrap §4.4）。
+  if (args.self) {
+    const root = computeRoot(args.specs);
+    if (!fs.existsSync(path.join(root, 'tools', 'gate.mjs'))) {
+      console.error('[--self] 仅当 specs 位于 t 核心仓库时可用（未找到 tools/gate.mjs）');
+      process.exit(2);
+    }
+    if (!args.compiler) args.compiler = toNative(path.join(root, 'out', 'dbg', 'tc.exe'));
+    if (!args.assertTcFresh && !args.noTcFresh) args.assertTcFresh = true;
+  }
+
   if (args.attest) return attest(args);
-  if (!args.compiler) { console.error('需要 --compiler <tc.exe>'); process.exit(2); }
+  if (!args.compiler) { console.error('需要 --compiler <tc.exe>（或 --self）'); process.exit(2); }
   if (args.assertSpecVersion && !assertSpecVersion(args.specs, args.compilerCommit)) process.exit(1);
+
+  // 新鲜度校验（--self 默认开启，或显式 --assert-tc-fresh）。仅 t 核心仓库有意义。
+  if (args.assertTcFresh) {
+    const root = computeRoot(args.specs);
+    if (!assertTcFresh(root)) process.exit(1);
+  }
 
   const { ids } = discover(args.specs);
   let targetIds = args.ids.length ? args.ids : [...ids.keys()];
