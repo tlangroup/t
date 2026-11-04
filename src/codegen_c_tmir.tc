@@ -115,6 +115,7 @@ pub var g_c_void_builtins: string =
     + " sb_append_fmt_str sb_append_fmt_str_conv sb_append_fmt_uint sb_append_fmt_uint_conv "
     + " sb_append_i64 sb_append_str sb_append_u64 sb_clear sb_free slice_append slice_append_sized "
     + " slice_set sym_release sym_release_all "
+    + " bsb_append_u8 bsb_append_bytes "
     + " arena_use_default arena_use_parse arena_use_front arena_use_back arena_use_func "
     + " arena_reset_parse arena_reset_front arena_reset_back arena_reset_func dbg_report_mem ";
 // 数学内建：用户裸名调用，运行库导出 t_math_<name>。
@@ -3224,6 +3225,13 @@ pub fn c_emit_inst(sb: StringBuilder, ins: TMIRInst) void {
         //   取 <slot>_buf 会读到空的旧缓冲（实测 `f(3).s` ⇒ string 空、i64 字段 0）。
         //   必须**先于** c_is_agg_base 判定，否则被后者抢走。
         else if (c_is_aggcall_slot(basen)) { basebuf = basen; }
+        else if (c_is_user_agg_ptr_ty(c_slot_ty_find(basen))) {
+            // ⭐ R-040：基槽类型是「指向用户聚合的指针」（ptr<%Box> 等）→ 取址 = 指针变量当前值本身，
+            //   绝不能取 <slot>_buf。指针变量可被 `q = &b` 重绑到别的缓冲（b_buf），若取 _buf 会越过重绑、
+            //   写到陈旧的自身缓冲（实测 rthyme-0040：b.v 不变而 q.v 变）。非重绑时 slot 初值即 _buf 指针，
+            //   取 slot 与取 _buf 等价，故恒取 slot 无回归。运行库句柄（TSb*/TMap*/TStr*）与标量指针不在此列。
+            basebuf = basen;
+        }
         else if (c_is_agg_base(basen)) { basebuf = base.sb_cat2(basen, "_buf"); }
         // 纯地址槽（slice_at / GEP / bitcast / struct_new… 结果，持有指针值但无自有缓冲）：
         // 取址 = 该指针本身。若按聚合基取 <slot>_buf 会指到不存在的（或全 0 的）缓冲。
@@ -3404,6 +3412,38 @@ pub fn c_emit_inst(sb: StringBuilder, ins: TMIRInst) void {
             return;
         }
         var dstn: string = c_strip_suf(dname);
+        // R-040：*ptrvar = 标量 ⇒ 经指针写回（store through），**不可**别名赋值。
+        //   原始指针槽（ptr<i64> 等）刻意不登记为地址槽（见 SLOT 预扫描注释：避免把指针值当
+        //   数据地址解引用 → var ti:TypeInfo 之类语义错乱），故 c_is_address 对其恒 false，旧版
+        //   落入末尾 c_emit_assign 把 `11` 别名赋给指针变量本身 → 后续解引用崩溃/错值。
+        //   对齐 LLVM 后端 tir_to_ll.tc:3237 的权威语义（ptr<inner> 值槽 + 标量 src ⇒ 解引用写穿）：
+        //   目的槽类型是「指向标量」的指针（ptr<i64>/ptr<u8>/…）且源非地址（标量值）时写穿；
+        //   源为地址（含 null=ptr、别名赋值）不在此分支，交由下方逻辑（p=null / GEP 标量写均正确）。
+        //   写穿宽度取 src 的 C 标量类型（*p=v 中 v 与 pointee 同型）。
+        //   指向聚合的指针（ptr<%Box>）不在此分支（pointee 以 % 开头），其字段写由 GEP 路径承担。
+        //   指向指针的指针（ptr<ptr<X>>）+ 源为指针 ⇒ 别名赋值（m=t470），绝不写穿（对齐 LLVM 值槽：src_is_ptr⇒alias）。
+        if (c_is_address(dstn) == false) {
+            var _dty: string = c_slot_ty_find(dstn);
+            var _srcn0: string = c_strip_suf(ins.args[0].name);
+            // 源类型：若源槽本身是「指针」类型（ptr<...>），则无论 c_is_address 是否登记，
+            // 一律视为地址/别名（p=q / m=t470），不写穿。此判定必须早于 c_is_address —— 原始指针
+            // 槽刻意不登记为地址槽（见 SLOT 预扫描注释），c_is_address 对其恒 false，若仅用它判断会把
+            // 指针别名赋值误判为写穿，踩坏内存（rthyme-0003 的 ptr<ptr<X>> 赋值）。
+            var _srcty_raw: string = c_slot_ty_find(_srcn0);
+            var _src_is_ptr: bool = c_starts(_srcty_raw, "ptr<") or _srcty_raw == "ptr";
+            if (c_starts(_dty, "ptr<") and c_is_address(_srcn0) == false and _src_is_ptr == false) {
+                var _pointee: string = c_strip_ptr(_dty);
+                if (str_len(_pointee) > 0 and c_starts(_pointee, "%") == false and c_is_arr(_pointee) == false and c_is_vec(_pointee) == false) {
+                    var _srcty: string = c_operand_c_ty(ins.args[0]);
+                    if (_srcty == "" or _srcty == "void") { _srcty = c_slot_ty_find(_srcn0); }
+                    if (_srcty == "" or _srcty == "void") { _srcty = "int64_t"; }
+                    sb_append_str(sb, "  *(("); sb_append_str(sb, _srcty);
+                    sb_append_str(sb, "*)("); sb_append_str(sb, dstn); sb_append_str(sb, ")) = ");
+                    c_emit_val(sb, ins.args[0]); sb_append_str(sb, ";\n");
+                    return;
+                }
+            }
+        }
         // 闭包构造：把「函数引用」写进 TClosure.field0（8B code 指针）。
         // 无 env 首参的普通函数须经 thunk 转发（c_clo_code），否则 CALL_IND 的 env 会吃掉第一个实参。
         if (c_is_func_ref(ins.args[0].name) and c_is_address(dstn)) {
@@ -3414,6 +3454,17 @@ pub fn c_emit_inst(sb: StringBuilder, ins: TMIRInst) void {
             sb_append_str(sb, ", sizeof(_cfp"); sb_append_str(sb, base.i2s(g_c_tmpc));
             sb_append_str(sb, ")); }\n");
             g_c_tmpc = g_c_tmpc + 1;
+            return;
+        }
+        // ⭐ R-040：目的槽类型是「指向用户聚合的指针」（ptr<%Box> 等）→ 一律指针别名赋值
+        //   （`q = &b` 让 q 持有 b 的地址，而非把 b 的数据 memcpy 进 q_buf）。字节缓冲模型里
+        //   ptr<%Agg> 虽被预扫描登记为聚合基（有 _buf），但它是**指针变量**，被 `&b` 重绑后必须指向
+        //   b_buf；若走下方 `c_is_address && c_is_agg_base` 的 memcpy 分支，会把 b 的数据拷进 q_buf，
+        //   导致 (*q).v 写不进 b（b.v 不变、q.v 变，实测 rthyme-0040）。运行库句柄（TSb*/TMap*/TStr*）
+        //   与标量指针不在此列（c_is_user_agg_ptr_ty 已排除）。
+        if (c_is_user_agg_ptr_ty(c_slot_ty_find(dstn))) {
+            sb_append_str(sb, "  "); sb_append_str(sb, dstn); sb_append_str(sb, " = ");
+            c_emit_val(sb, ins.args[0]); sb_append_str(sb, ";\n");
             return;
         }
         if (c_is_address(dstn)) {

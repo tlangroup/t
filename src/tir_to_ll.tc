@@ -2406,6 +2406,67 @@ pub fn ll_emit_builtin(cn: string, toks: []string) bool {
         ll_call_void("tll_read_line", ["ptr"], [llname.ll_llname(d)]);
         return true;
     }
+    // ── bsb_to_bytes：b → TStr out ──
+    // ⚠ 必须走 tll_bsb_to_bytes 末位 out 指针 shim，不能直接 call %TStr @t_bsb_to_bytes(%TSb*)：
+    // clang 在 Win64 把 16B %TStr 聚合返回编译为 sret 隐藏指针（void @t_bsb_to_bytes(ptr sret, %TSb*)），
+    // 而若按 RAX:RDX 按值返回发射 `call %TStr @t_bsb_to_bytes(%TSb*)`，调用方读到错位寄存器
+    // → TStr.len 取到垃圾（常为 2^47）→ t_arena_alloc 触发 "arena: out of memory" 或段错误。
+    // 模式同 file_read_all / read_line 的 tll_ 末位 out 指针 shim（见上方注释）。
+    if (cn == "bsb_to_bytes") {
+        ll_ensure_slot(d, "%TStr"); llname.ll_set_st(d, "%TStr");
+        // ⚠ toks[4] 是持有 TSb* 的栈槽（alloca %TSb*），须 ll_load 取出 TSb* 值再按 ptr 传，
+        // 不能像 TStr 形参那样直接传槽地址（否则 shim 把「槽地址」当 TSb* 解引用 → 读垃圾 → len=0）。
+        // 同 bsb_append_u8/bsb_append_bytes 的 TSb* 实参取法。
+        ll_call_void("tll_bsb_to_bytes", ["ptr", "ptr"], [ll_load(toks[4], "ptr"), llname.ll_llname(d)]);
+        return true;
+    }
+    // ── bsb_append_bytes：b(TSb*), s(TStr ptr) → void ──
+    // TStr 形参走指针 tll_bsb_append_bytes（同 bsb_to_bytes 的 TSb* 取法 + bytes_len 的 TStr 指针取法）：
+    // 规避 Win64 16B 聚合按值传参的 byval 错位。
+    if (cn == "bsb_append_bytes") {
+        ll_call_void("tll_bsb_append_bytes", ["ptr", "ptr"], [ll_load(toks[4], "ptr"), llname.ll_llname(toks[5])]);
+        return true;
+    }
+    // ── bytes_len：s(TStr ptr) → i64 ──
+    // ⚠ TStr 形参走指针 tll_bytes_len（同 tll_str_len）：规避 Win64 16B 聚合按值传参的 byval
+    // 寄存器错位（clang 把 TStr 形参编为 RCX 隐藏指针，LLVM 把 16B 聚合按值传参占 RCX:RDX，
+    // 致后续 i64 实参被推到 R8 与 clang 的 RDX 错位 → 索引读到垃圾）。
+    if (cn == "bytes_len") {
+        var ap: string = llname.ll_llname(toks[4]);
+        ll_maybe_declare("tll_bytes_len", "i64", ["ptr"]);
+        var r: string = ll_tmp();
+        sb_append_str(g_ll, "  ");
+        sb_append_str(g_ll, r);
+        sb_append_str(g_ll, " = call i64 @tll_bytes_len(ptr ");
+        sb_append_str(g_ll, ap);
+        sb_append_str(g_ll, ")\n");
+        ll_ensure_slot(d, "i64"); llname.ll_set_st(d, "i64"); ll_store(d, "i64", r);
+        return true;
+    }
+    // ── bytes_at：s(TStr ptr), i(i64) → i64 ──
+    if (cn == "bytes_at") {
+        var ap: string = llname.ll_llname(toks[4]);
+        var iv: string = ll_load(toks[5], "i64");
+        ll_maybe_declare("tll_bytes_at", "i64", ["ptr", "i64"]);
+        var r: string = ll_tmp();
+        sb_append_str(g_ll, "  ");
+        sb_append_str(g_ll, r);
+        sb_append_str(g_ll, " = call i64 @tll_bytes_at(ptr ");
+        sb_append_str(g_ll, ap);
+        sb_append_str(g_ll, ", i64 ");
+        sb_append_str(g_ll, iv);
+        sb_append_str(g_ll, ")\n");
+        ll_ensure_slot(d, "i64"); llname.ll_set_st(d, "i64"); ll_store(d, "i64", r);
+        return true;
+    }
+    // ── bytes_slice：s(TStr ptr), a, b(i64) → TStr out ──
+    // TStr 返回走末位 out 指针（同 bsb_to_bytes / file_read_all）；TStr 形参走指针。
+    if (cn == "bytes_slice") {
+        ll_ensure_slot(d, "%TStr"); llname.ll_set_st(d, "%TStr");
+        ll_call_void("tll_bytes_slice", ["ptr", "i64", "i64", "ptr"],
+                     [llname.ll_llname(toks[4]), ll_load(toks[5], "i64"), ll_load(toks[6], "i64"), llname.ll_llname(d)]);
+        return true;
+    }
     // ── fid_format：f, a_text, a_json, a_raw, a_pb → i64 ──
     if (cn == "fid_format") {
         // a_text/a_json/a_raw/a_pb 均为可选实参：前端常省略，原代码无条件读 toks[5..8] 会越界 panic。

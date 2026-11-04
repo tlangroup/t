@@ -3589,7 +3589,11 @@ pub fn tir_emit_assign(sid: i64, est: i64) TirEmitRes {
             tir_emit(TIRInst{ op: TIR_OP_STORE, st: ST_NONE, dst: tir_op(eptr), args: tir_a1(rhs), is_comment: false, line: g_cur_line, cmt: "" });
             return TirEmitRes{ name: rhs, st: est };
         } else if (base.node_kind((base.node_na((sid as u64)) as u64)) == "deref") {
-            var eptrr: TirEmitRes = tir_addr_of(base.node_na((sid as u64))); var eptr: string = eptrr.name;   // *r 作为左值：地址即指针值本身
+            // *r 作为左值：地址即 r 自身承载的指针值（r 是 ptr<ST>），不 load 出被指值。
+            // 旧版 tir_addr_of(deref) 走 tir_emit_expr 触发 load，拿到「被指值」副本再 store 进副本
+            // → 真实内存从未被写入（静默 no-op，写后读出旧值）。rthyme-0040 复现（*p=11 无效、q.v=9 无效）。
+            var inner: i64 = base.node_na((base.node_na((sid as u64)) as u64));   // deref 操作数 r
+            var eptrr: TirEmitRes = tir_emit_expr(inner); var eptr: string = eptrr.name;
             tir_emit(TIRInst{ op: TIR_OP_STORE, st: ST_NONE, dst: tir_op(eptr), args: tir_a1(rhs), is_comment: false, line: g_cur_line, cmt: "" });
             return TirEmitRes{ name: rhs, st: est };
         } else {
@@ -5671,12 +5675,17 @@ pub fn tir_member_addr(e: i64) string {
     // (ptr-to-ptr)，字段查找拿不到结构名 → fidx 恒 0、GEP 基落在 &ptrVar
     // → 静默把指针值本身当字段 0 读出。触发场景：TypeInfo 反射 `Struct(m) => m.field_count`。
     // 守卫：仅在被指对象确为可查字段的结构体时接管，避免误伤其它 ptr 基底。
-    var mbn_auto: string = "";   // A-fix：命中自动解引用时的「被指结构体名」（"" = 未命中）
-    if (base.node_kind((bn as u64)) != "index" and base.node_kind((bn as u64)) != "deref") {
+    var mbn_auto: string = "";   // A-fix：命中指针型接收者时的「被指结构体名」（"" = 未命中）
+    // ⚠ 指针型接收者 `ptr.field` ≡ `(*ptr).field`：基底槽本身即承载指针值（ptr<%Struct>），
+    // 下游 addr_of 对 ptr 源透传、GEP 直接下钻到「指针指向的结构」——地址即指针值本身，
+    // **绝不 load 出被指副本**（旧版 mk_deref 会令 tir_emit_expr 把结构按值物化进临时槽，
+    // 再 addr_of 取副本地址 → `ptr.field = v` 只改临时副本、写入静默丢失，rthyme-0040 复现）。
+    // 此处仅强制基底结构名（合成节点无 ti，tir_member_base_st 取不到），不再合成 deref。
+    if (base.node_kind((bn as u64)) != "index" and base.node_kind((bn as u64)) != "deref" and base.node_kind((bn as u64)) != "member") {
         var mbtd: i64 = tir_expr_td(bn);
         if (mbtd >= 0 and sema.tds[mbtd].cat == "pointer" and sema.tds[mbtd].elem >= 0) {
             var mbn: string = sema.tds[sema.tds[mbtd].elem].name;
-            if (sema.find_struct_fields(mbn) >= 0) { bn = base.mk_deref(bn, -1); mbn_auto = mbn; }
+            if (sema.find_struct_fields(mbn) >= 0) { mbn_auto = mbn; }
         }
     }
     var base_slot: string = "";
@@ -5700,7 +5709,10 @@ pub fn tir_member_addr(e: i64) string {
         // 基槽本就是指针，下游 addr_of 在 tir_to_ll 对「ptr<…> 源 + %结构 目标」做透传，GEP 直接下钻。
         base_slot = tir_member_addr(bn);
     } else {
-        var base_slotr: TirEmitRes = tir_emit_expr(bn);
+        // *r 作 member 基底（如显式 `(*q).v`）：地址即 r 承载的指针值，不 load 出被指副本。
+        var bnode: i64 = bn;
+        if (base.node_kind((bnode as u64)) == "deref") { bnode = base.node_na((bnode as u64)); }
+        var base_slotr: TirEmitRes = tir_emit_expr(bnode);
         base_slot = base_slotr.name;
         base_res_st = base_slotr.st;
     }
