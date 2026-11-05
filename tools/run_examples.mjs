@@ -214,7 +214,7 @@ const SMOKE_SKIP = new Map([
 // 导入它的示例间接保证，smoke 不计入。
 function hasMain(name) {
     try {
-        return /@main/.test(readFileSync(join(EX, `${name}.tc`), "utf8"));
+        return /@main|\bfn\s+main\b/.test(readFileSync(join(EX, `${name}.tc`), "utf8"));
     } catch { return false; }
 }
 

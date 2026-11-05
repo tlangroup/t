@@ -58,7 +58,7 @@ manager — via its `[compiler].extend` directive.
 ```t
 @import("std");
 
-fn main() i32 @main {
+fn main() i32 {
     println("hello from t");
     return 0;
 }

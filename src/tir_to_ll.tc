@@ -61,7 +61,7 @@ pub var g_str_table: []string;          // TIR strings: 段内容（tir_esc 转�
 pub var g_in_strings: bool = false;     // 当前是否处于 TIR strings: 段
 pub var g_ll_struct_types: []string;     // types: 段内已声明为 struct 的命名类型（%Node 等用户聚合，禁止被误判为 i64 标量）
 pub var g_ll_variant_types: []string;    // 变体类型名集合（由 @<V>_from_<C> 构造器在第 1 遍收集），供 struct_new 选择指针/值形态
-pub var g_has_main: bool = false;        // TIR 是否含入口函数（@main 标注），用于补 @main 包装器
+pub var g_has_main: bool = false;        // TIR 是否含入口函数（函数名为 main 或带 @main 注解），用于补 @main 包装器
 pub var g_main_fn: string = "";          // 入口函数 LLVM 名（mangled），如 main_fn
 pub var g_main_ret: string = "i32";      // 入口函数真实返回类型（wrapper 须按此类型调用，再适配成 i32 给 @main）
 pub var g_clo_consts: []string;          // 已发射的「裸函数引用 → %TClosure 常量」全局名（避免重复声明）
@@ -1443,7 +1443,7 @@ pub fn ll_emit_func(name: string, params: []string, ret: string) void {
         sb_append_str(sig, llname.st_to_ll(ret));
         sb_append_str(sig, " @");
     }
-    // 入口函数（@main 标注）改名 @t.<name>，避免与下方补的 @main 包装器重名
+    // 入口函数（函数名为 main 或带 @main 注解）改名 @t.<name>，避免与下方补的 @main 包装器重名
     // （用户若把入口命名为 main，直接发 @main 会与包装器 @main 冲突：invalid redefinition）。
     if (g_has_main and name == g_main_fn) { sb_append_str(sig, "t."); }
     sb_append_str(sig, name);
@@ -5079,9 +5079,10 @@ pub fn tir_to_ll_emit(module: TIRModule) string {
                 }
             }
         }
-        // 入口函数检测：直接用结构化字段 f.is_main（等价于旧路径在 func 头 token 中找 "@main"）。
-        // 注意 @main 是头标记 token，不在 g_pf_params（参数表）中，故旧路径的「在参数表里找 @main」写法是错误的。
-        if (g_has_main == false and f.is_main) {
+        // 入口函数检测：函数名为 `main`（默认入口）或带 @main 注解（兼容别名）即入口。
+        // @main 注解为废弃写法，名字 main 才是规范入口（见设计：fn main 即默认入口）。
+        // 用 or 短路：@main 命中后不再求值 f.name == "main"，避免重复 node 属性访问的编译器 quirks。
+        if (g_has_main == false and (f.is_main or f.name == "main")) {
             // ⚠ 代际分配器（2026-10-22）回归修复：g_main_fn/g_main_ret 是跨阶段持久全局，
             // 须存 g_arena 副本；直接存 g_pf_name/g_pf_ret（g_func 重降级 arena 指针）会在
             // arena_reset_func 后被覆盖/悬垂，导致后续 name==g_main_fn 比较读到野内容。
