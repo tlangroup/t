@@ -613,14 +613,21 @@ pub fn parse_schema(src: string) Schema {
     var toks: []Token = tokenize(src);
     var s: Schema;
     var pending_pb: bool = false;
+    var pending_anns: []Annotation;   // 类型级 #<id> 修饰词，挂到下一个 struct/enum（R-045）
     var i: i64 = 0;
     var n: i64 = slice_len(toks) as i64;
     while (i < n) {
         var k: string = toks[i].kind;
         if (str_eq(k, "Hash")) {
-            // 紧跟的标识符若是修饰词（pb / modifier），标记为 pending
-            if (i + 1 < n and str_eq(toks[i + 1].kind, "Identifier") and (str_eq(toks[i + 1].src, "pb") or str_eq(toks[i + 1].src, "modifier"))) {
-                pending_pb = true;
+            // 紧跟的标识符若是修饰词（pb / modifier），标记为 pending；否则作为自定义类型级
+            // 修饰词（#<id>，如 #thyme_reserved）暂存，挂到下一个 struct/enum 的 annotations（R-045）。
+            if (i + 1 < n and str_eq(toks[i + 1].kind, "Identifier")) {
+                var hk: string = toks[i + 1].src;
+                if (str_eq(hk, "pb") or str_eq(hk, "modifier")) {
+                    pending_pb = true;
+                } else {
+                    append(pending_anns, Annotation{ name: hk, args: [] });
+                }
             }
             i = i + 1;
             continue;
@@ -631,7 +638,9 @@ pub fn parse_schema(src: string) Schema {
             // 故先拷到本地单层变量再改字段，最后整体 append。
             var sd: StructDecl2 = r.d;
             sd.is_pb = pending_pb;
+            sd.annotations = concat_anns(pending_anns, sd.annotations);
             pending_pb = false;
+            var pa_empty: []Annotation; pending_anns = pa_empty;
             append(s.structs, sd);
             i = r.pos;
             continue;
@@ -640,7 +649,9 @@ pub fn parse_schema(src: string) Schema {
             var r: EParse = parse_enum(toks, i);
             var ed: EnumDecl2 = r.d;
             ed.is_pb = pending_pb;
+            ed.annotations = concat_anns(pending_anns, ed.annotations);
             pending_pb = false;
+            var pa_empty: []Annotation; pending_anns = pa_empty;
             append(s.enums, ed);
             i = r.pos;
             continue;
@@ -764,8 +775,12 @@ fn parse_type(toks: []Token, i: i64) PR {
         var n = mk_node("MapType", i); i = i + 1;
         if (str_eq(tok_kind(toks, i), "LBracket")) {
             i = i + 1;
+            // key 走递归 parse_type（与 value 一致），避免把 key 退化成 token kind（R-046）。
             while (i < slice_len(toks) as i64 and str_eq(tok_kind(toks, i), "RBracket") == false) {
-                append(n.children, mk_node(tok_kind(toks, i), i)); i = i + 1;
+                var kp: PR = parse_type(toks, i);
+                append(n.children, kp.n);
+                i = kp.pos;
+                if (str_eq(tok_kind(toks, i), "Comma")) { i = i + 1; }
             }
             if (str_eq(tok_kind(toks, i), "RBracket")) { i = i + 1; }
         }
