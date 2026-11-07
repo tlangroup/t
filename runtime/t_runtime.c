@@ -567,6 +567,24 @@ TStr t_sb_to_str(TSb* b) {
     TStr r; r.ptr = copy; r.len = b->len; return r;
 }
 
+// ── 字节缓冲 BytesBuilder（bsb_*）：二进制安全可增长字节缓冲 ──
+// 复用 TSb 实现；bsb_to_bytes 取出与缓冲共享存储的 TSlice 视图（非拷贝），
+// 后续再 append 可能触发扩容拷贝（语义同 t_sb_to_str）。
+TSb* t_bsb_new(void) {
+    return t_sb_new(t_arena_current());
+}
+void t_bsb_append_u8(TSb* b, uint8_t c) {
+    t_sb_append_char(b, c);   // 二进制安全：单字节，不做任何编码假设（NUL/高字节原样保留）
+}
+void t_bsb_append_bytes(TSb* b, TStr s) {
+    sb_reserve(b, b->len + s.len);
+    if (s.len > 0) memcpy(b->buf + b->len, s.ptr, (size_t)s.len);
+    b->len += s.len;
+}
+TStr t_bsb_to_bytes(TSb* b) {
+    TStr r; r.ptr = b->buf; r.len = b->len; return r;
+}
+
 void t_sb_clear(TSb* b) { b->len = 0; }
 
 // sb_free：TSb 与其 buf 都由 arena 拥有，不可单独释放，故 no-op。
@@ -1772,6 +1790,17 @@ void t_slice_set(TSlice s, int64_t i, const void* elem) {
 
 int64_t t_slice_len(TSlice s) { return s.len; }
 void*  t_slice_ptr(TSlice s) { return s.ptr; }
+
+// ── bytes（Bytes = TStr{u8 视图}）访问器 ──
+uint64_t t_bytes_len(TStr s) { return (uint64_t)s.len; }
+uint8_t  t_bytes_at(TStr s, int64_t i) {
+    if (i < 0 || i >= s.len) t_panic_bounds(i, s.len, "t_bytes_at");
+    return ((uint8_t*)s.ptr)[i];
+}
+TStr t_bytes_slice(TStr s, int64_t a, int64_t b) {
+    if (a < 0 || b < a || b > s.len) t_panic_bounds(a < 0 ? a : b, s.len, "t_bytes_slice");
+    TStr r; r.ptr = (uint8_t*)s.ptr + a; r.len = b - a; return r;
+}
 
 // 子切片 `s[a..b]`：O(1) 视图，与源共享底层缓冲。
 // cap 收成 len —— 对子切片 append 必定触发扩容拷贝，不会踩写源切片的后续元素。

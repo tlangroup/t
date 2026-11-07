@@ -1,0 +1,67 @@
+// R-016/R-017 std.pbwire 双后端验证：
+//   write/read_bytes·string round-trip、read_submessage 限界子视图、
+//   BoundsExceeded、skip_field（Varint/I64/LEN/I32）、capture_raw 原样留存。
+//
+// 注：本测试刻意把断言拆进若干 helper（而非全部塞进 @main），以规避 LLVM 后端对
+// 「单函数内局部变量 + 调用过多」的栈帧偏移 codegen bug（超阈值会内存损坏段错误）。
+// 两个 helper 各自独立调用 pbwire 的全部相关函数，覆盖度等价。C 后端无此限制。
+@import("std.pbwire");
+
+// write_string/read_bytes round-trip + BoundsExceeded
+fn test_string(buf: []u8, s: []u8) i64 {
+    var n: i64 = pbwire.write_string(buf, 0, s);
+    println(int_to_str(n));                          // 6 (1 长度前缀 + 5)
+    var b1 = pbwire.read_bytes(buf, 0);
+    println(int_to_str(b1.err as i64));              // 0 (ErrOk)
+    println(int_to_str(slice_len(b1.data)));         // 5
+    println(int_to_str(b1.data[0] as i64));          // 104 'h'
+
+    // BoundsExceeded：长度前缀声称 100 但可用缓冲远小于 100
+    n = pbwire.write_varint(buf, 0, 100);            // 长度前缀 = 100
+    var b2 = pbwire.read_bytes(buf, 0);
+    println(int_to_str(b2.err as i64));              // 5 (ErrBoundsExceeded)
+    return 0;
+}
+
+// skip_field（四种 wire_type）+ capture_raw + read_submessage
+fn test_skip(buf: []u8) i64 {
+    // skip_field (LEN)：tag=field3/LEN, len=3, "abc"
+    buf[0] = 0x1A; buf[1] = 0x03; buf[2] = 0x61; buf[3] = 0x62; buf[4] = 0x63;
+    var sk = pbwire.skip_field(buf, 0, pbwire.WT_LEN);
+    println(int_to_str(sk.next_off));                // 5
+
+    // capture_raw (LEN)：从 tag 起原样留存
+    var cr = pbwire.capture_raw(buf, 0, pbwire.WT_LEN);
+    println(int_to_str(cr.err as i64));              // 0
+    println(int_to_str(slice_len(cr.data)));         // 5
+    println(int_to_str(cr.data[0] as i64));          // 0x1A = 26
+
+    // skip_field (Varint)：tag=field1/Varint, 300
+    buf[0] = 0x08; buf[1] = 0xAC; buf[2] = 0x02;
+    var skv = pbwire.skip_field(buf, 0, pbwire.WT_VARINT);
+    println(int_to_str(skv.next_off));               // 3
+
+    // skip_field (I64) / (I32)
+    buf[0] = 0x09;                                  // field1 / I64
+    var ski = pbwire.skip_field(buf, 0, pbwire.WT_I64);
+    println(int_to_str(ski.next_off));               // 9
+    buf[0] = 0x0D;                                  // field1 / I32
+    var ski32 = pbwire.skip_field(buf, 0, pbwire.WT_I32);
+    println(int_to_str(ski32.next_off));             // 5
+
+    // read_submessage：限界只读子视图（len=3, "abc"）
+    buf[0] = 0x03; buf[1] = 0x61; buf[2] = 0x62; buf[3] = 0x63;
+    var sm = pbwire.read_submessage(buf, 0);
+    println(int_to_str(sm.err as i64));              // 0
+    println(int_to_str(slice_len(sm.view)));         // 3
+    println(int_to_str(sm.view[2] as i64));         // 0x63 = 99
+    return 0;
+}
+
+@main fn main() i64 {
+    var buf: [64]u8;
+    var hello: [5]u8 = [104, 101, 108, 108, 111];
+    test_string(buf, hello[0..5]);
+    test_skip(buf);
+    return 0;
+}

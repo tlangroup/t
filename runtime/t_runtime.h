@@ -96,6 +96,13 @@ TStr t_sb_to_str(TSb* b);          // 返回以 \0 结尾的 TStr（arena 分配
 void t_sb_clear(TSb* b);
 void t_sb_free(TSb* b);   // TSb 由 arena 拥有，无法单独释放（no-op）
 
+// ── 字节缓冲 BytesBuilder（bsb_*）：二进制安全可增长字节缓冲 ──
+// 复用 TSb 实现；bsb_to_bytes 取出与缓冲共享存储的 TStr（bytes 与 TStr 同 {ptr,len} 布局）视图（非拷贝）。
+TSb*    t_bsb_new(void);                       // = t_sb_new(t_arena_current())
+void    t_bsb_append_u8(TSb* b, uint8_t c);    // 追加单字节（二进制安全，NUL/高字节原样）
+void    t_bsb_append_bytes(TSb* b, TStr s);    // 追加一段 bytes（TStr 视图）
+TStr    t_bsb_to_bytes(TSb* b);                // 取出不可变 bytes 视图（共享存储）
+
 // int_to_str(v: i64) -> string —— 整数转十进制字符串（arena 分配）
 TStr t_int_to_str(int64_t v);
 
@@ -167,6 +174,11 @@ void   t_slice_set(TSlice s, int64_t i, const void* elem); // 越界 → panic
 int64_t t_slice_len(TSlice s);
 void*  t_slice_ptr(TSlice s);                  // 底层数组首地址（供 memset/序列化）
 TSlice t_slice_sub(TSlice s, int64_t a, int64_t b); // s[a..b] 子切片视图；越界 → panic
+
+// ── bytes（Bytes = TStr{u8 视图}，与 TStr 同 {ptr,len} 布局）访问器 ──
+uint64_t t_bytes_len(TStr s);                     // 字节数
+uint8_t  t_bytes_at(TStr s, int64_t i);           // 第 i 字节（越界 → panic）
+TStr     t_bytes_slice(TStr s, int64_t a, int64_t b); // s[a..b] 子视图（越界 → panic）
 
 // ── 位串 bitstr（§15）：任意位宽位序列；binary 为字节对齐特例 ──
 // 与 TSlice 同构（ptr/len/cap），但长度单位是 bit 而非 byte；尾部字节未用位填 0。

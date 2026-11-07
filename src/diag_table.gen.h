@@ -176,6 +176,8 @@ static const DiagDef DIAG_DEFS[] = {
   { "T-PIP-E007", "error", "PIP", "", "VOID_MAP", "element-wise pipe stage function must not return void" },
   { "T-PIP-W000", "warning", "PIP", "", "DISPATCH_AMBIG", "|> whole-apply and element-map both match; whole-apply chosen" },
   { "T-PIP-W001", "warning", "PIP", "", "RESULT_UNUSED", "pipe result is discarded in expression-statement position" },
+  { "T-PRB-E001", "error", "PRB", "", "PB_ENUM_FIRST_NONZERO", "first member of a #pb enum must have value 0 (proto3 constraint)" },
+  { "T-PRB-E002", "error", "PRB", "", "PB_ENUM_DUPLICATE_VALUE", "duplicate enum member value requires @allow_alias (proto3 constraint)" },
   { "T-RNG-E000", "error", "RNG", "", "ITER_NO_START", "range iteration requires a start bound" },
   { "T-RNG-E001", "error", "RNG", "", "INDEX_UNSUPPORTED", "type does not support range indexing" },
   { "T-RNG-E002", "error", "RNG", "", "OPEN_AS_VALUE", "open-ended range cannot be used as a value" },
@@ -204,6 +206,7 @@ static const DiagDef DIAG_DEFS[] = {
   { "T-SEM-E019", "error", "SEM", "", "VALUE_LOOP_PLAIN_BREAK", "plain `break` (without value) is not allowed in a value loop; use `break <expr>`" },
   { "T-SEM-E020", "error", "SEM", "", "NON_VALUE_LOOP_IN_EXPR", "a loop used as an expression must be a value loop (with `else` clause or `break <value>` in body)" },
   { "T-SEM-W000", "warning", "SEM", "", "OVERFLOW_LITERAL", "integer literal overflow" },
+  { "T-STR-W000", "warning", "STR", "", "STRING_OP_DEPRECATED", "string == / != is a content comparison and is deprecated" },
   { "T-TIM-E000", "error", "TIM", "", "BAD_SPEC", "invalid time format specifier" },
   { "T-TIM-E001", "error", "TIM", "", "PARSE_UNSUPPORTED", "time parsing unsupported" },
   { "T-TIM-E002", "error", "TIM", "", "SPEC_TYPE", "time specifier type mismatch" },
@@ -225,7 +228,7 @@ static const DiagDef DIAG_DEFS[] = {
   { "T-VEC-W000", "warning", "VEC", "", "VECTOR_WIDER_THAN_NATIVE", "vector is wider than the native SIMD register and will be split" },
   { "T-VEC-W001", "warning", "VEC", "", "TILE_WIDER_THAN_NATIVE", "hardware tile is wider than the native SIMD register and will fall back to scalar loops" },
 };
-#define DIAG_COUNT 212
+#define DIAG_COUNT 215
 
 /* legacy (old semantic name) -> machine code alias table */
 static const struct { const char* legacy; const char* code; } DIAG_LEGACY[] = {

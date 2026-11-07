@@ -1,0 +1,88 @@
+// R-018 / R-019 验证示例：comptime fn 求值结果的运行期落地 + CTFE 内 struct fields[] 字段表实体。
+//
+// 背景见 thyme/docs/tlang/003_comptime-landing.md：t 的 CTFE + @type_info 须能在编译期
+// 遍历 struct 字段表，并把 comptime fn 的求值结果落到运行期常量。
+//   R-018：修复「能算但落不下去（comptime const 运行期读为 0）」；
+//   R-019：修复「CTFE 内 fields[] 无实体（field_count 正确但 fields[0] 即越界）」。
+//
+// 本例覆盖：
+//   R-018  comptime const 承载 comptime fn 结果，运行期读到正确值；
+//   R-019  @type_info(T).Struct.fields[i] 编译期可遍历，.name/.tag/.offset 可用；
+//          编译期结果与运行期 type_info 逐项一致（双后端输出一致，见 .expected.txt）。
+//
+// 历史：R-018/R-019 落地前，ct_* 全部输出 0、fields[0] 报 T-MTA-E002 越界 —— 本例是该缺口的见证。
+
+#pb struct Point {
+    x: i64 @ 1;
+    y: i64 @ 2;
+    z: i64 @ 3;
+}
+
+// 编译期：字段数量
+comptime fn ct_field_count() i64 {
+    return @type_info(Point).Struct.field_count;
+}
+
+// 编译期：按字段名查找索引（L3 静态绑定的核心能力）
+comptime fn ct_find_field(name: string) i64 {
+    var n: i64 = @type_info(Point).Struct.field_count;
+    var i: i64 = 0;
+    while (i < n) {
+        if (@type_info(Point).Struct.fields[i].name == name) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// 编译期：按字段名取 wire tag（pb3 字段号）
+comptime fn ct_field_tag(name: string) i64 {
+    var n: i64 = @type_info(Point).Struct.field_count;
+    var i: i64 = 0;
+    while (i < n) {
+        if (@type_info(Point).Struct.fields[i].name == name) {
+            return @type_info(Point).Struct.fields[i].tag;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// 编译期：取字段字节偏移 —— 由编译器算出，不是手写常量
+comptime fn ct_field_offset(name: string) i64 {
+    var n: i64 = @type_info(Point).Struct.field_count;
+    var i: i64 = 0;
+    while (i < n) {
+        if (@type_info(Point).Struct.fields[i].name == name) {
+            return @type_info(Point).Struct.fields[i].offset;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// R-018：comptime fn 无运行期函数体，结果须经 comptime const 承载才能落运行期。
+comptime const CT_FIELD_COUNT: i64 = ct_field_count();
+comptime const CT_IDX_X: i64 = ct_find_field("x");
+comptime const CT_IDX_Z: i64 = ct_find_field("z");
+comptime const CT_IDX_MISSING: i64 = ct_find_field("nope");
+comptime const CT_TAG_Y: i64 = ct_field_tag("y");
+comptime const CT_OFF_Z: i64 = ct_field_offset("z");
+
+@main
+fn main() i64 {
+    // R-018：以下均为编译期折叠出的常量，运行期读取
+    println("ct_field_count=" + int_to_str(CT_FIELD_COUNT));    // 3
+    println("ct_find_x=" + int_to_str(CT_IDX_X));               // 0
+    println("ct_find_z=" + int_to_str(CT_IDX_Z));               // 2
+    println("ct_find_missing=" + int_to_str(CT_IDX_MISSING));   // -1
+    println("ct_tag_y=" + int_to_str(CT_TAG_Y));                // 2
+    println("ct_off_z=" + int_to_str(CT_OFF_Z));                // 16
+
+    // R-019 对照：运行期反射与编译期结果必须同源一致
+    var tp: TypeInfo = type_info(Point);
+    var mp: *TypeMeta = match (tp) { .Struct(mt) => mt, _ => null };
+    println("rt_field_count=" + int_to_str(mp.field_count));    // 3
+    println("rt_tag_y=" + int_to_str(mp.fields[1].tag));        // 2
+
+    return 0;
+}

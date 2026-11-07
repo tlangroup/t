@@ -1317,6 +1317,9 @@ pub fn check_call_args(e: i64, fti: i64, fname: string) void {
             g_lead_expect = saved_le4;
             var pt: i64 = tif_params[pstart + got];
             intlit_overflow_warn(k.val, pt);
+            if (null_lit_bad(k.val, pt)) {
+                err_null_into(k.val, pt);
+            }
             if (tip_kind(at) != "Unknown" and ti_equal(pt, at) == false and can_cast(at, pt) == false) {
                 err_type_mismatch(k.val, pt, at);
             }
@@ -1349,7 +1352,156 @@ pub fn check_indirect_call(e: i64, fti: i64) void {
     check_call_args(e, fti, "");
 }
 
+// ── O-7：`T → ?T` 隐式提升（对齐 Zig Z3）──────────────────────────────────
+//
+// Zig 没有 `some()`，靠「T 可隐式装进 ?T」把构造函数整个消灭。t 的宪法条款 L-02 原本
+// 禁止该方向的自动转换；本次按用户裁定放开（理由与代价见 docs/design/option/DESIGN.md O-7：
+// 放开的前提是 O-6 已把 ABI 换成按值布局，提升是「写一个 tag」的零分配动作）。
+//
+// ⚠ 这里**只做放行 + 打标记，不改写 AST**：base 没有节点克隆原语（节点是 24 张平行侧表），
+//   原地改写成 call 需要重建子树，风险高于收益。真正的包装交给 TIR 层
+//   （tir_emit_expr 读本标记后补一个 STRUCT_NEW 写入 __tag=1 + payload）。
+// 副作用因此被限制在「类型检查放行」这一件事上，AST 与 HIR 一字不动。
+
+pub var g_optlift_nodes: []i64;   // 已判定为「隐式提升」的表达式节点
+
+pub fn opt_lift_has(e: i64) bool {
+    var i: i64 = 0;
+    var n: i64 = slice_len(g_optlift_nodes) as i64;
+    while (i < n) {
+        if (g_optlift_nodes[i] == e) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+pub fn opt_lift_mark(e: i64) void {
+    if (opt_lift_has(e)) { return; }
+    append(g_optlift_nodes, e);
+}
+
+// 尝试把 `act` 提升进 `exp`（exp 必须是 Optional）。成功返回 true（调用方应放行，不报错）。
+pub fn opt_try_lift(e: i64, exp: i64, act: i64) bool {
+    if (exp < 0) { return false; }
+    if (exp >= slice_len(tis) as i64) { return false; }
+    if (tip_kind(exp) != "Optional") { return false; }
+    if (opt_lift_has(e)) { return true; }          // 已判定过：直接放行（防重推断递归）
+    if (act >= 0 and act < slice_len(tis) as i64 and tip_kind(act) == "Optional") { return false; }
+    var el: i64 = tis[exp].elem;
+    if (el < 0) { return false; }
+    // 整数字面量按量级自推断（5 → u8），与 `?i64` 的元素类型对不上 ⇒ 先按期望的元素类型
+    // 重推断（写 sb 位宽后缀 + 清类型缓存），否则 `var a: ?i64 = 5;` 仍会被拒。
+    if (base.node_kind((e as u64)) == "int" and base.node_sb((e as u64)) == "") {
+        if (el < slice_len(tis) as i64 and tis[el].kind == "Scalar") {
+            base.node_set_sb((e as u64), tip_name(el));
+            base.node_set_type(e, -1);
+            act = infer_expr(e);
+        }
+    }
+    if (act < 0 or act >= slice_len(tis) as i64) { return false; }
+    if (ti_equal(el, act) == false) { return false; }
+    opt_lift_mark(e);
+    return true;
+}
+
+// ── O-2（代码侧）：`null` 不能流进非 Optional / 非 Pointer 的定型目标 ──────────
+//
+// 背景：`null` 的静态类型一直是**顶层 Unknown**，靠「由目标反推」放行，副作用是
+// `var x: i64 = null;` 也通过（DESIGN.md §3 O-2 登记的已知副作用）。
+// ⚠ 这里刻意**不改**成专属 `null_t` 类型：Unknown 的放行语义散落在 lub（match 臂
+//   合流）、未定型推断、Array→Slice 构造等一大片既有逻辑里，换类型会同时引爆
+//   `var m: *TypeMeta = match (ti) { .Struct(mt) => mt, _ => null };` 这类既有合法写法。
+// ⇒ 采用**加法守卫**：只在「右值是空值字面量 + 目标是定型且不接受 null」时补一条诊断。
+pub fn ti_null_ok(t: i64) bool {
+    if (t < 0) { return true; }
+    if (t >= slice_len(tis) as i64) { return true; }
+    var k: string = tip_kind(t);
+    if (k == "Unknown") { return true; }
+    if (k == "Optional") { return true; }
+    if (k == "Pointer") { return true; }
+    return false;
+}
+
+pub fn null_lit_bad(node: i64, exp: i64) bool {
+    if (node < 0) { return false; }
+    var k: string = base.node_kind((node as u64));
+    if (k != "null" and k != "opt_none") { return false; }
+    if (exp < 0) { return false; }
+    if (exp >= slice_len(tis) as i64) { return false; }
+    if (tip_kind(exp) == "Unknown") { return false; }
+    return ti_null_ok(exp) == false;
+}
+
+pub fn err_null_into(node: i64, exp: i64) void {
+    var es: string = ti_str(exp);
+    var l: i64 = parse.n_line(node);
+    var c: i64 = parse.n_col(node);
+    var di: i64 = base.diag_new("T-SEM-E002", "error",
+        base.sb_cat2("`null` is not assignable to a value of type ", es),
+        parse.n_file(node), l, c, l, c + 4);
+    base.slb_begin();
+    base.slb_add(base.sb_cat2("expected: ", es));
+    base.slb_add("found:    null");
+    base.slb_add("hint: `null` is assignable only to an optional `?T` or a pointer `*T`");
+    base.diag_set_nt(di, base.slb_head);
+}
+
+// O-2 推断债（二）：`var a: ?i64 = some(7);` ⇒ 「expected ?i64 but got ?u8」。
+// 根因：`some` 是**无 Func 签名**的内建 ⇒ 走不到形参类型注入那条路，实参 `7` 按量级
+// 自推断成 u8。修法放在**报错点**（此处 `exp` 一定已知且可靠）：把 `some(...)` 实参子树里的
+// 无位宽后缀整数字面量按期望元素类型补 sb + 清类型缓存，再重推断一次，相等即放行。
+// ⚠ 只对 `some(...)` 生效：其他内建 / 普通调用各有自己的签名注入通路，不受这个债影响。
+fn opt_retag_intlits(n: i64, w: string) void {
+    if (n < 0) { return; }
+    var k: string = base.node_kind((n as u64));
+    if (k == "int") {
+        if (base.node_sb((n as u64)) == "") {
+            base.node_set_sb((n as u64), w);
+            base.node_set_type(n, -1);
+        }
+        return;
+    }
+    if (k == "float" or k == "bool" or k == "string" or k == "ident" or k == "null" or k == "opt_none") { return; }
+    var na: i64 = base.node_na((n as u64));
+    if (na >= 0 and na != n) { opt_retag_intlits(na, w); }
+    var nb: i64 = base.node_nb((n as u64));
+    if (nb >= 0 and nb != n) { opt_retag_intlits(nb, w); }
+    // call / 构造：`la` 是 kids（Child）链表下标，须走 kids_chain_idx 物化后再遍历。
+    var la: i64 = base.node_la((n as u64));
+    if (la >= 0) {
+        var ks: []i64 = base.kids_chain_idx(la);
+        var i: i64 = 0;
+        while (i < slice_len(ks) as i64) {
+            var kv: Child = base.kids[ks[i]];
+            if (kv.val != n) { opt_retag_intlits(kv.val, w); }
+            i = i + 1;
+        }
+    }
+}
+
+pub fn opt_try_retag_some(e: i64, exp: i64) bool {
+    if (e < 0) { return false; }
+    if (exp < 0 or exp >= slice_len(tis) as i64) { return false; }
+    if (tip_kind(exp) != "Optional") { return false; }
+    var el: i64 = tis[exp].elem;
+    if (el < 0 or el >= slice_len(tis) as i64) { return false; }
+    if (tis[el].kind != "Scalar") { return false; }
+    if (base.node_kind((e as u64)) != "call") { return false; }
+    var callee: i64 = base.node_na((e as u64));
+    if (callee < 0) { return false; }
+    if (base.node_kind((callee as u64)) != "ident" or base.node_sa((callee as u64)) != "some") { return false; }
+    var oan: i64 = call_arg_node(e, 0);
+    if (oan < 0) { return false; }
+    opt_retag_intlits(oan, tip_name(el));
+    var nt: i64 = infer_expr(e);
+    return ti_equal(exp, nt);
+}
+
 pub fn err_type_mismatch(eni: i64, exp: i64, act: i64) void {
+    // O-2：`some(<整数字面量>)` 按量级推宽的元素类型对不上 ⇒ 先按期望元素类型重推断。
+    if (opt_try_retag_some(eni, exp)) { return; }
+    // O-7：期望 ?T 而实得 T ⇒ 隐式提升，不报错（包装由 TIR 层补）。
+    if (opt_try_lift(eni, exp, act)) { return; }
     var es: string = ti_str(exp);
     var fs2: string = ti_str(act);
     var l: i64 = parse.n_line(eni);
@@ -1438,6 +1590,9 @@ pub var g_refl_builtins_done: bool = false;
 pub var g_ti_TypeInfo_ti: i64 = -1;
 pub var g_ti_TypeMeta_ti: i64 = -1;
 pub var g_ti_FieldInfo_ti: i64 = -1;
+pub var g_ti_EnumMember_ti: i64 = -1;
+pub var g_ti_Attribute_ti: i64 = -1;   // R-020：@type_attributes 返回项
+pub var g_ti_AttrArg_ti: i64 = -1;     // R-020：注解实参项
 
 pub fn ensure_reflection_builtins() void {
     if (g_refl_builtins_done) { return; }
@@ -1480,6 +1635,48 @@ pub fn ensure_reflection_builtins() void {
         var fi_decl: i64 = base.mk_StructDecl("FieldInfo", "", "", false, false, -1, fif, -1);
         g_ti_FieldInfo_ti = ti_named("Struct", "FieldInfo");
         sym_define(global_scope, "FieldInfo", "type", g_ti_FieldInfo_ti, fi_decl);
+    }
+
+    // EnumMember（R-026）：name:string, value:i64 —— @enum_members(T) 编译期返回的
+    // 枚举成员表项。与 TypeMeta/FieldInfo 同规格：合成 StructDecl + 惰性注入 global_scope，
+    // 不进 decl_list（避免字段类型解析轮误报 UNKNOWN_TYPE）。
+    var emf: i64 = -1; var emt: i64 = -1;
+    emt = base.list_push(emf, emt, base.mk_member("name", base.mk_scalar("string", -1), -1)); if (emf < 0) { emf = emt; }
+    emt = base.list_push(emf, emt, base.mk_member("value", base.mk_scalar("i64", -1), -1)); if (emf < 0) { emf = emt; }
+    if (sym_lookup(global_scope, "EnumMember") < 0) {
+        var em_decl: i64 = base.mk_StructDecl("EnumMember", "", "", false, false, -1, emf, -1);
+        g_ti_EnumMember_ti = ti_named("Struct", "EnumMember");
+        sym_define(global_scope, "EnumMember", "type", g_ti_EnumMember_ti, em_decl);
+        // 进 decl_list：使后端按普通结构发射 %EnumMember = type { ptr, i64 }，
+        // 从而 @enum_members(T) 的结果可在运行期物化（R-026 运行期半）。
+        // EnumMember 字段均为标量（string/i64），不会触发 TypeMeta/FieldInfo 那种
+        // 合成字段类型不可解析的 UNKNOWN_TYPE 问题。
+        append(lex.decl_list, em_decl);
+    }
+
+    // AttrArg（R-020）：kind:i64, value:string —— @type_attributes / @field_attributes 返回的
+    // 注解实参项。kind 编码：0=string, 1=number, 2=bool, 3=ident, 4=list（逗号连接名）。
+    // 与 EnumMember 同规格：合成 StructDecl + 惰性注入 global_scope + 进 decl_list（支撑运行期物化）。
+    var aaf: i64 = -1; var aat: i64 = -1;
+    aat = base.list_push(aaf, aat, base.mk_member("kind", base.mk_scalar("i64", -1), -1)); if (aaf < 0) { aaf = aat; }
+    aat = base.list_push(aaf, aat, base.mk_member("value", base.mk_scalar("string", -1), -1)); if (aaf < 0) { aaf = aat; }
+    if (sym_lookup(global_scope, "AttrArg") < 0) {
+        var aa_decl: i64 = base.mk_StructDecl("AttrArg", "", "", false, false, -1, aaf, -1);
+        g_ti_AttrArg_ti = ti_named("Struct", "AttrArg");
+        sym_define(global_scope, "AttrArg", "type", g_ti_AttrArg_ti, aa_decl);
+        append(lex.decl_list, aa_decl);
+    }
+
+    // Attribute（R-020）：name:string, args:[]AttrArg —— 用户级注解的反射表项。
+    // 与 EnumMember 同规格进 decl_list，使 @type_attributes(T) 结果可在运行期物化。
+    var atf: i64 = -1; var att: i64 = -1;
+    att = base.list_push(atf, att, base.mk_member("name", base.mk_scalar("string", -1), -1)); if (atf < 0) { atf = att; }
+    att = base.list_push(atf, att, base.mk_member("args", base.mk_slice(base.mk_named("AttrArg", -1), -1), -1)); if (atf < 0) { atf = att; }
+    if (sym_lookup(global_scope, "Attribute") < 0) {
+        var at_decl: i64 = base.mk_StructDecl("Attribute", "", "", false, false, -1, atf, -1);
+        g_ti_Attribute_ti = ti_named("Struct", "Attribute");
+        sym_define(global_scope, "Attribute", "type", g_ti_Attribute_ti, at_decl);
+        append(lex.decl_list, at_decl);
     }
 
     // TypeInfo variant arms：Int=0 … Union=10，Module=11（顺序对齐 base.tc:5606），单载荷 *TypeMeta（Bool 无载荷）
@@ -1674,12 +1871,15 @@ pub fn resolve_ti(tn: i64) i64 {
         }
         // 反射内建类型：若用户已自行声明（如编译 base.tc 自身）则走真实声明，
         // 否则惰性注入合成 VariantDecl/StructDecl，使 TypeInfo 在用户代码里可 match。
-        if (rnm == "TypeInfo" or rnm == "TypeMeta" or rnm == "FieldInfo") {
+        if (rnm == "TypeInfo" or rnm == "TypeMeta" or rnm == "FieldInfo" or rnm == "EnumMember" or rnm == "Attribute" or rnm == "AttrArg") {
             var rsi: i64 = sym_lookup(global_scope, rnm);
             if (rsi >= 0 and syms[rsi].decl >= 0) { return syms[rsi].ti; }
             ensure_reflection_builtins();
             if (rnm == "TypeInfo") { return g_ti_TypeInfo_ti; }
             if (rnm == "TypeMeta") { return g_ti_TypeMeta_ti; }
+            if (rnm == "EnumMember") { return g_ti_EnumMember_ti; }
+            if (rnm == "Attribute") { return g_ti_Attribute_ti; }
+            if (rnm == "AttrArg") { return g_ti_AttrArg_ti; }
             return g_ti_FieldInfo_ti;
         }
         // 位串基元类型 `bitstr`（§15）：值级 (ptr u8, bit_len, cap)，与 []u8 同构。
@@ -3957,10 +4157,11 @@ pub fn conpat_check(pat: i64, scr: i64, rep: bool) void {
         }
         return;
     }
-    // 载荷个数：单元 0、单载荷 1、多载荷 = vcn.ib（>=2，载荷类型链在 vcn.lb）
+    // 载荷个数：单元 0、单载荷 1、多载荷 = lb 列表长度（载荷类型链在 vcn.lb）。
+    // ⚠ R-025：不再读 vcn.ib（ib 已让位给 case tagID），改为从 lb 链长度推导。
     var want: i64 = 0;
     if (base.node_lb((vc as u64)) >= 0) {
-        want = base.node_ib((vc as u64));   // S4 §0.14.7 SoA：侧表读（原 vcn.ib）
+        want = slice_len(base.kids_chain(base.node_lb((vc as u64))));   // S4 §0.14.7 SoA：侧表读（原 vcn.ib）
     } else if (base.node_na((vc as u64)) >= 0) {
         want = 1;
     }
@@ -7214,6 +7415,72 @@ pub fn infer_expr_body(e: i64) i64 {
     // `@compile_error` 本就只许活在编译期上下文；`@type_*` 折不掉意味着类型实参
     // 在编译期不可解析。两者都不该、也无法降级为运行期代码（第 8 条）。
     if (k == "mbuiltin") {
+        if (base.node_sa((e as u64)) == "embed_file") {
+            // @embed_file("rel/path")：编译期读文件，把调用节点原地改写成 string 字面量。
+            // 二进制安全：TStr 常量用 sizeof(s)-1 取长度（非 strlen），NUL 字节无损。
+            // 路径基准：相对「包含本调用的源文件」所在目录；绝对路径（'/' 开头或 'X:' 盘符）直接使用。
+            var ef_a: i64 = base.node_la((e as u64));
+            if (ef_a < 0) { parse.fc_err("T-MTA-E006", "@embed_file 需要 1 个字符串字面量实参（相对调用源文件的路径）", e); return ti_mk("Unknown"); }
+            var ef_pn: i64 = base.kids[ef_a].val;
+            if (base.node_kind((ef_pn as u64)) != "string") { parse.fc_err("T-MTA-E006", "@embed_file 的实参必须是编译期字符串字面量", e); return ti_mk("Unknown"); }
+            var ef_rel: string = base.node_sa((ef_pn as u64));
+            var ef_abs: bool = false;
+            if ((str_len(ef_rel) as i64) > 0 and ef_rel[0] == 47) { ef_abs = true; }       // 以 '/' 开头：绝对 unix 路径
+            if ((str_len(ef_rel) as i64) >= 2 and ef_rel[1] == 58) { ef_abs = true; }       // 'X:' 盘符：绝对 windows 路径
+            var ef_full: string = ef_rel;
+            if (ef_abs == false) {
+                var ef_src: string = base.node_file((e as u64));
+                var ef_cut: i64 = -1;
+                var ef_i: i64 = (str_len(ef_src) as i64) - 1;
+                while (ef_i >= 0) {
+                    if (ef_src[ef_i] == 47 or ef_src[ef_i] == 92) { ef_cut = ef_i; break; }
+                    ef_i = ef_i - 1;
+                }
+                if (ef_cut >= 0) { ef_full = str_slice(ef_src, 0, ef_cut) + "/" + ef_rel; }
+            }
+            if (file_exists(ef_full) == false) { parse.fc_err("T-MTA-E006", base.sb_cat3("@embed_file: 找不到文件 ", ef_full, ""), e); return ti_mk("Unknown"); }
+            var ef_bytes: string = file_read_all(ef_full);
+            // 与真实字符串字面量同构：仅 kind + sa（字节），其余槽位清零。
+            base.node_set_kind((e as u64), "string");
+            base.node_set_sa((e as u64), ef_bytes);
+            base.node_set_na((e as u64), -1);
+            base.node_set_nb((e as u64), -1);
+            base.node_set_nc((e as u64), -1);
+            base.node_set_nd((e as u64), -1);
+            base.node_set_la((e as u64), -1);
+            base.node_set_ib((e as u64), -1);
+            base.node_set_lc((e as u64), -1);
+            hir.hir_invalidate((e as u64));
+            return ti_mk("String");
+        }
+        if (base.node_sa((e as u64)) == "bitCast" or base.node_sa((e as u64)) == "bitcast") {
+            // @bitCast(T, value)：把 value 的位模式原样重解释为 T（真位重解释，非算术转换）。
+            // 运行期可用：codegen 发射 TIR_OP_BITCAST（C/LLVM 双后端已实现其 lowering）。
+            // 要求 sizeof(T) == sizeof(typeof(value))；NaN/Inf/-0.0 位模式原样保留。
+            var bc_la: i64 = base.node_la((e as u64));
+            if (bc_la < 0) { parse.fc_err("T-SEM-E007", "@bitCast 需要 2 个实参 (类型, 值)", e); return ti_mk("Unknown"); }
+            var bc_ks: []i64 = base.kids_chain_idx(bc_la);
+            if (slice_len(bc_ks) as i64 != 2) { parse.fc_err("T-SEM-E007", "@bitCast 需要 (类型, 值) 两个实参", e); return ti_mk("Unknown"); }
+            // 第一个实参是「类型」本身（如 f32 / u32 / MyStruct），不是值；用 deser_type_of 把
+            // 类型表达式节点归一成类型描述符，再取其 name（与 @type_size 等同源解析路径）。
+            var bc_td: i64 = deser_type_of(base__kids[bc_ks[0]].val);
+            var bc_tinfo: TD = tds[bc_td];
+            var bc_tname: string = bc_tinfo.name;
+            if (bc_tname == "") { parse.fc_err("T-SEM-E008", "@bitCast 的第一个实参必须是类型（如 f32 / u32）", e); return ti_mk("Unknown"); }
+            var bc_vti: i64 = infer_expr(base__kids[bc_ks[1]].val);
+            if (bc_vti < 0 or tis[bc_vti].kind == "Unknown") { return ti_mk("Unknown"); }
+            var bc_vname: string = tip_name(bc_vti);
+            var bc_wt: i64 = sema_bitcast_width(bc_tname);
+            var bc_wv: i64 = sema_bitcast_width(bc_vname);
+            if (bc_wt < 0 or bc_wv < 0 or bc_wt != bc_wv) {
+                parse.fc_err("T-SEM-E008",
+                    base.sb_cat3("@bitCast 要求源与目标同尺寸：", bc_vname, base.sb_cat2(" -> ", bc_tname)), e);
+                return ti_mk("Unknown");
+            }
+            // 目标类型名暂存到节点 sb 槽（mbuiltin 节点的 sb 空闲），供 codegen 读取。
+            base.node_set_sb((e as u64), bc_tname);
+            return ti_named("Scalar", bc_tname);
+        }
         if (base.node_sa((e as u64)) == "compile_error") {
             // 语义同 Zig 的 @compileError：**只要被分析到就触发**。CTFE 执行到会触发，
             // 走到 check（说明这段代码真的会被编译）同样触发。死分支已由 mb_prune_if
@@ -7460,6 +7727,12 @@ pub fn infer_expr_body(e: i64) i64 {
             // P2b 类型构造元函数：返回 comptime 类型值（类型即值），静态类型记 Any，
             // 真正类型节点在 CTFE（meta_eval_mbuiltin）期产出并流入单态化。
             return ti_mk("Any");
+        } else if (base.node_sa((e as u64)) == "enum_members") {
+            // R-026：@enum_members(T) 编译期返回 []EnumMember（成员名/值表）。
+            // 结果类型固定为 []EnumMember，与具体枚举无关，故在类型推断期即可定死，
+            // 无需延迟到 CTFE（与 @int/@struct 等「类型即值」元函数不同）。
+            ensure_reflection_builtins();
+            return ti_elem_of("Slice", g_ti_EnumMember_ti);
         } else {
             parse.fc_err("T-MTA-E007",
                 base.sb_cat3("未知的编译期内建 `@", base.node_sa((e as u64)), "`"), e);
@@ -8417,7 +8690,21 @@ pub fn infer_expr_body(e: i64) i64 {
                 return ti_mk("Unknown");
             }
         }
-        if (op == "==" or op == "!=" or op == "<" or op == ">" or op == "<=" or op == ">=") {
+        // ⚠ Zig 0.17 对齐（R-012 字符串规范）：现代 Zig 已禁止对 `[]const u8` 直接用 `==`/`!=`
+        // （切片是身份/无语义比较，内容比较须 `std.mem.eql`）。t 刻意保留「内容比较」以维持现有代码
+        // （src/*.tc 大量 `node_kind(n) == "string"` 等）不破坏，但标注为**废弃**：建议改用
+        // `str_eq` 做显式内容比较（不等用 `not str_eq(a, b)`，因 `!=` 内部即降为 `t_str_eq(...)==false`）。
+        // 这里仅发警告、语义与运行时行为完全不变。
+        if (op == "==" or op == "!=") {
+            if (tip_kind(lt) == "String" and tip_kind(rt) == "String") {
+                base.diag_new("T-STR-W000", "warning",
+                    "string == / != 为内容比较（与 Zig 0.17 的 []const u8 不同：后者已禁止切片直接比较）。"
+                    + "为对齐 Zig 规范，建议改用 str_eq 做显式内容比较（不等用 not str_eq(a, b)）；该运算符未来可能调整语义",
+                    parse.n_file(e), parse.n_line(e), parse.n_col(e), parse.n_line(e), parse.n_col(e) + 1);
+            }
+            return ti_scalar("bool");
+        }
+        if (op == "<" or op == ">" or op == "<=" or op == ">=") {
             return ti_scalar("bool");
         }
         // 布尔逻辑（§set-ops §13.3）：`and` / `or` 是**唯一**的布尔拼写（`&&` / `||` 已移除）。
@@ -8760,6 +9047,19 @@ pub fn infer_expr_body(e: i64) i64 {
             // 可选类型内建：some(x)→Optional(实参类型)；unwrap(x)→Optional 元素类型；is_some/is_none(x)→bool。
             if ((fname == "some" or fname == "unwrap" or fname == "is_some" or fname == "is_none") and base.node_la((e as u64)) >= 0) {
                 var oan: i64 = call_arg_node(e, 0);
+                // O-2 推断债：`some` 是**内建、没有 Func 签名**，走不到形参类型注入那条路，
+                // 于是 `some(5)` 的实参按量级自推断成 u8 ⇒ `var a: ?i64 = some(5);` 报
+                // 「expected ?i64 but got ?u8」。修法：推断实参**之前**按期望类型的元素类型
+                // 给无位宽后缀的整数字面量补 sb（与 O-7 opt_try_lift 的重推断同手法）。
+                // 期望类型的来源：var 声明 / 赋值 / return / call 形参注入都会设 g_lead_expect。
+                if (fname == "some" and base.node_kind((oan as u64)) == "int" and base.node_sb((oan as u64)) == "") {
+                    if (g_lead_expect >= 0 and g_lead_expect < slice_len(tis) as i64 and tip_kind(g_lead_expect) == "Optional") {
+                        var sxi: TI = tis[g_lead_expect];
+                        if (sxi.elem >= 0 and sxi.elem < slice_len(tis) as i64 and tis[sxi.elem].kind == "Scalar") {
+                            base.node_set_sb((oan as u64), tip_name(sxi.elem));
+                        }
+                    }
+                }
                 var oat: i64 = ie_sub_in(ei, oan);
                 if (fname == "some") {
                     // 实参是**元素值**（非可选），结果为 Optional(该实参类型)。
@@ -9167,17 +9467,51 @@ pub fn infer_expr_body(e: i64) i64 {
         //  LLVM 发 `load i64, ptr null`、C 发非法的 `PF.encrypted` —— 静默错编，
         //  与 Enum 同批治理。）
         if (obk == "Variant") {
-            // M5 / P1：Variant 成员访问（如 `Shape.Circle`）此前无任何成员名校验。
-            // ⚠ 与 Enum/Flag 两分支不同：此处**不加 bd（callee）豁免**。
-            //    variant 的构造器本就以「成员访问充当 callee」的形式书写（`Shape.Circle(1.0)`），
-            //    加豁免会让最常见的构造形态连同拼错的 case 名一起逃过校验（设计文档 case 15）。
-            //    struct 的 bd 豁免是为 `p.clone()` 这类**方法调用**（成员名不是字段）而设的，
-            //    variant 没有方法，不存在该合法情形；安全性由全仓零误报扫描兜底。
-            // 返回值维持 Unknown 不变 —— 构造器具名形的发射走 call 分支，此处改返回值会牵动后端。
-            if (member_exists_in_type(obt, base.node_sa((e as u64))) == false) {
+            // R-037 修复：变体点式成员访问 `V.Case`（如 `Shape.Circle` / `Shape.Empty`）此前仅做
+            // 成员名校验、随后返回 Unknown 而**不改写节点**——后端把 `V.Case` 当成「类型值 V 的字段读」
+            // 发射，运行期静默 abort（exit 3 无诊断），正是 thyme 标注的 R-037 静默错编。
+            // ⚠ 与 Enum/Flag 两分支不同：此处**不加 bd（callee）豁免**（理由同原注释：variant 构造器
+            //   本就以成员访问充当 callee 书写，豁免会让最常见形态连同拼错 case 名一起逃过校验）。
+            // 修复：合法 case 改写成对应构造器（与 leading-dot `.Case` 取值同构，见上方 9358）：
+            //   · 带载荷 case → `V.Case` 改写为构造器**函数引用** `<V>_from_Case`（交由外层 (args) 调用）；
+            //   · 无载荷 case → `V.Case` 改写为**零参调用** `<V>_from_Case()`，直接得到变体值。
+            // 二者均 return infer_expr(e) 重入，类型由构造器符号决定，不再返回 Unknown → 消除静默错编。
+            var r037_mn: string = base.node_sa((e as u64));
+            if (member_exists_in_type(obt, r037_mn) == false) {
                 parse.fc_err("T-SEM-E015",
                     base.sb_cat4("变体 `", tip_name(obt), "` 没有 case `",
-                        base.sb_cat2(base.node_sa((e as u64)), "`：请检查拼写")), e);
+                        base.sb_cat2(r037_mn, "`：请检查拼写")), e);
+                return ti_mk("Unknown");
+            }
+            var r037_vname: string = variant_name_of_case(r037_mn);
+            if (str_len(r037_vname) as i64 > 0) {
+                var r037_decl: i64 = variant_decl_of(obt);
+                var r037_vc: i64 = -1;
+                if (r037_decl >= 0) { r037_vc = variant_find_case(r037_decl, r037_mn); }
+                var r037_has_payload: bool = false;
+                if (r037_vc >= 0) {
+                    r037_has_payload = (base.node_lb((r037_vc as u64)) >= 0) or (base.node_na((r037_vc as u64)) >= 0);
+                }
+                var r037_ctor: string = base.sb_cat3(r037_vname, "_from_", r037_mn);
+                if (r037_has_payload) {
+                    // 带载荷：改写为构造器函数引用（ident），外层 (args) 调用之。
+                    var r037_cid: i64 = base.mk_ident(r037_ctor, -1);
+                    base.node_set_kind((e as u64), "ident");
+                    base.node_set_sa((e as u64), base.node_sa((r037_cid as u64)));
+                    base.node_set_na((e as u64), -1);
+                    base.node_set_lb((e as u64), 0);
+                    hir.hir_invalidate((e as u64));
+                    return infer_expr(e);
+                }
+                // 无载荷：改写为零参构造器调用，直接得到变体值（与 leading-dot `.Case` 取值同构）。
+                var r037_cid2: i64 = base.mk_ident(r037_ctor, -1);
+                var r037_call: i64 = base.mk_call(r037_cid2, -1, -1);
+                base.node_set_kind((e as u64), base.node_kind((r037_call as u64)));
+                base.node_set_na((e as u64), base.node_na((r037_call as u64)));
+                base.node_set_la((e as u64), base.node_la((r037_call as u64)));
+                base.node_set_sa((e as u64), base.node_sa((r037_call as u64)));
+                hir.hir_invalidate((e as u64));
+                return infer_expr(e);
             }
             return ti_mk("Unknown");
         }
@@ -9733,6 +10067,9 @@ pub fn cs_var_decl(s: i64, init_i: i64) void {
         g_tile_expect = saved_te2;
         g_lead_expect = saved_le2;
         intlit_overflow_warn(base.node_nb((s as u64)), vt);
+        if (null_lit_bad(base.node_nb((s as u64)), vt)) {
+            err_null_into(base.node_nb((s as u64)), vt);
+        }
         if (tip_kind(it) != "Unknown" and ti_equal(it, vt) == false) {
             var vk: string = tip_kind(vt);
             // P3：位域 TI kind 已归 `Struct`，按 `tip_is_flag`（und 非空）判别。
@@ -9866,6 +10203,9 @@ pub fn cs_return(s: i64, val_i: i64) void {
                 base.node_na((s as u64)));
         }
         intlit_overflow_warn(base.node_na((s as u64)), cur_ret);
+        if (null_lit_bad(base.node_na((s as u64)), cur_ret)) {
+            err_null_into(base.node_na((s as u64)), cur_ret);
+        }
         if (tip_kind(rt) != "Unknown" and ti_equal(rt, cur_ret) == false) {
             if (can_cast(rt, cur_ret) == false) {
                 err_type_mismatch(base.node_na((s as u64)), cur_ret, rt);
@@ -9916,6 +10256,9 @@ pub fn cs_assignment(s: i64, ai: i64) void {
     g_tile_expect = saved_te1;
     g_lead_expect = saved_le1;
     intlit_overflow_warn(base.node_nb((s as u64)), tt);
+    if (null_lit_bad(base.node_nb((s as u64)), tt)) {
+        err_null_into(base.node_nb((s as u64)), tt);
+    }
     if (tip_kind(tt) != "Unknown" and tip_kind(vt2) != "Unknown" and ti_equal(tt, vt2) == false) {
         var str_to_sym2: bool = tip_kind(tt) == "Sym" and tip_kind(vt2) == "String";
         if (str_to_sym2 == false and can_cast(vt2, tt) == false) {
@@ -9978,6 +10321,18 @@ pub fn check_stmt_hir(si: i64) void {
     if (op == hir.HIR_OP_BLOCK) { cs_block_inst(si); return; }
     var s: i64 = hir.hir_inst_node(si);
     if (s < 0) { return; }
+    if (op == hir.HIR_OP_UNSAFE) {
+        // R-014：不安全作用域块。置 g_unsafe_depth 上下文标志，检查体（HIR 指令流），
+        // 还原标志，并将源节点脱糖为 "block" 使 TIR/后端按普通块处理（与既有 CST 路径一致）。
+        var prev_u: i64 = cur_scope;
+        cur_scope = scope_new_at(prev_u, s);
+        g_unsafe_depth = g_unsafe_depth + 1;
+        cs_stmts_hir(si);
+        cur_scope = prev_u;
+        g_unsafe_depth = g_unsafe_depth - 1;
+        base.node_set_kind((s as u64), "block");   // 脱糖：后续按普通 block 处理
+        return;
+    }
     if (op == hir.HIR_OP_CAPTURE) {
         if (base.node_na((s as u64)) >= 0) { sym_define(cur_scope, base.node_sa((s as u64)), "var", resolve_ti(base.node_na((s as u64))), -1); }
         return;
@@ -10247,6 +10602,9 @@ pub fn check_stmt_cst(s: i64) void {
                     base.node_na((s as u64)));
             }
             intlit_overflow_warn(base.node_na((s as u64)), cur_ret);
+            if (null_lit_bad(base.node_na((s as u64)), cur_ret)) {
+                err_null_into(base.node_na((s as u64)), cur_ret);
+            }
             if (tip_kind(rt) != "Unknown" and ti_equal(rt, cur_ret) == false) {
                 if (can_cast(rt, cur_ret) == false) {
                     err_type_mismatch(base.node_na((s as u64)), cur_ret, rt);
@@ -10365,6 +10723,27 @@ pub fn check_stmt_cst(s: i64) void {
                         "` 但被丢弃：请接收结果，或让末级函数返回 void"), base.node_na((s as u64)));
             }
         }
+        return;
+    }
+    // R-014：`unsafe { ... }` —— 与 block 同构的作用域块，检查期间置不安全上下文标志。
+    // 检查完 body 后脱糖为 "block"，使后端/返回分析/控制流分析零改动（基础设施阶段）。
+    if (base.node_kind((s as u64)) == "unsafe") {
+        var prev_u: i64 = cur_scope;
+        cur_scope = scope_new_at(prev_u, s);
+        g_unsafe_depth = g_unsafe_depth + 1;
+        var c5: i64 = base.node_la((s as u64));
+        var mq_ks: []i64 = base.kids_chain_idx(base.node_la((s as u64)));
+        var mq_ki: i64 = 0;
+        while (mq_ki < slice_len(mq_ks) as i64) {
+            c5 = mq_ks[mq_ki];
+            var k5: Child = base.kids[c5];
+            check_stmt(k5.val);
+            mq_ki = mq_ki + 1;
+            c5 = -1;
+        }
+        cur_scope = prev_u;
+        g_unsafe_depth = g_unsafe_depth - 1;
+        base.node_set_kind((s as u64), "block");   // 脱糖：后续按普通 block 处理
         return;
     }
     if (base.node_kind((s as u64)) == "block" or base.node_kind((s as u64)) == "block_expr" or base.node_kind((s as u64)) == "defer" or base.node_kind((s as u64)) == "comptime_block") {
@@ -10527,6 +10906,10 @@ pub fn check_struct_decl(d: i64) void {
     if (base.node_sb((d as u64)) == "packed") {
         check_packed_layout(d);
     }
+    // pb 修饰关键词：`pb` / `@pb` / `#pb` 标记的结构体是 protobuf message；其字段 `@N` 是线格式
+    // 契约字段号（protobuf 语义），必须显式给出、不可自动分配。统一经 la 上的 `pb` 注解识别
+    // （裸 `pb`、`@pb` 注解、`#pb` 合成的 `pb` 注解走同一条路径）。
+    var is_pb: bool = parse.ann_find(base.node_la((d as u64)), "pb") >= 0;
     var c: i64 = base.node_lb((d as u64));
     var total: i64 = 0;
     var tag_count: i64 = 0;
@@ -10548,6 +10931,13 @@ pub fn check_struct_decl(d: i64) void {
     if (tag_count > 0 and tag_count < total) {
         base.diag_new("T-SEM-E010", "error",
             base.sb_cat3("struct '", base.node_sa((d as u64)), "' 的字段 tagID 必须「全显式 @N」或「全自动」：不能部分字段写 @N、部分不写"),
+            parse.n_file(d), parse.n_line(d), parse.n_col(d), parse.n_line(d), parse.n_col(d) + 4);
+        return;
+    }
+    // ── pb message：字段号是线格式契约，必须每个字段都显式 @N（禁止自动分配 1,2,3…）──
+    if (is_pb and tag_count < total) {
+        base.diag_new("T-SEM-E010", "error",
+            base.sb_cat3("pb struct '", base.node_sa((d as u64)), "' 的每个字段都必须显式标注 @N tag id（protobuf 字段号是线格式契约，不可自动分配）"),
             parse.n_file(d), parse.n_line(d), parse.n_col(d), parse.n_line(d), parse.n_col(d) + 4);
         return;
     }
@@ -10761,6 +11151,10 @@ pub fn check_packed_layout(d: i64) void {
     append(pk_struct_total, total);
 }
 
+// R-030：#pb enum proto3 校验的去重护栏（check_enum_decl 在 sema / HIR 两趟都会被调用）。
+pub var g_pb_enum_done: []i64 = [];
+pub var g_pb_seen_vals: []i64 = [];
+
 pub fn check_enum_decl(d: i64) void {
     if (is_int_name(base.node_sb((d as u64))) == false) {
         var di: i64 = base.diag_new("T-SEM-E002", "error",
@@ -10794,6 +11188,73 @@ pub fn check_enum_decl(d: i64) void {
         }
         mq_ki8868 = mq_ki8868 + 1;
         c = -1;
+    }
+    // ── R-030：#pb enum proto3 校验 ──
+    // `#pb` 标记的 enum 是 wire 契约的一部分，须满足 proto3 三条约束：
+    //   1) 首个成员值必须为 0；2) 重复值须显式 @allow_alias；3) 底层类型须为整型
+    //      （底层整型约束已由上方 is_int_name 检查覆盖：非整型报 T-SEM-E002）。
+    // 无 #pb 的 enum 是纯语言层，跳过本段（与 #pb struct 对称）。
+    // ⚠ 幂等护栏：check_enum_decl 在 sema 与 HIR 两趟都会被调用，防止同一 decl 重复报 PB 诊断。
+    var is_pb_enum: bool = parse.ann_find(base.node_la((d as u64)), "pb") >= 0;
+    if (is_pb_enum) {
+        var pb_seen: bool = false;
+        var pj: i64 = 0;
+        while (pj < slice_len(g_pb_enum_done) as i64) {
+            if (g_pb_enum_done[pj] == d) { pb_seen = true; }
+            pj = pj + 1;
+        }
+        if (pb_seen == false) {
+            append(g_pb_enum_done, d);
+            var allow_alias: bool = parse.ann_find(base.node_la((d as u64)), "allow_alias") >= 0;
+            // 计算各成员值（与 @enum_members 同源：显式值已折 int 字面量，未折尝试 meta_eval，否则自动编号）
+            var pb_mks: []i64 = base.kids_chain_idx(base.node_lb((d as u64)));
+            var pb_mki: i64 = 0;
+            var pb_auto: i64 = 0;
+            var pb_first: bool = true;
+            g_pb_seen_vals = [];
+            while (pb_mki < slice_len(pb_mks) as i64) {
+                var pmn: i64 = base.kids[pb_mks[pb_mki]].val;
+                var pmval: i64 = -1;
+                var pmvn: i64 = base.node_na((pmn as u64));
+                if (pmvn >= 0) {
+                    if (base.node_kind((pmvn as u64)) == "int") {
+                        pmval = js_parse_int(base.node_sa((pmvn as u64)), base.node_ia((pmvn as u64)));
+                    } else {
+                        var pvv: i64 = meta_eval(pmvn);
+                        g_meta_err = false;
+                        if (pvv >= 0 and base.node_kind((pvv as u64)) == "int") {
+                            pmval = js_parse_int(base.node_sa((pvv as u64)), base.node_ia((pvv as u64)));
+                        }
+                    }
+                } else {
+                    pmval = pb_auto;
+                }
+                if (pmval >= 0) {
+                    if (pb_first) {
+                        pb_first = false;
+                        if (pmval != 0) {
+                            base.diag_new("T-PRB-E001", "error",
+                                base.sb_cat5("pb enum '", base.node_sa((d as u64)), "' 的首个成员 '", base.node_sa((pmn as u64)), "' 的值必须为 0（proto3 约束）"),
+                                parse.n_file(pmn), parse.n_line(pmn), parse.n_col(pmn), parse.n_line(pmn), parse.n_col(pmn) + (str_len(base.node_sa((pmn as u64))) as i64));
+                        }
+                    }
+                    var psi: i64 = 0;
+                    var pdup: bool = false;
+                    while (psi < slice_len(g_pb_seen_vals) as i64) {
+                        if (g_pb_seen_vals[psi] == pmval) { pdup = true; }
+                        psi = psi + 1;
+                    }
+                    if (pdup and allow_alias == false) {
+                        base.diag_new("T-PRB-E002", "error",
+                            base.sb_cat7("pb enum '", base.node_sa((d as u64)), "' 成员 '", base.node_sa((pmn as u64)), "' 的值 ", base.i2s(pmval), " 与另一成员重复，须在该 enum 上显式标注 @allow_alias（proto3 约束）"),
+                            parse.n_file(pmn), parse.n_line(pmn), parse.n_col(pmn), parse.n_line(pmn), parse.n_col(pmn) + (str_len(base.node_sa((pmn as u64))) as i64));
+                    }
+                    if (pdup == false) { append(g_pb_seen_vals, pmval); }
+                    pb_auto = pmval + 1;
+                }
+                pb_mki = pb_mki + 1;
+            }
+        }
     }
 }
 
@@ -11851,6 +12312,9 @@ pub fn check_global_var_decl(d: i64) void {
                 }
             }
         }
+        if (null_lit_bad(base.node_nb((d as u64)), vt)) {
+            err_null_into(base.node_nb((d as u64)), vt);
+        }
         if (tip_kind(it) != "Unknown" and tip_kind(vt) != "Unknown" and ti_equal(it, vt) == false) {
             // Sym 全局变量允许由字符串赋值（自动 intern → id）
             var gss: bool = tip_kind(vt) == "Sym" and tip_kind(it) == "String";
@@ -11892,6 +12356,9 @@ pub fn check_global_const_decl(d: i64) void {
         g_tile_expect = saved_te7;
         if (base.node_na((d as u64)) >= 0) {
             var ct: i64 = resolve_ti(base.node_na((d as u64)));
+            if (null_lit_bad(base.node_nb((d as u64)), ct)) {
+                err_null_into(base.node_nb((d as u64)), ct);
+            }
             if (tip_kind(it2) != "Unknown" and ti_equal(it2, ct) == false) {
                 if (can_cast(it2, ct) == false) {
                     err_type_mismatch(base.node_nb((d as u64)), ct, it2);
@@ -12805,6 +13272,37 @@ pub fn sel_register(imp: i64, alias: string) void {
     }
 }
 
+// R-023（extend 口子）：解析 T_IMPORT_EXTS 环境变量，返回用户配置的「额外导入扩展名」列表
+// （如 thyme 设 `T_IMPORT_EXTS=.tproto`）。t 本身不内嵌任何 schema 扩展名知识——thyme 通过此
+// 环境变量自行决定可导入哪些扩展名。逗号/空白分隔，每项自动补前导 '.'。
+pub fn import_extra_exts() []string {
+    var raw: string = getenv("T_IMPORT_EXTS");
+    var out: []string = [];
+    if (str_len(raw) == 0) { return out; }
+    var i: i64 = 0;
+    var n: i64 = str_len(raw);
+    var start: i64 = 0;
+    while (i <= n) {
+        var is_sep: bool = false;
+        if (i == n) { is_sep = true; }
+        else if (raw[i] == 44) { is_sep = true; }   // 44 = ','
+        if (is_sep) {
+            var a: i64 = start;
+            var b: i64 = i;
+            while (a < b and raw[a] == 32) { a = a + 1; }   // 去前导空格
+            while (b > a and raw[b - 1] == 32) { b = b - 1; } // 去尾随空格
+            if (b > a) {
+                var tok: string = str_slice(raw, a, b);
+                if (tok[0] != 46) { tok = base.sb_cat2(".", tok); }   // 46 = '.'，确保以 '.' 开头
+                append(out, tok);
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
 // 解析单个 import 声明：定位模块文件 → 去重/环检测 → 内联加载
 pub fn handle_one_import(imp: i64, at: i64) void {
     var nm: string = base.node_sb((imp as u64));
@@ -12877,11 +13375,31 @@ pub fn handle_one_import(imp: i64, at: i64) void {
         // T_TINT_DIR 已设且接口文件命中 → 优先用接口文件（不回退 .tc）；
         // 否则回退到 .tc 源码供类型检查（兼容无接口文件的模块）。
         if (chosen == "") {
+            // R-023（extend 口子）：导入解析除默认 .tc 外，额外尝试 T_IMPORT_EXTS 列出的扩展名。
+            // t 本身不内嵌任何特定 schema 扩展名——thyme 设 T_IMPORT_EXTS=.tproto 即可自行导入 *.tproto。
+            var rx: string = rel;
+            var rl: i64 = str_len(rx);
+            // 剥掉已带的已知扩展名（.tc 及用户配置的扩展名），避免 ``foo.tproto.tc`` 之类拼接。
+            if (rl >= 3 and str_slice(rx, rl - 3, rl) == ".tc") { rx = str_slice(rx, 0, rl - 3); }
+            var exts: []string = import_extra_exts();
+            var ei: i64 = 0;
+            while (ei < slice_len(exts) as i64) {
+                var el: i64 = str_len(exts[ei]);
+                if (rl >= el and str_slice(rx, rl - el, rl) == exts[ei]) { rx = str_slice(rx, 0, rl - el); break; }
+                ei = ei + 1;
+            }
             var i: i64 = 0;
             var nr: i64 = slice_len(g_src_roots) as i64;
             while (i < nr) {
-                var cand: string = path_resolve(base__sb_cat4(g_src_roots[i], "/", rel, ".tc"));
+                var cand: string = path_resolve(base__sb_cat4(g_src_roots[i], "/", rx, ".tc"));
                 if (path_exists(cand)) { chosen = cand; break; }
+                var ej: i64 = 0;
+                while (ej < slice_len(exts) as i64) {
+                    var cand2: string = path_resolve(base__sb_cat4(g_src_roots[i], "/", rx, exts[ej]));
+                    if (path_exists(cand2)) { chosen = cand2; break; }
+                    ej = ej + 1;
+                }
+                if (chosen != "") { break; }
                 i = i + 1;
             }
         }
@@ -12961,17 +13479,48 @@ pub fn handle_one_import(imp: i64, at: i64) void {
 // （.tlib 预编译外链在 Phase2 接入；T_LIB_PATH 环境变量亦在 Phase2 纳入。）
 pub fn resolve_external_lib(nm: string) string {
     var rel: string = dots_to_slashes(nm);
+    // R-023（extend 口子）：除默认 .tc 外，支持 T_IMPORT_EXTS 配置的额外扩展名（t 不内嵌 .tproto 知识）。
+    var rx: string = rel;
+    var rl: i64 = str_len(rx);
+    if (rl >= 3 and str_slice(rx, rl - 3, rl) == ".tc") { rx = str_slice(rx, 0, rl - 3); }
+    var exts: []string = import_extra_exts();
+    var ei: i64 = 0;
+    while (ei < slice_len(exts) as i64) {
+        var el: i64 = str_len(exts[ei]);
+        if (rl >= el and str_slice(rx, rl - el, rl) == exts[ei]) { rx = str_slice(rx, 0, rl - el); break; }
+        ei = ei + 1;
+    }
     var dirs: []string = lex__g_lib_dirs;          // compute_lib_dirs 已填充
     var i: i64 = 0;
     var nd: i64 = slice_len(dirs) as i64;
     while (i < nd) {
         var base: string = dirs[i];
-        var c_tc: string = path_resolve(base__sb_cat4(base, "/", rel, ".tc"));
+        var c_tc: string = path_resolve(base__sb_cat4(base, "/", rx, ".tc"));
         if (path_exists(c_tc)) { return c_tc; }
-        var c_idx: string = path_resolve(base__sb_cat4(base, "/", rel, "/index.tc"));
+        var ej: i64 = 0;
+        while (ej < slice_len(exts) as i64) {
+            var c_tx: string = path_resolve(base__sb_cat4(base, "/", rx, exts[ej]));
+            if (path_exists(c_tx)) { return c_tx; }
+            ej = ej + 1;
+        }
+        var c_idx: string = path_resolve(base__sb_cat4(base, "/", rx, "/index.tc"));
         if (path_exists(c_idx)) { return c_idx; }
-        var c_lib: string = path_resolve(base__sb_cat4(base, "/", rel, "/lib.tc"));
+        var ej2: i64 = 0;
+        while (ej2 < slice_len(exts) as i64) {
+            var suf2: string = base.sb_cat2("/index", exts[ej2]);
+            var c_idxtp: string = path_resolve(base__sb_cat4(base, "/", rx, suf2));
+            if (path_exists(c_idxtp)) { return c_idxtp; }
+            ej2 = ej2 + 1;
+        }
+        var c_lib: string = path_resolve(base__sb_cat4(base, "/", rx, "/lib.tc"));
         if (path_exists(c_lib)) { return c_lib; }
+        var ej3: i64 = 0;
+        while (ej3 < slice_len(exts) as i64) {
+            var suf3: string = base.sb_cat2("/lib", exts[ej3]);
+            var c_libtp: string = path_resolve(base__sb_cat4(base, "/", rx, suf3));
+            if (path_exists(c_libtp)) { return c_libtp; }
+            ej3 = ej3 + 1;
+        }
         i = i + 1;
     }
     return "";
@@ -13951,29 +14500,56 @@ pub fn mangle_modules() void {
                 // 未命中则保持 member 不变：同名局部/字段访问不受影响（由后续检查兜底）
             }
         } else if (base.node_kind((i as u64)) == "named" and base.node_sb((i as u64)) != "") {
-            var rcv2: string = alias_full(base.node_sb((i as u64)));
-            var di2: i64 = def_lookup(rcv2, base.node_sa((i as u64)));
-            if (di2 < 0) { di2 = reexport_lookup(rcv2, base.node_sa((i as u64))); }
-            if (di2 >= 0) {
-                var real_alias2: string = lex__g_def_alias[di2];
-                check_mod_visible(real_alias2, base.node_sa((i as u64)), di2, i);
-                base.node_set_sa((i as u64), mangled_name(real_alias2, base.node_sa((i as u64))));
+            var sb2: string = base.node_sb((i as u64));
+            var sa2: string = base.node_sa((i as u64));
+            // R-038：结构体嵌套类型限定 `Outer.Inner` → `Outer__Inner`（sb 非模块别名时）。
+            // 必须先于模块别名逻辑判定：避免把 `Outer.Inner` 误当模块引用而报 no symbol。
+            if (in_mod_aliases(sb2) == false) {
+                var nf2: string = parse.nested_full_of(sb2, sa2);
+                if (nf2 != "") {
+                    base.node_set_sa((i as u64), nf2);
+                } else {
+                    err_no_symbol(sb2, sa2, i);
+                }
+                base.node_set_sb((i as u64), "");
             } else {
-                err_no_symbol(base.node_sb((i as u64)), base.node_sa((i as u64)), i);
+                var rcv2: string = alias_full(sb2);
+                var di2: i64 = def_lookup(rcv2, sa2);
+                if (di2 < 0) { di2 = reexport_lookup(rcv2, sa2); }
+                if (di2 >= 0) {
+                    var real_alias2: string = lex__g_def_alias[di2];
+                    check_mod_visible(real_alias2, sa2, di2, i);
+                    base.node_set_sa((i as u64), mangled_name(real_alias2, sa2));
+                } else {
+                    err_no_symbol(sb2, sa2, i);
+                }
+                base.node_set_sb((i as u64), "");
             }
-            base.node_set_sb((i as u64), "");
         } else if (base.node_kind((i as u64)) == "struct_lit" and base.node_sb((i as u64)) != "") {
-            var rcv3: string = alias_full(base.node_sb((i as u64)));
-            var di3: i64 = def_lookup(rcv3, base.node_sa((i as u64)));
-            if (di3 < 0) { di3 = reexport_lookup(rcv3, base.node_sa((i as u64))); }
-            if (di3 >= 0) {
-                var real_alias3: string = lex__g_def_alias[di3];
-                check_mod_visible(real_alias3, base.node_sa((i as u64)), di3, i);
-                base.node_set_sa((i as u64), mangled_name(real_alias3, base.node_sa((i as u64))));
+            var sb3: string = base.node_sb((i as u64));
+            var sa3: string = base.node_sa((i as u64));
+            // R-038：嵌套类型字面量 `Outer.Inner { ... }` → `Outer__Inner`。
+            if (in_mod_aliases(sb3) == false) {
+                var nf3: string = parse.nested_full_of(sb3, sa3);
+                if (nf3 != "") {
+                    base.node_set_sa((i as u64), nf3);
+                } else {
+                    err_no_symbol(sb3, sa3, i);
+                }
+                base.node_set_sb((i as u64), "");
             } else {
-                err_no_symbol(base.node_sb((i as u64)), base.node_sa((i as u64)), i);
+                var rcv3: string = alias_full(sb3);
+                var di3: i64 = def_lookup(rcv3, sa3);
+                if (di3 < 0) { di3 = reexport_lookup(rcv3, sa3); }
+                if (di3 >= 0) {
+                    var real_alias3: string = lex__g_def_alias[di3];
+                    check_mod_visible(real_alias3, sa3, di3, i);
+                    base.node_set_sa((i as u64), mangled_name(real_alias3, sa3));
+                } else {
+                    err_no_symbol(sb3, sa3, i);
+                }
+                base.node_set_sb((i as u64), "");
             }
-            base.node_set_sb((i as u64), "");
         }
         i = i + 1;
     }
@@ -14078,6 +14654,7 @@ pub var g_menv_base: i64;        // 当前调用帧底：查找不跨帧（禁�
 pub var g_menv_nglobal: i64;     // 全局编译期常量区大小 [0, nglobal)
 pub var g_meta_depth: i64;       // meta 调用深度
 pub var g_in_comptime: i64;       // S1/Q1：当前处于 comptime 上下文的嵌套层数（comptime 块/函数体），>0 时裸类型名即 type 值
+pub var g_unsafe_depth: i64 = 0;  // R-014：当前处于 unsafe {} 作用域的嵌套深度；>0 即不安全上下文。基础设施阶段暂未强制任何操作，供后续 gate 危险操作（指针解引用/类型擦除）使用。
 pub var g_meta_steps: i64;       // 步数预算，防不终止的 meta 循环 / 递归
 pub var g_me_count: i64;         // P2b 调试：meta_eval 累计调用数
 pub var g_me_depth: i64;         // meta_eval 递归深度，用于最外层调用补充预算（避免共享预算在语义期耗尽导致误报 E612）
@@ -14371,9 +14948,74 @@ pub fn meta_eval_member(e: i64) i64 {
 // 且预算已耗尽时补充 500000，避免共享预算在语义分析期（早于 meta_pass 的 500000 重置）
 // 直接归零、导致合法 const 求值误报 T-MTA-E011。递归链不补预算，故不终止的 comptime
 // 循环（tests/conformance/fail/f66_meta_budget.tc）仍会被 500000 步预算截断。
+
+// ── R-020 注解反射辅助：把解析期注解节点（A 链）折叠为 []Attribute / []AttrArg 编译期值 ──
+// AttrArg.kind 编码：0=string, 1=number, 2=bool, 3=ident, 4=list（多个 ident 用逗号连接）。
+pub fn meta_attr_args_to_array(args_head: i64) i64 {
+    var ah: i64 = -1; var at: i64 = -1;
+    if (args_head >= 0) {
+        var ks: []i64 = base.kids_chain(args_head);
+        var ki: i64 = 0;
+        while (ki < slice_len(ks) as i64) {
+            var arg: i64 = ks[ki];
+            var kind: i64 = 0;
+            var val: string = "";
+            var ak: string = base.node_kind((arg as u64));
+            if (ak == "string") { kind = 0; val = base.node_sa((arg as u64)); }
+            else if (ak == "number") { kind = 1; val = base.node_sa((arg as u64)); }
+            else if (ak == "bool") { kind = 2; if (base.node_sa((arg as u64)) == "true") { val = "true"; } else { val = "false"; } }
+            else if (ak == "ident") { kind = 3; val = base.node_sa((arg as u64)); }
+            else if (ak == "list") {
+                kind = 4;
+                var lks: []i64 = base.kids_chain(base.node_la((arg as u64)));
+                var li: i64 = 0;
+                while (li < slice_len(lks) as i64) {
+                    var ln: i64 = lks[li];
+                    if (li > 0) { val = base__sb_cat2(val, ","); }
+                    val = base__sb_cat2(val, base.node_sa((ln as u64)));
+                    li = li + 1;
+                }
+            } else { kind = 0; val = ""; }
+            var fkh: i64 = -1; var fkt: i64 = -1;
+            fkt = base__list_push(fkh, fkt, base__mk_FV("kind", mv_int(kind), -1)); if (fkh < 0) { fkh = fkt; }
+            fkt = base__list_push(fkh, fkt, base__mk_FV("value", base.mk_string(val, -1), -1)); if (fkh < 0) { fkh = fkt; }
+            var argval: i64 = base__mk_struct_lit("AttrArg", fkh, -1);
+            at = base__list_push(ah, at, argval);
+            if (ah < 0) { ah = at; }
+            ki = ki + 1;
+        }
+    }
+    var arr: i64 = base.mk_array_lit(ah, -1);
+    base.node_set_type(arr, ti_elem_of("Slice", g_ti_AttrArg_ti));
+    return arr;
+}
+
+// 把一个注解链（A 节点链表）折叠为 []Attribute 编译期值。
+pub fn meta_attr_to_array(anns_head: i64) i64 {
+    var ah: i64 = -1; var at: i64 = -1;
+    if (anns_head >= 0) {
+        var ks: []i64 = base.kids_chain(anns_head);
+        var ki: i64 = 0;
+        while (ki < slice_len(ks) as i64) {
+            var ann: i64 = ks[ki];
+            var aname: string = base.node_sa((ann as u64));
+            var args: i64 = meta_attr_args_to_array(base.node_la((ann as u64)));
+            var fkh: i64 = -1; var fkt: i64 = -1;
+            fkt = base__list_push(fkh, fkt, base__mk_FV("name", base.mk_string(aname, -1), -1)); if (fkh < 0) { fkh = fkt; }
+            fkt = base__list_push(fkh, fkt, base__mk_FV("args", args, -1)); if (fkh < 0) { fkh = fkt; }
+            var aval: i64 = base__mk_struct_lit("Attribute", fkh, -1);
+            at = base__list_push(ah, at, aval);
+            if (ah < 0) { ah = at; }
+            ki = ki + 1;
+        }
+    }
+    var arr: i64 = base.mk_array_lit(ah, -1);
+    base.node_set_type(arr, ti_elem_of("Slice", g_ti_Attribute_ti));
+    return arr;
+}
+
 pub fn meta_eval(e: i64) i64 {
-    g_me_depth = g_me_depth + 1;
-    if (g_me_depth == 1 and g_meta_steps <= 0) { g_meta_steps = 500000; g_me_count = 0; }
+    g_me_depth = g_me_depth + 1;    if (g_me_depth == 1 and g_meta_steps <= 0) { g_meta_steps = 500000; g_me_count = 0; }
     var r: i64 = meta_eval_rec(e);
     g_me_depth = g_me_depth - 1;
     return r;
@@ -14515,6 +15157,123 @@ pub fn meta_eval_rec(e: i64) i64 {
         var r: i64 = base.mk_ct_variant("TypeInfo", arm, payload);
         base.node_set_type(r, g_ti_TypeInfo_ti);
         return r;
+    }
+    if (base.node_kind((e as u64)) == "enummembers") {
+        // @enum_members(T) 编译期返回 []EnumMember（成员名/值表，供 R-022 反射读取）。
+        // 与 @type_info 同走 CTFE 折叠：meta_eval 在此构造 comptime array_lit 值，
+        // 由 comptime_fold_pass 原地改写为 array_lit 节点，TIR 再经
+        // tir_maybe_array_to_slice 物化为运行时 %TSlice（与 var x: []T = [..] 同路径）。
+        var tnode: i64 = base.node_na((e as u64));
+        if (tnode < 0) {
+            var tname0: string = base.node_sa((e as u64));
+            tnode = type_node_from_ident(tname0);
+        }
+        var tname: string = ti_type_name(tnode);
+        ensure_reflection_builtins();
+        var si: i64 = sym_lookup(global_scope, tname);
+        if (si < 0) {
+            return meta_fail("T-MTA-E016", base__sb_cat2("`@enum_members` 找不到类型 `", tname), e);
+        }
+        var decl: i64 = syms[si].decl;
+        if (base.node_kind((decl as u64)) != "EnumDecl") {
+            return meta_fail("T-MTA-E016",
+                base__sb_cat3("`@enum_members` 要求枚举类型，但 `", tname, "` 不是枚举"), e);
+        }
+        var mh: i64 = base.node_lb((decl as u64));
+        var emh: i64 = -1;
+        var emt: i64 = -1;
+        if (mh >= 0) {
+            var ks: []i64 = base.kids_chain(mh);
+            var ki: i64 = 0;
+            var auto_val: i64 = 0;   // 自动编号游标（与 fold_enum_values 同口径）
+            while (ki < slice_len(ks) as i64) {
+                var mn: i64 = ks[ki];
+                var mname: string = base.node_sa((mn as u64));
+                // R-032：直接从成员节点取已折好的整型值，不再查 g_enum_cn/g_enum_cvi
+                // 全局表（该表在 CTFE 阶段未必填充，导致恒 -1 的静默错数据，违反 001 §5 红线）。
+                // 与 fold_enum_values 同源：成员值表达式在 na 上，显式值已折为 int 字面量，
+                // 未折的尝试再 meta_eval 一次；自动编号成员（na < 0）按游标续推。
+                var mval: i64 = -1;
+                var mvn: i64 = base.node_na((mn as u64));
+                if (mvn >= 0) {
+                    if (base.node_kind((mvn as u64)) == "int") {
+                        mval = js_parse_int(base.node_sa((mvn as u64)), base.node_ia((mvn as u64)));
+                    } else {
+                        var vv: i64 = meta_eval(mvn);
+                        g_meta_err = false;   // 复位：避免不可折节点污染后续成员
+                        if (vv >= 0 and base.node_kind((vv as u64)) == "int") {
+                            mval = js_parse_int(base.node_sa((vv as u64)), base.node_ia((vv as u64)));
+                        }
+                    }
+                } else {
+                    mval = auto_val;   // 自动编号成员
+                }
+                if (mval >= 0) { auto_val = mval + 1; }
+                var fifh: i64 = -1;
+                var fift: i64 = -1;
+                fift = base__list_push(fifh, fift, base__mk_FV("name", base.mk_string(mname, -1), -1));
+                if (fifh < 0) { fifh = fift; }
+                fift = base__list_push(fifh, fift, base__mk_FV("value", mv_int(mval), -1));
+                if (fifh < 0) { fifh = fift; }
+                var emval: i64 = base__mk_struct_lit("EnumMember", fifh, -1);
+                emt = base__list_push(emh, emt, emval);
+                if (emh < 0) { emh = emt; }
+                ki = ki + 1;
+            }
+        }
+        var arr: i64 = base.mk_array_lit(emh, -1);
+        base.node_set_type(arr, ti_elem_of("Slice", g_ti_EnumMember_ti));
+        return arr;
+    }
+    if (base.node_kind((e as u64)) == "typeattributes") {
+        // @type_attributes(T) 编译期返回 []Attribute（类型声明上的用户级注解表，供 R-020/R-022 反射读取）。
+        var tnode: i64 = base.node_na((e as u64));
+        if (tnode < 0) {
+            var tname0: string = base.node_sa((e as u64));
+            tnode = type_node_from_ident(tname0);
+        }
+        var tname: string = ti_type_name(tnode);
+        ensure_reflection_builtins();
+        var si: i64 = sym_lookup(global_scope, tname);
+        if (si < 0) {
+            return meta_fail("T-MTA-E016", base__sb_cat2("`@type_attributes` 找不到类型 `", tname), e);
+        }
+        var decl: i64 = syms[si].decl;
+        var anns: i64 = -1;
+        if (decl >= 0) { anns = base.node_la((decl as u64)); }
+        return meta_attr_to_array(anns);
+    }
+    if (base.node_kind((e as u64)) == "fieldattributes") {
+        // @field_attributes(T, "field") 编译期返回 []Attribute（指定字段上的注解表，供 R-021 @deprecated 反射读取）。
+        var tnode: i64 = base.node_na((e as u64));
+        if (tnode < 0) {
+            var tname0: string = base.node_sa((e as u64));
+            tnode = type_node_from_ident(tname0);
+        }
+        var tname: string = ti_type_name(tnode);
+        var fan: string = base.node_sb((e as u64));
+        ensure_reflection_builtins();
+        var si: i64 = sym_lookup(global_scope, tname);
+        if (si < 0) {
+            return meta_fail("T-MTA-E016", base__sb_cat2("`@field_attributes` 找不到类型 `", tname), e);
+        }
+        var decl: i64 = syms[si].decl;
+        if (base.node_kind((decl as u64)) != "StructDecl") {
+            return meta_fail("T-MTA-E016",
+                base__sb_cat3("`@field_attributes` 要求结构体类型，但 `", tname, "` 不是结构体"), e);
+        }
+        var flds: i64 = base.node_lb((decl as u64));
+        var anns: i64 = -1;
+        if (flds >= 0) {
+            var ks: []i64 = base.kids_chain(flds);
+            var ki: i64 = 0;
+            while (ki < slice_len(ks) as i64) {
+                var f: i64 = ks[ki];
+                if (base.node_sa((f as u64)) == fan) { anns = base.node_la((f as u64)); break; }
+                ki = ki + 1;
+            }
+        }
+        return meta_attr_to_array(anns);
     }
     return meta_fail("T-MTA-E016",
         base__sb_cat3("表达式 `", base.node_kind((e as u64)), "` 不可编译期求值"), e);
@@ -14853,6 +15612,35 @@ pub fn meta_eval_binary(e: i64) i64 {
     if (lv < 0) { return -1; }
     var rv: i64 = meta_eval(base.node_nb((e as u64)));
     if (rv < 0) { return -1; }
+    // R-036：编译期 `++`（Concat）—— 字符串拼接与数组（切片）拼接，与运行期 ++ 同源。
+    // 此前 CTFE 无此分支，导致 `comptime const A = "x" ++ "y"` / `slice_len` 静默失败、
+    // 退回零值（A=[] / 字符串空），正是 thyme 报告的「CTFE 下 ++ 静默为空」。
+    if (op == "Concat") {
+        if (base.node_kind((lv as u64)) == "string" and base.node_kind((rv as u64)) == "string") {
+            var sbs: StringBuilder = sb_new();
+            sb_append_str(sbs, base.node_sa((lv as u64)));
+            sb_append_str(sbs, base.node_sa((rv as u64)));
+            return base__mk_string(sb_to_str(sbs), -1);
+        }
+        if (base.node_kind((lv as u64)) == "array_lit" and base.node_kind((rv as u64)) == "array_lit") {
+            var h: i64 = -1;
+            var t: i64 = -1;
+            var c: i64 = base.node_la((lv as u64));
+            while (c >= 0) {
+                t = base__list_push(h, t, base__kids[c].val);
+                if (h < 0) { h = t; }
+                c = base__kids[c].next;
+            }
+            c = base.node_la((rv as u64));
+            while (c >= 0) {
+                t = base__list_push(h, t, base__kids[c].val);
+                if (h < 0) { h = t; }
+                c = base__kids[c].next;
+            }
+            return base__mk_array_lit(h, -1);
+        }
+        return meta_fail("T-MTA-E016", "编译期 `++` 的操作数须同为字符串或同为数组", e);
+    }
     if (base.node_kind((lv as u64)) == "string" or base.node_kind((rv as u64)) == "string") {
         if (base.node_kind((lv as u64)) != "string" or base.node_kind((rv as u64)) != "string") {
             return meta_fail("T-MTA-E016", "编译期字符串只能与字符串比较", e);
@@ -15294,11 +16082,18 @@ pub fn build_typemeta_value(tnode: i64, arm: string) i64 {
     ft = base__list_push(fh, ft, f_size);
     var f_kind: i64 = base__mk_FV("kind", mv_int(ti_arm_code(arm)), -1);
     ft = base__list_push(fh, ft, f_kind);
-    // field_types：Struct 类型由各字段类型合成 type 值数组
+    // field_types / fields：Struct 类型由各字段合成（type 值数组 + FieldInfo 数组）。
+    // 与运行期 type_info 暴露的 FieldInfo 成员（fi_name/fi_offset/fi_tag 等）保持一致：
+    // 同一份元信息，编译期与运行期两套入口不应出现「运行期有、编译期没有」的割裂。
     var fth: i64 = -1;
     var ftt: i64 = -1;
+    var ffh: i64 = -1;   // FieldInfo 值链表头（fields 数组元素）
+    var fft: i64 = -1;
     var nfields: i64 = 0;
     if (arm == "Struct") {
+        var si_f: i64 = sym_lookup(global_scope, tname);
+        var sdecl: i64 = -1;
+        if (si_f >= 0) { sdecl = syms[si_f].decl; }
         var fld: i64 = find_struct_fields(tname);
         if (fld >= 0) {
             var ks: []i64 = base.kids_chain(fld);
@@ -15306,10 +16101,31 @@ pub fn build_typemeta_value(tnode: i64, arm: string) i64 {
             while (ki < slice_len(ks) as i64) {
                 var fv_node: i64 = ks[ki];
                 var ftype: i64 = base.node_na((fv_node as u64));
+                // field_types 元素：真实 comptime type 值
                 var ftname: string = meta_type_to_str(ftype);
-                var tyval: i64 = type_node_from_ident(ftname);   // 真实 comptime type 值
+                var tyval: i64 = type_node_from_ident(ftname);
                 ftt = base__list_push(fth, ftt, tyval);
                 if (fth < 0) { fth = ftt; }
+                // fields 元素：FieldInfo 值（name/offset/type_name/type_size/is_ptr/tag）
+                var ffname: string = base.node_sa((fv_node as u64));
+                var ftag: i64 = base.node_ib((fv_node as u64));   // pb @N tagID（>=1 显式 / 自动分配 / -1）
+                var foff: i64 = -1;
+                if (sdecl >= 0) { foff = mb_struct_field_offset(sdecl, ffname); }
+                if (foff < 0) { foff = 0; }
+                var ftn: string = ti_type_name(ftype);
+                var ftsz: i64 = mb_size_of(ftype, 0);
+                if (ftsz < 0) { ftsz = 0; }
+                var fisptr: bool = (base.node_kind((ftype as u64)) == "pointer");
+                var fifh: i64 = -1; var fift: i64 = -1;
+                fift = base__list_push(fifh, fift, base__mk_FV("name", base.mk_string(ffname, -1), -1)); if (fifh < 0) { fifh = fift; }
+                fift = base__list_push(fifh, fift, base__mk_FV("offset", mv_int(foff), -1)); if (fifh < 0) { fifh = fift; }
+                fift = base__list_push(fifh, fift, base__mk_FV("type_name", base.mk_string(ftn, -1), -1)); if (fifh < 0) { fifh = fift; }
+                fift = base__list_push(fifh, fift, base__mk_FV("type_size", mv_int(ftsz), -1)); if (fifh < 0) { fifh = fift; }
+                fift = base__list_push(fifh, fift, base__mk_FV("is_ptr", mv_bool(fisptr), -1)); if (fifh < 0) { fifh = fift; }
+                fift = base__list_push(fifh, fift, base__mk_FV("tag", mv_int(ftag), -1)); if (fifh < 0) { fifh = fift; }
+                var fival: i64 = base__mk_struct_lit("FieldInfo", fifh, -1);
+                fft = base__list_push(ffh, fft, fival);
+                if (ffh < 0) { ffh = fft; }
                 nfields = nfields + 1;
                 ki = ki + 1;
             }
@@ -15318,7 +16134,7 @@ pub fn build_typemeta_value(tnode: i64, arm: string) i64 {
     var arr: i64 = base.mk_array_lit(fth, -1);
     var f_fc: i64 = base__mk_FV("field_count", mv_int(nfields), -1);
     ft = base__list_push(fh, ft, f_fc);
-    var f_fields: i64 = base__mk_FV("fields", base.mk_array_lit(-1, -1), -1);   // 占位空数组
+    var f_fields: i64 = base__mk_FV("fields", base.mk_array_lit(ffh, -1), -1);
     ft = base__list_push(fh, ft, f_fields);
     var f_ft: i64 = base__mk_FV("field_types", arr, -1);
     ft = base__list_push(fh, ft, f_ft);
@@ -15334,7 +16150,7 @@ pub fn meta_eval_builtin(e: i64, name: string) i64 {
     // 故此处不再登记；编译期上下文里出现它们会落到下面的 impure / -2 分支而报错，
     // 编译期输出请改用 `@compile_log(...)`。
     if (name == "int_to_str" or name == "i2s") { isb = true; }
-    if (name == "str_len" or name == "str_at") { isb = true; }
+    if (name == "str_len" or name == "str_at" or name == "slice_len") { isb = true; }
     if (name == "sym_intern") { isb = true; }
     if (isb == false) {
         if (meta_builtin_impure(name)) {
@@ -15382,6 +16198,22 @@ pub fn meta_eval_builtin(e: i64, name: string) i64 {
             return meta_fail("T-MTA-E016", "编译期 `str_len` 的实参须是字符串", e);
         }
         return mv_int(str_len(base.node_sa((argv[0] as u64))) as i64);
+    }
+    // R-032/R-036 同族：编译期 slice_len —— 支持 array_lit（CTFE 数组值）与 string，
+    // 使 `comptime const N = slice_len(@enum_members(E))` 与 `slice_len("xy")` 能折出正确长度，
+    // 不再因 CTFE 期无 slice_len 内建而求值失败、退回 int 零值（表现为 ct_count=0 的静默错）。
+    if (name == "slice_len") {
+        if (an != 1) {
+            return meta_fail("T-MTA-E010", "编译期 `slice_len` 需要 1 个实参", e);
+        }
+        var bv: i64 = argv[0];
+        if (base.node_kind((bv as u64)) == "string") {
+            return mv_int(str_len(base.node_sa((bv as u64))) as i64);
+        }
+        if (base.node_kind((bv as u64)) == "array_lit") {
+            return mv_int(slice_len(base.kids_chain_idx(base.node_la((bv as u64)))) as i64);
+        }
+        return meta_fail("T-MTA-E016", "编译期 `slice_len` 的实参须是数组或字符串", e);
     }
     if (an != 2) {
         return meta_fail("T-MTA-E010", "编译期 `str_at` 需要 2 个实参", e);
@@ -16246,7 +17078,18 @@ pub fn meta_pass() void {
                 var gv: i64 = meta_eval(base.node_nb((d as u64)));
                 g_meta_quiet = false;
                 g_meta_err = false;
-                if (gv >= 0) { menv_push(base.node_sa((d as u64)), gv); }
+                if (gv >= 0) {
+                    menv_push(base.node_sa((d as u64)), gv);
+                    // R-018：CTFE 折叠结果落地到运行期常量。const/let 初始化器一旦可编译期
+                    // 折叠，将其 AST 替换为折叠后的字面量，使后续 check 与双后端 codegen 直接见到
+                    // 常量值，而非未折叠的 comptime fn 调用（后者无运行期体，会静默落 0 / 垃圾值，
+                    // 违反验收标准第 3 条「无法折叠必须报错」）。先落地标量字面量（int/bool/string/
+                    // float）——覆盖「编译期算出的数，运行期是常量」主路径；聚合值后续按需扩展。
+                    var gvk: string = base.node_kind((gv as u64));
+                    if (gvk == "int" or gvk == "bool" or gvk == "string" or gvk == "float") {
+                        base.node_set_nb((d as u64), gv);
+                    }
+                }
             }
         }
         i = i + 1;
@@ -17348,6 +18191,16 @@ pub fn mb_pass() void {
 // P4 值→类型查询：在 CTFE 期把表达式 e 的静态类型折成类型节点（类型即值）。
 // 覆盖 p45 用到的形态：变量 / 浮点 / 字符串 / 结构体 / 结构体字段 / 切片 / 定长数组 /
 // 数组元素 / 函数返回值 / 字面量 / cast 表达式。返回类型节点，-1 表示无法确定。
+// 标量位宽（仅 @bitCast 用）：与 tir.tc:tir_width 同源但本模块内联，避免跨模块链接。
+// ⚠ 仅覆盖标量/浮点；聚合类型不走这里（R-013 的 @bitCast 仅服务标量真位重解释）。
+pub fn sema_bitcast_width(st: string) i64 {
+    if (st == "i8" or st == "u8" or st == "bool") { return 8; }
+    if (st == "i16" or st == "u16") { return 16; }
+    if (st == "i32" or st == "u32" or st == "f32") { return 32; }
+    if (st == "i64" or st == "u64" or st == "f64") { return 64; }
+    return -1;       // 未知/聚合：交给下游宽度校验报错路径
+}
+
 pub fn meta_type_of_expr(e: i64) i64 {
     if (e < 0) { return -1; }
     if (base.node_kind((e as u64)) == "paren" or base.node_kind((e as u64)) == "comptime") { return meta_type_of_expr(base.node_na((e as u64))); }
@@ -18612,7 +19465,7 @@ pub struct AnnDef {
 pub var g_ad_count: i64 = 39;
 pub var g_ad_name: [39]string = ["test", "test_skip", "test_only", "expect_fail", "test_group", "skip", "only", "should_fail", "tag", "derive", "cfg", "cfg_attr", "allow", "warn", "deny", "deprecated", "repr", "no_padding", "align", "bitpack", "offset", "binary_offset", "binary_skip", "soa", "aos", "inline", "no_inline", "must_use", "const_fn", "unsafe", "main", "export_symbol", "link_name", "c_export", "panic_handler", "doc", "doc_file", "export", "auto_convert"];
 pub var g_ad_spec: [39]string = ["none", "none", "none", "none", "string", "mixed", "none", "none", "ident_list", "ident_list", "ident", "mixed", "ident_list", "ident_list", "ident_list", "string", "ident", "none", "number", "ident", "number", "number", "none", "none", "none", "none", "none", "none", "none", "none", "none", "string", "string", "none", "none", "string", "string", "mixed", "none"];
-pub var g_ad_targets: [39]string = ["func", "func", "func", "func", "func", "func", "func", "func", "func", "struct, enum, flag, flag_set, union", "global, func, struct, enum, var, const", "global, func, struct, enum", "global, func, struct, var, const", "global, func, struct, var, const", "global, func, struct, var, const", "global, func, struct, enum, var, const", "struct, enum, union", "struct, flag", "struct, union", "struct", "flag_slot", "field", "field", "struct", "struct", "func", "func", "func", "func", "func", "func", "func", "func", "func", "func", "global, func, struct, enum, var, const, field", "func, struct, enum", "field, func, var, const", "struct, enum"];
+pub var g_ad_targets: [39]string = ["func", "func", "func", "func", "func", "func", "func", "func", "func", "struct, enum, flag, flag_set, union", "global, func, struct, enum, var, const", "global, func, struct, enum", "global, func, struct, var, const", "global, func, struct, var, const", "global, func, struct, var, const", "global, func, struct, enum, var, const, field", "struct, enum, union", "struct, flag", "struct, union", "struct", "flag_slot", "field", "field", "struct", "struct", "func", "func", "func", "func", "func", "func", "func", "func", "func", "func", "global, func, struct, enum, var, const, field", "func, struct, enum", "field, func, var, const", "struct, enum"];
 pub var g_ad_depr: [39]bool = [true, true, true, true, true, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, true];
 pub var g_ad_repl: [39]string = ["a `test \"name\" { ... }` declaration", "@skip", "@only", "@should_fail", "a `suite \"name\" { ... }` block", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "@derive(FromString)"];
 
@@ -18816,6 +19669,16 @@ pub fn ann_check_item(v: string, is_derive: bool, l: i64, c: i64) void {
 // validate（复刻 registry.ts:168）；ai = A 节点索引
 pub fn ann_validate(ai: i64, target: string) void {
     var name: string = base.node_sa((ai as u64));
+    // pb 修饰关键词：裸 `pb` / `@pb` 标记结构体为 protobuf message（与 `#pb` 同义）。
+    // 非注册注解，跳过未知注解校验（不要求进 g_ad_name 表，避免并行数组维护成本）。
+    if (name == "pb") { return; }
+    // R-030：proto3 别名标记 `@allow_alias` 仅对 enum 合法（声明级），跳过未知注解校验。
+    // 改为无条件跳过：该标记只被 #pb enum 的 proto3 重复值检查消费，放宽为无条件不影响约束。
+    if (name == "allow_alias") { return; }
+    // R-034：注册的自定义修饰词（#modifier 注册 / 内建 soa/aos）不是 @ 注解注册表成员，
+    // 但其合成注解节点已并入 anns 供反射读取；跳过未知注解校验，避免误报 T-ANN-E000。
+    // （pb 已升级为语境关键词，由上方 `if name=="pb" return` 单独跳过。）
+    if (lex.modifier_known(name)) { return; }
     var l: i64 = base.node_span_id(ai).line as i64;
     var c: i64 = base.node_span_id(ai).col as i64;
     var name_len: i64 = str_len(name) as i64;
