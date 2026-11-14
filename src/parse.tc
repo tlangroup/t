@@ -198,15 +198,48 @@ pub fn is_scalar_name(name: string) bool {
 }
 // <<< GEN:scalar_pred <<<
 
+// R-024：内联（匿名）嵌套 struct / enum 类型（如 `#pb struct Outer { inner: struct { x: i64 @ 1; } @ 1; }`）。
+// 合成唯一名并按「元组类型」同范式 append 到 decl_list，返回 named 节点引用。
+// 注意：嵌套类型声明会被 sema 当作普通具名类型注册（与 .{...} 元组类型同机制），
+// 故 StructDecl / EnumDecl 必须真正进入 decl_list 才能被 resolve_ti 找到。
+var g_nested_type_seq: i64 = 0;
+pub fn next_nested_type_name() string {
+    g_nested_type_seq = g_nested_type_seq + 1;
+    return base.sb_cat2("__nested_", base.i2s(g_nested_type_seq));
+}
+
+// R-038：命名嵌套类型声明（struct/enum 体内嵌具名 struct/enum，如 `#pb struct Outer { struct Inner {...} }`）。
+// 与 protobuf 的 DescriptorProto.nested_type 同构：嵌套类型是「完全限定名 = 父__子」（Outer__Inner）的真实类型，
+// 注册进 decl_list 即为真实类型；父→子归属另由 register_nested_decl 登记，供 mangle_modules 把
+// `Outer.Inner` 重整为 `Outer__Inner`，亦供任何下游 TDA/tdagen 还原 NestedType 归属（不以扁平化 `OuterInner` 丢失归属）。
+pub var g_nested_full: []string = [];          // 子全名，如 Outer__Inner
+pub var g_nested_parent_full: []string = [];   // 父全名，如 Outer
+pub var g_nested_child_local: []string = [];   // 子本地名，如 Inner
+pub fn register_nested_decl(full: string, parent: string, child: string) void {
+    append(g_nested_full, full);
+    append(g_nested_parent_full, parent);
+    append(g_nested_child_local, child);
+}
+// 给定父全名 + 子本地名，返回子全名（命中才返回非空）；mangle_modules 用它判定 `Outer.Inner` 是否合法嵌套类型。
+pub fn nested_full_of(parent: string, child: string) string {
+    var cand: string = base.sb_cat3(parent, "__", child);
+    var k: i64 = 0;
+    while (k < slice_len(g_nested_full) as i64) {
+        if (g_nested_full[k] == cand) { return cand; }
+        k = k + 1;
+    }
+    return "";
+}
+
 pub fn parse_type_inner() i64 {
     var t: string = lex.cur_t();
     // 括号类型 `( Type )`：只用来改写类型运算符的结合边界，**不包层、不引入新 kind**，
-    // 直接返回内部类型节点 ⇒ 对 sema / codegen 完全透明（<(A && B)?> 与 <C> 得到同一个 kind 的形态）。
+    // 直接返回内部类型节点 ⇒ 对 sema / codegen 完全透明（<?(A && B)> 与 <C> 得到同一个 kind 的形态）。
     // 存在理由：两处**表达式内部**类型位（`as T` 的 parse_post_cast、`fid > T` 的 M52 读路径）
     //   必须关闭合取连词（否则 `x as T && cond` 会被误读）⇒ 那里写不出合取类型，
-    //   括号是唯一的正经退路（`x as (A && B)`、`fid > (A && B)`）；`(A && B)?`、`*(A && B)` 同理。
+    //   括号是唯一的正经退路（`x as (A && B)`、`fid > (A && B)`）；`?(A && B)`、`*(A && B)` 同理。
     // ⚠ `()` 空括号不合法 —— unit / void 请用既有的关键字，不要指望 `()` 占位。
-    // ⚠ 这里调用的是 **parse_type**（非 inner）：括号内部允许完整的后缀 `?` 与合取连词，
+    // ⚠ 这里调用的是 **parse_type**（非 inner）：括号内部允许完整的合取连词与前缀 `?T`，
     //   这与 `[N]T` / `*T` / `?T` 内部的处理保持一致。
     if (t == "LParen") {
         lex.advance_i();
@@ -370,6 +403,28 @@ pub fn parse_type_inner() i64 {
         // meta T: type 的「类型之类型」占位；单态化时整体移除，与 any 同语义。
         return base.node_new("type");
     }
+    // R-024：内联 struct 类型 `struct { ... }`（匿名嵌套结构体，字段可自带 tagID / 嵌套更深）。
+    if (t == "KwStruct") {
+        lex.advance_i();   // 吃掉 `struct`
+        var nts: string = next_nested_type_name();
+        var sd: i64 = parse_struct_decl(nts, -1, "");
+        if (sd >= 0) {
+            base.node_at(sd, lex.pos - 1);
+            append(lex.decl_list, sd);
+        }
+        return base.mk_named(nts, -1);
+    }
+    // R-024：内联 enum 类型 `enum { ... }`（匿名嵌套枚举）。
+    if (t == "KwEnum") {
+        lex.advance_i();   // 吃掉 `enum`
+        var nte: string = next_nested_type_name();
+        var ed: i64 = parse_enum_decl(nte, -1);
+        if (ed >= 0) {
+            base.node_at(ed, lex.pos - 1);
+            append(lex.decl_list, ed);
+        }
+        return base.mk_named(nte, -1);
+    }
     if (t == "Identifier") {
         var idx: i64 = lex.advance_i();
         var name: string = lex.tk_v(idx);
@@ -472,10 +527,11 @@ pub fn parse_type_inner() i64 {
 //   而危险方向（把值级 `&&` 误吃进类型）只剩两个受控点。
 pub fn parse_type_ex(allow_and: bool) i64 {
     var t0: i64 = parse_type_inner();
-    while (lex.cur_t() == "Question") {
-        lex.advance_i();
-        t0 = base.mk_optional(t0, -1);
-    }
+    // ⚠ 2026-10-29：**后缀 `T?` 已从语法中删除** —— Zig 0.17 只有前缀 `?T`（裁定 O-1，
+    //   docs/design/option/DESIGN.md §2）。此处不再吃类型之后的 `Question`：
+    //   遇到 `i64?` 会停在 `?` 上，由调用方的 expect_tok 直接报错位，
+    //   而不是静默落成 Optional。裸 `?` 现在只剩「表达式位 opt_none 字面量」一处含义。
+    //   （历史上这里的 while 循环还会重复累加 `T??` / `T???`，一并移除。）
     // §set-ops 岔路 B：concept 多约束连词 `T: A & B`（§13.3 格族：类型位 meet 与值位
     // 集合交同为 `&`，不再另立 `&&`）。约束位把多个 concept 名连成 binary("&", ...)
     // 节点，由 sema.generic_normalize_func / collect_concept_constraints 拆解成约束列表。
@@ -648,8 +704,90 @@ pub fn parse_bitstr_lit(pat: bool) i64 {
     return base.mk_bitstr(h, -1);
 }
 
-pub fn parse_assign_expr() i64 {
+// ── O-4：`orelse`（对齐 Zig 0.17）──────────────────────────────
+// `a orelse b`：左操作数为 `?T`，非 none 时取出其值，否则求值右操作数。
+// 两条硬性语义要求使它**不能**压成 `orelse(a, b)` 这样的普通内建调用：
+//   ① 左操作数必须**只求值一次**（故须落入临时变量）；
+//   ② 右操作数必须**短路**（none 时不得求值）。
+// 因此走与值 if（`parse_value_if`，parse.tc:5195）同款姿势 —— 在 parser 层脱糖为
+// **已有节点组合**，双后端一行都不用改（设计 §2.9 姿势 A「脱糖在前、分后端在后」）：
+//
+//     { var __ol_N = a;
+//       match (is_some(__ol_N)) { true => unwrap(__ol_N), false => b } }
+//
+// 外层是 `block_expr`（base.tc:3450）；末语句必须是 `expr` 包装，因为 `infer_block_expr`
+// （sema.tc:6518）只把**末条 `expr` 语句**的 `na` 认作块值。临时名用自增计数器保证嵌套唯一，
+// 同 `desugar_value_loop` 按节点 id 命名的做法。
+//
+// **优先级**：塔变为 `assign → orelse → pipe → in → concat → range → or → … → primary`。
+// orelse 是最松的二元级 —— 与 Zig 的优先级表一致（orelse / catch 最低）。
+// 放在这里还有个工程好处：下行各层**一个调用点都不用改**，`a..b` / `a |> f` 等既有行为
+// 一字不变，满足 L-03「塔只向下扩展、不重排」。
+var g_orelse_uid: i64;
+
+// Z10：与比较运算混用时 Zig 要求显式括号 —— `x orelse y == z` 在 Zig 是**编译错误**，
+// 不是解析妥协。判据是操作数的**顶层**节点：写了括号时顶层是 `paren`（parse.tc:1280
+// 保留括号节点），裸写时顶层是 `binary` 且其 `sa` 为比较算符 ⇒ 二者可区分。
+fn orelse_operand_is_bare_cmp(n: i64) bool {
+    if (n < 0) { return false; }
+    if (base.node_kind((n as u64)) != "binary") { return false; }
+    var op: string = base.node_sa((n as u64));
+    if (op == "==" or op == "!=" or op == "<" or op == ">" or op == "<=" or op == ">=") { return true; }
+    return false;
+}
+
+// 单实参内建调用（some/unwrap/is_some/is_none 均按名字识别，见 sema.tc:8761）
+fn mk_call1(name: string, arg: i64, ti: i64) i64 {
+    var ah: i64 = base.list_push(-1, -1, arg);
+    return base.mk_call(base.mk_ident(name, -1), ah, ti);
+}
+
+pub fn desugar_orelse(a: i64, b: i64, ti: i64) i64 {
+    g_orelse_uid = g_orelse_uid + 1;
+    var tname: string = base.sb_cat2("__ol_", base.i2s(g_orelse_uid));
+    // var __ol_N = a;   —— na = -1：不写类型标注，由初始化式推断
+    var vd: i64 = base.mk_var_decl(tname, false, -1, a, ti);
+    var cond: i64 = mk_call1("is_some", base.mk_ident(tname, ti), ti);
+    var tval: i64 = mk_call1("unwrap", base.mk_ident(tname, ti), ti);
+    var t_arm: i64 = base.mk_arm("", false, base.mk_bool(true, ti), -1, tval, ti);
+    var f_arm: i64 = base.mk_arm("", false, base.mk_bool(false, ti), -1, b, ti);
+    // ⚠ mk_match 的 la 是 kids（Child）链表**下标**，不是节点 id —— 必须走 list_push。
+    var head: i64 = -1;
+    var tail: i64 = -1;
+    tail = base.list_push(head, tail, t_arm);
+    if (head < 0) { head = tail; }
+    tail = base.list_push(head, tail, f_arm);
+    if (head < 0) { head = tail; }
+    var m: i64 = base.mk_match(cond, head, ti);
+    var mstmt: i64 = base.mk_expr(m, ti);
+    var s_head: i64 = -1;
+    var s_tail: i64 = -1;
+    s_tail = base.list_push(s_head, s_tail, vd);
+    if (s_head < 0) { s_head = s_tail; }
+    s_tail = base.list_push(s_head, s_tail, mstmt);
+    if (s_head < 0) { s_head = s_tail; }
+    return base.mk_block_expr(s_head, ti);
+}
+
+pub fn parse_orelse() i64 {
     var left: i64 = parse_pipe();
+    if (lex.cur_t() == "KwOrelse") {
+        // 不明示括号就拒绝，并直接指出该怎么写（同 parse_value_if:5201 的报错风格，不带诊断码）
+        if (orelse_operand_is_bare_cmp(left)) {
+            parse_fatal("ambiguous precedence: parenthesize the comparison operand of `orelse` (write `(a == b) orelse c`, not `a == b orelse c`)");
+        }
+        var ti: i64 = lex.advance_i();
+        var right: i64 = parse_orelse();     // 右结合，同 `a = b = c`
+        if (orelse_operand_is_bare_cmp(right)) {
+            parse_fatal("ambiguous precedence: parenthesize the comparison operand of `orelse` (write `a orelse (b == c)`, not `a orelse b == c`)");
+        }
+        return desugar_orelse(left, right, ti);
+    }
+    return left;
+}
+
+pub fn parse_assign_expr() i64 {
+    var left: i64 = parse_orelse();
     if (lex.cur_t() == "Assign") {
         var ti: i64 = lex.advance_i();
         var right: i64 = parse_assign_expr();
@@ -1491,6 +1629,16 @@ pub fn parse_block_stmt() i64 {
     var body3: i64 = parse_block();
     var id4: i64 = base.mk_block(body3, tl);
     return id4;
+}
+
+// R-014：`unsafe { ... }` 语句块。建 kind=="unsafe" 节点，body 为语句链表（la）。
+// sema 检查期间开不安全上下文标志，检查完脱糖为 "block"（后端/返回分析零改动）。
+pub fn parse_unsafe_stmt() i64 {
+    var tl: i64 = lex.pos;
+    var body: i64 = parse_block();
+    var id: i64 = base.mk_block(body, tl);
+    base.node_set_kind((id as u64), "unsafe");
+    return id;
 }
 
 pub fn parse_var_stmt() i64 {
@@ -3148,13 +3296,56 @@ pub fn parse_declaration() i64 {
             if (lex.cur_t() == "Semicolon") { lex.advance_i(); }
             return -1;
         }
-        if (cm_id == "extern") {
-            parse_fatal_at("T-ANN-E004", "modifier '#extern' is obsolete; use the `extern` keyword instead", cm_i);
+        if (cm_id == "pb") {
+            // pb 修饰关键词：`#pb struct Name` 与 `@pb struct Name` 同义，把结构体标记为
+            // protobuf message。合成一个 `pb` 注解节点并入 anns，使 sema 经 ann_find(la, "pb")
+            // 统一识别（与 @pb 注解路径汇合）；pb 非布局修饰，不占用 capmod 槽。
+            // ⚠ 关键：注解链约定「链头/链元存的是 kids 池 entry 索引」，必须由 list_push
+            // 分配 kids 池 entry（node_new 不会分配）。若直接把 mk_A 返回的裸节点 id 当链头，
+            // kids_chain_idx(node_la) 会读到该下标处的陈旧 entry，其 .next 串到字段节点，
+            // 触发 "unknown annotation '@x'"（ann_validate 把字段名当注解名校验）。故这里
+            // 先 list_push 造 entry，再把 entry 索引并入 anns，与 parse_annotations 完全同构。
+            var pan: i64 = base.mk_A("pb", -1, cm_i);
+            var pan_entry: i64 = base.list_push(-1, -1, pan);
+            anns = list_concat(anns, pan_entry);
+            // 跳过 extern / modifier_known / capmod 分支
+        } else {
+            if (cm_id == "extern") {
+                parse_fatal_at("T-ANN-E004", "modifier '#extern' is obsolete; use the `extern` keyword instead", cm_i);
+            }
+            if (lex.modifier_known(cm_id) == false) {
+                parse_fatal_at("T-ANN-E003", base.sb_cat3("modifier '#", cm_id, "' is not registered"), cm_i);
+            }
+            capmod = cm_id;
+            // R-034：注册的自定义修饰词（含内建 soa/aos）同时合成注解节点并入 anns，
+            // 使 @type_attributes / @field_attributes 反射能纳入（custom_type_n 不再恒 0）。
+            // ann_validate 对 modifier_known 名跳过未知注解校验（见 sema.tc）。
+            var mpan: i64 = base.mk_A(cm_id, -1, cm_i);
+            var mpan_entry: i64 = base.list_push(-1, -1, mpan);
+            anns = list_concat(anns, mpan_entry);
         }
-        if (lex.modifier_known(cm_id) == false) {
-            parse_fatal_at("T-ANN-E003", base.sb_cat3("modifier '#", cm_id, "' is not registered"), cm_i);
+    }
+
+    // ── `pb` 修饰关键词（protobuf message）：语境识别，与 packed/extern 同构 ──
+    // 仅声明头、紧跟 struct/enum/variant 前识别；其余语境 `pb` 仍是普通标识符。
+    // 合成 `pb` 注解节点并入 anns，使 sema 经 ann_find(la, "pb") 统一识别（与 `#pb`/`@pb` 同一条路径）。
+    if (lex.cur_t() == "Identifier" and lex.cur_v() == "pb") {
+        var pb_i: i64 = lex.pos;
+        lex.advance_i();   // 吃掉 `pb`
+        // 合成 pb 注解节点并入 anns（必须经 list_push 造 kids 池 entry，见上文 #pb 分支注释）；
+        // 若已存在（如 `@pb` 已先写）则不重复合成，避免双 pb 注解。
+        if (ann_find(anns, "pb") < 0) {
+            var pan: i64 = base.mk_A("pb", -1, pb_i);
+            var pan_entry: i64 = base.list_push(-1, -1, pan);
+            anns = list_concat(anns, pan_entry);
         }
-        capmod = cm_id;
+        // 仅放行紧跟 struct/enum/variant；其余关键字（fn/var/...）报错，不静默落穿到其它派发
+        // （与 packed/extern 同构：非目标关键字即 T-PAR-E002）。放行则落穿到下方 struct/enum/variant dispatch。
+        if (lex.cur_t() == "KwStruct" or lex.cur_t() == "KwEnum" or lex.cur_t() == "KwVariant") {
+            // 落穿
+        } else {
+            parse_fatal_at("T-PAR-E002", "expected 'struct' / 'enum' / 'variant' after 'pb'", pb_i);
+        }
     }
 
     // 模块系统（M-Module）：顶层声明可用 `pub` 修饰，标记对外可见。
@@ -5136,11 +5327,101 @@ pub fn parse_inline_for_stmt() i64 {
     return id;
 }
 
+// ── O-5：可选载荷捕获 `if (x) |v| { … }` / `while (x) |v| { … }`（对齐 Zig Z7/Z8）────────
+//
+// 判空与取值合成**同一处语法**，不可能漂移 —— 这正是 Zig 的设计动机。
+//
+// 无歧义论证（`|v|` 的另两处用法都不在 `)` 之后）：
+//   bar-lambda `|v| expr`  只在**表达式起始位**（parse_primary）被识别；
+//   inline-for `inline for (it) |e| {}`  由 `inline` 关键字前缀区分。
+//   故 `if`/`while` 的 `)` 之后紧跟 `|` 是唯一形态，无需前瞻即可判定。
+//
+// 脱糖（复用既有内建，后端零改动 —— 与 `.?` / `orelse` 同一姿势）：
+//   if   (x) |v| { B }  ⇒  { var __optc_N = x;
+//                            if (is_some(__optc_N)) { var v = unwrap(__optc_N); B } }
+//   while (x) |v| { B }  ⇒  while (true) { var __optc_N = x;
+//                            if (is_none(__optc_N)) { break; } var v = unwrap(__optc_N); B }
+// 两者都保证**条件只求值一次**（先落临时变量），这是脱糖成 `is_some(x)` + `unwrap(x)` 的前提。
+//
+// ⚠ 不做 `|*v|`（Zig 的可变指针捕获）：t 的 unwrap 返回**副本**，取址指向临时量，语义无意义
+//    且易误用 ⇒ 遇到即报编译错误，而不是静默按值捕获。
+
+pub var g_optcap_seq: i64 = 0;
+
+// 调用方已吞掉首个 '|'；返回绑定名，并吞掉**闭合的 '|'**
+// （⚠ 只吃名字不闭合 ⇒ 下一个 parse_block 会在第二个 `|` 上报
+//   「expected LBrace, but found |」，列号指向第二个管道符，极易误判成捕获位没识别到）。
+fn parse_optcap_name() string {
+    if (lex.cur_t() == "Identifier") {
+        var vi: i64 = lex.advance_i();
+        var nm: string = lex.tk_v(vi);
+        expect_tok("BitOr");
+        return nm;
+    }
+    if (lex.cur_t() == "Star") {
+        parse_fatal("pointer capture `|*v|` is not supported: unwrap yields a copy, so taking its address would dangle");
+    }
+    parse_fatal("expected a binding name in optional capture `|v|`");
+    return "";
+}
+
+// 单实参链表（call 的 la 是 kids 链表下标，必须走 list_push）。
+fn optcap_args1(a: i64) i64 {
+    var t: i64 = base.list_push(-1, -1, a);
+    return t;
+}
+
+// 把 `stmt` 插到链表 `head` 的**头部**（list_push 只能追加到尾）。
+fn optcap_cons(stmt: i64, head: i64) i64 {
+    var n: i64 = base.list_push(-1, -1, stmt);
+    if (head >= 0) {
+        var c: Child = base.kids[n];
+        c.next = head;
+        slice_set(base.kids, n, c);
+    }
+    return n;
+}
+
+// `is_some(__optc_N)` / `unwrap(__optc_N)` —— sema 按**名字**识别这些内建
+// （fname 取调用目标 ident 的 sa），故合成 call 节点即可复用全链路。
+fn optcap_call(fname: string, tname: string, ti: i64) i64 {
+    return base.mk_call(base.mk_ident(fname, ti), optcap_args1(base.mk_ident(tname, ti)), ti);
+}
+
 pub fn parse_if_stmt() i64 {
     var ti: i64 = lex.advance_i();
     expect_tok("LParen");
     var cond: i64 = parse_expr();
     expect_tok("RParen");
+    // O-5：`if (x) |v| { … }` —— 载荷捕获位必须在 `)` 之后（见上方无歧义论证）。
+    if (lex.cur_t() == "BitOr") {
+        lex.advance_i();
+        var vname: string = parse_optcap_name();
+        var cbody: i64 = parse_block();
+        var celse: i64 = -2;
+        if (lex.cur_t() == "KwElse") {
+            lex.advance_i();
+            if (lex.cur_t() == "KwIf") {
+                var nested: i64 = parse_if_stmt();
+                celse = base.list_push(-1, -1, nested);
+            } else {
+                celse = parse_block();
+            }
+        }
+        var tname: string = base.sb_cat2("__optc_", base.i2s(g_optcap_seq));
+        g_optcap_seq = g_optcap_seq + 1;
+        // var __optc_N = x;
+        var decl: i64 = base.mk_var_decl(tname, false, -1, cond, ti);
+        // var v = unwrap(__optc_N);   （放在捕获体最前）
+        var vdecl: i64 = base.mk_var_decl(vname, false, -1, optcap_call("unwrap", tname, ti), ti);
+        var then_head: i64 = optcap_cons(vdecl, cbody);
+        // if (is_some(__optc_N)) { … } [else { … }]
+        var ifn: i64 = base.mk_if(optcap_call("is_some", tname, ti), then_head, celse, ti);
+        // 外层 { … }
+        var d1: i64 = base.list_push(-1, -1, decl);
+        var d2: i64 = base.list_push(d1, d1, ifn);
+        return base.mk_block(d1, ti);
+    }
     var then_head: i64 = parse_block();
     var else_head: i64 = -2;
     if (lex.cur_t() == "KwElse") {
@@ -5184,6 +5465,58 @@ pub fn parse_value_if() i64 {
     expect_tok("LParen");
     var cond: i64 = parse_expr();
     expect_tok("RParen");
+    // O-5（值位）：`if (x) |v| { E1 } else { E2 }`
+    //   ⇒ { var __optc_N = x;
+    //        match (is_some(__optc_N)) {
+    //          true  => { var v = unwrap(__optc_N); E1 },
+    //          false => E2 } }
+    // 与语句位的差别：值位**没有 then 块**可挂绑定，故 `v` 的声明必须进 true 臂的块内；
+    // 末语句仍须 `mk_expr` 包裹，否则 `infer_block_expr` 取不到块值（同 desugar_orelse）。
+    if (lex.cur_t() == "BitOr") {
+        lex.advance_i();
+        var vname: string = parse_optcap_name();
+        var cthen_e: i64 = parse_block_expr();
+        var celse_e: i64 = -1;
+        if (lex.cur_t() == "KwElse") {
+            lex.advance_i();
+            if (lex.cur_t() == "KwIf") {
+                celse_e = parse_value_if();
+            } else {
+                celse_e = parse_block_expr();
+            }
+        }
+        if (celse_e < 0) {
+            parse_fatal("an `if` in value position must have an `else` branch (valueless paths P3/P5 are not yet supported)");
+        }
+        var tname2: string = base.sb_cat2("__optc_", base.i2s(g_optcap_seq));
+        g_optcap_seq = g_optcap_seq + 1;
+        var vd0: i64 = base.mk_var_decl(tname2, false, -1, cond, ti);
+        var vdv: i64 = base.mk_var_decl(vname, false, -1, optcap_call("unwrap", tname2, ti), ti);
+        // true 臂体 = 块 ` { var v = unwrap(__optc_N); E1 } `
+        var ah: i64 = -1;
+        var at: i64 = -1;
+        at = base.list_push(ah, at, vdv);
+        if (ah < 0) { ah = at; }
+        at = base.list_push(ah, at, base.mk_expr(cthen_e, ti));
+        if (ah < 0) { ah = at; }
+        var tbody: i64 = base.mk_block_expr(ah, ti);
+        var t_arm2: i64 = base.mk_arm("", false, base.mk_bool(true, ti), -1, tbody, ti);
+        var f_arm2: i64 = base.mk_arm("", false, base.mk_bool(false, ti), -1, celse_e, ti);
+        var mh: i64 = -1;
+        var mt: i64 = -1;
+        mt = base.list_push(mh, mt, t_arm2);
+        if (mh < 0) { mh = mt; }
+        mt = base.list_push(mh, mt, f_arm2);
+        if (mh < 0) { mh = mt; }
+        var m2: i64 = base.mk_match(optcap_call("is_some", tname2, ti), mh, ti);
+        var sh: i64 = -1;
+        var st: i64 = -1;
+        st = base.list_push(sh, st, vd0);
+        if (sh < 0) { sh = st; }
+        st = base.list_push(sh, st, base.mk_expr(m2, ti));
+        if (sh < 0) { sh = st; }
+        return base.mk_block_expr(sh, ti);
+    }
     var then_e: i64 = parse_block_expr();
     var else_e: i64 = -1;
     if (lex.cur_t() == "KwElse") {
@@ -5228,6 +5561,34 @@ pub fn parse_while_stmt() i64 {
     expect_tok("LParen");
     var cond: i64 = parse_expr();
     expect_tok("RParen");
+    // O-5：`while (x) |v| { … }` —— 与 if 捕获的关键差异：Zig 语义下条件**每轮重新求值**，
+    //   故临时量 `__optc_N` 必须落在**循环体内**（if 捕获则落在外层块，只求值一次）。
+    //   退出用 `break`（tir_emit_stmt 的 break 查 tir_loop_top_end，嵌套 if 块内同样命中）。
+    if (lex.cur_t() == "BitOr") {
+        lex.advance_i();
+        var vname: string = parse_optcap_name();
+        var cbody: i64 = parse_block();
+        var celse: i64 = -1;
+        if (lex.cur_t() == "KwElse") {
+            lex.advance_i();
+            celse = parse_block();
+        }
+        var tname: string = base.sb_cat2("__optc_", base.i2s(g_optcap_seq));
+        g_optcap_seq = g_optcap_seq + 1;
+        // var __optc_N = x;
+        var decl: i64 = base.mk_var_decl(tname, false, -1, cond, ti);
+        // if (is_none(__optc_N)) { break; }
+        var brk: i64 = base.mk_break(-1, ti);
+        var b1: i64 = base.list_push(-1, -1, brk);
+        var ifn: i64 = base.mk_if(optcap_call("is_none", tname, ti), b1, -2, ti);
+        // var v = unwrap(__optc_N);
+        var vdecl: i64 = base.mk_var_decl(vname, false, -1, optcap_call("unwrap", tname, ti), ti);
+        // ⚠ optcap_cons 每次插到**头部** ⇒ 必须逆序 cons，最终顺序才是 decl, ifn, vdecl, <B…>
+        var h: i64 = optcap_cons(vdecl, cbody);
+        h = optcap_cons(ifn, h);
+        h = optcap_cons(decl, h);
+        return base.mk_while(base.mk_bool(true, ti), h, celse, ti);
+    }
     var body: i64 = parse_block();
     var else_e: i64 = -1;
     if (lex.cur_t() == "KwElse") {
@@ -5277,6 +5638,12 @@ pub fn parse_statement() i64 {
     if (t == "Identifier" and lex.cur_v() == "inline" and lex.peek_t(1) == "KwFor") {
         lex.advance_i();   // 吞掉 `inline`
         return parse_inline_for_stmt();
+    }
+    // R-014：`unsafe { ... }` 语句块（基础设施阶段：作用域 + 不安全上下文标志，暂不强约束任何操作）。
+    // 上下文关键字：仅当 `unsafe` 后紧跟 `{` 时进入；否则回落常规标识符解析（不抢占同名变量）。
+    if (t == "Identifier" and lex.cur_v() == "unsafe" and lex.peek_t(1) == "LBrace") {
+        lex.advance_i();   // 吞掉 `unsafe`
+        return parse_unsafe_stmt();
     }
     if (t == "LBrace") {
         return parse_block_stmt();
@@ -5908,6 +6275,22 @@ pub fn lbracket_is_next_arm_pattern() bool {
     return false;
 }
 
+// ── O-3：`.?` 断言取出（对齐 Zig 0.17）─────────────────────────
+// `x.?` ≡ `x orelse unreachable`：dst 为 none 时 panic，否则取出元素值。
+// 实现刻意做成**脱糖为既有内建调用 `unwrap(x)`**，而不是新增节点类型 —— 三个前提已核实：
+//   ① sema 对 some/unwrap/is_some/is_none **按名字**识别（`fname` 取调用目标 ident 的
+//      `sa`，见 sema.tc:8662 / 8761），合成 call 节点因此走完全相同的通路；
+//   ② `unwrap` 的运行期 panic 已经具备（runtime/t_runtime.c:246 `t_opt_unwrap` 遇
+//      NULL 打 JSON 错误并 exit(1)，LLVM shim 在 t_shim_ll.c:58 直接复用它）；
+//   ③ 既有 parser 层合成 call 的先例见 parse.tc:2916（模板脱糖合成 `format` 调用）。
+// ⇒ HIR/TIR/C 后端/LLVM 后端**一行都不用改**，这正是设计 §2.9 姿势 A「脱糖在前、分后端在后」。
+// ⚠ 别把它做成 `?.` 可选链：Zig 明确不做（Z12），理由见 docs/design/option/DESIGN.md。
+fn mk_opt_unwrap_postfix(e: i64, ti: i64) i64 {
+    lex.advance_i();                                    // 吃掉 `?`（Dot 已由调用方消费）
+    var ah: i64 = base.list_push(-1, -1, e);            // 实参链表：仅 e 一个元素
+    return base.mk_call(base.mk_ident("unwrap", -1), ah, ti);
+}
+
 pub fn parse_postfix() i64 {
     var e: i64 = parse_primary();
     while (lex.cur_t() == "Dot" or lex.cur_t() == "LBracket" or lex.cur_t() == "LParen") {
@@ -5920,7 +6303,11 @@ pub fn parse_postfix() i64 {
             break;
         }
         var ti: i64 = lex.advance_i();
-        if (t == "Dot") { e = parse_post_member(e, ti); }
+        if (t == "Dot") {
+            // O-3：`.?` 断言取出（语义 ≡ Zig 的 `x orelse unreachable`）。
+            if (lex.cur_t() == "Question") { e = mk_opt_unwrap_postfix(e, ti); }
+            else { e = parse_post_member(e, ti); }
+        }
         if (t == "LBracket") { e = parse_post_index(e, ti); }
         if (t == "LParen") { e = parse_post_call(e, ti); }
     }
@@ -6310,6 +6697,25 @@ pub fn parse_struct_decl(name: string, anns: i64, layout: string) i64 {
             var __it: i64 = parse_sfield();
             r_sfield_t = base.list_push(r_sfield, r_sfield_t, __it);
             if (r_sfield < 0) { r_sfield = r_sfield_t; }
+        } else if ((lex.cur_t() == "KwStruct" or lex.cur_t() == "KwEnum") and lex.peek_t(1) == "Identifier") {
+            // R-038：struct 体内嵌套具名 struct / enum 声明（如 `#pb struct Outer { struct Inner {...} }`）。
+            // 全名 = 父__子（Outer__Inner），与 protobuf NestedType 完全限定名同构；注册进 decl_list 即为真实类型，
+            // 父→子归属另由 register_nested_decl 登记（供 mangle_modules 把 `Outer.Inner` 重整为 `Outer__Inner`）。
+            // 仅拦截「关键字 + Ident」的具名形态；匿名内联 `struct {...}`（位置字段类型）仍走下方 else → parse_type 内联分支。
+            var r_is_enum: bool = (lex.cur_t() == "KwEnum");
+            lex.advance_i();                        // 吃掉 `struct` / `enum`
+            var r_child: string = expect_tok("Identifier");
+            var r_full: string = base.sb_cat3(name, "__", r_child);
+            var r_nd: i64 = -1;
+            if (r_is_enum) {
+                r_nd = parse_enum_decl(r_full, -1);
+            } else {
+                r_nd = parse_struct_decl(r_full, -1, "");
+            }
+            if (r_nd >= 0) {
+                append(lex.decl_list, r_nd);
+                register_nested_decl(r_full, name, r_child);
+            }
         } else {
             // 位置字段元组语法：`struct T { T1, T2, ... }` —— 字段自动命名 `_0`/`_1`/...。
             // 任意「类型起始 token」（标识符类型、类型关键字 string/void/map/unit、
@@ -6406,6 +6812,16 @@ pub fn parse_case(ci: i64) i64 {
     expect_tok("RParen");
     }
     var r_anns: i64 = parse_annotations();
+    // R-025：variant case 的 tagID `@ Integer`（pb oneof 每个成员占一个 field number，
+    //   与 struct 字段同构；parse_annotations 已跳过 @<int>，此处单独吃）。
+    //   存于 VC.ib（通用节点 walker 只遍历 na/nb/nc/nd/la/lb/lc，不遍历 ia/ib，故 ib 安全；
+    //   而 nb 会被 mb_walk 当成节点指针遍历 ⇒ 不能放 nb）。multi-payload 计数不再占用 ib，
+    //   改由 match 检查期从 lb 列表长度推导（见 sema match 检查）。
+    var r_tag: i64 = -1;
+    if (lex.cur_t() == "At") {
+        lex.advance_i();
+        r_tag = parse_int_str(expect_tok("Integer"));
+    }
     if (lex.cur_t() == "Comma" or lex.cur_t() == "Semicolon") {
     if (lex.cur_t() == "Comma") {
     expect_tok("Comma");
@@ -6416,9 +6832,12 @@ pub fn parse_case(ci: i64) i64 {
     }
     }
     var __id: i64 = base.mk_VC(r_Ident, ci, r_type, r_anns, -1);
+    if (r_tag >= 0) {
+        base.node_set_ib((__id as u64), r_tag);   // R-025：case tagID（≥0 显式；-1 = 无）
+    }
     if (r_cnt >= 2) {
         base.node_set_lb((__id as u64), r_types);
-        base.node_set_ib((__id as u64), r_cnt);   // S4 §0.14.7 SoA：取代 `r_vn.ib`（下方 slice_set 回写生效）
+        // R-025：multi-payload 计数不再写 ib（ib 已让位给 tagID）；match 检查期从 lb 长度推导。
     }
     return __id;
 }
@@ -6715,6 +7134,60 @@ pub fn parse_meta_builtin() i64 {
         base.node_at(tid, ti_at);
         return tid;
     }
+    // @enum_members(T)：与 @type_info 同构 —— 产出 enummembers 节点（sa=类型名，na=完整类型节点），
+    // 复用 meta_eval 的 CTFE 折叠路径（与 typeinfo 同），避免走 mbuiltin → t_enum_members 运行时调用
+    // （TIR 把 mbuiltin 统一降级为普通调用，无 CTFE 折叠，故此处提前脱糖）。形参第 0 位是类型（见 mb_arg_is_type）。
+    if (nm == "enum_members") {
+        var a0: i64 = -1;
+        if (head >= 0) {
+            var ks: []i64 = base.kids_chain(head);
+            if (slice_len(ks) > 0) { a0 = ks[0]; }
+        }
+        var tname: string = "";
+        if (a0 >= 0) { tname = base.node_sa((a0 as u64)); }
+        var tid: i64 = base.node_new("enummembers");
+        base.node_set_sa((tid as u64), tname);
+        if (a0 >= 0) { base.node_set_na((tid as u64), a0); }
+        base.node_at(tid, ti_at);
+        return tid;
+    }
+    // @type_attributes(T)（R-020）：产出 typeattributes 节点（sa=类型名，na=完整类型节点），
+    // 复用 meta_eval 的 CTFE 折叠路径，把类型声明上的注解链折叠为 []Attribute 编译期值。
+    if (nm == "type_attributes") {
+        var a0: i64 = -1;
+        if (head >= 0) {
+            var ks: []i64 = base.kids_chain(head);
+            if (slice_len(ks) > 0) { a0 = ks[0]; }
+        }
+        var tname: string = "";
+        if (a0 >= 0) { tname = base.node_sa((a0 as u64)); }
+        var tid: i64 = base.node_new("typeattributes");
+        base.node_set_sa((tid as u64), tname);
+        if (a0 >= 0) { base.node_set_na((tid as u64), a0); }
+        base.node_at(tid, ti_at);
+        return tid;
+    }
+    // @field_attributes(T, "field")（R-020）：产出 fieldattributes 节点（sa=类型名，na=完整类型节点，
+    // sb=字段名），把指定字段上的注解链折叠为 []Attribute 编译期值。
+    if (nm == "field_attributes") {
+        var a0: i64 = -1;
+        var a1: i64 = -1;
+        if (head >= 0) {
+            var ks: []i64 = base.kids_chain(head);
+            if (slice_len(ks) > 0) { a0 = ks[0]; }
+            if (slice_len(ks) > 1) { a1 = ks[1]; }
+        }
+        var tname: string = "";
+        if (a0 >= 0) { tname = base.node_sa((a0 as u64)); }
+        var fan: string = "";
+        if (a1 >= 0 and base.node_kind((a1 as u64)) == "string") { fan = base.node_sa((a1 as u64)); }
+        var fid: i64 = base.node_new("fieldattributes");
+        base.node_set_sa((fid as u64), tname);
+        if (a0 >= 0) { base.node_set_na((fid as u64), a0); }
+        base.node_set_sb((fid as u64), fan);
+        base.node_at(fid, ti_at);
+        return fid;
+    }
     var id: i64 = base.node_new("mbuiltin");
     base.node_set_sa((id as u64), nm);
     base.node_set_la((id as u64), head);
@@ -6733,6 +7206,10 @@ pub fn mb_arg_is_type(name: string, idx: i64) bool {
     if (name == "simd_lanes") { return idx == 0; }
     // `@type_info(T)`：第 0 个形参是**类型**，不是表达式（与 type_info 类型位内建同构）
     if (name == "type_info") { return idx == 0; }
+    // @enum_members(T)：第 0 个形参是枚举类型（R-026 枚举成员反射表）
+    if (name == "enum_members") { return idx == 0; }
+    // @type_attributes(T) / @field_attributes(T, "field")：第 0 个形参是类型（R-020 注解反射）
+    if (name == "type_attributes" or name == "field_attributes") { return idx == 0; }
     // P2b 类型构造元函数：@pointer / @enum / @fn 第 0 形参是类型，其余按表达式解析。
     if (name == "pointer" or name == "enum" or name == "fn") { return idx == 0; }
     // @variant(backing, names, types)：第 0 形参 backing（判别子类型）是类型，names/types 按表达式解析。

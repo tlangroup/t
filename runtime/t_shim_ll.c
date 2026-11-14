@@ -192,6 +192,22 @@ void    tll_getenv(TStr* name, TStr* out)            { *out = t_getenv(t_cstr(*n
 int32_t tll_file_exists(TStr* path)                  { return t_file_exists(t_cstr(*path)) ? 1 : 0; }
 int32_t tll_file_write_all(TStr* path, TStr* c)      { return t_file_write_all(t_cstr(*path), *c) ? 1 : 0; }
 void    tll_path_resolve(TStr* path, TStr* out)      { *out = t_path_resolve(t_cstr(*path)); }
+// ── BytesBuilder（bsb_*）：二进制安全字节缓冲（M-bytes）────────
+// bsb_to_bytes 返回聚合 TStr；走末位 out 指针规避 Win64 16B 聚合返回的 sret ABI 歧义
+// （clang 把 TStr 返回编译为隐藏 sret 指针，而编译器按 RAX:RDX 按值返回发射 IR 会错位崩溃）。
+void    tll_bsb_to_bytes(TSb* b, TStr* out)          { *out = t_bsb_to_bytes(b); }
+// bsb_append_bytes 的 TStr 形参走指针（同 tll_str_slice）：规避 Win64 16B 聚合按值传参的
+// byval 寄存器错位（clang 把 TStr 形参编为隐藏指针，LLVM 把 16B 聚合按值传参占 RCX:RDX，
+// 致与 clang 的隐藏指针错位 → 读到垃圾 len → 追加字节数错）。
+void    tll_bsb_append_bytes(TSb* b, TStr* s)         { t_bsb_append_bytes(b, *s); }
+// ── bytes（Bytes = TStr 视图）访问器（M-bytes）────────
+// bytes_len / bytes_at 的 TStr 形参走指针（同 tll_str_len / tll_str_at）：规避 Win64 16B 聚合
+// 按值传参的 byval 寄存器错位（clang 把 TStr 形参编译为 RCX 隐藏指针，而 LLVM 把 16B 聚合
+// 按值传参占 RCX:RDX 两槽，致后续 i64 实参被推到 R8，与 clang 的 RDX 错位 → 索引读到垃圾）。
+// bytes_slice 返回聚合 TStr，走末位 out 指针（同 tll_bsb_to_bytes / tll_file_read_all）。
+int64_t tll_bytes_len(TStr* s)                       { return (int64_t)t_bytes_len(*s); }
+int64_t tll_bytes_at(TStr* s, int64_t i)             { return (int64_t)t_bytes_at(*s, i); }
+void    tll_bytes_slice(TStr* s, int64_t a, int64_t b, TStr* out) { *out = t_bytes_slice(*s, a, b); }
 void    tll_args(TSlice* out)                        { *out = t_args(); }
 void    tll_exit(int32_t code)                       { t_exit(code); }
 int32_t tll_system(TStr* cmd)                        { return t_system(*cmd); }

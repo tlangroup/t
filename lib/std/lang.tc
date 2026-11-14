@@ -1,0 +1,1694 @@
+// ═══════════════════════════════════════════════════════════════════════════
+// lib/std/lang.tc — std 库模块 `std.lang`：语言前端共享库
+//
+// 命名空间：std.lang（库模块，文件头 `@module(pub)`）
+// 设计对标：Zig 0.17 的 `std.zig.Ast`（自包含词法/语法前端）+ `std.builtin.Type`
+//          （编译期/运行期共享的反射类型）。
+//
+// 目的（来自 thyme 004/005 需求 + 用户级诉求）：
+//   1. 与 format / lint 工具共用同一套词法 / AST；
+//   2. 支撑用户级语法扩展（宏 / derive / 注解元数据）；
+//   3. thyme 这类用户共享词法并叠加自己的元数据（注解 / 修饰词）。
+//
+// 关键约束（见 docs/compiler/cst-design-v2.md §4.14.7）：
+//   * std 库模块由 tc 编译，tc 又引用 std —— 构建期循环由 tools/build_std.mjs
+//     斩断（先预编译 std 为 .tlib，再供消费方以链接模式 import）。
+//   * 库模块**跳过进程级全局**：t__ginit 不被执行，故本模块**只承载编译期
+//     常量表 + 纯函数**，不得有任何运行期全局初始化器；AST 的存储全部放在
+//     `Ast` 实例内部（tokens / nodes / extra 切片），与编译器的全局节点表解耦。
+//
+//   这正是 Zig 的做法：`std.zig.Ast` 自己持有 `tokens` / `nodes` 切片，所有
+//   操作都吃一个 `*Ast` 实例，而非依赖全局状态 —— 因此同一份代码既能给编译器
+//   用，也能给独立工具（format / lint / tdagen）用。
+// ═══════════════════════════════════════════════════════════════════════════
+
+@module(pub)
+
+var cst = @import("std.rc.cst");   // 关键词表（Kw* 判定）+ 节点种类注册表
+
+// ───────────────────────────────────────────────────────────────────────────
+// 一、词法（Lexer）—— 自包含 tokenizer，零全局态
+// ───────────────────────────────────────────────────────────────────────────
+
+// 一个记号的种类即其名字字符串（与编译器 lex.tc 的 token 名对齐：Identifier /
+// Integer / String / At / Hash / LParen / KwStruct / Plus / Eq / …）。
+pub struct Token {
+    kind: string;     // TokenKind（见 §token 种类说明）
+    start: i64;       // 源字节起点（含）
+    end: i64;         // 源字节终点（不含）
+    src: string;      // 源切片 [start, end)
+    line: i64;        // 1-based 行号
+    col: i64;         // 1-based 列号（字节列）
+}
+
+// 取源中第 i 字节（u8）。t 字符串按字节索引。
+fn byte_at(src: string, i: i64) u8 {
+    return src[i];
+}
+
+fn is_digit(c: u8) bool {
+    return c >= 48 and c <= 57;   // '0'..'9'
+}
+
+fn is_lower(c: u8) bool {
+    return c >= 97 and c <= 122;  // 'a'..'z'
+}
+
+fn is_upper(c: u8) bool {
+    return c >= 65 and c <= 90;   // 'A'..'Z'
+}
+
+fn is_alpha(c: u8) bool {
+    return is_lower(c) or is_upper(c) or c == 95;   // 含下划线 _
+}
+
+fn is_ident_start(c: u8) bool {
+    return is_alpha(c) or c >= 128;   // ASCII 字母/下划线 或 UTF-8 首字节
+}
+
+fn is_ident_cont(c: u8) bool {
+    return is_alpha(c) or is_digit(c) or c == 95 or c >= 128;
+}
+
+fn is_space(c: u8) bool {
+    return c == 32 or c == 9 or c == 13 or c == 10;   // 空格/制表/CR/LF
+}
+
+// 运算符单字 token 名（与 lex.tc op1_name 对齐）
+fn op1_name(c: u8) string {
+    if (c == 43) { return "Plus"; }
+    if (c == 45) { return "Minus"; }
+    if (c == 42) { return "Star"; }
+    if (c == 47) { return "Slash"; }
+    if (c == 37) { return "Percent"; }
+    if (c == 61) { return "Assign"; }
+    if (c == 60) { return "Lt"; }
+    if (c == 62) { return "Gt"; }
+    if (c == 33) { return "Not"; }
+    if (c == 38) { return "BitAnd"; }
+    if (c == 124) { return "BitOr"; }
+    if (c == 94) { return "BitXor"; }
+    if (c == 126) { return "BitNot"; }
+    if (c == 58) { return "Colon"; }
+    if (c == 46) { return "Dot"; }
+    if (c == 63) { return "Question"; }
+    if (c == 40) { return "LParen"; }
+    if (c == 41) { return "RParen"; }
+    if (c == 123) { return "LBrace"; }
+    if (c == 125) { return "RBrace"; }
+    if (c == 91) { return "LBracket"; }
+    if (c == 93) { return "RBracket"; }
+    if (c == 44) { return "Comma"; }
+    if (c == 59) { return "Semicolon"; }
+    return "";
+}
+
+// 运算符双字 token 名（与 lex.tc op2_name 对齐，最大匹配）
+fn op2_name(a: u8, b: u8) string {
+    if (a == 45 and b == 62) { return "Arrow"; }
+    if (a == 61 and b == 62) { return "FatArrow"; }
+    if (a == 58 and b == 58) { return "DoubleColon"; }
+    if (a == 61 and b == 61) { return "Eq"; }
+    if (a == 33 and b == 61) { return "NotEq"; }
+    if (a == 60 and b == 61) { return "LtEq"; }
+    if (a == 62 and b == 61) { return "GtEq"; }
+    if (a == 38 and b == 38) { return "And"; }
+    if (a == 124 and b == 124) { return "Or"; }
+    if (a == 60 and b == 60) { return "ShiftLeft"; }
+    if (a == 62 and b == 62) { return "ShiftRight"; }
+    if (a == 46 and b == 46) { return "DotDot"; }
+    if (a == 43 and b == 43) { return "PlusPlus"; }
+    if (a == 43 and b == 61) { return "PlusAssign"; }
+    if (a == 45 and b == 61) { return "MinusAssign"; }
+    if (a == 42 and b == 61) { return "StarAssign"; }
+    if (a == 47 and b == 61) { return "SlashAssin"; }
+    if (a == 37 and b == 61) { return "PercentAssign"; }
+    if (a == 38 and b == 61) { return "BitAndAssign"; }
+    if (a == 124 and b == 61) { return "BitOrAssign"; }
+    if (a == 94 and b == 61) { return "BitXorAssign"; }
+    if (a == 124 and b == 62) { return "PipeApply"; }
+    return "";
+}
+
+// 自包含词法扫描：把 src 切成 token 序列（跳过 // 与 /* */ 注释，不产出 trivia）。
+// 与编译器 lex.tc 的 token 名保持对齐，便于同一套工具链。
+pub fn tokenize(src: string) []Token {
+    var toks: []Token;
+    var n: i64 = str_len(src) as i64;
+    var i: i64 = 0;
+    var line: i64 = 1;
+    var col: i64 = 1;
+    while (i < n) {
+        var c: u8 = byte_at(src, i);
+        // 空白
+        if (is_space(c)) {
+            if (c == 10) { line = line + 1; col = 1; } else { col = col + 1; }
+            i = i + 1;
+            continue;
+        }
+        // 行注释 //
+        if (c == 47 and i + 1 < n and byte_at(src, i + 1) == 47) {
+            i = i + 2;
+            while (i < n and byte_at(src, i) != 10) { i = i + 1; }
+            continue;
+        }
+        // 块注释 /* */
+        if (c == 47 and i + 1 < n and byte_at(src, i + 1) == 42) {
+            i = i + 2;
+            while (i < n) {
+                if (byte_at(src, i) == 10) { line = line + 1; col = 1; }
+                if (byte_at(src, i) == 42 and i + 1 < n and byte_at(src, i + 1) == 47) {
+                    i = i + 2;
+                    break;
+                }
+                i = i + 1;
+            }
+            continue;
+        }
+        var start: i64 = i;
+        var l0: i64 = line;
+        var c0: i64 = col;
+        // 标识符 / 关键字
+        if (is_ident_start(c)) {
+            i = i + 1; col = col + 1;
+            while (i < n and is_ident_cont(byte_at(src, i))) { i = i + 1; col = col + 1; }
+            var text: string = str_slice(src, start, i);
+            if (str_eq(text, "inf") or str_eq(text, "nan")) {
+                append(toks, Token{ kind: "Float", start: start, end: i, src: text, line: l0, col: c0 });
+                continue;
+            }
+            var tname: string = cst.kw_lookup(text);
+            if (str_len(tname) == 0) { tname = "Identifier"; }
+            append(toks, Token{ kind: tname, start: start, end: i, src: text, line: l0, col: c0 });
+            continue;
+        }
+        // 数字（含 0x / 0b / 0o 进制前缀与浮点 / 后缀）
+        if (is_digit(c) or (c == 48 and i + 1 < n and (byte_at(src, i + 1) == 120 or byte_at(src, i + 1) == 98 or byte_at(src, i + 1) == 111))) {
+            var is_float: bool = false;
+            i = i + 1; col = col + 1;
+            // 仅当首字 0 后紧跟 x / b / o 时才吃掉第二字（0x/0b/0o）；
+            // 普通 `0` 后跟 `,`/`;`/`)` 等必须留在原处，不得误吞。
+            if (c == 48 and i < n) {
+                var nx: u8 = byte_at(src, i);
+                if (nx == 120 or nx == 98 or nx == 111) { i = i + 1; col = col + 1; }
+            }
+            while (i < n) {
+                var d: u8 = byte_at(src, i);
+                if (is_digit(d)) { i = i + 1; col = col + 1; continue; }
+                if (d == 46) { is_float = true; i = i + 1; col = col + 1;   // '.'
+                    while (i < n and is_digit(byte_at(src, i))) { i = i + 1; col = col + 1; }
+                    continue; }
+                if (d == 101 or d == 69) { is_float = true; i = i + 1; col = col + 1;   // e/E 指数
+                    if (i < n and (byte_at(src, i) == 43 or byte_at(src, i) == 45)) { i = i + 1; col = col + 1; }
+                    while (i < n and is_digit(byte_at(src, i))) { i = i + 1; col = col + 1; }
+                    continue; }
+                // 类型/位宽后缀（i64 / u8 / f32 …）：沿用字母续接
+                if (is_alpha(d)) { i = i + 1; col = col + 1;
+                    while (i < n and is_ident_cont(byte_at(src, i))) { i = i + 1; col = col + 1; }
+                    continue; }
+                break;
+            }
+            var kind: string = "Integer";
+            if (is_float) { kind = "Float"; }
+            append(toks, Token{ kind: kind, start: start, end: i, src: str_slice(src, start, i), line: l0, col: c0 });
+            continue;
+        }
+        // 字符串 / 字符 / 格式串 / raw 串
+        if (c == 34) {   // " 普通字符串
+            i = i + 1; col = col + 1;
+            while (i < n and byte_at(src, i) != 34) {
+                if (byte_at(src, i) == 92) { i = i + 1; col = col + 1; }   // 跳过转义
+                if (byte_at(src, i) == 10) { line = line + 1; col = 1; }
+                i = i + 1; col = col + 1;
+            }
+            if (i < n) { i = i + 1; col = col + 1; }   // 收尾引号
+            append(toks, Token{ kind: "String", start: start, end: i, src: str_slice(src, start, i), line: l0, col: c0 });
+            continue;
+        }
+        if (c == 114 and i + 1 < n and byte_at(src, i + 1) == 34) {   // r" raw 字符串
+            i = i + 2; col = col + 2;
+            while (i < n and byte_at(src, i) != 34) { if (byte_at(src, i) == 10) { line = line + 1; col = 1; } i = i + 1; col = col + 1; }
+            if (i < n) { i = i + 1; col = col + 1; }
+            append(toks, Token{ kind: "String", start: start, end: i, src: str_slice(src, start, i), line: l0, col: c0 });
+            continue;
+        }
+        if (c == 96) {   // ` 格式串
+            i = i + 1; col = col + 1;
+            while (i < n and byte_at(src, i) != 96) { if (byte_at(src, i) == 10) { line = line + 1; col = 1; } i = i + 1; col = col + 1; }
+            if (i < n) { i = i + 1; col = col + 1; }
+            append(toks, Token{ kind: "FormatString", start: start, end: i, src: str_slice(src, start, i), line: l0, col: c0 });
+            continue;
+        }
+        if (c == 39) {   // ' 字符字面量（按 lex.tc 归为 Integer 携带码点）
+            i = i + 1; col = col + 1;
+            var code: i64 = 0;
+            if (i < n and byte_at(src, i) == 92) { i = i + 1; col = col + 1; }   // 转义
+            if (i < n) { code = byte_at(src, i) as i64; i = i + 1; col = col + 1; }
+            if (i < n and byte_at(src, i) == 39) { i = i + 1; col = col + 1; }
+            append(toks, Token{ kind: "Integer", start: start, end: i, src: str_slice(src, start, i), line: l0, col: c0 });
+            continue;
+        }
+        // @ 注解 / # 指令
+        if (c == 64) { i = i + 1; col = col + 1; append(toks, Token{ kind: "At", start: start, end: i, src: "@", line: l0, col: c0 }); continue; }
+        if (c == 35) { i = i + 1; col = col + 1; append(toks, Token{ kind: "Hash", start: start, end: i, src: "#", line: l0, col: c0 }); continue; }
+        // 三字符运算符（最大匹配优先）
+        if (i + 2 < n) {
+            var a2: u8 = byte_at(src, i);
+            var b2: u8 = byte_at(src, i + 1);
+            var d2: u8 = byte_at(src, i + 2);
+            if (a2 == 124 and b2 == 45 and d2 == 62) { append(toks, Token{ kind: "PipeMap", start: start, end: i + 3, src: "|->", line: l0, col: c0 }); i = i + 3; col = col + 3; continue; }
+            if (a2 == 124 and b2 == 62 and d2 == 63) { append(toks, Token{ kind: "PipeFilter", start: start, end: i + 3, src: "|>?", line: l0, col: c0 }); i = i + 3; col = col + 3; continue; }
+            if (a2 == 46 and b2 == 46 and d2 == 61) { append(toks, Token{ kind: "DotDotEq", start: start, end: i + 3, src: "..=", line: l0, col: c0 }); i = i + 3; col = col + 3; continue; }
+            if (a2 == 60 and b2 == 60 and d2 == 61) { append(toks, Token{ kind: "ShlAssign", start: start, end: i + 3, src: "<<=", line: l0, col: c0 }); i = i + 3; col = col + 3; continue; }
+            if (a2 == 62 and b2 == 62 and d2 == 61) { append(toks, Token{ kind: "ShrAssign", start: start, end: i + 3, src: ">>=", line: l0, col: c0 }); i = i + 3; col = col + 3; continue; }
+        }
+        // 双字符运算符
+        if (i + 1 < n) {
+            var two: string = op2_name(byte_at(src, i), byte_at(src, i + 1));
+            if (str_len(two) > 0) {
+                append(toks, Token{ kind: two, start: start, end: i + 2, src: str_slice(src, i, i + 2), line: l0, col: c0 });
+                i = i + 2; col = col + 2;
+                continue;
+            }
+        }
+        // 单字符运算符 / 标点
+        var one: string = op1_name(c);
+        if (str_len(one) > 0) {
+            append(toks, Token{ kind: one, start: start, end: i + 1, src: str_slice(src, i, i + 1), line: l0, col: c0 });
+            i = i + 1; col = col + 1;
+            continue;
+        }
+        // 非法字符：跳过（与编译器 lex.tc 行为一致，尽量报全）
+        i = i + 1; col = col + 1;
+    }
+    append(toks, Token{ kind: "Eof", start: n, end: n, src: "", line: line, col: col });
+    return toks;
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// 二、语法（AST）—— 自包含、实例持有（Zig std.zig.Ast 风格）
+// ───────────────────────────────────────────────────────────────────────────
+//
+// 与编译器 base.tc 的全局节点表（tbl_RecX_* / g_node_*）解耦：所有节点数据都
+// 放在实例内部（见 §五 的通用 `Node` 树），因此本模块无需任何运行期全局，可被
+// format/lint/thyme 独立消费。节点种类（tag）直接复用编译器的节点名字符串
+// （"StructDecl" / "FuncDecl" / "Field" / …），与 std.rc.cst 的节点种类注册表对齐。
+// （此前的扁平 Ast/ast_add_* 原型已并入 §五 的树状前端，避免重复定义。）
+
+// ───────────────────────────────────────────────────────────────────────────
+// 三、反射 / 元数据（对标 Zig std.builtin.Type）—— 编译期 + 运行期共享
+// ───────────────────────────────────────────────────────────────────────────
+//
+// 这是「本工程与 thyme 同一套代码」的核心：无论编译器（@type_info 合成）还是
+// thyme 的 tdagen（在 comptime 读 @type_info 生成 TDA），都消费下面这组类型。
+// 编译器 build_typemeta_value / 运行期 type_info intrinsic 都已改为构造这些
+// std.lang 类型（见 src/sema.tc、codegen_*）。
+
+// 一个字段的静态信息（struct 字段 / enum 成员共用同构表达）
+pub struct FieldInfo {
+    name: string;
+    offset: i64;        // 字节偏移（struct 字段）；enum 成员填 -1
+    type_name: string;  // 字段类型名（enum 成员填 ""）
+    type_size: i64;     // 字段类型宽度（enum 成员填 -1）
+    is_ptr: bool;
+    tag: i64;           // struct 字段 @N 字段号；enum 成员为枚举值
+}
+
+// enum 成员（R-026 / thyme 005）
+pub struct EnumMember {
+    name: string;
+    value: i64;         // 枚举整数值（可为负）
+}
+
+// 用户级注解 / 元数据（R-020 / R-022 / thyme 004）：name + 实参值序列
+pub struct Annotation {
+    name: string;
+    args: []AnnotationArg;
+}
+
+// 注解实参：整数 / 字符串 / 标识符（parse_annotation_args 已支持这三种）
+pub struct AnnotationArg {
+    kind: string;       // "int" / "str" / "ident"
+    int_val: i64;
+    str_val: string;
+    ident_val: string;
+}
+
+// 类型元信息（对标 Zig std.builtin.Type + 既有 TypeMeta）。
+// arm 顺序即 ti_kind 数值（Int=0 … Union=10，Module=11）。
+pub struct TypeMeta {
+    name: string;
+    size: i64;
+    kind: i64;
+    field_count: i64;
+    fields: []FieldInfo;       // struct 字段序列
+    enum_members: []EnumMember;// enum 成员序列（struct 时为空）
+    annotations: []Annotation; // 类型级注解（#modifier / #pb …）
+}
+
+// 类型信息变体（与编译器 TypeInfo 同构：每个 arm 单载荷 *TypeMeta）
+pub variant TypeInfo {
+    Int(*TypeMeta);
+    Float(*TypeMeta);
+    Bool;
+    Ptr(*TypeMeta);
+    Slice(*TypeMeta);
+    Array(*TypeMeta);
+    Fn(*TypeMeta);
+    Struct(*TypeMeta);
+    Enum(*TypeMeta);
+    Trait(*TypeMeta);
+    Union(*TypeMeta);
+    Module(*TypeMeta);
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// 四、声明级解析（Schema 提取）—— thyme tdagen / lint 直接消费的共享 AST
+// ───────────────────────────────────────────────────────────────────────────
+//
+// 对标 Zig std.zig.Ast 的「解析即产出结构化树」。这里给出声明级（decl-level）解析：
+// 把 .t / .tproto 源文本解析成 Schema（struct/enum 列表，含字段、@N 字段号、
+// 注解与实参、enum 成员与值）。这就是「本工程与 thyme 同一套代码」的落地处：
+// 编译器可用同一份解析产出 @type_info 的元数据；thyme 的 tdagen 在 comptime
+// 读它生成 TDA；format/lint 也在此之上做变换/检查。
+//
+// 光标通过「返回新位置」的 Result 结构传递（避免指针语义差异）。
+
+// 简单十进制串 → i64（处理可选负号与前导 +）
+pub fn atoi(s: string) i64 {
+    var n: i64 = str_len(s) as i64;
+    var v: i64 = 0;
+    var neg: bool = false;
+    var i: i64 = 0;
+    if (n > 0 and (s[i] == 45 or s[i] == 43)) { if (s[i] == 45) { neg = true; } i = i + 1; }
+    while (i < n) {
+        var c: u8 = s[i];
+        if (c >= 48 and c <= 57) { v = v * 10 + (c as i64) - 48; }
+        i = i + 1;
+    }
+    if (neg) { return 0 - v; }
+    return v;
+}
+
+// 字段声明
+pub struct FieldDecl {
+    name: string;
+    type_name: string;
+    tag: i64;             // @N 字段号；无则 -1
+    annotations: []Annotation;
+    default_expr: string; // 默认初始器源码（若有）
+}
+
+// struct 声明
+pub struct StructDecl2 {
+    name: string;
+    is_pb: bool;
+    fields: []FieldDecl;
+    annotations: []Annotation;
+}
+
+// enum 成员
+pub struct EnumMember2 {
+    name: string;
+    value: i64;
+    annotations: []Annotation;
+}
+
+// enum 声明
+pub struct EnumDecl2 {
+    name: string;
+    underlying: string;   // 底层整型（i32 / u8 …）
+    is_pb: bool;
+    members: []EnumMember2;
+    annotations: []Annotation;
+}
+
+pub struct Schema {
+    structs: []StructDecl2;
+    enums: []EnumDecl2;
+    errors: []string;     // 解析期诊断（不支持的声明等），不再静默丢弃（R-035 ③）
+}
+
+// 注解解析结果（携带新光标）
+pub struct AParse {
+    anns: []Annotation;
+    pos: i64;
+}
+
+// 从 toks[i]（应为 At）起解析一串注解，返回注解列表与新光标
+pub fn parse_annotations(toks: []Token, i: i64) AParse {
+    var anns: []Annotation;
+    var n: i64 = slice_len(toks) as i64;
+    while (i < n and str_eq(toks[i].kind, "At")) {
+        i = i + 1;   // 跳过 @
+        if (i >= n) { break; }
+        var aname: string = toks[i].src;
+        i = i + 1;
+        var args: []AnnotationArg;
+        if (i < n and str_eq(toks[i].kind, "LParen")) {
+            i = i + 1;
+            while (i < n and str_eq(toks[i].kind, "RParen") == false) {
+                var kk: string = toks[i].kind;
+                if (str_eq(kk, "Integer")) {
+                    append(args, AnnotationArg{ kind: "int", int_val: atoi(toks[i].src), str_val: "", ident_val: "" });
+                    i = i + 1;
+                } else if (str_eq(kk, "String")) {
+                    append(args, AnnotationArg{ kind: "str", int_val: 0, str_val: toks[i].src, ident_val: "" });
+                    i = i + 1;
+                } else if (str_eq(kk, "Identifier")) {
+                    append(args, AnnotationArg{ kind: "ident", int_val: 0, str_val: "", ident_val: toks[i].src });
+                    i = i + 1;
+                } else {
+                    i = i + 1;
+                }
+                if (i < n and str_eq(toks[i].kind, "Comma")) { i = i + 1; }
+            }
+            if (i < n and str_eq(toks[i].kind, "RParen")) { i = i + 1; }
+        }
+        append(anns, Annotation{ name: aname, args: args });
+    }
+    return AParse{ anns: anns, pos: i };
+}
+
+// struct 解析结果
+pub struct SParse {
+    d: StructDecl2;
+    pos: i64;
+}
+
+// 解析一个 struct 声明（toks[i] 应为 KwStruct）
+pub fn parse_struct(toks: []Token, i: i64) SParse {
+    var d: StructDecl2;
+    var n: i64 = slice_len(toks) as i64;
+    i = i + 1;   // 跳过 KwStruct
+    if (i < n and str_eq(toks[i].kind, "Identifier")) { d.name = toks[i].src; i = i + 1; }
+    // 底层类型参数化 struct<T> 暂忽略泛型参数
+    if (i < n and str_eq(toks[i].kind, "Lt")) {
+        while (i < n and str_eq(toks[i].kind, "Gt") == false) { i = i + 1; }
+        if (i < n and str_eq(toks[i].kind, "Gt")) { i = i + 1; }
+    }
+    // 类型级注解（#modifier / #pb 之外的 @ 注解）
+    var pa: AParse = parse_annotations(toks, i);
+    d.annotations = pa.anns;
+    i = pa.pos;
+    if (i < n and str_eq(toks[i].kind, "LBrace")) { i = i + 1; }
+    // 字段
+    while (i < n and str_eq(toks[i].kind, "RBrace") == false) {
+        if (str_eq(toks[i].kind, "At")) {
+            // 结构体级 @ 注解（如 @deprecated）落在字段区之前，归到 struct 注解
+            var pa2: AParse = parse_annotations(toks, i);
+            d.annotations = concat_anns(d.annotations, pa2.anns);
+            i = pa2.pos;
+            continue;
+        }
+        if (str_eq(toks[i].kind, "Identifier") == false) { i = i + 1; continue; }
+        var f: FieldDecl;
+        f.tag = -1;
+        f.name = toks[i].src;
+        i = i + 1;
+        // ② 每个字段显式重置注解与类型名：t 的循环内 var 不复零，否则上一字段的注解会串台、
+        //    残留类型名会污染本字段（R-035 ②）。
+        var f_empty_anns: []Annotation;
+        f.annotations = f_empty_anns;
+        f.type_name = "";
+        if (i < n and str_eq(toks[i].kind, "Colon")) { i = i + 1; }
+        // ① 类型位置复用通用 parse_type（正确处理 KwString / KwAny / KwVoid / KwUnit /
+        //    KwAuto、可选/切片/指针/映射/数组及点号前缀与泛型实参），不再因「关键字类型」导致
+        //    光标不推进、后续 @N 字段号整体错位（R-035 ①）。
+        if (i < n) {
+            var f_tr: PR = parse_type(toks, i);
+            f.type_name = type_node_str(f_tr.n);
+            i = f_tr.pos;
+        }
+        // @N 字段号 或 @注解
+        while (i < n and str_eq(toks[i].kind, "At")) {
+            if (i + 1 < n and str_eq(toks[i + 1].kind, "Integer")) {
+                f.tag = atoi(toks[i + 1].src);
+                i = i + 2;
+            } else {
+                var pa3: AParse = parse_annotations(toks, i);
+                f.annotations = concat_anns(f.annotations, pa3.anns);
+                i = pa3.pos;
+            }
+        }
+        // 默认初始器 = expr ;
+        if (i < n and str_eq(toks[i].kind, "Assign")) {
+            i = i + 1;
+            var ds: string = "";
+            while (i < n and str_eq(toks[i].kind, "Semicolon") == false) {
+                ds = ds + toks[i].src;
+                i = i + 1;
+            }
+            f.default_expr = ds;
+        }
+        if (i < n and str_eq(toks[i].kind, "Semicolon")) { i = i + 1; }
+        append(d.fields, f);
+    }
+    if (i < n and str_eq(toks[i].kind, "RBrace")) { i = i + 1; }
+    return SParse{ d: d, pos: i };
+}
+
+// enum 解析结果
+pub struct EParse {
+    d: EnumDecl2;
+    pos: i64;
+}
+
+// 解析一个 enum 声明（toks[i] 应为 KwEnum）
+pub fn parse_enum(toks: []Token, i: i64) EParse {
+    var d: EnumDecl2;
+    var n: i64 = slice_len(toks) as i64;
+    i = i + 1;   // 跳过 KwEnum
+    if (i < n and str_eq(toks[i].kind, "Identifier")) { d.name = toks[i].src; i = i + 1; }
+    // : 底层类型
+    if (i < n and str_eq(toks[i].kind, "Colon")) {
+        i = i + 1;
+        if (i < n and str_eq(toks[i].kind, "Identifier")) { d.underlying = toks[i].src; i = i + 1; }
+    }
+    var pa: AParse = parse_annotations(toks, i);
+    d.annotations = pa.anns;
+    i = pa.pos;
+    if (i < n and str_eq(toks[i].kind, "LBrace")) { i = i + 1; }
+    var auto_val: i64 = 0;
+    while (i < n and str_eq(toks[i].kind, "RBrace") == false) {
+        if (str_eq(toks[i].kind, "At")) {
+            var pa2: AParse = parse_annotations(toks, i);
+            d.annotations = concat_anns(d.annotations, pa2.anns);
+            i = pa2.pos;
+            continue;
+        }
+        if (str_eq(toks[i].kind, "Identifier") == false) { i = i + 1; continue; }
+        var m: EnumMember2;
+        m.name = toks[i].src;
+        i = i + 1;
+        m.value = auto_val;
+        if (i < n and str_eq(toks[i].kind, "Assign")) {
+            i = i + 1;
+            if (i < n and str_eq(toks[i].kind, "Integer")) { m.value = atoi(toks[i].src); i = i + 1; auto_val = m.value; }
+        }
+        auto_val = auto_val + 1;
+        // 成员级注解
+        var pa3: AParse = parse_annotations(toks, i);
+        m.annotations = pa3.anns;
+        i = pa3.pos;
+        if (i < n and str_eq(toks[i].kind, "Semicolon")) { i = i + 1; }
+        append(d.members, m);
+    }
+    if (i < n and str_eq(toks[i].kind, "RBrace")) { i = i + 1; }
+    return EParse{ d: d, pos: i };
+}
+
+// 合并两个注解列表（std 库无运行期全局，纯函数）
+pub fn concat_anns(a: []Annotation, b: []Annotation) []Annotation {
+    var out: []Annotation;
+    var k: i64 = 0;
+    while (k < slice_len(a) as i64) { append(out, a[k]); k = k + 1; }
+    k = 0;
+    while (k < slice_len(b) as i64) { append(out, b[k]); k = k + 1; }
+    return out;
+}
+
+// 入口：把源文本解析为 Schema
+pub fn parse_schema(src: string) Schema {
+    var toks: []Token = tokenize(src);
+    var s: Schema;
+    var pending_pb: bool = false;
+    var pending_anns: []Annotation;   // 类型级 #<id> 修饰词，挂到下一个 struct/enum（R-045）
+    var i: i64 = 0;
+    var n: i64 = slice_len(toks) as i64;
+    while (i < n) {
+        var k: string = toks[i].kind;
+        if (str_eq(k, "Hash")) {
+            // 紧跟的标识符若是修饰词（pb / modifier），标记为 pending；否则作为自定义类型级
+            // 修饰词（#<id>，如 #thyme_reserved）暂存，挂到下一个 struct/enum 的 annotations（R-045）。
+            if (i + 1 < n and str_eq(toks[i + 1].kind, "Identifier")) {
+                var hk: string = toks[i + 1].src;
+                if (str_eq(hk, "pb") or str_eq(hk, "modifier")) {
+                    pending_pb = true;
+                } else {
+                    append(pending_anns, Annotation{ name: hk, args: [] });
+                }
+            }
+            i = i + 1;
+            continue;
+        }
+        if (str_eq(k, "KwStruct")) {
+            var r: SParse = parse_struct(toks, i);
+            // 注意：本编译器对「字段的字段」两级赋值（r.d.is_pb = …）支持不稳，
+            // 故先拷到本地单层变量再改字段，最后整体 append。
+            var sd: StructDecl2 = r.d;
+            sd.is_pb = pending_pb;
+            sd.annotations = concat_anns(pending_anns, sd.annotations);
+            pending_pb = false;
+            var pa_empty: []Annotation; pending_anns = pa_empty;
+            append(s.structs, sd);
+            i = r.pos;
+            continue;
+        }
+        if (str_eq(k, "KwEnum")) {
+            var r: EParse = parse_enum(toks, i);
+            var ed: EnumDecl2 = r.d;
+            ed.is_pb = pending_pb;
+            ed.annotations = concat_anns(pending_anns, ed.annotations);
+            pending_pb = false;
+            var pa_empty: []Annotation; pending_anns = pa_empty;
+            append(s.enums, ed);
+            i = r.pos;
+            continue;
+        }
+        // ③ 不支持的顶层声明（variant/union/const/fn/let/trait/agent）：明确诊断并记入
+        //    s.errors，跳过其声明体，**不再静默丢弃**（R-035 ③，001 §5 红线）。
+        if (is_top_decl(k)) {
+            var dname: string = "";
+            if (i + 1 < n) { dname = toks[i + 1].src; }
+            var msg: string = "parse_schema: 不支持的顶层声明 '" ++ k ++ "'";
+            if (str_len(dname) > 0) { msg = msg ++ " (" ++ dname ++ ")"; }
+            msg = msg ++ " —— 该声明被忽略，未进入 Schema（请改用 struct/enum，或移除该声明）";
+            append(s.errors, msg);
+            println(msg);
+            i = skip_top_decl(toks, i);
+            continue;
+        }
+        i = i + 1;
+    }
+    return s;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 五、通用 AST（Zig std.zig.Ast 风格树状前端）—— format / lint / thyme 共用
+//
+// 与编译器 base.tc 的全局节点表解耦：本模块只产出「值语义」的 Node 树，所有解析
+// 结果都靠返回值传递（无运行期全局、无 SoA 节点表），因此同一份代码可被编译器、
+// format、lint、tdagen 任意消费。节点种类（tag）以字符串标识，与编译器 node_kind
+// 对齐（StructDecl / FuncDecl / Field / EnumMember / Binary / Call / …）。
+// ═══════════════════════════════════════════════════════════════════════════
+
+// 通用节点：tag 标识种类；mt 为主 token 下标（源定位）；text 缓存叶子文本；
+// data 携带辅助整数（@N 字段号 / enum 值 / 注解实参 kind）；children 为子节点。
+pub struct Node {
+    tag: string;
+    mt: i64;
+    text: string;
+    data: i64;
+    children: []Node;
+}
+
+// 解析结果：节点 + 新光标（t 不支持多返回值，统一用 wrapper 结构传递）
+pub struct PR {
+    n: Node;
+    pos: i64;
+}
+
+fn mk_node(tag: string, mt: i64) Node {
+    var n: Node;
+    n.tag = tag; n.mt = mt; n.text = ""; n.data = -1;
+    return n;
+}
+
+fn tok_kind(toks: []Token, i: i64) string {
+    if (i < 0 or i >= slice_len(toks) as i64) { return "Eof"; }
+    return toks[i].kind;
+}
+fn tok_src(toks: []Token, i: i64) string {
+    if (i < 0 or i >= slice_len(toks) as i64) { return ""; }
+    return toks[i].src;
+}
+
+// ── 注解（节点式，供通用树消费）──────────────────────────────────────────────
+fn parse_ann_node(toks: []Token, i: i64) PR {
+    var n: Node = mk_node("Annotation", i);   // i 在 '@'
+    i = i + 1;
+    n.text = tok_src(toks, i);                // 注解名
+    i = i + 1;
+    if (str_eq(tok_kind(toks, i), "LParen")) {
+        i = i + 1;
+        while (i < slice_len(toks) as i64 and str_eq(tok_kind(toks, i), "RParen") == false) {
+            var arg: Node = mk_node("AnnotationArg", i);
+            var kk = tok_kind(toks, i);
+            if (str_eq(kk, "Integer")) { arg.data = 0; arg.text = tok_src(toks, i); }
+            else if (str_eq(kk, "String")) { arg.data = 1; arg.text = tok_src(toks, i); }
+            else if (str_eq(kk, "Identifier")) { arg.data = 2; arg.text = tok_src(toks, i); }
+            else { arg.data = -1; arg.text = tok_src(toks, i); }
+            append(n.children, arg);
+            i = i + 1;
+            if (str_eq(tok_kind(toks, i), "Comma")) { i = i + 1; }
+        }
+        if (str_eq(tok_kind(toks, i), "RParen")) { i = i + 1; }
+    }
+    return PR{ n: n, pos: i };
+}
+
+fn parse_anns_node(toks: []Token, i: i64) PR {
+    var n: Node = mk_node("Annotations", i);
+    while (i < slice_len(toks) as i64 and str_eq(tok_kind(toks, i), "At")) {
+        var a = parse_ann_node(toks, i);
+        append(n.children, a.n);
+        i = a.pos;
+    }
+    return PR{ n: n, pos: i };
+}
+
+// ── 类型解析 ────────────────────────────────────────────────────────────────
+fn parse_type(toks: []Token, i: i64) PR {
+    if (str_eq(tok_kind(toks, i), "Question")) {
+        var n = mk_node("OptionalType", i); i = i + 1;
+        var s = parse_type(toks, i); append(n.children, s.n); return PR{ n: n, pos: s.pos };
+    }
+    if (str_eq(tok_kind(toks, i), "Star")) {
+        var n = mk_node("PointerType", i); i = i + 1;
+        var s = parse_type(toks, i); append(n.children, s.n); return PR{ n: n, pos: s.pos };
+    }
+    if (str_eq(tok_kind(toks, i), "LBracket")) {
+        i = i + 1;
+        if (str_eq(tok_kind(toks, i), "RBracket")) {
+            var n = mk_node("SliceType", i - 1); i = i + 1;
+            var s = parse_type(toks, i); append(n.children, s.n); return PR{ n: n, pos: s.pos };
+        }
+        var n = mk_node("ArrayType", i - 1);
+        while (i < slice_len(toks) as i64 and str_eq(tok_kind(toks, i), "RBracket") == false) {
+            append(n.children, mk_node(tok_kind(toks, i), i)); i = i + 1;
+        }
+        if (str_eq(tok_kind(toks, i), "RBracket")) { i = i + 1; }
+        var s = parse_type(toks, i); append(n.children, s.n); return PR{ n: n, pos: s.pos };
+    }
+    if (str_eq(tok_kind(toks, i), "KwMap")) {
+        var n = mk_node("MapType", i); i = i + 1;
+        if (str_eq(tok_kind(toks, i), "LBracket")) {
+            i = i + 1;
+            // key 走递归 parse_type（与 value 一致），避免把 key 退化成 token kind（R-046）。
+            while (i < slice_len(toks) as i64 and str_eq(tok_kind(toks, i), "RBracket") == false) {
+                var kp: PR = parse_type(toks, i);
+                append(n.children, kp.n);
+                i = kp.pos;
+                if (str_eq(tok_kind(toks, i), "Comma")) { i = i + 1; }
+            }
+            if (str_eq(tok_kind(toks, i), "RBracket")) { i = i + 1; }
+        }
+        var s = parse_type(toks, i); append(n.children, s.n); return PR{ n: n, pos: s.pos };
+    }
+    if (str_eq(tok_kind(toks, i), "Identifier")
+        or str_eq(tok_kind(toks, i), "KwString") or str_eq(tok_kind(toks, i), "KwAny")
+        or str_eq(tok_kind(toks, i), "KwVoid") or str_eq(tok_kind(toks, i), "KwUnit")
+        or str_eq(tok_kind(toks, i), "KwAuto")) {
+        var n = mk_node("TypeName", i); n.text = tok_src(toks, i); i = i + 1;
+        while (str_eq(tok_kind(toks, i), "Dot") and str_eq(tok_kind(toks, i + 1), "Identifier")) {
+            i = i + 1; n.text = n.text + "." + tok_src(toks, i); i = i + 1;
+        }
+        if (str_eq(tok_kind(toks, i), "Lt")) {
+            i = i + 1;
+            while (i < slice_len(toks) as i64 and str_eq(tok_kind(toks, i), "Gt") == false) {
+                var g = parse_type(toks, i); append(n.children, g.n); i = g.pos;
+                if (str_eq(tok_kind(toks, i), "Comma")) { i = i + 1; }
+            }
+            if (str_eq(tok_kind(toks, i), "Gt")) { i = i + 1; }
+        }
+        return PR{ n: n, pos: i };
+    }
+    var n = mk_node("Type", i);
+    append(n.children, mk_node(tok_kind(toks, i), i));
+    return PR{ n: n, pos: i + 1 };
+}
+
+// R-035 ①：把 parse_type 产出的类型节点渲染为规范类型名串（与 FieldDecl.type_name 语义一致）。
+// 覆盖 TypeName（含点号前缀与泛型实参）、可选(?T)、指针(*T)、切片([]T)、数组([N]T)、映射(map[K]V)。
+fn type_node_str(n: Node) string {
+    var tag: string = n.tag;
+    var k: i64 = slice_len(n.children) as i64;
+    if (str_eq(tag, "TypeName")) { return n.text; }
+    if (str_eq(tag, "OptionalType")) {
+        if (k > 0) { return "?" ++ type_node_str(n.children[0]); }
+        return "?";
+    }
+    if (str_eq(tag, "PointerType")) {
+        if (k > 0) { return "*" ++ type_node_str(n.children[0]); }
+        return "*";
+    }
+    if (str_eq(tag, "SliceType")) {
+        if (k > 0) { return "[]" ++ type_node_str(n.children[0]); }
+        return "[]";
+    }
+    if (str_eq(tag, "ArrayType")) {
+        var elem: Node;
+        if (k > 0) { elem = n.children[k - 1]; }
+        return "[" ++ "]" ++ type_node_str(elem);
+    }
+    if (str_eq(tag, "MapType")) {
+        var key: Node;
+        var val: Node;
+        if (k >= 2) { key = n.children[k - 2]; val = n.children[k - 1]; }
+        else if (k == 1) { val = n.children[0]; }
+        return "map[" ++ type_node_str(key) ++ "]" ++ type_node_str(val);
+    }
+    if (k > 0) { return type_node_str(n.children[0]); }
+    return tag;
+}
+
+// R-035 ③：识别 Schema 模型不支持的顶层声明关键字（variant/union/const/fn/let/trait/agent）。
+// struct/enum 已被 parse_schema 处理；#pb/#modifier 经 Hash 分支处理。
+fn is_top_decl(k: string) bool {
+    return str_eq(k, "KwVariant") or str_eq(k, "KwUnion") or str_eq(k, "KwConst")
+        or str_eq(k, "KwFn") or str_eq(k, "KwLet") or str_eq(k, "KwTrait")
+        or str_eq(k, "KwAgent");
+}
+
+// 跳过整个顶层声明体（至下一个顶层声明起点或 Eof），避免不支持的声明被静默丢弃后还污染后续解析。
+fn skip_top_decl(toks: []Token, i: i64) i64 {
+    var n: i64 = slice_len(toks) as i64;
+    var depth: i64 = 0;
+    while (i < n) {
+        var kk: string = toks[i].kind;
+        if (str_eq(kk, "LBrace")) { depth = depth + 1; }
+        else if (str_eq(kk, "RBrace")) {
+            if (depth > 0) { depth = depth - 1; }
+            else { return i; }
+        }
+        if (depth == 0 and (str_eq(kk, "KwStruct") or str_eq(kk, "KwEnum") or str_eq(kk, "Hash"))) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return i;
+}
+
+// 把 pending 的 pub 标记与注解前置到声明节点（避免两级字段赋值，统一走本地拷贝）
+fn attach_meta(d: Node, anns: []Node, is_pub: bool) Node {
+    var out: Node = d;
+    var ch: []Node;
+    if (is_pub) {
+        var p: Node = mk_node("Pub", -1);
+        append(ch, p);
+    }
+    var k: i64 = 0;
+    while (k < slice_len(anns) as i64) { append(ch, anns[k]); k = k + 1; }
+    k = 0;
+    while (k < slice_len(out.children) as i64) { append(ch, out.children[k]); k = k + 1; }
+    out.children = ch;
+    return out;
+}
+
+// ── 语句 / 表达式解析（覆盖整条语法，供 format / lint / 用户级语法扩展消费）────
+fn is_stopper(k: string) bool {
+    return str_eq(k, "FatArrow") or str_eq(k, "Comma") or str_eq(k, "Semicolon") or str_eq(k, "RBrace")
+        or str_eq(k, "RParen") or str_eq(k, "Eof");
+}
+
+fn parse_block(toks: []Token, i: i64) PR {
+    var n = mk_node("Block", i);
+    i = i + 1;   // 消费 LBrace
+    var m = slice_len(toks) as i64;
+    while (i < m and str_eq(tok_kind(toks, i), "RBrace") == false) {
+        var s = parse_stmt(toks, i);
+        append(n.children, s.n);
+        i = s.pos;
+        if (str_eq(tok_kind(toks, i), "Semicolon")) { i = i + 1; }
+    }
+    if (str_eq(tok_kind(toks, i), "RBrace")) { i = i + 1; }
+    return PR{ n: n, pos: i };
+}
+
+fn parse_local_var(toks: []Token, i: i64, is_const: bool) PR {
+    var n = mk_node("LocalVar", i);
+    if (is_const) { n.tag = "LocalConst"; }
+    i = i + 1;
+    if (str_eq(tok_kind(toks, i), "Identifier")) { n.text = tok_src(toks, i); i = i + 1; }
+    if (str_eq(tok_kind(toks, i), "Colon")) { i = i + 1; var t = parse_type(toks, i); append(n.children, t.n); i = t.pos; }
+    if (str_eq(tok_kind(toks, i), "Assign")) { i = i + 1; var e = parse_expr(toks, i); append(n.children, e.n); i = e.pos; }
+    return PR{ n: n, pos: i };
+}
+
+fn parse_if(toks: []Token, i: i64) PR {
+    var n = mk_node("If", i); i = i + 1;
+    var c = parse_expr(toks, i); append(n.children, c.n); i = c.pos;
+    if (str_eq(tok_kind(toks, i), "LBrace")) { var b = parse_block(toks, i); append(n.children, b.n); i = b.pos; }
+    if (str_eq(tok_kind(toks, i), "KwElse")) {
+        i = i + 1;
+        if (str_eq(tok_kind(toks, i), "KwIf")) { var e = parse_if(toks, i); append(n.children, e.n); i = e.pos; }
+        else if (str_eq(tok_kind(toks, i), "LBrace")) { var b = parse_block(toks, i); append(n.children, b.n); i = b.pos; }
+    }
+    return PR{ n: n, pos: i };
+}
+
+fn parse_while(toks: []Token, i: i64) PR {
+    var n = mk_node("While", i); i = i + 1;
+    var c = parse_expr(toks, i); append(n.children, c.n); i = c.pos;
+    if (str_eq(tok_kind(toks, i), "LBrace")) { var b = parse_block(toks, i); append(n.children, b.n); i = b.pos; }
+    return PR{ n: n, pos: i };
+}
+
+fn parse_for(toks: []Token, i: i64) PR {
+    var n = mk_node("For", i); i = i + 1;
+    var m = slice_len(toks) as i64;
+    if (str_eq(tok_kind(toks, i), "LParen")) {
+        i = i + 1;
+        var h = mk_node("ForHeader", i);
+        while (i < m and str_eq(tok_kind(toks, i), "RParen") == false) { append(h.children, mk_node(tok_kind(toks, i), i)); i = i + 1; }
+        if (str_eq(tok_kind(toks, i), "RParen")) { i = i + 1; }
+        append(n.children, h);
+    }
+    if (str_eq(tok_kind(toks, i), "LBrace")) { var b = parse_block(toks, i); append(n.children, b.n); i = b.pos; }
+    return PR{ n: n, pos: i };
+}
+
+fn parse_match(toks: []Token, i: i64) PR {
+    var n = mk_node("Match", i); i = i + 1;
+    var m = slice_len(toks) as i64;
+    var s = parse_expr(toks, i); append(n.children, s.n); i = s.pos;
+    if (str_eq(tok_kind(toks, i), "LBrace")) { i = i + 1; }
+    while (i < m and str_eq(tok_kind(toks, i), "RBrace") == false) {
+        var arm = mk_node("MatchArm", i);
+        var p = parse_expr(toks, i); append(arm.children, p.n); i = p.pos;
+        if (str_eq(tok_kind(toks, i), "FatArrow")) { i = i + 1; }
+        if (str_eq(tok_kind(toks, i), "LBrace")) { var b = parse_block(toks, i); append(arm.children, b.n); i = b.pos; }
+        else { var e = parse_expr(toks, i); append(arm.children, e.n); i = e.pos; }
+        append(n.children, arm);
+        if (str_eq(tok_kind(toks, i), "Comma")) { i = i + 1; }
+    }
+    if (str_eq(tok_kind(toks, i), "RBrace")) { i = i + 1; }
+    return PR{ n: n, pos: i };
+}
+
+fn parse_stmt(toks: []Token, i: i64) PR {
+    var k = tok_kind(toks, i);
+    if (str_eq(k, "KwLet")) { return parse_local_var(toks, i, true); }
+    if (str_eq(k, "KwVar")) { return parse_local_var(toks, i, false); }
+    if (str_eq(k, "KwIf")) { return parse_if(toks, i); }
+    if (str_eq(k, "KwWhile")) { return parse_while(toks, i); }
+    if (str_eq(k, "KwFor")) { return parse_for(toks, i); }
+    if (str_eq(k, "KwReturn")) {
+        var n = mk_node("Return", i); i = i + 1;
+        if (str_eq(tok_kind(toks, i), "Semicolon") == false and str_eq(tok_kind(toks, i), "RBrace") == false and str_eq(tok_kind(toks, i), "Eof") == false) {
+            var e = parse_expr(toks, i); append(n.children, e.n); i = e.pos;
+        }
+        return PR{ n: n, pos: i };
+    }
+    if (str_eq(k, "KwBreak")) { return PR{ n: mk_node("Break", i), pos: i + 1 }; }
+    if (str_eq(k, "KwContinue")) { return PR{ n: mk_node("Continue", i), pos: i + 1 }; }
+    if (str_eq(k, "KwDefer")) {
+        var n = mk_node("Defer", i); i = i + 1;
+        var s = parse_stmt(toks, i); append(n.children, s.n); return PR{ n: n, pos: s.pos };
+    }
+    if (str_eq(k, "KwComptime")) {
+        var n = mk_node("Comptime", i); i = i + 1;
+        if (str_eq(tok_kind(toks, i), "LBrace")) { var b = parse_block(toks, i); append(n.children, b.n); return PR{ n: n, pos: b.pos }; }
+        var s = parse_stmt(toks, i); append(n.children, s.n); return PR{ n: n, pos: s.pos };
+    }
+    if (str_eq(k, "KwMatch")) { return parse_match(toks, i); }
+    if (str_eq(k, "Identifier") and str_eq(tok_src(toks, i), "unsafe")) {
+        var n = mk_node("Unsafe", i); i = i + 1;
+        if (str_eq(tok_kind(toks, i), "LBrace")) { var b = parse_block(toks, i); append(n.children, b.n); return PR{ n: n, pos: b.pos }; }
+        return PR{ n: n, pos: i };
+    }
+    return parse_expr(toks, i);
+}
+
+// ── 表达式优先级链 ──────────────────────────────────────────────────────────
+fn parse_expr(toks: []Token, i: i64) PR { return parse_assign(toks, i); }
+
+fn parse_assign(toks: []Token, i: i64) PR {
+    var lhs = parse_pipe(toks, i);
+    var k = tok_kind(toks, lhs.pos);
+    if (str_eq(k, "Assign") or str_eq(k, "PlusAssign") or str_eq(k, "MinusAssign") or str_eq(k, "StarAssign")
+        or str_eq(k, "SlashAssin") or str_eq(k, "PercentAssign") or str_eq(k, "BitAndAssign")
+        or str_eq(k, "BitOrAssign") or str_eq(k, "BitXorAssign")) {
+        var n = mk_node("Assign", lhs.pos); n.text = k;
+        i = lhs.pos + 1;
+        var rhs = parse_pipe(toks, i);
+        append(n.children, lhs.n); append(n.children, rhs.n);
+        return PR{ n: n, pos: rhs.pos };
+    }
+    return lhs;
+}
+
+fn parse_pipe(toks: []Token, i: i64) PR {
+    var lhs = parse_orelse(toks, i);
+    if (str_eq(tok_kind(toks, lhs.pos), "PipeApply")) {
+        var n = mk_node("Pipe", lhs.pos);
+        i = lhs.pos + 1;
+        var rhs = parse_orelse(toks, i);
+        append(n.children, lhs.n); append(n.children, rhs.n);
+        return PR{ n: n, pos: rhs.pos };
+    }
+    return lhs;
+}
+
+fn parse_orelse(toks: []Token, i: i64) PR {
+    var lhs = parse_range(toks, i);
+    if (str_eq(tok_kind(toks, lhs.pos), "KwOrelse")) {
+        var n = mk_node("OrElse", lhs.pos);
+        i = lhs.pos + 1;
+        var rhs = parse_range(toks, i);
+        append(n.children, lhs.n); append(n.children, rhs.n);
+        return PR{ n: n, pos: rhs.pos };
+    }
+    return lhs;
+}
+
+fn parse_range(toks: []Token, i: i64) PR {
+    var lhs = parse_concat(toks, i);
+    var k = tok_kind(toks, lhs.pos);
+    if (str_eq(k, "DotDot") or str_eq(k, "DotDotEq")) {
+        var n = mk_node("Range", lhs.pos);
+        if (str_eq(k, "DotDotEq")) { n.text = "..="; } else { n.text = ".."; }
+        i = lhs.pos + 1;
+        var rhs = parse_concat(toks, i);
+        append(n.children, lhs.n); append(n.children, rhs.n);
+        return PR{ n: n, pos: rhs.pos };
+    }
+    return lhs;
+}
+
+fn parse_concat(toks: []Token, i: i64) PR {
+    var lhs = parse_in(toks, i);
+    if (str_eq(tok_kind(toks, lhs.pos), "PlusPlus")) {
+        var n = mk_node("Concat", lhs.pos);
+        i = lhs.pos + 1;
+        var rhs = parse_in(toks, i);
+        append(n.children, lhs.n); append(n.children, rhs.n);
+        return PR{ n: n, pos: rhs.pos };
+    }
+    return lhs;
+}
+
+fn parse_in(toks: []Token, i: i64) PR {
+    var lhs = parse_or(toks, i);
+    if (str_eq(tok_kind(toks, lhs.pos), "KwIn")) {
+        var n = mk_node("In", lhs.pos);
+        i = lhs.pos + 1;
+        var rhs = parse_or(toks, i);
+        append(n.children, lhs.n); append(n.children, rhs.n);
+        return PR{ n: n, pos: rhs.pos };
+    }
+    return lhs;
+}
+
+fn parse_or(toks: []Token, i: i64) PR {
+    var lhs = parse_and(toks, i);
+    if (str_eq(tok_kind(toks, lhs.pos), "KwOr")) {
+        var n = mk_node("Or", lhs.pos);
+        i = lhs.pos + 1;
+        var rhs = parse_and(toks, i);
+        append(n.children, lhs.n); append(n.children, rhs.n);
+        return PR{ n: n, pos: rhs.pos };
+    }
+    return lhs;
+}
+
+fn parse_and(toks: []Token, i: i64) PR {
+    var lhs = parse_cmp(toks, i);
+    if (str_eq(tok_kind(toks, lhs.pos), "KwAnd")) {
+        var n = mk_node("And", lhs.pos);
+        i = lhs.pos + 1;
+        var rhs = parse_cmp(toks, i);
+        append(n.children, lhs.n); append(n.children, rhs.n);
+        return PR{ n: n, pos: rhs.pos };
+    }
+    return lhs;
+}
+
+fn parse_cmp(toks: []Token, i: i64) PR {
+    var lhs = parse_add(toks, i);
+    var k = tok_kind(toks, lhs.pos);
+    if (str_eq(k, "Eq") or str_eq(k, "NotEq") or str_eq(k, "Lt") or str_eq(k, "Gt") or str_eq(k, "LtEq") or str_eq(k, "GtEq")) {
+        var n = mk_node("Binary", lhs.pos); n.text = k;
+        i = lhs.pos + 1;
+        var rhs = parse_add(toks, i);
+        append(n.children, lhs.n); append(n.children, rhs.n);
+        return PR{ n: n, pos: rhs.pos };
+    }
+    return lhs;
+}
+
+fn parse_add(toks: []Token, i: i64) PR {
+    var lhs = parse_mul(toks, i);
+    var k = tok_kind(toks, lhs.pos);
+    if (str_eq(k, "Plus") or str_eq(k, "Minus") or str_eq(k, "BitOr") or str_eq(k, "BitXor") or str_eq(k, "ShiftLeft") or str_eq(k, "ShiftRight")) {
+        var n = mk_node("Binary", lhs.pos); n.text = k;
+        i = lhs.pos + 1;
+        var rhs = parse_mul(toks, i);
+        append(n.children, lhs.n); append(n.children, rhs.n);
+        return PR{ n: n, pos: rhs.pos };
+    }
+    return lhs;
+}
+
+fn parse_mul(toks: []Token, i: i64) PR {
+    var lhs = parse_unary(toks, i);
+    var k = tok_kind(toks, lhs.pos);
+    if (str_eq(k, "Star") or str_eq(k, "Slash") or str_eq(k, "Percent") or str_eq(k, "BitAnd")) {
+        var n = mk_node("Binary", lhs.pos); n.text = k;
+        i = lhs.pos + 1;
+        var rhs = parse_unary(toks, i);
+        append(n.children, lhs.n); append(n.children, rhs.n);
+        return PR{ n: n, pos: rhs.pos };
+    }
+    return lhs;
+}
+
+fn parse_unary(toks: []Token, i: i64) PR {
+    var k = tok_kind(toks, i);
+    if (str_eq(k, "Minus") or str_eq(k, "Plus") or str_eq(k, "Not") or str_eq(k, "BitNot") or str_eq(k, "BitAnd") or str_eq(k, "Star")) {
+        var n = mk_node("Unary", i); n.text = k;
+        i = i + 1;
+        var operand = parse_unary(toks, i);
+        append(n.children, operand.n);
+        return PR{ n: n, pos: operand.pos };
+    }
+    return parse_postfix(toks, i);
+}
+
+fn parse_postfix(toks: []Token, i: i64) PR {
+    var e = parse_primary(toks, i);
+    var m = slice_len(toks) as i64;
+    while (e.pos < m) {
+        var k = tok_kind(toks, e.pos);
+        if (str_eq(k, "Dot")) {
+            i = e.pos + 1;
+            var child = mk_node("Ident", i);
+            child.text = tok_src(toks, i);
+            i = i + 1;
+            var n = mk_node("Member", e.pos);
+            append(n.children, e.n); append(n.children, child);
+            e = PR{ n: n, pos: i };
+        } else if (str_eq(k, "LBracket")) {
+            i = e.pos + 1;
+            var idx = parse_expr(toks, i);
+            if (str_eq(tok_kind(toks, idx.pos), "RBracket")) { i = idx.pos + 1; }
+            else { i = idx.pos; }
+            var n = mk_node("Index", e.pos);
+            append(n.children, e.n); append(n.children, idx.n);
+            e = PR{ n: n, pos: i };
+        } else if (str_eq(k, "LParen")) {
+            i = e.pos + 1;
+            var n = mk_node("Call", e.pos);
+            append(n.children, e.n);
+            while (i < m and str_eq(tok_kind(toks, i), "RParen") == false) {
+                var a = parse_expr(toks, i);
+                append(n.children, a.n);
+                i = a.pos;
+                if (str_eq(tok_kind(toks, i), "Comma")) { i = i + 1; }
+            }
+            if (str_eq(tok_kind(toks, i), "RParen")) { i = i + 1; }
+            e = PR{ n: n, pos: i };
+        } else if (str_eq(k, "KwAs")) {
+            i = e.pos + 1;
+            var t = parse_type(toks, i);
+            var n = mk_node("Cast", e.pos);
+            append(n.children, e.n); append(n.children, t.n);
+            e = PR{ n: n, pos: t.pos };
+        } else {
+            break;
+        }
+    }
+    return e;
+}
+
+fn parse_primary(toks: []Token, i: i64) PR {
+    var k = tok_kind(toks, i);
+    if (is_stopper(k)) { return PR{ n: mk_node("Empty", i), pos: i }; }
+    if (str_eq(k, "Integer")) { var n = mk_node("IntLit", i); n.text = tok_src(toks, i); return PR{ n: n, pos: i + 1 }; }
+    if (str_eq(k, "Float")) { var n = mk_node("FloatLit", i); n.text = tok_src(toks, i); return PR{ n: n, pos: i + 1 }; }
+    if (str_eq(k, "String")) { var n = mk_node("StrLit", i); n.text = tok_src(toks, i); return PR{ n: n, pos: i + 1 }; }
+    if (str_eq(k, "KwTrue") or str_eq(k, "KwFalse")) { var n = mk_node("BoolLit", i); n.text = tok_src(toks, i); return PR{ n: n, pos: i + 1 }; }
+    if (str_eq(k, "KwNull")) { return PR{ n: mk_node("NullLit", i), pos: i + 1 }; }
+    if (str_eq(k, "Identifier")) {
+        var n = mk_node("Ident", i); n.text = tok_src(toks, i);
+        return PR{ n: n, pos: i + 1 };
+    }
+    if (str_eq(k, "LParen")) {
+        i = i + 1;
+        if (str_eq(tok_kind(toks, i), "RParen")) { return PR{ n: mk_node("UnitLit", i - 1), pos: i + 1 }; }
+        var first = parse_expr(toks, i);
+        if (str_eq(tok_kind(toks, first.pos), "Comma")) {
+            var n = mk_node("TupleLit", i - 1);
+            append(n.children, first.n);
+            i = first.pos;
+            while (i < slice_len(toks) as i64 and str_eq(tok_kind(toks, i), "Comma")) {
+                i = i + 1;
+                var e2 = parse_expr(toks, i);
+                append(n.children, e2.n);
+                i = e2.pos;
+            }
+            if (str_eq(tok_kind(toks, i), "RParen")) { i = i + 1; }
+            return PR{ n: n, pos: i };
+        }
+        if (str_eq(tok_kind(toks, first.pos), "RParen")) { return PR{ n: mk_node("Paren", i - 1), pos: first.pos + 1 }; }
+        return PR{ n: mk_node("Paren", i - 1), pos: first.pos };
+    }
+    if (str_eq(k, "LBracket")) {
+        i = i + 1;
+        var m = slice_len(toks) as i64;
+        var looks_map: bool = false;
+        var j: i64 = i;
+        while (j < m and str_eq(tok_kind(toks, j), "RBracket") == false) {
+            if (str_eq(tok_kind(toks, j), "Colon")) { looks_map = true; break; }
+            if (str_eq(tok_kind(toks, j), "Comma")) { break; }
+            j = j + 1;
+        }
+        if (looks_map) {
+            var n = mk_node("MapLit", i - 1);
+            while (i < m and str_eq(tok_kind(toks, i), "RBracket") == false) {
+                var key = parse_expr(toks, i); append(n.children, key.n); i = key.pos;
+                if (str_eq(tok_kind(toks, i), "Colon")) { i = i + 1; }
+                var val = parse_expr(toks, i); append(n.children, val.n); i = val.pos;
+                if (str_eq(tok_kind(toks, i), "Comma")) { i = i + 1; }
+            }
+            if (str_eq(tok_kind(toks, i), "RBracket")) { i = i + 1; }
+            return PR{ n: n, pos: i };
+        }
+        var n2 = mk_node("ArrayLit", i - 1);
+        while (i < m and str_eq(tok_kind(toks, i), "RBracket") == false) {
+            var e3 = parse_expr(toks, i); append(n2.children, e3.n); i = e3.pos;
+            if (str_eq(tok_kind(toks, i), "Comma")) { i = i + 1; }
+        }
+        if (str_eq(tok_kind(toks, i), "RBracket")) { i = i + 1; }
+        return PR{ n: n2, pos: i };
+    }
+    if (str_eq(k, "LBrace")) {
+        i = i + 1;
+        var n = mk_node("StructLit", i - 1);
+        var m = slice_len(toks) as i64;
+        while (i < m and str_eq(tok_kind(toks, i), "RBrace") == false) {
+            var f = mk_node("FieldInit", i);
+            if (str_eq(tok_kind(toks, i), "Identifier")) { f.text = tok_src(toks, i); i = i + 1; }
+            if (str_eq(tok_kind(toks, i), "Colon")) { i = i + 1; }
+            var ve = parse_expr(toks, i); append(f.children, ve.n); i = ve.pos;
+            append(n.children, f);
+            if (str_eq(tok_kind(toks, i), "Comma")) { i = i + 1; }
+        }
+        if (str_eq(tok_kind(toks, i), "RBrace")) { i = i + 1; }
+        return PR{ n: n, pos: i };
+    }
+    if (str_eq(k, "KwMatch")) { return parse_match(toks, i); }
+    if (str_eq(k, "KwIf")) { return parse_if(toks, i); }
+    if (str_eq(k, "BitOr")) {
+        i = i + 1;
+        var n = mk_node("Lambda", i - 1);
+        while (i < slice_len(toks) as i64 and str_eq(tok_kind(toks, i), "BitOr") == false) {
+            if (str_eq(tok_kind(toks, i), "Identifier")) {
+                var p = mk_node("Param", i); p.text = tok_src(toks, i); append(n.children, p); i = i + 1;
+            } else { i = i + 1; }
+            if (str_eq(tok_kind(toks, i), "Comma")) { i = i + 1; }
+        }
+        if (str_eq(tok_kind(toks, i), "BitOr")) { i = i + 1; }
+        if (str_eq(tok_kind(toks, i), "LBrace")) { var b = parse_block(toks, i); append(n.children, b.n); i = b.pos; }
+        else { var be = parse_expr(toks, i); append(n.children, be.n); i = be.pos; }
+        return PR{ n: n, pos: i };
+    }
+    var n = mk_node(k, i); n.text = tok_src(toks, i);
+    return PR{ n: n, pos: i + 1 };
+}
+
+
+// ── 顶层文件解析 ────────────────────────────────────────────────────────────
+pub struct File {
+    source: string;
+    tokens: []Token;
+    root: Node;     // tag = "SourceFile"，children = 顶层声明
+}
+
+pub fn parse_file(src: string) File {
+    var f: File;
+    f.source = src;
+    f.tokens = tokenize(src);
+    var toks = f.tokens;
+    var i: i64 = 0;
+    var m: i64 = slice_len(toks) as i64;
+    var root: Node = mk_node("SourceFile", -1);
+    var pending_pub: bool = false;
+    var pending_anns: []Node;
+    while (i < m) {
+        var k = tok_kind(toks, i);
+        if (str_eq(k, "Eof")) { break; }
+        if (str_eq(k, "KwPub")) { pending_pub = true; i = i + 1; continue; }
+        if (str_eq(k, "At")) {
+            var a = parse_anns_node(toks, i);
+            var ai: i64 = 0;
+            while (ai < slice_len(a.n.children) as i64) { append(pending_anns, a.n.children[ai]); ai = ai + 1; }
+            i = a.pos;
+            continue;
+        }
+        if (str_eq(k, "Hash")) {
+            var d: Node = mk_node("Directive", i);
+            d.text = tok_src(toks, i + 1);
+            append(root.children, d);
+            i = i + 1;
+            while (i < m and str_eq(tok_kind(toks, i), "KwStruct") == false and str_eq(tok_kind(toks, i), "KwEnum") == false
+                and str_eq(tok_kind(toks, i), "KwVariant") == false and str_eq(tok_kind(toks, i), "KwFunc") == false
+                and str_eq(tok_kind(toks, i), "KwTrait") == false and str_eq(tok_kind(toks, i), "KwConst") == false
+                and str_eq(tok_kind(toks, i), "KwVar") == false and str_eq(tok_kind(toks, i), "KwFlag") == false
+                and str_eq(tok_kind(toks, i), "KwUnion") == false and str_eq(tok_kind(toks, i), "KwAgent") == false
+                and str_eq(tok_kind(toks, i), "KwFault") == false and str_eq(tok_kind(toks, i), "KwImport") == false
+                and str_eq(tok_kind(toks, i), "KwModule") == false and str_eq(tok_kind(toks, i), "Identifier") == false
+                and str_eq(tok_kind(toks, i), "Hash") == false and str_eq(tok_kind(toks, i), "At") == false) {
+                i = i + 1;
+            }
+            continue;
+        }
+        var decl: PR;
+        var handled: bool = false;
+        if (str_eq(k, "KwStruct")) { decl = parse_struct_decl(toks, i); handled = true; }
+        else if (str_eq(k, "KwEnum")) { decl = parse_enum_decl(toks, i); handled = true; }
+        else if (str_eq(k, "KwVariant")) { decl = parse_variant_decl(toks, i); handled = true; }
+        else if (str_eq(k, "KwFunc")) { decl = parse_func_decl(toks, i); handled = true; }
+        else if (str_eq(k, "KwTrait")) { decl = parse_trait_decl(toks, i); handled = true; }
+        else if (str_eq(k, "KwConst")) { decl = parse_global_var(toks, i, true); handled = true; }
+        else if (str_eq(k, "KwVar")) { decl = parse_global_var(toks, i, false); handled = true; }
+        else if (str_eq(k, "KwLet")) { decl = parse_global_var(toks, i, true); handled = true; }
+        else if (str_eq(k, "KwFlag")) { decl = parse_flag_decl(toks, i); handled = true; }
+        else if (str_eq(k, "KwUnion")) { decl = parse_union_decl(toks, i); handled = true; }
+        else if (str_eq(k, "KwAgent")) { decl = parse_agent_decl(toks, i); handled = true; }
+        else if (str_eq(k, "KwFault")) { decl = parse_fault_decl(toks, i); handled = true; }
+        else if (str_eq(k, "KwImport")) { decl = parse_import_decl(toks, i); handled = true; }
+        else if (str_eq(k, "KwModule")) { decl = parse_module_decl(toks, i); handled = true; }
+        else if (str_eq(k, "Identifier")) {
+            var txt = tok_src(toks, i);
+            if (str_eq(txt, "module")) { decl = parse_module_decl(toks, i); handled = true; }
+            else if (str_eq(txt, "trait")) { decl = parse_trait_decl(toks, i); handled = true; }
+            else if (str_eq(txt, "test")) { decl = parse_test_decl(toks, i); handled = true; }
+            else if (str_eq(txt, "suite")) { decl = parse_suite_decl(toks, i); handled = true; }
+        }
+        if (handled) {
+            var md = attach_meta(decl.n, pending_anns, pending_pub);
+            append(root.children, md);
+            i = decl.pos;
+            pending_pub = false;
+            pending_anns = [];
+            continue;
+        }
+        i = i + 1;
+    }
+    f.root = root;
+    return f;
+}
+
+// ── 各类声明 ────────────────────────────────────────────────────────────────
+fn parse_struct_decl(toks: []Token, i: i64) PR {
+    var n: Node = mk_node("StructDecl", i); i = i + 1;
+    if (str_eq(tok_kind(toks, i), "Identifier")) { n.text = tok_src(toks, i); i = i + 1; }
+    if (str_eq(tok_kind(toks, i), "Lt")) {
+        while (i < slice_len(toks) as i64 and str_eq(tok_kind(toks, i), "Gt") == false) { i = i + 1; }
+        if (str_eq(tok_kind(toks, i), "Gt")) { i = i + 1; }
+    }
+    var anns = parse_anns_node(toks, i);
+    i = anns.pos;
+    var ai: i64 = 0;
+    while (ai < slice_len(anns.n.children) as i64) { append(n.children, anns.n.children[ai]); ai = ai + 1; }
+    if (str_eq(tok_kind(toks, i), "LBrace")) { i = i + 1; }
+    while (i < slice_len(toks) as i64 and str_eq(tok_kind(toks, i), "RBrace") == false) {
+        if (str_eq(tok_kind(toks, i), "At")) {
+            var a = parse_anns_node(toks, i);
+            ai = 0; while (ai < slice_len(a.n.children) as i64) { append(n.children, a.n.children[ai]); ai = ai + 1; }
+            i = a.pos;
+            continue;
+        }
+        if (str_eq(tok_kind(toks, i), "Identifier") == false) { i = i + 1; continue; }
+        var f: Node = mk_node("Field", i);
+        f.text = tok_src(toks, i); i = i + 1;
+        if (str_eq(tok_kind(toks, i), "Colon")) { i = i + 1; }
+        var ty = parse_type(toks, i);
+        append(f.children, ty.n); i = ty.pos;
+        while (i < slice_len(toks) as i64 and str_eq(tok_kind(toks, i), "At")) {
+            if (i + 1 < slice_len(toks) as i64 and str_eq(tok_kind(toks, i + 1), "Integer")) {
+                f.data = atoi(tok_src(toks, i + 1)); i = i + 2;
+            } else {
+                var a = parse_anns_node(toks, i);
+                ai = 0; while (ai < slice_len(a.n.children) as i64) { append(f.children, a.n.children[ai]); ai = ai + 1; }
+                i = a.pos;
+            }
+        }
+        if (str_eq(tok_kind(toks, i), "Assign")) {
+            i = i + 1;
+            var de: Node = mk_node("Default", i);
+            while (i < slice_len(toks) as i64 and str_eq(tok_kind(toks, i), "Semicolon") == false) {
+                append(de.children, mk_node(tok_kind(toks, i), i)); i = i + 1;
+            }
+            append(f.children, de);
+        }
+        if (str_eq(tok_kind(toks, i), "Semicolon")) { i = i + 1; }
+        append(n.children, f);
+    }
+    if (str_eq(tok_kind(toks, i), "RBrace")) { i = i + 1; }
+    return PR{ n: n, pos: i };
+}
+
+fn parse_enum_decl(toks: []Token, i: i64) PR {
+    var n: Node = mk_node("EnumDecl", i); i = i + 1;
+    if (str_eq(tok_kind(toks, i), "Identifier")) { n.text = tok_src(toks, i); i = i + 1; }
+    if (str_eq(tok_kind(toks, i), "Colon")) {
+        i = i + 1;
+        var ty = parse_type(toks, i); append(n.children, ty.n); i = ty.pos;
+    }
+    var anns = parse_anns_node(toks, i);
+    i = anns.pos;
+    var ai: i64 = 0;
+    while (ai < slice_len(anns.n.children) as i64) { append(n.children, anns.n.children[ai]); ai = ai + 1; }
+    if (str_eq(tok_kind(toks, i), "LBrace")) { i = i + 1; }
+    var auto_val: i64 = 0;
+    while (i < slice_len(toks) as i64 and str_eq(tok_kind(toks, i), "RBrace") == false) {
+        if (str_eq(tok_kind(toks, i), "At")) {
+            var a = parse_anns_node(toks, i);
+            ai = 0; while (ai < slice_len(a.n.children) as i64) { append(n.children, a.n.children[ai]); ai = ai + 1; }
+            i = a.pos;
+            continue;
+        }
+        if (str_eq(tok_kind(toks, i), "Identifier") == false) { i = i + 1; continue; }
+        var mem: Node = mk_node("EnumMember", i);
+        mem.text = tok_src(toks, i); i = i + 1;
+        mem.data = auto_val;
+        if (str_eq(tok_kind(toks, i), "Assign")) {
+            i = i + 1;
+            if (str_eq(tok_kind(toks, i), "Integer")) { mem.data = atoi(tok_src(toks, i)); i = i + 1; auto_val = mem.data; }
+        }
+        auto_val = auto_val + 1;
+        var a = parse_anns_node(toks, i);
+        ai = 0; while (ai < slice_len(a.n.children) as i64) { append(mem.children, a.n.children[ai]); ai = ai + 1; }
+        i = a.pos;
+        if (str_eq(tok_kind(toks, i), "Semicolon")) { i = i + 1; }
+        append(n.children, mem);
+    }
+    if (str_eq(tok_kind(toks, i), "RBrace")) { i = i + 1; }
+    return PR{ n: n, pos: i };
+}
+
+fn parse_variant_decl(toks: []Token, i: i64) PR {
+    var n: Node = mk_node("VariantDecl", i); i = i + 1;
+    if (str_eq(tok_kind(toks, i), "Identifier")) { n.text = tok_src(toks, i); i = i + 1; }
+    if (str_eq(tok_kind(toks, i), "Lt")) {
+        while (i < slice_len(toks) as i64 and str_eq(tok_kind(toks, i), "Gt") == false) { i = i + 1; }
+        if (str_eq(tok_kind(toks, i), "Gt")) { i = i + 1; }
+    }
+    var anns = parse_anns_node(toks, i);
+    i = anns.pos;
+    var ai: i64 = 0;
+    while (ai < slice_len(anns.n.children) as i64) { append(n.children, anns.n.children[ai]); ai = ai + 1; }
+    if (str_eq(tok_kind(toks, i), "LBrace")) { i = i + 1; }
+    while (i < slice_len(toks) as i64 and str_eq(tok_kind(toks, i), "RBrace") == false) {
+        if (str_eq(tok_kind(toks, i), "At")) {
+            var a = parse_anns_node(toks, i);
+            ai = 0; while (ai < slice_len(a.n.children) as i64) { append(n.children, a.n.children[ai]); ai = ai + 1; }
+            i = a.pos;
+            continue;
+        }
+        if (str_eq(tok_kind(toks, i), "Identifier") == false) { i = i + 1; continue; }
+        var c: Node = mk_node("VariantCase", i);
+        c.text = tok_src(toks, i); i = i + 1;
+        if (str_eq(tok_kind(toks, i), "LParen")) {
+            i = i + 1;
+            while (i < slice_len(toks) as i64 and str_eq(tok_kind(toks, i), "RParen") == false) {
+                if (str_eq(tok_kind(toks, i), "At") and i + 1 < slice_len(toks) as i64 and str_eq(tok_kind(toks, i + 1), "Integer")) {
+                    c.data = atoi(tok_src(toks, i + 1)); i = i + 2;
+                } else {
+                    var pt = parse_type(toks, i); append(c.children, pt.n); i = pt.pos;
+                    if (str_eq(tok_kind(toks, i), "Comma")) { i = i + 1; }
+                }
+            }
+            if (str_eq(tok_kind(toks, i), "RParen")) { i = i + 1; }
+        }
+        if (str_eq(tok_kind(toks, i), "Semicolon")) { i = i + 1; }
+        append(n.children, c);
+    }
+    if (str_eq(tok_kind(toks, i), "RBrace")) { i = i + 1; }
+    return PR{ n: n, pos: i };
+}
+
+fn parse_func_decl(toks: []Token, i: i64) PR {
+    var n: Node = mk_node("FuncDecl", i); i = i + 1;
+    if (str_eq(tok_kind(toks, i), "Identifier")) { n.text = tok_src(toks, i); i = i + 1; }
+    if (str_eq(tok_kind(toks, i), "Lt")) {
+        while (i < slice_len(toks) as i64 and str_eq(tok_kind(toks, i), "Gt") == false) { i = i + 1; }
+        if (str_eq(tok_kind(toks, i), "Gt")) { i = i + 1; }
+    }
+    if (str_eq(tok_kind(toks, i), "LParen")) {
+        i = i + 1;
+        while (i < slice_len(toks) as i64 and str_eq(tok_kind(toks, i), "RParen") == false) {
+            if (str_eq(tok_kind(toks, i), "At")) {
+                var a = parse_anns_node(toks, i);
+                var ai = 0; while (ai < slice_len(a.n.children) as i64) { append(n.children, a.n.children[ai]); ai = ai + 1; }
+                i = a.pos;
+                if (str_eq(tok_kind(toks, i), "Comma")) { i = i + 1; }
+                continue;
+            }
+            var p: Node = mk_node("Param", i);
+            if (str_eq(tok_kind(toks, i), "Identifier")) { p.text = tok_src(toks, i); i = i + 1; }
+            if (str_eq(tok_kind(toks, i), "Colon")) { i = i + 1; }
+            var pt = parse_type(toks, i); append(p.children, pt.n); i = pt.pos;
+            append(n.children, p);
+            if (str_eq(tok_kind(toks, i), "Comma")) { i = i + 1; }
+        }
+        if (str_eq(tok_kind(toks, i), "RParen")) { i = i + 1; }
+    }
+    // 返回类型（t 语法：fn name(params) rettype { body }，rettype 前无冒号）
+    if (str_eq(tok_kind(toks, i), "LBrace") == false and str_eq(tok_kind(toks, i), "Semicolon") == false and str_eq(tok_kind(toks, i), "Eof") == false) {
+        var rt = parse_type(toks, i); append(n.children, rt.n); i = rt.pos;
+    }
+    if (str_eq(tok_kind(toks, i), "LBrace")) {
+        var b = parse_block(toks, i);
+        append(n.children, b.n);
+        i = b.pos;
+    }
+    return PR{ n: n, pos: i };
+}
+
+fn parse_trait_decl(toks: []Token, i: i64) PR {
+    var n: Node = mk_node("TraitDecl", i); i = i + 1;
+    if (str_eq(tok_kind(toks, i), "Identifier")) { n.text = tok_src(toks, i); i = i + 1; }
+    if (str_eq(tok_kind(toks, i), "LBrace")) {
+        var b = parse_block(toks, i);
+        append(n.children, b.n);
+        i = b.pos;
+    }
+    return PR{ n: n, pos: i };
+}
+
+fn parse_global_var(toks: []Token, i: i64, is_const: bool) PR {
+    var n: Node = mk_node("GlobalVarDecl", i);
+    if (is_const) { n.tag = "GlobalConstDecl"; }
+    i = i + 1;
+    if (str_eq(tok_kind(toks, i), "Identifier")) { n.text = tok_src(toks, i); i = i + 1; }
+    if (str_eq(tok_kind(toks, i), "Colon")) {
+        i = i + 1;
+        var ty = parse_type(toks, i); append(n.children, ty.n); i = ty.pos;
+    }
+    if (str_eq(tok_kind(toks, i), "Assign")) {
+        i = i + 1;
+        var e: Node = mk_node("Init", i);
+        while (i < slice_len(toks) as i64 and str_eq(tok_kind(toks, i), "Semicolon") == false) {
+            append(e.children, mk_node(tok_kind(toks, i), i)); i = i + 1;
+        }
+        append(n.children, e);
+    }
+    if (str_eq(tok_kind(toks, i), "Semicolon")) { i = i + 1; }
+    return PR{ n: n, pos: i };
+}
+
+fn parse_flag_decl(toks: []Token, i: i64) PR {
+    var n: Node = mk_node("FlagDecl", i); i = i + 1;
+    if (str_eq(tok_kind(toks, i), "Identifier")) { n.text = tok_src(toks, i); i = i + 1; }
+    if (str_eq(tok_kind(toks, i), "LBrace")) {
+        var b = parse_block(toks, i);
+        append(n.children, b.n);
+        i = b.pos;
+    }
+    return PR{ n: n, pos: i };
+}
+
+fn parse_union_decl(toks: []Token, i: i64) PR {
+    var n: Node = mk_node("UnionDecl", i); i = i + 1;
+    if (str_eq(tok_kind(toks, i), "Identifier")) { n.text = tok_src(toks, i); i = i + 1; }
+    if (str_eq(tok_kind(toks, i), "LBrace")) {
+        var b = parse_block(toks, i);
+        append(n.children, b.n);
+        i = b.pos;
+    }
+    return PR{ n: n, pos: i };
+}
+
+fn parse_agent_decl(toks: []Token, i: i64) PR {
+    var n: Node = mk_node("AgentDecl", i); i = i + 1;
+    if (str_eq(tok_kind(toks, i), "Identifier")) { n.text = tok_src(toks, i); i = i + 1; }
+    if (str_eq(tok_kind(toks, i), "LBrace")) {
+        var b = parse_block(toks, i);
+        append(n.children, b.n);
+        i = b.pos;
+    }
+    return PR{ n: n, pos: i };
+}
+
+fn parse_fault_decl(toks: []Token, i: i64) PR {
+    var n: Node = mk_node("FaultDecl", i); i = i + 1;
+    if (str_eq(tok_kind(toks, i), "Identifier")) { n.text = tok_src(toks, i); i = i + 1; }
+    if (str_eq(tok_kind(toks, i), "LBrace")) {
+        var b = parse_block(toks, i);
+        append(n.children, b.n);
+        i = b.pos;
+    }
+    return PR{ n: n, pos: i };
+}
+
+fn parse_import_decl(toks: []Token, i: i64) PR {
+    var n: Node = mk_node("ImportDecl", i); i = i + 1;
+    if (str_eq(tok_kind(toks, i), "String")) { n.text = tok_src(toks, i); i = i + 1; }
+    else {
+        while (i < slice_len(toks) as i64 and str_eq(tok_kind(toks, i), "Semicolon") == false and str_eq(tok_kind(toks, i), "Eof") == false) {
+            n.text = n.text + tok_src(toks, i); i = i + 1;
+        }
+    }
+    if (str_eq(tok_kind(toks, i), "Semicolon")) { i = i + 1; }
+    return PR{ n: n, pos: i };
+}
+
+fn parse_module_decl(toks: []Token, i: i64) PR {
+    var n: Node = mk_node("ModuleDecl", i); i = i + 1;
+    if (str_eq(tok_kind(toks, i), "String")) { n.text = tok_src(toks, i); i = i + 1; }
+    else {
+        while (i < slice_len(toks) as i64 and str_eq(tok_kind(toks, i), "Semicolon") == false and str_eq(tok_kind(toks, i), "Eof") == false) {
+            n.text = n.text + tok_src(toks, i); i = i + 1;
+        }
+    }
+    if (str_eq(tok_kind(toks, i), "Semicolon")) { i = i + 1; }
+    return PR{ n: n, pos: i };
+}
+
+fn parse_test_decl(toks: []Token, i: i64) PR {
+    var n: Node = mk_node("TestDecl", i); i = i + 1;
+    if (str_eq(tok_kind(toks, i), "String")) { n.text = tok_src(toks, i); i = i + 1; }
+    if (str_eq(tok_kind(toks, i), "Identifier")) { n.text = tok_src(toks, i); i = i + 1; }
+    if (str_eq(tok_kind(toks, i), "LBrace")) {
+        var b = parse_block(toks, i);
+        append(n.children, b.n);
+        i = b.pos;
+    }
+    return PR{ n: n, pos: i };
+}
+
+fn parse_suite_decl(toks: []Token, i: i64) PR {
+    var n: Node = mk_node("SuiteDecl", i); i = i + 1;
+    if (str_eq(tok_kind(toks, i), "String")) { n.text = tok_src(toks, i); i = i + 1; }
+    if (str_eq(tok_kind(toks, i), "LBrace")) {
+        var b = parse_block(toks, i);
+        append(n.children, b.n);
+        i = b.pos;
+    }
+    return PR{ n: n, pos: i };
+}
+
+// ── 树转文本（缩进打印，供 format/lint/demo 调试）────────────────────────────
+pub fn dump_node(n: Node, indent: i64) string {
+    var s: string = "";
+    var k: i64 = 0;
+    while (k < indent) { s = s + "  "; k = k + 1; }
+    s = s + n.tag;
+    if (str_len(n.text) > 0) { s = s + " '" + n.text + "'"; }
+    if (n.data >= 0) { s = s + " #" + int_to_str(n.data); }
+    s = s + "\n";
+    var j: i64 = 0;
+    while (j < slice_len(n.children) as i64) {
+        s = s + dump_node(n.children[j], indent + 1);
+        j = j + 1;
+    }
+    return s;
+}
+
+pub fn dump_file(f: File) string {
+    return dump_node(f.root, 0);
+}

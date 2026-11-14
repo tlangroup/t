@@ -1,0 +1,72 @@
+// R-015 std.pbwire 双后端验证：varint / key / fixed / sfixed / sint / bool / float / double
+// 关键验收：① 已知向量逐字节一致；② round-trip 全域；③ float/double 位级相等（含 NaN/Inf）。
+@import("std.pbwire");
+
+@main
+fn main() i64 {
+    var buf: [64]u8;
+    var n: i64;
+
+    // ── varint 已知向量 ──
+    // 300 = 0xAC 0x02 ；16384 = 0x80 0x80 0x01
+    buf = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+           0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+           0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+           0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    n = pbwire.write_varint(buf, 0, 300);
+    println(int_to_str(n));                         // 2
+    var r1 = pbwire.read_varint(buf, 0);
+    println(int_to_str(r1.value as i64));           // 300
+    n = pbwire.write_varint(buf, 0, 16384);
+    var r2 = pbwire.read_varint(buf, 0);
+    println(int_to_str(r2.value as i64));           // 16384
+
+    // max u64 = 10 字节全 0xFF 末字节 0x01
+    n = pbwire.write_varint(buf, 0, 0xFFFFFFFFFFFFFFFFu64);
+    println(int_to_str(n));                         // 10
+    var r3 = pbwire.read_varint(buf, 0);
+    println(int_to_str(r3.value as i64));           // -1（0xFFFFFFFFFFFFFFFF 当 i64 看）
+
+    // ── key ──
+    n = pbwire.write_key(buf, 0, 1, 0);            // field1, Varint → varint(8)
+    var k = pbwire.read_key(buf, 0);
+    println(int_to_str(k.field as i64));            // 1
+    println(int_to_str(k.wire_type as i64));        // 0
+
+    // ── fixed32 / sfixed32 ──
+    n = pbwire.write_fixed32(buf, 0, 0x01020304u32);
+    println(int_to_str(pbwire.read_fixed32(buf, 0) as i64));   // 16909060
+    n = pbwire.write_sfixed32(buf, 0, -3i32);
+    println(int_to_str(pbwire.read_sfixed32(buf, 0) as i64));  // -3
+
+    // ── sint32（zigzag）：-1→1, 1→2, -2→3 ──
+    n = pbwire.write_sint32(buf, 0, -1i32);
+    var s1 = pbwire.read_sint32(buf, 0);
+    println(int_to_str(s1.value as i64));          // -1
+    n = pbwire.write_sint32(buf, 0, 1i32);
+    var s2 = pbwire.read_sint32(buf, 0);
+    println(int_to_str(s2.value as i64));          // 1
+
+    // ── bool ──
+    n = pbwire.write_bool(buf, 0, true);
+    var b1 = pbwire.read_bool(buf, 0);
+    println(int_to_str(b1.value as i64));          // 1
+
+    // ── float：位级 round-trip（含 1.0 / NaN / Inf）──
+    n = pbwire.write_float(buf, 0, 1.0f32);
+    var f1bits: u32 = @bitCast(u32, pbwire.read_float(buf, 0));
+    println(int_to_str(f1bits as i64));            // 1065353216 (0x3F800000)
+    n = pbwire.write_float(buf, 0, @bitCast(f32, 0x7FC00000u32));   // NaN
+    var f2bits: u32 = @bitCast(u32, pbwire.read_float(buf, 0));
+    println(int_to_str(f2bits as i64));            // 2143289344 (0x7FC00000, NaN 位模式原样保留)
+    n = pbwire.write_float(buf, 0, @bitCast(f32, 0x7F800000u32));   // +Inf
+    var f3bits: u32 = @bitCast(u32, pbwire.read_float(buf, 0));
+    println(int_to_str(f3bits as i64));            // 2139095040 (0x7F800000)
+
+    // ── double ──
+    n = pbwire.write_double(buf, 0, 1.0);
+    var d1bits: u64 = @bitCast(u64, pbwire.read_double(buf, 0));
+    println(int_to_str(d1bits as i64));            // 4607182418800017408 (0x3FF0000000000000)
+
+    return 0;
+}

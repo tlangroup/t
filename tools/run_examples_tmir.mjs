@@ -119,7 +119,7 @@ const SMOKE_SKIP = new Map([
 ]);
 
 function hasMain(name) {
-    try { return /@main/.test(readFileSync(join(EX, `${name}.tc`), "utf8")); }
+    try { return /@main|\bfn\s+main\b/.test(readFileSync(join(EX, `${name}.tc`), "utf8")); }
     catch { return false; }
 }
 function hasGolden(name) { return existsSync(join(EX, `${name}.expected.txt`)); }

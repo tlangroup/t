@@ -427,7 +427,17 @@ const r = await node("ir_snapshot.mjs", "--compiler", `${G1}.exe`, "--jobs", "1"
             // 同 boot23：g1 不参与判据（它由改动前的编译器发射）。
             const ms = ["g2", "g3", "g4"].map((g) => md5(join(ROOT, `out/dbg/${g}.ll`)));
             const same = ms.every((m) => m === ms[0]);
-            return { ok: same, note: same ? `g2==g3==g4 = ${ms[0].slice(0, 8)}` : `不一致: ${ms.map((m) => m.slice(0, 6)).join(" ")}` };
+            if (!same) return { ok: false, note: `不一致: ${ms.map((m) => m.slice(0, 6)).join(" ")}` };
+            // 不动点成立即安装为权威入口 tc.exe（bootstrap.md §4.4）。
+            // 不等 gate 全绿：信任根滚动不应被预存 FAIL 阻塞；下游（含规范验证工具）
+            // 统一以 tc.exe 为唯一「最新权威」，避免散用 g1/g2/g3 造成「哪个是最新」漂移。
+            try {
+                copyFileSync(join(ROOT, "out/dbg/g4.exe"), join(ROOT, "out/dbg/tc.exe"));
+            } catch (e) {
+                return { ok: true, warn: true, note: `g2==g3==g4=${ms[0].slice(0, 8)}; 但安装 tc.exe 失败: ${e.message}` };
+            }
+            const h = md5(join(ROOT, "out/dbg/tc.exe"));
+            return { ok: true, note: `g2==g3==g4=${ms[0].slice(0, 8)}; 已安装 tc.exe (${h.slice(0, 8)})` };
         },
     },
     {
@@ -570,9 +580,18 @@ console.log(
     `${nSkip ? `, ${nSkip} skipped` : ""}${nWarn ? `, ${nWarn} warn` : ""}  —  ${total.toFixed(1)}s`
 );
 
-if (failed === 0 && LV === 2) {
-    console.log(`\n  四代自举产物在 out/dbg/g4.exe，确认无误后安装：`);
-    console.log(`    cp out/dbg/g4.exe out/dbg/tc.exe && cp ${GR}.exe out/rls/tc.exe`);
+if (LV === 2) {
+    // tc.exe 由 boot4 在不动点成立时自动安装（bootstrap.md §4.4）；此处仅确认/兜底告警。
+    const tcP = join(ROOT, "out/dbg/tc.exe");
+    const g4P = join(ROOT, "out/dbg/g4.exe");
+    const tcH = existsSync(tcP) ? md5(tcP) : null;
+    const g4H = existsSync(g4P) ? md5(g4P) : null;
+    if (g4H && tcH !== g4H) {
+        console.log(`\n  ⚠ tc.exe 不等于最新不动点 g4，手动安装：`);
+        console.log(`    cp out/dbg/g4.exe out/dbg/tc.exe`);
+    } else if (g4H) {
+        console.log(`\n  已确认 out/dbg/tc.exe == g4（最新不动点，权威入口）`);
+    }
 }
 if (nWarn > 0) {
     // 基线由 LLVM 自举产物 g1 录制（同源同后端，确定性）：快照是 LLVM-vs-LLVM 比对，
